@@ -1670,6 +1670,26 @@ impl LanguageServerPool {
         document_uri: Option<&Url>,
         timeout: Duration,
     ) -> io::Result<Arc<ConnectionHandle>> {
+        tokio::time::timeout(
+            timeout,
+            self.get_or_create_connection_wait_ready_inner(
+                server_name,
+                server_config,
+                document_uri,
+                timeout,
+            ),
+        )
+        .await
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "bridge: acquisition timed out"))?
+    }
+
+    async fn get_or_create_connection_wait_ready_inner(
+        &self,
+        server_name: &str,
+        server_config: &crate::config::settings::BridgeServerConfig,
+        document_uri: Option<&Url>,
+        timeout: Duration,
+    ) -> io::Result<Arc<ConnectionHandle>> {
         // `timeout` is the caller's overall budget; the incapable-shared divert
         // below acquires a second connection, so track elapsed time and hand it
         // only the remaining budget rather than a fresh full `timeout`.
