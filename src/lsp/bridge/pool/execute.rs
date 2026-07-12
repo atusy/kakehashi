@@ -433,7 +433,14 @@ mod tests {
         );
         first_request.abort();
         second_request.abort();
-        let _ = tokio::join!(first_request, second_request);
+        let (first_join, second_join) = tokio::join!(first_request, second_request);
+        for join in [first_join, second_join] {
+            let error = join.expect_err("an aborted request task must not complete normally");
+            assert!(
+                error.is_cancelled(),
+                "request task failed for a reason other than cancellation: {error}"
+            );
+        }
 
         assert_ne!(first, second, "concurrent requests need fresh numeric ids");
         if let Some(upstream_id) = numeric_upstream_id {
