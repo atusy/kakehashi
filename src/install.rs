@@ -247,7 +247,7 @@ fn install_language_blocking(
         force,
         queries_base_url,
         compile,
-        queries::install_queries_with_dependencies_from,
+        queries::install_queries_with_dependencies_from_under_operation_lock,
     )
 }
 
@@ -281,6 +281,18 @@ fn install_language_blocking_with_query_installer(
         return result;
     }
 
+    // Cover tombstone preparation and both artifact publications as one
+    // install operation. Bulk uninstall must not linearize between them.
+    let _operation_lock = match operation_lock::LanguageOperationGuard::shared(data_dir) {
+        Ok(lock) => lock,
+        Err(e) => {
+            let reason = e.to_string();
+            result.parser_error = Some(reason.clone());
+            result.queries_error = Some(reason);
+            return result;
+        }
+    };
+
     if let Err(e) = queries::clear_uninstall_tombstone_for_install(data_dir, language) {
         let reason = e.to_string();
         result.queries_error = Some(reason);
@@ -303,7 +315,7 @@ fn install_language_blocking_with_query_installer(
     // AlreadyExists means the artifact is present and usable — success,
     // not failure; treating it as an error made the auto-install manager
     // degrade a fully-installed language to "installed but with warnings".
-    match parser::install_parser(language, &parser_options) {
+    match parser::install_parser_under_operation_lock(language, &parser_options) {
         Ok(parser_result) => {
             result.parser_path = Some(parser_result.install_path);
         }
@@ -375,7 +387,7 @@ fn install_language_blocking_allowing_http_queries_for_tests(
         force,
         queries_base_url,
         compile,
-        queries::install_queries_with_dependencies_from_allowing_http_for_tests,
+        queries::install_queries_with_dependencies_from_allowing_http_for_tests_under_operation_lock,
     )
 }
 

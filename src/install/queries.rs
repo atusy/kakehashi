@@ -154,8 +154,9 @@ pub fn install_queries_with_dependencies(
     data_dir: &Path,
     force: bool,
 ) -> Result<QueryInstallResult, QueryInstallError> {
+    let _operation_lock = super::operation_lock::LanguageOperationGuard::shared(data_dir)?;
     clear_uninstall_tombstone_for_install(data_dir, language)?;
-    install_queries_with_dependencies_from_with_http_policy(
+    install_queries_with_dependencies_from_with_http_policy_under_operation_lock(
         NVIM_TREESITTER_QUERIES_URL,
         language,
         data_dir,
@@ -169,7 +170,7 @@ pub fn install_queries_with_dependencies_after_install_started(
     data_dir: &Path,
     force: bool,
 ) -> Result<QueryInstallResult, QueryInstallError> {
-    install_queries_with_dependencies_from_with_http_policy(
+    install_queries_with_dependencies_from_with_http_policy_under_operation_lock(
         NVIM_TREESITTER_QUERIES_URL,
         language,
         data_dir,
@@ -185,7 +186,17 @@ pub(crate) fn install_queries_with_dependencies_from(
     data_dir: &Path,
     force: bool,
 ) -> Result<QueryInstallResult, QueryInstallError> {
-    install_queries_with_dependencies_from_with_http_policy(
+    let _operation_lock = super::operation_lock::LanguageOperationGuard::shared(data_dir)?;
+    install_queries_with_dependencies_from_under_operation_lock(base_url, language, data_dir, force)
+}
+
+pub(crate) fn install_queries_with_dependencies_from_under_operation_lock(
+    base_url: &str,
+    language: &str,
+    data_dir: &Path,
+    force: bool,
+) -> Result<QueryInstallResult, QueryInstallError> {
+    install_queries_with_dependencies_from_with_http_policy_under_operation_lock(
         base_url,
         language,
         data_dir,
@@ -203,7 +214,20 @@ pub(crate) fn install_queries_with_dependencies_from_allowing_http_for_tests(
     data_dir: &Path,
     force: bool,
 ) -> Result<QueryInstallResult, QueryInstallError> {
-    install_queries_with_dependencies_from_with_http_policy(
+    let _operation_lock = super::operation_lock::LanguageOperationGuard::shared(data_dir)?;
+    install_queries_with_dependencies_from_allowing_http_for_tests_under_operation_lock(
+        base_url, language, data_dir, force,
+    )
+}
+
+#[cfg(test)]
+pub(crate) fn install_queries_with_dependencies_from_allowing_http_for_tests_under_operation_lock(
+    base_url: &str,
+    language: &str,
+    data_dir: &Path,
+    force: bool,
+) -> Result<QueryInstallResult, QueryInstallError> {
+    install_queries_with_dependencies_from_with_http_policy_under_operation_lock(
         base_url,
         language,
         data_dir,
@@ -219,17 +243,13 @@ enum QueryHttpPolicy {
     AllowHttpForTests,
 }
 
-fn install_queries_with_dependencies_from_with_http_policy(
+fn install_queries_with_dependencies_from_with_http_policy_under_operation_lock(
     base_url: &str,
     language: &str,
     data_dir: &Path,
     force: bool,
     http_policy: QueryHttpPolicy,
 ) -> Result<QueryInstallResult, QueryInstallError> {
-    // Acquire the data-directory lock before recursive installation takes any
-    // per-language replacement locks. This order prevents a bulk uninstall
-    // from deadlocking with inherited-query installation.
-    let _operation_lock = super::operation_lock::LanguageOperationGuard::shared(data_dir)?;
     let mut installed = std::collections::HashSet::new();
     install_queries_recursive(
         base_url,

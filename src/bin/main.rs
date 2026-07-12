@@ -1069,6 +1069,16 @@ fn run_install(language: &str, force: bool, verbose: bool, no_cache: bool) -> Re
         ExitCode::FAILURE
     })?;
 
+    // Tombstone clearing, parser publication, and query publication form one
+    // install operation relative to bulk uninstall.
+    let _operation_lock = kakehashi::install::operation_lock::LanguageOperationGuard::shared(
+        &data_dir,
+    )
+    .map_err(|e| {
+        eprintln!("✗ Failed to coordinate language installation: {e}");
+        ExitCode::FAILURE
+    })?;
+
     // Track success/failure for exit code
     let mut parser_success = true;
     let mut queries_success = true;
@@ -1091,7 +1101,7 @@ fn run_install(language: &str, force: bool, verbose: bool, no_cache: bool) -> Re
         compile: parser::ParserCompile::KillableSubprocess,
     };
 
-    match parser::install_parser(language, &options) {
+    match parser::install_parser_under_operation_lock(language, &options) {
         Ok(result) => {
             eprintln!("✓ Parser installed: {}", result.install_path.display());
             if verbose {

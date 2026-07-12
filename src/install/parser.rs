@@ -266,6 +266,16 @@ pub fn install_parser(
     language: &str,
     options: &InstallOptions,
 ) -> Result<ParserInstallResult, ParserInstallError> {
+    let _operation_lock = super::operation_lock::LanguageOperationGuard::shared(&options.data_dir)?;
+    install_parser_under_operation_lock(language, options)
+}
+
+/// Install a parser while the caller holds the data-directory operation lock.
+#[doc(hidden)]
+pub fn install_parser_under_operation_lock(
+    language: &str,
+    options: &InstallOptions,
+) -> Result<ParserInstallResult, ParserInstallError> {
     // `language` becomes path segments (`parser/<language>.<ext>` and the temp
     // file) and a URL/metadata key, so reject traversal-capable names before
     // touching the filesystem. Higher-level callers (auto-install) already gate
@@ -277,12 +287,6 @@ pub fn install_parser(
             format!("unsafe language name '{}'", language.escape_default()),
         )));
     }
-
-    // Operation locks are always acquired before any artifact-specific lock.
-    // Bulk uninstall takes the exclusive side of this lock, so an install
-    // phase either publishes completely before its snapshot or starts after
-    // the uninstall has established an empty state.
-    let _operation_lock = super::operation_lock::LanguageOperationGuard::shared(&options.data_dir)?;
 
     let parser_dir = options.data_dir.join("parser");
     let parser_file = parser_dir.join(format!("{}.{}", language, std::env::consts::DLL_EXTENSION));
