@@ -20,6 +20,10 @@ pub(crate) struct ComputePool {
 }
 
 impl ComputePool {
+    pub(crate) fn thread_count(&self) -> usize {
+        self.pool.current_num_threads()
+    }
+
     /// Build the pool at the ADR-specified size:
     /// `available_parallelism - 2`, at least 1.
     pub(crate) fn new() -> Self {

@@ -64,6 +64,19 @@ pub(crate) use token_collector::TokenKind;
 #[cfg(test)]
 use {delta::calculate_semantic_tokens_delta, tower_lsp_server::ls_types::SemanticTokens};
 
+fn should_parallelize_host_and_injections(
+    compute_threads: usize,
+    current_generation: u64,
+    discovery: Option<(u64, bool, usize)>,
+) -> bool {
+    compute_threads >= 3
+        && discovery.is_some_and(|(generation, complete, region_count)| {
+            generation == current_generation
+                && complete
+                && region_count >= INJECTION_CACHE_MIN_REGIONS
+        })
+}
+
 /// Compute full-document semantic tokens (host + injections) as one work-unit
 /// on the bounded compute pool; the injection fan-out's `par_iter` runs on the
 /// same pool (a Rayon parallel iterator invoked from a pool thread stays on
@@ -92,6 +105,7 @@ pub(crate) async fn handle_semantic_tokens_full(
     injection_cache: Option<InjectionCacheParams>,
     cancel: Option<crate::cancel::CancelToken>,
 ) -> Option<SemanticTokensResult> {
+    let compute_threads = pool.thread_count();
     pool.run(cancel.clone(), move || {
         let is_cancelled = || crate::cancel::is_cancelled(cancel.as_ref());
         let compute_started = std::time::Instant::now();
@@ -119,11 +133,17 @@ pub(crate) async fn handle_semantic_tokens_full(
         });
 
         let should_parallelize = cache_ctx.as_ref().is_some_and(|ctx| {
-            ctx.discovery.is_some_and(|discovery| {
-                discovery.generation == ctx.generation
-                    && discovery.complete
-                    && discovery.regions.len() >= INJECTION_CACHE_MIN_REGIONS
-            })
+            should_parallelize_host_and_injections(
+                compute_threads,
+                ctx.generation,
+                ctx.discovery.map(|discovery| {
+                    (
+                        discovery.generation,
+                        discovery.complete,
+                        discovery.regions.len(),
+                    )
+                }),
+            )
         });
         let mut host_work = || {
                     let started = std::time::Instant::now();
@@ -234,6 +254,39 @@ pub(crate) async fn handle_semantic_tokens_full(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parallel_host_injection_gate_checks_pool_and_discovery_contract() {
+        let threshold = INJECTION_CACHE_MIN_REGIONS;
+        let cases = [
+            (1, 7, None, false, "single-thread pool"),
+            (2, 7, Some((7, true, threshold)), false, "two-thread pool"),
+            (3, 7, None, false, "absent discovery"),
+            (3, 7, Some((6, true, threshold)), false, "stale discovery"),
+            (
+                3,
+                7,
+                Some((7, false, threshold)),
+                false,
+                "partial discovery",
+            ),
+            (
+                3,
+                7,
+                Some((7, true, threshold - 1)),
+                false,
+                "below threshold",
+            ),
+            (3, 7, Some((7, true, threshold)), true, "eligible"),
+        ];
+        for (threads, generation, discovery, expected, label) in cases {
+            assert_eq!(
+                should_parallelize_host_and_injections(threads, generation, discovery),
+                expected,
+                "{label}"
+            );
+        }
+    }
     use tower_lsp_server::ls_types::{Range, SemanticToken};
 
     /// Returns the search path for tree-sitter grammars.
