@@ -46,6 +46,12 @@ pub(super) struct InjectionLayer {
     ambiguous: bool,
 }
 
+impl InjectionLayer {
+    pub(super) fn is_ambiguous(&self) -> bool {
+        self.ambiguous
+    }
+}
+
 /// Layers rebuilt at an anchor plus ambiguity discovered at an unparseable
 /// next layer.
 ///

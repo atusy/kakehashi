@@ -284,6 +284,13 @@ impl Kakehashi {
                 let Some(layer) = stack.get(layer_index) else {
                     return Value::Null;
                 };
+                // A depth-only id cannot name which overlapping same-depth
+                // tree minted a node. Fail closed at the entry point as well
+                // as in follow-up accessors so we never hand out an id that is
+                // unusable immediately after creation (#350).
+                if layer.is_ambiguous() {
+                    return Value::Null;
+                }
 
                 let Some(node) = smallest_containing_node(&layer.tree, byte, doc_len) else {
                     return Value::Null;
