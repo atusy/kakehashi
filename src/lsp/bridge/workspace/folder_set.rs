@@ -50,6 +50,15 @@ impl WorkspaceFolderSet {
             .clone()
     }
 
+    /// Replace the complete set, preserving the protocol distinction between
+    /// `None` (`null`) and `Some(vec![])` (an explicitly empty folder list).
+    pub(crate) fn replace(&self, folders: Option<Vec<WorkspaceFolder>>) {
+        *self
+            .inner
+            .lock()
+            .recover_poison("WorkspaceFolderSet::replace") = folders;
+    }
+
     /// Whether a folder with `folder`'s URI is already in the set.
     pub(crate) fn contains(&self, folder: &WorkspaceFolder) -> bool {
         self.inner
@@ -207,5 +216,14 @@ mod tests {
         set.apply_change(Vec::new(), &[folder("file:///absent")]);
 
         assert_eq!(set.snapshot(), None);
+    }
+
+    #[test]
+    fn replace_preserves_an_explicit_empty_set() {
+        let set = WorkspaceFolderSet::new(None);
+
+        set.replace(Some(Vec::new()));
+
+        assert_eq!(set.snapshot(), Some(Vec::new()));
     }
 }
