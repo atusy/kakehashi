@@ -17,13 +17,21 @@ use crate::error::LockResultExt;
 /// with different document selectors).
 pub(crate) struct DynamicCapabilityRegistry {
     registrations: RwLock<HashMap<String, Registration>>,
+    /// Serializes capability acknowledgement/publication with outbound actions
+    /// whose validity depends on the published registry state.
+    workspace_folder_ordering: std::sync::Arc<tokio::sync::Mutex<()>>,
 }
 
 impl DynamicCapabilityRegistry {
     pub(crate) fn new() -> Self {
         Self {
             registrations: RwLock::new(HashMap::new()),
+            workspace_folder_ordering: std::sync::Arc::new(tokio::sync::Mutex::new(())),
         }
+    }
+
+    pub(crate) fn workspace_folder_ordering(&self) -> std::sync::Arc<tokio::sync::Mutex<()>> {
+        std::sync::Arc::clone(&self.workspace_folder_ordering)
     }
 
     pub(crate) fn register(&self, registrations: Vec<Registration>) {

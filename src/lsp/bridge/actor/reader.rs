@@ -1005,6 +1005,11 @@ async fn handle_server_request(
     if method == "client/registerCapability" {
         match client::register_capability::handle(&message, server_prefix) {
             Ok(registrations) => {
+                let _ordering = deps
+                    .dynamic_capabilities
+                    .workspace_folder_ordering()
+                    .lock_owned()
+                    .await;
                 let response = jsonrpc::Response::from_ok(id, serde_json::Value::Null);
                 if send_server_response(&deps.response_tx, response, server_prefix, method).await {
                     deps.dynamic_capabilities.register(registrations);
@@ -1021,6 +1026,11 @@ async fn handle_server_request(
     if method == "client/unregisterCapability" {
         match client::unregister_capability::handle(&message, server_prefix) {
             Ok(unregistrations) => {
+                let _ordering = deps
+                    .dynamic_capabilities
+                    .workspace_folder_ordering()
+                    .lock_owned()
+                    .await;
                 let response = jsonrpc::Response::from_ok(id, serde_json::Value::Null);
                 if send_server_response(&deps.response_tx, response, server_prefix, method).await {
                     deps.dynamic_capabilities.unregister(unregistrations);

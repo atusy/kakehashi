@@ -621,6 +621,15 @@ impl LanguageServerPool {
         // notified synchronously and every incompatible handle is marked
         // shutting down before the next await.
         let connections = Arc::clone(&self.connections).lock_owned().await;
+        let ordering_locks: Vec<_> = connections
+            .iter()
+            .filter(|(key, _)| key.is_client_fallback() || key.is_shared())
+            .map(|(_, handle)| handle.dynamic_capabilities().workspace_folder_ordering())
+            .collect();
+        let mut _ordering_guards = Vec::with_capacity(ordering_locks.len());
+        for ordering in ordering_locks {
+            _ordering_guards.push(ordering.lock_owned().await);
+        }
         if !self.workspace_folders.apply_change(added.clone(), removed) {
             return;
         }
@@ -3194,6 +3203,53 @@ mod tests {
         })
         .await
         .expect("detached cleanup must remove the stale handle after caller cancellation");
+    }
+
+    #[tokio::test]
+    async fn upstream_folder_change_observes_ordered_dynamic_unregistration() {
+        let pool = Arc::new(LanguageServerPool::new());
+        let key = ConnectionKey::for_server("lua");
+        let handle = create_handle_with_key(ConnectionState::Ready, key.clone()).await;
+        handle
+            .dynamic_capabilities()
+            .register(vec![tower_lsp_server::ls_types::Registration {
+                id: "workspace-folders".to_string(),
+                method: "workspace/didChangeWorkspaceFolders".to_string(),
+                register_options: None,
+            }]);
+        pool.insert_connection(Arc::clone(&handle)).await;
+        let ordering = handle
+            .dynamic_capabilities()
+            .workspace_folder_ordering()
+            .lock_owned()
+            .await;
+
+        let task = tokio::spawn({
+            let pool = Arc::clone(&pool);
+            async move {
+                pool.apply_workspace_folder_change(vec![test_workspace_folder("file:///new")], &[])
+                    .await;
+            }
+        });
+        tokio::task::yield_now().await;
+        assert_eq!(
+            pool.workspace_folders(),
+            None,
+            "propagation must not commit while capability ordering is held"
+        );
+        handle.dynamic_capabilities().unregister(vec![
+            tower_lsp_server::ls_types::Unregistration {
+                id: "workspace-folders".to_string(),
+                method: "workspace/didChangeWorkspaceFolders".to_string(),
+            },
+        ]);
+        drop(ordering);
+        task.await.unwrap();
+
+        assert!(
+            !pool.connections.lock().await.contains_key(&key),
+            "the post-ack propagation decision must observe unregistration and recycle"
+        );
     }
 
     /// A Ready shared connection whose server never advertised the
