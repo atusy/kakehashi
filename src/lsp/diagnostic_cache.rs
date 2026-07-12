@@ -420,7 +420,8 @@ pub(crate) struct DiagnosticAggregator {
     refresh_flight: Mutex<RefreshFlight>,
     /// Per-host coverage versions for the refresh **coverage gate** (#497, commit 2).
     /// `current` bumps on every set-changing republish (the editor's pulled view is
-    /// now stale); `served` records the `current` a pull was answered against. A
+    /// now stale); a pull captures the epoch plus `current` version through
+    /// [`Self::coverage_stamp`], and `served` records that version. A
     /// gated refresh fires only when some host has `current > served` ("dirty") — so
     /// a change the editor already re-pulled (its own `didChange` pull advances
     /// `served`) sends no redundant nudge. Drives [`Self::bump_current`],
