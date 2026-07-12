@@ -264,8 +264,20 @@ impl CancelForwarder {
             sender
         };
         if let Some(tx) = sender {
-            // Send notification (ignore if receiver dropped)
-            let _ = tx.send(());
+            if tx.send(()).is_err()
+                && let Some(generation) = generation
+            {
+                let mut subscribers = self
+                    .subscribers
+                    .lock()
+                    .recover_poison("CancelForwarder::retain_failed_cancel_delivery");
+                if subscribers.active_requests.get(upstream_id) == Some(&generation) {
+                    subscribers.delivered_cancellations.remove(upstream_id);
+                    subscribers
+                        .pending_cancellations
+                        .insert(upstream_id.clone(), generation);
+                }
+            }
             true
         } else {
             false
@@ -772,6 +784,30 @@ mod tests {
             .recover_poison("repeated cancel test");
         assert!(!state.pending_cancellations.contains_key(&upstream_id));
         drop(state);
+        drop(request_future);
+    }
+
+    #[tokio::test]
+    async fn cancelled_dropped_receiver_can_resubscribe_in_same_generation() {
+        let mock = MockService::new();
+        let pool = Arc::new(LanguageServerPool::new());
+        let forwarder = CancelForwarder::new(pool);
+        let mut service = RequestIdCapture::with_cancel_forwarder(mock, forwarder.clone());
+        let upstream_id = UpstreamId::Number(123);
+        let request = Request::build("textDocument/hover")
+            .params(serde_json::json!({}))
+            .id(123i64)
+            .finish();
+        let request_future = service.call(request);
+
+        drop(forwarder.subscribe(upstream_id.clone()).unwrap());
+        assert!(forwarder.notify_cancel(&upstream_id));
+        forwarder
+            .subscribe(upstream_id.clone())
+            .expect("failed delivery must be retained")
+            .await
+            .expect("retained cancellation is delivered");
+
         drop(request_future);
     }
 
