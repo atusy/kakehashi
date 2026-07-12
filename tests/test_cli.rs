@@ -727,7 +727,7 @@ fn test_language_status_shows_installed() {
 
 /// Status must not report an install as empty when it could not inspect it.
 #[test]
-fn test_language_status_fails_when_install_directory_is_unreadable() {
+fn test_language_status_fails_when_install_directory_is_not_a_directory() {
     use std::fs;
 
     let test_dir = tempfile::tempdir().expect("Failed to create temp dir");

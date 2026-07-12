@@ -420,8 +420,22 @@ fn run_language_status(verbose: bool) -> Result<(), ExitCode> {
             .extension()
             .map(|ext| ext == std::env::consts::DLL_EXTENSION)
             .unwrap_or(false);
+        let is_file = match std::fs::metadata(&path) {
+            Ok(metadata) => metadata.is_file(),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                match std::fs::symlink_metadata(&path) {
+                    Err(metadata_error)
+                        if metadata_error.kind() == std::io::ErrorKind::NotFound =>
+                    {
+                        return Ok(());
+                    }
+                    _ => return Err(error),
+                }
+            }
+            Err(error) => return Err(error),
+        };
         if is_parser
-            && std::fs::metadata(&path)?.is_file()
+            && is_file
             && let Some(stem) = path.file_stem()
         {
             languages.insert(stem.to_string_lossy().to_string());
@@ -581,7 +595,19 @@ fn installed_query_language_name_checked(path: &Path) -> std::io::Result<Option<
     if !queries::is_safe_language_name(&name) {
         return Ok(None);
     }
-    if !std::fs::metadata(path)?.is_dir() {
+    let is_dir = match std::fs::metadata(path) {
+        Ok(metadata) => metadata.is_dir(),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            match std::fs::symlink_metadata(path) {
+                Err(metadata_error) if metadata_error.kind() == std::io::ErrorKind::NotFound => {
+                    return Ok(None);
+                }
+                _ => return Err(error),
+            }
+        }
+        Err(error) => return Err(error),
+    };
+    if !is_dir {
         return Ok(None);
     }
     Ok(Some(name.to_string()))
