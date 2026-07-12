@@ -921,6 +921,46 @@ fn test_language_status_recovers_internal_query_backup() {
     );
 }
 
+#[test]
+fn test_language_status_fails_when_query_recovery_fails() {
+    use std::fs;
+
+    let test_dir = tempfile::tempdir().expect("Failed to create temp dir");
+    let queries_dir = test_dir.path().join("queries");
+    let backup = queries_dir.join(".lua.4294967295.0.backup");
+    fs::create_dir_all(&backup).expect("Failed to create recovery backup");
+    fs::write(backup.join("highlights.scm"), "(comment) @comment")
+        .expect("Failed to write recovery query");
+    fs::write(
+        queries_dir.join(".lua.4294967295.0.backup.kakehashi-owned"),
+        "owned\n",
+    )
+    .expect("Failed to write recovery ownership marker");
+    fs::create_dir(queries_dir.join(".lua.replace.lock"))
+        .expect("Failed to block recovery lock creation");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_kakehashi"))
+        .args([
+            "language",
+            "status",
+            "--data-dir",
+            test_dir.path().to_str().unwrap(),
+        ])
+        .output()
+        .expect("Failed to execute command");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "stderr: {stderr}");
+    assert!(
+        stderr.contains("failed to recover interrupted query installs"),
+        "stderr: {stderr}"
+    );
+    assert!(
+        !stderr.contains("No languages installed"),
+        "status must not report an empty install after recovery failed: {stderr}"
+    );
+}
+
 /// Test that status recovery does not delete an incomplete canonical query dir
 #[test]
 fn test_language_status_preserves_incomplete_query_dir_when_backup_exists() {
