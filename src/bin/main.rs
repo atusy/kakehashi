@@ -526,9 +526,6 @@ fn installed_query_language_name(path: &Path) -> Option<String> {
 }
 
 fn installed_query_language_name_checked(path: &Path) -> std::io::Result<Option<String>> {
-    if !std::fs::metadata(path)?.is_dir() {
-        return Ok(None);
-    }
     let Some(file_name) = path.file_name() else {
         return Ok(None);
     };
@@ -537,6 +534,9 @@ fn installed_query_language_name_checked(path: &Path) -> std::io::Result<Option<
         return Ok(None);
     }
     if !queries::is_safe_language_name(&name) {
+        return Ok(None);
+    }
+    if !std::fs::metadata(path)?.is_dir() {
         return Ok(None);
     }
     Ok(Some(name.to_string()))
