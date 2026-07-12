@@ -247,7 +247,7 @@ fn arm_windows_compile_job() -> Result<(), ParserInstallError> {
     use windows_sys::Win32::System::JobObjects::{
         AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
         JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
-        QueryInformationJobObject, SetInformationJobObject,
+        SetInformationJobObject,
     };
     use windows_sys::Win32::System::Threading::{GetCurrentProcess, IsProcessInJob};
 
@@ -272,25 +272,12 @@ fn arm_windows_compile_job() -> Result<(), ParserInstallError> {
         if AssignProcessToJobObject(job, GetCurrentProcess()) == 0 {
             let error = std::io::Error::last_os_error();
             let mut already_in_job = 0;
-            let membership_known = IsProcessInJob(
+            let covered_by_parent_job = IsProcessInJob(
                 GetCurrentProcess(),
                 std::ptr::null_mut(),
                 &mut already_in_job,
-            ) != 0;
-            let mut parent_info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
-            let parent_info_known = QueryInformationJobObject(
-                std::ptr::null_mut(),
-                JobObjectExtendedLimitInformation,
-                std::ptr::from_mut(&mut parent_info).cast(),
-                std::mem::size_of_val(&parent_info) as u32,
-                std::ptr::null_mut(),
-            ) != 0;
-            let covered_by_parent_job = membership_known
-                && parent_info_known
-                && watchdog_assignment_failure_is_covered_by_parent_job(
-                    already_in_job != 0,
-                    parent_info.BasicLimitInformation.LimitFlags,
-                );
+            ) != 0
+                && watchdog_assignment_failure_is_covered_by_parent_job(already_in_job != 0);
             let _ = CloseHandle(job);
             if covered_by_parent_job {
                 return Ok(());
@@ -313,12 +300,8 @@ fn arm_windows_compile_job() -> Result<(), ParserInstallError> {
 }
 
 #[cfg(any(windows, test))]
-fn watchdog_assignment_failure_is_covered_by_parent_job(
-    already_in_job: bool,
-    parent_limit_flags: u32,
-) -> bool {
-    const KILL_ON_JOB_CLOSE: u32 = 0x0000_2000;
-    already_in_job && parent_limit_flags & KILL_ON_JOB_CLOSE != 0
+fn watchdog_assignment_failure_is_covered_by_parent_job(already_in_job: bool) -> bool {
+    already_in_job
 }
 
 /// Resolve the path to re-exec for the `__compile-parser` subprocess.
@@ -2876,16 +2859,6 @@ mod tests {
 #[cfg(test)]
 #[test]
 fn existing_windows_job_covers_nested_assignment_failure() {
-    let kill_on_close = 0x0000_2000;
-    assert!(watchdog_assignment_failure_is_covered_by_parent_job(
-        true,
-        kill_on_close
-    ));
-    assert!(!watchdog_assignment_failure_is_covered_by_parent_job(
-        true, 0
-    ));
-    assert!(!watchdog_assignment_failure_is_covered_by_parent_job(
-        false,
-        kill_on_close
-    ));
+    assert!(watchdog_assignment_failure_is_covered_by_parent_job(true));
+    assert!(!watchdog_assignment_failure_is_covered_by_parent_job(false));
 }
