@@ -746,8 +746,10 @@ fn test_language_status_fails_when_install_directory_is_unreadable() {
 
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(!output.status.success(), "stderr: {stderr}");
-    assert!(stderr.contains("parser"), "stderr: {stderr}");
-    assert!(stderr.contains("Not a directory"), "stderr: {stderr}");
+    assert!(
+        stderr.contains("failed to inspect parser directory"),
+        "stderr: {stderr}"
+    );
     assert!(
         !stderr.contains("No languages installed"),
         "stderr: {stderr}"
