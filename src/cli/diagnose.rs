@@ -463,16 +463,26 @@ fn format_diagnostic(format: OutputFormat, display: &str, diagnostic: &Diagnosti
     }
 }
 
-/// Collapse a (possibly multi-line) diagnostic message onto one line so it
-/// stays parseable in the line-oriented `default` format. Single-pass: no
-/// intermediate `Vec` of words.
+/// Make an untrusted diagnostic field safe for the line-oriented `default`
+/// format: collapse whitespace runs and visibly escape terminal controls.
+/// Single-pass, with no intermediate collection.
 fn one_line(message: &str) -> String {
     let mut out = String::with_capacity(message.len());
-    for word in message.split_whitespace() {
-        if !out.is_empty() {
-            out.push(' ');
+    let mut pending_space = false;
+    for ch in message.chars() {
+        if ch.is_whitespace() {
+            pending_space = !out.is_empty();
+            continue;
         }
-        out.push_str(word);
+        if pending_space {
+            out.push(' ');
+            pending_space = false;
+        }
+        if ch.is_control() {
+            out.extend(ch.escape_default());
+        } else {
+            out.push(ch);
+        }
     }
     out
 }
@@ -684,6 +694,14 @@ mod tests {
         assert_eq!(
             format_diagnostic(OutputFormat::Default, "f", &d),
             "f:1:1: error: line one line two"
+        );
+    }
+
+    #[test]
+    fn default_fields_escape_non_whitespace_controls() {
+        assert_eq!(
+            one_line("before\u{1b}[31mred\u{7f}\u{009b}after"),
+            "before\\u{1b}[31mred\\u{7f}\\u{9b}after"
         );
     }
 
