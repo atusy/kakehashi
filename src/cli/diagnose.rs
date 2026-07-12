@@ -459,7 +459,7 @@ fn format_diagnostic(format: OutputFormat, display: &str, diagnostic: &Diagnosti
                 "source": diagnostic.source.as_deref(),
                 "message": diagnostic.message.as_str(),
             });
-            value.to_string()
+            escape_jsonl_terminal_controls(value.to_string())
         }
     }
 }
@@ -512,6 +512,24 @@ fn is_bidi_control(ch: char) -> bool {
         ch,
         '\u{061c}' | '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}'
     )
+}
+
+fn escape_jsonl_terminal_controls(json: String) -> String {
+    let requires_escape = |ch: char| (ch.is_control() && ch >= '\u{80}') || is_bidi_control(ch);
+    if !json.chars().any(requires_escape) {
+        return json;
+    }
+
+    use std::fmt::Write as _;
+    let mut escaped = String::with_capacity(json.len());
+    for ch in json.chars() {
+        if requires_escape(ch) {
+            write!(escaped, "\\u{:04x}", ch as u32).expect("writing to String cannot fail");
+        } else {
+            escaped.push(ch);
+        }
+    }
+    escaped
 }
 
 /// The lower-case severity word. Both an absent severity and an out-of-spec
@@ -712,12 +730,11 @@ mod tests {
         );
         d.source = Some("tool\u{009b}\u{2066}".to_string());
 
-        let value: serde_json::Value = serde_json::from_str(&format_diagnostic(
-            OutputFormat::Jsonl,
-            "dir/\u{1b}[2Jfile",
-            &d,
-        ))
-        .unwrap();
+        let rendered = format_diagnostic(OutputFormat::Jsonl, "dir/\u{1b}[2Jfile", &d);
+        assert!(rendered.contains("\\u009b"), "rendered: {rendered}");
+        assert!(rendered.contains("\\u202e"), "rendered: {rendered}");
+        assert!(rendered.contains("\\u2066"), "rendered: {rendered}");
+        let value: serde_json::Value = serde_json::from_str(&rendered).unwrap();
 
         assert_eq!(value["file"], "dir/\u{1b}[2Jfile");
         assert_eq!(value["message"], "boom\u{1b}[31m\u{202e}");
