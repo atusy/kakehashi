@@ -330,6 +330,43 @@ mod tests {
     }
 
     #[test]
+    fn settings_paths_are_anchored_after_expansion() {
+        let mut settings = crate::config::RawWorkspaceSettings {
+            search_paths: Some(vec!["$REL/runtime".into(), "$ABS/runtime".into()]),
+            languages: [(
+                "lua".into(),
+                crate::config::LanguageSettings {
+                    parser: Some("~/parser/lua.so".into()),
+                    ..Default::default()
+                },
+            )]
+            .into(),
+            ..Default::default()
+        };
+        let env = make_env(&[("REL", "vendor"), ("ABS", "/opt/kakehashi")]);
+
+        expand_settings_paths(
+            &mut settings,
+            Some(Path::new("/workspace")),
+            Some("/home/user"),
+            env,
+        )
+        .expect("settings paths should expand");
+
+        assert_eq!(
+            settings.search_paths,
+            Some(vec![
+                "/workspace/vendor/runtime".into(),
+                "/opt/kakehashi/runtime".into()
+            ])
+        );
+        assert_eq!(
+            settings.languages["lua"].parser.as_deref(),
+            Some("/home/user/parser/lua.so")
+        );
+    }
+
+    #[test]
     fn with_kakehashi_defaults_passes_through_existing_env() {
         let env = make_env(&[("HOME", "/home/user")]);
         let wrapped = with_kakehashi_defaults(env);

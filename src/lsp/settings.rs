@@ -471,6 +471,68 @@ mod tests {
         );
     }
 
+    #[test]
+    #[serial(xdg_env)]
+    fn merged_paths_keep_their_source_layer_base() {
+        let original_xdg = std::env::var("XDG_CONFIG_HOME").ok();
+        let user_root = TempDir::new().expect("failed to create user config temp dir");
+        let user_config_dir = user_root.path().join("kakehashi");
+        std::fs::create_dir_all(&user_config_dir).expect("failed to create user config dir");
+        std::fs::write(
+            user_config_dir.join("kakehashi.toml"),
+            "[languages.lua]\nparser = './parser/lua.so'\n",
+        )
+        .expect("failed to write user config");
+
+        let project_dir = TempDir::new().expect("failed to create project temp dir");
+        std::fs::write(
+            project_dir.path().join("kakehashi.toml"),
+            "[languages.lua]\nqueries = [{ path = './queries/highlights.scm' }]\n",
+        )
+        .expect("failed to write project config");
+
+        // SAFETY: #[serial(xdg_env)] prevents concurrent modification.
+        unsafe { std::env::set_var("XDG_CONFIG_HOME", user_root.path()) };
+        let outcome = load_settings(
+            Some(project_dir.path()),
+            Some((
+                SettingsSource::InitializationOptions,
+                serde_json::json!({ "searchPaths": ["./runtime"] }),
+            )),
+            None,
+            |_| None,
+        );
+        // SAFETY: #[serial(xdg_env)] prevents concurrent modification.
+        unsafe {
+            match original_xdg {
+                Some(value) => std::env::set_var("XDG_CONFIG_HOME", value),
+                None => std::env::remove_var("XDG_CONFIG_HOME"),
+            }
+        }
+
+        let settings = outcome.settings.expect("settings should load");
+        assert_eq!(
+            settings.search_paths,
+            [project_dir.path().join("runtime").to_string_lossy()]
+        );
+        assert_eq!(
+            settings.languages["lua"].parser.as_deref(),
+            Some(
+                user_config_dir
+                    .join("parser/lua.so")
+                    .to_string_lossy()
+                    .as_ref()
+            )
+        );
+        assert_eq!(
+            settings.languages["lua"].queries.as_ref().unwrap()[0].path,
+            project_dir
+                .path()
+                .join("queries/highlights.scm")
+                .to_string_lossy()
+        );
+    }
+
     /// override_settings (InitializationOptions) has highest precedence.
     #[test]
     #[serial(xdg_env)]

@@ -80,6 +80,12 @@ queries = [
    - Purpose: Per-session overrides from the editor/client configuration
    - Note: Runtime changes via `didChangeConfiguration` re-trigger the merge process
 
+Path fields are expanded and made absolute before layers are merged, while the
+source is still known. User, project, and explicit config files use their own
+parent directory; initialization and runtime client settings use the workspace
+root. This preserves path provenance when individual language fields survive
+from different layers.
+
 ### Merge Algorithm
 
 Layers are merged pairwise via `merge_workspace_settings` using `reduce` and `flatten`:
