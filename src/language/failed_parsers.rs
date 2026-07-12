@@ -15,7 +15,7 @@
 use dashmap::{DashMap, DashSet};
 use fs4::fs_std::FileExt;
 use std::fs;
-use std::io::{self, Read, Seek, Write};
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 
@@ -26,7 +26,15 @@ fn is_lock_contended(error: &io::Error) -> bool {
 }
 
 struct SessionMarker {
-    file: std::sync::Mutex<fs::File>,
+    state: std::sync::Mutex<MarkerState>,
+}
+
+struct MarkerState {
+    path: PathBuf,
+    file: fs::File,
+    /// Old markers whose cleanup failed stay locked so live peers never
+    /// misclassify their stale contents as a crash.
+    retired: Vec<(PathBuf, fs::File)>,
 }
 
 /// Registry for tracking failed parsers.
@@ -155,7 +163,11 @@ impl FailedParserRegistry {
                 .open(&path)?;
             file.lock_exclusive()?;
             let marker = Arc::new(SessionMarker {
-                file: std::sync::Mutex::new(file),
+                state: std::sync::Mutex::new(MarkerState {
+                    path,
+                    file,
+                    retired: Vec::new(),
+                }),
             });
             let _ = self.session_marker.set(marker);
         }
@@ -281,20 +293,70 @@ impl FailedParserRegistry {
             .session_marker
             .get()
             .ok_or_else(|| io::Error::other("crash recovery registry is not initialized"))?;
-        let mut file = marker
-            .file
+        let contents = parsing_languages.join("\n");
+        let mut current = marker
+            .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        file.seek(std::io::SeekFrom::Start(0))?;
-        let contents = parsing_languages.join("\n");
-        // Write and flush the new evidence before shortening an older, longer
-        // value. A crash between these operations may retain an extra stale
-        // language (safe over-quarantine), but cannot erase every currently
-        // active language and recreate the crash loop #725 prevents.
-        file.write_all(contents.as_bytes())?;
-        file.sync_data()?;
-        file.set_len(contents.len() as u64)?;
-        file.sync_data()?;
+
+        // Build and durably flush a replacement inode without touching the
+        // currently locked marker. Any create/write/sync failure therefore
+        // leaves the prior active-language evidence intact.
+        let next_path = self.session_marker_path();
+        let temp_path = self
+            .state_dir
+            .join(format!(".parsing_marker_next.{}", ulid::Ulid::new()));
+        let replacement = (|| -> io::Result<fs::File> {
+            let mut file = fs::OpenOptions::new()
+                .create_new(true)
+                .read(true)
+                .write(true)
+                .open(&temp_path)?;
+            file.lock_exclusive()?;
+            file.write_all(contents.as_bytes())?;
+            file.sync_data()?;
+            fs::rename(&temp_path, &next_path)?;
+            Ok(file)
+        })();
+        let replacement = match replacement {
+            Ok(file) => file,
+            Err(error) => {
+                let _ = fs::remove_file(&temp_path);
+                return Err(error);
+            }
+        };
+
+        // The replacement is now visible, durable, and already locked. Swap
+        // ownership before releasing the old lock, so startup scanning can
+        // never observe a gap with no live marker.
+        let old_path = std::mem::replace(&mut current.path, next_path);
+        let old_file = std::mem::replace(&mut current.file, replacement);
+        if let Err(remove_error) = fs::remove_file(&old_path) {
+            // Windows normally cannot unlink an open locked file. Clear its
+            // stale contents while it is still locked, then retry after close.
+            // If either operation fails, retain the lock for this session;
+            // safety prefers a later false quarantine over a live peer reading
+            // stale evidence now.
+            let cleared = old_file.set_len(0).and_then(|()| old_file.sync_data());
+            if cleared.is_ok() {
+                drop(old_file);
+                if let Err(error) = fs::remove_file(&old_path) {
+                    log::warn!(
+                        target: "kakehashi::crash_recovery",
+                        "Failed to remove retired parser marker after clearing it: {}",
+                        error
+                    );
+                }
+            } else {
+                log::warn!(
+                    target: "kakehashi::crash_recovery",
+                    "Failed to retire parser marker (unlink: {}; clear: {:?}); retaining lock",
+                    remove_error,
+                    cleared.err()
+                );
+                current.retired.push((old_path, old_file));
+            }
+        }
         Ok(())
     }
 }
@@ -466,6 +528,25 @@ mod tests {
         let persisted = fs::read_to_string(temp.path().join("failed_parsers")).unwrap();
         assert!(persisted.lines().any(|language| language == "lua"));
         assert!(persisted.lines().any(|language| language == "rust"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_failed_replacement_preserves_existing_active_evidence() {
+        let temp = tempdir().unwrap();
+        let state_dir = temp.path().join("state");
+        let moved_dir = temp.path().join("moved-state");
+        let registry = FailedParserRegistry::new(&state_dir);
+        registry.init().unwrap();
+        registry.begin_parsing("rust").unwrap();
+
+        // Make creation of the transactional replacement fail without touching
+        // the already-open marker inode.
+        fs::rename(&state_dir, &moved_dir).unwrap();
+        assert!(registry.begin_parsing("lua").is_err());
+
+        assert_eq!(session_marker_contents(&moved_dir), vec!["rust"]);
+        assert_eq!(registry.current_parsing_language().as_deref(), Some("rust"));
     }
 
     #[test]
