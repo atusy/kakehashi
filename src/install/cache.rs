@@ -150,8 +150,9 @@ fn publish_cache_temp(
     let filename: Vec<u16> = "parsers.lua".encode_utf16().collect();
     let header = std::mem::offset_of!(FILE_RENAME_INFO, FileName);
     let size = header + filename.len() * std::mem::size_of::<u16>();
-    let mut buffer = vec![0_u8; size];
-    let information = buffer.as_mut_ptr().cast::<FILE_RENAME_INFO>();
+    let units = size.div_ceil(std::mem::size_of::<FILE_RENAME_INFO>());
+    let mut buffer = vec![FILE_RENAME_INFO::default(); units];
+    let information = buffer.as_mut_ptr();
     // SAFETY: `buffer` is sized for the fixed header plus the UTF-16 filename;
     // both file handles remain alive for the call, and the relative filename is
     // resolved by Windows against the validated cache-directory handle.
