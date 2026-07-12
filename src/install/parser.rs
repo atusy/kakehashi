@@ -394,8 +394,14 @@ fn reserve_parser_staging_file(
             Ok(file) => {
                 #[cfg(unix)]
                 {
-                    file.lock_exclusive()?;
-                    return Ok((candidate, Some(file)));
+                    return match file.lock_exclusive() {
+                        Ok(()) => Ok((candidate, Some(file))),
+                        // Locking is an ownership optimization for cleanup,
+                        // not a prerequisite for compilation. On filesystems
+                        // without advisory locks, cleanup also declines to
+                        // claim unlocked artifacts conservatively.
+                        Err(_) => Ok((candidate, None)),
+                    };
                 }
                 #[cfg(not(unix))]
                 {
@@ -478,8 +484,7 @@ fn claim_and_unlink_stale_parser_file(
     }
     match file.try_lock_exclusive() {
         Ok(()) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => return Ok(None),
-        Err(error) => return Err(ParserInstallError::IoError(error)),
+        Err(_) => return Ok(None),
     }
     let opened = file.metadata()?;
     let current = match fs::metadata(path) {
