@@ -115,7 +115,10 @@ local x = 1
             // Redact items contents (vary by lua-ls timing) but preserve the array type
             let len = value.as_slice().map(|s| s.len()).unwrap_or(0);
             format!("[{len} items redacted]")
-        })
+        }),
+        // The resultId is a content hash of the items, so it varies with them;
+        // pin its presence, not its value.
+        ".resultId" => "[content hash redacted]",
     });
 
     shutdown_client(&mut client);

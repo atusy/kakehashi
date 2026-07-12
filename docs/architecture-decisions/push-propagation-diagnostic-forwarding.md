@@ -98,6 +98,68 @@ source. Push-driven servers feed this path natively; pull-driven servers feed it
 via the `pullFallback` toggle and, opportunistically, via any push they emit (see
 Per-server source and fallback).
 
+**Wire quiet window.** The wire sends are additionally coalesced per host: a
+changed merge inside a 1 s quiet window after the last send is withheld
+(wire-dirty) and one trailing republish at the window's end re-merges the
+*latest* cache, so a burst of feeds (spontaneous pushes, the pull-layer
+completion, the post-parse geometry re-merge — measured ~2.2 × ~1 MB
+publishes/s during sustained typing) collapses into at most one full-set
+publish per second per host. The first publish after quiet passes through
+immediately, so a change arriving after >= 1 s of wire quiet gains no latency
+(a second isolated change inside the window still waits for it). Only the wire
+waits: change detection, the coverage bump, and the refresh nudge fire at
+the same points as before, and `didClose`'s clearing publish bypasses the
+window (a deferred clear would be dropped by the trailing task's
+closed-document guard).
+
+**Config wire seal.** The cross-layer gate for
+`textDocument/publishDiagnostics` doubles as a seal on the editor-facing wire
+sends: when `layers.aggregation."textDocument/publishDiagnostics".priorities`
+resolves to `[]` for the host's language, `republish` skips the
+`publishDiagnostics` send entirely (except `didClose`'s harmless clearing
+publish, which fails open by design when the document is gone). This is the
+opt-out for pull-first editor setups, where the proactive publish is a
+redundant second delivery of the same merged set — the editor either ignores
+it or (Neovim ≥ 0.11) renders it as a duplicate diagnostic namespace next to
+the pulled one; on a diagnostics-heavy host it dominated the editor pipe
+(measured: 51 publishes × ~1 MB in a 44 s typing burst, 68% of all
+server→client bytes), head-of-line blocking every other response. At the
+`republish` level the seal skips only the wire send: the merge still runs and
+records the last-merged set, so change detection keeps driving the
+push-origin coverage bump and `workspace/diagnostic/refresh` — the sealed
+setup's delivery signal (refresh → client re-pull). The seal is binary (all
+layers gated off); a partially gated priorities list still publishes the full
+merge — per-layer selection applies to the debounced pull feed, as before.
+
+Seal prerequisites and caveats:
+
+- The delivery signal presumes the client advertises **both**
+  `textDocument.diagnostic` (it pulls) and
+  `workspace.diagnostics.refreshSupport` (it honors the nudge — the refresh is
+  capability-gated). Sealing against a push-only client is a diagnostics
+  blackout; against a pull-without-refresh client, spontaneous pushes rot
+  until the client's next edit-triggered pull. Only seal for refresh-capable
+  pull clients (Neovim ≥ 0.11 and VS Code qualify).
+- Put the `[]` on the `"textDocument/publishDiagnostics"` key specifically,
+  never on the `"_"` method wildcard — an empty method-wildcard priorities
+  list disables every method's layer walk (hover, completion, formatting, …),
+  which has always been `[]`'s meaning there.
+- The same resolved value also gates the **debounced pull feed** for the
+  method (as before this decision), which carries the #431 host re-sync to
+  push-only `_self` host servers — under a seal such a server stops receiving
+  debounced text updates and its diagnostics go stale between other
+  host-bridge requests. Don't seal a language that relies on a push-only
+  `_self` server.
+- Apply the seal at startup. A mid-session seal (via
+  `didChangeConfiguration`) leaves the last set that actually reached the
+  wire frozen in the editor's push namespace until `didClose` (a send
+  withheld by the quiet window at seal time is dropped with the gate state,
+  so the frozen view can be one window older than the last recorded set) —
+  config changes do not republish open hosts (a pre-existing property of
+  this pipeline).
+- Prior to this decision `priorities = []` on this method gated only the
+  pull feed; existing configs using it now also stop the wire sends.
+
 ### Path B — Client-initiated pull (retained)
 
 kakehashi keeps answering `textDocument/diagnostic` from the client:
@@ -107,6 +169,13 @@ kakehashi keeps answering `textDocument/diagnostic` from the client:
 - For push-driven downstream, serve their cached push slots from Path A via the
   `pushFallback` toggle.
 - Merge and respond. The advertised `diagnosticProvider` capability is unchanged.
+- The response is deterministically sorted (the same order as Path A's publish,
+  #423) and carries a **content-addressed `resultId`** (hash of the serialized
+  items — stateless, nothing to invalidate). A re-pull whose `previousResultId`
+  matches the recomputed id is answered with an `unchanged` report instead of
+  re-shipping the items: on a diagnostics-heavy host the full report is ~1 MB
+  (measured: ~2,235 items), and every `workspace/diagnostic/refresh`-induced
+  re-pull of a settled set previously re-shipped all of it.
 
 Path A writes the cache; Path B reads it for push-driven servers — one cache,
 two readers.
@@ -194,8 +263,10 @@ Producing the host publish mirrors the existing staged pull aggregation:
 
 Re-merging on every push republishes the cumulative host set: when region A
 publishes, then the host layer, then region C, each event re-runs the merge and
-re-publishes `{A}`, `{A, host}`, `{A, host, C}` — a slot is *replaced* by its
-source's latest push, never accumulated.
+records `{A}`, `{A, host}`, `{A, host, C}` — a slot is *replaced* by its
+source's latest push, never accumulated. (The wire sends are subject to the
+quiet window below, so the editor may see `{A}` and then `{A, host, C}`
+directly, the intermediate state coalesced into the trailing flush.)
 
 ### Versioning and staleness (the crux)
 
@@ -224,6 +295,27 @@ policy clean:
   offset re-positions an unchanged region's diagnostics after an edit *above* it
   with no re-push and no flicker — provided the epoch keys on content, not geometry
   (above), so a position-only edit does not advance it.
+- **Geometry-unknown deferral**: between `did_change` clearing the visible tree
+  and the off-ingress reparse landing, the regions' current offsets cannot be
+  computed. A republish in that window **defers** (publishes nothing, records
+  nothing) rather than merging with empty offsets — that would silently drop
+  every region push slot and flap the editor between the full and the
+  region-less set on each edit cycle (~2 × ~1 MB publishes per keystroke settle
+  on a diagnostics-heavy host, plus visible flicker). The reparse loop's
+  post-parse republish (gated on the same non-empty-region-slots predicate)
+  is the retry that publishes with real offsets, doubly backstopped by the
+  pass's debounced pull. A deferral still nudges pull-mode clients: the
+  push-origin callers treat it like a change for the coverage bump and
+  `workspace/diagnostic/refresh` (the cache did change; the retry itself
+  nudges only as degraded-pull recovery — a per-host debt recorded by a pull
+  the parse wait failed, consumed once by the post-parse pass or the
+  pull-side TOCTOU guard, forced past the coverage gate — the debt proves
+  the client holds a non-covering answer that version coverage cannot see —
+  but still single-flighted like every refresh). Accepted caveat: a parse
+  give-up (timeout,
+  parser gone) leaves the tree absent and both retries deferred until the
+  next edit — where the pre-deferral behavior published a region-LESS set,
+  which was worse.
 - **Version gate**: a slot whose epoch lags the source's current `content_epoch`
   is held (not published) until that server re-publishes at the current epoch,
   bounding the wrong-position window to the re-parse gap and self-healing. The virt
@@ -233,9 +325,10 @@ policy clean:
   (`host.rs`). This decision requires the virt sync to gain that content guard so
   the epoch advances only on a real content change.
 - **Re-merge on epoch bump**: when a source's `content_epoch` advances, kakehashi
-  re-merges and republishes that `host_uri` *immediately*, with the now-stale slots
-  held — otherwise nothing would clear the old diagnostics until a current-epoch
-  push happens to arrive. The bump itself is the trigger, not just incoming pushes.
+  re-merges that `host_uri` *immediately* (the wire send is subject to the quiet
+  window), with the now-stale slots held — otherwise nothing would clear the old
+  diagnostics until a current-epoch push happens to arrive. The bump itself is
+  the trigger, not just incoming pushes.
 - **Re-merge on geometry change**: a host edit that shifts a region's position
   without changing its content does *not* advance `content_epoch`, so lazy
   re-anchor alone would leave the previously-published (now mis-placed) host
@@ -465,9 +558,12 @@ because the #380 benefit now outweighs it:
   push.
 - The reader must transform and route pushes, interleaved with edits, relying on
   the per-URI ordering guarantee.
-- Re-publish is unthrottled by design (the `didChange` debounce is gone): a no-op
-  push is suppressed (winner content unchanged), but a chatty linter emitting
-  distinct results across separate loop wakes re-publishes each time. To bound the
+- Re-publish is unthrottled at the merge level (the `didChange` debounce is
+  gone): a no-op push is suppressed (winner content unchanged), and a chatty
+  linter emitting distinct results across separate loop wakes re-merges and
+  re-records each time — but the WIRE sends are coalesced by the per-host quiet
+  window (see "Wire quiet window"), so the editor sees at most one publish per
+  window. To bound the
   cost of a push-happy/misbehaving downstream, the forwarding loop first coalesces a
   drained burst of `publishDiagnostics` by `(connection, uri)` to the latest
   (`coalesce_upstream_batch`, #426), then records each surviving push in a

@@ -47,7 +47,7 @@
 //! version gate was evaluated and rejected (it converts a self-healing stale-overwrite
 //! into a reopen-resurrection hide); the stale-overwrite is left self-healing.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -159,19 +159,41 @@ pub(crate) fn merge_cached_diagnostics(
     }
     // Deterministic published order (#423): the cache walks `HashMap`-keyed sources
     // and servers, so without this the array order varies between republishes for a
-    // multi-source/multi-server host. Order by host position (top-to-bottom — "order
-    // cross-region merge by region start position"), then by the cheap distinguishing
-    // fields (message, source, severity). This is the `concatenated` strategy (every
+    // multi-source/multi-server host. This is the `concatenated` strategy (every
     // server's diagnostics are kept); the `preferred` election is deferred (it needs a
     // per-source version baseline, which #422 left unbuilt).
-    //
-    // The final tiebreak is each diagnostic's full serialized form — a **total** order
-    // over every field (code, tags, data, relatedInformation, …), so two genuinely
-    // distinct diagnostics at the same span can never fall back to HashMap order. It is
-    // evaluated **lazily** (`then_with`), only when every cheap field above already
-    // ties, so the serialization is off the hot path. Fully-identical diagnostics
-    // serialize equally and keep their (immaterial) relative order.
-    merged.sort_by(|a, b| {
+    sort_diagnostics(&mut merged);
+    merged
+}
+
+/// Order diagnostics deterministically: by host position (top-to-bottom —
+/// "order cross-region merge by region start position"), then by the cheap
+/// distinguishing fields (message, source, severity).
+///
+/// The final tiebreak is each diagnostic's full serialized form — a **total**
+/// order over every field (code, tags, data, relatedInformation, …), so two
+/// genuinely distinct diagnostics at the same span can never fall back to
+/// input (e.g. `HashMap`-walk or fan-in completion) order. It is evaluated
+/// **lazily** (`then_with`), only when every cheap field above already ties,
+/// so the serialization is off the hot path. Fully-identical diagnostics
+/// serialize equally and keep their (immaterial) relative order.
+///
+/// Shared by the proactive publish merge ([`merge_cached_diagnostics`], #423)
+/// and the client-pull response (`diagnostic_impl`): the pull's `resultId` is
+/// a content hash of the serialized items, so the same logical set must
+/// serialize identically across pulls regardless of fan-in completion order.
+///
+/// The tiebreak's `unwrap_or_default` cannot fire in practice: `ls_types`
+/// values serialize infallibly (string-keyed maps only, no non-UTF-8, no
+/// custom `Serialize`), and the idiom predates this sort's extraction. Were
+/// serialization ever to fail, the cheap keys above still order by
+/// position/message/source/severity — only fully-tied distinct diagnostics
+/// could then keep input order, and the `resultId`'s length suffix plus the
+/// per-item hash of everything that DID serialize bound the unchanged-report
+/// consequence to the same accepted 2^-64 collision class documented at
+/// `diagnostic_result_id`.
+pub(crate) fn sort_diagnostics(diagnostics: &mut [Diagnostic]) {
+    diagnostics.sort_by(|a, b| {
         let key = |d: &Diagnostic| {
             (
                 d.range.start.line,
@@ -191,7 +213,19 @@ pub(crate) fn merge_cached_diagnostics(
                     .cmp(&serde_json::to_string(b).unwrap_or_default())
             })
     });
-    merged
+}
+
+/// Whether `slots` holds any **non-empty** `Region` push slot — the shared
+/// predicate behind both [`DiagnosticAggregator::has_region_slots`] (the
+/// reparse loop's post-parse republish gate, on the raw cache) and
+/// `republish`'s `needs_geometry` (on the filtered publish snapshot). One
+/// implementation on purpose: the geometry-unknown deferral is retried only
+/// while this predicate holds, so the two call sites must never diverge.
+pub(crate) fn has_live_region_slots(slots: &SourceSlots) -> bool {
+    slots.iter().any(|(source, servers)| {
+        matches!(source, DiagnosticSource::Region(_))
+            && servers.values().any(|slot| !slot.diagnostics.is_empty())
+    })
 }
 
 /// Every distinct server name with a **push** slot (`Region`/`Host`, never
@@ -365,11 +399,15 @@ pub(crate) struct DiagnosticAggregator {
     /// removed — reclamation cannot race a republish into minting a second lock for
     /// the same host.
     republish_locks: Mutex<HashMap<Url, Arc<tokio::sync::Mutex<()>>>>,
-    /// The last diagnostic set published to the editor per host, so a republish
-    /// that would re-send an identical set is suppressed — the editor already has
-    /// it, and a redundant `publishDiagnostics` is a needless flicker/noise source
-    /// (#422). Updated under the host's republish lock (same-host republishes are
-    /// serialized), and forgotten on `didClose` ([`Self::forget_published`]).
+    /// The last **merged-and-recorded** diagnostic set per host, so a republish
+    /// producing an identical set is suppressed — a redundant re-emission is
+    /// needless flicker/noise (#422) — and the change signal driving the
+    /// refresh nudging stays exact. The wire send can lag this record (the
+    /// quiet window withholds it, tracked by [`WireGate::dirty`]) or be
+    /// skipped entirely (the publish seal: a pull-first client receives the
+    /// set via re-pull instead). Updated under the host's republish lock
+    /// (same-host republishes are serialized), and forgotten on `didClose`
+    /// ([`Self::forget_published`]).
     last_published: Mutex<HashMap<Url, Vec<Diagnostic>>>,
     /// Single-flight guard for the **workspace-wide** `workspace/diagnostic/refresh`
     /// nudge (#497). `workspace/diagnostic/refresh` is param-less and workspace-wide,
@@ -388,6 +426,28 @@ pub(crate) struct DiagnosticAggregator {
     /// `served`) sends no redundant nudge. Drives [`Self::bump_current`],
     /// [`Self::mark_served`], [`Self::is_dirty`]; forgotten on `didClose`.
     coverage: Mutex<HashMap<Url, HostCoverage>>,
+    /// Hosts whose LAST pull was answered degraded — the bounded parse wait
+    /// lapsed while the aggregator held live region pushes, so the response
+    /// was missing the region fold and deliberately did not `mark_served`.
+    /// The reparse loop's post-parse backstop consumes an entry
+    /// ([`Self::take_degraded_pull`]) to request the recovery
+    /// `workspace/diagnostic/refresh` for exactly the hosts that owe one —
+    /// keying the recovery on this instead of the workspace-wide coverage
+    /// dirtiness keeps unrelated stale hosts from turning every edit's parse
+    /// pass into a refresh trigger. A later non-degraded pull clears the debt
+    /// (it marks served); `didClose` forgets it.
+    degraded_pulls: Mutex<HashSet<Url>>,
+    /// Per-host coalescing state for the editor-facing `publishDiagnostics`
+    /// wire sends (the quiet window): see [`WireGate`] and
+    /// [`Self::wire_gate_admit`]. Mutated under the host's republish lock
+    /// (same-host republishes are serialized) with two off-lock exceptions:
+    /// the trailing task's [`Self::wire_gate_take_pending`] (flips only
+    /// `pending`) and `clear_host`'s [`Self::forget_wire_gate`] (idempotent
+    /// removal; a republish for a closed host never touches the gate, so the
+    /// off-lock forget cannot race state back in). The inner mutex is held
+    /// briefly, never across an await. Forgotten on `didClose` and under the
+    /// publish seal.
+    wire_gate: Mutex<HashMap<Url, WireGate>>,
     /// Always-on counters for the diagnostic path (#533): push-origin republishes
     /// in, `workspace/diagnostic/refresh` requested vs actually sent (the gap is
     /// what the #497 single-flight + coverage gate saves), and pulls answered with
@@ -409,6 +469,50 @@ struct RefreshFlight {
     /// refresh, #521), so the trailing must fire regardless of the coverage gate —
     /// there is no version representing what the downstream asked to refresh.
     pending_forced: bool,
+}
+
+/// Per-host coalescing state for the editor-facing `publishDiagnostics` wire
+/// sends. A changed merge inside the quiet window after the last send is
+/// **withheld** from the wire (`dirty`) and a single trailing republish is
+/// scheduled (`pending`); the trailing run re-merges the *latest* cache, so
+/// every state change inside the window collapses into one send. An isolated
+/// change (window already elapsed, or first publish) passes through
+/// immediately — the gate adds no latency outside bursts.
+struct WireGate {
+    /// When the last `publishDiagnostics` was actually **committed** (written
+    /// to the wire and stamped by [`DiagnosticAggregator::wire_gate_commit_send`]).
+    /// `None` means the entry was minted by an admit whose send has not
+    /// committed (yet, or ever — an aborted send): such a host's next publish
+    /// passes immediately, and the `dirty` debt below records that the
+    /// last-recorded set may never have reached the wire.
+    last_sent_at: Option<tokio::time::Instant>,
+    /// A trailing republish task is scheduled; bounds the tasks to one per
+    /// host per window.
+    pending: bool,
+    /// The recorded last-published set may not have reached the editor's
+    /// push namespace: either a changed merge was withheld by the quiet
+    /// window, or a send was admitted but its commit never happened (aborted
+    /// at the send await). A later republish must send even if its own merge
+    /// compares unchanged. Set on every admit, cleared only by the post-send
+    /// commit.
+    dirty: bool,
+}
+
+/// The wire-gate decision for one republish attempt: send now, or withhold
+/// until the quiet window elapses (scheduling the trailing republish iff no
+/// task is already parked).
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum WireAdmit {
+    /// Window clear: write to the wire now.
+    SendNow,
+    /// Inside the quiet window: withhold. `schedule_trailing` is `true` for
+    /// at most one caller at a time — the first defer while no trailing task
+    /// is parked (it must spawn the trailing republish after `remaining`);
+    /// attempts while one is parked get `false`.
+    Defer {
+        schedule_trailing: bool,
+        remaining: std::time::Duration,
+    },
 }
 
 /// Per-host coverage versions for the refresh gate (#497, commit 2).
@@ -635,12 +739,7 @@ impl DiagnosticAggregator {
     /// recompute on every edit.
     pub(crate) fn has_region_slots(&self, host: &Url) -> bool {
         let cache = self.lock();
-        cache.get(host).is_some_and(|sources| {
-            sources.iter().any(|(source, servers)| {
-                matches!(source, DiagnosticSource::Region(_))
-                    && servers.values().any(|slot| !slot.diagnostics.is_empty())
-            })
-        })
+        cache.get(host).is_some_and(has_live_region_slots)
     }
 
     /// Drop everything for a host (host `didClose`). Returns whether it existed.
@@ -649,10 +748,11 @@ impl DiagnosticAggregator {
         cache.remove(host).is_some()
     }
 
-    /// Whether `diagnostics` differs from the set last published for `host`,
-    /// recording it as the new last when it does. Returns `false` when identical,
-    /// so the caller skips a redundant `publishDiagnostics` the editor already has
-    /// (#422). Called under the host's republish lock, so same-host calls serialize.
+    /// Whether `diagnostics` differs from the last merged-and-recorded set for
+    /// `host` (see the `last_published` field doc — the wire send can lag or be
+    /// sealed), recording it as the new last when it does. Returns `false` when
+    /// identical, so the caller skips a redundant re-emission (#422). Called
+    /// under the host's republish lock, so same-host calls serialize.
     ///
     /// The comparison is **order-independent**: `merge_cached_diagnostics` walks
     /// `HashMap`-keyed sources/servers, so the same logical set can serialize in a
@@ -670,7 +770,12 @@ impl DiagnosticAggregator {
         // Single lookup via `get_mut`: update in place when the host is already
         // present (the common path), cloning the `host` key only on first insert.
         if let Some(prev) = last.get_mut(host) {
-            if same_diagnostic_multiset(prev, diagnostics) {
+            // Fast path: `merge_cached_diagnostics` output is deterministically
+            // sorted (#423 / `sort_diagnostics`, a total order), so equal sets
+            // arrive slice-equal — the O(n²) multiset walk below is only the
+            // fallback for order variation a future unsorted caller could
+            // introduce.
+            if prev.as_slice() == diagnostics || same_diagnostic_multiset(prev, diagnostics) {
                 return false;
             }
             *prev = diagnostics.to_vec();
@@ -680,8 +785,8 @@ impl DiagnosticAggregator {
         true
     }
 
-    /// Forget the last-published set for `host` (host `didClose`), so its entry
-    /// does not linger and a later re-open publishes afresh.
+    /// Forget the last-recorded set for `host` (host `didClose`), so its entry
+    /// does not linger and a later re-open starts change detection afresh.
     pub(crate) fn forget_published(&self, host: &Url) {
         self.last_published
             .lock()
@@ -755,9 +860,11 @@ impl DiagnosticAggregator {
 
     /// Bump a host's `current` coverage version (#497) — a **push-origin** change the
     /// editor doesn't know about just landed, so its last-pulled view is now stale.
-    /// Called only from the push/eviction paths (`publish_host_push`,
-    /// `publish_region_push`, `evict_connection_diagnostics`) when their `republish`
-    /// published a changed set — paired with the gated `request_pull_diagnostic_refresh`.
+    /// Called only from the push/eviction paths (`publish_recorded_hosts`,
+    /// `evict_connection_diagnostics`) when their `republish` reported Changed
+    /// (a changed merge was recorded; the wire send may be withheld or sealed)
+    /// or Deferred (the cache changed but region geometry was pending) —
+    /// paired with the gated `request_pull_diagnostic_refresh`.
     ///
     /// Deliberately **not** bumped on editor-originated republishes (`publish_pull_layer`
     /// /`clear_pull_layer`/edit-remerge/`clear_host`): those are answered by the
@@ -838,6 +945,168 @@ impl DiagnosticAggregator {
         self.coverage
             .lock()
             .recover_poison("DiagnosticAggregator::coverage")
+            .remove(host);
+    }
+
+    /// Record that a pull for `host` was answered degraded (see the
+    /// `degraded_pulls` field doc). Clones the key only on first insert.
+    pub(crate) fn record_degraded_pull(&self, host: &Url) {
+        let mut degraded = self
+            .degraded_pulls
+            .lock()
+            .recover_poison("DiagnosticAggregator::degraded_pulls");
+        if !degraded.contains(host) {
+            degraded.insert(host.clone());
+        }
+    }
+
+    /// Consume `host`'s degraded-pull debt, returning whether one existed —
+    /// the post-parse backstop's trigger for the recovery refresh.
+    pub(crate) fn take_degraded_pull(&self, host: &Url) -> bool {
+        self.degraded_pulls
+            .lock()
+            .recover_poison("DiagnosticAggregator::degraded_pulls")
+            .remove(host)
+    }
+
+    /// Forget `host`'s degraded-pull debt without acting on it: a later
+    /// non-degraded pull covered the host (it marked served), or the host
+    /// closed.
+    pub(crate) fn forget_degraded_pull(&self, host: &Url) {
+        self.degraded_pulls
+            .lock()
+            .recover_poison("DiagnosticAggregator::degraded_pulls")
+            .remove(host);
+    }
+
+    /// Decide whether a wire `publishDiagnostics` for `host` may be written
+    /// now, given the per-host quiet `window` (see [`WireGate`]). A `SendNow`
+    /// decision marks the `dirty` debt and opens no quiet window — the caller
+    /// stamps the send with [`Self::wire_gate_commit_send`] only **after** it
+    /// actually completed, so a republish aborted at the send await (the
+    /// synthetic pull task is abortable on supersession) leaves the debt in
+    /// place: the recorded-but-unsent set forces the next republish past the
+    /// unchanged check and onto the wire.
+    /// `Defer` marks `dirty` (a changed merge is being withheld) and hands the
+    /// trailing-republish duty to at most one caller at a time (the first
+    /// defer while no trailing task is parked). Called under the host's
+    /// republish lock, so same-host decisions are serialized — including the
+    /// decide→commit pair.
+    pub(crate) fn wire_gate_admit(&self, host: &Url, window: std::time::Duration) -> WireAdmit {
+        let now = tokio::time::Instant::now();
+        let mut gates = self
+            .wire_gate
+            .lock()
+            .recover_poison("DiagnosticAggregator::wire_gate");
+        // A host with no entry has no prior committed send: mint the entry
+        // with the debt already marked and pass. Marking `dirty` on EVERY
+        // admit (not just Defer) is what makes an aborted send recoverable —
+        // `published_set_changed` recorded the merge before the send, so
+        // without the debt a later identical merge would skip past the
+        // unchanged check while the editor never received the set.
+        let Some(gate) = gates.get_mut(host) else {
+            gates.insert(
+                host.clone(),
+                WireGate {
+                    last_sent_at: None,
+                    pending: false,
+                    dirty: true,
+                },
+            );
+            return WireAdmit::SendNow;
+        };
+        let elapsed = gate.last_sent_at.map(|at| now.duration_since(at));
+        match elapsed {
+            Some(elapsed) if elapsed < window => {
+                gate.dirty = true;
+                let schedule_trailing = !gate.pending;
+                gate.pending = true;
+                WireAdmit::Defer {
+                    schedule_trailing,
+                    remaining: window - elapsed,
+                }
+            }
+            _ => {
+                gate.dirty = true;
+                WireAdmit::SendNow
+            }
+        }
+    }
+
+    /// Record that a wire `publishDiagnostics` for `host` was actually sent:
+    /// stamp the send time (opening a fresh quiet window) and settle the
+    /// `dirty` debt. Called right after the send await, under the same
+    /// republish-lock hold as the [`Self::wire_gate_admit`] that admitted it.
+    /// Clones the key only on first insert.
+    pub(crate) fn wire_gate_commit_send(&self, host: &Url) {
+        let now = tokio::time::Instant::now();
+        let mut gates = self
+            .wire_gate
+            .lock()
+            .recover_poison("DiagnosticAggregator::wire_gate");
+        if let Some(gate) = gates.get_mut(host) {
+            gate.last_sent_at = Some(now);
+            gate.dirty = false;
+        } else {
+            // The admit minted an entry, but a `forget_wire_gate` (seal) can
+            // race in off the happy path; re-minting settled is fine.
+            gates.insert(
+                host.clone(),
+                WireGate {
+                    last_sent_at: Some(now),
+                    pending: false,
+                    dirty: false,
+                },
+            );
+        }
+    }
+
+    /// Whether a changed merge for `host` was withheld from the wire and not
+    /// yet sent — the trailing republish must send even when its own merge
+    /// compares unchanged against the recorded last-published set.
+    pub(crate) fn wire_gate_is_dirty(&self, host: &Url) -> bool {
+        self.wire_gate
+            .lock()
+            .recover_poison("DiagnosticAggregator::wire_gate")
+            .get(host)
+            .is_some_and(|gate| gate.dirty)
+    }
+
+    /// Clear the trailing-task marker for `host`, returning whether gate state
+    /// still existed. Called by the trailing republish task right before it
+    /// re-runs `republish`, so a defer that races the re-run schedules a fresh
+    /// trailing task instead of being silently absorbed by one that already
+    /// woke. `false` means the entry was forgotten while the task was parked
+    /// (`didClose`, or the seal) — the withheld debt was cancelled and the
+    /// task must bail rather than republish. (The bail covers only the
+    /// entry-gone case: a stale task waking against a reopened incarnation's
+    /// fresh entry gets `true` and clears its `pending`, which at worst
+    /// schedules one extra trailing task — the defer-reschedule design, not
+    /// this bail, is what keeps that safe.)
+    pub(crate) fn wire_gate_take_pending(&self, host: &Url) -> bool {
+        if let Some(gate) = self
+            .wire_gate
+            .lock()
+            .recover_poison("DiagnosticAggregator::wire_gate")
+            .get_mut(host)
+        {
+            gate.pending = false;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Forget the wire-gate state for `host` so the entry doesn't linger and a
+    /// parked trailing task bails ([`Self::wire_gate_take_pending`] returns
+    /// `false`). Called on `didClose` (`clear_host`, next to
+    /// [`Self::forget_coverage`] — after the clearing republish, which
+    /// bypasses the gate for closed hosts) and when the publish seal renders
+    /// the gate state moot.
+    pub(crate) fn forget_wire_gate(&self, host: &Url) {
+        self.wire_gate
+            .lock()
+            .recover_poison("DiagnosticAggregator::wire_gate")
             .remove(host);
     }
 
@@ -938,6 +1207,126 @@ mod tests {
 
     fn host() -> Url {
         Url::parse("file:///doc.md").unwrap()
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn wire_gate_passes_leading_edge_and_defers_within_the_window() {
+        let agg = DiagnosticAggregator::new();
+        let window = std::time::Duration::from_secs(1);
+
+        assert_eq!(
+            agg.wire_gate_admit(&host(), window),
+            WireAdmit::SendNow,
+            "the first send always passes (no prior send to be quiet after)"
+        );
+        agg.wire_gate_commit_send(&host());
+
+        // Within the window: withheld, and exactly the FIRST defer is handed
+        // the trailing-task duty.
+        let first = agg.wire_gate_admit(&host(), window);
+        assert!(
+            matches!(
+                first,
+                WireAdmit::Defer {
+                    schedule_trailing: true,
+                    ..
+                }
+            ),
+            "the first in-window attempt schedules the trailing republish, got {first:?}"
+        );
+        assert!(
+            agg.wire_gate_is_dirty(&host()),
+            "a withheld change marks the wire dirty"
+        );
+        let second = agg.wire_gate_admit(&host(), window);
+        assert!(
+            matches!(
+                second,
+                WireAdmit::Defer {
+                    schedule_trailing: false,
+                    ..
+                }
+            ),
+            "later in-window attempts must not schedule a second task, got {second:?}"
+        );
+
+        // Window elapsed: pass again; the COMMIT (post-send) clears dirty.
+        tokio::time::advance(window).await;
+        assert!(
+            agg.wire_gate_take_pending(&host()),
+            "the gate entry still exists while the host is open"
+        );
+        assert_eq!(
+            agg.wire_gate_admit(&host(), window),
+            WireAdmit::SendNow,
+            "the trailing attempt after the window sends"
+        );
+        assert!(
+            agg.wire_gate_is_dirty(&host()),
+            "the admit DECISION alone must not consume the withheld-send debt \
+             (an aborted send would otherwise lose it)"
+        );
+        agg.wire_gate_commit_send(&host());
+        assert!(
+            !agg.wire_gate_is_dirty(&host()),
+            "the post-send commit clears the dirty marker"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn wire_gate_defer_after_take_pending_reschedules() {
+        // A defer that lands after the trailing task woke (take_pending) but
+        // before the window reopened must schedule a FRESH trailing task —
+        // otherwise its change would wait for a task that no longer exists.
+        let agg = DiagnosticAggregator::new();
+        let window = std::time::Duration::from_secs(1);
+        assert_eq!(agg.wire_gate_admit(&host(), window), WireAdmit::SendNow);
+        agg.wire_gate_commit_send(&host());
+        assert!(matches!(
+            agg.wire_gate_admit(&host(), window),
+            WireAdmit::Defer {
+                schedule_trailing: true,
+                ..
+            }
+        ));
+
+        assert!(agg.wire_gate_take_pending(&host()));
+        assert!(matches!(
+            agg.wire_gate_admit(&host(), window),
+            WireAdmit::Defer {
+                schedule_trailing: true,
+                ..
+            }
+        ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn wire_gate_uncommitted_send_keeps_the_debt() {
+        // A republish aborted at the send await (synthetic pull tasks are
+        // abortable on supersession) commits nothing: the next attempt must
+        // pass again (no phantom quiet window) AND the dirty debt minted at
+        // admit must survive — `published_set_changed` recorded the merge
+        // before the send, so without the debt a later identical merge would
+        // skip the unchanged check while the editor never received the set.
+        let agg = DiagnosticAggregator::new();
+        let window = std::time::Duration::from_secs(1);
+
+        assert_eq!(agg.wire_gate_admit(&host(), window), WireAdmit::SendNow);
+        // (no commit: the send was aborted)
+        assert!(
+            agg.wire_gate_is_dirty(&host()),
+            "the admitted-but-uncommitted send leaves its debt marked"
+        );
+        assert_eq!(
+            agg.wire_gate_admit(&host(), window),
+            WireAdmit::SendNow,
+            "an uncommitted send must not open a quiet window"
+        );
+        agg.wire_gate_commit_send(&host());
+        assert!(
+            !agg.wire_gate_is_dirty(&host()),
+            "the completed send settles the debt"
+        );
     }
 
     #[tokio::test]

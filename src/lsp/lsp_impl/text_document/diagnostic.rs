@@ -16,6 +16,7 @@ use tower_lsp_server::jsonrpc::Result;
 use tower_lsp_server::ls_types::{
     Diagnostic, DocumentDiagnosticParams, DocumentDiagnosticReport, DocumentDiagnosticReportResult,
     FullDocumentDiagnosticReport, RelatedFullDocumentDiagnosticReport,
+    RelatedUnchangedDocumentDiagnosticReport, UnchangedDocumentDiagnosticReport,
 };
 use url::Url;
 
@@ -136,7 +137,7 @@ impl Kakehashi {
         // Get the language for this document
         let Some(language_name) = self.document_language(&uri) else {
             log::debug!(target: "kakehashi::diagnostic", "No language detected");
-            self.diagnostics.mark_served(&uri, served_version);
+            self.mark_pull_covered(&uri, served_version);
             return Ok(empty_diagnostic_report());
         };
 
@@ -157,7 +158,7 @@ impl Kakehashi {
                 "no diagnostic layer enabled for {} (layers.aggregation priorities / bridge._self)",
                 language_name
             );
-            self.diagnostics.mark_served(&uri, served_version);
+            self.mark_pull_covered(&uri, served_version);
             return Ok(empty_diagnostic_report());
         }
 
@@ -351,15 +352,81 @@ impl Kakehashi {
         )
         .await;
 
+        // Degraded-answer guard (the pull-side sibling of `republish`'s
+        // geometry-unknown deferral): the bounded parse wait above can lapse
+        // under load, leaving `snapshot` `None` for an open document while the
+        // aggregator holds live region pushes — the fold above then silently
+        // skipped every cached `Region` slot, so this answer is missing whole
+        // servers' diagnostics. A pull must respond (there is no "defer" for a
+        // request), so serve the degraded set — but do NOT mark it served, and
+        // record the per-host debt: the reparse loop's post-parse pass (or the
+        // TOCTOU guard below) consumes it and requests the recovery refresh
+        // (single-flighted, forced past the coverage gate) that brings the
+        // client back to a full view, instead of the gap being masked until
+        // the next edit. The predicate mirrors `republish`'s `needs_geometry`
+        // (non-empty region slots only).
+        let degraded_virt =
+            virt_enabled && snapshot.is_none() && self.diagnostics.has_region_slots(&uri);
+
         // The editor is about to receive the current merged set: advance `served` to
         // the version captured at entry, so the refresh gate stops treating those
         // changes as dirty (#497). Pure bookkeeping — never republishes — so this
         // can't beget a refresh.
-        self.diagnostics.mark_served(&uri, served_version);
+        if degraded_virt {
+            // The debt drives the post-parse recovery refresh (see
+            // `DiagnosticAggregator::degraded_pulls`).
+            self.diagnostics.record_degraded_pull(&uri);
+            // TOCTOU guard: `snapshot` was captured before the fan-out/fold
+            // awaits above, so the parse may have landed — and the post-parse
+            // debt consumer already run — in between, leaving this
+            // freshly-recorded debt with no consumer until the next edit. If
+            // geometry is available NOW, consume the debt here and fire the
+            // recovery refresh ourselves. FORCED past the coverage gate (still
+            // single-flighted): the debt itself proves the client just
+            // received a non-covering answer, which the version-based gate
+            // cannot see — an edit-race degradation leaves served == current
+            // (no push-origin change), so a gated request would be suppressed
+            // while the client displays the region-less set. `take` on both
+            // consumers makes double-firing impossible; if the snapshot is
+            // still absent, the parse that produces it has not run its
+            // post-parse pass yet, so that pass will consume. Loop-bounded:
+            // the refresh-induced re-pull sees the ready geometry, answers
+            // covering, and clears everything.
+            let geometry_ready = self
+                .documents
+                .get(&uri)
+                .and_then(|doc| doc.snapshot())
+                .is_some();
+            if geometry_ready && self.diagnostics.take_degraded_pull(&uri) {
+                crate::lsp::lsp_impl::DiagnosticPublisher::new(self)
+                    .request_pull_diagnostic_refresh(true);
+            }
+        } else {
+            self.mark_pull_covered(&uri, served_version);
+        }
 
-        Ok(make_diagnostic_report(combine_layer_diagnostics(
-            &layer_cfg, virt_items, host_items,
-        )))
+        let items = combine_layer_diagnostics(&layer_cfg, virt_items, host_items);
+        // Content-addressed result id over the canonically sorted items
+        // (stateless): the client echoes the id it last received as
+        // `previousResultId`; when the recomputed id matches, an UNCHANGED
+        // report replaces the full item list. On a diagnostics-heavy host a
+        // full report is ~1 MB (measured: ~2,235 items), and every
+        // `workspace/diagnostic/refresh`-induced re-pull of a settled set
+        // previously re-shipped all of it.
+        let (items, result_id) = finalize_pull_items(items);
+        if params.previous_result_id.as_deref() == Some(result_id.as_str()) {
+            return Ok(unchanged_diagnostic_report(result_id));
+        }
+        Ok(make_diagnostic_report(items, result_id))
+    }
+
+    /// A pull answered with a covering (non-degraded) report: advance the
+    /// coverage `served` marker and clear any earlier degraded-pull debt —
+    /// every covering exit must do both, or a stale debt would later fire an
+    /// unnecessary (though coverage-gated) recovery refresh.
+    fn mark_pull_covered(&self, uri: &Url, served_version: u64) {
+        self.diagnostics.mark_served(uri, served_version);
+        self.diagnostics.forget_degraded_pull(uri);
     }
 
     /// pushFallback fold (Path B, #425): append push-driven servers' cached
@@ -710,12 +777,74 @@ async fn dispatch_preferred_diagnostics(
     }
 }
 
-/// Create a full diagnostic report from aggregated diagnostics.
-fn make_diagnostic_report(diagnostics: Vec<Diagnostic>) -> DocumentDiagnosticReportResult {
+/// Canonicalize a pull result and mint its content-addressed id: sort the
+/// items deterministically (the fan-outs complete in arbitrary order, and the
+/// hash needs canonical serialization; it also gives the editor a stable list
+/// order, matching the publish path #423), then hash. One function so the
+/// handler cannot hash unsorted items — an order-unstable id would make
+/// `unchanged` reports silently never fire on multi-server hosts.
+fn finalize_pull_items(mut items: Vec<Diagnostic>) -> (Vec<Diagnostic>, String) {
+    crate::lsp::diagnostic_cache::sort_diagnostics(&mut items);
+    let id = diagnostic_result_id(&items);
+    (items, id)
+}
+
+/// FNV-1a 64-bit over a serde serialization stream: hashes without
+/// materializing the serialized form (a full pull set is ~1 MB — see
+/// [`diagnostic_result_id`]). Byte-identical to `fnv1a_hash(to_string(..))`
+/// because `to_writer` produces the same bytes as `to_string`.
+struct FnvWriter(u64);
+
+impl std::io::Write for FnvWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        const FNV_PRIME: u64 = 0x100000001b3;
+        for &byte in buf {
+            self.0 = (self.0 ^ u64::from(byte)).wrapping_mul(FNV_PRIME);
+        }
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Content-address a **sorted** pull result: the deterministic sort
+/// ([`sort_diagnostics`], applied by [`finalize_pull_items`]) makes the
+/// serialization canonical, so the same logical set always hashes to the same
+/// id and any field change produces a different one. The length suffix is
+/// cheap insurance against a 64-bit collision making a changed set read as
+/// unchanged (the same accepted trade as the bridge's `document_tracker`
+/// content fingerprint). Stateless: the client echoes the id back as
+/// `previousResultId` and the handler just recomputes — nothing to invalidate.
+///
+/// [`sort_diagnostics`]: crate::lsp::diagnostic_cache::sort_diagnostics
+fn diagnostic_result_id(items: &[Diagnostic]) -> String {
+    const FNV_OFFSET: u64 = 0xcbf29ce484222325;
+    let mut writer = FnvWriter(FNV_OFFSET);
+    // Serialization of ls_types values cannot realistically fail (no non-string
+    // map keys, and JSON numbers cannot be non-finite) and `FnvWriter` never
+    // errors; if it ever fails anyway, FAIL OPEN with an id that can never
+    // match a previous one — two differing sets could share a partial-stream
+    // prefix hash, and a false "unchanged" must stay impossible.
+    if serde_json::to_writer(&mut writer, items).is_err() {
+        static UNHASHABLE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let nonce = UNHASHABLE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        return format!("unhashable-{nonce}-{}", items.len());
+    }
+    format!("{:016x}-{}", writer.0, items.len())
+}
+
+/// Create a full diagnostic report from aggregated diagnostics. `result_id`
+/// lets the client echo `previousResultId` on its next pull so an unchanged
+/// set can be answered with [`unchanged_diagnostic_report`].
+fn make_diagnostic_report(
+    diagnostics: Vec<Diagnostic>,
+    result_id: String,
+) -> DocumentDiagnosticReportResult {
     DocumentDiagnosticReportResult::Report(DocumentDiagnosticReport::Full(
         RelatedFullDocumentDiagnosticReport {
             full_document_diagnostic_report: FullDocumentDiagnosticReport {
-                result_id: None, // No result_id for aggregated multi-region response
+                result_id: Some(result_id),
                 items: diagnostics,
             },
             related_documents: None,
@@ -723,7 +852,25 @@ fn make_diagnostic_report(diagnostics: Vec<Diagnostic>) -> DocumentDiagnosticRep
     ))
 }
 
+/// Create an UNCHANGED diagnostic report: the client's `previousResultId`
+/// matches the current set, so no items are re-shipped (LSP 3.17 pull
+/// diagnostics).
+fn unchanged_diagnostic_report(result_id: String) -> DocumentDiagnosticReportResult {
+    DocumentDiagnosticReportResult::Report(DocumentDiagnosticReport::Unchanged(
+        RelatedUnchangedDocumentDiagnosticReport {
+            unchanged_document_diagnostic_report: UnchangedDocumentDiagnosticReport { result_id },
+            related_documents: None,
+        },
+    ))
+}
+
 /// Create an empty diagnostic report (full report with no items).
+///
+/// Deliberately carries no `resultId`: these are the early-return paths
+/// (missing document, undetectable language, no participating layer) that
+/// answer before any merge exists. A tiny Full-empty response costs nothing to
+/// re-ship, and a client `previousResultId` can never match an absent id, so
+/// the unchanged-report machinery simply doesn't engage here.
 fn empty_diagnostic_report() -> DocumentDiagnosticReportResult {
     DocumentDiagnosticReportResult::Report(DocumentDiagnosticReport::Full(
         RelatedFullDocumentDiagnosticReport {
@@ -804,5 +951,141 @@ mod tests {
     fn combine_empty_priorities_yields_nothing() {
         let cfg = layer_cfg(vec![], AggregationStrategy::Concatenated);
         assert!(combine_layer_diagnostics(&cfg, vec![diag("virt")], vec![diag("host")]).is_empty());
+    }
+
+    #[test]
+    fn result_id_is_stable_across_fan_in_order() {
+        // The pull's fan-outs complete in arbitrary order; `finalize_pull_items`
+        // (the one function the handler goes through) must canonicalize
+        // permutations of the same logical set to the same result id —
+        // otherwise a client's previousResultId would never match on a
+        // multi-server host and unchanged reports would silently never fire.
+        // Deliberately feeds UNSORTED permutations so removing the sort inside
+        // `finalize_pull_items` fails this test.
+        let a = vec![diag("x"), diag("y"), diag("z")];
+        let b = vec![diag("z"), diag("x"), diag("y")];
+        let (sorted_a, id_a) = finalize_pull_items(a);
+        let (sorted_b, id_b) = finalize_pull_items(b);
+        assert_eq!(sorted_a, sorted_b, "the sort canonicalizes permutations");
+        assert_eq!(id_a, id_b);
+    }
+
+    #[test]
+    fn result_id_streaming_hash_matches_the_materialized_form() {
+        // `diagnostic_result_id` hashes through a serde writer to avoid a ~1 MB
+        // transient; the id must stay byte-identical to hashing the
+        // materialized serialization (the stateless contract: clients hold ids
+        // across server restarts, so the id algorithm is wire-format).
+        let items = vec![diag("x"), diag("y")];
+        let materialized = serde_json::to_string(&items).expect("serializes");
+        let expected = format!(
+            "{:016x}-{}",
+            crate::text::fnv1a_hash(&materialized),
+            items.len()
+        );
+        assert_eq!(diagnostic_result_id(&items), expected);
+    }
+
+    #[test]
+    fn result_id_changes_with_any_content_change() {
+        let base = vec![diag("x"), diag("y")];
+        let mut changed_message = base.clone();
+        changed_message[1].message = "y'".to_string();
+        let mut changed_severity = base.clone();
+        changed_severity[0].severity = Some(tower_lsp_server::ls_types::DiagnosticSeverity::ERROR);
+        let shrunk = vec![diag("x")];
+
+        let id = diagnostic_result_id(&base);
+        assert_ne!(id, diagnostic_result_id(&changed_message));
+        assert_ne!(id, diagnostic_result_id(&changed_severity));
+        assert_ne!(id, diagnostic_result_id(&shrunk));
+    }
+
+    #[tokio::test]
+    async fn degraded_pull_does_not_mark_the_change_served() {
+        // The pull-side sibling of republish's geometry deferral: when the
+        // bounded parse wait lapses (no snapshot) while the aggregator holds
+        // live region pushes, the answer is missing whole servers' diagnostics
+        // (the fold skips region slots without offsets). The answer must still
+        // be served — a pull cannot defer — but it must NOT advance `served`,
+        // and it records the per-host debt the post-parse pass consumes to
+        // fire the recovery refresh that brings the client back to a full
+        // view.
+        let (service, _socket) = tower_lsp_server::LspService::new(Kakehashi::new);
+        let server = service.inner();
+        server
+            .language
+            .language_registry_for_parallel()
+            .register("rust".to_string(), tree_sitter_rust::LANGUAGE.into());
+        let uri = Url::parse("file:///test/degraded_pull.rs").unwrap();
+        server.documents.insert(
+            uri.clone(),
+            "fn main() {}".to_string(),
+            Some("rust".to_string()),
+            None, // tree pending: snapshot() is None
+        );
+        server.diagnostics.record(
+            &uri,
+            crate::lsp::diagnostic_cache::DiagnosticSource::Region("region-1".to_string()),
+            "lua_ls".to_string(),
+            Some(crate::lsp::bridge::ProgressConnectionId::for_test(1)),
+            vec![diag("boom")],
+        );
+        server.diagnostics.bump_current(&uri);
+        assert!(
+            server.diagnostics.is_dirty(),
+            "the push made the host dirty"
+        );
+
+        let params = DocumentDiagnosticParams {
+            text_document: tower_lsp_server::ls_types::TextDocumentIdentifier {
+                uri: "file:///test/degraded_pull.rs".parse().expect("uri"),
+            },
+            identifier: None,
+            previous_result_id: None,
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+        };
+        let report = server
+            .diagnostic_impl(params)
+            .await
+            .expect("a degraded pull still answers");
+        let DocumentDiagnosticReportResult::Report(DocumentDiagnosticReport::Full(full)) = report
+        else {
+            panic!("degraded answer is a full report");
+        };
+        assert!(
+            full.full_document_diagnostic_report.items.is_empty(),
+            "the region push cannot be folded without geometry (that's the degradation)"
+        );
+        assert!(
+            server.diagnostics.is_dirty(),
+            "a degraded answer must not advance `served` — the gap would be masked"
+        );
+        assert!(
+            server.diagnostics.take_degraded_pull(&uri),
+            "the degraded answer records the per-host debt that keys the post-parse recovery refresh"
+        );
+    }
+
+    #[test]
+    fn unchanged_report_carries_the_id_and_no_items() {
+        let report = unchanged_diagnostic_report("abc-1".to_string());
+        let serialized = serde_json::to_value(&report).expect("serializes");
+        assert_eq!(serialized["kind"], "unchanged");
+        assert_eq!(serialized["resultId"], "abc-1");
+        assert!(
+            serialized.get("items").is_none(),
+            "an unchanged report re-ships no items"
+        );
+    }
+
+    #[test]
+    fn full_report_carries_the_result_id() {
+        let report = make_diagnostic_report(vec![diag("x")], "abc-1".to_string());
+        let serialized = serde_json::to_value(&report).expect("serializes");
+        assert_eq!(serialized["kind"], "full");
+        assert_eq!(serialized["resultId"], "abc-1");
+        assert_eq!(serialized["items"].as_array().map(Vec::len), Some(1));
     }
 }

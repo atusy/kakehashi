@@ -4,5 +4,6 @@ expression: result
 ---
 {
   "kind": "full",
+  "resultId": "[content hash redacted]",
   "items": "[0 items redacted]"
 }

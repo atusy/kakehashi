@@ -460,23 +460,30 @@ fn e2e_downstream_crash_refreshes_pull_clients() {
         }),
     );
 
-    // The crash mock pushes one diagnostic on didOpen; the editor receives it.
-    client
-        .wait_for_notification_where(
-            &["textDocument/publishDiagnostics"],
+    // The spontaneous push changes the merged set, driving BOTH a refresh
+    // (push/pull-divergence, #422) and a publish. The publish can lag the
+    // refresh — the wire quiet-window may defer it to the trailing flush — so
+    // wait for the refresh while collecting publishes, then make sure the
+    // pushed publish arrived (from the collected ones or a fresh wait). Ack
+    // the refresh: the bridge single-flights it (#497), so the crash-eviction
+    // refresh below won't be sent until this one is answered.
+    let (push_refresh_id, _, publishes) = client
+        .wait_for_server_request_watching(
+            "workspace/diagnostic/refresh",
             Duration::from_secs(15),
-            has_pushed_diag,
+            &["textDocument/publishDiagnostics"],
         )
-        .expect("editor should receive the pushed diagnostic before the crash");
-
-    // That spontaneous push itself changed the merged set, so it also drives a
-    // refresh (push/pull-divergence, #422). Consume it, and **ack** it: the bridge
-    // single-flights the workspace refresh (#497), so the crash-eviction refresh
-    // below won't be sent until this one is answered.
-    let (push_refresh_id, _) = client
-        .wait_for_server_request("workspace/diagnostic/refresh", Duration::from_secs(15))
         .expect("the spontaneous push must drive a workspace/diagnostic/refresh (#422)");
     client.send_response(push_refresh_id, json!(null));
+    if !publishes.iter().any(|(_, params)| has_pushed_diag(params)) {
+        client
+            .wait_for_notification_where(
+                &["textDocument/publishDiagnostics"],
+                Duration::from_secs(15),
+                has_pushed_diag,
+            )
+            .expect("editor should receive the pushed diagnostic before the crash");
+    }
 
     // The content-changing edit reaches the mock, driving it to exit (crash). The
     // bridge's reader sees EOF, evicts the dead connection's slots, and republishes
@@ -489,22 +496,341 @@ fn e2e_downstream_crash_refreshes_pull_clients() {
         }),
     );
 
+    // The eviction changed the merged set with no event the editor could see,
+    // so the bridge must emit a second `workspace/diagnostic/refresh` (#499),
+    // and the host must be republished cleared — again in either order (the
+    // cleared publish may ride the trailing quiet-window flush).
+    let (evict_refresh_id, _, publishes) = client
+        .wait_for_server_request_watching(
+            "workspace/diagnostic/refresh",
+            Duration::from_secs(15),
+            &["textDocument/publishDiagnostics"],
+        )
+        .expect(
+            "a crash eviction that clears the host must drive a workspace/diagnostic/refresh (#499)",
+        );
+    client.send_response(evict_refresh_id, json!(null));
+    if !publishes
+        .iter()
+        .any(|(_, params)| cleared_host_diag(params))
+    {
+        client
+            .wait_for_notification_where(
+                &["textDocument/publishDiagnostics"],
+                Duration::from_secs(15),
+                cleared_host_diag,
+            )
+            .expect("the crash must evict the dead server's diagnostic and republish cleared");
+    }
+
+    client.send_request("shutdown", json!(null));
+    client.send_notification("exit", json!(null));
+}
+
+#[test]
+fn e2e_publish_seal_via_language_wildcard_reaches_configured_languages() {
+    // The `languages._` wildcard's layers are field-merged into every
+    // configured language by Phase 2 base resolution (resolve_base_configs),
+    // so a wildcard seal reaches the markdown host even though this config
+    // also has explicit language entries via built-in defaults. Same shape as
+    // the exact-language seal e2e, minus the follow-up pull.
+    let config_dir = tempfile::TempDir::new().expect("temp dir");
+    let config_path = config_dir.path().join("publish_seal_wildcard.toml");
+    std::fs::write(&config_path, "").expect("write config");
+
+    let mut client = LspClient::builder()
+        .arg("--config-file")
+        .arg(config_path.to_str().expect("utf8 path"))
+        .build();
+
+    client.send_request(
+        "initialize",
+        json!({
+            "processId": std::process::id(),
+            "rootUri": null,
+            "capabilities": { "workspace": { "diagnostics": { "refreshSupport": true } } },
+            "workspaceFolders": null,
+            "initializationOptions": {
+                "languageServers": {
+                    "mock-push": { "cmd": [mock_bin(), "diagnostics-push"], "languages": ["lua"] }
+                },
+                "languages": {
+                    "_": {
+                        "layers": {
+                            "aggregation": {
+                                "textDocument/publishDiagnostics": { "priorities": [] }
+                            }
+                        }
+                    }
+                }
+            }
+        }),
+    );
+    client.send_notification("initialized", json!({}));
+
+    client.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": { "uri": MD_URI, "languageId": "markdown", "version": 1, "text": MD_TEXT }
+        }),
+    );
+
+    let (refresh_id, _, publishes) = client
+        .wait_for_server_request_watching(
+            "workspace/diagnostic/refresh",
+            Duration::from_secs(15),
+            &["textDocument/publishDiagnostics"],
+        )
+        .expect("a wildcard-sealed setup must still drive workspace/diagnostic/refresh");
+    let host_publishes: Vec<_> = publishes
+        .iter()
+        .filter(|(_, params)| params["uri"] == json!(MD_URI))
+        .collect();
+    assert!(
+        host_publishes.is_empty(),
+        "a languages._ seal must reach the markdown host (got {host_publishes:?})"
+    );
+    client.send_response(refresh_id, json!(null));
+
+    client.send_request("shutdown", json!(null));
+    client.send_notification("exit", json!(null));
+}
+
+#[test]
+fn e2e_didclose_clears_promptly_even_within_the_quiet_window() {
+    // The regression this pins: a clearing push withheld by the quiet window
+    // must not be dropped when the document closes — didClose's clearing
+    // publish bypasses the window and the withheld `dirty` debt forces it past
+    // the unchanged-skip, so a push-mode editor never keeps a closed buffer's
+    // diagnostics. Positive assertion: an empty publish for the host arrives
+    // regardless of whether the mock's clearing push raced the close.
+    let (mut client, _config_dir) = init_client();
+
+    client.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": { "uri": MD_URI, "languageId": "markdown", "version": 1, "text": MD_TEXT }
+        }),
+    );
+    client
+        .wait_for_notification_where(
+            &["textDocument/publishDiagnostics"],
+            Duration::from_secs(15),
+            has_pushed_diag,
+        )
+        .expect("editor should receive the pushed diagnostic");
+
+    // The edit drives the mock's clearing `[]` push; within 1 s of the last
+    // publish it is withheld by the quiet window. Closing right away must
+    // still clear the editor.
+    client.send_notification(
+        "textDocument/didChange",
+        json!({
+            "textDocument": { "uri": MD_URI, "version": 2 },
+            "contentChanges": [{ "text": MD_TEXT_EDITED }]
+        }),
+    );
+    client.send_notification(
+        "textDocument/didClose",
+        json!({ "textDocument": { "uri": MD_URI } }),
+    );
+
+    let cleared = client.wait_for_notification_where(
+        &["textDocument/publishDiagnostics"],
+        Duration::from_secs(15),
+        cleared_host_diag,
+    );
+    assert!(
+        cleared.is_some(),
+        "closing within the quiet window must still deliver a clearing publish"
+    );
+
+    client.send_request("shutdown", json!(null));
+    client.send_notification("exit", json!(null));
+}
+
+#[test]
+fn e2e_pull_result_id_roundtrip_reports_unchanged() {
+    // LSP 3.17 pull diagnostics: the full report carries a resultId; a re-pull
+    // echoing it as previousResultId while the set is unchanged is answered
+    // with an `unchanged` report (no items re-shipped — on a diagnostics-heavy
+    // host the full report is ~1 MB, and every refresh-induced re-pull of a
+    // settled set previously re-shipped all of it). A content change makes the
+    // next pull full again, with a different id.
+    let (mut client, _config_dir) = init_client();
+
+    client.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": { "uri": MD_URI, "languageId": "markdown", "version": 1, "text": MD_TEXT }
+        }),
+    );
+
+    // Wait for the spontaneous push so the folded set is stable across the two
+    // pulls below.
+    client
+        .wait_for_notification_where(
+            &["textDocument/publishDiagnostics"],
+            Duration::from_secs(15),
+            has_pushed_diag,
+        )
+        .expect("the push-driven mock should push on didOpen");
+
+    let first = client.send_request(
+        "textDocument/diagnostic",
+        json!({ "textDocument": { "uri": MD_URI } }),
+    );
+    assert_eq!(first["result"]["kind"], "full");
+    let result_id = first["result"]["resultId"]
+        .as_str()
+        .expect("a full pull report carries a resultId")
+        .to_string();
+
+    // Same set + matching previousResultId → unchanged, same id, no items.
+    let second = client.send_request(
+        "textDocument/diagnostic",
+        json!({
+            "textDocument": { "uri": MD_URI },
+            "previousResultId": result_id
+        }),
+    );
+    assert_eq!(
+        second["result"]["kind"], "unchanged",
+        "an unchanged set answered against a matching previousResultId re-ships nothing"
+    );
+    assert_eq!(second["result"]["resultId"], json!(result_id));
+    assert!(second["result"].get("items").is_none());
+
+    // A content change (the mock clears on didChange) invalidates the id: the
+    // next pull is full again with a different id. Wait for the cleared
+    // publish first so the cache settled.
+    client.send_notification(
+        "textDocument/didChange",
+        json!({
+            "textDocument": { "uri": MD_URI, "version": 2 },
+            "contentChanges": [{ "text": MD_TEXT_EDITED }]
+        }),
+    );
     client
         .wait_for_notification_where(
             &["textDocument/publishDiagnostics"],
             Duration::from_secs(15),
             cleared_host_diag,
         )
-        .expect("the crash must evict the dead server's diagnostic and republish cleared");
+        .expect("the mock's empty push should clear the host set");
 
-    // The eviction changed the merged set with no event the editor could see, so
-    // the bridge must emit a second `workspace/diagnostic/refresh` (#499) after the
-    // cleared publish, telling the pull-mode editor to re-pull the now-current set.
+    let third = client.send_request(
+        "textDocument/diagnostic",
+        json!({
+            "textDocument": { "uri": MD_URI },
+            "previousResultId": result_id
+        }),
+    );
+    assert_eq!(
+        third["result"]["kind"], "full",
+        "a changed set must be answered full even with a previousResultId"
+    );
+    assert_ne!(
+        third["result"]["resultId"],
+        json!(result_id),
+        "the id is content-addressed, so a changed set gets a new one"
+    );
+
+    client.send_request("shutdown", json!(null));
+    client.send_notification("exit", json!(null));
+}
+
+#[test]
+fn e2e_publish_seal_delivers_via_refresh_and_pull_only() {
+    // The cross-layer gate for `textDocument/publishDiagnostics` doubles as a
+    // wire seal: `priorities = []` stops the proactive publishes entirely (a
+    // pull-first editor setup ignores them or renders them as a duplicate
+    // namespace; measured at ~1 MB × dozens per typing burst on a
+    // diagnostics-heavy host) while delivery continues via
+    // `workspace/diagnostic/refresh` → client re-pull. Deterministic ordering:
+    // a publish (were the seal broken) would be a host's FIRST — which the
+    // wire quiet-window never defers (leading edge) — so it would be enqueued
+    // strictly before the refresh the same set-change drives; collecting
+    // publishes while waiting for the refresh therefore proves the seal
+    // without a negative timeout.
+    let config_dir = tempfile::TempDir::new().expect("temp dir");
+    let config_path = config_dir.path().join("publish_seal.toml");
+    std::fs::write(&config_path, "").expect("write config");
+
+    let mut client = LspClient::builder()
+        .arg("--config-file")
+        .arg(config_path.to_str().expect("utf8 path"))
+        .build();
+
+    client.send_request(
+        "initialize",
+        json!({
+            "processId": std::process::id(),
+            "rootUri": null,
+            "capabilities": { "workspace": { "diagnostics": { "refreshSupport": true } } },
+            "workspaceFolders": null,
+            "initializationOptions": {
+                "languageServers": {
+                    "mock-push": { "cmd": [mock_bin(), "diagnostics-push"], "languages": ["lua"] }
+                },
+                "languages": {
+                    "markdown": {
+                        "layers": {
+                            "aggregation": {
+                                "textDocument/publishDiagnostics": { "priorities": [] }
+                            }
+                        }
+                    }
+                }
+            }
+        }),
+    );
+    client.send_notification("initialized", json!({}));
+
+    client.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": { "uri": MD_URI, "languageId": "markdown", "version": 1, "text": MD_TEXT }
+        }),
+    );
+
+    // The mock's spontaneous push changes the merged set → the refresh nudge
+    // still fires (it is the sealed setup's delivery signal) — and no
+    // publishDiagnostics for the host may precede it.
+    let (refresh_id, _, publishes) = client
+        .wait_for_server_request_watching(
+            "workspace/diagnostic/refresh",
+            Duration::from_secs(15),
+            &["textDocument/publishDiagnostics"],
+        )
+        .expect("a sealed setup must still drive workspace/diagnostic/refresh on a push");
+    let host_publishes: Vec<_> = publishes
+        .iter()
+        .filter(|(_, params)| params["uri"] == json!(MD_URI))
+        .collect();
     assert!(
-        client
-            .wait_for_server_request("workspace/diagnostic/refresh", Duration::from_secs(15))
-            .is_some(),
-        "a crash eviction that clears the host must drive a workspace/diagnostic/refresh (#499)"
+        host_publishes.is_empty(),
+        "the seal must stop publishDiagnostics for the host (got {host_publishes:?})"
+    );
+    client.send_response(refresh_id, json!(null));
+
+    // Delivery works through the pull: the push-only mock's cached push is
+    // folded into the client-pull response in host coordinates (pushFallback).
+    let response = client.send_request(
+        "textDocument/diagnostic",
+        json!({ "textDocument": { "uri": MD_URI } }),
+    );
+    let items = response["result"]["items"]
+        .as_array()
+        .expect("the pull answer is a full diagnostic report with an items array");
+    let pulled = items
+        .iter()
+        .find(|d| is_mock_push(d))
+        .expect("the pushed diagnostic must be deliverable through the client pull");
+    assert_eq!(
+        pulled["range"]["start"]["line"],
+        json!(HOST_LINE),
+        "the pulled diagnostic must be in host coordinates (host line {HOST_LINE})"
     );
 
     client.send_request("shutdown", json!(null));

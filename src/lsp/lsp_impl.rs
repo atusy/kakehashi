@@ -667,8 +667,27 @@ impl Kakehashi {
                 // (which re-anchors region push slots against the now-current
                 // injection geometry).
                 injection.process_injections(&uri, true).await;
+                // This gate is the geometry-deferral's retry backstop —
+                // `republish`'s `needs_geometry` is the same shared predicate
+                // (`has_live_region_slots`), so a deferred publish always has
+                // this retry (diagnostic_publisher.rs).
                 if diagnostics.has_region_slots(&uri) {
                     publisher.republish(&uri).await;
+                }
+                // Degraded-pull recovery: a pull answered while THIS parse was
+                // pending couldn't fold the region slots and skipped
+                // `mark_served` — and no later event re-nudges a pull-first
+                // client until the next push. The per-host debt (recorded by
+                // that pull, consumed here exactly once) keys the recovery, so
+                // an ordinary edit cycle — or an unrelated host being dirty —
+                // never turns a parse pass into a refresh trigger. FORCED past
+                // the coverage gate (still single-flighted): the debt proves
+                // the client holds a non-covering answer, which the
+                // version-based gate cannot see — an edit-race degradation
+                // leaves served == current, so a gated request would be
+                // suppressed while the client displays the region-less set.
+                if diagnostics.take_degraded_pull(&uri) {
+                    publisher.request_pull_diagnostic_refresh(true);
                 }
 
                 // Schedule the debounced diagnostic HERE, after the reparse restored

@@ -6,8 +6,11 @@
 //! burst records all slots first and asks once per affected host): it snapshots the
 //! cache, transforms region push slots to host coordinates against the region's
 //! *current* offset (lazy re-anchor), merges with the host-event pull blob, and
-//! emits one `publishDiagnostics`. Routing every feed through one publisher is
-//! what keeps sibling regions intact against the client's URI-level clobber.
+//! emits at most one `publishDiagnostics` — the wire send is coalesced per host
+//! (the quiet window), can be sealed off by config, and is deferred while the
+//! region geometry is unknown (see [`DiagnosticPublisher::republish`]). Routing
+//! every feed through one publisher is what keeps sibling regions intact
+//! against the client's URI-level clobber.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -37,9 +40,61 @@ pub(crate) struct DiagnosticPush {
     pub(crate) diagnostics: Vec<Diagnostic>,
 }
 
+/// Outcome of one [`DiagnosticPublisher::republish`] pass.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RepublishOutcome {
+    /// The merged set changed and was recorded as the new last-published set
+    /// (and sent to the wire, unless the quiet window withheld it or the
+    /// config seal skipped it).
+    Changed,
+    /// The merge produced nothing new — identical to the recorded set (or the
+    /// host URI was unusable).
+    Unchanged,
+    /// Region geometry is unknown (tree pending): nothing was merged, recorded
+    /// or sent; the reparse loop's post-parse republish is the retry. The
+    /// CACHE did just change for a push-origin caller — that's why it asked to
+    /// republish — so push-origin callers treat this like `Changed` for the
+    /// coverage bump + `workspace/diagnostic/refresh` nudge: the retry nudges
+    /// only as degraded-pull recovery (per-host debt — see the reparse loop),
+    /// and a pull-mode client whose own re-pull
+    /// raced ahead of the push would otherwise rot on a stale set until the
+    /// next edit (the #496 symptom). The nudged re-pull is safe mid-window —
+    /// the pull path waits for the tree and folds cached pushes with fresh
+    /// geometry.
+    Deferred,
+}
+
+impl RepublishOutcome {
+    /// Whether a push-origin caller should bump coverage and nudge
+    /// `workspace/diagnostic/refresh` for this outcome (see [`Self::Deferred`]).
+    fn nudges_pull_clients(self) -> bool {
+        matches!(self, Self::Changed | Self::Deferred)
+    }
+}
+
+/// Quiet window for the editor-facing `publishDiagnostics` wire sends, per
+/// host. A changed merge inside the window after the last send is withheld and
+/// re-merged by one trailing republish at the window's end, so a burst of
+/// feeds (spontaneous pushes, the pull-layer completion, the post-parse
+/// geometry re-merge) collapses into at most one full-set publish per window
+/// per host — on a diagnostics-heavy host each publish is ~1 MB (measured:
+/// ~2,235 merged diagnostics), so the gate bounds sustained-typing wire cost
+/// at ~1 MB/s/host where it was ~2.2. An isolated change (window already
+/// elapsed) passes through immediately: the gate adds no latency outside
+/// bursts (more precisely: to a change arriving after >= 1 s of wire quiet).
+/// Deliberately a fixed constant, not a config knob: the window trades only
+/// push-namespace refresh cadence against pipe bytes, the failure mode of a
+/// wrong value is mild in both directions, and this branch's review explicitly
+/// chose existing config surfaces over new ones — revisit if a real setup
+/// needs a different cadence.
+const WIRE_PUBLISH_QUIET_WINDOW: std::time::Duration = std::time::Duration::from_secs(1);
+
 /// Bundles the state needed to merge the cache and publish for a host, so the
 /// notification feeds (reader push, host-event pull) can trigger a republish
-/// without each holding `Kakehashi`.
+/// without each holding `Kakehashi`. `Clone` is cheap (a `Client` handle plus
+/// `Arc`s) — the trailing wire-publish task clones it to re-run `republish`
+/// after the quiet window.
+#[derive(Clone)]
 pub(crate) struct DiagnosticPublisher {
     client: Client,
     language: Arc<LanguageCoordinator>,
@@ -111,17 +166,20 @@ impl DiagnosticPublisher {
     }
 
     async fn publish_recorded_hosts(&self, hosts: Vec<Url>) -> usize {
-        let mut published = 0;
+        // Counts hosts whose republish warrants the pull-client nudge (Changed
+        // or Deferred) — not wire sends, which the quiet window/seal may
+        // withhold.
+        let mut nudged = 0;
         for host in hosts {
-            if self.republish(&host).await {
+            if self.republish(&host).await.nudges_pull_clients() {
                 self.bump_current_if_open(&host);
-                published += 1;
+                nudged += 1;
             }
         }
-        if published > 0 {
+        if nudged > 0 {
             self.request_pull_diagnostic_refresh(false);
         }
-        published
+        nudged
     }
 
     /// Record a `_self` host-layer push and republish the host (host-document-bridge).
@@ -209,10 +267,17 @@ impl DiagnosticPublisher {
     /// Borrows the document text directly (no `snapshot()` clone) — detection
     /// never touches the tree, so this also avoids spuriously dropping a push for
     /// an open-but-not-yet-parsed document.
+    ///
+    /// Uses the trace-level detection variant: this runs per downstream push
+    /// (`record_host_push`) and up to twice more per changed republish
+    /// (`filter_stale_host_slots`, `publish_sealed`), so the debug-level
+    /// variant would re-grow the per-event `language_detection` log volume
+    /// that PR #677 moved off the hot paths. Detection itself is cheap here —
+    /// the `languageId` short-circuits at the first stage for open documents.
     fn open_document_language(&self, uri: &Url) -> Option<String> {
         let doc = self.documents.get(uri)?;
         self.language
-            .detect_language(uri.path(), doc.text(), None, doc.language_id())
+            .detect_language_trace(uri.path(), doc.text(), None, doc.language_id())
     }
 
     /// Remove `Host` push slots from `snapshot` whose server is no longer a
@@ -426,7 +491,7 @@ impl DiagnosticPublisher {
         let affected = self.aggregator.evict_connection(connection_id);
         let mut any_changed = false;
         for host in affected {
-            if self.republish(&host).await {
+            if self.republish(&host).await.nudges_pull_clients() {
                 // A crash eviction is a push-origin change the editor doesn't know
                 // about → bump coverage so the gated refresh below fires (#497).
                 self.bump_current_if_open(&host);
@@ -448,6 +513,16 @@ impl DiagnosticPublisher {
     /// event to learn about, so it does refresh).
     pub(crate) async fn clear_host(&self, host: &Url) {
         self.aggregator.evict_host(host);
+        // The clearing republish needs no gate preparation: `republish` bypasses
+        // the quiet window for a closed host (the document is already removed by
+        // `did_close` when this runs). Deliberately do NOT forget the wire-gate
+        // state before it — the `dirty` marker of a still-withheld send is what
+        // forces the clearing publish past the unchanged-skip when the withheld
+        // set was itself the empty set (all contributors cleared just before the
+        // close; the eviction then merges `[]` against a recorded `[]`, and
+        // without `dirty` the clearing publish would be skipped while the
+        // trailing task dies on its closed-document guard — pinning the closed
+        // buffer's stale diagnostics in the editor forever).
         self.republish(host).await;
         // The host is closed: forget its last-published set so the entry does not
         // linger and a later re-open publishes afresh (#422). Done after the
@@ -458,6 +533,11 @@ impl DiagnosticPublisher {
         // 0. (`clear_host` is editor-originated, so its republish doesn't bump
         // `current`; this just drops any prior push-origin coverage state.)
         self.aggregator.forget_coverage(host);
+        // And any degraded-pull debt — a closed doc owes no recovery refresh.
+        self.aggregator.forget_degraded_pull(host);
+        // And any wire-gate state left by earlier open-host publishes. The
+        // clearing republish above bypasses the gate because the host is closed.
+        self.aggregator.forget_wire_gate(host);
         // didClose is off the hot path: reclaim republish-lock entries whose lock
         // now has no live holder — this host's, once the clear-republish above
         // released it, plus any earlier-closed hosts that have since drained (#466).
@@ -467,13 +547,20 @@ impl DiagnosticPublisher {
     /// Merge the host's cached slots and publish the cumulative result. Region
     /// slots are transformed against the host document's *current* injection
     /// offsets; an empty merge clears the editor's diagnostics for the host.
+    /// For a pull-capable client that has been observed pulling this host, the
+    /// wire send may lag: the quiet window can withhold it into the trailing
+    /// flush, and the config seal can skip it entirely — see the gates below.
     ///
-    /// Returns `true` when a *changed* set was published to the editor, `false`
-    /// when nothing was sent (bad URI, or the merged set was identical to the
-    /// last publish). Push-origin callers ([`Self::publish_host_push`],
-    /// [`Self::publish_region_push`]) use this to decide whether to also nudge
-    /// pull-mode clients with [`Self::request_pull_diagnostic_refresh`].
-    pub(crate) async fn republish(&self, host: &Url) -> bool {
+    /// Returns [`RepublishOutcome::Changed`] when the merged set changed and
+    /// was recorded (the wire send may still be withheld or sealed),
+    /// [`RepublishOutcome::Unchanged`] when the merge produced nothing new,
+    /// and [`RepublishOutcome::Deferred`] when region geometry was unknown
+    /// mid-reparse (nothing merged or recorded; the reparse loop retries).
+    /// Push-origin callers (`publish_recorded_hosts`,
+    /// [`Self::evict_connection_diagnostics`]) nudge pull-mode clients with
+    /// [`Self::request_pull_diagnostic_refresh`] on `Changed` OR `Deferred` —
+    /// see [`RepublishOutcome::Deferred`] for why the deferral still nudges.
+    pub(crate) async fn republish(&self, host: &Url) -> RepublishOutcome {
         // Serialize the whole snapshot→merge→publish so concurrent republishes
         // (region push vs host-event pull) emit in order and a stale snapshot can
         // never publish after a fresh one (push-propagation-diagnostic-forwarding).
@@ -504,12 +591,43 @@ impl DiagnosticPublisher {
         // Recompute injection offsets only when there are region push slots to
         // transform. A PullLayer-only snapshot (the common pull-driven case) needs
         // none, so skip the whole-document injection resolution — and shorten the
-        // time this host's republish lock is held.
-        let region_offsets = if snapshot
-            .keys()
-            .any(|source| matches!(source, DiagnosticSource::Region(_)))
-        {
-            self.current_region_offsets(host)
+        // time this host's republish lock is held. The predicate IS
+        // `DiagnosticAggregator::has_region_slots`'s (the shared
+        // `has_live_region_slots`): the geometry-unknown deferral below relies
+        // on the reparse loop's post-parse republish, which is gated on
+        // exactly that check.
+        let needs_geometry = crate::lsp::diagnostic_cache::has_live_region_slots(&snapshot);
+        let region_offsets = if needs_geometry {
+            match self.current_region_offsets(host) {
+                Some(offsets) => offsets,
+                // The document is open but has no parse snapshot: `did_change`
+                // cleared the tree and the off-ingress reparse hasn't landed yet,
+                // so the regions' current offsets are UNKNOWN — not gone. Merging
+                // now would silently drop every region push slot and publish a
+                // set missing whole servers, which the post-parse republish then
+                // reverts: on a diagnostics-heavy host that flapped the editor
+                // between the full and the region-less set on every edit cycle
+                // (~2 × ~1 MB publishes per keystroke settle, plus visible
+                // flicker for push-mode clients). Defer instead: publish nothing,
+                // record nothing. The reparse loop re-runs `republish` after the
+                // parse lands whenever non-empty region slots remain
+                // (`has_region_slots` — the same predicate as `needs_geometry`),
+                // and the pass's debounced pull re-feeds and republishes too.
+                // Caveats, accepted: a parse give-up (timeout / parser gone)
+                // leaves the tree absent, so both retries stay deferred until
+                // the next edit (main published a region-LESS set there — worse);
+                // and an edit that evicts the very slots that forced this defer
+                // hands coverage to the debounced pull alone. Push-origin
+                // delivery does not depend on the retry: `Deferred` nudges
+                // pull-mode clients at defer time (see `RepublishOutcome`).
+                None => {
+                    log::debug!(
+                        target: LOG_TARGET,
+                        "defer republish for {host}: tree pending, region geometry unknown"
+                    );
+                    return RepublishOutcome::Deferred;
+                }
+            }
         } else {
             HashMap::new()
         };
@@ -519,33 +637,196 @@ impl DiagnosticPublisher {
             Ok(uri) => uri,
             Err(e) => {
                 log::warn!(target: LOG_TARGET, "skip publish, bad host URI {host}: {e}");
-                return false;
+                return RepublishOutcome::Unchanged;
             }
         };
 
         // Suppress a republish that would re-send the exact set the editor already
         // has — a redundant publishDiagnostics is needless flicker/noise (#422).
         // Done under the per-host republish lock (held above), so the compare-and-set
-        // is serialized with other republishes for this host.
-        if !self.aggregator.published_set_changed(host, &diagnostics) {
+        // is serialized with other republishes for this host. A withheld wire
+        // send (`wire_gate_is_dirty`) still proceeds: the recorded set is ahead
+        // of what actually reached the editor, so the trailing republish must
+        // send even though its own merge compares unchanged.
+        let changed = if self.aggregator.published_set_changed(host, &diagnostics) {
+            RepublishOutcome::Changed
+        } else {
+            RepublishOutcome::Unchanged
+        };
+        if changed == RepublishOutcome::Unchanged && !self.aggregator.wire_gate_is_dirty(host) {
             log::debug!(
                 target: LOG_TARGET,
                 "skip republish for {host}: merged set unchanged ({} diagnostics)",
                 diagnostics.len()
             );
-            return false;
+            return RepublishOutcome::Unchanged;
         }
 
-        log::debug!(
-            target: LOG_TARGET,
-            "publishing {} merged diagnostics for {}",
-            diagnostics.len(),
-            host
-        );
-        self.client
-            .publish_diagnostics(lsp_uri, diagnostics, None)
-            .await;
-        true
+        // The cross-layer gate for `textDocument/publishDiagnostics` doubles as a
+        // WIRE SEAL when it resolves to no layers at all: a pull-first editor
+        // setup can stop the proactive publishes entirely via existing config.
+        // On a diagnostics-heavy host they dominated the editor pipe (measured:
+        // 51 publishes × ~1 MB in a 44 s typing burst, 68% of all server→client
+        // bytes — head-of-line blocking every other response) while a pulling
+        // editor ignores them or renders them as a duplicate namespace. The
+        // merge above still ran and recorded the set: change detection keeps
+        // driving the push-origin coverage bump and
+        // `workspace/diagnostic/refresh`, which IS the sealed setup's delivery
+        // signal (refresh → client re-pull). The wire-gate state is dropped —
+        // there is no wire under the seal, so nothing can be owed to it (a
+        // stale `dirty` from before a mid-session seal would otherwise linger).
+        if self.publish_sealed(host) {
+            self.aggregator.forget_wire_gate(host);
+            log::debug!(
+                target: LOG_TARGET,
+                "seal: skipping publish of {} merged diagnostics for {} \
+                 (layers.aggregation publishDiagnostics resolves to no layers)",
+                diagnostics.len(),
+                host
+            );
+            return changed;
+        }
+
+        // A republish for a CLOSED host bypasses the quiet window and never
+        // touches gate state. This is (or races) `didClose`'s clearing publish,
+        // and both halves matter: a *deferred* clearing publish would be
+        // dropped by the trailing task's closed-document guard, pinning the
+        // closed buffer's last diagnostics in the editor forever; and a racing
+        // in-flight republish that *stamped* fresh gate state here (after
+        // `clear_host`'s forget, which does not hold the republish lock) would
+        // be exactly what defers that clearing publish. Both republishes are
+        // serialized on the per-host lock, so the clearing (empty) publish
+        // always lands last. (This ungated send shares the pre-existing
+        // record-before-send hazard: an abort landing exactly at the send
+        // below loses it — same class as main, bounded to closed-host races.)
+        if self.documents.get(host).is_none() {
+            log::debug!(
+                target: LOG_TARGET,
+                "publishing {} merged diagnostics for closed host {} (quiet window bypassed)",
+                diagnostics.len(),
+                host
+            );
+            self.client
+                .publish_diagnostics(lsp_uri, diagnostics, None)
+                .await;
+            return changed;
+        }
+
+        // Coalesce the wire sends per host (the quiet window): a burst of
+        // set-changing feeds — spontaneous pushes, the pull-layer completion,
+        // the post-parse geometry re-merge, each ~1 MB on a diagnostics-heavy
+        // host — collapses into at most one publish per window, re-merged from
+        // the LATEST cache by the trailing republish. An isolated change sends
+        // immediately. Deferral withholds only the wire: the set was already
+        // recorded above, so the return value (and with it the push-origin
+        // coverage bump + refresh nudge) is unaffected.
+        match self
+            .aggregator
+            .wire_gate_admit(host, WIRE_PUBLISH_QUIET_WINDOW)
+        {
+            crate::lsp::diagnostic_cache::WireAdmit::SendNow => {
+                log::debug!(
+                    target: LOG_TARGET,
+                    "publishing {} merged diagnostics for {}",
+                    diagnostics.len(),
+                    host
+                );
+                self.client
+                    .publish_diagnostics(lsp_uri, diagnostics, None)
+                    .await;
+                // Stamp the send only AFTER it completed: this republish can run
+                // inside an abortable task (the synthetic pull is aborted on
+                // supersession), and an abort landing at the send await must not
+                // leave gate state claiming a send that never happened — that
+                // would both defer the next change and consume a withheld
+                // `dirty` debt. Same lock hold as the admit, so the pair is
+                // atomic per host.
+                self.aggregator.wire_gate_commit_send(host);
+            }
+            crate::lsp::diagnostic_cache::WireAdmit::Defer {
+                schedule_trailing,
+                remaining,
+            } => {
+                log::debug!(
+                    target: LOG_TARGET,
+                    "withholding publish of {} merged diagnostics for {} ({}ms of quiet window left)",
+                    diagnostics.len(),
+                    host,
+                    remaining.as_millis()
+                );
+                if schedule_trailing {
+                    self.spawn_trailing_wire_publish(host.clone(), remaining);
+                }
+            }
+        }
+        changed
+    }
+
+    /// Re-run [`Self::republish`] for `host` once the quiet window elapses,
+    /// sending the (re-merged, latest) withheld set to the wire. At most one
+    /// task is parked per host at a time ([`WireAdmit::Defer`]'s
+    /// `schedule_trailing`). Clears the gate's `pending` marker *before*
+    /// re-running, so a defer racing the re-run schedules a fresh task rather
+    /// than being absorbed by one that already woke — and BAILS when the gate
+    /// entry is gone (`didClose` or the seal forgot it while this task was
+    /// parked): the debt was cancelled. (A stale task waking against a
+    /// reopened incarnation's fresh entry is instead kept safe by the
+    /// defer-reschedule design — see `wire_gate_take_pending`.)
+    ///
+    /// Shutdown: a task parked at teardown fires up to one window later and
+    /// sends a fire-and-forget notification into a closing client — tower-lsp
+    /// suppresses or error-logs it; nothing panics and no fresh downstream
+    /// state is created (unlike the reparse loop, which checks the shutdown
+    /// token because its work spawns bridge connections).
+    ///
+    /// [`WireAdmit::Defer`]: crate::lsp::diagnostic_cache::WireAdmit::Defer
+    fn spawn_trailing_wire_publish(&self, host: Url, remaining: std::time::Duration) {
+        let publisher = self.clone();
+        // Anchor the deadline NOW (at defer time), not at the task's first poll
+        // — under load the first poll can lag, which would silently stretch the
+        // quiet window.
+        let deadline = tokio::time::Instant::now() + remaining;
+        tokio::spawn(async move {
+            tokio::time::sleep_until(deadline).await;
+            if !publisher.aggregator.wire_gate_take_pending(&host) {
+                return; // gate forgotten while parked: debt cancelled
+            }
+            // Belt to the bail above: a host closed while this task was parked
+            // (but not yet forgotten) is `clear_host`'s to finish — its
+            // clearing republish bypasses the gate and lands last on the
+            // per-host lock.
+            if publisher.documents.get(&host).is_none() {
+                return;
+            }
+            publisher.republish(&host).await;
+        });
+    }
+
+    /// Whether the editor-facing `publishDiagnostics` wire sends are sealed for
+    /// `host` by config: the cross-layer gate for
+    /// `textDocument/publishDiagnostics` resolves to an **empty** priorities
+    /// list (`layers.aggregation."textDocument/publishDiagnostics".priorities =
+    /// []` on the host's language or the `_` wildcard).
+    ///
+    /// The seal is deliberately **binary** (all layers gated off), not
+    /// per-layer: a partially gated list still publishes the full merge, and
+    /// per-layer selection keeps applying to the debounced pull feed
+    /// (`coordinator/diagnostic.rs`) as before — filtering the wire set by
+    /// layer would diverge it from the change-detection set that drives the
+    /// refresh nudging. Fails open (not sealed) when the document is gone or
+    /// its language is undetectable, so a `didClose` clearing publish still
+    /// goes out.
+    fn publish_sealed(&self, host: &Url) -> bool {
+        self.open_document_language(host)
+            .is_some_and(|language_name| {
+                crate::lsp::lsp_impl::bridge_context::resolve_layer_config_from_settings(
+                    &self.settings_manager.load_settings(),
+                    &language_name,
+                    "textDocument/publishDiagnostics",
+                )
+                .priorities
+                .is_empty()
+            })
     }
 
     /// Ask pull-mode clients to re-pull diagnostics (`workspace/diagnostic/refresh`)
@@ -566,18 +847,25 @@ impl DiagnosticPublisher {
     /// Emitted **off** the per-host republish lock and **only** from the origins
     /// the editor can't learn about on its own — the push-origin paths
     /// ([`Self::publish_host_push`], [`Self::publish_region_push`]), the
-    /// crash-driven eviction ([`Self::evict_connection_diagnostics`]), and the
+    /// crash-driven eviction ([`Self::evict_connection_diagnostics`]), the
     /// upstream forwarding loop relaying a downstream server's own
-    /// `workspace/diagnostic/refresh` (`deliver_upstream_notification`) — never from
-    /// the pull-origin republish ([`Self::publish_pull_layer`]), the
-    /// editor-originated eviction paths ([`Self::clear_pull_layer`],
-    /// [`Self::clear_host`]), nor the edit-origin re-merge (`did_change`): those
-    /// carry no *new* result the editor is unaware of — a pull-origin set is already
-    /// the answer to a pull the editor made, and an edit-origin re-merge is covered
-    /// by the editor's own `didChange` re-pull — so a refresh there would be
-    /// redundant. (No tight loop forms: a
-    /// refresh-induced pull is answered inline by `diagnostic_impl`, which never
-    /// republishes, so a refresh cannot directly beget another; the indirect
+    /// `workspace/diagnostic/refresh` (`deliver_upstream_notification`), and the
+    /// reparse loop's post-parse backstop (and the pull-side TOCTOU guard) as
+    /// **degraded-pull recovery** — a pull that raced the parse was answered
+    /// without the region fold; the per-host debt keys the call, and it is
+    /// FORCED past the coverage gate because the debt proves the client holds
+    /// a non-covering answer the version-based gate cannot see (an edit-race
+    /// degradation leaves `served == current`) — never from the pull-origin republish
+    /// ([`Self::publish_pull_layer`]) nor the editor-originated eviction paths
+    /// ([`Self::clear_pull_layer`], [`Self::clear_host`]): those carry no *new*
+    /// result the editor is unaware of — a pull-origin set is already the
+    /// answer to a pull the editor made, and an ordinary edit-origin re-merge
+    /// is covered by the editor's own `didChange` re-pull — so a refresh there
+    /// would be redundant. (No tight loop forms: a
+    /// refresh-induced pull is answered inline by `diagnostic_impl`, which
+    /// never republishes; the one pull-side refresh — the degraded-pull TOCTOU
+    /// guard — consumes its debt on firing and the induced re-pull sees ready
+    /// geometry and answers covering, so it begets at most one round; the indirect
     /// push→refresh→re-pull→downstream-re-push→here path is bounded by
     /// `published_set_changed`, converging once the re-pushed set stabilizes.)
     ///
@@ -617,7 +905,9 @@ impl DiagnosticPublisher {
         // `false` here means either one is already outstanding (recorded as `pending`,
         // so the outstanding task's loop fires the trailing) or — for a non-`forced`
         // request — nothing is dirty (the editor already has the current set). A
-        // `forced` downstream-forwarded refresh (#521) bypasses the coverage gate.
+        // `forced` request bypasses the coverage gate: the downstream-forwarded
+        // refresh (#521) and the degraded-pull recovery (whose per-host debt
+        // proves a non-covering answer no coverage version represents).
         if !self.aggregator.try_begin_refresh(forced) {
             return;
         }
@@ -669,25 +959,37 @@ impl DiagnosticPublisher {
 
     /// Map each currently-resolvable injection region of the host document to its
     /// offset, recomputed from the live document so region push slots re-anchor
-    /// after edits above them. Empty when the document is missing or has no
-    /// injections.
-    fn current_region_offsets(&self, host: &Url) -> HashMap<String, RegionOffset> {
+    /// after edits above them.
+    ///
+    /// `None` means the geometry is **unknown**: the document is open but has no
+    /// parse snapshot (`did_change` cleared the tree; the off-ingress reparse
+    /// hasn't landed) — the caller must defer publishing rather than treat the
+    /// regions as gone. `Some(empty)` means there legitimately are no regions to
+    /// anchor: the document is closed, or its language resolves to no injection
+    /// query — stale region slots drop from the merge.
+    fn current_region_offsets(&self, host: &Url) -> Option<HashMap<String, RegionOffset>> {
         let mut offsets = HashMap::new();
 
         let Some(doc) = self.documents.get(host) else {
-            return offsets;
+            return Some(offsets); // closed host: nothing to anchor against
         };
         let Some(snapshot) = doc.snapshot() else {
-            return offsets;
+            return None; // open but tree pending: geometry unknown, defer
         };
-        let Some(language_name) =
-            self.language
-                .detect_language(host.path(), snapshot.text(), None, doc.language_id())
-        else {
-            return offsets;
+        // Trace-level detection: this runs on the republish path whenever
+        // region slots are present (every keystroke settle during a typing
+        // burst) — the debug variant would re-grow the per-event
+        // `language_detection` log volume PR #677 moved off hot paths.
+        let Some(language_name) = self.language.detect_language_trace(
+            host.path(),
+            snapshot.text(),
+            None,
+            doc.language_id(),
+        ) else {
+            return Some(offsets);
         };
         let Some(injection_query) = self.language.injection_query(&language_name) else {
-            return offsets;
+            return Some(offsets);
         };
 
         let resolved_regions = match self
@@ -714,7 +1016,7 @@ impl DiagnosticPublisher {
                 ),
             );
         }
-        offsets
+        Some(offsets)
     }
 }
 
@@ -744,7 +1046,7 @@ mod tests {
     use super::*;
     use crate::config::settings::{
         BridgeLanguageConfig, BridgeServerConfig, HOST_BRIDGE_KEY, LanguageSettings,
-        WorkspaceSettings,
+        LayerAggregationConfig, LayersConfig, WorkspaceSettings,
     };
     use std::collections::HashMap;
     use tower_lsp_server::LspService;
@@ -800,6 +1102,31 @@ mod tests {
             languages,
             ..Default::default()
         }
+    }
+
+    /// [`rust_settings`]`(true)` plus the publish wire seal on the rust entry:
+    /// `layers.aggregation."textDocument/publishDiagnostics".priorities = []`.
+    /// (On the exact language entry because `apply_settings` takes the raw
+    /// `WorkspaceSettings`, bypassing Phase 2 base resolution
+    /// (`resolve_base_configs`) — in production that phase field-merges the
+    /// `_` wildcard's `layers` into every configured language, so a
+    /// `languages._` seal DOES reach a language with its own entry there.)
+    fn rust_settings_with_publish_seal() -> WorkspaceSettings {
+        let mut settings = rust_settings(true);
+        let lang = settings
+            .languages
+            .get_mut("rust")
+            .expect("rust_settings defines the rust language");
+        lang.layers = Some(LayersConfig {
+            aggregation: Some(HashMap::from([(
+                "textDocument/publishDiagnostics".to_string(),
+                LayerAggregationConfig {
+                    priorities: Some(Vec::new()),
+                    strategy: None,
+                },
+            )])),
+        });
+        settings
     }
 
     /// `service.inner()` borrows from `service`, so the harness is set up inline
@@ -936,8 +1263,9 @@ mod tests {
             .await;
 
         assert_eq!(published_hosts, 1, "one host should be published once");
-        assert!(
-            !publisher.republish(&uri).await,
+        assert_eq!(
+            publisher.republish(&uri).await,
+            RepublishOutcome::Unchanged,
             "the batch must already have published its final aggregate"
         );
         let snapshot = server.diagnostics.snapshot(&uri);
@@ -1002,8 +1330,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn republish_reports_whether_the_published_set_changed() {
-        // `republish` returns whether it published a *changed* set — the gate the
+    async fn republish_reports_whether_the_recorded_set_changed() {
+        // `republish` reports whether the merged-and-RECORDED set changed (the
+        // wire send may be withheld by the quiet window or sealed) — the gate the
         // push-origin paths use to decide whether to also emit
         // `workspace/diagnostic/refresh` (so a pull-mode editor re-pulls and sees an
         // async host push; push/pull-divergence, #422). A non-empty first publish is
@@ -1030,13 +1359,353 @@ mod tests {
             Some(ProgressConnectionId::for_test(1)),
             vec![diag("boom")],
         );
-        assert!(
+        assert_eq!(
             publisher.republish(&uri).await,
+            RepublishOutcome::Changed,
             "first publish of a non-empty host set must report a change (drives the refresh)"
         );
-        assert!(
-            !publisher.republish(&uri).await,
+        assert_eq!(
+            publisher.republish(&uri).await,
+            RepublishOutcome::Unchanged,
             "re-publishing the identical set must report unchanged (no redundant refresh)"
+        );
+    }
+
+    #[tokio::test]
+    async fn publish_sealed_reflects_the_layer_gate() {
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+        register_rust(server);
+        let uri = Url::parse("file:///test/host_seal.rs").unwrap();
+        server.documents.insert(
+            uri.clone(),
+            "fn main() {}".to_string(),
+            Some("rust".to_string()),
+            None,
+        );
+        let publisher = DiagnosticPublisher::new(server);
+
+        server.settings_manager.apply_settings(rust_settings(true));
+        assert!(
+            !publisher.publish_sealed(&uri),
+            "default layer priorities publish as before"
+        );
+
+        server
+            .settings_manager
+            .apply_settings(rust_settings_with_publish_seal());
+        assert!(
+            publisher.publish_sealed(&uri),
+            "publishDiagnostics priorities = [] seals the wire sends"
+        );
+
+        let closed = Url::parse("file:///test/never_opened.rs").unwrap();
+        assert!(
+            !publisher.publish_sealed(&closed),
+            "an unresolvable document fails open (didClose's clearing publish goes out)"
+        );
+    }
+
+    #[tokio::test]
+    async fn republish_under_seal_keeps_the_change_contract() {
+        // With the wire sealed, the merge and the last-published recording must
+        // behave exactly as in publish mode: a changed set reports Changed
+        // (drives the coverage bump + refresh — the sealed setup's delivery
+        // signal), an identical re-merge reports Unchanged. If the seal skipped
+        // the recording,
+        // every push would re-report "changed" and spam refreshes forever.
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+        register_rust(server);
+        server
+            .settings_manager
+            .apply_settings(rust_settings_with_publish_seal());
+        let uri = Url::parse("file:///test/host_sealed_contract.rs").unwrap();
+        server.documents.insert(
+            uri.clone(),
+            "fn main() {}".to_string(),
+            Some("rust".to_string()),
+            None,
+        );
+        let publisher = DiagnosticPublisher::new(server);
+        server.diagnostics.record(
+            &uri,
+            DiagnosticSource::Host,
+            "rust_ls".to_string(),
+            Some(ProgressConnectionId::for_test(1)),
+            vec![diag("boom")],
+        );
+
+        assert_eq!(
+            publisher.republish(&uri).await,
+            RepublishOutcome::Changed,
+            "a changed set reports Changed under the seal (drives the refresh)"
+        );
+        assert_eq!(
+            publisher.republish(&uri).await,
+            RepublishOutcome::Unchanged,
+            "the sealed set was recorded as last-published, so a re-merge is unchanged"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn trailing_republish_flushes_the_withheld_wire_send() {
+        // Inside the quiet window a changed merge is withheld from the wire
+        // (dirty) and one trailing task is parked; once the window elapses the
+        // task re-runs republish, which sends despite its own merge comparing
+        // unchanged, and clears the dirty marker — after which an identical
+        // re-merge is a plain skip again.
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+        register_rust(server);
+        server.settings_manager.apply_settings(rust_settings(true));
+        let uri = Url::parse("file:///test/host_trailing.rs").unwrap();
+        server.documents.insert(
+            uri.clone(),
+            "fn main() {}".to_string(),
+            Some("rust".to_string()),
+            None,
+        );
+        let publisher = DiagnosticPublisher::new(server);
+
+        // Leading edge: first changed set passes through immediately.
+        server.diagnostics.record(
+            &uri,
+            DiagnosticSource::Host,
+            "rust_ls".to_string(),
+            Some(ProgressConnectionId::for_test(1)),
+            vec![diag("first")],
+        );
+        assert_eq!(publisher.republish(&uri).await, RepublishOutcome::Changed);
+        assert!(!server.diagnostics.wire_gate_is_dirty(&uri));
+
+        // A second change inside the window: reported as changed, but the wire
+        // send is withheld (dirty) with a trailing task parked.
+        server.diagnostics.record(
+            &uri,
+            DiagnosticSource::Host,
+            "rust_ls".to_string(),
+            Some(ProgressConnectionId::for_test(1)),
+            vec![diag("second")],
+        );
+        assert_eq!(
+            publisher.republish(&uri).await,
+            RepublishOutcome::Changed,
+            "a withheld change still reports changed (drives the refresh nudge)"
+        );
+        assert!(
+            server.diagnostics.wire_gate_is_dirty(&uri),
+            "the change was withheld from the wire"
+        );
+
+        // The window elapses; the parked trailing task re-runs republish.
+        tokio::time::advance(super::WIRE_PUBLISH_QUIET_WINDOW).await;
+        // Advance virtual time once more so Tokio drains the woken trailing
+        // task through its nested awaits without relying on a poll count.
+        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        assert!(
+            !server.diagnostics.wire_gate_is_dirty(&uri),
+            "the trailing republish flushed the withheld set"
+        );
+        assert_eq!(
+            publisher.republish(&uri).await,
+            RepublishOutcome::Unchanged,
+            "after the flush an identical re-merge is a plain unchanged skip"
+        );
+    }
+
+    #[tokio::test]
+    async fn republish_defers_while_region_geometry_is_unknown() {
+        // `did_change` clears the visible tree; until the off-ingress reparse
+        // lands, `doc.snapshot()` is `None` and the regions' current offsets are
+        // unknown. A republish in that window must DEFER (publish nothing,
+        // record nothing) instead of merging with empty offsets — which silently
+        // dropped every region push slot and flapped the editor between the full
+        // and the region-less set on each edit cycle. The document here is
+        // inserted with no tree, modelling exactly that window.
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+        let uri = Url::parse("file:///test/host_geometry_unknown.md").unwrap();
+        server.documents.insert(
+            uri.clone(),
+            "```lua\nlocal x = 1\n```\n".to_string(),
+            Some("markdown".to_string()),
+            None, // no tree: snapshot() is None
+        );
+        server.diagnostics.record(
+            &uri,
+            DiagnosticSource::Region("region-1".to_string()),
+            "lua_ls".to_string(),
+            Some(ProgressConnectionId::for_test(1)),
+            vec![diag("unused variable")],
+        );
+        let publisher = DiagnosticPublisher::new(server);
+
+        assert_eq!(
+            publisher.republish(&uri).await,
+            RepublishOutcome::Deferred,
+            "a republish with live region slots but no parse snapshot must defer"
+        );
+        // Nothing was recorded as last-published: once the parse lands, the same
+        // merged set must still count as a change (the deferred publish happens).
+        assert!(
+            server.diagnostics.published_set_changed(&uri, &[]),
+            "deferral must not record a last-published set"
+        );
+    }
+
+    #[tokio::test]
+    async fn republish_proceeds_without_a_tree_when_region_slots_are_empty() {
+        // The deferral is keyed on NON-EMPTY region slots (mirroring
+        // `has_region_slots`, the reparse loop's backstop gate). A host whose
+        // only region slot is an empty clearing push needs no geometry — its
+        // merge drops nothing real — so it publishes even while the tree is
+        // pending. If this deferred instead, the post-parse backstop would skip
+        // it (`has_region_slots` is false) and the publish would be lost.
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+        let uri = Url::parse("file:///test/host_empty_region_slot.md").unwrap();
+        server.documents.insert(
+            uri.clone(),
+            "```lua\nlocal x = 1\n```\n".to_string(),
+            Some("markdown".to_string()),
+            None,
+        );
+        server.diagnostics.record(
+            &uri,
+            DiagnosticSource::Region("region-1".to_string()),
+            "lua_ls".to_string(),
+            Some(ProgressConnectionId::for_test(1)),
+            Vec::new(), // a clearing push: nothing to anchor
+        );
+        let publisher = DiagnosticPublisher::new(server);
+
+        assert_eq!(
+            publisher.republish(&uri).await,
+            RepublishOutcome::Changed,
+            "an all-empty region snapshot needs no geometry; the (empty) merge publishes"
+        );
+    }
+
+    #[tokio::test]
+    async fn current_region_offsets_distinguishes_unknown_from_absent_geometry() {
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+        let publisher = DiagnosticPublisher::new(server);
+
+        // Open document without a tree: geometry UNKNOWN → None (defer).
+        let pending = Url::parse("file:///test/pending.md").unwrap();
+        server.documents.insert(
+            pending.clone(),
+            "# doc".to_string(),
+            Some("markdown".to_string()),
+            None,
+        );
+        assert!(
+            publisher.current_region_offsets(&pending).is_none(),
+            "an open document with no parse snapshot has unknown geometry"
+        );
+
+        // Closed (never-opened) document: geometry ABSENT → Some(empty) (stale
+        // region slots legitimately drop; didClose's clearing publish proceeds).
+        let closed = Url::parse("file:///test/closed.md").unwrap();
+        assert!(
+            publisher
+                .current_region_offsets(&closed)
+                .is_some_and(|offsets| offsets.is_empty()),
+            "a closed document has no regions to anchor, not unknown geometry"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn closed_host_republish_bypasses_the_quiet_window() {
+        // A republish for a closed host is (or races) didClose's clearing
+        // publish: it must never be deferred — a deferred clear dies on the
+        // trailing task's guards, pinning stale diagnostics on a closed buffer
+        // — and must never stamp gate state that would defer the clearing
+        // publish serialized behind it.
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+        // Slots recorded for a URI that was never inserted as a document. The
+        // pull-layer slot is host-local and unfiltered, so it survives the
+        // closed-document merge (Host slots would be stale-filtered away).
+        let uri = Url::parse("file:///test/closed_host_bypass.rs").unwrap();
+        let publisher = DiagnosticPublisher::new(server);
+        server.diagnostics.set_pull_layer(&uri, vec![diag("stale")]);
+
+        assert_eq!(
+            publisher.republish(&uri).await,
+            RepublishOutcome::Changed,
+            "the first closed-host publish goes straight to the wire"
+        );
+        server.diagnostics.set_pull_layer(&uri, Vec::new());
+        assert_eq!(
+            publisher.republish(&uri).await,
+            RepublishOutcome::Changed,
+            "an immediate second closed-host publish must not be quiet-window deferred"
+        );
+        assert!(
+            !server.diagnostics.wire_gate_is_dirty(&uri),
+            "closed-host publishes leave no wire-gate state behind"
+        );
+        assert!(
+            !server.diagnostics.wire_gate_take_pending(&uri),
+            "no gate entry was minted for the closed host"
+        );
+    }
+
+    #[tokio::test]
+    async fn deferred_region_push_still_nudges_pull_clients() {
+        // A spontaneous region push landing in the tree-pending window defers
+        // the publish — but the CACHE changed, so the push-origin path must
+        // still bump coverage (making the workspace dirty) so the gated
+        // workspace/diagnostic/refresh nudges pull-mode clients. Losing the
+        // nudge here would revive the #496 rot: a client whose own re-pull
+        // raced ahead of the push keeps a stale set until the next edit.
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+        let host_uri = Url::parse("file:///test/deferred_nudge.md").unwrap();
+        server.documents.insert(
+            host_uri.clone(),
+            "```lua\nlocal x = 1\n```\n".to_string(),
+            Some("markdown".to_string()),
+            None, // tree pending: geometry unknown
+        );
+        let virtual_uri = VirtualDocumentUri::new(
+            &crate::lsp::lsp_impl::url_to_uri(&host_uri).unwrap(),
+            "lua",
+            "region-1",
+        );
+        server
+            .bridge
+            .register_opened_document_for_test(
+                &host_uri,
+                &virtual_uri,
+                &crate::lsp::bridge::ConnectionKey::for_server("lua_ls"),
+            )
+            .await;
+        let mut settings = WorkspaceSettings::default();
+        settings.language_servers.insert(
+            "lua_ls".to_string(),
+            BridgeServerConfig {
+                cmd: vec!["lua-language-server".to_string()],
+                ..Default::default()
+            },
+        );
+        server.settings_manager.apply_settings(settings);
+
+        assert!(!server.diagnostics.is_dirty(), "fresh host is clean");
+        DiagnosticPublisher::new(server)
+            .publish_region_push(
+                &virtual_uri.to_uri_string(),
+                "lua_ls".to_string(),
+                ProgressConnectionId::for_test(1),
+                vec![diag("unused variable")],
+            )
+            .await;
+        assert!(
+            server.diagnostics.is_dirty(),
+            "a geometry-deferred push must still bump coverage (drives the refresh nudge)"
         );
     }
 
@@ -1301,8 +1970,9 @@ mod tests {
         );
         let publisher = DiagnosticPublisher::new(server);
         // Establish the editor's baseline: the non-empty set is published.
-        assert!(
+        assert_eq!(
             publisher.republish(&uri).await,
+            RepublishOutcome::Changed,
             "the initial non-empty set is a change"
         );
 
@@ -1315,8 +1985,9 @@ mod tests {
         // `initialize` (server→client messages are suppressed until then), the
         // mock-client harness this file's tests deliberately avoid — true
         // end-to-end refresh coverage belongs in the e2e suite.
-        assert!(
-            !publisher.republish(&uri).await,
+        assert_eq!(
+            publisher.republish(&uri).await,
+            RepublishOutcome::Unchanged,
             "eviction published the empty changed set; re-publishing is unchanged"
         );
     }

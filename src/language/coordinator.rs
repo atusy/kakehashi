@@ -1225,6 +1225,17 @@ impl LanguageCoordinator {
         self.detect_language_logged(path, content, token, language_id, log::Level::Debug)
     }
 
+    /// Host-language detection for high-frequency paths that log at TRACE.
+    pub(crate) fn detect_language_trace(
+        &self,
+        path: &str,
+        content: &str,
+        token: Option<&str>,
+        language_id: Option<&str>,
+    ) -> Option<String> {
+        self.detect_language_logged(path, content, token, language_id, log::Level::Trace)
+    }
+
     /// Canonical injection language for bridge selection and virtual URIs.
     ///
     /// Candidate selection deliberately does not inspect parser state: eager
