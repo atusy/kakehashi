@@ -34,6 +34,13 @@ pub(crate) fn read_regular_file_to_string(path: &Path) -> std::io::Result<String
             "path is not a regular file",
         ));
     }
+    #[cfg(unix)]
+    {
+        use nix::fcntl::{FcntlArg, OFlag, fcntl};
+
+        let flags = OFlag::from_bits_truncate(fcntl(&file, FcntlArg::F_GETFL)?);
+        fcntl(&file, FcntlArg::F_SETFL(flags - OFlag::O_NONBLOCK))?;
+    }
     let mut text = String::new();
     file.read_to_string(&mut text)?;
     Ok(text)
