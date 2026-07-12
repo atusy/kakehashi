@@ -931,8 +931,10 @@ fn test_language_status_fails_when_query_recovery_fails() {
     fs::create_dir_all(&backup).expect("Failed to create recovery backup");
     fs::write(backup.join("highlights.scm"), "(comment) @comment")
         .expect("Failed to write recovery query");
+    fs::write(backup.join(".kakehashi-install-complete"), "ok\n")
+        .expect("Failed to write recovery completion marker");
     fs::write(
-        queries_dir.join(".lua.4294967295.0.backup.kakehashi-owned"),
+        queries_dir.join(".lua.4294967295.0.backup.kakehashi-backup"),
         "owned\n",
     )
     .expect("Failed to write recovery ownership marker");
