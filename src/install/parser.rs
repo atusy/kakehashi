@@ -313,7 +313,15 @@ fn cleanup_orphan_parser_backup_markers(parser_dir: &Path, language: &str) -> st
         let Some(marker_name) = marker.file_name().and_then(|name| name.to_str()) else {
             continue;
         };
-        let Some(backup_name) = marker_name.strip_suffix(".owner") else {
+        let (backup_name, staged) = if let Some(backup_name) = marker_name.strip_suffix(".owner") {
+            (backup_name, false)
+        } else if let Some((backup_name, nonce)) = marker_name
+            .strip_suffix(".tmp")
+            .and_then(|name| name.rsplit_once(".owner."))
+            && ulid::Ulid::from_string(nonce).is_ok()
+        {
+            (backup_name, true)
+        } else {
             continue;
         };
         if !generated_parser_backup_matches_language(backup_name, language) {
@@ -321,7 +329,15 @@ fn cleanup_orphan_parser_backup_markers(parser_dir: &Path, language: &str) -> st
         }
         let backup = parser_dir.join(backup_name);
         if !backup.try_exists()? && parser_backup_marker_is_owned(&marker)? {
-            remove_parser_backup_marker(&backup)?;
+            if staged {
+                match fs::remove_file(marker) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(error),
+                }
+            } else {
+                remove_parser_backup_marker(&backup)?;
+            }
         }
     }
     Ok(())
@@ -2023,12 +2039,21 @@ mod tests {
         let owned_marker = parser_backup_ownership_sidecar(&owned_backup);
         let user_backup = parser_dir.join(generated_backup_name("lua", 123, 5));
         let user_marker = parser_backup_ownership_sidecar(&user_backup);
+        let staged_marker = parser_backup_ownership_sidecar(&owned_backup)
+            .with_extension(format!("owner.{}.tmp", ulid::Ulid::new()));
+        let malformed_staging =
+            parser_backup_ownership_sidecar(&owned_backup).with_extension("owner.not-a-ulid.tmp");
         fs::write(&owned_marker, PARSER_BACKUP_MARKER_CONTENT).expect("write owned marker");
         fs::write(&user_marker, b"user marker").expect("write user marker");
+        fs::write(&staged_marker, PARSER_BACKUP_MARKER_CONTENT).expect("write staged marker");
+        fs::write(&malformed_staging, PARSER_BACKUP_MARKER_CONTENT)
+            .expect("write malformed staging marker");
 
         recover_parser_backups(&parser_dir, &canonical, "lua").expect("clean orphan markers");
 
         assert!(!owned_marker.exists());
+        assert!(!staged_marker.exists());
+        assert!(malformed_staging.exists());
         assert!(user_marker.exists());
         assert!(!canonical.exists());
     }
