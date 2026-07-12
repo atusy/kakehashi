@@ -524,9 +524,21 @@ fn cleanup_interrupted_parser_installs(parser_dir: &Path) -> Result<(), ParserIn
         let path = entry.path();
         if let Some(pid) = cleanup_claim_pid(&path) {
             if !process_is_running(pid) {
+                let is_file = match fs::symlink_metadata(&path) {
+                    Ok(metadata) => metadata.file_type().is_file(),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+                    Err(error) => return Err(ParserInstallError::IoError(error)),
+                };
+                if !is_file {
+                    continue;
+                }
                 match fs::remove_file(path) {
                     Ok(()) => {}
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error)
+                        if matches!(
+                            error.kind(),
+                            std::io::ErrorKind::NotFound | std::io::ErrorKind::IsADirectory
+                        ) => {}
                     Err(error) => return Err(ParserInstallError::IoError(error)),
                 }
             }
@@ -1234,11 +1246,14 @@ mod tests {
             ".lua.{pid}.0.{}.tmp",
             std::env::consts::DLL_EXTENSION
         ));
+        let claim = parser_dir.join(format!(".parser-cleanup.{pid}.0"));
         fs::create_dir(&staged).expect("create impostor directory");
+        fs::create_dir(&claim).expect("create impostor claim directory");
 
         cleanup_interrupted_parser_installs(&parser_dir).expect("cleanup succeeds");
 
         assert!(staged.is_dir(), "non-file staging path is preserved");
+        assert!(claim.is_dir(), "non-file cleanup claim is preserved");
     }
 
     const TREE_SITTER_JSON_URL: &str =
