@@ -21,13 +21,15 @@ use super::metadata::{FetchOptions, MetadataError, fetch_parser_metadata};
 /// HTTP timeout for archive downloads.
 const ARCHIVE_HTTP_TIMEOUT: Duration = Duration::from_secs(120);
 const PARSER_OPERATION_MARKER_SUFFIX: &str = ".operation";
-const PARSER_BACKUP_MARKER_CONTENT: &[u8] = b"kakehashi parser backup v1\n";
+const PARSER_BACKUP_INTENT_CONTENT: &[u8] = b"kakehashi parser backup intent v1\n";
+const PARSER_BACKUP_MARKER_CONTENT: &[u8] = b"kakehashi parser backup owned v1\n";
 
 #[cfg(any(windows, test))]
 trait ParserFileOps {
     fn rename(&mut self, from: &Path, to: &Path) -> std::io::Result<()>;
     fn remove_file(&mut self, path: &Path) -> std::io::Result<()>;
     fn create_backup_marker(&mut self, backup: &Path) -> std::io::Result<()>;
+    fn finalize_backup_marker(&mut self, backup: &Path) -> std::io::Result<()>;
     fn remove_backup_marker(&mut self, backup: &Path) -> std::io::Result<()>;
 }
 
@@ -74,6 +76,17 @@ fn publish_parser_transactionally(
             return Err(error);
         }
     };
+
+    if had_old_parser && let Err(finalize_error) = ops.finalize_backup_marker(backup_file) {
+        let rollback = ops.rename(backup_file, parser_file);
+        let cleanup = ops.remove_backup_marker(backup_file);
+        return Err(std::io::Error::new(
+            finalize_error.kind(),
+            format!(
+                "failed to finalize parser backup ownership: {finalize_error}; rollback: {rollback:?}; marker cleanup: {cleanup:?}"
+            ),
+        ));
+    }
 
     match ops.rename(tmp_file, parser_file) {
         Ok(()) => {
@@ -129,6 +142,26 @@ fn publish_parser_transactionally(
 struct StdParserFileOps;
 
 #[cfg(windows)]
+fn write_marker_atomically(marker_path: &Path, content: &[u8]) -> std::io::Result<()> {
+    let marker_tmp = marker_path.with_extension(format!("owner.{}.tmp", ulid::Ulid::new()));
+    let mut marker = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&marker_tmp)?;
+    if let Err(error) = marker.write_all(content).and_then(|()| marker.sync_all()) {
+        drop(marker);
+        let _ = fs::remove_file(marker_tmp);
+        return Err(error);
+    }
+    drop(marker);
+    if let Err(error) = fs::rename(&marker_tmp, &marker_path) {
+        let _ = fs::remove_file(marker_tmp);
+        return Err(error);
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
 impl ParserFileOps for StdParserFileOps {
     fn rename(&mut self, from: &Path, to: &Path) -> std::io::Result<()> {
         fs::rename(from, to)
@@ -149,36 +182,32 @@ impl ParserFileOps for StdParserFileOps {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => return Err(error),
         }
-        let marker_path = parser_backup_ownership_sidecar(backup);
-        let marker_tmp = marker_path.with_extension(format!("owner.{}.tmp", ulid::Ulid::new()));
-        let mut marker = fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&marker_tmp)?;
-        if let Err(error) = marker.write_all(PARSER_BACKUP_MARKER_CONTENT) {
-            drop(marker);
-            let _ = fs::remove_file(marker_tmp);
-            return Err(error);
-        }
-        if let Err(error) = marker.sync_all() {
-            drop(marker);
-            let _ = fs::remove_file(marker_tmp);
-            return Err(error);
-        }
-        drop(marker);
-        if let Err(error) = fs::rename(&marker_tmp, &marker_path) {
-            let _ = fs::remove_file(marker_tmp);
-            return Err(error);
-        }
-        Ok(())
+        write_marker_atomically(
+            &parser_backup_intent_sidecar(backup),
+            PARSER_BACKUP_INTENT_CONTENT,
+        )
+    }
+
+    fn finalize_backup_marker(&mut self, backup: &Path) -> std::io::Result<()> {
+        write_marker_atomically(
+            &parser_backup_ownership_sidecar(backup),
+            PARSER_BACKUP_MARKER_CONTENT,
+        )?;
+        fs::remove_file(parser_backup_intent_sidecar(backup))
     }
 
     fn remove_backup_marker(&mut self, backup: &Path) -> std::io::Result<()> {
-        match fs::remove_file(parser_backup_ownership_sidecar(backup)) {
-            Ok(()) => Ok(()),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(error) => Err(error),
+        for marker in [
+            parser_backup_ownership_sidecar(backup),
+            parser_backup_intent_sidecar(backup),
+        ] {
+            match fs::remove_file(marker) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error),
+            }
         }
+        Ok(())
     }
 }
 
@@ -215,15 +244,31 @@ fn parser_backup_ownership_sidecar(backup: &Path) -> PathBuf {
     ))
 }
 
-fn remove_parser_backup_marker(backup: &Path) -> std::io::Result<()> {
-    match fs::remove_file(parser_backup_ownership_sidecar(backup)) {
-        Ok(()) => Ok(()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(error),
-    }
+fn parser_backup_intent_sidecar(backup: &Path) -> PathBuf {
+    backup.with_file_name(format!(
+        "{}.owner.intent",
+        backup
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or(".parser.backup")
+    ))
 }
 
-fn parser_backup_marker_is_owned(marker: &Path) -> std::io::Result<bool> {
+fn remove_parser_backup_marker(backup: &Path) -> std::io::Result<()> {
+    for marker in [
+        parser_backup_ownership_sidecar(backup),
+        parser_backup_intent_sidecar(backup),
+    ] {
+        match fs::remove_file(marker) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
+
+fn parser_backup_marker_has_content(marker: &Path, expected: &[u8]) -> std::io::Result<bool> {
     let metadata = match fs::symlink_metadata(marker) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
@@ -255,15 +300,21 @@ fn parser_backup_marker_is_owned(marker: &Path) -> std::io::Result<bool> {
         Err(error) => return Err(error),
     };
     let metadata = file.metadata()?;
-    if !metadata.file_type().is_file()
-        || metadata.len() != PARSER_BACKUP_MARKER_CONTENT.len() as u64
-    {
+    if !metadata.file_type().is_file() || metadata.len() != expected.len() as u64 {
         return Ok(false);
     }
-    let mut content = Vec::with_capacity(PARSER_BACKUP_MARKER_CONTENT.len() + 1);
-    file.take((PARSER_BACKUP_MARKER_CONTENT.len() + 1) as u64)
+    let mut content = Vec::with_capacity(expected.len() + 1);
+    file.take((expected.len() + 1) as u64)
         .read_to_end(&mut content)?;
-    Ok(content == PARSER_BACKUP_MARKER_CONTENT)
+    Ok(content == expected)
+}
+
+fn parser_backup_marker_is_owned(marker: &Path) -> std::io::Result<bool> {
+    parser_backup_marker_has_content(marker, PARSER_BACKUP_MARKER_CONTENT)
+}
+
+fn parser_backup_marker_is_intent(marker: &Path) -> std::io::Result<bool> {
+    parser_backup_marker_has_content(marker, PARSER_BACKUP_INTENT_CONTENT)
 }
 
 fn parser_backup_files(parser_dir: &Path, language: &str) -> std::io::Result<Vec<PathBuf>> {
@@ -285,6 +336,27 @@ fn parser_backup_files(parser_dir: &Path, language: &str) -> std::io::Result<Vec
             continue;
         }
         if parser_backup_marker_is_owned(&parser_backup_ownership_sidecar(&entry.path()))? {
+            backups.push(entry.path());
+        }
+    }
+    Ok(backups)
+}
+
+fn parser_backup_intent_files(parser_dir: &Path, language: &str) -> std::io::Result<Vec<PathBuf>> {
+    let entries = match fs::read_dir(parser_dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error),
+    };
+    let mut backups = Vec::new();
+    for entry in entries {
+        let entry = entry?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if entry.file_type()?.is_file()
+            && generated_parser_backup_matches_language(name, language)
+            && parser_backup_marker_is_intent(&parser_backup_intent_sidecar(&entry.path()))?
+        {
             backups.push(entry.path());
         }
     }
@@ -377,8 +449,9 @@ fn recover_parser_backups(
     language: &str,
 ) -> std::io::Result<bool> {
     cleanup_orphan_parser_backup_markers(parser_dir, language)?;
-    let backups = parser_backup_files(parser_dir, language)?;
-    if backups.is_empty() {
+    let mut backups = parser_backup_files(parser_dir, language)?;
+    let intent_backups = parser_backup_intent_files(parser_dir, language)?;
+    if backups.is_empty() && intent_backups.is_empty() {
         return Ok(false);
     }
     if parser_file.try_exists()? {
@@ -391,8 +464,14 @@ fn recover_parser_backups(
         for backup in backups {
             remove_owned_parser_backup(&backup)?;
         }
+        // An intent beside an existing canonical parser never proves ownership:
+        // the backup claim may have collided before rename. Preserve that file.
+        for backup in intent_backups {
+            remove_parser_backup_marker(&backup)?;
+        }
         return Ok(false);
     }
+    backups.extend(intent_backups);
     let mut timed_backups = backups
         .into_iter()
         .map(|path| {
@@ -424,10 +503,19 @@ fn remove_parser_install_and_backups(parser_dir: &Path, language: &str) -> std::
     }
     cleanup_orphan_parser_backup_markers(parser_dir, language)?;
     let parser_file = parser_dir.join(format!("{}.{}", language, std::env::consts::DLL_EXTENSION));
+    let canonical_exists = parser_file.try_exists()?;
     // Remove recovery copies first. If uninstall is interrupted, leaving the
     // canonical parser is an incomplete uninstall that can be retried; deleting
     // canonical first could let the next install resurrect an old backup.
     let mut removed = false;
+    for backup in parser_backup_intent_files(parser_dir, language)? {
+        if canonical_exists {
+            remove_parser_backup_marker(&backup)?;
+        } else {
+            remove_owned_parser_backup(&backup)?;
+            removed = true;
+        }
+    }
     for backup in parser_backup_files(parser_dir, language)? {
         remove_owned_parser_backup(&backup)?;
         removed = true;
@@ -820,14 +908,23 @@ pub fn remove_parser_install_after_operation_started(
     let mut marker = fs::File::create(parser_operation_marker_path(parser_dir, language))?;
     writeln!(marker, "uninstall:{}", ulid::Ulid::new())?;
     cleanup_orphan_parser_backup_markers(parser_dir, language)?;
+    let parser_file = parser_dir.join(format!("{language}.{}", std::env::consts::DLL_EXTENSION));
+    let canonical_exists = parser_file.try_exists()?;
     // Delete recovery copies first so an interrupted uninstall cannot leave a
     // backup that a later install would restore after canonical removal.
     let mut removed = false;
+    for backup in parser_backup_intent_files(parser_dir, language)? {
+        if canonical_exists {
+            remove_parser_backup_marker(&backup)?;
+        } else {
+            remove_owned_parser_backup(&backup)?;
+            removed = true;
+        }
+    }
     for backup in parser_backup_files(parser_dir, language)? {
         remove_owned_parser_backup(&backup)?;
         removed = true;
     }
-    let parser_file = parser_dir.join(format!("{language}.{}", std::env::consts::DLL_EXTENSION));
     match fs::remove_file(parser_file) {
         Ok(()) => Ok(true),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(removed),
@@ -1555,6 +1652,7 @@ mod tests {
         failed_removals: Vec<PathBuf>,
         vanished_removals: Vec<PathBuf>,
         backup_markers: HashSet<PathBuf>,
+        finalized_backup_markers: HashSet<PathBuf>,
         fail_marker_creation: bool,
         fail_marker_write_after_create: bool,
         fail_marker_removal: bool,
@@ -1640,6 +1738,18 @@ mod tests {
                 ));
             }
             self.backup_markers.remove(backup);
+            self.finalized_backup_markers.remove(backup);
+            Ok(())
+        }
+
+        fn finalize_backup_marker(&mut self, backup: &Path) -> std::io::Result<()> {
+            if !self.backup_markers.remove(backup) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "missing intent marker",
+                ));
+            }
+            self.finalized_backup_markers.insert(backup.to_path_buf());
             Ok(())
         }
     }
@@ -2022,6 +2132,48 @@ mod tests {
             b"working parser"
         );
         assert!(!backup.exists());
+    }
+
+    #[test]
+    fn parser_recovery_restores_intent_backup_when_canonical_is_missing() {
+        let temp = tempdir().expect("temp dir");
+        let parser_dir = temp.path().join("parser");
+        fs::create_dir_all(&parser_dir).expect("create parser dir");
+        let canonical = parser_dir.join(format!("lua.{}", std::env::consts::DLL_EXTENSION));
+        let backup = parser_dir.join(generated_backup_name("lua", 123, 7));
+        fs::write(&backup, b"working parser").expect("write backup");
+        fs::write(
+            parser_backup_intent_sidecar(&backup),
+            PARSER_BACKUP_INTENT_CONTENT,
+        )
+        .expect("write intent marker");
+
+        assert!(recover_parser_backups(&parser_dir, &canonical, "lua").expect("recover intent"));
+        assert_eq!(
+            fs::read(&canonical).expect("read canonical"),
+            b"working parser"
+        );
+        assert!(!parser_backup_intent_sidecar(&backup).exists());
+    }
+
+    #[test]
+    fn parser_recovery_preserves_colliding_intent_backup_when_canonical_exists() {
+        let temp = tempdir().expect("temp dir");
+        let parser_dir = temp.path().join("parser");
+        fs::create_dir_all(&parser_dir).expect("create parser dir");
+        let canonical = parser_dir.join(format!("lua.{}", std::env::consts::DLL_EXTENSION));
+        let backup = parser_dir.join(generated_backup_name("lua", 123, 8));
+        fs::write(&canonical, b"canonical").expect("write canonical");
+        fs::write(&backup, b"unrelated").expect("write colliding backup");
+        fs::write(
+            parser_backup_intent_sidecar(&backup),
+            PARSER_BACKUP_INTENT_CONTENT,
+        )
+        .expect("write intent marker");
+
+        assert!(!recover_parser_backups(&parser_dir, &canonical, "lua").expect("clean intent"));
+        assert_eq!(fs::read(&backup).expect("preserve collision"), b"unrelated");
+        assert!(!parser_backup_intent_sidecar(&backup).exists());
     }
 
     #[test]
