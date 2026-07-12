@@ -7,8 +7,8 @@ use std::str::FromStr;
 
 use tower_lsp_server::ls_types::{
     ClientCapabilities, DidChangeConfigurationParams, DidChangeWorkspaceFoldersParams,
-    DidCloseTextDocumentParams, InitializeParams, InitializedParams, TextDocumentIdentifier, Uri,
-    WorkspaceFolder, WorkspaceFoldersChangeEvent,
+    DidCloseTextDocumentParams, InitializeParams, InitializedParams, ServerCapabilities,
+    TextDocumentIdentifier, Uri, WorkspaceFolder, WorkspaceFoldersChangeEvent,
 };
 
 use super::client_capabilities::build_bridge_client_capabilities;
@@ -157,6 +157,18 @@ pub(crate) fn validate_initialize_response(response: &serde_json::Value) -> std:
             "bridge: initialize response missing valid result",
         ));
     };
+
+    if let Some(capabilities) = result
+        .get("capabilities")
+        .filter(|capabilities| !capabilities.is_null())
+    {
+        serde_json::from_value::<ServerCapabilities>(capabilities.clone()).map_err(|error| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("bridge: invalid initialize capabilities: {error}"),
+            )
+        })?;
+    }
 
     validate_utf16_encoding(
         result
@@ -473,6 +485,19 @@ mod tests {
             "Expected valid response to be accepted: {:?}",
             response
         );
+    }
+
+    #[test]
+    fn validate_rejects_non_object_capabilities() {
+        let response = serde_json::json!({
+            "result": { "capabilities": "not-an-object" }
+        });
+
+        let error = validate_initialize_response(&response)
+            .expect_err("non-object server capabilities must fail the handshake");
+
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("initialize capabilities"));
     }
 
     #[rstest]
