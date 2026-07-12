@@ -1,6 +1,5 @@
 ---
 source: tests/e2e_lsp_protocol.rs
-assertion_line: 46
 expression: capabilities
 ---
 {
@@ -58,6 +57,12 @@ expression: capabilities
   "foldingRangeProvider": true,
   "declarationProvider": {
     "workDoneProgress": true
+  },
+  "workspace": {
+    "workspaceFolders": {
+      "supported": true,
+      "changeNotifications": true
+    }
   },
   "semanticTokensProvider": {
     "legend": {
