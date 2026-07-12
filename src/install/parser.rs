@@ -462,6 +462,7 @@ fn staged_parser_pid(path: &Path) -> Option<u32> {
         || !super::queries::is_safe_language_name(language)
         || !is_canonical_decimal(pid)
         || !is_canonical_decimal(counter)
+        || counter.parse::<u64>().is_err()
         || extension != std::env::consts::DLL_EXTENSION
     {
         return None;
@@ -482,7 +483,11 @@ fn cleanup_claim_pid(path: &Path) -> Option<u32> {
     let mut parts = rest.split('.');
     let pid = parts.next()?;
     let counter = parts.next()?;
-    if parts.next().is_some() || !is_canonical_decimal(pid) || !is_canonical_decimal(counter) {
+    if parts.next().is_some()
+        || !is_canonical_decimal(pid)
+        || !is_canonical_decimal(counter)
+        || counter.parse::<u64>().is_err()
+    {
         return None;
     }
     let pid = pid.parse().ok()?;
@@ -601,6 +606,7 @@ fn claim_and_unlink_stale_parser_file(
     }
 }
 
+#[cfg(unix)]
 const PARSER_CLEANUP_MARKER: &[u8] = b"kakehashi parser cleanup v1\n";
 
 #[cfg(unix)]
@@ -1503,6 +1509,12 @@ mod tests {
         fs::write(&staged, b"unreadable lookalike").expect("write staging file");
         fs::set_permissions(&staged, fs::Permissions::from_mode(0o000))
             .expect("remove read permission");
+
+        if fs::File::open(&staged).is_ok() {
+            fs::set_permissions(&staged, fs::Permissions::from_mode(0o600))
+                .expect("restore staging permissions");
+            return;
+        }
 
         cleanup_interrupted_parser_installs(&parser_dir).expect("cleanup remains best-effort");
 
