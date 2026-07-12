@@ -1206,8 +1206,9 @@ mod tests {
             panic!("create test symlink: {error}");
         }
 
-        let result = write_content_to_output("generated", Some(output), true, "configuration");
+        let result = write_content_to_output("generated", Some(output.clone()), true, "configuration");
         assert!(result.is_err());
+        assert!(output.symlink_metadata().unwrap().file_type().is_symlink());
         assert_eq!(std::fs::read_to_string(target).unwrap(), "shared");
     }
 }
