@@ -310,6 +310,31 @@ fn e2e_directory_walk_respects_gitignore_but_explicit_path_wins() {
 }
 
 #[test]
+fn e2e_directory_walk_formats_extensionless_shebang_file() {
+    let source = "#!/usr/bin/env python\nvalue = 1\n";
+    let ws = workspace_with(&[("tool", source)]);
+    std::fs::write(
+        ws.path().join("kakehashi.toml"),
+        config_toml().replace("languages = [\"lua\"]", "languages = [\"python\"]"),
+    )
+    .expect("write Python formatter config");
+
+    let output = run_format(ws.path(), &["."]);
+
+    assert!(
+        output.status.success(),
+        "directory format should succeed; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        read(ws.path(), "tool").starts_with("#!/USR/BIN/ENV PYTHON"),
+        "directory walk should use shebang detection; content: {:?}; stderr: {}",
+        read(ws.path(), "tool"),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
 fn e2e_tab_size_and_insert_spaces_reach_the_downstream_server() {
     // Workspace whose mock server echoes the FormattingOptions it received.
     let ws = workspace_with(&[("doc.md", MARKDOWN)]);

@@ -60,6 +60,32 @@ impl Kakehashi {
             .is_some()
     }
 
+    /// Whether a file discovered during a directory walk identifies a known
+    /// language by path or by its first line. The bounded read keeps filtering
+    /// cheap while matching explicit-file shebang and mode-line detection.
+    pub(crate) fn cli_can_handle_discovered_file(&self, path: &Path) -> bool {
+        use std::io::{BufRead as _, Read as _};
+
+        if self.cli_can_handle_path(path) {
+            return true;
+        }
+        const MAX_FIRST_LINE_BYTES: u64 = 8 * 1024;
+        let Ok(file) = std::fs::File::open(path) else {
+            return false;
+        };
+        let mut first_line = String::new();
+        if std::io::BufReader::new(file)
+            .take(MAX_FIRST_LINE_BYTES)
+            .read_line(&mut first_line)
+            .is_err()
+        {
+            return false;
+        }
+        self.language
+            .loadable_language_for_document(&path.to_string_lossy(), &first_line)
+            .is_some()
+    }
+
     /// Gracefully shut down downstream language servers (LSP shutdown/exit
     /// handshake, escalating for unresponsive ones).
     pub(crate) async fn cli_shutdown(&self) {
