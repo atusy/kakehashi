@@ -232,6 +232,15 @@ impl CancelForwarder {
             if subscribers.active_requests.get(upstream_id).copied() != generation {
                 return false;
             }
+            if let Some(generation) = generation
+                && subscribers
+                    .delivered_cancellations
+                    .get(upstream_id)
+                    .copied()
+                    == Some(generation)
+            {
+                return true;
+            }
             let sender = subscribers
                 .subscribers
                 .remove(upstream_id)
@@ -725,6 +734,36 @@ mod tests {
             "a cancelled active generation must not create a fresh receiver"
         );
 
+        drop(request_future);
+    }
+
+    #[tokio::test]
+    async fn repeated_cancel_does_not_recreate_pending_state_after_delivery() {
+        let mock = MockService::new();
+        let pool = Arc::new(LanguageServerPool::new());
+        let forwarder = CancelForwarder::new(pool);
+        let mut service = RequestIdCapture::with_cancel_forwarder(mock, forwarder.clone());
+        let upstream_id = UpstreamId::Number(123);
+        let request = Request::build("textDocument/hover")
+            .params(serde_json::json!({}))
+            .id(123i64)
+            .finish();
+        let request_future = service.call(request);
+
+        assert!(forwarder.notify_cancel(&upstream_id));
+        forwarder
+            .subscribe(upstream_id.clone())
+            .unwrap()
+            .await
+            .unwrap();
+        assert!(forwarder.notify_cancel(&upstream_id));
+
+        let state = forwarder
+            .subscribers
+            .lock()
+            .recover_poison("repeated cancel test");
+        assert!(!state.pending_cancellations.contains_key(&upstream_id));
+        drop(state);
         drop(request_future);
     }
 
