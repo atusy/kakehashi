@@ -177,6 +177,10 @@ fn open_windows_staging_guard(path: &Path) -> Result<fs::File, ParserInstallErro
     fs::OpenOptions::new()
         .read(true)
         .write(true)
+        // The loader receives a fresh staging path. Create it here so the
+        // delete-denying handle covers the entire compile, including its
+        // first write.
+        .create(true)
         // Excluding FILE_SHARE_DELETE makes rename/delete fail while the
         // re-exec child or its in-process compile is still using this path.
         .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
