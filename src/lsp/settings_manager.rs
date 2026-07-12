@@ -324,11 +324,13 @@ mod tests {
         assert!(manager.settings_transaction.try_lock().is_err());
         let first_base = manager.load_raw_settings();
 
-        let second_started = Arc::new(tokio::sync::Notify::new());
+        let (second_attempted_tx, second_attempted_rx) = tokio::sync::oneshot::channel();
         let second_manager = Arc::clone(&manager);
-        let second_started_task = Arc::clone(&second_started);
         let second = tokio::spawn(async move {
-            second_started_task.notify_one();
+            assert!(second_manager.settings_transaction.try_lock().is_err());
+            second_attempted_tx
+                .send(())
+                .expect("first transaction still receives attempt signal");
             let _guard = second_manager.begin_settings_transaction().await;
             let base = second_manager.load_raw_settings();
             let merged = crate::config::merge_workspace_settings(
@@ -348,7 +350,9 @@ mod tests {
             second_manager.apply_settings_with_raw(merged, effective);
         });
 
-        second_started.notified().await;
+        second_attempted_rx
+            .await
+            .expect("second transaction attempts lock acquisition");
         let first = crate::config::merge_workspace_settings(
             Some((*first_base).clone()),
             Some(RawWorkspaceSettings {
