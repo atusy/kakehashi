@@ -133,7 +133,10 @@ fn parse_complete_parsers_lua(
     // A prefix ending after one complete language entry can still yield a
     // non-empty map. Require the outer `return { ... }` table to close before
     // accepting or publishing metadata.
-    if find_matching_brace(content).is_none() {
+    if returned_table_start(content)
+        .and_then(|start| find_matching_brace(&content[start..]))
+        .is_none()
+    {
         return Err(MetadataError::ParseError(
             "incomplete parsers.lua document".to_string(),
         ));
@@ -346,6 +349,95 @@ fn find_matching_brace(s: &str) -> Option<&str> {
     }
 }
 
+fn returned_table_start(s: &str) -> Option<usize> {
+    let mut quote = None;
+    let mut escaped = false;
+    let mut line_comment = false;
+    let mut long_bracket = None;
+    let mut offset = 0;
+
+    while offset < s.len() {
+        if let Some(equals) = long_bracket {
+            if is_long_bracket_close(&s[offset..], equals) {
+                offset += equals + 2;
+                long_bracket = None;
+            } else {
+                offset += s[offset..].chars().next()?.len_utf8();
+            }
+            continue;
+        }
+
+        let c = s[offset..].chars().next()?;
+        let char_len = c.len_utf8();
+        if line_comment {
+            if c == '\n' {
+                line_comment = false;
+            }
+            offset += char_len;
+            continue;
+        }
+        if let Some(delimiter) = quote {
+            if escaped {
+                escaped = false;
+            } else if c == '\\' {
+                escaped = true;
+            } else if c == delimiter {
+                quote = None;
+            }
+            offset += char_len;
+            continue;
+        }
+
+        if s[offset..].starts_with("--") {
+            offset += 2;
+            if let Some(equals) = long_bracket_open(&s[offset..]) {
+                offset += equals + 2;
+                long_bracket = Some(equals);
+            } else {
+                line_comment = true;
+            }
+            continue;
+        }
+        if let Some(equals) = long_bracket_open(&s[offset..]) {
+            offset += equals + 2;
+            long_bracket = Some(equals);
+            continue;
+        }
+        if s[offset..].starts_with("return")
+            && (offset == 0
+                || !s[..offset]
+                    .chars()
+                    .next_back()
+                    .is_some_and(is_lua_identifier_char))
+            && !s[offset + "return".len()..]
+                .chars()
+                .next()
+                .is_some_and(is_lua_identifier_char)
+        {
+            let table_start = offset + "return".len();
+            let whitespace = s[table_start..]
+                .chars()
+                .take_while(|next| next.is_whitespace())
+                .map(char::len_utf8)
+                .sum::<usize>();
+            if s[table_start + whitespace..].starts_with('{') {
+                return Some(table_start + whitespace);
+            }
+        }
+
+        match c {
+            '\'' | '"' => quote = Some(c),
+            _ => {}
+        }
+        offset += char_len;
+    }
+    None
+}
+
+fn is_lua_identifier_char(c: char) -> bool {
+    c == '_' || c.is_ascii_alphanumeric()
+}
+
 fn long_bracket_open(s: &str) -> Option<usize> {
     let bytes = s.as_bytes();
     if bytes.first() != Some(&b'[') {
@@ -460,6 +552,15 @@ mod tests {
     #[test]
     fn braces_in_strings_and_comments_do_not_hide_truncation() {
         let partial = "return {\n-- } is not the table end\nlua = { url = 'https://example/}', revision = 'ok' },";
+        assert!(matches!(
+            parse_complete_parsers_lua(partial),
+            Err(MetadataError::ParseError(_))
+        ));
+    }
+
+    #[test]
+    fn braces_in_preamble_comments_do_not_complete_the_document() {
+        let partial = "-- {} is not the returned table\nreturn {\nlua = { install_info = { url = 'https://example/lua', revision = 'ok' } },";
         assert!(matches!(
             parse_complete_parsers_lua(partial),
             Err(MetadataError::ParseError(_))
