@@ -166,25 +166,7 @@ fn fetch_parsers_lua() -> Result<String, MetadataError> {
 fn parse_parsers_lua(content: &str) -> Result<HashMap<String, ParserMetadata>, MetadataError> {
     let mut parsers = HashMap::new();
 
-    // Pattern to match parser entries in main branch format: lang = { ... }
-    // The pattern matches language names at the start of a line (with optional indentation)
-    // followed by = {
-    let lang_pattern = Regex::new(r#"(?m)^([ \t]*)([a-zA-Z][a-zA-Z0-9_]*)\s*=\s*\{"#)
-        .expect("valid regex for lang pattern");
-
-    // Language entries share the table's minimum indentation. Restricting to
-    // that level keeps nested install_info fields from looking like languages.
-    let candidates: Vec<(usize, String)> = lang_pattern
-        .captures_iter(content)
-        .filter_map(|cap| Some((cap.get(1)?.as_str().len(), cap.get(2)?.as_str().to_string())))
-        // Filter out non-language keys like "return", "install_info", etc.
-        .filter(|(_, name)| !is_reserved_key(name))
-        .collect();
-    let top_level_indent = candidates.iter().map(|(indent, _)| *indent).min();
-    let lang_names = candidates
-        .into_iter()
-        .filter(|(indent, _)| Some(*indent) == top_level_indent)
-        .map(|(_, name)| name);
+    let lang_names = top_level_table_keys(content);
 
     // For each language, find its block and extract metadata
     for lang in lang_names {
@@ -206,6 +188,118 @@ fn parse_parsers_lua(content: &str) -> Result<HashMap<String, ParserMetadata>, M
     }
 
     Ok(parsers)
+}
+
+fn top_level_table_keys(s: &str) -> Vec<String> {
+    let Some(mut offset) = returned_table_start(s) else {
+        return Vec::new();
+    };
+    let mut keys = Vec::new();
+    let mut depth = 0;
+    let mut quote = None;
+    let mut escaped = false;
+    let mut line_comment = false;
+    let mut long_bracket = None;
+
+    while offset < s.len() {
+        if let Some(equals) = long_bracket {
+            if is_long_bracket_close(&s[offset..], equals) {
+                offset += equals + 2;
+                long_bracket = None;
+            } else if let Some(c) = s[offset..].chars().next() {
+                offset += c.len_utf8();
+            }
+            continue;
+        }
+
+        let Some(c) = s[offset..].chars().next() else {
+            break;
+        };
+        let char_len = c.len_utf8();
+        if line_comment {
+            if c == '\n' {
+                line_comment = false;
+            }
+            offset += char_len;
+            continue;
+        }
+        if let Some(delimiter) = quote {
+            if escaped {
+                escaped = false;
+            } else if c == '\\' {
+                escaped = true;
+            } else if c == delimiter {
+                quote = None;
+            }
+            offset += char_len;
+            continue;
+        }
+        if s[offset..].starts_with("--") {
+            offset += 2;
+            if let Some(equals) = long_bracket_open(&s[offset..]) {
+                offset += equals + 2;
+                long_bracket = Some(equals);
+            } else {
+                line_comment = true;
+            }
+            continue;
+        }
+        if let Some(equals) = long_bracket_open(&s[offset..]) {
+            offset += equals + 2;
+            long_bracket = Some(equals);
+            continue;
+        }
+
+        if depth == 1
+            && c.is_ascii_alphabetic()
+            && (offset == 0
+                || !s[..offset]
+                    .chars()
+                    .next_back()
+                    .is_some_and(is_lua_identifier_char))
+        {
+            let name_len = s[offset..]
+                .chars()
+                .take_while(|next| is_lua_identifier_char(*next))
+                .map(char::len_utf8)
+                .sum::<usize>();
+            let name_end = offset + name_len;
+            let whitespace = s[name_end..]
+                .chars()
+                .take_while(|next| next.is_whitespace())
+                .map(char::len_utf8)
+                .sum::<usize>();
+            let equals = name_end + whitespace;
+            if s[equals..].starts_with('=') {
+                let after_equals = equals + 1;
+                let whitespace = s[after_equals..]
+                    .chars()
+                    .take_while(|next| next.is_whitespace())
+                    .map(char::len_utf8)
+                    .sum::<usize>();
+                if s[after_equals + whitespace..].starts_with('{') {
+                    let name = &s[offset..name_end];
+                    if !is_reserved_key(name) {
+                        keys.push(name.to_string());
+                    }
+                }
+            }
+        }
+
+        match c {
+            '\'' | '"' => quote = Some(c),
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    break;
+                }
+            }
+            _ => {}
+        }
+        offset += char_len;
+    }
+    keys
 }
 
 /// Check if a key is a reserved/internal key (not a language name)
@@ -583,6 +677,16 @@ mod tests {
             parse_complete_parsers_lua(content),
             Err(MetadataError::ParseError(_))
         ));
+    }
+
+    #[test]
+    fn top_level_entries_do_not_depend_on_indentation() {
+        let content = "return {\nlua = { install_info = { url = 'https://example/lua', revision = 'lua-rev' } },\n  rust = { install_info = { url = 'https://example/rust', revision = 'rust-rev' } },\n}";
+        let parsers = parse_complete_parsers_lua(content).expect("complete metadata");
+
+        assert_eq!(parsers.len(), 2);
+        assert!(parsers.contains_key("lua"));
+        assert!(parsers.contains_key("rust"));
     }
 
     #[test]
