@@ -1044,16 +1044,32 @@ mod tests {
             .map(|(p, b)| (p.to_string(), b.to_string()))
             .collect();
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind local server");
+        listener
+            .set_nonblocking(true)
+            .expect("make local server non-blocking");
         let base_url = format!("http://{}", listener.local_addr().unwrap());
         let requests = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let server_requests = requests.clone();
 
         std::thread::spawn(move || {
-            // Bounded so the thread (and its socket) terminates instead of
-            // living until process exit: no test downloads anywhere near this
-            // many files (2 query files per language, short inherits chains).
-            for stream in listener.incoming().take(64) {
-                let Ok(mut stream) = stream else { continue };
+            const IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+            const ACCEPT_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(10);
+            let mut idle_deadline = std::time::Instant::now() + IDLE_TIMEOUT;
+            loop {
+                let mut stream = match listener.accept() {
+                    Ok((stream, _)) => {
+                        idle_deadline = std::time::Instant::now() + IDLE_TIMEOUT;
+                        stream
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        if std::time::Instant::now() >= idle_deadline {
+                            break;
+                        }
+                        std::thread::sleep(ACCEPT_RETRY_DELAY);
+                        continue;
+                    }
+                    Err(_) => break,
+                };
                 let mut reader = BufReader::new(&mut stream);
                 let mut request_line = String::new();
                 if reader.read_line(&mut request_line).is_err() {
