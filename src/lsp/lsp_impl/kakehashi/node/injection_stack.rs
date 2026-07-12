@@ -181,37 +181,39 @@ pub(super) fn injection_stack_at(
         }
         // Smallest effective span wins — that's the most specific injection at
         // the cursor after offset/include adjustments.
-        candidates.sort_by_key(|(_, ranges)| total_span(ranges));
+        let mut materialized = Vec::new();
+        for (region, absolute_ranges) in candidates {
+            // Pass the actual injection content to the language resolver so its
+            // shebang / first-line heuristics can fire for nested injections.
+            let content =
+                &host_text[region.content_node.start_byte()..region.content_node.end_byte()];
+            let Some((resolved_lang, _)) =
+                coordinator.resolve_injection_language(&region.language, content)
+            else {
+                continue;
+            };
+            // Only trees which can mint node IDs contribute to ambiguity.
+            // `walk_document_layers` likewise skips unresolved, unloaded, or
+            // unparsable siblings rather than visiting them.
+            let Some(language) = coordinator
+                .language_registry_for_parallel()
+                .get(&resolved_lang)
+            else {
+                continue;
+            };
+            let Some(injected_tree) =
+                parse_with_absolute_ranges(&language, host_text, &absolute_ranges)
+            else {
+                continue;
+            };
+            materialized.push((resolved_lang, injected_tree, absolute_ranges));
+        }
+        materialized.sort_by_key(|(_, _, ranges)| total_span(ranges));
         // Once an ancestor was ambiguous, every descendant is ambiguous too:
         // rebuilding the same child path inside the chosen smallest parent
         // still cannot prove that parent was the sibling which minted the id.
-        let ambiguous = parent_ambiguous || candidates.len() > 1;
-        let Some((region, absolute_ranges)) = candidates.into_iter().next() else {
-            break;
-        };
-
-        // Pass the actual injection content to the language resolver so its
-        // shebang / first-line heuristics (language-detection-fallback-chain) can fire for nested
-        // injections — passing "" would silently disable detection.
-        let content = &host_text[region.content_node.start_byte()..region.content_node.end_byte()];
-        let Some((resolved_lang, _)) =
-            coordinator.resolve_injection_language(&region.language, content)
-        else {
-            break;
-        };
-        // `get` clones the grammar out (owned `Language`) and releases its
-        // internal DashMap ref before returning, so there is no read guard to
-        // scope around the parse below. Fetched inline (not via a function-
-        // level binding) to keep that intent obvious.
-        let Some(language) = coordinator
-            .language_registry_for_parallel()
-            .get(&resolved_lang)
-        else {
-            break;
-        };
-
-        let Some(injected_tree) =
-            parse_with_absolute_ranges(&language, host_text, &absolute_ranges)
+        let ambiguous = parent_ambiguous || materialized.len() > 1;
+        let Some((resolved_lang, injected_tree, absolute_ranges)) = materialized.into_iter().next()
         else {
             break;
         };
@@ -1196,6 +1198,53 @@ mod tests {
         assert!(
             matches!(truncated, NodeResolution::Ambiguous),
             "a truncated stack below an ambiguous ancestor is still ambiguous"
+        );
+    }
+
+    #[test]
+    fn unavailable_overlapping_region_does_not_make_loaded_layer_ambiguous() {
+        let query_root = tempfile::tempdir().expect("create query root");
+        let query_dir = query_root.path().join("queries/markdown");
+        std::fs::create_dir_all(&query_dir).expect("create markdown query dir");
+        std::fs::write(
+            query_dir.join("injections.scm"),
+            r#"
+            ((section) @injection.content
+              (#set! injection.language "unavailable-language")
+              (#set! injection.include-children))
+            ((paragraph) @injection.content
+              (#set! injection.language "markdown")
+              (#set! injection.include-children))
+            "#,
+        )
+        .expect("write overlapping injection query");
+
+        let grammar_root = std::env::var("TREE_SITTER_GRAMMARS")
+            .unwrap_or_else(|_| "deps/test/kakehashi".to_string());
+        let coordinator = LanguageCoordinator::new();
+        let settings = crate::config::WorkspaceSettings {
+            search_paths: vec![
+                query_root.path().to_string_lossy().into_owned(),
+                grammar_root,
+            ],
+            ..Default::default()
+        };
+        let _ = coordinator.load_settings(&settings);
+        assert!(coordinator.ensure_language_loaded("markdown").success);
+
+        let text = "# heading\n\nresolvable paragraph\n";
+        let mut pool = coordinator.create_document_parser_pool();
+        let mut parser = pool.acquire("markdown").expect("acquire markdown parser");
+        let tree = parser.parse(text, None).expect("parse markdown");
+        pool.release("markdown".to_string(), parser);
+        let byte = text.find("resolvable").expect("paragraph byte");
+
+        let stack = injection_stack_at(&coordinator, "markdown", text, &tree, byte);
+
+        assert!(stack.len() > 1, "the loaded paragraph layer materializes");
+        assert!(
+            !stack[1].ambiguous,
+            "a sibling which cannot mint IDs must not taint the loaded layer"
         );
     }
 }
