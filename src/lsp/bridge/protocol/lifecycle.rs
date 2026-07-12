@@ -492,6 +492,27 @@ mod tests {
         );
     }
 
+    #[test]
+    fn validate_returns_advertised_capabilities() {
+        let response = serde_json::json!({
+            "result": {
+                "capabilities": {
+                    "textDocumentSync": 1,
+                    "completionProvider": { "triggerCharacters": ["."] }
+                }
+            }
+        });
+
+        let capabilities = parse_initialize_response_capabilities(&response)
+            .expect("valid capabilities must be returned");
+
+        assert!(capabilities.text_document_sync.is_some());
+        let completion = capabilities
+            .completion_provider
+            .expect("completion capability must be preserved");
+        assert_eq!(completion.trigger_characters, Some(vec![".".to_string()]));
+    }
+
     #[rstest]
     #[case::non_object(serde_json::json!("not-an-object"))]
     #[case::invalid_known_field(serde_json::json!({"hoverProvider": 42}))]
