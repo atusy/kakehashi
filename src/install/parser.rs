@@ -173,13 +173,35 @@ fn write_marker_atomically(marker_path: &Path, content: &[u8]) -> std::io::Resul
 
 #[cfg(windows)]
 fn publish_marker_no_replace(from: &Path, to: &Path) -> std::io::Result<()> {
+    move_file_no_replace(from, to)
+}
+
+#[cfg(windows)]
+fn windows_verbatim_path(path: &Path) -> std::io::Result<Vec<u16>> {
     use std::os::windows::ffi::OsStrExt;
+    let absolute = std::path::absolute(path)?;
+    let text = absolute.as_os_str().to_string_lossy();
+    let verbatim = if text.starts_with(r"\\?\") {
+        text.into_owned()
+    } else if let Some(unc) = text.strip_prefix(r"\\") {
+        format!(r"\\?\UNC\{unc}")
+    } else {
+        format!(r"\\?\{text}")
+    };
+    Ok(std::ffi::OsStr::new(&verbatim)
+        .encode_wide()
+        .chain(Some(0))
+        .collect())
+}
+
+#[cfg(windows)]
+fn move_file_no_replace(from: &Path, to: &Path) -> std::io::Result<()> {
     #[link(name = "kernel32")]
     unsafe extern "system" {
         fn MoveFileExW(existing: *const u16, new: *const u16, flags: u32) -> i32;
     }
-    let from: Vec<u16> = from.as_os_str().encode_wide().chain(Some(0)).collect();
-    let to: Vec<u16> = to.as_os_str().encode_wide().chain(Some(0)).collect();
+    let from = windows_verbatim_path(from)?;
+    let to = windows_verbatim_path(to)?;
     // Flags 0 is an atomic same-volume move that fails when `to` exists.
     if unsafe { MoveFileExW(from.as_ptr(), to.as_ptr(), 0) } == 0 {
         Err(std::io::Error::last_os_error())
@@ -217,7 +239,7 @@ fn path_entry_exists(path: &Path) -> std::io::Result<bool> {
 #[cfg(windows)]
 impl ParserFileOps for StdParserFileOps {
     fn rename(&mut self, from: &Path, to: &Path) -> std::io::Result<()> {
-        fs::rename(from, to)
+        move_file_no_replace(from, to)
     }
 
     fn remove_file(&mut self, path: &Path) -> std::io::Result<()> {
@@ -1738,6 +1760,26 @@ mod tests {
         assert_eq!(fs::read_dir(temp.path()).expect("list temp").count(), 1);
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn atomic_marker_publish_supports_long_windows_paths() {
+        let temp = tempdir().expect("temp dir");
+        let mut directory = temp.path().to_path_buf();
+        while directory.as_os_str().len() < 280 {
+            directory.push("long-parser-marker-segment");
+        }
+        fs::create_dir_all(&directory).expect("create long directory");
+        let marker = directory.join("backup.owner");
+
+        write_marker_atomically(&marker, PARSER_BACKUP_INTENT_CONTENT)
+            .expect("publish long marker");
+
+        assert_eq!(
+            fs::read(marker).expect("read long marker"),
+            PARSER_BACKUP_INTENT_CONTENT
+        );
+    }
+
     #[derive(Default)]
     struct FakeParserFileOps {
         files: HashMap<PathBuf, &'static str>,
@@ -1761,6 +1803,12 @@ mod tests {
                 .is_some_and(|extension| extension == "backup")
             {
                 self.backup_claim_observed_marker = self.backup_markers.contains(to);
+            }
+            if self.files.contains_key(to) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::AlreadyExists,
+                    "destination exists",
+                ));
             }
             if self
                 .failed_renames
