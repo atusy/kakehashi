@@ -450,6 +450,22 @@ fn test_config_init_output_dash_outputs_to_stdout() {
     );
 }
 
+#[test]
+fn test_config_init_force_output_dash_warns_force_is_ignored() {
+    let output = Command::new(env!("CARGO_BIN_EXE_kakehashi"))
+        .args(["config", "init", "--force", "--output", "-"])
+        .output()
+        .expect("Failed to execute command");
+
+    assert!(output.status.success());
+    assert!(String::from_utf8_lossy(&output.stdout).contains("autoInstall"));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("Warning") && stderr.contains("--force"),
+        "Should warn that --force has no effect for stdout. Got: {stderr}"
+    );
+}
+
 /// Test that config schema outputs valid JSON to stdout
 #[test]
 fn test_config_schema_outputs_valid_json_to_stdout() {
