@@ -684,6 +684,10 @@ fn process_is_running_windows(pid: u32) -> bool {
             let _ = CloseHandle(handle);
             if queried == 0 {
                 WindowsProcessProbe::UnexpectedFailure
+            // Windows cannot distinguish a live process from one that exited
+            // with code STILL_ACTIVE (259). Preserve the artifact in that
+            // ambiguous case; false retention is safer than deleting a live
+            // compiler's staging file.
             } else if exit_code == STILL_ACTIVE as u32 {
                 WindowsProcessProbe::Running
             } else {
@@ -1877,7 +1881,7 @@ mod tests {
         lock.lock_exclusive().expect("lock staging file");
         let mut cmd = Command::new("sleep");
         cmd.arg("30");
-        inherit_staging_lock(&mut cmd, &lock);
+        inherit_staging_lock(&mut cmd, &lock).unwrap();
         let mut child = cmd.spawn().expect("spawn lock inheritor");
         drop(lock);
 
