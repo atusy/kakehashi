@@ -67,11 +67,17 @@ impl MetadataCache {
         fs::create_dir_all(&self.cache_dir)?;
         let mut staged = tempfile::NamedTempFile::new_in(&self.cache_dir)?;
         staged.write_all(content.as_bytes())?;
-        staged.flush()?;
+        staged.as_file().sync_all()?;
         staged
             .persist(self.cache_path())
-            .map(|_| ())
-            .map_err(|error| error.error)
+            .map_err(|error| error.error)?;
+        // A directory sync makes the rename durable on filesystems that
+        // buffer directory-entry updates. Data is already durable, so keep
+        // this best-effort for platforms that cannot sync directories.
+        if let Ok(directory) = fs::File::open(&self.cache_dir) {
+            let _ = directory.sync_all();
+        }
+        Ok(())
     }
 }
 
