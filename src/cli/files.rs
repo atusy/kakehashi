@@ -80,7 +80,15 @@ pub(crate) fn collect_files(
         }
     }
     files.sort();
-    files.dedup();
+    let mut seen = std::collections::HashSet::new();
+    files.retain(|path| {
+        // Preserve the stable sorted spelling for output, but compare the
+        // resolved path so explicit symlink aliases do not process one file
+        // twice. If an entry vanished after collection, retain its lexical
+        // path and let the caller report the existing read error.
+        let identity = std::fs::canonicalize(path).unwrap_or_else(|_| path.clone());
+        seen.insert(identity)
+    });
     Ok(CollectedFiles { files, walk_errors })
 }
 
@@ -446,6 +454,26 @@ mod tests {
         );
 
         assert_eq!(files, vec![tmp.path().join("doc.md")]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_aliases_are_deduplicated() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let document = tmp.path().join("doc.md");
+        let alias = tmp.path().join("alias.md");
+        write(&document, "x");
+        symlink(&document, &alias).unwrap();
+
+        let files = collect_paths(tmp.path(), &[document.clone(), alias], &[], &markdown_only);
+
+        assert_eq!(files.len(), 1, "one filesystem file must be processed once");
+        assert_eq!(
+            std::fs::canonicalize(&files[0]).unwrap(),
+            std::fs::canonicalize(document).unwrap()
+        );
     }
 
     #[test]
