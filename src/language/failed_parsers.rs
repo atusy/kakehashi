@@ -517,6 +517,33 @@ mod tests {
     }
 
     #[test]
+    fn test_abort_releases_marker_lock_for_crash_recovery() {
+        const CHILD_STATE_DIR: &str = "KAKEHASHI_ABORT_TEST_STATE_DIR";
+        if let Some(state_dir) = std::env::var_os(CHILD_STATE_DIR) {
+            let registry = FailedParserRegistry::new(Path::new(&state_dir));
+            registry.init().unwrap();
+            registry.begin_parsing("lua").unwrap();
+            std::process::abort();
+        }
+
+        let temp = tempdir().unwrap();
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "language::failed_parsers::tests::test_abort_releases_marker_lock_for_crash_recovery",
+                "--nocapture",
+            ])
+            .env(CHILD_STATE_DIR, temp.path())
+            .status()
+            .unwrap();
+        assert!(!status.success(), "child must terminate via abort");
+
+        let restarted = FailedParserRegistry::new(temp.path());
+        restarted.init().unwrap();
+        assert!(restarted.is_failed("lua"));
+    }
+
+    #[test]
     fn test_live_peer_marker_is_not_treated_as_a_crash() {
         let temp = tempdir().unwrap();
         let first = FailedParserRegistry::new(temp.path());
