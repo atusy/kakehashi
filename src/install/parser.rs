@@ -37,24 +37,24 @@ fn publish_parser_transactionally(
     parser_file: &Path,
     backup_file: &Path,
 ) -> std::io::Result<()> {
+    ops.create_backup_marker(backup_file)?;
     let had_old_parser = match ops.rename(parser_file, backup_file) {
-        Ok(()) => {
-            if let Err(marker_error) = ops.create_backup_marker(backup_file) {
-                return match ops.rename(backup_file, parser_file) {
-                    Ok(()) => Err(marker_error),
-                    Err(rollback_error) => Err(std::io::Error::new(
-                        marker_error.kind(),
-                        format!(
-                            "failed to mark parser backup: {marker_error}; failed to restore backup '{}': {rollback_error}",
-                            backup_file.display()
-                        ),
-                    )),
-                };
-            }
-            true
+        Ok(()) => true,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            ops.remove_backup_marker(backup_file)?;
+            false
         }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
-        Err(error) => return Err(error),
+        Err(error) => {
+            if let Err(marker_error) = ops.remove_backup_marker(backup_file) {
+                return Err(std::io::Error::new(
+                    error.kind(),
+                    format!(
+                        "failed to claim parser backup: {error}; failed to remove new ownership marker: {marker_error}"
+                    ),
+                ));
+            }
+            return Err(error);
+        }
     };
 
     match ops.rename(tmp_file, parser_file) {
@@ -121,11 +121,17 @@ impl ParserFileOps for StdParserFileOps {
 
     fn create_backup_marker(&mut self, backup: &Path) -> std::io::Result<()> {
         use std::io::Write;
+        let marker_path = parser_backup_ownership_sidecar(backup);
         let mut marker = fs::OpenOptions::new()
             .write(true)
             .create_new(true)
-            .open(parser_backup_ownership_sidecar(backup))?;
-        marker.write_all(b"ok\n")
+            .open(&marker_path)?;
+        if let Err(error) = marker.write_all(b"ok\n") {
+            drop(marker);
+            let _ = fs::remove_file(marker_path);
+            return Err(error);
+        }
+        Ok(())
     }
 
     fn remove_backup_marker(&mut self, backup: &Path) -> std::io::Result<()> {
@@ -1340,10 +1346,18 @@ mod tests {
         vanished_removals: Vec<PathBuf>,
         backup_markers: HashSet<PathBuf>,
         fail_marker_creation: bool,
+        fail_marker_write_after_create: bool,
+        backup_claim_observed_marker: bool,
     }
 
     impl ParserFileOps for FakeParserFileOps {
         fn rename(&mut self, from: &Path, to: &Path) -> std::io::Result<()> {
+            if to
+                .extension()
+                .is_some_and(|extension| extension == "backup")
+            {
+                self.backup_claim_observed_marker = self.backup_markers.contains(to);
+            }
             if self
                 .failed_renames
                 .iter()
@@ -1394,6 +1408,13 @@ mod tests {
                     "injected marker collision",
                 ));
             }
+            if self.fail_marker_write_after_create {
+                self.backup_markers.remove(backup);
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::WriteZero,
+                    "injected marker write failure",
+                ));
+            }
             Ok(())
         }
 
@@ -1435,6 +1456,8 @@ mod tests {
         assert_eq!(ops.files.get(&parser), Some(&"new"));
         assert!(!ops.files.contains_key(&tmp));
         assert!(!ops.files.contains_key(&backup));
+        assert!(ops.backup_claim_observed_marker);
+        assert!(!ops.backup_markers.contains(&backup));
     }
 
     #[test]
@@ -1547,6 +1570,25 @@ mod tests {
         assert_eq!(ops.files.get(&parser), Some(&"old"));
         assert!(!ops.files.contains_key(&backup));
         assert!(ops.backup_markers.contains(&backup));
+    }
+
+    #[test]
+    fn transactional_publish_cleans_marker_after_marker_write_failure() {
+        let tmp = PathBuf::from("parser.tmp");
+        let parser = PathBuf::from("parser.dll");
+        let backup = PathBuf::from("parser.backup");
+        let mut ops = FakeParserFileOps::default();
+        ops.files.insert(tmp.clone(), "new");
+        ops.files.insert(parser.clone(), "old");
+        ops.fail_marker_write_after_create = true;
+
+        publish_parser_transactionally(&mut ops, &tmp, &parser, &backup)
+            .expect_err("marker write failure must abort before moving parser");
+
+        assert_eq!(ops.files.get(&parser), Some(&"old"));
+        assert_eq!(ops.files.get(&tmp), Some(&"new"));
+        assert!(!ops.files.contains_key(&backup));
+        assert!(!ops.backup_markers.contains(&backup));
     }
 
     fn generated_backup_name(language: &str, pid: u32, counter: usize) -> String {
