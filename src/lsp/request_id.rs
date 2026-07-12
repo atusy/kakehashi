@@ -409,14 +409,22 @@ where
         // Check if this is a $/cancelRequest notification and forward to downstream
         // Per LSP spec, cancel params.id can be either integer or string
         let cancel_forwarder = self.cancel_forwarder.clone();
-        let active_request = cancel_forwarder.clone().and_then(|forwarder| {
-            let upstream_id = match request_id.as_ref()? {
-                Id::Number(id) => UpstreamId::Number(*id),
-                Id::String(id) => UpstreamId::String(id.clone()),
-                Id::Null => return None,
-            };
-            Some(ActiveRequestGuard::new(forwarder, upstream_id))
-        });
+        let is_cancel_notification = matches!(
+            req.method(),
+            "$/cancelRequest" | "window/workDoneProgress/cancel"
+        );
+        let active_request = if is_cancel_notification {
+            None
+        } else {
+            cancel_forwarder.clone().and_then(|forwarder| {
+                let upstream_id = match request_id.as_ref()? {
+                    Id::Number(id) => UpstreamId::Number(*id),
+                    Id::String(id) => UpstreamId::String(id.clone()),
+                    Id::Null => return None,
+                };
+                Some(ActiveRequestGuard::new(forwarder, upstream_id))
+            })
+        };
         if req.method() == "$/cancelRequest"
             && let Some(forwarder) = cancel_forwarder.as_ref()
             && let Some(params) = req.params()
@@ -914,6 +922,24 @@ mod tests {
         // Should not crash, just skip forwarding
         let result = service.call(request).await;
         assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn malformed_cancel_message_id_does_not_replace_active_generation() {
+        let mock = MockService::new();
+        let pool = Arc::new(LanguageServerPool::new());
+        let forwarder = CancelForwarder::new(pool);
+        let upstream_id = UpstreamId::Number(123);
+        let generation = forwarder.register_request(upstream_id.clone());
+        let mut service = RequestIdCapture::with_cancel_forwarder(mock.clone(), forwarder.clone());
+
+        let request = Request::build("$/cancelRequest")
+            .id(123i64)
+            .params(serde_json::json!({ "id": 123 }))
+            .finish();
+        service.call(request).await.unwrap();
+
+        assert_eq!(forwarder.request_generation(&upstream_id), Some(generation));
     }
 
     #[tokio::test]
