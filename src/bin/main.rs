@@ -682,7 +682,13 @@ fn write_new_output_with(
     write: impl FnOnce(&mut std::fs::File) -> std::io::Result<()>,
 ) -> std::io::Result<()> {
     let parent = path.parent().unwrap_or_else(|| std::path::Path::new("."));
-    let mut temp = tempfile::NamedTempFile::new_in(parent)?;
+    let mut builder = tempfile::Builder::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        builder.permissions(std::fs::Permissions::from_mode(0o666));
+    }
+    let mut temp = builder.tempfile_in(parent)?;
     write(temp.as_file_mut())?;
     temp.as_file().sync_all()?;
     temp.persist_noclobber(path)
@@ -1130,5 +1136,26 @@ mod tests {
 
         assert!(result.is_err());
         assert!(!output.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn no_clobber_output_uses_normal_umask_permissions() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let temp = tempfile::TempDir::new().unwrap();
+        let output = temp.path().join("atomic.toml");
+        let ordinary = temp.path().join("ordinary.toml");
+        write_new_output_with(&output, |file| {
+            use std::io::Write as _;
+            file.write_all(b"generated")
+        })
+        .unwrap();
+        std::fs::write(&ordinary, "generated").unwrap();
+
+        assert_eq!(
+            output.metadata().unwrap().permissions().mode() & 0o777,
+            ordinary.metadata().unwrap().permissions().mode() & 0o777
+        );
     }
 }
