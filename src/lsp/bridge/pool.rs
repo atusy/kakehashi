@@ -562,11 +562,15 @@ impl LanguageServerPool {
         removed: &[tower_lsp_server::ls_types::WorkspaceFolder],
     ) {
         let _change = self.workspace_folder_change_lock.lock().await;
+        // Acquire every fallible/cancellable prerequisite before committing the
+        // upstream snapshot. Once committed below, all live capable handles are
+        // notified synchronously and every incompatible handle is marked
+        // shutting down before the next await.
+        let mut connections = self.connections.lock().await;
         if !self.workspace_folders.apply_change(added.clone(), removed) {
             return;
         }
 
-        let mut connections = self.connections.lock().await;
         let mut invalidated = Vec::new();
         for (key, handle) in connections.iter() {
             if !(key.is_client_fallback() || key.is_shared()) {
@@ -1150,11 +1154,16 @@ impl LanguageServerPool {
         connections: &mut HashMap<ConnectionKey, Arc<ConnectionHandle>>,
         invalidated: Vec<ConnectionKey>,
     ) -> Vec<(ConnectionKey, Arc<ConnectionHandle>)> {
-        let mut stale_handles = Vec::new();
-        for key in invalidated {
-            if let Some(handle) = connections.get(&key) {
+        // Mark the complete set synchronously before cleanup can yield. If the
+        // caller is cancelled during a purge, no unnotified stale handle can be
+        // selected for new work against the already-committed global snapshot.
+        for key in &invalidated {
+            if let Some(handle) = connections.get(key) {
                 handle.begin_shutdown();
             }
+        }
+        let mut stale_handles = Vec::new();
+        for key in invalidated {
             self.host_documents
                 .lock()
                 .await
@@ -3073,6 +3082,31 @@ mod tests {
         .await;
 
         assert!(pool.connections.lock().await.contains_key(&key));
+    }
+
+    #[tokio::test]
+    async fn cancelled_upstream_folder_change_does_not_commit_before_connection_lock() {
+        let pool = Arc::new(LanguageServerPool::new());
+        let old = test_workspace_folder("file:///old");
+        let new = test_workspace_folder("file:///new");
+        pool.set_workspace_folders(Some(vec![old.clone()]));
+        let connections = pool.connections.lock().await;
+
+        let task = tokio::spawn({
+            let pool = Arc::clone(&pool);
+            async move {
+                pool.apply_workspace_folder_change(vec![new], &[old]).await;
+            }
+        });
+        tokio::task::yield_now().await;
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        drop(connections);
+
+        assert_eq!(
+            pool.workspace_folders(),
+            Some(vec![test_workspace_folder("file:///old")])
+        );
     }
 
     /// A Ready shared connection whose server never advertised the
