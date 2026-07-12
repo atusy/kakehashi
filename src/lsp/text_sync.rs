@@ -54,7 +54,8 @@ pub(crate) fn apply_content_changes_with_edits(
             // shorter base text is edited with a range authored against a later
             // document state (concurrent `didChange` processing). Clamping keeps
             // the splice in bounds; `start <= end` is enforced so the range never
-            // inverts.
+            // inverts. Clamping to line content also keeps an overlong column
+            // from consuming that line's terminator (#707).
             let mapper = PositionMapper::new(&text);
             let start_offset = mapper.position_to_byte_clamped(range.start);
             let end_offset = mapper.position_to_byte_clamped(range.end).max(start_offset);
@@ -215,13 +216,53 @@ mod tests {
     }
 
     #[test]
+    fn test_overlong_column_does_not_consume_line_terminator() {
+        let old_text = "hello\nworld\n";
+        let changes = vec![TextDocumentContentChangeEvent {
+            range: Some(Range {
+                start: Position::new(0, 5),
+                end: Position::new(0, 999),
+            }),
+            range_length: None,
+            text: String::new(),
+        }];
+
+        let (new_text, edits) = apply_content_changes_with_edits(old_text, changes);
+
+        assert_eq!(new_text, old_text);
+        assert_eq!(edits.len(), 1);
+        assert_eq!(edits[0].start_byte, 5);
+        assert_eq!(edits[0].old_end_byte, 5);
+    }
+
+    #[test]
+    fn test_overlong_column_does_not_consume_crlf_terminator() {
+        let old_text = "hello\r\nworld\r\n";
+        let changes = vec![TextDocumentContentChangeEvent {
+            range: Some(Range {
+                start: Position::new(0, 5),
+                end: Position::new(0, 999),
+            }),
+            range_length: None,
+            text: String::new(),
+        }];
+
+        let (new_text, edits) = apply_content_changes_with_edits(old_text, changes);
+
+        assert_eq!(new_text, old_text);
+        assert_eq!(edits.len(), 1);
+        assert_eq!(edits[0].start_byte, 5);
+        assert_eq!(edits[0].old_end_byte, 5);
+    }
+
+    #[test]
     fn test_out_of_range_edit_keeps_inputedit_byte_and_point_consistent() {
         // When the range is clamped, the InputEdit's tree-sitter points must be
         // derived from the clamped byte offsets, not the original out-of-bounds
         // LSP positions — otherwise byte and point disagree and incremental
         // parsing corrupts. Base "local x = {\n}\n" (14 bytes): line 1 is "}"
-        // (one char), so character 2/3 are past it. Both ends clamp to byte 14,
-        // which is row 2, col 0 — NOT the raw position's row 1.
+        // (one char), so character 2/3 are past it. Both ends clamp to byte 13,
+        // immediately before the newline — NOT the next line's byte 14.
         let old_text = "local x = {\n}\n";
         let changes = vec![TextDocumentContentChangeEvent {
             range: Some(Range {
@@ -258,11 +299,11 @@ mod tests {
             point_of(edit.old_end_byte),
             "old_end_position must correspond to old_end_byte"
         );
-        // Concretely: both ends clamped to byte 14 → row 2, col 0.
-        assert_eq!(edit.old_end_byte, 14);
+        // Concretely: both ends clamp to byte 13 → row 1, col 1.
+        assert_eq!(edit.old_end_byte, 13);
         assert_eq!(
             (edit.old_end_position.row, edit.old_end_position.column),
-            (2, 0)
+            (1, 1)
         );
     }
 

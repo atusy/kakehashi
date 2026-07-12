@@ -1,20 +1,23 @@
 use line_index::{LineIndex, WideEncoding, WideLineCol};
 use tower_lsp_server::ls_types::Position;
 
+use super::char_boundary::floor_char_boundary;
+
 /// Position mapper for converting between LSP positions and byte offsets
-pub struct PositionMapper {
+pub struct PositionMapper<'text> {
     line_index: LineIndex,
+    text: &'text str,
 }
 
-impl PositionMapper {
+impl<'text> PositionMapper<'text> {
     /// Create a new PositionMapper with pre-computed line starts
-    pub fn new(text: &str) -> Self {
+    pub fn new(text: &'text str) -> Self {
         let line_index = LineIndex::new(text);
-        Self { line_index }
+        Self { line_index, text }
     }
 }
 
-impl PositionMapper {
+impl PositionMapper<'_> {
     /// Convert LSP Position to byte offset in the document
     pub fn position_to_byte(&self, position: Position) -> Option<usize> {
         // LSP positions are UTF-16 based
@@ -38,11 +41,10 @@ impl PositionMapper {
     /// line's end yields a byte offset running past that line (it is computed
     /// as `line_start + character`), and a `line` past EOF yields `None`.
     /// Both must be reined in, and *differently*:
-    /// - **character past the line's end** → clamp to the end of that line
-    ///   (`line(l).end()`, which is the start of the next line, i.e. just
-    ///   past this line's terminator). The request stays within its own line
-    ///   and never reaches a later line's content or injection region —
-    ///   unlike snapping to the document end, which would.
+    /// - **character past the line's end** → clamp to the end of that line's
+    ///   content, before its `\n` or `\r\n` terminator. The request stays
+    ///   within its own line and cannot consume the terminator or reach a later
+    ///   line's content — unlike snapping to the document end, which would.
     /// - **line past the last line** → clamp to the document's end.
     ///
     /// An in-bounds position maps exactly (identical to `position_to_byte`):
@@ -53,10 +55,19 @@ impl PositionMapper {
             // Line exists: take the mapped offset but clamp it to the line's
             // end so an over-long character can't spill past this line.
             Some(line_range) => {
-                let line_end: usize = line_range.end().into();
-                self.position_to_byte(position)
+                let line_start: usize = line_range.start().into();
+                let line_range_end: usize = line_range.end().into();
+                let line = &self.text[line_start..line_range_end];
+                let content = line
+                    .strip_suffix('\n')
+                    .map(|line| line.strip_suffix('\r').unwrap_or(line))
+                    .unwrap_or(line);
+                let line_end = line_start + content.len();
+                let byte = self
+                    .position_to_byte(position)
                     .unwrap_or(line_end)
-                    .min(line_end)
+                    .min(line_end);
+                floor_char_boundary(self.text, byte)
             }
             // The line itself is past EOF: clamp to the document end.
             None => self.line_index.len().into(),
@@ -397,13 +408,28 @@ mod tests {
 
     #[test]
     fn clamped_snaps_overlong_character_to_line_end_not_document_end() {
-        // Line 0 is "hello\n" (bytes 0..6); `line(0).end()` is byte 6, the
-        // start of line 1. A character far past the line end clamps there —
-        // within line 0's bounds, NOT the document end (12) — so a
-        // single-line range can never spill into later lines.
+        // LineIndex includes the terminator in line 0's byte range (0..6), but
+        // the valid LSP end position is byte 5, before `\n`. A far-past column
+        // clamps there, not to the start of line 1 or the document end.
         let text = "hello\nworld\n";
         let mapper = PositionMapper::new(text);
-        assert_eq!(mapper.position_to_byte_clamped(Position::new(0, 999)), 6);
+        assert_eq!(mapper.position_to_byte_clamped(Position::new(0, 999)), 5);
+    }
+
+    #[test]
+    fn clamped_snaps_overlong_character_before_crlf() {
+        let text = "hello\r\nworld\r\n";
+        let mapper = PositionMapper::new(text);
+
+        assert_eq!(mapper.position_to_byte_clamped(Position::new(0, 999)), 5);
+    }
+
+    #[test]
+    fn clamped_floors_utf16_position_inside_surrogate_pair() {
+        let text = "👋x\n";
+        let mapper = PositionMapper::new(text);
+
+        assert_eq!(mapper.position_to_byte_clamped(Position::new(0, 1)), 0);
     }
 
     #[test]

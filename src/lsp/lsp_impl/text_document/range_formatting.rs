@@ -605,14 +605,14 @@ mod tests {
         // A character past a valid line's end must clamp to that line's end,
         // not the document end — otherwise a single-line request would
         // broaden into later lines and dispatch to regions the user did not
-        // select. Line 0 is "first line\n" (bytes 0..11), so col 999 clamps
-        // to byte 11 (start of line 1), well short of the document end (23).
+        // select. Line 0's content is bytes 0..10, so col 999 clamps to byte
+        // 10 before the newline, well short of the document end (23).
         let text = "first line\nsecond line\n";
         let mapper = PositionMapper::new(text);
         let range = pos_range(0, 0, 0, 999);
 
         let bytes = clamp_request_to_document(&mapper, range);
-        assert_eq!(bytes, 0..11);
+        assert_eq!(bytes, 0..10);
     }
 
     #[test]
