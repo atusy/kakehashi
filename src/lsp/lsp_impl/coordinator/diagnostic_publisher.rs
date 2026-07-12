@@ -145,6 +145,9 @@ impl DiagnosticPublisher {
     /// Coalesce a burst of downstream `workspace/diagnostic/refresh` requests
     /// into one forced upstream refresh after the burst settles (#789).
     pub(crate) fn request_forwarded_diagnostic_refresh(&self) {
+        if self.shutdown.is_cancelled() {
+            return;
+        }
         if !self.diagnostic_refresh_supported() {
             return;
         }
@@ -1184,6 +1187,21 @@ mod tests {
         let metrics = server.diagnostics.metrics_snapshot();
         assert_eq!(metrics.refreshes_requested, 1);
         assert_eq!(metrics.refreshes_sent, 0, "shutdown must suppress the send");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_rejects_new_forwarded_refresh_inputs() {
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+        server.shutdown_token.cancel();
+        let publisher = DiagnosticPublisher::new(server);
+
+        publisher.request_forwarded_diagnostic_refresh();
+
+        assert_eq!(
+            server.diagnostics.metrics_snapshot(),
+            crate::lsp::diagnostic_cache::DiagnosticMetricsSnapshot::default()
+        );
     }
 
     #[tokio::test(start_paused = true)]
