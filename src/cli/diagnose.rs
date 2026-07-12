@@ -429,6 +429,7 @@ fn format_diagnostic(format: OutputFormat, display: &str, diagnostic: &Diagnosti
             // source.
             match diagnostic.source.as_deref() {
                 Some(source) => {
+                    let source = one_line(source);
                     format!("{display}:{line}:{col}: {severity}: {message} [{source}]")
                 }
                 None => format!("{display}:{line}:{col}: {severity}: {message}"),
@@ -598,6 +599,17 @@ mod tests {
         assert_eq!(
             format_diagnostic(OutputFormat::Default, "a.md", &d),
             "a.md:5:3: error: boom [lua-ls]"
+        );
+    }
+
+    #[test]
+    fn default_format_collapses_multiline_source() {
+        let mut d = diag(4, 2, Some(DiagnosticSeverity::ERROR), "boom");
+        d.source = Some("lua-ls\nspoofed\tfield".to_string());
+
+        assert_eq!(
+            format_diagnostic(OutputFormat::Default, "a.md", &d),
+            "a.md:5:3: error: boom [lua-ls spoofed field]"
         );
     }
 
