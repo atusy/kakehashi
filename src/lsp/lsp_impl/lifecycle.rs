@@ -199,13 +199,15 @@ impl Kakehashi {
             self.home_dir.as_deref(),
             |var| std::env::var(var).ok(),
         );
+
+        if let Some(error) = settings_outcome.fatal_error {
+            log::error!(target: "kakehashi::config", "{error}");
+            return Err(configuration_load_error(error));
+        }
+
         self.notifier()
             .log_settings_events(&settings_outcome.events)
             .await;
-
-        if let Some(error) = settings_outcome.fatal_error {
-            return Err(configuration_load_error(error));
-        }
 
         // Nudge users off the deprecated `rootMarkers` config key. The claim
         // guard latches session-wide so a later didChangeConfiguration carrying
