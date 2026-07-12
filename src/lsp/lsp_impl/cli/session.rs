@@ -61,8 +61,8 @@ impl Kakehashi {
     }
 
     /// Whether a file discovered during a directory walk identifies a known
-    /// language by path or by a bounded prefix of its first line. Only path
-    /// misses read content. The hard cap keeps ordinary directory traversal
+    /// language by path or by a bounded prefix of its first line. Content is
+    /// read only when path-based detection fails. The hard cap keeps traversal
     /// from scanning arbitrarily large extensionless files; explicitly named
     /// files remain authoritative for mode markers beyond the cap. Files whose
     /// first-line I/O fails are retained so the command's normal read path can
