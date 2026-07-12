@@ -1268,6 +1268,9 @@ pub(crate) fn collect_injection_tokens_parallel(
         let mut contexts = Vec::with_capacity(discovery.regions.len());
         let mut exclusion_byte_ranges = Vec::with_capacity(discovery.regions.len());
         for region in &discovery.regions {
+            if is_cancelled(cancel) {
+                return (Vec::new(), Vec::new());
+            }
             // A region whose highlight query isn't loaded is dropped (rebuild
             // returns None) — same as the inline path's query-missing branch. The
             // generation match makes this near-impossible, but the drop is safe.
