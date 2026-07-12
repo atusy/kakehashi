@@ -194,11 +194,13 @@ Edge cases:
 This holds even when a host node and an injected node share an identical span **and** kind (e.g. recursive same-language injection such as markdown-in-markdown). The identity key carries an injection-`layer` discriminator (lazy-node-identity-tracking § Node Uniqueness Key), so the two are distinct ULIDs and `parent`/`children` resolve each in the tree that minted it.
 
 The layer discriminator identifies a **depth**, not a same-depth region. When
-multiple overlapping injection regions at the same depth contain the requested
+multiple ID-minting injection regions at the same depth contain the requested
 position, `kakehashi/node` returns `null` rather than minting an identity from an
-arbitrary sibling. Accessors likewise return `null` for an already-held ID when
-rebuilding its path becomes ambiguous. Clients must re-acquire after edits, but
-re-acquisition can remain unavailable while the overlap itself persists.
+arbitrary sibling. Unresolvable or unloaded overlapping regions cannot mint IDs
+and therefore do not make an otherwise viable layer ambiguous. Accessors likewise
+return `null` for an already-held ID when rebuilding its path becomes ambiguous.
+Clients must re-acquire after edits, but re-acquisition can remain unavailable
+while the viable overlap itself persists.
 
 **`null` cases**:
 - `parent`: id not in tracker, id refers to a root node, **or** its injection layer is ambiguous
