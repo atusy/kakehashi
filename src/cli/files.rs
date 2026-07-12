@@ -457,7 +457,6 @@ mod tests {
     fn read_rejects_fifo_replacing_a_collected_file() {
         use nix::sys::stat::Mode;
         use nix::unistd::mkfifo;
-        use std::io::Write as _;
 
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("input.md");
@@ -465,22 +464,17 @@ mod tests {
         let collected = collect_paths(tmp.path(), std::slice::from_ref(&path), &[], &markdown_only);
         std::fs::remove_file(&path).unwrap();
         mkfifo(&path, Mode::S_IRUSR | Mode::S_IWUSR).unwrap();
-        let writer_path = path.clone();
-        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
-        let writer = std::thread::spawn(move || {
-            let mut fifo = std::fs::File::options()
-                .read(true)
-                .write(true)
-                .open(writer_path)
+        let collected_path = collected[0].clone();
+        let (result_tx, result_rx) = std::sync::mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            result_tx
+                .send(read_regular_file_to_string(&collected_path))
                 .unwrap();
-            fifo.write_all(b"replacement").unwrap();
-            ready_tx.send(()).unwrap();
-            std::thread::sleep(std::time::Duration::from_millis(50));
         });
-        ready_rx.recv().unwrap();
-
-        let result = read_regular_file_to_string(&collected[0]);
-        writer.join().unwrap();
+        let result = result_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("reading a FIFO without a writer must not block");
+        reader.join().unwrap();
 
         assert!(result.is_err());
     }
