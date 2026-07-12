@@ -183,9 +183,10 @@ fn test_config_file_nonexistent_fails_initialization() {
         .expect("missing explicit config file should reject initialize");
     assert_eq!(error["code"], json!(-32803));
     assert!(
-        error["message"]
-            .as_str()
-            .is_some_and(|message| message.contains("Config file not found")),
+        error["message"].as_str().is_some_and(|message| {
+            message.contains("Config file not found")
+                && message.contains(&config_path.display().to_string())
+        }),
         "initialize error should identify the missing config file: {error}"
     );
 }
@@ -215,9 +216,10 @@ fn test_config_file_invalid_toml_fails_initialization() {
         .expect("invalid explicit config file should reject initialize");
     assert_eq!(error["code"], json!(-32803));
     assert!(
-        error["message"]
-            .as_str()
-            .is_some_and(|message| message.contains("Failed to parse")),
+        error["message"].as_str().is_some_and(|message| {
+            message.contains("Failed to parse")
+                && message.contains(&config_path.display().to_string())
+        }),
         "initialize error should identify the parse failure: {error}"
     );
 }
