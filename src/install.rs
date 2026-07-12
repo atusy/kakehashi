@@ -90,6 +90,11 @@ pub(crate) fn test_data_dir() -> PathBuf {
 #[cfg(test)]
 pub(crate) fn test_state_dir() -> PathBuf {
     use std::sync::OnceLock;
+    // Rust does not drop statics, so this small directory intentionally remains
+    // in the OS temp tree after the test process exits. Keeping the `TempDir`
+    // guard (rather than only its path) prevents premature cleanup while tests
+    // are still using the shared process-local registry state; this matches the
+    // E2E helpers' accepted lifetime policy.
     static DIR: OnceLock<tempfile::TempDir> = OnceLock::new();
     DIR.get_or_init(|| tempfile::tempdir().expect("create unit-test crash state directory"))
         .path()
