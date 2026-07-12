@@ -1061,14 +1061,18 @@ mod tests {
                         idle_deadline = std::time::Instant::now() + IDLE_TIMEOUT;
                         stream
                     }
-                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    Err(error)
+                        if matches!(
+                            error.kind(),
+                            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
+                        ) =>
+                    {
                         if std::time::Instant::now() >= idle_deadline {
                             break;
                         }
                         std::thread::sleep(ACCEPT_RETRY_DELAY);
                         continue;
                     }
-                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
                     Err(_) => break,
                 };
                 let mut reader = BufReader::new(&mut stream);
