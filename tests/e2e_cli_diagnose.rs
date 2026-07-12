@@ -109,6 +109,22 @@ fn stderr_of(output: &Output) -> String {
 }
 
 #[test]
+fn e2e_diagnose_missing_explicit_config_exits_error() {
+    let ws = tempfile::tempdir().expect("create workspace tempdir");
+    std::fs::write(ws.path().join("doc.md"), PLAIN_MARKDOWN).expect("write document");
+
+    let output = run_diagnose(ws.path(), &["doc.md"]);
+
+    assert_eq!(output.status.code(), Some(2));
+    let stderr = stderr_of(&output);
+    assert_eq!(
+        stderr.matches("Config file not found").count(),
+        1,
+        "stderr should report the missing explicit config exactly once: {stderr}"
+    );
+}
+
+#[test]
 fn e2e_diagnose_default_format_reports_transformed_position() {
     let ws = workspace_with(&config_toml(), &[("doc.md", MARKDOWN)]);
 

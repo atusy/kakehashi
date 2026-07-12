@@ -101,6 +101,22 @@ fn read(workspace: &Path, name: &str) -> String {
 }
 
 #[test]
+fn e2e_format_missing_explicit_config_exits_error() {
+    let ws = tempfile::tempdir().expect("create workspace tempdir");
+    std::fs::write(ws.path().join("doc.md"), MARKDOWN).expect("write document");
+
+    let output = run_format(ws.path(), &["doc.md"]);
+
+    assert_eq!(output.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        stderr.matches("Config file not found").count(),
+        1,
+        "stderr should report the missing explicit config exactly once: {stderr}"
+    );
+}
+
+#[test]
 fn e2e_format_rewrites_file_in_place_and_is_idempotent() {
     let ws = workspace_with(&[("doc.md", MARKDOWN)]);
 

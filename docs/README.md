@@ -167,7 +167,7 @@ Path fields support environment variable expansion and tilde (`~`) expansion, ma
 - `languages[*].parser`
 - `languages[*].queries[*].path`
 
-**Behavior on undefined variables:** If a referenced environment variable is not defined, configuration loading fails with an error notification and falls back to previous settings (or defaults). The exception is `KAKEHASHI_DATA_DIR`, which automatically falls back to the platform-specific default when unset (see [Default Data Directories](#default-data-directories)).
+**Behavior on undefined variables:** If a referenced environment variable is not defined during ordinary startup loading, the merged configuration is discarded and programmed defaults are used. A runtime `workspace/didChangeConfiguration` update is discarded while the previous settings remain active. Explicit `--config-file` inputs are stricter: an expansion failure rejects LSP initialization or makes the CLI command exit with status 2. The exception is `KAKEHASHI_DATA_DIR`, which automatically falls back to the platform-specific default when unset (see [Default Data Directories](#default-data-directories)).
 
 ### Option Reference
 
@@ -516,7 +516,10 @@ kakehashi --config-file /path/to/empty.toml
 When `--config-file` is specified:
 - Default user config (`~/.config/kakehashi/kakehashi.toml`) is **skipped**
 - Default project config (`./kakehashi.toml`) is **skipped**
-- Non-existent files produce an error
+- Every explicit file is validated before merging, so a missing or unreadable
+  file, malformed TOML, or path-expansion failure aborts startup even when a
+  later layer would override the invalid value. LSP initialization returns a
+  `RequestFailed` error; `format` and `diagnose` exit with status 2.
 - `initializationOptions` from the LSP client still apply on top
 
 ## CLI Commands

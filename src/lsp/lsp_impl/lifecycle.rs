@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use tower_lsp_server::Client;
-use tower_lsp_server::jsonrpc::Result;
+use tower_lsp_server::jsonrpc::{Error, ErrorCode, Result};
 use tower_lsp_server::ls_types::ColorProviderCapability;
 use tower_lsp_server::ls_types::{
     ClientCapabilities, CodeActionOptions, CodeActionProviderCapability, CodeLensOptions,
@@ -30,6 +30,17 @@ use crate::lsp::{SettingsSource, load_settings};
 use super::apply_edit_translation::ApplyEditTranslator;
 use super::show_document_translation::ShowDocumentTranslator;
 use super::{Kakehashi, uri_to_url};
+
+// LSP `RequestFailed`; ls-types does not currently expose this error code.
+const REQUEST_FAILED_ERROR_CODE: i64 = -32803;
+
+fn configuration_load_error(message: String) -> Error {
+    Error {
+        code: ErrorCode::ServerError(REQUEST_FAILED_ERROR_CODE),
+        message: message.into(),
+        data: None,
+    }
+}
 
 /// Translators for downstream-initiated request payloads that carry
 /// virtual-document coordinates, bundled so the forwarding loop threads one
@@ -188,6 +199,11 @@ impl Kakehashi {
             self.home_dir.as_deref(),
             |var| std::env::var(var).ok(),
         );
+
+        if let Some(error) = settings_outcome.fatal_error {
+            return Err(configuration_load_error(error));
+        }
+
         self.notifier()
             .log_settings_events(&settings_outcome.events)
             .await;

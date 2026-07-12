@@ -157,23 +157,173 @@ fn test_config_file_two_files_merge_in_order() {
     );
 }
 
-/// --config-file with non-existent path: the file load fails with an error,
-/// and the configuration layer is skipped, so effective settings fall back to defaults.
+/// --config-file with non-existent path fails initialization instead of silently
+/// falling back to defaults.
 #[test]
-fn test_config_file_nonexistent_falls_back_to_defaults() {
+fn test_config_file_nonexistent_fails_initialization() {
+    let dir = TempDir::new().unwrap();
+    let config_path = dir.path().join("missing.toml");
     let mut client = LspClient::builder()
         .arg("--config-file")
-        .arg("/nonexistent/kakehashi-test-config.toml")
+        .arg(config_path.to_str().unwrap())
         .env_remove("KAKEHASHI_DATA_DIR")
         .build();
 
-    let settings = get_effective_settings(&mut client);
+    let response = client.send_request(
+        "initialize",
+        json!({
+            "processId": std::process::id(),
+            "rootUri": null,
+            "capabilities": {}
+        }),
+    );
 
-    // The missing file produces None in the merge, so only defaults apply
-    assert_eq!(
-        settings["autoInstall"],
-        json!(true),
-        "missing config file should fall back to default autoInstall=true"
+    let error = response
+        .get("error")
+        .expect("missing explicit config file should reject initialize");
+    assert_eq!(error["code"], json!(-32803));
+    assert!(
+        error["message"].as_str().is_some_and(|message| {
+            message.contains("Config file not found")
+                && message.contains(&config_path.display().to_string())
+        }),
+        "initialize error should identify the missing config file: {error}"
+    );
+}
+
+#[test]
+fn test_config_file_invalid_toml_fails_initialization() {
+    let dir = TempDir::new().unwrap();
+    let config_path = dir.path().join("invalid.toml");
+    std::fs::write(&config_path, "searchPaths = [\"/unterminated\"\n").unwrap();
+    let mut client = LspClient::builder()
+        .arg("--config-file")
+        .arg(config_path.to_str().unwrap())
+        .env_remove("KAKEHASHI_DATA_DIR")
+        .build();
+
+    let response = client.send_request(
+        "initialize",
+        json!({
+            "processId": std::process::id(),
+            "rootUri": null,
+            "capabilities": {}
+        }),
+    );
+
+    let error = response
+        .get("error")
+        .expect("invalid explicit config file should reject initialize");
+    assert_eq!(error["code"], json!(-32803));
+    assert!(
+        error["message"].as_str().is_some_and(|message| {
+            message.contains("Failed to parse")
+                && message.contains(&config_path.display().to_string())
+        }),
+        "initialize error should identify the parse failure: {error}"
+    );
+}
+
+#[test]
+fn test_config_file_invalid_path_expansion_fails_initialization() {
+    let dir = TempDir::new().unwrap();
+    let config_path = dir.path().join("invalid-path.toml");
+    std::fs::write(
+        &config_path,
+        "searchPaths = [\"$KAKEHASHI_TEST_UNDEFINED/path\"]\n",
+    )
+    .unwrap();
+    let mut client = LspClient::builder()
+        .arg("--config-file")
+        .arg(config_path.to_str().unwrap())
+        .env_remove("KAKEHASHI_TEST_UNDEFINED")
+        .env_remove("KAKEHASHI_DATA_DIR")
+        .build();
+
+    let response = client.send_request(
+        "initialize",
+        json!({
+            "processId": std::process::id(),
+            "rootUri": null,
+            "capabilities": {}
+        }),
+    );
+
+    let error = response
+        .get("error")
+        .expect("invalid explicit path expansion should reject initialize");
+    assert_eq!(error["code"], json!(-32803));
+    assert!(
+        error["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("Path expansion failed")
+                && message.contains(config_path.to_str().unwrap())),
+        "initialize error should identify the expansion failure and file: {error}"
+    );
+}
+
+#[test]
+fn test_config_file_masked_invalid_path_expansion_fails_initialization() {
+    let dir = TempDir::new().unwrap();
+    let invalid = dir.path().join("invalid.toml");
+    let valid = dir.path().join("valid.toml");
+    std::fs::write(
+        &invalid,
+        "searchPaths = [\"$KAKEHASHI_TEST_UNDEFINED/path\"]\n",
+    )
+    .unwrap();
+    std::fs::write(&valid, "searchPaths = [\"/valid\"]\n").unwrap();
+    let mut client = LspClient::builder()
+        .arg("--config-file")
+        .arg(invalid.to_str().unwrap())
+        .arg("--config-file")
+        .arg(valid.to_str().unwrap())
+        .env_remove("KAKEHASHI_TEST_UNDEFINED")
+        .env_remove("KAKEHASHI_DATA_DIR")
+        .build();
+
+    let response = client.send_request(
+        "initialize",
+        json!({
+            "processId": std::process::id(),
+            "rootUri": null,
+            "capabilities": {}
+        }),
+    );
+
+    assert!(
+        response.get("error").is_some(),
+        "a later explicit layer must not mask an earlier layer's invalid path: {response}"
+    );
+}
+
+#[test]
+fn test_config_file_does_not_make_invalid_initialization_options_fatal() {
+    let dir = TempDir::new().unwrap();
+    let config_path = dir.path().join("valid.toml");
+    std::fs::write(&config_path, "autoInstall = false\n").unwrap();
+    let mut client = LspClient::builder()
+        .arg("--config-file")
+        .arg(config_path.to_str().unwrap())
+        .env_remove("KAKEHASHI_TEST_UNDEFINED")
+        .env_remove("KAKEHASHI_DATA_DIR")
+        .build();
+
+    let response = client.send_request(
+        "initialize",
+        json!({
+            "processId": std::process::id(),
+            "rootUri": null,
+            "capabilities": {},
+            "initializationOptions": {
+                "searchPaths": ["$KAKEHASHI_TEST_UNDEFINED/path"]
+            }
+        }),
+    );
+
+    assert!(
+        response.get("result").is_some(),
+        "initializationOptions keep their existing non-fatal policy: {response}"
     );
 }
 

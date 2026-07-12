@@ -136,7 +136,10 @@ async fn run_async(options: DiagnoseOptions) -> u8 {
     let (service, socket) = LspService::new(Kakehashi::new);
     crate::cli::spawn_client_pump(socket);
     let server = service.inner();
-    server.cli_initialize(&cwd).await;
+    if let Err(error) = server.cli_initialize(&cwd).await {
+        elnln!("error: failed to initialize: {}", error.message);
+        return EXIT_ERROR;
+    }
 
     let code = if options.stdin_filename.is_some() {
         run_stdin(server, &cwd, &options).await

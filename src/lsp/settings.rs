@@ -10,7 +10,11 @@ use std::path::Path;
 pub enum SettingsEventKind {
     Info,
     Warning,
-    /// Hard error surfaced via `window/showMessage` so the user cannot miss it.
+    /// Hard error normally surfaced via `window/showMessage`.
+    ///
+    /// Fatal explicit-config errors instead reject initialization before
+    /// settings events are sent, so the initialize response is their sole
+    /// client-facing report.
     Error,
 }
 
@@ -69,6 +73,11 @@ pub struct SettingsLoadOutcome {
     /// with the didChangeConfiguration path); it is intentionally kept out of
     /// `events` so the many callers that re-load settings do not re-warn.
     pub used_deprecated_root_markers: bool,
+    /// Fatal error from an explicitly requested configuration source.
+    ///
+    /// Missing implicit user/project files remain optional, but a path passed
+    /// through `--config-file` represents user intent and must not be skipped.
+    pub fatal_error: Option<String>,
 }
 
 pub fn load_settings(
@@ -80,29 +89,47 @@ pub fn load_settings(
     let env_fn = crate::config::expand::with_kakehashi_defaults(env_fn);
     let mut events = Vec::new();
     let mut used_deprecated_root_markers = false;
+    let mut fatal_error = None;
 
     // Layer 1: Programmed defaults (configuration-merging-strategy: lowest precedence)
     let defaults = Some(default_settings());
 
     // Layers 2+3: config files (either explicit --config-file or default locations)
-    let config_layers: Vec<Option<RawWorkspaceSettings>> =
-        if let Some(files) = crate::config::expand::config_file_override() {
-            events.push(SettingsEvent::info(format!(
-                "Using {} explicit config file(s); default config locations skipped",
-                files.len()
-            )));
-            files
-                .iter()
-                .map(|p| load_toml_file(p, &mut events, &mut used_deprecated_root_markers))
-                .collect()
-        } else {
-            vec![
-                // Layer 2: User config from XDG_CONFIG_HOME (~/.config/kakehashi/kakehashi.toml)
-                load_user_config_with_events(&mut events, &mut used_deprecated_root_markers),
-                // Layer 3: Project config from root_path/kakehashi.toml
-                load_toml_settings(root_path, &mut events, &mut used_deprecated_root_markers),
-            ]
-        };
+    let config_layers: Vec<Option<RawWorkspaceSettings>> = if let Some(files) =
+        crate::config::expand::config_file_override()
+    {
+        events.push(SettingsEvent::info(format!(
+            "Using {} explicit config file(s); default config locations skipped",
+            files.len()
+        )));
+        let mut layers = Vec::with_capacity(files.len());
+        for path in files {
+            let event_start = events.len();
+            let layer = load_toml_file(path, &mut events, &mut used_deprecated_root_markers);
+            if fatal_error.is_none() {
+                fatal_error = events[event_start..]
+                    .iter()
+                    .find(|event| event.kind == SettingsEventKind::Error)
+                    .map(|event| event.message.clone());
+            }
+            if let Some(raw_settings) = layer.as_ref()
+                && let Err(errs) = WorkspaceSettings::try_from_settings(raw_settings, home, &env_fn)
+            {
+                let message = format!("Path expansion failed in {}: {errs}", path.display());
+                events.push(SettingsEvent::error(message.clone()));
+                fatal_error.get_or_insert(message);
+            }
+            layers.push(layer);
+        }
+        layers
+    } else {
+        vec![
+            // Layer 2: User config from XDG_CONFIG_HOME (~/.config/kakehashi/kakehashi.toml)
+            load_user_config_with_events(&mut events, &mut used_deprecated_root_markers),
+            // Layer 3: Project config from root_path/kakehashi.toml
+            load_toml_settings(root_path, &mut events, &mut used_deprecated_root_markers),
+        ]
+    };
 
     // Layer 4: Override settings from initialization options or client configuration
     let override_settings = override_settings.and_then(|(source, value)| {
@@ -124,26 +151,41 @@ pub fn load_settings(
         .flatten();
     let raw_settings = merged.clone();
     let settings =
-        merged.and_then(
-            |m| match WorkspaceSettings::try_from_settings(&m, home, &env_fn) {
-                Ok(ws) => Some(ws),
-                Err(errs) => {
-                    events.push(SettingsEvent::error(format!(
-                        "Path expansion failed: {errs}. \
-                     This configuration has been discarded; previous settings remain in effect. \
-                     Please correct the affected paths and environment variables or remove them from your config.",
-                    )));
-                    None
-                }
-            },
-        );
+        expand_merged_settings(merged, home, &env_fn, &mut events, fatal_error.is_some());
 
     SettingsLoadOutcome {
         settings,
         raw_settings,
         events,
         used_deprecated_root_markers,
+        fatal_error,
     }
+}
+
+fn expand_merged_settings(
+    merged: Option<RawWorkspaceSettings>,
+    home: Option<&str>,
+    env_fn: impl Fn(&str) -> Option<String>,
+    events: &mut Vec<SettingsEvent>,
+    skip_due_to_fatal_error: bool,
+) -> Option<WorkspaceSettings> {
+    if skip_due_to_fatal_error {
+        return None;
+    }
+
+    merged.and_then(
+        |settings| match WorkspaceSettings::try_from_settings(&settings, home, env_fn) {
+            Ok(settings) => Some(settings),
+            Err(errs) => {
+                events.push(SettingsEvent::error(format!(
+                    "Path expansion failed: {errs}. \
+                     This configuration has been discarded. \
+                     Please correct the affected paths and environment variables or remove them from your config.",
+                )));
+                None
+            }
+        },
+    )
 }
 
 /// Load user config and add appropriate events to the events vector.
@@ -567,6 +609,35 @@ mod tests {
                 .map(|e| format!("{:?}: {}", e.kind, &e.message))
                 .collect::<Vec<_>>()
         );
+        assert!(
+            outcome
+                .events
+                .iter()
+                .all(|event| !event.message.contains("previous settings")),
+            "initialization-time errors must not claim that previous settings exist"
+        );
+    }
+
+    #[test]
+    fn fatal_explicit_error_skips_duplicate_merged_expansion_event() {
+        let merged = RawWorkspaceSettings {
+            search_paths: Some(vec!["$UNDEFINED_VAR/parsers".to_string()]),
+            ..Default::default()
+        };
+        let mut events = vec![SettingsEvent::error(
+            "Path expansion failed in explicit.toml",
+        )];
+
+        let settings = expand_merged_settings(
+            Some(merged),
+            None,
+            crate::config::make_env(&[]),
+            &mut events,
+            true,
+        );
+
+        assert!(settings.is_none());
+        assert_eq!(events.len(), 1, "fatal error must be reported only once");
     }
 
     /// A config layer using the deprecated `rootMarkers` key sets the outcome
