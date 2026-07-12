@@ -261,6 +261,21 @@ fn compile_parser(grammar_path: &Path, output_path: &Path) -> Result<(), ParserI
     Ok(())
 }
 
+fn publish_compiled_parser(tmp_file: &Path, parser_file: &Path) -> Result<(), ParserInstallError> {
+    // On unix `rename` atomically replaces an existing parser. Windows
+    // `rename` instead fails if the destination exists, which would make a
+    // `force` reinstall fail after a good compile — remove the old file
+    // first there (a small non-atomic window, acceptable on the
+    // non-primary platform).
+    #[cfg(windows)]
+    let _ = fs::remove_file(parser_file);
+    if let Err(e) = fs::rename(tmp_file, parser_file) {
+        let _ = fs::remove_file(tmp_file);
+        return Err(ParserInstallError::IoError(e));
+    }
+    Ok(())
+}
+
 /// Install a Tree-sitter parser for a language.
 pub fn install_parser(
     language: &str,
@@ -346,19 +361,7 @@ pub fn install_parser(
         ParserCompile::InProcess => compile_parser_inprocess(&source_dir, &tmp_file),
     };
     match compiled {
-        Ok(()) => {
-            // On unix `rename` atomically replaces an existing parser. Windows
-            // `rename` instead fails if the destination exists, which would make a
-            // `force` reinstall fail after a good compile — remove the old file
-            // first there (a small non-atomic window, acceptable on the
-            // non-primary platform).
-            #[cfg(windows)]
-            let _ = fs::remove_file(&parser_file);
-            if let Err(e) = fs::rename(&tmp_file, &parser_file) {
-                let _ = fs::remove_file(&tmp_file);
-                return Err(ParserInstallError::IoError(e));
-            }
-        }
+        Ok(()) => publish_compiled_parser(&tmp_file, &parser_file)?,
         Err(e) => {
             let _ = fs::remove_file(&tmp_file);
             return Err(e);
