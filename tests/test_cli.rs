@@ -1243,22 +1243,44 @@ fn test_language_uninstall_all() {
 #[test]
 fn test_language_uninstall_does_not_create_missing_data_dir() {
     let parent = tempfile::tempdir().unwrap();
+    let data_dir = parent.path().join("testlang");
+    let output = Command::new(env!("CARGO_BIN_EXE_kakehashi"))
+        .args(["language", "uninstall", "testlang", "--data-dir"])
+        .arg(&data_dir)
+        .arg("--force")
+        .output()
+        .unwrap();
 
-    for args in [vec!["--all"], vec!["testlang"]] {
-        let data_dir = parent.path().join(args[0].trim_start_matches('-'));
-        let output = Command::new(env!("CARGO_BIN_EXE_kakehashi"))
-            .arg("language")
-            .arg("uninstall")
-            .args(&args)
-            .arg("--data-dir")
-            .arg(&data_dir)
-            .arg("--force")
-            .output()
-            .unwrap();
+    assert!(output.status.success());
+    assert!(!data_dir.exists(), "targeted uninstall must remain a no-op");
+}
 
-        assert!(output.status.success());
-        assert!(!data_dir.exists(), "uninstall must remain a no-op");
-    }
+#[test]
+fn test_language_uninstall_all_coordinates_missing_data_dir() {
+    use kakehashi::install::operation_lock::LanguageOperationGuard;
+    use std::fs;
+
+    let parent = tempfile::tempdir().unwrap();
+    let data_dir = parent.path().join("missing");
+    let install = LanguageOperationGuard::shared(&data_dir).unwrap();
+    fs::create_dir_all(data_dir.join("parser")).unwrap();
+    let parser = data_dir
+        .join("parser")
+        .join(format!("lua.{}", std::env::consts::DLL_EXTENSION));
+    fs::write(&parser, "parser").unwrap();
+
+    let mut uninstall = Command::new(env!("CARGO_BIN_EXE_kakehashi"))
+        .args(["language", "uninstall", "--all", "--data-dir"])
+        .arg(&data_dir)
+        .arg("--force")
+        .spawn()
+        .unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    assert!(uninstall.try_wait().unwrap().is_none());
+
+    drop(install);
+    assert!(uninstall.wait().unwrap().success());
+    assert!(!parser.exists());
 }
 
 #[test]

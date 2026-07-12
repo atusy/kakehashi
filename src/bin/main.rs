@@ -740,10 +740,8 @@ fn run_language_uninstall(
     })?;
 
     match std::fs::symlink_metadata(&data_dir) {
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            if all {
-                eprintln!("No languages installed to uninstall.");
-            } else if let Some(language) = language.as_deref() {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound && !all => {
+            if let Some(language) = language.as_deref() {
                 eprintln!("Language '{}' is not installed.", language);
             }
             return Ok(());
