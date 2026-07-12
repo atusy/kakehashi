@@ -71,7 +71,10 @@ impl Kakehashi {
         }
         const MAX_FIRST_LINE_BYTES: u64 = 8 * 1024;
         let Ok(file) = std::fs::File::open(path) else {
-            return false;
+            // Keep the candidate so the command's normal read path reports
+            // the operational error instead of silently treating it as an
+            // unsupported language.
+            return true;
         };
         let mut first_line = String::new();
         if std::io::BufReader::new(file)
@@ -79,7 +82,7 @@ impl Kakehashi {
             .read_line(&mut first_line)
             .is_err()
         {
-            return false;
+            return true;
         }
         self.language
             .loadable_language_for_document(&path.to_string_lossy(), &first_line)
