@@ -1312,8 +1312,8 @@ mod tests {
         let path = temp.path().join("staging");
         let lock = fs::File::create(&path).expect("create staging file");
         lock.lock_exclusive().expect("lock staging file");
-        let mut cmd = Command::new("sh");
-        cmd.arg("-c").arg("sleep 30");
+        let mut cmd = Command::new("sleep");
+        cmd.arg("30");
         inherit_staging_lock(&mut cmd, &lock);
         let mut child = cmd.spawn().expect("spawn lock inheritor");
         drop(lock);
