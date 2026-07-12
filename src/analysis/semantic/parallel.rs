@@ -1267,10 +1267,7 @@ pub(crate) fn collect_injection_tokens_parallel(
         DISCOVERY_REUSE_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let mut contexts = Vec::with_capacity(discovery.regions.len());
         let mut exclusion_byte_ranges = Vec::with_capacity(discovery.regions.len());
-        for region in &discovery.regions {
-            if is_cancelled(cancel) {
-                return (Vec::new(), Vec::new());
-            }
+        let completed = visit_until_cancelled(&discovery.regions, cancel, |region| {
             // A region whose highlight query isn't loaded is dropped (rebuild
             // returns None) — same as the inline path's query-missing branch. The
             // generation match makes this near-impossible, but the drop is safe.
@@ -1285,6 +1282,9 @@ pub(crate) fn collect_injection_tokens_parallel(
             ) {
                 contexts.push(ctx);
             }
+        });
+        if !completed {
+            return (Vec::new(), Vec::new());
         }
         (contexts, exclusion_byte_ranges)
     } else {
@@ -1447,6 +1447,20 @@ pub(crate) fn collect_injection_tokens_parallel(
     (all_tokens, active_regions)
 }
 
+fn visit_until_cancelled<T>(
+    items: &[T],
+    cancel: Option<&crate::cancel::CancelToken>,
+    mut visit: impl FnMut(&T),
+) -> bool {
+    for item in items {
+        if crate::cancel::is_cancelled(cancel) {
+            return false;
+        }
+        visit(item);
+    }
+    true
+}
+
 /// Translate an eligible region's host-absolute tokens into region-local
 /// coordinates for caching: subtract the region's first host line so a stored
 /// entry re-anchors with a single `line += line_start` on reuse. The column is
@@ -1577,6 +1591,20 @@ mod tests {
 
     use super::super::token_collector::build_line_start_bytes;
     use super::*;
+
+    #[test]
+    fn reusable_region_visit_stops_on_mid_loop_cancel() {
+        let cancel = crate::cancel::CancelToken::default();
+        cancel.cancel_after_polls(4);
+        let mut visited = Vec::new();
+
+        assert!(!visit_until_cancelled(
+            &[0, 1, 2, 3, 4],
+            Some(&cancel),
+            |item| visited.push(*item)
+        ));
+        assert_eq!(visited, vec![0, 1, 2]);
+    }
     use crate::language::registry::LanguageRegistry;
 
     fn create_test_registry() -> LanguageRegistry {
