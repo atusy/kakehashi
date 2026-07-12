@@ -33,6 +33,43 @@ use crate::lsp::bridge::protocol::{
 };
 use crate::lsp::bridge::workspace::WorkspaceFolderSet;
 
+struct ShutdownCoordinator {
+    owner: AtomicBool,
+    changed: tokio::sync::Notify,
+}
+
+impl ShutdownCoordinator {
+    fn new() -> Self {
+        Self {
+            owner: AtomicBool::new(false),
+            changed: tokio::sync::Notify::new(),
+        }
+    }
+}
+
+struct ShutdownOwner {
+    coordinator: Arc<ShutdownCoordinator>,
+}
+
+impl ShutdownOwner {
+    fn claim(coordinator: &Arc<ShutdownCoordinator>) -> Option<Self> {
+        coordinator
+            .owner
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .ok()
+            .map(|_| Self {
+                coordinator: Arc::clone(coordinator),
+            })
+    }
+}
+
+impl Drop for ShutdownOwner {
+    fn drop(&mut self) {
+        self.coordinator.owner.store(false, Ordering::Release);
+        self.coordinator.changed.notify_waiters();
+    }
+}
+
 /// Whether `caps` advertises everything the shared-instance opt-in (#391)
 /// needs to drive one connection across roots via
 /// `workspace/didChangeWorkspaceFolders`: `workspace.workspaceFolders` with
@@ -93,8 +130,7 @@ pub(crate) struct ConnectionHandle {
     /// Exactly one caller owns writer reclamation and child termination. Other
     /// shutdown callers wait on `shutdown_complete` instead of competing for the
     /// sole writer or publishing completion early.
-    shutdown_owner: AtomicBool,
-    shutdown_complete: tokio::sync::Notify,
+    shutdown_coordinator: Arc<ShutdownCoordinator>,
     /// Channel sender for outbound messages (ls-bridge-message-ordering single-writer pattern).
     ///
     /// All notifications and requests are queued here and written to stdin
@@ -203,8 +239,7 @@ impl ConnectionHandle {
         Self {
             state: std::sync::RwLock::new(initial_state),
             state_watch,
-            shutdown_owner: AtomicBool::new(false),
-            shutdown_complete: tokio::sync::Notify::new(),
+            shutdown_coordinator: Arc::new(ShutdownCoordinator::new()),
             tx,
             writer_handle: std::sync::Mutex::new(Some(writer_handle)),
             router,
@@ -795,21 +830,15 @@ impl ConnectionHandle {
     /// Valid from Closing or Failed states per ls-bridge-message-ordering/ls-bridge-graceful-shutdown.
     pub(crate) fn complete_shutdown(&self) {
         self.set_state(ConnectionState::Closed);
-        self.shutdown_complete.notify_waiters();
+        self.shutdown_coordinator.changed.notify_waiters();
     }
 
-    pub(crate) fn claim_shutdown_ownership(&self) -> bool {
-        self.state() != ConnectionState::Closed
-            && self
-                .shutdown_owner
-                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-                .is_ok()
-    }
-
-    pub(crate) async fn wait_for_shutdown_completion(&self) {
+    async fn wait_for_shutdown_turn(&self) {
         loop {
-            let notified = self.shutdown_complete.notified();
-            if self.state() == ConnectionState::Closed {
+            let notified = self.shutdown_coordinator.changed.notified();
+            if self.state() == ConnectionState::Closed
+                || !self.shutdown_coordinator.owner.load(Ordering::Acquire)
+            {
                 return;
             }
             notified.await;
@@ -826,18 +855,15 @@ impl ConnectionHandle {
     /// No internal timeout (ls-bridge-timeout-hierarchy): the caller (`shutdown_all_with_timeout`) enforces the
     /// global budget so a slow server can use leftover time without N×timeout multiplication.
     pub(crate) async fn graceful_shutdown(&self) -> io::Result<()> {
-        let owner = self.claim_shutdown_ownership();
-        self.graceful_shutdown_as(owner).await
-    }
-
-    pub(crate) async fn graceful_shutdown_as(&self, owner: bool) -> io::Result<()> {
-        if self.state() == ConnectionState::Closed {
-            return Ok(());
-        }
-        if !owner {
-            self.wait_for_shutdown_completion().await;
-            return Ok(());
-        }
+        let _owner = loop {
+            if self.state() == ConnectionState::Closed {
+                return Ok(());
+            }
+            if let Some(owner) = ShutdownOwner::claim(&self.shutdown_coordinator) {
+                break owner;
+            }
+            self.wait_for_shutdown_turn().await;
+        };
         // 1. Transition to Closing state
         self.begin_shutdown();
 
@@ -1305,12 +1331,12 @@ mod tests {
     #[tokio::test]
     async fn shutdown_waiter_observes_owner_completion_without_regressing_closed() {
         let handle = Arc::new(spawn_sink_handle().await);
-        assert!(handle.claim_shutdown_ownership());
-        assert!(!handle.claim_shutdown_ownership());
+        let owner = ShutdownOwner::claim(&handle.shutdown_coordinator).unwrap();
+        assert!(ShutdownOwner::claim(&handle.shutdown_coordinator).is_none());
 
         let mut waiter = tokio::spawn({
             let handle = Arc::clone(&handle);
-            async move { handle.graceful_shutdown_as(false).await }
+            async move { handle.graceful_shutdown().await }
         });
         assert!(
             tokio::time::timeout(Duration::from_millis(10), &mut waiter)
@@ -1320,9 +1346,29 @@ mod tests {
         );
 
         handle.complete_shutdown();
+        drop(owner);
         waiter.await.unwrap().unwrap();
         handle.begin_shutdown();
         assert_eq!(handle.state(), ConnectionState::Closed);
+    }
+
+    #[tokio::test]
+    async fn aborted_shutdown_owner_relinquishes_ownership() {
+        let handle = Arc::new(spawn_sink_handle().await);
+        let (claimed_tx, claimed_rx) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn({
+            let coordinator = Arc::clone(&handle.shutdown_coordinator);
+            async move {
+                let _owner = ShutdownOwner::claim(&coordinator).unwrap();
+                let _ = claimed_tx.send(());
+                std::future::pending::<()>().await;
+            }
+        });
+        claimed_rx.await.unwrap();
+        task.abort();
+        let _ = task.await;
+
+        assert!(ShutdownOwner::claim(&handle.shutdown_coordinator).is_some());
     }
 
     /// Test that liveness timer does not start in Closing state (ls-bridge-timeout-hierarchy Phase 4).

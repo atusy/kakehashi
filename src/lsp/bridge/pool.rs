@@ -75,12 +75,9 @@ fn same_launch_config(
 
 async fn shutdown_invalidated_connection(key: ConnectionKey, handle: Arc<ConnectionHandle>) {
     const RELOAD_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
-    let owner = handle.claim_shutdown_ownership();
     let shutdown_handle = Arc::clone(&handle);
-    let shutdown_task =
-        tokio::spawn(async move { shutdown_handle.graceful_shutdown_as(owner).await });
-    let abort = shutdown_task.abort_handle();
-    match tokio::time::timeout(RELOAD_SHUTDOWN_TIMEOUT, shutdown_task).await {
+    let mut shutdown_task = tokio::spawn(async move { shutdown_handle.graceful_shutdown().await });
+    match tokio::time::timeout(RELOAD_SHUTDOWN_TIMEOUT, &mut shutdown_task).await {
         Ok(Ok(_)) => {}
         Ok(Err(error)) => {
             log::error!(
@@ -89,26 +86,22 @@ async fn shutdown_invalidated_connection(key: ConnectionKey, handle: Arc<Connect
                 key,
                 error
             );
-            if owner {
-                handle.complete_shutdown();
-            } else {
-                handle.wait_for_shutdown_completion().await;
-            }
+            // A panic drops the RAII owner and wakes waiters. Retry through the
+            // coordinator so another caller can take over physical shutdown.
+            let _ = handle.graceful_shutdown().await;
         }
         Err(_) => {
-            abort.abort();
+            shutdown_task.abort();
+            let _ = shutdown_task.await;
             log::warn!(
                 target: "kakehashi::bridge",
                 "Timed out shutting down invalidated {} connection",
                 key
             );
-            if owner {
-                handle.complete_shutdown();
-            } else {
-                // The active owner remains responsible for the child. Removal
-                // must wait for its completion rather than publishing Closed.
-                handle.wait_for_shutdown_completion().await;
-            }
+            // Aborting drops the RAII owner. Retry through the coordinator: if
+            // another owner is active we wait for it; otherwise this call takes
+            // over and closes the child before cleanup removes the handle.
+            let _ = handle.graceful_shutdown().await;
         }
     }
 }
