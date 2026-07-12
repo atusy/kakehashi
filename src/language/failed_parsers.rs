@@ -13,10 +13,17 @@
 //! Supports concurrent parsing by tracking per-language parsing counts.
 
 use dashmap::{DashMap, DashSet};
+use fs4::fs_std::FileExt;
 use std::fs;
-use std::io;
+use std::io::{self, Read, Seek, Write};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
+
+const PARSING_MARKER_PREFIX: &str = "parsing_in_progress.";
+
+struct SessionMarker {
+    file: std::sync::Mutex<fs::File>,
+}
 
 /// Registry for tracking failed parsers.
 ///
@@ -33,6 +40,9 @@ pub(crate) struct FailedParserRegistry {
     parsing_counts: Arc<DashMap<String, usize>>,
     /// Serializes count transitions with their durable marker update.
     persistence_lock: Arc<std::sync::Mutex<()>>,
+    /// This session's exclusively locked marker. A peer can distinguish this
+    /// live owner from an unlocked marker left by a crashed process.
+    session_marker: Arc<OnceLock<Arc<SessionMarker>>>,
 }
 
 impl FailedParserRegistry {
@@ -43,12 +53,18 @@ impl FailedParserRegistry {
             state_dir: state_dir.to_path_buf(),
             parsing_counts: Arc::new(DashMap::new()),
             persistence_lock: Arc::new(std::sync::Mutex::new(())),
+            session_marker: Arc::new(OnceLock::new()),
         }
     }
 
     /// Path to the "parsing in progress" state file.
     fn parsing_state_path(&self) -> PathBuf {
         self.state_dir.join("parsing_in_progress")
+    }
+
+    fn session_marker_path(&self) -> PathBuf {
+        self.state_dir
+            .join(format!("{PARSING_MARKER_PREFIX}{}", ulid::Ulid::new()))
     }
 
     /// Path to the "failed parsers" list file.
@@ -67,7 +83,18 @@ impl FailedParserRegistry {
         // Load previously failed parsers
         self.load_failed_parsers()?;
 
-        // Check for crash recovery
+        // Serialize recovery scanning with marker creation. Otherwise a peer
+        // could observe a newly-created marker before its owner locks it and
+        // misclassify the live session as crashed.
+        let init_lock = fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(self.state_dir.join("crash_recovery.lock"))?;
+        init_lock.lock_exclusive()?;
+
+        // Recover the legacy single marker written by older versions.
         let parsing_state = self.parsing_state_path();
         if parsing_state.exists() {
             // Previous parsing was interrupted - crash detected!
@@ -88,6 +115,60 @@ impl FailedParserRegistry {
             let _ = fs::remove_file(&parsing_state);
         }
 
+        // Recover only unlocked per-session markers. A locked marker belongs
+        // to another live kakehashi process sharing this state directory.
+        for entry in fs::read_dir(&self.state_dir)? {
+            let entry = entry?;
+            let name = entry.file_name();
+            if !name.to_string_lossy().starts_with(PARSING_MARKER_PREFIX) {
+                continue;
+            }
+            let mut file = fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(entry.path())?;
+            match file.try_lock_exclusive() {
+                Ok(()) => {
+                    let mut content = String::new();
+                    file.read_to_string(&mut content)?;
+                    self.mark_languages_failed(&content)?;
+                    drop(file);
+                    let _ = fs::remove_file(entry.path());
+                }
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+                Err(error) => return Err(error),
+            }
+        }
+
+        if self.session_marker.get().is_none() {
+            let path = self.session_marker_path();
+            let file = fs::OpenOptions::new()
+                .create_new(true)
+                .read(true)
+                .write(true)
+                .open(&path)?;
+            file.lock_exclusive()?;
+            let marker = Arc::new(SessionMarker {
+                file: std::sync::Mutex::new(file),
+            });
+            let _ = self.session_marker.set(marker);
+        }
+
+        Ok(())
+    }
+
+    fn mark_languages_failed(&self, content: &str) -> io::Result<()> {
+        for line in content.lines() {
+            let language = line.trim();
+            if !language.is_empty() {
+                log::error!(
+                    target: "kakehashi::crash_recovery",
+                    "Detected crash during parsing of '{}'. Marking as failed.",
+                    language
+                );
+                self.mark_failed(language)?;
+            }
+        }
         Ok(())
     }
 
@@ -183,16 +264,24 @@ impl FailedParserRegistry {
             .map(|entry| entry.key().clone())
             .collect();
 
-        if !parsing_languages.is_empty() {
-            fs::create_dir_all(&self.state_dir)?;
-            fs::write(self.parsing_state_path(), parsing_languages.join("\n"))?;
-        } else {
-            match fs::remove_file(self.parsing_state_path()) {
-                Ok(()) => {}
-                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-                Err(error) => return Err(error),
-            }
-        }
+        let marker = self
+            .session_marker
+            .get()
+            .ok_or_else(|| io::Error::other("crash recovery registry is not initialized"))?;
+        let mut file = marker
+            .file
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        file.seek(std::io::SeekFrom::Start(0))?;
+        let contents = parsing_languages.join("\n");
+        // Write and flush the new evidence before shortening an older, longer
+        // value. A crash between these operations may retain an extra stale
+        // language (safe over-quarantine), but cannot erase every currently
+        // active language and recreate the crash loop #725 prevents.
+        file.write_all(contents.as_bytes())?;
+        file.sync_data()?;
+        file.set_len(contents.len() as u64)?;
+        file.sync_data()?;
         Ok(())
     }
 }
@@ -217,6 +306,20 @@ impl FailedParserRegistry {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    fn session_marker_contents(state_dir: &Path) -> Vec<String> {
+        fs::read_dir(state_dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(PARSING_MARKER_PREFIX)
+            })
+            .map(|entry| fs::read_to_string(entry.path()).unwrap())
+            .collect()
+    }
 
     impl FailedParserRegistry {
         /// Get the currently parsing languages (test helper).
@@ -316,6 +419,23 @@ mod tests {
     }
 
     #[test]
+    fn test_live_peer_marker_is_not_treated_as_a_crash() {
+        let temp = tempdir().unwrap();
+        let first = FailedParserRegistry::new(temp.path());
+        first.init().unwrap();
+        first.begin_parsing("lua").unwrap();
+
+        let second = FailedParserRegistry::new(temp.path());
+        second.init().unwrap();
+
+        assert!(
+            !second.is_failed("lua"),
+            "a live peer's active parser must not be quarantined"
+        );
+        first.end_parsing_language("lua").unwrap();
+    }
+
+    #[test]
     fn test_successful_parsing_does_not_mark_failed() {
         let temp = tempdir().unwrap();
 
@@ -395,11 +515,7 @@ mod tests {
         registry.begin_parsing("lua").unwrap();
 
         // Verify that crash evidence is durable before native parsing begins.
-        let parsing_state_path = temp.path().join("parsing_in_progress");
-        assert!(
-            parsing_state_path.exists(),
-            "begin_parsing should write parsing_in_progress to disk"
-        );
+        assert_eq!(session_marker_contents(temp.path()), vec!["lua"]);
 
         // Verify that in-memory state is updated (we'll add accessor for this)
         assert_eq!(
@@ -433,11 +549,7 @@ mod tests {
         );
 
         // Successful completion removes the recovery evidence.
-        let parsing_state_path = temp.path().join("parsing_in_progress");
-        assert!(
-            !parsing_state_path.exists(),
-            "end_parsing_language should remove the crash marker"
-        );
+        assert_eq!(session_marker_contents(temp.path()), vec![""]);
     }
 
     #[test]
