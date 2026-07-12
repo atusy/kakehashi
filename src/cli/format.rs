@@ -319,6 +319,7 @@ fn write_atomically(path: &Path, content: &str) -> std::io::Result<()> {
     use std::io::Write as _;
 
     let target = std::fs::canonicalize(path)?;
+    reject_multiple_hard_links(&target)?;
     let dir = target.parent().filter(|p| !p.as_os_str().is_empty());
     let mut tmp = tempfile::NamedTempFile::new_in(dir.unwrap_or(Path::new(".")))?;
     tmp.write_all(content.as_bytes())?;
@@ -333,6 +334,9 @@ fn write_atomically(path: &Path, content: &str) -> std::io::Result<()> {
     // over — after writing, so a read-only target mode can't block the write.
     tmp.as_file()
         .set_permissions(std::fs::metadata(&target)?.permissions())?;
+    // A link can be added while the replacement is prepared. Check again at
+    // the last point before persist would split that new alias from `target`.
+    reject_multiple_hard_links(&target)?;
     tmp.persist(&target).map_err(|e| e.error)?;
     // Best-effort directory fsync: on some filesystems the rename's
     // directory-entry update is itself buffered, so without this a power
@@ -344,4 +348,57 @@ fn write_atomically(path: &Path, content: &str) -> std::io::Result<()> {
         let _ = dir_handle.sync_all();
     }
     Ok(())
+}
+
+#[cfg(unix)]
+fn reject_multiple_hard_links(target: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let links = std::fs::metadata(target)?.nlink();
+    if links > 1 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "refusing atomic replacement of a file with {links} hard links; remove the aliases first"
+            ),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn reject_multiple_hard_links(_target: &Path) -> std::io::Result<()> {
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn write_atomically_rejects_multiply_linked_target_without_changes() {
+        use std::os::unix::fs::MetadataExt as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("source.lua");
+        let alias = dir.path().join("alias.lua");
+        std::fs::write(&target, "old\n").unwrap();
+        std::fs::hard_link(&target, &alias).unwrap();
+        let inode = std::fs::metadata(&target).unwrap().ino();
+        let entries_before = std::fs::read_dir(dir.path()).unwrap().count();
+
+        let error = write_atomically(&target, "new\n").unwrap_err();
+
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(error.to_string().contains("hard link"));
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "old\n");
+        assert_eq!(std::fs::read_to_string(&alias).unwrap(), "old\n");
+        assert_eq!(std::fs::metadata(&target).unwrap().ino(), inode);
+        assert_eq!(std::fs::metadata(&alias).unwrap().ino(), inode);
+        assert_eq!(
+            std::fs::read_dir(dir.path()).unwrap().count(),
+            entries_before
+        );
+    }
 }
