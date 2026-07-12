@@ -1355,6 +1355,54 @@ fn test_language_uninstall_all_rejects_symlinked_install_roots() {
 
 #[cfg(unix)]
 #[test]
+fn test_language_uninstall_rejects_symlinked_install_roots() {
+    use std::fs;
+    use std::os::unix::fs::symlink;
+
+    for root_name in ["parser", "queries"] {
+        let test_dir = tempfile::tempdir().expect("Failed to create temp dir");
+        let data_dir = test_dir.path().join("data");
+        let outside = test_dir.path().join("outside");
+        fs::create_dir_all(&data_dir).expect("Failed to create data dir");
+        let asset = if root_name == "parser" {
+            fs::create_dir_all(&outside).expect("Failed to create outside parser dir");
+            let path = outside.join(format!("lua.{}", std::env::consts::DLL_EXTENSION));
+            fs::write(&path, "fake").expect("Failed to write outside parser");
+            path
+        } else {
+            let path = outside.join("lua/highlights.scm");
+            fs::create_dir_all(path.parent().unwrap()).expect("Failed to create outside query dir");
+            fs::write(&path, "(comment) @comment").expect("Failed to write outside query");
+            path
+        };
+        symlink(&outside, data_dir.join(root_name)).expect("Failed to link install root");
+
+        let output = Command::new(env!("CARGO_BIN_EXE_kakehashi"))
+            .args([
+                "language",
+                "uninstall",
+                "lua",
+                "--data-dir",
+                data_dir.to_str().unwrap(),
+                "--force",
+            ])
+            .output()
+            .expect("Failed to execute command");
+
+        assert!(
+            !output.status.success(),
+            "targeted uninstall must reject symlinked {root_name}; stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            asset.exists(),
+            "outside {root_name} asset must remain untouched"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
 fn test_language_uninstall_all_removes_dangling_parser_entry() {
     use std::fs;
     use std::os::unix::fs::symlink;

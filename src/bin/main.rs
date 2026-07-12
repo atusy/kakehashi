@@ -630,6 +630,16 @@ fn run_language_uninstall(
             eprintln!("Failed to scan installed languages: {e}");
             ExitCode::FAILURE
         })?;
+    } else {
+        // Targeted uninstall does not need to enumerate every entry, but it
+        // still builds removal paths beneath both roots. Reject a symlinked or
+        // non-directory root before recovery/removal can escape data_dir.
+        for (path, kind) in [(&parser_dir, "parser"), (&queries_dir, "queries")] {
+            read_optional_install_dir(path, kind).map_err(|e| {
+                eprintln!("Failed to validate install roots: {e}");
+                ExitCode::FAILURE
+            })?;
+        }
     }
     if let Err(e) = queries::recover_interrupted_query_installs(&queries_dir) {
         if all {
