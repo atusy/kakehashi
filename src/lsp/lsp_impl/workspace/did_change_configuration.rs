@@ -416,6 +416,11 @@ impl Kakehashi {
             }
         };
 
+        // Serialize the snapshot read and publication as one transaction. The
+        // reload lock inside apply_shared_settings starts too late to prevent
+        // two callers deriving replacements from the same old snapshot.
+        let _settings_transaction = self.settings_manager.begin_settings_transaction().await;
+
         // Merge onto current effective settings (not from scratch).
         // The current settings already reflect defaults < user < project < initializationOptions,
         // so merging preserves languages and other fields set during initialize.
