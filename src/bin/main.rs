@@ -718,25 +718,15 @@ fn write_forced_output_with(
     let directory = path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty());
+    let mut builder = tempfile::Builder::new();
     #[cfg(unix)]
-    let created_permissions = {
-        let directory = directory.unwrap_or(std::path::Path::new("."));
-        let probe = directory.join(format!(".kakehashi-mode-{}", ulid::Ulid::new()));
-        let file = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&probe)?;
-        let permissions = file.metadata()?.permissions();
-        drop(file);
-        std::fs::remove_file(probe)?;
-        permissions
-    };
-    let mut temporary =
-        tempfile::NamedTempFile::new_in(directory.unwrap_or(std::path::Path::new(".")))?;
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        builder.permissions(std::fs::Permissions::from_mode(0o666));
+    }
+    let mut temporary = builder.tempfile_in(directory.unwrap_or(std::path::Path::new(".")))?;
     write(temporary.as_file_mut(), content)?;
     temporary.as_file().sync_all()?;
-    #[cfg(unix)]
-    temporary.as_file().set_permissions(created_permissions)?;
 
     match temporary.persist_noclobber(path) {
         Ok(_) => Ok(WriteDisposition::Created),
