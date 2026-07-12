@@ -85,8 +85,7 @@ impl Kakehashi {
         const MAX_FIRST_LINE_BYTES: usize = 8 * 1024;
         let path_text = path.to_string_lossy();
         let mut probe = Vec::with_capacity(MAX_FIRST_LINE_BYTES + 1);
-        if std::io::BufReader::new(file)
-            .take((MAX_FIRST_LINE_BYTES + 1) as u64)
+        if std::io::BufReader::new(file.take((MAX_FIRST_LINE_BYTES + 1) as u64))
             .read_until(b'\n', &mut probe)
             .is_err()
         {
