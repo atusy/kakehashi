@@ -193,9 +193,16 @@ Edge cases:
 
 This holds even when a host node and an injected node share an identical span **and** kind (e.g. recursive same-language injection such as markdown-in-markdown). The identity key carries an injection-`layer` discriminator (lazy-node-identity-tracking § Node Uniqueness Key), so the two are distinct ULIDs and `parent`/`children` resolve each in the tree that minted it.
 
+The layer discriminator identifies a **depth**, not a same-depth region. When
+multiple overlapping injection regions at the same depth contain the requested
+position, `kakehashi/node` returns `null` rather than minting an identity from an
+arbitrary sibling. Accessors likewise return `null` for an already-held ID when
+rebuilding its path becomes ambiguous. Clients must re-acquire after edits, but
+re-acquisition can remain unavailable while the overlap itself persists.
+
 **`null` cases**:
-- `parent`: id not in tracker, **or** id refers to a root node
-- `children` / `namedChildren`: id not in tracker
+- `parent`: id not in tracker, id refers to a root node, **or** its injection layer is ambiguous
+- `children` / `namedChildren`: id not in tracker, **or** its injection layer is ambiguous
 
 **Empty children**: A node that exists but has no children (or no *named* children, for `namedChildren`) returns `[]` (not `null`).
 
@@ -322,7 +329,7 @@ All three collapse to `null`. This is a deliberate consequence of the no-tombsto
 - **Composable API**: Five orthogonal methods cover position lookup, navigation (named + anonymous, or named-only), and content retrieval
 - **No tree-sitter on client**: Editors can implement syntax-aware features without bundling tree-sitter
 - **Lazy memory growth**: Only nodes touched via the protocol consume tracker memory; `namedChildren` further avoids minting IDs for anonymous children a client would discard
-- **Injection-explicit**: Multi-layer language stacks are addressable without ambiguity
+- **Injection-explicit**: Host-vs-injected and unambiguous nested layers are addressable by depth
 - **tree-sitter-faithful named selection**: `namedOnly` and `namedChildren` map 1:1 to `named_descendant_for_byte_range` / `named_children()`, giving editor-default parity (e.g. Neovim `get_node`) in one round trip with no extra ID churn
 - **Predictable error model**: `null` is the universal "not currently resolvable" signal
 
@@ -331,6 +338,7 @@ All three collapse to `null`. This is a deliberate consequence of the no-tombsto
 - **N+1 for positions**: Clients building outline views must call `range` once per node (a bulk `childrenWithRange` remains a possible future addition), or accept paying for it only when needed
 - **No invalidate diagnostics**: Clients cannot tell why an ID failed; they must re-acquire blindly
 - **Cross-injection navigation is two-step**: `parent` does not transparently cross into a host tree
+- **Overlapping same-depth injections are not addressable**: A depth-only identity cannot distinguish sibling regions, so lookup and accessors fail closed with `null`
 - **`injection` mixed mode**: `true` saturates while integer indices are strict (resolve via a single formula, return `null` when out of bounds) — clients must remember which mode they want
 - **Unbounded tracker growth per URI**: Long editing sessions on large files accumulate IDs until `didClose` (no LRU per lazy-node-identity-tracking)
 
