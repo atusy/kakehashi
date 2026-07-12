@@ -561,8 +561,8 @@ fn run_language_uninstall(
     let mut any_failed = false;
     for lang in &languages_to_uninstall {
         // Reject unsafe names before building any path from them: `lang` is
-        // user input and feeds fs::remove_file via find_parser_file, so a
-        // separator-carrying name must not escape the data dir.
+        // user input and feeds both removal APIs, so a separator-carrying name
+        // must not escape the data dir.
         if !queries::is_safe_language_name(lang) {
             // Debug-format: untrusted input could smuggle ANSI escapes.
             eprintln!("✗ Invalid language name {:?}", lang);
@@ -571,20 +571,6 @@ fn run_language_uninstall(
         }
 
         let mut removed_something = false;
-
-        // Remove parser file
-        if let Some(parser_path) = find_parser_file(&parser_dir, lang) {
-            match fs::remove_file(&parser_path) {
-                Ok(()) => {
-                    eprintln!("✓ Removed parser: {}", parser_path.display());
-                    removed_something = true;
-                }
-                Err(e) => {
-                    eprintln!("✗ Failed to remove parser {}: {}", parser_path.display(), e);
-                    any_failed = true;
-                }
-            }
-        }
 
         // Remove queries directory and any kakehashi-created backups under the
         // same lock used by install replacement, so uninstall cannot race a
@@ -601,6 +587,27 @@ fn run_language_uninstall(
             }
             Err(e) => {
                 eprintln!("✗ Failed to remove queries for '{}': {}", lang, e);
+                any_failed = true;
+            }
+        }
+
+        // Make parser removal the final artifact operation. Besides sharing a
+        // lock with parser publication, its tombstone must be written after
+        // query cleanup so an installer that starts during that cleanup cannot
+        // publish a parser after this command reports success.
+        match parser::remove_parser_install(&parser_dir, lang) {
+            Ok(true) => {
+                eprintln!(
+                    "✓ Removed parser: {}",
+                    parser_dir
+                        .join(format!("{}.{}", lang, std::env::consts::DLL_EXTENSION))
+                        .display()
+                );
+                removed_something = true;
+            }
+            Ok(false) => {}
+            Err(e) => {
+                eprintln!("✗ Failed to remove parser for '{}': {}", lang, e);
                 any_failed = true;
             }
         }
