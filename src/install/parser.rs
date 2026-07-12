@@ -494,6 +494,20 @@ fn cleanup_claim_pid(path: &Path) -> Option<u32> {
     (1..=i32::MAX as u32).contains(&pid).then_some(pid)
 }
 
+#[cfg(any(windows, test))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum WindowsProcessProbe {
+    Running,
+    Exited,
+    AccessDenied,
+    UnexpectedFailure,
+}
+
+#[cfg(any(windows, test))]
+fn windows_process_probe_is_running(probe: WindowsProcessProbe) -> bool {
+    !matches!(probe, WindowsProcessProbe::Exited)
+}
+
 #[cfg(unix)]
 fn claim_and_unlink_stale_parser_file(
     parser_dir: &Path,
@@ -1294,6 +1308,22 @@ fn invalid_metadata(message: String) -> ParserInstallError {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    #[test]
+    fn windows_process_probe_only_recovers_confirmed_exits() {
+        assert!(windows_process_probe_is_running(
+            WindowsProcessProbe::Running
+        ));
+        assert!(!windows_process_probe_is_running(
+            WindowsProcessProbe::Exited
+        ));
+        assert!(windows_process_probe_is_running(
+            WindowsProcessProbe::AccessDenied
+        ));
+        assert!(windows_process_probe_is_running(
+            WindowsProcessProbe::UnexpectedFailure
+        ));
+    }
 
     #[cfg(unix)]
     fn terminated_child_pid() -> u32 {
