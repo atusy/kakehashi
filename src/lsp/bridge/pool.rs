@@ -1669,6 +1669,7 @@ impl LanguageServerPool {
         let (marker, connection_key) = self
             .resolve_acquire(server_name, server_config, document_uri)
             .await;
+        let remaining = timeout.saturating_sub(start.elapsed());
 
         // Acquire and wait through initialization for the resolved key.
         let handle = match self
@@ -1677,7 +1678,7 @@ impl LanguageServerPool {
                 server_config,
                 connection_key,
                 marker.clone(),
-                timeout,
+                remaining,
             )
             .await
         {
@@ -2077,14 +2078,22 @@ impl LanguageServerPool {
         let (marker, connection_key) = self
             .resolve_acquire(server_name, server_config, document_uri)
             .await;
-        self.get_or_create_connection_resolved(
-            server_name,
-            server_config,
-            connection_key,
-            marker,
-            timeout,
-        )
-        .await
+        match self
+            .get_or_create_connection_resolved(
+                server_name,
+                server_config,
+                connection_key,
+                marker,
+                timeout,
+            )
+            .await
+        {
+            Err(error) if error.kind() == io::ErrorKind::Unsupported => Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "bridge: shared connection lost workspace-folder support; retry routing",
+            )),
+            result => result,
+        }
     }
 
     /// Get-or-spawn against an ALREADY-resolved `(connection_key, marker)` pair
