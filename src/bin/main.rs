@@ -739,6 +739,18 @@ fn run_language_uninstall(
         ExitCode::FAILURE
     })?;
 
+    match std::fs::symlink_metadata(&data_dir) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            if all {
+                eprintln!("No languages installed to uninstall.");
+            } else if let Some(language) = language.as_deref() {
+                eprintln!("Language '{}' is not installed.", language);
+            }
+            return Ok(());
+        }
+        _ => {}
+    }
+
     let parser_dir = data_dir.join("parser");
     let queries_dir = data_dir.join("queries");
     let targeted_language = if all {
@@ -1059,6 +1071,11 @@ fn run_install(language: &str, force: bool, verbose: bool, no_cache: bool) -> Re
         eprintln!("Error: Could not determine data directory. Please specify --data-dir.");
         ExitCode::FAILURE
     })?;
+
+    if !queries::is_safe_language_name(language) {
+        eprintln!("✗ Invalid language name {:?}", language);
+        return Err(ExitCode::FAILURE);
+    }
 
     // Tombstone clearing, parser publication, and query publication form one
     // install operation relative to bulk uninstall.

@@ -1240,6 +1240,50 @@ fn test_language_uninstall_all() {
     assert!(queries.is_empty(), "All queries should be removed");
 }
 
+#[test]
+fn test_language_uninstall_does_not_create_missing_data_dir() {
+    let parent = tempfile::tempdir().unwrap();
+
+    for args in [vec!["--all"], vec!["testlang"]] {
+        let data_dir = parent.path().join(args[0].trim_start_matches('-'));
+        let output = Command::new(env!("CARGO_BIN_EXE_kakehashi"))
+            .arg("language")
+            .arg("uninstall")
+            .args(&args)
+            .arg("--data-dir")
+            .arg(&data_dir)
+            .arg("--force")
+            .output()
+            .unwrap();
+
+        assert!(output.status.success());
+        assert!(!data_dir.exists(), "uninstall must remain a no-op");
+    }
+}
+
+#[test]
+fn test_language_install_rejects_unsafe_name_before_creating_data_dir() {
+    let parent = tempfile::tempdir().unwrap();
+    let data_dir = parent.path().join("missing");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_kakehashi"))
+        .args([
+            "language",
+            "install",
+            "../../evil",
+            "--data-dir",
+            data_dir.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    assert!(
+        !data_dir.exists(),
+        "invalid input must not create lock state"
+    );
+}
+
 /// A bulk uninstall must include an install that starts after confirmation is
 /// requested but completes before its exclusive snapshot.
 #[test]
@@ -1248,6 +1292,8 @@ fn test_language_uninstall_all_includes_install_completed_before_exclusive_lock(
     use std::fs;
     use std::io::{Read, Write};
     use std::process::Stdio;
+    use std::sync::mpsc;
+    use std::time::Duration;
 
     let test_dir = tempfile::tempdir().expect("Failed to create temp dir");
     fs::create_dir_all(test_dir.path().join("parser")).expect("Failed to create parser dir");
@@ -1266,12 +1312,28 @@ fn test_language_uninstall_all_includes_install_completed_before_exclusive_lock(
         .spawn()
         .expect("Failed to start uninstall command");
 
-    let mut prompt = Vec::new();
-    let stderr = uninstall.stderr.as_mut().unwrap();
-    while !prompt.ends_with(b"[y/N] ") {
-        let mut byte = [0];
-        assert_eq!(stderr.read(&mut byte).unwrap(), 1, "prompt ended early");
-        prompt.push(byte[0]);
+    let mut stderr = uninstall.stderr.take().unwrap();
+    let (prompt_tx, prompt_rx) = mpsc::channel();
+    let prompt_reader = std::thread::spawn(move || {
+        let mut prompt = Vec::new();
+        while !prompt.ends_with(b"[y/N] ") {
+            let mut byte = [0];
+            if stderr.read(&mut byte)? == 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "prompt ended early",
+                ));
+            }
+            prompt.push(byte[0]);
+        }
+        prompt_tx.send(()).map_err(|_| {
+            std::io::Error::new(std::io::ErrorKind::BrokenPipe, "prompt receiver dropped")
+        })?;
+        Ok::<_, std::io::Error>(stderr)
+    });
+    if prompt_rx.recv_timeout(Duration::from_secs(2)).is_err() {
+        let _ = uninstall.kill();
+        panic!("timed out waiting for uninstall confirmation prompt");
     }
 
     // This install starts after the prompt and holds the shared side while it
@@ -1287,6 +1349,7 @@ fn test_language_uninstall_all_includes_install_completed_before_exclusive_lock(
     let status = uninstall
         .wait()
         .expect("Failed to wait for uninstall command");
+    prompt_reader.join().unwrap().unwrap();
     assert!(status.success(), "Uninstall --all should succeed");
     assert!(
         !parser.exists(),
