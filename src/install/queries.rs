@@ -818,8 +818,15 @@ fn newest_complete_backup_dir(
     };
     let mut newest: Option<(std::time::SystemTime, PathBuf)> = None;
 
-    for entry in entries.flatten() {
+    for entry in entries {
+        let entry = entry?;
         let path = entry.path();
+        // This helper is also called independently of the outer recovery scan.
+        // Never follow a generated-name backup symlink or suppress entry-type
+        // errors while selecting a directory to rename into the canonical path.
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
         let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
             continue;
         };
@@ -1267,6 +1274,28 @@ mod tests {
         write_backup_ownership_marker(&backup).unwrap();
 
         recover_interrupted_query_installs(&queries_parent).unwrap();
+
+        assert!(!queries_parent.join("lua").exists());
+        assert!(fs::symlink_metadata(&backup).is_ok());
+        assert!(outside.join("highlights.scm").exists());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn per_language_recovery_does_not_follow_backup_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let temp = TempDir::new().unwrap();
+        let queries_parent = temp.path().join("queries");
+        let outside = temp.path().join("outside");
+        fs::create_dir_all(&queries_parent).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(outside.join("highlights.scm"), "(comment) @comment\n").unwrap();
+        let backup = queries_parent.join(".lua.4294967295.0.backup");
+        symlink(&outside, &backup).unwrap();
+        write_backup_ownership_marker(&backup).unwrap();
+
+        recover_interrupted_query_install(&queries_parent, "lua").unwrap();
 
         assert!(!queries_parent.join("lua").exists());
         assert!(fs::symlink_metadata(&backup).is_ok());
