@@ -568,12 +568,10 @@ fn claim_and_unlink_stale_parser_file(
             Ok(()) => {
                 let current = fs::symlink_metadata(&claimed)?;
                 if opened.dev() != current.dev() || opened.ino() != current.ino() {
-                    // A non-cooperating actor replaced the pathname just before
-                    // the atomic claim. Restore it when the original name is
-                    // still free; never delete the unexpected inode.
-                    let _ = fs::rename(&claimed, path);
+                    // Never restore with rename: Unix rename would overwrite a
+                    // new entry created at the original pathname. Invalidate
+                    // provenance and retain the unexpected inode in the claim.
                     let _ = fs::remove_file(&marker);
-                    let _ = fs::remove_dir(&candidate);
                     return Ok(None);
                 }
                 return Ok(Some(candidate));
@@ -597,16 +595,33 @@ const PARSER_CLEANUP_MARKER: &[u8] = b"kakehashi parser cleanup v1\n";
 #[cfg(unix)]
 fn remove_stale_cleanup_claim(path: &Path) {
     use std::io::Read;
-    use std::os::unix::fs::OpenOptionsExt;
+    use std::os::unix::fs::MetadataExt;
 
-    let marker = path.join("owner");
-    let Ok(file) = fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(nix::libc::O_NOFOLLOW)
-        .open(&marker)
-    else {
+    use nix::fcntl::{OFlag, open, openat};
+    use nix::sys::stat::Mode;
+    use nix::unistd::{UnlinkatFlags, unlinkat};
+
+    let Ok(dir_fd) = open(
+        path,
+        OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW,
+        Mode::empty(),
+    ) else {
         return;
     };
+    let dir = fs::File::from(dir_fd);
+    let Ok(opened) = dir.metadata() else {
+        return;
+    };
+
+    let Ok(marker_fd) = openat(
+        &dir,
+        "owner",
+        OFlag::O_RDONLY | OFlag::O_NOFOLLOW,
+        Mode::empty(),
+    ) else {
+        return;
+    };
+    let file = fs::File::from(marker_fd);
     let mut contents = Vec::with_capacity(PARSER_CLEANUP_MARKER.len() + 1);
     if file
         .take(PARSER_CLEANUP_MARKER.len() as u64 + 1)
@@ -616,9 +631,19 @@ fn remove_stale_cleanup_claim(path: &Path) {
     {
         return;
     }
-    // The private, marker-bearing directory is the durable ownership record.
-    // remove_dir_all does not traverse a directory symlink swapped into `path`.
-    let _ = fs::remove_dir_all(path);
+    // Remove only the two protocol-owned entries through the opened directory
+    // descriptor. A rename-and-replace of `path` cannot redirect these unlinks.
+    let _ = unlinkat(&dir, "artifact", UnlinkatFlags::NoRemoveDir);
+    let _ = unlinkat(&dir, "owner", UnlinkatFlags::NoRemoveDir);
+
+    // The remaining directory is empty. Verify the pathname still names the
+    // opened directory before removing it; never recurse through the pathname.
+    let Ok(current) = fs::symlink_metadata(path) else {
+        return;
+    };
+    if opened.dev() == current.dev() && opened.ino() == current.ino() {
+        let _ = fs::remove_dir(path);
+    }
 }
 
 #[cfg(unix)]
@@ -669,7 +694,7 @@ fn cleanup_interrupted_parser_installs(parser_dir: &Path) -> Result<(), ParserIn
             let Some(claimed) = claim_and_unlink_stale_parser_file(parser_dir, &path)? else {
                 continue;
             };
-            let _ = fs::remove_dir_all(claimed);
+            remove_stale_cleanup_claim(&claimed);
         }
     }
     Ok(())
