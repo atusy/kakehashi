@@ -1825,6 +1825,50 @@ fn test_language_uninstall_cancel_does_not_recover_unrelated_languages() {
 
 #[cfg(unix)]
 #[test]
+fn test_language_uninstall_ignores_unrelated_unreadable_recovery_state() {
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+
+    let test_dir = tempfile::tempdir().expect("Failed to create temp dir");
+    let unrelated_tmp = test_dir.path().join("queries/.python.4294967295.0.tmp");
+    fs::create_dir_all(&unrelated_tmp).expect("Failed to create unrelated recovery temp");
+    fs::write(unrelated_tmp.join("query.scm"), "(comment) @comment")
+        .expect("Failed to write unrelated recovery query");
+    fs::set_permissions(&unrelated_tmp, fs::Permissions::from_mode(0o000))
+        .expect("Failed to make unrelated recovery state unreadable");
+    if fs::read_dir(&unrelated_tmp).is_ok() {
+        fs::set_permissions(&unrelated_tmp, fs::Permissions::from_mode(0o700))
+            .expect("Failed to restore recovery permissions");
+        return;
+    }
+
+    let output = Command::new(env!("CARGO_BIN_EXE_kakehashi"))
+        .args([
+            "language",
+            "uninstall",
+            "lua",
+            "--data-dir",
+            test_dir.path().to_str().unwrap(),
+            "--force",
+        ])
+        .output()
+        .expect("Failed to execute command");
+
+    fs::set_permissions(&unrelated_tmp, fs::Permissions::from_mode(0o700))
+        .expect("Failed to restore recovery permissions");
+    assert!(
+        output.status.success(),
+        "unrelated recovery state must not block targeted uninstall: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        unrelated_tmp.exists(),
+        "unrelated recovery state must remain"
+    );
+}
+
+#[cfg(unix)]
+#[test]
 fn test_language_uninstall_all_query_removal_failure_preserves_parser() {
     use std::fs;
     use std::os::unix::fs::PermissionsExt;

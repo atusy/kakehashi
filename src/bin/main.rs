@@ -661,7 +661,7 @@ fn preflight_targeted_query_state(queries_dir: &Path, language: &str) -> Result<
             .file_type()
             .map_err(|e| format!("cannot inspect query entry '{}': {e}", path.display()))?;
         let is_target = name == language;
-        let is_recovery = queries::is_recovery_directory_name(name);
+        let is_recovery = queries::recovery_directory_language(name) == Some(language);
         if is_target && !(file_type.is_dir() || file_type.is_symlink()) {
             return Err(format!(
                 "query entry '{}' is not a directory or symlink",
