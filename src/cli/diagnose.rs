@@ -422,6 +422,7 @@ fn format_diagnostic(format: OutputFormat, display: &str, diagnostic: &Diagnosti
     let col = diagnostic.range.start.character.saturating_add(1);
     match format {
         OutputFormat::Default => {
+            let display = one_line(display);
             let severity = severity_word(diagnostic.severity);
             let message = one_line(&diagnostic.message);
             // Branch on the source rather than building a separate ` [src]`
@@ -633,6 +634,16 @@ mod tests {
         assert_eq!(
             format_diagnostic(OutputFormat::Default, "a.md", &d),
             "a.md:1:1: hint: hint here"
+        );
+    }
+
+    #[test]
+    fn default_format_escapes_controls_in_display_path() {
+        let d = diag(0, 0, Some(DiagnosticSeverity::ERROR), "boom");
+
+        assert_eq!(
+            format_diagnostic(OutputFormat::Default, "dir/\u{1b}[2Jfile\nname", &d),
+            "dir/\\u{1b}[2Jfile name:1:1: error: boom"
         );
     }
 
