@@ -77,6 +77,11 @@ impl Kakehashi {
             return true;
         };
         let mut first_line = Vec::new();
+        // Intentionally read the complete first line: syntect's first-line
+        // rules include mode markers that may occur near its end, and applying
+        // a different cutoff here would recreate explicit-vs-directory drift.
+        // This runs only for path-detection misses, one file at a time, and
+        // retains less data than normal processing (which reads the full file).
         if std::io::BufReader::new(file)
             .read_until(b'\n', &mut first_line)
             .is_err()
