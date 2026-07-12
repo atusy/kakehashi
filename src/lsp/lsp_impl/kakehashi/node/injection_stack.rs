@@ -39,6 +39,10 @@ pub(super) struct InjectionLayer {
     /// parent's, so container exclusions (e.g. blockquote `> ` prefixes) are
     /// inherited down the nesting chain.
     pub(super) ranges: Vec<tree_sitter::Range>,
+    /// More than one same-depth injection region contained the cursor when
+    /// this layer was selected. A depth-only id cannot identify the minting
+    /// sibling, so id-based accessors must reject this layer.
+    ambiguous: bool,
 }
 
 /// Whether `pattern_index` carries an `#offset!` directive. Used to decide if
@@ -85,6 +89,7 @@ pub(super) fn injection_stack_at(
     stack.push(InjectionLayer {
         tree: host_tree.clone(),
         ranges: vec![whole_document_range(host_text)],
+        ambiguous: false,
     });
 
     let mut current_language: String = host_language.to_string();
@@ -106,6 +111,7 @@ pub(super) fn injection_stack_at(
         let parent_layer = stack
             .last()
             .expect("stack always contains at least the host layer");
+        let parent_ambiguous = parent_layer.ambiguous;
         let parent_ranges = parent_layer.ranges.clone();
         let root = parent_layer.tree.root_node();
         let Some(injections) = collect_all_injections(&root, host_text, Some(&injection_query))
@@ -166,6 +172,10 @@ pub(super) fn injection_stack_at(
         // Smallest effective span wins — that's the most specific injection at
         // the cursor after offset/include adjustments.
         candidates.sort_by_key(|(_, ranges)| total_span(ranges));
+        // Once an ancestor was ambiguous, every descendant is ambiguous too:
+        // rebuilding the same child path inside the chosen smallest parent
+        // still cannot prove that parent was the sibling which minted the id.
+        let ambiguous = parent_ambiguous || candidates.len() > 1;
         let Some((region, absolute_ranges)) = candidates.into_iter().next() else {
             break;
         };
@@ -199,6 +209,7 @@ pub(super) fn injection_stack_at(
         stack.push(InjectionLayer {
             tree: injected_tree,
             ranges: absolute_ranges,
+            ambiguous,
         });
         current_language = resolved_lang;
     }
@@ -225,9 +236,11 @@ pub(super) fn injection_stack_at(
 /// identity: an edit that restructures the nesting while keeping
 /// `stack.len() > layer` can leave a *different* tree at that depth. Resolution
 /// then succeeds only if that tree happens to hold a node at the identical
-/// `(start, end, kind)`, and otherwise returns `None`. We do not (and with a
-/// depth index cannot) detect that case, so the "re-acquire on `null`" contract
-/// — not a wrong-tree guarantee — is what protects clients. See the
+/// `(start, end, kind)`, and otherwise returns `None`. The resolver rejects a
+/// layer when multiple same-depth regions contain the anchor, closing the
+/// known overlapping-sibling path (#350), but a depth index still cannot
+/// detect every cross-edit replacement of one non-overlapping region by
+/// another. See the
 /// layer-discriminator options in lazy-node-identity-tracking for the
 /// region-ULID alternative that would close this gap.
 ///
@@ -315,6 +328,9 @@ pub(super) fn with_resolved_node_ranges<R>(
     // only. `stack.get(layer)` is None when the nesting is now shallower.
     let stack = injection_stack_at(coordinator, host_language, host_text, host_tree, start);
     let layer_entry = stack.get(layer)?;
+    if layer_entry.ambiguous {
+        return None;
+    }
     let node = find_node_at(&layer_entry.tree, start, end, kind)?;
     Some(f(node, &layer_entry.ranges))
 }
@@ -363,6 +379,9 @@ pub(super) fn with_resolved_node_pair<R>(
 
     let stack = injection_stack_at(coordinator, host_language, host_text, host_tree, desc_start);
     let layer_entry = stack.get(layer)?;
+    if layer_entry.ambiguous {
+        return None;
+    }
     let resolved_node = find_node_at(&layer_entry.tree, node_start, node_end, node_kind)?;
     let resolved_desc = find_node_at(&layer_entry.tree, desc_start, desc_end, desc_kind)?;
     Some(f(resolved_node, resolved_desc))
@@ -785,15 +804,12 @@ pub(crate) fn collect_document_layer_trees(
 /// [`collect_injection_languages_in_document`]. `byte_filter` prunes regions
 /// (and their entire subtrees) that don't intersect the given host-byte range.
 ///
-/// Known limitation (#350): when two injection regions at the same depth
-/// **overlap**, the walker visits both, but [`with_resolved_node`] resolves a
-/// minted id by rebuilding the cursor-path stack, which keeps only the
-/// smallest region containing the byte — so an id minted from the larger
-/// sibling may resolve in the **wrong same-depth region** (if that region's
-/// tree happens to hold a node with the identical `(start, end, kind)`) or
-/// return `null` (the protocol's re-acquire signal). Same depth-as-identity
-/// weakness documented in lazy-node-identity-tracking; disjoint same-depth
-/// regions (the norm) are unaffected.
+/// Overlapping same-depth regions remain unaddressable by the depth index:
+/// the walker visits both, while the cursor-path stack keeps the smallest.
+/// [`with_resolved_node`] therefore rejects such an ambiguous layer instead
+/// of risking wrong-tree resolution (#350). A durable region identity is
+/// still required to make those ids navigable; disjoint same-depth regions
+/// (the norm) are unaffected.
 pub(in crate::lsp::lsp_impl::kakehashi) fn walk_document_layers(
     coordinator: &LanguageCoordinator,
     host_language: &str,
@@ -1023,6 +1039,75 @@ mod tests {
         assert_eq!(
             ranges[0].end_point,
             tree_sitter::Point { row: 3, column: 0 }
+        );
+    }
+
+    #[test]
+    fn overlapping_same_depth_regions_do_not_resolve_an_ambiguous_node() {
+        let query_root = tempfile::tempdir().expect("create query root");
+        let query_dir = query_root.path().join("queries/markdown");
+        std::fs::create_dir_all(&query_dir).expect("create markdown query dir");
+        std::fs::write(
+            query_dir.join("injections.scm"),
+            r#"
+            ((section) @injection.content
+              (#set! injection.language "markdown")
+              (#set! injection.include-children))
+            ((paragraph) @injection.content
+              (#set! injection.language "markdown")
+              (#set! injection.include-children))
+            "#,
+        )
+        .expect("write overlapping injection query");
+
+        let grammar_root = std::env::var("TREE_SITTER_GRAMMARS")
+            .unwrap_or_else(|_| "deps/test/kakehashi".to_string());
+        let coordinator = LanguageCoordinator::new();
+        let settings = crate::config::WorkspaceSettings {
+            search_paths: vec![
+                query_root.path().to_string_lossy().into_owned(),
+                grammar_root,
+            ],
+            ..Default::default()
+        };
+        let _ = coordinator.load_settings(&settings);
+        if !coordinator.ensure_language_loaded("markdown").success {
+            eprintln!("Skipping: markdown parser not available");
+            return;
+        }
+
+        let text = "# heading\n\nambiguous paragraph\n";
+        let mut pool = coordinator.create_document_parser_pool();
+        let Some(mut parser) = pool.acquire("markdown") else {
+            return;
+        };
+        let tree = parser.parse(text, None).expect("parse markdown");
+        pool.release("markdown".to_string(), parser);
+
+        let mut paragraph = tree
+            .root_node()
+            .descendant_for_byte_range(text.find("ambiguous").unwrap(), text.len() - 1)
+            .expect("paragraph node");
+        while paragraph.kind() != "paragraph" {
+            paragraph = paragraph.parent().expect("paragraph ancestor");
+        }
+        assert_eq!(paragraph.kind(), "paragraph");
+
+        let resolved = with_resolved_node(
+            &coordinator,
+            "markdown",
+            text,
+            &tree,
+            paragraph.start_byte(),
+            paragraph.end_byte(),
+            paragraph.kind(),
+            1,
+            |node| (node.start_byte(), node.end_byte(), node.kind()),
+        );
+
+        assert_eq!(
+            resolved, None,
+            "a depth-only id cannot prove which overlapping sibling minted it"
         );
     }
 }
