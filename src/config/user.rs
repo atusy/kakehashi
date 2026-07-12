@@ -75,7 +75,8 @@ pub(crate) struct UserConfig {
 /// Returns:
 /// - `Ok(Some(config))` if the file exists and is valid TOML
 /// - `Ok(None)` if the file does not exist (zero-config experience preserved)
-/// - `Err(UserConfigError)` if the file exists but contains invalid TOML
+/// - `Err(UserConfigError)` if the configured path cannot be read or contains
+///   invalid TOML
 pub fn load_user_config() -> UserConfigResult<Option<UserConfig>> {
     let path = match user_config_path() {
         Some(p) => p,
@@ -98,7 +99,17 @@ pub fn load_user_config() -> UserConfigResult<Option<UserConfig>> {
                         source: metadata_error,
                     });
                 }
-                Ok(_) => return Err(UserConfigError::IoError { path, source }),
+                Ok(_) => {
+                    // The path may have appeared after the first read. Retry
+                    // once so a concurrent atomic install does not surface a
+                    // stale NotFound; a dangling symlink still fails here.
+                    std::fs::read_to_string(&path).map_err(|retry_source| {
+                        UserConfigError::IoError {
+                            path: path.clone(),
+                            source: retry_source,
+                        }
+                    })?
+                }
             }
         }
         Err(source) => {
@@ -173,6 +184,32 @@ mod tests {
     use super::*;
     use serial_test::serial;
     use std::env;
+
+    struct EnvVarGuard {
+        key: &'static str,
+        original: Option<std::ffi::OsString>,
+    }
+
+    impl EnvVarGuard {
+        fn set(key: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
+            let original = env::var_os(key);
+            // SAFETY: callers serialize every test that mutates this key.
+            unsafe { env::set_var(key, value) };
+            Self { key, original }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            // SAFETY: callers serialize every test that mutates this key.
+            unsafe {
+                match &self.original {
+                    Some(value) => env::set_var(self.key, value),
+                    None => env::remove_var(self.key),
+                }
+            }
+        }
+    }
 
     #[test]
     #[serial(xdg_env)]
@@ -297,23 +334,14 @@ mod tests {
         use std::os::unix::fs::symlink;
         use tempfile::TempDir;
 
-        let original = env::var("XDG_CONFIG_HOME").ok();
         let temp_dir = TempDir::new().expect("failed to create temp dir");
         let config_dir = temp_dir.path().join("kakehashi");
         std::fs::create_dir_all(&config_dir).expect("failed to create config dir");
         symlink("missing.toml", config_dir.join("kakehashi.toml"))
             .expect("failed to create dangling config symlink");
 
-        // SAFETY: #[serial(xdg_env)] prevents concurrent modification of XDG_CONFIG_HOME.
-        unsafe { env::set_var("XDG_CONFIG_HOME", temp_dir.path()) };
+        let _xdg = EnvVarGuard::set("XDG_CONFIG_HOME", temp_dir.path());
         let result = load_user_config();
-        // SAFETY: #[serial(xdg_env)] prevents concurrent modification of XDG_CONFIG_HOME.
-        unsafe {
-            match original {
-                Some(value) => env::set_var("XDG_CONFIG_HOME", value),
-                None => env::remove_var("XDG_CONFIG_HOME"),
-            }
-        }
 
         assert!(
             matches!(result, Err(UserConfigError::IoError { .. })),
