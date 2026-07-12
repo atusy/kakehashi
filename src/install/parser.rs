@@ -395,6 +395,10 @@ pub fn install_parser(
         }
         ParserCompile::InProcess => compile_parser_inprocess(&source_dir, &tmp_file),
     };
+    // On Windows this is the parent's no-delete-sharing staging handle. The
+    // compiler has returned (and its overlapping child handle is closed), so
+    // release ours before the final rename or error-path removal.
+    drop(tmp_lock);
     match compiled {
         Ok(()) => {
             // On unix `rename` atomically replaces an existing parser. Windows
