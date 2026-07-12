@@ -317,7 +317,8 @@ fn e2e_directory_walk_formats_extensionless_shebang_file() {
     // character. Discovery must continue assembling the complete valid UTF-8
     // first line and still detect its shebang language.
     let source = format!("{prefix}{padding}é\nvalue = 1\n");
-    let ws = workspace_with(&[("tool", &source)]);
+    let late_mode_line = format!("{}-*- C++ -*-\nvalue = 2\n", " ".repeat(12 * 1024));
+    let ws = workspace_with(&[("tool", &source), ("modeline", &late_mode_line)]);
     let unknown = "x".repeat(9 * 1024);
     std::fs::write(ws.path().join("unknown"), &unknown).expect("write unknown text file");
     let sparse_path = ws.path().join("binary");
@@ -337,7 +338,10 @@ fn e2e_directory_walk_formats_extensionless_shebang_file() {
     sparse.write_all(&[0xff]).expect("mark sparse as binary");
     std::fs::write(
         ws.path().join("kakehashi.toml"),
-        config_toml().replace("languages = [\"lua\"]", "languages = [\"python\"]"),
+        format!(
+            "{}\n[languages.cpp]\nbase = \"lua\"\n",
+            config_toml().replace("languages = [\"lua\"]", "languages = [\"python\", \"lua\"]")
+        ),
     )
     .expect("write Python formatter config");
 
@@ -353,6 +357,12 @@ fn e2e_directory_walk_formats_extensionless_shebang_file() {
         formatted.starts_with("#!/USR/BIN/ENV PYTHON"),
         "directory walk should use shebang detection; content: {:?}; stderr: {}",
         formatted,
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(read(ws.path(), "modeline"), late_mode_line);
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("1 unchanged"),
+        "the late mode-line file should be collected even though no formatter applies; stderr: {}",
         String::from_utf8_lossy(&output.stderr)
     );
     assert_eq!(read(ws.path(), "unknown"), unknown);

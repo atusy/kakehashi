@@ -61,14 +61,14 @@ impl Kakehashi {
     }
 
     /// Whether a file discovered during a directory walk identifies a known
-    /// language by path or by a bounded first-line probe. Only path misses read
-    /// content. Files whose probe is truncated are retained for authoritative
-    /// detection during normal processing, preserving explicit-file parity
-    /// without unbounded allocation during discovery. Files whose
+    /// language by path or by a memory-bounded streaming scan of its first
+    /// line. Only path misses read content. The scan keeps overlapping windows
+    /// so shebangs and mode markers beyond the first buffer remain detectable
+    /// without retaining an arbitrarily long line. Files whose
     /// first-line I/O fails are retained so the command's normal read path can
     /// report the operational error; invalid UTF-8 is filtered as non-text.
     pub(crate) fn cli_can_handle_discovered_file(&self, path: &Path) -> bool {
-        use std::io::{BufRead as _, Read as _};
+        use std::io::Read as _;
 
         if self.cli_can_handle_path(path) {
             return true;
@@ -79,36 +79,51 @@ impl Kakehashi {
             // unsupported language.
             return true;
         };
-        const MAX_FIRST_LINE_BYTES: usize = 8 * 1024;
-        let mut first_line = Vec::new();
-        if std::io::BufReader::new(file)
-            .take((MAX_FIRST_LINE_BYTES + 1) as u64)
-            .read_until(b'\n', &mut first_line)
-            .is_err()
-        {
-            return true;
-        }
-        let truncated = first_line.len() > MAX_FIRST_LINE_BYTES;
-        let probe = &first_line[..first_line.len().min(MAX_FIRST_LINE_BYTES)];
-        let first_line = match std::str::from_utf8(probe) {
-            Ok(line) => line,
-            // A valid multibyte character may straddle the hard probe boundary.
-            Err(error) if truncated && error.error_len().is_none() => {
-                std::str::from_utf8(&probe[..error.valid_up_to()])
-                    .expect("valid_up_to always identifies valid UTF-8")
+        const READ_CHUNK_BYTES: usize = 4 * 1024;
+        const WINDOW_BYTES: usize = 8 * 1024;
+        let path = path.to_string_lossy();
+        let mut reader = std::io::BufReader::new(file);
+        let mut chunk = [0; READ_CHUNK_BYTES];
+        let mut window = Vec::with_capacity(WINDOW_BYTES + READ_CHUNK_BYTES);
+        loop {
+            let read = match reader.read(&mut chunk) {
+                Ok(0) => return false,
+                Ok(read) => read,
+                Err(_) => return true,
+            };
+            let line_end = chunk[..read]
+                .iter()
+                .position(|byte| *byte == b'\n')
+                .map_or(read, |index| index + 1);
+            window.extend_from_slice(&chunk[..line_end]);
+
+            let valid = match std::str::from_utf8(&window) {
+                Ok(valid) => valid,
+                Err(error) if error.error_len().is_none() => {
+                    std::str::from_utf8(&window[..error.valid_up_to()])
+                        .expect("valid_up_to always identifies valid UTF-8")
+                }
+                Err(_) => return false,
+            };
+            if self
+                .language
+                .loadable_language_for_document(&path, valid)
+                .is_some()
+            {
+                return true;
             }
-            // Unknown extensionless binary content cannot participate in text
-            // language detection.
-            Err(_) => return false,
-        };
-        if truncated {
-            // Syntect mode markers can occur after the probe. Keep valid text
-            // so the normal full-document path makes the authoritative choice.
-            return true;
+            if line_end < read || chunk[..line_end].ends_with(b"\n") {
+                return false;
+            }
+
+            if window.len() > WINDOW_BYTES {
+                let mut keep_from = window.len() - WINDOW_BYTES;
+                while keep_from < window.len() && (window[keep_from] & 0b1100_0000) == 0b1000_0000 {
+                    keep_from += 1;
+                }
+                window.drain(..keep_from);
+            }
         }
-        self.language
-            .loadable_language_for_document(&path.to_string_lossy(), first_line)
-            .is_some()
     }
 
     /// Gracefully shut down downstream language servers (LSP shutdown/exit
