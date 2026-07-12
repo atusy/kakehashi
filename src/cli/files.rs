@@ -18,13 +18,15 @@ use std::path::{Path, PathBuf};
 
 fn has_symlink_ancestor(
     path: &Path,
-    base: &Path,
+    boundary: Option<&Path>,
     cache: &mut std::collections::HashMap<PathBuf, bool>,
 ) -> bool {
-    let is_within_base = path.starts_with(base);
+    let is_within_boundary = boundary.is_some_and(|boundary| path.starts_with(boundary));
     path.ancestors()
         .skip(1)
-        .take_while(|ancestor| !is_within_base || ancestor.starts_with(base))
+        .take_while(|ancestor| {
+            !is_within_boundary || boundary.is_some_and(|boundary| ancestor.starts_with(boundary))
+        })
         .any(|ancestor| {
             *cache.entry(ancestor.to_path_buf()).or_insert_with(|| {
                 std::fs::symlink_metadata(ancestor)
@@ -116,6 +118,7 @@ pub(crate) fn collect_files(
     let mut walk_errors = 0usize;
     let mut explicit_inputs = Vec::new();
     let mut ancestor_symlinks = std::collections::HashMap::new();
+    let mut has_outside_input = false;
     for path in paths {
         // Normalize before stat: a relative path must resolve against
         // `base`, not against whatever the process cwd happens to be.
@@ -134,8 +137,9 @@ pub(crate) fn collect_files(
                 continue;
             }
             if paths.len() > 1 {
+                has_outside_input |= !path.starts_with(base);
                 let has_alias =
-                    is_symlink || has_symlink_ancestor(&path, base, &mut ancestor_symlinks);
+                    is_symlink || has_symlink_ancestor(&path, Some(base), &mut ancestor_symlinks);
                 explicit_inputs.push((path.clone(), true, has_alias));
             }
             walk_errors += walk_directory(&path, &exclude_matcher, is_supported, &mut files);
@@ -144,15 +148,18 @@ pub(crate) fn collect_files(
                 continue;
             }
             if paths.len() > 1 {
+                has_outside_input |= !path.starts_with(base);
                 let has_alias =
-                    is_symlink || has_symlink_ancestor(&path, base, &mut ancestor_symlinks);
+                    is_symlink || has_symlink_ancestor(&path, Some(base), &mut ancestor_symlinks);
                 explicit_inputs.push((path.clone(), false, has_alias));
             }
             files.push(path);
         }
     }
     files.sort();
-    let has_explicit_alias = if explicit_inputs.iter().any(|input| input.2) {
+    let may_have_explicit_alias = explicit_inputs.iter().any(|input| input.2)
+        || (has_outside_input && has_symlink_ancestor(base, None, &mut ancestor_symlinks));
+    let has_explicit_alias = if may_have_explicit_alias {
         let mut identities = explicit_inputs
             .into_iter()
             .map(|(path, is_dir, _)| {
@@ -170,7 +177,7 @@ pub(crate) fn collect_files(
             let identity = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
             let is_alias = std::fs::symlink_metadata(&path)
                 .is_ok_and(|metadata| metadata.file_type().is_symlink())
-                || has_symlink_ancestor(&path, base, &mut ancestor_symlinks);
+                || has_symlink_ancestor(&path, Some(base), &mut ancestor_symlinks);
             representatives
                 .entry(identity)
                 .and_modify(|representative: &mut (PathBuf, bool)| {
@@ -646,6 +653,35 @@ mod tests {
         );
 
         assert_eq!(files.len(), 1, "one filesystem file must be processed once");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn aliases_above_the_collection_base_are_deduplicated() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let real_parent = tmp.path().join("real-parent");
+        let real_base = real_parent.join("cwd");
+        let document = real_base.join("doc.md");
+        write(&document, "x");
+
+        let alias_parent = tmp.path().join("alias-parent");
+        symlink(&real_parent, &alias_parent).unwrap();
+        let alias_base = alias_parent.join("cwd");
+
+        let files = collect_paths(
+            &alias_base,
+            &[PathBuf::from("doc.md"), document.clone()],
+            &[],
+            &markdown_only,
+        );
+
+        assert_eq!(files.len(), 1, "one filesystem file must be processed once");
+        assert_eq!(
+            std::fs::canonicalize(&files[0]).unwrap(),
+            std::fs::canonicalize(document).unwrap()
+        );
     }
 
     #[cfg(unix)]
