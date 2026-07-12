@@ -435,9 +435,9 @@ pub struct ParserInstallResult {
     pub language: String,
     /// Path where parser was installed.
     pub install_path: PathBuf,
-    /// Git revision that was used, or `None` when an interrupted replacement
-    /// was recovered without rebuilding from source.
-    pub revision: Option<String>,
+    /// Git revision that was used. Empty when an interrupted replacement was
+    /// recovered without rebuilding from source.
+    pub revision: String,
 }
 
 /// How the parser source is compiled.
@@ -810,7 +810,7 @@ pub fn install_parser_after_operation_started(
         return Ok(ParserInstallResult {
             language: language.to_string(),
             install_path: parser_file,
-            revision: None,
+            revision: String::new(),
         });
     }
 
@@ -889,7 +889,7 @@ pub fn install_parser_after_operation_started(
     Ok(ParserInstallResult {
         language: language.to_string(),
         install_path: parser_file,
-        revision: Some(metadata.revision),
+        revision: metadata.revision,
     })
 }
 

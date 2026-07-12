@@ -877,8 +877,8 @@ fn run_install(language: &str, force: bool, verbose: bool, no_cache: bool) -> Re
     ) {
         Ok(result) => {
             eprintln!("✓ Parser installed: {}", result.install_path.display());
-            if verbose && let Some(revision) = result.revision {
-                eprintln!("  Revision: {revision}");
+            if verbose && !result.revision.is_empty() {
+                eprintln!("  Revision: {}", result.revision);
             }
         }
         Err(e) => {
