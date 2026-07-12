@@ -953,7 +953,7 @@ fn test_did_change_configuration_preserves_config_file_settings() {
 
     client.send_notification(
         "workspace/didChangeConfiguration",
-        json!({ "settings": { "autoInstall": false } }),
+        json!({ "settings": { "kakehashi": { "autoInstall": false } } }),
     );
 
     let settings = poll_effective_settings(
@@ -996,7 +996,7 @@ fn test_did_change_configuration_removed_key_reverts_to_config_file() {
 
     client.send_notification(
         "workspace/didChangeConfiguration",
-        json!({ "settings": { "searchPaths": ["/replacement"] } }),
+        json!({ "settings": { "kakehashi": { "searchPaths": ["/replacement"] } } }),
     );
     let settings = poll_effective_settings(
         &mut client,
