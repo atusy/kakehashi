@@ -486,29 +486,19 @@ fn installed_query_language_name_if_dir(path: &Path, is_dir: bool) -> Option<Str
 
 fn installed_query_language_name_for_uninstall(
     entry: &std::fs::DirEntry,
-    queries_dir: &Path,
 ) -> Result<Option<String>, String> {
-    let file_type = entry.file_type().map_err(|e| {
-        format!(
-            "cannot inspect an entry in queries directory '{}': {e}",
-            queries_dir.display()
-        )
-    })?;
+    let path = entry.path();
+    let file_type = entry
+        .file_type()
+        .map_err(|e| format!("cannot inspect query entry '{}': {e}", path.display()))?;
     let is_dir = if file_type.is_symlink() {
-        entry
-            .path()
-            .metadata()
-            .map_err(|e| {
-                format!(
-                    "cannot resolve query entry '{}': {e}",
-                    entry.path().display()
-                )
-            })?
+        path.metadata()
+            .map_err(|e| format!("cannot resolve query entry '{}': {e}", path.display()))?
             .is_dir()
     } else {
         file_type.is_dir()
     };
-    Ok(installed_query_language_name_if_dir(&entry.path(), is_dir))
+    Ok(installed_query_language_name_if_dir(&path, is_dir))
 }
 
 fn read_optional_install_dir(path: &Path, kind: &str) -> Result<Option<std::fs::ReadDir>, String> {
@@ -561,7 +551,7 @@ fn collect_installed_languages_for_uninstall(
                     queries_dir.display()
                 )
             })?;
-            if let Some(name) = installed_query_language_name_for_uninstall(&entry, queries_dir)? {
+            if let Some(name) = installed_query_language_name_for_uninstall(&entry)? {
                 languages.insert(name);
             }
         }
