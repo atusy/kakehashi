@@ -491,6 +491,12 @@ fn run_language_status(verbose: bool) -> Result<(), ExitCode> {
 }
 
 fn validate_install_root(path: &Path) -> std::io::Result<()> {
+    let path = if path.is_absolute() {
+        std::borrow::Cow::Borrowed(path)
+    } else {
+        std::borrow::Cow::Owned(std::env::current_dir()?.join(path))
+    };
+    let path = path.as_ref();
     match std::fs::metadata(path) {
         Ok(metadata) if metadata.is_dir() => Ok(()),
         Ok(_) => Err(std::io::Error::new(
@@ -498,15 +504,32 @@ fn validate_install_root(path: &Path) -> std::io::Result<()> {
             "install data path is not a directory",
         )),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            match std::fs::symlink_metadata(path) {
-                // A truly absent root is the normal state before any install.
-                Err(metadata_error) if metadata_error.kind() == std::io::ErrorKind::NotFound => {
-                    Ok(())
+            for ancestor in path.ancestors() {
+                match std::fs::symlink_metadata(ancestor) {
+                    Err(metadata_error)
+                        if metadata_error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(metadata_error) => return Err(metadata_error),
+                    Ok(metadata) if metadata.file_type().is_symlink() => {
+                        let target = std::fs::metadata(ancestor)?;
+                        return if target.is_dir() {
+                            Ok(())
+                        } else {
+                            Err(std::io::Error::new(
+                                std::io::ErrorKind::NotADirectory,
+                                "install data ancestor is not a directory",
+                            ))
+                        };
+                    }
+                    Ok(metadata) if metadata.is_dir() => return Ok(()),
+                    Ok(_) => {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::NotADirectory,
+                            "install data ancestor is not a directory",
+                        ));
+                    }
                 }
-                // Preserve the original follow failure for a dangling link.
-                Ok(_) => Err(e),
-                Err(metadata_error) => Err(metadata_error),
             }
+            Err(e)
         }
         Err(e) => Err(e),
     }

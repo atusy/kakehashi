@@ -816,6 +816,34 @@ fn test_language_status_fails_for_dangling_data_directory_symlink() {
 
 #[cfg(unix)]
 #[test]
+fn test_language_status_fails_below_dangling_data_directory_ancestor() {
+    use std::os::unix::fs::symlink;
+
+    let test_dir = tempfile::tempdir().expect("Failed to create temp dir");
+    let dangling = test_dir.path().join("dangling");
+    symlink("missing-data-directory", &dangling).expect("Failed to create dangling data ancestor");
+    let data_dir = dangling.join("nested-data");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_kakehashi"))
+        .args([
+            "language",
+            "status",
+            "--data-dir",
+            data_dir.to_str().unwrap(),
+        ])
+        .output()
+        .expect("Failed to execute command");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "stderr: {stderr}");
+    assert!(
+        stderr.contains("failed to inspect data directory"),
+        "stderr: {stderr}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
 fn test_language_status_fails_for_dangling_parser_entry_symlink() {
     use std::fs;
     use std::os::unix::fs::symlink;
