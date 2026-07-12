@@ -77,6 +77,14 @@ fn should_parallelize_host_and_injections(
         })
 }
 
+fn run_sequential_injection<T>(
+    host_complete: bool,
+    cancelled: bool,
+    injection_work: impl FnOnce() -> T,
+) -> Option<T> {
+    (!cancelled && host_complete).then(injection_work)
+}
+
 /// Compute full-document semantic tokens (host + injections) as one work-unit
 /// on the bounded compute pool; the injection fan-out's `par_iter` runs on the
 /// same pool (a Rayon parallel iterator invoked from a pool thread stays on
@@ -192,10 +200,9 @@ pub(crate) async fn handle_semantic_tokens_full(
                 rayon::join(host_work, injection_work)
             } else {
                 let host_result = host_work();
-                if !host_result.0 || is_cancelled() {
-                    return None;
-                }
-                (host_result, injection_work())
+                let injection_result =
+                    run_sequential_injection(host_result.0, is_cancelled(), injection_work)?;
+                (host_result, injection_result)
             };
 
         if !host_complete {
@@ -290,6 +297,24 @@ mod tests {
                 "{label}"
             );
         }
+    }
+
+    #[test]
+    fn sequential_injection_does_not_start_after_host_cancel() {
+        let starts = std::cell::Cell::new(0);
+        let mut work = || {
+            starts.set(starts.get() + 1);
+            "ran"
+        };
+
+        assert_eq!(run_sequential_injection(false, false, &mut work), None);
+        assert_eq!(run_sequential_injection(true, true, &mut work), None);
+        assert_eq!(starts.get(), 0);
+        assert_eq!(
+            run_sequential_injection(true, false, &mut work),
+            Some("ran")
+        );
+        assert_eq!(starts.get(), 1);
     }
     use tower_lsp_server::ls_types::{Range, SemanticToken};
 
