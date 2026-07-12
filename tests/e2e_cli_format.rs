@@ -335,10 +335,11 @@ fn e2e_directory_walk_formats_extensionless_shebang_file() {
         "directory format should succeed; stderr: {}",
         String::from_utf8_lossy(&output.stderr)
     );
+    let formatted = read(ws.path(), "tool");
     assert!(
-        read(ws.path(), "tool").starts_with("#!/USR/BIN/ENV PYTHON"),
+        formatted.starts_with("#!/USR/BIN/ENV PYTHON"),
         "directory walk should use shebang detection; content: {:?}; stderr: {}",
-        read(ws.path(), "tool"),
+        formatted,
         String::from_utf8_lossy(&output.stderr)
     );
     assert_eq!(read(ws.path(), "unknown"), unknown);
