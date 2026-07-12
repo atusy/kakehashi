@@ -631,6 +631,8 @@ fn generated_backup_parts(name: &str) -> Option<(&str, &str, &str)> {
     let pid = parts.next()?;
     let counter = parts.next()?;
     if parts.next().is_none()
+        && !pid.is_empty()
+        && !counter.is_empty()
         && pid.bytes().all(|b| b.is_ascii_digit())
         && counter.bytes().all(|b| b.is_ascii_digit())
     {
@@ -647,6 +649,8 @@ fn generated_temp_parts(name: &str) -> Option<(&str, &str, &str)> {
     let pid = parts.next()?;
     let counter = parts.next()?;
     if parts.next().is_none()
+        && !pid.is_empty()
+        && !counter.is_empty()
         && pid.bytes().all(|b| b.is_ascii_digit())
         && counter.bytes().all(|b| b.is_ascii_digit())
     {
@@ -990,6 +994,14 @@ fn download_file(url: &str, http_policy: QueryHttpPolicy) -> Result<String, Quer
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn recovery_directory_names_require_numeric_fields() {
+        assert!(is_recovery_directory_name(".lua.123.0.tmp"));
+        assert!(is_recovery_directory_name(".lua.123.0.backup"));
+        assert!(!is_recovery_directory_name(".lua...tmp"));
+        assert!(!is_recovery_directory_name(".lua...backup"));
+    }
     use tempfile::TempDir;
 
     #[test]
