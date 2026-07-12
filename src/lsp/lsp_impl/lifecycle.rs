@@ -19,6 +19,7 @@ use tower_lsp_server::ls_types::{
     SemanticTokensServerCapabilities, ServerCapabilities, ServerInfo, SignatureHelpOptions,
     TextDocumentSyncCapability, TextDocumentSyncKind, TextDocumentSyncOptions,
     TextDocumentSyncSaveOptions, TypeDefinitionProviderCapability, Uri, WorkDoneProgressOptions,
+    WorkspaceFoldersServerCapabilities, WorkspaceServerCapabilities,
 };
 use url::Url;
 
@@ -221,6 +222,16 @@ fn bridge_workspace_folders(
             }])
         })
     })
+}
+
+fn workspace_server_capabilities() -> WorkspaceServerCapabilities {
+    WorkspaceServerCapabilities {
+        workspace_folders: Some(WorkspaceFoldersServerCapabilities {
+            supported: Some(true),
+            change_notifications: Some(OneOf::Left(true)),
+        }),
+        file_operations: None,
+    }
 }
 
 impl Kakehashi {
@@ -616,6 +627,7 @@ impl Kakehashi {
                         ..Default::default()
                     },
                 )),
+                workspace: Some(workspace_server_capabilities()),
                 experimental: Some(serde_json::json!({
                     "kakehashi": {
                         "wrappedDidChangeConfigurationSettings": true,
@@ -2388,6 +2400,16 @@ mod tests {
         .expect("valid initialize params");
 
         assert_eq!(bridge_root_uri(&params).as_deref(), Some(expected.as_str()));
+    }
+
+    #[test]
+    fn workspace_capabilities_request_folder_change_notifications() {
+        let workspace = workspace_server_capabilities();
+        let folders = workspace
+            .workspace_folders
+            .expect("workspace folder capability");
+        assert_eq!(folders.supported, Some(true));
+        assert_eq!(folders.change_notifications, Some(OneOf::Left(true)));
     }
 
     /// A throwaway cancel context for tests that don't exercise cancellation.
