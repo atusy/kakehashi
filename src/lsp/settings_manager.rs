@@ -321,6 +321,7 @@ mod tests {
     async fn settings_transaction_serializes_snapshot_derivation_and_publication() {
         let manager = Arc::new(SettingsManager::new());
         let first_guard = manager.begin_settings_transaction().await;
+        assert!(manager.settings_transaction.try_lock().is_err());
         let first_base = manager.load_raw_settings();
 
         let second_started = Arc::new(tokio::sync::Notify::new());
@@ -338,7 +339,13 @@ mod tests {
                 }),
             )
             .expect("two settings snapshots merge");
-            second_manager.apply_settings_with_raw(merged, WorkspaceSettings::default());
+            let effective = WorkspaceSettings::try_from_settings(
+                &merged,
+                None,
+                with_kakehashi_defaults(|_| None),
+            )
+            .expect("merged settings expand");
+            second_manager.apply_settings_with_raw(merged, effective);
         });
 
         second_started.notified().await;
@@ -350,7 +357,10 @@ mod tests {
             }),
         )
         .expect("two settings snapshots merge");
-        manager.apply_settings_with_raw(first, WorkspaceSettings::default());
+        let first_effective =
+            WorkspaceSettings::try_from_settings(&first, None, with_kakehashi_defaults(|_| None))
+                .expect("merged settings expand");
+        manager.apply_settings_with_raw(first, first_effective);
         drop(first_guard);
         second.await.expect("second transaction completes");
 
