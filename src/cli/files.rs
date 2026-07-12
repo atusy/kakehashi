@@ -16,6 +16,15 @@
 
 use std::path::{Path, PathBuf};
 
+fn has_symlink_ancestor(path: &Path, cache: &mut std::collections::HashMap<PathBuf, bool>) -> bool {
+    path.ancestors().skip(1).any(|ancestor| {
+        *cache.entry(ancestor.to_path_buf()).or_insert_with(|| {
+            std::fs::symlink_metadata(ancestor)
+                .is_ok_and(|metadata| metadata.file_type().is_symlink())
+        })
+    })
+}
+
 /// Files collected from CLI paths plus any non-fatal directory walk errors
 /// encountered while discovering them.
 pub(crate) struct CollectedFiles {
@@ -97,7 +106,8 @@ pub(crate) fn collect_files(
 
     let mut files = Vec::new();
     let mut walk_errors = 0usize;
-    let mut explicit_identities = Vec::new();
+    let mut explicit_inputs = Vec::new();
+    let mut ancestor_symlinks = std::collections::HashMap::new();
     for path in paths {
         // Normalize before stat: a relative path must resolve against
         // `base`, not against whatever the process cwd happens to be.
@@ -116,8 +126,8 @@ pub(crate) fn collect_files(
                 continue;
             }
             if paths.len() > 1 {
-                let resolved = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
-                explicit_identities.push((path.clone(), resolved, true));
+                let has_alias = is_symlink || has_symlink_ancestor(&path, &mut ancestor_symlinks);
+                explicit_inputs.push((path.clone(), true, has_alias));
             }
             walk_errors += walk_directory(&path, &exclude_matcher, is_supported, &mut files);
         } else {
@@ -125,14 +135,25 @@ pub(crate) fn collect_files(
                 continue;
             }
             if paths.len() > 1 {
-                let resolved = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
-                explicit_identities.push((path.clone(), resolved, false));
+                let has_alias = is_symlink || has_symlink_ancestor(&path, &mut ancestor_symlinks);
+                explicit_inputs.push((path.clone(), false, has_alias));
             }
             files.push(path);
         }
     }
     files.sort();
-    let has_explicit_alias = explicit_inputs_have_alias(&mut explicit_identities);
+    let has_explicit_alias = if explicit_inputs.iter().any(|input| input.2) {
+        let mut identities = explicit_inputs
+            .into_iter()
+            .map(|(path, is_dir, _)| {
+                let resolved = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
+                (path, resolved, is_dir)
+            })
+            .collect::<Vec<_>>();
+        explicit_inputs_have_alias(&mut identities)
+    } else {
+        false
+    };
     if has_explicit_alias {
         let mut seen = std::collections::HashSet::with_capacity(files.len());
         files.retain(|path| {
@@ -256,6 +277,22 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert!(!explicit_inputs_have_alias(&mut inputs));
+    }
+
+    #[test]
+    fn large_ordinary_explicit_file_list_is_collected() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = (0..256)
+            .map(|index| {
+                let path = tmp.path().join(format!("file-{index}.md"));
+                write(&path, "x");
+                path
+            })
+            .collect::<Vec<_>>();
+
+        let files = collect_paths(tmp.path(), &paths, &[], &markdown_only);
+
+        assert_eq!(files.len(), paths.len());
     }
 
     fn write(path: &Path, content: &str) {
