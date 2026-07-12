@@ -88,6 +88,8 @@ impl RepublishOutcome {
 /// chose existing config surfaces over new ones — revisit if a real setup
 /// needs a different cadence.
 const WIRE_PUBLISH_QUIET_WINDOW: std::time::Duration = std::time::Duration::from_secs(1);
+const MAX_WIRE_PUBLISH_QUIET_WINDOW: std::time::Duration =
+    std::time::Duration::from_secs(24 * 60 * 60);
 
 /// Bundles the state needed to merge the cache and publish for a host, so the
 /// notification feeds (reader push, host-event pull) can trigger a republish
@@ -847,6 +849,7 @@ impl DiagnosticPublisher {
                 .min_publish_interval_ms
             })
             .map(std::time::Duration::from_millis)
+            .map(|window| window.min(MAX_WIRE_PUBLISH_QUIET_WINDOW))
             .unwrap_or(WIRE_PUBLISH_QUIET_WINDOW)
     }
 
@@ -1477,6 +1480,14 @@ mod tests {
             .settings_manager
             .apply_settings(rust_settings_with_publish_interval(0));
         assert!(publisher.publish_quiet_window(&uri).is_zero());
+
+        server
+            .settings_manager
+            .apply_settings(rust_settings_with_publish_interval(u64::MAX));
+        assert_eq!(
+            publisher.publish_quiet_window(&uri),
+            MAX_WIRE_PUBLISH_QUIET_WINDOW
+        );
     }
 
     #[tokio::test]
