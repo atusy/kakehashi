@@ -198,7 +198,7 @@ fn open_windows_staging_guard(path: &Path) -> Result<fs::File, ParserInstallErro
 /// torn down with it; the grace margin keeps the parent's deadline the usual
 /// trigger. Unix-only (process groups); a no-op elsewhere. The subcommand entry
 /// (`src/bin/main.rs`) calls this before compiling.
-pub fn arm_compile_watchdog() {
+pub fn arm_compile_watchdog() -> Result<(), ParserInstallError> {
     #[cfg(unix)]
     {
         use nix::sys::signal::{Signal, killpg};
@@ -214,7 +214,7 @@ pub fn arm_compile_watchdog() {
         // along with us. In that case skip the watchdog: the parent-side deadline
         // still bounds the compile; we only forgo the orphan backstop.
         if getpgrp() != getpid() {
-            return;
+            return Ok(());
         }
         std::thread::spawn(|| {
             std::thread::sleep(PARSER_COMPILE_TIMEOUT + Duration::from_secs(30));
@@ -222,6 +222,44 @@ pub fn arm_compile_watchdog() {
             let _ = killpg(Pid::from_raw(0), Signal::SIGKILL);
         });
     }
+    #[cfg(windows)]
+    arm_windows_compile_job()?;
+    Ok(())
+}
+
+#[cfg(windows)]
+fn arm_windows_compile_job() -> Result<(), ParserInstallError> {
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::JobObjects::{
+        AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+        JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
+        SetInformationJobObject,
+    };
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+
+    unsafe {
+        let job = CreateJobObjectW(std::ptr::null(), std::ptr::null());
+        if job.is_null() {
+            return Err(ParserInstallError::IoError(std::io::Error::last_os_error()));
+        }
+        let mut info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+        info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        if SetInformationJobObject(
+            job,
+            JobObjectExtendedLimitInformation,
+            std::ptr::from_ref(&info).cast(),
+            std::mem::size_of_val(&info) as u32,
+        ) == 0
+            || AssignProcessToJobObject(job, GetCurrentProcess()) == 0
+        {
+            let error = std::io::Error::last_os_error();
+            let _ = CloseHandle(job);
+            return Err(ParserInstallError::IoError(error));
+        }
+        // Deliberately retain the raw handle until process teardown. Closing it
+        // then atomically terminates any compiler descendants still in the job.
+    }
+    Ok(())
 }
 
 /// Resolve the path to re-exec for the `__compile-parser` subprocess.

@@ -784,7 +784,10 @@ fn run_compile_parser(
     // Self-bound the compile so a parent crash mid-compile can't leave us (and a
     // hung cc) running as an orphan; the parent's deadline is still the usual
     // trigger.
-    parser::arm_compile_watchdog();
+    if let Err(e) = parser::arm_compile_watchdog() {
+        eprintln!("parser compile setup failed: {e}");
+        return Err(ExitCode::FAILURE);
+    }
     match parser::compile_parser_inprocess(grammar_dir, output_path) {
         Ok(()) => Ok(()),
         Err(e) => {
