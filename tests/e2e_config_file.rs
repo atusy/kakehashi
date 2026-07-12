@@ -181,7 +181,7 @@ fn test_config_file_nonexistent_fails_initialization() {
     let error = response
         .get("error")
         .expect("missing explicit config file should reject initialize");
-    assert_eq!(error["code"], json!(-32602));
+    assert_eq!(error["code"], json!(-32803));
     assert!(
         error["message"]
             .as_str()
@@ -213,7 +213,7 @@ fn test_config_file_invalid_toml_fails_initialization() {
     let error = response
         .get("error")
         .expect("invalid explicit config file should reject initialize");
-    assert_eq!(error["code"], json!(-32602));
+    assert_eq!(error["code"], json!(-32803));
     assert!(
         error["message"]
             .as_str()
@@ -250,7 +250,7 @@ fn test_config_file_invalid_path_expansion_fails_initialization() {
     let error = response
         .get("error")
         .expect("invalid explicit path expansion should reject initialize");
-    assert_eq!(error["code"], json!(-32602));
+    assert_eq!(error["code"], json!(-32803));
     assert!(
         error["message"]
             .as_str()
