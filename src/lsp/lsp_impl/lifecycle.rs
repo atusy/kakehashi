@@ -205,7 +205,6 @@ impl Kakehashi {
         // response: returning before the settings events are logged keeps the
         // error from also arriving as a window/logMessage duplicate.
         if let Some(error) = settings_outcome.fatal_error {
-            log::error!(target: "kakehashi::config", "{error}");
             return Err(configuration_load_error(error));
         }
 
