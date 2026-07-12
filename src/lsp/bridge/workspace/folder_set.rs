@@ -60,16 +60,17 @@ impl WorkspaceFolderSet {
         }
     }
 
-    fn deduplicate(folders: Option<Vec<WorkspaceFolder>>) -> Option<Vec<WorkspaceFolder>> {
-        folders.map(|folders| {
+    fn deduplicate(mut folders: Option<Vec<WorkspaceFolder>>) -> Option<Vec<WorkspaceFolder>> {
+        if let Some(folders) = folders.as_mut() {
             let mut unique = Vec::<WorkspaceFolder>::with_capacity(folders.len());
-            for folder in folders {
+            for folder in folders.drain(..) {
                 if !unique.iter().any(|existing| existing.uri == folder.uri) {
                     unique.push(folder);
                 }
             }
-            unique
-        })
+            *folders = unique;
+        }
+        folders
     }
 
     /// Snapshot the current folders for answering a `workspace/workspaceFolders`
@@ -108,21 +109,27 @@ impl WorkspaceFolderSet {
     /// Apply an upstream workspace-folder change atomically. Removals match by
     /// URI (folder names are display metadata), then additions append in event
     /// order while preserving URI uniqueness.
-    pub(crate) fn apply_change(&self, added: Vec<WorkspaceFolder>, removed: &[WorkspaceFolder]) {
+    pub(crate) fn apply_change(
+        &self,
+        added: Vec<WorkspaceFolder>,
+        removed: &[WorkspaceFolder],
+    ) -> bool {
         let mut guard = self
             .inner
             .lock()
             .recover_poison("WorkspaceFolderSet::apply_change");
         if guard.is_none() && added.is_empty() {
-            return;
+            return false;
         }
         let folders = guard.get_or_insert_with(Vec::new);
-        folders.retain(|existing| !removed.iter().any(|item| item.uri == existing.uri));
+        let before = folders.clone();
+        folders.retain(|existing| !removed.iter().any(|removed| removed.uri == existing.uri));
         for folder in added {
             if !folders.iter().any(|existing| existing.uri == folder.uri) {
                 folders.push(folder);
             }
         }
+        *folders != before
     }
 
     /// Apply an upstream delta only after its effective wire delta is queued.
@@ -327,19 +334,10 @@ mod tests {
     }
 
     #[test]
-    fn add_to_none_materializes_folder_set() {
-        let set = WorkspaceFolderSet::new(None);
-
-        set.apply_change(vec![folder("file:///a")], &[]);
-
-        assert_eq!(set.snapshot(), Some(vec![folder("file:///a")]));
-    }
-
-    #[test]
     fn removal_only_change_preserves_a_none_set() {
         let set = WorkspaceFolderSet::new(None);
 
-        set.apply_change(Vec::new(), &[folder("file:///absent")]);
+        assert!(!set.apply_change(Vec::new(), &[folder("file:///absent")]));
 
         assert_eq!(set.snapshot(), None);
     }

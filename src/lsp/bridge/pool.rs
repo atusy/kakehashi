@@ -562,11 +562,9 @@ impl LanguageServerPool {
         removed: &[tower_lsp_server::ls_types::WorkspaceFolder],
     ) {
         let _change = self.workspace_folder_change_lock.lock().await;
-        self.workspace_folders.apply_change(added.clone(), removed);
-        self.set_root_uri(
-            self.workspace_folders()
-                .and_then(|folders| folders.first().map(|folder| folder.uri.to_string())),
-        );
+        if !self.workspace_folders.apply_change(added.clone(), removed) {
+            return;
+        }
 
         let mut connections = self.connections.lock().await;
         let mut invalidated = Vec::new();
@@ -3053,6 +3051,24 @@ mod tests {
             .await;
 
         assert!(!pool.connections.lock().await.contains_key(&key));
+    }
+
+    #[tokio::test]
+    async fn ineffective_upstream_folder_delta_keeps_an_incapable_live_connection() {
+        let pool = LanguageServerPool::new();
+        pool.set_workspace_folders(Some(vec![test_workspace_folder("file:///same")]));
+        let key = ConnectionKey::for_server("lua");
+        let handle = create_handle_with_key(ConnectionState::Ready, key.clone()).await;
+        handle.set_server_capabilities(tower_lsp_server::ls_types::ServerCapabilities::default());
+        pool.insert_connection(handle).await;
+
+        pool.apply_workspace_folder_change(
+            vec![test_workspace_folder("file:///same")],
+            &[test_workspace_folder("file:///unknown")],
+        )
+        .await;
+
+        assert!(pool.connections.lock().await.contains_key(&key));
     }
 
     /// A Ready shared connection whose server never advertised the
