@@ -1256,6 +1256,21 @@ fn test_language_uninstall_does_not_create_missing_data_dir() {
 }
 
 #[test]
+fn test_language_uninstall_rejects_unsafe_name_when_data_dir_is_missing() {
+    let parent = tempfile::tempdir().unwrap();
+    let data_dir = parent.path().join("missing");
+    let output = Command::new(env!("CARGO_BIN_EXE_kakehashi"))
+        .args(["language", "uninstall", "../../evil", "--data-dir"])
+        .arg(&data_dir)
+        .arg("--force")
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    assert!(!data_dir.exists());
+}
+
+#[test]
 fn test_language_uninstall_all_coordinates_missing_data_dir() {
     use kakehashi::install::operation_lock::LanguageOperationGuard;
     use std::fs;

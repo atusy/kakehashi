@@ -739,18 +739,6 @@ fn run_language_uninstall(
         ExitCode::FAILURE
     })?;
 
-    match std::fs::symlink_metadata(&data_dir) {
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound && !all => {
-            if let Some(language) = language.as_deref() {
-                eprintln!("Language '{}' is not installed.", language);
-            }
-            return Ok(());
-        }
-        _ => {}
-    }
-
-    let parser_dir = data_dir.join("parser");
-    let queries_dir = data_dir.join("queries");
     let targeted_language = if all {
         None
     } else {
@@ -763,6 +751,19 @@ fn run_language_uninstall(
         }
         Some(language)
     };
+
+    match std::fs::symlink_metadata(&data_dir) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound && !all => {
+            if let Some(language) = language.as_deref() {
+                eprintln!("Language '{}' is not installed.", language);
+            }
+            return Ok(());
+        }
+        _ => {}
+    }
+
+    let parser_dir = data_dir.join("parser");
+    let queries_dir = data_dir.join("queries");
     // Bulk discovery must be exclusive to avoid observing install renames,
     // but never make installers wait while the command is awaiting consent.
     // The authoritative locked snapshot below determines the actual set.
