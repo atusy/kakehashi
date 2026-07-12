@@ -69,7 +69,7 @@ impl Kakehashi {
         if self.cli_can_handle_path(path) {
             return true;
         }
-        const MAX_FIRST_LINE_BYTES: u64 = 8 * 1024;
+        const MAX_FIRST_LINE_BYTES: usize = 8 * 1024;
         let Ok(file) = std::fs::File::open(path) else {
             // Keep the candidate so the command's normal read path reports
             // the operational error instead of silently treating it as an
@@ -78,10 +78,16 @@ impl Kakehashi {
         };
         let mut first_line = Vec::new();
         if std::io::BufReader::new(file)
-            .take(MAX_FIRST_LINE_BYTES)
+            .take((MAX_FIRST_LINE_BYTES + 1) as u64)
             .read_until(b'\n', &mut first_line)
             .is_err()
         {
+            return true;
+        }
+        if first_line.len() > MAX_FIRST_LINE_BYTES {
+            // Preserve exact explicit-file semantics without making directory
+            // filtering allocate an unbounded line: let normal processing read
+            // the full document and perform its existing content detection.
             return true;
         }
         let first_line = String::from_utf8_lossy(&first_line);

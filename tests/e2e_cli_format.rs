@@ -311,8 +311,13 @@ fn e2e_directory_walk_respects_gitignore_but_explicit_path_wins() {
 
 #[test]
 fn e2e_directory_walk_formats_extensionless_shebang_file() {
-    let source = "#!/usr/bin/env python\nvalue = 1\n";
-    let ws = workspace_with(&[("tool", source)]);
+    let prefix = "#!/usr/bin/env python ";
+    let padding = " ".repeat(8191 - prefix.len());
+    // Byte 8192 cuts through this multibyte character. Directory discovery
+    // must fall back to normal full-document detection instead of rejecting
+    // or silently skipping the valid UTF-8 file.
+    let source = format!("{prefix}{padding}é\nvalue = 1\n");
+    let ws = workspace_with(&[("tool", &source)]);
     std::fs::write(
         ws.path().join("kakehashi.toml"),
         config_toml().replace("languages = [\"lua\"]", "languages = [\"python\"]"),
