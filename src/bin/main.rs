@@ -646,17 +646,28 @@ fn write_content_to_output(
     }
 
     if let Some(path) = output.as_ref().filter(|p| p.as_os_str() != "-") {
-        if path.exists() && !force {
-            eprintln!(
-                "Error: File '{}' already exists. Use --force to overwrite.",
-                path.display()
-            );
-            return Err(ExitCode::FAILURE);
-        }
+        let write_result = if force {
+            std::fs::write(path, content)
+        } else {
+            use std::io::Write as _;
 
-        match std::fs::write(path, content) {
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(path)
+                .and_then(|mut file| file.write_all(content.as_bytes()))
+        };
+
+        match write_result {
             Ok(()) => {
                 eprintln!("Created {label} file: {}", path.display());
+            }
+            Err(e) if !force && e.kind() == std::io::ErrorKind::AlreadyExists => {
+                eprintln!(
+                    "Error: File '{}' already exists. Use --force to overwrite.",
+                    path.display()
+                );
+                return Err(ExitCode::FAILURE);
             }
             Err(e) => {
                 eprintln!("Failed to write {label} file: {}", e);
@@ -1095,5 +1106,23 @@ mod tests {
         );
         assert_eq!(installed_query_language_name(&unsafe_name), None);
         assert_eq!(installed_query_language_name(&hidden), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn output_without_force_rejects_dangling_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::TempDir::new().unwrap();
+        let redirected = temp.path().join("redirected.toml");
+        let output = temp.path().join("config.toml");
+        symlink(&redirected, &output).unwrap();
+
+        let result =
+            write_content_to_output("generated", Some(output.clone()), false, "configuration");
+
+        assert!(result.is_err());
+        assert!(output.symlink_metadata().is_ok());
+        assert!(!redirected.exists());
     }
 }
