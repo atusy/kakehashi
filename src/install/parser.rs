@@ -599,10 +599,6 @@ fn claim_and_unlink_stale_parser_file(
     if !initial.file_type().is_file() {
         return Ok(None);
     }
-    #[cfg(windows)]
-    if windows_metadata_is_reparse_point(&initial) {
-        return Ok(None);
-    }
     let file = match fs::OpenOptions::new()
         .read(true)
         // The pathname can be replaced after symlink_metadata. Never block if
@@ -790,6 +786,10 @@ fn claim_stale_parser_file_windows(
     if !initial.file_type().is_file() {
         return Ok(None);
     }
+    #[cfg(windows)]
+    if windows_metadata_is_reparse_point(&initial) {
+        return Ok(None);
+    }
 
     loop {
         let candidate = parser_dir.join(format!(
@@ -819,7 +819,17 @@ fn claim_stale_parser_file_windows(
 
         let claimed = candidate.join("artifact");
         match fs::rename(path, &claimed) {
-            Ok(()) => return Ok(Some(candidate)),
+            Ok(()) => {
+                let _current = fs::symlink_metadata(&claimed)?;
+                #[cfg(windows)]
+                if !_current.file_type().is_file() || windows_metadata_is_reparse_point(&_current) {
+                    // The source changed between validation and rename. Remove
+                    // provenance so a later cleanup cannot delete it.
+                    let _ = fs::remove_file(&marker);
+                    return Ok(None);
+                }
+                return Ok(Some(candidate));
+            }
             Err(_) => {
                 // A live Windows compiler holds a handle that denies delete
                 // sharing, so rename fails here. Unknown failures are equally
