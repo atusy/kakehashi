@@ -26,6 +26,9 @@ pub(crate) struct SettingsSnapshot {
 pub(crate) struct SettingsManager {
     root_path: ArcSwap<Option<PathBuf>>,
     settings_snapshot: ArcSwap<SettingsSnapshot>,
+    /// Serializes read-modify-write settings transactions from runtime config
+    /// pushes and post-install search-path updates.
+    settings_transaction: tokio::sync::Mutex<()>,
     /// Client capabilities from initialize() - immutable after initialization.
     /// Uses OnceLock to enforce "set once, read many" semantics per LSP protocol.
     client_capabilities: OnceLock<ClientCapabilities>,
@@ -79,10 +82,19 @@ impl SettingsManager {
                 raw_settings: Arc::new(raw_settings),
                 settings: Arc::new(settings),
             })),
+            settings_transaction: tokio::sync::Mutex::new(()),
             client_capabilities: OnceLock::new(),
             root_markers_deprecation_warned: AtomicBool::new(false),
             unwrapped_didchange_deprecation_warned: AtomicBool::new(false),
         }
+    }
+
+    /// Begin a settings read-modify-write transaction.
+    ///
+    /// Callers must acquire this before loading the snapshot they intend to
+    /// derive from and retain it until the derived snapshot is published.
+    pub(crate) async fn begin_settings_transaction(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.settings_transaction.lock().await
     }
 
     /// Claim the one-per-session slot for the `rootMarkers` deprecation notice.
@@ -304,6 +316,51 @@ mod tests {
         DocumentSymbolClientCapabilities, SemanticTokensWorkspaceClientCapabilities,
         TextDocumentClientCapabilities, WorkspaceClientCapabilities,
     };
+
+    #[tokio::test]
+    async fn settings_transaction_serializes_snapshot_derivation_and_publication() {
+        let manager = Arc::new(SettingsManager::new());
+        let first_guard = manager.begin_settings_transaction().await;
+        let first_base = manager.load_raw_settings();
+
+        let second_started = Arc::new(tokio::sync::Notify::new());
+        let second_manager = Arc::clone(&manager);
+        let second_started_task = Arc::clone(&second_started);
+        let second = tokio::spawn(async move {
+            second_started_task.notify_one();
+            let _guard = second_manager.begin_settings_transaction().await;
+            let base = second_manager.load_raw_settings();
+            let merged = crate::config::merge_workspace_settings(
+                Some((*base).clone()),
+                Some(RawWorkspaceSettings {
+                    search_paths: Some(vec!["/installed".to_string()]),
+                    ..Default::default()
+                }),
+            )
+            .expect("two settings snapshots merge");
+            second_manager.apply_settings_with_raw(merged, WorkspaceSettings::default());
+        });
+
+        second_started.notified().await;
+        let first = crate::config::merge_workspace_settings(
+            Some((*first_base).clone()),
+            Some(RawWorkspaceSettings {
+                auto_install: Some(false),
+                ..Default::default()
+            }),
+        )
+        .expect("two settings snapshots merge");
+        manager.apply_settings_with_raw(first, WorkspaceSettings::default());
+        drop(first_guard);
+        second.await.expect("second transaction completes");
+
+        let final_settings = manager.load_raw_settings();
+        assert_eq!(final_settings.auto_install, Some(false));
+        assert_eq!(
+            final_settings.search_paths.as_deref(),
+            Some(["/installed".to_string()].as_slice())
+        );
+    }
 
     #[test]
     fn test_new_creates_default_state() {
