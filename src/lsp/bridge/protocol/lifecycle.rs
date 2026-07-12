@@ -155,7 +155,8 @@ pub(crate) fn parse_initialize_response_capabilities(
 
     // 2. Reject if result is absent or null
     let Some(result) = response.get("result").filter(|result| !result.is_null()) else {
-        return Err(std::io::Error::other(
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
             "bridge: initialize response missing valid result",
         ));
     };
@@ -537,7 +538,9 @@ mod tests {
     ) {
         let result = parse_initialize_response_capabilities(&response);
         assert!(result.is_err(), "Expected rejection for: {:?}", response);
-        let err_msg = result.unwrap_err().to_string();
+        let error = result.unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        let err_msg = error.to_string();
         assert!(
             err_msg.contains(expected_error),
             "Expected error containing {:?}, got: {}",
