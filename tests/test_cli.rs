@@ -1305,6 +1305,41 @@ fn test_language_uninstall_all_fails_for_dangling_install_dir() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn test_language_uninstall_all_fails_before_removal_for_query_symlink_loop() {
+    use std::fs;
+    use std::os::unix::fs::symlink;
+
+    let test_dir = tempfile::tempdir().expect("Failed to create temp dir");
+    let parser_dir = test_dir.path().join("parser");
+    let queries_dir = test_dir.path().join("queries");
+    fs::create_dir_all(&parser_dir).expect("Failed to create parser dir");
+    fs::create_dir_all(&queries_dir).expect("Failed to create queries dir");
+    let parser = parser_dir.join(format!("testlang.{}", std::env::consts::DLL_EXTENSION));
+    fs::write(&parser, "fake").expect("Failed to write parser");
+    symlink("loop", queries_dir.join("loop")).expect("Failed to create query symlink loop");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_kakehashi"))
+        .args([
+            "language",
+            "uninstall",
+            "--all",
+            "--data-dir",
+            test_dir.path().to_str().unwrap(),
+            "--force",
+        ])
+        .output()
+        .expect("Failed to execute command");
+
+    assert!(
+        !output.status.success(),
+        "an unreadable query entry must fail; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(parser.exists(), "preflight failure must not remove parsers");
+}
+
 /// Test that language uninstall --all ignores internal query staging directories
 #[test]
 fn test_language_uninstall_all_ignores_internal_query_dirs() {
