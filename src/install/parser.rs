@@ -22,6 +22,64 @@ use super::metadata::{FetchOptions, MetadataError, fetch_parser_metadata};
 const ARCHIVE_HTTP_TIMEOUT: Duration = Duration::from_secs(120);
 const PARSER_OPERATION_MARKER_SUFFIX: &str = ".operation";
 
+#[cfg(any(windows, test))]
+trait ParserFileOps {
+    fn rename(&mut self, from: &Path, to: &Path) -> std::io::Result<()>;
+    fn remove_file(&mut self, path: &Path) -> std::io::Result<()>;
+}
+
+#[cfg(any(windows, test))]
+fn publish_parser_transactionally(
+    ops: &mut impl ParserFileOps,
+    tmp_file: &Path,
+    parser_file: &Path,
+    backup_file: &Path,
+) -> std::io::Result<()> {
+    let had_old_parser = match ops.rename(parser_file, backup_file) {
+        Ok(()) => true,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Err(error) => return Err(error),
+    };
+
+    match ops.rename(tmp_file, parser_file) {
+        Ok(()) => {
+            if had_old_parser {
+                ops.remove_file(backup_file)?;
+            }
+            Ok(())
+        }
+        Err(publish_error) => {
+            if !had_old_parser {
+                return Err(publish_error);
+            }
+            match ops.rename(backup_file, parser_file) {
+                Ok(()) => Err(publish_error),
+                Err(rollback_error) => Err(std::io::Error::new(
+                    rollback_error.kind(),
+                    format!(
+                        "failed to publish parser: {publish_error}; failed to restore backup '{}': {rollback_error}",
+                        backup_file.display()
+                    ),
+                )),
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
+struct StdParserFileOps;
+
+#[cfg(windows)]
+impl ParserFileOps for StdParserFileOps {
+    fn rename(&mut self, from: &Path, to: &Path) -> std::io::Result<()> {
+        fs::rename(from, to)
+    }
+
+    fn remove_file(&mut self, path: &Path) -> std::io::Result<()> {
+        fs::remove_file(path)
+    }
+}
+
 /// Error types for parser installation.
 #[derive(Debug)]
 pub enum ParserInstallError {
@@ -1084,10 +1142,62 @@ fn invalid_metadata(message: String) -> ParserInstallError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
     use tempfile::tempdir;
 
     const TREE_SITTER_JSON_URL: &str =
         "https://github.com/tree-sitter/tree-sitter-json/archive/v0.24.8.tar.gz";
+
+    #[derive(Default)]
+    struct FakeParserFileOps {
+        files: HashMap<PathBuf, &'static str>,
+        fail_rename: Option<(PathBuf, PathBuf)>,
+    }
+
+    impl ParserFileOps for FakeParserFileOps {
+        fn rename(&mut self, from: &Path, to: &Path) -> std::io::Result<()> {
+            if self
+                .fail_rename
+                .as_ref()
+                .is_some_and(|(fail_from, fail_to)| fail_from == from && fail_to == to)
+            {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "injected publish failure",
+                ));
+            }
+            let value = self.files.remove(from).ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::NotFound, "missing source")
+            })?;
+            self.files.insert(to.to_path_buf(), value);
+            Ok(())
+        }
+
+        fn remove_file(&mut self, path: &Path) -> std::io::Result<()> {
+            self.files
+                .remove(path)
+                .map(|_| ())
+                .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "missing file"))
+        }
+    }
+
+    #[test]
+    fn transactional_publish_restores_old_parser_when_publish_fails() {
+        let tmp = PathBuf::from("parser.tmp");
+        let parser = PathBuf::from("parser.dll");
+        let backup = PathBuf::from("parser.backup");
+        let mut ops = FakeParserFileOps::default();
+        ops.files.insert(tmp.clone(), "new");
+        ops.files.insert(parser.clone(), "old");
+        ops.fail_rename = Some((tmp.clone(), parser.clone()));
+
+        let error = publish_parser_transactionally(&mut ops, &tmp, &parser, &backup)
+            .expect_err("injected publish failure must be reported");
+
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        assert_eq!(ops.files.get(&parser), Some(&"old"));
+        assert!(!ops.files.contains_key(&backup));
+    }
 
     #[test]
     fn install_parser_rejects_unsafe_language_name() {
