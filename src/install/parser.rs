@@ -139,14 +139,8 @@ impl ParserFileOps for StdParserFileOps {
     }
 
     fn create_backup_marker(&mut self, backup: &Path) -> std::io::Result<()> {
-        static MARKER_COUNTER: std::sync::atomic::AtomicUsize =
-            std::sync::atomic::AtomicUsize::new(0);
         let marker_path = parser_backup_ownership_sidecar(backup);
-        let marker_tmp = marker_path.with_extension(format!(
-            "owner.{}.{}.tmp",
-            std::process::id(),
-            MARKER_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-        ));
+        let marker_tmp = marker_path.with_extension(format!("owner.{}.tmp", ulid::Ulid::new()));
         let mut marker = fs::OpenOptions::new()
             .write(true)
             .create_new(true)
