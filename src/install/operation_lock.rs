@@ -46,14 +46,17 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let shared = LanguageOperationGuard::shared(temp.path()).unwrap();
         let path = temp.path().to_path_buf();
+        let (started_tx, started_rx) = mpsc::channel();
         let (acquired_tx, acquired_rx) = mpsc::channel();
 
         let waiter = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
             let exclusive = LanguageOperationGuard::exclusive(&path).unwrap();
             acquired_tx.send(()).unwrap();
             exclusive
         });
 
+        started_rx.recv_timeout(Duration::from_secs(2)).unwrap();
         assert_eq!(
             acquired_rx.recv_timeout(Duration::from_millis(50)),
             Err(mpsc::RecvTimeoutError::Timeout)
