@@ -612,7 +612,8 @@ fn recover_parser_backups(
         return Ok(false);
     }
     if path_entry_exists(parser_file)? {
-        if !fs::metadata(parser_file)?.is_file() {
+        let canonical_is_file = fs::symlink_metadata(parser_file)?.file_type().is_file();
+        if !canonical_is_file && !backups.is_empty() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 format!("parser path '{}' is not a file", parser_file.display()),
@@ -2568,12 +2569,17 @@ mod tests {
         let parser_dir = temp.path().join("parser");
         fs::create_dir_all(&parser_dir).expect("create parser dir");
         let canonical = parser_dir.join(format!("lua.{}", std::env::consts::DLL_EXTENSION));
-        let backup = parser_dir.join(generated_backup_name("lua", 123, 11));
+        let backup = parser_dir.join(generated_backup_name_with_transaction(
+            "lua",
+            123,
+            11,
+            ulid::Ulid::new(),
+        ));
         symlink(parser_dir.join("missing-target"), &canonical).expect("create dangling canonical");
         fs::write(&backup, b"unrelated").expect("write colliding backup");
         fs::write(
             parser_backup_intent_sidecar(&backup),
-            PARSER_BACKUP_INTENT_CONTENT,
+            parser_backup_marker_content(&backup, false),
         )
         .expect("write intent");
 
@@ -2583,6 +2589,12 @@ mod tests {
         );
         assert_eq!(fs::read(&backup).expect("preserve collision"), b"unrelated");
         assert!(!parser_backup_intent_sidecar(&backup).exists());
+        assert!(
+            fs::symlink_metadata(&canonical)
+                .expect("preserve dangling canonical entry")
+                .file_type()
+                .is_symlink()
+        );
     }
 
     #[test]
