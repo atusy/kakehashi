@@ -876,8 +876,8 @@ fn run_install(language: &str, force: bool, verbose: bool, no_cache: bool) -> Re
                 eprintln!("  Revision: {}", result.revision);
             }
         }
-        Err(parser::ParserInstallError::Recovered(path)) => {
-            eprintln!("✓ Parser recovered: {}", path.display());
+        Err(parser::ParserInstallError::AlreadyExists(path)) => {
+            eprintln!("✓ Parser available: {}", path.display());
         }
         Err(e) => {
             eprintln!("✗ Parser installation failed: {}", e);

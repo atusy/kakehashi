@@ -391,8 +391,6 @@ pub enum ParserInstallError {
     IoError(std::io::Error),
     /// Parser already exists.
     AlreadyExists(PathBuf),
-    /// An interrupted replacement was recovered instead of rebuilding.
-    Recovered(PathBuf),
 }
 
 impl std::fmt::Display for ParserInstallError {
@@ -410,7 +408,6 @@ impl std::fmt::Display for ParserInstallError {
                     path.display()
                 )
             }
-            Self::Recovered(path) => write!(f, "Recovered parser at {}", path.display()),
         }
     }
 }
@@ -817,7 +814,7 @@ pub fn install_parser_after_operation_started(
 
     #[cfg(windows)]
     if recovered && !options.force {
-        return Err(ParserInstallError::Recovered(parser_file));
+        return Err(ParserInstallError::AlreadyExists(parser_file));
     }
 
     let install_token = begin_parser_install(&parser_dir, &parser_file, language, options.force)?;
