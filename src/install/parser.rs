@@ -161,10 +161,31 @@ pub fn compile_parser_inprocess(
             ),
         ))
     })?;
+    #[cfg(windows)]
+    let _staging_guard = open_windows_staging_guard(output_path)?;
     let loader = Loader::with_parser_lib_path(parent_dir.to_path_buf());
     loader
         .compile_parser_at_path(grammar_path, output_path.to_path_buf(), &[])
         .map_err(|e| ParserInstallError::CompileError(e.to_string()))
+}
+
+#[cfg(windows)]
+fn open_windows_staging_guard(path: &Path) -> Result<fs::File, ParserInstallError> {
+    use std::os::windows::fs::OpenOptionsExt;
+    use windows_sys::Win32::Storage::FileSystem::{FILE_SHARE_READ, FILE_SHARE_WRITE};
+
+    fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        // The loader receives a fresh staging path. Create it here so the
+        // delete-denying handle covers the entire compile, including its
+        // first write.
+        .create(true)
+        // Excluding FILE_SHARE_DELETE makes rename/delete fail while the
+        // re-exec child or its in-process compile is still using this path.
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+        .open(path)
+        .map_err(ParserInstallError::IoError)
 }
 
 /// Arm a self-deadline inside the `__compile-parser` subprocess.
@@ -177,11 +198,21 @@ pub fn compile_parser_inprocess(
 /// can only reach us and our `cc`, never a shell that launched us directly), then
 /// spawn a watchdog that group-kills us shortly after [`PARSER_COMPILE_TIMEOUT`].
 ///
-/// On a normal/quick compile the process exits first and the watchdog thread is
-/// torn down with it; the grace margin keeps the parent's deadline the usual
-/// trigger. Unix-only (process groups); a no-op elsewhere. The subcommand entry
-/// (`src/bin/main.rs`) calls this before compiling.
+/// On a normal/quick compile the process exits first and the watchdog thread or
+/// Windows job is torn down with it; the grace margin keeps the parent's
+/// deadline the usual trigger.
+///
+/// This infallible entry point preserves the public API used before Windows
+/// support. The internal compile subcommand uses [`try_arm_compile_watchdog`]
+/// so a Windows setup failure is surfaced instead of silently weakening its
+/// process-tree deadline.
 pub fn arm_compile_watchdog() {
+    let _ = try_arm_compile_watchdog();
+}
+
+/// Arm the compile watchdog and surface platform setup failures.
+#[doc(hidden)]
+pub fn try_arm_compile_watchdog() -> Result<(), ParserInstallError> {
     #[cfg(unix)]
     {
         use nix::sys::signal::{Signal, killpg};
@@ -197,7 +228,7 @@ pub fn arm_compile_watchdog() {
         // along with us. In that case skip the watchdog: the parent-side deadline
         // still bounds the compile; we only forgo the orphan backstop.
         if getpgrp() != getpid() {
-            return;
+            return Ok(());
         }
         std::thread::spawn(|| {
             std::thread::sleep(PARSER_COMPILE_TIMEOUT + Duration::from_secs(30));
@@ -205,6 +236,53 @@ pub fn arm_compile_watchdog() {
             let _ = killpg(Pid::from_raw(0), Signal::SIGKILL);
         });
     }
+    #[cfg(windows)]
+    arm_windows_compile_job()?;
+    Ok(())
+}
+
+#[cfg(windows)]
+fn arm_windows_compile_job() -> Result<(), ParserInstallError> {
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::JobObjects::{
+        AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+        JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
+        SetInformationJobObject,
+    };
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+
+    unsafe {
+        let job = CreateJobObjectW(std::ptr::null(), std::ptr::null());
+        if job.is_null() {
+            return Err(ParserInstallError::IoError(std::io::Error::last_os_error()));
+        }
+        let mut info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+        info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        if SetInformationJobObject(
+            job,
+            JobObjectExtendedLimitInformation,
+            std::ptr::from_ref(&info).cast(),
+            std::mem::size_of_val(&info) as u32,
+        ) == 0
+            || AssignProcessToJobObject(job, GetCurrentProcess()) == 0
+        {
+            let error = std::io::Error::last_os_error();
+            let _ = CloseHandle(job);
+            return Err(ParserInstallError::IoError(error));
+        }
+        // The thread exclusively owns the successful job handle. Closing it at
+        // the same deadline as the Unix watchdog atomically terminates this
+        // subprocess and any compiler descendants still assigned to the job.
+        // windows-sys 0.61 models HANDLE as `*mut c_void`, which is not Send.
+        // Transfer its pointer-sized value to the owning watchdog thread and
+        // reconstruct it only for CloseHandle.
+        let job = job as usize;
+        std::thread::spawn(move || {
+            std::thread::sleep(PARSER_COMPILE_TIMEOUT + Duration::from_secs(30));
+            let _ = CloseHandle(job as _);
+        });
+    }
+    Ok(())
 }
 
 /// Resolve the path to re-exec for the `__compile-parser` subprocess.
@@ -258,7 +336,7 @@ fn compile_parser(
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null());
     if let Some(staging_lock) = staging_lock {
-        inherit_staging_lock(&mut cmd, staging_lock);
+        inherit_staging_lock(&mut cmd, staging_lock)?;
     }
     let status = run_killable_subprocess(cmd, PARSER_COMPILE_TIMEOUT, "parser compile")?;
     if !status.success() {
@@ -272,7 +350,10 @@ fn compile_parser(
 }
 
 #[cfg(unix)]
-fn inherit_staging_lock(cmd: &mut Command, staging_lock: &fs::File) {
+fn inherit_staging_lock(
+    cmd: &mut Command,
+    staging_lock: &fs::File,
+) -> Result<(), ParserInstallError> {
     use std::os::fd::AsRawFd;
     use std::os::unix::process::CommandExt;
 
@@ -292,10 +373,31 @@ fn inherit_staging_lock(cmd: &mut Command, staging_lock: &fs::File) {
             Ok(())
         });
     }
+    Ok(())
 }
 
-#[cfg(not(unix))]
-fn inherit_staging_lock(_cmd: &mut Command, _staging_lock: &fs::File) {}
+#[cfg(windows)]
+fn inherit_staging_lock(
+    cmd: &mut Command,
+    staging_lock: &fs::File,
+) -> Result<(), ParserInstallError> {
+    // Rust's Windows Command implementation explicitly inherits stdio handles.
+    // Carry the parent's delete-denying staging handle as the internal compile
+    // child's unused stdin, closing the parent-exit/child-start cleanup window.
+    let inherited = staging_lock
+        .try_clone()
+        .map_err(ParserInstallError::IoError)?;
+    cmd.stdin(std::process::Stdio::from(inherited));
+    Ok(())
+}
+
+#[cfg(not(any(unix, windows)))]
+fn inherit_staging_lock(
+    _cmd: &mut Command,
+    _staging_lock: &fs::File,
+) -> Result<(), ParserInstallError> {
+    Ok(())
+}
 
 /// Install a Tree-sitter parser for a language.
 pub fn install_parser(
@@ -378,6 +480,10 @@ pub fn install_parser(
         }
         ParserCompile::InProcess => compile_parser_inprocess(&source_dir, &tmp_file),
     };
+    // On Windows this is the parent's no-delete-sharing staging handle. The
+    // compiler has returned (and its overlapping child handle is closed), so
+    // release ours before the final rename or error-path removal.
+    drop(tmp_lock);
     match compiled {
         Ok(()) => {
             // On unix `rename` atomically replaces an existing parser. Windows
@@ -421,11 +527,16 @@ fn reserve_parser_staging_file(
             PARSER_TMP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             std::env::consts::DLL_EXTENSION
         ));
-        match fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&candidate)
+        let mut options = fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(windows)]
         {
+            use std::os::windows::fs::OpenOptionsExt;
+            use windows_sys::Win32::Storage::FileSystem::{FILE_SHARE_READ, FILE_SHARE_WRITE};
+            options.read(true);
+            options.share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE);
+        }
+        match options.open(&candidate) {
             Ok(file) => {
                 #[cfg(unix)]
                 {
@@ -438,7 +549,14 @@ fn reserve_parser_staging_file(
                         Err(_) => Ok((candidate, None)),
                     };
                 }
-                #[cfg(not(unix))]
+                #[cfg(windows)]
+                {
+                    // The parent retains a no-delete-sharing handle until the
+                    // re-exec child has opened its overlapping guard. This
+                    // closes the parent-exit/child-start cleanup race.
+                    return Ok((candidate, Some(file)));
+                }
+                #[cfg(not(any(unix, windows)))]
                 {
                     drop(file);
                     return Ok((candidate, None));
@@ -468,7 +586,7 @@ fn staged_parser_pid(path: &Path) -> Option<u32> {
         return None;
     }
     let pid = pid.parse().ok()?;
-    (1..=i32::MAX as u32).contains(&pid).then_some(pid)
+    is_native_process_id(pid).then_some(pid)
 }
 
 fn is_canonical_decimal(value: &str) -> bool {
@@ -491,7 +609,93 @@ fn cleanup_claim_pid(path: &Path) -> Option<u32> {
         return None;
     }
     let pid = pid.parse().ok()?;
-    (1..=i32::MAX as u32).contains(&pid).then_some(pid)
+    is_native_process_id(pid).then_some(pid)
+}
+
+fn is_native_process_id(pid: u32) -> bool {
+    #[cfg(windows)]
+    {
+        // Windows process IDs are unsigned DWORD values.
+        pid != 0
+    }
+    #[cfg(not(windows))]
+    {
+        // Unix probing converts to libc's signed pid_t.
+        (1..=i32::MAX as u32).contains(&pid)
+    }
+}
+
+#[cfg(any(windows, test))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum WindowsProcessProbe {
+    Running,
+    Exited,
+    AccessDenied,
+    UnexpectedFailure,
+}
+
+#[cfg(any(windows, test))]
+fn windows_process_probe_is_running(probe: WindowsProcessProbe) -> bool {
+    !matches!(probe, WindowsProcessProbe::Exited)
+}
+
+#[cfg(windows)]
+fn windows_metadata_is_reparse_point(metadata: &fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt;
+    use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
+
+    metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+}
+
+#[cfg(windows)]
+fn open_windows_claim_directory_guard(path: &Path) -> std::io::Result<fs::File> {
+    use std::os::windows::fs::OpenOptionsExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    };
+
+    fs::OpenOptions::new()
+        .read(true)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)
+}
+
+#[cfg(windows)]
+fn process_is_running_windows(pid: u32) -> bool {
+    use windows_sys::Win32::Foundation::{
+        CloseHandle, ERROR_ACCESS_DENIED, ERROR_INVALID_PARAMETER, GetLastError, STILL_ACTIVE,
+    };
+    use windows_sys::Win32::System::Threading::{
+        GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+
+    let probe = unsafe {
+        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if handle.is_null() {
+            match GetLastError() {
+                ERROR_INVALID_PARAMETER => WindowsProcessProbe::Exited,
+                ERROR_ACCESS_DENIED => WindowsProcessProbe::AccessDenied,
+                _ => WindowsProcessProbe::UnexpectedFailure,
+            }
+        } else {
+            let mut exit_code = 0;
+            let queried = GetExitCodeProcess(handle, &mut exit_code);
+            let _ = CloseHandle(handle);
+            if queried == 0 {
+                WindowsProcessProbe::UnexpectedFailure
+            // Windows cannot distinguish a live process from one that exited
+            // with code STILL_ACTIVE (259). Preserve the artifact in that
+            // ambiguous case; false retention is safer than deleting a live
+            // compiler's staging file.
+            } else if exit_code == STILL_ACTIVE as u32 {
+                WindowsProcessProbe::Running
+            } else {
+                WindowsProcessProbe::Exited
+            }
+        }
+    };
+    windows_process_probe_is_running(probe)
 }
 
 #[cfg(unix)]
@@ -684,6 +888,191 @@ fn process_is_running(pid: u32) -> bool {
     }
 }
 
+#[cfg(any(windows, test))]
+fn claim_stale_parser_file_windows(
+    parser_dir: &Path,
+    path: &Path,
+) -> Result<Option<PathBuf>, ParserInstallError> {
+    use std::io::Write;
+
+    let initial = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(ParserInstallError::IoError(error)),
+    };
+    if !initial.file_type().is_file() {
+        return Ok(None);
+    }
+    #[cfg(windows)]
+    if windows_metadata_is_reparse_point(&initial) {
+        return Ok(None);
+    }
+
+    loop {
+        let candidate = parser_dir.join(format!(
+            ".parser-cleanup.{}.{}",
+            std::process::id(),
+            PARSER_TMP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        match fs::create_dir(&candidate) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(ParserInstallError::IoError(error)),
+        }
+        let marker = candidate.join("owner");
+        let marker_result = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&marker)
+            .and_then(|mut file| {
+                file.write_all(PARSER_CLEANUP_MARKER)?;
+                file.sync_all()
+            });
+        if let Err(error) = marker_result {
+            let _ = fs::remove_file(&marker);
+            let _ = fs::remove_dir(&candidate);
+            return Err(ParserInstallError::IoError(error));
+        }
+
+        let claimed = candidate.join("artifact");
+        match fs::rename(path, &claimed) {
+            Ok(()) => {
+                let _current = fs::symlink_metadata(&claimed)?;
+                #[cfg(windows)]
+                if !_current.file_type().is_file() || windows_metadata_is_reparse_point(&_current) {
+                    // The source changed between validation and rename. Remove
+                    // provenance so a later cleanup cannot delete it.
+                    let _ = fs::remove_file(&marker);
+                    return Ok(None);
+                }
+                return Ok(Some(candidate));
+            }
+            Err(_) => {
+                // A live Windows compiler holds a handle that denies delete
+                // sharing, so rename fails here. Unknown failures are equally
+                // conservative: leave the source and discard our empty claim.
+                let _ = fs::remove_file(&marker);
+                let _ = fs::remove_dir(&candidate);
+                return Ok(None);
+            }
+        }
+    }
+}
+
+#[cfg(any(windows, test))]
+fn remove_stale_cleanup_claim_windows(path: &Path) {
+    use std::io::Read;
+
+    let Ok(metadata) = fs::symlink_metadata(path) else {
+        return;
+    };
+    if !metadata.file_type().is_dir() {
+        return;
+    }
+    #[cfg(windows)]
+    let claim_guard = {
+        // `is_dir` can be true for junctions and other directory reparse
+        // points. Never resolve `owner` or `artifact` through one.
+        if windows_metadata_is_reparse_point(&metadata) {
+            return;
+        }
+        let Ok(guard) = open_windows_claim_directory_guard(path) else {
+            return;
+        };
+        let Ok(opened) = guard.metadata() else {
+            return;
+        };
+        if !opened.file_type().is_dir() || windows_metadata_is_reparse_point(&opened) {
+            return;
+        }
+        guard
+    };
+    let marker = path.join("owner");
+    let Ok(marker_metadata) = fs::symlink_metadata(&marker) else {
+        return;
+    };
+    if !marker_metadata.file_type().is_file() {
+        return;
+    }
+    #[cfg(windows)]
+    if windows_metadata_is_reparse_point(&marker_metadata) {
+        return;
+    }
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT;
+        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    let Ok(file) = options.open(&marker) else {
+        return;
+    };
+    if !file
+        .metadata()
+        .is_ok_and(|metadata| metadata.file_type().is_file())
+    {
+        return;
+    }
+    let mut contents = Vec::with_capacity(PARSER_CLEANUP_MARKER.len() + 1);
+    if file
+        .take(PARSER_CLEANUP_MARKER.len() as u64 + 1)
+        .read_to_end(&mut contents)
+        .is_err()
+        || contents != PARSER_CLEANUP_MARKER
+    {
+        return;
+    }
+    match fs::remove_file(path.join("artifact")) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(_) => return,
+    }
+    let _ = fs::remove_file(marker);
+    #[cfg(windows)]
+    drop(claim_guard);
+    let _ = fs::remove_dir(path);
+}
+
+#[cfg(any(windows, test))]
+fn cleanup_interrupted_parser_installs_windows_with(
+    parser_dir: &Path,
+    process_is_running: impl Fn(u32) -> bool,
+) -> Result<(), ParserInstallError> {
+    let entries = match fs::read_dir(parser_dir) {
+        Ok(entries) => entries,
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::PermissionDenied
+            ) =>
+        {
+            return Ok(());
+        }
+        Err(error) => return Err(ParserInstallError::IoError(error)),
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if let Some(pid) = cleanup_claim_pid(&path) {
+            if !process_is_running(pid) {
+                remove_stale_cleanup_claim_windows(&path);
+            }
+            continue;
+        }
+        let Some(pid) = staged_parser_pid(&path) else {
+            continue;
+        };
+        if !process_is_running(pid) {
+            let Ok(Some(claimed)) = claim_stale_parser_file_windows(parser_dir, &path) else {
+                continue;
+            };
+            remove_stale_cleanup_claim_windows(&claimed);
+        }
+    }
+    Ok(())
+}
+
 #[cfg(unix)]
 fn cleanup_interrupted_parser_installs(parser_dir: &Path) -> Result<(), ParserInstallError> {
     let entries = match fs::read_dir(parser_dir) {
@@ -725,10 +1114,13 @@ fn cleanup_interrupted_parser_installs(parser_dir: &Path) -> Result<(), ParserIn
     Ok(())
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn cleanup_interrupted_parser_installs(parser_dir: &Path) -> Result<(), ParserInstallError> {
+    cleanup_interrupted_parser_installs_windows_with(parser_dir, process_is_running_windows)
+}
+
+#[cfg(not(any(unix, windows)))]
 fn cleanup_interrupted_parser_installs(_parser_dir: &Path) -> Result<(), ParserInstallError> {
-    // There is no portable process-liveness API. Keep possibly live staging
-    // files instead of risking deletion of another installer process's output.
     Ok(())
 }
 
@@ -1083,10 +1475,11 @@ fn reap_bounded(child: &mut std::process::Child) {
 /// as its own process-group leader, so its pgid equals its pid and a group-wide
 /// `SIGKILL` reaches the whole tree (`cc`, linkers, etc.). This only *terminates*
 /// descendants; the caller reaps the direct child via `child.wait()`, and the
-/// terminated descendants are reparented to init and reaped there. On non-unix this
-/// falls back to a direct `child.kill()`, which does **not** reach descendants —
-/// the orphaned-`cc` hazard is unmitigated there (kakehashi targets unix in
-/// practice; a Job Object would be the Windows equivalent).
+/// terminated descendants are reparented to init and reaped there. On Windows,
+/// [`arm_compile_watchdog`] assigns the compile process and descendants to a
+/// kill-on-close Job Object; killing the direct child closes its job handle and
+/// terminates the tree. Other platforms fall back to killing only the direct
+/// child.
 fn kill_process_group(child: &mut std::process::Child) {
     #[cfg(unix)]
     {
@@ -1295,6 +1688,174 @@ mod tests {
     use super::*;
     use tempfile::tempdir;
 
+    #[test]
+    fn windows_process_probe_only_recovers_confirmed_exits() {
+        assert!(windows_process_probe_is_running(
+            WindowsProcessProbe::Running
+        ));
+        assert!(!windows_process_probe_is_running(
+            WindowsProcessProbe::Exited
+        ));
+        assert!(windows_process_probe_is_running(
+            WindowsProcessProbe::AccessDenied
+        ));
+        assert!(windows_process_probe_is_running(
+            WindowsProcessProbe::UnexpectedFailure
+        ));
+    }
+
+    #[test]
+    fn windows_cleanup_removes_confirmed_dead_staging_artifact() {
+        let temp = tempdir().expect("temp dir");
+        let parser_dir = temp.path().join("parser");
+        fs::create_dir_all(&parser_dir).expect("create parser dir");
+        let staged = parser_dir.join(format!(
+            ".lua.123.0.{}.tmp",
+            std::env::consts::DLL_EXTENSION
+        ));
+        fs::write(&staged, b"stale parser").expect("write staging file");
+
+        cleanup_interrupted_parser_installs_windows_with(&parser_dir, |_| false)
+            .expect("cleanup succeeds");
+
+        assert!(!staged.exists(), "confirmed-dead staging file is removed");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn windows_claim_recovery_rejects_symlink_marker() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempdir().expect("temp dir");
+        let parser_dir = temp.path().join("parser");
+        fs::create_dir_all(&parser_dir).expect("create parser dir");
+        let claim = parser_dir.join(".parser-cleanup.123.0");
+        fs::create_dir(&claim).expect("create claim dir");
+        fs::write(claim.join("artifact"), b"user data").expect("write artifact");
+        let target = temp.path().join("marker-target");
+        fs::write(&target, PARSER_CLEANUP_MARKER).expect("write marker target");
+        symlink(&target, claim.join("owner")).expect("create marker symlink");
+
+        cleanup_interrupted_parser_installs_windows_with(&parser_dir, |_| false)
+            .expect("cleanup succeeds");
+
+        assert!(claim.exists(), "unproven claim is preserved");
+        assert_eq!(
+            fs::read(claim.join("artifact")).expect("read artifact"),
+            b"user data"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_staging_guards_overlap_without_delete_window() {
+        let temp = tempdir().expect("temp dir");
+        let parser_dir = temp.path().join("parser");
+        fs::create_dir_all(&parser_dir).expect("create parser dir");
+        let (staged, parent_guard) =
+            reserve_parser_staging_file(&parser_dir, "lua").expect("reserve staging file");
+        let child_guard = open_windows_staging_guard(&staged).expect("open child guard");
+        let renamed = parser_dir.join("renamed");
+
+        assert!(
+            fs::rename(&staged, &renamed).is_err(),
+            "parent and child guards deny cleanup rename"
+        );
+        drop(parent_guard);
+        assert!(
+            fs::rename(&staged, &renamed).is_err(),
+            "child guard remains after parent exit"
+        );
+        drop(child_guard);
+        fs::rename(&staged, &renamed).expect("rename succeeds after compiler exit");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_staging_guard_is_inherited_at_spawn() {
+        let temp = tempdir().expect("temp dir");
+        let parser_dir = temp.path().join("parser");
+        fs::create_dir_all(&parser_dir).expect("create parser dir");
+        let (staged, parent_guard) =
+            reserve_parser_staging_file(&parser_dir, "lua").expect("reserve staging file");
+        let mut command = Command::new("cmd.exe");
+        command.args(["/C", "ping -n 3 127.0.0.1 >NUL"]);
+        inherit_staging_lock(&mut command, parent_guard.as_ref().expect("Windows guard"))
+            .expect("configure inherited guard");
+        let mut child = command.spawn().expect("spawn sleeping child");
+        drop(parent_guard);
+        let renamed = parser_dir.join("renamed");
+
+        assert!(
+            fs::rename(&staged, &renamed).is_err(),
+            "child owns the guard before spawn returns"
+        );
+        child.kill().expect("kill child");
+        child.wait().expect("wait child");
+        fs::rename(&staged, &renamed).expect("rename succeeds after child exit");
+    }
+
+    #[cfg(windows)]
+    const WINDOWS_JOB_HELPER_PID_FILE: &str = "KAKEHASHI_WINDOWS_JOB_HELPER_PID_FILE";
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "subprocess helper for windows_job_kills_descendant_on_owner_exit"]
+    fn windows_job_descendant_helper() {
+        let pid_file = std::env::var_os(WINDOWS_JOB_HELPER_PID_FILE)
+            .map(PathBuf::from)
+            .expect("helper PID file");
+        arm_windows_compile_job().expect("arm helper Job Object");
+        let descendant = Command::new("cmd.exe")
+            .args(["/C", "ping -n 60 127.0.0.1 >NUL"])
+            .spawn()
+            .expect("spawn descendant");
+        fs::write(pid_file, descendant.id().to_string()).expect("publish descendant PID");
+        std::thread::sleep(Duration::from_secs(60));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_job_kills_descendant_on_owner_exit() {
+        let temp = tempdir().expect("temp dir");
+        let pid_file = temp.path().join("descendant.pid");
+        let mut helper = Command::new(std::env::current_exe().expect("test executable"))
+            .args([
+                "--ignored",
+                "--exact",
+                "install::parser::tests::windows_job_descendant_helper",
+                "--nocapture",
+            ])
+            .env(WINDOWS_JOB_HELPER_PID_FILE, &pid_file)
+            .spawn()
+            .expect("spawn Job Object helper");
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let descendant_pid = loop {
+            if let Ok(pid) = fs::read_to_string(&pid_file)
+                && let Ok(pid) = pid.parse::<u32>()
+            {
+                break pid;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "helper did not publish descendant PID"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        assert!(process_is_running_windows(descendant_pid));
+
+        helper.kill().expect("kill Job Object owner");
+        helper.wait().expect("wait for helper");
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while process_is_running_windows(descendant_pid) && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            !process_is_running_windows(descendant_pid),
+            "kill-on-close Job Object terminates descendants"
+        );
+    }
+
     #[cfg(unix)]
     fn terminated_child_pid() -> u32 {
         let mut child = std::process::Command::new(
@@ -1320,7 +1881,7 @@ mod tests {
         lock.lock_exclusive().expect("lock staging file");
         let mut cmd = Command::new("sleep");
         cmd.arg("30");
-        inherit_staging_lock(&mut cmd, &lock);
+        inherit_staging_lock(&mut cmd, &lock).unwrap();
         let mut child = cmd.spawn().expect("spawn lock inheritor");
         drop(lock);
 
@@ -1424,6 +1985,20 @@ mod tests {
         );
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn windows_accepts_full_width_process_ids_in_cleanup_names() {
+        let pid = i32::MAX as u32 + 1;
+        let staged = PathBuf::from(format!(
+            ".lua.{pid}.0.{}.tmp",
+            std::env::consts::DLL_EXTENSION
+        ));
+        let claim = PathBuf::from(format!(".parser-cleanup.{pid}.0"));
+
+        assert_eq!(staged_parser_pid(&staged), Some(pid));
+        assert_eq!(cleanup_claim_pid(&claim), Some(pid));
+    }
+
     #[cfg(unix)]
     #[test]
     fn cleanup_preserves_staging_file_claimed_by_another_cleaner() {
@@ -1470,6 +2045,20 @@ mod tests {
 
         assert!(!owned.exists(), "proven abandoned claim is removed");
         assert!(unowned.exists(), "unmarked lookalike is preserved");
+    }
+
+    #[test]
+    fn windows_cleanup_keeps_marker_when_artifact_removal_fails() {
+        let temp = tempdir().expect("temp dir");
+        let claim = temp.path().join(".parser-cleanup.123.0");
+        fs::create_dir(&claim).expect("create claim");
+        fs::write(claim.join("owner"), PARSER_CLEANUP_MARKER).expect("write marker");
+        fs::create_dir(claim.join("artifact")).expect("create non-removable artifact shape");
+
+        remove_stale_cleanup_claim_windows(&claim);
+
+        assert!(claim.join("owner").exists(), "retry marker is preserved");
+        assert!(claim.join("artifact").exists(), "failed artifact remains");
     }
 
     #[cfg(unix)]
