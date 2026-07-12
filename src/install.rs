@@ -371,7 +371,7 @@ fn install_language_blocking_with_query_installer(
     // AlreadyExists means the artifact is present and usable — success,
     // not failure; treating it as an error made the auto-install manager
     // degrade a fully-installed language to "installed but with warnings".
-    match parser::install_parser(language, &parser_options) {
+    match parser::install_parser_after_operation_started(language, &parser_options) {
         Ok(parser_result) => {
             result.parser_path = Some(parser_result.install_path);
         }

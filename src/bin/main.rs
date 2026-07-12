@@ -779,7 +779,7 @@ fn run_install(language: &str, force: bool, verbose: bool, no_cache: bool) -> Re
         compile: parser::ParserCompile::KillableSubprocess,
     };
 
-    match parser::install_parser(language, &options) {
+    match parser::install_parser_after_operation_started(language, &options) {
         Ok(result) => {
             eprintln!("✓ Parser installed: {}", result.install_path.display());
             if verbose {

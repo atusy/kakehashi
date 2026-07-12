@@ -154,6 +154,7 @@ pub fn install_queries_with_dependencies(
     data_dir: &Path,
     force: bool,
 ) -> Result<QueryInstallResult, QueryInstallError> {
+    let _operation_lock = super::LanguageOperationLockGuard::acquire(data_dir, language)?;
     clear_uninstall_tombstone_for_install(data_dir, language)?;
     install_queries_with_dependencies_from_with_http_policy(
         NVIM_TREESITTER_QUERIES_URL,
