@@ -998,11 +998,22 @@ impl LanguageCoordinator {
             filename,
         ) {
             Ok(r) => r,
-            Err(_) => {
-                debug!(
-                    "Query file {}/{} not found in search paths (this is normal if not provided)",
-                    ctx.language_id, filename
-                );
+            Err(err) => {
+                if QueryLoader::find_query_file(paths, ctx.language_id, filename).is_none() {
+                    debug!(
+                        "Query file {}/{} not found in search paths (this is normal if not provided)",
+                        ctx.language_id, filename
+                    );
+                } else {
+                    events.push(LanguageEvent::log(
+                        LanguageLogLevel::Warning,
+                        format!(
+                            "Failed to load {} query for {}: {err}",
+                            ctx.query_kind.name(),
+                            ctx.language_id
+                        ),
+                    ));
+                }
                 return;
             }
         };
