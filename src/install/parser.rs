@@ -190,10 +190,17 @@ fn parser_backup_files(parser_dir: &Path, language: &str) -> std::io::Result<Vec
         let Some(name) = name.to_str() else {
             continue;
         };
-        if entry.file_type()?.is_file()
-            && generated_parser_backup_matches_language(name, language)
-            && parser_backup_ownership_sidecar(&entry.path()).is_file()
+        if !entry.file_type()?.is_file()
+            || !generated_parser_backup_matches_language(name, language)
         {
+            continue;
+        }
+        let marker_content = match fs::read(parser_backup_ownership_sidecar(&entry.path())) {
+            Ok(content) => content,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error),
+        };
+        if marker_content == PARSER_BACKUP_MARKER_CONTENT {
             backups.push(entry.path());
         }
     }
@@ -222,7 +229,7 @@ fn cleanup_orphan_parser_backup_markers(parser_dir: &Path, language: &str) -> st
             continue;
         }
         let backup = parser_dir.join(backup_name);
-        if !backup.exists() && fs::read(&marker)? == PARSER_BACKUP_MARKER_CONTENT {
+        if !backup.try_exists()? && fs::read(&marker)? == PARSER_BACKUP_MARKER_CONTENT {
             fs::remove_file(marker)?;
         }
     }
@@ -253,7 +260,13 @@ fn recover_parser_backups(
     if backups.is_empty() {
         return Ok(());
     }
-    if parser_file.is_file() {
+    if parser_file.try_exists()? {
+        if !fs::metadata(parser_file)?.is_file() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("parser path '{}' is not a file", parser_file.display()),
+            ));
+        }
         for backup in backups {
             remove_owned_parser_backup(&backup)?;
         }
@@ -1758,6 +1771,49 @@ mod tests {
         assert!(!owned_marker.exists());
         assert!(user_marker.exists());
         assert!(!canonical.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn parser_recovery_propagates_ownership_marker_read_error() {
+        use std::os::unix::fs::symlink;
+        let temp = tempdir().expect("temp dir");
+        let parser_dir = temp.path().join("parser");
+        fs::create_dir_all(&parser_dir).expect("create parser dir");
+        let canonical = parser_dir.join(format!("lua.{}", std::env::consts::DLL_EXTENSION));
+        let backup = parser_dir.join(generated_backup_name("lua", 123, 4));
+        let marker = parser_backup_ownership_sidecar(&backup);
+        fs::write(&backup, b"working parser").expect("write backup");
+        symlink(&marker, &marker).expect("create marker symlink loop");
+
+        recover_parser_backups(&parser_dir, &canonical, "lua")
+            .expect_err("marker read error must abort recovery");
+
+        assert!(backup.exists());
+        assert!(!canonical.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn parser_recovery_propagates_canonical_metadata_error() {
+        use std::os::unix::fs::symlink;
+        let temp = tempdir().expect("temp dir");
+        let parser_dir = temp.path().join("parser");
+        fs::create_dir_all(&parser_dir).expect("create parser dir");
+        let canonical = parser_dir.join(format!("lua.{}", std::env::consts::DLL_EXTENSION));
+        let backup = parser_dir.join(generated_backup_name("lua", 123, 4));
+        fs::write(&backup, b"working parser").expect("write backup");
+        fs::write(
+            parser_backup_ownership_sidecar(&backup),
+            PARSER_BACKUP_MARKER_CONTENT,
+        )
+        .expect("mark owned backup");
+        symlink(&canonical, &canonical).expect("create canonical symlink loop");
+
+        recover_parser_backups(&parser_dir, &canonical, "lua")
+            .expect_err("canonical metadata error must abort recovery");
+
+        assert!(backup.exists());
     }
 
     #[test]
