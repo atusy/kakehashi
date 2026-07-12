@@ -1,5 +1,8 @@
 use clap::{Parser, Subcommand};
-use kakehashi::install::{LanguageOperationLockGuard, default_data_dir, metadata, parser, queries};
+use kakehashi::install::{
+    AllLanguageOperationsLockGuard, LanguageOperationLockGuard, default_data_dir, metadata, parser,
+    queries,
+};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -495,6 +498,22 @@ fn run_language_uninstall(
         ExitCode::FAILURE
     })?;
 
+    // Acquire before discovery: an install that is still compiling has no
+    // parser/query artifact to enumerate. Waiting for every active language
+    // operation makes its publication visible before the --all snapshot, and
+    // retaining the lock through confirmation prevents a new language from
+    // appearing outside that snapshot before removal completes.
+    let _all_operations_lock = if all {
+        Some(
+            AllLanguageOperationsLockGuard::acquire(&data_dir).map_err(|error| {
+                eprintln!("Error: failed to lock uninstall --all: {error}");
+                ExitCode::FAILURE
+            })?,
+        )
+    } else {
+        None
+    };
+
     let parser_dir = data_dir.join("parser");
     let queries_dir = data_dir.join("queries");
     if let Err(e) = queries::recover_interrupted_query_installs(&queries_dir) {
@@ -573,12 +592,18 @@ fn run_language_uninstall(
         // Parser and query locks protect their own artifacts, but only this
         // outer lock prevents their phases from interleaving with a complete
         // install in another process.
-        let _operation_lock = match LanguageOperationLockGuard::acquire(&data_dir, lang) {
-            Ok(lock) => lock,
-            Err(error) => {
-                eprintln!("✗ Failed to lock uninstall for '{}': {}", lang, error);
-                any_failed = true;
-                continue;
+        let _operation_lock = if all {
+            // The exclusive all-language lock already excludes every install
+            // and uninstall. Acquiring its shared side again would deadlock.
+            None
+        } else {
+            match LanguageOperationLockGuard::acquire(&data_dir, lang) {
+                Ok(lock) => Some(lock),
+                Err(error) => {
+                    eprintln!("✗ Failed to lock uninstall for '{}': {}", lang, error);
+                    any_failed = true;
+                    continue;
+                }
             }
         };
 
