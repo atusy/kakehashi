@@ -249,7 +249,7 @@ fn arm_windows_compile_job() -> Result<(), ParserInstallError> {
         JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
         SetInformationJobObject,
     };
-    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, IsProcessInJob};
 
     unsafe {
         let job = CreateJobObjectW(std::ptr::null(), std::ptr::null());
@@ -264,10 +264,24 @@ fn arm_windows_compile_job() -> Result<(), ParserInstallError> {
             std::ptr::from_ref(&info).cast(),
             std::mem::size_of_val(&info) as u32,
         ) == 0
-            || AssignProcessToJobObject(job, GetCurrentProcess()) == 0
         {
             let error = std::io::Error::last_os_error();
             let _ = CloseHandle(job);
+            return Err(ParserInstallError::IoError(error));
+        }
+        if AssignProcessToJobObject(job, GetCurrentProcess()) == 0 {
+            let error = std::io::Error::last_os_error();
+            let mut already_in_job = 0;
+            let covered_by_parent_job = IsProcessInJob(
+                GetCurrentProcess(),
+                std::ptr::null_mut(),
+                &mut already_in_job,
+            ) != 0
+                && watchdog_assignment_failure_is_covered_by_parent_job(already_in_job != 0);
+            let _ = CloseHandle(job);
+            if covered_by_parent_job {
+                return Ok(());
+            }
             return Err(ParserInstallError::IoError(error));
         }
         // The thread exclusively owns the successful job handle. Closing it at
@@ -283,6 +297,11 @@ fn arm_windows_compile_job() -> Result<(), ParserInstallError> {
         });
     }
     Ok(())
+}
+
+#[cfg(any(windows, test))]
+fn watchdog_assignment_failure_is_covered_by_parent_job(already_in_job: bool) -> bool {
+    already_in_job
 }
 
 /// Resolve the path to re-exec for the `__compile-parser` subprocess.
@@ -2836,4 +2855,10 @@ mod tests {
 
         assert!(dest.exists(), "Clone directory should exist");
     }
+}
+#[cfg(test)]
+#[test]
+fn existing_windows_job_covers_nested_assignment_failure() {
+    assert!(watchdog_assignment_failure_is_covered_by_parent_job(true));
+    assert!(!watchdog_assignment_failure_is_covered_by_parent_job(false));
 }
