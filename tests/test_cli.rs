@@ -1196,14 +1196,7 @@ fn test_language_uninstall_all() {
                         !name
                             .strip_prefix('.')
                             .and_then(|name| name.strip_suffix(".parser-backup.lock"))
-                            .is_some_and(|language| {
-                                !language.is_empty()
-                                    && language.bytes().all(|byte| {
-                                        byte.is_ascii_lowercase()
-                                            || byte.is_ascii_digit()
-                                            || byte == b'_'
-                                    })
-                            })
+                            .is_some_and(kakehashi::install::queries::is_safe_language_name)
                     })
                 })
                 .collect()
