@@ -183,7 +183,7 @@ fn normalize_layer(
         Ok(()) => Some(settings),
         Err(errs) => {
             events.push(SettingsEvent::error(format!(
-                "Path expansion failed: {errs}. This configuration layer has been discarded."
+                "Path expansion failed: {errs}. The complete configuration has been discarded; previous settings remain in effect. Please correct the affected paths and environment variables or remove them from your config."
             )));
             None
         }
