@@ -681,6 +681,12 @@ fn write_content_to_output(
 }
 
 fn write_forced_output(path: &std::path::Path, content: &str) -> std::io::Result<()> {
+    if std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_symlink()) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("refusing to follow output symlink '{}'", path.display()),
+        ));
+    }
     #[cfg(unix)]
     {
         use std::io::Write as _;
@@ -1182,6 +1188,14 @@ mod tests {
         std::fs::write(&target, "shared").unwrap();
         symlink(&target, &output).unwrap();
 
+        let error = write_forced_output(&output, "generated").unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(
+            error
+                .to_string()
+                .contains("refusing to follow output symlink")
+        );
+
         let result =
             write_content_to_output("generated", Some(output.clone()), true, "configuration");
 
@@ -1205,6 +1219,14 @@ mod tests {
             }
             panic!("create test symlink: {error}");
         }
+
+        let error = write_forced_output(&output, "generated").unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(
+            error
+                .to_string()
+                .contains("refusing to follow output symlink")
+        );
 
         let result =
             write_content_to_output("generated", Some(output.clone()), true, "configuration");
