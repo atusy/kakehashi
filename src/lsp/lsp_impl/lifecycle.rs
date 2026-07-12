@@ -1642,7 +1642,7 @@ mod tests {
     }
 
     #[test]
-    fn bridge_workspace_context_preserves_no_workspace_initialize() {
+    fn bridge_root_uri_preserves_no_workspace_initialize() {
         let params: InitializeParams = serde_json::from_value(serde_json::json!({
             "capabilities": {},
             "rootUri": null,
