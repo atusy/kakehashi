@@ -180,6 +180,7 @@ pub fn install_queries_with_dependencies_after_install_started(
 }
 
 /// Like [`install_queries_with_dependencies`] but downloading from `base_url`.
+#[cfg(test)]
 pub(crate) fn install_queries_with_dependencies_from(
     base_url: &str,
     language: &str,
