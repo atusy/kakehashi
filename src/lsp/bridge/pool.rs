@@ -78,11 +78,20 @@ async fn shutdown_invalidated_connection(key: ConnectionKey, handle: Arc<Connect
     let shutdown_handle = Arc::clone(&handle);
     let mut shutdown_task = tokio::spawn(async move { shutdown_handle.graceful_shutdown().await });
     match tokio::time::timeout(RELOAD_SHUTDOWN_TIMEOUT, &mut shutdown_task).await {
-        Ok(Ok(_)) => {}
+        Ok(Ok(Ok(()))) => {}
+        Ok(Ok(Err(error))) => {
+            log::error!(
+                target: "kakehashi::bridge",
+                "Graceful shutdown for invalidated {} connection failed: {}",
+                key,
+                error
+            );
+            let _ = handle.graceful_shutdown().await;
+        }
         Ok(Err(error)) => {
             log::error!(
                 target: "kakehashi::bridge",
-                "Shutdown task for invalidated {} connection failed: {}",
+                "Shutdown task for invalidated {} connection panicked or was cancelled: {}",
                 key,
                 error
             );
