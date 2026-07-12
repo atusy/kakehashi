@@ -1536,14 +1536,17 @@ mod tests {
         });
         tokio::task::yield_now().await;
 
-        for _ in 0..9 {
+        for _ in 0..11 {
             tokio::time::advance(std::time::Duration::from_millis(90)).await;
             assert!(
                 aggregator.begin_forwarded_refresh_debounce().is_none(),
                 "continuous activity reuses the debounce task"
             );
         }
-        tokio::time::advance(std::time::Duration::from_millis(190)).await;
+        // The last activity was at 990 ms, so an unbounded quiet-window-only
+        // implementation would remain parked until 1090 ms. The anchored
+        // one-second deadline must release it after just 10 ms.
+        tokio::time::advance(std::time::Duration::from_millis(10)).await;
         waiter.await.expect("debounce task completes at max wait");
     }
 
