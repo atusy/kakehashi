@@ -73,34 +73,32 @@ fn same_launch_config(
         && old.is_enabled() == new.is_enabled()
 }
 
-fn shutdown_invalidated_connection(key: ConnectionKey, handle: Arc<ConnectionHandle>) {
-    tokio::spawn(async move {
-        const RELOAD_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
-        let shutdown_handle = Arc::clone(&handle);
-        let shutdown_task = tokio::spawn(async move { shutdown_handle.graceful_shutdown().await });
-        let abort = shutdown_task.abort_handle();
-        match tokio::time::timeout(RELOAD_SHUTDOWN_TIMEOUT, shutdown_task).await {
-            Ok(Ok(_)) => {}
-            Ok(Err(error)) => {
-                log::error!(
-                    target: "kakehashi::bridge",
-                    "Shutdown task for invalidated {} connection failed: {}",
-                    key,
-                    error
-                );
-                handle.complete_shutdown();
-            }
-            Err(_) => {
-                abort.abort();
-                log::warn!(
-                    target: "kakehashi::bridge",
-                    "Timed out shutting down invalidated {} connection",
-                    key
-                );
-                handle.complete_shutdown();
-            }
+async fn shutdown_invalidated_connection(key: ConnectionKey, handle: Arc<ConnectionHandle>) {
+    const RELOAD_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
+    let shutdown_handle = Arc::clone(&handle);
+    let shutdown_task = tokio::spawn(async move { shutdown_handle.graceful_shutdown().await });
+    let abort = shutdown_task.abort_handle();
+    match tokio::time::timeout(RELOAD_SHUTDOWN_TIMEOUT, shutdown_task).await {
+        Ok(Ok(_)) => {}
+        Ok(Err(error)) => {
+            log::error!(
+                target: "kakehashi::bridge",
+                "Shutdown task for invalidated {} connection failed: {}",
+                key,
+                error
+            );
+            handle.complete_shutdown();
         }
-    });
+        Err(_) => {
+            abort.abort();
+            log::warn!(
+                target: "kakehashi::bridge",
+                "Timed out shutting down invalidated {} connection",
+                key
+            );
+            handle.complete_shutdown();
+        }
+    }
 }
 
 /// Own invalidation cleanup independently of the request future that triggered
@@ -132,10 +130,10 @@ fn spawn_invalidated_connection_cleanup(
                 stale_handles.push((key, handle));
             }
         }
-        drop(connections);
         for (key, handle) in stale_handles {
-            shutdown_invalidated_connection(key, handle);
+            shutdown_invalidated_connection(key, handle).await;
         }
+        drop(connections);
     })
 }
 
@@ -845,7 +843,7 @@ impl LanguageServerPool {
         }
         drop(connections);
         for (key, handle) in stale_handles {
-            shutdown_invalidated_connection(key, handle);
+            tokio::spawn(shutdown_invalidated_connection(key, handle));
         }
         pushed
     }
@@ -2157,7 +2155,10 @@ impl LanguageServerPool {
                     // purge instead of spawning over partial document state.
                     connections.remove(&connection_key);
                     if let Some(handle) = invalidated_handle {
-                        shutdown_invalidated_connection(connection_key.clone(), handle);
+                        tokio::spawn(shutdown_invalidated_connection(
+                            connection_key.clone(),
+                            handle,
+                        ));
                     }
                 }
             }
@@ -3193,7 +3194,7 @@ mod tests {
         assert!(task.await.unwrap_err().is_cancelled());
         drop(host_documents);
 
-        tokio::time::timeout(Duration::from_secs(1), async {
+        tokio::time::timeout(Duration::from_secs(4), async {
             loop {
                 if !pool.connections.lock().await.contains_key(&key) {
                     break;
@@ -3203,6 +3204,11 @@ mod tests {
         })
         .await
         .expect("detached cleanup must remove the stale handle after caller cancellation");
+        assert_eq!(
+            handle.state(),
+            ConnectionState::Closed,
+            "removal must not become observable before bounded shutdown finishes"
+        );
     }
 
     #[tokio::test]
