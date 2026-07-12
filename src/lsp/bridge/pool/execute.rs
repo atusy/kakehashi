@@ -404,10 +404,9 @@ mod tests {
         *probe.get().expect("probe should be populated")
     }
 
-    #[tokio::test]
-    async fn downstream_ids_are_unique_and_independent_of_upstream_id() {
+    async fn assert_concurrent_downstream_ids_are_unique(upstream_id: UpstreamId, name: &str) {
         let pool = Arc::new(LanguageServerPool::new());
-        let host_uri = test_host_uri("downstream-id");
+        let host_uri = test_host_uri(name);
         pool.open_host_incarnation(&host_uri, 1).await;
         let handle = create_handle_with_key(
             ConnectionState::Ready,
@@ -415,8 +414,6 @@ mod tests {
         )
         .await;
         pool.insert_connection(Arc::clone(&handle)).await;
-        let upstream_id = UpstreamId::String("client-request".into());
-
         let (first_request, first_probe) = start_observed_request(
             Arc::clone(&pool),
             Arc::clone(&handle),
@@ -435,6 +432,17 @@ mod tests {
         let _ = tokio::join!(first_request, second_request);
 
         assert_ne!(first, second, "concurrent requests need fresh numeric ids");
+    }
+
+    #[tokio::test]
+    async fn downstream_ids_are_unique_and_independent_of_upstream_id() {
+        assert_concurrent_downstream_ids_are_unique(
+            UpstreamId::String("client-request".into()),
+            "string-upstream-id",
+        )
+        .await;
+        assert_concurrent_downstream_ids_are_unique(UpstreamId::Number(42), "numeric-upstream-id")
+            .await;
     }
 
     #[tokio::test]
