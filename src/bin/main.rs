@@ -664,7 +664,7 @@ fn write_content_to_output(
             }
             Err(e) if !force && e.kind() == std::io::ErrorKind::AlreadyExists => {
                 eprintln!(
-                    "Error: File '{}' already exists. Use --force to overwrite.",
+                    "Error: An entry already exists at '{}'. Use --force to overwrite.",
                     path.display()
                 );
                 return Err(ExitCode::FAILURE);
@@ -1122,7 +1122,20 @@ mod tests {
             write_content_to_output("generated", Some(output.clone()), false, "configuration");
 
         assert!(result.is_err());
-        assert!(output.symlink_metadata().is_ok());
+        assert!(output.symlink_metadata().unwrap().file_type().is_symlink());
         assert!(!redirected.exists());
+    }
+
+    #[test]
+    fn output_without_force_preserves_existing_file() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let output = temp.path().join("config.toml");
+        std::fs::write(&output, "existing").unwrap();
+
+        let result =
+            write_content_to_output("generated", Some(output.clone()), false, "configuration");
+
+        assert!(result.is_err());
+        assert_eq!(std::fs::read_to_string(output).unwrap(), "existing");
     }
 }
