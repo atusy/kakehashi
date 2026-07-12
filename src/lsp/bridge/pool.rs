@@ -368,10 +368,9 @@ pub struct LanguageServerPool {
     /// Passed to downstream servers during LSP handshake so they can provide
     /// workspace-aware features (diagnostics, go-to-definition, etc.).
     root_uri: OnceLock<Option<String>>,
-    /// Workspace folders forwarded from upstream client.
-    ///
-    /// Set once via `set_workspace_folders()` after receiving the upstream initialize request.
-    /// Passed to downstream servers during LSP handshake.
+    /// Current workspace folders from the upstream client. Seeded during
+    /// initialize, then updated by `workspace/didChangeWorkspaceFolders` and
+    /// snapshotted for each later downstream handshake.
     workspace_folders: super::WorkspaceFolderSet,
     /// Client capabilities forwarded from upstream client.
     ///
@@ -538,8 +537,7 @@ impl LanguageServerPool {
 
     /// Set the workspace folders.
     ///
-    /// Called once during upstream initialize to forward workspace folders to downstream servers.
-    /// Subsequent calls are ignored (OnceLock semantics).
+    /// Called during upstream initialize to seed the workspace-folder snapshot.
     pub(crate) fn set_workspace_folders(
         &self,
         folders: Option<Vec<tower_lsp_server::ls_types::WorkspaceFolder>>,
