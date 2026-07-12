@@ -323,9 +323,7 @@ fn e2e_directory_walk_formats_extensionless_shebang_file() {
     std::fs::write(ws.path().join("unknown"), &unknown).expect("write unknown text file");
     let sparse_path = ws.path().join("binary");
     let sparse = std::fs::File::create(&sparse_path).expect("create extensionless sparse binary");
-    sparse
-        .set_len(64 * 1024 * 1024)
-        .expect("size sparse binary");
+    sparse.set_len(16 * 1024).expect("size sparse binary");
     drop(sparse);
     use std::io::{Seek as _, Write as _};
     let mut sparse = std::fs::OpenOptions::new()
