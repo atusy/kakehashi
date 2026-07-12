@@ -64,6 +64,10 @@ pub(crate) use token_collector::TokenKind;
 #[cfg(test)]
 use {delta::calculate_semantic_tokens_delta, tower_lsp_server::ls_types::SemanticTokens};
 
+/// Below this, scheduling a second Rayon branch costs more than the injection
+/// work it can overlap. Matches the injection-cache engagement threshold.
+const PARALLEL_HOST_INJECTION_MIN_REGIONS: usize = 8;
+
 /// Compute full-document semantic tokens (host + injections) as one work-unit
 /// on the bounded compute pool; the injection fan-out's `par_iter` runs on the
 /// same pool (a Rayon parallel iterator invoked from a pool thread stays on
@@ -94,40 +98,9 @@ pub(crate) async fn handle_semantic_tokens_full(
 ) -> Option<SemanticTokensResult> {
     pool.run(cancel.clone(), move || {
         let is_cancelled = || crate::cancel::is_cancelled(cancel.as_ref());
-        let t_start = std::time::Instant::now();
-
-        let mut all_tokens: Vec<RawToken> = Vec::with_capacity(1000);
+        let mut host_tokens: Vec<RawToken> = Vec::with_capacity(1000);
         let lines: Vec<&str> = text.lines().collect();
         let line_starts = build_line_start_bytes(&text);
-
-        // Collect host document tokens first (no exclusion — finalize handles it).
-        if !collect_host_tokens(
-            &text,
-            &tree,
-            &query,
-            filetype.as_deref(),
-            capture_mappings.as_deref(),
-            &text,
-            &lines,
-            &line_starts,
-            0,
-            0,
-            supports_multiline,
-            &[],
-            &[],
-            cancel.as_ref(),
-            &mut all_tokens,
-        ) {
-            return None;
-        }
-
-        let host_elapsed = t_start.elapsed();
-
-        // The host collector polls mid-query; this boundary also catches a
-        // supersede that lands after its last poll and before injection work.
-        if is_cancelled() {
-            return None;
-        }
 
         // Borrow the owned cache handle into a request-scoped context for the
         // injection pass (#529); `None` keeps the uncached behavior.
@@ -148,22 +121,66 @@ pub(crate) async fn handle_semantic_tokens_full(
             discovery: p.discovery.as_deref(),
         });
 
-        // Collect injection tokens in parallel using Rayon.
-        // Also returns active injection regions for finalize-time exclusion.
-        // `cancel` is polled inside discovery and the per-region fan-out so a
-        // supersede lands mid-pass, not just at these outer boundaries.
-        let (injection_tokens, active_injection_regions) = collect_injection_tokens_parallel(
-            &text,
-            &lines,
-            &line_starts,
-            &tree,
-            filetype.as_deref(),
-            &coordinator,
-            capture_mappings.as_deref(),
-            supports_multiline,
-            cache_ctx.as_ref(),
-            cancel.as_ref(),
-        );
+        let should_parallelize = cache_ctx
+            .as_ref()
+            .and_then(|ctx| ctx.discovery)
+            .is_some_and(|discovery| {
+                discovery.complete
+                    && discovery.regions.len() >= PARALLEL_HOST_INJECTION_MIN_REGIONS
+            });
+        let mut host_work = || {
+                    let started = std::time::Instant::now();
+                    let complete = collect_host_tokens(
+                        &text,
+                        &tree,
+                        &query,
+                        filetype.as_deref(),
+                        capture_mappings.as_deref(),
+                        &text,
+                        &lines,
+                        &line_starts,
+                        0,
+                        0,
+                        supports_multiline,
+                        &[],
+                        &[],
+                        cancel.as_ref(),
+                        &mut host_tokens,
+                    );
+                    (complete, started.elapsed())
+                };
+        let injection_work = || {
+                    let started = std::time::Instant::now();
+                    let result = collect_injection_tokens_parallel(
+                        &text,
+                        &lines,
+                        &line_starts,
+                        &tree,
+                        filetype.as_deref(),
+                        &coordinator,
+                        capture_mappings.as_deref(),
+                        supports_multiline,
+                        cache_ctx.as_ref(),
+                        cancel.as_ref(),
+                    );
+                    (result, started.elapsed())
+                };
+
+        // Host highlighting and a substantial injection pass read the same
+        // immutable snapshot and only meet during finalization. Overlap them
+        // when discovery proves enough injection work exists to amortize the
+        // second Rayon branch; otherwise retain the sequential fast path.
+        let ((host_complete, host_elapsed), (injection_result, injections_elapsed)) =
+            if should_parallelize {
+                rayon::join(host_work, injection_work)
+            } else {
+                (host_work(), injection_work())
+            };
+
+        if !host_complete {
+            return None;
+        }
+        let (injection_tokens, active_injection_regions) = injection_result;
 
         // A supersede observed during the injection pass leaves a partial token
         // set; drop it so the handler never stores partial results.
@@ -171,14 +188,12 @@ pub(crate) async fn handle_semantic_tokens_full(
             return None;
         }
 
-        let injections_elapsed = t_start.elapsed().saturating_sub(host_elapsed);
-
         // Merge injection tokens with host tokens
-        all_tokens.extend(injection_tokens);
+        host_tokens.extend(injection_tokens);
 
         let finalize_start = std::time::Instant::now();
         let result = finalize_tokens_cancellable(
-            all_tokens,
+            host_tokens,
             &active_injection_regions,
             &lines,
             cancel.as_ref(),
