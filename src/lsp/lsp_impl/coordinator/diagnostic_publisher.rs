@@ -1311,8 +1311,8 @@ mod tests {
         );
 
         // The editor pulls and is answered against the current version → clean.
-        let v = server.diagnostics.coverage_stamp(&uri);
-        server.diagnostics.mark_served(&uri, v);
+        let stamp = server.diagnostics.coverage_stamp(&uri);
+        server.diagnostics.mark_served(&uri, stamp);
         assert!(
             !server.diagnostics.is_dirty(),
             "a covering pull clears dirty"
