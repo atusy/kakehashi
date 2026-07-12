@@ -160,7 +160,11 @@ impl DiagnosticPublisher {
                 biased;
                 _ = publisher.shutdown.cancelled() => {}
                 _ = wait_for_forwarded_refresh_settle(&publisher.aggregator, generation) => {
-                    publisher.request_pull_diagnostic_refresh_inner(true, false);
+                    // Cancellation can race immediately after `select!` chose the
+                    // timer branch, so re-check at the refresh admission boundary.
+                    if !publisher.shutdown.is_cancelled() {
+                        publisher.request_pull_diagnostic_refresh_inner(true, false);
+                    }
                 }
             }
         });
@@ -949,7 +953,7 @@ impl DiagnosticPublisher {
     }
 
     fn request_pull_diagnostic_refresh_inner(&self, forced: bool, record_request: bool) {
-        if !self.diagnostic_refresh_supported() {
+        if self.shutdown.is_cancelled() || !self.diagnostic_refresh_supported() {
             return;
         }
         // Count the ask before the gates so `requested - sent` measures total
