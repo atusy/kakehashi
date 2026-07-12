@@ -3,7 +3,7 @@ use log::warn;
 use path_clean::PathClean;
 use std::fmt::Write;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use tree_sitter::{Language, Query};
 
 /// Parser library file extensions for different platforms
@@ -88,8 +88,9 @@ pub(crate) fn format_search_paths<P: AsRef<Path>>(paths: &[P]) -> String {
 pub(crate) struct QueryLoader;
 
 impl QueryLoader {
-    fn query_file_path(base: &Path, lang_name: &str, file_name: &str) -> PathBuf {
-        base.join("queries").join(lang_name).join(file_name).clean()
+    fn query_file_path(base: &Path, lang_name: &str, file_name: &str) -> Option<PathBuf> {
+        is_single_path_component(lang_name)
+            .then(|| base.join("queries").join(lang_name).join(file_name).clean())
     }
 
     fn parser_library_path(base: &Path, language: &str, ext: &str) -> PathBuf {
@@ -210,7 +211,7 @@ impl QueryLoader {
         file_name: &str,
     ) -> Option<PathBuf> {
         for base in runtime_bases {
-            let candidate = Self::query_file_path(base.as_ref(), lang_name, file_name);
+            let candidate = Self::query_file_path(base.as_ref(), lang_name, file_name)?;
             if candidate.exists() {
                 return Some(candidate);
             }
@@ -410,6 +411,11 @@ impl QueryLoader {
     }
 }
 
+fn is_single_path_component(value: &str) -> bool {
+    let mut components = Path::new(value).components();
+    matches!(components.next(), Some(Component::Normal(_))) && components.next().is_none()
+}
+
 fn normalize_inherited_language_name(name: &str) -> String {
     name.strip_prefix('(')
         .and_then(|name| name.strip_suffix(')'))
@@ -482,6 +488,30 @@ mod tests {
         // Test not finding a non-existent file
         let result = QueryLoader::find_query_file(NO_SEARCH_PATHS, "rust", "highlights.scm");
         assert!(result.is_none());
+    }
+
+    #[test]
+    fn find_query_file_rejects_language_path_traversal() {
+        let dir = tempdir().unwrap();
+        let runtime = dir.path().join("runtime");
+        let outside = dir.path().join("outside");
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(outside.join("highlights.scm"), "(identifier) @variable").unwrap();
+
+        let result = QueryLoader::find_query_file(&[runtime], "../../outside", "highlights.scm");
+
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn implicit_asset_language_must_be_one_normal_component() {
+        assert!(is_single_path_component("typescript-react"));
+        assert!(!is_single_path_component(""));
+        assert!(!is_single_path_component("."));
+        assert!(!is_single_path_component(".."));
+        assert!(!is_single_path_component("../rust"));
+        assert!(!is_single_path_component("rust/query"));
+        assert!(!is_single_path_component("/rust"));
     }
 
     #[test]
