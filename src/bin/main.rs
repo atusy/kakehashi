@@ -854,7 +854,7 @@ fn run_install(language: &str, force: bool, verbose: bool, no_cache: bool) -> Re
     // Install queries (with inherited dependencies)
     eprintln!("Installing queries for '{}' to {:?}...", language, data_dir);
 
-    match queries::install_queries_with_dependencies_after_install_started(
+    match queries::install_queries_with_dependencies_after_install_started_with_permit(
         language,
         &data_dir,
         force,

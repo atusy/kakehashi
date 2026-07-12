@@ -170,6 +170,23 @@ pub fn install_queries_with_dependencies_after_install_started(
     language: &str,
     data_dir: &Path,
     force: bool,
+) -> Result<QueryInstallResult, QueryInstallError> {
+    validate_safe_language_name(language)?;
+    let _operation_lock = super::LanguageOperationLockGuard::acquire(data_dir, language)?;
+    install_queries_with_dependencies_after_install_started_with_permit(
+        language,
+        data_dir,
+        force,
+        super::LanguageOperationPermit::Language(&_operation_lock),
+    )
+}
+
+/// Continue query installation while the caller holds the operation lock.
+#[doc(hidden)]
+pub fn install_queries_with_dependencies_after_install_started_with_permit(
+    language: &str,
+    data_dir: &Path,
+    force: bool,
     permit: super::LanguageOperationPermit<'_>,
 ) -> Result<QueryInstallResult, QueryInstallError> {
     if !permit.covers(data_dir, language) {
