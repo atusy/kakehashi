@@ -61,12 +61,15 @@ pub(crate) fn collect_files(
 
     let mut files = Vec::new();
     let mut walk_errors = 0usize;
+    let mut has_explicit_symlink = false;
     for path in paths {
         // Normalize before stat: a relative path must resolve against
         // `base`, not against whatever the process cwd happens to be.
         let path = normalize_path(base, path);
         let metadata = std::fs::metadata(&path)
             .map_err(|e| format!("cannot access '{}': {e}", path.display()))?;
+        has_explicit_symlink |= std::fs::symlink_metadata(&path)
+            .is_ok_and(|metadata| metadata.file_type().is_symlink());
         if metadata.is_dir() {
             if is_excluded(&exclude_matcher, base, &path, true) {
                 continue;
@@ -80,15 +83,19 @@ pub(crate) fn collect_files(
         }
     }
     files.sort();
-    let mut seen = std::collections::HashSet::new();
-    files.retain(|path| {
-        // Preserve the stable sorted spelling for output, but compare the
-        // resolved path so explicit symlink aliases do not process one file
-        // twice. If an entry vanished after collection, retain its lexical
-        // path and let the caller report the existing read error.
-        let identity = std::fs::canonicalize(path).unwrap_or_else(|_| path.clone());
-        seen.insert(identity)
-    });
+    if has_explicit_symlink {
+        let mut seen = std::collections::HashSet::new();
+        files.retain(|path| {
+            // Preserve the stable sorted spelling for output, but compare the
+            // resolved path so explicit symlink aliases do not process one file
+            // twice. If an entry vanished after collection, retain its lexical
+            // path and let the caller report the existing read error.
+            let identity = std::fs::canonicalize(path).unwrap_or_else(|_| path.clone());
+            seen.insert(identity)
+        });
+    } else {
+        files.dedup();
+    }
     Ok(CollectedFiles { files, walk_errors })
 }
 
