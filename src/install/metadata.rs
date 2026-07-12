@@ -171,11 +171,19 @@ fn parse_parsers_lua(content: &str) -> Result<HashMap<String, ParserMetadata>, M
     for (lang, block) in lang_names {
         // Query-only entries (for example upstream `ecma`) intentionally have
         // no install_info and are not installable parsers.
-        if has_install_info(block) {
-            let info = extract_parser_metadata_from_block(block).ok_or_else(|| {
-                MetadataError::ParseError(format!("incomplete parser metadata for {lang}"))
-            })?;
-            parsers.insert(lang, info);
+        match install_info(block) {
+            InstallInfo::Absent => {}
+            InstallInfo::Invalid => {
+                return Err(MetadataError::ParseError(format!(
+                    "invalid install_info for {lang}"
+                )));
+            }
+            InstallInfo::Table(install_info) => {
+                let info = extract_parser_metadata_from_block(install_info).ok_or_else(|| {
+                    MetadataError::ParseError(format!("incomplete parser metadata for {lang}"))
+                })?;
+                parsers.insert(lang, info);
+            }
         }
     }
 
@@ -348,14 +356,7 @@ fn is_reserved_key(name: &str) -> bool {
     )
 }
 
-fn extract_parser_metadata_from_block(block_content: &str) -> Option<ParserMetadata> {
-    let install_info =
-        table_entries(block_content, 0)
-            .into_iter()
-            .find_map(|(name, value)| match (name.as_str(), value) {
-                ("install_info", LuaValue::Table(table)) => Some(table),
-                _ => None,
-            })?;
+fn extract_parser_metadata_from_block(install_info: &str) -> Option<ParserMetadata> {
     let fields = table_entries(install_info, 0);
     let string_field = |key: &str| {
         fields.iter().find_map(|(name, value)| match value {
@@ -374,10 +375,21 @@ fn extract_parser_metadata_from_block(block_content: &str) -> Option<ParserMetad
     })
 }
 
-fn has_install_info(block: &str) -> bool {
-    table_entries(block, 0)
+enum InstallInfo<'a> {
+    Absent,
+    Table(&'a str),
+    Invalid,
+}
+
+fn install_info(block: &str) -> InstallInfo<'_> {
+    match table_entries(block, 0)
         .into_iter()
-        .any(|(name, value)| name == "install_info" && matches!(value, LuaValue::Table(_)))
+        .find(|(name, _)| name == "install_info")
+    {
+        None => InstallInfo::Absent,
+        Some((_, LuaValue::Table(table))) => InstallInfo::Table(table),
+        Some(_) => InstallInfo::Invalid,
+    }
 }
 
 /// Find the content within matching braces starting from the first `{`.
@@ -719,6 +731,16 @@ mod tests {
     #[test]
     fn commented_metadata_fields_do_not_validate_an_entry() {
         let content = "return {\nlua = { install_info = {\n-- url = 'https://example/wrong'\n-- revision = 'wrong'\n} },\n}";
+
+        assert!(matches!(
+            parse_complete_parsers_lua(content),
+            Err(MetadataError::ParseError(_))
+        ));
+    }
+
+    #[test]
+    fn non_table_install_info_invalidates_the_document() {
+        let content = "return {\nlua = { install_info = { url = 'https://example/lua', revision = 'ok' } },\nrust = { install_info = 'damaged' },\n}";
 
         assert!(matches!(
             parse_complete_parsers_lua(content),
