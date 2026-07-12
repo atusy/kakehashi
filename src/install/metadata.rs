@@ -298,12 +298,24 @@ fn table_entries(s: &str, mut offset: usize) -> Vec<(String, LuaValue<'_>)> {
                 let name = s[offset..name_end].to_string();
                 if s[value_start..].starts_with('{') {
                     if let Some(block) = find_matching_brace(&s[value_start..]) {
-                        keys.push((name, LuaValue::Table(block)));
+                        if has_valid_field_terminator(&s[value_start + block.len()..]) {
+                            keys.push((name, LuaValue::Table(block)));
+                        } else {
+                            keys.push((name, LuaValue::Other));
+                        }
+                    } else {
+                        keys.push((name, LuaValue::Other));
                     }
                 } else if matches!(s[value_start..].chars().next(), Some('\'' | '"'))
                     && let Some(value) = quoted_string(&s[value_start..])
                 {
-                    keys.push((name, LuaValue::String(value)));
+                    let delimiter_len = s[value_start..].chars().next().unwrap().len_utf8();
+                    let value_end = value_start + delimiter_len + value.len() + delimiter_len;
+                    if has_valid_field_terminator(&s[value_end..]) {
+                        keys.push((name, LuaValue::String(value)));
+                    } else {
+                        keys.push((name, LuaValue::Other));
+                    }
                 } else {
                     keys.push((name, LuaValue::Other));
                 }
@@ -324,6 +336,28 @@ fn table_entries(s: &str, mut offset: usize) -> Vec<(String, LuaValue<'_>)> {
         offset += char_len;
     }
     keys
+}
+
+fn has_valid_field_terminator(mut rest: &str) -> bool {
+    loop {
+        rest = rest.trim_start_matches(char::is_whitespace);
+        if let Some(comment) = rest.strip_prefix("--") {
+            if let Some(equals) = long_bracket_open(comment) {
+                let opener_len = equals + 2;
+                let closer = format!("]{}]", "=".repeat(equals));
+                let Some(close_offset) = comment[opener_len..].find(&closer) else {
+                    return false;
+                };
+                rest = &comment[opener_len + close_offset + closer.len()..];
+            } else if let Some(newline) = comment.find('\n') {
+                rest = &comment[newline + 1..];
+            } else {
+                return false;
+            }
+            continue;
+        }
+        return matches!(rest.chars().next(), Some(',' | ';' | '}'));
+    }
 }
 
 fn quoted_string(s: &str) -> Option<&str> {
@@ -404,14 +438,14 @@ fn install_info(block: &str) -> InstallInfo<'_> {
 
 /// Find the content within matching braces starting from the first `{`.
 fn find_matching_brace(s: &str) -> Option<&str> {
-    let start = s.find('{')?;
+    let mut start = None;
     let mut depth = 0;
-    let mut end = start;
+    let mut end = 0;
     let mut quote = None;
     let mut escaped = false;
     let mut line_comment = false;
     let mut long_bracket = None;
-    let mut offset = start;
+    let mut offset = 0;
 
     while offset < s.len() {
         if let Some(equals) = long_bracket {
@@ -463,7 +497,12 @@ fn find_matching_brace(s: &str) -> Option<&str> {
 
         match c {
             '\'' | '"' => quote = Some(c),
-            '{' => depth += 1,
+            '{' => {
+                if depth == 0 {
+                    start = Some(offset);
+                }
+                depth += 1;
+            }
             '}' => {
                 depth -= 1;
                 if depth == 0 {
@@ -477,7 +516,7 @@ fn find_matching_brace(s: &str) -> Option<&str> {
     }
 
     if depth == 0 {
-        Some(&s[start..end])
+        Some(&s[start?..end])
     } else {
         None
     }
@@ -864,6 +903,28 @@ return {
     }
 
     #[test]
+    fn rejects_unclosed_nested_table() {
+        let content = "return { lua = { install_info = { url = 'x', revision = 'r' } }";
+        assert!(matches!(
+            parse_complete_parsers_lua(content),
+            Err(MetadataError::ParseError(_))
+        ));
+    }
+
+    #[test]
+    fn rejects_missing_table_field_separators() {
+        for content in [
+            "return { lua = { install_info = { url = 'x', revision = 'r' } } rust = { install_info = { url = 'y', revision = 's' } }, }",
+            "return { lua = { install_info = { url = 'x' revision = 'r' }, }, }",
+        ] {
+            assert!(matches!(
+                parse_complete_parsers_lua(content),
+                Err(MetadataError::ParseError(_))
+            ));
+        }
+    }
+
+    #[test]
     fn test_find_matching_brace() {
         let s = "{ foo { bar } baz }";
         let result = find_matching_brace(s);
@@ -872,6 +933,9 @@ return {
         let s2 = "prefix { inner } suffix";
         let result2 = find_matching_brace(s2);
         assert_eq!(result2, Some("{ inner }"));
+
+        let with_comment_brace = "-- { ignored\n{ real }";
+        assert_eq!(find_matching_brace(with_comment_brace), Some("{ real }"));
     }
 
     #[test]
