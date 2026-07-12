@@ -62,6 +62,13 @@ impl LanguageOperationPermit<'_> {
             Self::All(guard) => guard.data_dir == data_dir,
         }
     }
+
+    pub(crate) fn covers_all(&self, data_dir: &std::path::Path) -> bool {
+        let Ok(data_dir) = fs::canonicalize(data_dir) else {
+            return false;
+        };
+        matches!(self, Self::All(guard) if guard.data_dir == data_dir)
+    }
 }
 
 fn open_all_language_operations_lock(data_dir: &std::path::Path) -> std::io::Result<fs::File> {

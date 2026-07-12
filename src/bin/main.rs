@@ -541,7 +541,14 @@ fn run_language_uninstall(
 
     let parser_dir = data_dir.join("parser");
     let queries_dir = data_dir.join("queries");
-    if let Err(e) = queries::recover_interrupted_query_installs(&queries_dir) {
+    let recovery = match all_operations_lock.as_ref() {
+        Some(lock) => queries::recover_interrupted_query_installs_with_permit(
+            &queries_dir,
+            LanguageOperationPermit::All(lock),
+        ),
+        None => queries::recover_interrupted_query_installs(&queries_dir),
+    };
+    if let Err(e) = recovery {
         eprintln!("Warning: failed to recover interrupted query installs: {e}");
     }
 
@@ -582,7 +589,14 @@ fn run_language_uninstall(
                     ExitCode::FAILURE
                 })?,
             );
-            if let Err(e) = queries::recover_interrupted_query_installs(&queries_dir) {
+            if let Err(e) = queries::recover_interrupted_query_installs_with_permit(
+                &queries_dir,
+                LanguageOperationPermit::All(
+                    all_operations_lock
+                        .as_ref()
+                        .expect("--all reacquired its exclusive operation lock"),
+                ),
+            ) {
                 eprintln!("Warning: failed to recover interrupted query installs: {e}");
             }
             let refreshed = collect_installed_languages(&parser_dir, &queries_dir);

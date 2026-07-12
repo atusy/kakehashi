@@ -503,6 +503,37 @@ fn unique_backup_query_dir(queries_dir: &Path, language: &str) -> PathBuf {
 
 /// Recover query directories stranded by a process exit during replacement.
 pub fn recover_interrupted_query_installs(queries_parent: &Path) -> Result<(), QueryInstallError> {
+    let Some(data_dir) = queries_parent.parent() else {
+        return Err(QueryInstallError::IoError(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "queries directory must have a data-directory parent",
+        )));
+    };
+    let all_lock = super::AllLanguageOperationsLockGuard::acquire(data_dir)?;
+    recover_interrupted_query_installs_with_permit(
+        queries_parent,
+        super::LanguageOperationPermit::All(&all_lock),
+    )
+}
+
+/// Recover all query installs while the caller holds the all-language lock.
+#[doc(hidden)]
+pub fn recover_interrupted_query_installs_with_permit(
+    queries_parent: &Path,
+    permit: super::LanguageOperationPermit<'_>,
+) -> Result<(), QueryInstallError> {
+    let Some(data_dir) = queries_parent.parent() else {
+        return Err(QueryInstallError::IoError(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "queries directory must have a data-directory parent",
+        )));
+    };
+    if !permit.covers_all(data_dir) {
+        return Err(QueryInstallError::IoError(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "operation permit does not cover all-language query recovery",
+        )));
+    }
     let entries = match fs::read_dir(queries_parent) {
         Ok(entries) => entries,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
