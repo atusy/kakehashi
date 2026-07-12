@@ -62,6 +62,21 @@ fn host_position_encoding(capabilities: &ClientCapabilities) -> Option<PositionE
         .map(|_| PositionEncodingKind::UTF16)
 }
 
+/// Derive only the root URI the upstream client supplied for downstream
+/// initialization. Kakehashi may use its process CWD internally for config
+/// discovery, but forwarding that fallback would turn a no-workspace session
+/// into an unrelated workspace for every bridged server.
+fn bridge_root_uri(params: &InitializeParams) -> Option<String> {
+    #[allow(deprecated)]
+    let primary_uri = params
+        .workspace_folders
+        .as_ref()
+        .and_then(|folders| folders.first())
+        .map(|folder| &folder.uri)
+        .or(params.root_uri.as_ref());
+    primary_uri.map(|uri| uri.as_str().to_string())
+}
+
 impl Kakehashi {
     pub(crate) async fn initialize_impl(
         &self,
@@ -91,18 +106,12 @@ impl Kakehashi {
         #[allow(deprecated)]
         let primary_uri: Option<&Uri> = first_folder.map(|f| &f.uri).or(params.root_uri.as_ref());
 
-        // Get root URI string for downstream servers, falling back to current directory
-        let root_uri_for_bridge: Option<String> =
-            primary_uri.map(|uri| uri.to_string()).or_else(|| {
-                std::env::current_dir()
-                    .ok()
-                    .and_then(|p| Url::from_file_path(p).ok())
-                    .map(|u| u.to_string())
-            });
+        // Preserve the upstream workspace contract for downstream servers. The
+        // separate internal root-path fallback below may still use the CWD.
+        let root_uri_for_bridge = bridge_root_uri(&params);
 
         // Forward root_uri and workspace_folders to bridge pool for downstream server initialization
         self.bridge.pool().set_root_uri(root_uri_for_bridge.clone());
-
         use std::str::FromStr as _;
         let workspace_folders_for_bridge = params.workspace_folders.clone().or_else(|| {
             root_uri_for_bridge.as_ref().and_then(|uri| {
@@ -1630,6 +1639,18 @@ mod tests {
             None,
             "omitted capability uses the protocol's UTF-16 default",
         );
+    }
+
+    #[test]
+    fn bridge_workspace_context_preserves_no_workspace_initialize() {
+        let params: InitializeParams = serde_json::from_value(serde_json::json!({
+            "capabilities": {},
+            "rootUri": null,
+            "workspaceFolders": null
+        }))
+        .expect("valid initialize params");
+
+        assert_eq!(bridge_root_uri(&params), None);
     }
 
     /// A throwaway cancel context for tests that don't exercise cancellation.
