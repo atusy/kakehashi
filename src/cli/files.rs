@@ -61,7 +61,7 @@ pub(crate) fn collect_files(
 
     let mut files = Vec::new();
     let mut walk_errors = 0usize;
-    let mut has_explicit_alias = false;
+    let mut explicit_identities = Vec::new();
     for path in paths {
         // Normalize before stat: a relative path must resolve against
         // `base`, not against whatever the process cwd happens to be.
@@ -79,19 +79,31 @@ pub(crate) fn collect_files(
             if is_excluded(&exclude_matcher, base, &path, true) {
                 continue;
             }
-            has_explicit_alias |= paths.len() > 1
-                && std::fs::canonicalize(&path).is_ok_and(|resolved| resolved != path);
+            if paths.len() > 1 {
+                let resolved = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
+                explicit_identities.push((path.clone(), resolved));
+            }
             walk_errors += walk_directory(&path, &exclude_matcher, is_supported, &mut files);
         } else {
             if is_excluded(&exclude_matcher, base, &path, false) {
                 continue;
             }
-            has_explicit_alias |= paths.len() > 1
-                && std::fs::canonicalize(&path).is_ok_and(|resolved| resolved != path);
+            if paths.len() > 1 {
+                let resolved = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
+                explicit_identities.push((path.clone(), resolved));
+            }
             files.push(path);
         }
     }
     files.sort();
+    let overlaps = |left: &Path, right: &Path| {
+        left == right || left.starts_with(right) || right.starts_with(left)
+    };
+    let has_explicit_alias = explicit_identities.iter().enumerate().any(|(index, left)| {
+        explicit_identities[index + 1..]
+            .iter()
+            .any(|right| overlaps(&left.1, &right.1) && !overlaps(&left.0, &right.0))
+    });
     if has_explicit_alias {
         let mut seen = std::collections::HashSet::new();
         files.retain(|path| {
