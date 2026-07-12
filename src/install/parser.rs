@@ -568,11 +568,11 @@ fn cleanup_orphan_parser_backup_markers(parser_dir: &Path, language: &str) -> st
             }
         } else if kind == 1 {
             if parser_backup_marker_is_intent(&marker, &backup)?
-                && (!backup.try_exists()? || path_entry_exists(&canonical)?)
+                && (!path_entry_exists(&backup)? || path_entry_exists(&canonical)?)
             {
                 remove_parser_backup_marker(&backup)?;
             }
-        } else if parser_backup_marker_is_owned(&marker, &backup)? && !backup.try_exists()? {
+        } else if parser_backup_marker_is_owned(&marker, &backup)? && !path_entry_exists(&backup)? {
             remove_parser_backup_marker(&backup)?;
         }
     }

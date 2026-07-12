@@ -509,6 +509,7 @@ fn collect_installed_languages(
             }
         }
     }
+    #[cfg(windows)]
     languages.extend(parser::owned_parser_backup_languages(parser_dir)?);
     if let Ok(entries) = fs::read_dir(queries_dir) {
         for entry in entries.flatten() {
