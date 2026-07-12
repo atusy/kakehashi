@@ -241,7 +241,8 @@ fn read_workspace_toml_contents(
                 }
                 Err(metadata_error) => {
                     events.push(SettingsEvent::warning(format!(
-                        "Failed to read kakehashi.toml: {metadata_error}"
+                        "Failed to read {}: {metadata_error}",
+                        config_path.display()
                     )));
                     None
                 }
@@ -251,7 +252,8 @@ fn read_workspace_toml_contents(
                     Ok(contents) => Some(contents),
                     Err(retry_error) => {
                         events.push(SettingsEvent::warning(format!(
-                            "Failed to read kakehashi.toml: {retry_error}"
+                            "Failed to read {}: {retry_error}",
+                            config_path.display()
                         )));
                         None
                     }
@@ -260,7 +262,8 @@ fn read_workspace_toml_contents(
         }
         Err(err) => {
             events.push(SettingsEvent::warning(format!(
-                "Failed to read kakehashi.toml: {}",
+                "Failed to read {}: {}",
+                config_path.display(),
                 err
             )));
             None
@@ -766,7 +769,8 @@ mod tests {
         assert!(
             events.iter().any(|event| {
                 event.kind == SettingsEventKind::Warning
-                    && event.message.contains("Failed to read kakehashi.toml")
+                    && event.message.contains("Failed to read")
+                    && event.message.contains(&dir.path().display().to_string())
             }),
             "a configured but broken workspace path must emit a read warning: {events:?}"
         );
