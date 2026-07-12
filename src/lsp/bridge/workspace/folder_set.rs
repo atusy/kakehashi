@@ -106,6 +106,25 @@ impl WorkspaceFolderSet {
             .is_some_and(|folders| folders.iter().any(|existing| existing.uri == folder.uri))
     }
 
+    /// Record marker ownership when `folder` is already present, without
+    /// changing the served set or requiring a downstream announcement.
+    pub(crate) fn claim_marker_ownership_if_present(&self, folder: &WorkspaceFolder) -> bool {
+        let inner = self
+            .inner
+            .lock()
+            .recover_poison("WorkspaceFolderSet::claim_marker_ownership_if_present");
+        let present = inner
+            .as_ref()
+            .is_some_and(|folders| folders.iter().any(|existing| existing.uri == folder.uri));
+        if present {
+            self.marker_owned
+                .lock()
+                .recover_poison("WorkspaceFolderSet::marker_owned")
+                .insert(folder.uri.as_str().to_string());
+        }
+        present
+    }
+
     /// Apply an upstream workspace-folder change atomically. Removals match by
     /// URI (folder names are display metadata), then additions append in event
     /// order while preserving URI uniqueness.
@@ -369,6 +388,21 @@ mod tests {
             Vec::new(),
             &[marker.clone()],
             |_, _| panic!("marker ownership makes the wire delta empty"),
+        ));
+
+        assert_eq!(set.snapshot(), Some(vec![marker]));
+    }
+
+    #[test]
+    fn existing_upstream_folder_can_become_marker_owned() {
+        let marker = folder("file:///marker");
+        let set = WorkspaceFolderSet::new(Some(vec![marker.clone()]));
+
+        assert!(set.claim_marker_ownership_if_present(&marker));
+        assert!(set.apply_upstream_change_and_announce(
+            Vec::new(),
+            &[marker.clone()],
+            |_, _| panic!("claimed marker ownership makes the wire delta empty"),
         ));
 
         assert_eq!(set.snapshot(), Some(vec![marker]));

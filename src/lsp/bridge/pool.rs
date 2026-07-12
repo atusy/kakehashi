@@ -2047,7 +2047,10 @@ impl LanguageServerPool {
                 "bridge: connection was replaced before didChangeWorkspaceFolders",
             ));
         }
-        if handle.workspace_folders().contains(folder) {
+        if handle
+            .workspace_folders()
+            .claim_marker_ownership_if_present(folder)
+        {
             return Ok(true);
         }
         if !handle.supports_workspace_folder_changes() {
