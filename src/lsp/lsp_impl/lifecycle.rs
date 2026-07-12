@@ -200,12 +200,17 @@ impl Kakehashi {
             self.home_dir.as_deref(),
             |var| std::env::var(var).ok(),
         );
-        let settings_events = settings_outcome.events;
-        let mut default_settings_warning = None;
 
+        // Report the fatal explicit-config failure only through the initialize
+        // response: returning before the settings events are logged keeps the
+        // error from also arriving as a window/logMessage duplicate.
         if let Some(error) = settings_outcome.fatal_error {
+            log::error!(target: "kakehashi::config", "{error}");
             return Err(configuration_load_error(error));
         }
+
+        let settings_events = settings_outcome.events;
+        let mut default_settings_warning = None;
 
         // Nudge users off the deprecated `rootMarkers` config key. The claim
         // guard latches session-wide so a later didChangeConfiguration carrying
