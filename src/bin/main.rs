@@ -604,7 +604,7 @@ fn run_language_uninstall(
         }
 
         // Make parser removal the final artifact operation. Besides sharing a
-        // lock with parser publication, its tombstone must be written after
+        // lock with parser publication, its operation marker must be written after
         // query cleanup so an installer that starts during that cleanup cannot
         // publish a parser after this command reports success.
         match parser::remove_parser_install(&parser_dir, lang) {
