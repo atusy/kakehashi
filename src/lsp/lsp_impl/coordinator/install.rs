@@ -194,6 +194,10 @@ impl InstallCoordinator {
         uri: Url,
         is_injection: bool,
     ) {
+        // Keep the post-install search-path derivation in the same transaction
+        // domain as runtime configuration pushes, or either update can overwrite
+        // the other after deriving from a shared stale snapshot.
+        let _settings_transaction = self.settings_manager.begin_settings_transaction().await;
         let settings_snapshot = self.settings_manager.load_settings_pair();
         let (updated_raw_settings, updated_settings) = updated_settings_after_install(
             &settings_snapshot.raw_settings,
