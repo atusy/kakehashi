@@ -1098,16 +1098,14 @@ mod tests {
             ..Default::default()
         };
         let _ = coordinator.load_settings(&settings);
-        if !coordinator.ensure_language_loaded("markdown").success {
-            eprintln!("Skipping: markdown parser not available");
-            return;
-        }
+        assert!(
+            coordinator.ensure_language_loaded("markdown").success,
+            "markdown parser fixture is required"
+        );
 
         let text = "# heading\n\nambiguous paragraph\n";
         let mut pool = coordinator.create_document_parser_pool();
-        let Some(mut parser) = pool.acquire("markdown") else {
-            return;
-        };
+        let mut parser = pool.acquire("markdown").expect("acquire markdown parser");
         let tree = parser.parse(text, None).expect("parse markdown");
         pool.release("markdown".to_string(), parser);
 
@@ -1119,6 +1117,23 @@ mod tests {
             paragraph = paragraph.parent().expect("paragraph ancestor");
         }
         assert_eq!(paragraph.kind(), "paragraph");
+
+        let stack = injection_stack_at(
+            &coordinator,
+            "markdown",
+            text,
+            &tree,
+            paragraph.start_byte(),
+        );
+        assert!(
+            stack.len() > 2,
+            "recursive markdown fixture has a child layer"
+        );
+        assert!(stack[1].ambiguous, "the overlapping siblings are detected");
+        assert!(
+            stack[2].ambiguous,
+            "an ambiguous ancestor taints its descendant layer"
+        );
 
         let resolved = with_resolved_node(
             &coordinator,
@@ -1135,6 +1150,29 @@ mod tests {
         assert!(
             matches!(resolved, NodeResolution::Ambiguous),
             "a depth-only id cannot prove which overlapping sibling minted it"
+        );
+
+        let pair = with_resolved_node_pair(
+            &coordinator,
+            "markdown",
+            text,
+            &tree,
+            (
+                paragraph.start_byte(),
+                paragraph.end_byte(),
+                paragraph.kind(),
+            ),
+            (
+                paragraph.start_byte(),
+                paragraph.end_byte(),
+                paragraph.kind(),
+            ),
+            1,
+            |_, _| (),
+        );
+        assert!(
+            matches!(pair, NodeResolution::Ambiguous),
+            "pair resolution must reject the same ambiguous layer"
         );
     }
 }
