@@ -574,10 +574,7 @@ fn e2e_diagnose_directory_walk_respects_gitignore_but_explicit_path_wins() {
 #[test]
 fn e2e_diagnose_directory_walk_includes_extensionless_shebang_file() {
     let config = config_toml().replace("languages = [\"lua\"]", "languages = [\"python\"]");
-    let ws = workspace_with(
-        &config,
-        &[("tool", "#!/usr/bin/env python\nvalue = 1\n")],
-    );
+    let ws = workspace_with(&config, &[("tool", "#!/usr/bin/env python\nvalue = 1\n")]);
 
     let output = run_diagnose(ws.path(), &[".", "--fail-on-warning"]);
 

@@ -76,14 +76,15 @@ impl Kakehashi {
             // unsupported language.
             return true;
         };
-        let mut first_line = String::new();
+        let mut first_line = Vec::new();
         if std::io::BufReader::new(file)
             .take(MAX_FIRST_LINE_BYTES)
-            .read_line(&mut first_line)
+            .read_until(b'\n', &mut first_line)
             .is_err()
         {
             return true;
         }
+        let first_line = String::from_utf8_lossy(&first_line);
         self.language
             .loadable_language_for_document(&path.to_string_lossy(), &first_line)
             .is_some()
