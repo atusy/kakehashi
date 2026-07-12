@@ -83,14 +83,10 @@ impl BridgeReader {
             }
             let buffered = self.stdout.fill_buf().await?;
             if buffered.is_empty() {
-                return if line.is_empty() {
-                    Ok(line)
-                } else {
-                    Err(io::Error::new(
-                        io::ErrorKind::UnexpectedEof,
-                        "downstream connection closed mid-header",
-                    ))
-                };
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "downstream connection closed while reading headers",
+                ));
             }
             let consumed = buffered
                 .iter()
