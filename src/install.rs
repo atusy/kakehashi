@@ -426,27 +426,18 @@ mod tests {
     fn language_operation_lock_serializes_the_same_language() {
         let temp = tempfile::tempdir().unwrap();
         let first = LanguageOperationLockGuard::acquire(temp.path(), "lua").unwrap();
-        let (started_tx, started_rx) = std::sync::mpsc::channel();
-        let (acquired_tx, acquired_rx) = std::sync::mpsc::channel();
-        let data_dir = temp.path().to_path_buf();
-        let waiter = std::thread::spawn(move || {
-            started_tx.send(()).unwrap();
-            let _second = LanguageOperationLockGuard::acquire(&data_dir, "lua").unwrap();
-            acquired_tx.send(()).unwrap();
-        });
-        started_rx.recv().unwrap();
-
+        let second = fs::OpenOptions::new()
+            .write(true)
+            .open(temp.path().join(".operation-locks/lua.lock"))
+            .unwrap();
         assert!(
-            acquired_rx
-                .recv_timeout(std::time::Duration::from_millis(100))
-                .is_err(),
-            "a same-language operation must wait for the current one"
+            second.try_lock_exclusive().is_err(),
+            "the same-language lock must be unavailable while held"
         );
         drop(first);
-        acquired_rx
-            .recv_timeout(std::time::Duration::from_secs(5))
-            .expect("the waiter acquires after release");
-        waiter.join().unwrap();
+        second
+            .try_lock_exclusive()
+            .expect("the same-language lock becomes available after release");
     }
 
     #[test]
