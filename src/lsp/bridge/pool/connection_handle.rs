@@ -558,7 +558,10 @@ impl ConnectionHandle {
                             Some(OneOf::Right(id)) => Some(id.as_str()),
                             _ => None,
                         })
-                        .is_some_and(|id| self.dynamic_capabilities().is_registration_revoked(id))
+                        .is_some_and(|id| {
+                            self.dynamic_capabilities()
+                                .is_registration_revoked(id, "workspace/didChangeWorkspaceFolders")
+                        })
             })
     }
 

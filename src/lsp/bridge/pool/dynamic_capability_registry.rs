@@ -25,7 +25,7 @@ pub(crate) struct DynamicCapabilityRegistry {
 #[derive(Default)]
 struct CapabilityRegistrationState {
     active: HashMap<String, Registration>,
-    revoked_ids: HashSet<String>,
+    revoked_methods_by_id: HashMap<String, HashSet<String>>,
 }
 
 impl DynamicCapabilityRegistry {
@@ -46,7 +46,16 @@ impl DynamicCapabilityRegistry {
             .write()
             .recover_poison("DynamicCapabilityRegistry::register");
         for reg in registrations {
-            guard.revoked_ids.remove(&reg.id);
+            let clear_id = guard
+                .revoked_methods_by_id
+                .get_mut(&reg.id)
+                .is_some_and(|methods| {
+                    methods.remove(&reg.method);
+                    methods.is_empty()
+                });
+            if clear_id {
+                guard.revoked_methods_by_id.remove(&reg.id);
+            }
             guard.active.insert(reg.id.clone(), reg);
         }
     }
@@ -58,7 +67,11 @@ impl DynamicCapabilityRegistry {
             .recover_poison("DynamicCapabilityRegistry::unregister");
         for unreg in unregistrations {
             guard.active.remove(&unreg.id);
-            guard.revoked_ids.insert(unreg.id);
+            guard
+                .revoked_methods_by_id
+                .entry(unreg.id)
+                .or_default()
+                .insert(unreg.method);
         }
     }
 
@@ -71,15 +84,17 @@ impl DynamicCapabilityRegistry {
             .any(|r| r.method == method)
     }
 
-    /// Whether a registration ID was explicitly revoked and has not since
-    /// been registered again. This also covers IDs advertised in initialize
-    /// capabilities rather than through `client/registerCapability`.
-    pub(crate) fn is_registration_revoked(&self, id: &str) -> bool {
+    /// Whether a registration ID/method pair was explicitly revoked and has
+    /// not since been registered again. This also covers registrations
+    /// advertised in initialize capabilities rather than through
+    /// `client/registerCapability`.
+    pub(crate) fn is_registration_revoked(&self, id: &str, method: &str) -> bool {
         self.registrations
             .read()
             .recover_poison("DynamicCapabilityRegistry::is_registration_revoked")
-            .revoked_ids
-            .contains(id)
+            .revoked_methods_by_id
+            .get(id)
+            .is_some_and(|methods| methods.contains(method))
     }
 }
 
@@ -127,7 +142,7 @@ mod tests {
         registry.unregister(vec![unreg]);
 
         assert!(!registry.has_registration("textDocument/completion"));
-        assert!(registry.is_registration_revoked("1"));
+        assert!(registry.is_registration_revoked("1", "textDocument/completion"));
     }
 
     #[test]
@@ -135,12 +150,26 @@ mod tests {
         let registry = DynamicCapabilityRegistry::new();
         let unreg = make_unregistration("1", "textDocument/completion");
         registry.unregister(vec![unreg]);
-        assert!(registry.is_registration_revoked("1"));
+        assert!(registry.is_registration_revoked("1", "textDocument/completion"));
 
         registry.register(vec![make_registration("1", "textDocument/completion")]);
 
-        assert!(!registry.is_registration_revoked("1"));
+        assert!(!registry.is_registration_revoked("1", "textDocument/completion"));
         assert!(registry.has_registration("textDocument/completion"));
+    }
+
+    #[test]
+    fn reusing_an_id_for_another_method_preserves_revocation() {
+        let registry = DynamicCapabilityRegistry::new();
+        registry.unregister(vec![make_unregistration(
+            "wf-id",
+            "workspace/didChangeWorkspaceFolders",
+        )]);
+
+        registry.register(vec![make_registration("wf-id", "textDocument/hover")]);
+
+        assert!(registry.is_registration_revoked("wf-id", "workspace/didChangeWorkspaceFolders"));
+        assert!(registry.has_registration("textDocument/hover"));
     }
 
     #[test]
