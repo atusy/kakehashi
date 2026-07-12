@@ -431,7 +431,8 @@ fn staged_parser_pid(path: &Path) -> Option<u32> {
     {
         return None;
     }
-    pid.parse().ok()
+    let pid = pid.parse().ok()?;
+    (1..=i32::MAX as u32).contains(&pid).then_some(pid)
 }
 
 fn is_canonical_decimal(value: &str) -> bool {
@@ -1155,15 +1156,23 @@ mod tests {
     use tempfile::tempdir;
 
     #[cfg(unix)]
+    fn terminated_child_pid() -> u32 {
+        let mut child = std::process::Command::new("true")
+            .spawn()
+            .expect("spawn short-lived child");
+        let pid = child.id();
+        child.wait().expect("wait for short-lived child");
+        assert!(!process_is_running(pid), "reaped child PID is not running");
+        pid
+    }
+
+    #[cfg(unix)]
     #[test]
     fn cleanup_removes_staged_parser_from_dead_process() {
         let temp = tempdir().expect("temp dir");
         let parser_dir = temp.path().join("parser");
         fs::create_dir_all(&parser_dir).expect("create parser dir");
-        let mut pid = std::process::id().saturating_add(100_000);
-        while process_is_running(pid) {
-            pid = pid.saturating_add(1);
-        }
+        let pid = terminated_child_pid();
         let staged = parser_dir.join(format!(
             ".lua.{pid}.0.{}.tmp",
             std::env::consts::DLL_EXTENSION
@@ -1209,10 +1218,18 @@ mod tests {
             ".lua.000123.0.{}.tmp",
             std::env::consts::DLL_EXTENSION
         ));
+        let zero_pid = parser_dir.join(format!(".lua.0.0.{}.tmp", std::env::consts::DLL_EXTENSION));
+        let oversized_pid = parser_dir.join(format!(
+            ".lua.{}.0.{}.tmp",
+            i32::MAX as u32 + 1,
+            std::env::consts::DLL_EXTENSION
+        ));
         let noncanonical_claim = parser_dir.join(".parser-cleanup.000123.0");
         fs::write(&empty_counter, b"user file").expect("write user file");
         fs::write(&leading_zero, b"user file").expect("write user file");
         fs::write(&leading_zero_pid, b"user file").expect("write user file");
+        fs::write(&zero_pid, b"user file").expect("write user file");
+        fs::write(&oversized_pid, b"user file").expect("write user file");
         fs::write(&noncanonical_claim, b"user file").expect("write user file");
 
         cleanup_interrupted_parser_installs(&parser_dir).expect("cleanup succeeds");
@@ -1220,6 +1237,8 @@ mod tests {
         assert!(empty_counter.exists(), "empty counter name is preserved");
         assert!(leading_zero.exists(), "leading-zero name is preserved");
         assert!(leading_zero_pid.exists(), "leading-zero PID is preserved");
+        assert!(zero_pid.exists(), "zero PID is preserved");
+        assert!(oversized_pid.exists(), "oversized PID is preserved");
         assert!(
             noncanonical_claim.exists(),
             "leading-zero cleanup claim PID is preserved"
@@ -1232,10 +1251,7 @@ mod tests {
         let temp = tempdir().expect("temp dir");
         let parser_dir = temp.path().join("parser");
         fs::create_dir_all(&parser_dir).expect("create parser dir");
-        let mut pid = std::process::id().saturating_add(100_000);
-        while process_is_running(pid) {
-            pid = pid.saturating_add(1);
-        }
+        let pid = terminated_child_pid();
         let staged = parser_dir.join(format!(
             ".lua.{pid}.0.{}.tmp",
             std::env::consts::DLL_EXTENSION
@@ -1257,10 +1273,7 @@ mod tests {
         let temp = tempdir().expect("temp dir");
         let parser_dir = temp.path().join("parser");
         fs::create_dir_all(&parser_dir).expect("create parser dir");
-        let mut pid = std::process::id().saturating_add(100_000);
-        while process_is_running(pid) {
-            pid = pid.saturating_add(1);
-        }
+        let pid = terminated_child_pid();
         let staged = parser_dir.join(format!(
             ".lua.{pid}.0.{}.tmp",
             std::env::consts::DLL_EXTENSION
