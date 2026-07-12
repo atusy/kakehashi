@@ -157,23 +157,66 @@ fn test_config_file_two_files_merge_in_order() {
     );
 }
 
-/// --config-file with non-existent path: the file load fails with an error,
-/// and the configuration layer is skipped, so effective settings fall back to defaults.
+/// --config-file with non-existent path fails initialization instead of silently
+/// falling back to defaults.
 #[test]
-fn test_config_file_nonexistent_falls_back_to_defaults() {
+fn test_config_file_nonexistent_fails_initialization() {
     let mut client = LspClient::builder()
         .arg("--config-file")
         .arg("/nonexistent/kakehashi-test-config.toml")
         .env_remove("KAKEHASHI_DATA_DIR")
         .build();
 
-    let settings = get_effective_settings(&mut client);
+    let response = client.send_request(
+        "initialize",
+        json!({
+            "processId": std::process::id(),
+            "rootUri": null,
+            "capabilities": {}
+        }),
+    );
 
-    // The missing file produces None in the merge, so only defaults apply
-    assert_eq!(
-        settings["autoInstall"],
-        json!(true),
-        "missing config file should fall back to default autoInstall=true"
+    let error = response
+        .get("error")
+        .expect("missing explicit config file should reject initialize");
+    assert_eq!(error["code"], json!(-32602));
+    assert!(
+        error["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("Config file not found")),
+        "initialize error should identify the missing config file: {error}"
+    );
+}
+
+#[test]
+fn test_config_file_invalid_toml_fails_initialization() {
+    let dir = TempDir::new().unwrap();
+    let config_path = dir.path().join("invalid.toml");
+    std::fs::write(&config_path, "searchPaths = [\"/unterminated\"\n").unwrap();
+    let mut client = LspClient::builder()
+        .arg("--config-file")
+        .arg(config_path.to_str().unwrap())
+        .env_remove("KAKEHASHI_DATA_DIR")
+        .build();
+
+    let response = client.send_request(
+        "initialize",
+        json!({
+            "processId": std::process::id(),
+            "rootUri": null,
+            "capabilities": {}
+        }),
+    );
+
+    let error = response
+        .get("error")
+        .expect("invalid explicit config file should reject initialize");
+    assert_eq!(error["code"], json!(-32602));
+    assert!(
+        error["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("Failed to parse")),
+        "initialize error should identify the parse failure: {error}"
     );
 }
 

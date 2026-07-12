@@ -192,10 +192,13 @@ impl Kakehashi {
         let settings_events = settings_outcome.events;
         let mut default_settings_warning = None;
 
-        // Nudge users off deprecated config keys. Each claim guard latches
-        // session-wide so a later didChangeConfiguration carrying the same key
-        // does not warn a second time (and vice versa). The two keys claim
-        // independently: seeing one must not suppress the other.
+        if let Some(error) = settings_outcome.fatal_error {
+            return Err(tower_lsp_server::jsonrpc::Error::invalid_params(error));
+        }
+
+        // Nudge users off the deprecated `rootMarkers` config key. The claim
+        // guard latches session-wide so a later didChangeConfiguration carrying
+        // `rootMarkers` does not warn a second time (and vice versa).
         if settings_outcome.deprecated_keys.root_markers
             && self
                 .settings_manager
