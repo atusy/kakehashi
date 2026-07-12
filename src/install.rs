@@ -372,7 +372,10 @@ fn install_language_blocking_with_query_installer(
         return result;
     }
 
-    let _operation_lock = match LanguageOperationLockGuard::acquire(data_dir, language) {
+    // Query inheritance can publish multiple languages. Hold the all-language
+    // operation lock across parser and query publication so every inherited
+    // parent is ordered against targeted uninstall without lock-order cycles.
+    let _operation_lock = match AllLanguageOperationsLockGuard::acquire(data_dir) {
         Ok(lock) => lock,
         Err(error) => {
             let reason = format!("Failed to lock language operation: {error}");
@@ -407,7 +410,7 @@ fn install_language_blocking_with_query_installer(
     match parser::install_parser_after_operation_started(
         language,
         &parser_options,
-        LanguageOperationPermit::Language(&_operation_lock),
+        LanguageOperationPermit::All(&_operation_lock),
     ) {
         Ok(parser_result) => {
             result.parser_path = Some(parser_result.install_path);

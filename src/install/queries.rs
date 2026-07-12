@@ -155,7 +155,7 @@ pub fn install_queries_with_dependencies(
     force: bool,
 ) -> Result<QueryInstallResult, QueryInstallError> {
     validate_safe_language_name(language)?;
-    let _operation_lock = super::LanguageOperationLockGuard::acquire(data_dir, language)?;
+    let _operation_lock = super::AllLanguageOperationsLockGuard::acquire(data_dir)?;
     clear_uninstall_tombstone_for_install(data_dir, language)?;
     install_queries_with_dependencies_from_with_http_policy(
         NVIM_TREESITTER_QUERIES_URL,
@@ -172,13 +172,13 @@ pub fn install_queries_with_dependencies_after_install_started(
     force: bool,
 ) -> Result<QueryInstallResult, QueryInstallError> {
     validate_safe_language_name(language)?;
-    let _operation_lock = super::LanguageOperationLockGuard::acquire(data_dir, language)?;
+    let _operation_lock = super::AllLanguageOperationsLockGuard::acquire(data_dir)?;
     clear_uninstall_tombstone_for_install(data_dir, language)?;
     install_queries_with_dependencies_after_install_started_with_permit(
         language,
         data_dir,
         force,
-        super::LanguageOperationPermit::Language(&_operation_lock),
+        super::LanguageOperationPermit::All(&_operation_lock),
     )
 }
 

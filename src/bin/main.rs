@@ -416,7 +416,10 @@ fn run_language_status(verbose: bool) -> Result<(), ExitCode> {
                 .map(|ext| ext == std::env::consts::DLL_EXTENSION)
                 .unwrap_or(false);
             if is_parser && let Some(stem) = path.file_stem() {
-                languages.insert(stem.to_string_lossy().to_string());
+                let stem = stem.to_string_lossy();
+                if queries::is_safe_language_name(&stem) {
+                    languages.insert(stem.to_string());
+                }
             }
         }
     }
