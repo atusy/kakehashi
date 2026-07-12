@@ -759,7 +759,8 @@ mod tests {
         use std::os::unix::fs::symlink;
 
         let dir = TempDir::new().unwrap();
-        symlink("missing.toml", dir.path().join("kakehashi.toml")).unwrap();
+        let config_path = dir.path().join("kakehashi.toml");
+        symlink("missing.toml", &config_path).unwrap();
 
         let mut events = Vec::new();
         let mut used_deprecated = false;
@@ -770,7 +771,7 @@ mod tests {
             events.iter().any(|event| {
                 event.kind == SettingsEventKind::Warning
                     && event.message.contains("Failed to read")
-                    && event.message.contains(&dir.path().display().to_string())
+                    && event.message.contains(&config_path.display().to_string())
             }),
             "a configured but broken workspace path must emit a read warning: {events:?}"
         );
