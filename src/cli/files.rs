@@ -647,6 +647,47 @@ mod tests {
         assert_eq!(files.len(), 1, "one filesystem file must be processed once");
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn windows_file_symlink_aliases_are_deduplicated() {
+        use std::os::windows::fs::symlink_file;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let document = tmp.path().join("doc.md");
+        let alias = tmp.path().join("alias.md");
+        write(&document, "x");
+        if symlink_file(&document, &alias).is_err() {
+            return;
+        }
+
+        let files = collect_paths(tmp.path(), &[document, alias], &[], &markdown_only);
+
+        assert_eq!(files.len(), 1, "one filesystem file must be processed once");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_directory_symlink_aliases_are_deduplicated() {
+        use std::os::windows::fs::symlink_dir;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let real = tmp.path().join("real");
+        let alias = tmp.path().join("alias");
+        write(&real.join("doc.md"), "x");
+        if symlink_dir(&real, &alias).is_err() {
+            return;
+        }
+
+        let files = collect_paths(
+            tmp.path(),
+            &[tmp.path().to_path_buf(), alias],
+            &[],
+            &markdown_only,
+        );
+
+        assert_eq!(files.len(), 1, "one filesystem file must be processed once");
+    }
+
     #[test]
     fn explicitly_named_hidden_directory_is_walked() {
         // The walker's hidden-file filter applies to entries, not to the
