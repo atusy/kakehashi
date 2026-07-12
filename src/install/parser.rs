@@ -1755,6 +1755,22 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn owned_parser_backup_languages_propagates_marker_read_error() {
+        use std::os::unix::fs::symlink;
+        let temp = tempdir().expect("temp dir");
+        let parser_dir = temp.path().join("parser");
+        fs::create_dir_all(&parser_dir).expect("create parser dir");
+        let backup = parser_dir.join(generated_backup_name("lua", 123, 4));
+        let marker = parser_backup_ownership_sidecar(&backup);
+        fs::write(&backup, b"parser").expect("write backup");
+        symlink(&marker, &marker).expect("create marker symlink loop");
+
+        owned_parser_backup_languages(&parser_dir)
+            .expect_err("uninspectable ownership marker must abort discovery");
+    }
+
     #[test]
     fn parser_uninstall_removes_owned_backups_only() {
         let temp = tempdir().expect("temp dir");

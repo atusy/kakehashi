@@ -486,7 +486,10 @@ fn installed_query_language_name(path: &Path) -> Option<String> {
     Some(name.to_string())
 }
 
-fn collect_installed_languages(parser_dir: &Path, queries_dir: &Path) -> Vec<String> {
+fn collect_installed_languages(
+    parser_dir: &Path,
+    queries_dir: &Path,
+) -> std::io::Result<Vec<String>> {
     use std::collections::BTreeSet;
     use std::fs;
 
@@ -506,9 +509,7 @@ fn collect_installed_languages(parser_dir: &Path, queries_dir: &Path) -> Vec<Str
             }
         }
     }
-    if let Ok(backup_languages) = parser::owned_parser_backup_languages(parser_dir) {
-        languages.extend(backup_languages);
-    }
+    languages.extend(parser::owned_parser_backup_languages(parser_dir)?);
     if let Ok(entries) = fs::read_dir(queries_dir) {
         for entry in entries.flatten() {
             if let Some(name) = installed_query_language_name(&entry.path()) {
@@ -516,7 +517,7 @@ fn collect_installed_languages(parser_dir: &Path, queries_dir: &Path) -> Vec<Str
             }
         }
     }
-    languages.into_iter().collect()
+    Ok(languages.into_iter().collect())
 }
 
 /// Run the language uninstall command
@@ -563,7 +564,13 @@ fn run_language_uninstall(
 
     // Determine which languages to uninstall
     let mut languages_to_uninstall = if all {
-        collect_installed_languages(&parser_dir, &queries_dir)
+        match collect_installed_languages(&parser_dir, &queries_dir) {
+            Ok(languages) => languages,
+            Err(error) => {
+                eprintln!("Error: failed to inspect parser backups: {error}");
+                return Err(ExitCode::FAILURE);
+            }
+        }
     } else {
         vec![language.expect("language required when --all not specified")]
     };
@@ -608,7 +615,13 @@ fn run_language_uninstall(
             ) {
                 eprintln!("Warning: failed to recover interrupted query installs: {e}");
             }
-            let refreshed = collect_installed_languages(&parser_dir, &queries_dir);
+            let refreshed = match collect_installed_languages(&parser_dir, &queries_dir) {
+                Ok(languages) => languages,
+                Err(error) => {
+                    eprintln!("Error: failed to inspect parser backups: {error}");
+                    return Err(ExitCode::FAILURE);
+                }
+            };
             if refreshed == languages_to_uninstall {
                 break;
             }
