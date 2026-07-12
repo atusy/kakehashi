@@ -186,9 +186,6 @@ fn write_marker_atomically(marker_path: &Path, content: &[u8]) -> std::io::Resul
         let _ = fs::remove_file(marker_tmp);
         return Err(error);
     }
-    // A crash or unlink failure leaves only a content-validated staging alias,
-    // which recovery removes by its exact ULID shape.
-    let _ = fs::remove_file(marker_tmp);
     Ok(())
 }
 
