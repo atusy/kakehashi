@@ -208,6 +208,9 @@ pub(super) fn injection_stack_at(
             // it before parsing so a timeout cannot erase sibling ambiguity.
             viable_candidates += 1;
             if selected.is_some() {
+                if parent_ambiguous || viable_candidates > 1 {
+                    break;
+                }
                 continue;
             }
             let Some(injected_tree) =
@@ -216,6 +219,9 @@ pub(super) fn injection_stack_at(
                 continue;
             };
             selected = Some((resolved_lang, injected_tree, absolute_ranges));
+            if parent_ambiguous || viable_candidates > 1 {
+                break;
+            }
         }
         // Once an ancestor was ambiguous, every descendant is ambiguous too:
         // rebuilding the same child path inside the chosen smallest parent
