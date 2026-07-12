@@ -691,14 +691,16 @@ fn publish_compiled_parser(
             format!("Parser install for {language} was superseded by a newer parser operation"),
         )));
     }
-    // On unix `rename` atomically replaces an existing parser. Windows
-    // `rename` instead fails if the destination exists, which would make a
-    // `force` reinstall fail after a good compile — remove the old file
-    // first there (a small non-atomic window, acceptable on the
-    // non-primary platform).
+    // Unix atomically replaces the destination. Windows needs the same-directory
+    // owned backup so a failed publication can restore the working parser.
+    #[cfg(not(windows))]
+    let published = fs::rename(tmp_file, parser_file);
     #[cfg(windows)]
-    let _ = fs::remove_file(parser_file);
-    if let Err(e) = fs::rename(tmp_file, parser_file) {
+    let published = {
+        let backup_file = tmp_file.with_extension("backup");
+        publish_parser_transactionally(&mut StdParserFileOps, tmp_file, parser_file, &backup_file)
+    };
+    if let Err(e) = published {
         let _ = fs::remove_file(tmp_file);
         return Err(ParserInstallError::IoError(e));
     }
@@ -749,10 +751,18 @@ pub fn remove_parser_install_after_operation_started(
     let _replace_lock = ParserReplaceLockGuard::acquire(parser_dir, language)?;
     let mut marker = fs::File::create(parser_operation_marker_path(parser_dir, language))?;
     writeln!(marker, "uninstall:{}", ulid::Ulid::new())?;
+    cleanup_orphan_parser_backup_markers(parser_dir, language)?;
+    // Delete recovery copies first so an interrupted uninstall cannot leave a
+    // backup that a later install would restore after canonical removal.
+    let mut removed = false;
+    for backup in parser_backup_files(parser_dir, language)? {
+        remove_owned_parser_backup(&backup)?;
+        removed = true;
+    }
     let parser_file = parser_dir.join(format!("{language}.{}", std::env::consts::DLL_EXTENSION));
     match fs::remove_file(parser_file) {
         Ok(()) => Ok(true),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(removed),
         Err(error) => Err(ParserInstallError::IoError(error)),
     }
 }

@@ -725,12 +725,7 @@ fn run_language_uninstall(
             operation_permit,
         ) {
             Ok(true) => {
-                eprintln!(
-                    "✓ Removed parser: {}",
-                    parser_dir
-                        .join(format!("{}.{}", lang, std::env::consts::DLL_EXTENSION))
-                        .display()
-                );
+                eprintln!("✓ Removed parser installation for '{}'", lang);
                 removed_something = true;
             }
             Ok(false) => {}
