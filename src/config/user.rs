@@ -92,7 +92,7 @@ pub fn load_user_config() -> UserConfigResult<Option<UserConfig>> {
             match std::fs::symlink_metadata(&path) {
                 Err(metadata_error)
                     if metadata_error.kind() == std::io::ErrorKind::NotFound
-                        && !contains_dangling_symlink(&path) =>
+                        && !contains_broken_symlink(&path) =>
                 {
                     return Ok(None);
                 }
@@ -114,7 +114,7 @@ pub fn load_user_config() -> UserConfigResult<Option<UserConfig>> {
                             match std::fs::symlink_metadata(&path) {
                                 Err(final_error)
                                     if final_error.kind() == std::io::ErrorKind::NotFound
-                                        && !contains_dangling_symlink(&path) =>
+                                        && !contains_broken_symlink(&path) =>
                                 {
                                     return Ok(None);
                                 }
@@ -158,7 +158,7 @@ pub fn load_user_config() -> UserConfigResult<Option<UserConfig>> {
     }))
 }
 
-fn contains_dangling_symlink(path: &std::path::Path) -> bool {
+fn contains_broken_symlink(path: &std::path::Path) -> bool {
     let mut prefix = std::path::PathBuf::new();
     for component in path.components() {
         prefix.push(component);
