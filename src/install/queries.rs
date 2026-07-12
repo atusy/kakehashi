@@ -279,10 +279,11 @@ fn install_queries_recursive(
     let queries_parent = data_dir.join("queries");
     fs::create_dir_all(&queries_parent)?;
     {
-        // Avoid downloading an implicitly inherited language that an
-        // explicit uninstall has disabled. This is only an early-out: the
-        // publication path checks again under the same lock so an uninstall
-        // that starts after this point still wins.
+        // Avoid downloading while an uninstall tombstone remains. Top-level
+        // installs clear their own tombstone before entering this recursion;
+        // inherited installs deliberately do not. This is only an early-out:
+        // publication checks again under the same lock so an uninstall that
+        // starts after this point still wins.
         let _replace_lock = QueryReplaceLockGuard::acquire(&queries_parent, language)?;
         if uninstall_tombstone_path(&queries_parent, language).is_file() {
             return Err(query_install_superseded_by_uninstall(language));
