@@ -63,7 +63,9 @@ impl Kakehashi {
     /// Whether a file discovered during a directory walk identifies a known
     /// language by path or by its first line. Only path misses read content,
     /// and only the first line is materialized, matching explicit-file shebang
-    /// and mode-line detection without reading the full document.
+    /// and mode-line detection without reading the full document. Files whose
+    /// first-line I/O fails are retained so the command's normal read path can
+    /// report the operational error; invalid UTF-8 is filtered as non-text.
     pub(crate) fn cli_can_handle_discovered_file(&self, path: &Path) -> bool {
         use std::io::BufRead as _;
 
