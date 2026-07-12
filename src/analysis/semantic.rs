@@ -191,7 +191,11 @@ pub(crate) async fn handle_semantic_tokens_full(
             if should_parallelize {
                 rayon::join(host_work, injection_work)
             } else {
-                (host_work(), injection_work())
+                let host_result = host_work();
+                if !host_result.0 || is_cancelled() {
+                    return None;
+                }
+                (host_result, injection_work())
             };
 
         if !host_complete {
