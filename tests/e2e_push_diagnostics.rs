@@ -885,7 +885,7 @@ fn e2e_downstream_refresh_burst_is_coalesced() {
     client.send_response(id, json!(null));
     assert!(
         client
-            .wait_for_server_request("workspace/diagnostic/refresh", Duration::from_millis(500))
+            .wait_for_server_request("workspace/diagnostic/refresh", Duration::from_millis(1200))
             .is_none(),
         "one burst must produce at most one editor-visible refresh"
     );
