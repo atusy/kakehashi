@@ -36,16 +36,15 @@ impl<'text> PositionMapper<'text> {
 
 fn normalize_lone_carriage_returns(text: &str) -> Cow<'_, str> {
     let bytes = text.as_bytes();
-    let has_lone_cr = bytes
-        .iter()
-        .enumerate()
-        .any(|(index, byte)| *byte == b'\r' && bytes.get(index + 1) != Some(&b'\n'));
-    if !has_lone_cr {
+    let Some(first_lone_cr) = bytes.iter().enumerate().find_map(|(index, byte)| {
+        (*byte == b'\r' && bytes.get(index + 1) != Some(&b'\n')).then_some(index)
+    }) else {
         return Cow::Borrowed(text);
-    }
+    };
 
     let mut normalized = bytes.to_vec();
-    for index in 0..normalized.len() {
+    normalized[first_lone_cr] = b'\n';
+    for index in first_lone_cr + 1..normalized.len() {
         if normalized[index] == b'\r' && normalized.get(index + 1) != Some(&b'\n') {
             normalized[index] = b'\n';
         }
