@@ -148,33 +148,40 @@ impl WorkspaceFolderSet {
             .inner
             .lock()
             .recover_poison("WorkspaceFolderSet::apply_upstream_change_and_announce");
-        let marker_owned = self
-            .marker_owned
-            .lock()
-            .recover_poison("WorkspaceFolderSet::marker_owned");
-        let effective_removed: Vec<_> = removed
-            .iter()
-            .filter(|folder| {
-                guard
-                    .as_ref()
-                    .is_some_and(|folders| folders.iter().any(|f| f.uri == folder.uri))
-                    && !marker_owned.contains(folder.uri.as_str())
-            })
-            .cloned()
-            .collect();
-        let effective_added: Vec<_> = added
-            .into_iter()
-            .filter(|folder| {
-                !guard.as_ref().is_some_and(|folders| {
-                    folders.iter().any(|existing| {
-                        existing.uri == folder.uri
-                            && !effective_removed
-                                .iter()
-                                .any(|removed| removed.uri == existing.uri)
-                    })
+        let effective_removed: Vec<_> = {
+            let marker_owned = self
+                .marker_owned
+                .lock()
+                .recover_poison("WorkspaceFolderSet::marker_owned");
+            removed
+                .iter()
+                .filter(|folder| {
+                    guard
+                        .as_ref()
+                        .is_some_and(|folders| folders.iter().any(|f| f.uri == folder.uri))
+                        && !marker_owned.contains(folder.uri.as_str())
                 })
-            })
-            .collect();
+                .cloned()
+                .collect()
+        };
+        let mut effective_added = Vec::new();
+        for folder in added {
+            let already_present = guard.as_ref().is_some_and(|folders| {
+                folders.iter().any(|existing| {
+                    existing.uri == folder.uri
+                        && !effective_removed
+                            .iter()
+                            .any(|removed| removed.uri == existing.uri)
+                })
+            });
+            if !already_present
+                && !effective_added
+                    .iter()
+                    .any(|accepted: &WorkspaceFolder| accepted.uri == folder.uri)
+            {
+                effective_added.push(folder);
+            }
+        }
         if effective_added.is_empty() && effective_removed.is_empty() {
             return true;
         }
@@ -406,5 +413,27 @@ mod tests {
         ));
 
         assert_eq!(set.snapshot(), Some(vec![renamed]));
+    }
+
+    #[test]
+    fn upstream_change_deduplicates_added_uris_before_announcement() {
+        let added = folder("file:///new");
+        let duplicate = WorkspaceFolder {
+            uri: added.uri.clone(),
+            name: "duplicate name".to_string(),
+        };
+        let set = WorkspaceFolderSet::new(Some(Vec::new()));
+
+        assert!(set.apply_upstream_change_and_announce(
+            vec![added.clone(), duplicate],
+            &[],
+            |effective_added, effective_removed| {
+                assert_eq!(effective_added, &[added.clone()]);
+                assert!(effective_removed.is_empty());
+                true
+            },
+        ));
+
+        assert_eq!(set.snapshot(), Some(vec![added]));
     }
 }
