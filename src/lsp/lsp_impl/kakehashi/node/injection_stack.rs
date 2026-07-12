@@ -285,9 +285,10 @@ pub(super) fn injection_stack_at(
 /// would otherwise be indistinguishable here (issue #313).
 ///
 /// Across edits the depth index is a weaker guarantee. If an edit makes the
-/// stack shallower than `layer`, resolution returns `NotFound` — a safe
-/// "re-acquire" signal. But `layer` is only a depth, not a tree
-/// identity: an edit that restructures the nesting while keeping
+/// stack shallower than `layer`, resolution returns a safe "re-acquire"
+/// signal: `Ambiguous` when the rebuilt prefix already lost sibling identity,
+/// and `NotFound` otherwise. But `layer` is only a depth, not a tree identity:
+/// an edit that restructures the nesting while keeping
 /// `stack.len() > layer` can leave a *different* tree at that depth. Resolution
 /// then succeeds only if that tree happens to hold a node at the identical
 /// `(start, end, kind)`, and otherwise returns `NotFound`. The resolver returns
