@@ -1,3 +1,5 @@
+use std::borrow::Cow;
+
 use line_index::{LineIndex, WideEncoding, WideLineCol};
 use tower_lsp_server::ls_types::Position;
 
@@ -7,8 +9,9 @@ use super::char_boundary::floor_char_boundary;
 pub struct PositionMapper<'text> {
     /// LSP line index, including lone-CR line boundaries.
     line_index: LineIndex,
-    /// tree-sitter counts only LF as a row boundary.
-    tree_line_index: LineIndex,
+    /// Only needed for lone-CR documents: tree-sitter counts only LF as a row
+    /// boundary, while `line_index` above follows LSP semantics in that case.
+    tree_line_index: Option<LineIndex>,
     text: &'text str,
 }
 
@@ -21,8 +24,8 @@ impl<'text> PositionMapper<'text> {
         // width, allowing the dependency's logarithmic lookups to implement
         // the full LSP line-ending contract without altering document text.
         let indexed_text = normalize_lone_carriage_returns(text);
+        let tree_line_index = matches!(indexed_text, Cow::Owned(_)).then(|| LineIndex::new(text));
         let line_index = LineIndex::new(&indexed_text);
-        let tree_line_index = LineIndex::new(text);
         Self {
             line_index,
             tree_line_index,
@@ -31,14 +34,14 @@ impl<'text> PositionMapper<'text> {
     }
 }
 
-fn normalize_lone_carriage_returns(text: &str) -> std::borrow::Cow<'_, str> {
+fn normalize_lone_carriage_returns(text: &str) -> Cow<'_, str> {
     let bytes = text.as_bytes();
     let has_lone_cr = bytes
         .iter()
         .enumerate()
         .any(|(index, byte)| *byte == b'\r' && bytes.get(index + 1) != Some(&b'\n'));
     if !has_lone_cr {
-        return std::borrow::Cow::Borrowed(text);
+        return Cow::Borrowed(text);
     }
 
     let mut normalized = bytes.to_vec();
@@ -47,9 +50,7 @@ fn normalize_lone_carriage_returns(text: &str) -> std::borrow::Cow<'_, str> {
             normalized[index] = b'\n';
         }
     }
-    std::borrow::Cow::Owned(
-        String::from_utf8(normalized).expect("replacing ASCII bytes preserves valid UTF-8"),
-    )
+    Cow::Owned(String::from_utf8(normalized).expect("replacing ASCII bytes preserves valid UTF-8"))
 }
 
 impl PositionMapper<'_> {
@@ -133,12 +134,13 @@ impl PositionMapper<'_> {
     /// length, so `try_line_col` resolves for every input; the `None` arm is
     /// unreachable and degrades to the document start.
     pub fn byte_to_point(&self, offset: usize) -> tree_sitter::Point {
-        let len: usize = self.tree_line_index.len().into();
+        let line_index = self.tree_line_index.as_ref().unwrap_or(&self.line_index);
+        let len: usize = line_index.len().into();
         let offset = offset.min(len);
         match offset
             .try_into()
             .ok()
-            .and_then(|o| self.tree_line_index.try_line_col(o))
+            .and_then(|o| line_index.try_line_col(o))
         {
             Some(line_col) => {
                 tree_sitter::Point::new(line_col.line as usize, line_col.col as usize)
