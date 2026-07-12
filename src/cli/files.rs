@@ -16,6 +16,29 @@
 
 use std::path::{Path, PathBuf};
 
+/// Read a collected path as UTF-8 text.
+pub(crate) fn read_regular_file_to_string(path: &Path) -> std::io::Result<String> {
+    use std::io::Read as _;
+
+    let mut options = std::fs::File::options();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.custom_flags(nix::libc::O_NONBLOCK);
+    }
+    let mut file = options.open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "path is not a regular file",
+        ));
+    }
+    let mut text = String::new();
+    file.read_to_string(&mut text)?;
+    Ok(text)
+}
+
 /// Files collected from CLI paths plus any non-fatal directory walk errors
 /// encountered while discovering them.
 pub(crate) struct CollectedFiles {
@@ -425,6 +448,39 @@ mod tests {
         let _listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
 
         let result = collect_files(tmp.path(), &[socket], &[], &markdown_only);
+
+        assert!(result.is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_rejects_fifo_replacing_a_collected_file() {
+        use nix::sys::stat::Mode;
+        use nix::unistd::mkfifo;
+        use std::io::Write as _;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("input.md");
+        write(&path, "regular");
+        let collected = collect_paths(tmp.path(), std::slice::from_ref(&path), &[], &markdown_only);
+        std::fs::remove_file(&path).unwrap();
+        mkfifo(&path, Mode::S_IRUSR | Mode::S_IWUSR).unwrap();
+        let writer_path = path.clone();
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let writer = std::thread::spawn(move || {
+            let mut fifo = std::fs::File::options()
+                .read(true)
+                .write(true)
+                .open(writer_path)
+                .unwrap();
+            fifo.write_all(b"replacement").unwrap();
+            ready_tx.send(()).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        });
+        ready_rx.recv().unwrap();
+
+        let result = read_regular_file_to_string(&collected[0]);
+        writer.join().unwrap();
 
         assert!(result.is_err());
     }

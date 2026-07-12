@@ -39,7 +39,7 @@ use std::time::Duration;
 use tower_lsp_server::LspService;
 use tower_lsp_server::ls_types::{Diagnostic, DiagnosticSeverity, NumberOrString};
 
-use crate::cli::files::collect_files;
+use crate::cli::files::{collect_files, read_regular_file_to_string};
 use crate::lsp::Kakehashi;
 
 /// Write one line to stderr, tolerating a closed pipe.
@@ -259,7 +259,7 @@ async fn run_paths(server: &Kakehashi, cwd: &Path, options: &DiagnoseOptions) ->
         // Collected paths are absolute; report them cwd-relative so the output
         // stays readable (and editor-openable) in deep trees.
         let display = file.strip_prefix(cwd).unwrap_or(file).display().to_string();
-        let text = match std::fs::read_to_string(file) {
+        let text = match read_regular_file_to_string(file) {
             Ok(text) => text,
             Err(e) => {
                 elnln!("error: cannot read '{display}': {e}");

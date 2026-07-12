@@ -22,7 +22,7 @@ use std::time::Duration;
 
 use tower_lsp_server::LspService;
 
-use crate::cli::files::collect_files;
+use crate::cli::files::{collect_files, read_regular_file_to_string};
 use crate::lsp::Kakehashi;
 
 /// Options for the `format` subcommand, mirroring its CLI flags.
@@ -232,7 +232,7 @@ async fn run_paths(server: &Kakehashi, cwd: &Path, options: &FormatOptions) -> u
         // Collected paths are absolute (normalize_path); report them
         // cwd-relative so the output stays readable in deep trees.
         let display = file.strip_prefix(cwd).unwrap_or(file).display();
-        let text = match std::fs::read_to_string(file) {
+        let text = match read_regular_file_to_string(file) {
             Ok(text) => text,
             Err(e) => {
                 eprintln!("error: cannot read '{display}': {e}");
