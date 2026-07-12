@@ -681,7 +681,10 @@ fn write_new_output_with(
     path: &std::path::Path,
     write: impl FnOnce(&mut std::fs::File) -> std::io::Result<()>,
 ) -> std::io::Result<()> {
-    let parent = path.parent().unwrap_or_else(|| std::path::Path::new("."));
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| std::path::Path::new("."));
     let mut builder = tempfile::Builder::new();
     #[cfg(unix)]
     {
