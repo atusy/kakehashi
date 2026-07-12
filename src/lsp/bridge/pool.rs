@@ -1655,49 +1655,30 @@ impl LanguageServerPool {
             )
             .await?;
 
-        // The shared connection's capability is only known now that it is Ready.
-        // If it came up incapable and does not already serve this root, the
-        // shared-instance opt-in must degrade to a per-root instance (#391):
-        // opening this document on a server that ignores
-        // didChangeWorkspaceFolders would wedge the 2nd+ root. `resolve_acquire`
-        // now sees the shared connection as Ready+incapable, so it re-resolves
-        // to the per-root key; acquire that connection instead, within the
-        // caller's remaining budget.
-        if handle.key().is_shared() && !handle.supports_workspace_folder_changes() {
-            let serves_this_root = marker
-                .as_ref()
-                .is_some_and(|(_root, folder)| handle.workspace_folders().contains(folder));
-            if !serves_this_root {
-                handle.log_incapable_fallback_once(server_name);
-                let remaining = timeout.saturating_sub(start.elapsed());
-                // Reuse the already-resolved `marker` to build the per-root key
-                // directly — re-running `resolve_acquire` here would redo the
-                // filesystem marker walk and re-lock `connections` for the same
-                // result (the shared connection is now Ready+incapable).
-                let per_root_key = ConnectionKey::new(
-                    server_name,
-                    marker
-                        .as_ref()
-                        .map(|(root, _folder)| root.as_str().to_owned()),
-                );
-                return self
-                    .acquire_resolved_wait_ready(
-                        server_name,
-                        server_config,
-                        per_root_key,
-                        marker,
-                        remaining,
-                    )
-                    .await;
-            }
-        }
-
         // Announce the (possibly newly-joined) root before the caller opens any
         // document. Idempotent if `acquire_resolved_wait_ready`'s ReturnExisting
         // path already announced; on the initializing-retry path it is the only
         // announce. Propagates a queue-full failure so the caller retries rather
         // than open a document for an unannounced root.
-        self.announce_shared_root(&handle, &marker).await?;
+        if !self.announce_shared_root(&handle, &marker).await? {
+            handle.log_incapable_fallback_once(server_name);
+            let remaining = timeout.saturating_sub(start.elapsed());
+            let per_root_key = ConnectionKey::new(
+                server_name,
+                marker
+                    .as_ref()
+                    .map(|(root, _folder)| root.as_str().to_owned()),
+            );
+            return self
+                .acquire_resolved_wait_ready(
+                    server_name,
+                    server_config,
+                    per_root_key,
+                    marker,
+                    remaining,
+                )
+                .await;
+        }
         Ok(handle)
     }
 
@@ -1905,7 +1886,9 @@ impl LanguageServerPool {
     /// the same connection follows it on the wire (FIFO), satisfying "announce
     /// the root, then open the document".
     ///
-    /// Returns `Ok(())` when the root is announced (or no announce is needed).
+    /// Returns `Ok(true)` when the root is announced (or no announce is needed),
+    /// and `Ok(false)` when a newly required root cannot join because dynamic
+    /// support disappeared.
     /// Returns an error only when the root is newly required but its
     /// `didChangeWorkspaceFolders` could not be queued (outbound queue full or
     /// closed): the caller must NOT then open documents on this connection,
@@ -1921,17 +1904,13 @@ impl LanguageServerPool {
         &self,
         handle: &Arc<ConnectionHandle>,
         marker: &Option<(Url, tower_lsp_server::ls_types::WorkspaceFolder)>,
-    ) -> io::Result<()> {
+    ) -> io::Result<bool> {
         if !handle.key().is_shared() {
-            return Ok(());
+            return Ok(true);
         }
         let Some((_root, folder)) = marker else {
-            return Ok(());
+            return Ok(true);
         };
-        if !handle.supports_workspace_folder_changes() {
-            return Ok(());
-        }
-        let folder = folder.clone();
         // The closure runs under the folder-set lock and reports its send
         // outcome out here so the error kind can distinguish retryable
         // backpressure (queue full) from a dead/serialization-failed connection.
@@ -1955,6 +1934,18 @@ impl LanguageServerPool {
                 "bridge: connection was replaced before didChangeWorkspaceFolders",
             ));
         }
+        let _ordering = handle
+            .dynamic_capabilities()
+            .workspace_folder_ordering()
+            .lock_owned()
+            .await;
+        if handle.workspace_folders().contains(folder) {
+            return Ok(true);
+        }
+        if !handle.supports_workspace_folder_changes() {
+            return Ok(false);
+        }
+        let folder = folder.clone();
         // Add + announce atomically under the folder-set lock: the folder is
         // committed only if the `didChangeWorkspaceFolders` actually queued, and
         // a concurrent caller cannot observe it as announced (and skip its own
@@ -1991,7 +1982,7 @@ impl LanguageServerPool {
         drop(connections);
 
         if announced {
-            return Ok(());
+            return Ok(true);
         }
         // Map the send failure to a faithful error kind so callers recover
         // correctly: queue-full is retryable backpressure, but a closed channel
@@ -2108,7 +2099,12 @@ impl LanguageServerPool {
                 // check, so it must not be held here (the tokio mutex is not
                 // reentrant).
                 drop(connections);
-                self.announce_shared_root(&handle, &marker).await?;
+                if !self.announce_shared_root(&handle, &marker).await? {
+                    return Err(io::Error::new(
+                        io::ErrorKind::WouldBlock,
+                        "bridge: shared connection lost workspace-folder support; retry per root",
+                    ));
+                }
                 return Ok(handle);
             }
             ConnectionAction::FailFast(err) => {
@@ -3255,6 +3251,48 @@ mod tests {
         assert!(
             !pool.connections.lock().await.contains_key(&key),
             "the post-ack propagation decision must observe unregistration and recycle"
+        );
+    }
+
+    #[tokio::test]
+    async fn shared_root_announcement_observes_ordered_dynamic_unregistration() {
+        let pool = Arc::new(LanguageServerPool::new());
+        let handle =
+            create_handle_with_key(ConnectionState::Ready, ConnectionKey::shared("lua")).await;
+        handle
+            .dynamic_capabilities()
+            .register(vec![tower_lsp_server::ls_types::Registration {
+                id: "workspace-folders".to_string(),
+                method: "workspace/didChangeWorkspaceFolders".to_string(),
+                register_options: None,
+            }]);
+        pool.insert_connection(Arc::clone(&handle)).await;
+        let ordering = handle
+            .dynamic_capabilities()
+            .workspace_folder_ordering()
+            .lock_owned()
+            .await;
+        let folder = test_workspace_folder("file:///new");
+        let marker = Some((Url::parse("file:///new").unwrap(), folder.clone()));
+
+        let task = tokio::spawn({
+            let pool = Arc::clone(&pool);
+            let handle = Arc::clone(&handle);
+            async move { pool.announce_shared_root(&handle, &marker).await }
+        });
+        tokio::task::yield_now().await;
+        handle.dynamic_capabilities().unregister(vec![
+            tower_lsp_server::ls_types::Unregistration {
+                id: "workspace-folders".to_string(),
+                method: "workspace/didChangeWorkspaceFolders".to_string(),
+            },
+        ]);
+        drop(ordering);
+
+        assert!(!task.await.unwrap().unwrap());
+        assert!(
+            !handle.workspace_folders().contains(&folder),
+            "a root must not be committed after its capability acknowledgement"
         );
     }
 
