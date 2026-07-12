@@ -311,11 +311,11 @@ fn recover_parser_backups(
     parser_dir: &Path,
     parser_file: &Path,
     language: &str,
-) -> std::io::Result<()> {
+) -> std::io::Result<bool> {
     cleanup_orphan_parser_backup_markers(parser_dir, language)?;
     let backups = parser_backup_files(parser_dir, language)?;
     if backups.is_empty() {
-        return Ok(());
+        return Ok(false);
     }
     if parser_file.try_exists()? {
         if !fs::metadata(parser_file)?.is_file() {
@@ -327,7 +327,7 @@ fn recover_parser_backups(
         for backup in backups {
             remove_owned_parser_backup(&backup)?;
         }
-        return Ok(());
+        return Ok(false);
     }
     let mut timed_backups = backups
         .into_iter()
@@ -343,7 +343,7 @@ fn recover_parser_backups(
     for (_, obsolete) in timed_backups {
         remove_owned_parser_backup(&obsolete)?;
     }
-    Ok(())
+    Ok(true)
 }
 
 /// Remove the canonical parser and every kakehashi-generated replacement backup.
@@ -435,8 +435,9 @@ pub struct ParserInstallResult {
     pub language: String,
     /// Path where parser was installed.
     pub install_path: PathBuf,
-    /// Git revision that was used.
-    pub revision: String,
+    /// Git revision that was used, or `None` when an interrupted replacement
+    /// was recovered without rebuilding from source.
+    pub revision: Option<String>,
 }
 
 /// How the parser source is compiled.
@@ -802,7 +803,17 @@ pub fn install_parser_after_operation_started(
 
     fs::create_dir_all(&parser_dir)?;
     #[cfg(windows)]
-    recover_parser_backups(&parser_dir, &parser_file, language)?;
+    let recovered = recover_parser_backups(&parser_dir, &parser_file, language)?;
+
+    #[cfg(windows)]
+    if recovered && !options.force {
+        return Ok(ParserInstallResult {
+            language: language.to_string(),
+            install_path: parser_file,
+            revision: None,
+        });
+    }
+
     let install_token = begin_parser_install(&parser_dir, &parser_file, language, options.force)?;
 
     // Fetch metadata (with caching support)
@@ -878,7 +889,7 @@ pub fn install_parser_after_operation_started(
     Ok(ParserInstallResult {
         language: language.to_string(),
         install_path: parser_file,
-        revision: metadata.revision,
+        revision: Some(metadata.revision),
     })
 }
 
@@ -1889,7 +1900,9 @@ mod tests {
         )
         .expect("mark owned backup");
 
-        recover_parser_backups(&parser_dir, &canonical, "lua").expect("recover parser backup");
+        assert!(
+            recover_parser_backups(&parser_dir, &canonical, "lua").expect("recover parser backup")
+        );
 
         assert_eq!(
             fs::read(&canonical).expect("read restored parser"),
@@ -1913,7 +1926,9 @@ mod tests {
         )
         .expect("mark owned backup");
 
-        recover_parser_backups(&parser_dir, &canonical, "lua").expect("clean parser backup");
+        assert!(
+            !recover_parser_backups(&parser_dir, &canonical, "lua").expect("clean parser backup")
+        );
 
         assert_eq!(fs::read(&canonical).expect("read canonical"), b"new parser");
         assert!(!backup.exists());
