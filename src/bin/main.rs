@@ -640,12 +640,12 @@ fn write_content_to_output(
     force: bool,
     label: &str,
 ) -> Result<(), ExitCode> {
-    // Check for --force without --output (warn but continue)
-    if force && output.is_none() {
-        eprintln!("Warning: --force has no effect without --output");
+    let writes_stdout = output.as_ref().is_none_or(|path| path.as_os_str() == "-");
+    if force && writes_stdout {
+        eprintln!("Warning: --force has no effect when output is stdout");
     }
 
-    if let Some(path) = output.as_ref().filter(|p| p.as_os_str() != "-") {
+    if let Some(path) = output.as_ref().filter(|_| !writes_stdout) {
         let write_result = if force {
             write_forced_output(path, content)
         } else {
