@@ -105,7 +105,8 @@ async fn shutdown_invalidated_connection(key: ConnectionKey, handle: Arc<Connect
 /// it. The owned map guard prevents a same-key respawn until every key-based
 /// purge is complete; dropping the caller's future only detaches this task.
 fn spawn_invalidated_connection_cleanup(
-    mut connections: tokio::sync::OwnedMutexGuard<HashMap<ConnectionKey, Arc<ConnectionHandle>>>,
+    connections: tokio::sync::OwnedMutexGuard<HashMap<ConnectionKey, Arc<ConnectionHandle>>>,
+    connection_map: Arc<Mutex<HashMap<ConnectionKey, Arc<ConnectionHandle>>>>,
     invalidated: Vec<ConnectionKey>,
     host_documents: Arc<Mutex<HashMap<(String, ConnectionKey), HostDocSyncState>>>,
     document_tracker: Arc<DocumentTracker>,
@@ -126,13 +127,20 @@ fn spawn_invalidated_connection_cleanup(
                 .retain(|(_, connection_key), _| connection_key != &key);
             document_tracker.purge_connection(&key).await;
             purge_transition_locks(&open_transition_locks, &key).await;
-            if let Some(handle) = connections.remove(&key) {
-                stale_handles.push((key, handle));
+            if let Some(handle) = connections.get(&key) {
+                stale_handles.push((key, Arc::clone(handle)));
             }
         }
+        // Keep Closing handles mapped while releasing the map lock. This blocks
+        // same-key respawn, while allowing global shutdown to snapshot and join
+        // these handles under its own deadline instead of waiting outside it.
+        drop(connections);
         let mut shutdowns = tokio::task::JoinSet::new();
-        for (key, handle) in stale_handles {
-            shutdowns.spawn(shutdown_invalidated_connection(key, handle));
+        for (key, handle) in &stale_handles {
+            shutdowns.spawn(shutdown_invalidated_connection(
+                key.clone(),
+                Arc::clone(handle),
+            ));
         }
         while let Some(result) = shutdowns.join_next().await {
             if let Err(error) = result {
@@ -142,7 +150,15 @@ fn spawn_invalidated_connection_cleanup(
                 );
             }
         }
-        drop(connections);
+        let mut connections = connection_map.lock().await;
+        for (key, stale) in stale_handles {
+            if connections
+                .get(&key)
+                .is_some_and(|current| Arc::ptr_eq(current, &stale))
+            {
+                connections.remove(&key);
+            }
+        }
     })
 }
 
@@ -683,6 +699,7 @@ impl LanguageServerPool {
 
         let cleanup = spawn_invalidated_connection_cleanup(
             connections,
+            Arc::clone(&self.connections),
             invalidated,
             Arc::clone(&self.host_documents),
             Arc::clone(&self.document_tracker),
@@ -3241,20 +3258,24 @@ mod tests {
         drop(host_documents);
 
         tokio::time::timeout(Duration::from_secs(4), async {
-            loop {
-                if !pool.connections.lock().await.contains_key(&key) {
-                    break;
-                }
+            while handle.state() != ConnectionState::Closed {
                 tokio::task::yield_now().await;
             }
         })
         .await
-        .expect("detached cleanup must remove the stale handle after caller cancellation");
+        .expect("detached cleanup must close the stale handle after caller cancellation");
         assert_eq!(
             handle.state(),
             ConnectionState::Closed,
             "removal must not become observable before bounded shutdown finishes"
         );
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while pool.connections.lock().await.contains_key(&key) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("closed stale handle must be removed");
     }
 
     #[tokio::test]

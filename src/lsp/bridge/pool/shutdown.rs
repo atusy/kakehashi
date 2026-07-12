@@ -57,15 +57,15 @@ impl LanguageServerPool {
             connections
                 .iter()
                 .filter_map(|(key, handle)| match handle.state() {
-                    ConnectionState::Ready | ConnectionState::Initializing => {
-                        Some((key.clone(), Arc::clone(handle)))
-                    }
+                    ConnectionState::Ready
+                    | ConnectionState::Initializing
+                    | ConnectionState::Closing => Some((key.clone(), Arc::clone(handle))),
                     ConnectionState::Failed => {
                         failed_connections.push(key.clone());
                         handle.complete_shutdown();
                         None
                     }
-                    ConnectionState::Closing | ConnectionState::Closed => {
+                    ConnectionState::Closed => {
                         already_closing.push(key.clone());
                         None
                     }
