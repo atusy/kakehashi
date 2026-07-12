@@ -46,12 +46,14 @@ impl SettingsEvent {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SettingsSource {
     InitializationOptions,
+    SessionOverrides,
 }
 
 impl SettingsSource {
     fn description(self) -> &'static str {
         match self {
             SettingsSource::InitializationOptions => "initialization options",
+            SettingsSource::SessionOverrides => "retained session overrides",
         }
     }
 }
@@ -60,6 +62,10 @@ impl SettingsSource {
 pub struct SettingsLoadOutcome {
     pub settings: Option<WorkspaceSettings>,
     pub raw_settings: Option<RawWorkspaceSettings>,
+    /// Parsed session override supplied for this load, retained separately from
+    /// the merged result so a later project-root reload can replace only the
+    /// file layer.
+    pub override_settings: Option<RawWorkspaceSettings>,
     pub events: Vec<SettingsEvent>,
     /// True if any loaded config layer used the deprecated `rootMarkers` key
     /// (superseded by `workspaceMarkers`). Serde's alias erases which spelling
@@ -117,7 +123,7 @@ pub fn load_settings(
     // Merge all layers: defaults < config_layers < override (later layers override earlier)
     let mut layers = vec![defaults];
     layers.extend(config_layers);
-    layers.push(override_settings);
+    layers.push(override_settings.clone());
     let merged = layers
         .into_iter()
         .reduce(merge_workspace_settings)
@@ -141,6 +147,7 @@ pub fn load_settings(
     SettingsLoadOutcome {
         settings,
         raw_settings,
+        override_settings,
         events,
         used_deprecated_root_markers,
     }

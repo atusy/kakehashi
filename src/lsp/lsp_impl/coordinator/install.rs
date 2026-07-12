@@ -239,8 +239,11 @@ impl InstallCoordinator {
             &self.settings_manager,
             &self.cache,
             &self.bridge,
-            Some(raw_settings),
-            settings,
+            super::super::SettingsUpdate {
+                root_path: None,
+                raw_settings: Some(raw_settings),
+                settings,
+            },
         )
         .await;
     }

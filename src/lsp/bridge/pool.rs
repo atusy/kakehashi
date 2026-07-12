@@ -556,8 +556,8 @@ impl LanguageServerPool {
         &self,
         added: Vec<tower_lsp_server::ls_types::WorkspaceFolder>,
         removed: &[tower_lsp_server::ls_types::WorkspaceFolder],
-    ) {
-        self.workspace_folders.apply_change(added, removed);
+    ) -> Option<Vec<tower_lsp_server::ls_types::WorkspaceFolder>> {
+        self.workspace_folders.apply_change(added, removed)
     }
 
     /// Set the upstream client capabilities.

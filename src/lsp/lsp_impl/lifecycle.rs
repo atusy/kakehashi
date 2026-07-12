@@ -149,11 +149,20 @@ impl Kakehashi {
             .pool()
             .set_client_capabilities(params.capabilities);
 
-        // Get root path from primary URI, falling back to current directory
+        // Get root path from the first workspace folder. When no folder remains,
+        // lifecycle updates fall back to initialize-time rootUri, then CWD (#746).
         let uri_to_path = |uri: &Uri| uri_to_url(uri).ok().and_then(|url| url.to_file_path().ok());
-        let root_path = primary_uri
+        #[allow(deprecated)]
+        let fallback_root_path = params
+            .root_uri
+            .as_ref()
             .and_then(uri_to_path)
             .or_else(|| std::env::current_dir().ok());
+        self.settings_manager
+            .set_fallback_root_path(fallback_root_path.clone());
+        let root_path = first_folder
+            .and_then(|folder| uri_to_path(&folder.uri))
+            .or(fallback_root_path);
 
         // Store root path for later use and log the source
         #[allow(deprecated)]
@@ -192,6 +201,8 @@ impl Kakehashi {
         self.notifier()
             .log_settings_events(&settings_outcome.events)
             .await;
+        self.settings_manager
+            .set_session_settings(settings_outcome.override_settings.clone());
 
         // Nudge users off the deprecated `rootMarkers` config key. The claim
         // guard latches session-wide so a later didChangeConfiguration carrying
