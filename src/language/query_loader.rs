@@ -211,8 +211,13 @@ impl QueryLoader {
     ) -> Option<PathBuf> {
         for base in runtime_bases {
             let candidate = Self::query_file_path(base.as_ref(), lang_name, file_name);
-            if candidate.exists() {
-                return Some(candidate);
+            match fs::symlink_metadata(&candidate) {
+                Ok(_) => return Some(candidate),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                // Presence probing must not downgrade inaccessible/broken
+                // assets to an ordinary optional-kind absence. Return the
+                // candidate so the real read reports its concrete I/O error.
+                Err(_) => return Some(candidate),
             }
         }
         None
