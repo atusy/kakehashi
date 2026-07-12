@@ -480,26 +480,24 @@ fn installed_query_language_name(path: &Path) -> Option<String> {
     Some(name.to_string())
 }
 
+fn read_optional_install_dir(path: &Path, kind: &str) -> Result<Option<std::fs::ReadDir>, String> {
+    match std::fs::read_dir(path) {
+        Ok(entries) => Ok(Some(entries)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(format!(
+            "cannot read {kind} directory '{}': {e}",
+            path.display()
+        )),
+    }
+}
+
 fn collect_installed_languages_for_uninstall(
     parser_dir: &Path,
     queries_dir: &Path,
 ) -> Result<std::collections::BTreeSet<String>, String> {
-    use std::fs;
-    use std::io::ErrorKind;
-
     let mut languages = std::collections::BTreeSet::new();
 
-    let parser_entries = match fs::read_dir(parser_dir) {
-        Ok(entries) => Some(entries),
-        Err(e) if e.kind() == ErrorKind::NotFound => None,
-        Err(e) => {
-            return Err(format!(
-                "cannot read parser directory '{}': {e}",
-                parser_dir.display()
-            ));
-        }
-    };
-    if let Some(entries) = parser_entries {
+    if let Some(entries) = read_optional_install_dir(parser_dir, "parser")? {
         for entry in entries {
             let entry = entry.map_err(|e| {
                 format!(
@@ -518,17 +516,7 @@ fn collect_installed_languages_for_uninstall(
         }
     }
 
-    let query_entries = match fs::read_dir(queries_dir) {
-        Ok(entries) => Some(entries),
-        Err(e) if e.kind() == ErrorKind::NotFound => None,
-        Err(e) => {
-            return Err(format!(
-                "cannot read queries directory '{}': {e}",
-                queries_dir.display()
-            ));
-        }
-    };
-    if let Some(entries) = query_entries {
+    if let Some(entries) = read_optional_install_dir(queries_dir, "queries")? {
         for entry in entries {
             let entry = entry.map_err(|e| {
                 format!(
