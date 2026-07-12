@@ -240,25 +240,23 @@ pub(super) fn injection_stack_at(
 /// would otherwise be indistinguishable here (issue #313).
 ///
 /// Across edits the depth index is a weaker guarantee. If an edit makes the
-/// stack shallower than `layer`, `stack.get(layer)` is `None` and we return
-/// `None` — a safe "re-acquire" signal. But `layer` is only a depth, not a tree
+/// stack shallower than `layer`, resolution returns `NotFound` — a safe
+/// "re-acquire" signal. But `layer` is only a depth, not a tree
 /// identity: an edit that restructures the nesting while keeping
 /// `stack.len() > layer` can leave a *different* tree at that depth. Resolution
 /// then succeeds only if that tree happens to hold a node at the identical
-/// `(start, end, kind)`, and otherwise returns `None`. The resolver rejects a
-/// layer when multiple same-depth regions contain the anchor, closing the
+/// `(start, end, kind)`, and otherwise returns `NotFound`. The resolver returns
+/// `Ambiguous` when multiple same-depth regions contain the anchor, closing the
 /// known overlapping-sibling path (#350), but a depth index still cannot
 /// detect every cross-edit replacement of one non-overlapping region by
 /// another. See the
 /// layer-discriminator options in lazy-node-identity-tracking for the
 /// region-ULID alternative that would close this gap.
 ///
-/// `f` is invoked at most once, with the matching `Node`. Returning `None`
-/// from `f` is distinguishable from the "no match" outcome only by
-/// the caller's outer `Option` — both surface as `Option<R>` because the
-/// outer call returns `None` when nothing matched. Callers that need to
-/// distinguish "found node but operation returned nothing" (e.g. parent of
-/// a root) from "no match" should use a richer `R` like `Option<T>`.
+/// `f` is invoked at most once, with the matching `Node`, and its result is
+/// wrapped in `NodeResolution::Found`. This preserves `Found(None)` for an
+/// operation such as asking a tree root for its parent, distinct from both
+/// `NotFound` and `Ambiguous`.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn with_resolved_node<R>(
     coordinator: &LanguageCoordinator,
@@ -363,9 +361,9 @@ pub(super) fn with_resolved_node_ranges<R>(
 /// start byte — the method's contract requires the descendant to lie inside
 /// `node`, so when the pair is genuinely related the smallest-region path at
 /// that byte reaches the layer that minted both. An unrelated pair (descendant
-/// outside `node`, or minted from a different same-depth region — the #350
-/// overlap caveat applies here too) simply fails one of the lookups and
-/// collapses to `None`, the protocol's re-acquire signal.
+/// outside `node`, or minted from different disjoint regions) returns
+/// `NotFound`. Overlapping same-depth ancestry returns `Ambiguous` instead;
+/// both outcomes surface as the protocol's null re-acquire signal.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn with_resolved_node_pair<R>(
     coordinator: &LanguageCoordinator,
