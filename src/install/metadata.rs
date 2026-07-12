@@ -372,7 +372,11 @@ fn extract_parser_metadata_from_block(install_info: &str) -> Option<ParserMetada
     };
     let url = string_field("url")?;
     let revision = string_field("revision")?;
-    let location = string_field("location");
+    let location = match fields.iter().find(|(name, _)| name == "location") {
+        None => None,
+        Some((_, LuaValue::String(value))) => Some((*value).to_string()),
+        Some(_) => return None,
+    };
 
     Some(ParserMetadata {
         url,
@@ -757,6 +761,16 @@ mod tests {
     #[test]
     fn scalar_parser_entry_invalidates_the_document() {
         let content = "return {\nlua = { install_info = { url = 'https://example/lua', revision = 'ok' } },\nrust = false,\n}";
+
+        assert!(matches!(
+            parse_complete_parsers_lua(content),
+            Err(MetadataError::ParseError(_))
+        ));
+    }
+
+    #[test]
+    fn scalar_location_invalidates_the_document() {
+        let content = "return {\nlua = { install_info = { url = 'https://example/lua', revision = 'ok', location = false } },\n}";
 
         assert!(matches!(
             parse_complete_parsers_lua(content),
