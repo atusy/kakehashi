@@ -429,7 +429,11 @@ fn format_diagnostic(format: OutputFormat, display: &str, diagnostic: &Diagnosti
             // source.
             match diagnostic.source.as_deref() {
                 Some(source) => {
-                    let source = one_line(source);
+                    let source = if source.chars().any(char::is_whitespace) {
+                        std::borrow::Cow::Owned(one_line(source))
+                    } else {
+                        std::borrow::Cow::Borrowed(source)
+                    };
                     format!("{display}:{line}:{col}: {severity}: {message} [{source}]")
                 }
                 None => format!("{display}:{line}:{col}: {severity}: {message}"),
