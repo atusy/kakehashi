@@ -203,9 +203,9 @@ fn top_level_table_keys(s: &str) -> Result<Vec<(String, &str)>, MetadataError> {
         .filter_map(|(name, value)| match (is_reserved_key(&name), value) {
             (true, _) => None,
             (false, LuaValue::Table(block)) => Some(Ok((name, block))),
-            (false, LuaValue::String(_)) => Some(Err(MetadataError::ParseError(format!(
-                "invalid parser entry for {name}"
-            )))),
+            (false, LuaValue::String(_) | LuaValue::Other) => Some(Err(MetadataError::ParseError(
+                format!("invalid parser entry for {name}"),
+            ))),
         })
         .collect()
 }
@@ -304,6 +304,8 @@ fn table_entries(s: &str, mut offset: usize) -> Vec<(String, LuaValue<'_>)> {
                     && let Some(value) = quoted_string(&s[value_start..])
                 {
                     keys.push((name, LuaValue::String(value)));
+                } else {
+                    keys.push((name, LuaValue::Other));
                 }
             }
         }
@@ -342,6 +344,7 @@ fn quoted_string(s: &str) -> Option<&str> {
 enum LuaValue<'a> {
     Table(&'a str),
     String(&'a str),
+    Other,
 }
 
 /// Check if a key is a reserved/internal key (not a language name)
@@ -752,8 +755,8 @@ mod tests {
     }
 
     #[test]
-    fn non_table_parser_entry_invalidates_the_document() {
-        let content = "return {\nlua = { install_info = { url = 'https://example/lua', revision = 'ok' } },\nrust = 'damaged',\n}";
+    fn scalar_parser_entry_invalidates_the_document() {
+        let content = "return {\nlua = { install_info = { url = 'https://example/lua', revision = 'ok' } },\nrust = false,\n}";
 
         assert!(matches!(
             parse_complete_parsers_lua(content),
