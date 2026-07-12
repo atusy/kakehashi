@@ -164,11 +164,12 @@ async-friendliness is achieved at the Rust↔Lua boundary, not inside Lua.
     join one `Shared` connection via `workspace/didChangeWorkspaceFolders` (the
     `WorkspaceFolderSet`, defined in `workspace/folder_set.rs`, driven from
     `pool.rs`). A shared connection that came up **without**
-    `workspace.workspaceFolders.changeNotifications`
-    (`supports_workspace_folder_changes`, static `InitializeResult` capabilities
-    only — no dynamic `client/registerCapability` tracking) cannot take on a new
-    root, so the document is **diverted to its own per-root process** (not
-    dropped). This divert happens at **two** sites, because the shared
+    `workspace.workspaceFolders.changeNotifications` and has not dynamically
+    registered `workspace/didChangeWorkspaceFolders`
+    (`supports_workspace_folder_changes` tracks both initialize-time and dynamic
+    capability lifecycles) cannot take on a new root, so the document is
+    **diverted to its own per-root process** (not dropped). This divert happens
+    at **two** sites, because the shared
     connection's capability is only known once it is `Ready`:
     - **Early** in `resolve_acquire` — when the shared handle is *already*
       `Ready` and incapable.
