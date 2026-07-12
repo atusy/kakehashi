@@ -90,7 +90,10 @@ pub fn load_user_config() -> UserConfigResult<Option<UserConfig>> {
         Ok(contents) => contents,
         Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
             match std::fs::symlink_metadata(&path) {
-                Err(metadata_error) if metadata_error.kind() == std::io::ErrorKind::NotFound => {
+                Err(metadata_error)
+                    if metadata_error.kind() == std::io::ErrorKind::NotFound
+                        && !contains_dangling_symlink(&path) =>
+                {
                     return Ok(None);
                 }
                 Err(metadata_error) => {
@@ -110,7 +113,8 @@ pub fn load_user_config() -> UserConfigResult<Option<UserConfig>> {
                         {
                             match std::fs::symlink_metadata(&path) {
                                 Err(final_error)
-                                    if final_error.kind() == std::io::ErrorKind::NotFound =>
+                                    if final_error.kind() == std::io::ErrorKind::NotFound
+                                        && !contains_dangling_symlink(&path) =>
                                 {
                                     return Ok(None);
                                 }
@@ -152,6 +156,20 @@ pub fn load_user_config() -> UserConfigResult<Option<UserConfig>> {
         settings,
         uses_deprecated_root_markers,
     }))
+}
+
+fn contains_dangling_symlink(path: &std::path::Path) -> bool {
+    let mut prefix = std::path::PathBuf::new();
+    for component in path.components() {
+        prefix.push(component);
+        if let Ok(metadata) = std::fs::symlink_metadata(&prefix)
+            && metadata.file_type().is_symlink()
+            && std::fs::metadata(&prefix).is_err()
+        {
+            return true;
+        }
+    }
+    false
 }
 
 /// Returns the path to the user configuration file.
@@ -373,6 +391,27 @@ mod tests {
         assert!(
             matches!(result, Err(UserConfigError::IoError { .. })),
             "a configured but broken path must not be treated as absent: {result:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial(xdg_env)]
+    fn load_user_config_reports_dangling_parent_symlink() {
+        use std::os::unix::fs::symlink;
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().expect("failed to create temp dir");
+        let config_home = temp_dir.path().join("config");
+        symlink("missing-config", &config_home)
+            .expect("failed to create dangling config-home symlink");
+
+        let _xdg = EnvVarGuard::set("XDG_CONFIG_HOME", &config_home);
+        let result = load_user_config();
+
+        assert!(
+            matches!(result, Err(UserConfigError::IoError { .. })),
+            "a broken ancestor of the configured path must not be treated as absent: {result:?}"
         );
     }
 
