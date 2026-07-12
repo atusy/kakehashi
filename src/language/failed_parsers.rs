@@ -323,9 +323,9 @@ impl FailedParserRegistry {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
 
-        // Build and flush a replacement inode without touching the currently
-        // locked marker. Any create/write/sync failure therefore leaves the
-        // prior active-language evidence intact.
+        // Build a replacement inode without touching the currently locked
+        // marker. Any create/write failure therefore leaves the prior
+        // active-language evidence intact.
         let next_path = self.session_marker_path();
         let temp_path = self
             .state_dir
@@ -338,7 +338,6 @@ impl FailedParserRegistry {
                 .open(&temp_path)?;
             file.lock_exclusive()?;
             file.write_all(contents.as_bytes())?;
-            file.sync_data()?;
             fs::rename(&temp_path, &next_path)?;
             Ok(file)
         })();
@@ -350,9 +349,9 @@ impl FailedParserRegistry {
             }
         };
 
-        // The replacement is now visible with flushed contents and already
-        // locked. Swap ownership before releasing the old lock, so startup
-        // scanning can never observe a gap with no live marker.
+        // The replacement is now visible and already locked. Swap ownership
+        // before releasing the old lock, so startup scanning can never observe
+        // a gap with no live marker.
         let old_path = std::mem::replace(&mut current.path, next_path);
         let old_file = std::mem::replace(&mut current.file, replacement);
         if let Err(remove_error) = fs::remove_file(&old_path) {
@@ -361,7 +360,7 @@ impl FailedParserRegistry {
             // If either operation fails, retain the lock for this session;
             // safety prefers a later false quarantine over a live peer reading
             // stale evidence now.
-            let cleared = old_file.set_len(0).and_then(|()| old_file.sync_data());
+            let cleared = old_file.set_len(0);
             if cleared.is_ok() {
                 drop(old_file);
                 if let Err(error) = fs::remove_file(&old_path) {
