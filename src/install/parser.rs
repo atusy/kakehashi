@@ -441,12 +441,30 @@ fn claim_and_unlink_stale_parser_file(
     path: &Path,
 ) -> Result<Option<PathBuf>, ParserInstallError> {
     use std::os::unix::fs::MetadataExt;
+    use std::os::unix::fs::OpenOptionsExt;
 
-    let file = match fs::OpenOptions::new().read(true).open(path) {
+    let initial = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(ParserInstallError::IoError(error)),
+    };
+    if !initial.file_type().is_file() {
+        return Ok(None);
+    }
+    let file = match fs::OpenOptions::new()
+        .read(true)
+        // The pathname can be replaced after symlink_metadata. Never block if
+        // an external actor swaps in a FIFO before open.
+        .custom_flags(nix::libc::O_NONBLOCK)
+        .open(path)
+    {
         Ok(file) => file,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(ParserInstallError::IoError(error)),
     };
+    if !file.metadata()?.file_type().is_file() {
+        return Ok(None);
+    }
     match file.try_lock_exclusive() {
         Ok(()) => {}
         Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => return Ok(None),
@@ -1200,6 +1218,27 @@ mod tests {
         cleanup_interrupted_parser_installs(&parser_dir).expect("cleanup succeeds");
 
         assert!(staged.exists(), "another cleaner owns the staging file");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cleanup_skips_non_file_staging_path() {
+        let temp = tempdir().expect("temp dir");
+        let parser_dir = temp.path().join("parser");
+        fs::create_dir_all(&parser_dir).expect("create parser dir");
+        let mut pid = std::process::id().saturating_add(100_000);
+        while process_is_running(pid) {
+            pid = pid.saturating_add(1);
+        }
+        let staged = parser_dir.join(format!(
+            ".lua.{pid}.0.{}.tmp",
+            std::env::consts::DLL_EXTENSION
+        ));
+        fs::create_dir(&staged).expect("create impostor directory");
+
+        cleanup_interrupted_parser_installs(&parser_dir).expect("cleanup succeeds");
+
+        assert!(staged.is_dir(), "non-file staging path is preserved");
     }
 
     const TREE_SITTER_JSON_URL: &str =
