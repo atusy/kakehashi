@@ -227,7 +227,11 @@ impl FailedParserRegistry {
             .entry(language.to_string())
             .and_modify(|count| *count += 1)
             .or_insert(1);
-        self.persist_current_state()
+        if let Err(error) = self.persist_current_state() {
+            self.decrement_parsing_count(language);
+            return Err(error);
+        }
+        Ok(())
     }
 
     /// Record that parsing completed successfully for a language.
@@ -238,7 +242,11 @@ impl FailedParserRegistry {
             .persistence_lock
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        // Decrement the parsing count for this language
+        self.decrement_parsing_count(language);
+        self.persist_current_state()
+    }
+
+    fn decrement_parsing_count(&self, language: &str) {
         if let Some(mut entry) = self.parsing_counts.get_mut(language) {
             *entry -= 1;
             if *entry == 0 {
@@ -247,7 +255,6 @@ impl FailedParserRegistry {
                 self.parsing_counts.remove(language);
             }
         }
-        self.persist_current_state()
     }
 
     /// Persist current parsing state to disk.
