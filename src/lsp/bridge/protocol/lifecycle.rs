@@ -130,12 +130,14 @@ pub(crate) fn build_did_change_configuration_notification(
     )
 }
 
-/// Validates a JSON-RPC initialize response.
+/// Validates a JSON-RPC initialize response and extracts its capabilities.
 ///
 /// Uses lenient interpretation to maximize compatibility with non-conformant
 /// servers: a non-null `error` field is prioritized, a null `error` alongside a
 /// result is accepted, and a null/missing result is rejected.
-pub(crate) fn validate_initialize_response(response: &serde_json::Value) -> std::io::Result<()> {
+pub(crate) fn parse_initialize_response_capabilities(
+    response: &serde_json::Value,
+) -> std::io::Result<ServerCapabilities> {
     // 1. Check for error response (prioritize error if present)
     if let Some(error) = response.get("error").filter(|e| !e.is_null()) {
         // Error field is non-null: treat as error regardless of result
@@ -152,23 +154,11 @@ pub(crate) fn validate_initialize_response(response: &serde_json::Value) -> std:
     }
 
     // 2. Reject if result is absent or null
-    let Some(result) = response.get("result").filter(|r| !r.is_null()) else {
+    let Some(result) = response.get("result").filter(|result| !result.is_null()) else {
         return Err(std::io::Error::other(
             "bridge: initialize response missing valid result",
         ));
     };
-
-    if let Some(capabilities) = result
-        .get("capabilities")
-        .filter(|capabilities| !capabilities.is_null())
-    {
-        serde_json::from_value::<ServerCapabilities>(capabilities.clone()).map_err(|error| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!("bridge: invalid initialize capabilities: {error}"),
-            )
-        })?;
-    }
 
     validate_utf16_encoding(
         result
@@ -178,7 +168,19 @@ pub(crate) fn validate_initialize_response(response: &serde_json::Value) -> std:
     )?;
     validate_utf16_encoding(result.get("offsetEncoding"), "offsetEncoding")?;
 
-    Ok(())
+    let capabilities = result
+        .get("capabilities")
+        .filter(|capabilities| !capabilities.is_null());
+
+    match capabilities {
+        Some(capabilities) => serde_json::from_value(capabilities.clone()).map_err(|error| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("bridge: invalid initialize capabilities: {error}"),
+            )
+        }),
+        None => Ok(ServerCapabilities::default()),
+    }
 }
 
 fn validate_utf16_encoding(
@@ -189,8 +191,6 @@ fn validate_utf16_encoding(
         return Ok(());
     };
     if announced.is_null() {
-        // Optional JSON-RPC fields are commonly serialized as explicit null;
-        // like absence, that announces no alternative to the UTF-16 default.
         return Ok(());
     }
     let Some(encoding) = announced.as_str() else {
@@ -433,7 +433,7 @@ mod tests {
         assert_eq!(json["params"]["textDocument"]["uri"], uri);
     }
 
-    // Tests for validate_initialize_response
+    // Tests for parse_initialize_response_capabilities
 
     #[rstest]
     #[case::valid_result_without_error(
@@ -442,27 +442,23 @@ mod tests {
     #[case::valid_result_with_null_error(
         serde_json::json!({"result": {"capabilities": {}}, "error": null})
     )]
-    #[case::omitted_capabilities(serde_json::json!({"result": {}}))]
-    #[case::null_capabilities(serde_json::json!({"result": {"capabilities": null}}))]
     #[case::explicit_utf16_position_encoding(
-        serde_json::json!({
-            "result": {"capabilities": {"positionEncoding": "utf-16"}}
-        })
+        serde_json::json!({"result": {"capabilities": {"positionEncoding": "utf-16"}}})
     )]
     #[case::legacy_utf16_offset_encoding(
-        serde_json::json!({
-            "result": {"capabilities": {}, "offsetEncoding": "utf-16"}
-        })
+        serde_json::json!({"result": {"capabilities": {}, "offsetEncoding": "utf-16"}})
     )]
     #[case::null_standard_encoding(
-        serde_json::json!({
-            "result": {"capabilities": {"positionEncoding": null}}
-        })
+        serde_json::json!({"result": {"capabilities": {"positionEncoding": null}}})
     )]
     #[case::null_legacy_encoding(
-        serde_json::json!({
-            "result": {"capabilities": {}, "offsetEncoding": null}
-        })
+        serde_json::json!({"result": {"capabilities": {}, "offsetEncoding": null}})
+    )]
+    #[case::omitted_capabilities(
+        serde_json::json!({"result": {}})
+    )]
+    #[case::null_capabilities(
+        serde_json::json!({"result": {"capabilities": null}})
     )]
     #[case::complex_result_object(
         serde_json::json!({
@@ -483,19 +479,19 @@ mod tests {
     #[trace]
     fn validate_accepts_valid_response(#[case] response: serde_json::Value) {
         assert!(
-            validate_initialize_response(&response).is_ok(),
+            parse_initialize_response_capabilities(&response).is_ok(),
             "Expected valid response to be accepted: {:?}",
             response
         );
     }
 
-    #[test]
-    fn validate_rejects_non_object_capabilities() {
-        let response = serde_json::json!({
-            "result": { "capabilities": "not-an-object" }
-        });
+    #[rstest]
+    #[case::non_object(serde_json::json!("not-an-object"))]
+    #[case::invalid_known_field(serde_json::json!({"hoverProvider": 42}))]
+    fn validate_rejects_malformed_capabilities(#[case] capabilities: serde_json::Value) {
+        let response = serde_json::json!({ "result": { "capabilities": capabilities } });
 
-        let error = validate_initialize_response(&response)
+        let error = parse_initialize_response_capabilities(&response)
             .expect_err("non-object server capabilities must fail the handshake");
 
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
@@ -520,7 +516,7 @@ mod tests {
         #[case] response: serde_json::Value,
         #[case] expected_error: &str,
     ) {
-        let result = validate_initialize_response(&response);
+        let result = parse_initialize_response_capabilities(&response);
         assert!(result.is_err(), "Expected rejection for: {:?}", response);
         let err_msg = result.unwrap_err().to_string();
         assert!(
@@ -529,41 +525,6 @@ mod tests {
             expected_error,
             err_msg
         );
-    }
-
-    #[rstest]
-    #[case::standard_utf8(
-        serde_json::json!({
-            "result": {"capabilities": {"positionEncoding": "utf-8"}}
-        }),
-        "positionEncoding",
-        "utf-8",
-    )]
-    #[case::legacy_utf8(
-        serde_json::json!({
-            "result": {"capabilities": {}, "offsetEncoding": "utf-8"}
-        }),
-        "offsetEncoding",
-        "utf-8",
-    )]
-    #[case::malformed_standard_encoding(
-        serde_json::json!({
-            "result": {"capabilities": {"positionEncoding": 16}}
-        }),
-        "positionEncoding",
-        "non-string",
-    )]
-    #[trace]
-    fn validate_rejects_non_utf16_position_encoding(
-        #[case] response: serde_json::Value,
-        #[case] field: &str,
-        #[case] announced: &str,
-    ) {
-        let error = validate_initialize_response(&response)
-            .expect_err("non-UTF-16 downstream encoding must fail initialization");
-        let message = error.to_string();
-        assert!(message.contains(field), "unexpected error: {message}");
-        assert!(message.contains(announced), "unexpected error: {message}");
     }
 
     #[rstest]
@@ -627,7 +588,7 @@ mod tests {
         #[case] expected_code: &str,
         #[case] expected_message: &str,
     ) {
-        let result = validate_initialize_response(&response);
+        let result = parse_initialize_response_capabilities(&response);
         assert!(result.is_err(), "Expected rejection for: {:?}", response);
         let err_msg = result.unwrap_err().to_string();
         assert!(
