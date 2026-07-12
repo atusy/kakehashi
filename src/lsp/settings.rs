@@ -80,9 +80,17 @@ pub fn load_settings(
     let env_fn = crate::config::expand::with_kakehashi_defaults(env_fn);
     let mut events = Vec::new();
     let mut used_deprecated_root_markers = false;
+    let mut path_expansion_failed = false;
 
     // Layer 1: Programmed defaults (configuration-merging-strategy: lowest precedence)
-    let defaults = normalize_layer(default_settings(), None, home, &env_fn, &mut events);
+    let defaults = normalize_layer(
+        default_settings(),
+        None,
+        home,
+        &env_fn,
+        &mut events,
+        &mut path_expansion_failed,
+    );
 
     // Layers 2+3: config files (either explicit --config-file or default locations)
     let config_layers: Vec<Option<RawWorkspaceSettings>> =
@@ -97,7 +105,14 @@ pub fn load_settings(
                     let base = absolute_parent(p);
                     load_toml_file(p, &mut events, &mut used_deprecated_root_markers).and_then(
                         |settings| {
-                            normalize_layer(settings, base.as_deref(), home, &env_fn, &mut events)
+                            normalize_layer(
+                                settings,
+                                base.as_deref(),
+                                home,
+                                &env_fn,
+                                &mut events,
+                                &mut path_expansion_failed,
+                            )
                         },
                     )
                 })
@@ -113,12 +128,20 @@ pub fn load_settings(
                             home,
                             &env_fn,
                             &mut events,
+                            &mut path_expansion_failed,
                         )
                     }),
                 // Layer 3: Project config from root_path/kakehashi.toml
                 load_toml_settings(root_path, &mut events, &mut used_deprecated_root_markers)
                     .and_then(|settings| {
-                        normalize_layer(settings, root_path, home, &env_fn, &mut events)
+                        normalize_layer(
+                            settings,
+                            root_path,
+                            home,
+                            &env_fn,
+                            &mut events,
+                            &mut path_expansion_failed,
+                        )
                     }),
             ]
         };
@@ -131,7 +154,16 @@ pub fn load_settings(
             &mut events,
             &mut used_deprecated_root_markers,
         )
-        .and_then(|settings| normalize_layer(settings, root_path, home, &env_fn, &mut events))
+        .and_then(|settings| {
+            normalize_layer(
+                settings,
+                root_path,
+                home,
+                &env_fn,
+                &mut events,
+                &mut path_expansion_failed,
+            )
+        })
     });
 
     // Merge all layers: defaults < config_layers < override (later layers override earlier)
@@ -143,11 +175,7 @@ pub fn load_settings(
         .reduce(merge_workspace_settings)
         .flatten();
     let raw_settings = merged.clone();
-    let layer_expansion_failed = events.iter().any(|event| {
-        event.kind == SettingsEventKind::Error
-            && event.message.starts_with("Path expansion failed:")
-    });
-    let settings = (!layer_expansion_failed)
+    let settings = (!path_expansion_failed)
         .then(|| {
             merged
                 .as_ref()
@@ -178,10 +206,12 @@ fn normalize_layer(
     home: Option<&str>,
     env_fn: &impl Fn(&str) -> Option<String>,
     events: &mut Vec<SettingsEvent>,
+    path_expansion_failed: &mut bool,
 ) -> Option<RawWorkspaceSettings> {
     match crate::config::expand::expand_settings_paths(&mut settings, base, home, env_fn) {
         Ok(()) => Some(settings),
         Err(errs) => {
+            *path_expansion_failed = true;
             events.push(SettingsEvent::error(format!(
                 "Path expansion failed: {errs}. The complete configuration has been discarded; previous settings remain in effect. Please correct the affected paths and environment variables or remove them from your config."
             )));
