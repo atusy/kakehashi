@@ -641,6 +641,17 @@ mod tests {
     }
 
     #[test]
+    fn jsonl_format_preserves_multiline_source() {
+        let mut d = diag(0, 0, Some(DiagnosticSeverity::ERROR), "boom");
+        d.source = Some("lua-ls\nsecond\tfield".to_string());
+
+        let value: serde_json::Value =
+            serde_json::from_str(&format_diagnostic(OutputFormat::Jsonl, "x.lua", &d)).unwrap();
+
+        assert_eq!(value["source"], "lua-ls\nsecond\tfield");
+    }
+
+    #[test]
     fn jsonl_numeric_code_stays_numeric() {
         let mut d = diag(0, 0, Some(DiagnosticSeverity::ERROR), "m");
         d.code = Some(NumberOrString::Number(42));
