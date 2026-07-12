@@ -332,6 +332,10 @@ fn append_unknown_layers_keys(
 impl Kakehashi {
     /// Handle workspace/didChangeConfiguration notification.
     pub(crate) async fn did_change_configuration_impl(&self, params: DidChangeConfigurationParams) {
+        let has_kakehashi_wrapper = params
+            .settings
+            .as_object()
+            .is_some_and(|settings| settings.contains_key("kakehashi"));
         let uses_deprecated_unwrapped_shape =
             uses_deprecated_unwrapped_didchange_shape(&params.settings);
         let (settings_value, unknown_keys) = settings_payload(params.settings);
@@ -370,9 +374,10 @@ impl Kakehashi {
             return;
         }
 
-        if settings_value
-            .as_object()
-            .is_some_and(serde_json::Map::is_empty)
+        if !has_kakehashi_wrapper
+            && settings_value
+                .as_object()
+                .is_some_and(serde_json::Map::is_empty)
         {
             return;
         }
