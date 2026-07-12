@@ -99,7 +99,7 @@ impl PositionMapper<'_> {
                 let content = line
                     .strip_suffix('\n')
                     .map(|line| line.strip_suffix('\r').unwrap_or(line))
-                    .unwrap_or(line);
+                    .unwrap_or_else(|| line.strip_suffix('\r').unwrap_or(line));
                 let line_end = line_start + content.len();
                 let byte = self
                     .position_to_byte(position)
@@ -477,6 +477,13 @@ mod tests {
         // the valid LSP end position is byte 5, before `\n`. A far-past column
         // clamps there, not to the start of line 1 or the document end.
         let text = "hello\nworld\n";
+        let mapper = PositionMapper::new(text);
+        assert_eq!(mapper.position_to_byte_clamped(Position::new(0, 999)), 5);
+    }
+
+    #[test]
+    fn clamped_snaps_overlong_character_before_lone_carriage_return() {
+        let text = "hello\rworld";
         let mapper = PositionMapper::new(text);
         assert_eq!(mapper.position_to_byte_clamped(Position::new(0, 999)), 5);
     }
