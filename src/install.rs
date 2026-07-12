@@ -37,9 +37,9 @@ use std::path::PathBuf;
 /// - macOS: ~/Library/Application Support/kakehashi/
 /// - Windows: %APPDATA%/kakehashi/
 pub fn default_data_dir() -> Option<PathBuf> {
-    // In `cfg(test)`, redirect every caller (Kakehashi::new -> failed
-    // parser registry, search-path defaulting, etc.) to a project-local
-    // persistent dir under `deps/` so the developer's real
+    // In `cfg(test)`, redirect install assets, search-path defaults, and
+    // other persistent data callers to a project-local dir under `deps/`
+    // so the developer's real
     // `~/.local/share/kakehashi/` is never read or written. The dir is
     // shared across test processes to keep parser/query installs cached
     // between runs. Crash-recovery state is stored separately in the

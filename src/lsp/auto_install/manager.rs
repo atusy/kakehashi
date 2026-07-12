@@ -173,7 +173,8 @@ impl AutoInstallManager {
     ///
     /// State storage location: `KAKEHASHI_STATE_DIR` if set, else the default
     /// data directory, falling back to a `kakehashi` dir under the OS temp dir
-    /// if neither resolves. Crash-recovery state (`parsing_in_progress`,
+    /// if neither resolves. Unit-test builds instead use a stable process-owned
+    /// temp directory, independent of the shared parser assets. Crash-recovery state (`parsing_in_progress`,
     /// `failed_parsers`) is ephemeral and conceptually distinct from the
     /// persistent parser/query install assets in the data dir; the override
     /// lets it live elsewhere — e.g. so concurrent test processes that share one
