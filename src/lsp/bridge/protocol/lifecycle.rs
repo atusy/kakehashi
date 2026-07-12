@@ -442,6 +442,8 @@ mod tests {
     #[case::valid_result_with_null_error(
         serde_json::json!({"result": {"capabilities": {}}, "error": null})
     )]
+    #[case::omitted_capabilities(serde_json::json!({"result": {}}))]
+    #[case::null_capabilities(serde_json::json!({"result": {"capabilities": null}}))]
     #[case::explicit_utf16_position_encoding(
         serde_json::json!({
             "result": {"capabilities": {"positionEncoding": "utf-16"}}
