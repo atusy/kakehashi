@@ -6,8 +6,8 @@
 //! `CancelForwarder::subscribe()` via a oneshot so it can abort and return
 //! `RequestCancelled`.
 
+use std::collections::HashMap;
 use std::collections::hash_map::Entry;
-use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -64,9 +64,10 @@ impl std::error::Error for AlreadySubscribedError {}
 /// in the short interval between those two events.
 #[derive(Default)]
 struct CancelSubscriberState {
-    subscribers: HashMap<UpstreamId, oneshot::Sender<()>>,
-    active_requests: HashSet<UpstreamId>,
-    pending_cancellations: HashSet<UpstreamId>,
+    subscribers: HashMap<UpstreamId, (Option<u64>, oneshot::Sender<()>)>,
+    active_requests: HashMap<UpstreamId, u64>,
+    pending_cancellations: HashMap<UpstreamId, u64>,
+    next_generation: u64,
 }
 
 type CancelSubscriberRegistry = std::sync::Mutex<CancelSubscriberState>;
@@ -113,11 +114,30 @@ impl CancelForwarder {
     /// forwarding pass reads, so notifying first could silently drop the
     /// downstream `$/cancelRequest` (capture-before-notify; see
     /// `forward_cancel_by_upstream_id_with_notify`).
+    #[cfg(test)]
     pub(crate) async fn forward_cancel(&self, upstream_id: UpstreamId) -> std::io::Result<()> {
+        let generation = self.request_generation(&upstream_id);
+        self.forward_cancel_for_generation(upstream_id, generation)
+            .await
+    }
+
+    async fn forward_cancel_for_generation(
+        &self,
+        upstream_id: UpstreamId,
+        generation: Option<u64>,
+    ) -> std::io::Result<()> {
+        let validate_forwarder = self.clone();
+        let notify_forwarder = self.clone();
+        let validate_id = upstream_id.clone();
+        let notify_id = upstream_id.clone();
         self.pool
-            .forward_cancel_by_upstream_id_with_notify(upstream_id.clone(), || {
-                self.notify_cancel(&upstream_id);
-            })
+            .forward_cancel_by_upstream_id_if_current(
+                upstream_id,
+                move || validate_forwarder.request_generation(&validate_id) == generation,
+                move || {
+                    notify_forwarder.notify_cancel_for_generation(&notify_id, generation);
+                },
+            )
             .await
     }
 
@@ -147,14 +167,18 @@ impl CancelForwarder {
                 .subscribers
                 .lock()
                 .recover_poison("CancelForwarder::subscribe");
-            if subscribers.pending_cancellations.remove(&upstream_id) {
+            let generation = subscribers.active_requests.get(&upstream_id).copied();
+            if generation.is_some()
+                && subscribers.pending_cancellations.get(&upstream_id).copied() == generation
+            {
+                subscribers.pending_cancellations.remove(&upstream_id);
                 let _ = tx.send(());
                 return Ok(rx);
             }
             match subscribers.subscribers.entry(upstream_id) {
                 Entry::Occupied(entry) => return Err(AlreadySubscribedError(entry.key().clone())),
                 Entry::Vacant(entry) => {
-                    entry.insert(tx);
+                    entry.insert((generation, tx));
                 }
             }
         }
@@ -176,17 +200,36 @@ impl CancelForwarder {
     /// Notify a subscriber that its request was cancelled, or retain the signal
     /// while an accepted request has not subscribed yet. Returns whether the ID
     /// belongs to an active request or subscriber.
+    #[cfg(test)]
     pub(crate) fn notify_cancel(&self, upstream_id: &UpstreamId) -> bool {
+        let generation = self.request_generation(upstream_id);
+        self.notify_cancel_for_generation(upstream_id, generation)
+    }
+
+    fn notify_cancel_for_generation(
+        &self,
+        upstream_id: &UpstreamId,
+        generation: Option<u64>,
+    ) -> bool {
         let sender = {
             let mut subscribers = self
                 .subscribers
                 .lock()
                 .recover_poison("CancelForwarder::notify_cancel");
-            let sender = subscribers.subscribers.remove(upstream_id);
-            if sender.is_none() && subscribers.active_requests.contains(upstream_id) {
+            if subscribers.active_requests.get(upstream_id).copied() != generation {
+                return false;
+            }
+            let sender = subscribers
+                .subscribers
+                .remove(upstream_id)
+                .filter(|(subscriber_generation, _)| *subscriber_generation == generation)
+                .map(|(_, sender)| sender);
+            if sender.is_none()
+                && let Some(generation) = generation
+            {
                 subscribers
                     .pending_cancellations
-                    .insert(upstream_id.clone());
+                    .insert(upstream_id.clone(), generation);
                 return true;
             }
             sender
@@ -200,43 +243,60 @@ impl CancelForwarder {
         }
     }
 
-    fn register_request(&self, upstream_id: UpstreamId) {
-        self.subscribers
+    fn register_request(&self, upstream_id: UpstreamId) -> u64 {
+        let mut state = self
+            .subscribers
             .lock()
-            .recover_poison("CancelForwarder::register_request")
-            .active_requests
-            .insert(upstream_id);
+            .recover_poison("CancelForwarder::register_request");
+        let generation = state.next_generation;
+        state.next_generation = state.next_generation.wrapping_add(1);
+        state.active_requests.insert(upstream_id, generation);
+        generation
     }
 
-    fn unregister_request(&self, upstream_id: &UpstreamId) {
+    fn unregister_request(&self, upstream_id: &UpstreamId, generation: u64) {
         let mut state = self
             .subscribers
             .lock()
             .recover_poison("CancelForwarder::unregister_request");
-        state.active_requests.remove(upstream_id);
-        state.pending_cancellations.remove(upstream_id);
-        state.subscribers.remove(upstream_id);
+        if state.active_requests.get(upstream_id) == Some(&generation) {
+            state.active_requests.remove(upstream_id);
+            state.pending_cancellations.remove(upstream_id);
+            state.subscribers.remove(upstream_id);
+        }
+    }
+
+    fn request_generation(&self, upstream_id: &UpstreamId) -> Option<u64> {
+        self.subscribers
+            .lock()
+            .recover_poison("CancelForwarder::request_generation")
+            .active_requests
+            .get(upstream_id)
+            .copied()
     }
 }
 
 struct ActiveRequestGuard {
     cancel_forwarder: CancelForwarder,
     upstream_id: UpstreamId,
+    generation: u64,
 }
 
 impl ActiveRequestGuard {
     fn new(cancel_forwarder: CancelForwarder, upstream_id: UpstreamId) -> Self {
-        cancel_forwarder.register_request(upstream_id.clone());
+        let generation = cancel_forwarder.register_request(upstream_id.clone());
         Self {
             cancel_forwarder,
             upstream_id,
+            generation,
         }
     }
 }
 
 impl Drop for ActiveRequestGuard {
     fn drop(&mut self) {
-        self.cancel_forwarder.unregister_request(&self.upstream_id);
+        self.cancel_forwarder
+            .unregister_request(&self.upstream_id, self.generation);
     }
 }
 
@@ -344,6 +404,7 @@ where
                 });
 
             if let Some(upstream_id) = id_to_cancel {
+                let generation = forwarder.request_generation(&upstream_id);
                 let forwarder = forwarder.clone();
                 // Fire-and-forget: spawn without tracking JoinHandle.
                 //
@@ -359,7 +420,10 @@ where
                 // let the woken handler tear down the registry/router state the
                 // forwarding pass is about to read (capture-before-notify).
                 tokio::spawn(async move {
-                    if let Err(e) = forwarder.forward_cancel(upstream_id.clone()).await {
+                    if let Err(e) = forwarder
+                        .forward_cancel_for_generation(upstream_id.clone(), generation)
+                        .await
+                    {
                         // Log the error but don't fail - cancel forwarding is best-effort
                         log::debug!(
                             target: "kakehashi::cancel",
@@ -640,6 +704,38 @@ mod tests {
             ),
             "dropping the accepted request must not poison later reuse of its ID"
         );
+    }
+
+    #[tokio::test]
+    async fn delayed_cancel_does_not_hit_reused_request_id() {
+        let mock = MockService::new();
+        let pool = Arc::new(LanguageServerPool::new());
+        let forwarder = CancelForwarder::new(pool);
+        let mut service = RequestIdCapture::with_cancel_forwarder(mock, forwarder.clone());
+        let upstream_id = UpstreamId::Number(123);
+        let request = || {
+            Request::build("textDocument/hover")
+                .params(serde_json::json!({}))
+                .id(123i64)
+                .finish()
+        };
+
+        let old_request = service.call(request());
+        let old_generation = forwarder.request_generation(&upstream_id);
+        drop(old_request);
+
+        let new_request = service.call(request());
+        let mut new_request_cancel = forwarder.subscribe(upstream_id.clone()).unwrap();
+        forwarder
+            .forward_cancel_for_generation(upstream_id, old_generation)
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            new_request_cancel.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ));
+        drop(new_request);
     }
 
     #[tokio::test]

@@ -2660,9 +2660,24 @@ impl LanguageServerPool {
     /// first atomically marks queued work for writer-side skipping and captures
     /// only already-writing/sent IDs that still need a FIFO cancel notification;
     /// the later cleanup is then harmless.
+    #[cfg(test)]
     pub(crate) async fn forward_cancel_by_upstream_id_with_notify(
         &self,
         upstream_id: UpstreamId,
+        notify: impl FnOnce(),
+    ) -> io::Result<()> {
+        self.forward_cancel_by_upstream_id_if_current(upstream_id, || true, notify)
+            .await
+    }
+
+    /// Generation-aware cancellation used by the upstream middleware. The
+    /// validity check runs while the upstream registry is locked, so request-ID
+    /// reuse cannot replace the old request's downstream mappings between the
+    /// check and target capture.
+    pub(crate) async fn forward_cancel_by_upstream_id_if_current(
+        &self,
+        upstream_id: UpstreamId,
+        is_current: impl FnOnce() -> bool,
         notify: impl FnOnce(),
     ) -> io::Result<()> {
         // 1. Snapshot the connections registered for this upstream id.
@@ -2671,6 +2686,9 @@ impl LanguageServerPool {
                 .upstream_request_registry
                 .lock()
                 .recover_poison("LanguageServerPool::forward_cancel_by_upstream_id");
+            if !is_current() {
+                return Ok(());
+            }
             match registry.get(&upstream_id) {
                 Some(connections) => connections.keys().cloned().collect(),
                 None => {
