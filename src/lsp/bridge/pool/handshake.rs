@@ -90,3 +90,59 @@ pub(super) async fn perform_lsp_handshake(
 
     Ok(capabilities)
 }
+
+#[cfg(all(test, unix))]
+mod tests {
+    use std::sync::Arc;
+
+    use super::*;
+    use crate::lsp::bridge::actor::{ResponseRouter, spawn_reader_task};
+    use crate::lsp::bridge::connection::AsyncBridgeConnection;
+
+    #[tokio::test]
+    async fn malformed_capabilities_stop_before_initialized() {
+        for capabilities in [
+            serde_json::json!("not-an-object"),
+            serde_json::json!({"hoverProvider": 42}),
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let output = temp.path().join("messages");
+            let mut connection = AsyncBridgeConnection::spawn(vec![
+                "sh".to_string(),
+                "-c".to_string(),
+                "cat > \"$1\"".to_string(),
+                "sh".to_string(),
+                output.display().to_string(),
+            ])
+            .await
+            .unwrap();
+            let (writer, reader) = connection.split();
+            let router = Arc::new(ResponseRouter::new());
+            let reader_handle = spawn_reader_task(reader, Arc::clone(&router));
+            let handle = ConnectionHandle::new(writer, router, reader_handle);
+            let (response_tx, response_rx) = tokio::sync::oneshot::channel();
+            response_tx
+                .send(serde_json::json!({"result": {"capabilities": capabilities}}))
+                .unwrap();
+
+            let error = perform_lsp_handshake(
+                &handle,
+                RequestId::new(1),
+                response_rx,
+                None,
+                None,
+                None,
+                None,
+                false,
+            )
+            .await
+            .expect_err("malformed capabilities must stop the handshake");
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+
+            drop(handle);
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            let messages = std::fs::read_to_string(&output).unwrap_or_default();
+            assert!(!messages.contains("initialized"));
+        }
+    }
+}
