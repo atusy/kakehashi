@@ -493,6 +493,8 @@ fn claim_and_unlink_stale_parser_file(
     parser_dir: &Path,
     path: &Path,
 ) -> Result<Option<PathBuf>, ParserInstallError> {
+    use std::io::Write;
+    use std::os::unix::fs::DirBuilderExt;
     use std::os::unix::fs::MetadataExt;
     use std::os::unix::fs::OpenOptionsExt;
 
@@ -540,80 +542,83 @@ fn claim_and_unlink_stale_parser_file(
             std::process::id(),
             PARSER_TMP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         ));
-        match fs::hard_link(path, &candidate) {
+        let mut builder = fs::DirBuilder::new();
+        builder.mode(0o700);
+        match builder.create(&candidate) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(ParserInstallError::IoError(error)),
+        }
+        let marker = candidate.join("owner");
+        let marker_result = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .custom_flags(nix::libc::O_NOFOLLOW)
+            .open(&marker)
+            .and_then(|mut file| {
+                file.write_all(PARSER_CLEANUP_MARKER)?;
+                file.sync_all()
+            });
+        if let Err(error) = marker_result {
+            let _ = fs::remove_dir(&candidate);
+            return Err(ParserInstallError::IoError(error));
+        }
+        let claimed = candidate.join("artifact");
+        match fs::rename(path, &claimed) {
             Ok(()) => {
-                // The directory entry is the authority for unlink. Re-check
-                // after creating the claim so a pathname replacement cannot
-                // make us delete an inode other than the one we locked.
-                let current = match fs::symlink_metadata(path) {
-                    Ok(metadata) => metadata,
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                        let _ = fs::remove_file(&candidate);
-                        return Ok(None);
-                    }
-                    Err(error) => return Err(ParserInstallError::IoError(error)),
-                };
+                let current = fs::symlink_metadata(&claimed)?;
                 if opened.dev() != current.dev() || opened.ino() != current.ino() {
-                    let _ = fs::remove_file(&candidate);
+                    // A non-cooperating actor replaced the pathname just before
+                    // the atomic claim. Restore it when the original name is
+                    // still free; never delete the unexpected inode.
+                    let _ = fs::rename(&claimed, path);
+                    let _ = fs::remove_file(&marker);
+                    let _ = fs::remove_dir(&candidate);
                     return Ok(None);
-                }
-                match fs::remove_file(path) {
-                    Ok(()) => {}
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                    Err(error) => return Err(ParserInstallError::IoError(error)),
                 }
                 return Ok(Some(candidate));
             }
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            // Cleanup is opportunistic. Some Unix-backed data directories do
-            // not support hard links; leaving a stale artifact is preferable
-            // to making every future parser install fail there.
-            Err(_) => return Ok(None),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let _ = fs::remove_file(&marker);
+                let _ = fs::remove_dir(&candidate);
+                return Ok(None);
+            }
+            Err(_) => {
+                let _ = fs::remove_file(&marker);
+                let _ = fs::remove_dir(&candidate);
+                return Ok(None);
+            }
         }
     }
 }
 
-#[cfg(unix)]
-fn unlink_stale_cleanup_claim(path: &Path) -> Result<(), ParserInstallError> {
-    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+const PARSER_CLEANUP_MARKER: &[u8] = b"kakehashi parser cleanup v1\n";
 
-    let file = match fs::OpenOptions::new()
+#[cfg(unix)]
+fn remove_stale_cleanup_claim(path: &Path) {
+    use std::io::Read;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let marker = path.join("owner");
+    let Ok(file) = fs::OpenOptions::new()
         .read(true)
-        .custom_flags(nix::libc::O_NONBLOCK | nix::libc::O_NOFOLLOW)
-        .open(path)
+        .custom_flags(nix::libc::O_NOFOLLOW)
+        .open(&marker)
+    else {
+        return;
+    };
+    let mut contents = Vec::with_capacity(PARSER_CLEANUP_MARKER.len() + 1);
+    if file
+        .take(PARSER_CLEANUP_MARKER.len() as u64 + 1)
+        .read_to_end(&mut contents)
+        .is_err()
+        || contents != PARSER_CLEANUP_MARKER
     {
-        Ok(file) => file,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(error) if error.raw_os_error() == Some(nix::libc::ELOOP) => return Ok(()),
-        Err(_) => return Ok(()),
-    };
-    if !file.metadata()?.file_type().is_file() || file.try_lock_exclusive().is_err() {
-        return Ok(());
+        return;
     }
-    let opened = file.metadata()?;
-    let current = match fs::symlink_metadata(path) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(_) => return Ok(()),
-    };
-    if opened.dev() != current.dev() || opened.ino() != current.ino() {
-        return Ok(());
-    }
-    match fs::remove_file(path) {
-        Ok(()) => Ok(()),
-        Err(error)
-            if matches!(
-                error.kind(),
-                std::io::ErrorKind::NotFound | std::io::ErrorKind::IsADirectory
-            ) =>
-        {
-            Ok(())
-        }
-        // Recovery is best-effort; an undeletable abandoned claim must not
-        // prevent an otherwise valid parser installation.
-        Err(_) => Ok(()),
-    }
+    // The private, marker-bearing directory is the durable ownership record.
+    // remove_dir_all does not traverse a directory symlink swapped into `path`.
+    let _ = fs::remove_dir_all(path);
 }
 
 #[cfg(unix)]
@@ -649,7 +654,7 @@ fn cleanup_interrupted_parser_installs(parser_dir: &Path) -> Result<(), ParserIn
         let path = entry.path();
         if let Some(pid) = cleanup_claim_pid(&path) {
             if !process_is_running(pid) {
-                unlink_stale_cleanup_claim(&path)?;
+                remove_stale_cleanup_claim(&path);
             }
             continue;
         }
@@ -664,11 +669,7 @@ fn cleanup_interrupted_parser_installs(parser_dir: &Path) -> Result<(), ParserIn
             let Some(claimed) = claim_and_unlink_stale_parser_file(parser_dir, &path)? else {
                 continue;
             };
-            match fs::remove_file(claimed) {
-                Ok(()) => {}
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => return Err(ParserInstallError::IoError(error)),
-            }
+            let _ = fs::remove_dir_all(claimed);
         }
     }
     Ok(())
@@ -1381,20 +1382,23 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn cleanup_preserves_cleanup_claim_locked_by_live_cleaner() {
+    fn cleanup_only_removes_proven_cleanup_claims() {
         let temp = tempdir().expect("temp dir");
         let parser_dir = temp.path().join("parser");
         fs::create_dir_all(&parser_dir).expect("create parser dir");
-        let claim = parser_dir.join(format!(".parser-cleanup.{}.0", terminated_child_pid()));
-        fs::write(&claim, b"claimed parser").expect("write cleanup claim");
-        let claimed_elsewhere = fs::File::open(&claim).expect("open cleanup claim");
-        claimed_elsewhere
-            .lock_exclusive()
-            .expect("simulate live cleaner's claim");
+        let pid = terminated_child_pid();
+        let owned = parser_dir.join(format!(".parser-cleanup.{pid}.0"));
+        let unowned = parser_dir.join(format!(".parser-cleanup.{pid}.1"));
+        fs::create_dir(&owned).expect("create owned cleanup claim");
+        fs::write(owned.join("owner"), PARSER_CLEANUP_MARKER).expect("write ownership marker");
+        fs::write(owned.join("artifact"), b"stale parser").expect("write stale artifact");
+        fs::create_dir(&unowned).expect("create unowned lookalike");
+        fs::write(unowned.join("artifact"), b"user data").expect("write user data");
 
         cleanup_interrupted_parser_installs(&parser_dir).expect("cleanup succeeds");
 
-        assert!(claim.exists(), "live cleaner retains its cleanup claim");
+        assert!(!owned.exists(), "proven abandoned claim is removed");
+        assert!(unowned.exists(), "unmarked lookalike is preserved");
     }
 
     #[cfg(unix)]
