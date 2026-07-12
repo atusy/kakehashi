@@ -143,14 +143,27 @@ impl DiagnosticPublisher {
     /// Coalesce a burst of downstream `workspace/diagnostic/refresh` requests
     /// into one forced upstream refresh after the burst settles (#789).
     pub(crate) fn request_forwarded_diagnostic_refresh(&self) {
+        if !self.diagnostic_refresh_supported() {
+            return;
+        }
+        // Preserve the metrics contract: each capability-eligible downstream
+        // ask is counted before this debounce decides how many wire sends survive.
+        self.aggregator.record_refresh_requested();
         let Some(generation) = self.aggregator.begin_forwarded_refresh_debounce() else {
             return;
         };
         let publisher = self.clone();
         tokio::spawn(async move {
             wait_for_forwarded_refresh_settle(&publisher.aggregator, generation).await;
-            publisher.request_pull_diagnostic_refresh(true);
+            publisher.request_pull_diagnostic_refresh_inner(true, false);
         });
+    }
+
+    fn diagnostic_refresh_supported(&self) -> bool {
+        self.settings_manager
+            .client_capabilities_lock()
+            .get()
+            .is_some_and(crate::lsp::client::check_diagnostic_refresh_support)
     }
 
     /// Route a downstream `publishDiagnostics` push into the cache, classifying by
@@ -925,17 +938,18 @@ impl DiagnosticPublisher {
     /// leaking a tower-lsp pending-request entry plus a parked task — the same gate
     /// the `semantic_tokens_refresh` path uses.
     pub(crate) fn request_pull_diagnostic_refresh(&self, forced: bool) {
-        let supported = self
-            .settings_manager
-            .client_capabilities_lock()
-            .get()
-            .is_some_and(crate::lsp::client::check_diagnostic_refresh_support);
-        if !supported {
+        self.request_pull_diagnostic_refresh_inner(forced, true);
+    }
+
+    fn request_pull_diagnostic_refresh_inner(&self, forced: bool, record_request: bool) {
+        if !self.diagnostic_refresh_supported() {
             return;
         }
         // Count the ask before the gate so `requested - sent` measures what the
         // single-flight + coverage gate saves (#533).
-        self.aggregator.record_refresh_requested();
+        if record_request {
+            self.aggregator.record_refresh_requested();
+        }
         // Coalesce against any in-flight refresh and apply the coverage gate (#497):
         // `false` here means either one is already outstanding (recorded as `pending`,
         // so the outstanding task's loop fires the trailing) or — for a non-`forced`
@@ -1085,7 +1099,10 @@ mod tests {
     };
     use std::collections::HashMap;
     use tower_lsp_server::LspService;
-    use tower_lsp_server::ls_types::{Position, Range};
+    use tower_lsp_server::ls_types::{
+        ClientCapabilities, DiagnosticWorkspaceClientCapabilities, Position, Range,
+        WorkspaceClientCapabilities,
+    };
 
     fn diag(message: &str) -> Diagnostic {
         Diagnostic {
@@ -1093,6 +1110,30 @@ mod tests {
             message: message.to_string(),
             ..Default::default()
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn forwarded_refresh_metrics_count_inputs_before_debounce() {
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+        server
+            .settings_manager
+            .set_capabilities(ClientCapabilities {
+                workspace: Some(WorkspaceClientCapabilities {
+                    diagnostics: Some(DiagnosticWorkspaceClientCapabilities {
+                        refresh_support: Some(true),
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            });
+        let publisher = DiagnosticPublisher::new(server);
+
+        publisher.request_forwarded_diagnostic_refresh();
+        publisher.request_forwarded_diagnostic_refresh();
+        publisher.request_forwarded_diagnostic_refresh();
+
+        assert_eq!(server.diagnostics.metrics_snapshot().refreshes_requested, 3);
     }
 
     fn rust_server_config() -> (String, BridgeServerConfig) {
