@@ -548,7 +548,7 @@ fn staged_parser_pid(path: &Path) -> Option<u32> {
         return None;
     }
     let pid = pid.parse().ok()?;
-    (1..=i32::MAX as u32).contains(&pid).then_some(pid)
+    is_native_process_id(pid).then_some(pid)
 }
 
 fn is_canonical_decimal(value: &str) -> bool {
@@ -571,7 +571,20 @@ fn cleanup_claim_pid(path: &Path) -> Option<u32> {
         return None;
     }
     let pid = pid.parse().ok()?;
-    (1..=i32::MAX as u32).contains(&pid).then_some(pid)
+    is_native_process_id(pid).then_some(pid)
+}
+
+fn is_native_process_id(pid: u32) -> bool {
+    #[cfg(windows)]
+    {
+        // Windows process IDs are unsigned DWORD values.
+        pid != 0
+    }
+    #[cfg(not(windows))]
+    {
+        // Unix probing converts to libc's signed pid_t.
+        (1..=i32::MAX as u32).contains(&pid)
+    }
 }
 
 #[cfg(any(windows, test))]
@@ -1837,6 +1850,20 @@ mod tests {
             oversized_claim.exists(),
             "oversized-PID cleanup claim is preserved"
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_accepts_full_width_process_ids_in_cleanup_names() {
+        let pid = i32::MAX as u32 + 1;
+        let staged = PathBuf::from(format!(
+            ".lua.{pid}.0.{}.tmp",
+            std::env::consts::DLL_EXTENSION
+        ));
+        let claim = PathBuf::from(format!(".parser-cleanup.{pid}.0"));
+
+        assert_eq!(staged_parser_pid(&staged), Some(pid));
+        assert_eq!(cleanup_claim_pid(&claim), Some(pid));
     }
 
     #[cfg(unix)]
