@@ -179,8 +179,8 @@ pub(super) fn injection_stack_at(
             }
             candidates.push((region, absolute_ranges));
         }
-        // Smallest effective span wins — that's the most specific injection at
-        // the cursor after offset/include adjustments.
+        // Try smallest effective spans first — the first viable tree is the
+        // most specific injection at the cursor that can actually mint IDs.
         candidates.sort_by_key(|(_, ranges)| total_span(ranges));
         let mut selected = None;
         let mut viable_candidates = 0usize;
