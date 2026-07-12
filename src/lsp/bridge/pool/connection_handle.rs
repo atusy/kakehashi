@@ -128,8 +128,8 @@ pub(crate) struct ConnectionHandle {
     /// via `state_watch.subscribe()`.
     state_watch: tokio::sync::watch::Sender<ConnectionState>,
     /// Exactly one caller owns writer reclamation and child termination. Other
-    /// shutdown callers wait on `shutdown_complete` instead of competing for the
-    /// sole writer or publishing completion early.
+    /// shutdown callers wait through `ShutdownCoordinator::changed` instead of
+    /// competing for the sole writer or publishing completion early.
     shutdown_coordinator: Arc<ShutdownCoordinator>,
     /// Channel sender for outbound messages (ls-bridge-message-ordering single-writer pattern).
     ///
