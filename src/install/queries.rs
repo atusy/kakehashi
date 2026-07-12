@@ -579,7 +579,6 @@ pub fn remove_query_install_and_backups_after_operation_started(
             "operation permit does not cover this query removal",
         )));
     }
-    validate_safe_language_name(language)?;
     fs::create_dir_all(queries_parent)?;
     let _replace_lock = QueryReplaceLockGuard::acquire(queries_parent, language)?;
     write_uninstall_tombstone(queries_parent, language)?;
