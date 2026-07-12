@@ -295,8 +295,16 @@ fn unsafe_language_name_error(language: &str) -> ParserInstallError {
     ))
 }
 
-fn begin_parser_install(parser_dir: &Path, language: &str) -> Result<String, ParserInstallError> {
+fn begin_parser_install(
+    parser_dir: &Path,
+    parser_file: &Path,
+    language: &str,
+    force: bool,
+) -> Result<String, ParserInstallError> {
     let _replace_lock = ParserReplaceLockGuard::acquire(parser_dir, language)?;
+    if parser_file.exists() && !force {
+        return Err(ParserInstallError::AlreadyExists(parser_file.to_path_buf()));
+    }
     let token = format!("install:{}", ulid::Ulid::new());
     let mut marker = fs::File::create(parser_uninstall_tombstone_path(parser_dir, language))?;
     marker.write_all(token.as_bytes())?;
@@ -372,12 +380,7 @@ pub fn install_parser(
 
     let parser_dir = options.data_dir.join("parser");
     let parser_file = parser_dir.join(format!("{}.{}", language, std::env::consts::DLL_EXTENSION));
-    let install_token = begin_parser_install(&parser_dir, language)?;
-
-    // Check if parser already exists
-    if parser_file.exists() && !options.force {
-        return Err(ParserInstallError::AlreadyExists(parser_file));
-    }
+    let install_token = begin_parser_install(&parser_dir, &parser_file, language, options.force)?;
 
     // Fetch metadata (with caching support)
     if options.verbose {
@@ -1467,6 +1470,35 @@ mod tests {
     }
 
     #[test]
+    fn an_already_installed_parser_does_not_supersede_an_inflight_force_install() {
+        let temp = tempdir().expect("temp dir");
+        let parser_dir = temp.path().join("parser");
+        fs::create_dir_all(&parser_dir).expect("create parser dir");
+        let parser_file = parser_dir.join(format!("lua.{}", std::env::consts::DLL_EXTENSION));
+        fs::write(&parser_file, b"installed parser").expect("write installed parser");
+        let first_token = begin_parser_install(&parser_dir, &parser_file, "lua", true)
+            .expect("start force install");
+        let options = InstallOptions {
+            data_dir: temp.path().to_path_buf(),
+            force: false,
+            verbose: false,
+            no_cache: false,
+            compile: ParserCompile::InProcess,
+        };
+
+        let result = install_parser("lua", &options);
+
+        assert!(
+            matches!(result, Err(ParserInstallError::AlreadyExists(path)) if path == parser_file)
+        );
+        assert_eq!(
+            fs::read_to_string(parser_uninstall_tombstone_path(&parser_dir, "lua")).unwrap(),
+            first_token,
+            "a no-op install must not cancel the in-flight force install"
+        );
+    }
+
+    #[test]
     fn uninstall_tombstone_prevents_staged_parser_publication() {
         let temp = tempdir().expect("temp dir");
         let parser_dir = temp.path().join("parser");
@@ -1498,7 +1530,8 @@ mod tests {
         let tmp_file = parser_dir.join(".lua.staged.tmp");
         fs::create_dir_all(&parser_dir).expect("create parser dir");
         fs::write(&tmp_file, b"compiled parser").expect("write staged parser");
-        let install_token = begin_parser_install(&parser_dir, "lua").expect("start install");
+        let install_token =
+            begin_parser_install(&parser_dir, &parser_file, "lua", true).expect("start install");
 
         assert!(!remove_parser_install(&parser_dir, "lua").expect("uninstall succeeds"));
         let publish = publish_compiled_parser(&tmp_file, &parser_file, "lua", &install_token);
@@ -1521,7 +1554,8 @@ mod tests {
         let parser_file = parser_dir.join(format!("lua.{}", std::env::consts::DLL_EXTENSION));
         let tmp_file = parser_dir.join(".lua.staged.tmp");
         remove_parser_install(&parser_dir, "lua").expect("record uninstall");
-        let install_token = begin_parser_install(&parser_dir, "lua").expect("start later install");
+        let install_token = begin_parser_install(&parser_dir, &parser_file, "lua", true)
+            .expect("start later install");
         fs::write(&tmp_file, b"compiled parser").expect("write staged parser");
 
         publish_compiled_parser(&tmp_file, &parser_file, "lua", &install_token)
@@ -1535,9 +1569,10 @@ mod tests {
         let temp = tempdir().expect("temp dir");
         let parser_dir = temp.path().join("parser");
         let parser_file = parser_dir.join(format!("lua.{}", std::env::consts::DLL_EXTENSION));
-        let first_token = begin_parser_install(&parser_dir, "lua").expect("start first install");
+        let first_token = begin_parser_install(&parser_dir, &parser_file, "lua", true)
+            .expect("start first install");
         remove_parser_install(&parser_dir, "lua").expect("superseding uninstall");
-        begin_parser_install(&parser_dir, "lua").expect("start second install");
+        begin_parser_install(&parser_dir, &parser_file, "lua", true).expect("start second install");
         let first_tmp_file = parser_dir.join(".lua.first.staged.tmp");
         fs::write(&first_tmp_file, b"first parser").expect("stage first parser");
 
