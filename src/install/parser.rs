@@ -139,6 +139,16 @@ impl ParserFileOps for StdParserFileOps {
     }
 
     fn create_backup_marker(&mut self, backup: &Path) -> std::io::Result<()> {
+        match fs::symlink_metadata(backup) {
+            Ok(_) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::AlreadyExists,
+                    format!("parser backup '{}' already exists", backup.display()),
+                ));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
         let marker_path = parser_backup_ownership_sidecar(backup);
         let marker_tmp = marker_path.with_extension(format!("owner.{}.tmp", ulid::Ulid::new()));
         let mut marker = fs::OpenOptions::new()
@@ -1603,7 +1613,10 @@ mod tests {
         }
 
         fn create_backup_marker(&mut self, backup: &Path) -> std::io::Result<()> {
-            if self.fail_marker_creation || !self.backup_markers.insert(backup.to_path_buf()) {
+            if self.files.contains_key(backup)
+                || self.fail_marker_creation
+                || !self.backup_markers.insert(backup.to_path_buf())
+            {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::AlreadyExists,
                     "injected marker collision",
