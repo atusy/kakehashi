@@ -145,14 +145,6 @@ impl WorkspaceFolderSet {
             .marker_owned
             .lock()
             .recover_poison("WorkspaceFolderSet::marker_owned");
-        let effective_added: Vec<_> = added
-            .into_iter()
-            .filter(|folder| {
-                !guard
-                    .as_ref()
-                    .is_some_and(|folders| folders.iter().any(|f| f.uri == folder.uri))
-            })
-            .collect();
         let effective_removed: Vec<_> = removed
             .iter()
             .filter(|folder| {
@@ -162,6 +154,19 @@ impl WorkspaceFolderSet {
                     && !marker_owned.contains(folder.uri.as_str())
             })
             .cloned()
+            .collect();
+        let effective_added: Vec<_> = added
+            .into_iter()
+            .filter(|folder| {
+                !guard.as_ref().is_some_and(|folders| {
+                    folders.iter().any(|existing| {
+                        existing.uri == folder.uri
+                            && !effective_removed
+                                .iter()
+                                .any(|removed| removed.uri == existing.uri)
+                    })
+                })
+            })
             .collect();
         if effective_added.is_empty() && effective_removed.is_empty() {
             return true;
@@ -378,5 +383,30 @@ mod tests {
         ));
 
         assert_eq!(set.snapshot(), Some(vec![old]));
+    }
+
+    #[test]
+    fn upstream_remove_and_readd_replaces_the_folder_metadata() {
+        let old = WorkspaceFolder {
+            uri: folder("file:///same").uri,
+            name: "old name".to_string(),
+        };
+        let renamed = WorkspaceFolder {
+            uri: old.uri.clone(),
+            name: "new name".to_string(),
+        };
+        let set = WorkspaceFolderSet::new(Some(vec![old.clone()]));
+
+        assert!(set.apply_upstream_change_and_announce(
+            vec![renamed.clone()],
+            &[old.clone()],
+            |added, removed| {
+                assert_eq!(added, &[renamed.clone()]);
+                assert_eq!(removed, &[old.clone()]);
+                true
+            },
+        ));
+
+        assert_eq!(set.snapshot(), Some(vec![renamed]));
     }
 }

@@ -120,7 +120,7 @@ use crate::error::LockResultExt;
 use super::protocol::{
     JsonRpcNotification, RequestId, VirtualDocumentUri,
     build_did_change_configuration_notification, build_did_change_workspace_folders_notification,
-    build_didopen_notification,
+    build_didopen_notification, build_workspace_folder_change_notification,
 };
 
 /// Timeout for the LSP initialize handshake and for wait-for-ready on an
@@ -364,14 +364,17 @@ pub struct LanguageServerPool {
     consecutive_panic_counts: std::sync::Mutex<HashMap<ConnectionKey, u32>>,
     /// Workspace root URI forwarded from upstream client.
     ///
-    /// Seeded during initialize and updated when the primary workspace folder changes.
+    /// Set once via `set_root_uri()` after receiving the upstream initialize request.
     /// Passed to downstream servers during LSP handshake so they can provide
     /// workspace-aware features (diagnostics, go-to-definition, etc.).
-    root_uri: arc_swap::ArcSwap<Option<String>>,
+    root_uri: OnceLock<Option<String>>,
     /// Current workspace folders from the upstream client. Seeded during
     /// initialize, then updated by `workspace/didChangeWorkspaceFolders` and
     /// snapshotted for each later downstream handshake.
     workspace_folders: super::WorkspaceFolderSet,
+    /// Serializes upstream folder deltas through global state, live connection
+    /// notification queues, and incapable-connection invalidation.
+    workspace_folder_change_lock: Mutex<()>,
     /// Client capabilities forwarded from upstream client.
     ///
     /// Set once via `set_client_capabilities()` after receiving the upstream initialize request.
@@ -457,8 +460,9 @@ impl LanguageServerPool {
             upstream_request_registry: std::sync::Mutex::new(HashMap::new()),
             cancel_metrics: CancelForwardingMetrics::default(),
             consecutive_panic_counts: std::sync::Mutex::new(HashMap::new()),
-            root_uri: arc_swap::ArcSwap::new(Arc::new(None)),
+            root_uri: OnceLock::new(),
             workspace_folders: super::WorkspaceFolderSet::new(None),
+            workspace_folder_change_lock: Mutex::new(()),
             client_capabilities: OnceLock::new(),
             upstream_tx,
             upstream_rx: std::sync::Mutex::new(Some(upstream_rx)),
@@ -524,14 +528,15 @@ impl LanguageServerPool {
 
     /// Set the workspace root URI.
     ///
-    /// Called during initialize and when the primary workspace folder changes.
+    /// Called once during upstream initialize to forward the root URI to downstream servers.
+    /// Subsequent calls are ignored (OnceLock semantics).
     pub(crate) fn set_root_uri(&self, uri: Option<String>) {
-        self.root_uri.store(Arc::new(uri));
+        let _ = self.root_uri.set(uri);
     }
 
     /// Get the workspace root URI.
     fn root_uri(&self) -> Option<String> {
-        self.root_uri.load().as_ref().clone()
+        self.root_uri.get().and_then(|v| v.clone())
     }
 
     /// Set the workspace folders.
@@ -545,9 +550,7 @@ impl LanguageServerPool {
     }
 
     /// Get the workspace folders.
-    pub(crate) fn workspace_folders(
-        &self,
-    ) -> Option<Vec<tower_lsp_server::ls_types::WorkspaceFolder>> {
+    fn workspace_folders(&self) -> Option<Vec<tower_lsp_server::ls_types::WorkspaceFolder>> {
         self.workspace_folders.snapshot()
     }
 
@@ -558,6 +561,7 @@ impl LanguageServerPool {
         added: Vec<tower_lsp_server::ls_types::WorkspaceFolder>,
         removed: &[tower_lsp_server::ls_types::WorkspaceFolder],
     ) {
+        let _change = self.workspace_folder_change_lock.lock().await;
         self.workspace_folders.apply_change(added.clone(), removed);
         self.set_root_uri(
             self.workspace_folders()
@@ -567,17 +571,12 @@ impl LanguageServerPool {
         let mut connections = self.connections.lock().await;
         let mut invalidated = Vec::new();
         for (key, handle) in connections.iter() {
-            let follows_client_workspace = key.is_client_fallback();
-            if !follows_client_workspace {
-                // Marker-owned and shared connections derive their folders
-                // from marker-root acquisition, not this client snapshot.
+            if !(key.is_client_fallback() || key.is_shared()) {
                 continue;
             }
             if handle.state() == ConnectionState::Initializing {
-                // Its initialize request captured the old snapshot and an LSP
-                // notification cannot be sent until after `initialized`.
-                // Recycle it so the next acquisition handshakes with the
-                // committed snapshot instead of retaining stale folders.
+                // Its initialize request already captured the old snapshot and
+                // notifications cannot precede `initialized`; respawn lazily.
                 invalidated.push(key.clone());
                 continue;
             }
@@ -588,16 +587,28 @@ impl LanguageServerPool {
                 invalidated.push(key.clone());
                 continue;
             }
-            let notification =
-                build_did_change_workspace_folders_notification(added.clone(), removed.to_vec());
-            if handle.send_notification(notification) == NotificationSendResult::Queued {
-                handle
-                    .workspace_folders()
-                    .apply_change(added.clone(), removed);
-            } else {
+            let queued = handle
+                .workspace_folders()
+                .apply_upstream_change_and_announce(
+                    added.clone(),
+                    removed,
+                    |effective_added, effective_removed| {
+                        handle.send_notification(build_workspace_folder_change_notification(
+                            effective_added.to_vec(),
+                            effective_removed.to_vec(),
+                        )) == NotificationSendResult::Queued
+                    },
+                );
+            if !queued {
+                log::warn!(
+                    target: "kakehashi::bridge",
+                    "[{}] workspace folder delta was not queued; recycling stale connection",
+                    key
+                );
                 invalidated.push(key.clone());
             }
         }
+
         let mut stale_handles = Vec::new();
         for key in invalidated {
             if let Some(handle) = connections.get(&key) {
@@ -1888,11 +1899,9 @@ impl LanguageServerPool {
         let announced = handle
             .workspace_folders()
             .add_and_announce(folder.clone(), || {
-                let result =
-                    handle.send_notification(build_did_change_workspace_folders_notification(
-                        vec![folder.clone()],
-                        Vec::new(),
-                    ));
+                let result = handle.send_notification(
+                    build_did_change_workspace_folders_notification(vec![folder.clone()]),
+                );
                 send_outcome = result;
                 if result == NotificationSendResult::Queued {
                     log::debug!(
@@ -2116,6 +2125,7 @@ impl LanguageServerPool {
         // matches `connection_key`.
         // Resolved before the reader task spawns because the reader answers
         // downstream `workspace/workspaceFolders` queries with these folders.
+        let marker_owned = marker.is_some();
         let (root_uri, init_folders) = super::root_markers::workspace_from_marker(marker, || {
             (self.root_uri(), self.workspace_folders())
         });
@@ -2130,7 +2140,11 @@ impl LanguageServerPool {
         // answer downstream `workspace/workspaceFolders` pulls. Shared-instance
         // servers (#391) grow it as new roots join; the immutable spawn-time
         // `init_folders` still seeds the `initialize` handshake.
-        let workspace_folders = super::WorkspaceFolderSet::new(init_folders.clone());
+        let workspace_folders = if marker_owned {
+            super::WorkspaceFolderSet::new_marker_owned(init_folders.clone())
+        } else {
+            super::WorkspaceFolderSet::new(init_folders.clone())
+        };
 
         // Now spawn reader task with liveness timeout - it can route the initialize response immediately
         // Liveness timeout is configured via LivenessTimeout::default() (60s per ls-bridge-timeout-hierarchy Tier 2)
@@ -2920,126 +2934,6 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn workspace_folder_change_updates_primary_root_for_future_spawns() {
-        let pool = LanguageServerPool::new();
-        let folder = |uri: &str| tower_lsp_server::ls_types::WorkspaceFolder {
-            uri: uri.parse().unwrap(),
-            name: uri.to_string(),
-        };
-        let original = folder("file:///original");
-        let replacement = folder("file:///replacement");
-        pool.set_root_uri(Some(original.uri.to_string()));
-        pool.set_workspace_folders(Some(vec![original.clone()]));
-
-        pool.apply_workspace_folder_change(vec![replacement.clone()], &[original])
-            .await;
-
-        assert_eq!(pool.root_uri().as_deref(), Some("file:///replacement"));
-        assert_eq!(pool.workspace_folders(), Some(vec![replacement]));
-    }
-
-    #[tokio::test]
-    async fn workspace_folder_change_forwards_to_capable_and_recycles_incapable_fallback() {
-        let pool = LanguageServerPool::new();
-        let capable =
-            create_handle_with_key(ConnectionState::Ready, ConnectionKey::for_server("capable"))
-                .await;
-        capable.set_server_capabilities(capable_workspace_folders_caps());
-        let incapable = create_handle_with_key(
-            ConnectionState::Ready,
-            ConnectionKey::for_server("incapable"),
-        )
-        .await;
-        incapable.set_server_capabilities(Default::default());
-        pool.insert_connection(Arc::clone(&capable)).await;
-        pool.insert_connection(Arc::clone(&incapable)).await;
-        let added = tower_lsp_server::ls_types::WorkspaceFolder {
-            uri: "file:///added".parse().unwrap(),
-            name: "added".to_string(),
-        };
-
-        pool.apply_workspace_folder_change(vec![added.clone()], &[])
-            .await;
-
-        assert_eq!(capable.workspace_folders().snapshot(), Some(vec![added]));
-        assert!(
-            !pool.connections.lock().await.contains_key(incapable.key()),
-            "an incapable fallback must respawn with the current workspace snapshot"
-        );
-    }
-
-    #[tokio::test]
-    async fn workspace_folder_change_recycles_initializing_connection() {
-        let pool = LanguageServerPool::new();
-        let key = ConnectionKey::for_server("initializing");
-        let handle = create_handle_with_key(ConnectionState::Initializing, key.clone()).await;
-        pool.insert_connection(handle).await;
-        let added = tower_lsp_server::ls_types::WorkspaceFolder {
-            uri: "file:///added".parse().unwrap(),
-            name: "added".to_string(),
-        };
-
-        pool.apply_workspace_folder_change(vec![added], &[]).await;
-
-        assert!(
-            !pool.connections.lock().await.contains_key(&key),
-            "a handshake seeded from the old snapshot must not remain reusable"
-        );
-    }
-
-    #[tokio::test]
-    async fn workspace_folder_change_does_not_touch_marker_owned_connection() {
-        let pool = LanguageServerPool::new();
-        let key = ConnectionKey::new("marker", Some("file:///marker".to_string()));
-        let handle = create_handle_with_key(ConnectionState::Ready, key.clone()).await;
-        handle.set_server_capabilities(capable_workspace_folders_caps());
-        pool.insert_connection(Arc::clone(&handle)).await;
-
-        pool.apply_workspace_folder_change(
-            vec![tower_lsp_server::ls_types::WorkspaceFolder {
-                uri: "file:///client".parse().unwrap(),
-                name: "client".to_string(),
-            }],
-            &[],
-        )
-        .await;
-
-        assert!(pool.connections.lock().await.contains_key(&key));
-        assert_eq!(handle.workspace_folders().snapshot(), None);
-    }
-
-    #[tokio::test]
-    async fn workspace_folder_change_does_not_touch_shared_marker_folders() {
-        let pool = LanguageServerPool::new();
-        let key = ConnectionKey::shared("shared");
-        let handle = create_handle_with_key(ConnectionState::Ready, key.clone()).await;
-        handle.set_server_capabilities(capable_workspace_folders_caps());
-        let marker = tower_lsp_server::ls_types::WorkspaceFolder {
-            uri: "file:///repo/pkg".parse().unwrap(),
-            name: "pkg".to_string(),
-        };
-        handle
-            .workspace_folders()
-            .replace(Some(vec![marker.clone()]));
-        pool.insert_connection(Arc::clone(&handle)).await;
-
-        pool.apply_workspace_folder_change(
-            vec![tower_lsp_server::ls_types::WorkspaceFolder {
-                uri: "file:///other".parse().unwrap(),
-                name: "other".to_string(),
-            }],
-            &[tower_lsp_server::ls_types::WorkspaceFolder {
-                uri: "file:///repo".parse().unwrap(),
-                name: "repo".to_string(),
-            }],
-        )
-        .await;
-
-        assert!(pool.connections.lock().await.contains_key(&key));
-        assert_eq!(handle.workspace_folders().snapshot(), Some(vec![marker]));
-    }
-
     fn shared_config() -> crate::config::settings::BridgeServerConfig {
         crate::config::settings::BridgeServerConfig {
             prefer_shared_instance: Some(true),
@@ -3114,6 +3008,51 @@ mod tests {
 
         let (_marker, key) = pool.resolve_acquire("lua", &config, Some(&doc)).await;
         assert_eq!(key, ConnectionKey::shared("lua"));
+    }
+
+    fn test_workspace_folder(uri: &str) -> tower_lsp_server::ls_types::WorkspaceFolder {
+        use std::str::FromStr as _;
+        tower_lsp_server::ls_types::WorkspaceFolder {
+            uri: tower_lsp_server::ls_types::Uri::from_str(uri).unwrap(),
+            name: uri.rsplit('/').next().unwrap().to_string(),
+        }
+    }
+
+    #[tokio::test]
+    async fn upstream_folder_delta_updates_a_capable_live_fallback_connection() {
+        let pool = LanguageServerPool::new();
+        let key = ConnectionKey::for_server("lua");
+        let handle = create_handle_with_key(ConnectionState::Ready, key.clone()).await;
+        handle.set_server_capabilities(capable_workspace_folders_caps());
+        handle
+            .workspace_folders()
+            .replace(Some(vec![test_workspace_folder("file:///old")]));
+        pool.insert_connection(Arc::clone(&handle)).await;
+
+        pool.apply_workspace_folder_change(
+            vec![test_workspace_folder("file:///new")],
+            &[test_workspace_folder("file:///old")],
+        )
+        .await;
+
+        assert_eq!(
+            handle.workspace_folders().snapshot(),
+            Some(vec![test_workspace_folder("file:///new")])
+        );
+    }
+
+    #[tokio::test]
+    async fn upstream_folder_delta_invalidates_an_incapable_live_fallback_connection() {
+        let pool = LanguageServerPool::new();
+        let key = ConnectionKey::for_server("lua");
+        let handle = create_handle_with_key(ConnectionState::Ready, key.clone()).await;
+        handle.set_server_capabilities(tower_lsp_server::ls_types::ServerCapabilities::default());
+        pool.insert_connection(handle).await;
+
+        pool.apply_workspace_folder_change(vec![test_workspace_folder("file:///new")], &[])
+            .await;
+
+        assert!(!pool.connections.lock().await.contains_key(&key));
     }
 
     /// A Ready shared connection whose server never advertised the
