@@ -1277,6 +1277,34 @@ fn test_language_uninstall_all_fails_for_unreadable_install_dirs() {
     assert_uninstall_all_fails_for_unreadable_dir("queries");
 }
 
+#[cfg(unix)]
+#[test]
+fn test_language_uninstall_all_fails_for_dangling_install_dir() {
+    use std::os::unix::fs::symlink;
+
+    let test_dir = tempfile::tempdir().expect("Failed to create temp dir");
+    symlink("missing-parser-target", test_dir.path().join("parser"))
+        .expect("Failed to create dangling parser link");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_kakehashi"))
+        .args([
+            "language",
+            "uninstall",
+            "--all",
+            "--data-dir",
+            test_dir.path().to_str().unwrap(),
+            "--force",
+        ])
+        .output()
+        .expect("Failed to execute command");
+
+    assert!(
+        !output.status.success(),
+        "a present but unreadable install root must fail; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 /// Test that language uninstall --all ignores internal query staging directories
 #[test]
 fn test_language_uninstall_all_ignores_internal_query_dirs() {

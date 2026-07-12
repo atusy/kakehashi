@@ -483,7 +483,13 @@ fn installed_query_language_name(path: &Path) -> Option<String> {
 fn read_optional_install_dir(path: &Path, kind: &str) -> Result<Option<std::fs::ReadDir>, String> {
     match std::fs::read_dir(path) {
         Ok(entries) => Ok(Some(entries)),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e)
+            if e.kind() == std::io::ErrorKind::NotFound
+                && std::fs::symlink_metadata(path)
+                    .is_err_and(|metadata_error| metadata_error.kind() == e.kind()) =>
+        {
+            Ok(None)
+        }
         Err(e) => Err(format!(
             "cannot read {kind} directory '{}': {e}",
             path.display()
