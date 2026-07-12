@@ -72,11 +72,16 @@ pub(crate) fn collect_files(
                 continue;
             }
             walk_errors += walk_directory(&path, &exclude_matcher, is_supported, &mut files);
-        } else {
+        } else if metadata.is_file() {
             if is_excluded(&exclude_matcher, base, &path, false) {
                 continue;
             }
             files.push(path);
+        } else {
+            return Err(format!(
+                "cannot access '{}': path is not a regular file or directory",
+                path.display()
+            ));
         }
     }
     files.sort();
@@ -409,6 +414,18 @@ mod tests {
             &[],
             &markdown_only,
         );
+        assert!(result.is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn explicit_special_file_is_an_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let socket = tmp.path().join("input.md");
+        let _listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+
+        let result = collect_files(tmp.path(), &[socket], &[], &markdown_only);
+
         assert!(result.is_err());
     }
 
