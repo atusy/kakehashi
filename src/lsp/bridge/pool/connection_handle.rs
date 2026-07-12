@@ -496,14 +496,17 @@ impl ConnectionHandle {
         &self.workspace_folders
     }
 
-    /// Whether the downstream server advertised support for receiving
-    /// `workspace/didChangeWorkspaceFolders` notifications — the capability
-    /// the shared-instance opt-in (#391) requires. Returns `false` until the
-    /// initialize handshake stores capabilities, so a still-initializing
-    /// connection is treated as not-yet-capable.
+    /// Whether the downstream server statically advertised or dynamically
+    /// registered support for receiving `workspace/didChangeWorkspaceFolders`
+    /// notifications — the capability the shared-instance opt-in (#391)
+    /// requires. Before initialize completes, only a dynamic registration can
+    /// make this return `true`.
     pub(crate) fn supports_workspace_folder_changes(&self) -> bool {
-        self.server_capabilities()
-            .is_some_and(supports_workspace_folder_changes)
+        self.dynamic_capabilities()
+            .has_registration("workspace/didChangeWorkspaceFolders")
+            || self
+                .server_capabilities()
+                .is_some_and(supports_workspace_folder_changes)
     }
 
     /// Log, at most once per connection, that a `preferSharedInstance` server
@@ -1920,6 +1923,21 @@ mod tests {
             Some(true),
             Some(OneOf::Left(true)),
         ))));
+        assert!(handle.supports_workspace_folder_changes());
+    }
+
+    #[tokio::test]
+    async fn handle_accepts_dynamic_workspace_folder_registration() {
+        let handle = spawn_sink_handle().await;
+        handle.set_server_capabilities(ServerCapabilities::default());
+        handle
+            .dynamic_capabilities()
+            .register(vec![tower_lsp_server::ls_types::Registration {
+                id: "workspace-folders".to_string(),
+                method: "workspace/didChangeWorkspaceFolders".to_string(),
+                register_options: None,
+            }]);
+
         assert!(handle.supports_workspace_folder_changes());
     }
 

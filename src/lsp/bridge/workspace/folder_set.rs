@@ -26,10 +26,13 @@ use tower_lsp_server::ls_types::WorkspaceFolder;
 use crate::error::LockResultExt;
 
 /// The workspace folders one downstream connection currently serves, shared
-/// (cheaply cloneable) between the reader task and the pool.
+/// (cheaply cloneable) between the reader task and the pool. Marker ownership
+/// is tracked separately so an upstream removal cannot remove a folder that
+/// the downstream connection still serves for marker-based routing.
 #[derive(Clone)]
 pub(crate) struct WorkspaceFolderSet {
     inner: Arc<Mutex<Option<Vec<WorkspaceFolder>>>>,
+    marker_owned: Arc<Mutex<std::collections::HashSet<String>>>,
 }
 
 impl WorkspaceFolderSet {
@@ -38,6 +41,22 @@ impl WorkspaceFolderSet {
     pub(crate) fn new(initial: Option<Vec<WorkspaceFolder>>) -> Self {
         Self {
             inner: Arc::new(Mutex::new(Self::deduplicate(initial))),
+            marker_owned: Arc::new(Mutex::new(std::collections::HashSet::new())),
+        }
+    }
+
+    /// Seed a connection whose initialize-time folders came from marker
+    /// resolution rather than the upstream client's workspace list.
+    pub(crate) fn new_marker_owned(initial: Option<Vec<WorkspaceFolder>>) -> Self {
+        let initial = Self::deduplicate(initial);
+        let marker_owned = initial
+            .iter()
+            .flatten()
+            .map(|folder| folder.uri.as_str().to_string())
+            .collect();
+        Self {
+            inner: Arc::new(Mutex::new(initial)),
+            marker_owned: Arc::new(Mutex::new(marker_owned)),
         }
     }
 
@@ -65,10 +84,16 @@ impl WorkspaceFolderSet {
     /// Replace the complete set, preserving the protocol distinction between
     /// `None` (`null`) and `Some(vec![])` (an explicitly empty folder list).
     pub(crate) fn replace(&self, folders: Option<Vec<WorkspaceFolder>>) {
-        *self
+        let mut inner = self
             .inner
             .lock()
-            .recover_poison("WorkspaceFolderSet::replace") = Self::deduplicate(folders);
+            .recover_poison("WorkspaceFolderSet::replace");
+        let mut marker_owned = self
+            .marker_owned
+            .lock()
+            .recover_poison("WorkspaceFolderSet::marker_owned");
+        *inner = Self::deduplicate(folders);
+        marker_owned.clear();
     }
 
     /// Whether a folder with `folder`'s URI is already in the set.
@@ -100,6 +125,60 @@ impl WorkspaceFolderSet {
         }
     }
 
+    /// Apply an upstream delta only after its effective wire delta is queued.
+    /// Marker-owned URIs survive upstream removals; adding an already-present
+    /// marker URI likewise needs no downstream notification.
+    pub(crate) fn apply_upstream_change_and_announce<F>(
+        &self,
+        added: Vec<WorkspaceFolder>,
+        removed: &[WorkspaceFolder],
+        announce: F,
+    ) -> bool
+    where
+        F: FnOnce(&[WorkspaceFolder], &[WorkspaceFolder]) -> bool,
+    {
+        let mut guard = self
+            .inner
+            .lock()
+            .recover_poison("WorkspaceFolderSet::apply_upstream_change_and_announce");
+        let marker_owned = self
+            .marker_owned
+            .lock()
+            .recover_poison("WorkspaceFolderSet::marker_owned");
+        let effective_added: Vec<_> = added
+            .into_iter()
+            .filter(|folder| {
+                !guard
+                    .as_ref()
+                    .is_some_and(|folders| folders.iter().any(|f| f.uri == folder.uri))
+            })
+            .collect();
+        let effective_removed: Vec<_> = removed
+            .iter()
+            .filter(|folder| {
+                guard
+                    .as_ref()
+                    .is_some_and(|folders| folders.iter().any(|f| f.uri == folder.uri))
+                    && !marker_owned.contains(folder.uri.as_str())
+            })
+            .cloned()
+            .collect();
+        if effective_added.is_empty() && effective_removed.is_empty() {
+            return true;
+        }
+        if !announce(&effective_added, &effective_removed) {
+            return false;
+        }
+        let folders = guard.get_or_insert_with(Vec::new);
+        folders.retain(|existing| {
+            !effective_removed
+                .iter()
+                .any(|removed| removed.uri == existing.uri)
+        });
+        folders.extend(effective_added);
+        true
+    }
+
     /// Atomically add `folder` and announce it, returning whether the set now
     /// contains it. If `folder` is already present, returns `true` without
     /// calling `announce`. Otherwise `announce` runs **while the set lock is
@@ -124,11 +203,19 @@ impl WorkspaceFolderSet {
         if let Some(folders) = guard.as_ref()
             && folders.iter().any(|existing| existing.uri == folder.uri)
         {
+            self.marker_owned
+                .lock()
+                .recover_poison("WorkspaceFolderSet::marker_owned")
+                .insert(folder.uri.as_str().to_string());
             return true;
         }
         if announce() {
             // Materialize the `None` set into `Some` ONLY on a committed add, so
             // a failed announce leaves the "answer null" state untouched.
+            self.marker_owned
+                .lock()
+                .recover_poison("WorkspaceFolderSet::marker_owned")
+                .insert(folder.uri.as_str().to_string());
             guard.get_or_insert_with(Vec::new).push(folder);
             true
         } else {
@@ -259,5 +346,37 @@ mod tests {
         set.replace(Some(Vec::new()));
 
         assert_eq!(set.snapshot(), Some(Vec::new()));
+    }
+
+    #[test]
+    fn upstream_removal_retains_a_marker_owned_folder_without_announcing() {
+        let marker = folder("file:///marker");
+        let set = WorkspaceFolderSet::new_marker_owned(Some(vec![marker.clone()]));
+
+        assert!(set.apply_upstream_change_and_announce(
+            Vec::new(),
+            &[marker.clone()],
+            |_, _| panic!("marker ownership makes the wire delta empty"),
+        ));
+
+        assert_eq!(set.snapshot(), Some(vec![marker]));
+    }
+
+    #[test]
+    fn failed_upstream_announce_keeps_prior_live_state() {
+        let old = folder("file:///old");
+        let set = WorkspaceFolderSet::new(Some(vec![old.clone()]));
+
+        assert!(!set.apply_upstream_change_and_announce(
+            vec![folder("file:///new")],
+            &[old.clone()],
+            |added, removed| {
+                assert_eq!(added, &[folder("file:///new")]);
+                assert_eq!(removed, &[old.clone()]);
+                false
+            },
+        ));
+
+        assert_eq!(set.snapshot(), Some(vec![old]));
     }
 }
