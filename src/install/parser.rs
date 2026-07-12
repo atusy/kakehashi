@@ -575,6 +575,48 @@ fn claim_and_unlink_stale_parser_file(
 }
 
 #[cfg(unix)]
+fn unlink_stale_cleanup_claim(path: &Path) -> Result<(), ParserInstallError> {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+
+    let file = match fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(nix::libc::O_NONBLOCK | nix::libc::O_NOFOLLOW)
+        .open(path)
+    {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) if error.raw_os_error() == Some(nix::libc::ELOOP) => return Ok(()),
+        Err(_) => return Ok(()),
+    };
+    if !file.metadata()?.file_type().is_file() || file.try_lock_exclusive().is_err() {
+        return Ok(());
+    }
+    let opened = file.metadata()?;
+    let current = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(_) => return Ok(()),
+    };
+    if opened.dev() != current.dev() || opened.ino() != current.ino() {
+        return Ok(());
+    }
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::IsADirectory
+            ) =>
+        {
+            Ok(())
+        }
+        // Recovery is best-effort; an undeletable abandoned claim must not
+        // prevent an otherwise valid parser installation.
+        Err(_) => Ok(()),
+    }
+}
+
+#[cfg(unix)]
 fn process_is_running(pid: u32) -> bool {
     let Ok(pid) = i32::try_from(pid) else {
         return false;
@@ -607,23 +649,7 @@ fn cleanup_interrupted_parser_installs(parser_dir: &Path) -> Result<(), ParserIn
         let path = entry.path();
         if let Some(pid) = cleanup_claim_pid(&path) {
             if !process_is_running(pid) {
-                let is_file = match fs::symlink_metadata(&path) {
-                    Ok(metadata) => metadata.file_type().is_file(),
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
-                    Err(error) => return Err(ParserInstallError::IoError(error)),
-                };
-                if !is_file {
-                    continue;
-                }
-                match fs::remove_file(path) {
-                    Ok(()) => {}
-                    Err(error)
-                        if matches!(
-                            error.kind(),
-                            std::io::ErrorKind::NotFound | std::io::ErrorKind::IsADirectory
-                        ) => {}
-                    Err(error) => return Err(ParserInstallError::IoError(error)),
-                }
+                unlink_stale_cleanup_claim(&path)?;
             }
             continue;
         }
@@ -1351,6 +1377,24 @@ mod tests {
         cleanup_interrupted_parser_installs(&parser_dir).expect("cleanup succeeds");
 
         assert!(staged.exists(), "another cleaner owns the staging file");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cleanup_preserves_cleanup_claim_locked_by_live_cleaner() {
+        let temp = tempdir().expect("temp dir");
+        let parser_dir = temp.path().join("parser");
+        fs::create_dir_all(&parser_dir).expect("create parser dir");
+        let claim = parser_dir.join(format!(".parser-cleanup.{}.0", terminated_child_pid()));
+        fs::write(&claim, b"claimed parser").expect("write cleanup claim");
+        let claimed_elsewhere = fs::File::open(&claim).expect("open cleanup claim");
+        claimed_elsewhere
+            .lock_exclusive()
+            .expect("simulate live cleaner's claim");
+
+        cleanup_interrupted_parser_installs(&parser_dir).expect("cleanup succeeds");
+
+        assert!(claim.exists(), "live cleaner retains its cleanup claim");
     }
 
     #[cfg(unix)]
