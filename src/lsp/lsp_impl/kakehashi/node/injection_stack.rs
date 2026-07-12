@@ -1131,9 +1131,10 @@ mod tests {
         let tree = parser.parse(text, None).expect("parse markdown");
         pool.release("markdown".to_string(), parser);
 
+        let paragraph_byte = text.find("ambiguous").unwrap();
         let mut paragraph = tree
             .root_node()
-            .descendant_for_byte_range(text.find("ambiguous").unwrap(), text.len() - 1)
+            .descendant_for_byte_range(paragraph_byte, paragraph_byte)
             .expect("paragraph node");
         while paragraph.kind() != "paragraph" {
             paragraph = paragraph.parent().expect("paragraph ancestor");
