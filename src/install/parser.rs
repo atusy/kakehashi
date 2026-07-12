@@ -1429,10 +1429,11 @@ fn reap_bounded(child: &mut std::process::Child) {
 /// as its own process-group leader, so its pgid equals its pid and a group-wide
 /// `SIGKILL` reaches the whole tree (`cc`, linkers, etc.). This only *terminates*
 /// descendants; the caller reaps the direct child via `child.wait()`, and the
-/// terminated descendants are reparented to init and reaped there. On non-unix this
-/// falls back to a direct `child.kill()`, which does **not** reach descendants —
-/// the orphaned-`cc` hazard is unmitigated there (kakehashi targets unix in
-/// practice; a Job Object would be the Windows equivalent).
+/// terminated descendants are reparented to init and reaped there. On Windows,
+/// [`arm_compile_watchdog`] assigns the compile process and descendants to a
+/// kill-on-close Job Object; killing the direct child closes its job handle and
+/// terminates the tree. Other platforms fall back to killing only the direct
+/// child.
 fn kill_process_group(child: &mut std::process::Child) {
     #[cfg(unix)]
     {
