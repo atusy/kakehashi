@@ -33,7 +33,7 @@ struct SessionMarker {
 struct MarkerState {
     path: PathBuf,
     file: fs::File,
-    /// Old markers whose cleanup failed stay locked so live peers never
+    /// Old markers that cannot be cleared stay locked so live peers never
     /// misclassify their stale contents as a crash.
     retired: Vec<(PathBuf, fs::File)>,
 }
