@@ -181,7 +181,8 @@ pub(super) fn injection_stack_at(
         }
         // Smallest effective span wins — that's the most specific injection at
         // the cursor after offset/include adjustments.
-        let mut materialized = Vec::new();
+        candidates.sort_by_key(|(_, ranges)| total_span(ranges));
+        let mut selected = None;
         let mut viable_candidates = 0usize;
         for (region, absolute_ranges) in candidates {
             // Pass the actual injection content to the language resolver so its
@@ -206,20 +207,21 @@ pub(super) fn injection_stack_at(
             // walk even if this bounded reparse transiently times out. Count
             // it before parsing so a timeout cannot erase sibling ambiguity.
             viable_candidates += 1;
+            if selected.is_some() {
+                continue;
+            }
             let Some(injected_tree) =
                 parse_with_absolute_ranges(&language, host_text, &absolute_ranges)
             else {
                 continue;
             };
-            materialized.push((resolved_lang, injected_tree, absolute_ranges));
+            selected = Some((resolved_lang, injected_tree, absolute_ranges));
         }
-        materialized.sort_by_key(|(_, _, ranges)| total_span(ranges));
         // Once an ancestor was ambiguous, every descendant is ambiguous too:
         // rebuilding the same child path inside the chosen smallest parent
         // still cannot prove that parent was the sibling which minted the id.
         let ambiguous = parent_ambiguous || viable_candidates > 1;
-        let Some((resolved_lang, injected_tree, absolute_ranges)) = materialized.into_iter().next()
-        else {
+        let Some((resolved_lang, injected_tree, absolute_ranges)) = selected else {
             break;
         };
 
