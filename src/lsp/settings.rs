@@ -85,7 +85,7 @@ pub fn load_settings(
     let env_fn = crate::config::expand::with_kakehashi_defaults(env_fn);
     let mut events = Vec::new();
     let mut used_deprecated_root_markers = false;
-    let mut fatal_error = None;
+    let explicit_config_requested = crate::config::expand::config_file_override().is_some();
 
     // Layer 1: Programmed defaults (configuration-merging-strategy: lowest precedence)
     let defaults = Some(default_settings());
@@ -97,15 +97,10 @@ pub fn load_settings(
                 "Using {} explicit config file(s); default config locations skipped",
                 files.len()
             )));
-            let layers = files
+            files
                 .iter()
                 .map(|p| load_toml_file(p, &mut events, &mut used_deprecated_root_markers))
-                .collect();
-            fatal_error = events
-                .iter()
-                .find(|event| event.kind == SettingsEventKind::Error)
-                .map(|event| event.message.clone());
-            layers
+                .collect()
         } else {
             vec![
                 // Layer 2: User config from XDG_CONFIG_HOME (~/.config/kakehashi/kakehashi.toml)
@@ -148,6 +143,15 @@ pub fn load_settings(
                 }
             },
         );
+
+    let fatal_error = explicit_config_requested
+        .then(|| {
+            events
+                .iter()
+                .find(|event| event.kind == SettingsEventKind::Error)
+                .map(|event| event.message.clone())
+        })
+        .flatten();
 
     SettingsLoadOutcome {
         settings,

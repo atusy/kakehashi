@@ -220,6 +220,43 @@ fn test_config_file_invalid_toml_fails_initialization() {
     );
 }
 
+#[test]
+fn test_config_file_invalid_path_expansion_fails_initialization() {
+    let dir = TempDir::new().unwrap();
+    let config_path = dir.path().join("invalid-path.toml");
+    std::fs::write(
+        &config_path,
+        "searchPaths = [\"$KAKEHASHI_TEST_UNDEFINED/path\"]\n",
+    )
+    .unwrap();
+    let mut client = LspClient::builder()
+        .arg("--config-file")
+        .arg(config_path.to_str().unwrap())
+        .env_remove("KAKEHASHI_TEST_UNDEFINED")
+        .env_remove("KAKEHASHI_DATA_DIR")
+        .build();
+
+    let response = client.send_request(
+        "initialize",
+        json!({
+            "processId": std::process::id(),
+            "rootUri": null,
+            "capabilities": {}
+        }),
+    );
+
+    let error = response
+        .get("error")
+        .expect("invalid explicit path expansion should reject initialize");
+    assert_eq!(error["code"], json!(-32602));
+    assert!(
+        error["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("Path expansion failed")),
+        "initialize error should identify the expansion failure: {error}"
+    );
+}
+
 /// --config-file with an empty temp file gives defaults only (test isolation pattern).
 #[test]
 fn test_config_file_empty_file_gives_defaults() {
