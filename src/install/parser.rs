@@ -285,8 +285,13 @@ fn cleanup_orphan_parser_backup_markers(parser_dir: &Path, language: &str) -> st
             continue;
         }
         let backup = parser_dir.join(backup_name);
-        if !backup.try_exists()? && fs::read(&marker)? == PARSER_BACKUP_MARKER_CONTENT {
-            fs::remove_file(marker)?;
+        let marker_content = match fs::read(&marker) {
+            Ok(content) => content,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error),
+        };
+        if !backup.try_exists()? && marker_content == PARSER_BACKUP_MARKER_CONTENT {
+            remove_parser_backup_marker(&backup)?;
         }
     }
     Ok(())
