@@ -225,8 +225,8 @@ impl FailedParserRegistry {
 
     /// Record that parsing is starting for a language.
     ///
-    /// The durable marker is updated before returning, so an uncatchable crash
-    /// in the native parser still leaves recovery evidence for the next run.
+    /// The marker is persisted before returning, so an uncatchable process
+    /// crash in the native parser still leaves recovery evidence for restart.
     ///
     /// Supports concurrent parsing by tracking a counter per language.
     pub fn begin_parsing(&self, language: &str) -> io::Result<()> {
@@ -269,7 +269,7 @@ impl FailedParserRegistry {
         }
     }
 
-    /// Force the current active-parser set into this session's durable marker.
+    /// Force the current active-parser set into this session's crash marker.
     ///
     /// Begin/end transitions already persist this state synchronously. This
     /// explicit flush remains available to lifecycle paths such as shutdown.
@@ -298,9 +298,9 @@ impl FailedParserRegistry {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
 
-        // Build and durably flush a replacement inode without touching the
-        // currently locked marker. Any create/write/sync failure therefore
-        // leaves the prior active-language evidence intact.
+        // Build and flush a replacement inode without touching the currently
+        // locked marker. Any create/write/sync failure therefore leaves the
+        // prior active-language evidence intact.
         let next_path = self.session_marker_path();
         let temp_path = self
             .state_dir
@@ -325,9 +325,9 @@ impl FailedParserRegistry {
             }
         };
 
-        // The replacement is now visible, durable, and already locked. Swap
-        // ownership before releasing the old lock, so startup scanning can
-        // never observe a gap with no live marker.
+        // The replacement is now visible with flushed contents and already
+        // locked. Swap ownership before releasing the old lock, so startup
+        // scanning can never observe a gap with no live marker.
         let old_path = std::mem::replace(&mut current.path, next_path);
         let old_file = std::mem::replace(&mut current.file, replacement);
         if let Err(remove_error) = fs::remove_file(&old_path) {
