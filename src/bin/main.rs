@@ -656,10 +656,11 @@ fn write_content_to_output(
                 .create_new(true)
                 .open(path)
                 .and_then(|mut file| file.write_all(content.as_bytes()))
+                .map(|()| WriteDisposition::Created)
         };
         match write_result {
-            Ok(()) => {
-                eprintln!("Created {label} file: {}", path.display());
+            Ok(disposition) => {
+                eprintln!("{} {label} file: {}", disposition.verb(), path.display());
             }
             Err(e) if !force && e.kind() == std::io::ErrorKind::AlreadyExists => {
                 eprintln!(
@@ -680,7 +681,22 @@ fn write_content_to_output(
     Ok(())
 }
 
-fn write_forced_output(path: &std::path::Path, content: &str) -> std::io::Result<()> {
+#[derive(Debug, PartialEq, Eq)]
+enum WriteDisposition {
+    Created,
+    Overwrote,
+}
+
+impl WriteDisposition {
+    fn verb(&self) -> &'static str {
+        match self {
+            Self::Created => "Created",
+            Self::Overwrote => "Overwrote",
+        }
+    }
+}
+
+fn write_forced_output(path: &std::path::Path, content: &str) -> std::io::Result<WriteDisposition> {
     if std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_symlink()) {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
@@ -691,13 +707,27 @@ fn write_forced_output(path: &std::path::Path, content: &str) -> std::io::Result
     {
         use std::io::Write as _;
         use std::os::unix::fs::OpenOptionsExt as _;
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .custom_flags(nix::libc::O_NOFOLLOW)
-            .open(path)?;
-        file.write_all(content.as_bytes())
+        let create = || {
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .custom_flags(nix::libc::O_NOFOLLOW)
+                .open(path)
+        };
+        let (mut file, disposition) = match create() {
+            Ok(file) => (file, WriteDisposition::Created),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => (
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .truncate(true)
+                    .custom_flags(nix::libc::O_NOFOLLOW)
+                    .open(path)?,
+                WriteDisposition::Overwrote,
+            ),
+            Err(error) => return Err(error),
+        };
+        file.write_all(content.as_bytes())?;
+        Ok(disposition)
     }
     #[cfg(not(unix))]
     {
@@ -706,16 +736,38 @@ fn write_forced_output(path: &std::path::Path, content: &str) -> std::io::Result
             use std::io::Write as _;
             use std::os::windows::fs::OpenOptionsExt as _;
             const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
-            let mut file = std::fs::OpenOptions::new()
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
-                .open(path)?;
-            file.write_all(content.as_bytes())
+            let create = || {
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+                    .open(path)
+            };
+            let (mut file, disposition) = match create() {
+                Ok(file) => (file, WriteDisposition::Created),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => (
+                    std::fs::OpenOptions::new()
+                        .write(true)
+                        .truncate(true)
+                        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+                        .open(path)?,
+                    WriteDisposition::Overwrote,
+                ),
+                Err(error) => return Err(error),
+            };
+            file.write_all(content.as_bytes())?;
+            Ok(disposition)
         }
         #[cfg(not(windows))]
-        std::fs::write(path, content)
+        {
+            let disposition = if path.exists() {
+                WriteDisposition::Overwrote
+            } else {
+                WriteDisposition::Created
+            };
+            std::fs::write(path, content)?;
+            Ok(disposition)
+        }
     }
 }
 
@@ -1175,6 +1227,22 @@ mod tests {
 
         assert!(result.is_err());
         assert_eq!(std::fs::read_to_string(output).unwrap(), "existing");
+    }
+
+    #[test]
+    fn force_output_reports_whether_it_created_or_overwrote() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let output = temp.path().join("config.toml");
+
+        assert_eq!(
+            write_forced_output(&output, "first").unwrap(),
+            WriteDisposition::Created
+        );
+        assert_eq!(
+            write_forced_output(&output, "second").unwrap(),
+            WriteDisposition::Overwrote
+        );
+        assert_eq!(std::fs::read_to_string(output).unwrap(), "second");
     }
 
     #[cfg(unix)]
