@@ -404,7 +404,7 @@ impl Kakehashi {
         let base_ts = self.settings_manager.load_base_raw_settings();
         // SAFETY: merge_workspace_settings(Some, Some) always returns Some, so unwrap_or_return is
         // defensive only — the None branch is unreachable under the current implementation.
-        let Some(merged_ts) = merge_workspace_settings(Some((*base_ts).clone()), Some(parsed))
+        let Some(mut merged_ts) = merge_workspace_settings(Some((*base_ts).clone()), Some(parsed))
         else {
             log::warn!(
                 "merge_workspace_settings returned None despite two Some inputs; skipping configuration update"
@@ -417,7 +417,9 @@ impl Kakehashi {
             self.home_dir.as_deref(),
             crate::config::expand::with_kakehashi_defaults(|var| std::env::var(var).ok()),
         ) {
-            Ok(settings) => {
+            Ok(mut settings) => {
+                self.settings_manager
+                    .apply_installed_search_paths(&mut merged_ts, &mut settings);
                 let warnings = Self::misconfigured_settings_warnings(&settings);
                 self.apply_raw_settings(merged_ts, settings, settings_transaction)
                     .await;
