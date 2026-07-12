@@ -394,6 +394,14 @@ fn run_language_status(verbose: bool) -> Result<(), ExitCode> {
         ExitCode::FAILURE
     })?;
 
+    validate_install_root(&data_dir).map_err(|e| {
+        eprintln!(
+            "Error: failed to inspect data directory '{}': {e}",
+            data_dir.display()
+        );
+        ExitCode::FAILURE
+    })?;
+
     let parser_dir = data_dir.join("parser");
     let queries_dir = data_dir.join("queries");
     if let Err(e) = queries::recover_interrupted_query_installs(&queries_dir) {
@@ -480,6 +488,28 @@ fn run_language_status(verbose: bool) -> Result<(), ExitCode> {
     }
 
     Ok(())
+}
+
+fn validate_install_root(path: &Path) -> std::io::Result<()> {
+    match std::fs::metadata(path) {
+        Ok(metadata) if metadata.is_dir() => Ok(()),
+        Ok(_) => Err(std::io::Error::new(
+            std::io::ErrorKind::NotADirectory,
+            "install data path is not a directory",
+        )),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            match std::fs::symlink_metadata(path) {
+                // A truly absent root is the normal state before any install.
+                Err(metadata_error) if metadata_error.kind() == std::io::ErrorKind::NotFound => {
+                    Ok(())
+                }
+                // Preserve the original follow failure for a dangling link.
+                Ok(_) => Err(e),
+                Err(metadata_error) => Err(metadata_error),
+            }
+        }
+        Err(e) => Err(e),
+    }
 }
 
 /// Visit every entry in an installation directory.

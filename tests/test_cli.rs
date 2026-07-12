@@ -789,6 +789,33 @@ fn test_language_status_fails_for_dangling_install_directory_symlink() {
 
 #[cfg(unix)]
 #[test]
+fn test_language_status_fails_for_dangling_data_directory_symlink() {
+    use std::os::unix::fs::symlink;
+
+    let test_dir = tempfile::tempdir().expect("Failed to create temp dir");
+    let data_dir = test_dir.path().join("data");
+    symlink("missing-data-directory", &data_dir).expect("Failed to create dangling data symlink");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_kakehashi"))
+        .args([
+            "language",
+            "status",
+            "--data-dir",
+            data_dir.to_str().unwrap(),
+        ])
+        .output()
+        .expect("Failed to execute command");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "stderr: {stderr}");
+    assert!(
+        stderr.contains("failed to inspect data directory"),
+        "stderr: {stderr}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
 fn test_language_status_fails_for_dangling_parser_entry_symlink() {
     use std::fs;
     use std::os::unix::fs::symlink;
