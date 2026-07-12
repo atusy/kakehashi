@@ -334,8 +334,8 @@ fn write_atomically(path: &Path, content: &str) -> std::io::Result<()> {
     // over — after writing, so a read-only target mode can't block the write.
     tmp.as_file()
         .set_permissions(std::fs::metadata(&target)?.permissions())?;
-    // A link can be added while the replacement is prepared. Narrow that race
-    // by checking again immediately before persist would split the new alias.
+    // A link can be added while the replacement is prepared. Check again
+    // immediately before persist, which would otherwise split the new alias.
     reject_multiple_hard_links(&target)?;
     tmp.persist(&target).map_err(|e| e.error)?;
     // Best-effort directory fsync: on some filesystems the rename's
