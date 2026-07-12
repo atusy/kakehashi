@@ -185,7 +185,9 @@ Queries are searched as `{searchPath}/queries/{language}/{query_type}.scm`.
 For implicit lookup, `{language}` must be one normal path component; values
 containing path separators, `.`/`..` components, or platform path prefixes do
 not resolve. Use an explicit `languages[*].parser` or `languages[*].queries`
-path when an asset cannot follow this layout.
+path for the configured parser and query kinds when an asset cannot follow this
+layout. Runtime-named queries (including capture kinds and inherited parents)
+must use the implicit layout.
 
 #### `autoInstall`
 
