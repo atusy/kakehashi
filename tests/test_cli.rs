@@ -1602,6 +1602,68 @@ fn test_language_uninstall_all_query_removal_failure_preserves_parser() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn test_language_uninstall_all_preflights_recovery_backups_before_restore() {
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+
+    let test_dir = tempfile::tempdir().expect("Failed to create temp dir");
+    let queries_dir = test_dir.path().join("queries");
+    let backup = queries_dir.join(".lua.4294967295.0.backup");
+    let nested = backup.join("nested");
+    fs::create_dir_all(&nested).expect("Failed to create backup tree");
+    fs::write(backup.join("highlights.scm"), "(comment) @comment")
+        .expect("Failed to write backup query");
+    fs::write(nested.join("query.scm"), "(comment) @comment")
+        .expect("Failed to write nested backup query");
+    fs::write(backup.join(".kakehashi-install-complete"), "ok\n")
+        .expect("Failed to mark backup complete");
+    fs::write(
+        queries_dir.join(".lua.4294967295.0.backup.kakehashi-backup"),
+        "ok\n",
+    )
+    .expect("Failed to mark backup ownership");
+    fs::set_permissions(&nested, fs::Permissions::from_mode(0o000))
+        .expect("Failed to make backup subtree unreadable");
+    if fs::read_dir(&nested).is_ok() {
+        fs::set_permissions(&nested, fs::Permissions::from_mode(0o700))
+            .expect("Failed to restore backup permissions");
+        return;
+    }
+
+    let output = Command::new(env!("CARGO_BIN_EXE_kakehashi"))
+        .args([
+            "language",
+            "uninstall",
+            "--all",
+            "--data-dir",
+            test_dir.path().to_str().unwrap(),
+            "--force",
+        ])
+        .output()
+        .expect("Failed to execute command");
+
+    let restored_nested = queries_dir.join("lua/nested");
+    let nested_to_restore = if nested.exists() {
+        &nested
+    } else {
+        &restored_nested
+    };
+    fs::set_permissions(nested_to_restore, fs::Permissions::from_mode(0o700))
+        .expect("Failed to restore backup subtree permissions");
+    assert!(
+        !output.status.success(),
+        "unreadable backup must fail preflight; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(backup.exists(), "preflight must not restore the backup");
+    assert!(
+        !queries_dir.join("lua").exists(),
+        "failed preflight must not revive the canonical install"
+    );
+}
+
 /// Test that language uninstall --all ignores internal query staging directories
 #[test]
 fn test_language_uninstall_all_ignores_internal_query_dirs() {

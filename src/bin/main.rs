@@ -522,7 +522,11 @@ fn installed_query_language_name_for_uninstall(
     // make the kakehashi-owned namespace impossible to clean.
     let is_dir = file_type.is_dir() || file_type.is_symlink();
     let language = installed_query_language_name_if_dir(&path, is_dir);
-    if language.is_some() && file_type.is_dir() {
+    // Hidden staging/backup directories are skipped as installed languages,
+    // but recovery can mutate them into canonical installs. Validate every
+    // real directory before recovery so an unreadable candidate cannot be
+    // renamed first and fail only on the post-recovery scan.
+    if file_type.is_dir() {
         preflight_query_install_tree(&path)?;
     }
     Ok(language)
