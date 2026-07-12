@@ -59,6 +59,23 @@ impl WorkspaceFolderSet {
             .is_some_and(|folders| folders.iter().any(|existing| existing.uri == folder.uri))
     }
 
+    /// Apply an upstream workspace-folder change atomically. Removals match by
+    /// URI (folder names are display metadata), then additions append in event
+    /// order while preserving URI uniqueness.
+    pub(crate) fn apply_change(&self, added: Vec<WorkspaceFolder>, removed: &[WorkspaceFolder]) {
+        let mut guard = self
+            .inner
+            .lock()
+            .recover_poison("WorkspaceFolderSet::apply_change");
+        let folders = guard.get_or_insert_with(Vec::new);
+        folders.retain(|existing| !removed.iter().any(|removed| removed.uri == existing.uri));
+        for folder in added {
+            if !folders.iter().any(|existing| existing.uri == folder.uri) {
+                folders.push(folder);
+            }
+        }
+    }
+
     /// Atomically add `folder` and announce it, returning whether the set now
     /// contains it. If `folder` is already present, returns `true` without
     /// calling `announce`. Otherwise `announce` runs **while the set lock is
@@ -163,5 +180,20 @@ mod tests {
         let set = WorkspaceFolderSet::new(None);
         assert!(set.add_and_announce(folder("file:///a"), || true));
         assert_eq!(set.snapshot(), Some(vec![folder("file:///a")]));
+    }
+
+    #[test]
+    fn apply_change_removes_by_uri_and_adds_without_duplicates() {
+        let set = WorkspaceFolderSet::new(Some(vec![folder("file:///a"), folder("file:///b")]));
+
+        set.apply_change(
+            vec![folder("file:///b"), folder("file:///c")],
+            &[folder("file:///a")],
+        );
+
+        assert_eq!(
+            set.snapshot(),
+            Some(vec![folder("file:///b"), folder("file:///c")])
+        );
     }
 }
