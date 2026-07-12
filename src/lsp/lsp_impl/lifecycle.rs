@@ -540,8 +540,8 @@ impl Kakehashi {
     /// are orphaned — observed live as a `with-logging emmylua_ls` wrapper
     /// re-parented to launchd and running for hours, because not every
     /// downstream exits on stdin EOF. On SIGTERM/SIGHUP this persists the
-    /// crash-detection marker (`parsing_in_progress` — a kill mid-parse is
-    /// precisely what that marker detects) and runs the same bounded
+    /// crash-detection marker (the locked per-session marker — a kill mid-parse
+    /// is precisely what that marker detects) and runs the same bounded
     /// `shutdown_all` as the graceful path (LSP handshake, then
     /// SIGTERM→SIGKILL escalation, global timeout), then exits with the
     /// conventional 128+signal status. Unlike `shutdown_impl` it does NOT
@@ -587,7 +587,7 @@ impl Kakehashi {
             };
             log::info!("received signal {signum}: reaping downstream servers before exit");
             // Crash-detection parity with `shutdown_impl`: a kill mid-parse is
-            // exactly the case the `parsing_in_progress` marker exists for, so
+            // exactly the case the per-session marker exists for, so
             // persist it before the (comparatively slow) downstream reap.
             if let Err(e) = failed_parsers.persist_state() {
                 log::warn!(

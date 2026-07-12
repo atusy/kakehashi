@@ -42,7 +42,7 @@ pub fn default_data_dir() -> Option<PathBuf> {
     // persistent dir under `deps/` so the developer's real
     // `~/.local/share/kakehashi/` is never read or written. The dir is
     // shared across the test process to keep parser/query installs
-    // cached between runs; transient crash-recovery files
+    // cached between runs; legacy transient crash-recovery files
     // (`parsing_in_progress`, `failed_parsers`) are cleared once per
     // process at first call so a prior E2E shutdown can't taint this run.
     #[cfg(test)]
@@ -63,7 +63,7 @@ pub fn default_data_dir() -> Option<PathBuf> {
 /// Project-local persistent data directory used by unit tests.
 ///
 /// Lives under `deps/` (already gitignored). Parser/query installs persist
-/// across runs to avoid re-downloading, while crash-recovery state files
+/// across runs to avoid re-downloading, while legacy crash-recovery state files
 /// are cleared once per test process so a previous test's leftovers
 /// (typically from an E2E binary that exited mid-parse) don't poison this
 /// run. Returns the same path every call within a process via `OnceLock`.

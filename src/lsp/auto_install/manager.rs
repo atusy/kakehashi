@@ -159,9 +159,10 @@ impl AutoInstallManager {
     /// persistent parser/query install assets in the data dir; the override
     /// lets it live elsewhere — e.g. so concurrent test processes that share one
     /// read-only install dir can isolate their crash state and not poison each
-    /// other (a leftover `parsing_in_progress` from another process is otherwise
-    /// read as a crash and marks that parser failed).
-    /// If initialization fails, returns an empty registry.
+    /// other (an unlocked marker from another process is otherwise read as a
+    /// crash and marks that parser failed).
+    /// If initialization fails, returns an uninitialized registry whose
+    /// `begin_parsing` calls fail closed before entering native parser code.
     pub fn init_failed_parser_registry() -> FailedParserRegistry {
         let state_dir = std::env::var_os("KAKEHASHI_STATE_DIR")
             // An empty value resolves to the process cwd (writing crash files
