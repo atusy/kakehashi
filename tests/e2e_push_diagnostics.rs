@@ -61,6 +61,30 @@ fn init_client_with_mode_caps(mode: &str, capabilities: Value) -> (LspClient, te
         .arg("--config-file")
         .arg(config_path.to_str().expect("utf8 path"))
         .build();
+    let initialization_options = if mode == "diagnostics-refresh-burst" {
+        json!({
+            "languageServers": {
+                "mock-push": { "cmd": [mock_bin(), mode], "languages": ["lua"] }
+            },
+            "languages": {
+                "markdown": {
+                    "bridge": {
+                        "lua": {
+                            "aggregation": {
+                                "textDocument/publishDiagnostics": { "pullFallback": false }
+                            }
+                        }
+                    }
+                }
+            }
+        })
+    } else {
+        json!({
+            "languageServers": {
+                "mock-push": { "cmd": [mock_bin(), mode], "languages": ["lua"] }
+            }
+        })
+    };
 
     client.send_request(
         "initialize",
@@ -69,11 +93,7 @@ fn init_client_with_mode_caps(mode: &str, capabilities: Value) -> (LspClient, te
             "rootUri": null,
             "capabilities": capabilities,
             "workspaceFolders": null,
-            "initializationOptions": {
-                "languageServers": {
-                    "mock-push": { "cmd": [mock_bin(), mode], "languages": ["lua"] }
-                }
-            }
+            "initializationOptions": initialization_options
         }),
     );
     client.send_notification("initialized", json!({}));
@@ -434,7 +454,10 @@ fn e2e_downstream_crash_evicts_its_pushed_diagnostics() {
 /// will send `workspace/diagnostic/refresh` (it's gated on this; an editor that
 /// doesn't advertise it is never sent the request).
 fn refresh_capable_caps() -> Value {
-    json!({ "workspace": { "diagnostics": { "refreshSupport": true } } })
+    json!({
+        "workspace": { "diagnostics": { "refreshSupport": true } },
+        "window": { "workDoneProgress": true }
+    })
 }
 
 #[test]
@@ -867,6 +890,110 @@ fn e2e_downstream_refresh_forwarded_to_refresh_capable_client() {
             .wait_for_server_request("workspace/diagnostic/refresh", Duration::from_secs(15))
             .is_some(),
         "a downstream's workspace/diagnostic/refresh must reach a refresh-capable editor (#521)"
+    );
+
+    client.send_request("shutdown", json!(null));
+    client.send_notification("exit", json!(null));
+}
+
+#[test]
+fn e2e_downstream_refresh_burst_is_coalesced() {
+    let (mut client, _config_dir) =
+        init_client_with_mode_caps("diagnostics-refresh-burst", refresh_capable_caps());
+    open_host(&mut client);
+
+    let (id, _) = client
+        .wait_for_server_request("workspace/diagnostic/refresh", Duration::from_secs(15))
+        .expect("the leading refresh must reach the editor immediately");
+
+    // Keep the leading refresh unacknowledged while pulling generation 1. The
+    // mock emits generations 2–10 after answering this pull, so every later
+    // downstream refresh arrives during the leading request's single-flight.
+    let leading_pull_id = client.send_request_async(
+        "textDocument/diagnostic",
+        json!({ "textDocument": { "uri": MD_URI } }),
+    );
+    let (leading_pull, mut refreshes_before_barrier, mut barriers) = client
+        .receive_response_for_id_watching_two_server_requests(
+            leading_pull_id,
+            "workspace/diagnostic/refresh",
+            "window/workDoneProgress/create",
+        );
+    assert!(
+        leading_pull["result"]["items"]
+            .as_array()
+            .is_some_and(|items| items.iter().any(|diagnostic| {
+                diagnostic["message"] == json!("mock-diagnostic-generation:1")
+            })),
+        "the leading refresh must expose the first downstream generation: {leading_pull}"
+    );
+    assert!(
+        refreshes_before_barrier.is_empty(),
+        "single-flight must suppress refreshes during the leading pull: {refreshes_before_barrier:?}"
+    );
+
+    if barriers.is_empty() {
+        let (barrier_id, refreshes) = client
+            .wait_for_server_request_watching_server_requests(
+                "window/workDoneProgress/create",
+                "workspace/diagnostic/refresh",
+                Duration::from_secs(5),
+            )
+            .expect("the upstream FIFO must expose the refresh-neutral progress barrier");
+        barriers.push((barrier_id, Value::Null));
+        refreshes_before_barrier.extend(refreshes);
+    }
+    assert!(
+        refreshes_before_barrier.is_empty(),
+        "single-flight must hold through complete burst admission: {refreshes_before_barrier:?}"
+    );
+    assert_eq!(
+        barriers.len(),
+        1,
+        "expected one progress barrier: {barriers:?}"
+    );
+    client.send_response(barriers.remove(0).0, json!(null));
+    assert!(
+        client
+            .wait_for_server_request("workspace/diagnostic/refresh", Duration::from_millis(250),)
+            .is_none(),
+        "the settled trailing edge must remain pending while the leading refresh is in flight"
+    );
+    client.send_response(id, json!(null));
+
+    let (trailing_id, _) = client
+        .wait_for_server_request("workspace/diagnostic/refresh", Duration::from_millis(1200))
+        .expect("activity after the leading edge must produce one trailing refresh");
+    client.send_response(trailing_id, json!(null));
+
+    let trailing_pull_id = client.send_request_async(
+        "textDocument/diagnostic",
+        json!({ "textDocument": { "uri": MD_URI } }),
+    );
+    let (trailing_pull, refreshes_during_trailing_pull) = client
+        .receive_response_for_id_watching_server_requests(
+            trailing_pull_id,
+            "workspace/diagnostic/refresh",
+        );
+    assert!(
+        refreshes_during_trailing_pull.is_empty(),
+        "the trailing pull must not conceal duplicate refreshes: {refreshes_during_trailing_pull:?}"
+    );
+    let items = trailing_pull["result"]["items"]
+        .as_array()
+        .expect("the pull after a coalesced refresh returns a full report");
+    assert!(
+        items
+            .iter()
+            .any(|diagnostic| { diagnostic["message"] == json!("mock-diagnostic-generation:10") }),
+        "the re-pull must include the refreshing downstream's latest diagnostics"
+    );
+
+    assert!(
+        client
+            .wait_for_server_request("workspace/diagnostic/refresh", Duration::from_millis(2000))
+            .is_none(),
+        "one burst must produce only its leading and trailing refreshes"
     );
 
     client.send_request("shutdown", json!(null));

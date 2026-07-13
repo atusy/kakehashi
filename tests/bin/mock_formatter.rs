@@ -73,6 +73,10 @@
 //! - `diagnostics-refresh` — sends a `workspace/diagnostic/refresh` server→client
 //!   request on `didOpen`. The bridge forwards it upstream to the editor; used to
 //!   prove that forward is capability-gated (#521).
+//! - `diagnostics-refresh-burst` — advertises pull diagnostics, sends generation
+//!   1's refresh on `didOpen`, then emits generations 2–10 after the first pull.
+//!   The editor-facing test keeps the leading refresh unacknowledged during that
+//!   pull, so all later refreshes exercise debounce plus refresh single-flight.
 //! - `on-type` — advertises `documentOnTypeFormattingProvider` with `}` and
 //!   `;` as triggers; answers `textDocument/onTypeFormatting` with the
 //!   uppercasing whole-document edit for ANY typed character (bridge-side
@@ -140,6 +144,7 @@ fn main() {
     let mut last_will_save_uri: Option<String> = None;
     let mut did_save_count: usize = 0;
     let mut last_did_save_uri: Option<String> = None;
+    let mut diagnostic_generation: u64 = 0;
 
     while let Some(message) = read_message(&mut reader) {
         let method = message
@@ -212,6 +217,7 @@ fn main() {
                     "diagnostics"
                     | "diagnostics-fail"
                     | "diagnostics-malformed"
+                    | "diagnostics-refresh-burst"
                     | "diagnostics-push-pullcap" => json!({
                         "diagnosticProvider": {
                             "interFileDependencies": false,
@@ -325,6 +331,9 @@ fn main() {
                     // back as a response with no `method`, which the read loop
                     // ignores. A fixed id is fine since nothing awaits the ack.
                     if mode == "diagnostics-refresh" {
+                        request(&mut writer, json!(1000), "workspace/diagnostic/refresh");
+                    } else if mode == "diagnostics-refresh-burst" {
+                        diagnostic_generation = 1;
                         request(&mut writer, json!(1000), "workspace/diagnostic/refresh");
                     }
                 }
@@ -828,11 +837,20 @@ fn main() {
                 // but only for documents this server actually received via
                 // didOpen, so the test also proves the host document was
                 // synced before the pull.
+                let diagnostic_message = if mode == "diagnostics-refresh-burst" {
+                    format!("mock-diagnostic-generation:{diagnostic_generation}")
+                } else {
+                    message
+                        .pointer("/params/textDocument/uri")
+                        .and_then(Value::as_str)
+                        .map(|uri| format!("mock-diagnostic:{uri}"))
+                        .unwrap_or_default()
+                };
                 let result = message
                     .pointer("/params/textDocument/uri")
                     .and_then(Value::as_str)
                     .filter(|uri| documents.contains_key(*uri))
-                    .map(|uri| {
+                    .map(|_| {
                         json!({
                             "kind": "full",
                             "items": [{
@@ -841,12 +859,42 @@ fn main() {
                                     "end": { "line": 0, "character": 1 }
                                 },
                                 "severity": 2,
-                                "message": format!("mock-diagnostic:{uri}")
+                                "message": diagnostic_message
                             }]
                         })
                     })
                     .unwrap_or(Value::Null);
                 respond(&mut writer, id, result);
+                if mode == "diagnostics-refresh-burst" && diagnostic_generation == 1 {
+                    for id in 1001..1010 {
+                        diagnostic_generation += 1;
+                        request(&mut writer, json!(id), "workspace/diagnostic/refresh");
+                    }
+                    // Work-done progress shares the loss-intolerant upstream
+                    // FIFO with refreshes but cannot schedule a diagnostic
+                    // refresh itself. Its editor-facing create request is an
+                    // observable, refresh-neutral admission barrier.
+                    let token = json!("diagnostic-refresh-burst-admitted");
+                    request_with_params(
+                        &mut writer,
+                        json!(2000),
+                        "window/workDoneProgress/create",
+                        json!({ "token": token }),
+                    );
+                    notify(
+                        &mut writer,
+                        "$/progress",
+                        json!({
+                            "token": token,
+                            "value": { "kind": "begin", "title": "refresh burst barrier" }
+                        }),
+                    );
+                    notify(
+                        &mut writer,
+                        "$/progress",
+                        json!({ "token": token, "value": { "kind": "end" } }),
+                    );
+                }
             }
             "codeLens/resolve" => {
                 // Materialize the command, echoing the lens's own data back so

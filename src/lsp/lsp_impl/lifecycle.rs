@@ -645,11 +645,12 @@ impl Kakehashi {
 
         // Dump diagnostic-path counters (#533) so a session's refresh amplification
         // (push republishes in → refreshes requested vs sent → pulls answered) is
-        // readable without a profiler. `requested - sent` is what the #497 gate saved.
+        // readable without a profiler. `requested - sent` includes refreshes
+        // coalesced, gated, or suppressed during shutdown.
         let m = self.diagnostics.metrics_snapshot();
         log::info!(
             target: "kakehashi::diagnostic_metrics",
-            "diagnostic path totals: push_republishes={} refreshes_requested={} refreshes_sent={} (gate saved {}) pulls_answered={} mean_pull_us={}",
+            "diagnostic path totals: push_republishes={} refreshes_requested={} refreshes_sent={} (not sent: coalesced/gated/shutdown {}) pulls_answered={} mean_pull_us={}",
             m.push_republishes,
             m.refreshes_requested,
             m.refreshes_sent,
@@ -1426,18 +1427,14 @@ async fn deliver_upstream_notification(
     match notification {
         UpstreamNotification::DiagnosticRefresh => {
             // A downstream server asked the editor to re-pull diagnostics. Route it
-            // through the publisher's `request_pull_diagnostic_refresh` so it reuses
-            // the `workspace.diagnostics.refreshSupport` capability gate (a client
-            // that doesn't support refresh would otherwise leak a tower-lsp
-            // pending-request entry + parked task) and the detached `tokio::spawn`
-            // (an inline `.await` here would block this delivery loop on the client
-            // round-trip — head-of-line). A `None` publisher (test loop) has no
-            // settings to gate on, so the forward is dropped; production always has
-            // one (#521).
+            // through `request_forwarded_diagnostic_refresh`, which forwards the
+            // leading edge immediately and debounces later burst activity before
+            // reusing the capability-gated, detached forced-refresh path. Detaching
+            // avoids blocking this delivery loop on the editor round-trip
+            // (head-of-line). A `None` publisher (test loop) has no settings to gate
+            // on, so the forward is dropped; production always has one (#521, #789).
             if let Some(publisher) = diagnostic_publisher {
-                // `forced`: a downstream server explicitly asked for a refresh, which
-                // no coverage version represents, so bypass the coverage gate (#497).
-                publisher.request_pull_diagnostic_refresh(true);
+                publisher.request_forwarded_diagnostic_refresh();
             }
         }
         UpstreamNotification::PublishDiagnostics {

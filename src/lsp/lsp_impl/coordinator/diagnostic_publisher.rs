@@ -88,6 +88,33 @@ impl RepublishOutcome {
 /// chose existing config surfaces over new ones — revisit if a real setup
 /// needs a different cadence.
 const WIRE_PUBLISH_QUIET_WINDOW: std::time::Duration = std::time::Duration::from_secs(1);
+/// Short enough that a downstream re-analysis still prompts a timely editor
+/// pull, but longer than the 1 ms-scale refresh bursts observed in #789.
+const FORWARDED_REFRESH_SETTLE_WINDOW: std::time::Duration = std::time::Duration::from_millis(100);
+/// Bound staleness when a server emits refreshes continuously. This matches the
+/// existing diagnostics publish cadence and still reduces a sustained stream
+/// from an unbounded rate to at most one refresh per second.
+const FORWARDED_REFRESH_MAX_WAIT: std::time::Duration = std::time::Duration::from_secs(1);
+
+async fn wait_for_forwarded_refresh_settle(
+    aggregator: &DiagnosticAggregator,
+    mut snapshot: crate::lsp::diagnostic_cache::ForwardedRefreshWaitSnapshot,
+    deadline: tokio::time::Instant,
+) -> crate::lsp::diagnostic_cache::ForwardedRefreshWait {
+    loop {
+        tokio::time::sleep_until(
+            (snapshot.last_activity_at + FORWARDED_REFRESH_SETTLE_WINDOW).min(deadline),
+        )
+        .await;
+        let force = tokio::time::Instant::now() >= deadline;
+        match aggregator.finish_forwarded_refresh_wait(snapshot.generation, force) {
+            crate::lsp::diagnostic_cache::ForwardedRefreshWait::Restart(latest) => {
+                snapshot = latest;
+            }
+            decision => return decision,
+        }
+    }
+}
 
 /// Bundles the state needed to merge the cache and publish for a host, so the
 /// notification feeds (reader push, host-event pull) can trigger a republish
@@ -103,6 +130,7 @@ pub(crate) struct DiagnosticPublisher {
     settings_manager: Arc<SettingsManager>,
     cache: Arc<crate::lsp::cache::CacheCoordinator>,
     aggregator: Arc<DiagnosticAggregator>,
+    shutdown: tokio_util::sync::CancellationToken,
 }
 
 impl DiagnosticPublisher {
@@ -115,7 +143,110 @@ impl DiagnosticPublisher {
             settings_manager: Arc::clone(&server.settings_manager),
             cache: Arc::clone(&server.cache),
             aggregator: Arc::clone(&server.diagnostics),
+            shutdown: server.shutdown_token.clone(),
         }
+    }
+
+    /// Forward the first downstream `workspace/diagnostic/refresh` immediately,
+    /// then coalesce later burst activity into at most one trailing refresh
+    /// after quiet or the max-wait deadline (#789).
+    pub(crate) fn request_forwarded_diagnostic_refresh(&self) {
+        if self.shutdown.is_cancelled() {
+            return;
+        }
+        if !self.diagnostic_refresh_supported() {
+            return;
+        }
+        // Preserve the metrics contract: each capability-eligible downstream
+        // ask is counted before this debounce decides how many wire sends survive.
+        self.aggregator.record_refresh_requested();
+        let Some(snapshot) = self.aggregator.begin_forwarded_refresh_debounce() else {
+            return;
+        };
+        if self.request_pull_diagnostic_refresh_inner(true, false) {
+            self.aggregator
+                .mark_forwarded_refresh_covered(snapshot.generation);
+        }
+        let publisher = self.clone();
+        tokio::spawn(async move {
+            let mut snapshot = snapshot;
+            let mut deadline = snapshot.last_activity_at + FORWARDED_REFRESH_MAX_WAIT;
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = publisher.shutdown.cancelled() => {
+                        publisher.aggregator.cancel_forwarded_refresh_debounce();
+                        break;
+                    }
+                    decision = wait_for_forwarded_refresh_settle(
+                        &publisher.aggregator,
+                        snapshot,
+                        deadline,
+                    ) => {
+                        // Cancellation can race immediately after `select!` chose the
+                        // timer branch, so re-check at the refresh admission boundary.
+                        if publisher.shutdown.is_cancelled() {
+                            publisher.aggregator.cancel_forwarded_refresh_debounce();
+                            break;
+                        }
+                        match decision {
+                            crate::lsp::diagnostic_cache::ForwardedRefreshWait::SendTrailing(
+                                admitted,
+                            ) => {
+                                if publisher.request_pull_diagnostic_refresh_inner(true, false) {
+                                    publisher
+                                        .aggregator
+                                        .mark_forwarded_refresh_covered(admitted.generation);
+                                    if let Some(latest) = publisher
+                                        .aggregator
+                                        .finish_forwarded_refresh_admission(admitted.generation)
+                                    {
+                                        snapshot = latest;
+                                        deadline = tokio::time::Instant::now()
+                                            + FORWARDED_REFRESH_MAX_WAIT;
+                                        continue;
+                                    }
+                                } else {
+                                    publisher.aggregator.cancel_forwarded_refresh_debounce();
+                                }
+                                break;
+                            }
+                            crate::lsp::diagnostic_cache::ForwardedRefreshWait::Settled => break,
+                            crate::lsp::diagnostic_cache::ForwardedRefreshWait::MaxWait {
+                                snapshot: latest,
+                                send_trailing,
+                            } => {
+                                if send_trailing {
+                                    if publisher
+                                        .request_pull_diagnostic_refresh_inner(true, false)
+                                    {
+                                        publisher
+                                            .aggregator
+                                            .mark_forwarded_refresh_covered(latest.generation);
+                                    } else {
+                                        publisher.aggregator.cancel_forwarded_refresh_debounce();
+                                        break;
+                                    }
+                                }
+                                snapshot = latest;
+                                deadline = tokio::time::Instant::now()
+                                    + FORWARDED_REFRESH_MAX_WAIT;
+                            }
+                            crate::lsp::diagnostic_cache::ForwardedRefreshWait::Restart(_) => {
+                                unreachable!("the settle waiter consumes restart decisions")
+                            }
+                        }
+                    }
+                }
+            }
+        });
+    }
+
+    fn diagnostic_refresh_supported(&self) -> bool {
+        self.settings_manager
+            .client_capabilities_lock()
+            .get()
+            .is_some_and(crate::lsp::client::check_diagnostic_refresh_support)
     }
 
     /// Route a downstream `publishDiagnostics` push into the cache, classifying by
@@ -890,17 +1021,18 @@ impl DiagnosticPublisher {
     /// leaking a tower-lsp pending-request entry plus a parked task — the same gate
     /// the `semantic_tokens_refresh` path uses.
     pub(crate) fn request_pull_diagnostic_refresh(&self, forced: bool) {
-        let supported = self
-            .settings_manager
-            .client_capabilities_lock()
-            .get()
-            .is_some_and(crate::lsp::client::check_diagnostic_refresh_support);
-        if !supported {
-            return;
+        self.request_pull_diagnostic_refresh_inner(forced, true);
+    }
+
+    fn request_pull_diagnostic_refresh_inner(&self, forced: bool, record_request: bool) -> bool {
+        if self.shutdown.is_cancelled() || !self.diagnostic_refresh_supported() {
+            return false;
         }
-        // Count the ask before the gate so `requested - sent` measures what the
-        // single-flight + coverage gate saves (#533).
-        self.aggregator.record_refresh_requested();
+        // Count the ask before the gates so `requested - sent` measures total
+        // debounce/single-flight/coverage savings (#533, #789).
+        if record_request {
+            self.aggregator.record_refresh_requested();
+        }
         // Coalesce against any in-flight refresh and apply the coverage gate (#497):
         // `false` here means either one is already outstanding (recorded as `pending`,
         // so the outstanding task's loop fires the trailing) or — for a non-`forced`
@@ -909,10 +1041,11 @@ impl DiagnosticPublisher {
         // refresh (#521) and the degraded-pull recovery (whose per-host debt
         // proves a non-covering answer no coverage version represents).
         if !self.aggregator.try_begin_refresh(forced) {
-            return;
+            return forced;
         }
         let client = self.client.clone();
         let aggregator = Arc::clone(&self.aggregator);
+        let shutdown = self.shutdown.clone();
         tokio::spawn(async move {
             loop {
                 // `workspace_diagnostic_refresh()` resolves when the editor answers
@@ -940,6 +1073,13 @@ impl DiagnosticPublisher {
                 // future change adds a *pre-shutdown* panic source to this task,
                 // revisit — it would wedge the guard (and a drop-guard "fix" would
                 // reopen the `finish_refresh` lost-wakeup, so clear it atomically).
+                // Admission can race shutdown before this detached task first runs.
+                // Do not start a request once cancellation is observable, and clear
+                // the single-flight claim that admission already took.
+                if shutdown.is_cancelled() {
+                    aggregator.cancel_refresh_flight();
+                    break;
+                }
                 // Count each wire send, including trailing fires (#533).
                 aggregator.record_refresh_sent();
                 if let Err(e) = client.workspace_diagnostic_refresh().await {
@@ -950,11 +1090,16 @@ impl DiagnosticPublisher {
                 }
                 // Fire exactly one more iff a refresh was requested while this one
                 // was in flight; otherwise the guard is now clear and we stop.
+                if shutdown.is_cancelled() {
+                    aggregator.cancel_refresh_flight();
+                    break;
+                }
                 if !aggregator.finish_refresh() {
                     break;
                 }
             }
         });
+        true
     }
 
     /// Map each currently-resolvable injection region of the host document to its
@@ -1050,7 +1195,10 @@ mod tests {
     };
     use std::collections::HashMap;
     use tower_lsp_server::LspService;
-    use tower_lsp_server::ls_types::{Position, Range};
+    use tower_lsp_server::ls_types::{
+        ClientCapabilities, DiagnosticWorkspaceClientCapabilities, Position, Range,
+        WorkspaceClientCapabilities,
+    };
 
     fn diag(message: &str) -> Diagnostic {
         Diagnostic {
@@ -1058,6 +1206,149 @@ mod tests {
             message: message.to_string(),
             ..Default::default()
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn forwarded_refresh_sends_the_leading_edge_immediately() {
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+        server
+            .settings_manager
+            .set_capabilities(ClientCapabilities {
+                workspace: Some(WorkspaceClientCapabilities {
+                    diagnostics: Some(DiagnosticWorkspaceClientCapabilities {
+                        refresh_support: Some(true),
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            });
+        let publisher = DiagnosticPublisher::new(server);
+        let before = tokio::time::Instant::now();
+
+        publisher.request_forwarded_diagnostic_refresh();
+        tokio::time::advance(std::time::Duration::ZERO).await;
+
+        assert_eq!(
+            tokio::time::Instant::now(),
+            before,
+            "the leading send must happen without advancing to the debounce timer"
+        );
+        assert_eq!(
+            server.diagnostics.metrics_snapshot().refreshes_sent,
+            1,
+            "the first refresh after idle must not wait for the debounce window"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn forwarded_refresh_metrics_count_inputs_before_debounce() {
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+        server
+            .settings_manager
+            .set_capabilities(ClientCapabilities {
+                workspace: Some(WorkspaceClientCapabilities {
+                    diagnostics: Some(DiagnosticWorkspaceClientCapabilities {
+                        refresh_support: Some(true),
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            });
+        let publisher = DiagnosticPublisher::new(server);
+
+        publisher.request_forwarded_diagnostic_refresh();
+        publisher.request_forwarded_diagnostic_refresh();
+        publisher.request_forwarded_diagnostic_refresh();
+
+        assert_eq!(server.diagnostics.metrics_snapshot().refreshes_requested, 3);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_cancels_pending_forwarded_refresh() {
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+        server
+            .settings_manager
+            .set_capabilities(ClientCapabilities {
+                workspace: Some(WorkspaceClientCapabilities {
+                    diagnostics: Some(DiagnosticWorkspaceClientCapabilities {
+                        refresh_support: Some(true),
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            });
+        let publisher = DiagnosticPublisher::new(server);
+        publisher.request_forwarded_diagnostic_refresh();
+        server.shutdown_token.cancel();
+
+        tokio::time::advance(FORWARDED_REFRESH_MAX_WAIT).await;
+        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+
+        let metrics = server.diagnostics.metrics_snapshot();
+        assert_eq!(metrics.refreshes_requested, 1);
+        assert_eq!(metrics.refreshes_sent, 0, "shutdown must suppress the send");
+        assert!(
+            server
+                .diagnostics
+                .begin_forwarded_refresh_debounce()
+                .is_some(),
+            "shutdown must release the debounce task claim"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_rejects_new_forwarded_refresh_inputs() {
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+        server
+            .settings_manager
+            .set_capabilities(ClientCapabilities {
+                workspace: Some(WorkspaceClientCapabilities {
+                    diagnostics: Some(DiagnosticWorkspaceClientCapabilities {
+                        refresh_support: Some(true),
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            });
+        server.shutdown_token.cancel();
+        let publisher = DiagnosticPublisher::new(server);
+
+        publisher.request_forwarded_diagnostic_refresh();
+
+        assert_eq!(
+            server.diagnostics.metrics_snapshot(),
+            crate::lsp::diagnostic_cache::DiagnosticMetricsSnapshot::default()
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn shutdown_cancels_an_admitted_refresh_before_send() {
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+        server
+            .settings_manager
+            .set_capabilities(ClientCapabilities {
+                workspace: Some(WorkspaceClientCapabilities {
+                    diagnostics: Some(DiagnosticWorkspaceClientCapabilities {
+                        refresh_support: Some(true),
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            });
+        let publisher = DiagnosticPublisher::new(server);
+
+        publisher.request_pull_diagnostic_refresh(true);
+        server.shutdown_token.cancel();
+        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+
+        let metrics = server.diagnostics.metrics_snapshot();
+        assert_eq!(metrics.refreshes_requested, 1);
+        assert_eq!(metrics.refreshes_sent, 0, "admitted task must not send");
     }
 
     fn rust_server_config() -> (String, BridgeServerConfig) {
@@ -1445,6 +1736,43 @@ mod tests {
             publisher.republish(&uri).await,
             RepublishOutcome::Unchanged,
             "the sealed set was recorded as last-published, so a re-merge is unchanged"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn forwarded_refresh_stream_is_bounded_by_max_wait() {
+        let aggregator = Arc::new(DiagnosticAggregator::new());
+        let snapshot = aggregator
+            .begin_forwarded_refresh_debounce()
+            .expect("first refresh claims the debounce task");
+        let deadline = snapshot.last_activity_at + FORWARDED_REFRESH_MAX_WAIT;
+        let waiter_aggregator = Arc::clone(&aggregator);
+        let waiter = tokio::spawn(async move {
+            super::wait_for_forwarded_refresh_settle(&waiter_aggregator, snapshot, deadline).await
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+
+        for _ in 0..11 {
+            tokio::time::advance(std::time::Duration::from_millis(90)).await;
+            assert!(
+                aggregator.begin_forwarded_refresh_debounce().is_none(),
+                "continuous activity reuses the debounce task"
+            );
+        }
+        // The last activity was at 990 ms, so an unbounded quiet-window-only
+        // implementation would remain parked until 1090 ms. The anchored
+        // one-second deadline must release it after just 10 ms.
+        tokio::time::advance(std::time::Duration::from_millis(10)).await;
+        assert!(matches!(
+            waiter.await.expect("debounce task completes at max wait"),
+            crate::lsp::diagnostic_cache::ForwardedRefreshWait::MaxWait {
+                send_trailing: true,
+                ..
+            }
+        ));
+        assert!(
+            aggregator.begin_forwarded_refresh_debounce().is_none(),
+            "a max-wait fire must keep the cycle active until activity becomes quiet"
         );
     }
 
