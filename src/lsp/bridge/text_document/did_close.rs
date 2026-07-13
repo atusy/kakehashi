@@ -176,6 +176,8 @@ impl LanguageServerPool {
         // Use the connection key from OpenedVirtualDoc for per-connection tracking
         self.untrack_document(&doc.virtual_uri, &doc.connection_key)
             .await;
+        self.diagnostic_pull_baselines
+            .remove(&(doc.connection_key.clone(), doc.virtual_uri.to_uri_string()));
         drop(transition_guard);
         self.remove_open_transition_lock_if_unshared(
             &doc.virtual_uri,

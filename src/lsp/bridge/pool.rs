@@ -39,6 +39,12 @@ pub(crate) use dynamic_capability_registry::DynamicCapabilityRegistry;
 pub(crate) use message_sender::{ConnectionHandleSender, MessageSender};
 pub(crate) use shutdown_timeout::GlobalShutdownTimeout;
 
+#[derive(Clone)]
+pub(crate) struct DiagnosticPullBaseline {
+    pub(crate) result_id: String,
+    pub(crate) diagnostics: Arc<Vec<tower_lsp_server::ls_types::Diagnostic>>,
+}
+
 fn same_launch_config(
     old: &crate::config::settings::BridgeServerConfig,
     new: &crate::config::settings::BridgeServerConfig,
@@ -346,6 +352,12 @@ pub struct LanguageServerPool {
     /// servers via `bridge._self`, with their version and content
     /// fingerprint for lazy full-text re-sync.
     host_documents: Mutex<HashMap<(String, ConnectionKey), HostDocSyncState>>,
+    /// Last full downstream pull report per exact connection/document. Region
+    /// diagnostics stay virtual-local and are re-anchored with the request's
+    /// current offset when a server answers `unchanged`.
+    pub(crate) diagnostic_pull_baselines: DashMap<(ConnectionKey, String), DiagnosticPullBaseline>,
+    /// Invalidates in-flight baseline reads across a settings replacement.
+    pub(crate) diagnostic_pull_generation: AtomicU64,
     /// Upstream request ID → set of downstream connections, for fan-out cancel
     /// forwarding (ls-bridge-message-ordering). Multiple connections can share an ID when a single
     /// upstream request (e.g. diagnostic) targets several injected languages.
@@ -455,6 +467,8 @@ impl LanguageServerPool {
             host_lifecycle_locks: DashMap::new(),
             latest_virtual_contents: DashMap::new(),
             host_documents: Mutex::new(HashMap::new()),
+            diagnostic_pull_baselines: DashMap::new(),
+            diagnostic_pull_generation: AtomicU64::new(0),
             upstream_request_registry: std::sync::Mutex::new(HashMap::new()),
             cancel_metrics: CancelForwardingMetrics::default(),
             consecutive_panic_counts: std::sync::Mutex::new(HashMap::new()),
@@ -646,6 +660,12 @@ impl LanguageServerPool {
         &self,
         resolve: impl Fn(&str) -> Option<crate::config::settings::BridgeServerConfig>,
     ) -> usize {
+        // A downstream may change diagnostic semantics without changing its
+        // document contents, so no previousResultId lineage survives a settings
+        // replacement safely.
+        self.diagnostic_pull_generation
+            .fetch_add(1, Ordering::AcqRel);
+        self.diagnostic_pull_baselines.clear();
         let mut connections = self.connections.lock().await;
         let mut invalidated = Vec::new();
         let mut resolved = HashMap::new();
@@ -675,6 +695,8 @@ impl LanguageServerPool {
                 .await
                 .retain(|(_, connection_key), _| connection_key != &key);
             self.document_tracker.purge_connection(&key).await;
+            self.diagnostic_pull_baselines
+                .retain(|(connection_key, _), _| connection_key != &key);
             self.purge_open_transition_locks(&key).await;
             if let Some(handle) = connections.remove(&key) {
                 stale_handles.push((key, handle));
@@ -2004,6 +2026,8 @@ impl LanguageServerPool {
                     self.document_tracker
                         .purge_connection(&connection_key)
                         .await;
+                    self.diagnostic_pull_baselines
+                        .retain(|(key, _), _| key != &connection_key);
                     self.purge_open_transition_locks(&connection_key).await;
                     // Remove only after every async purge completes. If this
                     // acquire future is aborted at a cleanup await, the stale
@@ -6659,6 +6683,25 @@ mod tests {
             })
             .await;
         assert_eq!(pushed, 0, "no live connections → nothing pushed");
+    }
+
+    #[tokio::test]
+    async fn settings_reload_clears_diagnostic_pull_baselines() {
+        let pool = LanguageServerPool::new();
+        pool.diagnostic_pull_baselines.insert(
+            (
+                ConnectionKey::for_server("rust-analyzer"),
+                "file:///test.rs".to_string(),
+            ),
+            DiagnosticPullBaseline {
+                result_id: "r1".to_string(),
+                diagnostics: Arc::new(Vec::new()),
+            },
+        );
+
+        pool.propagate_settings(|_| None).await;
+
+        assert!(pool.diagnostic_pull_baselines.is_empty());
     }
 
     #[test]

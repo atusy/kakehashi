@@ -659,7 +659,6 @@ async fn send_diagnostic_fan_out_request(t: FanOutTask) -> std::io::Result<Vec<D
             t.offset,
             &t.virtual_content,
             t.upstream_id,
-            None, // No previous_result_id
         ),
     )
     .await

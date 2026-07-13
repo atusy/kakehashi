@@ -23,9 +23,9 @@ use std::io;
 use std::sync::Arc;
 
 use tower_lsp_server::ls_types::{
-    Diagnostic, DidChangeTextDocumentParams, DidOpenTextDocumentParams, DocumentDiagnosticReport,
-    Location, LocationLink, TextDocumentContentChangeEvent, TextDocumentIdentifier,
-    TextDocumentItem, TextEdit, Uri, VersionedTextDocumentIdentifier,
+    Diagnostic, DidChangeTextDocumentParams, DidOpenTextDocumentParams, Location, LocationLink,
+    TextDocumentContentChangeEvent, TextDocumentIdentifier, TextDocumentItem, TextEdit, Uri,
+    VersionedTextDocumentIdentifier,
 };
 use url::Url;
 
@@ -197,6 +197,8 @@ impl LanguageServerPool {
             handle.send_notification(notification);
         }
         docs.retain(|(doc_uri, _), _| *doc_uri != uri_string);
+        self.diagnostic_pull_baselines
+            .retain(|(_, doc_uri), _| doc_uri != &uri_string);
     }
 
     /// Forward a `textDocument/willSave` notification (#357) to every host
@@ -359,9 +361,10 @@ impl LanguageServerPool {
     /// (error response, absent `result` member, unknown `kind`, a `full` report
     /// missing `items`, or items that fail to deserialize) is a counted request
     /// failure (`Err`), mirroring [`Self::send_host_formatting_request`]; a
-    /// `null`/`unchanged` result is the authoritative empty `Ok(vec![])`; and a
-    /// server that does not advertise the capability stays the lenient empty
-    /// `Ok(vec![])`. The dedicated method keeps that strictness out of the
+    /// `null` is authoritative empty, while `unchanged` reuses the baseline
+    /// established by the preceding full report. A server that does not
+    /// advertise the capability stays the lenient empty `Ok(vec![])`. The
+    /// dedicated method keeps that strictness out of the
     /// shared raw path that other host methods rely on.
     ///
     /// Waits through server initialization (the caller's request timeout bounds
@@ -377,7 +380,7 @@ impl LanguageServerPool {
         server_name: &str,
         server_config: &BridgeServerConfig,
         doc: &HostDocument<'_>,
-        params: serde_json::Value,
+        mut params: serde_json::Value,
         upstream_request_id: Option<UpstreamId>,
     ) -> io::Result<Vec<Diagnostic>> {
         let method = "textDocument/diagnostic";
@@ -395,14 +398,47 @@ impl LanguageServerPool {
             // nothing without looking like a failure.
             return Ok(Vec::new());
         }
-        self.execute_host_request(
-            handle,
-            doc,
-            upstream_request_id,
-            |request_id| JsonRpcRequest::new(request_id.as_i64(), method, params),
-            move |response| parse_host_diagnostic_response(response, method),
-        )
-        .await?
+        let cache_key = (handle.key().clone(), doc.uri.as_str().to_string());
+        let connection_generation = self.document_connection_generation(handle.key());
+        let settings_generation = self
+            .diagnostic_pull_generation
+            .load(std::sync::atomic::Ordering::Acquire);
+        let baseline = self
+            .diagnostic_pull_baselines
+            .get(&cache_key)
+            .map(|entry| entry.value().clone());
+        let previous_result_id = baseline.as_ref().map(|entry| entry.result_id.clone());
+        if let Some(result_id) = &previous_result_id {
+            params["previousResultId"] = serde_json::Value::String(result_id.clone());
+        }
+        let report = self
+            .execute_host_request(
+                handle,
+                doc,
+                upstream_request_id,
+                |request_id| JsonRpcRequest::new(request_id.as_i64(), method, params),
+                move |response| {
+                    if response_has_jsonrpc_error(&response, method) {
+                        return Err(io::Error::other(format!(
+                            "downstream server answered {method} with an error response: {}",
+                            jsonrpc_error_summary(&response)
+                        )));
+                    }
+                    super::diagnostic::parse_downstream_diagnostic_report(response)
+                },
+            )
+            .await??;
+        let document_is_open = self
+            .host_documents()
+            .await
+            .contains_key(&(cache_key.1.clone(), cache_key.0.clone()));
+        let lineage_is_current = document_is_open
+            && connection_generation == self.document_connection_generation(&cache_key.0)
+            && settings_generation
+                == self
+                    .diagnostic_pull_generation
+                    .load(std::sync::atomic::Ordering::Acquire);
+        Ok(self.resolve_diagnostic_pull_report(&cache_key, baseline, report, lineage_is_current))
     }
 
     /// Drive a host bridge request end-to-end: register for cancel
@@ -603,12 +639,12 @@ fn parse_host_formatting_response(
 /// malformed report (an unknown `kind`, a `full` report missing `items`, or
 /// `items` that fail to deserialize) is a request failure (`Err`) — collapsing
 /// it into the empty layer would let a broken host server pass as "nothing
-/// wrong". A `null` result or an `unchanged` report (a server should not send
-/// `unchanged` — we never supply `previousResultId` — but honor it) is the
-/// authoritative empty `Ok(vec![])`. `relatedDocuments` entries are dropped:
-/// diagnostics for OTHER documents have no place in this document's report.
+/// wrong". A `null` result or a spurious `unchanged` report without a cached
+/// baseline is the authoritative empty `Ok(vec![])`. `relatedDocuments`
+/// entries are dropped: diagnostics for OTHER documents have no place here.
+#[cfg(test)]
 fn parse_host_diagnostic_response(
-    mut response: serde_json::Value,
+    response: serde_json::Value,
     method: &'static str,
 ) -> io::Result<Vec<Diagnostic>> {
     if response_has_jsonrpc_error(&response, method) {
@@ -617,28 +653,10 @@ fn parse_host_diagnostic_response(
             jsonrpc_error_summary(&response)
         )));
     }
-    let Some(result) = response.get_mut("result").map(serde_json::Value::take) else {
-        return Err(io::Error::other(format!(
-            "{method} response carries neither result nor error (protocol violation)"
-        )));
-    };
-    if result.is_null() {
-        return Ok(Vec::new());
-    }
-    match serde_json::from_value::<DocumentDiagnosticReport>(result) {
-        Ok(DocumentDiagnosticReport::Full(report)) => {
-            Ok(report.full_document_diagnostic_report.items)
-        }
-        Ok(DocumentDiagnosticReport::Unchanged(_)) => Ok(Vec::new()),
-        Err(e) => {
-            log::warn!(
-                target: "kakehashi::bridge",
-                "host diagnostic report failed to deserialize: {e}"
-            );
-            Err(io::Error::other(format!(
-                "malformed {method} result from downstream server: {e}"
-            )))
-        }
+    match super::diagnostic::parse_downstream_diagnostic_report(response)? {
+        super::diagnostic::DownstreamDiagnosticReport::Full { diagnostics, .. } => Ok(diagnostics),
+        super::diagnostic::DownstreamDiagnosticReport::Unchanged
+        | super::diagnostic::DownstreamDiagnosticReport::Null => Ok(Vec::new()),
     }
 }
 
@@ -842,10 +860,10 @@ mod tests {
     }
 
     #[test]
-    fn host_diagnostic_null_and_unchanged_are_authoritative_empty() {
-        // `null` and an `unchanged` report are handled responses meaning "no
-        // diagnostics" — `Ok(vec![])`, not a failure. (We never send a
-        // `previousResultId`, but honor `unchanged` if a server volunteers it.)
+    fn host_diagnostic_null_and_spurious_unchanged_are_empty() {
+        // This parser seam has no baseline. `null` and a volunteered
+        // `unchanged` therefore stay empty; the live send path resolves a
+        // legitimate unchanged response from its per-document cache.
         let null = serde_json::json!({ "jsonrpc": "2.0", "id": 1, "result": null });
         assert!(
             parse_host_diagnostic_response(null, "textDocument/diagnostic")
@@ -859,7 +877,7 @@ mod tests {
         });
         assert!(
             parse_host_diagnostic_response(unchanged, "textDocument/diagnostic")
-                .expect("unchanged is authoritative empty")
+                .expect("spurious unchanged without a baseline stays empty")
                 .is_empty()
         );
     }
