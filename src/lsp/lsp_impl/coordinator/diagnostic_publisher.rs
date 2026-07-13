@@ -90,6 +90,12 @@ const WIRE_PUBLISH_QUIET_WINDOW: std::time::Duration = std::time::Duration::from
 const MAX_WIRE_PUBLISH_QUIET_WINDOW: std::time::Duration =
     std::time::Duration::from_secs(24 * 60 * 60);
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct PublishContractSnapshot {
+    incarnation: u64,
+    effective: Option<(bool, std::time::Duration)>,
+}
+
 /// Bundles the state needed to merge the cache and publish for a host, so the
 /// notification feeds (reader push, host-event pull) can trigger a republish
 /// without each holding `Kakehashi`. `Clone` is cheap (a `Client` handle plus
@@ -279,6 +285,23 @@ impl DiagnosticPublisher {
         let doc = self.documents.get(uri)?;
         self.language
             .detect_language_trace(uri.path(), doc.text(), None, doc.language_id())
+    }
+
+    /// Capture the publish contract against one consistent document lifetime
+    /// and the language registry/settings state visible at this call.
+    pub(crate) fn publish_contract_snapshot(&self, uri: &Url) -> Option<PublishContractSnapshot> {
+        let doc = self.documents.get(uri)?;
+        let incarnation = doc.incarnation();
+        let language_name =
+            self.language
+                .detect_language_trace(uri.path(), doc.text(), None, doc.language_id());
+        let effective = language_name.map(|language_name| {
+            Self::effective_publish_contract(&self.settings_manager.load_settings(), &language_name)
+        });
+        Some(PublishContractSnapshot {
+            incarnation,
+            effective,
+        })
     }
 
     /// Remove `Host` push slots from `snapshot` whose server is no longer a
@@ -753,6 +776,12 @@ impl DiagnosticPublisher {
                         diagnostics.len(),
                         host
                     );
+                    // The watch closes the resolvable race before admission.
+                    // Once this LSP notification has entered its async send,
+                    // however, it cannot be recalled if settings change during
+                    // the await. That already-admitted notification may land
+                    // once under the previous contract; the settings reload's
+                    // republish pass reconciles the host under the new contract.
                     self.client
                         .publish_diagnostics(lsp_uri, diagnostics, None)
                         .await;
@@ -822,18 +851,24 @@ impl DiagnosticPublisher {
     pub(crate) fn publish_contract_changed(
         &self,
         host: &Url,
-        previous: &crate::config::WorkspaceSettings,
+        previous: Option<PublishContractSnapshot>,
     ) -> bool {
-        let Some(language_name) = self.open_document_language(host) else {
-            // Unknown language: conservatively invalidate any prior publish
-            // contract rather than retaining potentially stale wire state.
-            return true;
+        let Some(current) = self.publish_contract_snapshot(host) else {
+            return false;
         };
-        Self::effective_publish_contract(previous, &language_name)
-            != Self::effective_publish_contract(
-                &self.settings_manager.load_settings(),
-                &language_name,
-            )
+        match previous {
+            Some(previous)
+                if previous.incarnation == current.incarnation
+                    && previous.effective.is_some()
+                    && current.effective.is_some() =>
+            {
+                previous.effective != current.effective
+            }
+            // A new/reopened or language-unknown host has no comparable old
+            // contract. Conservatively invalidate rather than retain stale wire
+            // state from another lifetime or detection result.
+            _ => true,
+        }
     }
 
     fn effective_publish_contract(
@@ -1737,11 +1772,14 @@ mod tests {
             Some("rust".to_string()),
             None,
         );
+        let publisher = DiagnosticPublisher::new(server);
+        let previous = publisher.publish_contract_snapshot(&uri);
         let mut current = previous.clone();
-        current.diagnostics_debounce_ms += 1;
-        server.settings_manager.apply_settings(current);
+        let mut current_settings = rust_settings(true);
+        current_settings.diagnostics_debounce_ms += 1;
+        server.settings_manager.apply_settings(current_settings);
 
-        assert!(!DiagnosticPublisher::new(server).publish_contract_changed(&uri, &previous));
+        assert!(!publisher.publish_contract_changed(&uri, previous));
     }
 
     #[test]
@@ -1758,19 +1796,23 @@ mod tests {
         );
         let publisher = DiagnosticPublisher::new(server);
 
-        let defaulted = rust_settings(true);
+        server.settings_manager.apply_settings(rust_settings(true));
+        let defaulted = publisher.publish_contract_snapshot(&uri);
         server
             .settings_manager
             .apply_settings(rust_settings_with_publish_interval(1000));
-        assert!(!publisher.publish_contract_changed(&uri, &defaulted));
+        assert!(!publisher.publish_contract_changed(&uri, defaulted));
 
-        let oversized = rust_settings_with_publish_interval(u64::MAX);
+        server
+            .settings_manager
+            .apply_settings(rust_settings_with_publish_interval(u64::MAX));
+        let oversized = publisher.publish_contract_snapshot(&uri);
         server
             .settings_manager
             .apply_settings(rust_settings_with_publish_interval(
                 MAX_WIRE_PUBLISH_QUIET_WINDOW.as_millis() as u64,
             ));
-        assert!(!publisher.publish_contract_changed(&uri, &oversized));
+        assert!(!publisher.publish_contract_changed(&uri, oversized));
     }
 
     #[tokio::test]
@@ -1787,9 +1829,11 @@ mod tests {
             Some("rust".to_string()),
             None,
         );
+        let publisher = DiagnosticPublisher::new(server);
+        let previous = publisher.publish_contract_snapshot(&uri);
         server.settings_manager.apply_settings(rust_settings(true));
 
-        assert!(DiagnosticPublisher::new(server).publish_contract_changed(&uri, &previous));
+        assert!(publisher.publish_contract_changed(&uri, previous));
     }
 
     #[tokio::test]
