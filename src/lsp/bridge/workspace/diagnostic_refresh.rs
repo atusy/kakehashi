@@ -8,7 +8,7 @@
 use log::debug;
 use tower_lsp_server::jsonrpc;
 
-use crate::lsp::bridge::actor::{ServerRequestDeps, UpstreamNotification};
+use crate::lsp::bridge::actor::ServerRequestDeps;
 
 /// Handle a `workspace/diagnostic/refresh` request, returning the JSON-RPC body
 /// the dispatcher wraps in a response.
@@ -18,11 +18,9 @@ pub(in crate::lsp::bridge) fn handle(
 ) -> jsonrpc::Result<serde_json::Value> {
     debug!(
         target: "kakehashi::bridge::reader",
-        "{}Forwarding workspace/diagnostic/refresh upstream",
+        "{}Acknowledging workspace/diagnostic/refresh",
         server_prefix
     );
-    let _ = deps
-        .upstream_tx
-        .send(UpstreamNotification::DiagnosticRefresh);
+    let _ = deps;
     Ok(serde_json::Value::Null)
 }

@@ -11,7 +11,7 @@ use url::Url;
 
 use crate::lsp::lsp_impl::Kakehashi;
 use crate::lsp::lsp_impl::text_document::publish_diagnostic::{
-    DiagnosticSnapshot, PullLayerOutcome, collect_push_diagnostics,
+    DiagnosticSnapshot, DiagnosticSnapshotLineage, PullLayerOutcome, collect_push_diagnostics,
 };
 use crate::lsp::settings_manager::SettingsManager;
 use crate::lsp::synthetic_diagnostics::SyntheticDiagnosticsManager;
@@ -174,7 +174,7 @@ impl DiagnosticScheduler {
 
 impl DiagnosticSnapshotPreparer {
     pub(crate) fn prepare_diagnostic_snapshot(&self, uri: &Url) -> Option<DiagnosticSnapshot> {
-        let (snapshot, language_name) = {
+        let (snapshot, language_name, content_version) = {
             let doc = self.documents.get(uri)?;
             let snapshot = doc.snapshot()?;
             let language_name = self.language.detect_language(
@@ -183,7 +183,8 @@ impl DiagnosticSnapshotPreparer {
                 None,
                 doc.language_id(),
             )?;
-            (snapshot, language_name)
+            let content_version = doc.content_version();
+            (snapshot, language_name, content_version)
         };
 
         // Cross-layer gating, keyed by the same method name as the
@@ -367,6 +368,10 @@ impl DiagnosticSnapshotPreparer {
         };
 
         Some(DiagnosticSnapshot {
+            lineage: DiagnosticSnapshotLineage {
+                incarnation: snapshot.incarnation(),
+                content_version,
+            },
             virt_contexts,
             host_pull_enabled,
             host,

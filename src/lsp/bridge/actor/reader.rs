@@ -1030,6 +1030,14 @@ async fn handle_server_request(
         Err(error) => jsonrpc::Response::from_error(id, error),
     };
     send_server_response(&deps.response_tx, response, server_prefix, method).await;
+    // A downstream server may wait for this response before answering the
+    // diagnostic pull triggered by the refresh. Queue the acknowledgement
+    // first so prefetch can never deadlock behind its own server request.
+    if method == "workspace/diagnostic/refresh" {
+        let _ = deps
+            .upstream_tx
+            .send(UpstreamNotification::DiagnosticRefresh);
+    }
 }
 
 /// Frame a server-request response and send it to the downstream server via the
@@ -2601,8 +2609,8 @@ mod tests {
     /// Test that workspace/diagnostic/refresh is forwarded upstream and acknowledged.
     ///
     /// When a downstream server sends workspace/diagnostic/refresh:
-    /// 1. An UpstreamNotification::DiagnosticRefresh is sent on the upstream channel
-    /// 2. A success response (not MethodNotFound) is sent back to the server
+    /// 1. A success response (not MethodNotFound) is queued back to the server
+    /// 2. Only then is UpstreamNotification::DiagnosticRefresh queued upstream
     #[tokio::test]
     async fn handle_message_diagnostic_refresh_forwards_upstream() {
         let router = ResponseRouter::new();
@@ -2635,13 +2643,7 @@ mod tests {
 
         handle_message(message, &router, "", &deps).await;
 
-        // Should have sent DiagnosticRefresh on the upstream channel
-        let notification = upstream_rx
-            .try_recv()
-            .expect("should have upstream notification");
-        assert_eq!(notification, UpstreamNotification::DiagnosticRefresh);
-
-        // Should have sent a success response (not MethodNotFound)
+        // The response is queued before prefetch can be triggered upstream.
         let response = response_rx.try_recv().expect("should have response");
         match response {
             OutboundMessage::Untracked(val) => {
@@ -2651,6 +2653,11 @@ mod tests {
             }
             _ => panic!("Expected Untracked variant"),
         }
+
+        let notification = upstream_rx
+            .try_recv()
+            .expect("should have upstream notification after response");
+        assert_eq!(notification, UpstreamNotification::DiagnosticRefresh);
     }
 
     /// workspace/workspaceFolders must be answered with the folders the

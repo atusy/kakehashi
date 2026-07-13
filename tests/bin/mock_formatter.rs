@@ -218,7 +218,11 @@ fn main() {
                     | "diagnostics-fail"
                     | "diagnostics-malformed"
                     | "diagnostics-refresh-prefetch"
+                    | "diagnostics-refresh-prefetch-ack-order"
                     | "diagnostics-refresh-prefetch-disabled"
+                    | "diagnostics-refresh-prefetch-fail"
+                    | "diagnostics-refresh-prefetch-stale"
+                    | "diagnostics-refresh-prefetch-unchanged"
                     | "diagnostics-refresh-burst"
                     | "diagnostics-push-pullcap" => json!({
                         "diagnosticProvider": {
@@ -336,10 +340,20 @@ fn main() {
                         || matches!(
                             mode.as_str(),
                             "diagnostics-refresh-prefetch"
+                                | "diagnostics-refresh-prefetch-ack-order"
                                 | "diagnostics-refresh-prefetch-disabled"
+                                | "diagnostics-refresh-prefetch-unchanged"
                         )
                     {
                         request(&mut writer, json!(1000), "workspace/diagnostic/refresh");
+                        if mode == "diagnostics-refresh-prefetch-ack-order" {
+                            match read_message(&mut reader) {
+                                Some(reply) if reply.get("id") == Some(&json!(1000)) => {}
+                                other => panic!(
+                                    "refresh prefetch started before its downstream ACK: {other:?}"
+                                ),
+                            }
+                        }
                     } else if mode == "diagnostics-refresh-burst" {
                         diagnostic_generation = 1;
                         request(&mut writer, json!(1000), "workspace/diagnostic/refresh");
@@ -826,7 +840,9 @@ fn main() {
             "textDocument/diagnostic" => {
                 if matches!(
                     mode.as_str(),
-                    "diagnostics-refresh-prefetch" | "diagnostics-refresh-prefetch-disabled"
+                    "diagnostics-refresh-prefetch"
+                        | "diagnostics-refresh-prefetch-ack-order"
+                        | "diagnostics-refresh-prefetch-disabled"
                 ) {
                     diagnostic_generation += 1;
                     std::thread::sleep(std::time::Duration::from_millis(1000));
@@ -837,6 +853,110 @@ fn main() {
                     // path (vs. a server that never starts), which CLI mode
                     // must not read as "no diagnostics".
                     respond_error(&mut writer, id, -32603, "mock diagnostic request failure");
+                    continue;
+                }
+                if mode == "diagnostics-refresh-prefetch-fail" {
+                    diagnostic_generation += 1;
+                    if diagnostic_generation == 1 {
+                        respond(
+                            &mut writer,
+                            id,
+                            json!({
+                                "kind": "full",
+                                "resultId": "refresh-prefetch-before-failure",
+                                "items": [{
+                                    "range": {
+                                        "start": { "line": 0, "character": 0 },
+                                        "end": { "line": 0, "character": 1 }
+                                    },
+                                    "severity": 2,
+                                    "message": "mock-diagnostic-before-refresh-failure"
+                                }]
+                            }),
+                        );
+                        request(&mut writer, json!(1000), "workspace/diagnostic/refresh");
+                    } else if diagnostic_generation == 2 {
+                        respond_error(&mut writer, id, -32603, "mock refresh prefetch failure");
+                    } else if message
+                        .pointer("/params/previousResultId")
+                        .and_then(Value::as_str)
+                        == Some("refresh-prefetch-before-failure")
+                    {
+                        respond(
+                            &mut writer,
+                            id,
+                            json!({
+                                "kind": "unchanged",
+                                "resultId": "refresh-prefetch-before-failure"
+                            }),
+                        );
+                    } else {
+                        respond(&mut writer, id, json!({ "kind": "full", "items": [] }));
+                    }
+                    continue;
+                }
+                if mode == "diagnostics-refresh-prefetch-stale" {
+                    diagnostic_generation += 1;
+                    if diagnostic_generation == 2 {
+                        std::thread::sleep(std::time::Duration::from_millis(1000));
+                    }
+                    let marker = match diagnostic_generation {
+                        1 => "mock-diagnostic-before-stale-prefetch",
+                        2 => "mock-diagnostic-from-stale-prefetch",
+                        _ => "mock-diagnostic-after-stale-prefetch",
+                    };
+                    respond(
+                        &mut writer,
+                        id,
+                        json!({
+                            "kind": "full",
+                            "items": [{
+                                "range": {
+                                    "start": { "line": 0, "character": 0 },
+                                    "end": { "line": 0, "character": 1 }
+                                },
+                                "severity": 2,
+                                "message": marker
+                            }]
+                        }),
+                    );
+                    if diagnostic_generation == 1 {
+                        // Let the initial publish reach the editor before the
+                        // refresh cycle emits its in-flight synchronization log.
+                        std::thread::sleep(std::time::Duration::from_millis(200));
+                        request(&mut writer, json!(1000), "workspace/diagnostic/refresh");
+                    }
+                    continue;
+                }
+                if mode == "diagnostics-refresh-prefetch-unchanged" {
+                    if message
+                        .pointer("/params/previousResultId")
+                        .and_then(Value::as_str)
+                        == Some("refresh-prefetch-stable")
+                    {
+                        respond(
+                            &mut writer,
+                            id,
+                            json!({ "kind": "unchanged", "resultId": "refresh-prefetch-stable" }),
+                        );
+                    } else {
+                        respond(
+                            &mut writer,
+                            id,
+                            json!({
+                                "kind": "full",
+                                "resultId": "refresh-prefetch-stable",
+                                "items": [{
+                                    "range": {
+                                        "start": { "line": 0, "character": 0 },
+                                        "end": { "line": 0, "character": 1 }
+                                    },
+                                    "severity": 2,
+                                    "message": "mock-diagnostic-refresh-unchanged"
+                                }]
+                            }),
+                        );
+                    }
                     continue;
                 }
                 if mode == "diagnostics-malformed" {
@@ -856,7 +976,9 @@ fn main() {
                     format!("mock-diagnostic-generation:{diagnostic_generation}")
                 } else if matches!(
                     mode.as_str(),
-                    "diagnostics-refresh-prefetch" | "diagnostics-refresh-prefetch-disabled"
+                    "diagnostics-refresh-prefetch"
+                        | "diagnostics-refresh-prefetch-ack-order"
+                        | "diagnostics-refresh-prefetch-disabled"
                 ) {
                     format!("mock-diagnostic-refresh-prefetched:{diagnostic_generation}")
                 } else {

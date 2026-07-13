@@ -15,15 +15,26 @@ use crate::config::settings::ResolvedLayerConfig;
 use crate::lsp::bridge::LanguageServerPool;
 use crate::lsp::lsp_impl::bridge_context::{DocumentRequestContext, HostRequestContext};
 
+use super::RequestErrorSink;
 use super::diagnostic::{
     collect_host_diagnostics, collect_region_diagnostics, combine_layer_diagnostics,
 };
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct DiagnosticSnapshotLineage {
+    pub(crate) incarnation: u64,
+    pub(crate) content_version: u64,
+}
 
 /// Everything a push-diagnostics task needs, captured at schedule time
 /// (cross-layer-aggregation): the virt layer's per-region contexts, the host
 /// layer's context when host bridging participates, and the resolved
 /// cross-layer config that combines them.
 pub(crate) struct DiagnosticSnapshot {
+    /// Document inputs from which this snapshot was prepared. Refresh prefetch
+    /// checks them again before committing so an edit or close/reopen cannot be
+    /// overwritten by an older in-flight pull.
+    pub(crate) lineage: DiagnosticSnapshotLineage,
     /// Per-region virt contexts; empty when the virt layer is gated off or
     /// the document has no bridgeable injection regions.
     pub(crate) virt_contexts: Vec<DocumentRequestContext>,
@@ -84,6 +95,16 @@ pub(crate) async fn collect_push_diagnostics(
     uri: &Url,
     log_target: &'static str,
 ) -> PullLayerOutcome {
+    collect_push_diagnostics_with_error_sink(snapshot_data, pool, uri, log_target, &None).await
+}
+
+pub(crate) async fn collect_push_diagnostics_with_error_sink(
+    snapshot_data: Option<DiagnosticSnapshot>,
+    pool: &Arc<LanguageServerPool>,
+    uri: &Url,
+    log_target: &'static str,
+    request_error_sink: &RequestErrorSink,
+) -> PullLayerOutcome {
     let Some(snapshot) = snapshot_data else {
         return PullLayerOutcome::Skip;
     };
@@ -105,6 +126,7 @@ pub(crate) async fn collect_push_diagnostics(
     // async blocks would otherwise rely on disjoint-field captures of
     // `snapshot`, which compiles but reads ambiguously).
     let DiagnosticSnapshot {
+        lineage: _,
         mut virt_contexts,
         host,
         host_pull_enabled,
@@ -145,10 +167,12 @@ pub(crate) async fn collect_push_diagnostics(
         let mut join_set = JoinSet::new();
         for region_ctx in virt_contexts {
             let pool = Arc::clone(pool);
+            let request_error_sink = request_error_sink.clone();
             // Push diagnostics run in LSP mode only — failures are log-only
             // (the editor re-pulls), so no request-error sink is threaded.
-            join_set
-                .spawn(async move { collect_region_diagnostics(&region_ctx, pool, &None).await });
+            join_set.spawn(async move {
+                collect_region_diagnostics(&region_ctx, pool, &request_error_sink).await
+            });
         }
 
         let mut all_diagnostics = Vec::new();
@@ -173,7 +197,7 @@ pub(crate) async fn collect_push_diagnostics(
             // for the re-sync (above), not the pull. Push diagnostics are
             // LSP-mode-only, so failures are log-only (`&None` error sink).
             Some(ctx) if host_pull_enabled => {
-                collect_host_diagnostics(ctx, Arc::clone(pool), &None).await
+                collect_host_diagnostics(ctx, Arc::clone(pool), request_error_sink).await
             }
             _ => Vec::new(),
         }
@@ -249,6 +273,10 @@ mod tests {
         pool.insert_connection(handle).await;
 
         let snapshot = DiagnosticSnapshot {
+            lineage: DiagnosticSnapshotLineage {
+                incarnation: 0,
+                content_version: 0,
+            },
             virt_contexts: vec![virt_ctx_for_server("test")],
             host: None,
             host_pull_enabled: false,

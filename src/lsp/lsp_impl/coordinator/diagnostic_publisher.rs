@@ -28,7 +28,7 @@ use crate::lsp::diagnostic_cache::{
 use crate::lsp::lsp_impl::Kakehashi;
 use crate::lsp::lsp_impl::coordinator::diagnostic::DiagnosticSnapshotPreparer;
 use crate::lsp::lsp_impl::text_document::publish_diagnostic::{
-    PullLayerOutcome, collect_push_diagnostics,
+    PullLayerOutcome, collect_push_diagnostics_with_error_sink,
 };
 use crate::lsp::settings_manager::SettingsManager;
 use tower_lsp_server::Client;
@@ -253,17 +253,20 @@ impl DiagnosticPublisher {
         if !self.prefetch_open_pull_fallback_diagnostics().await || self.shutdown.is_cancelled() {
             return false;
         }
+        self.aggregator
+            .mark_forwarded_refresh_prefetched(generation);
 
-        if self.diagnostic_refresh_supported()
-            && !self.request_pull_diagnostic_refresh_inner(true, false)
+        if !self.diagnostic_refresh_supported() {
+            self.aggregator.mark_forwarded_refresh_covered(generation);
+        } else if self
+            .aggregator
+            .forwarded_refresh_needs_editor_send(generation)
         {
-            return false;
+            if !self.request_pull_diagnostic_refresh_inner(true, false) {
+                return false;
+            }
+            self.aggregator.mark_forwarded_refresh_covered(generation);
         }
-        // A client without refreshSupport is still covered by the completed
-        // prefetch. New downstream activity advances the generation and causes a
-        // trailing cycle; this activity must not prefetch twice merely because no
-        // editor-facing request can be sent.
-        self.aggregator.mark_forwarded_refresh_covered(generation);
         true
     }
 
@@ -271,10 +274,33 @@ impl DiagnosticPublisher {
         let mut tasks = tokio::task::JoinSet::new();
         for uri in self.documents.open_uris() {
             let snapshot = self.snapshot_preparer.prepare_diagnostic_snapshot(&uri);
+            let lineage = snapshot.as_ref().map(|snapshot| snapshot.lineage);
             let pool = self.bridge.pool_arc();
             let publisher = self.clone();
             tasks.spawn(async move {
-                let outcome = collect_push_diagnostics(snapshot, &pool, &uri, LOG_TARGET).await;
+                let errors = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+                let error_sink = Some(std::sync::Arc::clone(&errors));
+                let outcome = collect_push_diagnostics_with_error_sink(
+                    snapshot,
+                    &pool,
+                    &uri,
+                    LOG_TARGET,
+                    &error_sink,
+                )
+                .await;
+                if errors.load(std::sync::atomic::Ordering::Relaxed) != 0 {
+                    log::warn!(target: LOG_TARGET, "Keeping the previous pull layer after refresh prefetch failed for {uri}");
+                    return;
+                }
+                if lineage.is_some_and(|lineage| {
+                    publisher.documents.get(&uri).is_none_or(|document| {
+                        document.incarnation() != lineage.incarnation
+                            || document.content_version() != lineage.content_version
+                    })
+                }) {
+                    log::debug!(target: LOG_TARGET, "Discarding stale refresh prefetch for {uri}");
+                    return;
+                }
                 match outcome {
                     PullLayerOutcome::Skip => {}
                     PullLayerOutcome::Clear => publisher.clear_pull_layer(&uri).await,
@@ -647,12 +673,12 @@ impl DiagnosticPublisher {
     /// returned clean keeps its empty `PullLayer` (via [`Self::publish_pull_layer`]),
     /// so that path still suppresses a stale push — the two empties differ.
     ///
-    /// Deliberately does **not** emit `workspace/diagnostic/refresh` (#499). This is
-    /// the empty-contributors branch of the same host-event pull task as
-    /// [`Self::publish_pull_layer`], which #496 left no-refresh: both are always
-    /// downstream of a host event (didOpen/didChange/didSave) the editor originated
-    /// and re-pulls for on its own. There is no spontaneous `clear_pull_layer`, so a
-    /// refresh here would be redundant (the editor's own re-pull already covers it).
+    /// Deliberately does **not** emit `workspace/diagnostic/refresh` (#499). Host
+    /// events (didOpen/didChange/didSave) are editor-originated, while a downstream
+    /// refresh prefetch is enclosed by a workspace refresh cycle that forwards its
+    /// one capability-gated editor request only after every host finishes. Emitting
+    /// here would therefore duplicate that cycle's nudge; an incapable editor still
+    /// receives the clearing `publishDiagnostics` notification from `republish`.
     pub(crate) async fn clear_pull_layer(&self, host: &Url) {
         self.aggregator
             .evict_source(host, &DiagnosticSource::PullLayer);
