@@ -20,7 +20,7 @@ pub(crate) use parallel::build_document_discovery;
 pub(crate) use range::filter_semantic_tokens_by_range;
 
 // Re-export for parallel processing
-use parallel::{InjectionCacheCtx, collect_injection_tokens_parallel};
+use parallel::{INJECTION_CACHE_MIN_REGIONS, InjectionCacheCtx, collect_injection_tokens_parallel};
 
 /// Owned handle the LSP layer passes into [`handle_semantic_tokens_full`] to
 /// enable per-region injection-token caching (#529). `None` disables caching
@@ -64,6 +64,27 @@ pub(crate) use token_collector::TokenKind;
 #[cfg(test)]
 use {delta::calculate_semantic_tokens_delta, tower_lsp_server::ls_types::SemanticTokens};
 
+fn should_parallelize_host_and_injections(
+    compute_threads: usize,
+    current_generation: u64,
+    discovery: Option<(u64, bool, usize)>,
+) -> bool {
+    compute_threads >= 3
+        && discovery.is_some_and(|(generation, complete, region_count)| {
+            generation == current_generation
+                && complete
+                && region_count >= INJECTION_CACHE_MIN_REGIONS
+        })
+}
+
+fn run_sequential_injection<T>(
+    host_complete: bool,
+    cancelled: bool,
+    injection_work: impl FnOnce() -> T,
+) -> Option<T> {
+    (!cancelled && host_complete).then(injection_work)
+}
+
 /// Compute full-document semantic tokens (host + injections) as one work-unit
 /// on the bounded compute pool; the injection fan-out's `par_iter` runs on the
 /// same pool (a Rayon parallel iterator invoked from a pool thread stays on
@@ -92,42 +113,13 @@ pub(crate) async fn handle_semantic_tokens_full(
     injection_cache: Option<InjectionCacheParams>,
     cancel: Option<crate::cancel::CancelToken>,
 ) -> Option<SemanticTokensResult> {
+    let compute_threads = pool.thread_count();
     pool.run(cancel.clone(), move || {
         let is_cancelled = || crate::cancel::is_cancelled(cancel.as_ref());
-        let t_start = std::time::Instant::now();
-
-        let mut all_tokens: Vec<RawToken> = Vec::with_capacity(1000);
+        let compute_started = std::time::Instant::now();
+        let mut host_tokens: Vec<RawToken> = Vec::with_capacity(1000);
         let lines: Vec<&str> = text.lines().collect();
         let line_starts = build_line_start_bytes(&text);
-
-        // Collect host document tokens first (no exclusion — finalize handles it).
-        if !collect_host_tokens(
-            &text,
-            &tree,
-            &query,
-            filetype.as_deref(),
-            capture_mappings.as_deref(),
-            &text,
-            &lines,
-            &line_starts,
-            0,
-            0,
-            supports_multiline,
-            &[],
-            &[],
-            cancel.as_ref(),
-            &mut all_tokens,
-        ) {
-            return None;
-        }
-
-        let host_elapsed = t_start.elapsed();
-
-        // The host collector polls mid-query; this boundary also catches a
-        // supersede that lands after its last poll and before injection work.
-        if is_cancelled() {
-            return None;
-        }
 
         // Borrow the owned cache handle into a request-scoped context for the
         // injection pass (#529); `None` keeps the uncached behavior.
@@ -148,22 +140,80 @@ pub(crate) async fn handle_semantic_tokens_full(
             discovery: p.discovery.as_deref(),
         });
 
-        // Collect injection tokens in parallel using Rayon.
-        // Also returns active injection regions for finalize-time exclusion.
-        // `cancel` is polled inside discovery and the per-region fan-out so a
-        // supersede lands mid-pass, not just at these outer boundaries.
-        let (injection_tokens, active_injection_regions) = collect_injection_tokens_parallel(
-            &text,
-            &lines,
-            &line_starts,
-            &tree,
-            filetype.as_deref(),
-            &coordinator,
-            capture_mappings.as_deref(),
-            supports_multiline,
-            cache_ctx.as_ref(),
-            cancel.as_ref(),
-        );
+        let should_parallelize = cache_ctx.as_ref().is_some_and(|ctx| {
+            should_parallelize_host_and_injections(
+                compute_threads,
+                ctx.generation,
+                ctx.discovery.map(|discovery| {
+                    (
+                        discovery.generation,
+                        discovery.complete,
+                        discovery.regions.len(),
+                    )
+                }),
+            )
+        });
+        let mut host_work = || {
+            let started = std::time::Instant::now();
+            let complete = collect_host_tokens(
+                &text,
+                &tree,
+                &query,
+                filetype.as_deref(),
+                capture_mappings.as_deref(),
+                &text,
+                &lines,
+                &line_starts,
+                0,
+                0,
+                supports_multiline,
+                &[],
+                &[],
+                cancel.as_ref(),
+                &mut host_tokens,
+            );
+            (complete, started.elapsed())
+        };
+        let injection_work = || {
+            let started = std::time::Instant::now();
+            let result = collect_injection_tokens_parallel(
+                &text,
+                &lines,
+                &line_starts,
+                &tree,
+                filetype.as_deref(),
+                &coordinator,
+                capture_mappings.as_deref(),
+                supports_multiline,
+                cache_ctx.as_ref(),
+                cancel.as_ref(),
+            );
+            (result, started.elapsed())
+        };
+
+        // Host highlighting and a substantial injection pass read the same
+        // immutable snapshot and only meet during finalization. Overlap them
+        // when discovery proves enough injection work exists to amortize the
+        // second Rayon branch; otherwise retain the sequential fast path.
+        let ((host_complete, host_elapsed), (injection_result, injections_elapsed)) =
+            if should_parallelize {
+                // Match the sequential injection boundary: do not dispatch
+                // either Rayon branch when supersession has already landed.
+                if is_cancelled() {
+                    return None;
+                }
+                rayon::join(host_work, injection_work)
+            } else {
+                let host_result = host_work();
+                let injection_result =
+                    run_sequential_injection(host_result.0, is_cancelled(), injection_work)?;
+                (host_result, injection_result)
+            };
+
+        if !host_complete {
+            return None;
+        }
+        let (injection_tokens, active_injection_regions) = injection_result;
 
         // A supersede observed during the injection pass leaves a partial token
         // set; drop it so the handler never stores partial results.
@@ -171,31 +221,32 @@ pub(crate) async fn handle_semantic_tokens_full(
             return None;
         }
 
-        let injections_elapsed = t_start.elapsed().saturating_sub(host_elapsed);
-
         // Merge injection tokens with host tokens
-        all_tokens.extend(injection_tokens);
+        host_tokens.extend(injection_tokens);
 
         let finalize_start = std::time::Instant::now();
         let result = finalize_tokens_cancellable(
-            all_tokens,
+            host_tokens,
             &active_injection_regions,
             &lines,
             cancel.as_ref(),
         );
         let finalize_elapsed = finalize_start.elapsed();
+        let compute_elapsed = compute_started.elapsed();
         if is_cancelled() {
             return None;
         }
 
-        // One developer-only event per completed compute keeps the phases
-        // comparable without adding hot-loop logging or operator noise.
+        // Host/injection durations overlap when `parallel=true`, so `compute`
+        // is the authoritative wall time; branch durations must not be summed.
         log::debug!(
             target: "kakehashi::semantic",
-            "[SEMANTIC_TOKENS] compute phases: host={}ms injections={}ms finalize={}ms regions_reused={}",
-            host_elapsed.as_millis(),
-            injections_elapsed.as_millis(),
-            finalize_elapsed.as_millis(),
+            "[SEMANTIC_TOKENS] compute phases: compute={}us host={}us injections={}us finalize={}us parallel={} regions_reused={}",
+            compute_elapsed.as_micros(),
+            host_elapsed.as_micros(),
+            injections_elapsed.as_micros(),
+            finalize_elapsed.as_micros(),
+            should_parallelize,
             injection_cache
                 .as_ref()
                 // The same generation gate the reuse path applies: a
@@ -219,6 +270,57 @@ pub(crate) async fn handle_semantic_tokens_full(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parallel_host_injection_gate_checks_pool_and_discovery_contract() {
+        let threshold = INJECTION_CACHE_MIN_REGIONS;
+        let cases = [
+            (1, 7, None, false, "single-thread pool"),
+            (2, 7, Some((7, true, threshold)), false, "two-thread pool"),
+            (3, 7, None, false, "absent discovery"),
+            (3, 7, Some((6, true, threshold)), false, "stale discovery"),
+            (
+                3,
+                7,
+                Some((7, false, threshold)),
+                false,
+                "partial discovery",
+            ),
+            (
+                3,
+                7,
+                Some((7, true, threshold - 1)),
+                false,
+                "below threshold",
+            ),
+            (3, 7, Some((7, true, threshold)), true, "eligible"),
+        ];
+        for (threads, generation, discovery, expected, label) in cases {
+            assert_eq!(
+                should_parallelize_host_and_injections(threads, generation, discovery),
+                expected,
+                "{label}"
+            );
+        }
+    }
+
+    #[test]
+    fn sequential_injection_does_not_start_after_host_cancel() {
+        let starts = std::cell::Cell::new(0);
+        let mut work = || {
+            starts.set(starts.get() + 1);
+            "ran"
+        };
+
+        assert_eq!(run_sequential_injection(false, false, &mut work), None);
+        assert_eq!(run_sequential_injection(true, true, &mut work), None);
+        assert_eq!(starts.get(), 0);
+        assert_eq!(
+            run_sequential_injection(true, false, &mut work),
+            Some("ran")
+        );
+        assert_eq!(starts.get(), 1);
+    }
     use tower_lsp_server::ls_types::{Range, SemanticToken};
 
     /// Returns the search path for tree-sitter grammars.
