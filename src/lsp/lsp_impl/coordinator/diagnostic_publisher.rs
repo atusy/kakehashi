@@ -781,19 +781,32 @@ impl DiagnosticPublisher {
         previous: &crate::config::WorkspaceSettings,
     ) -> bool {
         let Some(language_name) = self.open_document_language(host) else {
+            // Unknown language: conservatively invalidate any prior publish
+            // contract rather than retaining potentially stale wire state.
             return true;
         };
-        let previous = crate::lsp::lsp_impl::bridge_context::resolve_layer_config_from_settings(
-            previous,
-            &language_name,
+        Self::effective_publish_contract(previous, &language_name)
+            != Self::effective_publish_contract(
+                &self.settings_manager.load_settings(),
+                &language_name,
+            )
+    }
+
+    fn effective_publish_contract(
+        settings: &crate::config::WorkspaceSettings,
+        language_name: &str,
+    ) -> (bool, std::time::Duration) {
+        let config = crate::lsp::lsp_impl::bridge_context::resolve_layer_config_from_settings(
+            settings,
+            language_name,
             "textDocument/publishDiagnostics",
         );
-        let current = crate::lsp::lsp_impl::bridge_context::resolve_layer_config_from_settings(
-            &self.settings_manager.load_settings(),
-            &language_name,
-            "textDocument/publishDiagnostics",
-        );
-        previous != current
+        let quiet_window = config
+            .min_publish_interval_ms
+            .map(std::time::Duration::from_millis)
+            .map(|window| window.min(MAX_WIRE_PUBLISH_QUIET_WINDOW))
+            .unwrap_or(WIRE_PUBLISH_QUIET_WINDOW);
+        (config.priorities.is_empty(), quiet_window)
     }
 
     /// Re-run [`Self::republish`] for `host` once the quiet window elapses or
@@ -861,28 +874,23 @@ impl DiagnosticPublisher {
     fn publish_sealed(&self, host: &Url) -> bool {
         self.open_document_language(host)
             .is_some_and(|language_name| {
-                crate::lsp::lsp_impl::bridge_context::resolve_layer_config_from_settings(
+                Self::effective_publish_contract(
                     &self.settings_manager.load_settings(),
                     &language_name,
-                    "textDocument/publishDiagnostics",
                 )
-                .priorities
-                .is_empty()
+                .0
             })
     }
 
     fn publish_quiet_window(&self, host: &Url) -> std::time::Duration {
         self.open_document_language(host)
-            .and_then(|language_name| {
-                crate::lsp::lsp_impl::bridge_context::resolve_layer_config_from_settings(
+            .map(|language_name| {
+                Self::effective_publish_contract(
                     &self.settings_manager.load_settings(),
                     &language_name,
-                    "textDocument/publishDiagnostics",
                 )
-                .min_publish_interval_ms
+                .1
             })
-            .map(std::time::Duration::from_millis)
-            .map(|window| window.min(MAX_WIRE_PUBLISH_QUIET_WINDOW))
             .unwrap_or(WIRE_PUBLISH_QUIET_WINDOW)
     }
 
@@ -1620,6 +1628,35 @@ mod tests {
         server.settings_manager.apply_settings(current);
 
         assert!(!DiagnosticPublisher::new(server).publish_contract_changed(&uri, &previous));
+    }
+
+    #[test]
+    fn publish_contract_change_compares_effective_quiet_windows() {
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+        register_rust(server);
+        let uri = Url::parse("file:///test/equivalent_contract.rs").unwrap();
+        server.documents.insert(
+            uri.clone(),
+            "fn main() {}".to_string(),
+            Some("rust".to_string()),
+            None,
+        );
+        let publisher = DiagnosticPublisher::new(server);
+
+        let defaulted = rust_settings(true);
+        server
+            .settings_manager
+            .apply_settings(rust_settings_with_publish_interval(1000));
+        assert!(!publisher.publish_contract_changed(&uri, &defaulted));
+
+        let oversized = rust_settings_with_publish_interval(u64::MAX);
+        server
+            .settings_manager
+            .apply_settings(rust_settings_with_publish_interval(
+                MAX_WIRE_PUBLISH_QUIET_WINDOW.as_millis() as u64,
+            ));
+        assert!(!publisher.publish_contract_changed(&uri, &oversized));
     }
 
     #[tokio::test]
