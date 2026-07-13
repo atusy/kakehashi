@@ -422,7 +422,7 @@ fn format_diagnostic(format: OutputFormat, display: &str, diagnostic: &Diagnosti
     let col = diagnostic.range.start.character.saturating_add(1);
     match format {
         OutputFormat::Default => {
-            let display = one_line(display);
+            let display = escape_terminal_controls(display);
             let severity = severity_word(diagnostic.severity);
             let message = one_line(&diagnostic.message);
             // Branch on the source rather than building a separate ` [src]`
@@ -501,6 +501,31 @@ fn one_line(message: &str) -> std::borrow::Cow<'_, str> {
         }
     }
     std::borrow::Cow::Owned(out)
+}
+
+/// Visibly escape terminal and bidirectional controls without changing other
+/// characters. Paths use this instead of [`one_line`] because spaces and other
+/// non-control whitespace are valid filename characters and must retain their
+/// identity in diagnostic locations.
+fn escape_terminal_controls(text: &str) -> std::borrow::Cow<'_, str> {
+    if !text
+        .chars()
+        .any(|ch| ch.is_control() || is_bidi_control(ch))
+    {
+        return std::borrow::Cow::Borrowed(text);
+    }
+
+    let mut escaped = String::with_capacity(text.len());
+    for ch in text.chars() {
+        if is_bidi_control(ch) {
+            escaped.extend(ch.escape_unicode());
+        } else if ch.is_control() {
+            escaped.extend(ch.escape_default());
+        } else {
+            escaped.push(ch);
+        }
+    }
+    std::borrow::Cow::Owned(escaped)
 }
 
 fn is_bidi_control(ch: char) -> bool {
@@ -683,7 +708,17 @@ mod tests {
 
         assert_eq!(
             format_diagnostic(OutputFormat::Default, "dir/\u{1b}[2Jfile\nname", &d),
-            "dir/\\u{1b}[2Jfile name:1:1: error: boom"
+            "dir/\\u{1b}[2Jfile\\nname:1:1: error: boom"
+        );
+    }
+
+    #[test]
+    fn default_format_preserves_spaces_in_display_path() {
+        let d = diag(0, 0, Some(DiagnosticSeverity::ERROR), "boom");
+
+        assert_eq!(
+            format_diagnostic(OutputFormat::Default, " dir/a  b.rs ", &d),
+            " dir/a  b.rs :1:1: error: boom"
         );
     }
 
