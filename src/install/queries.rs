@@ -1194,7 +1194,10 @@ fn copy_windows_tombstone_security(source: &fs::File, target: &fs::File) -> std:
             )
         };
         if status != ERROR_SUCCESS {
-            return Err(std::io::Error::from_raw_os_error(status as i32));
+            return Err(std::io::Error::other(format!(
+                "GetSecurityInfo failed: {}",
+                std::io::Error::from_raw_os_error(status as i32)
+            )));
         }
         Ok((SecurityDescriptor(descriptor), owner, group, dacl))
     }
@@ -1210,7 +1213,10 @@ fn copy_windows_tombstone_security(source: &fs::File, target: &fs::File) -> std:
     if unsafe { GetSecurityDescriptorControl(source_descriptor.0, &mut control, &mut revision) }
         == 0
     {
-        return Err(std::io::Error::last_os_error());
+        return Err(std::io::Error::other(format!(
+            "GetSecurityDescriptorControl failed: {}",
+            std::io::Error::last_os_error()
+        )));
     }
     let dacl_mode = if control & SE_DACL_PROTECTED != 0 {
         PROTECTED_DACL_SECURITY_INFORMATION
@@ -1230,7 +1236,10 @@ fn copy_windows_tombstone_security(source: &fs::File, target: &fs::File) -> std:
         )
     };
     if dacl_status != ERROR_SUCCESS {
-        return Err(std::io::Error::from_raw_os_error(dacl_status as i32));
+        return Err(std::io::Error::other(format!(
+            "SetSecurityInfo DACL failed: {}",
+            std::io::Error::from_raw_os_error(dacl_status as i32)
+        )));
     }
 
     // New stages normally inherit the same owner/group. Only request the
@@ -1257,7 +1266,10 @@ fn copy_windows_tombstone_security(source: &fs::File, target: &fs::File) -> std:
             )
         };
         if handle.is_null() || handle == windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE {
-            return Err(std::io::Error::last_os_error());
+            return Err(std::io::Error::other(format!(
+                "ReOpenFile WRITE_OWNER failed: {}",
+                std::io::Error::last_os_error()
+            )));
         }
         // SAFETY: successful ReOpenFile returned a newly owned handle.
         let owner_handle = unsafe { fs::File::from_raw_handle(handle) };
@@ -1281,7 +1293,10 @@ fn copy_windows_tombstone_security(source: &fs::File, target: &fs::File) -> std:
             )
         };
         if status != ERROR_SUCCESS {
-            return Err(std::io::Error::from_raw_os_error(status as i32));
+            return Err(std::io::Error::other(format!(
+                "SetSecurityInfo owner/group failed: {}",
+                std::io::Error::from_raw_os_error(status as i32)
+            )));
         }
     }
     Ok(())
@@ -2180,14 +2195,18 @@ mod tests {
     #[test]
     #[cfg(windows)]
     fn windows_tombstone_preserves_null_protected_dacl() {
-        use std::os::windows::io::AsRawHandle as _;
-        use windows_sys::Win32::Foundation::{ERROR_SUCCESS, LocalFree};
+        use std::os::windows::io::{AsRawHandle as _, FromRawHandle as _};
+        use windows_sys::Win32::Foundation::{ERROR_SUCCESS, INVALID_HANDLE_VALUE, LocalFree};
         use windows_sys::Win32::Security::Authorization::{
             GetSecurityInfo, SE_FILE_OBJECT, SetSecurityInfo,
         };
         use windows_sys::Win32::Security::{
             DACL_SECURITY_INFORMATION, GetSecurityDescriptorControl,
             PROTECTED_DACL_SECURITY_INFORMATION, SE_DACL_PROTECTED,
+        };
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, READ_CONTROL, ReOpenFile,
+            WRITE_DAC,
         };
 
         let temp = TempDir::new().unwrap();
@@ -2200,11 +2219,23 @@ mod tests {
             .write(true)
             .open(&tombstone)
             .unwrap();
+        // SAFETY: success returns a distinct owned handle with WRITE_DAC.
+        let security_handle = unsafe {
+            ReOpenFile(
+                existing.as_raw_handle(),
+                READ_CONTROL | WRITE_DAC,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                0,
+            )
+        };
+        assert_ne!(security_handle, INVALID_HANDLE_VALUE);
+        // SAFETY: successful ReOpenFile returned a newly owned handle.
+        let security_file = unsafe { fs::File::from_raw_handle(security_handle) };
         // SAFETY: the handle is valid; a null DACL is intentional and grants
         // full access while remaining observably distinct from an inherited ACL.
         let status = unsafe {
             SetSecurityInfo(
-                existing.as_raw_handle(),
+                security_file.as_raw_handle(),
                 SE_FILE_OBJECT,
                 DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
                 std::ptr::null_mut(),
