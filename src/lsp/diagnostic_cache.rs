@@ -1219,7 +1219,7 @@ impl DiagnosticAggregator {
             // The send ends the admitted cycle. A real activity that starts a
             // quiet leading edge, recovers an uncommitted first send, or rolls
             // a continuous burst at maxWait owns the next cycle's snapshot.
-            if record_activity && (gate.last_sent_at.is_none() || was_quiet || reached_max_wait) {
+            if reached_max_wait || (record_activity && (gate.last_sent_at.is_none() || was_quiet)) {
                 gate.debounce = debounce;
                 gate.max_wait = max_wait;
             }
@@ -1550,6 +1550,47 @@ mod tests {
             ),
             WireAdmit::Defer { remaining, .. }
                 if remaining == admitted_debounce
+        ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn wire_debounce_adopts_live_timing_after_trailing_max_wait() {
+        let agg = DiagnosticAggregator::new();
+        let admitted_debounce = std::time::Duration::from_millis(200);
+        let admitted_max_wait = std::time::Duration::from_millis(1000);
+        let updated_debounce = std::time::Duration::from_millis(500);
+        let updated_max_wait = std::time::Duration::from_millis(5000);
+        assert_eq!(
+            agg.wire_debounce_admit(&host(), admitted_debounce, admitted_max_wait, true),
+            WireAdmit::SendNow
+        );
+        agg.wire_gate_commit_send(&host());
+
+        for _ in 0..9 {
+            tokio::time::advance(std::time::Duration::from_millis(100)).await;
+            assert!(matches!(
+                agg.wire_debounce_admit(&host(), updated_debounce, updated_max_wait, true),
+                WireAdmit::Defer { .. }
+            ));
+        }
+        tokio::time::advance(std::time::Duration::from_millis(100)).await;
+        assert!(agg.wire_gate_take_pending(&host()));
+        assert_eq!(
+            agg.wire_debounce_admit(&host(), updated_debounce, updated_max_wait, false),
+            WireAdmit::SendNow
+        );
+        agg.wire_gate_commit_send(&host());
+
+        tokio::time::advance(std::time::Duration::from_millis(100)).await;
+        assert!(matches!(
+            agg.wire_debounce_admit(
+                &host(),
+                updated_debounce,
+                updated_max_wait,
+                true
+            ),
+            WireAdmit::Defer { remaining, .. }
+                if remaining == updated_debounce
         ));
     }
 
