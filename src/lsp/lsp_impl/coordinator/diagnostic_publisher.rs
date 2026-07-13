@@ -276,7 +276,7 @@ impl DiagnosticPublisher {
             let Some(snapshot) = self.snapshot_preparer.prepare_diagnostic_snapshot(&uri) else {
                 continue;
             };
-            let lineage = Some(snapshot.lineage);
+            let lineage = snapshot.lineage;
             let pool = self.bridge.pool_arc();
             let publisher = self.clone();
             tasks.spawn(async move {
@@ -326,12 +326,9 @@ impl DiagnosticPublisher {
     async fn commit_refresh_prefetch(
         &self,
         uri: &Url,
-        lineage: Option<DiagnosticSnapshotLineage>,
+        lineage: DiagnosticSnapshotLineage,
         outcome: PullLayerOutcome,
     ) {
-        let Some(lineage) = lineage else {
-            return;
-        };
         let edit_lock = self.documents.edit_lock(uri);
         let edit_guard = edit_lock.lock().await;
         let Some(document) = self.documents.get(uri) else {
