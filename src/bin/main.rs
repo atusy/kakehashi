@@ -467,7 +467,7 @@ fn run_language_status(verbose: bool) -> Result<(), ExitCode> {
 }
 
 fn installed_query_language_name(path: &Path) -> Option<String> {
-    if !path.is_dir() {
+    if !std::fs::symlink_metadata(path).ok()?.is_dir() {
         return None;
     }
     let name = path.file_name()?.to_string_lossy();

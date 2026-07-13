@@ -725,6 +725,48 @@ fn test_language_status_shows_installed() {
     );
 }
 
+/// A symlink at the managed query-language entry is not an installed query
+/// directory, even when its external target contains complete-looking files.
+#[cfg(any(unix, windows))]
+#[test]
+fn test_language_status_ignores_symlinked_query_language_directories() {
+    use std::fs;
+
+    let test_dir = tempfile::tempdir().expect("Failed to create temp dir");
+    let external = test_dir.path().join("external/lua");
+    fs::create_dir_all(&external).expect("Failed to create external query dir");
+    fs::write(external.join("highlights.scm"), "(comment) @comment")
+        .expect("Failed to write external query");
+    let managed = test_dir.path().join("data/queries/lua");
+    fs::create_dir_all(managed.parent().unwrap()).expect("Failed to create queries parent");
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(&external, &managed).expect("Failed to symlink query dir");
+    #[cfg(windows)]
+    std::os::windows::fs::symlink_dir(&external, &managed).expect("Failed to symlink query dir");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_kakehashi"))
+        .args([
+            "language",
+            "status",
+            "--data-dir",
+            test_dir.path().join("data").to_str().unwrap(),
+        ])
+        .output()
+        .expect("Failed to execute command");
+
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.status.success(), "status failed: {combined}");
+    assert!(
+        combined.contains("No languages installed"),
+        "query-directory symlinks must not enter discovery: {combined}"
+    );
+    assert!(external.join("highlights.scm").is_file());
+}
+
 /// Test that language status shows missing queries
 #[test]
 fn test_language_status_missing_queries() {
