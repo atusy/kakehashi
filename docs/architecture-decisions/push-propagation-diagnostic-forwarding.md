@@ -98,19 +98,23 @@ source. Push-driven servers feed this path natively; pull-driven servers feed it
 via the `pullFallback` toggle and, opportunistically, via any push they emit (see
 Per-server source and fallback).
 
-**Wire quiet window.** The wire sends are additionally coalesced per host: a
-changed merge inside a 1 s quiet window after the last send is withheld
-(wire-dirty) and one trailing republish at the window's end re-merges the
-*latest* cache, so a burst of feeds (spontaneous pushes, the pull-layer
-completion, the post-parse geometry re-merge — measured ~2.2 × ~1 MB
-publishes/s during sustained typing) collapses into at most one full-set
-publish per second per host. The first publish after quiet passes through
-immediately, so a change arriving after >= 1 s of wire quiet gains no latency
-(a second isolated change inside the window still waits for it). Only the wire
-waits: change detection, the coverage bump, and the refresh nudge fire at
-the same points as before, and `didClose`'s clearing publish bypasses the
-window (a deferred clear would be dropped by the trailing task's
-closed-document guard).
+**Wire leading + trailing debounce.** Wire sends are coalesced per host URI
+under a workspace-wide method policy:
+
+```toml
+[features."textDocument/publishDiagnostics"]
+debounceMs = 100
+maxWaitMs = 1000
+```
+
+The first changed merge after idle passes immediately. Later changes update the
+cached latest set and one trailing republish re-merges it after `debounceMs` of
+quiet; continuous activity is forced no later than `maxWaitMs` after the previous
+send. State is per URI, so a noisy document cannot delay another. Only the wire
+waits: change detection, the coverage bump, and the refresh nudge fire at the same
+points as before. `didClose` forgets pending state and sends its clearing publish
+outside the debounce; shutdown cancels pending tasks. Pull diagnostics are outside
+this scheduler.
 
 **Config wire seal.** The cross-layer gate for
 `textDocument/publishDiagnostics` doubles as a seal on the editor-facing wire

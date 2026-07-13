@@ -125,6 +125,69 @@ fn is_mock_push(d: &Value) -> bool {
 }
 
 #[test]
+fn e2e_publish_diagnostics_burst_keeps_latest_trailing_value() {
+    let (mut client, _config_dir) = init_client_with_mode("diagnostics-push-burst");
+    open_host(&mut client);
+
+    client
+        .wait_for_notification_where(
+            &["textDocument/publishDiagnostics"],
+            Duration::from_secs(15),
+            |params| {
+                params["diagnostics"].as_array().is_some_and(|diagnostics| {
+                    diagnostics
+                        .iter()
+                        .any(|diagnostic| diagnostic["message"] == json!("mock-push-burst:1"))
+                })
+            },
+        )
+        .expect("the isolated leading diagnostic must publish immediately");
+
+    client
+        .wait_for_notification_where(
+            &["textDocument/publishDiagnostics"],
+            Duration::from_secs(5),
+            |params| {
+                params["diagnostics"].as_array().is_some_and(|diagnostics| {
+                    diagnostics
+                        .iter()
+                        .any(|diagnostic| diagnostic["message"] == json!("mock-push-burst:2"))
+                })
+            },
+        )
+        .expect("the first change after idle starts the next burst immediately");
+
+    let (_, trailing) = client
+        .wait_for_notification_where(
+            &["textDocument/publishDiagnostics"],
+            Duration::from_secs(5),
+            |params| {
+                params["diagnostics"].as_array().is_some_and(|diagnostics| {
+                    diagnostics.iter().any(|diagnostic| {
+                        diagnostic["message"].as_str().is_some_and(|message| {
+                            message == "mock-push-burst:3" || message == "mock-push-burst:4"
+                        })
+                    })
+                })
+            },
+        )
+        .expect("the burst must produce one trailing publish");
+    assert!(
+        trailing["diagnostics"]
+            .as_array()
+            .is_some_and(|diagnostics| {
+                diagnostics
+                    .iter()
+                    .any(|diagnostic| diagnostic["message"] == json!("mock-push-burst:4"))
+            }),
+        "the trailing publish must contain only the latest burst value: {trailing}"
+    );
+
+    client.send_request("shutdown", json!(null));
+    client.send_notification("exit", json!(null));
+}
+
+#[test]
 fn e2e_push_diagnostic_reaches_editor_in_host_coords_then_clears() {
     let (mut client, _config_dir) = init_client();
 

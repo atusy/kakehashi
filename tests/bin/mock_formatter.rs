@@ -324,6 +324,19 @@ fn main() {
                             "textDocument/publishDiagnostics",
                             push_diagnostics(uri, true),
                         );
+                    } else if mode == "diagnostics-push-burst" {
+                        for generation in 1..=4 {
+                            notify(
+                                &mut writer,
+                                "textDocument/publishDiagnostics",
+                                push_diagnostics_with_message(
+                                    uri,
+                                    format!("mock-push-burst:{generation}"),
+                                ),
+                            );
+                            let delay = if generation == 1 { 300 } else { 30 };
+                            std::thread::sleep(std::time::Duration::from_millis(delay));
+                        }
                     }
                     // `diagnostics-refresh`: ask the client (via the bridge) to
                     // re-pull diagnostics. The bridge forwards this upstream to the
@@ -1085,6 +1098,21 @@ fn push_diagnostics(uri: &str, present: bool) -> Value {
         json!([])
     };
     json!({ "uri": uri, "diagnostics": diagnostics })
+}
+
+fn push_diagnostics_with_message(uri: &str, message: String) -> Value {
+    json!({
+        "uri": uri,
+        "diagnostics": [{
+            "range": {
+                "start": { "line": 0, "character": 0 },
+                "end": { "line": 0, "character": 7 }
+            },
+            "severity": 1,
+            "source": "mock-push",
+            "message": message
+        }]
+    })
 }
 
 /// Send a server→client **request** (a message carrying both `id` and `method`,

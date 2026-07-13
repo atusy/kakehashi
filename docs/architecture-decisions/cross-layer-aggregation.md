@@ -81,7 +81,11 @@ Phased roadmap:
    the editor-facing wire sends (the pull-first opt-out; delivery continues
    via `workspace/diagnostic/refresh` → re-pull, and `didClose`'s clearing
    publish still fails open) — prerequisites and caveats in
-   push-propagation-diagnostic-forwarding "Config wire seal".
+   push-propagation-diagnostic-forwarding "Config wire seal". Non-empty
+   publishes then pass through the independent global
+   `features."textDocument/publishDiagnostics"` scheduler; aggregation decides
+   *what* may publish, while that per-URI scheduler decides *when* it reaches
+   the wire.
 5. **Layer-level `concatenated` for `textDocument/codeAction`** — ✅
    implemented (and the DEFAULT for the method): the virt layer's actions
    (merged across every injection region the request range overlaps) and the
