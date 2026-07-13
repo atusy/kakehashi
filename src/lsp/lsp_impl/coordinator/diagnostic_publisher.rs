@@ -1193,6 +1193,17 @@ mod tests {
     async fn shutdown_rejects_new_forwarded_refresh_inputs() {
         let (service, _socket) = LspService::new(Kakehashi::new);
         let server = service.inner();
+        server
+            .settings_manager
+            .set_capabilities(ClientCapabilities {
+                workspace: Some(WorkspaceClientCapabilities {
+                    diagnostics: Some(DiagnosticWorkspaceClientCapabilities {
+                        refresh_support: Some(true),
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            });
         server.shutdown_token.cancel();
         let publisher = DiagnosticPublisher::new(server);
 
