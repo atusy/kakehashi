@@ -409,6 +409,11 @@ pub(crate) struct DiagnosticAggregator {
     /// (same-host republishes are serialized), and forgotten on `didClose`
     /// ([`Self::forget_published`]).
     last_published: Mutex<HashMap<Url, Vec<Diagnostic>>>,
+    /// The last set that actually completed a client-facing wire send. This is
+    /// distinct from `last_published`, which advances when a set is recorded
+    /// even if debounce withholds it. Keeping both lets an A -> pending B -> A
+    /// reversion cancel the wire debt instead of sending duplicate A.
+    last_wire_published: Mutex<HashMap<Url, Vec<Diagnostic>>>,
     /// Single-flight guard for the **workspace-wide** `workspace/diagnostic/refresh`
     /// nudge (#497). `workspace/diagnostic/refresh` is param-less and workspace-wide,
     /// so concurrent refreshes are redundant; without this, a burst of set-changing
@@ -987,6 +992,36 @@ impl DiagnosticAggregator {
             .lock()
             .recover_poison("DiagnosticAggregator::last_published")
             .remove(host);
+        self.last_wire_published
+            .lock()
+            .recover_poison("DiagnosticAggregator::last_wire_published")
+            .remove(host);
+    }
+
+    /// Settle a withheld wire debt when the latest merged set has reverted to
+    /// what the editor already received. The parked task may still wake, but
+    /// `dirty = false` makes its unchanged republish a no-op.
+    pub(crate) fn settle_wire_reversion(&self, host: &Url, diagnostics: &[Diagnostic]) -> bool {
+        let matches_wire = self
+            .last_wire_published
+            .lock()
+            .recover_poison("DiagnosticAggregator::last_wire_published")
+            .get(host)
+            .is_some_and(|wire| {
+                wire.as_slice() == diagnostics || same_diagnostic_multiset(wire, diagnostics)
+            });
+        if !matches_wire {
+            return false;
+        }
+        if let Some(gate) = self
+            .wire_gate
+            .lock()
+            .recover_poison("DiagnosticAggregator::wire_gate")
+            .get_mut(host)
+        {
+            gate.dirty = false;
+        }
+        true
     }
 
     /// Begin a workspace-wide refresh under the single-flight + coverage guard
@@ -1295,6 +1330,22 @@ impl DiagnosticAggregator {
                     dirty: false,
                 },
             );
+        }
+        drop(gates);
+
+        // Called under the per-host republish lock after the send await, so the
+        // last-recorded set is exactly the set that just reached the wire.
+        if let Some(sent) = self
+            .last_published
+            .lock()
+            .recover_poison("DiagnosticAggregator::last_published")
+            .get(host)
+            .cloned()
+        {
+            self.last_wire_published
+                .lock()
+                .recover_poison("DiagnosticAggregator::last_wire_published")
+                .insert(host.clone(), sent);
         }
     }
 
