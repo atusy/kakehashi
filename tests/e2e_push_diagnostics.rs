@@ -454,7 +454,10 @@ fn e2e_downstream_crash_evicts_its_pushed_diagnostics() {
 /// will send `workspace/diagnostic/refresh` (it's gated on this; an editor that
 /// doesn't advertise it is never sent the request).
 fn refresh_capable_caps() -> Value {
-    json!({ "workspace": { "diagnostics": { "refreshSupport": true } } })
+    json!({
+        "workspace": { "diagnostics": { "refreshSupport": true } },
+        "window": { "workDoneProgress": true }
+    })
 }
 
 #[test]
@@ -910,11 +913,11 @@ fn e2e_downstream_refresh_burst_is_coalesced() {
         "textDocument/diagnostic",
         json!({ "textDocument": { "uri": MD_URI } }),
     );
-    let (leading_pull, mut refreshes_before_barrier, mut barrier_pushes) = client
-        .receive_response_for_id_watching_server_requests_and_notification(
+    let (leading_pull, mut refreshes_before_barrier, mut barriers) = client
+        .receive_response_for_id_watching_two_server_requests(
             leading_pull_id,
             "workspace/diagnostic/refresh",
-            "textDocument/publishDiagnostics",
+            "window/workDoneProgress/create",
         );
     assert!(
         leading_pull["result"]["items"]
@@ -929,33 +932,27 @@ fn e2e_downstream_refresh_burst_is_coalesced() {
         "single-flight must suppress refreshes during the leading pull: {refreshes_before_barrier:?}"
     );
 
-    if barrier_pushes.is_empty() {
-        let (barrier, refreshes) = client
-            .wait_for_notification_watching_server_requests(
-                "textDocument/publishDiagnostics",
+    if barriers.is_empty() {
+        let (barrier_id, refreshes) = client
+            .wait_for_server_request_watching_server_requests(
+                "window/workDoneProgress/create",
                 "workspace/diagnostic/refresh",
                 Duration::from_secs(5),
             )
-            .expect("the upstream FIFO must publish the post-burst barrier");
-        barrier_pushes.push(barrier);
+            .expect("the upstream FIFO must expose the refresh-neutral progress barrier");
+        barriers.push((barrier_id, Value::Null));
         refreshes_before_barrier.extend(refreshes);
     }
-    assert!(
-        barrier_pushes
-            .iter()
-            .any(|params| params["diagnostics"]
-                .as_array()
-                .is_some_and(|diagnostics| diagnostics.iter().any(|diagnostic| {
-                    diagnostic["message"].as_str().is_some_and(|message| {
-                        message.ends_with("diagnostic-refresh-burst-admitted")
-                    })
-                }))),
-        "the upstream FIFO must expose the post-burst push barrier: {barrier_pushes:?}"
-    );
     assert!(
         refreshes_before_barrier.is_empty(),
         "single-flight must hold through complete burst admission: {refreshes_before_barrier:?}"
     );
+    assert_eq!(
+        barriers.len(),
+        1,
+        "expected one progress barrier: {barriers:?}"
+    );
+    client.send_response(barriers.remove(0).0, json!(null));
     client.send_response(id, json!(null));
 
     let (trailing_id, _) = client

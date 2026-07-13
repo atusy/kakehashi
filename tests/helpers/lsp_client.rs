@@ -349,6 +349,7 @@ fn read_framed_message<R: BufRead>(reader: &mut R) -> ReadOutcome {
 /// (method, params) collected while waiting for it — the result of
 /// [`LspClient::wait_for_server_request_watching`].
 pub(crate) type WatchedServerRequest = (Value, Value, Vec<(String, Value)>);
+type TwoWatchedServerRequestResponse = (Value, Vec<(Value, Value)>, Vec<(Value, Value)>);
 
 impl LspClient {
     /// Spawn the kakehashi binary and create a new LSP client.
@@ -481,15 +482,15 @@ impl LspClient {
         &mut self,
         expected_id: i64,
         watched_method: Option<&str>,
-        watched_notification: Option<&str>,
-    ) -> (Value, Vec<(Value, Value)>, Vec<Value>) {
+        second_watched_method: Option<&str>,
+    ) -> TwoWatchedServerRequestResponse {
         const MAX_MESSAGES: u32 = 1000;
         const TIMEOUT: Duration = Duration::from_secs(30);
 
         let start_time = Instant::now();
         let mut message_count = 0u32;
         let mut watched = Vec::new();
-        let mut watched_notifications = Vec::new();
+        let mut second_watched = Vec::new();
 
         loop {
             // Check message count threshold
@@ -534,20 +535,20 @@ impl LspClient {
                             id.clone(),
                             message.get("params").cloned().unwrap_or(Value::Null),
                         ));
+                    } else if Some(method) == second_watched_method {
+                        second_watched.push((
+                            id.clone(),
+                            message.get("params").cloned().unwrap_or(Value::Null),
+                        ));
                     }
                     continue;
                 }
                 // Response should match our request id
                 if id.as_i64() == Some(expected_id) {
-                    return (message, watched, watched_notifications);
+                    return (message, watched, second_watched);
                 }
             }
-            if message.get("id").is_none()
-                && message.get("method").and_then(Value::as_str) == watched_notification
-            {
-                watched_notifications.push(message.get("params").cloned().unwrap_or(Value::Null));
-            }
-            // Otherwise it's an unrelated notification like window/logMessage, skip it
+            // Otherwise it's a notification like window/logMessage, skip it
         }
     }
 
@@ -615,26 +616,26 @@ impl LspClient {
         expected_id: i64,
         watched_method: &str,
     ) -> (Value, Vec<(Value, Value)>) {
-        let (response, requests, _) = self.receive_response_for_id_watching_server_requests_inner(
+        let (response, watched, _) = self.receive_response_for_id_watching_server_requests_inner(
             expected_id,
             Some(watched_method),
             None,
         );
-        (response, requests)
+        (response, watched)
     }
 
-    /// Receive a response while preserving both concurrent server requests and
-    /// notifications used as an ordered forwarding barrier.
-    pub(crate) fn receive_response_for_id_watching_server_requests_and_notification(
+    /// Receive a response while preserving two independently significant
+    /// server-request methods that race with it.
+    pub(crate) fn receive_response_for_id_watching_two_server_requests(
         &mut self,
         expected_id: i64,
         watched_method: &str,
-        watched_notification: &str,
-    ) -> (Value, Vec<(Value, Value)>, Vec<Value>) {
+        second_watched_method: &str,
+    ) -> TwoWatchedServerRequestResponse {
         self.receive_response_for_id_watching_server_requests_inner(
             expected_id,
             Some(watched_method),
-            Some(watched_notification),
+            Some(second_watched_method),
         )
     }
 
@@ -673,9 +674,9 @@ impl LspClient {
         }
     }
 
-    /// Wait for a notification while preserving server requests of
-    /// `watched_method` that precede it on the editor-facing connection.
-    pub(crate) fn wait_for_notification_watching_server_requests(
+    /// Wait for one server request while preserving requests of another method
+    /// that precede it on the editor-facing connection.
+    pub(crate) fn wait_for_server_request_watching_server_requests(
         &mut self,
         expected_method: &str,
         watched_method: &str,
@@ -692,18 +693,14 @@ impl LspClient {
 
             let message = self.try_receive_message(remaining)?;
             let method = message.get("method").and_then(Value::as_str);
-            if message.get("id").is_some() && method == Some(watched_method) {
-                watched.push((
-                    message.get("id").cloned().expect("checked above"),
-                    message.get("params").cloned().unwrap_or(Value::Null),
-                ));
-                continue;
-            }
-            if message.get("id").is_none() && method == Some(expected_method) {
-                return Some((
-                    message.get("params").cloned().unwrap_or(Value::Null),
-                    watched,
-                ));
+            if let Some(id) = message.get("id").cloned() {
+                if method == Some(watched_method) {
+                    watched.push((id, message.get("params").cloned().unwrap_or(Value::Null)));
+                    continue;
+                }
+                if method == Some(expected_method) {
+                    return Some((id, watched));
+                }
             }
         }
     }

@@ -870,29 +870,30 @@ fn main() {
                         diagnostic_generation += 1;
                         request(&mut writer, json!(id), "workspace/diagnostic/refresh");
                     }
-                    if let Some(uri) = message
-                        .pointer("/params/textDocument/uri")
-                        .and_then(Value::as_str)
-                    {
-                        // This push shares the loss-intolerant upstream FIFO with
-                        // refreshes. Its editor-facing publication is therefore
-                        // an observable barrier after all burst admissions.
-                        notify(
-                            &mut writer,
-                            "textDocument/publishDiagnostics",
-                            json!({
-                                "uri": uri,
-                                "diagnostics": [{
-                                    "range": {
-                                        "start": { "line": 0, "character": 0 },
-                                        "end": { "line": 0, "character": 1 }
-                                    },
-                                    "severity": 3,
-                                    "message": "diagnostic-refresh-burst-admitted"
-                                }]
-                            }),
-                        );
-                    }
+                    // Work-done progress shares the loss-intolerant upstream
+                    // FIFO with refreshes but cannot schedule a diagnostic
+                    // refresh itself. Its editor-facing create request is an
+                    // observable, refresh-neutral admission barrier.
+                    let token = json!("diagnostic-refresh-burst-admitted");
+                    request_with_params(
+                        &mut writer,
+                        json!(2000),
+                        "window/workDoneProgress/create",
+                        json!({ "token": token }),
+                    );
+                    notify(
+                        &mut writer,
+                        "$/progress",
+                        json!({
+                            "token": token,
+                            "value": { "kind": "begin", "title": "refresh burst barrier" }
+                        }),
+                    );
+                    notify(
+                        &mut writer,
+                        "$/progress",
+                        json!({ "token": token, "value": { "kind": "end" } }),
+                    );
                 }
             }
             "codeLens/resolve" => {
