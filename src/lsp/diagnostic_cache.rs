@@ -497,7 +497,7 @@ pub(crate) struct ForwardedRefreshWaitSnapshot {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ForwardedRefreshWait {
     Restart(ForwardedRefreshWaitSnapshot),
-    SendTrailing,
+    SendTrailing(ForwardedRefreshWaitSnapshot),
     Settled,
     MaxWait {
         snapshot: ForwardedRefreshWaitSnapshot,
@@ -693,15 +693,43 @@ impl DiagnosticAggregator {
                     .last_activity_at
                     .expect("activity generation has a timestamp"),
             })
+        } else if debounce.covered_generation != Some(debounce.generation)
+            && debounce.refresh_epoch == debounce.refresh_epoch_at_last_activity
+        {
+            ForwardedRefreshWait::SendTrailing(ForwardedRefreshWaitSnapshot {
+                generation: debounce.generation,
+                last_activity_at: debounce
+                    .last_activity_at
+                    .expect("activity generation has a timestamp"),
+            })
         } else {
             debounce.task_scheduled = false;
-            if debounce.covered_generation != Some(debounce.generation)
-                && debounce.refresh_epoch == debounce.refresh_epoch_at_last_activity
-            {
-                ForwardedRefreshWait::SendTrailing
-            } else {
-                ForwardedRefreshWait::Settled
-            }
+            ForwardedRefreshWait::Settled
+        }
+    }
+
+    /// Release a quiet-edge claim after its forced refresh admission. If newer
+    /// activity arrived in the admission gap, keep the same task responsible
+    /// for settling that generation instead of letting it start a second
+    /// leading cycle beside the admitted trailing request.
+    pub(crate) fn finish_forwarded_refresh_admission(
+        &self,
+        admitted_generation: u64,
+    ) -> Option<ForwardedRefreshWaitSnapshot> {
+        let mut debounce = self
+            .forwarded_refresh_debounce
+            .lock()
+            .recover_poison("DiagnosticAggregator::forwarded_refresh_debounce");
+        if debounce.generation == admitted_generation {
+            debounce.task_scheduled = false;
+            None
+        } else {
+            Some(ForwardedRefreshWaitSnapshot {
+                generation: debounce.generation,
+                last_activity_at: debounce
+                    .last_activity_at
+                    .expect("activity generation has a timestamp"),
+            })
         }
     }
 
@@ -2445,10 +2473,15 @@ mod tests {
         else {
             panic!("activity during the wait must restart the settle window");
         };
-        assert_eq!(
-            agg.finish_forwarded_refresh_wait(latest.generation, false),
-            ForwardedRefreshWait::SendTrailing,
-            "activity after the leading send releases exactly one trailing refresh"
+        let ForwardedRefreshWait::SendTrailing(admitted) =
+            agg.finish_forwarded_refresh_wait(latest.generation, false)
+        else {
+            panic!("activity after the leading send releases one trailing refresh");
+        };
+        agg.mark_forwarded_refresh_covered(admitted.generation);
+        assert!(
+            agg.finish_forwarded_refresh_admission(admitted.generation)
+                .is_none()
         );
         assert!(
             agg.begin_forwarded_refresh_debounce().is_some(),
@@ -2550,11 +2583,48 @@ mod tests {
         else {
             panic!("the waiter must observe the newer activity");
         };
-        assert_eq!(
-            agg.finish_forwarded_refresh_wait(newest.generation, false),
-            ForwardedRefreshWait::SendTrailing,
+        assert!(
+            matches!(
+                agg.finish_forwarded_refresh_wait(newest.generation, false),
+                ForwardedRefreshWait::SendTrailing(snapshot)
+                    if snapshot.generation == newest.generation
+            ),
             "an older admission must not suppress the newer generation"
         );
+    }
+
+    #[test]
+    fn quiet_trailing_keeps_the_claim_until_refresh_admission() {
+        let agg = DiagnosticAggregator::new();
+        let first = agg
+            .begin_forwarded_refresh_debounce()
+            .expect("the first refresh schedules the settle task");
+        agg.mark_forwarded_refresh_covered(first.generation);
+        assert!(agg.begin_forwarded_refresh_debounce().is_none());
+        let ForwardedRefreshWait::Restart(latest) =
+            agg.finish_forwarded_refresh_wait(first.generation, false)
+        else {
+            panic!("the waiter must observe post-leading activity");
+        };
+
+        let ForwardedRefreshWait::SendTrailing(admitted) =
+            agg.finish_forwarded_refresh_wait(latest.generation, false)
+        else {
+            panic!("the quiet edge needs a trailing refresh");
+        };
+        assert!(
+            agg.begin_forwarded_refresh_debounce().is_none(),
+            "the trailing edge must retain the claim until admission"
+        );
+        agg.mark_forwarded_refresh_covered(admitted.generation);
+        let newer = agg
+            .finish_forwarded_refresh_admission(admitted.generation)
+            .expect("activity in the admission gap stays owned by this task");
+        assert!(matches!(
+            agg.finish_forwarded_refresh_wait(newer.generation, false),
+            ForwardedRefreshWait::SendTrailing(snapshot)
+                if snapshot.generation == newer.generation
+        ));
     }
 
     #[test]

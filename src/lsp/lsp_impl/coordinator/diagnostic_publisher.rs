@@ -190,8 +190,25 @@ impl DiagnosticPublisher {
                             break;
                         }
                         match decision {
-                            crate::lsp::diagnostic_cache::ForwardedRefreshWait::SendTrailing => {
-                                publisher.request_pull_diagnostic_refresh_inner(true, false);
+                            crate::lsp::diagnostic_cache::ForwardedRefreshWait::SendTrailing(
+                                admitted,
+                            ) => {
+                                if publisher.request_pull_diagnostic_refresh_inner(true, false) {
+                                    publisher
+                                        .aggregator
+                                        .mark_forwarded_refresh_covered(admitted.generation);
+                                    if let Some(latest) = publisher
+                                        .aggregator
+                                        .finish_forwarded_refresh_admission(admitted.generation)
+                                    {
+                                        snapshot = latest;
+                                        deadline = tokio::time::Instant::now()
+                                            + FORWARDED_REFRESH_MAX_WAIT;
+                                        continue;
+                                    }
+                                } else {
+                                    publisher.aggregator.cancel_forwarded_refresh_debounce();
+                                }
                                 break;
                             }
                             crate::lsp::diagnostic_cache::ForwardedRefreshWait::Settled => break,
