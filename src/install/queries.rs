@@ -414,14 +414,51 @@ fn install_queries_recursive(
     })
 }
 
-pub fn query_install_is_complete(queries_dir: &Path) -> bool {
-    let Ok(directory_metadata) = fs::symlink_metadata(queries_dir) else {
-        return false;
+#[cfg(unix)]
+fn open_directory_nofollow(path: &Path) -> std::io::Result<fs::File> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+
+    fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(nix::libc::O_DIRECTORY | nix::libc::O_NOFOLLOW)
+        .open(path)
+}
+
+#[cfg(windows)]
+fn open_directory_nofollow(path: &Path) -> std::io::Result<fs::File> {
+    use std::os::windows::fs::OpenOptionsExt as _;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
     };
-    if !directory_metadata.is_dir() {
-        return false;
+
+    fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn open_directory_nofollow(_path: &Path) -> std::io::Result<fs::File> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "no-follow directory handles are unavailable on this platform",
+    ))
+}
+
+fn directory_identity_nofollow(path: &Path) -> std::io::Result<same_file::Handle> {
+    let directory = open_directory_nofollow(path)?;
+    let metadata = directory.metadata()?;
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "query language entry is not a real directory",
+        ));
     }
-    let Ok(directory_before) = same_file::Handle::from_path(queries_dir) else {
+    same_file::Handle::from_file(directory)
+}
+
+pub fn query_install_is_complete(queries_dir: &Path) -> bool {
+    let Ok(directory_before) = directory_identity_nofollow(queries_dir) else {
         return false;
     };
     let highlights_path = queries_dir.join("highlights.scm");
@@ -438,17 +475,10 @@ pub fn query_install_is_complete(queries_dir: &Path) -> bool {
         return false;
     }
 
-    // Child checks above necessarily resolve a pathname. Revalidate both the
-    // managed entry type and directory identity afterward so replacing the
-    // directory with a symlink during those checks cannot make an external
-    // query tree satisfy the completeness predicate.
-    let Ok(directory_metadata) = fs::symlink_metadata(queries_dir) else {
-        return false;
-    };
-    if !directory_metadata.is_dir() {
-        return false;
-    }
-    let Ok(directory_after) = same_file::Handle::from_path(queries_dir) else {
+    // Child checks above necessarily resolve a pathname. Re-open the managed
+    // entry without following links and compare directory identity afterward,
+    // so a replacement symlink cannot satisfy the completeness predicate.
+    let Ok(directory_after) = directory_identity_nofollow(queries_dir) else {
         return false;
     };
     directory_before == directory_after
