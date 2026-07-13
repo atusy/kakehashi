@@ -904,10 +904,15 @@ fn e2e_downstream_refresh_burst_is_coalesced() {
         .expect("the leading refresh must reach the editor immediately");
     client.send_response(id, json!(null));
 
-    let leading_pull = client.send_request(
+    let leading_pull_id = client.send_request_async(
         "textDocument/diagnostic",
         json!({ "textDocument": { "uri": MD_URI } }),
     );
+    let (leading_pull, refreshes_during_leading_pull) = client
+        .receive_response_for_id_watching_server_requests(
+            leading_pull_id,
+            "workspace/diagnostic/refresh",
+        );
     assert!(
         leading_pull["result"]["items"]
             .as_array()
@@ -917,14 +922,27 @@ fn e2e_downstream_refresh_burst_is_coalesced() {
         "the leading refresh must expose the first downstream generation: {leading_pull}"
     );
 
-    let (trailing_id, _) = client
-        .wait_for_server_request("workspace/diagnostic/refresh", Duration::from_millis(1200))
-        .expect("activity after the leading edge must produce one trailing refresh");
+    let (trailing_id, _) = match refreshes_during_leading_pull.as_slice() {
+        [] => client
+            .wait_for_server_request("workspace/diagnostic/refresh", Duration::from_millis(1200))
+            .expect("activity after the leading edge must produce one trailing refresh"),
+        [(id, params)] => (id.clone(), params.clone()),
+        refreshes => panic!("the leading pull observed duplicate refreshes: {refreshes:?}"),
+    };
     client.send_response(trailing_id, json!(null));
 
-    let trailing_pull = client.send_request(
+    let trailing_pull_id = client.send_request_async(
         "textDocument/diagnostic",
         json!({ "textDocument": { "uri": MD_URI } }),
+    );
+    let (trailing_pull, refreshes_during_trailing_pull) = client
+        .receive_response_for_id_watching_server_requests(
+            trailing_pull_id,
+            "workspace/diagnostic/refresh",
+        );
+    assert!(
+        refreshes_during_trailing_pull.is_empty(),
+        "the trailing pull must not conceal duplicate refreshes: {refreshes_during_trailing_pull:?}"
     );
     let items = trailing_pull["result"]["items"]
         .as_array()
