@@ -552,7 +552,8 @@ struct DiagnosticMetrics {
     refreshes_requested: AtomicU64,
     /// `workspace/diagnostic/refresh` requests actually written to the wire (post
     /// forwarded-refresh debounce + single-flight/coverage gates, including
-    /// trailing fires). `requested - sent` is the total coalescing/gate savings.
+    /// trailing fires). `requested - sent` includes coalesced, gated, and
+    /// shutdown-suppressed requests.
     refreshes_sent: AtomicU64,
     /// `textDocument/diagnostic` pulls answered (every return of the LSP handler).
     pulls_answered: AtomicU64,
@@ -2528,7 +2529,7 @@ mod tests {
         assert_eq!(
             m.refreshes_requested.saturating_sub(m.refreshes_sent),
             2,
-            "requested - sent is what coalescing and the gates saved"
+            "requested - sent includes coalesced, gated, and shutdown-suppressed requests"
         );
         assert_eq!(m.pulls_answered, 2);
         assert_eq!(m.pull_micros_total, 400);
