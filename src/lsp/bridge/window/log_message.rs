@@ -17,15 +17,33 @@ use tower_lsp_server::ls_types::LogMessageParams;
 use super::{prefixed_message, send_window_notification};
 use crate::lsp::bridge::actor::{ServerRequestDeps, UpstreamNotification};
 
+#[derive(Deserialize)]
+struct LogMessageType {
+    #[serde(rename = "type")]
+    typ: tower_lsp_server::ls_types::MessageType,
+}
+
 /// Forward a `window/logMessage` notification to the editor.
 pub(in crate::lsp::bridge) fn forward(
     message: &serde_json::Value,
     server_prefix: &str,
     deps: &ServerRequestDeps,
 ) {
-    // Deserialize from a reference to avoid cloning the params value.
+    let Ok(log_type) = LogMessageType::deserialize(&message["params"]) else {
+        debug!(
+            target: "kakehashi::bridge::reader",
+            "{}Dropping window/logMessage with invalid params",
+            server_prefix
+        );
+        return;
+    };
+    if !deps.dynamic_capabilities.allows_log_message(log_type.typ) {
+        return;
+    }
+
+    // Deserialize the message text only after the cheap severity gate, so a
+    // suppressed downstream flood does not allocate one String per message.
     match LogMessageParams::deserialize(&message["params"]) {
-        Ok(params) if !deps.dynamic_capabilities.allows_log_message(params.typ) => {}
         Ok(params) => send_window_notification(
             deps,
             server_prefix,

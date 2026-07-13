@@ -678,9 +678,10 @@ impl LogMessageLevel {
         match value {
             value if value == Self::Error as u8 => Self::Error,
             value if value == Self::Warning as u8 => Self::Warning,
+            value if value == Self::Info as u8 => Self::Info,
             value if value == Self::Log as u8 => Self::Log,
             value if value == Self::Off as u8 => Self::Off,
-            _ => Self::Info,
+            _ => Self::Off,
         }
     }
 
@@ -694,10 +695,10 @@ impl LogMessageLevel {
                 message_type,
                 MessageType::ERROR | MessageType::WARNING | MessageType::INFO
             ),
-            Self::Log => matches!(
-                message_type,
-                MessageType::ERROR | MessageType::WARNING | MessageType::INFO | MessageType::LOG
-            ),
+            // `MessageType` is an open integer enum. Treat `log` as the
+            // pass-through threshold so LSP 3.18 `Debug = 5` and future
+            // severities are not silently dropped by an older ls-types crate.
+            Self::Log => true,
             Self::Off => false,
         }
     }
@@ -1002,7 +1003,16 @@ mod tests {
         assert!(LogMessageLevel::Info.allows(MessageType::INFO));
         assert!(!LogMessageLevel::Info.allows(MessageType::LOG));
         assert!(LogMessageLevel::Log.allows(MessageType::LOG));
+        let debug: MessageType = serde_json::from_str("5").unwrap();
+        assert!(LogMessageLevel::Log.allows(debug));
+        assert!(!LogMessageLevel::Info.allows(debug));
         assert!(!LogMessageLevel::Off.allows(MessageType::ERROR));
+
+        assert_eq!(
+            LogMessageLevel::from_u8(LogMessageLevel::Info.as_u8()),
+            LogMessageLevel::Info
+        );
+        assert_eq!(LogMessageLevel::from_u8(u8::MAX), LogMessageLevel::Off);
     }
 
     #[test]
