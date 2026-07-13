@@ -161,7 +161,11 @@ impl DiagnosticPublisher {
         tokio::spawn(async move {
             tokio::select! {
                 biased;
-                _ = publisher.shutdown.cancelled() => {}
+                _ = publisher.shutdown.cancelled() => {
+                    publisher
+                        .aggregator
+                        .finish_forwarded_refresh_wait(generation, true);
+                }
                 _ = wait_for_forwarded_refresh_settle(&publisher.aggregator, generation) => {
                     // Cancellation can race immediately after `select!` chose the
                     // timer branch, so re-check at the refresh admission boundary.
@@ -1187,6 +1191,13 @@ mod tests {
         let metrics = server.diagnostics.metrics_snapshot();
         assert_eq!(metrics.refreshes_requested, 1);
         assert_eq!(metrics.refreshes_sent, 0, "shutdown must suppress the send");
+        assert!(
+            server
+                .diagnostics
+                .begin_forwarded_refresh_debounce()
+                .is_some(),
+            "shutdown must release the debounce task claim"
+        );
     }
 
     #[tokio::test(start_paused = true)]
