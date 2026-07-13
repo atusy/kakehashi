@@ -567,10 +567,10 @@ impl LanguageServerPool {
         let mut connections = self.connections.lock().await;
         let mut invalidated = Vec::new();
         for (key, handle) in connections.iter() {
-            let follows_client_workspace = key.is_client_fallback() || key.is_shared();
+            let follows_client_workspace = key.is_client_fallback();
             if !follows_client_workspace {
-                // Marker-owned connections derive their workspace from the
-                // marker root, not the upstream client-folder snapshot.
+                // Marker-owned and shared connections derive their folders
+                // from marker-root acquisition, not this client snapshot.
                 continue;
             }
             if handle.state() == ConnectionState::Initializing {
@@ -3007,6 +3007,37 @@ mod tests {
 
         assert!(pool.connections.lock().await.contains_key(&key));
         assert_eq!(handle.workspace_folders().snapshot(), None);
+    }
+
+    #[tokio::test]
+    async fn workspace_folder_change_does_not_touch_shared_marker_folders() {
+        let pool = LanguageServerPool::new();
+        let key = ConnectionKey::shared("shared");
+        let handle = create_handle_with_key(ConnectionState::Ready, key.clone()).await;
+        handle.set_server_capabilities(capable_workspace_folders_caps());
+        let marker = tower_lsp_server::ls_types::WorkspaceFolder {
+            uri: "file:///repo/pkg".parse().unwrap(),
+            name: "pkg".to_string(),
+        };
+        handle
+            .workspace_folders()
+            .replace(Some(vec![marker.clone()]));
+        pool.insert_connection(Arc::clone(&handle)).await;
+
+        pool.apply_workspace_folder_change(
+            vec![tower_lsp_server::ls_types::WorkspaceFolder {
+                uri: "file:///other".parse().unwrap(),
+                name: "other".to_string(),
+            }],
+            &[tower_lsp_server::ls_types::WorkspaceFolder {
+                uri: "file:///repo".parse().unwrap(),
+                name: "repo".to_string(),
+            }],
+        )
+        .await;
+
+        assert!(pool.connections.lock().await.contains_key(&key));
+        assert_eq!(handle.workspace_folders().snapshot(), Some(vec![marker]));
     }
 
     fn shared_config() -> crate::config::settings::BridgeServerConfig {
