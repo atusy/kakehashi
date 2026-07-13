@@ -197,6 +197,11 @@ pub(crate) async fn handle_semantic_tokens_full(
         // second Rayon branch; otherwise retain the sequential fast path.
         let ((host_complete, host_elapsed), (injection_result, injections_elapsed)) =
             if should_parallelize {
+                // Match the sequential injection boundary: do not dispatch
+                // either Rayon branch when supersession has already landed.
+                if is_cancelled() {
+                    return None;
+                }
                 rayon::join(host_work, injection_work)
             } else {
                 let host_result = host_work();

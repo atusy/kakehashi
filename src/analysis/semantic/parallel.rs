@@ -1447,6 +1447,10 @@ pub(crate) fn collect_injection_tokens_parallel(
     (all_tokens, active_regions)
 }
 
+/// Visit items until cancellation is observed between items.
+///
+/// A cancellation that arrives during `visit` is observed before the next
+/// item; the current opaque callback is allowed to finish.
 fn visit_until_cancelled<T>(
     items: &[T],
     cancel: Option<&crate::cancel::CancelToken>,
