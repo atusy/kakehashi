@@ -28,7 +28,7 @@ use crate::lsp::diagnostic_cache::{
 use crate::lsp::lsp_impl::Kakehashi;
 use crate::lsp::lsp_impl::coordinator::diagnostic::DiagnosticSnapshotPreparer;
 use crate::lsp::lsp_impl::text_document::publish_diagnostic::{
-    PullLayerOutcome, collect_push_diagnostics_with_error_sink,
+    DiagnosticSnapshotLineage, PullLayerOutcome, collect_push_diagnostics_with_error_sink,
 };
 use crate::lsp::settings_manager::SettingsManager;
 use tower_lsp_server::Client;
@@ -292,22 +292,9 @@ impl DiagnosticPublisher {
                     log::warn!(target: LOG_TARGET, "Keeping the previous pull layer after refresh prefetch failed for {uri}");
                     return;
                 }
-                if lineage.is_some_and(|lineage| {
-                    publisher.documents.get(&uri).is_none_or(|document| {
-                        document.incarnation() != lineage.incarnation
-                            || document.content_version() != lineage.content_version
-                    })
-                }) {
-                    log::debug!(target: LOG_TARGET, "Discarding stale refresh prefetch for {uri}");
-                    return;
-                }
-                match outcome {
-                    PullLayerOutcome::Skip => {}
-                    PullLayerOutcome::Clear => publisher.clear_pull_layer(&uri).await,
-                    PullLayerOutcome::Publish(diagnostics) => {
-                        publisher.publish_pull_layer(&uri, diagnostics).await;
-                    }
-                }
+                publisher
+                    .commit_refresh_prefetch(&uri, lineage, outcome)
+                    .await;
             });
         }
 
@@ -327,6 +314,52 @@ impl DiagnosticPublisher {
             }
         }
         true
+    }
+
+    /// Commit a refresh prefetch only while its document inputs are current.
+    ///
+    /// The lineage check and synchronous cache mutation share the document's
+    /// edit lock with didChange/didClose/didOpen. This closes the check→commit
+    /// race without holding the lock across the editor-facing republish await.
+    async fn commit_refresh_prefetch(
+        &self,
+        uri: &Url,
+        lineage: Option<DiagnosticSnapshotLineage>,
+        outcome: PullLayerOutcome,
+    ) {
+        let Some(lineage) = lineage else {
+            return;
+        };
+        let edit_lock = self.documents.edit_lock(uri);
+        let edit_guard = edit_lock.lock().await;
+        let Some(document) = self.documents.get(uri) else {
+            drop(edit_guard);
+            self.documents.remove_edit_lock_if_unshared(uri, &edit_lock);
+            log::debug!(target: LOG_TARGET, "Discarding refresh prefetch for closed {uri}");
+            return;
+        };
+        let current = {
+            document.incarnation() == lineage.incarnation
+                && document.content_version() == lineage.content_version
+        };
+        drop(document);
+        if !current {
+            log::debug!(target: LOG_TARGET, "Discarding stale refresh prefetch for {uri}");
+            return;
+        }
+
+        match outcome {
+            PullLayerOutcome::Skip => return,
+            PullLayerOutcome::Clear => {
+                self.aggregator
+                    .evict_source(uri, &DiagnosticSource::PullLayer);
+            }
+            PullLayerOutcome::Publish(diagnostics) => {
+                self.aggregator.set_pull_layer(uri, diagnostics);
+            }
+        }
+        drop(edit_guard);
+        self.republish(uri).await;
     }
 
     fn diagnostic_refresh_supported(&self) -> bool {

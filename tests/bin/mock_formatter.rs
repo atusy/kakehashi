@@ -340,20 +340,11 @@ fn main() {
                         || matches!(
                             mode.as_str(),
                             "diagnostics-refresh-prefetch"
-                                | "diagnostics-refresh-prefetch-ack-order"
                                 | "diagnostics-refresh-prefetch-disabled"
                                 | "diagnostics-refresh-prefetch-unchanged"
                         )
                     {
                         request(&mut writer, json!(1000), "workspace/diagnostic/refresh");
-                        if mode == "diagnostics-refresh-prefetch-ack-order" {
-                            match read_message(&mut reader) {
-                                Some(reply) if reply.get("id") == Some(&json!(1000)) => {}
-                                other => panic!(
-                                    "refresh prefetch started before its downstream ACK: {other:?}"
-                                ),
-                            }
-                        }
                     } else if mode == "diagnostics-refresh-burst" {
                         diagnostic_generation = 1;
                         request(&mut writer, json!(1000), "workspace/diagnostic/refresh");
@@ -840,9 +831,7 @@ fn main() {
             "textDocument/diagnostic" => {
                 if matches!(
                     mode.as_str(),
-                    "diagnostics-refresh-prefetch"
-                        | "diagnostics-refresh-prefetch-ack-order"
-                        | "diagnostics-refresh-prefetch-disabled"
+                    "diagnostics-refresh-prefetch" | "diagnostics-refresh-prefetch-disabled"
                 ) {
                     diagnostic_generation += 1;
                     std::thread::sleep(std::time::Duration::from_millis(1000));
@@ -892,6 +881,20 @@ fn main() {
                         );
                     } else {
                         respond(&mut writer, id, json!({ "kind": "full", "items": [] }));
+                    }
+                    continue;
+                }
+                if mode == "diagnostics-refresh-prefetch-ack-order" {
+                    diagnostic_generation += 1;
+                    respond(&mut writer, id, json!({ "kind": "full", "items": [] }));
+                    if diagnostic_generation == 1 {
+                        request(&mut writer, json!(1000), "workspace/diagnostic/refresh");
+                        match read_message(&mut reader) {
+                            Some(reply) if reply.get("id") == Some(&json!(1000)) => {}
+                            other => panic!(
+                                "refresh prefetch started before its downstream ACK: {other:?}"
+                            ),
+                        }
                     }
                     continue;
                 }
@@ -976,9 +979,7 @@ fn main() {
                     format!("mock-diagnostic-generation:{diagnostic_generation}")
                 } else if matches!(
                     mode.as_str(),
-                    "diagnostics-refresh-prefetch"
-                        | "diagnostics-refresh-prefetch-ack-order"
-                        | "diagnostics-refresh-prefetch-disabled"
+                    "diagnostics-refresh-prefetch" | "diagnostics-refresh-prefetch-disabled"
                 ) {
                     format!("mock-diagnostic-refresh-prefetched:{diagnostic_generation}")
                 } else {

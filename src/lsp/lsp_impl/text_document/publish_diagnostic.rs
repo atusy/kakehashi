@@ -168,8 +168,9 @@ pub(crate) async fn collect_push_diagnostics_with_error_sink(
         for region_ctx in virt_contexts {
             let pool = Arc::clone(pool);
             let request_error_sink = request_error_sink.clone();
-            // Push diagnostics run in LSP mode only — failures are log-only
-            // (the editor re-pulls), so no request-error sink is threaded.
+            // Ordinary push diagnostics use no sink (failures are log-only);
+            // refresh prefetch installs one so it can preserve the last good
+            // PullLayer when any participating request fails.
             join_set.spawn(async move {
                 collect_region_diagnostics(&region_ctx, pool, &request_error_sink).await
             });
@@ -194,8 +195,8 @@ pub(crate) async fn collect_push_diagnostics_with_error_sink(
     let host_fut = async {
         match &host {
             // Pull only when enabled; a configured-but-gated host context exists
-            // for the re-sync (above), not the pull. Push diagnostics are
-            // LSP-mode-only, so failures are log-only (`&None` error sink).
+            // for the re-sync (above), not the pull. The caller chooses whether
+            // failures are log-only or counted for refresh-prefetch preservation.
             Some(ctx) if host_pull_enabled => {
                 collect_host_diagnostics(ctx, Arc::clone(pool), request_error_sink).await
             }
