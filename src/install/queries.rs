@@ -757,13 +757,14 @@ fn write_uninstall_tombstone(
     queries_parent: &Path,
     language: &str,
 ) -> Result<(), QueryInstallError> {
-    write_uninstall_tombstone_with_before_publish(queries_parent, language, |_, _| {})
+    write_uninstall_tombstone_with_before_publish(queries_parent, language, |_, _| {}, |_| Ok(()))
 }
 
 fn write_uninstall_tombstone_with_before_publish(
     queries_parent: &Path,
     language: &str,
     before_publish: impl FnOnce(&Path, &Path),
+    _sync_parent: impl FnOnce(&Path) -> std::io::Result<()>,
 ) -> Result<(), QueryInstallError> {
     validate_safe_language_name(language)?;
     let path = uninstall_tombstone_path(queries_parent, language);
@@ -1646,9 +1647,14 @@ mod tests {
         fs::write(&tombstone, "old tombstone\n").unwrap();
         let outside_alias = temp.path().join("outside-alias");
 
-        write_uninstall_tombstone_with_before_publish(&queries_parent, "rust", |path, _| {
-            fs::hard_link(path, &outside_alias).unwrap();
-        })
+        write_uninstall_tombstone_with_before_publish(
+            &queries_parent,
+            "rust",
+            |path, _| {
+                fs::hard_link(path, &outside_alias).unwrap();
+            },
+            |_| Ok(()),
+        )
         .unwrap();
 
         assert_eq!(
@@ -1677,6 +1683,7 @@ mod tests {
                 fs::remove_file(staged_path).unwrap();
                 symlink(&victim, staged_path).unwrap();
             },
+            |_| Ok(()),
         );
 
         assert!(
@@ -1694,11 +1701,15 @@ mod tests {
         let tombstone = uninstall_tombstone_path(&queries_parent, "rust");
         fs::write(&tombstone, "old tombstone\n").unwrap();
 
-        let result =
-            write_uninstall_tombstone_with_before_publish(&queries_parent, "rust", |path, _| {
+        let result = write_uninstall_tombstone_with_before_publish(
+            &queries_parent,
+            "rust",
+            |path, _| {
                 fs::remove_file(path).unwrap();
                 fs::create_dir(path).unwrap();
-            });
+            },
+            |_| Ok(()),
+        );
 
         assert!(result.is_err(), "a directory cannot be replaced by a file");
         let names: Vec<_> = fs::read_dir(&queries_parent)
@@ -1788,10 +1799,15 @@ mod tests {
         let victim = temp.path().join("victim");
         fs::write(&victim, "keep me\n").unwrap();
 
-        write_uninstall_tombstone_with_before_publish(&queries_parent, "rust", |path, _| {
-            fs::remove_file(path).unwrap();
-            symlink_file(&victim, path).unwrap();
-        })
+        write_uninstall_tombstone_with_before_publish(
+            &queries_parent,
+            "rust",
+            |path, _| {
+                fs::remove_file(path).unwrap();
+                symlink_file(&victim, path).unwrap();
+            },
+            |_| Ok(()),
+        )
         .unwrap();
 
         assert_eq!(fs::read_to_string(victim).unwrap(), "keep me\n");
