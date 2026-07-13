@@ -465,11 +465,14 @@ fn open_directory_nofollow(path: &Path) -> std::io::Result<fs::File> {
 fn open_directory_nofollow(path: &Path) -> std::io::Result<fs::File> {
     use std::os::windows::fs::OpenOptionsExt as _;
     use windows_sys::Win32::Storage::FileSystem::{
-        FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+        FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES,
     };
 
     fs::OpenOptions::new()
-        .read(true)
+        // Metadata identity needs attributes, not directory enumeration.
+        // Keeping this narrower than GENERIC_READ preserves traversable-but-
+        // non-listable directory ACLs, matching the child pathname checks.
+        .access_mode(FILE_READ_ATTRIBUTES)
         .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
         .open(path)
 }
