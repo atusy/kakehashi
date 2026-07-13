@@ -82,7 +82,7 @@ mod tests {
     use std::sync::Arc;
     use std::thread;
 
-    use tower_lsp_server::ls_types::{Registration, Unregistration};
+    use tower_lsp_server::ls_types::{MessageType, Registration, Unregistration};
 
     use super::DynamicCapabilityRegistry;
 
@@ -160,6 +160,37 @@ mod tests {
 
         // "diag-2" should still be registered
         assert!(registry.has_registration("textDocument/diagnostic"));
+    }
+
+    #[test]
+    fn downstream_log_gate_matches_every_global_level() {
+        use crate::config::settings::LogMessageLevel;
+
+        let registry = DynamicCapabilityRegistry::new();
+        let debug: MessageType = serde_json::from_str("5").unwrap();
+        let message_types = [
+            MessageType::ERROR,
+            MessageType::WARNING,
+            MessageType::INFO,
+            MessageType::LOG,
+            debug,
+        ];
+        for level in [
+            LogMessageLevel::Error,
+            LogMessageLevel::Warning,
+            LogMessageLevel::Info,
+            LogMessageLevel::Log,
+            LogMessageLevel::Off,
+        ] {
+            registry.store_log_message_level(level);
+            for message_type in message_types {
+                assert_eq!(
+                    registry.allows_log_message(message_type),
+                    level.allows(message_type),
+                    "downstream atomic gate diverged at {level:?}"
+                );
+            }
+        }
     }
 
     #[test]
