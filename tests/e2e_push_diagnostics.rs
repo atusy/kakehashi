@@ -61,7 +61,10 @@ fn init_client_with_mode_caps(mode: &str, capabilities: Value) -> (LspClient, te
         .arg("--config-file")
         .arg(config_path.to_str().expect("utf8 path"))
         .build();
-    let initialization_options = if mode == "diagnostics-refresh-burst" {
+    let initialization_options = if matches!(
+        mode,
+        "diagnostics-refresh-burst" | "diagnostics-refresh-prefetch-disabled"
+    ) {
         json!({
             "languageServers": {
                 "mock-push": { "cmd": [mock_bin(), mode], "languages": ["lua"] }
@@ -890,6 +893,101 @@ fn e2e_downstream_refresh_forwarded_to_refresh_capable_client() {
             .wait_for_server_request("workspace/diagnostic/refresh", Duration::from_secs(15))
             .is_some(),
         "a downstream's workspace/diagnostic/refresh must reach a refresh-capable editor (#521)"
+    );
+
+    client.send_request("shutdown", json!(null));
+    client.send_notification("exit", json!(null));
+}
+
+#[test]
+fn e2e_downstream_refresh_prefetches_before_forwarding() {
+    let (mut client, _config_dir) =
+        init_client_with_mode_caps("diagnostics-refresh-prefetch", refresh_capable_caps());
+    open_host(&mut client);
+
+    assert!(
+        client
+            .wait_for_server_request("workspace/diagnostic/refresh", Duration::from_millis(100),)
+            .is_none(),
+        "the editor refresh must wait for the delayed pullFallback prefetch"
+    );
+
+    let (_, published) = client
+        .wait_for_notification_where(
+            &["textDocument/publishDiagnostics"],
+            Duration::from_secs(15),
+            |params| {
+                params["diagnostics"].as_array().is_some_and(|diagnostics| {
+                    diagnostics.iter().any(|diagnostic| {
+                        diagnostic["message"].as_str().is_some_and(|message| {
+                            message.starts_with("mock-diagnostic-refresh-prefetched:")
+                        })
+                    })
+                })
+            },
+        )
+        .expect("the refresh cycle must publish its completed pullFallback prefetch");
+    assert_eq!(published["uri"], json!(MD_URI));
+
+    let (refresh_id, _) = client
+        .wait_for_server_request("workspace/diagnostic/refresh", Duration::from_secs(2))
+        .expect("the editor refresh must follow the completed prefetch");
+    client.send_response(refresh_id, json!(null));
+
+    client.send_request("shutdown", json!(null));
+    client.send_notification("exit", json!(null));
+}
+
+#[test]
+fn e2e_downstream_refresh_prefetch_is_client_capability_independent() {
+    let (mut client, _config_dir) =
+        init_client_with_mode_caps("diagnostics-refresh-prefetch", json!({}));
+    open_host(&mut client);
+
+    client
+        .wait_for_notification_where(
+            &["textDocument/publishDiagnostics"],
+            Duration::from_secs(15),
+            |params| {
+                params["diagnostics"].as_array().is_some_and(|diagnostics| {
+                    diagnostics.iter().any(|diagnostic| {
+                        diagnostic["message"] == json!("mock-diagnostic-refresh-prefetched:2")
+                    })
+                })
+            },
+        )
+        .expect("refresh prefetch must run even when the editor lacks refreshSupport");
+    assert!(
+        client
+            .wait_for_server_request("workspace/diagnostic/refresh", Duration::from_millis(400),)
+            .is_none(),
+        "an editor without refreshSupport must not receive a refresh request"
+    );
+
+    client.send_request("shutdown", json!(null));
+    client.send_notification("exit", json!(null));
+}
+
+#[test]
+fn e2e_downstream_refresh_skips_pull_fallback_disabled_contexts() {
+    let (mut client, _config_dir) = init_client_with_mode_caps(
+        "diagnostics-refresh-prefetch-disabled",
+        refresh_capable_caps(),
+    );
+    open_host(&mut client);
+
+    let (refresh_id, _) = client
+        .wait_for_server_request("workspace/diagnostic/refresh", Duration::from_millis(250))
+        .expect("pullFallback=false must not delay the editor refresh with a downstream pull");
+    client.send_response(refresh_id, json!(null));
+    assert!(
+        client
+            .wait_for_notification(
+                "textDocument/publishDiagnostics",
+                Duration::from_millis(400),
+            )
+            .is_none(),
+        "pullFallback=false must not publish a prefetched diagnostic set"
     );
 
     client.send_request("shutdown", json!(null));

@@ -217,6 +217,8 @@ fn main() {
                     "diagnostics"
                     | "diagnostics-fail"
                     | "diagnostics-malformed"
+                    | "diagnostics-refresh-prefetch"
+                    | "diagnostics-refresh-prefetch-disabled"
                     | "diagnostics-refresh-burst"
                     | "diagnostics-push-pullcap" => json!({
                         "diagnosticProvider": {
@@ -330,7 +332,13 @@ fn main() {
                     // editor (#521). Fire-and-forget: the bridge's `null` ack comes
                     // back as a response with no `method`, which the read loop
                     // ignores. A fixed id is fine since nothing awaits the ack.
-                    if mode == "diagnostics-refresh" {
+                    if mode == "diagnostics-refresh"
+                        || matches!(
+                            mode.as_str(),
+                            "diagnostics-refresh-prefetch"
+                                | "diagnostics-refresh-prefetch-disabled"
+                        )
+                    {
                         request(&mut writer, json!(1000), "workspace/diagnostic/refresh");
                     } else if mode == "diagnostics-refresh-burst" {
                         diagnostic_generation = 1;
@@ -816,6 +824,13 @@ fn main() {
                 respond(&mut writer, id, json!({ "executed": command }));
             }
             "textDocument/diagnostic" => {
+                if matches!(
+                    mode.as_str(),
+                    "diagnostics-refresh-prefetch" | "diagnostics-refresh-prefetch-disabled"
+                ) {
+                    diagnostic_generation += 1;
+                    std::thread::sleep(std::time::Duration::from_millis(300));
+                }
                 if mode == "diagnostics-fail" {
                     // Healthy handshake (advertises diagnosticProvider), broken
                     // request: exercises the request-time diagnostic failure
@@ -839,6 +854,11 @@ fn main() {
                 // synced before the pull.
                 let diagnostic_message = if mode == "diagnostics-refresh-burst" {
                     format!("mock-diagnostic-generation:{diagnostic_generation}")
+                } else if matches!(
+                    mode.as_str(),
+                    "diagnostics-refresh-prefetch" | "diagnostics-refresh-prefetch-disabled"
+                ) {
+                    format!("mock-diagnostic-refresh-prefetched:{diagnostic_generation}")
                 } else {
                     message
                         .pointer("/params/textDocument/uri")
