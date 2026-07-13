@@ -400,7 +400,7 @@ impl QueryLoader {
         for path in search_paths {
             for ext in PARSER_EXTENSIONS {
                 let parser_path = Self::parser_library_path(path.as_ref(), language, ext);
-                if parser_path.exists() {
+                if crate::install::parser::parser_file_is_regular(&parser_path) {
                     return Some(parser_path);
                 }
             }
@@ -536,6 +536,36 @@ mod tests {
                 .unwrap()
                 .to_string_lossy()
                 .ends_with("parser/rust.so")
+        );
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn implicit_library_resolution_rejects_managed_parser_symlinks() {
+        let dir = tempdir().unwrap();
+        let parser_dir = dir.path().join("parser");
+        fs::create_dir_all(&parser_dir).unwrap();
+        let external = dir.path().join("external.so");
+        fs::write(&external, "external parser").unwrap();
+        let managed = parser_dir.join("rust.so");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&external, &managed).unwrap();
+        #[cfg(windows)]
+        if let Err(e) = std::os::windows::fs::symlink_file(&external, &managed) {
+            if e.kind() == std::io::ErrorKind::PermissionDenied || e.raw_os_error() == Some(1314) {
+                return;
+            }
+            panic!("failed to create parser symlink: {e}");
+        }
+
+        assert!(
+            QueryLoader::resolve_library_path(None, "rust", &[dir.path()]).is_none(),
+            "implicit managed parser lookup must not follow links"
+        );
+        assert_eq!(
+            QueryLoader::resolve_library_path(managed.to_str(), "rust", NO_SEARCH_PATHS),
+            Some(managed),
+            "explicit parser configuration remains an intentional path override"
         );
     }
 

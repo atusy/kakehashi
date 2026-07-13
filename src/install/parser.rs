@@ -120,10 +120,85 @@ pub fn parser_file_exists(language: &str, data_dir: &Path) -> Option<PathBuf> {
         data_dir
             .join("parser")
             .join(format!("{}.{}", language, std::env::consts::DLL_EXTENSION));
-    if parser_file.exists() {
+    if parser_file_is_regular(&parser_file) {
         Some(parser_file)
     } else {
         None
+    }
+}
+
+/// Whether `path` is a regular managed parser leaf rather than a link/reparse
+/// entry whose target merely looks like a parser file.
+pub fn parser_file_is_regular(path: &Path) -> bool {
+    let Ok(metadata) = fs::symlink_metadata(path) else {
+        return false;
+    };
+    if !metadata.file_type().is_file() {
+        return false;
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt as _;
+        use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
+
+        if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return false;
+        }
+    }
+    true
+}
+
+fn parser_leaf_is_link(metadata: &fs::Metadata) -> bool {
+    #[cfg(unix)]
+    {
+        metadata.file_type().is_symlink()
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt as _;
+        use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
+
+        metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = metadata;
+        false
+    }
+}
+
+fn parser_leaf_requires_force(path: &Path) -> std::io::Result<bool> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => Ok(!parser_leaf_is_link(&metadata)),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(err) => Err(err),
+    }
+}
+
+#[cfg(windows)]
+fn remove_existing_parser_leaf(path: &Path) -> std::io::Result<()> {
+    use std::os::windows::fs::MetadataExt as _;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT,
+    };
+
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => return Err(err),
+    };
+    let attributes = metadata.file_attributes();
+    if attributes & FILE_ATTRIBUTE_DIRECTORY != 0 && attributes & FILE_ATTRIBUTE_REPARSE_POINT == 0
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::IsADirectory,
+            "managed parser leaf is an ordinary directory",
+        ));
+    }
+    if attributes & FILE_ATTRIBUTE_DIRECTORY != 0 {
+        fs::remove_dir(path)
+    } else {
+        fs::remove_file(path)
     }
 }
 
@@ -282,7 +357,7 @@ pub fn install_parser(
     let parser_file = parser_dir.join(format!("{}.{}", language, std::env::consts::DLL_EXTENSION));
 
     // Check if parser already exists
-    if parser_file.exists() && !options.force {
+    if !options.force && parser_leaf_requires_force(&parser_file)? {
         return Err(ParserInstallError::AlreadyExists(parser_file));
     }
 
@@ -353,7 +428,10 @@ pub fn install_parser(
             // first there (a small non-atomic window, acceptable on the
             // non-primary platform).
             #[cfg(windows)]
-            let _ = fs::remove_file(&parser_file);
+            if let Err(e) = remove_existing_parser_leaf(&parser_file) {
+                let _ = fs::remove_file(&tmp_file);
+                return Err(ParserInstallError::IoError(e));
+            }
             if let Err(e) = fs::rename(&tmp_file, &parser_file) {
                 let _ = fs::remove_file(&tmp_file);
                 return Err(ParserInstallError::IoError(e));
@@ -937,6 +1015,91 @@ fn invalid_metadata(message: String) -> ParserInstallError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn parser_file_exists_rejects_a_managed_symlink() {
+        let temp = tempdir().unwrap();
+        let parser_dir = temp.path().join("parser");
+        fs::create_dir_all(&parser_dir).unwrap();
+        let external = temp
+            .path()
+            .join(format!("external.{}", std::env::consts::DLL_EXTENSION));
+        fs::write(&external, "external parser").unwrap();
+        let managed = parser_dir.join(format!("lua.{}", std::env::consts::DLL_EXTENSION));
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&external, &managed).unwrap();
+        #[cfg(windows)]
+        if let Err(e) = std::os::windows::fs::symlink_file(&external, &managed) {
+            if e.kind() == std::io::ErrorKind::PermissionDenied || e.raw_os_error() == Some(1314) {
+                return;
+            }
+            panic!("failed to create parser symlink: {e}");
+        }
+
+        assert_eq!(
+            parser_file_exists("lua", temp.path()),
+            None,
+            "managed parser links must not suppress repair"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_force_install_preserves_a_managed_parser_socket() {
+        use std::os::unix::net::UnixListener;
+
+        let temp = tempdir().unwrap();
+        let managed = temp
+            .path()
+            .join(format!("lua.{}", std::env::consts::DLL_EXTENSION));
+        let listener = UnixListener::bind(&managed).unwrap();
+
+        assert!(parser_leaf_requires_force(&managed).unwrap());
+        assert!(managed.exists());
+
+        drop(listener);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn replacement_removes_a_managed_parser_directory_link() {
+        let temp = tempdir().unwrap();
+        let external = temp.path().join("external");
+        fs::create_dir(&external).unwrap();
+        let managed = temp
+            .path()
+            .join(format!("lua.{}", std::env::consts::DLL_EXTENSION));
+        if let Err(e) = std::os::windows::fs::symlink_dir(&external, &managed) {
+            if e.kind() == std::io::ErrorKind::PermissionDenied || e.raw_os_error() == Some(1314) {
+                return;
+            }
+            panic!("failed to create parser directory link: {e}");
+        }
+
+        remove_existing_parser_leaf(&managed).unwrap();
+
+        assert!(!managed.exists());
+        assert!(
+            external.is_dir(),
+            "removing the link must preserve its target"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn replacement_preserves_an_ordinary_parser_directory() {
+        let temp = tempdir().unwrap();
+        let managed = temp
+            .path()
+            .join(format!("lua.{}", std::env::consts::DLL_EXTENSION));
+        fs::create_dir(&managed).unwrap();
+
+        let err = remove_existing_parser_leaf(&managed).unwrap_err();
+
+        assert_eq!(err.kind(), std::io::ErrorKind::IsADirectory);
+        assert!(managed.is_dir());
+    }
     use tempfile::tempdir;
 
     const TREE_SITTER_JSON_URL: &str =

@@ -408,7 +408,7 @@ fn run_language_status(verbose: bool) -> Result<(), ExitCode> {
     if let Ok(entries) = fs::read_dir(&parser_dir) {
         for entry in entries.flatten() {
             let path = entry.path();
-            let is_parser = path.is_file()
+            let is_parser = parser::parser_file_is_regular(&path)
                 && path
                     .extension()
                     .is_some_and(|ext| ext == std::env::consts::DLL_EXTENSION);
@@ -509,7 +509,7 @@ fn run_language_uninstall(
         if let Ok(entries) = fs::read_dir(&parser_dir) {
             for entry in entries.flatten() {
                 let path = entry.path();
-                let is_parser = path.is_file()
+                let is_parser = parser::parser_file_is_regular(&path)
                     && path
                         .extension()
                         .is_some_and(|ext| ext == std::env::consts::DLL_EXTENSION);
@@ -630,7 +630,11 @@ fn run_language_uninstall(
 /// Find the parser file for a language.
 fn find_parser_file(parser_dir: &std::path::Path, lang: &str) -> Option<PathBuf> {
     let path = parser_dir.join(format!("{}.{}", lang, std::env::consts::DLL_EXTENSION));
-    if path.is_file() { Some(path) } else { None }
+    if parser::parser_file_is_regular(&path) {
+        Some(path)
+    } else {
+        None
+    }
 }
 
 /// Write content to stdout or a file, with --force / --output semantics.
