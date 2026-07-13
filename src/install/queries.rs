@@ -766,11 +766,12 @@ fn write_uninstall_tombstone_with_before_publish(
     before_publish: impl FnOnce(&Path, &Path),
 ) -> Result<(), QueryInstallError> {
     validate_safe_language_name(language)?;
+    remove_stale_uninstall_stages(queries_parent, language)?;
     let path = uninstall_tombstone_path(queries_parent, language);
     validate_existing_tombstone(&path)?;
     let stage_prefix = format!(".{language}.uninstalled.");
     let mut builder = tempfile::Builder::new();
-    builder.prefix(&stage_prefix);
+    builder.prefix(&stage_prefix).suffix(".tmp");
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt as _;
@@ -784,6 +785,39 @@ fn write_uninstall_tombstone_with_before_publish(
     before_publish(&path, staged.path());
     let published = staged.persist(&path).map_err(|error| error.error)?;
     verify_published_tombstone(published, &path)?;
+    Ok(())
+}
+
+/// Remove crash-stranded private stages for `language`.
+///
+/// Production callers hold that language's [`QueryReplaceLockGuard`], so no
+/// live kakehashi publisher can own a matching stage while this sweep runs.
+/// File symlinks are removed as directory entries; matching directories are
+/// not managed by this file-stage namespace and are left untouched.
+fn remove_stale_uninstall_stages(
+    queries_parent: &Path,
+    language: &str,
+) -> Result<(), QueryInstallError> {
+    let prefix = format!(".{language}.uninstalled.");
+    for entry in fs::read_dir(queries_parent)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if !name.starts_with(&prefix) || !name.ends_with(".tmp") {
+            continue;
+        }
+        let file_type = entry.file_type()?;
+        if !file_type.is_file() && !file_type.is_symlink() {
+            continue;
+        }
+        match fs::remove_file(entry.path()) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(QueryInstallError::IoError(error)),
+        }
+    }
     Ok(())
 }
 
@@ -1540,6 +1574,22 @@ mod tests {
             vec![tombstone.file_name().unwrap().to_os_string()],
             "the private stage must be removed on every persist failure"
         );
+    }
+
+    #[test]
+    fn tombstone_publish_reclaims_crash_stranded_stage() {
+        let temp = TempDir::new().unwrap();
+        let queries_parent = temp.path().join("queries");
+        fs::create_dir_all(&queries_parent).unwrap();
+        let stale = queries_parent.join(".rust.uninstalled.crashed.tmp");
+        fs::write(&stale, "partial\n").unwrap();
+        let unrelated = queries_parent.join(".lua.uninstalled.crashed.tmp");
+        fs::write(&unrelated, "keep\n").unwrap();
+
+        write_uninstall_tombstone(&queries_parent, "rust").unwrap();
+
+        assert!(!stale.exists(), "same-language stale stage is managed");
+        assert!(unrelated.exists(), "other languages have separate locks");
     }
 
     #[test]
