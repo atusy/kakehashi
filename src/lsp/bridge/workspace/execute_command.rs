@@ -27,12 +27,34 @@ use crate::config::settings::WorkspaceSettings;
 use crate::config::{merge_bridge_server_configs, resolve_with_wildcard};
 use crate::lsp::bridge::actor::RouterCleanupGuard;
 use crate::lsp::bridge::decode_command;
-use crate::lsp::bridge::pool::{ConnectionHandle, LanguageServerPool, UpstreamId};
+use crate::lsp::bridge::pool::{ConnectionHandle, ConnectionState, LanguageServerPool, UpstreamId};
 use crate::lsp::bridge::protocol::{JsonRpcRequest, response_has_jsonrpc_error};
 use tower_lsp_server::ls_types::ExecuteCommandParams;
 use url::Url;
 
 const METHOD: &str = "workspace/executeCommand";
+
+#[derive(Debug, PartialEq, Eq)]
+enum ReadyPaletteOrigin {
+    None,
+    Unique(crate::lsp::bridge::ConnectionKey),
+    Ambiguous,
+}
+
+fn select_ready_palette_origin(
+    origins: &[crate::lsp::bridge::ConnectionKey],
+    mut is_ready: impl FnMut(&crate::lsp::bridge::ConnectionKey) -> bool,
+) -> ReadyPaletteOrigin {
+    let mut ready = origins.iter().filter(|key| is_ready(key));
+    let Some(first) = ready.next() else {
+        return ReadyPaletteOrigin::None;
+    };
+    if ready.next().is_some() {
+        ReadyPaletteOrigin::Ambiguous
+    } else {
+        ReadyPaletteOrigin::Unique(first.clone())
+    }
+}
 
 impl LanguageServerPool {
     /// Route a bridged `workspace/executeCommand` back to the origin downstream
@@ -160,13 +182,51 @@ impl LanguageServerPool {
         settings: &WorkspaceSettings,
         upstream_id: Option<UpstreamId>,
     ) -> Option<Value> {
-        let Some(key) = self.command_origins().route(&params.command) else {
+        let origins = self.command_origins().origins(&params.command);
+        if origins.is_empty() {
             warn!(
                 target: "kakehashi::bridge",
                 "executeCommand: {:?} is neither a bridged nor a registered command; ignoring",
                 params.command
             );
             return None;
+        }
+
+        // Resolve liveness from one connections-map snapshot. Handshakes may
+        // finish in any order, but the command linearizes here: exactly one
+        // Ready advertiser is safe; several are inherently ambiguous because a
+        // raw palette command carries no document/workspace identity.
+        let ready_keys: std::collections::HashSet<_> = {
+            let connections = self.connections().await;
+            origins
+                .iter()
+                .filter(|key| {
+                    connections
+                        .get(*key)
+                        .is_some_and(|handle| handle.state() == ConnectionState::Ready)
+                })
+                .cloned()
+                .collect()
+        };
+        let key = match select_ready_palette_origin(&origins, |key| ready_keys.contains(key)) {
+            ReadyPaletteOrigin::Unique(key) => key,
+            ReadyPaletteOrigin::Ambiguous => {
+                warn!(
+                    target: "kakehashi::bridge",
+                    "executeCommand: palette command {:?} has multiple live origins; ignoring",
+                    params.command
+                );
+                return None;
+            }
+            ReadyPaletteOrigin::None if origins.len() == 1 => origins[0].clone(),
+            ReadyPaletteOrigin::None => {
+                warn!(
+                    target: "kakehashi::bridge",
+                    "executeCommand: palette command {:?} has multiple registered origins and none is live; ignoring",
+                    params.command
+                );
+                return None;
+            }
         };
         let origin = key.server();
         let handle = match self.ready_connection_by_key(&key).await {
@@ -373,6 +433,38 @@ fn parse_execute_command_response(mut response: Value) -> Option<Value> {
 mod tests {
     use super::*;
     use serde_json::json;
+    use std::collections::HashSet;
+
+    #[test]
+    fn collision_routes_when_exactly_one_advertiser_is_live() {
+        let ruff =
+            crate::lsp::bridge::ConnectionKey::new("ruff", Some("file:///workspace/a".to_string()));
+        let eslint = crate::lsp::bridge::ConnectionKey::new(
+            "eslint",
+            Some("file:///workspace/b".to_string()),
+        );
+        let ready = HashSet::from([eslint.clone()]);
+
+        assert_eq!(
+            select_ready_palette_origin(&[ruff, eslint.clone()], |key| ready.contains(key)),
+            ReadyPaletteOrigin::Unique(eslint),
+        );
+    }
+
+    #[test]
+    fn collision_refuses_to_choose_between_live_advertisers() {
+        let ruff =
+            crate::lsp::bridge::ConnectionKey::new("ruff", Some("file:///workspace/a".to_string()));
+        let eslint = crate::lsp::bridge::ConnectionKey::new(
+            "eslint",
+            Some("file:///workspace/b".to_string()),
+        );
+
+        assert_eq!(
+            select_ready_palette_origin(&[ruff, eslint], |_| true),
+            ReadyPaletteOrigin::Ambiguous,
+        );
+    }
 
     #[test]
     fn parse_relays_a_real_result_verbatim() {
