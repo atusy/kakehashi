@@ -316,6 +316,7 @@ Configure language servers for bridging LSP requests in injection regions.
 | `workspaceMarkers` | Marker files/directories locating the workspace root the server is initialized with, following Neovim's `vim.fs.root` `(string\|string[])[]` shape. (The pre-rename key `rootMarkers` is still accepted as a deprecated alias.) Entries are tried **in list order** (earlier = higher priority): each entry is searched up the triggering document's ancestors nearest-first before the next entry is tried, so a higher-priority marker in a far ancestor outranks a lower-priority one sitting next to the document. A **nested array** is one equal-priority group where the nearest ancestor containing any of its names wins — e.g. `[["stylua.toml", ".luarc.json"], ".git"]` means "nearest of stylua.toml/.luarc.json, otherwise .git". The first matching entry's directory becomes the server's `rootUri` and sole workspace folder. Default: `[".git"]`. No marker hit falls back to the client-supplied root; an explicit `[]` disables the search. The connection pool is keyed by `(server, resolved root)`, so in a multi-root monorepo documents under different marker roots get their own downstream process, each rooted correctly; documents sharing a root (or the no-marker fallback) share one process. Trade-off: process count grows with the number of distinct roots opened, and there is currently no idle-eviction — a long session touching many roots keeps one process per root alive until shutdown. Servers that operate purely on `workspaceFolders` can opt out of this growth with `preferSharedInstance` (below). |
 | `onTypeFormattingTriggers` | Trigger characters for bridged `textDocument/onTypeFormatting` (e.g. `["}", ";"]`). kakehashi advertises the sorted union across all servers at initialize and forwards a request to a downstream server only when that server's own capabilities declare the typed character. Unset everywhere (default) → the capability is not advertised. |
 | `preferSharedInstance` | Prefer reusing **one** downstream process across every workspace root for this server instead of the default one-process-per-marker-root (above). Default `false`. It is a *preference*, honored only when the downstream server advertises `workspace.workspaceFolders.{supported, changeNotifications}`: when it does, kakehashi routes all roots to a single connection and announces each new root with `workspace/didChangeWorkspaceFolders`; when it does not, kakehashi logs once and silently falls back to the per-root-instance model. Because that fallback is universal, a blanket `languageServers._.preferSharedInstance = true` is safe across a mixed set of servers. Use it to bound process count and get cross-root navigation for servers that key purely off `workspaceFolders`; leave it `false` for servers needing per-root isolation (per-root virtualenv, conflicting tool/package versions) or that key behavior off the immutable `rootUri`. Note: removal/idle-eviction of folders is not modeled yet — the set only grows. |
+| `features."window/logMessage".logLevel` | Minimum downstream `window/logMessage` severity forwarded to the client: `error`, `warning`, `info`, `log`, or `off`. Unset preserves transparent passthrough. The setting applies live and does not affect `window/showMessage`. It may be placed under `languageServers._` and overridden per server. |
 
 > **Migration note**: `workspaceMarkers` was previously named `rootMarkers`
 > (aligning with the LSP spec's `workspaceFolders`). The old `rootMarkers` key
@@ -331,6 +332,26 @@ server's explicit value overrides the wildcard, so `_.preferSharedInstance =
 true` can still be opted out of per server with `preferSharedInstance =
 false`. A wildcard-only entry is never spawned itself, and a concrete server
 whose merged `cmd` is still empty is skipped.
+
+For example, this suppresses informational logs globally while silencing one
+particularly noisy server completely:
+
+```json
+{
+  "languageServers": {
+    "_": {
+      "features": {
+        "window/logMessage": { "logLevel": "warning" }
+      }
+    },
+    "noisy-ls": {
+      "features": {
+        "window/logMessage": { "logLevel": "off" }
+      }
+    }
+  }
+}
+```
 
 **Bridge Language Configuration:**
 
