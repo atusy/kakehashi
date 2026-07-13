@@ -768,6 +768,7 @@ fn write_uninstall_tombstone_with_before_publish(
     validate_safe_language_name(language)?;
     let path = uninstall_tombstone_path(queries_parent, language);
     let existing_permissions = validate_existing_tombstone(&path)?;
+    let had_existing_tombstone = existing_permissions.is_some();
     let stage_counter = QUERY_TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
     let stage_prefix = format!(
         ".{language}.uninstalled.{}.{}.",
@@ -790,9 +791,74 @@ fn write_uninstall_tombstone_with_before_publish(
     staged.write_all(b"ok\n")?;
     staged.as_file().sync_all()?;
     before_publish(&path, staged.path());
-    let published = staged.persist(&path).map_err(|error| error.error)?;
+    let published = publish_staged_tombstone(staged, &path, had_existing_tombstone)?;
     verify_published_tombstone(published, &path)?;
     Ok(())
+}
+
+#[cfg(not(windows))]
+fn publish_staged_tombstone(
+    staged: tempfile::NamedTempFile,
+    path: &Path,
+    _had_existing_tombstone: bool,
+) -> std::io::Result<fs::File> {
+    staged.persist(path).map_err(|error| error.error)
+}
+
+#[cfg(windows)]
+fn publish_staged_tombstone(
+    staged: tempfile::NamedTempFile,
+    path: &Path,
+    had_existing_tombstone: bool,
+) -> std::io::Result<fs::File> {
+    if !had_existing_tombstone {
+        return staged.persist(path).map_err(|error| error.error);
+    }
+
+    use std::os::windows::ffi::OsStrExt as _;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_ATTRIBUTE_NORMAL, REPLACEFILE_WRITE_THROUGH, ReplaceFileW, SetFileAttributesW,
+    };
+
+    let (file, temporary_path) = staged.into_parts();
+    let temporary_wide: Vec<u16> = temporary_path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let destination_wide: Vec<u16> = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    // NamedTempFile marks the stage temporary. Normalize it before
+    // publication, matching tempfile::persist's Windows implementation.
+    // SAFETY: both UTF-16 buffers are NUL-terminated and live through calls.
+    if unsafe { SetFileAttributesW(temporary_wide.as_ptr(), FILE_ATTRIBUTE_NORMAL) } == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // ReplaceFileW preserves the replaced file's security descriptor and
+    // other metadata that std::fs::Permissions cannot represent on Windows.
+    // WRITE_THROUGH also waits for the replacement to reach disk.
+    // SAFETY: paths are valid NUL-terminated buffers; optional pointers are
+    // null; `file` keeps the staged inode open for later identity checking.
+    let succeeded = unsafe {
+        ReplaceFileW(
+            destination_wide.as_ptr(),
+            temporary_wide.as_ptr(),
+            std::ptr::null(),
+            REPLACEFILE_WRITE_THROUGH,
+            std::ptr::null(),
+            std::ptr::null(),
+        )
+    };
+    if succeeded == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // The temporary pathname moved away. Dropping TempPath attempts to unlink
+    // that now-missing old name and must not touch the published destination.
+    drop(temporary_path);
+    Ok(file)
 }
 
 /// Open or create the managed tombstone leaf without following a link there.
