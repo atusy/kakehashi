@@ -1,9 +1,10 @@
 //! `window/logMessage` notification forwarder.
 //!
-//! Inbound (downstream → editor). Valid messages are enqueued here; the shared
-//! client-facing delivery boundary applies the workspace-wide severity policy
-//! used by kakehashi's own log messages too. A downstream flood cannot harm the bridge because the window
-//! channel is bounded and drop-on-full (see [`UpstreamNotification`]). The text
+//! Inbound (downstream → editor). The live workspace threshold is checked before
+//! enqueue so suppressed logs cannot consume bounded queue capacity; the shared
+//! client-facing delivery boundary rechecks it for configuration races and uses
+//! the same policy for kakehashi's own messages. A downstream flood cannot harm
+//! the bridge because the window channel is bounded and drop-on-full (see [`UpstreamNotification`]). The text
 //! is prefixed with the originating server name so output from multiple bridged
 //! servers stays distinguishable.
 //!
