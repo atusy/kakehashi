@@ -49,6 +49,8 @@ opt-level = 3
 
 [dependencies]
 arc-swap = "1"
+cap-primitives = "4"
+cap-std = "4"
 clap = { version = "4", features = ["derive"] }
 dashmap = "6"
 dirs = "6"
@@ -60,7 +62,6 @@ log = "0.4"
 lua-pattern = { version = "0.1", features = ["to-regex"] }
 path-clean = "1"
 regex = "1"
-same-file = "1"
 schemars = { version = "1", features = ["preserve_order"] }
 serde = { version = "1", features = ["derive"] }
 # regex-fancy (pure Rust) over regex-onig (C oniguruma): we only compile
@@ -115,6 +116,9 @@ e2e = []
 # Signal::SIGPIPE for asserting the termination signal.
 [target.'cfg(unix)'.dev-dependencies]
 nix = { version = "0.31", features = ["fs", "signal"] }
+
+[target.'cfg(windows)'.dev-dependencies]
+junction = { version = "2", default-features = false }
 
 [dev-dependencies]
 tokio-test = "0.4"

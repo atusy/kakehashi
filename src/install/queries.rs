@@ -415,13 +415,14 @@ fn install_queries_recursive(
 }
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
-fn open_directory_nofollow(path: &Path) -> std::io::Result<fs::File> {
-    use std::os::unix::fs::OpenOptionsExt as _;
+fn query_directory_open_options() -> cap_primitives::fs::OpenOptions {
+    use cap_primitives::fs::OpenOptionsExt as _;
 
-    fs::OpenOptions::new()
+    let mut options = cap_primitives::fs::OpenOptions::new();
+    options
         .read(true)
-        .custom_flags(nix::libc::O_PATH | nix::libc::O_DIRECTORY | nix::libc::O_NOFOLLOW)
-        .open(path)
+        .custom_flags(nix::libc::O_PATH | nix::libc::O_DIRECTORY);
+    options
 }
 
 #[cfg(any(
@@ -429,15 +430,19 @@ fn open_directory_nofollow(path: &Path) -> std::io::Result<fs::File> {
     target_os = "ios",
     target_os = "tvos",
     target_os = "watchos",
-    target_os = "visionos"
+    target_os = "visionos",
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "solaris",
+    target_os = "illumos",
+    target_os = "aix"
 ))]
-fn open_directory_nofollow(path: &Path) -> std::io::Result<fs::File> {
-    use std::os::unix::fs::OpenOptionsExt as _;
+fn query_directory_open_options() -> cap_primitives::fs::OpenOptions {
+    use cap_primitives::fs::OpenOptionsExt as _;
 
-    fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(nix::libc::O_SEARCH | nix::libc::O_NOFOLLOW)
-        .open(path)
+    let mut options = cap_primitives::fs::OpenOptions::new();
+    options.read(true).custom_flags(nix::libc::O_SEARCH);
+    options
 }
 
 #[cfg(all(
@@ -449,79 +454,99 @@ fn open_directory_nofollow(path: &Path) -> std::io::Result<fs::File> {
         target_os = "ios",
         target_os = "tvos",
         target_os = "watchos",
-        target_os = "visionos"
+        target_os = "visionos",
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "solaris",
+        target_os = "illumos",
+        target_os = "aix"
     ))
 ))]
-fn open_directory_nofollow(path: &Path) -> std::io::Result<fs::File> {
-    use std::os::unix::fs::OpenOptionsExt as _;
-
-    fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(nix::libc::O_DIRECTORY | nix::libc::O_NOFOLLOW)
-        .open(path)
+fn query_directory_open_options() -> cap_primitives::fs::OpenOptions {
+    let mut options = cap_primitives::fs::OpenOptions::new();
+    options.read(true);
+    options
 }
 
 #[cfg(windows)]
-fn open_directory_nofollow(path: &Path) -> std::io::Result<fs::File> {
-    use std::os::windows::fs::OpenOptionsExt as _;
+fn query_directory_open_options() -> cap_primitives::fs::OpenOptions {
+    use cap_primitives::fs::OpenOptionsExt as _;
     use windows_sys::Win32::Storage::FileSystem::{
-        FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES,
+        FILE_FLAG_BACKUP_SEMANTICS, FILE_READ_ATTRIBUTES,
     };
 
-    fs::OpenOptions::new()
-        // Metadata identity needs attributes, not directory enumeration.
-        // Keeping this narrower than GENERIC_READ preserves traversable-but-
-        // non-listable directory ACLs, matching the child pathname checks.
+    let mut options = cap_primitives::fs::OpenOptions::new();
+    options
         .access_mode(FILE_READ_ATTRIBUTES)
-        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
-        .open(path)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS);
+    options
 }
 
 #[cfg(not(any(unix, windows)))]
-fn open_directory_nofollow(_path: &Path) -> std::io::Result<fs::File> {
-    Err(std::io::Error::new(
-        std::io::ErrorKind::Unsupported,
-        "no-follow directory handles are unavailable on this platform",
-    ))
+fn query_directory_open_options() -> cap_primitives::fs::OpenOptions {
+    let mut options = cap_primitives::fs::OpenOptions::new();
+    options.read(true);
+    options
 }
 
-fn directory_identity_nofollow(path: &Path) -> std::io::Result<same_file::Handle> {
-    let directory = open_directory_nofollow(path)?;
-    let metadata = directory.metadata()?;
-    if !metadata.is_dir() || metadata.file_type().is_symlink() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "query language entry is not a real directory",
+fn open_query_language_dir_nofollow(queries_dir: &Path) -> std::io::Result<fs::File> {
+    use cap_primitives::fs::FollowSymlinks;
+
+    let parent = queries_dir
+        .parent()
+        .ok_or_else(|| std::io::Error::other("query language directory has no parent"))?;
+    let name = queries_dir
+        .file_name()
+        .ok_or_else(|| std::io::Error::other("query language directory has no name"))?;
+    let parent = cap_std::fs::Dir::open_ambient_dir(parent, cap_std::ambient_authority())?;
+    let parent = parent.into_std_file();
+    let mut options = query_directory_open_options();
+    options
+        ._cap_fs_ext_follow(FollowSymlinks::No)
+        ._cap_fs_ext_maybe_dir(true);
+    let directory = cap_primitives::fs::open(&parent, Path::new(name), &options)?;
+    if !directory.metadata()?.is_dir() {
+        return Err(std::io::Error::other(
+            "query language entry is not a directory",
         ));
     }
-    same_file::Handle::from_file(directory)
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt as _;
+        use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
+
+        if directory.metadata()?.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err(std::io::Error::other(
+                "query language entry is a reparse point",
+            ));
+        }
+    }
+    Ok(directory)
 }
 
 pub fn query_install_is_complete(queries_dir: &Path) -> bool {
-    let Ok(directory_before) = directory_identity_nofollow(queries_dir) else {
+    use cap_primitives::fs::FollowSymlinks;
+
+    let Ok(directory) = open_query_language_dir_nofollow(queries_dir) else {
         return false;
     };
-    let highlights_path = queries_dir.join("highlights.scm");
-    let Ok(metadata) = fs::symlink_metadata(&highlights_path) else {
+    let Ok(metadata) =
+        cap_primitives::fs::stat(&directory, Path::new("highlights.scm"), FollowSymlinks::No)
+    else {
         return false;
     };
     // The marker is written only after a staged install has written all
     // required files. Legacy direct-write directories did not have it, so a
     // non-empty highlights.scm still counts as installed to avoid clobbering
     // valid user-managed or pre-marker query directories.
-    let complete = metadata.file_type().is_file()
-        && (queries_dir.join(QUERY_INSTALL_COMPLETE_MARKER).is_file() || metadata.len() > 0);
-    if !complete {
-        return false;
-    }
-
-    // Child checks above necessarily resolve a pathname. Re-open the managed
-    // entry without following links and compare directory identity afterward,
-    // so a replacement symlink cannot satisfy the completeness predicate.
-    let Ok(directory_after) = directory_identity_nofollow(queries_dir) else {
-        return false;
-    };
-    directory_before == directory_after
+    metadata.is_file()
+        && (cap_primitives::fs::stat(
+            &directory,
+            Path::new(QUERY_INSTALL_COMPLETE_MARKER),
+            FollowSymlinks::Yes,
+        )
+        .is_ok_and(|marker| marker.is_file())
+            || metadata.len() > 0)
 }
 
 /// Whether a kakehashi-owned crash backup is safe to restore as the exact
@@ -1181,7 +1206,37 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
+    #[cfg(windows)]
+    #[test]
+    fn query_install_is_incomplete_when_language_directory_is_a_junction() {
+        let temp = TempDir::new().unwrap();
+        let external = temp.path().join("external");
+        fs::create_dir_all(&external).unwrap();
+        fs::write(external.join("highlights.scm"), "(comment) @comment").unwrap();
+        let managed = temp.path().join("queries/lua");
+        fs::create_dir_all(managed.parent().unwrap()).unwrap();
+        junction::create(&external, &managed).unwrap();
+
+        assert!(
+            !query_install_is_complete(&managed),
+            "managed directory junctions must not redirect completeness checks"
+        );
+    }
+
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "tvos",
+        target_os = "watchos",
+        target_os = "visionos",
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "solaris",
+        target_os = "illumos",
+        target_os = "aix"
+    ))]
     #[test]
     fn query_install_completeness_does_not_require_directory_read_permission() {
         use std::os::unix::fs::PermissionsExt as _;
