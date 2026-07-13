@@ -427,6 +427,18 @@ pub fn query_install_is_complete(queries_dir: &Path) -> bool {
         && (queries_dir.join(QUERY_INSTALL_COMPLETE_MARKER).is_file() || metadata.len() > 0)
 }
 
+/// Whether a kakehashi-owned crash backup is safe to restore as the exact
+/// pre-replacement state. Unlike active install completeness, recovery keeps
+/// the existing user-managed symlink contract: the next install can then
+/// classify and repair the restored directory without losing its contents.
+fn query_backup_is_recoverable(queries_dir: &Path) -> bool {
+    let Ok(metadata) = fs::metadata(queries_dir.join("highlights.scm")) else {
+        return false;
+    };
+    metadata.is_file()
+        && (queries_dir.join(QUERY_INSTALL_COMPLETE_MARKER).is_file() || metadata.len() > 0)
+}
+
 /// RAII cleanup for a staging directory: removes it on drop so every error
 /// path (including `?` propagation added later) leaves nothing stranded. On
 /// the success path `replace_query_dir` renames the directory away, making
@@ -810,7 +822,7 @@ fn newest_complete_backup_dir(
         if !generated_backup_matches_language(name, language) {
             continue;
         }
-        if !backup_is_owned(&path) || !query_install_is_complete(&path) {
+        if !backup_is_owned(&path) || !query_backup_is_recoverable(&path) {
             continue;
         }
         let modified = entry
@@ -1000,6 +1012,29 @@ mod tests {
             !query_install_is_complete(&queries_dir),
             "managed query files must not be satisfied by an external symlink target"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recovery_restores_owned_backup_with_symlinked_highlights() {
+        use std::os::unix::fs::symlink;
+
+        let temp = TempDir::new().unwrap();
+        let queries_parent = temp.path().join("queries");
+        let backup = queries_parent.join(".lua.123.0.backup");
+        let outside = temp.path().join("outside.scm");
+        std::fs::create_dir_all(&backup).unwrap();
+        std::fs::write(&outside, "(identifier) @variable\n").unwrap();
+        symlink(&outside, backup.join("highlights.scm")).unwrap();
+        write_backup_ownership_marker(&backup).unwrap();
+
+        recover_interrupted_query_install(&queries_parent, "lua").unwrap();
+
+        assert!(
+            queries_parent.join("lua/highlights.scm").is_symlink(),
+            "crash recovery must restore the exact pre-replacement directory"
+        );
+        assert!(!backup.exists());
     }
 
     #[test]
