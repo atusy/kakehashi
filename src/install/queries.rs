@@ -421,6 +421,9 @@ pub fn query_install_is_complete(queries_dir: &Path) -> bool {
     if !directory_metadata.is_dir() {
         return false;
     }
+    let Ok(directory_before) = same_file::Handle::from_path(queries_dir) else {
+        return false;
+    };
     let highlights_path = queries_dir.join("highlights.scm");
     let Ok(metadata) = fs::symlink_metadata(&highlights_path) else {
         return false;
@@ -429,8 +432,26 @@ pub fn query_install_is_complete(queries_dir: &Path) -> bool {
     // required files. Legacy direct-write directories did not have it, so a
     // non-empty highlights.scm still counts as installed to avoid clobbering
     // valid user-managed or pre-marker query directories.
-    metadata.file_type().is_file()
-        && (queries_dir.join(QUERY_INSTALL_COMPLETE_MARKER).is_file() || metadata.len() > 0)
+    let complete = metadata.file_type().is_file()
+        && (queries_dir.join(QUERY_INSTALL_COMPLETE_MARKER).is_file() || metadata.len() > 0);
+    if !complete {
+        return false;
+    }
+
+    // Child checks above necessarily resolve a pathname. Revalidate both the
+    // managed entry type and directory identity afterward so replacing the
+    // directory with a symlink during those checks cannot make an external
+    // query tree satisfy the completeness predicate.
+    let Ok(directory_metadata) = fs::symlink_metadata(queries_dir) else {
+        return false;
+    };
+    if !directory_metadata.is_dir() {
+        return false;
+    }
+    let Ok(directory_after) = same_file::Handle::from_path(queries_dir) else {
+        return false;
+    };
+    directory_before == directory_after
 }
 
 /// Whether a kakehashi-owned crash backup is safe to restore as the exact

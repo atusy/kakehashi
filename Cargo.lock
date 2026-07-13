@@ -972,6 +972,7 @@ dependencies = [
  "rayon",
  "regex",
  "rstest",
+ "same-file",
  "schemars",
  "serde",
  "serde_json",
