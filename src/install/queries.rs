@@ -913,16 +913,20 @@ fn replace_query_dir(
         return Ok(ReplaceQueryDirResult::Uninstalled);
     }
 
-    if !queries_dir.exists() {
-        fs::rename(tmp_queries_dir, queries_dir)?;
-        return Ok(ReplaceQueryDirResult::Replaced);
+    match fs::symlink_metadata(queries_dir) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            fs::rename(tmp_queries_dir, queries_dir)?;
+            return Ok(ReplaceQueryDirResult::Replaced);
+        }
+        Err(e) => return Err(QueryInstallError::IoError(e)),
+        Ok(_) => {}
     }
 
     let backup_dir = unique_backup_query_dir(queries_dir, language);
     write_backup_ownership_marker(&backup_dir)?;
     if let Err(e) = fs::rename(queries_dir, &backup_dir) {
         let _ = fs::remove_file(backup_ownership_sidecar(&backup_dir));
-        // The target vanished between the exists() check above and this
+        // The target vanished between the metadata check above and this
         // rename (external cleanup — the lock only serializes kakehashi's own
         // installers): nothing to back up, so publish the staged dir instead
         // of aborting the install.
@@ -1560,6 +1564,38 @@ mod tests {
         assert!(
             !queries_parent.join("raced_lang").exists(),
             "uninstall tombstone must prevent restoring canonical queries"
+        );
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn replace_query_dir_repairs_a_dangling_language_directory_symlink() {
+        let temp_dir = TempDir::new().unwrap();
+        let queries_parent = temp_dir.path().join("queries");
+        fs::create_dir_all(&queries_parent).unwrap();
+        let queries_dir = queries_parent.join("lua");
+        let missing_target = temp_dir.path().join("missing");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&missing_target, &queries_dir).unwrap();
+        #[cfg(windows)]
+        std::os::windows::fs::symlink_dir(&missing_target, &queries_dir).unwrap();
+        let staged = create_unique_temp_query_dir(&queries_parent, "lua").unwrap();
+        fs::write(staged.join("highlights.scm"), "managed").unwrap();
+        write_install_marker_for_tests(&staged).unwrap();
+
+        let result = replace_query_dir(&staged, &queries_dir, "lua", false);
+
+        assert!(matches!(result, Ok(ReplaceQueryDirResult::Replaced)));
+        assert!(
+            fs::symlink_metadata(&queries_dir)
+                .unwrap()
+                .file_type()
+                .is_dir(),
+            "the dangling symlink must be replaced by the staged directory"
+        );
+        assert_eq!(
+            fs::read_to_string(queries_dir.join("highlights.scm")).unwrap(),
+            "managed"
         );
     }
 
