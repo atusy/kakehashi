@@ -441,11 +441,18 @@ impl LanguageServerPool {
                     super::diagnostic::parse_downstream_diagnostic_report(response)
                 },
             )
-            .await??;
+            .await?;
         let document_is_open = self
             .host_documents()
             .await
             .contains_key(&(cache_key.1.clone(), cache_key.0.clone()));
+        let report = match report {
+            Ok(report) => report,
+            Err(error) => {
+                self.record_failed_diagnostic_pull(&cache_key, snapshot, document_is_open);
+                return Err(error);
+            }
+        };
         Ok(self.resolve_diagnostic_pull_report(&cache_key, snapshot, report, document_is_open))
     }
 

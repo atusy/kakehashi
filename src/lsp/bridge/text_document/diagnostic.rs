@@ -120,7 +120,19 @@ impl LanguageServerPool {
                     parse_downstream_diagnostic_report(response)
                 },
             )
-            .await??;
+            .await?;
+
+        let report = match report {
+            Ok(report) => report,
+            Err(error) => {
+                self.record_failed_diagnostic_pull(
+                    &cache_key,
+                    snapshot,
+                    self.is_virtual_doc_open_on_connection(&cache_key.1, &cache_key.0),
+                );
+                return Err(error);
+            }
+        };
 
         let mut diagnostics = self.resolve_diagnostic_pull_report(
             &cache_key,
@@ -145,27 +157,8 @@ impl LanguageServerPool {
             .diagnostic_pull_lock
             .lock()
             .recover_poison("LanguageServerPool::diagnostic_pull_lock");
-        let current_document_generation = self
-            .diagnostic_document_generations
-            .get(cache_key)
-            .map(|entry| *entry)
-            .unwrap_or(0);
-        let lineage_is_current = document_is_open
-            && snapshot.settings_generation
-                == self
-                    .diagnostic_pull_generations
-                    .get(&cache_key.0)
-                    .map(|entry| *entry)
-                    .unwrap_or(0)
-            && snapshot.document_generation == current_document_generation
-            && snapshot.connection_generation == self.document_connection_generation(&cache_key.0);
-        let lineage_is_current = lineage_is_current
-            && snapshot.host_generation
-                == self
-                    .diagnostic_host_generations
-                    .get(&snapshot.host_uri)
-                    .map(|entry| *entry)
-                    .unwrap_or(0);
+        let lineage_is_current =
+            self.diagnostic_pull_lineage_is_current(cache_key, &snapshot, document_is_open);
         if !lineage_is_current {
             return match report {
                 DownstreamDiagnosticReport::Full { diagnostics, .. } => diagnostics,
@@ -233,6 +226,55 @@ impl LanguageServerPool {
                 Vec::new()
             }
         }
+    }
+
+    pub(super) fn record_failed_diagnostic_pull(
+        &self,
+        cache_key: &(super::super::pool::ConnectionKey, String),
+        snapshot: super::super::pool::DiagnosticPullSnapshot,
+        document_is_open: bool,
+    ) {
+        let _guard = self
+            .diagnostic_pull_lock
+            .lock()
+            .recover_poison("LanguageServerPool::diagnostic_pull_lock");
+        if self.diagnostic_pull_lineage_is_current(cache_key, &snapshot, document_is_open)
+            && self
+                .diagnostic_pull_applied_sequences
+                .get(cache_key)
+                .is_none_or(|sequence| *sequence < snapshot.request_sequence)
+        {
+            self.diagnostic_pull_applied_sequences
+                .insert(cache_key.clone(), snapshot.request_sequence);
+        }
+    }
+
+    fn diagnostic_pull_lineage_is_current(
+        &self,
+        cache_key: &(super::super::pool::ConnectionKey, String),
+        snapshot: &super::super::pool::DiagnosticPullSnapshot,
+        document_is_open: bool,
+    ) -> bool {
+        let current_document_generation = self
+            .diagnostic_document_generations
+            .get(cache_key)
+            .map(|entry| *entry)
+            .unwrap_or(0);
+        document_is_open
+            && snapshot.settings_generation
+                == self
+                    .diagnostic_pull_generations
+                    .get(&cache_key.0)
+                    .map(|entry| *entry)
+                    .unwrap_or(0)
+            && snapshot.document_generation == current_document_generation
+            && snapshot.connection_generation == self.document_connection_generation(&cache_key.0)
+            && snapshot.host_generation
+                == self
+                    .diagnostic_host_generations
+                    .get(&snapshot.host_uri)
+                    .map(|entry| *entry)
+                    .unwrap_or(0)
     }
 
     fn store_diagnostic_baseline_if_current(
@@ -612,6 +654,42 @@ mod tests {
 
         assert_eq!(final_result_id(false), "r3");
         assert_eq!(final_result_id(true), "r3");
+    }
+
+    #[test]
+    fn newer_malformed_report_fences_an_older_full_report() {
+        let pool = LanguageServerPool::new();
+        let key = (
+            super::super::super::pool::ConnectionKey::for_server("lua_ls"),
+            "kakehashi-virtual://region-1".to_string(),
+        );
+        pool.diagnostic_pull_baselines.insert(
+            key.clone(),
+            super::super::super::pool::DiagnosticPullBaseline {
+                result_id: "r1".to_string(),
+                diagnostics: std::sync::Arc::new(Vec::new()),
+                request_sequence: 0,
+            },
+        );
+        let older = test_snapshot(&pool, &key);
+        let newer = test_snapshot(&pool, &key);
+
+        pool.record_failed_diagnostic_pull(&key, newer, true);
+        pool.resolve_diagnostic_pull_report(
+            &key,
+            older,
+            DownstreamDiagnosticReport::Full {
+                result_id: Some("late".to_string()),
+                diagnostics: Vec::new(),
+            },
+            true,
+        );
+
+        assert_eq!(
+            pool.diagnostic_pull_baselines.get(&key).unwrap().result_id,
+            "r1",
+            "the older successful response must not supersede a newer malformed response"
+        );
     }
 
     #[test]
