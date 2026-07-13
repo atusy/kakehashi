@@ -360,9 +360,10 @@ pub(super) fn parse_downstream_diagnostic_report(
     // two paths reject the same shapes): an absent/unknown `kind`, a `full`
     // report missing `items`, a malformed `unchanged` report or
     // `relatedDocuments`, or `items` that don't deserialize as `Diagnostic[]`
-    // is a malformed payload (request failure). A valid `unchanged` report is
-    // the authoritative empty. `relatedDocuments` (diagnostics for OTHER
-    // documents) are dropped — they have no place in this region's report.
+    // is a malformed payload (request failure). A valid `unchanged` report and
+    // its result ID are returned for the caller to resolve against the request's
+    // baseline. `relatedDocuments` (diagnostics for OTHER documents) are
+    // dropped — they have no place in this region's report.
     match serde_json::from_value::<DocumentDiagnosticReport>(result) {
         Ok(DocumentDiagnosticReport::Full(report)) => Ok(DownstreamDiagnosticReport::Full {
             result_id: report.full_document_diagnostic_report.result_id,
@@ -674,6 +675,10 @@ mod tests {
         // Close lands while the first pull awaits connection readiness, before
         // it can create a downstream cache key/snapshot.
         pool.invalidate_diagnostic_host(&host);
+        assert!(
+            !pool.diagnostic_host_generations.contains_key(host.as_str()),
+            "closed hosts must not remain retained"
+        );
         let snapshot =
             pool.diagnostic_pull_snapshot(&key, host.as_str(), host_generation, request_sequence);
 
@@ -689,6 +694,12 @@ mod tests {
         );
 
         assert!(!pool.diagnostic_pull_baselines.contains_key(&key));
+
+        let (reopened_generation, _) = pool.begin_diagnostic_pull(&host);
+        assert_ne!(
+            reopened_generation, host_generation,
+            "a reopen must receive a fresh incarnation after pruning"
+        );
     }
 
     #[test]

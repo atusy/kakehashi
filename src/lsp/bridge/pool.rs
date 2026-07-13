@@ -377,6 +377,10 @@ pub struct LanguageServerPool {
     pub(crate) diagnostic_pull_lock: std::sync::Mutex<()>,
     pub(crate) diagnostic_pull_request_sequence: AtomicU64,
     pub(crate) diagnostic_pull_applied_sequences: DashMap<(ConnectionKey, String), u64>,
+    /// Assigns a process-unique incarnation to hosts when their first pull
+    /// begins. Closed hosts can then be removed from the generation map
+    /// without a later reopen reusing an old generation.
+    pub(crate) diagnostic_host_epoch: AtomicU64,
     pub(crate) diagnostic_host_generations: DashMap<String, u64>,
     /// Upstream request ID → set of downstream connections, for fan-out cancel
     /// forwarding (ls-bridge-message-ordering). Multiple connections can share an ID when a single
@@ -493,6 +497,7 @@ impl LanguageServerPool {
             diagnostic_pull_lock: std::sync::Mutex::new(()),
             diagnostic_pull_request_sequence: AtomicU64::new(1),
             diagnostic_pull_applied_sequences: DashMap::new(),
+            diagnostic_host_epoch: AtomicU64::new(1),
             diagnostic_host_generations: DashMap::new(),
             upstream_request_registry: std::sync::Mutex::new(HashMap::new()),
             cancel_metrics: CancelForwardingMetrics::default(),
@@ -1668,11 +1673,10 @@ impl LanguageServerPool {
             .diagnostic_pull_lock
             .lock()
             .recover_poison("LanguageServerPool::diagnostic_pull_lock");
-        let host_generation = self
+        let host_generation = *self
             .diagnostic_host_generations
-            .get(host_uri.as_str())
-            .map(|entry| *entry)
-            .unwrap_or(0);
+            .entry(host_uri.as_str().to_string())
+            .or_insert_with(|| self.diagnostic_host_epoch.fetch_add(1, Ordering::Relaxed));
         let request_sequence = self
             .diagnostic_pull_request_sequence
             .fetch_add(1, Ordering::Relaxed);
@@ -1732,10 +1736,7 @@ impl LanguageServerPool {
             .diagnostic_pull_lock
             .lock()
             .recover_poison("LanguageServerPool::diagnostic_pull_lock");
-        self.diagnostic_host_generations
-            .entry(host_uri.as_str().to_string())
-            .and_modify(|generation| *generation = generation.wrapping_add(1))
-            .or_insert(1);
+        self.diagnostic_host_generations.remove(host_uri.as_str());
     }
 
     pub(super) fn invalidate_diagnostic_connections(&self, keys: &[ConnectionKey]) {
