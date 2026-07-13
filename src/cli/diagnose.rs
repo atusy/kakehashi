@@ -470,7 +470,8 @@ fn format_diagnostic(format: OutputFormat, display: &str, diagnostic: &Diagnosti
 }
 
 /// Make an untrusted diagnostic field safe for the line-oriented `default`
-/// format: collapse whitespace runs and visibly escape terminal controls.
+/// format: collapse whitespace runs and visibly escape remaining terminal
+/// controls.
 /// A validation pass borrows already-safe text; only rewritten fields need a
 /// second pass and an allocation.
 fn one_line(message: &str) -> std::borrow::Cow<'_, str> {
