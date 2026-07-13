@@ -16,7 +16,10 @@
 
 use std::path::{Path, PathBuf};
 
+use crate::cli::terminal::escape_terminal_controls;
+
 fn format_walk_error(error: &str) -> String {
+    let error = escape_terminal_controls(error);
     format!("error: skipping unreadable entry (will exit 2): {error}")
 }
 
@@ -191,6 +194,14 @@ mod tests {
 
     fn markdown_only(path: &Path) -> bool {
         path.extension().is_some_and(|e| e == "md")
+    }
+
+    #[test]
+    fn walk_errors_escape_terminal_controls() {
+        assert_eq!(
+            format_walk_error("dir/\u{1b}\u{2028}entry: denied"),
+            "error: skipping unreadable entry (will exit 2): dir/\\u{1b}\\u{2028}entry: denied"
+        );
     }
 
     fn collect_paths(
