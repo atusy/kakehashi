@@ -164,7 +164,8 @@ impl DiagnosticPublisher {
             return;
         };
         if self.request_pull_diagnostic_refresh_inner(true, false) {
-            self.aggregator.mark_forwarded_refresh_covered();
+            self.aggregator
+                .mark_forwarded_refresh_covered(snapshot.generation);
         }
         let publisher = self.clone();
         tokio::spawn(async move {
@@ -190,9 +191,7 @@ impl DiagnosticPublisher {
                         }
                         match decision {
                             crate::lsp::diagnostic_cache::ForwardedRefreshWait::SendTrailing => {
-                                if publisher.request_pull_diagnostic_refresh_inner(true, false) {
-                                    publisher.aggregator.mark_forwarded_refresh_covered();
-                                }
+                                publisher.request_pull_diagnostic_refresh_inner(true, false);
                                 break;
                             }
                             crate::lsp::diagnostic_cache::ForwardedRefreshWait::Settled => break,
@@ -203,7 +202,9 @@ impl DiagnosticPublisher {
                                 if send_trailing
                                     && publisher.request_pull_diagnostic_refresh_inner(true, false)
                                 {
-                                    publisher.aggregator.mark_forwarded_refresh_covered();
+                                    publisher
+                                        .aggregator
+                                        .mark_forwarded_refresh_covered(latest.generation);
                                 }
                                 snapshot = latest;
                                 deadline = tokio::time::Instant::now()
