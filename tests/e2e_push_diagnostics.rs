@@ -61,6 +61,30 @@ fn init_client_with_mode_caps(mode: &str, capabilities: Value) -> (LspClient, te
         .arg("--config-file")
         .arg(config_path.to_str().expect("utf8 path"))
         .build();
+    let initialization_options = if mode == "diagnostics-refresh-burst" {
+        json!({
+            "languageServers": {
+                "mock-push": { "cmd": [mock_bin(), mode], "languages": ["lua"] }
+            },
+            "languages": {
+                "markdown": {
+                    "bridge": {
+                        "lua": {
+                            "aggregation": {
+                                "textDocument/publishDiagnostics": { "pullFallback": false }
+                            }
+                        }
+                    }
+                }
+            }
+        })
+    } else {
+        json!({
+            "languageServers": {
+                "mock-push": { "cmd": [mock_bin(), mode], "languages": ["lua"] }
+            }
+        })
+    };
 
     client.send_request(
         "initialize",
@@ -69,11 +93,7 @@ fn init_client_with_mode_caps(mode: &str, capabilities: Value) -> (LspClient, te
             "rootUri": null,
             "capabilities": capabilities,
             "workspaceFolders": null,
-            "initializationOptions": {
-                "languageServers": {
-                    "mock-push": { "cmd": [mock_bin(), mode], "languages": ["lua"] }
-                }
-            }
+            "initializationOptions": initialization_options
         }),
     );
     client.send_notification("initialized", json!({}));
@@ -884,22 +904,35 @@ fn e2e_downstream_refresh_burst_is_coalesced() {
         .expect("the leading refresh must reach the editor immediately");
     client.send_response(id, json!(null));
 
+    let leading_pull = client.send_request(
+        "textDocument/diagnostic",
+        json!({ "textDocument": { "uri": MD_URI } }),
+    );
+    assert!(
+        leading_pull["result"]["items"]
+            .as_array()
+            .is_some_and(|items| items.iter().any(|diagnostic| {
+                diagnostic["message"] == json!("mock-diagnostic-generation:1")
+            })),
+        "the leading refresh must expose the first downstream generation: {leading_pull}"
+    );
+
     let (trailing_id, _) = client
         .wait_for_server_request("workspace/diagnostic/refresh", Duration::from_millis(1200))
         .expect("activity after the leading edge must produce one trailing refresh");
     client.send_response(trailing_id, json!(null));
 
-    let response = client.send_request(
+    let trailing_pull = client.send_request(
         "textDocument/diagnostic",
         json!({ "textDocument": { "uri": MD_URI } }),
     );
-    let items = response["result"]["items"]
+    let items = trailing_pull["result"]["items"]
         .as_array()
         .expect("the pull after a coalesced refresh returns a full report");
     assert!(
-        items.iter().any(|diagnostic| diagnostic["message"]
-            .as_str()
-            .is_some_and(|message| message.starts_with("mock-diagnostic:"))),
+        items
+            .iter()
+            .any(|diagnostic| { diagnostic["message"] == json!("mock-diagnostic-generation:10") }),
         "the re-pull must include the refreshing downstream's latest diagnostics"
     );
 

@@ -143,6 +143,7 @@ fn main() {
     let mut last_will_save_uri: Option<String> = None;
     let mut did_save_count: usize = 0;
     let mut last_did_save_uri: Option<String> = None;
+    let mut diagnostic_generation: u64 = 0;
 
     while let Some(message) = read_message(&mut reader) {
         let method = message
@@ -331,9 +332,8 @@ fn main() {
                     if mode == "diagnostics-refresh" {
                         request(&mut writer, json!(1000), "workspace/diagnostic/refresh");
                     } else if mode == "diagnostics-refresh-burst" {
-                        for id in 1000..1010 {
-                            request(&mut writer, json!(id), "workspace/diagnostic/refresh");
-                        }
+                        diagnostic_generation = 1;
+                        request(&mut writer, json!(1000), "workspace/diagnostic/refresh");
                     }
                 }
             }
@@ -836,11 +836,20 @@ fn main() {
                 // but only for documents this server actually received via
                 // didOpen, so the test also proves the host document was
                 // synced before the pull.
+                let diagnostic_message = if mode == "diagnostics-refresh-burst" {
+                    format!("mock-diagnostic-generation:{diagnostic_generation}")
+                } else {
+                    message
+                        .pointer("/params/textDocument/uri")
+                        .and_then(Value::as_str)
+                        .map(|uri| format!("mock-diagnostic:{uri}"))
+                        .unwrap_or_default()
+                };
                 let result = message
                     .pointer("/params/textDocument/uri")
                     .and_then(Value::as_str)
                     .filter(|uri| documents.contains_key(*uri))
-                    .map(|uri| {
+                    .map(|_| {
                         json!({
                             "kind": "full",
                             "items": [{
@@ -849,12 +858,18 @@ fn main() {
                                     "end": { "line": 0, "character": 1 }
                                 },
                                 "severity": 2,
-                                "message": format!("mock-diagnostic:{uri}")
+                                "message": diagnostic_message
                             }]
                         })
                     })
                     .unwrap_or(Value::Null);
                 respond(&mut writer, id, result);
+                if mode == "diagnostics-refresh-burst" && diagnostic_generation == 1 {
+                    for id in 1001..1010 {
+                        diagnostic_generation += 1;
+                        request(&mut writer, json!(id), "workspace/diagnostic/refresh");
+                    }
+                }
             }
             "codeLens/resolve" => {
                 // Materialize the command, echoing the lens's own data back so
