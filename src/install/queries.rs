@@ -766,7 +766,6 @@ fn write_uninstall_tombstone_with_before_publish(
     before_publish: impl FnOnce(&Path, &Path),
 ) -> Result<(), QueryInstallError> {
     validate_safe_language_name(language)?;
-    remove_stale_uninstall_stages(queries_parent, language)?;
     let path = uninstall_tombstone_path(queries_parent, language);
     validate_existing_tombstone(&path)?;
     let stage_counter = QUERY_TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
@@ -793,60 +792,6 @@ fn write_uninstall_tombstone_with_before_publish(
     Ok(())
 }
 
-/// Remove crash-stranded private stages for `language`.
-///
-/// Production callers hold that language's [`QueryReplaceLockGuard`], so no
-/// live kakehashi publisher can own a matching stage while this sweep runs.
-/// File symlinks are removed as directory entries; matching directories are
-/// not managed by this file-stage namespace and are left untouched.
-fn remove_stale_uninstall_stages(
-    queries_parent: &Path,
-    language: &str,
-) -> Result<(), QueryInstallError> {
-    for entry in fs::read_dir(queries_parent)? {
-        let entry = entry?;
-        let name = entry.file_name();
-        let Some(name) = name.to_str() else {
-            continue;
-        };
-        if !generated_uninstall_stage_matches_language(name, language) {
-            continue;
-        }
-        let file_type = entry.file_type()?;
-        if !file_type.is_file() && !file_type.is_symlink() {
-            continue;
-        }
-        match fs::remove_file(entry.path()) {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(QueryInstallError::IoError(error)),
-        }
-    }
-    Ok(())
-}
-
-fn generated_uninstall_stage_matches_language(name: &str, language: &str) -> bool {
-    let prefix = format!(".{language}.uninstalled.");
-    let Some(rest) = name
-        .strip_prefix(&prefix)
-        .and_then(|rest| rest.strip_suffix(".tmp"))
-    else {
-        return false;
-    };
-    let mut parts = rest.split('.');
-    let (Some(pid), Some(counter), Some(random), None) =
-        (parts.next(), parts.next(), parts.next(), parts.next())
-    else {
-        return false;
-    };
-    !pid.is_empty()
-        && pid.bytes().all(|byte| byte.is_ascii_digit())
-        && !counter.is_empty()
-        && counter.bytes().all(|byte| byte.is_ascii_digit())
-        && random.len() == 12
-        && random.bytes().all(|byte| byte.is_ascii_alphanumeric())
-}
-
 /// Open or create the managed tombstone leaf without following a link there.
 ///
 /// Parent components deliberately retain ordinary path resolution: users may
@@ -870,13 +815,14 @@ fn validate_existing_tombstone(path: &Path) -> std::io::Result<()> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(error) => return Err(error),
     };
-    if !file.metadata()?.file_type().is_file() {
+    let metadata = file.metadata()?;
+    if !metadata.file_type().is_file() {
         return Err(std::io::Error::other(
             "query uninstall tombstone is not a regular file",
         ));
     }
     use std::os::unix::fs::MetadataExt as _;
-    require_single_link(file.metadata()?.nlink())?;
+    require_single_link(metadata.nlink())?;
     Ok(())
 }
 
@@ -1600,28 +1546,6 @@ mod tests {
             vec![tombstone.file_name().unwrap().to_os_string()],
             "the private stage must be removed on every persist failure"
         );
-    }
-
-    #[test]
-    fn tombstone_publish_reclaims_crash_stranded_stage() {
-        let temp = TempDir::new().unwrap();
-        let queries_parent = temp.path().join("queries");
-        fs::create_dir_all(&queries_parent).unwrap();
-        let stale = queries_parent.join(".rust.uninstalled.123.7.ABCDEFGHIJKL.tmp");
-        fs::write(&stale, "partial\n").unwrap();
-        let same_language_unrelated = queries_parent.join(".rust.uninstalled.notes.tmp");
-        fs::write(&same_language_unrelated, "keep notes\n").unwrap();
-        let unrelated = queries_parent.join(".lua.uninstalled.123.7.ABCDEFGHIJKL.tmp");
-        fs::write(&unrelated, "keep\n").unwrap();
-
-        write_uninstall_tombstone(&queries_parent, "rust").unwrap();
-
-        assert!(!stale.exists(), "same-language stale stage is managed");
-        assert!(
-            same_language_unrelated.exists(),
-            "a wildcard-like name is not proof of kakehashi ownership"
-        );
-        assert!(unrelated.exists(), "other languages have separate locks");
     }
 
     #[test]
