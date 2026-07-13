@@ -519,10 +519,22 @@ pub fn remove_query_install_and_backups(
     queries_parent: &Path,
     language: &str,
 ) -> Result<QueryRemoval, QueryInstallError> {
+    remove_query_install_and_backups_with_tombstone_writer(
+        queries_parent,
+        language,
+        write_uninstall_tombstone,
+    )
+}
+
+fn remove_query_install_and_backups_with_tombstone_writer(
+    queries_parent: &Path,
+    language: &str,
+    write_tombstone: impl FnOnce(&Path, &str) -> Result<(), QueryInstallError>,
+) -> Result<QueryRemoval, QueryInstallError> {
     validate_safe_language_name(language)?;
     fs::create_dir_all(queries_parent)?;
     let _replace_lock = QueryReplaceLockGuard::acquire(queries_parent, language)?;
-    write_uninstall_tombstone(queries_parent, language)?;
+    write_tombstone(queries_parent, language)?;
     let queries_dir = queries_parent.join(language);
     let mut removal = QueryRemoval {
         removed_queries: false,
