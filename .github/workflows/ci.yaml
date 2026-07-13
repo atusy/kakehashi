@@ -26,6 +26,14 @@ jobs:
       - run: make deps/tree-sitter
       - run: cargo test
 
+  test-windows-query-tombstone:
+    name: Test Windows query tombstone
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+      - run: cargo test --lib windows_tombstone -- --nocapture
+      - run: cargo test --lib windows_security_copy_failure -- --nocapture
+
   fmt:
     name: Format
     runs-on: ubuntu-latest
