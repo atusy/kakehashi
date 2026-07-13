@@ -100,7 +100,7 @@ percent-encoding = "2"
 rayon = "1"
 futures = "0.3.31"
 
-[target.'cfg(not(any(target_os = "aix", target_os = "openbsd", target_os = "dragonfly")))'.dependencies]
+[target.'cfg(any(target_os = "linux", target_os = "android", target_os = "macos", target_os = "ios", target_os = "tvos", target_os = "watchos", target_os = "visionos", target_os = "freebsd", target_os = "netbsd", target_os = "solaris", target_os = "illumos", windows))'.dependencies]
 cap-primitives = "4"
 
 [target.'cfg(windows)'.dependencies]

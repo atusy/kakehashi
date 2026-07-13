@@ -458,13 +458,6 @@ fn query_directory_open_options() -> cap_primitives::fs::OpenOptions {
     options
 }
 
-#[cfg(not(any(unix, windows)))]
-fn query_directory_open_options() -> cap_primitives::fs::OpenOptions {
-    let mut options = cap_primitives::fs::OpenOptions::new();
-    options.read(true);
-    options
-}
-
 #[cfg(any(
     target_os = "linux",
     target_os = "android",
@@ -477,8 +470,7 @@ fn query_directory_open_options() -> cap_primitives::fs::OpenOptions {
     target_os = "netbsd",
     target_os = "solaris",
     target_os = "illumos",
-    windows,
-    not(any(unix, windows))
+    windows
 ))]
 fn open_query_language_dir_nofollow(queries_dir: &Path) -> std::io::Result<fs::File> {
     use cap_primitives::fs::FollowSymlinks;
@@ -535,8 +527,7 @@ fn open_query_language_dir_nofollow(queries_dir: &Path) -> std::io::Result<fs::F
     target_os = "netbsd",
     target_os = "solaris",
     target_os = "illumos",
-    windows,
-    not(any(unix, windows))
+    windows
 ))]
 pub fn query_install_is_complete(queries_dir: &Path) -> bool {
     use cap_primitives::fs::FollowSymlinks;
@@ -557,28 +548,26 @@ pub fn query_install_is_complete(queries_dir: &Path) -> bool {
         && (cap_primitives::fs::stat(
             &directory,
             Path::new(QUERY_INSTALL_COMPLETE_MARKER),
-            FollowSymlinks::Yes,
+            FollowSymlinks::No,
         )
         .is_ok_and(|marker| marker.is_file())
             || metadata.len() > 0)
 }
 
-#[cfg(all(
-    unix,
-    not(any(
-        target_os = "linux",
-        target_os = "android",
-        target_os = "macos",
-        target_os = "ios",
-        target_os = "tvos",
-        target_os = "watchos",
-        target_os = "visionos",
-        target_os = "freebsd",
-        target_os = "netbsd",
-        target_os = "solaris",
-        target_os = "illumos"
-    ))
-))]
+#[cfg(not(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "tvos",
+    target_os = "watchos",
+    target_os = "visionos",
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "solaris",
+    target_os = "illumos",
+    windows
+)))]
 pub fn query_install_is_complete(queries_dir: &Path) -> bool {
     let Ok(directory_metadata) = fs::symlink_metadata(queries_dir) else {
         return false;
@@ -589,8 +578,9 @@ pub fn query_install_is_complete(queries_dir: &Path) -> bool {
     let Ok(metadata) = fs::symlink_metadata(queries_dir.join("highlights.scm")) else {
         return false;
     };
-    metadata.file_type().is_file()
-        && (queries_dir.join(QUERY_INSTALL_COMPLETE_MARKER).is_file() || metadata.len() > 0)
+    let marker_is_file = fs::symlink_metadata(queries_dir.join(QUERY_INSTALL_COMPLETE_MARKER))
+        .is_ok_and(|marker| marker.file_type().is_file());
+    metadata.file_type().is_file() && (marker_is_file || metadata.len() > 0)
 }
 
 /// Whether a kakehashi-owned crash backup is safe to restore as the exact
@@ -1191,6 +1181,26 @@ mod tests {
     }
 
     #[cfg(unix)]
+    fn create_file_symlink_or_skip(target: &Path, link: &Path) -> bool {
+        std::os::unix::fs::symlink(target, link).unwrap();
+        true
+    }
+
+    #[cfg(windows)]
+    fn create_file_symlink_or_skip(target: &Path, link: &Path) -> bool {
+        match std::os::windows::fs::symlink_file(target, link) {
+            Ok(()) => true,
+            Err(e)
+                if e.kind() == std::io::ErrorKind::PermissionDenied
+                    || e.raw_os_error() == Some(1314) =>
+            {
+                false
+            }
+            Err(e) => panic!("failed to create file symlink: {e}"),
+        }
+    }
+
+    #[cfg(unix)]
     #[test]
     fn symlinked_highlights_file_is_not_a_complete_install() {
         use std::os::unix::fs::symlink;
@@ -1247,6 +1257,28 @@ mod tests {
         assert!(
             !query_install_is_complete(&managed),
             "managed language-directory symlinks must not redirect completeness checks"
+        );
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn query_install_is_incomplete_when_completion_marker_is_a_symlink() {
+        let temp = TempDir::new().unwrap();
+        let queries_dir = temp.path().join("queries/lua");
+        fs::create_dir_all(&queries_dir).unwrap();
+        fs::write(queries_dir.join("highlights.scm"), "").unwrap();
+        let external_marker = queries_dir.join("external-marker-target");
+        fs::write(&external_marker, "owned elsewhere").unwrap();
+        if !create_file_symlink_or_skip(
+            &external_marker,
+            &queries_dir.join(QUERY_INSTALL_COMPLETE_MARKER),
+        ) {
+            return;
+        }
+
+        assert!(
+            !query_install_is_complete(&queries_dir),
+            "an external marker target must not make empty highlights complete"
         );
     }
 
