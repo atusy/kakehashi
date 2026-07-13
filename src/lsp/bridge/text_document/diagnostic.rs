@@ -159,35 +159,43 @@ impl LanguageServerPool {
                 }
             };
         }
-        let previous_revision = snapshot.baseline.as_ref().map(|entry| entry.revision);
+        let may_apply = self
+            .diagnostic_pull_applied_sequences
+            .get(cache_key)
+            .is_none_or(|sequence| *sequence < snapshot.request_sequence);
         match report {
             DownstreamDiagnosticReport::Full {
                 result_id,
                 diagnostics,
             } => {
-                if let Some(result_id) = result_id {
+                if may_apply && let Some(result_id) = result_id {
                     self.store_diagnostic_baseline_if_current(
                         cache_key,
-                        previous_revision,
+                        snapshot.request_sequence,
                         result_id,
                         diagnostics.clone(),
                     );
-                } else {
-                    self.diagnostic_pull_baselines
-                        .remove_if(cache_key, |_, entry| {
-                            Some(entry.revision) == previous_revision
-                        });
+                } else if may_apply {
+                    self.diagnostic_pull_baselines.remove(cache_key);
+                }
+                if may_apply {
+                    self.diagnostic_pull_applied_sequences
+                        .insert(cache_key.clone(), snapshot.request_sequence);
                 }
                 diagnostics
             }
             DownstreamDiagnosticReport::Unchanged { result_id } => {
-                if let Some(baseline) = &snapshot.baseline {
+                if may_apply && let Some(baseline) = &snapshot.baseline {
                     self.store_diagnostic_baseline_if_current(
                         cache_key,
-                        previous_revision,
+                        snapshot.request_sequence,
                         result_id,
                         baseline.diagnostics.as_ref().clone(),
                     );
+                }
+                if may_apply {
+                    self.diagnostic_pull_applied_sequences
+                        .insert(cache_key.clone(), snapshot.request_sequence);
                 }
                 diagnostics_for_unchanged_baseline(
                     snapshot
@@ -197,10 +205,11 @@ impl LanguageServerPool {
                 )
             }
             DownstreamDiagnosticReport::Null => {
-                self.diagnostic_pull_baselines
-                    .remove_if(cache_key, |_, entry| {
-                        Some(entry.revision) == previous_revision
-                    });
+                if may_apply {
+                    self.diagnostic_pull_baselines.remove(cache_key);
+                    self.diagnostic_pull_applied_sequences
+                        .insert(cache_key.clone(), snapshot.request_sequence);
+                }
                 Vec::new()
             }
         }
@@ -209,35 +218,29 @@ impl LanguageServerPool {
     fn store_diagnostic_baseline_if_current(
         &self,
         cache_key: &(super::super::pool::ConnectionKey, String),
-        expected_revision: Option<u64>,
+        request_sequence: u64,
         result_id: String,
         diagnostics: Vec<Diagnostic>,
     ) -> bool {
         use dashmap::mapref::entry::Entry;
         match self.diagnostic_pull_baselines.entry(cache_key.clone()) {
-            Entry::Occupied(mut entry) if Some(entry.get().revision) == expected_revision => {
+            Entry::Occupied(mut entry) if entry.get().request_sequence < request_sequence => {
                 entry.insert(super::super::pool::DiagnosticPullBaseline {
                     result_id,
                     diagnostics: std::sync::Arc::new(diagnostics),
-                    revision: self
-                        .diagnostic_pull_revision
-                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-                        .wrapping_add(1),
+                    request_sequence,
                 });
                 true
             }
-            Entry::Vacant(entry) if expected_revision.is_none() => {
+            Entry::Vacant(entry) => {
                 entry.insert(super::super::pool::DiagnosticPullBaseline {
                     result_id,
                     diagnostics: std::sync::Arc::new(diagnostics),
-                    revision: self
-                        .diagnostic_pull_revision
-                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-                        .wrapping_add(1),
+                    request_sequence,
                 });
                 true
             }
-            Entry::Occupied(_) | Entry::Vacant(_) => false,
+            Entry::Occupied(_) => false,
         }
     }
 }
@@ -500,7 +503,7 @@ mod tests {
         let old = super::super::super::pool::DiagnosticPullBaseline {
             result_id: "r1".to_string(),
             diagnostics: std::sync::Arc::new(vec![Diagnostic::default()]),
-            revision: 1,
+            request_sequence: 1,
         };
         pool.diagnostic_pull_baselines.insert(
             key.clone(),
@@ -510,7 +513,7 @@ mod tests {
                     message: "new".to_string(),
                     ..Default::default()
                 }]),
-                revision: 2,
+                request_sequence: 2,
             },
         );
 
@@ -533,44 +536,52 @@ mod tests {
     }
 
     #[test]
-    fn concurrent_responses_can_advance_a_baseline_only_once() {
-        let pool = std::sync::Arc::new(LanguageServerPool::new());
-        let key = (
-            super::super::super::pool::ConnectionKey::for_server("lua_ls"),
-            "kakehashi-virtual://region-1".to_string(),
-        );
-        pool.diagnostic_pull_baselines.insert(
-            key.clone(),
-            super::super::super::pool::DiagnosticPullBaseline {
-                result_id: "r1".to_string(),
-                diagnostics: std::sync::Arc::new(Vec::new()),
-                revision: 1,
-            },
-        );
-        let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
-        let mut threads = Vec::new();
-        for result_id in ["r2", "r3"] {
-            let pool = std::sync::Arc::clone(&pool);
-            let key = key.clone();
-            let barrier = std::sync::Arc::clone(&barrier);
-            threads.push(std::thread::spawn(move || {
-                barrier.wait();
-                pool.store_diagnostic_baseline_if_current(
+    fn newer_request_wins_in_both_response_completion_orders() {
+        fn final_result_id(newer_completes_first: bool) -> String {
+            let pool = LanguageServerPool::new();
+            let key = (
+                super::super::super::pool::ConnectionKey::for_server("lua_ls"),
+                "kakehashi-virtual://region-1".to_string(),
+            );
+            pool.diagnostic_pull_baselines.insert(
+                key.clone(),
+                super::super::super::pool::DiagnosticPullBaseline {
+                    result_id: "r1".to_string(),
+                    diagnostics: std::sync::Arc::new(Vec::new()),
+                    request_sequence: 0,
+                },
+            );
+            pool.diagnostic_pull_applied_sequences
+                .insert(key.clone(), 0);
+            let older = pool.diagnostic_pull_snapshot(&key);
+            let newer = pool.diagnostic_pull_snapshot(&key);
+            let resolve = |snapshot, result_id: &str| {
+                pool.resolve_diagnostic_pull_report(
                     &key,
-                    Some(1),
-                    result_id.to_string(),
-                    Vec::new(),
-                )
-            }));
+                    snapshot,
+                    DownstreamDiagnosticReport::Full {
+                        result_id: Some(result_id.to_string()),
+                        diagnostics: Vec::new(),
+                    },
+                    true,
+                );
+            };
+            if newer_completes_first {
+                resolve(newer, "r3");
+                resolve(older, "r2");
+            } else {
+                resolve(older, "r2");
+                resolve(newer, "r3");
+            }
+            pool.diagnostic_pull_baselines
+                .get(&key)
+                .unwrap()
+                .result_id
+                .clone()
         }
-        barrier.wait();
 
-        let updates = threads
-            .into_iter()
-            .map(|thread| thread.join().unwrap())
-            .filter(|updated| *updated)
-            .count();
-        assert_eq!(updates, 1, "the r1 lineage may advance exactly once");
+        assert_eq!(final_result_id(false), "r3");
+        assert_eq!(final_result_id(true), "r3");
     }
 
     #[test]
@@ -585,13 +596,15 @@ mod tests {
             super::super::super::pool::DiagnosticPullBaseline {
                 result_id: "r1".to_string(),
                 diagnostics: std::sync::Arc::new(Vec::new()),
-                revision: 3,
+                request_sequence: 3,
             },
         );
+        pool.diagnostic_pull_applied_sequences
+            .insert(key.clone(), 3);
         let old = super::super::super::pool::DiagnosticPullBaseline {
             result_id: "r1".to_string(),
             diagnostics: std::sync::Arc::new(Vec::new()),
-            revision: 1,
+            request_sequence: 1,
         };
 
         resolve_current(&pool, &key, Some(old), DownstreamDiagnosticReport::Null);
@@ -599,10 +612,6 @@ mod tests {
         assert_eq!(
             pool.diagnostic_pull_baselines.get(&key).unwrap().result_id,
             "r1"
-        );
-        assert_eq!(
-            pool.diagnostic_pull_baselines.get(&key).unwrap().revision,
-            3
         );
     }
 
@@ -629,8 +638,8 @@ mod tests {
         assert!(!pool.diagnostic_pull_baselines.contains_key(&key));
     }
 
-    #[tokio::test]
-    async fn settings_invalidation_is_atomic_with_baseline_snapshot_and_resolution() {
+    #[test]
+    fn settings_invalidation_is_atomic_with_baseline_snapshot_and_resolution() {
         let pool = LanguageServerPool::new();
         let key = (
             super::super::super::pool::ConnectionKey::for_server("lua_ls"),
@@ -644,12 +653,12 @@ mod tests {
                     message: "old settings".to_string(),
                     ..Default::default()
                 }]),
-                revision: 1,
+                request_sequence: 1,
             },
         );
         let snapshot = pool.diagnostic_pull_snapshot(&key);
 
-        pool.propagate_settings(|_| None).await;
+        pool.invalidate_diagnostic_connections(std::slice::from_ref(&key.0));
         let diagnostics = pool.resolve_diagnostic_pull_report(
             &key,
             snapshot,

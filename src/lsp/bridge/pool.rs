@@ -43,7 +43,7 @@ pub(crate) use shutdown_timeout::GlobalShutdownTimeout;
 pub(crate) struct DiagnosticPullBaseline {
     pub(crate) result_id: String,
     pub(crate) diagnostics: Arc<Vec<tower_lsp_server::ls_types::Diagnostic>>,
-    pub(crate) revision: u64,
+    pub(crate) request_sequence: u64,
 }
 
 pub(crate) struct DiagnosticPullSnapshot {
@@ -51,6 +51,7 @@ pub(crate) struct DiagnosticPullSnapshot {
     pub(crate) settings_generation: u64,
     pub(crate) document_generation: u64,
     pub(crate) connection_generation: u64,
+    pub(crate) request_sequence: u64,
 }
 
 fn same_launch_config(
@@ -372,7 +373,8 @@ pub struct LanguageServerPool {
     pub(crate) diagnostic_pull_generation: AtomicU64,
     /// Serializes baseline snapshots/mutations with every invalidation fence.
     pub(crate) diagnostic_pull_lock: std::sync::Mutex<()>,
-    pub(crate) diagnostic_pull_revision: AtomicU64,
+    pub(crate) diagnostic_pull_request_sequence: AtomicU64,
+    pub(crate) diagnostic_pull_applied_sequences: DashMap<(ConnectionKey, String), u64>,
     /// Upstream request ID → set of downstream connections, for fan-out cancel
     /// forwarding (ls-bridge-message-ordering). Multiple connections can share an ID when a single
     /// upstream request (e.g. diagnostic) targets several injected languages.
@@ -486,7 +488,8 @@ impl LanguageServerPool {
             diagnostic_document_generations: DashMap::new(),
             diagnostic_pull_generation: AtomicU64::new(0),
             diagnostic_pull_lock: std::sync::Mutex::new(()),
-            diagnostic_pull_revision: AtomicU64::new(1),
+            diagnostic_pull_request_sequence: AtomicU64::new(1),
+            diagnostic_pull_applied_sequences: DashMap::new(),
             upstream_request_registry: std::sync::Mutex::new(HashMap::new()),
             cancel_metrics: CancelForwardingMetrics::default(),
             consecutive_panic_counts: std::sync::Mutex::new(HashMap::new()),
@@ -681,16 +684,6 @@ impl LanguageServerPool {
         // A downstream may change diagnostic semantics without changing its
         // document contents, so no previousResultId lineage survives a settings
         // replacement safely.
-        {
-            let _guard = self
-                .diagnostic_pull_lock
-                .lock()
-                .recover_poison("LanguageServerPool::diagnostic_pull_lock");
-            self.diagnostic_pull_generation
-                .fetch_add(1, Ordering::AcqRel);
-            self.diagnostic_pull_baselines.clear();
-            self.diagnostic_document_generations.clear();
-        }
         let mut connections = self.connections.lock().await;
         let mut invalidated = Vec::new();
         let mut resolved = HashMap::new();
@@ -710,6 +703,13 @@ impl LanguageServerPool {
             }
         }
 
+        let mut affected_connections = invalidated.clone();
+        affected_connections.extend(connections.iter().filter_map(|(key, handle)| {
+            let settings = resolved.get(key).and_then(|settings| settings.as_ref());
+            (settings != handle.current_settings().as_deref()).then(|| key.clone())
+        }));
+        self.invalidate_diagnostic_connections(&affected_connections);
+
         let mut stale_handles = Vec::new();
         for key in invalidated {
             if let Some(handle) = connections.get(&key) {
@@ -720,16 +720,6 @@ impl LanguageServerPool {
                 .await
                 .retain(|(_, connection_key), _| connection_key != &key);
             self.document_tracker.purge_connection(&key).await;
-            {
-                let _guard = self
-                    .diagnostic_pull_lock
-                    .lock()
-                    .recover_poison("LanguageServerPool::diagnostic_pull_lock");
-                self.diagnostic_pull_baselines
-                    .retain(|(connection_key, _), _| connection_key != &key);
-                self.diagnostic_document_generations
-                    .retain(|(connection_key, _), _| connection_key != &key);
-            }
             self.purge_open_transition_locks(&key).await;
             if let Some(handle) = connections.remove(&key) {
                 stale_handles.push((key, handle));
@@ -1691,6 +1681,9 @@ impl LanguageServerPool {
             settings_generation: self.diagnostic_pull_generation.load(Ordering::Acquire),
             document_generation,
             connection_generation: self.document_connection_generation(&key.0),
+            request_sequence: self
+                .diagnostic_pull_request_sequence
+                .fetch_add(1, Ordering::Relaxed),
         }
     }
 
@@ -1700,10 +1693,30 @@ impl LanguageServerPool {
             .lock()
             .recover_poison("LanguageServerPool::diagnostic_pull_lock");
         self.diagnostic_pull_baselines.remove(key);
+        self.diagnostic_pull_applied_sequences.remove(key);
         self.diagnostic_document_generations
             .entry(key.clone())
             .and_modify(|generation| *generation = generation.wrapping_add(1))
             .or_insert(1);
+    }
+
+    pub(super) fn invalidate_diagnostic_connections(&self, keys: &[ConnectionKey]) {
+        if keys.is_empty() {
+            return;
+        }
+        let _guard = self
+            .diagnostic_pull_lock
+            .lock()
+            .recover_poison("LanguageServerPool::diagnostic_pull_lock");
+        self.diagnostic_pull_generation
+            .fetch_add(1, Ordering::AcqRel);
+        let affected = |key: &ConnectionKey| keys.iter().any(|candidate| candidate == key);
+        self.diagnostic_pull_baselines
+            .retain(|(key, _), _| !affected(key));
+        self.diagnostic_document_generations
+            .retain(|(key, _), _| !affected(key));
+        self.diagnostic_pull_applied_sequences
+            .retain(|(key, _), _| !affected(key));
     }
 
     /// Resolve the marker workspace AND the pool key `(server_name, root)` for a
@@ -2096,16 +2109,7 @@ impl LanguageServerPool {
                     self.document_tracker
                         .purge_connection(&connection_key)
                         .await;
-                    {
-                        let _guard = self
-                            .diagnostic_pull_lock
-                            .lock()
-                            .recover_poison("LanguageServerPool::diagnostic_pull_lock");
-                        self.diagnostic_pull_baselines
-                            .retain(|(key, _), _| key != &connection_key);
-                        self.diagnostic_document_generations
-                            .retain(|(key, _), _| key != &connection_key);
-                    }
+                    self.invalidate_diagnostic_connections(std::slice::from_ref(&connection_key));
                     self.purge_open_transition_locks(&connection_key).await;
                     // Remove only after every async purge completes. If this
                     // acquire future is aborted at a cleanup await, the stale
@@ -6764,7 +6768,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn settings_reload_clears_diagnostic_pull_baselines() {
+    async fn no_op_settings_reload_preserves_diagnostic_pull_baselines() {
         let pool = LanguageServerPool::new();
         pool.diagnostic_pull_baselines.insert(
             (
@@ -6774,13 +6778,42 @@ mod tests {
             DiagnosticPullBaseline {
                 result_id: "r1".to_string(),
                 diagnostics: Arc::new(Vec::new()),
-                revision: 1,
+                request_sequence: 1,
             },
         );
 
         pool.propagate_settings(|_| None).await;
 
-        assert!(pool.diagnostic_pull_baselines.is_empty());
+        assert_eq!(pool.diagnostic_pull_baselines.len(), 1);
+    }
+
+    #[test]
+    fn diagnostic_invalidation_is_scoped_to_connection_key() {
+        let pool = LanguageServerPool::new();
+        let affected = ConnectionKey::for_server("rust-analyzer-a");
+        let unrelated = ConnectionKey::for_server("rust-analyzer-b");
+        for key in [&affected, &unrelated] {
+            pool.diagnostic_pull_baselines.insert(
+                (key.clone(), "file:///test.rs".to_string()),
+                DiagnosticPullBaseline {
+                    result_id: "r1".to_string(),
+                    diagnostics: Arc::new(Vec::new()),
+                    request_sequence: 1,
+                },
+            );
+        }
+
+        pool.invalidate_diagnostic_connections(std::slice::from_ref(&affected));
+
+        assert!(
+            !pool
+                .diagnostic_pull_baselines
+                .contains_key(&(affected, "file:///test.rs".to_string()))
+        );
+        assert!(
+            pool.diagnostic_pull_baselines
+                .contains_key(&(unrelated, "file:///test.rs".to_string()))
+        );
     }
 
     #[test]
