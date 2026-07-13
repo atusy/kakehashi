@@ -216,12 +216,17 @@ impl DiagnosticPublisher {
                                 snapshot: latest,
                                 send_trailing,
                             } => {
-                                if send_trailing
-                                    && publisher.request_pull_diagnostic_refresh_inner(true, false)
-                                {
-                                    publisher
-                                        .aggregator
-                                        .mark_forwarded_refresh_covered(latest.generation);
+                                if send_trailing {
+                                    if publisher
+                                        .request_pull_diagnostic_refresh_inner(true, false)
+                                    {
+                                        publisher
+                                            .aggregator
+                                            .mark_forwarded_refresh_covered(latest.generation);
+                                    } else {
+                                        publisher.aggregator.cancel_forwarded_refresh_debounce();
+                                        break;
+                                    }
                                 }
                                 snapshot = latest;
                                 deadline = tokio::time::Instant::now()
