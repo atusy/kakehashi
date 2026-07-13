@@ -258,14 +258,15 @@ impl Kakehashi {
         let will_save_advertised = host_bridging_enabled || settings.any_bridge_server_runnable();
         self.apply_initial_settings(raw_settings, settings).await;
 
+        let notifier = self.notifier();
         for (level, message) in startup_logs {
-            self.notifier().log(level, message).await;
+            notifier.log(level, message).await;
         }
-        self.notifier().log_settings_events(&settings_events).await;
+        notifier.log_settings_events(&settings_events).await;
         if let Some(message) = default_settings_warning {
-            self.notifier().log_warning(message).await;
+            notifier.log_warning(message).await;
         }
-        self.notifier().log_info("server initialized!").await;
+        notifier.log_info("server initialized!").await;
         Ok(InitializeResult {
             server_info: Some(ServerInfo {
                 name: "kakehashi".to_string(),
