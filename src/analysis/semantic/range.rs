@@ -31,9 +31,13 @@ pub(crate) fn filter_semantic_tokens_by_range(
 ///
 /// This function:
 /// 1. Converts delta-encoded tokens to absolute positions
-/// 2. Filters to tokens within the range (inclusive)
+/// 2. Keeps tokens that intersect the end-exclusive range
 /// 3. Re-encodes as delta-encoded tokens
 fn filter_tokens_by_range(tokens: &[SemanticToken], range: &Range) -> Vec<SemanticToken> {
+    if (range.start.line, range.start.character) >= (range.end.line, range.end.character) {
+        return Vec::new();
+    }
+
     let start_line = range.start.line as usize;
     let end_line = range.end.line as usize;
 
@@ -235,6 +239,32 @@ mod tests {
         assert!(
             filter_tokens_by_range(&tokens, &range).is_empty(),
             "a token beginning at the end-exclusive boundary is outside the range"
+        );
+    }
+
+    #[test]
+    fn test_filter_tokens_returns_nothing_for_empty_range_inside_token() {
+        let tokens = vec![SemanticToken {
+            delta_line: 1,
+            delta_start: 5,
+            length: 3,
+            token_type: 0,
+            token_modifiers_bitset: 0,
+        }];
+        let range = Range {
+            start: Position {
+                line: 1,
+                character: 6,
+            },
+            end: Position {
+                line: 1,
+                character: 6,
+            },
+        };
+
+        assert!(
+            filter_tokens_by_range(&tokens, &range).is_empty(),
+            "an empty range intersects no semantic token"
         );
     }
 
