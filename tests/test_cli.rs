@@ -733,7 +733,7 @@ fn test_language_status_ignores_parser_shaped_directories() {
 
     let test_dir = tempfile::tempdir().expect("Failed to create temp dir");
     let ext = std::env::consts::DLL_EXTENSION;
-    fs::create_dir_all(test_dir.path().join(format!("parser/not-a-parser.{ext}")))
+    fs::create_dir_all(test_dir.path().join(format!("parser/fakeparser.{ext}")))
         .expect("Failed to create parser-shaped directory");
 
     let output = Command::new(env!("CARGO_BIN_EXE_kakehashi"))
@@ -757,7 +757,7 @@ fn test_language_status_ignores_parser_shaped_directories() {
         "parser-shaped directories must be ignored: {combined}"
     );
     assert!(
-        !combined.contains("not-a-parser"),
+        !combined.contains("fakeparser"),
         "parser-shaped directory was reported as a language: {combined}"
     );
 }
