@@ -93,6 +93,8 @@ impl Kakehashi {
         )
         .await;
 
-        result.handle(&self.client, "references", None, Ok).await
+        result
+            .handle(&self.notifier(), "references", None, Ok)
+            .await
     }
 }

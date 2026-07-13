@@ -122,6 +122,9 @@ servers in the workspace:
 debounceMs = 100
 maxWaitMs = 1000
 
+[features."window/logMessage"]
+logLevel = "info"
+
 [features."workspace/diagnostic/refresh"]
 debounceMs = 100
 maxWaitMs = 1000
@@ -133,6 +136,12 @@ Publish diagnostics keep only the latest merged set per URI, and different URIs
 never delay one another. Pull diagnostics are unaffected. The values
 apply to cycles admitted after a live configuration update; an active cycle keeps
 the timing snapshot it started with. `maxWaitMs` must be at least `debounceMs`.
+
+`features."window/logMessage".logLevel` is one workspace-wide threshold for
+both messages forwarded from downstream servers and messages emitted by
+kakehashi itself. Values are `error`, `warning`, `info`, `log`, and `off`; the
+default `info` suppresses only LSP `Log` messages. Live updates affect subsequent
+messages. `window/showMessage` is never filtered by this policy.
 
 ```json
 {

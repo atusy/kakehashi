@@ -558,8 +558,8 @@ impl Kakehashi {
                 // `errors` was just recorded into the sink above; this arm only
                 // chooses log severity.
                 if errors > 0 {
-                    self.client
-                        .log_message(
+                    self.notifier()
+                        .log(
                             tower_lsp_server::ls_types::MessageType::WARNING,
                             "No textDocument/formatting response from any host bridge server",
                         )

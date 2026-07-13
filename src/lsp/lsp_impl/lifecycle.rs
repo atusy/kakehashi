@@ -504,9 +504,12 @@ impl Kakehashi {
             // The single proactive diagnostics publisher: region pushes routed up
             // by the reader resolve to a host + region and republish the merged
             // host set (push-propagation-diagnostic-forwarding).
-            let diagnostic_publisher = Some(Arc::new(
-                crate::lsp::lsp_impl::coordinator::DiagnosticPublisher::new(self),
-            ));
+            let delivery_context = Some(Arc::new(UpstreamDeliveryContext {
+                diagnostic_publisher: Arc::new(
+                    crate::lsp::lsp_impl::coordinator::DiagnosticPublisher::new(self),
+                ),
+                settings_manager: Arc::clone(&self.settings_manager),
+            }));
             // LSP conditions workspace/applyEdit on the client capability;
             // resolved once here — client capabilities are fixed after
             // initialize.
@@ -524,7 +527,7 @@ impl Kakehashi {
                 translators,
                 inbound_request_registry,
                 client,
-                diagnostic_publisher,
+                delivery_context,
                 token,
                 editor_supports_apply_edit,
             ));
@@ -740,6 +743,11 @@ async fn forward_upstream_request(
 /// - The `cancel_token` is cancelled (deterministic shutdown)
 // Heterogeneous channels + collaborators threaded into one long-lived loop task;
 // bundling them into a struct would just move the list, not shorten it.
+struct UpstreamDeliveryContext {
+    diagnostic_publisher: Arc<crate::lsp::lsp_impl::coordinator::DiagnosticPublisher>,
+    settings_manager: Arc<crate::lsp::settings_manager::SettingsManager>,
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn upstream_forwarding_loop(
     mut upstream_rx: tokio::sync::mpsc::UnboundedReceiver<crate::lsp::bridge::UpstreamNotification>,
@@ -750,7 +758,7 @@ async fn upstream_forwarding_loop(
     translators: Option<Arc<UpstreamRequestTranslators>>,
     inbound_request_registry: crate::lsp::bridge::InboundRequestRegistry,
     client: Client,
-    diagnostic_publisher: Option<Arc<crate::lsp::lsp_impl::coordinator::DiagnosticPublisher>>,
+    delivery_context: Option<Arc<UpstreamDeliveryContext>>,
     cancel_token: tokio_util::sync::CancellationToken,
     editor_supports_apply_edit: bool,
 ) {
@@ -802,7 +810,7 @@ async fn upstream_forwarding_loop(
                             coalesce_upstream_batch(batch),
                             &mut created_tokens,
                             &mut begun_tokens,
-                            diagnostic_publisher.as_deref(),
+                            delivery_context.as_deref(),
                             &cancel_token,
                         )
                         .await;
@@ -844,7 +852,7 @@ async fn upstream_forwarding_loop(
                             notification,
                             &mut created_tokens,
                             &mut begun_tokens,
-                            diagnostic_publisher.as_deref(),
+                            delivery_context.as_deref(),
                         )
                         .await
                     }
@@ -865,7 +873,7 @@ async fn deliver_upstream_batch(
     batch: Vec<crate::lsp::bridge::UpstreamNotification>,
     created_tokens: &mut std::collections::HashSet<tower_lsp_server::ls_types::NumberOrString>,
     begun_tokens: &mut std::collections::HashSet<tower_lsp_server::ls_types::NumberOrString>,
-    diagnostic_publisher: Option<&crate::lsp::lsp_impl::coordinator::DiagnosticPublisher>,
+    delivery_context: Option<&UpstreamDeliveryContext>,
     cancel_token: &tokio_util::sync::CancellationToken,
 ) {
     use crate::lsp::bridge::UpstreamNotification;
@@ -890,7 +898,9 @@ async fn deliver_upstream_batch(
             }),
             barrier => {
                 if !pushes.is_empty() {
-                    if let Some(publisher) = diagnostic_publisher {
+                    if let Some(publisher) =
+                        delivery_context.map(|context| context.diagnostic_publisher.as_ref())
+                    {
                         tokio::select! {
                             biased;
                             _ = cancel_token.cancelled() => return,
@@ -908,14 +918,15 @@ async fn deliver_upstream_batch(
                     barrier,
                     created_tokens,
                     begun_tokens,
-                    diagnostic_publisher,
+                    delivery_context,
                 )
                 .await;
             }
         }
     }
     if !pushes.is_empty()
-        && let Some(publisher) = diagnostic_publisher
+        && let Some(publisher) =
+            delivery_context.map(|context| context.diagnostic_publisher.as_ref())
     {
         tokio::select! {
             biased;
@@ -1420,7 +1431,7 @@ async fn deliver_upstream_notification(
     notification: crate::lsp::bridge::UpstreamNotification,
     created_tokens: &mut std::collections::HashSet<tower_lsp_server::ls_types::NumberOrString>,
     begun_tokens: &mut std::collections::HashSet<tower_lsp_server::ls_types::NumberOrString>,
-    diagnostic_publisher: Option<&crate::lsp::lsp_impl::coordinator::DiagnosticPublisher>,
+    delivery_context: Option<&UpstreamDeliveryContext>,
 ) {
     use crate::lsp::bridge::UpstreamNotification;
     use tower_lsp_server::ls_types::{ProgressParamsValue, WorkDoneProgress};
@@ -1433,7 +1444,9 @@ async fn deliver_upstream_notification(
             // avoids blocking this delivery loop on the editor round-trip
             // (head-of-line). A `None` publisher (test loop) has no settings to gate
             // on, so the forward is dropped; production always has one (#521, #789).
-            if let Some(publisher) = diagnostic_publisher {
+            if let Some(publisher) =
+                delivery_context.map(|context| context.diagnostic_publisher.as_ref())
+            {
                 publisher.request_forwarded_diagnostic_refresh();
             }
         }
@@ -1449,14 +1462,25 @@ async fn deliver_upstream_notification(
             // (test loop) drops it. (Pushes without a server name were already
             // dropped at the reader, so `server` is always set here.) The
             // `connection_id` tags the cached slot so a later crash can evict it (#469).
-            if let Some(publisher) = diagnostic_publisher {
+            if let Some(publisher) =
+                delivery_context.map(|context| context.diagnostic_publisher.as_ref())
+            {
                 publisher
                     .publish_push(uri, server, connection_id, diagnostics)
                     .await;
             }
         }
         UpstreamNotification::LogMessage { typ, message } => {
-            client.log_message(typ, message).await;
+            if delivery_context.is_none_or(|context| {
+                context
+                    .settings_manager
+                    .load_settings()
+                    .features
+                    .window_log_message
+                    .allows(typ)
+            }) {
+                client.log_message(typ, message).await;
+            }
         }
         UpstreamNotification::ShowMessage { typ, message } => {
             client.show_message(typ, message).await;
@@ -1561,7 +1585,9 @@ async fn deliver_upstream_notification(
             // diagnostic slots it produced and republish the affected hosts so a
             // dead server's diagnostics don't linger until didClose (#469). A
             // `None` publisher (test loop) has no cache to evict.
-            if let Some(publisher) = diagnostic_publisher {
+            if let Some(publisher) =
+                delivery_context.map(|context| context.diagnostic_publisher.as_ref())
+            {
                 publisher.evict_connection_diagnostics(connection_id).await;
             }
         }

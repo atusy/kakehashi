@@ -99,7 +99,7 @@ impl Kakehashi {
             cancel_rx,
         )
         .await;
-        result.handle(&self.client, "rename", None, Ok).await
+        result.handle(&self.notifier(), "rename", None, Ok).await
     }
 }
 

@@ -84,6 +84,8 @@ impl Kakehashi {
         )
         .await;
 
-        result.handle(&self.client, "inlay hint", None, Ok).await
+        result
+            .handle(&self.notifier(), "inlay hint", None, Ok)
+            .await
     }
 }

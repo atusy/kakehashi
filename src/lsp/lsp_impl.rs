@@ -63,7 +63,11 @@ pub(super) fn build_notifier<'a>(
     client: &'a Client,
     settings_manager: &'a SettingsManager,
 ) -> ClientNotifier<'a> {
-    ClientNotifier::new(client.clone(), settings_manager.client_capabilities_lock())
+    ClientNotifier::new(
+        client.clone(),
+        settings_manager,
+        settings_manager.client_capabilities_lock(),
+    )
 }
 
 /// Detect the canonical language for a document using the full language-detection-fallback-chain.

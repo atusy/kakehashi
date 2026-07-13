@@ -89,7 +89,7 @@ impl Kakehashi {
         )
         .await;
         result
-            .handle(&self.client, "type definition", None, Ok)
+            .handle(&self.notifier(), "type definition", None, Ok)
             .await
     }
 

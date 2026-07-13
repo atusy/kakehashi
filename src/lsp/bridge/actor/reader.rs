@@ -938,8 +938,8 @@ fn handle_cancel_request(message: &serde_json::Value, deps: &ServerRequestDeps) 
 ///
 /// Routes `window/logMessage`, `window/showMessage`, and `telemetry/event` to
 /// their per-method modules ([`window::log_message`], [`window::show_message`],
-/// [`telemetry::event`]); all are forwarded unconditionally so the bridge stays
-/// transparent.
+/// [`telemetry::event`]). Valid notifications are enqueued here; the upstream
+/// delivery boundary applies the global `window/logMessage` severity policy.
 ///
 /// `$/progress`, `$/cancelRequest`, and non-scratch `textDocument/publishDiagnostics`
 /// (routed to the diagnostics cache — push-propagation-diagnostic-forwarding) are
