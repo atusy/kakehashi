@@ -538,9 +538,9 @@ mod tests {
     #[test]
     fn default_settings_emit_publish_diagnostics_feature_policy() {
         let toml = toml::to_string_pretty(&default_settings()).unwrap();
-        assert!(toml.contains("[features.textDocument/publishDiagnostics]"));
-        assert!(toml.contains("debounceMs = 100"));
-        assert!(toml.contains("maxWaitMs = 1000"));
+        assert!(toml.contains(
+            "[features.textDocument/publishDiagnostics]\ndebounceMs = 100\nmaxWaitMs = 1000"
+        ));
     }
 
     #[test]

@@ -287,8 +287,9 @@ fn test_config_init_emits_publish_diagnostics_feature_defaults() {
         .expect("run config init");
     assert!(output.status.success());
     let stdout = String::from_utf8(output.stdout).unwrap();
-    assert!(stdout.contains("[features.\"textDocument/publishDiagnostics\"]\n"));
-    assert!(stdout.contains("debounceMs = 100\nmaxWaitMs = 1000"));
+    assert!(stdout.contains(
+        "[features.\"textDocument/publishDiagnostics\"]\ndebounceMs = 100\nmaxWaitMs = 1000"
+    ));
 }
 
 /// Test that config init documents the per-root-instance default by emitting
