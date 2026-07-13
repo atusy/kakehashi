@@ -14,10 +14,10 @@ use crate::config::settings::ResolvedLayerConfig;
 use crate::lsp::bridge::LanguageServerPool;
 use crate::lsp::lsp_impl::bridge_context::{DocumentRequestContext, HostRequestContext};
 
-use super::RequestErrorSink;
 use super::diagnostic::{
     collect_host_diagnostics, collect_region_diagnostics, combine_layer_diagnostics,
 };
+use super::{RequestErrorSink, count_request_errors};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct DiagnosticSnapshotLineage {
@@ -175,20 +175,7 @@ pub(crate) async fn collect_push_diagnostics_with_error_sink(
             });
         }
 
-        let mut all_diagnostics = Vec::new();
-        while let Some(result) = join_set.join_next().await {
-            match result {
-                Ok(diags) => all_diagnostics.extend(diags),
-                Err(join_err) => {
-                    log::warn!(
-                        target: log_target,
-                        "Diagnostic region task panicked: {}",
-                        join_err
-                    );
-                }
-            }
-        }
-        all_diagnostics
+        collect_joined_region_diagnostics(join_set, request_error_sink, log_target).await
     };
 
     let host_fut = async {
@@ -210,6 +197,28 @@ pub(crate) async fn collect_push_diagnostics_with_error_sink(
     ))
 }
 
+async fn collect_joined_region_diagnostics(
+    mut join_set: JoinSet<Vec<tower_lsp_server::ls_types::Diagnostic>>,
+    request_error_sink: &RequestErrorSink,
+    log_target: &str,
+) -> Vec<tower_lsp_server::ls_types::Diagnostic> {
+    let mut all_diagnostics = Vec::new();
+    while let Some(result) = join_set.join_next().await {
+        match result {
+            Ok(diags) => all_diagnostics.extend(diags),
+            Err(join_err) => {
+                count_request_errors(request_error_sink, 1);
+                log::warn!(
+                    target: log_target,
+                    "Diagnostic region task panicked: {}",
+                    join_err
+                );
+            }
+        }
+    }
+    all_diagnostics
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -218,6 +227,7 @@ mod tests {
     use crate::lsp::bridge::ConnectionState;
     use crate::lsp::bridge::ResolvedServerConfig;
     use crate::lsp::bridge::test_helpers::create_handle_with_state;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     fn virt_ctx_for_server(server: &str) -> DocumentRequestContext {
         DocumentRequestContext {
@@ -255,6 +265,18 @@ mod tests {
             max_fan_out: None,
             client_progress_token: None,
         }
+    }
+
+    #[tokio::test]
+    async fn panicked_region_task_is_counted_as_prefetch_failure() {
+        let sink = Some(Arc::new(AtomicUsize::new(0)));
+        let mut join_set = JoinSet::new();
+        join_set.spawn(async { panic!("region task failed") });
+
+        let diagnostics = collect_joined_region_diagnostics(join_set, &sink, "test").await;
+
+        assert!(diagnostics.is_empty());
+        assert_eq!(sink.unwrap().load(Ordering::Relaxed), 1);
     }
 
     /// An all-incapable virt snapshot must still publish an (empty) pull layer,
