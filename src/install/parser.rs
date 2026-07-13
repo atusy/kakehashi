@@ -120,11 +120,30 @@ pub fn parser_file_exists(language: &str, data_dir: &Path) -> Option<PathBuf> {
         data_dir
             .join("parser")
             .join(format!("{}.{}", language, std::env::consts::DLL_EXTENSION));
-    if parser_file.exists() {
+    if parser_file_is_regular(&parser_file) {
         Some(parser_file)
     } else {
         None
     }
+}
+
+fn parser_file_is_regular(path: &Path) -> bool {
+    let Ok(metadata) = fs::symlink_metadata(path) else {
+        return false;
+    };
+    if !metadata.file_type().is_file() {
+        return false;
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt as _;
+        use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
+
+        if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return false;
+        }
+    }
+    true
 }
 
 /// Upper bound for a single parser compile.
@@ -282,7 +301,7 @@ pub fn install_parser(
     let parser_file = parser_dir.join(format!("{}.{}", language, std::env::consts::DLL_EXTENSION));
 
     // Check if parser already exists
-    if parser_file.exists() && !options.force {
+    if parser_file_is_regular(&parser_file) && !options.force {
         return Err(ParserInstallError::AlreadyExists(parser_file));
     }
 
@@ -937,6 +956,34 @@ fn invalid_metadata(message: String) -> ParserInstallError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn parser_file_exists_rejects_a_managed_symlink() {
+        let temp = tempdir().unwrap();
+        let parser_dir = temp.path().join("parser");
+        fs::create_dir_all(&parser_dir).unwrap();
+        let external = temp
+            .path()
+            .join(format!("external.{}", std::env::consts::DLL_EXTENSION));
+        fs::write(&external, "external parser").unwrap();
+        let managed = parser_dir.join(format!("lua.{}", std::env::consts::DLL_EXTENSION));
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&external, &managed).unwrap();
+        #[cfg(windows)]
+        if let Err(e) = std::os::windows::fs::symlink_file(&external, &managed) {
+            if e.kind() == std::io::ErrorKind::PermissionDenied || e.raw_os_error() == Some(1314) {
+                return;
+            }
+            panic!("failed to create parser symlink: {e}");
+        }
+
+        assert_eq!(
+            parser_file_exists("lua", temp.path()),
+            None,
+            "managed parser links must not suppress repair"
+        );
+    }
     use tempfile::tempdir;
 
     const TREE_SITTER_JSON_URL: &str =
