@@ -1331,6 +1331,94 @@ fn test_language_uninstall_all_ignores_parser_shaped_directories() {
     );
 }
 
+#[cfg(any(unix, windows))]
+#[test]
+fn test_language_uninstall_all_ignores_symlinked_parser_files() {
+    use std::fs;
+
+    let test_dir = tempfile::tempdir().expect("Failed to create temp dir");
+    let ext = std::env::consts::DLL_EXTENSION;
+    fs::create_dir_all(test_dir.path().join("parser")).expect("Failed to create parser dir");
+    let external = test_dir.path().join(format!("external.{ext}"));
+    fs::write(&external, "external parser").expect("Failed to create external parser");
+    let managed = test_dir.path().join(format!("parser/lua.{ext}"));
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(&external, &managed).expect("Failed to symlink parser");
+    #[cfg(windows)]
+    if let Err(e) = std::os::windows::fs::symlink_file(&external, &managed) {
+        if e.kind() == std::io::ErrorKind::PermissionDenied || e.raw_os_error() == Some(1314) {
+            return;
+        }
+        panic!("failed to create parser symlink: {e}");
+    }
+
+    let output = Command::new(env!("CARGO_BIN_EXE_kakehashi"))
+        .args([
+            "language",
+            "uninstall",
+            "--all",
+            "--force",
+            "--data-dir",
+            test_dir.path().to_str().unwrap(),
+        ])
+        .output()
+        .expect("Failed to execute command");
+
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.status.success(), "uninstall failed: {combined}");
+    assert!(combined.contains("No languages installed to uninstall"));
+    assert!(managed.is_symlink(), "managed symlink must remain intact");
+    assert!(external.is_file(), "external parser must remain intact");
+}
+
+#[cfg(any(unix, windows))]
+#[test]
+fn test_language_uninstall_explicit_ignores_symlinked_parser_files() {
+    use std::fs;
+
+    let test_dir = tempfile::tempdir().expect("Failed to create temp dir");
+    let ext = std::env::consts::DLL_EXTENSION;
+    fs::create_dir_all(test_dir.path().join("parser")).expect("Failed to create parser dir");
+    let external = test_dir.path().join(format!("external.{ext}"));
+    fs::write(&external, "external parser").expect("Failed to create external parser");
+    let managed = test_dir.path().join(format!("parser/lua.{ext}"));
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(&external, &managed).expect("Failed to symlink parser");
+    #[cfg(windows)]
+    if let Err(e) = std::os::windows::fs::symlink_file(&external, &managed) {
+        if e.kind() == std::io::ErrorKind::PermissionDenied || e.raw_os_error() == Some(1314) {
+            return;
+        }
+        panic!("failed to create parser symlink: {e}");
+    }
+
+    let output = Command::new(env!("CARGO_BIN_EXE_kakehashi"))
+        .args([
+            "language",
+            "uninstall",
+            "lua",
+            "--force",
+            "--data-dir",
+            test_dir.path().to_str().unwrap(),
+        ])
+        .output()
+        .expect("Failed to execute command");
+
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.status.success(), "uninstall failed: {combined}");
+    assert!(combined.contains("Language 'lua' is not installed"));
+    assert!(managed.is_symlink(), "managed symlink must remain intact");
+    assert!(external.is_file(), "external parser must remain intact");
+}
+
 /// Explicit uninstall must use the same regular-file check as discovery, so a
 /// parser-shaped directory is reported as absent and never passed to removal.
 #[test]
