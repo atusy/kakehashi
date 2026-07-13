@@ -722,6 +722,9 @@ impl DiagnosticPublisher {
         // immediately. Deferral withholds only the wire: the set was already
         // recorded above, so the return value (and with it the push-origin
         // coverage bump + refresh nudge) is unaffected.
+        // Subscribe before resolving/admitting so a settings replacement in
+        // that window remains observable by a newly parked trailing task.
+        let settings_changed = self.settings_manager.subscribe_settings_changes();
         let quiet_window = self.publish_quiet_window(host);
         match self.aggregator.wire_gate_admit(host, quiet_window) {
             crate::lsp::diagnostic_cache::WireAdmit::SendNow => {
@@ -755,7 +758,7 @@ impl DiagnosticPublisher {
                     remaining.as_millis()
                 );
                 if schedule_trailing {
-                    self.spawn_trailing_wire_publish(host.clone(), remaining);
+                    self.spawn_trailing_wire_publish(host.clone(), remaining, settings_changed);
                 }
             }
         }
@@ -780,9 +783,13 @@ impl DiagnosticPublisher {
     /// token because its work spawns bridge connections).
     ///
     /// [`WireAdmit::Defer`]: crate::lsp::diagnostic_cache::WireAdmit::Defer
-    fn spawn_trailing_wire_publish(&self, host: Url, remaining: std::time::Duration) {
+    fn spawn_trailing_wire_publish(
+        &self,
+        host: Url,
+        remaining: std::time::Duration,
+        mut settings_changed: tokio::sync::watch::Receiver<u64>,
+    ) {
         let publisher = self.clone();
-        let mut settings_changed = self.settings_manager.subscribe_settings_changes();
         // Anchor the deadline NOW (at defer time), not at the task's first poll
         // — under load the first poll can lag, which would silently stretch the
         // quiet window.
