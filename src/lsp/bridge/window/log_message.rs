@@ -12,15 +12,15 @@
 
 use log::debug;
 use serde::Deserialize;
-use tower_lsp_server::ls_types::LogMessageParams;
 
 use super::{prefixed_message, send_window_notification};
 use crate::lsp::bridge::actor::{ServerRequestDeps, UpstreamNotification};
 
 #[derive(Deserialize)]
-struct LogMessageType {
+struct BorrowedLogMessageParams<'a> {
     #[serde(rename = "type")]
     typ: tower_lsp_server::ls_types::MessageType,
+    message: &'a str,
 }
 
 /// Forward a `window/logMessage` notification to the editor.
@@ -29,7 +29,7 @@ pub(in crate::lsp::bridge) fn forward(
     server_prefix: &str,
     deps: &ServerRequestDeps,
 ) {
-    let Ok(log_type) = LogMessageType::deserialize(&message["params"]) else {
+    let Ok(params) = BorrowedLogMessageParams::deserialize(&message["params"]) else {
         debug!(
             target: "kakehashi::bridge::reader",
             "{}Dropping window/logMessage with invalid params",
@@ -37,27 +37,17 @@ pub(in crate::lsp::bridge) fn forward(
         );
         return;
     };
-    if !deps.dynamic_capabilities.allows_log_message(log_type.typ) {
+    if !deps.dynamic_capabilities.allows_log_message(params.typ) {
         return;
     }
 
-    // Deserialize the message text only after the cheap severity gate, so a
-    // suppressed downstream flood does not allocate one String per message.
-    match LogMessageParams::deserialize(&message["params"]) {
-        Ok(params) => send_window_notification(
-            deps,
-            server_prefix,
-            "window/logMessage",
-            UpstreamNotification::LogMessage {
-                typ: params.typ,
-                message: prefixed_message(deps.server_name.as_deref(), &params.message),
-            },
-        ),
-        Err(e) => debug!(
-            target: "kakehashi::bridge::reader",
-            "{}Dropping window/logMessage with invalid params: {}",
-            server_prefix,
-            e
-        ),
-    }
+    send_window_notification(
+        deps,
+        server_prefix,
+        "window/logMessage",
+        UpstreamNotification::LogMessage {
+            typ: params.typ,
+            message: prefixed_message(deps.server_name.as_deref(), params.message),
+        },
+    );
 }
