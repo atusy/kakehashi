@@ -32,11 +32,6 @@ fn default_priorities() -> Vec<String> {
 ///   This is the default for the diagnostics methods
 ///   (`textDocument/diagnostic`, `textDocument/publishDiagnostics`) and
 ///   `textDocument/codeAction`.
-/// Severity threshold for forwarding downstream `window/logMessage`.
-///
-/// LSP severities are ordered from `Error` through `Log`; `Off` suppresses the
-/// method entirely. Unknown numeric message types are never admitted by a
-/// configured threshold.
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum AggregationStrategy {
@@ -353,6 +348,11 @@ impl RootMarker {
     }
 }
 
+/// Severity threshold for forwarding downstream `window/logMessage`.
+///
+/// LSP severities are ordered from `Error` through `Log`; `Off` suppresses the
+/// method entirely. Unknown numeric message types are never admitted by a
+/// configured threshold.
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum ForwardLogLevel {
