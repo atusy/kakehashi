@@ -164,7 +164,7 @@ impl InstallCoordinator {
         self.dispatch_install_events(language, &result.events).await;
 
         if let Some(data_dir) = result.outcome.data_dir() {
-            self.reload_language_after_install(language, data_dir, uri, is_injection)
+            self.reload_language_after_install(language, data_dir, is_injection)
                 .await;
             return true;
         }
@@ -191,7 +191,6 @@ impl InstallCoordinator {
         &self,
         language: &str,
         data_dir: &std::path::Path,
-        uri: Url,
         is_injection: bool,
     ) {
         let settings_snapshot = self.settings_manager.load_settings_pair();
@@ -210,15 +209,28 @@ impl InstallCoordinator {
             .await;
 
         if !is_injection {
-            let host_language = self.get_language_for_document(&uri);
-            // Resurrection-safe, off-ingress reparse: re-reads the latest store
-            // text and persists through a non-inserting CAS, so a didClose during
-            // the install can't be resurrected. (The original didOpen's ticket
-            // already advanced the watermark on its skip-parse path, so this
-            // carries no ticket.)
-            self.parse_coordinator()
-                .reparse_installed_document(uri.clone(), host_language)
-                .await;
+            let uris = self
+                .documents
+                .open_uris()
+                .into_iter()
+                .filter(|candidate| {
+                    self.documents
+                        .get(candidate)
+                        .is_some_and(|document| document.tree().is_none())
+                        && self.get_language_for_document(candidate).as_deref() == Some(language)
+                })
+                .collect::<Vec<_>>();
+            let parse = self.parse_coordinator();
+            for uri in uris {
+                // Resurrection-safe, off-ingress reparse: re-reads the latest store
+                // text and persists through a non-inserting CAS, so a didClose during
+                // the install can't be resurrected. (The original didOpen's ticket
+                // already advanced the watermark on its skip-parse path, so this
+                // carries no ticket.)
+                parse
+                    .reparse_installed_document(uri, Some(language.to_string()))
+                    .await;
+            }
         }
     }
 
@@ -274,6 +286,7 @@ mod tests {
     use crate::config::{LanguageSettings, RawWorkspaceSettings, WILDCARD_KEY, WorkspaceSettings};
     use std::collections::HashMap;
     use std::path::Path;
+    use tower_lsp_server::LspService;
 
     #[test]
     fn reload_after_install_preserves_explicit_matching_override_in_raw_settings() {
@@ -384,6 +397,40 @@ mod tests {
                 "/custom".to_string(),
                 "/installed".to_string(),
             ]
+        );
+    }
+
+    #[tokio::test]
+    async fn reload_after_install_reparses_every_open_document_for_the_language() {
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+        server
+            .language
+            .language_registry_for_parallel()
+            .register("rust".to_string(), tree_sitter_rust::LANGUAGE.into());
+        let first = Url::parse("file:///workspace/first.rs").unwrap();
+        let waiting = Url::parse("file:///workspace/waiting.rs").unwrap();
+        for uri in [&first, &waiting] {
+            server.documents.insert(
+                uri.clone(),
+                "fn main() {}".to_string(),
+                Some("rust".to_string()),
+                None,
+            );
+        }
+
+        server
+            .install_coordinator()
+            .reload_language_after_install("rust", Path::new("/installed"), false)
+            .await;
+
+        assert!(
+            server.documents.get(&first).unwrap().tree().is_some(),
+            "the document that won the install should be reparsed"
+        );
+        assert!(
+            server.documents.get(&waiting).unwrap().tree().is_some(),
+            "a same-language document that lost the install claim must also be reparsed"
         );
     }
 }
