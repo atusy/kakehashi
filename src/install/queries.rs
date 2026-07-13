@@ -1670,6 +1670,37 @@ mod tests {
     }
 
     #[test]
+    fn uninstall_sync_failure_preserves_queries_and_backups() {
+        let temp = TempDir::new().unwrap();
+        let queries_parent = temp.path().join("queries");
+        let queries_dir = queries_parent.join("rust");
+        fs::create_dir_all(&queries_dir).unwrap();
+        fs::write(queries_dir.join("highlights.scm"), "old queries\n").unwrap();
+        let backup = queries_parent.join(".rust.123.0.backup");
+        fs::create_dir(&backup).unwrap();
+        fs::write(backup.join("highlights.scm"), "backup\n").unwrap();
+        write_backup_ownership_marker(&backup).unwrap();
+
+        let result = remove_query_install_and_backups_with_tombstone_writer(
+            &queries_parent,
+            "rust",
+            |_, _| {
+                Err(QueryInstallError::IoError(std::io::Error::other(
+                    "injected durability failure",
+                )))
+            },
+        );
+
+        assert!(matches!(result, Err(QueryInstallError::IoError(_))));
+        assert!(queries_dir.exists(), "canonical queries are not removed");
+        assert!(backup.exists(), "owned backup is not removed");
+        assert!(
+            backup_ownership_sidecar(&backup).exists(),
+            "backup ownership evidence is not removed"
+        );
+    }
+
+    #[test]
     fn tombstone_publish_does_not_truncate_raced_hard_link_alias() {
         let temp = TempDir::new().unwrap();
         let queries_parent = temp.path().join("queries");
