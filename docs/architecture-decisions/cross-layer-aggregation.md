@@ -81,8 +81,8 @@ Phased roadmap:
    the editor-facing wire sends (the pull-first opt-out; delivery continues
    via `workspace/diagnostic/refresh` → re-pull, and `didClose`'s clearing
    publish still fails open) — prerequisites and caveats in
-   push-propagation-diagnostic-forwarding "Config wire seal". Non-empty
-   publishes then pass through the independent global
+   push-propagation-diagnostic-forwarding "Config wire seal". With non-empty
+   priorities, publishes (including open-document clearing payloads) pass through the independent global
    `features."textDocument/publishDiagnostics"` scheduler; aggregation decides
    *what* may publish, while that per-URI scheduler decides *when* it reaches
    the wire.
