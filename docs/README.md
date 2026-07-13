@@ -692,7 +692,9 @@ as visible Rust-style escapes (for example, `\u{1b}`). In message and source
 fields, whitespace runs become single spaces before remaining controls are
 escaped. Use `--output-format jsonl` when consumers need the original field
 values. JSON escapes controls on the wire, but parsing each JSONL record
-recovers the exact path, message, and source strings.
+recovers the exact emitted Unicode field values. In path mode, `file` is
+cwd-relative and uses Rust's display representation, which can be lossy for a
+non-UTF-8 filename.
 
 Diagnostics go to stdout; the one-line summary, any errors, and `RUST_LOG`
 output go to stderr — so stdout stays a clean data channel for `| jq` / `| head`
