@@ -231,7 +231,7 @@ async fn run_paths(server: &Kakehashi, cwd: &Path, options: &DiagnoseOptions) ->
     }) {
         Ok(collected) => collected,
         Err(e) => {
-            elnln!("error: {e}");
+            elnln!("error: {}", escape_terminal_controls(&e.to_string()));
             return EXIT_ERROR;
         }
     };
@@ -262,7 +262,10 @@ async fn run_paths(server: &Kakehashi, cwd: &Path, options: &DiagnoseOptions) ->
         let text = match std::fs::read_to_string(file) {
             Ok(text) => text,
             Err(e) => {
-                elnln!("error: cannot read '{display}': {e}");
+                elnln!(
+                    "error: cannot read '{}': {e}",
+                    escape_terminal_controls(&display)
+                );
                 report.operational_error = true;
                 continue;
             }
@@ -413,6 +416,8 @@ fn summarize(report: &Report, file_count: usize) -> u8 {
 }
 
 fn format_server_failure(display: &str, failure: &str) -> String {
+    let display = escape_terminal_controls(display);
+    let failure = escape_terminal_controls(failure);
     format!("error: {display}: {failure}")
 }
 
@@ -723,6 +728,14 @@ mod tests {
         assert_eq!(
             format_diagnostic(OutputFormat::Default, " dir/a  b.rs ", &d),
             " dir/a  b.rs :1:1: error: boom"
+        );
+    }
+
+    #[test]
+    fn server_failure_escapes_untrusted_fields() {
+        assert_eq!(
+            format_server_failure(" dir/\u{1b}  f ", "server\nspoof\u{1b}"),
+            "error:  dir/\\u{1b}  f : server\\nspoof\\u{1b}"
         );
     }
 
