@@ -45,6 +45,8 @@ pub(crate) enum ExpandError {
     UndefinedVar { var_name: String, input: String },
     /// The path uses `~` but no home directory is available.
     NoHomeDir { input: String },
+    /// A setting violates a cross-field invariant.
+    InvalidSetting { message: String },
 }
 
 impl fmt::Display for ExpandError {
@@ -62,6 +64,7 @@ impl fmt::Display for ExpandError {
                     "path uses ~ but home directory is not available (in \"{input}\")"
                 )
             }
+            ExpandError::InvalidSetting { message } => write!(f, "{message}"),
         }
     }
 }

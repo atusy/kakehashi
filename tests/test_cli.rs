@@ -267,6 +267,18 @@ fn test_config_init_includes_capture_mappings() {
     );
 }
 
+#[test]
+fn test_config_init_emits_workspace_refresh_feature_defaults() {
+    let output = Command::new(env!("CARGO_BIN_EXE_kakehashi"))
+        .args(["config", "init"])
+        .output()
+        .expect("run config init");
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("[features.\"workspace/diagnostic/refresh\"]\n"));
+    assert!(stdout.contains("debounceMs = 100\nmaxWaitMs = 1000"));
+}
+
 /// Test that config init documents the per-root-instance default by emitting
 /// `preferSharedInstance = false` under the `languageServers._` wildcard, so
 /// the opt-in (#391) is discoverable in the generated template.

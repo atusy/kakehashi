@@ -13,6 +13,7 @@ const KNOWN_WORKSPACE_SETTING_KEYS: &[&str] = &[
     "captureMappings",
     "autoInstall",
     "diagnosticsDebounceMs",
+    "features",
     "languageServers",
 ];
 
@@ -413,7 +414,7 @@ impl Kakehashi {
             }
             Err(errs) => {
                 let event = crate::lsp::SettingsEvent::error(format!(
-                    "Path expansion failed: {errs}. \
+                    "Invalid configuration: {errs}. \
                      This configuration has been discarded; previous settings remain in effect. \
                      Please correct the affected paths and environment variables or remove them from your config.",
                 ));

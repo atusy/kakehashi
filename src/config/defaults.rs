@@ -6,8 +6,11 @@
 use super::WILDCARD_KEY;
 use super::settings::{
     AggregationConfig, AggregationStrategy, BridgeLanguageConfig, BridgeServerConfig,
-    CaptureMapping, CaptureMappings, DEFAULT_DEBOUNCE_MS, LanguageSettings, LayerAggregationConfig,
-    LayerSource, LayersConfig, QueryTypeMappings, RawWorkspaceSettings, RootMarker,
+    CaptureMapping, CaptureMappings, DEFAULT_DEBOUNCE_MS,
+    DEFAULT_WORKSPACE_DIAGNOSTIC_REFRESH_DEBOUNCE_MS,
+    DEFAULT_WORKSPACE_DIAGNOSTIC_REFRESH_MAX_WAIT_MS, DebounceFeatureSettings, FeatureSettings,
+    LanguageSettings, LayerAggregationConfig, LayerSource, LayersConfig, QueryTypeMappings,
+    RawWorkspaceSettings, RootMarker,
 };
 use std::collections::HashMap;
 
@@ -21,6 +24,12 @@ pub fn default_settings() -> RawWorkspaceSettings {
         capture_mappings: default_capture_mappings(),
         auto_install: Some(true),
         diagnostics_debounce_ms: Some(DEFAULT_DEBOUNCE_MS),
+        features: Some(FeatureSettings {
+            workspace_diagnostic_refresh: Some(DebounceFeatureSettings {
+                debounce_ms: Some(DEFAULT_WORKSPACE_DIAGNOSTIC_REFRESH_DEBOUNCE_MS),
+                max_wait_ms: Some(DEFAULT_WORKSPACE_DIAGNOSTIC_REFRESH_MAX_WAIT_MS),
+            }),
+        }),
         language_servers: Some(default_language_servers()),
     }
 }
@@ -512,6 +521,14 @@ mod tests {
             Some(DEFAULT_DEBOUNCE_MS),
             "template diagnosticsDebounceMs must mirror the runtime default"
         );
+    }
+
+    #[test]
+    fn default_settings_emit_workspace_refresh_feature_policy() {
+        let toml = toml::to_string_pretty(&default_settings()).unwrap();
+        assert!(toml.contains("[features.workspace/diagnostic/refresh]"));
+        assert!(toml.contains("debounceMs = 100"));
+        assert!(toml.contains("maxWaitMs = 1000"));
     }
 
     #[test]
