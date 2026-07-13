@@ -429,6 +429,11 @@ fn format_diagnostic(format: OutputFormat, display: &str, diagnostic: &Diagnosti
             // source.
             match diagnostic.source.as_deref() {
                 Some(source) => {
+                    let source = if source.chars().any(char::is_whitespace) {
+                        std::borrow::Cow::Owned(one_line(source))
+                    } else {
+                        std::borrow::Cow::Borrowed(source)
+                    };
                     format!("{display}:{line}:{col}: {severity}: {message} [{source}]")
                 }
                 None => format!("{display}:{line}:{col}: {severity}: {message}"),
@@ -602,6 +607,17 @@ mod tests {
     }
 
     #[test]
+    fn default_format_collapses_multiline_source() {
+        let mut d = diag(4, 2, Some(DiagnosticSeverity::ERROR), "boom");
+        d.source = Some("lua-ls\nspoofed\tfield".to_string());
+
+        assert_eq!(
+            format_diagnostic(OutputFormat::Default, "a.md", &d),
+            "a.md:5:3: error: boom [lua-ls spoofed field]"
+        );
+    }
+
+    #[test]
     fn default_format_without_source_omits_the_bracket() {
         let d = diag(0, 0, Some(DiagnosticSeverity::HINT), "hint here");
         assert_eq!(
@@ -626,6 +642,17 @@ mod tests {
         assert_eq!(value["source"], "ruff");
         assert_eq!(value["code"], "E501");
         assert_eq!(value["message"], "msg");
+    }
+
+    #[test]
+    fn jsonl_format_preserves_multiline_source() {
+        let mut d = diag(0, 0, Some(DiagnosticSeverity::ERROR), "boom");
+        d.source = Some("lua-ls\nsecond\tfield".to_string());
+
+        let value: serde_json::Value =
+            serde_json::from_str(&format_diagnostic(OutputFormat::Jsonl, "x.lua", &d)).unwrap();
+
+        assert_eq!(value["source"], "lua-ls\nsecond\tfield");
     }
 
     #[test]
