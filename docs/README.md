@@ -113,17 +113,24 @@ This section is a practical reference. For the exhaustive field list and types, 
 ### Configuration Options
 
 Workspace-wide client-facing policies live under top-level `features`, keyed by
-the LSP method they govern. Diagnostic refresh bursts use one scheduler shared by
-all downstream servers in the workspace:
+the LSP method they govern. Publish scheduling is global policy with independent
+state per host URI; diagnostic refresh uses one scheduler shared by all downstream
+servers in the workspace:
 
 ```toml
+[features."textDocument/publishDiagnostics"]
+debounceMs = 100
+maxWaitMs = 1000
+
 [features."workspace/diagnostic/refresh"]
 debounceMs = 100
 maxWaitMs = 1000
 ```
 
-The first refresh after idle is immediate. Later activity is released after
-`debounceMs` of quiet, with `maxWaitMs` bounding a continuous burst. The values
+Both schedulers send the first activity after idle immediately. Later activity is
+released after `debounceMs` of quiet, with `maxWaitMs` bounding a continuous burst.
+Publish diagnostics keep only the latest merged set per URI, and different URIs
+never delay one another. Pull diagnostics are unaffected. The values
 apply to cycles admitted after a live configuration update; an active cycle keeps
 the timing snapshot it started with. `maxWaitMs` must be at least `debounceMs`.
 

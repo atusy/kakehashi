@@ -527,6 +527,9 @@ struct WireGate {
     /// passes immediately, and the `dirty` debt below records that the
     /// last-recorded set may never have reached the wire.
     last_sent_at: Option<tokio::time::Instant>,
+    /// Latest set-changing feed admitted for this host. Trailing retries do
+    /// not advance it, so `debounce` measures quiet since real activity.
+    last_activity_at: Option<tokio::time::Instant>,
     /// A trailing republish task is scheduled; bounds the tasks to one per
     /// host per window.
     pending: bool,
@@ -1187,7 +1190,18 @@ impl DiagnosticAggregator {
     /// defer while no trailing task is parked). Called under the host's
     /// republish lock, so same-host decisions are serialized — including the
     /// decide→commit pair.
+    #[cfg(test)]
     pub(crate) fn wire_gate_admit(&self, host: &Url, window: std::time::Duration) -> WireAdmit {
+        self.wire_debounce_admit(host, window, window, true)
+    }
+
+    pub(crate) fn wire_debounce_admit(
+        &self,
+        host: &Url,
+        debounce: std::time::Duration,
+        max_wait: std::time::Duration,
+        record_activity: bool,
+    ) -> WireAdmit {
         let now = tokio::time::Instant::now();
         let mut gates = self
             .wire_gate
@@ -1204,26 +1218,36 @@ impl DiagnosticAggregator {
                 host.clone(),
                 WireGate {
                     last_sent_at: None,
+                    last_activity_at: Some(now),
                     pending: false,
                     dirty: true,
                 },
             );
             return WireAdmit::SendNow;
         };
-        let elapsed = gate.last_sent_at.map(|at| now.duration_since(at));
-        match elapsed {
-            Some(elapsed) if elapsed < window => {
-                gate.dirty = true;
-                let schedule_trailing = !gate.pending;
-                gate.pending = true;
-                WireAdmit::Defer {
-                    schedule_trailing,
-                    remaining: window - elapsed,
-                }
-            }
-            _ => {
-                gate.dirty = true;
-                WireAdmit::SendNow
+        let was_quiet = gate
+            .last_activity_at
+            .is_some_and(|at| now.duration_since(at) >= debounce);
+        if record_activity {
+            gate.last_activity_at = Some(now);
+        }
+        let quiet_deadline = gate.last_activity_at.unwrap_or(now) + debounce;
+        let max_deadline = gate.last_sent_at.map(|at| at + max_wait);
+        let send_now = gate.last_sent_at.is_none()
+            || (record_activity && was_quiet)
+            || max_deadline.is_some_and(|deadline| now >= deadline)
+            || (!record_activity && now >= quiet_deadline);
+        if send_now {
+            gate.dirty = true;
+            WireAdmit::SendNow
+        } else {
+            let deadline = max_deadline.map_or(quiet_deadline, |max| quiet_deadline.min(max));
+            gate.dirty = true;
+            let schedule_trailing = !gate.pending;
+            gate.pending = true;
+            WireAdmit::Defer {
+                schedule_trailing,
+                remaining: deadline.saturating_duration_since(now),
             }
         }
     }
@@ -1249,6 +1273,7 @@ impl DiagnosticAggregator {
                 host.clone(),
                 WireGate {
                     last_sent_at: Some(now),
+                    last_activity_at: Some(now),
                     pending: false,
                     dirty: false,
                 },
@@ -1465,6 +1490,89 @@ mod tests {
         assert!(
             !agg.wire_gate_is_dirty(&host()),
             "the post-send commit clears the dirty marker"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn wire_debounce_tracks_quiet_from_latest_activity() {
+        let agg = DiagnosticAggregator::new();
+        let debounce = std::time::Duration::from_millis(100);
+        let max_wait = std::time::Duration::from_secs(1);
+        assert_eq!(
+            agg.wire_debounce_admit(&host(), debounce, max_wait, true),
+            WireAdmit::SendNow
+        );
+        agg.wire_gate_commit_send(&host());
+
+        tokio::time::advance(std::time::Duration::from_millis(10)).await;
+        assert!(matches!(
+            agg.wire_debounce_admit(&host(), debounce, max_wait, true),
+            WireAdmit::Defer { .. }
+        ));
+        tokio::time::advance(std::time::Duration::from_millis(80)).await;
+        assert!(matches!(
+            agg.wire_debounce_admit(&host(), debounce, max_wait, true),
+            WireAdmit::Defer { .. }
+        ));
+        tokio::time::advance(std::time::Duration::from_millis(20)).await;
+        assert!(agg.wire_gate_take_pending(&host()));
+        assert!(matches!(
+            agg.wire_debounce_admit(&host(), debounce, max_wait, false),
+            WireAdmit::Defer { remaining, .. }
+                if remaining == std::time::Duration::from_millis(80)
+        ));
+        tokio::time::advance(std::time::Duration::from_millis(80)).await;
+        assert!(agg.wire_gate_take_pending(&host()));
+        assert_eq!(
+            agg.wire_debounce_admit(&host(), debounce, max_wait, false),
+            WireAdmit::SendNow
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn wire_debounce_forces_continuous_activity_at_max_wait() {
+        let agg = DiagnosticAggregator::new();
+        let debounce = std::time::Duration::from_millis(100);
+        let max_wait = std::time::Duration::from_millis(1000);
+        assert_eq!(
+            agg.wire_debounce_admit(&host(), debounce, max_wait, true),
+            WireAdmit::SendNow
+        );
+        agg.wire_gate_commit_send(&host());
+        for _ in 0..10 {
+            tokio::time::advance(std::time::Duration::from_millis(90)).await;
+            assert!(matches!(
+                agg.wire_debounce_admit(&host(), debounce, max_wait, true),
+                WireAdmit::Defer { .. }
+            ));
+        }
+        tokio::time::advance(std::time::Duration::from_millis(100)).await;
+        assert_eq!(
+            agg.wire_debounce_admit(&host(), debounce, max_wait, true),
+            WireAdmit::SendNow
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn wire_debounce_is_independent_per_uri() {
+        let agg = DiagnosticAggregator::new();
+        let first = host();
+        let second = Url::parse("file:///other.md").unwrap();
+        let debounce = std::time::Duration::from_millis(100);
+        let max_wait = std::time::Duration::from_secs(1);
+        assert_eq!(
+            agg.wire_debounce_admit(&first, debounce, max_wait, true),
+            WireAdmit::SendNow
+        );
+        agg.wire_gate_commit_send(&first);
+        assert!(matches!(
+            agg.wire_debounce_admit(&first, debounce, max_wait, true),
+            WireAdmit::Defer { .. }
+        ));
+        assert_eq!(
+            agg.wire_debounce_admit(&second, debounce, max_wait, true),
+            WireAdmit::SendNow,
+            "one URI's pending burst must not delay another URI"
         );
     }
 

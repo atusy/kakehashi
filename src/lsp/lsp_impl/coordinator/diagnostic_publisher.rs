@@ -76,22 +76,10 @@ impl RepublishOutcome {
     }
 }
 
-/// Quiet window for the editor-facing `publishDiagnostics` wire sends, per
-/// host. A changed merge inside the window after the last send is withheld and
-/// re-merged by one trailing republish at the window's end, so a burst of
-/// feeds (spontaneous pushes, the pull-layer completion, the post-parse
-/// geometry re-merge) collapses into at most one full-set publish per window
-/// per host — on a diagnostics-heavy host each publish is ~1 MB (measured:
-/// ~2,235 merged diagnostics), so the gate bounds sustained-typing wire cost
-/// at ~1 MB/s/host where it was ~2.2. An isolated change (window already
-/// elapsed) passes through immediately: the gate adds no latency outside
-/// bursts (more precisely: to a change arriving after >= 1 s of wire quiet).
-/// Deliberately a fixed constant, not a config knob: the window trades only
-/// push-namespace refresh cadence against pipe bytes, the failure mode of a
-/// wrong value is mild in both directions, and this branch's review explicitly
-/// chose existing config surfaces over new ones — revisit if a real setup
-/// needs a different cadence.
-const WIRE_PUBLISH_QUIET_WINDOW: std::time::Duration = std::time::Duration::from_secs(1);
+/// Programmed quiet-window default used by paused-time tests. Runtime scheduling
+/// reads the top-level feature policy on each set-changing admission.
+#[cfg(test)]
+const WIRE_PUBLISH_QUIET_WINDOW: std::time::Duration = std::time::Duration::from_millis(100);
 #[cfg(test)]
 const FORWARDED_REFRESH_SETTLE_WINDOW: std::time::Duration = std::time::Duration::from_millis(100);
 #[cfg(test)]
@@ -851,6 +839,14 @@ impl DiagnosticPublisher {
     /// [`Self::request_pull_diagnostic_refresh`] on `Changed` OR `Deferred` —
     /// see [`RepublishOutcome::Deferred`] for why the deferral still nudges.
     pub(crate) async fn republish(&self, host: &Url) -> RepublishOutcome {
+        self.republish_with_wire_activity(host, true).await
+    }
+
+    async fn republish_with_wire_activity(
+        &self,
+        host: &Url,
+        wire_activity: bool,
+    ) -> RepublishOutcome {
         // Serialize the whole snapshot→merge→publish so concurrent republishes
         // (region push vs host-event pull) emit in order and a stale snapshot can
         // never publish after a fresh one (push-propagation-diagnostic-forwarding).
@@ -1010,10 +1006,17 @@ impl DiagnosticPublisher {
         // immediately. Deferral withholds only the wire: the set was already
         // recorded above, so the return value (and with it the push-origin
         // coverage bump + refresh nudge) is unaffected.
-        match self
-            .aggregator
-            .wire_gate_admit(host, WIRE_PUBLISH_QUIET_WINDOW)
-        {
+        let timing = self
+            .settings_manager
+            .load_settings()
+            .features
+            .text_document_publish_diagnostics;
+        match self.aggregator.wire_debounce_admit(
+            host,
+            std::time::Duration::from_millis(timing.debounce_ms),
+            std::time::Duration::from_millis(timing.max_wait_ms),
+            wire_activity,
+        ) {
             crate::lsp::diagnostic_cache::WireAdmit::SendNow => {
                 log::debug!(
                     target: LOG_TARGET,
@@ -1063,11 +1066,8 @@ impl DiagnosticPublisher {
     /// reopened incarnation's fresh entry is instead kept safe by the
     /// defer-reschedule design — see `wire_gate_take_pending`.)
     ///
-    /// Shutdown: a task parked at teardown fires up to one window later and
-    /// sends a fire-and-forget notification into a closing client — tower-lsp
-    /// suppresses or error-logs it; nothing panics and no fresh downstream
-    /// state is created (unlike the reparse loop, which checks the shutdown
-    /// token because its work spawns bridge connections).
+    /// Shutdown races the timer against the shared cancellation token, forgets
+    /// this host's gate state, and exits without a wire send.
     ///
     /// [`WireAdmit::Defer`]: crate::lsp::diagnostic_cache::WireAdmit::Defer
     fn spawn_trailing_wire_publish(&self, host: Url, remaining: std::time::Duration) {
@@ -1077,7 +1077,14 @@ impl DiagnosticPublisher {
         // quiet window.
         let deadline = tokio::time::Instant::now() + remaining;
         tokio::spawn(async move {
-            tokio::time::sleep_until(deadline).await;
+            tokio::select! {
+                biased;
+                _ = publisher.shutdown.cancelled() => {
+                    publisher.aggregator.forget_wire_gate(&host);
+                    return;
+                }
+                _ = tokio::time::sleep_until(deadline) => {}
+            }
             if !publisher.aggregator.wire_gate_take_pending(&host) {
                 return; // gate forgotten while parked: debt cancelled
             }
@@ -1088,7 +1095,7 @@ impl DiagnosticPublisher {
             if publisher.documents.get(&host).is_none() {
                 return;
             }
-            publisher.republish(&host).await;
+            publisher.republish_with_wire_activity(&host, false).await;
         });
     }
 
@@ -2083,6 +2090,45 @@ mod tests {
             RepublishOutcome::Unchanged,
             "after the flush an identical re-merge is a plain unchanged skip"
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_cancels_pending_trailing_publish() {
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+        register_rust(server);
+        server.settings_manager.apply_settings(rust_settings(true));
+        let uri = Url::parse("file:///test/host_trailing_shutdown.rs").unwrap();
+        server.documents.insert(
+            uri.clone(),
+            "fn main() {}".to_string(),
+            Some("rust".to_string()),
+            None,
+        );
+        let publisher = DiagnosticPublisher::new(server);
+        server.diagnostics.record(
+            &uri,
+            DiagnosticSource::Host,
+            "rust_ls".to_string(),
+            Some(ProgressConnectionId::for_test(1)),
+            vec![diag("first")],
+        );
+        publisher.republish(&uri).await;
+        server.diagnostics.record(
+            &uri,
+            DiagnosticSource::Host,
+            "rust_ls".to_string(),
+            Some(ProgressConnectionId::for_test(1)),
+            vec![diag("withheld")],
+        );
+        publisher.republish(&uri).await;
+        assert!(server.diagnostics.wire_gate_is_dirty(&uri));
+
+        server.shutdown_token.cancel();
+        tokio::time::advance(WIRE_PUBLISH_QUIET_WINDOW).await;
+        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        assert!(!server.diagnostics.wire_gate_is_dirty(&uri));
+        assert!(!server.diagnostics.wire_gate_take_pending(&uri));
     }
 
     #[tokio::test]
