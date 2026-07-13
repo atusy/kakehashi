@@ -151,14 +151,24 @@ pub fn parser_file_is_regular(path: &Path) -> bool {
 #[cfg(windows)]
 fn remove_existing_parser_leaf(path: &Path) -> std::io::Result<()> {
     use std::os::windows::fs::MetadataExt as _;
-    use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_DIRECTORY;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT,
+    };
 
     let metadata = match fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(err) => return Err(err),
     };
-    if metadata.file_attributes() & FILE_ATTRIBUTE_DIRECTORY != 0 {
+    let attributes = metadata.file_attributes();
+    if attributes & FILE_ATTRIBUTE_DIRECTORY != 0 && attributes & FILE_ATTRIBUTE_REPARSE_POINT == 0
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::IsADirectory,
+            "managed parser leaf is an ordinary directory",
+        ));
+    }
+    if attributes & FILE_ATTRIBUTE_DIRECTORY != 0 {
         fs::remove_dir(path)
     } else {
         fs::remove_file(path)
@@ -391,7 +401,10 @@ pub fn install_parser(
             // first there (a small non-atomic window, acceptable on the
             // non-primary platform).
             #[cfg(windows)]
-            remove_existing_parser_leaf(&parser_file)?;
+            if let Err(e) = remove_existing_parser_leaf(&parser_file) {
+                let _ = fs::remove_file(&tmp_file);
+                return Err(ParserInstallError::IoError(e));
+            }
             if let Err(e) = fs::rename(&tmp_file, &parser_file) {
                 let _ = fs::remove_file(&tmp_file);
                 return Err(ParserInstallError::IoError(e));
@@ -1027,6 +1040,21 @@ mod tests {
             external.is_dir(),
             "removing the link must preserve its target"
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn replacement_preserves_an_ordinary_parser_directory() {
+        let temp = tempdir().unwrap();
+        let managed = temp
+            .path()
+            .join(format!("lua.{}", std::env::consts::DLL_EXTENSION));
+        fs::create_dir(&managed).unwrap();
+
+        let err = remove_existing_parser_leaf(&managed).unwrap_err();
+
+        assert_eq!(err.kind(), std::io::ErrorKind::IsADirectory);
+        assert!(managed.is_dir());
     }
     use tempfile::tempdir;
 
