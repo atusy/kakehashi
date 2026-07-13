@@ -95,9 +95,8 @@ async fn shutdown_invalidated_connection(key: ConnectionKey, handle: Arc<Connect
                 key,
                 error
             );
-            // A panic drops the RAII owner and wakes waiters. Retry through the
-            // coordinator so another caller can take over physical shutdown.
-            let _ = handle.graceful_shutdown().await;
+            // Dropping the panicked task drops its kill-on-drop child handle.
+            handle.complete_shutdown();
         }
         Err(_) => {
             shutdown_task.abort();
@@ -107,10 +106,9 @@ async fn shutdown_invalidated_connection(key: ConnectionKey, handle: Arc<Connect
                 "Timed out shutting down invalidated {} connection",
                 key
             );
-            // Aborting drops the RAII owner. Retry through the coordinator: if
-            // another owner is active we wait for it; otherwise this call takes
-            // over and closes the child before cleanup removes the handle.
-            let _ = handle.graceful_shutdown().await;
+            // Aborting drops the reclaimed writer and its kill-on-drop child,
+            // keeping invalidation bounded even when shutdown never responds.
+            handle.complete_shutdown();
         }
     }
 }
