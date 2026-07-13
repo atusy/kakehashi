@@ -370,10 +370,7 @@ impl ForwardLogLevel {
             ),
             Self::Log => matches!(
                 message_type,
-                MessageType::ERROR
-                    | MessageType::WARNING
-                    | MessageType::INFO
-                    | MessageType::LOG
+                MessageType::ERROR | MessageType::WARNING | MessageType::INFO | MessageType::LOG
             ),
             Self::Off => false,
         }
