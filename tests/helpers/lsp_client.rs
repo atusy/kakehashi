@@ -631,6 +631,21 @@ impl LspClient {
             {
                 return (message, watched);
             }
+            if let (Some(id), Some(method)) = (
+                message.get("id").cloned(),
+                message.get("method").and_then(Value::as_str),
+            ) {
+                if method == "window/showMessageRequest" {
+                    // This request is explicitly permitted during initialize;
+                    // null means the user dismissed it. Reply immediately so
+                    // a server awaiting the choice can finish initialization.
+                    self.send_response(id, Value::Null);
+                    continue;
+                }
+                panic!(
+                    "unexpected server request {method} while waiting for response {expected_id}"
+                );
+            }
             if message.get("id").is_none()
                 && let Some(method) = message.get("method").and_then(Value::as_str)
                 && watched_methods.contains(&method)
