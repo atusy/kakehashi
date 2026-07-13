@@ -118,60 +118,47 @@ async fn shutdown_invalidated_connection(key: ConnectionKey, handle: Arc<Connect
 /// Own invalidation cleanup independently of the request future that triggered
 /// it. The owned map guard prevents a same-key respawn until every key-based
 /// purge is complete; dropping the caller's future only detaches this task.
-fn spawn_invalidated_connection_cleanup(
+async fn cleanup_invalidated_connections(
     connections: tokio::sync::OwnedMutexGuard<HashMap<ConnectionKey, Arc<ConnectionHandle>>>,
     connection_map: Arc<Mutex<HashMap<ConnectionKey, Arc<ConnectionHandle>>>>,
     invalidated: Vec<ConnectionKey>,
     host_documents: Arc<Mutex<HashMap<(String, ConnectionKey), HostDocSyncState>>>,
     document_tracker: Arc<DocumentTracker>,
     open_transition_locks: Arc<OpenTransitionLocks>,
-) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
-        let mut stale_handles = Vec::new();
-        for key in &invalidated {
-            if let Some(handle) = connections.get(key) {
-                handle.begin_shutdown();
-                stale_handles.push((key.clone(), Arc::clone(handle)));
-            }
+) {
+    let mut stale_handles = Vec::new();
+    for key in &invalidated {
+        if let Some(handle) = connections.get(key) {
+            handle.begin_shutdown();
+            stale_handles.push((key.clone(), Arc::clone(handle)));
         }
-        // Closing entries remain mapped, so same-key respawn is still gated;
-        // release the global map before any purge await so shutdown_all can
-        // snapshot and coordinate these handles under its own deadline.
-        drop(connections);
+    }
+    // Closing entries remain mapped, so same-key respawn is still gated;
+    // release the global map before any purge await so shutdown_all can
+    // snapshot and coordinate these handles under its own deadline.
+    drop(connections);
 
-        for key in invalidated {
-            host_documents
-                .lock()
-                .await
-                .retain(|(_, connection_key), _| connection_key != &key);
-            document_tracker.purge_connection(&key).await;
-            purge_transition_locks(&open_transition_locks, &key).await;
+    for key in invalidated {
+        host_documents
+            .lock()
+            .await
+            .retain(|(_, connection_key), _| connection_key != &key);
+        document_tracker.purge_connection(&key).await;
+        purge_transition_locks(&open_transition_locks, &key).await;
+    }
+    let mut connections = connection_map.lock().await;
+    for (key, stale) in &stale_handles {
+        if connections
+            .get(key)
+            .is_some_and(|current| Arc::ptr_eq(current, stale))
+        {
+            connections.remove(key);
         }
-        let mut shutdowns = tokio::task::JoinSet::new();
-        for (key, handle) in &stale_handles {
-            shutdowns.spawn(shutdown_invalidated_connection(
-                key.clone(),
-                Arc::clone(handle),
-            ));
-        }
-        while let Some(result) = shutdowns.join_next().await {
-            if let Err(error) = result {
-                log::error!(
-                    target: "kakehashi::bridge",
-                    "invalidated connection shutdown task failed: {error}"
-                );
-            }
-        }
-        let mut connections = connection_map.lock().await;
-        for (key, stale) in stale_handles {
-            if connections
-                .get(&key)
-                .is_some_and(|current| Arc::ptr_eq(current, &stale))
-            {
-                connections.remove(&key);
-            }
-        }
-    })
+    }
+    drop(connections);
+    for (key, handle) in stale_handles {
+        tokio::spawn(shutdown_invalidated_connection(key, handle));
+    }
 }
 
 async fn purge_transition_locks(
@@ -743,14 +730,15 @@ impl LanguageServerPool {
         // I/O, so release the per-connection ordering guards before starting it.
         drop(_ordering_guards);
 
-        spawn_invalidated_connection_cleanup(
+        cleanup_invalidated_connections(
             connections,
             Arc::clone(&self.connections),
             invalidated,
             Arc::clone(&self.host_documents),
             Arc::clone(&self.document_tracker),
             Arc::clone(&self.open_transition_locks),
-        );
+        )
+        .await;
     }
 
     /// Set the upstream client capabilities.
