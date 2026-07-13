@@ -192,23 +192,26 @@ impl LanguageServerPool {
             return None;
         }
 
-        // Resolve liveness from one connections-map snapshot. Handshakes may
-        // finish in any order, but the command linearizes here: exactly one
-        // Ready advertiser is safe; several are inherently ambiguous because a
-        // raw palette command carries no document/workspace identity.
-        let ready_keys: std::collections::HashSet<_> = {
+        // Resolve liveness from one connections-map snapshot, scanning the
+        // handles' actual advertised command lists rather than only the origin
+        // registry. A handshake publishes its capabilities + Ready state before
+        // recording dynamic palette metadata; consulting only the registry in
+        // that window would miss a live colliding advertiser (#823). The command
+        // linearizes at this snapshot: exactly one Ready advertiser is safe;
+        // several are inherently ambiguous because the raw name carries no
+        // document/workspace identity.
+        let ready_origins: Vec<_> = {
             let connections = self.connections().await;
-            origins
+            connections
                 .iter()
-                .filter(|key| {
-                    connections
-                        .get(*key)
-                        .is_some_and(|handle| handle.state() == ConnectionState::Ready)
+                .filter(|(_, handle)| {
+                    handle.state() == ConnectionState::Ready
+                        && handle.advertises_execute_command(&params.command)
                 })
-                .cloned()
+                .map(|(key, _)| key.clone())
                 .collect()
         };
-        let key = match select_ready_palette_origin(&origins, |key| ready_keys.contains(key)) {
+        let key = match select_ready_palette_origin(&ready_origins, |_| true) {
             ReadyPaletteOrigin::Unique(key) => key,
             ReadyPaletteOrigin::Ambiguous => {
                 warn!(

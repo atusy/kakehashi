@@ -10,9 +10,10 @@
 //! in the same workspace context (not a fresh client-root connection).
 //!
 //! Global to the editor↔Kakehashi session (one instance on the pool) and keyed
-//! by command name. Every distinct advertising connection is retained: a raw
-//! palette command is routable only while its origin is unambiguous. Bridged
-//! action commands embed their exact origin and do not use this registry.
+//! by command name. Every distinct advertising connection is retained so a raw
+//! palette command can reconnect its sole known origin when none is live; live
+//! collision detection reads the handles' exact capabilities at dispatch time.
+//! Bridged action commands embed their exact origin and do not use this registry.
 
 use std::collections::HashMap;
 use std::sync::Mutex;
