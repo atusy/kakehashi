@@ -73,9 +73,10 @@
 //! - `diagnostics-refresh` — sends a `workspace/diagnostic/refresh` server→client
 //!   request on `didOpen`. The bridge forwards it upstream to the editor; used to
 //!   prove that forward is capability-gated (#521).
-//! - `diagnostics-refresh-burst` — advertises pull diagnostics and sends ten
-//!   refresh requests on `didOpen`, so the editor-facing test can verify both
-//!   burst coalescing and the diagnostic result delivered by the induced pull.
+//! - `diagnostics-refresh-burst` — advertises pull diagnostics, sends generation
+//!   1's refresh on `didOpen`, then emits generations 2–10 after the first pull.
+//!   The editor-facing test keeps the leading refresh unacknowledged during that
+//!   pull, so all later refreshes exercise debounce plus refresh single-flight.
 //! - `on-type` — advertises `documentOnTypeFormattingProvider` with `}` and
 //!   `;` as triggers; answers `textDocument/onTypeFormatting` with the
 //!   uppercasing whole-document edit for ANY typed character (bridge-side
