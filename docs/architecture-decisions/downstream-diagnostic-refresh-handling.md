@@ -103,11 +103,23 @@ downstream server. The first downstream refresh after idle starts a leading
 cycle immediately. Each cycle first completes the workspace-wide Path A prefetch
 and only then forwards the editor refresh, so a client pull cannot race ahead of
 kakehashi's proactive cache. Further downstream refreshes join one trailing
-debounce cycle: 100 ms of quiet releases the latest activity, while an anchored
-1 s maximum wait prevents a continuously chatty server from postponing it
-forever. Prefetch cycles never overlap; if the maximum wait expires during a
-prefetch, the dirty trailing cycle starts immediately after the current prefetch
-finishes. If another editor refresh is sent after the latest downstream activity,
+debounce cycle. Its workspace-wide timing policy is configured independently of
+languages and downstream servers:
+
+```toml
+[features."workspace/diagnostic/refresh"]
+debounceMs = 100
+maxWaitMs = 1000
+```
+
+The shown values are programmed defaults. `debounceMs` of quiet releases the
+latest activity, while the anchored `maxWaitMs` prevents a continuously chatty
+server from postponing it forever. `maxWaitMs` must be at least `debounceMs`;
+invalid updates are rejected as a whole. A cycle snapshots both values when its
+leading edge is admitted, so live updates affect the next cycle without moving
+an in-flight deadline. Prefetch cycles never overlap; if the maximum wait expires
+during a prefetch, the dirty trailing cycle starts immediately after the current
+prefetch finishes. If another editor refresh is sent after the latest downstream activity,
 that send already provides the required re-pull nudge and the trailing forward is
 suppressed. This keeps independent downstream servers on the same workspace-wide
 cadence without coupling separate kakehashi workspace connections.
