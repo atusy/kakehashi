@@ -86,7 +86,7 @@ async fn shutdown_invalidated_connection(key: ConnectionKey, handle: Arc<Connect
                 key,
                 error
             );
-            let _ = handle.graceful_shutdown().await;
+            handle.complete_shutdown();
         }
         Ok(Err(error)) => {
             log::error!(
