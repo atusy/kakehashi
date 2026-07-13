@@ -70,6 +70,6 @@ impl Kakehashi {
             cancel_rx,
         )
         .await;
-        result.handle(&self.client, "hover", None, Ok).await
+        result.handle(&self.notifier(), "hover", None, Ok).await
     }
 }

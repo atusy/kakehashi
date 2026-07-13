@@ -83,7 +83,7 @@ impl Kakehashi {
         )
         .await;
         result
-            .handle(&self.client, "signature help", None, Ok)
+            .handle(&self.notifier(), "signature help", None, Ok)
             .await
     }
 }

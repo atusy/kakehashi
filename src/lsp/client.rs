@@ -12,6 +12,7 @@ use tower_lsp_server::ls_types::notification::Progress;
 use tower_lsp_server::ls_types::{ClientCapabilities, MessageType};
 
 use crate::language::{LanguageEvent, LanguageLogLevel};
+use crate::lsp::settings_manager::SettingsManager;
 use crate::lsp::{SettingsEvent, SettingsEventKind};
 
 use super::progress::{create_progress_begin, create_progress_end};
@@ -99,6 +100,7 @@ fn batch_requests_semantic_tokens_refresh(events: &[LanguageEvent]) -> bool {
 #[derive(Clone)]
 pub(crate) struct ClientNotifier<'a> {
     client: Client,
+    settings_manager: &'a SettingsManager,
     /// Reference to capabilities stored in Kakehashi.
     /// Uses OnceLock to handle pre/post initialization states.
     client_capabilities: &'a OnceLock<ClientCapabilities>,
@@ -108,6 +110,7 @@ impl std::fmt::Debug for ClientNotifier<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ClientNotifier")
             .field("client", &self.client)
+            .field("settings_manager", &"&SettingsManager")
             .field("client_capabilities", &"&OnceLock<ClientCapabilities>")
             .finish()
     }
@@ -117,17 +120,27 @@ impl<'a> ClientNotifier<'a> {
     /// Create a new `ClientNotifier` wrapping the given LSP client.
     pub(crate) fn new(
         client: Client,
+        settings_manager: &'a SettingsManager,
         client_capabilities: &'a OnceLock<ClientCapabilities>,
     ) -> Self {
         Self {
             client,
+            settings_manager,
             client_capabilities,
         }
     }
 
     /// Log a message to the client at the specified severity level.
     pub(crate) async fn log(&self, level: MessageType, message: impl Into<String>) {
-        self.client.log_message(level, message.into()).await;
+        if self
+            .settings_manager
+            .load_settings()
+            .features
+            .window_log_message
+            .allows(level)
+        {
+            self.client.log_message(level, message.into()).await;
+        }
     }
 
     /// Log an informational message.
@@ -253,7 +266,7 @@ impl<'a> ClientNotifier<'a> {
                         LanguageLogLevel::Warning => MessageType::WARNING,
                         LanguageLogLevel::Info => MessageType::INFO,
                     };
-                    self.client.log_message(message_type, message.clone()).await;
+                    self.log(message_type, message.clone()).await;
                 }
                 LanguageEvent::ShowMessage { level, message } => {
                     let message_type = match level {
@@ -286,14 +299,10 @@ impl<'a> ClientNotifier<'a> {
                         .await;
                 }
                 SettingsEventKind::Warning => {
-                    self.client
-                        .log_message(MessageType::WARNING, event.message.clone())
-                        .await;
+                    self.log(MessageType::WARNING, event.message.clone()).await;
                 }
                 SettingsEventKind::Info => {
-                    self.client
-                        .log_message(MessageType::INFO, event.message.clone())
-                        .await;
+                    self.log(MessageType::INFO, event.message.clone()).await;
                 }
             }
         }

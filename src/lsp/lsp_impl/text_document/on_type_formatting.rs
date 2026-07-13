@@ -92,7 +92,7 @@ impl Kakehashi {
         )
         .await;
         result
-            .handle(&self.client, "onTypeFormatting", None, Ok)
+            .handle(&self.notifier(), "onTypeFormatting", None, Ok)
             .await
     }
 }

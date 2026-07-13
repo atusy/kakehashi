@@ -66,7 +66,7 @@ impl Kakehashi {
         .await;
 
         result
-            .handle(&self.client, "color presentation", Vec::new(), Ok)
+            .handle(&self.notifier(), "color presentation", Vec::new(), Ok)
             .await
     }
 }

@@ -453,13 +453,13 @@ impl Kakehashi {
                     None,
                 )
                 .await
-                .handle(&self.client, "code action", None, Ok)
+                .handle(&self.notifier(), "code action", None, Ok)
                 .await
             }
             AggregationStrategy::Concatenated => {
                 dispatch_concatenated(&ctx.document, pool.clone(), f, None, None, None)
                     .await
-                    .handle(&self.client, "code action", None, |vecs| {
+                    .handle(&self.notifier(), "code action", None, |vecs| {
                         Ok(concat_merge(vecs))
                     })
                     .await
@@ -591,8 +591,8 @@ impl Kakehashi {
             FanInResult::Done(value) => Ok(on_done(value)),
             FanInResult::NoResult { errors } => {
                 if errors > 0 {
-                    self.client
-                        .log_message(
+                    self.notifier()
+                        .log(
                             MessageType::WARNING,
                             format!("No {METHOD} response from any host bridge server"),
                         )

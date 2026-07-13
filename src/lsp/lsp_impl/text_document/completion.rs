@@ -84,7 +84,7 @@ impl Kakehashi {
         .await;
 
         result
-            .handle(&self.client, "completion", None, |v| {
+            .handle(&self.notifier(), "completion", None, |v| {
                 Ok(v.map(CompletionResponse::List))
             })
             .await

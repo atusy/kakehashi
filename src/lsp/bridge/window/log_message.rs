@@ -1,8 +1,8 @@
 //! `window/logMessage` notification forwarder.
 //!
-//! Inbound (downstream → editor). Forwarded unconditionally so the bridge stays
-//! transparent: messages a direct connection would surface are not silently
-//! swallowed. A downstream flood cannot harm the bridge because the window
+//! Inbound (downstream → editor). Valid messages are enqueued here; the shared
+//! client-facing delivery boundary applies the workspace-wide severity policy
+//! used by kakehashi's own log messages too. A downstream flood cannot harm the bridge because the window
 //! channel is bounded and drop-on-full (see [`UpstreamNotification`]). The text
 //! is prefixed with the originating server name so output from multiple bridged
 //! servers stays distinguishable.

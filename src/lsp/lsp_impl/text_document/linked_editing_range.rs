@@ -79,7 +79,7 @@ impl Kakehashi {
         )
         .await;
         result
-            .handle(&self.client, "linkedEditingRange", None, Ok)
+            .handle(&self.notifier(), "linkedEditingRange", None, Ok)
             .await
     }
 }

@@ -32,7 +32,7 @@ impl<T> FanInResult<T> {
     /// - `Cancelled`: returns `Err(Error::request_cancelled())`.
     pub(crate) async fn handle<R>(
         self,
-        client: &tower_lsp_server::Client,
+        notifier: &crate::lsp::client::ClientNotifier<'_>,
         method_name: &str,
         no_result: R,
         on_done: impl FnOnce(T) -> tower_lsp_server::jsonrpc::Result<R>,
@@ -45,8 +45,8 @@ impl<T> FanInResult<T> {
                 } else {
                     tower_lsp_server::ls_types::MessageType::LOG
                 };
-                client
-                    .log_message(
+                notifier
+                    .log(
                         level,
                         format!("No {method_name} response from any bridge server"),
                     )

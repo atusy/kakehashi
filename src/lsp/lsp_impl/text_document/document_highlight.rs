@@ -84,7 +84,7 @@ impl Kakehashi {
         .await;
 
         result
-            .handle(&self.client, "document highlight", None, Ok)
+            .handle(&self.notifier(), "document highlight", None, Ok)
             .await
     }
 }
