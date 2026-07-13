@@ -416,7 +416,7 @@ impl Kakehashi {
                 let event = crate::lsp::SettingsEvent::error(format!(
                     "Invalid configuration: {errs}. \
                      This configuration has been discarded; previous settings remain in effect. \
-                     Please correct the affected paths and environment variables or remove them from your config.",
+                     Please correct the invalid settings or remove them from your config.",
                 ));
                 self.notifier().log_settings_events(&[event]).await;
             }
