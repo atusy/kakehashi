@@ -3285,7 +3285,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn upstream_folder_change_detaches_owned_connection_cleanup() {
+    async fn upstream_folder_change_waits_until_stale_connection_is_unmapped() {
         let pool = Arc::new(LanguageServerPool::new());
         let key = ConnectionKey::for_server("lua");
         let handle = create_handle_with_key(ConnectionState::Ready, key.clone()).await;
@@ -3293,7 +3293,7 @@ mod tests {
         pool.insert_connection(Arc::clone(&handle)).await;
         let host_documents = pool.host_documents.lock().await;
 
-        let task = tokio::spawn({
+        let mut task = tokio::spawn({
             let pool = Arc::clone(&pool);
             async move {
                 pool.apply_workspace_folder_change(vec![test_workspace_folder("file:///new")], &[])
@@ -3307,11 +3307,22 @@ mod tests {
         })
         .await
         .expect("owned cleanup must mark the stale handle before its first await");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), &mut task)
+                .await
+                .is_err(),
+            "the update must not return while keyed state is only partially purged"
+        );
+        drop(host_documents);
+
         tokio::time::timeout(Duration::from_secs(1), task)
             .await
-            .expect("workspace-folder handling must not wait for connection cleanup")
+            .expect("cleanup must finish after the blocked purge resumes")
             .unwrap();
-        drop(host_documents);
+        assert!(
+            !pool.connections.lock().await.contains_key(&key),
+            "the stale entry must be unavailable when the update returns"
+        );
 
         tokio::time::timeout(Duration::from_secs(4), async {
             while handle.state() != ConnectionState::Closed {
@@ -3325,13 +3336,6 @@ mod tests {
             ConnectionState::Closed,
             "removal must not become observable before bounded shutdown finishes"
         );
-        tokio::time::timeout(Duration::from_secs(1), async {
-            while pool.connections.lock().await.contains_key(&key) {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("closed stale handle must be removed");
     }
 
     #[tokio::test]
