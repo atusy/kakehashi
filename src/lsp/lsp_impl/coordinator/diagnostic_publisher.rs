@@ -562,6 +562,14 @@ impl DiagnosticPublisher {
     /// [`Self::request_pull_diagnostic_refresh`] on `Changed` OR `Deferred` —
     /// see [`RepublishOutcome::Deferred`] for why the deferral still nudges.
     pub(crate) async fn republish(&self, host: &Url) -> RepublishOutcome {
+        self.republish_with_before_wire_admit(host, || {}).await
+    }
+
+    async fn republish_with_before_wire_admit(
+        &self,
+        host: &Url,
+        before_wire_admit: impl FnOnce(),
+    ) -> RepublishOutcome {
         // Serialize the whole snapshot→merge→publish so concurrent republishes
         // (region push vs host-event pull) emit in order and a stale snapshot can
         // never publish after a fresh one (push-propagation-diagnostic-forwarding).
@@ -663,6 +671,11 @@ impl DiagnosticPublisher {
             return RepublishOutcome::Unchanged;
         }
 
+        // Subscribe before resolving the wire contract so a settings replacement
+        // cannot land between the seal read and the watch generation we retain.
+        let mut settings_changed = self.settings_manager.subscribe_settings_changes();
+        let mut before_wire_admit = Some(before_wire_admit);
+
         // The cross-layer gate for `textDocument/publishDiagnostics` doubles as a
         // WIRE SEAL when it resolves to no layers at all: a pull-first editor
         // setup can stop the proactive publishes entirely via existing config.
@@ -676,18 +689,6 @@ impl DiagnosticPublisher {
         // signal (refresh → client re-pull). The wire-gate state is dropped —
         // there is no wire under the seal, so nothing can be owed to it (a
         // stale `dirty` from before a mid-session seal would otherwise linger).
-        if self.publish_sealed(host) {
-            self.aggregator.forget_wire_gate(host);
-            log::debug!(
-                target: LOG_TARGET,
-                "seal: skipping publish of {} merged diagnostics for {} \
-                 (layers.aggregation publishDiagnostics resolves to no layers)",
-                diagnostics.len(),
-                host
-            );
-            return changed;
-        }
-
         // A republish for a CLOSED host bypasses the quiet window and never
         // touches gate state. This is (or races) `didClose`'s clearing publish,
         // and both halves matter: a *deferred* clearing publish would be
@@ -721,43 +722,65 @@ impl DiagnosticPublisher {
         // immediately. Deferral withholds only the wire: the set was already
         // recorded above, so the return value (and with it the push-origin
         // coverage bump + refresh nudge) is unaffected.
-        // Subscribe before resolving/admitting so a settings replacement in
-        // that window remains observable by a newly parked trailing task.
-        let settings_changed = self.settings_manager.subscribe_settings_changes();
-        let quiet_window = self.publish_quiet_window(host);
-        match self.aggregator.wire_gate_admit(host, quiet_window) {
-            crate::lsp::diagnostic_cache::WireAdmit::SendNow => {
+        loop {
+            if self.publish_sealed(host) {
+                self.aggregator.forget_wire_gate(host);
                 log::debug!(
                     target: LOG_TARGET,
-                    "publishing {} merged diagnostics for {}",
+                    "seal: skipping publish of {} merged diagnostics for {} \
+                     (layers.aggregation publishDiagnostics resolves to no layers)",
                     diagnostics.len(),
                     host
                 );
-                self.client
-                    .publish_diagnostics(lsp_uri, diagnostics, None)
-                    .await;
-                // Stamp the send only AFTER it completed: this republish can run
-                // inside an abortable task (the synthetic pull is aborted on
-                // supersession), and an abort landing at the send await must not
-                // leave gate state claiming a send that never happened — that
-                // would both defer the next change and consume a withheld
-                // `dirty` debt. Same lock hold as the admit, so the pair is
-                // atomic per host.
-                self.aggregator.wire_gate_commit_send(host);
+                return changed;
             }
-            crate::lsp::diagnostic_cache::WireAdmit::Defer {
-                schedule_trailing,
-                remaining,
-            } => {
-                log::debug!(
-                    target: LOG_TARGET,
-                    "withholding publish of {} merged diagnostics for {} ({}ms of quiet window left)",
-                    diagnostics.len(),
-                    host,
-                    remaining.as_millis()
-                );
-                if schedule_trailing {
-                    self.spawn_trailing_wire_publish(host.clone(), remaining, settings_changed);
+            if let Some(before_wire_admit) = before_wire_admit.take() {
+                before_wire_admit();
+            }
+            let quiet_window = self.publish_quiet_window(host);
+            match self.aggregator.wire_gate_admit(host, quiet_window) {
+                crate::lsp::diagnostic_cache::WireAdmit::SendNow => {
+                    // `SendNow` does not mutate gate state until commit. If settings
+                    // changed after contract resolution, retry from the new seal and
+                    // quiet window rather than publishing under the stale contract.
+                    if settings_changed.has_changed().unwrap_or(false) {
+                        settings_changed.borrow_and_update();
+                        continue;
+                    }
+                    log::debug!(
+                        target: LOG_TARGET,
+                        "publishing {} merged diagnostics for {}",
+                        diagnostics.len(),
+                        host
+                    );
+                    self.client
+                        .publish_diagnostics(lsp_uri, diagnostics, None)
+                        .await;
+                    // Stamp the send only AFTER it completed: this republish can run
+                    // inside an abortable task (the synthetic pull is aborted on
+                    // supersession), and an abort landing at the send await must not
+                    // leave gate state claiming a send that never happened — that
+                    // would both defer the next change and consume a withheld
+                    // `dirty` debt. Same lock hold as the admit, so the pair is
+                    // atomic per host.
+                    self.aggregator.wire_gate_commit_send(host);
+                    break;
+                }
+                crate::lsp::diagnostic_cache::WireAdmit::Defer {
+                    schedule_trailing,
+                    remaining,
+                } => {
+                    log::debug!(
+                        target: LOG_TARGET,
+                        "withholding publish of {} merged diagnostics for {} ({}ms of quiet window left)",
+                        diagnostics.len(),
+                        host,
+                        remaining.as_millis()
+                    );
+                    if schedule_trailing {
+                        self.spawn_trailing_wire_publish(host.clone(), remaining, settings_changed);
+                    }
+                    break;
                 }
             }
         }
@@ -1510,6 +1533,46 @@ mod tests {
             !publisher.publish_sealed(&closed),
             "an unresolvable document fails open (didClose's clearing publish goes out)"
         );
+    }
+
+    #[tokio::test]
+    async fn settings_seal_between_resolution_and_admission_suppresses_send() {
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+        register_rust(server);
+        server.settings_manager.apply_settings(rust_settings(true));
+        let uri = Url::parse("file:///test/raced_seal.rs").unwrap();
+        server.documents.insert(
+            uri.clone(),
+            "fn main() {}".to_string(),
+            Some("rust".to_string()),
+            None,
+        );
+        server.diagnostics.record(
+            &uri,
+            DiagnosticSource::Host,
+            "rust_ls".to_string(),
+            Some(ProgressConnectionId::for_test(1)),
+            vec![diag("boom")],
+        );
+        let publisher = DiagnosticPublisher::new(server);
+
+        let outcome = publisher
+            .republish_with_before_wire_admit(&uri, || {
+                server
+                    .settings_manager
+                    .apply_settings(rust_settings_with_publish_seal());
+            })
+            .await;
+
+        assert_eq!(outcome, RepublishOutcome::Changed);
+        assert!(publisher.publish_sealed(&uri));
+        assert!(matches!(
+            server
+                .diagnostics
+                .wire_gate_admit(&uri, WIRE_PUBLISH_QUIET_WINDOW),
+            crate::lsp::diagnostic_cache::WireAdmit::SendNow
+        ));
     }
 
     #[test]
