@@ -954,11 +954,10 @@ fn write_uninstall_tombstone_at_with_security_copy(
     use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt};
     use std::os::windows::ffi::OsStrExt as _;
     use std::os::windows::io::{AsRawHandle as _, FromRawHandle as _};
-    use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+    use windows_sys::Win32::Foundation::{GENERIC_READ, GENERIC_WRITE, INVALID_HANDLE_VALUE};
     use windows_sys::Win32::Storage::FileSystem::{
-        DELETE, FILE_FLAG_WRITE_THROUGH, FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_RENAME_INFO,
-        FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FileRenameInfo, ReOpenFile,
-        SetFileInformationByHandle,
+        DELETE, FILE_FLAG_WRITE_THROUGH, FILE_RENAME_INFO, FILE_SHARE_DELETE, FILE_SHARE_READ,
+        FILE_SHARE_WRITE, FileRenameInfo, ReOpenFile, SetFileInformationByHandle,
     };
 
     validate_safe_language_name(language)?;
@@ -1008,7 +1007,7 @@ fn write_uninstall_tombstone_at_with_security_copy(
         let handle = unsafe {
             ReOpenFile(
                 staged.as_raw_handle(),
-                FILE_GENERIC_READ | FILE_GENERIC_WRITE | DELETE,
+                GENERIC_READ | GENERIC_WRITE | DELETE,
                 FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
                 FILE_FLAG_WRITE_THROUGH,
             )
