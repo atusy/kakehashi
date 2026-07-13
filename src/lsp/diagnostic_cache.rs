@@ -1330,6 +1330,22 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn zero_window_uncommitted_send_retries() {
+        let agg = DiagnosticAggregator::new();
+        let window = std::time::Duration::ZERO;
+
+        assert_eq!(agg.wire_gate_admit(&host(), window), WireAdmit::SendNow);
+        assert!(agg.wire_gate_is_dirty(&host()));
+        assert_eq!(
+            agg.wire_gate_admit(&host(), window),
+            WireAdmit::SendNow,
+            "zero-window retry must survive an aborted send"
+        );
+        agg.wire_gate_commit_send(&host());
+        assert!(!agg.wire_gate_is_dirty(&host()));
+    }
+
+    #[tokio::test]
     async fn per_host_republish_locks_are_independent_but_serialize_same_host() {
         use std::time::Duration;
         let agg = DiagnosticAggregator::new();

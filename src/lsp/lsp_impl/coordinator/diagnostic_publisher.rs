@@ -723,15 +723,6 @@ impl DiagnosticPublisher {
         // recorded above, so the return value (and with it the push-origin
         // coverage bump + refresh nudge) is unaffected.
         let quiet_window = self.publish_quiet_window(host);
-        if quiet_window.is_zero() {
-            // A live config change to zero also clears any withheld debt and
-            // makes its already-scheduled trailing task a no-op.
-            self.aggregator.forget_wire_gate(host);
-            self.client
-                .publish_diagnostics(lsp_uri, diagnostics, None)
-                .await;
-            return changed;
-        }
         match self.aggregator.wire_gate_admit(host, quiet_window) {
             crate::lsp::diagnostic_cache::WireAdmit::SendNow => {
                 log::debug!(
