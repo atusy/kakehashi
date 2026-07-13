@@ -483,7 +483,8 @@ struct ForwardedRefreshDebounce {
     generation: u64,
     task_scheduled: bool,
     last_activity_at: Option<tokio::time::Instant>,
-    refreshes_sent_at_last_activity: u64,
+    refresh_epoch: u64,
+    refresh_epoch_at_last_activity: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -497,6 +498,10 @@ pub(crate) enum ForwardedRefreshWait {
     Restart(ForwardedRefreshWaitSnapshot),
     SendTrailing,
     Settled,
+    MaxWait {
+        snapshot: ForwardedRefreshWaitSnapshot,
+        send_trailing: bool,
+    },
 }
 
 /// Per-host coalescing state for the editor-facing `publishDiagnostics` wire
@@ -642,8 +647,7 @@ impl DiagnosticAggregator {
         debounce.generation = debounce.generation.wrapping_add(1);
         let last_activity_at = tokio::time::Instant::now();
         debounce.last_activity_at = Some(last_activity_at);
-        debounce.refreshes_sent_at_last_activity =
-            self.metrics.refreshes_sent.load(Ordering::Relaxed);
+        debounce.refresh_epoch_at_last_activity = debounce.refresh_epoch;
         if debounce.task_scheduled {
             None
         } else {
@@ -663,13 +667,24 @@ impl DiagnosticAggregator {
     pub(crate) fn finish_forwarded_refresh_wait(
         &self,
         observed: u64,
-        force: bool,
+        max_wait_reached: bool,
     ) -> ForwardedRefreshWait {
         let mut debounce = self
             .forwarded_refresh_debounce
             .lock()
             .recover_poison("DiagnosticAggregator::forwarded_refresh_debounce");
-        if !force && debounce.generation != observed {
+        if max_wait_reached {
+            return ForwardedRefreshWait::MaxWait {
+                snapshot: ForwardedRefreshWaitSnapshot {
+                    generation: debounce.generation,
+                    last_activity_at: debounce
+                        .last_activity_at
+                        .expect("activity generation has a timestamp"),
+                },
+                send_trailing: debounce.refresh_epoch == debounce.refresh_epoch_at_last_activity,
+            };
+        }
+        if debounce.generation != observed {
             ForwardedRefreshWait::Restart(ForwardedRefreshWaitSnapshot {
                 generation: debounce.generation,
                 last_activity_at: debounce
@@ -678,13 +693,19 @@ impl DiagnosticAggregator {
             })
         } else {
             debounce.task_scheduled = false;
-            let refreshes_sent = self.metrics.refreshes_sent.load(Ordering::Relaxed);
-            if refreshes_sent == debounce.refreshes_sent_at_last_activity {
+            if debounce.refresh_epoch == debounce.refresh_epoch_at_last_activity {
                 ForwardedRefreshWait::SendTrailing
             } else {
                 ForwardedRefreshWait::Settled
             }
         }
+    }
+
+    pub(crate) fn cancel_forwarded_refresh_debounce(&self) {
+        self.forwarded_refresh_debounce
+            .lock()
+            .recover_poison("DiagnosticAggregator::forwarded_refresh_debounce")
+            .task_scheduled = false;
     }
 
     pub(crate) fn new() -> Self {
@@ -699,6 +720,12 @@ impl DiagnosticAggregator {
 
     /// Record that a `workspace/diagnostic/refresh` was actually written to the wire.
     pub(crate) fn record_refresh_sent(&self) {
+        let mut debounce = self
+            .forwarded_refresh_debounce
+            .lock()
+            .recover_poison("DiagnosticAggregator::forwarded_refresh_debounce");
+        debounce.refresh_epoch = debounce.refresh_epoch.wrapping_add(1);
+        drop(debounce);
         self.metrics.record_refresh_sent();
     }
 
