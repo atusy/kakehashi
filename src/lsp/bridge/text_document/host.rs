@@ -168,6 +168,7 @@ impl LanguageServerPool {
     /// Mirrors the virt path's `close_host_document`; called from the
     /// upstream `didClose` handler.
     pub(crate) async fn close_host_bridge_document(&self, uri: &Url) {
+        self.invalidate_diagnostic_host(uri);
         let Ok(uri_lsp) = host_url_to_lsp_uri(uri) else {
             return;
         };
@@ -406,7 +407,7 @@ impl LanguageServerPool {
             return Ok(Vec::new());
         }
         let cache_key = (handle.key().clone(), doc.uri.as_str().to_string());
-        let snapshot = self.diagnostic_pull_snapshot(&cache_key);
+        let snapshot = self.diagnostic_pull_snapshot(&cache_key, doc.uri.as_str());
         let previous_result_id = snapshot
             .baseline
             .as_ref()

@@ -52,6 +52,8 @@ pub(crate) struct DiagnosticPullSnapshot {
     pub(crate) document_generation: u64,
     pub(crate) connection_generation: u64,
     pub(crate) request_sequence: u64,
+    pub(crate) host_uri: String,
+    pub(crate) host_generation: u64,
 }
 
 fn same_launch_config(
@@ -375,6 +377,7 @@ pub struct LanguageServerPool {
     pub(crate) diagnostic_pull_lock: std::sync::Mutex<()>,
     pub(crate) diagnostic_pull_request_sequence: AtomicU64,
     pub(crate) diagnostic_pull_applied_sequences: DashMap<(ConnectionKey, String), u64>,
+    pub(crate) diagnostic_host_generations: DashMap<String, u64>,
     /// Upstream request ID → set of downstream connections, for fan-out cancel
     /// forwarding (ls-bridge-message-ordering). Multiple connections can share an ID when a single
     /// upstream request (e.g. diagnostic) targets several injected languages.
@@ -490,6 +493,7 @@ impl LanguageServerPool {
             diagnostic_pull_lock: std::sync::Mutex::new(()),
             diagnostic_pull_request_sequence: AtomicU64::new(1),
             diagnostic_pull_applied_sequences: DashMap::new(),
+            diagnostic_host_generations: DashMap::new(),
             upstream_request_registry: std::sync::Mutex::new(HashMap::new()),
             cancel_metrics: CancelForwardingMetrics::default(),
             consecutive_panic_counts: std::sync::Mutex::new(HashMap::new()),
@@ -1662,6 +1666,7 @@ impl LanguageServerPool {
     pub(crate) fn diagnostic_pull_snapshot(
         &self,
         key: &(ConnectionKey, String),
+        host_uri: &str,
     ) -> DiagnosticPullSnapshot {
         let _guard = self
             .diagnostic_pull_lock
@@ -1688,6 +1693,12 @@ impl LanguageServerPool {
             request_sequence: self
                 .diagnostic_pull_request_sequence
                 .fetch_add(1, Ordering::Relaxed),
+            host_uri: host_uri.to_string(),
+            host_generation: self
+                .diagnostic_host_generations
+                .get(host_uri)
+                .map(|entry| *entry)
+                .unwrap_or(0),
         }
     }
 
@@ -1700,6 +1711,17 @@ impl LanguageServerPool {
         self.diagnostic_pull_applied_sequences.remove(key);
         self.diagnostic_document_generations
             .entry(key.clone())
+            .and_modify(|generation| *generation = generation.wrapping_add(1))
+            .or_insert(1);
+    }
+
+    pub(crate) fn invalidate_diagnostic_host(&self, host_uri: &Url) {
+        let _guard = self
+            .diagnostic_pull_lock
+            .lock()
+            .recover_poison("LanguageServerPool::diagnostic_pull_lock");
+        self.diagnostic_host_generations
+            .entry(host_uri.as_str().to_string())
             .and_modify(|generation| *generation = generation.wrapping_add(1))
             .or_insert(1);
     }
