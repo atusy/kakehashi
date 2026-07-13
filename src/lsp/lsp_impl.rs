@@ -478,7 +478,21 @@ impl Kakehashi {
         raw_settings: RawWorkspaceSettings,
         settings: WorkspaceSettings,
     ) {
-        let (reparse_uris, previous_settings) = apply_shared_settings(
+        // Capture editor-facing diagnostic contracts before the language
+        // registry/settings swap. Detecting both sides after reload would compare
+        // the old settings under the new language when aliases/detection change.
+        let previous_publisher = DiagnosticPublisher::new(self);
+        let previous_publish_contracts: std::collections::HashMap<_, _> = self
+            .documents
+            .open_uris()
+            .into_iter()
+            .filter_map(|uri| {
+                previous_publisher
+                    .publish_contract_snapshot(&uri)
+                    .map(|contract| (uri, contract))
+            })
+            .collect();
+        let (reparse_uris, _previous_settings) = apply_shared_settings(
             &self.client,
             ReloadLanguageState {
                 language: &self.language,
@@ -508,7 +522,12 @@ impl Kakehashi {
         futures::future::join_all(
             reparse_uris
                 .iter()
-                .filter(|uri| publisher.publish_contract_changed(uri, &previous_settings))
+                .filter(|uri| {
+                    publisher.publish_contract_changed(
+                        uri,
+                        previous_publish_contracts.get(*uri).copied(),
+                    )
+                })
                 .map(|uri| publisher.republish_after_settings_change(uri)),
         )
         .await;

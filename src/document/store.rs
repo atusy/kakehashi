@@ -114,6 +114,14 @@ impl DocumentStore {
         Self::default()
     }
 
+    /// Snapshot the URIs that are open at this instant.
+    pub(crate) fn open_uris(&self) -> Vec<Url> {
+        self.documents
+            .iter()
+            .map(|entry| entry.key().clone())
+            .collect()
+    }
+
     pub(crate) fn invalidate_all_parses(&self) -> Vec<Url> {
         let mut uris = Vec::with_capacity(self.documents.len());
         for mut entry in self.documents.iter_mut() {

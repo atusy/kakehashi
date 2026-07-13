@@ -1774,7 +1774,6 @@ mod tests {
         );
         let publisher = DiagnosticPublisher::new(server);
         let previous = publisher.publish_contract_snapshot(&uri);
-        let mut current = previous.clone();
         let mut current_settings = rust_settings(true);
         current_settings.diagnostics_debounce_ms += 1;
         server.settings_manager.apply_settings(current_settings);
@@ -1834,6 +1833,32 @@ mod tests {
         server.settings_manager.apply_settings(rust_settings(true));
 
         assert!(publisher.publish_contract_changed(&uri, previous));
+    }
+
+    #[test]
+    fn publish_contract_change_uses_captured_pre_reload_language_contract() {
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+        register_rust(server);
+        server.settings_manager.apply_settings(rust_settings(true));
+        let uri = Url::parse("file:///test/language_contract_changed.rs").unwrap();
+        server.documents.insert(
+            uri.clone(),
+            "fn main() {}".to_string(),
+            Some("rust".to_string()),
+            None,
+        );
+        let publisher = DiagnosticPublisher::new(server);
+        let current = publisher.publish_contract_snapshot(&uri).unwrap();
+        let previous = PublishContractSnapshot {
+            incarnation: current.incarnation,
+            // This effective contract may have belonged to a different language
+            // before aliases/detection were reloaded. It must not be recomputed
+            // under the current language name.
+            effective: Some((true, current.effective.unwrap().1)),
+        };
+
+        assert!(publisher.publish_contract_changed(&uri, Some(previous)));
     }
 
     #[tokio::test]
