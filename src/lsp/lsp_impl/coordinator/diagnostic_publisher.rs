@@ -1015,7 +1015,7 @@ impl DiagnosticPublisher {
             host,
             std::time::Duration::from_millis(timing.debounce_ms),
             std::time::Duration::from_millis(timing.max_wait_ms),
-            wire_activity,
+            wire_activity && changed == RepublishOutcome::Changed,
         ) {
             crate::lsp::diagnostic_cache::WireAdmit::SendNow => {
                 log::debug!(
@@ -2076,8 +2076,14 @@ mod tests {
             "the change was withheld from the wire"
         );
 
+        // An identical feed while the changed set is already dirty must not
+        // count as new burst activity and move the quiet deadline.
+        tokio::time::advance(super::WIRE_PUBLISH_QUIET_WINDOW / 2).await;
+        assert_eq!(publisher.republish(&uri).await, RepublishOutcome::Unchanged);
+        assert!(server.diagnostics.wire_gate_is_dirty(&uri));
+
         // The window elapses; the parked trailing task re-runs republish.
-        tokio::time::advance(super::WIRE_PUBLISH_QUIET_WINDOW).await;
+        tokio::time::advance(super::WIRE_PUBLISH_QUIET_WINDOW / 2).await;
         // Advance virtual time once more so Tokio drains the woken trailing
         // task through its nested awaits without relying on a poll count.
         tokio::time::sleep(std::time::Duration::from_millis(1)).await;
