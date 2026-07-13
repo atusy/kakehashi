@@ -568,7 +568,12 @@ impl LanguageServerPool {
         let mut invalidated = Vec::new();
         for (key, handle) in connections.iter() {
             let follows_client_workspace = key.is_client_fallback() || key.is_shared();
-            if follows_client_workspace && handle.state() == ConnectionState::Initializing {
+            if !follows_client_workspace {
+                // Marker-owned connections derive their workspace from the
+                // marker root, not the upstream client-folder snapshot.
+                continue;
+            }
+            if handle.state() == ConnectionState::Initializing {
                 // Its initialize request captured the old snapshot and an LSP
                 // notification cannot be sent until after `initialized`.
                 // Recycle it so the next acquisition handshakes with the
@@ -580,9 +585,7 @@ impl LanguageServerPool {
                 continue;
             }
             if !handle.supports_workspace_folder_changes() {
-                if follows_client_workspace {
-                    invalidated.push(key.clone());
-                }
+                invalidated.push(key.clone());
                 continue;
             }
             let notification =
@@ -2983,6 +2986,27 @@ mod tests {
             !pool.connections.lock().await.contains_key(&key),
             "a handshake seeded from the old snapshot must not remain reusable"
         );
+    }
+
+    #[tokio::test]
+    async fn workspace_folder_change_does_not_touch_marker_owned_connection() {
+        let pool = LanguageServerPool::new();
+        let key = ConnectionKey::new("marker", Some("file:///marker".to_string()));
+        let handle = create_handle_with_key(ConnectionState::Ready, key.clone()).await;
+        handle.set_server_capabilities(capable_workspace_folders_caps());
+        pool.insert_connection(Arc::clone(&handle)).await;
+
+        pool.apply_workspace_folder_change(
+            vec![tower_lsp_server::ls_types::WorkspaceFolder {
+                uri: "file:///client".parse().unwrap(),
+                name: "client".to_string(),
+            }],
+            &[],
+        )
+        .await;
+
+        assert!(pool.connections.lock().await.contains_key(&key));
+        assert_eq!(handle.workspace_folders().snapshot(), None);
     }
 
     fn shared_config() -> crate::config::settings::BridgeServerConfig {
