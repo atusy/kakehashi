@@ -664,7 +664,8 @@ impl LanguageServerPool {
         let mut connections = self.connections.lock().await;
         let mut invalidated = Vec::new();
         for (key, handle) in connections.iter() {
-            if handle.state() == ConnectionState::Initializing {
+            let follows_client_workspace = key.is_client_fallback() || key.is_shared();
+            if follows_client_workspace && handle.state() == ConnectionState::Initializing {
                 // Its initialize request captured the old snapshot and an LSP
                 // notification cannot be sent until after `initialized`.
                 // Recycle it so the next acquisition handshakes with the
@@ -672,9 +673,13 @@ impl LanguageServerPool {
                 invalidated.push(key.clone());
                 continue;
             }
-            if handle.state() != ConnectionState::Ready
-                || !handle.supports_workspace_folder_changes()
-            {
+            if handle.state() != ConnectionState::Ready {
+                continue;
+            }
+            if !handle.supports_workspace_folder_changes() {
+                if follows_client_workspace {
+                    invalidated.push(key.clone());
+                }
                 continue;
             }
             let notification =
@@ -3334,7 +3339,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn workspace_folder_change_forwards_only_to_capable_ready_connections() {
+    async fn workspace_folder_change_forwards_to_capable_and_recycles_incapable_fallback() {
         let pool = LanguageServerPool::new();
         let capable =
             create_handle_with_key(ConnectionState::Ready, ConnectionKey::for_server("capable"))
@@ -3357,7 +3362,10 @@ mod tests {
             .await;
 
         assert_eq!(capable.workspace_folders().snapshot(), Some(vec![added]));
-        assert_eq!(incapable.workspace_folders().snapshot(), None);
+        assert!(
+            !pool.connections.lock().await.contains_key(incapable.key()),
+            "an incapable fallback must respawn with the current workspace snapshot"
+        );
     }
 
     #[tokio::test]
