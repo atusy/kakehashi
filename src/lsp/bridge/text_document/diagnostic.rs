@@ -200,6 +200,11 @@ impl LanguageServerPool {
                 diagnostics
             }
             DownstreamDiagnosticReport::Unchanged { result_id } => {
+                // A compliant server returns Unchanged only after we supplied a
+                // previousResultId. Without a baseline, the empty result below
+                // is deliberately non-cacheable; advancing the sequence merely
+                // prevents this malformed older response from outranking a
+                // concurrent newer pull. A later Full report can still apply.
                 if may_apply && let Some(baseline) = &snapshot.baseline {
                     self.store_diagnostic_baseline_if_current(
                         cache_key,

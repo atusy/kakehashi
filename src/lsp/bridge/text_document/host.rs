@@ -420,6 +420,10 @@ impl LanguageServerPool {
             .map(|entry| entry.result_id.clone());
         if let Some(result_id) = &previous_result_id {
             params["previousResultId"] = serde_json::Value::String(result_id.clone());
+        } else if let Some(params) = params.as_object_mut() {
+            // Keep absence distinct from JSON null even if a future caller
+            // reuses a params object instead of constructing a fresh one.
+            params.remove("previousResultId");
         }
         let report = self
             .execute_host_request(
