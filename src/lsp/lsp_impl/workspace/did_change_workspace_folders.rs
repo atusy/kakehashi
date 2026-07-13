@@ -2,10 +2,10 @@
 
 use tower_lsp_server::ls_types::DidChangeWorkspaceFoldersParams;
 
-use crate::config::WorkspaceSettings;
+use crate::config::{WorkspaceSettings, merge_workspace_settings};
 use crate::lsp::{SettingsSource, load_settings};
 
-use super::super::Kakehashi;
+use super::super::{Kakehashi, lock_settings_reload};
 
 impl Kakehashi {
     pub(crate) async fn did_change_workspace_folders_impl(
@@ -18,6 +18,14 @@ impl Kakehashi {
             .pool()
             .apply_workspace_folder_change(added, &removed)
             .await;
+
+        // Reading the settings in effect, merging the reloaded root onto them,
+        // and publishing the result share the one reload transaction
+        // `workspace/didChangeConfiguration` uses. Without it a configuration
+        // push racing this notification can publish a merge derived from the
+        // snapshot the other has already replaced.
+        let reload = lock_settings_reload().await;
+
         let root_path = self
             .bridge
             .pool()
@@ -49,23 +57,34 @@ impl Kakehashi {
             None,
         );
         self.notifier().log_settings_events(&outcome.events).await;
-        let (raw, settings) = if let Some(settings) = outcome.settings {
-            (
-                outcome
-                    .raw_settings
-                    .unwrap_or_else(|| crate::config::RawWorkspaceSettings::from(&settings)),
-                settings,
-            )
-        } else {
-            let raw = crate::config::defaults::default_settings();
-            let settings = WorkspaceSettings::try_from_settings(
-                &raw,
-                self.home_dir.as_deref(),
-                crate::config::expand::with_kakehashi_defaults(|var| std::env::var(var).ok()),
-            )
-            .unwrap_or_default();
-            (raw, settings)
+        let root_settings = outcome
+            .raw_settings
+            .unwrap_or_else(crate::config::defaults::default_settings);
+        let active_settings = self.settings_manager.load_raw_settings();
+        let Some(raw) =
+            merge_workspace_settings(Some(root_settings), Some((*active_settings).clone()))
+        else {
+            return;
         };
-        self.apply_initial_settings(raw, settings).await;
+        match WorkspaceSettings::try_from_settings(
+            &raw,
+            self.home_dir.as_deref(),
+            crate::config::expand::with_kakehashi_defaults(|var| std::env::var(var).ok()),
+        ) {
+            Ok(settings) => {
+                let warnings = Self::misconfigured_settings_warnings(&settings);
+                self.apply_raw_settings_locked(&reload, raw, settings).await;
+                drop(reload);
+                self.warn_on_misconfigured_settings(&warnings).await;
+            }
+            Err(error) => {
+                drop(reload);
+                self.notifier()
+                    .log_warning(format!(
+                        "Workspace root changed, but reloaded settings were invalid: {error}"
+                    ))
+                    .await;
+            }
+        }
     }
 }
