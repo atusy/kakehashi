@@ -3,6 +3,26 @@
 
 use std::process::Command;
 
+#[cfg(unix)]
+fn create_dir_symlink_or_skip(target: &std::path::Path, link: &std::path::Path) -> bool {
+    std::os::unix::fs::symlink(target, link).expect("Failed to symlink query dir");
+    true
+}
+
+#[cfg(windows)]
+fn create_dir_symlink_or_skip(target: &std::path::Path, link: &std::path::Path) -> bool {
+    match std::os::windows::fs::symlink_dir(target, link) {
+        Ok(()) => true,
+        Err(e)
+            if e.kind() == std::io::ErrorKind::PermissionDenied
+                || e.raw_os_error() == Some(1314) =>
+        {
+            false
+        }
+        Err(e) => panic!("failed to create directory symlink: {e}"),
+    }
+}
+
 /// Test that --help flag shows help message with program description
 #[test]
 fn test_help_flag_shows_help_message() {
@@ -725,6 +745,47 @@ fn test_language_status_shows_installed() {
     );
 }
 
+/// A symlink at the managed query-language entry is not an installed query
+/// directory, even when its external target contains complete-looking files.
+#[cfg(any(unix, windows))]
+#[test]
+fn test_language_status_ignores_symlinked_query_language_directories() {
+    use std::fs;
+
+    let test_dir = tempfile::tempdir().expect("Failed to create temp dir");
+    let external = test_dir.path().join("external/lua");
+    fs::create_dir_all(&external).expect("Failed to create external query dir");
+    fs::write(external.join("highlights.scm"), "(comment) @comment")
+        .expect("Failed to write external query");
+    let managed = test_dir.path().join("data/queries/lua");
+    fs::create_dir_all(managed.parent().unwrap()).expect("Failed to create queries parent");
+    if !create_dir_symlink_or_skip(&external, &managed) {
+        return;
+    }
+
+    let output = Command::new(env!("CARGO_BIN_EXE_kakehashi"))
+        .args([
+            "language",
+            "status",
+            "--data-dir",
+            test_dir.path().join("data").to_str().unwrap(),
+        ])
+        .output()
+        .expect("Failed to execute command");
+
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.status.success(), "status failed: {combined}");
+    assert!(
+        combined.contains("No languages installed"),
+        "query-directory symlinks must not enter discovery: {combined}"
+    );
+    assert!(external.join("highlights.scm").is_file());
+}
+
 /// Test that language status shows missing queries
 #[test]
 fn test_language_status_missing_queries() {
@@ -1207,6 +1268,56 @@ fn test_language_uninstall_all() {
         })
         .unwrap_or_default();
     assert!(queries.is_empty(), "All queries should be removed");
+}
+
+/// Bulk uninstall discovery must not follow a managed query-language symlink
+/// or claim that removing external query content is in scope.
+#[cfg(any(unix, windows))]
+#[test]
+fn test_language_uninstall_all_ignores_symlinked_query_language_directories() {
+    use std::fs;
+
+    let test_dir = tempfile::tempdir().expect("Failed to create temp dir");
+    let external = test_dir.path().join("external/lua");
+    fs::create_dir_all(&external).expect("Failed to create external query dir");
+    let external_query = external.join("highlights.scm");
+    fs::write(&external_query, "(comment) @comment").expect("Failed to write external query");
+    let managed = test_dir.path().join("data/queries/lua");
+    fs::create_dir_all(managed.parent().unwrap()).expect("Failed to create queries parent");
+    if !create_dir_symlink_or_skip(&external, &managed) {
+        return;
+    }
+
+    let output = Command::new(env!("CARGO_BIN_EXE_kakehashi"))
+        .args([
+            "language",
+            "uninstall",
+            "--all",
+            "--force",
+            "--data-dir",
+            test_dir.path().join("data").to_str().unwrap(),
+        ])
+        .output()
+        .expect("Failed to execute command");
+
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.status.success(), "uninstall failed: {combined}");
+    assert!(
+        combined.contains("No languages installed to uninstall"),
+        "query-directory symlinks must not enter uninstall discovery: {combined}"
+    );
+    assert!(
+        managed.is_symlink(),
+        "managed symlink must remain untouched"
+    );
+    assert!(
+        external_query.is_file(),
+        "external query must remain intact"
+    );
 }
 
 /// Test that language uninstall --all ignores internal query staging directories

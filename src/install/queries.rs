@@ -414,17 +414,173 @@ fn install_queries_recursive(
     })
 }
 
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn query_directory_open_options() -> cap_primitives::fs::OpenOptions {
+    use cap_primitives::fs::OpenOptionsExt as _;
+
+    let mut options = cap_primitives::fs::OpenOptions::new();
+    options
+        .read(true)
+        .custom_flags(nix::libc::O_PATH | nix::libc::O_DIRECTORY);
+    options
+}
+
+#[cfg(any(
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "tvos",
+    target_os = "watchos",
+    target_os = "visionos",
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "solaris",
+    target_os = "illumos"
+))]
+fn query_directory_open_options() -> cap_primitives::fs::OpenOptions {
+    use cap_primitives::fs::OpenOptionsExt as _;
+
+    let mut options = cap_primitives::fs::OpenOptions::new();
+    options.read(true).custom_flags(nix::libc::O_SEARCH);
+    options
+}
+
+#[cfg(windows)]
+fn query_directory_open_options() -> cap_primitives::fs::OpenOptions {
+    use cap_primitives::fs::OpenOptionsExt as _;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_FLAG_BACKUP_SEMANTICS, FILE_READ_ATTRIBUTES,
+    };
+
+    let mut options = cap_primitives::fs::OpenOptions::new();
+    options
+        .access_mode(FILE_READ_ATTRIBUTES)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS);
+    options
+}
+
+#[cfg(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "tvos",
+    target_os = "watchos",
+    target_os = "visionos",
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "solaris",
+    target_os = "illumos",
+    windows
+))]
+fn open_query_language_dir_nofollow(queries_dir: &Path) -> std::io::Result<fs::File> {
+    use cap_primitives::fs::FollowSymlinks;
+
+    let parent = queries_dir
+        .parent()
+        .ok_or_else(|| std::io::Error::other("query language directory has no parent"))?;
+    let name = queries_dir
+        .file_name()
+        .ok_or_else(|| std::io::Error::other("query language directory has no name"))?;
+    let mut parent_options = query_directory_open_options();
+    parent_options._cap_fs_ext_maybe_dir(true);
+    let parent = cap_primitives::fs::open_ambient(
+        parent,
+        &parent_options,
+        cap_primitives::ambient_authority(),
+    )?;
+    if !parent.metadata()?.is_dir() {
+        return Err(std::io::Error::other("queries parent is not a directory"));
+    }
+    let mut options = query_directory_open_options();
+    options
+        ._cap_fs_ext_follow(FollowSymlinks::No)
+        ._cap_fs_ext_maybe_dir(true);
+    let directory = cap_primitives::fs::open(&parent, Path::new(name), &options)?;
+    if !directory.metadata()?.is_dir() {
+        return Err(std::io::Error::other(
+            "query language entry is not a directory",
+        ));
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt as _;
+        use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
+
+        if directory.metadata()?.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err(std::io::Error::other(
+                "query language entry is a reparse point",
+            ));
+        }
+    }
+    Ok(directory)
+}
+
+#[cfg(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "tvos",
+    target_os = "watchos",
+    target_os = "visionos",
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "solaris",
+    target_os = "illumos",
+    windows
+))]
 pub fn query_install_is_complete(queries_dir: &Path) -> bool {
-    let highlights_path = queries_dir.join("highlights.scm");
-    let Ok(metadata) = fs::symlink_metadata(&highlights_path) else {
+    use cap_primitives::fs::FollowSymlinks;
+
+    let Ok(directory) = open_query_language_dir_nofollow(queries_dir) else {
+        return false;
+    };
+    let Ok(metadata) =
+        cap_primitives::fs::stat(&directory, Path::new("highlights.scm"), FollowSymlinks::No)
+    else {
         return false;
     };
     // The marker is written only after a staged install has written all
     // required files. Legacy direct-write directories did not have it, so a
     // non-empty highlights.scm still counts as installed to avoid clobbering
     // valid user-managed or pre-marker query directories.
-    metadata.file_type().is_file()
-        && (queries_dir.join(QUERY_INSTALL_COMPLETE_MARKER).is_file() || metadata.len() > 0)
+    metadata.is_file()
+        && (cap_primitives::fs::stat(
+            &directory,
+            Path::new(QUERY_INSTALL_COMPLETE_MARKER),
+            FollowSymlinks::No,
+        )
+        .is_ok_and(|marker| marker.is_file())
+            || metadata.len() > 0)
+}
+
+#[cfg(not(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "tvos",
+    target_os = "watchos",
+    target_os = "visionos",
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "solaris",
+    target_os = "illumos",
+    windows
+)))]
+pub fn query_install_is_complete(queries_dir: &Path) -> bool {
+    let Ok(directory_metadata) = fs::symlink_metadata(queries_dir) else {
+        return false;
+    };
+    if !directory_metadata.is_dir() {
+        return false;
+    }
+    let Ok(metadata) = fs::symlink_metadata(queries_dir.join("highlights.scm")) else {
+        return false;
+    };
+    let marker_is_file = fs::symlink_metadata(queries_dir.join(QUERY_INSTALL_COMPLETE_MARKER))
+        .is_ok_and(|marker| marker.file_type().is_file());
+    metadata.file_type().is_file() && (marker_is_file || metadata.len() > 0)
 }
 
 /// Whether a kakehashi-owned crash backup is safe to restore as the exact
@@ -725,7 +881,7 @@ fn recover_interrupted_query_install(
         return Ok(());
     }
     let queries_dir = queries_parent.join(language);
-    if queries_dir.exists() {
+    if path_entry_exists(&queries_dir)? {
         return Ok(());
     }
 
@@ -733,7 +889,7 @@ fn recover_interrupted_query_install(
     if uninstall_tombstone_path(queries_parent, language).is_file() {
         return Ok(());
     }
-    if queries_dir.exists() {
+    if path_entry_exists(&queries_dir)? {
         return Ok(());
     }
 
@@ -759,6 +915,14 @@ fn recover_interrupted_query_install(
     }
     let _ = fs::remove_file(ownership);
     Ok(())
+}
+
+fn path_entry_exists(path: &Path) -> Result<bool, QueryInstallError> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(QueryInstallError::IoError(e)),
+    }
 }
 
 fn uninstall_tombstone_path(queries_parent: &Path, language: &str) -> PathBuf {
@@ -907,7 +1071,7 @@ fn replace_query_dir(
         return Ok(ReplaceQueryDirResult::Uninstalled);
     }
 
-    if !queries_dir.exists() {
+    if !path_entry_exists(queries_dir)? {
         fs::rename(tmp_queries_dir, queries_dir)?;
         return Ok(ReplaceQueryDirResult::Replaced);
     }
@@ -916,7 +1080,7 @@ fn replace_query_dir(
     write_backup_ownership_marker(&backup_dir)?;
     if let Err(e) = fs::rename(queries_dir, &backup_dir) {
         let _ = fs::remove_file(backup_ownership_sidecar(&backup_dir));
-        // The target vanished between the exists() check above and this
+        // The target vanished between the metadata check above and this
         // rename (external cleanup — the lock only serializes kakehashi's own
         // installers): nothing to back up, so publish the staged dir instead
         // of aborting the install.
@@ -997,6 +1161,46 @@ mod tests {
     use tempfile::TempDir;
 
     #[cfg(unix)]
+    fn create_dir_symlink_or_skip(target: &Path, link: &Path) -> bool {
+        std::os::unix::fs::symlink(target, link).unwrap();
+        true
+    }
+
+    #[cfg(windows)]
+    fn create_dir_symlink_or_skip(target: &Path, link: &Path) -> bool {
+        match std::os::windows::fs::symlink_dir(target, link) {
+            Ok(()) => true,
+            Err(e)
+                if e.kind() == std::io::ErrorKind::PermissionDenied
+                    || e.raw_os_error() == Some(1314) =>
+            {
+                false
+            }
+            Err(e) => panic!("failed to create directory symlink: {e}"),
+        }
+    }
+
+    #[cfg(unix)]
+    fn create_file_symlink_or_skip(target: &Path, link: &Path) -> bool {
+        std::os::unix::fs::symlink(target, link).unwrap();
+        true
+    }
+
+    #[cfg(windows)]
+    fn create_file_symlink_or_skip(target: &Path, link: &Path) -> bool {
+        match std::os::windows::fs::symlink_file(target, link) {
+            Ok(()) => true,
+            Err(e)
+                if e.kind() == std::io::ErrorKind::PermissionDenied
+                    || e.raw_os_error() == Some(1314) =>
+            {
+                false
+            }
+            Err(e) => panic!("failed to create file symlink: {e}"),
+        }
+    }
+
+    #[cfg(unix)]
     #[test]
     fn symlinked_highlights_file_is_not_a_complete_install() {
         use std::os::unix::fs::symlink;
@@ -1035,6 +1239,106 @@ mod tests {
             "crash recovery must restore the exact pre-replacement directory"
         );
         assert!(!backup.exists());
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn query_install_is_incomplete_when_language_directory_is_a_symlink() {
+        let temp = TempDir::new().unwrap();
+        let external = temp.path().join("external");
+        std::fs::create_dir_all(&external).unwrap();
+        std::fs::write(external.join("highlights.scm"), "(comment) @comment").unwrap();
+        let managed = temp.path().join("queries/lua");
+        std::fs::create_dir_all(managed.parent().unwrap()).unwrap();
+        if !create_dir_symlink_or_skip(&external, &managed) {
+            return;
+        }
+
+        assert!(
+            !query_install_is_complete(&managed),
+            "managed language-directory symlinks must not redirect completeness checks"
+        );
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn query_install_is_incomplete_when_completion_marker_is_a_symlink() {
+        let temp = TempDir::new().unwrap();
+        let queries_dir = temp.path().join("queries/lua");
+        fs::create_dir_all(&queries_dir).unwrap();
+        fs::write(queries_dir.join("highlights.scm"), "").unwrap();
+        let external_marker = queries_dir.join("external-marker-target");
+        fs::write(&external_marker, "owned elsewhere").unwrap();
+        if !create_file_symlink_or_skip(
+            &external_marker,
+            &queries_dir.join(QUERY_INSTALL_COMPLETE_MARKER),
+        ) {
+            return;
+        }
+
+        assert!(
+            !query_install_is_complete(&queries_dir),
+            "an external marker target must not make empty highlights complete"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn query_install_is_incomplete_when_language_directory_is_a_junction() {
+        let temp = TempDir::new().unwrap();
+        let external = temp.path().join("external");
+        fs::create_dir_all(&external).unwrap();
+        fs::write(external.join("highlights.scm"), "(comment) @comment").unwrap();
+        let managed = temp.path().join("queries/lua");
+        fs::create_dir_all(managed.parent().unwrap()).unwrap();
+        junction::create(&external, &managed).unwrap();
+
+        assert!(
+            !query_install_is_complete(&managed),
+            "managed directory junctions must not redirect completeness checks"
+        );
+    }
+
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "tvos",
+        target_os = "watchos",
+        target_os = "visionos",
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "solaris",
+        target_os = "illumos"
+    ))]
+    #[test]
+    fn query_install_completeness_does_not_require_directory_read_permission() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let temp = TempDir::new().unwrap();
+        let queries_dir = temp.path().join("queries/lua");
+        fs::create_dir_all(&queries_dir).unwrap();
+        fs::write(queries_dir.join("highlights.scm"), "(comment) @comment").unwrap();
+        fs::set_permissions(&queries_dir, fs::Permissions::from_mode(0o111)).unwrap();
+        fs::set_permissions(
+            queries_dir.parent().unwrap(),
+            fs::Permissions::from_mode(0o111),
+        )
+        .unwrap();
+
+        let complete = query_install_is_complete(&queries_dir);
+
+        fs::set_permissions(
+            queries_dir.parent().unwrap(),
+            fs::Permissions::from_mode(0o700),
+        )
+        .unwrap();
+        fs::set_permissions(&queries_dir, fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(
+            complete,
+            "known query files under searchable directories remain inspectable"
+        );
     }
 
     #[test]
@@ -1261,6 +1565,35 @@ mod tests {
             !tmp.exists(),
             "generated staging dirs from crashed installs should be collected"
         );
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn recovery_does_not_restore_a_backup_over_a_dangling_managed_symlink() {
+        let temp = TempDir::new().unwrap();
+        let queries_parent = temp.path().join("queries");
+        fs::create_dir_all(&queries_parent).unwrap();
+        let queries_dir = queries_parent.join("lua");
+        if !create_dir_symlink_or_skip(&temp.path().join("missing"), &queries_dir) {
+            return;
+        }
+        let backup = queries_parent.join(".lua.1.1.backup");
+        fs::create_dir_all(&backup).unwrap();
+        fs::write(backup.join("highlights.scm"), "backup").unwrap();
+        write_install_marker_for_tests(&backup).unwrap();
+        write_backup_ownership_marker(&backup).unwrap();
+
+        let result = recover_interrupted_query_install(&queries_parent, "lua");
+
+        assert!(result.is_ok(), "recovery failed: {result:?}");
+        assert!(
+            fs::symlink_metadata(&queries_dir)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "recovery must leave the occupied managed entry for normal repair"
+        );
+        assert!(backup.is_dir(), "backup must remain available for recovery");
     }
 
     #[test]
@@ -1534,6 +1867,75 @@ mod tests {
         assert!(
             !queries_parent.join("raced_lang").exists(),
             "uninstall tombstone must prevent restoring canonical queries"
+        );
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn replace_query_dir_repairs_a_dangling_language_directory_symlink() {
+        let temp_dir = TempDir::new().unwrap();
+        let queries_parent = temp_dir.path().join("queries");
+        fs::create_dir_all(&queries_parent).unwrap();
+        let queries_dir = queries_parent.join("lua");
+        let missing_target = temp_dir.path().join("missing");
+        if !create_dir_symlink_or_skip(&missing_target, &queries_dir) {
+            return;
+        }
+        let staged = create_unique_temp_query_dir(&queries_parent, "lua").unwrap();
+        fs::write(staged.join("highlights.scm"), "managed").unwrap();
+        write_install_marker_for_tests(&staged).unwrap();
+
+        let result = replace_query_dir(&staged, &queries_dir, "lua", false);
+
+        assert!(matches!(result, Ok(ReplaceQueryDirResult::Replaced)));
+        assert!(
+            fs::symlink_metadata(&queries_dir)
+                .unwrap()
+                .file_type()
+                .is_dir(),
+            "the dangling symlink must be replaced by the staged directory"
+        );
+        assert_eq!(
+            fs::read_to_string(queries_dir.join("highlights.scm")).unwrap(),
+            "managed"
+        );
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn replace_query_dir_repairs_a_live_language_directory_symlink() {
+        let temp_dir = TempDir::new().unwrap();
+        let queries_parent = temp_dir.path().join("queries");
+        fs::create_dir_all(&queries_parent).unwrap();
+        let external = temp_dir.path().join("external");
+        fs::create_dir_all(&external).unwrap();
+        fs::write(external.join("highlights.scm"), "external").unwrap();
+        let queries_dir = queries_parent.join("lua");
+        if !create_dir_symlink_or_skip(&external, &queries_dir) {
+            return;
+        }
+        let staged = create_unique_temp_query_dir(&queries_parent, "lua").unwrap();
+        fs::write(staged.join("highlights.scm"), "managed").unwrap();
+        write_install_marker_for_tests(&staged).unwrap();
+
+        let result = replace_query_dir(&staged, &queries_dir, "lua", false);
+
+        assert!(matches!(result, Ok(ReplaceQueryDirResult::Replaced)));
+        assert!(
+            fs::symlink_metadata(&queries_dir)
+                .unwrap()
+                .file_type()
+                .is_dir(),
+            "the live symlink must be replaced by the staged directory"
+        );
+        assert_eq!(
+            fs::read_to_string(queries_dir.join("highlights.scm")).unwrap(),
+            "managed"
+        );
+        assert_eq!(
+            fs::read_to_string(external.join("highlights.scm")).unwrap(),
+            "external",
+            "repair must not modify the symlink target"
         );
     }
 

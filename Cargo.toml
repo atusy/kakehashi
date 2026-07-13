@@ -100,6 +100,12 @@ percent-encoding = "2"
 rayon = "1"
 futures = "0.3.31"
 
+[target.'cfg(any(target_os = "linux", target_os = "android", target_os = "macos", target_os = "ios", target_os = "tvos", target_os = "watchos", target_os = "visionos", target_os = "freebsd", target_os = "netbsd", target_os = "solaris", target_os = "illumos", windows))'.dependencies]
+cap-primitives = "4"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem"] }
+
 # Unix-only dependencies (signal handling; "fs" for FD_CLOEXEC in tests)
 [target.'cfg(unix)'.dependencies]
 nix = { version = "0.31", features = ["signal", "process", "fs"] }
@@ -111,6 +117,9 @@ e2e = []
 # Signal::SIGPIPE for asserting the termination signal.
 [target.'cfg(unix)'.dev-dependencies]
 nix = { version = "0.31", features = ["fs", "signal"] }
+
+[target.'cfg(windows)'.dev-dependencies]
+junction = { version = "2", default-features = false }
 
 [dev-dependencies]
 tokio-test = "0.4"
