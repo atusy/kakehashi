@@ -473,11 +473,21 @@ impl LspClient {
     /// Skips server-initiated notifications and requests until finding matching response.
     /// Times out after 30 seconds or 1000 messages to prevent indefinite hangs.
     fn receive_response_for_id(&mut self, expected_id: i64) -> Value {
+        self.receive_response_for_id_watching_server_requests_inner(expected_id, None)
+            .0
+    }
+
+    fn receive_response_for_id_watching_server_requests_inner(
+        &mut self,
+        expected_id: i64,
+        watched_method: Option<&str>,
+    ) -> (Value, Vec<(Value, Value)>) {
         const MAX_MESSAGES: u32 = 1000;
         const TIMEOUT: Duration = Duration::from_secs(30);
 
         let start_time = Instant::now();
         let mut message_count = 0u32;
+        let mut watched = Vec::new();
 
         loop {
             // Check message count threshold
@@ -514,13 +524,20 @@ impl LspClient {
 
             // Check if this is a response to our request
             if let Some(id) = message.get("id") {
-                // Server-to-client requests have "method" field, skip them
-                if message.get("method").is_some() {
+                // Preserve watched server-to-client requests instead of silently
+                // discarding them while a synchronous client request is in flight.
+                if let Some(method) = message.get("method").and_then(Value::as_str) {
+                    if Some(method) == watched_method {
+                        watched.push((
+                            id.clone(),
+                            message.get("params").cloned().unwrap_or(Value::Null),
+                        ));
+                    }
                     continue;
                 }
                 // Response should match our request id
                 if id.as_i64() == Some(expected_id) {
-                    return message;
+                    return (message, watched);
                 }
             }
             // Otherwise it's a notification like window/logMessage, skip it
@@ -580,6 +597,21 @@ impl LspClient {
     /// Receive response for a specific request ID (public version).
     pub(crate) fn receive_response_for_id_public(&mut self, expected_id: i64) -> Value {
         self.receive_response_for_id(expected_id)
+    }
+
+    /// Receive one client-request response while preserving server requests of
+    /// `watched_method` that arrived before it. This prevents exact-sequence E2E
+    /// assertions from losing concurrent server requests in the ordinary
+    /// synchronous response loop.
+    pub(crate) fn receive_response_for_id_watching_server_requests(
+        &mut self,
+        expected_id: i64,
+        watched_method: &str,
+    ) -> (Value, Vec<(Value, Value)>) {
+        self.receive_response_for_id_watching_server_requests_inner(
+            expected_id,
+            Some(watched_method),
+        )
     }
 
     /// Wait for a notification with a specific method name.
