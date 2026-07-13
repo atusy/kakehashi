@@ -902,8 +902,10 @@ fn e2e_downstream_refresh_burst_is_coalesced() {
     let (id, _) = client
         .wait_for_server_request("workspace/diagnostic/refresh", Duration::from_secs(15))
         .expect("the leading refresh must reach the editor immediately");
-    client.send_response(id, json!(null));
 
+    // Keep the leading refresh unacknowledged while pulling generation 1. The
+    // mock emits generations 2–10 after answering this pull, so every later
+    // downstream refresh arrives during the leading request's single-flight.
     let leading_pull_id = client.send_request_async(
         "textDocument/diagnostic",
         json!({ "textDocument": { "uri": MD_URI } }),
@@ -921,6 +923,7 @@ fn e2e_downstream_refresh_burst_is_coalesced() {
             })),
         "the leading refresh must expose the first downstream generation: {leading_pull}"
     );
+    client.send_response(id, json!(null));
 
     let (trailing_id, _) = match refreshes_during_leading_pull.as_slice() {
         [] => client
