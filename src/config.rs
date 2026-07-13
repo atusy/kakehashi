@@ -260,11 +260,15 @@ impl WorkspaceSettings {
         let mut errors = Vec::new();
 
         let refresh = ws.features.workspace_diagnostic_refresh;
-        if refresh.max_wait_ms < refresh.debounce_ms {
+        if refresh.max_wait_ms == 0
+            || refresh.debounce_ms > settings::MAX_FEATURE_TIMING_MS
+            || refresh.max_wait_ms > settings::MAX_FEATURE_TIMING_MS
+            || refresh.max_wait_ms < refresh.debounce_ms
+        {
             errors.push(expand::ExpandError::InvalidSetting {
                 message: format!(
-                    "features.\"workspace/diagnostic/refresh\".maxWaitMs ({}) must be greater than or equal to debounceMs ({})",
-                    refresh.max_wait_ms, refresh.debounce_ms
+                    "features.\"workspace/diagnostic/refresh\" requires 0 <= debounceMs <= maxWaitMs <= {} and maxWaitMs > 0 (got debounceMs={}, maxWaitMs={})",
+                    settings::MAX_FEATURE_TIMING_MS, refresh.debounce_ms, refresh.max_wait_ms
                 ),
             });
         }
@@ -727,7 +731,35 @@ mod tests {
         )
         .unwrap();
         let error = WorkspaceSettings::try_from_settings(&raw, None, |_| None).unwrap_err();
-        assert!(error.to_string().contains("maxWaitMs (100)"));
+        assert!(error.to_string().contains("debounceMs=101, maxWaitMs=100"));
+    }
+
+    #[test]
+    fn workspace_diagnostic_refresh_rejects_zero_and_unbounded_max_wait() {
+        for max_wait_ms in [0, settings::MAX_FEATURE_TIMING_MS + 1] {
+            let raw = RawWorkspaceSettings {
+                features: Some(settings::FeatureSettings {
+                    workspace_diagnostic_refresh: Some(settings::DebounceFeatureSettings {
+                        debounce_ms: Some(0),
+                        max_wait_ms: Some(max_wait_ms),
+                    }),
+                }),
+                ..Default::default()
+            };
+            assert!(WorkspaceSettings::try_from_settings(&raw, None, |_| None).is_err());
+        }
+    }
+
+    #[test]
+    fn feature_policy_rejects_unknown_methods_and_fields() {
+        for invalid in [
+            r#"[features."workspace/diagnostic/refresh"]
+               debouncMs = 100"#,
+            r#"[features."workspace/diagnostics/refresh"]
+               debounceMs = 100"#,
+        ] {
+            assert!(toml::from_str::<RawWorkspaceSettings>(invalid).is_err());
+        }
     }
 
     #[test]
