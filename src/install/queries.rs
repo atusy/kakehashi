@@ -415,6 +415,12 @@ fn install_queries_recursive(
 }
 
 pub fn query_install_is_complete(queries_dir: &Path) -> bool {
+    let Ok(directory_metadata) = fs::symlink_metadata(queries_dir) else {
+        return false;
+    };
+    if !directory_metadata.is_dir() {
+        return false;
+    }
     let highlights_path = queries_dir.join("highlights.scm");
     let Ok(metadata) = fs::symlink_metadata(&highlights_path) else {
         return false;
@@ -1035,6 +1041,26 @@ mod tests {
             "crash recovery must restore the exact pre-replacement directory"
         );
         assert!(!backup.exists());
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn query_install_is_incomplete_when_language_directory_is_a_symlink() {
+        let temp = TempDir::new().unwrap();
+        let external = temp.path().join("external");
+        std::fs::create_dir_all(&external).unwrap();
+        std::fs::write(external.join("highlights.scm"), "(comment) @comment").unwrap();
+        let managed = temp.path().join("queries/lua");
+        std::fs::create_dir_all(managed.parent().unwrap()).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&external, &managed).unwrap();
+        #[cfg(windows)]
+        std::os::windows::fs::symlink_dir(&external, &managed).unwrap();
+
+        assert!(
+            !query_install_is_complete(&managed),
+            "managed language-directory symlinks must not redirect completeness checks"
+        );
     }
 
     #[test]
