@@ -486,6 +486,13 @@ struct ForwardedRefreshDebounce {
     refresh_epoch: u64,
     refresh_epoch_at_last_activity: u64,
     covered_generation: Option<u64>,
+    prefetched_generation: Option<u64>,
+}
+
+fn forwarded_refresh_cycle_pending(debounce: &ForwardedRefreshDebounce) -> bool {
+    debounce.prefetched_generation != Some(debounce.generation)
+        || (debounce.covered_generation != Some(debounce.generation)
+            && debounce.refresh_epoch == debounce.refresh_epoch_at_last_activity)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -682,8 +689,7 @@ impl DiagnosticAggregator {
                         .last_activity_at
                         .expect("activity generation has a timestamp"),
                 },
-                send_trailing: debounce.covered_generation != Some(debounce.generation)
-                    && debounce.refresh_epoch == debounce.refresh_epoch_at_last_activity,
+                send_trailing: forwarded_refresh_cycle_pending(&debounce),
             };
         }
         if debounce.generation != observed {
@@ -693,9 +699,7 @@ impl DiagnosticAggregator {
                     .last_activity_at
                     .expect("activity generation has a timestamp"),
             })
-        } else if debounce.covered_generation != Some(debounce.generation)
-            && debounce.refresh_epoch == debounce.refresh_epoch_at_last_activity
-        {
+        } else if forwarded_refresh_cycle_pending(&debounce) {
             ForwardedRefreshWait::SendTrailing(ForwardedRefreshWaitSnapshot {
                 generation: debounce.generation,
                 last_activity_at: debounce
@@ -751,6 +755,32 @@ impl DiagnosticAggregator {
         if debounce.generation == generation {
             debounce.covered_generation = Some(generation);
         }
+    }
+
+    /// Record that the proactive pullFallback cache was refreshed for this
+    /// downstream activity generation. An older prefetch never covers activity
+    /// that arrived while it was running.
+    pub(crate) fn mark_forwarded_refresh_prefetched(&self, generation: u64) {
+        let mut debounce = self
+            .forwarded_refresh_debounce
+            .lock()
+            .recover_poison("DiagnosticAggregator::forwarded_refresh_debounce");
+        if debounce.generation == generation {
+            debounce.prefetched_generation = Some(generation);
+        }
+    }
+
+    /// Whether a completed prefetch for `generation` should still nudge the
+    /// editor. Newer activity must first receive its own prefetch, while another
+    /// refresh sent after this activity already supplies the nudge.
+    pub(crate) fn forwarded_refresh_needs_editor_send(&self, generation: u64) -> bool {
+        let debounce = self
+            .forwarded_refresh_debounce
+            .lock()
+            .recover_poison("DiagnosticAggregator::forwarded_refresh_debounce");
+        debounce.generation == generation
+            && debounce.covered_generation != Some(generation)
+            && debounce.refresh_epoch == debounce.refresh_epoch_at_last_activity
     }
 
     pub(crate) fn new() -> Self {
@@ -2463,6 +2493,7 @@ mod tests {
         let first = agg
             .begin_forwarded_refresh_debounce()
             .expect("the first refresh schedules the trailing task");
+        agg.mark_forwarded_refresh_prefetched(first.generation);
         agg.record_refresh_sent();
         assert!(
             agg.begin_forwarded_refresh_debounce().is_none(),
@@ -2478,6 +2509,7 @@ mod tests {
         else {
             panic!("activity after the leading send releases one trailing refresh");
         };
+        agg.mark_forwarded_refresh_prefetched(admitted.generation);
         agg.mark_forwarded_refresh_covered(admitted.generation);
         assert!(
             agg.finish_forwarded_refresh_admission(admitted.generation)
@@ -2496,6 +2528,7 @@ mod tests {
             .begin_forwarded_refresh_debounce()
             .expect("the first refresh schedules the settle task");
 
+        agg.mark_forwarded_refresh_prefetched(first.generation);
         agg.record_refresh_sent();
 
         assert_eq!(
@@ -2506,28 +2539,56 @@ mod tests {
     }
 
     #[test]
-    fn another_refresh_after_the_latest_activity_satisfies_the_trailing_edge() {
+    fn another_refresh_after_latest_activity_does_not_skip_its_prefetch() {
         let agg = DiagnosticAggregator::new();
         let first = agg
             .begin_forwarded_refresh_debounce()
             .expect("the first refresh schedules the settle task");
-        agg.record_refresh_sent();
+        agg.mark_forwarded_refresh_prefetched(first.generation);
         assert!(
             agg.begin_forwarded_refresh_debounce().is_none(),
-            "later downstream activity remains in the same debounce cycle"
+            "activity arriving during the first prefetch remains in the same task"
         );
+        // The old cycle's editor refresh is admitted only after the newer
+        // activity. It covers the editor nudge, but cannot retroactively prefetch
+        // the newer downstream state.
+        agg.record_refresh_sent();
         let ForwardedRefreshWait::Restart(latest) =
             agg.finish_forwarded_refresh_wait(first.generation, false)
         else {
             panic!("the waiter must observe the later activity");
         };
 
-        agg.record_refresh_sent();
+        let ForwardedRefreshWait::SendTrailing(admitted) =
+            agg.finish_forwarded_refresh_wait(latest.generation, false)
+        else {
+            panic!("an editor refresh cannot cover a pullFallback prefetch that never ran");
+        };
+        agg.mark_forwarded_refresh_prefetched(admitted.generation);
+        assert!(
+            !agg.forwarded_refresh_needs_editor_send(admitted.generation),
+            "the late editor refresh still covers the nudge after the newer prefetch"
+        );
+    }
 
+    #[test]
+    fn another_refresh_during_prefetch_skips_only_the_duplicate_editor_send() {
+        let agg = DiagnosticAggregator::new();
+        let generation = agg
+            .begin_forwarded_refresh_debounce()
+            .expect("the refresh starts one prefetch cycle");
+
+        agg.record_refresh_sent();
+        agg.mark_forwarded_refresh_prefetched(generation.generation);
+
+        assert!(
+            !agg.forwarded_refresh_needs_editor_send(generation.generation),
+            "an intervening editor refresh already supplies the post-prefetch nudge"
+        );
         assert_eq!(
-            agg.finish_forwarded_refresh_wait(latest.generation, false),
+            agg.finish_forwarded_refresh_wait(generation.generation, false),
             ForwardedRefreshWait::Settled,
-            "a refresh sent after the latest activity makes a forced trailing send redundant"
+            "the completed prefetch and intervening nudge cover the cycle"
         );
     }
 
@@ -2537,6 +2598,7 @@ mod tests {
         let first = agg
             .begin_forwarded_refresh_debounce()
             .expect("the first refresh schedules the settle task");
+        agg.mark_forwarded_refresh_prefetched(first.generation);
         agg.mark_forwarded_refresh_covered(first.generation);
         assert!(agg.begin_forwarded_refresh_debounce().is_none());
 
@@ -2547,6 +2609,7 @@ mod tests {
         else {
             panic!("activity after the leading edge needs a max-wait send");
         };
+        agg.mark_forwarded_refresh_prefetched(latest.generation);
         agg.mark_forwarded_refresh_covered(latest.generation);
 
         assert_eq!(
@@ -2562,6 +2625,7 @@ mod tests {
         let first = agg
             .begin_forwarded_refresh_debounce()
             .expect("the first refresh schedules the settle task");
+        agg.mark_forwarded_refresh_prefetched(first.generation);
         agg.mark_forwarded_refresh_covered(first.generation);
         assert!(agg.begin_forwarded_refresh_debounce().is_none());
         let ForwardedRefreshWait::MaxWait {
@@ -2599,6 +2663,7 @@ mod tests {
         let first = agg
             .begin_forwarded_refresh_debounce()
             .expect("the first refresh schedules the settle task");
+        agg.mark_forwarded_refresh_prefetched(first.generation);
         agg.mark_forwarded_refresh_covered(first.generation);
         assert!(agg.begin_forwarded_refresh_debounce().is_none());
         let ForwardedRefreshWait::Restart(latest) =

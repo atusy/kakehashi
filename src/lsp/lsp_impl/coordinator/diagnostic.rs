@@ -11,7 +11,7 @@ use url::Url;
 
 use crate::lsp::lsp_impl::Kakehashi;
 use crate::lsp::lsp_impl::text_document::publish_diagnostic::{
-    DiagnosticSnapshot, PullLayerOutcome, collect_push_diagnostics,
+    DiagnosticSnapshot, DiagnosticSnapshotLineage, PullLayerOutcome, collect_push_diagnostics,
 };
 use crate::lsp::settings_manager::SettingsManager;
 use crate::lsp::synthetic_diagnostics::SyntheticDiagnosticsManager;
@@ -43,14 +43,34 @@ fn dispatches_to_any_server(
     !truncate_entries(expand_priorities(priorities, configs), max_fan_out).is_empty()
 }
 
-pub(crate) struct DiagnosticScheduler {
+#[derive(Clone)]
+pub(crate) struct DiagnosticSnapshotPreparer {
     language: std::sync::Arc<LanguageCoordinator>,
     documents: std::sync::Arc<DocumentStore>,
     bridge: std::sync::Arc<BridgeCoordinator>,
     settings_manager: std::sync::Arc<SettingsManager>,
     cache: std::sync::Arc<crate::lsp::cache::CacheCoordinator>,
+}
+
+impl DiagnosticSnapshotPreparer {
+    pub(crate) fn new(server: &Kakehashi) -> Self {
+        Self {
+            language: std::sync::Arc::clone(&server.language),
+            documents: std::sync::Arc::clone(&server.documents),
+            bridge: std::sync::Arc::clone(&server.bridge),
+            settings_manager: std::sync::Arc::clone(&server.settings_manager),
+            cache: std::sync::Arc::clone(&server.cache),
+        }
+    }
+}
+
+pub(crate) struct DiagnosticScheduler {
+    documents: std::sync::Arc<DocumentStore>,
+    bridge: std::sync::Arc<BridgeCoordinator>,
+    settings_manager: std::sync::Arc<SettingsManager>,
     debounced_diagnostics: std::sync::Arc<DebouncedDiagnosticsManager>,
     synthetic_diagnostics: std::sync::Arc<SyntheticDiagnosticsManager>,
+    snapshot_preparer: DiagnosticSnapshotPreparer,
     /// The single proactive publisher: the host-event pull below feeds its
     /// result into the cache and republishes (push-propagation-diagnostic-forwarding),
     /// rather than calling `client.publish_diagnostics` directly, so it can never
@@ -61,13 +81,12 @@ pub(crate) struct DiagnosticScheduler {
 impl DiagnosticScheduler {
     pub(crate) fn new(server: &Kakehashi) -> Self {
         Self {
-            language: std::sync::Arc::clone(&server.language),
             documents: std::sync::Arc::clone(&server.documents),
             bridge: std::sync::Arc::clone(&server.bridge),
             settings_manager: std::sync::Arc::clone(&server.settings_manager),
-            cache: std::sync::Arc::clone(&server.cache),
             debounced_diagnostics: std::sync::Arc::clone(&server.debounced_diagnostics),
             synthetic_diagnostics: std::sync::Arc::clone(&server.synthetic_diagnostics),
+            snapshot_preparer: DiagnosticSnapshotPreparer::new(server),
             publisher: std::sync::Arc::new(super::DiagnosticPublisher::new(server)),
         }
     }
@@ -149,7 +168,13 @@ impl DiagnosticScheduler {
     /// configured-but-pull-gated host still lands here so its re-sync runs), and
     /// `Some(snapshot)` with virt regions and/or a pullable host context.
     pub(crate) fn prepare_diagnostic_snapshot(&self, uri: &Url) -> Option<DiagnosticSnapshot> {
-        let (snapshot, language_name) = {
+        self.snapshot_preparer.prepare_diagnostic_snapshot(uri)
+    }
+}
+
+impl DiagnosticSnapshotPreparer {
+    pub(crate) fn prepare_diagnostic_snapshot(&self, uri: &Url) -> Option<DiagnosticSnapshot> {
+        let (snapshot, language_name, content_version) = {
             let doc = self.documents.get(uri)?;
             let snapshot = doc.snapshot()?;
             let language_name = self.language.detect_language(
@@ -158,7 +183,8 @@ impl DiagnosticScheduler {
                 None,
                 doc.language_id(),
             )?;
-            (snapshot, language_name)
+            let content_version = doc.content_version();
+            (snapshot, language_name, content_version)
         };
 
         // Cross-layer gating, keyed by the same method name as the
@@ -342,6 +368,10 @@ impl DiagnosticScheduler {
         };
 
         Some(DiagnosticSnapshot {
+            lineage: DiagnosticSnapshotLineage {
+                incarnation: snapshot.incarnation(),
+                content_version,
+            },
             virt_contexts,
             host_pull_enabled,
             host,

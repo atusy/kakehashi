@@ -42,6 +42,7 @@ const MD_TEXT: &str = "# Test\n\n```lua\nlocal x = 1\n```\n";
 /// so a `didChange` carrying it is NOT skipped by the content-fingerprint guard
 /// (#422) and reaches the downstream mock.
 const MD_TEXT_EDITED: &str = "# Test\n\n```lua\nlocal x = 2\n```\n";
+const MD_MIXED_TEXT: &str = "# Test\n\n```lua\nlocal x = 1\n```\n\n```python\nprint('x')\n```\n";
 const HOST_LINE: i64 = 3;
 
 fn init_client() -> (LspClient, tempfile::TempDir) {
@@ -61,7 +62,28 @@ fn init_client_with_mode_caps(mode: &str, capabilities: Value) -> (LspClient, te
         .arg("--config-file")
         .arg(config_path.to_str().expect("utf8 path"))
         .build();
-    let initialization_options = if mode == "diagnostics-refresh-burst" {
+    let initialization_options = if mode == "diagnostics-refresh-prefetch-mixed" {
+        json!({
+            "languageServers": {
+                "mock-push": { "cmd": [mock_bin(), mode], "languages": ["lua", "python"] }
+            },
+            "languages": {
+                "markdown": {
+                    "bridge": {
+                        "lua": {},
+                        "python": {
+                            "aggregation": {
+                                "textDocument/publishDiagnostics": { "pullFallback": false }
+                            }
+                        }
+                    }
+                }
+            }
+        })
+    } else if matches!(
+        mode,
+        "diagnostics-refresh-burst" | "diagnostics-refresh-prefetch-disabled"
+    ) {
         json!({
             "languageServers": {
                 "mock-push": { "cmd": [mock_bin(), mode], "languages": ["lua"] }
@@ -863,6 +885,10 @@ fn e2e_publish_seal_delivers_via_refresh_and_pull_only() {
 /// Send a `didOpen` for the markdown host (with its lua region) so the bridge
 /// spawns the downstream mock for that region and forwards the region's events.
 fn open_host(client: &mut LspClient) {
+    open_host_with_text(client, MD_TEXT);
+}
+
+fn open_host_with_text(client: &mut LspClient, text: &str) {
     client.send_notification(
         "textDocument/didOpen",
         json!({
@@ -870,7 +896,7 @@ fn open_host(client: &mut LspClient) {
                 "uri": MD_URI,
                 "languageId": "markdown",
                 "version": 1,
-                "text": MD_TEXT
+                "text": text
             }
         }),
     );
@@ -893,6 +919,335 @@ fn e2e_downstream_refresh_forwarded_to_refresh_capable_client() {
     );
 
     client.send_request("shutdown", json!(null));
+    client.send_notification("exit", json!(null));
+}
+
+#[test]
+fn e2e_downstream_refresh_prefetches_before_forwarding() {
+    let (mut client, _config_dir) =
+        init_client_with_mode_caps("diagnostics-refresh-prefetch", refresh_capable_caps());
+    open_host(&mut client);
+
+    assert!(
+        client
+            .wait_for_server_request("workspace/diagnostic/refresh", Duration::from_millis(100),)
+            .is_none(),
+        "the editor refresh must wait for the delayed pullFallback prefetch"
+    );
+
+    let (_, published) = client
+        .wait_for_notification_where(
+            &["textDocument/publishDiagnostics"],
+            Duration::from_secs(15),
+            |params| {
+                params["diagnostics"].as_array().is_some_and(|diagnostics| {
+                    diagnostics.iter().any(|diagnostic| {
+                        diagnostic["message"].as_str().is_some_and(|message| {
+                            message.starts_with("mock-diagnostic-refresh-prefetched:")
+                        })
+                    })
+                })
+            },
+        )
+        .expect("the refresh cycle must publish its completed pullFallback prefetch");
+    assert_eq!(published["uri"], json!(MD_URI));
+
+    let (refresh_id, _) = client
+        .wait_for_server_request("workspace/diagnostic/refresh", Duration::from_secs(2))
+        .expect("the editor refresh must follow the completed prefetch");
+    client.send_response(refresh_id, json!(null));
+
+    client.send_request("shutdown", json!(null));
+    client.send_notification("exit", json!(null));
+}
+
+#[test]
+fn e2e_downstream_refresh_prefetch_is_client_capability_independent() {
+    let (mut client, _config_dir) =
+        init_client_with_mode_caps("diagnostics-refresh-prefetch", json!({}));
+    open_host(&mut client);
+
+    client
+        .wait_for_notification_where(
+            &["textDocument/publishDiagnostics"],
+            Duration::from_secs(15),
+            |params| {
+                params["diagnostics"].as_array().is_some_and(|diagnostics| {
+                    diagnostics.iter().any(|diagnostic| {
+                        diagnostic["message"] == json!("mock-diagnostic-refresh-prefetched:2")
+                    })
+                })
+            },
+        )
+        .expect("refresh prefetch must run even when the editor lacks refreshSupport");
+    assert!(
+        client
+            .wait_for_server_request("workspace/diagnostic/refresh", Duration::from_millis(400),)
+            .is_none(),
+        "an editor without refreshSupport must not receive a refresh request"
+    );
+
+    client.send_request("shutdown", json!(null));
+    client.send_notification("exit", json!(null));
+}
+
+#[test]
+fn e2e_downstream_refresh_skips_pull_fallback_disabled_contexts() {
+    let (mut client, _config_dir) = init_client_with_mode_caps(
+        "diagnostics-refresh-prefetch-disabled",
+        refresh_capable_caps(),
+    );
+    open_host(&mut client);
+
+    let (refresh_id, _) = client
+        .wait_for_server_request("workspace/diagnostic/refresh", Duration::from_millis(600))
+        .expect("pullFallback=false must not delay the editor refresh with a downstream pull");
+    client.send_response(refresh_id, json!(null));
+    assert!(
+        client
+            .wait_for_notification(
+                "textDocument/publishDiagnostics",
+                Duration::from_millis(400),
+            )
+            .is_none(),
+        "pullFallback=false must not publish a prefetched diagnostic set"
+    );
+
+    client.send_request("shutdown", json!(null));
+    client.send_notification("exit", json!(null));
+}
+
+#[test]
+fn e2e_downstream_refresh_prefetches_only_eligible_mixed_contexts() {
+    let (mut client, _config_dir) =
+        init_client_with_mode_caps("diagnostics-refresh-prefetch-mixed", refresh_capable_caps());
+    open_host_with_text(&mut client, MD_MIXED_TEXT);
+
+    client
+        .wait_for_notification_where(
+            &["textDocument/publishDiagnostics"],
+            Duration::from_secs(15),
+            |params| {
+                params["diagnostics"].as_array().is_some_and(|diagnostics| {
+                    diagnostics.iter().any(|diagnostic| {
+                        diagnostic["message"].as_str().is_some_and(|message| {
+                            message == "mock-diagnostic-refresh-prefetched:1"
+                        })
+                    })
+                })
+            },
+        )
+        .expect("precondition: consume the initial didOpen diagnostic publish");
+
+    // The mixed mock requests refresh only after this hover round-trip.
+    // Its subsequent refresh prefetch is therefore generation 2 and cannot be
+    // confused with the generation-1 didOpen publish above.
+    client.send_request(
+        "textDocument/hover",
+        json!({
+            "textDocument": { "uri": MD_URI },
+            "position": { "line": 3, "character": 0 }
+        }),
+    );
+    let (_, published) = client
+        .wait_for_notification_where(
+            &["textDocument/publishDiagnostics"],
+            Duration::from_secs(15),
+            |params| {
+                params["diagnostics"].as_array().is_some_and(|diagnostics| {
+                    diagnostics.iter().any(|diagnostic| {
+                        diagnostic["message"] == json!("mock-diagnostic-refresh-prefetched:2")
+                    })
+                })
+            },
+        )
+        .expect("the refresh-specific prefetch must publish generation 2");
+    let diagnostics = published["diagnostics"].as_array().unwrap();
+    assert!(
+        diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic["range"]["start"]["line"] == json!(3)),
+        "the pullFallback=true lua context must be prefetched: {diagnostics:?}"
+    );
+    assert!(
+        diagnostics
+            .iter()
+            .all(|diagnostic| diagnostic["range"]["start"]["line"] != json!(7)),
+        "the pullFallback=false python context must not be prefetched: {diagnostics:?}"
+    );
+
+    let (refresh_id, _) = client
+        .wait_for_server_request("workspace/diagnostic/refresh", Duration::from_secs(5))
+        .expect("the mixed-context prefetch must complete before editor refresh");
+    client.send_response(refresh_id, json!(null));
+    client.send_request("shutdown", json!(null));
+    client.send_notification("exit", json!(null));
+}
+
+#[test]
+fn e2e_downstream_refresh_forwards_after_prefetch_failure() {
+    let (mut client, _config_dir) =
+        init_client_with_mode_caps("diagnostics-refresh-prefetch-fail", refresh_capable_caps());
+    open_host(&mut client);
+
+    client
+        .wait_for_notification_where(
+            &["textDocument/publishDiagnostics"],
+            Duration::from_secs(5),
+            |params| {
+                params["diagnostics"].as_array().is_some_and(|diagnostics| {
+                    diagnostics.iter().any(|diagnostic| {
+                        diagnostic["message"] == json!("mock-diagnostic-before-refresh-failure")
+                    })
+                })
+            },
+        )
+        .expect("precondition: a successful pull layer is published before refresh");
+
+    let (refresh_id, _) = client
+        .wait_for_server_request("workspace/diagnostic/refresh", Duration::from_secs(5))
+        .expect("a failed prefetch must not strand the downstream refresh cycle");
+    client.send_response(refresh_id, json!(null));
+
+    let pulled = client.send_request(
+        "textDocument/diagnostic",
+        json!({ "textDocument": { "uri": MD_URI } }),
+    );
+    assert!(
+        pulled["result"]["items"]
+            .as_array()
+            .is_some_and(|diagnostics| diagnostics.iter().any(|diagnostic| {
+                diagnostic["message"] == json!("mock-diagnostic-before-refresh-failure")
+            })),
+        "a failed refresh prefetch must preserve the previous pull layer: {pulled}"
+    );
+
+    client.send_request("shutdown", json!(null));
+    client.send_notification("exit", json!(null));
+}
+
+#[test]
+fn e2e_downstream_refresh_preserves_unchanged_prefetch_results() {
+    let (mut client, _config_dir) = init_client_with_mode_caps(
+        "diagnostics-refresh-prefetch-unchanged",
+        refresh_capable_caps(),
+    );
+    open_host(&mut client);
+
+    let (refresh_id, _) = client
+        .wait_for_server_request("workspace/diagnostic/refresh", Duration::from_secs(5))
+        .expect("the unchanged prefetch must complete before forwarding");
+    client.send_response(refresh_id, json!(null));
+
+    let pulled = client.send_request(
+        "textDocument/diagnostic",
+        json!({ "textDocument": { "uri": MD_URI } }),
+    );
+    assert!(
+        pulled["result"]["items"]
+            .as_array()
+            .is_some_and(|diagnostics| {
+                diagnostics.iter().any(|diagnostic| {
+                    diagnostic["message"] == json!("mock-diagnostic-refresh-unchanged")
+                })
+            }),
+        "an unchanged downstream report must retain its prior diagnostics: {pulled}"
+    );
+
+    client.send_request("shutdown", json!(null));
+    client.send_notification("exit", json!(null));
+}
+
+#[test]
+fn e2e_downstream_refresh_ack_precedes_prefetch_request() {
+    let (mut client, _config_dir) = init_client_with_mode_caps(
+        "diagnostics-refresh-prefetch-ack-order",
+        refresh_capable_caps(),
+    );
+    open_host(&mut client);
+
+    let (refresh_id, _) = client
+        .wait_for_server_request("workspace/diagnostic/refresh", Duration::from_secs(5))
+        .expect("prefetch must proceed after the downstream ACK");
+    client.send_response(refresh_id, json!(null));
+
+    client.send_request("shutdown", json!(null));
+    client.send_notification("exit", json!(null));
+}
+
+#[test]
+fn e2e_downstream_refresh_discards_prefetch_after_document_change() {
+    let (mut client, _config_dir) =
+        init_client_with_mode_caps("diagnostics-refresh-prefetch-stale", refresh_capable_caps());
+    open_host(&mut client);
+
+    client
+        .wait_for_notification_where(
+            &["textDocument/publishDiagnostics"],
+            Duration::from_secs(5),
+            |params| {
+                params["diagnostics"].as_array().is_some_and(|diagnostics| {
+                    diagnostics.iter().any(|diagnostic| {
+                        diagnostic["message"] == json!("mock-diagnostic-before-stale-prefetch")
+                    })
+                })
+            },
+        )
+        .expect("precondition: the initial pull layer is published");
+    // The mock waits 200 ms before requesting refresh, then holds the second
+    // diagnostic pull for 1 s. This lands the edit inside that in-flight pull.
+    std::thread::sleep(Duration::from_millis(400));
+
+    client.send_notification(
+        "textDocument/didChange",
+        json!({
+            "textDocument": { "uri": MD_URI, "version": 2 },
+            "contentChanges": [{ "text": format!("{MD_TEXT}\n") }]
+        }),
+    );
+
+    let (refresh_id, _, publishes) = client
+        .wait_for_server_request_watching(
+            "workspace/diagnostic/refresh",
+            Duration::from_secs(5),
+            &["textDocument/publishDiagnostics"],
+        )
+        .expect("the refresh must still be forwarded after discarding stale prefetch data");
+    assert!(
+        publishes.iter().all(|(_, params)| {
+            params["diagnostics"].as_array().is_none_or(|diagnostics| {
+                diagnostics.iter().all(|diagnostic| {
+                    diagnostic["message"] != json!("mock-diagnostic-from-stale-prefetch")
+                })
+            })
+        }),
+        "an in-flight prefetch from the old document version must never publish: {publishes:?}"
+    );
+    client.send_response(refresh_id, json!(null));
+
+    client.send_request("shutdown", json!(null));
+    client.send_notification("exit", json!(null));
+}
+
+#[test]
+fn e2e_shutdown_cancels_a_live_refresh_prefetch() {
+    let (mut client, _config_dir) =
+        init_client_with_mode_caps("diagnostics-refresh-prefetch", refresh_capable_caps());
+    open_host(&mut client);
+    assert!(
+        client
+            .wait_for_server_request("workspace/diagnostic/refresh", Duration::from_millis(100),)
+            .is_none(),
+        "precondition: the delayed prefetch is still running"
+    );
+
+    client.send_request("shutdown", json!(null));
+    assert!(
+        client
+            .wait_for_server_request("workspace/diagnostic/refresh", Duration::from_millis(400),)
+            .is_none(),
+        "shutdown must cancel the live prefetch without forwarding a refresh"
+    );
     client.send_notification("exit", json!(null));
 }
 

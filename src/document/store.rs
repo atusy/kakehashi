@@ -114,6 +114,16 @@ impl DocumentStore {
         Self::default()
     }
 
+    /// Snapshot the URIs of all currently open documents without retaining any
+    /// DashMap shard guards across async work.
+    pub(crate) fn open_uris(&self) -> Vec<Url> {
+        let mut uris = Vec::with_capacity(self.documents.len());
+        for entry in self.documents.iter() {
+            uris.push(entry.key().clone());
+        }
+        uris
+    }
+
     pub(crate) fn invalidate_all_parses(&self) -> Vec<Url> {
         let mut uris = Vec::with_capacity(self.documents.len());
         for mut entry in self.documents.iter_mut() {

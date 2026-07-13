@@ -99,11 +99,15 @@ pull-driven downstream; whether the editor actually re-pulls is its own
 on it. This gate is orthogonal to rule 2's *pull*.
 
 Forwarding is scheduled once per upstream workspace connection, not once per
-downstream server. The first downstream refresh after idle is the leading edge
-and is forwarded immediately. Further downstream refreshes join one trailing
+downstream server. The first downstream refresh after idle starts a leading
+cycle immediately. Each cycle first completes the workspace-wide Path A prefetch
+and only then forwards the editor refresh, so a client pull cannot race ahead of
+kakehashi's proactive cache. Further downstream refreshes join one trailing
 debounce cycle: 100 ms of quiet releases the latest activity, while an anchored
 1 s maximum wait prevents a continuously chatty server from postponing it
-forever. If another editor refresh is sent after the latest downstream activity,
+forever. Prefetch cycles never overlap; if the maximum wait expires during a
+prefetch, the dirty trailing cycle starts immediately after the current prefetch
+finishes. If another editor refresh is sent after the latest downstream activity,
 that send already provides the required re-pull nudge and the trailing forward is
 suppressed. This keeps independent downstream servers on the same workspace-wide
 cadence without coupling separate kakehashi workspace connections.
@@ -200,17 +204,18 @@ keeps the default `true`. kakehashi never guesses the editor's behavior.
 
 ## Decision–Implementation Gap
 
-**Implemented**: rules 1 and 3. For rule 1 (accept always), kakehashi advertises
+**Implemented**: rules 1, 2, and 3. For rule 1 (accept always), kakehashi advertises
 `workspace.diagnostics.refreshSupport = true` to downstream
 (`src/lsp/bridge/protocol/client_capabilities.rs`), and the downstream
 `workspace/diagnostic/refresh` request handler
 (`src/lsp/bridge/workspace/diagnostic_refresh.rs`) acks it with a `null` result
-while emitting `UpstreamNotification::DiagnosticRefresh`. For rule 3, the
-lifecycle arm routes that notification through the workspace-wide leading +
-trailing scheduler, which checks `workspace.diagnostics.refreshSupport` before
-admission and sends through the existing detached single-flight path.
+while emitting `UpstreamNotification::DiagnosticRefresh`. For rule 2, the
+workspace-wide scheduler snapshots every open URI with the same
+`DiagnosticSnapshotPreparer` as didOpen/didSave/didChange, runs
+`collect_push_diagnostics`, and updates the shared pull layer before continuing.
+For rule 3, each completed prefetch cycle checks
+`workspace.diagnostics.refreshSupport` and sends through the existing detached
+single-flight path. A client without refresh support still runs rule 2 but skips
+only the editor-facing request.
 
-**Planned** (this decision):
-
-- Rule 2 — add the downstream-refresh → Path A pull trigger (today a downstream
-  refresh never re-pulls).
+There is no current implementation gap for this decision.

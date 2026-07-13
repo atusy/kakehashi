@@ -26,6 +26,10 @@ use crate::lsp::diagnostic_cache::{
     DiagnosticAggregator, DiagnosticSource, merge_cached_diagnostics,
 };
 use crate::lsp::lsp_impl::Kakehashi;
+use crate::lsp::lsp_impl::coordinator::diagnostic::DiagnosticSnapshotPreparer;
+use crate::lsp::lsp_impl::text_document::publish_diagnostic::{
+    DiagnosticSnapshotLineage, PullLayerOutcome, collect_push_diagnostics_with_error_sink,
+};
 use crate::lsp::settings_manager::SettingsManager;
 use tower_lsp_server::Client;
 use tower_lsp_server::ls_types::Diagnostic;
@@ -129,6 +133,7 @@ pub(crate) struct DiagnosticPublisher {
     bridge: Arc<BridgeCoordinator>,
     settings_manager: Arc<SettingsManager>,
     cache: Arc<crate::lsp::cache::CacheCoordinator>,
+    snapshot_preparer: DiagnosticSnapshotPreparer,
     aggregator: Arc<DiagnosticAggregator>,
     shutdown: tokio_util::sync::CancellationToken,
 }
@@ -142,6 +147,7 @@ impl DiagnosticPublisher {
             bridge: Arc::clone(&server.bridge),
             settings_manager: Arc::clone(&server.settings_manager),
             cache: Arc::clone(&server.cache),
+            snapshot_preparer: DiagnosticSnapshotPreparer::new(server),
             aggregator: Arc::clone(&server.diagnostics),
             shutdown: server.shutdown_token.clone(),
         }
@@ -154,23 +160,26 @@ impl DiagnosticPublisher {
         if self.shutdown.is_cancelled() {
             return;
         }
-        if !self.diagnostic_refresh_supported() {
-            return;
+        // Preserve the metrics contract for editor-facing asks. Prefetch still
+        // runs without refreshSupport because pullFallback is a kakehashi cache
+        // policy, not a promise that the editor will pull.
+        if self.diagnostic_refresh_supported() {
+            self.aggregator.record_refresh_requested();
         }
-        // Preserve the metrics contract: each capability-eligible downstream
-        // ask is counted before this debounce decides how many wire sends survive.
-        self.aggregator.record_refresh_requested();
         let Some(snapshot) = self.aggregator.begin_forwarded_refresh_debounce() else {
             return;
         };
-        if self.request_pull_diagnostic_refresh_inner(true, false) {
-            self.aggregator
-                .mark_forwarded_refresh_covered(snapshot.generation);
-        }
         let publisher = self.clone();
         tokio::spawn(async move {
             let mut snapshot = snapshot;
             let mut deadline = snapshot.last_activity_at + FORWARDED_REFRESH_MAX_WAIT;
+            if !publisher
+                .complete_forwarded_refresh_cycle(snapshot.generation)
+                .await
+            {
+                publisher.aggregator.cancel_forwarded_refresh_debounce();
+                return;
+            }
             loop {
                 tokio::select! {
                     biased;
@@ -193,10 +202,10 @@ impl DiagnosticPublisher {
                             crate::lsp::diagnostic_cache::ForwardedRefreshWait::SendTrailing(
                                 admitted,
                             ) => {
-                                if publisher.request_pull_diagnostic_refresh_inner(true, false) {
-                                    publisher
-                                        .aggregator
-                                        .mark_forwarded_refresh_covered(admitted.generation);
+                                if publisher
+                                    .complete_forwarded_refresh_cycle(admitted.generation)
+                                    .await
+                                {
                                     if let Some(latest) = publisher
                                         .aggregator
                                         .finish_forwarded_refresh_admission(admitted.generation)
@@ -216,17 +225,13 @@ impl DiagnosticPublisher {
                                 snapshot: latest,
                                 send_trailing,
                             } => {
-                                if send_trailing {
-                                    if publisher
-                                        .request_pull_diagnostic_refresh_inner(true, false)
-                                    {
-                                        publisher
-                                            .aggregator
-                                            .mark_forwarded_refresh_covered(latest.generation);
-                                    } else {
-                                        publisher.aggregator.cancel_forwarded_refresh_debounce();
-                                        break;
-                                    }
+                                if send_trailing
+                                    && !publisher
+                                        .complete_forwarded_refresh_cycle(latest.generation)
+                                        .await
+                                {
+                                    publisher.aggregator.cancel_forwarded_refresh_debounce();
+                                    break;
                                 }
                                 snapshot = latest;
                                 deadline = tokio::time::Instant::now()
@@ -240,6 +245,120 @@ impl DiagnosticPublisher {
                 }
             }
         });
+    }
+
+    /// Complete one scheduled downstream-refresh cycle: refresh every proactive
+    /// pullFallback cache entry first, then (when supported) notify the editor.
+    async fn complete_forwarded_refresh_cycle(&self, generation: u64) -> bool {
+        if !self.prefetch_open_pull_fallback_diagnostics().await || self.shutdown.is_cancelled() {
+            return false;
+        }
+        self.aggregator
+            .mark_forwarded_refresh_prefetched(generation);
+
+        if !self.diagnostic_refresh_supported() {
+            self.aggregator.mark_forwarded_refresh_covered(generation);
+        } else if self
+            .aggregator
+            .forwarded_refresh_needs_editor_send(generation)
+        {
+            if !self.request_pull_diagnostic_refresh_inner(true, false) {
+                return false;
+            }
+            self.aggregator.mark_forwarded_refresh_covered(generation);
+        }
+        true
+    }
+
+    async fn prefetch_open_pull_fallback_diagnostics(&self) -> bool {
+        let mut tasks = tokio::task::JoinSet::new();
+        for uri in self.documents.open_uris() {
+            let Some(snapshot) = self.snapshot_preparer.prepare_diagnostic_snapshot(&uri) else {
+                continue;
+            };
+            let lineage = snapshot.lineage;
+            let pool = self.bridge.pool_arc();
+            let publisher = self.clone();
+            tasks.spawn(async move {
+                let errors = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+                let error_sink = Some(std::sync::Arc::clone(&errors));
+                let outcome = collect_push_diagnostics_with_error_sink(
+                    Some(snapshot),
+                    &pool,
+                    &uri,
+                    LOG_TARGET,
+                    &error_sink,
+                )
+                .await;
+                if errors.load(std::sync::atomic::Ordering::Relaxed) != 0 {
+                    log::warn!(target: LOG_TARGET, "Keeping the previous pull layer after refresh prefetch failed for {uri}");
+                    return;
+                }
+                publisher
+                    .commit_refresh_prefetch(&uri, lineage, outcome)
+                    .await;
+            });
+        }
+
+        while !tasks.is_empty() {
+            tokio::select! {
+                biased;
+                _ = self.shutdown.cancelled() => {
+                    tasks.abort_all();
+                    while tasks.join_next().await.is_some() {}
+                    return false;
+                }
+                result = tasks.join_next() => {
+                    if let Some(Err(error)) = result {
+                        log::warn!(target: LOG_TARGET, "Diagnostic refresh prefetch task failed: {error}");
+                    }
+                }
+            }
+        }
+        true
+    }
+
+    /// Commit a refresh prefetch only while its document inputs are current.
+    ///
+    /// The lineage check and synchronous cache mutation share the document's
+    /// edit lock with didChange/didClose/didOpen. This closes the check→commit
+    /// race without holding the lock across the editor-facing republish await.
+    async fn commit_refresh_prefetch(
+        &self,
+        uri: &Url,
+        lineage: DiagnosticSnapshotLineage,
+        outcome: PullLayerOutcome,
+    ) {
+        let edit_lock = self.documents.edit_lock(uri);
+        let edit_guard = edit_lock.lock().await;
+        let Some(document) = self.documents.get(uri) else {
+            drop(edit_guard);
+            self.documents.remove_edit_lock_if_unshared(uri, &edit_lock);
+            log::debug!(target: LOG_TARGET, "Discarding refresh prefetch for closed {uri}");
+            return;
+        };
+        let current = {
+            document.incarnation() == lineage.incarnation
+                && document.content_version() == lineage.content_version
+        };
+        drop(document);
+        if !current {
+            log::debug!(target: LOG_TARGET, "Discarding stale refresh prefetch for {uri}");
+            return;
+        }
+
+        match outcome {
+            PullLayerOutcome::Skip => return,
+            PullLayerOutcome::Clear => {
+                self.aggregator
+                    .evict_source(uri, &DiagnosticSource::PullLayer);
+            }
+            PullLayerOutcome::Publish(diagnostics) => {
+                self.aggregator.set_pull_layer(uri, diagnostics);
+            }
+        }
+        drop(edit_guard);
+        self.republish(uri).await;
     }
 
     fn diagnostic_refresh_supported(&self) -> bool {
@@ -557,7 +676,7 @@ impl DiagnosticPublisher {
         Some(host)
     }
 
-    /// Feed the host-event pull's combined result into the cache and republish.
+    /// Feed a proactive pull's combined result into the cache and republish.
     ///
     /// The pull blob is already host-local; it replaces the
     /// [`DiagnosticSource::PullLayer`] slot, then the merge folds in region push
@@ -586,12 +705,12 @@ impl DiagnosticPublisher {
     /// returned clean keeps its empty `PullLayer` (via [`Self::publish_pull_layer`]),
     /// so that path still suppresses a stale push — the two empties differ.
     ///
-    /// Deliberately does **not** emit `workspace/diagnostic/refresh` (#499). This is
-    /// the empty-contributors branch of the same host-event pull task as
-    /// [`Self::publish_pull_layer`], which #496 left no-refresh: both are always
-    /// downstream of a host event (didOpen/didChange/didSave) the editor originated
-    /// and re-pulls for on its own. There is no spontaneous `clear_pull_layer`, so a
-    /// refresh here would be redundant (the editor's own re-pull already covers it).
+    /// Deliberately does **not** emit `workspace/diagnostic/refresh` (#499). Host
+    /// events (didOpen/didChange/didSave) are editor-originated, while a downstream
+    /// refresh prefetch is enclosed by a workspace refresh cycle that forwards its
+    /// one capability-gated editor request only after every host finishes. Emitting
+    /// here would therefore duplicate that cycle's nudge; an incapable editor still
+    /// receives the clearing `publishDiagnostics` notification from `republish`.
     pub(crate) async fn clear_pull_layer(&self, host: &Url) {
         self.aggregator
             .evict_source(host, &DiagnosticSource::PullLayer);

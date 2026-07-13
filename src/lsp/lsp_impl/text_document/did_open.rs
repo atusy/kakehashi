@@ -756,6 +756,11 @@ print("hello")
 
         // Snapshot text is CONSTANT across both fires; only the store text changes.
         let snapshot = || DiagnosticSnapshot {
+            lineage:
+                crate::lsp::lsp_impl::text_document::publish_diagnostic::DiagnosticSnapshotLineage {
+                    incarnation: 0,
+                    content_version: 0,
+                },
             virt_contexts: vec![],
             host_pull_enabled: true,
             host: Some(HostRequestContext {
@@ -865,6 +870,11 @@ print("hello")
             .bridge
             .get_host_configs_for_language(&server.settings_manager.load_settings(), "rust");
         let snapshot = DiagnosticSnapshot {
+            lineage:
+                crate::lsp::lsp_impl::text_document::publish_diagnostic::DiagnosticSnapshotLineage {
+                    incarnation: 0,
+                    content_version: 0,
+                },
             virt_contexts: vec![],
             host_pull_enabled: true,
             host: Some(HostRequestContext {

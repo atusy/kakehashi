@@ -1,10 +1,9 @@
-//! Shared fan-out/aggregation for the host-event diagnostic pull
-//! (push-propagation-diagnostic-forwarding): on `didOpen`/`didSave`/`didChange`,
-//! `DiagnosticScheduler` pulls every layer's diagnostics from a prepared snapshot
-//! and the result is fed into the cache as the `PullLayer` blob, then republished.
-//! `DiagnosticScheduler` handles superseding (via `SyntheticDiagnosticsManager` /
-//! `DebouncedDiagnosticsManager`); this module just collects the per-layer
-//! diagnostics.
+//! Shared fan-out/aggregation for proactive diagnostic pulls. Host events
+//! (`didOpen`/`didSave`/`didChange`) and downstream refresh prefetch both pull
+//! every eligible layer from a prepared snapshot and feed the result into the
+//! cached `PullLayer`. Host-event callers treat request failures as log-only;
+//! refresh prefetch supplies an error sink so it can preserve the last good
+//! layer. Scheduling, supersession, and cache commit policy stay with callers.
 
 use std::sync::Arc;
 
@@ -18,12 +17,23 @@ use crate::lsp::lsp_impl::bridge_context::{DocumentRequestContext, HostRequestCo
 use super::diagnostic::{
     collect_host_diagnostics, collect_region_diagnostics, combine_layer_diagnostics,
 };
+use super::{RequestErrorSink, count_request_errors};
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct DiagnosticSnapshotLineage {
+    pub(crate) incarnation: u64,
+    pub(crate) content_version: u64,
+}
 
 /// Everything a push-diagnostics task needs, captured at schedule time
 /// (cross-layer-aggregation): the virt layer's per-region contexts, the host
 /// layer's context when host bridging participates, and the resolved
 /// cross-layer config that combines them.
 pub(crate) struct DiagnosticSnapshot {
+    /// Document inputs from which this snapshot was prepared. Refresh prefetch
+    /// checks them again before committing so an edit or close/reopen cannot be
+    /// overwritten by an older in-flight pull.
+    pub(crate) lineage: DiagnosticSnapshotLineage,
     /// Per-region virt contexts; empty when the virt layer is gated off or
     /// the document has no bridgeable injection regions.
     pub(crate) virt_contexts: Vec<DocumentRequestContext>,
@@ -52,7 +62,7 @@ impl DiagnosticSnapshot {
     }
 }
 
-/// What the host-event pull collection wants done to the host's `PullLayer`
+/// What a proactive pull collection wants done to the host's `PullLayer`
 /// slot (push-propagation-diagnostic-forwarding). The three states are
 /// distinct: `Skip` ≠ `Clear` (do nothing vs evict).
 pub(crate) enum PullLayerOutcome {
@@ -84,6 +94,16 @@ pub(crate) async fn collect_push_diagnostics(
     uri: &Url,
     log_target: &'static str,
 ) -> PullLayerOutcome {
+    collect_push_diagnostics_with_error_sink(snapshot_data, pool, uri, log_target, &None).await
+}
+
+pub(crate) async fn collect_push_diagnostics_with_error_sink(
+    snapshot_data: Option<DiagnosticSnapshot>,
+    pool: &Arc<LanguageServerPool>,
+    uri: &Url,
+    log_target: &'static str,
+    request_error_sink: &RequestErrorSink,
+) -> PullLayerOutcome {
     let Some(snapshot) = snapshot_data else {
         return PullLayerOutcome::Skip;
     };
@@ -105,6 +125,7 @@ pub(crate) async fn collect_push_diagnostics(
     // async blocks would otherwise rely on disjoint-field captures of
     // `snapshot`, which compiles but reads ambiguously).
     let DiagnosticSnapshot {
+        lineage: _,
         mut virt_contexts,
         host,
         host_pull_enabled,
@@ -145,35 +166,25 @@ pub(crate) async fn collect_push_diagnostics(
         let mut join_set = JoinSet::new();
         for region_ctx in virt_contexts {
             let pool = Arc::clone(pool);
-            // Push diagnostics run in LSP mode only — failures are log-only
-            // (the editor re-pulls), so no request-error sink is threaded.
-            join_set
-                .spawn(async move { collect_region_diagnostics(&region_ctx, pool, &None).await });
+            let request_error_sink = request_error_sink.clone();
+            // Ordinary push diagnostics use no sink (failures are log-only);
+            // refresh prefetch installs one so it can preserve the last good
+            // PullLayer when any participating request fails.
+            join_set.spawn(async move {
+                collect_region_diagnostics(&region_ctx, pool, &request_error_sink).await
+            });
         }
 
-        let mut all_diagnostics = Vec::new();
-        while let Some(result) = join_set.join_next().await {
-            match result {
-                Ok(diags) => all_diagnostics.extend(diags),
-                Err(join_err) => {
-                    log::warn!(
-                        target: log_target,
-                        "Diagnostic region task panicked: {}",
-                        join_err
-                    );
-                }
-            }
-        }
-        all_diagnostics
+        collect_joined_region_diagnostics(join_set, request_error_sink, log_target).await
     };
 
     let host_fut = async {
         match &host {
             // Pull only when enabled; a configured-but-gated host context exists
-            // for the re-sync (above), not the pull. Push diagnostics are
-            // LSP-mode-only, so failures are log-only (`&None` error sink).
+            // for the re-sync (above), not the pull. The caller chooses whether
+            // failures are log-only or counted for refresh-prefetch preservation.
             Some(ctx) if host_pull_enabled => {
-                collect_host_diagnostics(ctx, Arc::clone(pool), &None).await
+                collect_host_diagnostics(ctx, Arc::clone(pool), request_error_sink).await
             }
             _ => Vec::new(),
         }
@@ -186,6 +197,28 @@ pub(crate) async fn collect_push_diagnostics(
     ))
 }
 
+async fn collect_joined_region_diagnostics(
+    mut join_set: JoinSet<Vec<tower_lsp_server::ls_types::Diagnostic>>,
+    request_error_sink: &RequestErrorSink,
+    log_target: &str,
+) -> Vec<tower_lsp_server::ls_types::Diagnostic> {
+    let mut all_diagnostics = Vec::new();
+    while let Some(result) = join_set.join_next().await {
+        match result {
+            Ok(diags) => all_diagnostics.extend(diags),
+            Err(join_err) => {
+                count_request_errors(request_error_sink, 1);
+                log::warn!(
+                    target: log_target,
+                    "Diagnostic region task panicked: {}",
+                    join_err
+                );
+            }
+        }
+    }
+    all_diagnostics
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -194,6 +227,7 @@ mod tests {
     use crate::lsp::bridge::ConnectionState;
     use crate::lsp::bridge::ResolvedServerConfig;
     use crate::lsp::bridge::test_helpers::create_handle_with_state;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     fn virt_ctx_for_server(server: &str) -> DocumentRequestContext {
         DocumentRequestContext {
@@ -233,6 +267,18 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn panicked_region_task_is_counted_as_prefetch_failure() {
+        let sink = Some(Arc::new(AtomicUsize::new(0)));
+        let mut join_set = JoinSet::new();
+        join_set.spawn(async { panic!("region task failed") });
+
+        let diagnostics = collect_joined_region_diagnostics(join_set, &sink, "test").await;
+
+        assert!(diagnostics.is_empty());
+        assert_eq!(sink.unwrap().load(Ordering::Relaxed), 1);
+    }
+
     /// An all-incapable virt snapshot must still publish an (empty) pull layer,
     /// NOT `Clear`: `has_contributors()` runs BEFORE the capability prefilter, so
     /// dropping every server leaves the same empty publish the per-region
@@ -249,6 +295,10 @@ mod tests {
         pool.insert_connection(handle).await;
 
         let snapshot = DiagnosticSnapshot {
+            lineage: DiagnosticSnapshotLineage {
+                incarnation: 0,
+                content_version: 0,
+            },
             virt_contexts: vec![virt_ctx_for_server("test")],
             host: None,
             host_pull_enabled: false,
