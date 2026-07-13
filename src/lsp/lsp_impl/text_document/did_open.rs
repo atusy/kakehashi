@@ -1143,7 +1143,7 @@ print("hello")
         // The document was closed during the install: nothing is in the store.
         server
             .parse_coordinator()
-            .reparse_installed_document(uri.clone(), Some("rust".to_string()))
+            .reparse_installed_document(uri.clone(), "rust")
             .await;
 
         assert!(
@@ -1173,7 +1173,7 @@ print("hello")
 
         server
             .parse_coordinator()
-            .reparse_installed_document(uri.clone(), Some("rust".to_string()))
+            .reparse_installed_document(uri.clone(), "rust")
             .await;
 
         assert!(
@@ -1263,7 +1263,7 @@ print("hello")
 
         server
             .parse_coordinator()
-            .reparse_installed_document(uri.clone(), Some("rust".to_string()))
+            .reparse_installed_document(uri.clone(), "rust")
             .await;
 
         let doc = server.documents.get(&uri).unwrap();

@@ -191,7 +191,7 @@ impl InstallCoordinator {
         &self,
         language: &str,
         data_dir: &std::path::Path,
-        is_injection: bool,
+        _is_injection: bool,
     ) {
         let settings_snapshot = self.settings_manager.load_settings_pair();
         let (updated_raw_settings, updated_settings) = updated_settings_after_install(
@@ -208,29 +208,25 @@ impl InstallCoordinator {
             .log_language_events(&load_result.events)
             .await;
 
-        if !is_injection {
-            let uris = self
-                .documents
-                .open_uris()
-                .into_iter()
-                .filter(|candidate| {
-                    self.documents
-                        .get(candidate)
-                        .is_some_and(|document| document.tree().is_none())
-                        && self.get_language_for_document(candidate).as_deref() == Some(language)
-                })
-                .collect::<Vec<_>>();
-            let parse = self.parse_coordinator();
-            for uri in uris {
-                // Resurrection-safe, off-ingress reparse: re-reads the latest store
-                // text and persists through a non-inserting CAS, so a didClose during
-                // the install can't be resurrected. (The original didOpen's ticket
-                // already advanced the watermark on its skip-parse path, so this
-                // carries no ticket.)
-                parse
-                    .reparse_installed_document(uri, Some(language.to_string()))
-                    .await;
-            }
+        let uris = self
+            .documents
+            .open_uris()
+            .into_iter()
+            .filter(|candidate| {
+                self.documents
+                    .get(candidate)
+                    .is_some_and(|document| document.tree().is_none())
+                    && self.get_language_for_document(candidate).as_deref() == Some(language)
+            })
+            .collect::<Vec<_>>();
+        let parse = self.parse_coordinator();
+        for uri in uris {
+            // Resurrection-safe, off-ingress reparse: re-detects the language from
+            // the current document lifetime and persists through a non-inserting
+            // CAS, so a didClose/reopen during the install can't receive a tree for
+            // the old language. This runs even when an injection discovered the
+            // parser first: the global install claim may have host-language waiters.
+            parse.reparse_installed_document(uri, language).await;
         }
     }
 
@@ -432,5 +428,57 @@ mod tests {
             server.documents.get(&waiting).unwrap().tree().is_some(),
             "a same-language document that lost the install claim must also be reparsed"
         );
+    }
+
+    #[tokio::test]
+    async fn injection_install_reparses_waiting_host_documents_for_the_same_language() {
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+        server
+            .language
+            .language_registry_for_parallel()
+            .register("rust".to_string(), tree_sitter_rust::LANGUAGE.into());
+        let waiting = Url::parse("file:///workspace/waiting.rs").unwrap();
+        server.documents.insert(
+            waiting.clone(),
+            "fn main() {}".to_string(),
+            Some("rust".to_string()),
+            None,
+        );
+
+        server
+            .install_coordinator()
+            .reload_language_after_install("rust", Path::new("/installed"), true)
+            .await;
+
+        assert!(server.documents.get(&waiting).unwrap().tree().is_some());
+    }
+
+    #[tokio::test]
+    async fn reload_does_not_attach_installed_language_tree_to_relabelled_document() {
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+        server
+            .language
+            .language_registry_for_parallel()
+            .register("rust".to_string(), tree_sitter_rust::LANGUAGE.into());
+        server
+            .language
+            .language_registry_for_parallel()
+            .register("go".to_string(), tree_sitter_go::LANGUAGE.into());
+        let uri = Url::parse("file:///workspace/reopened.rs").unwrap();
+        server.documents.insert(
+            uri.clone(),
+            "package main".to_string(),
+            Some("go".to_string()),
+            None,
+        );
+
+        server
+            .parse_coordinator()
+            .reparse_installed_document(uri.clone(), "rust")
+            .await;
+
+        assert!(server.documents.get(&uri).unwrap().tree().is_none());
     }
 }

@@ -746,7 +746,7 @@ impl ParseCoordinator {
     /// tree lands (or another parse wins). Sustained editing falls back to the
     /// reader's on-demand parse; the parse actor replaces this with a proper
     /// coalescing loop.
-    pub(crate) async fn reparse_installed_document(&self, uri: Url, language_id: Option<String>) {
+    pub(crate) async fn reparse_installed_document(&self, uri: Url, installed_language: &str) {
         /// Bound on the convergence retries (a burst of edits landing exactly as
         /// the install completes); past this the reader on-demand parse covers it.
         const MAX_REPARSE_ATTEMPTS: usize = 8;
@@ -774,7 +774,10 @@ impl ParseCoordinator {
             }
             let language_name =
                 self.language
-                    .detect_language(uri.path(), doc.text(), None, language_id.as_deref());
+                    .detect_language(uri.path(), doc.text(), None, doc.language_id());
+            if language_name.as_deref() != Some(installed_language) {
+                return;
+            }
             (
                 language_name,
                 doc.language_id().map(|s| s.to_string()),
