@@ -789,7 +789,7 @@ fn open_regular_tombstone(path: &Path) -> std::io::Result<fs::File> {
         ));
     }
     use std::os::unix::fs::MetadataExt as _;
-    reject_multiple_links(file.metadata()?.nlink())?;
+    require_single_link(file.metadata()?.nlink())?;
     Ok(file)
 }
 
@@ -830,15 +830,15 @@ fn open_regular_tombstone(path: &Path) -> std::io::Result<fs::File> {
     }
     // SAFETY: GetFileInformationByHandle succeeded above.
     let information = unsafe { information.assume_init() };
-    reject_multiple_links(u64::from(information.nNumberOfLinks))?;
+    require_single_link(u64::from(information.nNumberOfLinks))?;
     Ok(file)
 }
 
 #[cfg(any(unix, windows))]
-fn reject_multiple_links(links: u64) -> std::io::Result<()> {
-    if links > 1 {
+fn require_single_link(links: u64) -> std::io::Result<()> {
+    if links != 1 {
         Err(std::io::Error::other(
-            "query uninstall tombstone has multiple hard links",
+            "query uninstall tombstone must have exactly one hard link",
         ))
     } else {
         Ok(())
@@ -1361,6 +1361,14 @@ mod tests {
             matches!(result, Err(QueryInstallError::IoError(_))),
             "a multiply linked managed tombstone must fail the uninstall"
         );
+    }
+
+    #[test]
+    #[cfg(any(unix, windows))]
+    fn tombstone_link_count_requires_one_live_name() {
+        assert!(require_single_link(0).is_err());
+        assert!(require_single_link(1).is_ok());
+        assert!(require_single_link(2).is_err());
     }
 
     #[test]
