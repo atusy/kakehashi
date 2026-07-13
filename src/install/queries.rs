@@ -522,7 +522,7 @@ pub fn remove_query_install_and_backups(
     remove_query_install_and_backups_with_tombstone_writer(
         queries_parent,
         language,
-        |pinned, parent, lang| write_uninstall_tombstone_at(pinned, parent, lang),
+        write_uninstall_tombstone_at,
     )
 }
 
@@ -626,6 +626,7 @@ fn remove_dir_all_at_tolerating_vanished(
 /// deleted, and (b) `Path::exists()` returns false on ANY metadata error
 /// (e.g. PermissionDenied), which must propagate the original error instead
 /// of being mistaken for absence.
+#[cfg(test)]
 fn remove_dir_all_tolerating_vanished(dir: &Path) -> Result<bool, QueryInstallError> {
     match fs::remove_dir_all(dir) {
         Ok(()) => Ok(true),
@@ -795,6 +796,7 @@ fn uninstall_tombstone_path(queries_parent: &Path, language: &str) -> PathBuf {
     queries_parent.join(format!(".{language}{QUERY_UNINSTALL_TOMBSTONE_SUFFIX}"))
 }
 
+#[cfg(test)]
 fn write_uninstall_tombstone(
     queries_parent: &Path,
     language: &str,
@@ -1018,6 +1020,7 @@ fn write_uninstall_tombstone_at(
     result
 }
 
+#[cfg(test)]
 fn write_uninstall_tombstone_with_before_publish(
     queries_parent: &Path,
     language: &str,
@@ -1067,12 +1070,12 @@ fn write_uninstall_tombstone_with_before_publish(
     Ok(())
 }
 
-#[cfg(not(windows))]
+#[cfg(all(test, not(windows)))]
 fn sync_tombstone_parent(queries_parent: &Path) -> std::io::Result<()> {
     fs::File::open(queries_parent)?.sync_all()
 }
 
-#[cfg(windows)]
+#[cfg(all(test, windows))]
 fn sync_tombstone_parent(_queries_parent: &Path) -> std::io::Result<()> {
     // The stage handle carries FILE_FLAG_WRITE_THROUGH before FileRenameInfo
     // publication. Microsoft documents that metadata changes, including a
@@ -1080,7 +1083,7 @@ fn sync_tombstone_parent(_queries_parent: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-#[cfg(not(windows))]
+#[cfg(all(test, not(windows)))]
 fn publish_staged_tombstone(
     staged: tempfile::NamedTempFile,
     path: &Path,
@@ -1089,13 +1092,13 @@ fn publish_staged_tombstone(
     staged.persist(path).map_err(|error| error.error)
 }
 
-#[cfg(windows)]
+#[cfg(all(test, windows))]
 struct WindowsTombstonePublish {
     directory: fs::File,
     rename_handle: fs::File,
 }
 
-#[cfg(windows)]
+#[cfg(all(test, windows))]
 fn prepare_windows_tombstone_publish(
     queries_parent: &Path,
     staged: &fs::File,
@@ -1178,7 +1181,7 @@ fn normalize_windows_stage_attributes(file: &fs::File) -> std::io::Result<()> {
     }
 }
 
-#[cfg(windows)]
+#[cfg(all(test, windows))]
 fn publish_staged_tombstone(
     staged: tempfile::NamedTempFile,
     path: &Path,
@@ -1236,7 +1239,7 @@ fn publish_staged_tombstone(
 /// kakehashi-owned leaf is constrained. An observed existing leaf is validated,
 /// then a private same-directory inode atomically replaces its directory entry;
 /// no pre-existing inode is ever truncated.
-#[cfg(unix)]
+#[cfg(all(test, unix))]
 fn validate_existing_tombstone(path: &Path) -> std::io::Result<Option<fs::Permissions>> {
     use std::os::unix::fs::OpenOptionsExt;
 
@@ -1263,7 +1266,7 @@ fn validate_existing_tombstone(path: &Path) -> std::io::Result<Option<fs::Permis
     Ok(Some(metadata.permissions()))
 }
 
-#[cfg(windows)]
+#[cfg(all(test, windows))]
 fn validate_existing_tombstone(path: &Path) -> std::io::Result<Option<fs::Permissions>> {
     use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
     use windows_sys::Win32::Storage::FileSystem::{
@@ -1306,7 +1309,7 @@ fn require_single_link(links: u64) -> std::io::Result<()> {
     }
 }
 
-#[cfg(unix)]
+#[cfg(all(test, unix))]
 fn verify_published_tombstone(published: fs::File, path: &Path) -> std::io::Result<()> {
     use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
 
@@ -1329,7 +1332,7 @@ fn verify_published_tombstone(published: fs::File, path: &Path) -> std::io::Resu
     Ok(())
 }
 
-#[cfg(windows)]
+#[cfg(all(test, windows))]
 fn verify_published_tombstone(published: fs::File, path: &Path) -> std::io::Result<()> {
     use std::os::windows::fs::{MetadataExt as _, OpenOptionsExt as _};
     use windows_sys::Win32::Storage::FileSystem::{
@@ -1379,7 +1382,7 @@ fn windows_file_information(
     Ok(unsafe { information.assume_init() })
 }
 
-#[cfg(not(any(unix, windows)))]
+#[cfg(all(test, not(any(unix, windows))))]
 fn verify_published_tombstone(_published: fs::File, path: &Path) -> std::io::Result<()> {
     if fs::symlink_metadata(path)?.file_type().is_file() {
         Ok(())
@@ -1390,7 +1393,7 @@ fn verify_published_tombstone(_published: fs::File, path: &Path) -> std::io::Res
     }
 }
 
-#[cfg(not(any(unix, windows)))]
+#[cfg(all(test, not(any(unix, windows))))]
 fn validate_existing_tombstone(path: &Path) -> std::io::Result<Option<fs::Permissions>> {
     match fs::symlink_metadata(path) {
         Ok(metadata) if metadata.file_type().is_file() => Ok(Some(metadata.permissions())),
