@@ -758,9 +758,73 @@ fn write_uninstall_tombstone(
     language: &str,
 ) -> Result<(), QueryInstallError> {
     validate_safe_language_name(language)?;
-    let mut file = fs::File::create(uninstall_tombstone_path(queries_parent, language))?;
+    let mut file = open_regular_tombstone(&uninstall_tombstone_path(queries_parent, language))?;
+    file.set_len(0)?;
     file.write_all(b"ok\n")?;
     Ok(())
+}
+
+/// Open or create the managed tombstone leaf without following a link there.
+///
+/// Parent components deliberately retain ordinary path resolution: users may
+/// symlink their data directory or `queries` directory. Only the final,
+/// kakehashi-owned leaf is constrained, and truncation happens after the
+/// opened handle has been confirmed to name a regular file.
+#[cfg(unix)]
+fn open_regular_tombstone(path: &Path) -> std::io::Result<fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let file = fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        // O_NOFOLLOW binds the validation to the opened leaf rather than a
+        // racy metadata pre-check. O_NONBLOCK prevents a substituted FIFO
+        // from blocking the uninstall before fstat can reject it.
+        .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_NONBLOCK)
+        .open(path)?;
+    if !file.metadata()?.file_type().is_file() {
+        return Err(std::io::Error::other(
+            "query uninstall tombstone is not a regular file",
+        ));
+    }
+    Ok(file)
+}
+
+#[cfg(windows)]
+fn open_regular_tombstone(path: &Path) -> std::io::Result<fs::File> {
+    use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_OPEN_REPARSE_POINT,
+    };
+
+    let file = fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        // Open the reparse point itself, if present, so validation cannot be
+        // raced into following its target. Truncation happens only afterward.
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)?;
+    let metadata = file.metadata()?;
+    if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+        || !metadata.file_type().is_file()
+    {
+        return Err(std::io::Error::other(
+            "query uninstall tombstone is not a regular file",
+        ));
+    }
+    Ok(file)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn open_regular_tombstone(path: &Path) -> std::io::Result<fs::File> {
+    // No portable no-follow open exists. Creating a fresh leaf is atomic and
+    // safe; conservatively reject an existing leaf on these platforms.
+    fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
 }
 
 fn clear_uninstall_tombstone(
@@ -1189,6 +1253,63 @@ mod tests {
         assert!(
             !queries_parent.exists(),
             "unsafe cleanup must not even create the queries directory"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn remove_query_install_rejects_symlinked_uninstall_tombstone() {
+        use std::os::unix::fs::symlink;
+
+        let temp = TempDir::new().unwrap();
+        let queries_parent = temp.path().join("queries");
+        fs::create_dir_all(&queries_parent).unwrap();
+        let victim = temp.path().join("victim");
+        fs::write(&victim, "keep me\n").unwrap();
+        symlink(&victim, uninstall_tombstone_path(&queries_parent, "rust")).unwrap();
+
+        let result = remove_query_install_and_backups(&queries_parent, "rust");
+
+        assert_eq!(
+            fs::read_to_string(&victim).unwrap(),
+            "keep me\n",
+            "opening the tombstone must not follow and overwrite its target"
+        );
+        assert!(
+            matches!(result, Err(QueryInstallError::IoError(_))),
+            "a managed tombstone symlink must fail the uninstall"
+        );
+    }
+
+    #[test]
+    fn remove_query_install_reuses_regular_uninstall_tombstone() {
+        let temp = TempDir::new().unwrap();
+        let queries_parent = temp.path().join("queries");
+        fs::create_dir_all(&queries_parent).unwrap();
+        let tombstone = uninstall_tombstone_path(&queries_parent, "rust");
+        fs::write(&tombstone, "stale tombstone contents\n").unwrap();
+
+        remove_query_install_and_backups(&queries_parent, "rust").unwrap();
+
+        assert_eq!(fs::read_to_string(tombstone).unwrap(), "ok\n");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn remove_query_install_supports_symlinked_queries_parent() {
+        use std::os::unix::fs::symlink;
+
+        let temp = TempDir::new().unwrap();
+        let real_queries = temp.path().join("real-queries");
+        fs::create_dir_all(&real_queries).unwrap();
+        let linked_queries = temp.path().join("queries");
+        symlink(&real_queries, &linked_queries).unwrap();
+
+        remove_query_install_and_backups(&linked_queries, "rust").unwrap();
+
+        assert_eq!(
+            fs::read_to_string(uninstall_tombstone_path(&real_queries, "rust")).unwrap(),
+            "ok\n"
         );
     }
 
