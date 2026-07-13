@@ -473,7 +473,7 @@ impl LspClient {
     /// Skips server-initiated notifications and requests until finding matching response.
     /// Times out after 30 seconds or 1000 messages to prevent indefinite hangs.
     fn receive_response_for_id(&mut self, expected_id: i64) -> Value {
-        self.receive_response_for_id_watching_server_requests_inner(expected_id, None)
+        self.receive_response_for_id_watching_server_requests_inner(expected_id, None, None)
             .0
     }
 
@@ -481,13 +481,15 @@ impl LspClient {
         &mut self,
         expected_id: i64,
         watched_method: Option<&str>,
-    ) -> (Value, Vec<(Value, Value)>) {
+        watched_notification: Option<&str>,
+    ) -> (Value, Vec<(Value, Value)>, Vec<Value>) {
         const MAX_MESSAGES: u32 = 1000;
         const TIMEOUT: Duration = Duration::from_secs(30);
 
         let start_time = Instant::now();
         let mut message_count = 0u32;
         let mut watched = Vec::new();
+        let mut watched_notifications = Vec::new();
 
         loop {
             // Check message count threshold
@@ -537,10 +539,15 @@ impl LspClient {
                 }
                 // Response should match our request id
                 if id.as_i64() == Some(expected_id) {
-                    return (message, watched);
+                    return (message, watched, watched_notifications);
                 }
             }
-            // Otherwise it's a notification like window/logMessage, skip it
+            if message.get("id").is_none()
+                && message.get("method").and_then(Value::as_str) == watched_notification
+            {
+                watched_notifications.push(message.get("params").cloned().unwrap_or(Value::Null));
+            }
+            // Otherwise it's an unrelated notification like window/logMessage, skip it
         }
     }
 
@@ -608,9 +615,26 @@ impl LspClient {
         expected_id: i64,
         watched_method: &str,
     ) -> (Value, Vec<(Value, Value)>) {
+        let (response, requests, _) = self.receive_response_for_id_watching_server_requests_inner(
+            expected_id,
+            Some(watched_method),
+            None,
+        );
+        (response, requests)
+    }
+
+    /// Receive a response while preserving both concurrent server requests and
+    /// notifications used as an ordered forwarding barrier.
+    pub(crate) fn receive_response_for_id_watching_server_requests_and_notification(
+        &mut self,
+        expected_id: i64,
+        watched_method: &str,
+        watched_notification: &str,
+    ) -> (Value, Vec<(Value, Value)>, Vec<Value>) {
         self.receive_response_for_id_watching_server_requests_inner(
             expected_id,
             Some(watched_method),
+            Some(watched_notification),
         )
     }
 
@@ -646,6 +670,41 @@ impl LspClient {
             }
             // Otherwise it's a response or server-to-client request; skip it
             // and keep waiting within the deadline.
+        }
+    }
+
+    /// Wait for a notification while preserving server requests of
+    /// `watched_method` that precede it on the editor-facing connection.
+    pub(crate) fn wait_for_notification_watching_server_requests(
+        &mut self,
+        expected_method: &str,
+        watched_method: &str,
+        timeout: Duration,
+    ) -> Option<(Value, Vec<(Value, Value)>)> {
+        let start_time = Instant::now();
+        let mut watched = Vec::new();
+
+        loop {
+            let remaining = timeout.saturating_sub(start_time.elapsed());
+            if remaining.is_zero() {
+                return None;
+            }
+
+            let message = self.try_receive_message(remaining)?;
+            let method = message.get("method").and_then(Value::as_str);
+            if message.get("id").is_some() && method == Some(watched_method) {
+                watched.push((
+                    message.get("id").cloned().expect("checked above"),
+                    message.get("params").cloned().unwrap_or(Value::Null),
+                ));
+                continue;
+            }
+            if message.get("id").is_none() && method == Some(expected_method) {
+                return Some((
+                    message.get("params").cloned().unwrap_or(Value::Null),
+                    watched,
+                ));
+            }
         }
     }
 

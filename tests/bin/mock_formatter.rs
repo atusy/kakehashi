@@ -870,6 +870,29 @@ fn main() {
                         diagnostic_generation += 1;
                         request(&mut writer, json!(id), "workspace/diagnostic/refresh");
                     }
+                    if let Some(uri) = message
+                        .pointer("/params/textDocument/uri")
+                        .and_then(Value::as_str)
+                    {
+                        // This push shares the loss-intolerant upstream FIFO with
+                        // refreshes. Its editor-facing publication is therefore
+                        // an observable barrier after all burst admissions.
+                        notify(
+                            &mut writer,
+                            "textDocument/publishDiagnostics",
+                            json!({
+                                "uri": uri,
+                                "diagnostics": [{
+                                    "range": {
+                                        "start": { "line": 0, "character": 0 },
+                                        "end": { "line": 0, "character": 1 }
+                                    },
+                                    "severity": 3,
+                                    "message": "diagnostic-refresh-burst-admitted"
+                                }]
+                            }),
+                        );
+                    }
                 }
             }
             "codeLens/resolve" => {

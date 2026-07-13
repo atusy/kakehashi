@@ -910,10 +910,11 @@ fn e2e_downstream_refresh_burst_is_coalesced() {
         "textDocument/diagnostic",
         json!({ "textDocument": { "uri": MD_URI } }),
     );
-    let (leading_pull, refreshes_during_leading_pull) = client
-        .receive_response_for_id_watching_server_requests(
+    let (leading_pull, mut refreshes_before_barrier, mut barrier_pushes) = client
+        .receive_response_for_id_watching_server_requests_and_notification(
             leading_pull_id,
             "workspace/diagnostic/refresh",
+            "textDocument/publishDiagnostics",
         );
     assert!(
         leading_pull["result"]["items"]
@@ -924,29 +925,32 @@ fn e2e_downstream_refresh_burst_is_coalesced() {
         "the leading refresh must expose the first downstream generation: {leading_pull}"
     );
     assert!(
-        refreshes_during_leading_pull.is_empty(),
-        "single-flight must suppress refreshes during the leading pull: {refreshes_during_leading_pull:?}"
+        refreshes_before_barrier.is_empty(),
+        "single-flight must suppress refreshes during the leading pull: {refreshes_before_barrier:?}"
     );
 
-    // A second pull is an ordered post-burst barrier: the mock reads it only
-    // after writing refresh generations 2–10, and its response follows those
-    // refresh frames on the same downstream connection.
-    let barrier_pull_id = client.send_request_async(
-        "textDocument/diagnostic",
-        json!({ "textDocument": { "uri": MD_URI } }),
-    );
-    let (barrier_pull, refreshes_before_barrier) = client
-        .receive_response_for_id_watching_server_requests(
-            barrier_pull_id,
-            "workspace/diagnostic/refresh",
-        );
+    if barrier_pushes.is_empty() {
+        let (barrier, refreshes) = client
+            .wait_for_notification_watching_server_requests(
+                "textDocument/publishDiagnostics",
+                "workspace/diagnostic/refresh",
+                Duration::from_secs(5),
+            )
+            .expect("the upstream FIFO must publish the post-burst barrier");
+        barrier_pushes.push(barrier);
+        refreshes_before_barrier.extend(refreshes);
+    }
     assert!(
-        barrier_pull["result"]["items"]
-            .as_array()
-            .is_some_and(|items| items.iter().any(|diagnostic| {
-                diagnostic["message"] == json!("mock-diagnostic-generation:10")
-            })),
-        "the ordered barrier must observe the complete downstream burst: {barrier_pull}"
+        barrier_pushes
+            .iter()
+            .any(|params| params["diagnostics"]
+                .as_array()
+                .is_some_and(|diagnostics| diagnostics.iter().any(|diagnostic| {
+                    diagnostic["message"].as_str().is_some_and(|message| {
+                        message.ends_with("diagnostic-refresh-burst-admitted")
+                    })
+                }))),
+        "the upstream FIFO must expose the post-burst push barrier: {barrier_pushes:?}"
     );
     assert!(
         refreshes_before_barrier.is_empty(),
