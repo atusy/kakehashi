@@ -3,7 +3,22 @@
 use tower_lsp_server::ls_types::DidOpenTextDocumentParams;
 
 use super::super::{Kakehashi, build_notifier, uri_to_url};
+use crate::document::DocumentStore;
 use crate::language::LanguageEvent;
+
+async fn has_tree_for_incarnation(
+    documents: &DocumentStore,
+    uri: &url::Url,
+    incarnation: u64,
+) -> bool {
+    let edit_lock = documents.edit_lock(uri);
+    let _lifecycle = edit_lock.lock().await;
+    let Some(document) = documents.get(uri) else {
+        documents.remove_edit_lock_if_unshared(uri, &edit_lock);
+        return false;
+    };
+    document.incarnation() == incarnation && document.tree().is_some()
+}
 
 impl Kakehashi {
     pub(crate) async fn did_open_impl(&self, params: DidOpenTextDocumentParams) {
@@ -162,15 +177,11 @@ impl Kakehashi {
                             // and the pull-layer diagnostics were skipped on this
                             // first open of a just-installed parser. Skipped in CLI
                             // mode (#489), matching the handler's own gate.
-                            if !is_cli_mode {
-                                let edit_lock = documents.edit_lock(&install_uri);
-                                let _lifecycle = edit_lock.lock().await;
-                                if documents.get(&install_uri).is_some_and(|doc| {
-                                    doc.incarnation() == incarnation && doc.tree().is_some()
-                                }) {
-                                    diagnostic_scheduler
-                                        .spawn_synthetic_diagnostic_task(install_uri);
-                                }
+                            if !is_cli_mode
+                                && has_tree_for_incarnation(&documents, &install_uri, incarnation)
+                                    .await
+                            {
+                                diagnostic_scheduler.spawn_synthetic_diagnostic_task(install_uri);
                             }
                         }
                     });
@@ -324,6 +335,21 @@ mod tests {
         })
         .await
         .expect("condition should become true");
+    }
+
+    #[tokio::test]
+    async fn missing_install_recovery_document_reclaims_inserted_edit_lock() {
+        let documents = DocumentStore::new();
+        let uri = Url::parse("file:///test/closed-during-install.rs").unwrap();
+        let edit_lock = documents.edit_lock(&uri);
+        let weak_lock = std::sync::Arc::downgrade(&edit_lock);
+        drop(edit_lock);
+
+        assert!(!has_tree_for_incarnation(&documents, &uri, 1).await);
+        assert!(
+            weak_lock.upgrade().is_none(),
+            "the missing-document path must remove its inserted edit lock"
+        );
     }
 
     #[tokio::test]
