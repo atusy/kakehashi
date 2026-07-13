@@ -356,6 +356,10 @@ pub struct LanguageServerPool {
     /// diagnostics stay virtual-local and are re-anchored with the request's
     /// current offset when a server answers `unchanged`.
     pub(crate) diagnostic_pull_baselines: DashMap<(ConnectionKey, String), DiagnosticPullBaseline>,
+    /// Per downstream document incarnation fence. Unlike connection generation,
+    /// this advances on close so an old response cannot attach to a reopen of
+    /// the same URI on the same process.
+    pub(crate) diagnostic_document_generations: DashMap<(ConnectionKey, String), u64>,
     /// Invalidates in-flight baseline reads across a settings replacement.
     pub(crate) diagnostic_pull_generation: AtomicU64,
     /// Upstream request ID → set of downstream connections, for fan-out cancel
@@ -468,6 +472,7 @@ impl LanguageServerPool {
             latest_virtual_contents: DashMap::new(),
             host_documents: Mutex::new(HashMap::new()),
             diagnostic_pull_baselines: DashMap::new(),
+            diagnostic_document_generations: DashMap::new(),
             diagnostic_pull_generation: AtomicU64::new(0),
             upstream_request_registry: std::sync::Mutex::new(HashMap::new()),
             cancel_metrics: CancelForwardingMetrics::default(),
@@ -666,6 +671,7 @@ impl LanguageServerPool {
         self.diagnostic_pull_generation
             .fetch_add(1, Ordering::AcqRel);
         self.diagnostic_pull_baselines.clear();
+        self.diagnostic_document_generations.clear();
         let mut connections = self.connections.lock().await;
         let mut invalidated = Vec::new();
         let mut resolved = HashMap::new();
@@ -696,6 +702,8 @@ impl LanguageServerPool {
                 .retain(|(_, connection_key), _| connection_key != &key);
             self.document_tracker.purge_connection(&key).await;
             self.diagnostic_pull_baselines
+                .retain(|(connection_key, _), _| connection_key != &key);
+            self.diagnostic_document_generations
                 .retain(|(connection_key, _), _| connection_key != &key);
             self.purge_open_transition_locks(&key).await;
             if let Some(handle) = connections.remove(&key) {
@@ -1636,6 +1644,21 @@ impl LanguageServerPool {
 }
 
 impl LanguageServerPool {
+    pub(crate) fn diagnostic_document_generation(&self, key: &(ConnectionKey, String)) -> u64 {
+        self.diagnostic_document_generations
+            .get(key)
+            .map(|entry| *entry)
+            .unwrap_or(0)
+    }
+
+    pub(crate) fn invalidate_diagnostic_document(&self, key: &(ConnectionKey, String)) {
+        self.diagnostic_pull_baselines.remove(key);
+        self.diagnostic_document_generations
+            .entry(key.clone())
+            .and_modify(|generation| *generation = generation.wrapping_add(1))
+            .or_insert(1);
+    }
+
     /// Resolve the marker workspace AND the pool key `(server_name, root)` for a
     /// request on `document_uri` in a SINGLE filesystem walk — the one point of
     /// root resolution. The spawn handshake (`marker`) and every map lookup
@@ -2027,6 +2050,8 @@ impl LanguageServerPool {
                         .purge_connection(&connection_key)
                         .await;
                     self.diagnostic_pull_baselines
+                        .retain(|(key, _), _| key != &connection_key);
+                    self.diagnostic_document_generations
                         .retain(|(key, _), _| key != &connection_key);
                     self.purge_open_transition_locks(&connection_key).await;
                     // Remove only after every async purge completes. If this

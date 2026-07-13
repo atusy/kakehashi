@@ -196,9 +196,16 @@ impl LanguageServerPool {
             );
             handle.send_notification(notification);
         }
+        let closed_keys = docs
+            .keys()
+            .filter(|(doc_uri, _)| doc_uri == &uri_string)
+            .cloned()
+            .map(|(doc_uri, connection_key)| (connection_key, doc_uri))
+            .collect::<Vec<_>>();
         docs.retain(|(doc_uri, _), _| *doc_uri != uri_string);
-        self.diagnostic_pull_baselines
-            .retain(|(_, doc_uri), _| doc_uri != &uri_string);
+        for key in closed_keys {
+            self.invalidate_diagnostic_document(&key);
+        }
     }
 
     /// Forward a `textDocument/willSave` notification (#357) to every host
@@ -400,6 +407,7 @@ impl LanguageServerPool {
         }
         let cache_key = (handle.key().clone(), doc.uri.as_str().to_string());
         let connection_generation = self.document_connection_generation(handle.key());
+        let document_generation = self.diagnostic_document_generation(&cache_key);
         let settings_generation = self
             .diagnostic_pull_generation
             .load(std::sync::atomic::Ordering::Acquire);
@@ -437,7 +445,8 @@ impl LanguageServerPool {
             && settings_generation
                 == self
                     .diagnostic_pull_generation
-                    .load(std::sync::atomic::Ordering::Acquire);
+                    .load(std::sync::atomic::Ordering::Acquire)
+            && document_generation == self.diagnostic_document_generation(&cache_key);
         Ok(self.resolve_diagnostic_pull_report(&cache_key, baseline, report, lineage_is_current))
     }
 
