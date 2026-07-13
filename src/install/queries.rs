@@ -416,14 +416,14 @@ fn install_queries_recursive(
 
 pub fn query_install_is_complete(queries_dir: &Path) -> bool {
     let highlights_path = queries_dir.join("highlights.scm");
-    let Ok(metadata) = fs::metadata(&highlights_path) else {
+    let Ok(metadata) = fs::symlink_metadata(&highlights_path) else {
         return false;
     };
     // The marker is written only after a staged install has written all
     // required files. Legacy direct-write directories did not have it, so a
     // non-empty highlights.scm still counts as installed to avoid clobbering
     // valid user-managed or pre-marker query directories.
-    metadata.is_file()
+    metadata.file_type().is_file()
         && (queries_dir.join(QUERY_INSTALL_COMPLETE_MARKER).is_file() || metadata.len() > 0)
 }
 
@@ -983,6 +983,24 @@ fn download_file(url: &str, http_policy: QueryHttpPolicy) -> Result<String, Quer
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_highlights_file_is_not_a_complete_install() {
+        use std::os::unix::fs::symlink;
+
+        let temp = TempDir::new().unwrap();
+        let queries_dir = temp.path().join("queries/lua");
+        let outside = temp.path().join("outside.scm");
+        std::fs::create_dir_all(&queries_dir).unwrap();
+        std::fs::write(&outside, "(identifier) @variable\n").unwrap();
+        symlink(&outside, queries_dir.join("highlights.scm")).unwrap();
+
+        assert!(
+            !query_install_is_complete(&queries_dir),
+            "managed query files must not be satisfied by an external symlink target"
+        );
+    }
 
     #[test]
     fn remove_dir_all_tolerates_a_confirmed_vanished_dir() {
