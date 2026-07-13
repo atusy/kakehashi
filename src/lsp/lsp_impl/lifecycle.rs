@@ -645,12 +645,12 @@ impl Kakehashi {
 
         // Dump diagnostic-path counters (#533) so a session's refresh amplification
         // (push republishes in → refreshes requested vs sent → pulls answered) is
-        // readable without a profiler. `requested - sent` is the total saved by
-        // forwarded-refresh debounce plus the #497 single-flight/coverage gates.
+        // readable without a profiler. `requested - sent` includes refreshes
+        // coalesced, gated, or suppressed during shutdown.
         let m = self.diagnostics.metrics_snapshot();
         log::info!(
             target: "kakehashi::diagnostic_metrics",
-            "diagnostic path totals: push_republishes={} refreshes_requested={} refreshes_sent={} (coalescing/gates saved {}) pulls_answered={} mean_pull_us={}",
+            "diagnostic path totals: push_republishes={} refreshes_requested={} refreshes_sent={} (not sent: coalesced/gated/shutdown {}) pulls_answered={} mean_pull_us={}",
             m.push_republishes,
             m.refreshes_requested,
             m.refreshes_sent,
