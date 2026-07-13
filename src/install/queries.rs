@@ -544,7 +544,7 @@ fn remove_query_install_and_backups_with_hooks(
     fs::create_dir_all(queries_parent)?;
     let pinned_parent =
         cap_std::fs::Dir::open_ambient_dir(queries_parent, cap_std::ambient_authority())?;
-    let _replace_lock = QueryReplaceLockGuard::acquire(queries_parent, language)?;
+    let _replace_lock = QueryReplaceLockGuard::acquire_at(&pinned_parent, language)?;
     write_tombstone(queries_parent, language)?;
     before_remove(queries_parent);
     let mut removal = QueryRemoval {
@@ -1380,6 +1380,20 @@ impl QueryReplaceLockGuard {
             .write(true)
             .truncate(false)
             .open(path)?;
+        file.lock_exclusive()?;
+        Ok(Self { _file: file })
+    }
+
+    fn acquire_at(
+        queries_parent: &cap_std::fs::Dir,
+        language: &str,
+    ) -> Result<Self, QueryInstallError> {
+        validate_safe_language_name(language)?;
+        let mut options = cap_std::fs::OpenOptions::new();
+        options.create(true).write(true).truncate(false);
+        let file = queries_parent
+            .open_with(format!(".{language}.replace.lock"), &options)?
+            .into_std();
         file.lock_exclusive()?;
         Ok(Self { _file: file })
     }
