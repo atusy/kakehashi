@@ -147,8 +147,10 @@ impl LanguageServerPool {
         let lineage_is_current = document_is_open
             && snapshot.settings_generation
                 == self
-                    .diagnostic_pull_generation
-                    .load(std::sync::atomic::Ordering::Acquire)
+                    .diagnostic_pull_generations
+                    .get(&cache_key.0)
+                    .map(|entry| *entry)
+                    .unwrap_or(0)
             && snapshot.document_generation == current_document_generation
             && snapshot.connection_generation == self.document_connection_generation(&cache_key.0);
         if !lineage_is_current {
@@ -670,6 +672,46 @@ mod tests {
 
         assert!(diagnostics.is_empty());
         assert!(!pool.diagnostic_pull_baselines.contains_key(&key));
+    }
+
+    #[test]
+    fn unrelated_connection_invalidation_preserves_in_flight_unchanged() {
+        let pool = LanguageServerPool::new();
+        let affected = super::super::super::pool::ConnectionKey::for_server("lua_ls_a");
+        let key = (
+            super::super::super::pool::ConnectionKey::for_server("lua_ls_b"),
+            "kakehashi-virtual://region-1".to_string(),
+        );
+        pool.diagnostic_pull_baselines.insert(
+            key.clone(),
+            super::super::super::pool::DiagnosticPullBaseline {
+                result_id: "r1".to_string(),
+                diagnostics: std::sync::Arc::new(vec![Diagnostic {
+                    message: "unrelated".to_string(),
+                    ..Default::default()
+                }]),
+                request_sequence: 0,
+            },
+        );
+        pool.diagnostic_pull_applied_sequences
+            .insert(key.clone(), 0);
+        let snapshot = pool.diagnostic_pull_snapshot(&key);
+
+        pool.invalidate_diagnostic_connections(std::slice::from_ref(&affected));
+        let diagnostics = pool.resolve_diagnostic_pull_report(
+            &key,
+            snapshot,
+            DownstreamDiagnosticReport::Unchanged {
+                result_id: "r2".to_string(),
+            },
+            true,
+        );
+
+        assert_eq!(diagnostics[0].message, "unrelated");
+        assert_eq!(
+            pool.diagnostic_pull_baselines.get(&key).unwrap().result_id,
+            "r2"
+        );
     }
 
     #[test]

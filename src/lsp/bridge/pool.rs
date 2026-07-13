@@ -369,8 +369,8 @@ pub struct LanguageServerPool {
     /// this advances on close so an old response cannot attach to a reopen of
     /// the same URI on the same process.
     pub(crate) diagnostic_document_generations: DashMap<(ConnectionKey, String), u64>,
-    /// Invalidates in-flight baseline reads across a settings replacement.
-    pub(crate) diagnostic_pull_generation: AtomicU64,
+    /// Per-connection settings/respawn fence for in-flight baseline reads.
+    pub(crate) diagnostic_pull_generations: DashMap<ConnectionKey, u64>,
     /// Serializes baseline snapshots/mutations with every invalidation fence.
     pub(crate) diagnostic_pull_lock: std::sync::Mutex<()>,
     pub(crate) diagnostic_pull_request_sequence: AtomicU64,
@@ -486,7 +486,7 @@ impl LanguageServerPool {
             host_documents: Mutex::new(HashMap::new()),
             diagnostic_pull_baselines: DashMap::new(),
             diagnostic_document_generations: DashMap::new(),
-            diagnostic_pull_generation: AtomicU64::new(0),
+            diagnostic_pull_generations: DashMap::new(),
             diagnostic_pull_lock: std::sync::Mutex::new(()),
             diagnostic_pull_request_sequence: AtomicU64::new(1),
             diagnostic_pull_applied_sequences: DashMap::new(),
@@ -1678,7 +1678,11 @@ impl LanguageServerPool {
             .unwrap_or(0);
         DiagnosticPullSnapshot {
             baseline,
-            settings_generation: self.diagnostic_pull_generation.load(Ordering::Acquire),
+            settings_generation: self
+                .diagnostic_pull_generations
+                .get(&key.0)
+                .map(|entry| *entry)
+                .unwrap_or(0),
             document_generation,
             connection_generation: self.document_connection_generation(&key.0),
             request_sequence: self
@@ -1708,8 +1712,12 @@ impl LanguageServerPool {
             .diagnostic_pull_lock
             .lock()
             .recover_poison("LanguageServerPool::diagnostic_pull_lock");
-        self.diagnostic_pull_generation
-            .fetch_add(1, Ordering::AcqRel);
+        for key in keys {
+            self.diagnostic_pull_generations
+                .entry(key.clone())
+                .and_modify(|generation| *generation = generation.wrapping_add(1))
+                .or_insert(1);
+        }
         let affected = |key: &ConnectionKey| keys.iter().any(|candidate| candidate == key);
         self.diagnostic_pull_baselines
             .retain(|(key, _), _| !affected(key));
