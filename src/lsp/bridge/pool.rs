@@ -734,15 +734,20 @@ impl LanguageServerPool {
         // I/O, so release the per-connection ordering guards before starting it.
         drop(_ordering_guards);
 
-        cleanup_invalidated_connections(
+        let cleanup = tokio::spawn(cleanup_invalidated_connections(
             connections,
             Arc::clone(&self.connections),
             invalidated,
             Arc::clone(&self.host_documents),
             Arc::clone(&self.document_tracker),
             Arc::clone(&self.open_transition_locks),
-        )
-        .await;
+        ));
+        if let Err(error) = cleanup.await {
+            log::error!(
+                target: "kakehashi::bridge",
+                "workspace-folder invalidation cleanup task failed: {error}"
+            );
+        }
     }
 
     /// Set the upstream client capabilities.
@@ -3339,6 +3344,46 @@ mod tests {
             handle.state(),
             ConnectionState::Closed,
             "removal must not become observable before bounded shutdown finishes"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelled_post_commit_folder_change_finishes_owned_cleanup() {
+        let pool = Arc::new(LanguageServerPool::new());
+        let key = ConnectionKey::for_server("lua");
+        let handle = create_handle_with_key(ConnectionState::Ready, key.clone()).await;
+        handle.set_server_capabilities(tower_lsp_server::ls_types::ServerCapabilities::default());
+        pool.insert_connection(Arc::clone(&handle)).await;
+        let host_documents = pool.host_documents.lock().await;
+
+        let task = tokio::spawn({
+            let pool = Arc::clone(&pool);
+            async move {
+                pool.apply_workspace_folder_change(vec![test_workspace_folder("file:///new")], &[])
+                    .await;
+            }
+        });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while handle.state() != ConnectionState::Closing {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("owned cleanup must begin after the snapshot commit");
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        drop(host_documents);
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while pool.connections.lock().await.contains_key(&key) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("owned cleanup must unmap stale state after caller cancellation");
+        assert_eq!(
+            pool.workspace_folders(),
+            Some(vec![test_workspace_folder("file:///new")])
         );
     }
 
