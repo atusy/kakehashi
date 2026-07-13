@@ -531,10 +531,20 @@ fn remove_query_install_and_backups_with_tombstone_writer(
     language: &str,
     write_tombstone: impl FnOnce(&Path, &str) -> Result<(), QueryInstallError>,
 ) -> Result<QueryRemoval, QueryInstallError> {
+    remove_query_install_and_backups_with_hooks(queries_parent, language, write_tombstone, |_| {})
+}
+
+fn remove_query_install_and_backups_with_hooks(
+    queries_parent: &Path,
+    language: &str,
+    write_tombstone: impl FnOnce(&Path, &str) -> Result<(), QueryInstallError>,
+    before_remove: impl FnOnce(&Path),
+) -> Result<QueryRemoval, QueryInstallError> {
     validate_safe_language_name(language)?;
     fs::create_dir_all(queries_parent)?;
     let _replace_lock = QueryReplaceLockGuard::acquire(queries_parent, language)?;
     write_tombstone(queries_parent, language)?;
+    before_remove(queries_parent);
     let queries_dir = queries_parent.join(language);
     let mut removal = QueryRemoval {
         removed_queries: false,
