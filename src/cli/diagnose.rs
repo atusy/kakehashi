@@ -271,7 +271,7 @@ async fn run_paths(server: &Kakehashi, cwd: &Path, options: &DiagnoseOptions) ->
             .cli_diagnose_text(file, &text, SERVER_READY_TIMEOUT)
             .await;
         for failure in &outcome.server_failures {
-            elnln!("error: {display}: {failure}");
+            elnln!("{}", format_server_failure(&display, failure));
             report.operational_error = true;
         }
         if pipe_closed {
@@ -339,7 +339,7 @@ async fn run_stdin(server: &Kakehashi, cwd: &Path, options: &DiagnoseOptions) ->
     let mut report = Report::default();
     let display = name.display().to_string();
     for failure in &outcome.server_failures {
-        elnln!("error: {display}: {failure}");
+        elnln!("{}", format_server_failure(&display, failure));
         report.operational_error = true;
     }
     let mut buf = String::new();
@@ -410,6 +410,10 @@ fn summarize(report: &Report, file_count: usize) -> u8 {
     elnln!("{} {diag_label} in {file_count} {file_label}", report.total);
 
     report.exit_code()
+}
+
+fn format_server_failure(display: &str, failure: &str) -> String {
+    format!("error: {display}: {failure}")
 }
 
 /// Render one diagnostic in the requested format. `display` is the
