@@ -788,6 +788,8 @@ fn open_regular_tombstone(path: &Path) -> std::io::Result<fs::File> {
             "query uninstall tombstone is not a regular file",
         ));
     }
+    use std::os::unix::fs::MetadataExt as _;
+    reject_multiple_links(file.metadata()?.nlink())?;
     Ok(file)
 }
 
@@ -814,7 +816,33 @@ fn open_regular_tombstone(path: &Path) -> std::io::Result<fs::File> {
             "query uninstall tombstone is not a regular file",
         ));
     }
+    use std::os::windows::io::AsRawHandle as _;
+    use windows_sys::Win32::Storage::FileSystem::{
+        BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
+    };
+    let mut information = std::mem::MaybeUninit::<BY_HANDLE_FILE_INFORMATION>::uninit();
+    // SAFETY: `file` keeps this handle valid for the call, and Windows
+    // initializes the complete output structure whenever it reports success.
+    let succeeded =
+        unsafe { GetFileInformationByHandle(file.as_raw_handle(), information.as_mut_ptr()) };
+    if succeeded == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: GetFileInformationByHandle succeeded above.
+    let information = unsafe { information.assume_init() };
+    reject_multiple_links(u64::from(information.nNumberOfLinks))?;
     Ok(file)
+}
+
+#[cfg(any(unix, windows))]
+fn reject_multiple_links(links: u64) -> std::io::Result<()> {
+    if links > 1 {
+        Err(std::io::Error::other(
+            "query uninstall tombstone has multiple hard links",
+        ))
+    } else {
+        Ok(())
+    }
 }
 
 #[cfg(not(any(unix, windows)))]
@@ -1310,6 +1338,28 @@ mod tests {
         assert_eq!(
             fs::read_to_string(uninstall_tombstone_path(&real_queries, "rust")).unwrap(),
             "ok\n"
+        );
+    }
+
+    #[test]
+    fn remove_query_install_rejects_hard_linked_uninstall_tombstone() {
+        let temp = TempDir::new().unwrap();
+        let queries_parent = temp.path().join("queries");
+        fs::create_dir_all(&queries_parent).unwrap();
+        let victim = temp.path().join("victim");
+        fs::write(&victim, "keep me\n").unwrap();
+        fs::hard_link(&victim, uninstall_tombstone_path(&queries_parent, "rust")).unwrap();
+
+        let result = remove_query_install_and_backups(&queries_parent, "rust");
+
+        assert_eq!(
+            fs::read_to_string(&victim).unwrap(),
+            "keep me\n",
+            "opening the tombstone must not overwrite another hard-link name"
+        );
+        assert!(
+            matches!(result, Err(QueryInstallError::IoError(_))),
+            "a multiply linked managed tombstone must fail the uninstall"
         );
     }
 
