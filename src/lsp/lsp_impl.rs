@@ -183,6 +183,13 @@ pub(super) async fn apply_shared_settings(
         None => settings_manager.apply_settings(settings),
     }
     let settings = settings_manager.load_settings();
+    // Update the reader-side copy before propagating downstream settings so a
+    // newly suppressed log cannot occupy the bounded window queue after this
+    // configuration application completes.
+    bridge
+        .pool()
+        .set_log_message_level(settings.features.window_log_message)
+        .await;
     // Path c: apply downstream config at this single reload choke point
     // (initialize, didChangeConfiguration, auto-install reload): push runtime
     // settings in place and recycle connections whose launch config changed.

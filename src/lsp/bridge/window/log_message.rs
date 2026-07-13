@@ -24,6 +24,7 @@ pub(in crate::lsp::bridge) fn forward(
 ) {
     // Deserialize from a reference to avoid cloning the params value.
     match LogMessageParams::deserialize(&message["params"]) {
+        Ok(params) if !deps.dynamic_capabilities.allows_log_message(params.typ) => {}
         Ok(params) => send_window_notification(
             deps,
             server_prefix,

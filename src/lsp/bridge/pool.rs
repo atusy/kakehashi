@@ -122,7 +122,7 @@ fn shutdown_invalidated_connection(key: ConnectionKey, handle: Arc<ConnectionHan
 
 use std::collections::HashMap;
 use std::io;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
@@ -415,6 +415,9 @@ pub struct LanguageServerPool {
     /// Merged into bridge defaults during downstream LSP handshake so servers
     /// can provide richer responses (e.g., markdown docs, resolve support).
     client_capabilities: OnceLock<tower_lsp_server::ls_types::ClientCapabilities>,
+    /// Workspace-wide downstream log threshold. Existing connection registries
+    /// receive live updates; newly spawned readers copy the current value.
+    log_message_level: AtomicU8,
     /// Sender for forwarding downstream server notifications to the upstream editor.
     ///
     /// Cloned into each reader task so they can signal events like
@@ -505,6 +508,9 @@ impl LanguageServerPool {
             root_uri: OnceLock::new(),
             workspace_folders: OnceLock::new(),
             client_capabilities: OnceLock::new(),
+            log_message_level: AtomicU8::new(
+                crate::config::settings::LogMessageLevel::Info.as_u8(),
+            ),
             upstream_tx,
             upstream_rx: std::sync::Mutex::new(Some(upstream_rx)),
             window_tx,
@@ -543,6 +549,18 @@ impl LanguageServerPool {
     /// (#404).
     pub(crate) fn inbound_request_registry(&self) -> super::InboundRequestRegistry {
         self.inbound_request_registry.clone()
+    }
+
+    pub(crate) async fn set_log_message_level(
+        &self,
+        level: crate::config::settings::LogMessageLevel,
+    ) {
+        self.log_message_level
+            .store(level.as_u8(), Ordering::Release);
+        let connections = self.connections.lock().await;
+        for handle in connections.values() {
+            handle.dynamic_capabilities().store_log_message_level(level);
+        }
     }
 
     /// Shared work-done progress token registry (for seam tests that need to
@@ -2187,6 +2205,11 @@ impl LanguageServerPool {
 
         // Create dynamic capability registry (shared between reader and connection handle)
         let dynamic_capabilities = Arc::new(DynamicCapabilityRegistry::new());
+        dynamic_capabilities.store_log_message_level(
+            crate::config::settings::LogMessageLevel::from_u8(
+                self.log_message_level.load(Ordering::Acquire),
+            ),
+        );
 
         // workspaceMarkers workspace-root detection (root_markers module): the same
         // marker workspace resolved for the pool key above (entry-priority
