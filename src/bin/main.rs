@@ -408,7 +408,7 @@ fn run_language_status(verbose: bool) -> Result<(), ExitCode> {
     if let Ok(entries) = fs::read_dir(&parser_dir) {
         for entry in entries.flatten() {
             let path = entry.path();
-            let is_parser = parser_entry_is_regular(&path)
+            let is_parser = parser::parser_file_is_regular(&path)
                 && path
                     .extension()
                     .is_some_and(|ext| ext == std::env::consts::DLL_EXTENSION);
@@ -509,7 +509,7 @@ fn run_language_uninstall(
         if let Ok(entries) = fs::read_dir(&parser_dir) {
             for entry in entries.flatten() {
                 let path = entry.path();
-                let is_parser = parser_entry_is_regular(&path)
+                let is_parser = parser::parser_file_is_regular(&path)
                     && path
                         .extension()
                         .is_some_and(|ext| ext == std::env::consts::DLL_EXTENSION);
@@ -630,30 +630,11 @@ fn run_language_uninstall(
 /// Find the parser file for a language.
 fn find_parser_file(parser_dir: &std::path::Path, lang: &str) -> Option<PathBuf> {
     let path = parser_dir.join(format!("{}.{}", lang, std::env::consts::DLL_EXTENSION));
-    if parser_entry_is_regular(&path) {
+    if parser::parser_file_is_regular(&path) {
         Some(path)
     } else {
         None
     }
-}
-
-fn parser_entry_is_regular(path: &Path) -> bool {
-    let Ok(metadata) = std::fs::symlink_metadata(path) else {
-        return false;
-    };
-    if !metadata.file_type().is_file() {
-        return false;
-    }
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::MetadataExt as _;
-        use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
-
-        if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
-            return false;
-        }
-    }
-    true
 }
 
 /// Write content to stdout or a file, with --force / --output semantics.

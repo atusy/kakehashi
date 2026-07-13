@@ -127,7 +127,9 @@ pub fn parser_file_exists(language: &str, data_dir: &Path) -> Option<PathBuf> {
     }
 }
 
-fn parser_file_is_regular(path: &Path) -> bool {
+/// Whether `path` is a regular managed parser leaf rather than a link/reparse
+/// entry whose target merely looks like a parser file.
+pub fn parser_file_is_regular(path: &Path) -> bool {
     let Ok(metadata) = fs::symlink_metadata(path) else {
         return false;
     };
