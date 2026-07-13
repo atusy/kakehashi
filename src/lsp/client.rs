@@ -266,7 +266,7 @@ impl<'a> ClientNotifier<'a> {
                         LanguageLogLevel::Warning => MessageType::WARNING,
                         LanguageLogLevel::Info => MessageType::INFO,
                     };
-                    self.log(message_type, message.clone()).await;
+                    self.log(message_type, message).await;
                 }
                 LanguageEvent::ShowMessage { level, message } => {
                     let message_type = match level {
@@ -274,9 +274,7 @@ impl<'a> ClientNotifier<'a> {
                         LanguageLogLevel::Warning => MessageType::WARNING,
                         LanguageLogLevel::Info => MessageType::INFO,
                     };
-                    self.client
-                        .show_message(message_type, message.clone())
-                        .await;
+                    self.client.show_message(message_type, message).await;
                 }
                 // Refresh requests are handled once, before the loop — see above.
                 LanguageEvent::SemanticTokensRefresh { .. } => {}
@@ -299,10 +297,10 @@ impl<'a> ClientNotifier<'a> {
                         .await;
                 }
                 SettingsEventKind::Warning => {
-                    self.log(MessageType::WARNING, event.message.clone()).await;
+                    self.log(MessageType::WARNING, event.message.as_str()).await;
                 }
                 SettingsEventKind::Info => {
-                    self.log(MessageType::INFO, event.message.clone()).await;
+                    self.log(MessageType::INFO, event.message.as_str()).await;
                 }
             }
         }
