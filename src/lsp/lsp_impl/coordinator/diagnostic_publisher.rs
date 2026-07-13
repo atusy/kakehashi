@@ -81,12 +81,11 @@ impl RepublishOutcome {
 /// ~2,235 merged diagnostics), so the gate bounds sustained-typing wire cost
 /// at ~1 MB/s/host where it was ~2.2. An isolated change (window already
 /// elapsed) passes through immediately: the gate adds no latency outside
-/// bursts (more precisely: to a change arriving after >= 1 s of wire quiet).
-/// Deliberately a fixed constant, not a config knob: the window trades only
-/// push-namespace refresh cadence against pipe bytes, the failure mode of a
-/// wrong value is mild in both directions, and this branch's review explicitly
-/// chose existing config surfaces over new ones — revisit if a real setup
-/// needs a different cadence.
+/// bursts (more precisely: to a change arriving after the configured interval
+/// of wire quiet). One second is the fallback when
+/// `languages.<lang>.layers.aggregation."textDocument/publishDiagnostics".
+/// minPublishIntervalMs` is absent; configured values are capped at 24 hours
+/// so an accidental extreme cannot indefinitely withhold a trailing publish.
 const WIRE_PUBLISH_QUIET_WINDOW: std::time::Duration = std::time::Duration::from_secs(1);
 const MAX_WIRE_PUBLISH_QUIET_WINDOW: std::time::Duration =
     std::time::Duration::from_secs(24 * 60 * 60);
