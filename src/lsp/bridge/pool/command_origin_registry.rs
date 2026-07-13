@@ -54,18 +54,27 @@ impl CommandOriginRegistry {
         added
     }
 
-    /// The sole connection that advertised a palette command name. Returns
-    /// `None` for both unknown and ambiguous names; callers log either as a
-    /// fail-soft refusal rather than execute against an arbitrary workspace.
-    pub(crate) fn route(&self, command: &str) -> Option<ConnectionKey> {
+    /// Snapshot every distinct connection that advertised `command`, in first
+    /// advertisement order. The dispatcher uses this to consider current
+    /// connection liveness without holding the registry lock across `.await`.
+    pub(crate) fn origins(&self, command: &str) -> Vec<ConnectionKey> {
         self.origins
             .lock()
-            .recover_poison("CommandOriginRegistry::route")
+            .recover_poison("CommandOriginRegistry::origins")
             .get(command)
-            .and_then(|origins| match origins.as_slice() {
-                [origin] => Some(origin.clone()),
-                [] | [_, ..] => None,
-            })
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// Whether `command` is a raw name some downstream advertised. Separate from
+    /// [`Self::origins`] because the dispatch gate only needs the yes/no and runs
+    /// on every `workspace/executeCommand`; cloning the origin list to test it
+    /// for emptiness would allocate per request.
+    pub(crate) fn is_registered(&self, command: &str) -> bool {
+        self.origins
+            .lock()
+            .recover_poison("CommandOriginRegistry::is_registered")
+            .contains_key(command)
     }
 }
 
@@ -85,7 +94,7 @@ mod tests {
             ),
             vec!["ruff.fix".to_string(), "ruff.sort".to_string()]
         );
-        assert_eq!(reg.route("ruff.fix").as_ref(), Some(&ruff_a));
+        assert_eq!(reg.origins("ruff.fix"), vec![ruff_a.clone()]);
 
         // The same connection advertising again neither duplicates the editor
         // registration nor makes its route ambiguous.
@@ -93,13 +102,9 @@ mod tests {
             reg.register(&ruff_a, vec!["ruff.fix".to_string()])
                 .is_empty()
         );
-        assert_eq!(
-            reg.route("ruff.fix").as_ref(),
-            Some(&ruff_a),
-            "re-advertising from one origin stays uniquely routable"
-        );
+        assert_eq!(reg.origins("ruff.fix"), vec![ruff_a]);
 
-        assert_eq!(reg.route("unknown.cmd"), None);
+        assert!(reg.origins("unknown.cmd").is_empty());
     }
 
     #[test]
@@ -117,10 +122,21 @@ mod tests {
                 .is_empty(),
             "the editor command name is registered only once"
         );
+        assert_eq!(reg.origins("source.fixAll"), vec![ruff, eslint]);
+    }
+
+    #[test]
+    fn collision_keeps_every_candidate_for_live_origin_resolution() {
+        let reg = CommandOriginRegistry::default();
+        let ruff = ConnectionKey::new("ruff", Some("/w/a".to_string()));
+        let eslint = ConnectionKey::new("eslint", Some("/w/b".to_string()));
+        reg.register(&ruff, vec!["source.fixAll".to_string()]);
+        reg.register(&eslint, vec!["source.fixAll".to_string()]);
+
         assert_eq!(
-            reg.route("source.fixAll"),
-            None,
-            "an ambiguous raw command must fail soft instead of choosing the last handshake"
+            reg.origins("source.fixAll"),
+            vec![ruff, eslint],
+            "dispatch must be able to distinguish one live candidate from several"
         );
     }
 }
