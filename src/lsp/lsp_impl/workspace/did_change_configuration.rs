@@ -65,8 +65,7 @@ fn settings_payload(settings: Value) -> (Value, Vec<String>) {
 
         let mut unknown_keys = object
             .into_iter()
-            .map(|(key, _)| key)
-            .filter(|key| is_workspace_setting_key_or_typo(key))
+            .filter_map(|(key, value)| is_kakehashi_section_sibling(&key, &value).then_some(key))
             .collect::<Vec<_>>();
         unknown_keys.extend(unknown_workspace_setting_keys(&kakehashi));
         sort_and_dedup_unknown_keys(&mut unknown_keys);
@@ -129,6 +128,15 @@ fn is_workspace_setting_key_or_typo(key: &str) -> bool {
         || KNOWN_WORKSPACE_SETTING_KEYS
             .iter()
             .any(|known_key| is_one_edit_apart(key, known_key))
+}
+
+fn is_kakehashi_section_sibling(key: &str, value: &Value) -> bool {
+    if key == "features" {
+        return value
+            .as_object()
+            .is_some_and(|features| features.contains_key("workspace/diagnostic/refresh"));
+    }
+    is_workspace_setting_key_or_typo(key)
 }
 
 fn is_one_edit_apart(candidate: &str, known: &str) -> bool {
@@ -468,6 +476,37 @@ mod tests {
         assert!(!is_workspace_setting_key_or_typo("editor"));
         assert!(!is_workspace_setting_key_or_typo("files"));
         assert!(!is_workspace_setting_key_or_typo("workbench"));
+    }
+
+    #[test]
+    fn settings_payload_ignores_unrelated_features_section_sibling() {
+        let (payload, unknown_keys) = settings_payload(serde_json::json!({
+            "kakehashi": {
+                "autoInstall": true
+            },
+            "features": {
+                "someOtherClientFeature": true
+            }
+        }));
+
+        assert_eq!(payload, serde_json::json!({ "autoInstall": true }));
+        assert!(unknown_keys.is_empty());
+    }
+
+    #[test]
+    fn settings_payload_rejects_kakehashi_features_section_sibling() {
+        let (_payload, unknown_keys) = settings_payload(serde_json::json!({
+            "kakehashi": {
+                "autoInstall": true
+            },
+            "features": {
+                "workspace/diagnostic/refresh": {
+                    "debounceMs": 20
+                }
+            }
+        }));
+
+        assert_eq!(unknown_keys, ["features"]);
     }
 
     #[test]
