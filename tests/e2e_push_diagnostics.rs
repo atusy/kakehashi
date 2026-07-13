@@ -923,15 +923,40 @@ fn e2e_downstream_refresh_burst_is_coalesced() {
             })),
         "the leading refresh must expose the first downstream generation: {leading_pull}"
     );
+    assert!(
+        refreshes_during_leading_pull.is_empty(),
+        "single-flight must suppress refreshes during the leading pull: {refreshes_during_leading_pull:?}"
+    );
+
+    // A second pull is an ordered post-burst barrier: the mock reads it only
+    // after writing refresh generations 2–10, and its response follows those
+    // refresh frames on the same downstream connection.
+    let barrier_pull_id = client.send_request_async(
+        "textDocument/diagnostic",
+        json!({ "textDocument": { "uri": MD_URI } }),
+    );
+    let (barrier_pull, refreshes_before_barrier) = client
+        .receive_response_for_id_watching_server_requests(
+            barrier_pull_id,
+            "workspace/diagnostic/refresh",
+        );
+    assert!(
+        barrier_pull["result"]["items"]
+            .as_array()
+            .is_some_and(|items| items.iter().any(|diagnostic| {
+                diagnostic["message"] == json!("mock-diagnostic-generation:10")
+            })),
+        "the ordered barrier must observe the complete downstream burst: {barrier_pull}"
+    );
+    assert!(
+        refreshes_before_barrier.is_empty(),
+        "single-flight must hold through complete burst admission: {refreshes_before_barrier:?}"
+    );
     client.send_response(id, json!(null));
 
-    let (trailing_id, _) = match refreshes_during_leading_pull.as_slice() {
-        [] => client
-            .wait_for_server_request("workspace/diagnostic/refresh", Duration::from_millis(1200))
-            .expect("activity after the leading edge must produce one trailing refresh"),
-        [(id, params)] => (id.clone(), params.clone()),
-        refreshes => panic!("the leading pull observed duplicate refreshes: {refreshes:?}"),
-    };
+    let (trailing_id, _) = client
+        .wait_for_server_request("workspace/diagnostic/refresh", Duration::from_millis(1200))
+        .expect("activity after the leading edge must produce one trailing refresh");
     client.send_response(trailing_id, json!(null));
 
     let trailing_pull_id = client.send_request_async(
