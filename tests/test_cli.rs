@@ -279,6 +279,18 @@ fn test_config_init_emits_workspace_refresh_feature_defaults() {
     assert!(stdout.contains("debounceMs = 100\nmaxWaitMs = 1000"));
 }
 
+#[test]
+fn test_config_init_emits_publish_diagnostics_feature_defaults() {
+    let output = Command::new(env!("CARGO_BIN_EXE_kakehashi"))
+        .args(["config", "init"])
+        .output()
+        .expect("run config init");
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("[features.\"textDocument/publishDiagnostics\"]\n"));
+    assert!(stdout.contains("debounceMs = 100\nmaxWaitMs = 1000"));
+}
+
 /// Test that config init documents the per-root-instance default by emitting
 /// `preferSharedInstance = false` under the `languageServers._` wildcard, so
 /// the opt-in (#391) is discoverable in the generated template.

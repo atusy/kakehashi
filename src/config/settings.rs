@@ -642,6 +642,8 @@ pub struct RawWorkspaceSettings {
 
 pub const DEFAULT_WORKSPACE_DIAGNOSTIC_REFRESH_DEBOUNCE_MS: u64 = 100;
 pub const DEFAULT_WORKSPACE_DIAGNOSTIC_REFRESH_MAX_WAIT_MS: u64 = 1000;
+pub const DEFAULT_PUBLISH_DIAGNOSTICS_DEBOUNCE_MS: u64 = 100;
+pub const DEFAULT_PUBLISH_DIAGNOSTICS_MAX_WAIT_MS: u64 = 1000;
 /// Largest accepted debounce/max-wait duration (24 hours). This keeps timer
 /// arithmetic within a practical, platform-independent Instant range.
 pub const MAX_FEATURE_TIMING_MS: u64 = 86_400_000;
@@ -658,6 +660,8 @@ pub struct DebounceFeatureSettings {
 #[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct FeatureSettings {
+    #[serde(rename = "textDocument/publishDiagnostics")]
+    pub text_document_publish_diagnostics: Option<DebounceFeatureSettings>,
     #[serde(rename = "workspace/diagnostic/refresh")]
     pub workspace_diagnostic_refresh: Option<DebounceFeatureSettings>,
 }
@@ -669,7 +673,11 @@ impl Serialize for FeatureSettings {
     {
         use serde::ser::SerializeMap;
 
-        let mut map = serializer.serialize_map(Some(1))?;
+        let mut map = serializer.serialize_map(Some(2))?;
+        map.serialize_entry(
+            "textDocument/publishDiagnostics",
+            &self.text_document_publish_diagnostics,
+        )?;
         map.serialize_entry(
             "workspace/diagnostic/refresh",
             &self.workspace_diagnostic_refresh,
@@ -695,13 +703,23 @@ impl Default for ResolvedDebounceFeatureSettings {
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ResolvedFeatureSettings {
+    pub text_document_publish_diagnostics: ResolvedDebounceFeatureSettings,
     pub workspace_diagnostic_refresh: ResolvedDebounceFeatureSettings,
 }
 
 impl FeatureSettings {
     pub(crate) fn resolve(&self) -> ResolvedFeatureSettings {
+        let publish = self.text_document_publish_diagnostics.as_ref();
         let refresh = self.workspace_diagnostic_refresh.as_ref();
         ResolvedFeatureSettings {
+            text_document_publish_diagnostics: ResolvedDebounceFeatureSettings {
+                debounce_ms: publish
+                    .and_then(|settings| settings.debounce_ms)
+                    .unwrap_or(DEFAULT_PUBLISH_DIAGNOSTICS_DEBOUNCE_MS),
+                max_wait_ms: publish
+                    .and_then(|settings| settings.max_wait_ms)
+                    .unwrap_or(DEFAULT_PUBLISH_DIAGNOSTICS_MAX_WAIT_MS),
+            },
             workspace_diagnostic_refresh: ResolvedDebounceFeatureSettings {
                 debounce_ms: refresh
                     .and_then(|settings| settings.debounce_ms)
