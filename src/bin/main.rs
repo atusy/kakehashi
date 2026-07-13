@@ -686,6 +686,10 @@ fn run_config_init(output: Option<PathBuf>, force: bool) -> Result<(), ExitCode>
         "[features.workspace/diagnostic/refresh]",
         "[features.\"workspace/diagnostic/refresh\"]",
     );
+    let config_toml = config_toml.replace(
+        "[features.textDocument/publishDiagnostics]",
+        "[features.\"textDocument/publishDiagnostics\"]",
+    );
 
     // Prepend documentation link
     let content = format!("{}\n{}", DOC_LINK, config_toml);

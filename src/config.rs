@@ -259,6 +259,20 @@ impl WorkspaceSettings {
         let mut ws = base_convert(settings);
         let mut errors = Vec::new();
 
+        let publish = ws.features.text_document_publish_diagnostics;
+        if publish.max_wait_ms == 0
+            || publish.debounce_ms > settings::MAX_FEATURE_TIMING_MS
+            || publish.max_wait_ms > settings::MAX_FEATURE_TIMING_MS
+            || publish.max_wait_ms < publish.debounce_ms
+        {
+            errors.push(expand::ExpandError::InvalidSetting {
+                message: format!(
+                    "features.\"textDocument/publishDiagnostics\" requires 0 <= debounceMs <= maxWaitMs <= {} and maxWaitMs > 0 (got debounceMs={}, maxWaitMs={})",
+                    settings::MAX_FEATURE_TIMING_MS, publish.debounce_ms, publish.max_wait_ms
+                ),
+            });
+        }
+
         let refresh = ws.features.workspace_diagnostic_refresh;
         if refresh.max_wait_ms == 0
             || refresh.debounce_ms > settings::MAX_FEATURE_TIMING_MS
@@ -386,6 +400,20 @@ impl From<&WorkspaceSettings> for RawWorkspaceSettings {
             auto_install: Some(settings.auto_install),
             diagnostics_debounce_ms: Some(settings.diagnostics_debounce_ms),
             features: Some(settings::FeatureSettings {
+                text_document_publish_diagnostics: Some(settings::DebounceFeatureSettings {
+                    debounce_ms: Some(
+                        settings
+                            .features
+                            .text_document_publish_diagnostics
+                            .debounce_ms,
+                    ),
+                    max_wait_ms: Some(
+                        settings
+                            .features
+                            .text_document_publish_diagnostics
+                            .max_wait_ms,
+                    ),
+                }),
                 workspace_diagnostic_refresh: Some(settings::DebounceFeatureSettings {
                     debounce_ms: Some(settings.features.workspace_diagnostic_refresh.debounce_ms),
                     max_wait_ms: Some(settings.features.workspace_diagnostic_refresh.max_wait_ms),
@@ -721,6 +749,61 @@ mod tests {
     }
 
     #[test]
+    fn publish_diagnostics_feature_resolves_defaults_and_custom_values() {
+        let defaults = base_convert(&RawWorkspaceSettings::default());
+        assert_eq!(
+            defaults
+                .features
+                .text_document_publish_diagnostics
+                .debounce_ms,
+            settings::DEFAULT_PUBLISH_DIAGNOSTICS_DEBOUNCE_MS
+        );
+        assert_eq!(
+            defaults
+                .features
+                .text_document_publish_diagnostics
+                .max_wait_ms,
+            settings::DEFAULT_PUBLISH_DIAGNOSTICS_MAX_WAIT_MS
+        );
+        let raw: RawWorkspaceSettings = toml::from_str(
+            r#"
+            [features."textDocument/publishDiagnostics"]
+            debounceMs = 30
+            maxWaitMs = 300
+            "#,
+        )
+        .unwrap();
+        let custom = WorkspaceSettings::try_from_settings(&raw, None, |_| None).unwrap();
+        assert_eq!(
+            custom
+                .features
+                .text_document_publish_diagnostics
+                .debounce_ms,
+            30
+        );
+        assert_eq!(
+            custom
+                .features
+                .text_document_publish_diagnostics
+                .max_wait_ms,
+            300
+        );
+    }
+
+    #[test]
+    fn publish_diagnostics_rejects_invalid_timing() {
+        let raw: RawWorkspaceSettings = toml::from_str(
+            r#"
+            [features."textDocument/publishDiagnostics"]
+            debounceMs = 101
+            maxWaitMs = 100
+            "#,
+        )
+        .unwrap();
+        assert!(WorkspaceSettings::try_from_settings(&raw, None, |_| None).is_err());
+    }
+
+    #[test]
     fn workspace_diagnostic_refresh_rejects_invalid_timing() {
         let raw: RawWorkspaceSettings = toml::from_str(
             r#"
@@ -739,6 +822,7 @@ mod tests {
         for max_wait_ms in [0, settings::MAX_FEATURE_TIMING_MS + 1] {
             let raw = RawWorkspaceSettings {
                 features: Some(settings::FeatureSettings {
+                    text_document_publish_diagnostics: None,
                     workspace_diagnostic_refresh: Some(settings::DebounceFeatureSettings {
                         debounce_ms: Some(0),
                         max_wait_ms: Some(max_wait_ms),

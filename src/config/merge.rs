@@ -423,6 +423,16 @@ fn merge_features(
 ) -> Option<FeatureSettings> {
     match (base, overlay) {
         (Some(base), Some(overlay)) => Some(FeatureSettings {
+            text_document_publish_diagnostics: match (
+                base.text_document_publish_diagnostics,
+                overlay.text_document_publish_diagnostics,
+            ) {
+                (Some(base), Some(overlay)) => Some(DebounceFeatureSettings {
+                    debounce_ms: overlay.debounce_ms.or(base.debounce_ms),
+                    max_wait_ms: overlay.max_wait_ms.or(base.max_wait_ms),
+                }),
+                (base, overlay) => overlay.or(base),
+            },
             workspace_diagnostic_refresh: match (
                 base.workspace_diagnostic_refresh,
                 overlay.workspace_diagnostic_refresh,
@@ -516,6 +526,33 @@ mod tests {
             .unwrap();
         assert_eq!(refresh.debounce_ms, Some(80));
         assert_eq!(refresh.max_wait_ms, Some(400));
+    }
+
+    #[test]
+    fn publish_feature_merge_preserves_unspecified_max_wait() {
+        let base: RawWorkspaceSettings = toml::from_str(
+            r#"
+            [features."textDocument/publishDiagnostics"]
+            debounceMs = 40
+            maxWaitMs = 400
+            "#,
+        )
+        .unwrap();
+        let overlay: RawWorkspaceSettings = toml::from_str(
+            r#"
+            [features."textDocument/publishDiagnostics"]
+            debounceMs = 80
+            "#,
+        )
+        .unwrap();
+        let merged = merge_workspace_settings(Some(base), Some(overlay)).unwrap();
+        let publish = merged
+            .features
+            .unwrap()
+            .text_document_publish_diagnostics
+            .unwrap();
+        assert_eq!(publish.debounce_ms, Some(80));
+        assert_eq!(publish.max_wait_ms, Some(400));
     }
     use crate::config::QueryTypeMappings;
     use crate::config::settings;

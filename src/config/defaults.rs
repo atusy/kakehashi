@@ -6,8 +6,8 @@
 use super::WILDCARD_KEY;
 use super::settings::{
     AggregationConfig, AggregationStrategy, BridgeLanguageConfig, BridgeServerConfig,
-    CaptureMapping, CaptureMappings, DEFAULT_DEBOUNCE_MS,
-    DEFAULT_WORKSPACE_DIAGNOSTIC_REFRESH_DEBOUNCE_MS,
+    CaptureMapping, CaptureMappings, DEFAULT_DEBOUNCE_MS, DEFAULT_PUBLISH_DIAGNOSTICS_DEBOUNCE_MS,
+    DEFAULT_PUBLISH_DIAGNOSTICS_MAX_WAIT_MS, DEFAULT_WORKSPACE_DIAGNOSTIC_REFRESH_DEBOUNCE_MS,
     DEFAULT_WORKSPACE_DIAGNOSTIC_REFRESH_MAX_WAIT_MS, DebounceFeatureSettings, FeatureSettings,
     LanguageSettings, LayerAggregationConfig, LayerSource, LayersConfig, QueryTypeMappings,
     RawWorkspaceSettings, RootMarker,
@@ -25,6 +25,10 @@ pub fn default_settings() -> RawWorkspaceSettings {
         auto_install: Some(true),
         diagnostics_debounce_ms: Some(DEFAULT_DEBOUNCE_MS),
         features: Some(FeatureSettings {
+            text_document_publish_diagnostics: Some(DebounceFeatureSettings {
+                debounce_ms: Some(DEFAULT_PUBLISH_DIAGNOSTICS_DEBOUNCE_MS),
+                max_wait_ms: Some(DEFAULT_PUBLISH_DIAGNOSTICS_MAX_WAIT_MS),
+            }),
             workspace_diagnostic_refresh: Some(DebounceFeatureSettings {
                 debounce_ms: Some(DEFAULT_WORKSPACE_DIAGNOSTIC_REFRESH_DEBOUNCE_MS),
                 max_wait_ms: Some(DEFAULT_WORKSPACE_DIAGNOSTIC_REFRESH_MAX_WAIT_MS),
@@ -527,6 +531,14 @@ mod tests {
     fn default_settings_emit_workspace_refresh_feature_policy() {
         let toml = toml::to_string_pretty(&default_settings()).unwrap();
         assert!(toml.contains("[features.workspace/diagnostic/refresh]"));
+        assert!(toml.contains("debounceMs = 100"));
+        assert!(toml.contains("maxWaitMs = 1000"));
+    }
+
+    #[test]
+    fn default_settings_emit_publish_diagnostics_feature_policy() {
+        let toml = toml::to_string_pretty(&default_settings()).unwrap();
+        assert!(toml.contains("[features.textDocument/publishDiagnostics]"));
         assert!(toml.contains("debounceMs = 100"));
         assert!(toml.contains("maxWaitMs = 1000"));
     }
