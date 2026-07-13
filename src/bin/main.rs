@@ -690,6 +690,10 @@ fn run_config_init(output: Option<PathBuf>, force: bool) -> Result<(), ExitCode>
         "[features.textDocument/publishDiagnostics]",
         "[features.\"textDocument/publishDiagnostics\"]",
     );
+    let config_toml = config_toml.replace(
+        "[features.window/logMessage]",
+        "[features.\"window/logMessage\"]",
+    );
 
     // Prepend documentation link
     let content = format!("{}\n{}", DOC_LINK, config_toml);

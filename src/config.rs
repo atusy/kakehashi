@@ -414,6 +414,9 @@ impl From<&WorkspaceSettings> for RawWorkspaceSettings {
                             .max_wait_ms,
                     ),
                 }),
+                window_log_message: Some(settings::LogMessageFeatureSettings {
+                    log_level: Some(settings.features.window_log_message),
+                }),
                 workspace_diagnostic_refresh: Some(settings::DebounceFeatureSettings {
                     debounce_ms: Some(settings.features.workspace_diagnostic_refresh.debounce_ms),
                     max_wait_ms: Some(settings.features.workspace_diagnostic_refresh.max_wait_ms),
@@ -823,6 +826,7 @@ mod tests {
             let raw = RawWorkspaceSettings {
                 features: Some(settings::FeatureSettings {
                     text_document_publish_diagnostics: None,
+                    window_log_message: None,
                     workspace_diagnostic_refresh: Some(settings::DebounceFeatureSettings {
                         debounce_ms: Some(0),
                         max_wait_ms: Some(max_wait_ms),

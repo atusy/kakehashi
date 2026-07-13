@@ -1,6 +1,7 @@
 use super::settings::{
     AggregationConfig, BridgeLanguageConfig, BridgeServerConfig, DebounceFeatureSettings,
     FeatureSettings, LanguageSettings, LayerAggregationConfig, LayersConfig,
+    LogMessageFeatureSettings,
 };
 use super::{CaptureMappings, RawWorkspaceSettings, WILDCARD_KEY};
 use std::collections::{HashMap, HashSet};
@@ -433,6 +434,12 @@ fn merge_features(
                 }),
                 (base, overlay) => overlay.or(base),
             },
+            window_log_message: match (base.window_log_message, overlay.window_log_message) {
+                (Some(base), Some(overlay)) => Some(LogMessageFeatureSettings {
+                    log_level: overlay.log_level.or(base.log_level),
+                }),
+                (base, overlay) => overlay.or(base),
+            },
             workspace_diagnostic_refresh: match (
                 base.workspace_diagnostic_refresh,
                 overlay.workspace_diagnostic_refresh,
@@ -553,6 +560,34 @@ mod tests {
             .unwrap();
         assert_eq!(publish.debounce_ms, Some(80));
         assert_eq!(publish.max_wait_ms, Some(400));
+    }
+
+    #[test]
+    fn log_message_feature_merge_preserves_unspecified_level() {
+        let base: RawWorkspaceSettings = toml::from_str(
+            r#"
+            [features."window/logMessage"]
+            logLevel = "warning"
+            "#,
+        )
+        .unwrap();
+        let overlay: RawWorkspaceSettings = toml::from_str(
+            r#"
+            [features."textDocument/publishDiagnostics"]
+            debounceMs = 80
+            "#,
+        )
+        .unwrap();
+        let merged = merge_workspace_settings(Some(base), Some(overlay)).unwrap();
+        assert_eq!(
+            merged
+                .features
+                .unwrap()
+                .window_log_message
+                .unwrap()
+                .log_level,
+            Some(crate::config::settings::LogMessageLevel::Warning)
+        );
     }
     use crate::config::QueryTypeMappings;
     use crate::config::settings;

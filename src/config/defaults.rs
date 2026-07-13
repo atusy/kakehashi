@@ -9,8 +9,8 @@ use super::settings::{
     CaptureMapping, CaptureMappings, DEFAULT_DEBOUNCE_MS, DEFAULT_PUBLISH_DIAGNOSTICS_DEBOUNCE_MS,
     DEFAULT_PUBLISH_DIAGNOSTICS_MAX_WAIT_MS, DEFAULT_WORKSPACE_DIAGNOSTIC_REFRESH_DEBOUNCE_MS,
     DEFAULT_WORKSPACE_DIAGNOSTIC_REFRESH_MAX_WAIT_MS, DebounceFeatureSettings, FeatureSettings,
-    LanguageSettings, LayerAggregationConfig, LayerSource, LayersConfig, QueryTypeMappings,
-    RawWorkspaceSettings, RootMarker,
+    LanguageSettings, LayerAggregationConfig, LayerSource, LayersConfig, LogMessageFeatureSettings,
+    LogMessageLevel, QueryTypeMappings, RawWorkspaceSettings, RootMarker,
 };
 use std::collections::HashMap;
 
@@ -28,6 +28,9 @@ pub fn default_settings() -> RawWorkspaceSettings {
             text_document_publish_diagnostics: Some(DebounceFeatureSettings {
                 debounce_ms: Some(DEFAULT_PUBLISH_DIAGNOSTICS_DEBOUNCE_MS),
                 max_wait_ms: Some(DEFAULT_PUBLISH_DIAGNOSTICS_MAX_WAIT_MS),
+            }),
+            window_log_message: Some(LogMessageFeatureSettings {
+                log_level: Some(LogMessageLevel::Info),
             }),
             workspace_diagnostic_refresh: Some(DebounceFeatureSettings {
                 debounce_ms: Some(DEFAULT_WORKSPACE_DIAGNOSTIC_REFRESH_DEBOUNCE_MS),
@@ -541,6 +544,12 @@ mod tests {
         assert!(toml.contains(
             "[features.textDocument/publishDiagnostics]\ndebounceMs = 100\nmaxWaitMs = 1000"
         ));
+    }
+
+    #[test]
+    fn default_settings_emit_log_message_feature_policy() {
+        let toml = toml::to_string_pretty(&default_settings()).unwrap();
+        assert!(toml.contains("[features.window/logMessage]\nlogLevel = \"info\""));
     }
 
     #[test]
