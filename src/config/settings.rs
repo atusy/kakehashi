@@ -845,6 +845,21 @@ mod tests {
         assert!(level.allows(tower_lsp_server::ls_types::MessageType::WARNING));
         assert!(!level.allows(tower_lsp_server::ls_types::MessageType::INFO));
         assert!(!level.allows(tower_lsp_server::ls_types::MessageType::LOG));
+
+        for value in ["error", "warning", "info", "log", "off"] {
+            let input = format!("[features.\"window/logMessage\"]\nlogLevel = \"{value}\"");
+            assert!(
+                toml::from_str::<BridgeServerConfig>(&input).is_ok(),
+                "{value} should parse"
+            );
+        }
+        assert!(
+            toml::from_str::<BridgeServerConfig>(
+                "[features.\"window/logMessage\"]\nlogLevel = \"debug\""
+            )
+            .is_err(),
+            "unknown levels must be rejected"
+        );
     }
     use crate::config::WILDCARD_KEY;
     use rstest::rstest;

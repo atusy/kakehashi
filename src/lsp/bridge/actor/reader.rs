@@ -1322,6 +1322,16 @@ mod tests {
             window_rx.try_recv(),
             Ok(UpstreamNotification::ShowMessage { .. })
         ));
+
+        deps.dynamic_capabilities
+            .store_forward_log_level(Some(ForwardLogLevel::Off));
+        for typ in 1..=4 {
+            handle_message(notification(typ), &router, "", &deps).await;
+        }
+        assert!(
+            window_rx.try_recv().is_err(),
+            "off should drop every window/logMessage severity"
+        );
     }
 
     #[tokio::test]
