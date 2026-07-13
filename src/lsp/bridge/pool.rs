@@ -1663,10 +1663,28 @@ impl LanguageServerPool {
 }
 
 impl LanguageServerPool {
+    pub(crate) fn begin_diagnostic_pull(&self, host_uri: &Url) -> (u64, u64) {
+        let _guard = self
+            .diagnostic_pull_lock
+            .lock()
+            .recover_poison("LanguageServerPool::diagnostic_pull_lock");
+        let host_generation = self
+            .diagnostic_host_generations
+            .get(host_uri.as_str())
+            .map(|entry| *entry)
+            .unwrap_or(0);
+        let request_sequence = self
+            .diagnostic_pull_request_sequence
+            .fetch_add(1, Ordering::Relaxed);
+        (host_generation, request_sequence)
+    }
+
     pub(crate) fn diagnostic_pull_snapshot(
         &self,
         key: &(ConnectionKey, String),
         host_uri: &str,
+        host_generation: u64,
+        request_sequence: u64,
     ) -> DiagnosticPullSnapshot {
         let _guard = self
             .diagnostic_pull_lock
@@ -1690,15 +1708,9 @@ impl LanguageServerPool {
                 .unwrap_or(0),
             document_generation,
             connection_generation: self.document_connection_generation(&key.0),
-            request_sequence: self
-                .diagnostic_pull_request_sequence
-                .fetch_add(1, Ordering::Relaxed),
+            request_sequence,
             host_uri: host_uri.to_string(),
-            host_generation: self
-                .diagnostic_host_generations
-                .get(host_uri)
-                .map(|entry| *entry)
-                .unwrap_or(0),
+            host_generation,
         }
     }
 

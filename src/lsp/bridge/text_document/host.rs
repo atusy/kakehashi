@@ -392,6 +392,7 @@ impl LanguageServerPool {
         upstream_request_id: Option<UpstreamId>,
     ) -> io::Result<Vec<Diagnostic>> {
         let method = "textDocument/diagnostic";
+        let (host_generation, request_sequence) = self.begin_diagnostic_pull(doc.uri);
         let handle = self
             .get_or_create_connection_wait_ready(
                 server_name,
@@ -407,7 +408,12 @@ impl LanguageServerPool {
             return Ok(Vec::new());
         }
         let cache_key = (handle.key().clone(), doc.uri.as_str().to_string());
-        let snapshot = self.diagnostic_pull_snapshot(&cache_key, doc.uri.as_str());
+        let snapshot = self.diagnostic_pull_snapshot(
+            &cache_key,
+            doc.uri.as_str(),
+            host_generation,
+            request_sequence,
+        );
         let previous_result_id = snapshot
             .baseline
             .as_ref()

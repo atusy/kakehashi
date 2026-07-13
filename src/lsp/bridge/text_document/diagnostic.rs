@@ -50,6 +50,7 @@ impl LanguageServerPool {
         virtual_content: &str,
         upstream_request_id: Option<UpstreamId>,
     ) -> io::Result<Vec<Diagnostic>> {
+        let (host_generation, request_sequence) = self.begin_diagnostic_pull(host_uri);
         // Pre-work: wait for server to become Ready (unlike other handlers that fail fast).
         let handle = self
             .get_or_create_connection_wait_ready(
@@ -78,7 +79,12 @@ impl LanguageServerPool {
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?;
         let virtual_uri = VirtualDocumentUri::new(&host_uri_lsp, injection_language, region_id);
         let cache_key = (handle.key().clone(), virtual_uri.to_uri_string());
-        let snapshot = self.diagnostic_pull_snapshot(&cache_key, host_uri.as_str());
+        let snapshot = self.diagnostic_pull_snapshot(
+            &cache_key,
+            host_uri.as_str(),
+            host_generation,
+            request_sequence,
+        );
         let previous_result_id = snapshot
             .baseline
             .as_ref()
@@ -417,13 +423,22 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    fn test_snapshot(
+        pool: &LanguageServerPool,
+        key: &(super::super::super::pool::ConnectionKey, String),
+    ) -> super::super::super::pool::DiagnosticPullSnapshot {
+        let host = Url::parse("file:///host.md").unwrap();
+        let (host_generation, request_sequence) = pool.begin_diagnostic_pull(&host);
+        pool.diagnostic_pull_snapshot(key, host.as_str(), host_generation, request_sequence)
+    }
+
     fn resolve_current(
         pool: &LanguageServerPool,
         key: &(super::super::super::pool::ConnectionKey, String),
         baseline: Option<super::super::super::pool::DiagnosticPullBaseline>,
         report: DownstreamDiagnosticReport,
     ) -> Vec<Diagnostic> {
-        let mut snapshot = pool.diagnostic_pull_snapshot(key, "file:///host.md");
+        let mut snapshot = test_snapshot(pool, key);
         snapshot.baseline = baseline;
         pool.resolve_diagnostic_pull_report(key, snapshot, report, true)
     }
@@ -562,8 +577,8 @@ mod tests {
             );
             pool.diagnostic_pull_applied_sequences
                 .insert(key.clone(), 0);
-            let older = pool.diagnostic_pull_snapshot(&key, "file:///host.md");
-            let newer = pool.diagnostic_pull_snapshot(&key, "file:///host.md");
+            let older = test_snapshot(&pool, &key);
+            let newer = test_snapshot(&pool, &key);
             let resolve = |snapshot, result_id: &str| {
                 pool.resolve_diagnostic_pull_report(
                     &key,
@@ -631,7 +646,7 @@ mod tests {
             super::super::super::pool::ConnectionKey::for_server("lua_ls"),
             "kakehashi-virtual://region-1".to_string(),
         );
-        let snapshot = pool.diagnostic_pull_snapshot(&key, "file:///host.md");
+        let snapshot = test_snapshot(&pool, &key);
         pool.invalidate_diagnostic_document(&key);
 
         pool.resolve_diagnostic_pull_report(
@@ -655,11 +670,14 @@ mod tests {
             super::super::super::pool::ConnectionKey::for_server("lua_ls"),
             "kakehashi-virtual://region-1".to_string(),
         );
-        let snapshot = pool.diagnostic_pull_snapshot(&key, host.as_str());
-
-        // No downstream document/baseline exists yet: this models close
-        // landing between the first pull's snapshot and its didOpen.
+        let (host_generation, request_sequence) = pool.begin_diagnostic_pull(&host);
+        // Close lands while the first pull awaits connection readiness, before
+        // it can create a downstream cache key/snapshot.
         pool.invalidate_diagnostic_host(&host);
+        let snapshot =
+            pool.diagnostic_pull_snapshot(&key, host.as_str(), host_generation, request_sequence);
+
+        // No downstream document/baseline existed when close ran.
         pool.resolve_diagnostic_pull_report(
             &key,
             snapshot,
@@ -691,7 +709,7 @@ mod tests {
                 request_sequence: 1,
             },
         );
-        let snapshot = pool.diagnostic_pull_snapshot(&key, "file:///host.md");
+        let snapshot = test_snapshot(&pool, &key);
 
         pool.invalidate_diagnostic_connections(std::slice::from_ref(&key.0));
         let diagnostics = pool.resolve_diagnostic_pull_report(
@@ -728,7 +746,7 @@ mod tests {
         );
         pool.diagnostic_pull_applied_sequences
             .insert(key.clone(), 0);
-        let snapshot = pool.diagnostic_pull_snapshot(&key, "file:///host.md");
+        let snapshot = test_snapshot(&pool, &key);
 
         pool.invalidate_diagnostic_connections(std::slice::from_ref(&affected));
         let diagnostics = pool.resolve_diagnostic_pull_report(
