@@ -829,7 +829,7 @@ fn main() {
                     "diagnostics-refresh-prefetch" | "diagnostics-refresh-prefetch-disabled"
                 ) {
                     diagnostic_generation += 1;
-                    std::thread::sleep(std::time::Duration::from_millis(300));
+                    std::thread::sleep(std::time::Duration::from_millis(1000));
                 }
                 if mode == "diagnostics-fail" {
                     // Healthy handshake (advertises diagnosticProvider), broken

@@ -977,7 +977,7 @@ fn e2e_downstream_refresh_skips_pull_fallback_disabled_contexts() {
     open_host(&mut client);
 
     let (refresh_id, _) = client
-        .wait_for_server_request("workspace/diagnostic/refresh", Duration::from_millis(250))
+        .wait_for_server_request("workspace/diagnostic/refresh", Duration::from_millis(600))
         .expect("pullFallback=false must not delay the editor refresh with a downstream pull");
     client.send_response(refresh_id, json!(null));
     assert!(
