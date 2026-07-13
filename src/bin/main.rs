@@ -509,10 +509,10 @@ fn run_language_uninstall(
         if let Ok(entries) = fs::read_dir(&parser_dir) {
             for entry in entries.flatten() {
                 let path = entry.path();
-                let is_parser = path
-                    .extension()
-                    .map(|ext| ext == std::env::consts::DLL_EXTENSION)
-                    .unwrap_or(false);
+                let is_parser = path.is_file()
+                    && path
+                        .extension()
+                        .is_some_and(|ext| ext == std::env::consts::DLL_EXTENSION);
                 if is_parser && let Some(stem) = path.file_stem() {
                     languages.insert(stem.to_string_lossy().to_string());
                 }

@@ -1246,6 +1246,45 @@ fn test_language_uninstall_all() {
     assert!(queries.is_empty(), "All queries should be removed");
 }
 
+/// Bulk uninstall discovery must ignore parser-shaped directories instead of
+/// treating them as installed languages that subsequently cannot be removed.
+#[test]
+fn test_language_uninstall_all_ignores_parser_shaped_directories() {
+    use std::fs;
+
+    let test_dir = tempfile::tempdir().expect("Failed to create temp dir");
+    let ext = std::env::consts::DLL_EXTENSION;
+    let parser_dir = test_dir.path().join(format!("parser/fakeparser.{ext}"));
+    fs::create_dir_all(&parser_dir).expect("Failed to create parser-shaped directory");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_kakehashi"))
+        .args([
+            "language",
+            "uninstall",
+            "--all",
+            "--force",
+            "--data-dir",
+            test_dir.path().to_str().unwrap(),
+        ])
+        .output()
+        .expect("Failed to execute command");
+
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.status.success(), "uninstall failed: {combined}");
+    assert!(
+        combined.contains("No languages installed to uninstall"),
+        "parser-shaped directories must not enter uninstall discovery: {combined}"
+    );
+    assert!(
+        parser_dir.is_dir(),
+        "unrelated directory must remain intact"
+    );
+}
+
 /// Test that language uninstall --all ignores internal query staging directories
 #[test]
 fn test_language_uninstall_all_ignores_internal_query_dirs() {
