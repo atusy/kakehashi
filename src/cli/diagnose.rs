@@ -189,8 +189,9 @@ impl Report {
         // position, then tie-break by severity, source, code, and message so
         // two findings at the same spot always print in the same order.
         diagnostics.sort_by(|a, b| sort_key(a).cmp(&sort_key(b)));
+        let display = prepare_display(format, display);
         for diagnostic in &diagnostics {
-            out.push_str(&format_diagnostic(format, display, diagnostic));
+            out.push_str(&format_diagnostic_prepared(format, &display, diagnostic));
             out.push('\n');
             self.tally(diagnostic, fail_on_warning);
         }
@@ -421,9 +422,20 @@ fn format_server_failure(display: &str, failure: &str) -> String {
     format!("error: {display}: {failure}")
 }
 
-/// Render one diagnostic in the requested format. `display` is the
-/// already-formatted (cwd-relative or stdin) path.
-fn format_diagnostic(format: OutputFormat, display: &str, diagnostic: &Diagnostic) -> String {
+fn prepare_display(format: OutputFormat, display: &str) -> std::borrow::Cow<'_, str> {
+    match format {
+        OutputFormat::Default => escape_terminal_controls(display),
+        OutputFormat::Jsonl => std::borrow::Cow::Borrowed(display),
+    }
+}
+
+/// Render one diagnostic in the requested format. `display` has already been
+/// prepared for the selected format so callers can reuse it across a file.
+fn format_diagnostic_prepared(
+    format: OutputFormat,
+    display: &str,
+    diagnostic: &Diagnostic,
+) -> String {
     // LSP positions are 0-based; editors and quickfix consumers expect 1-based
     // line and column. `character` is a UTF-16 offset — presenting it as a
     // column is the same approximation grep/ripgrep make.
@@ -431,7 +443,6 @@ fn format_diagnostic(format: OutputFormat, display: &str, diagnostic: &Diagnosti
     let col = diagnostic.range.start.character.saturating_add(1);
     match format {
         OutputFormat::Default => {
-            let display = escape_terminal_controls(display);
             let severity = severity_word(diagnostic.severity);
             let message = one_line(&diagnostic.message);
             // Branch on the source rather than building a separate ` [src]`
@@ -467,6 +478,12 @@ fn format_diagnostic(format: OutputFormat, display: &str, diagnostic: &Diagnosti
             escape_jsonl_terminal_controls(value.to_string())
         }
     }
+}
+
+#[cfg(test)]
+fn format_diagnostic(format: OutputFormat, display: &str, diagnostic: &Diagnostic) -> String {
+    let display = prepare_display(format, display);
+    format_diagnostic_prepared(format, &display, diagnostic)
 }
 
 /// Make an untrusted diagnostic field safe for the line-oriented `default`
