@@ -100,7 +100,7 @@ async fn wait_for_forwarded_refresh_settle(
     aggregator: &DiagnosticAggregator,
     mut snapshot: crate::lsp::diagnostic_cache::ForwardedRefreshWaitSnapshot,
     deadline: tokio::time::Instant,
-) -> bool {
+) -> crate::lsp::diagnostic_cache::ForwardedRefreshWait {
     loop {
         tokio::time::sleep_until(
             (snapshot.last_activity_at + FORWARDED_REFRESH_SETTLE_WINDOW).min(deadline),
@@ -111,8 +111,7 @@ async fn wait_for_forwarded_refresh_settle(
             crate::lsp::diagnostic_cache::ForwardedRefreshWait::Restart(latest) => {
                 snapshot = latest;
             }
-            crate::lsp::diagnostic_cache::ForwardedRefreshWait::SendTrailing => return true,
-            crate::lsp::diagnostic_cache::ForwardedRefreshWait::Settled => return false,
+            decision => return decision,
         }
     }
 }
@@ -164,26 +163,50 @@ impl DiagnosticPublisher {
         let Some(snapshot) = self.aggregator.begin_forwarded_refresh_debounce() else {
             return;
         };
-        let deadline = snapshot.last_activity_at + FORWARDED_REFRESH_MAX_WAIT;
         self.request_pull_diagnostic_refresh_inner(true, false);
         let publisher = self.clone();
         tokio::spawn(async move {
-            tokio::select! {
-                biased;
-                _ = publisher.shutdown.cancelled() => {
-                    publisher
-                        .aggregator
-                        .finish_forwarded_refresh_wait(snapshot.generation, true);
-                }
-                should_send = wait_for_forwarded_refresh_settle(
-                    &publisher.aggregator,
-                    snapshot,
-                    deadline,
-                ) => {
-                    // Cancellation can race immediately after `select!` chose the
-                    // timer branch, so re-check at the refresh admission boundary.
-                    if should_send && !publisher.shutdown.is_cancelled() {
-                        publisher.request_pull_diagnostic_refresh_inner(true, false);
+            let mut snapshot = snapshot;
+            let mut deadline = snapshot.last_activity_at + FORWARDED_REFRESH_MAX_WAIT;
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = publisher.shutdown.cancelled() => {
+                        publisher.aggregator.cancel_forwarded_refresh_debounce();
+                        break;
+                    }
+                    decision = wait_for_forwarded_refresh_settle(
+                        &publisher.aggregator,
+                        snapshot,
+                        deadline,
+                    ) => {
+                        // Cancellation can race immediately after `select!` chose the
+                        // timer branch, so re-check at the refresh admission boundary.
+                        if publisher.shutdown.is_cancelled() {
+                            publisher.aggregator.cancel_forwarded_refresh_debounce();
+                            break;
+                        }
+                        match decision {
+                            crate::lsp::diagnostic_cache::ForwardedRefreshWait::SendTrailing => {
+                                publisher.request_pull_diagnostic_refresh_inner(true, false);
+                                break;
+                            }
+                            crate::lsp::diagnostic_cache::ForwardedRefreshWait::Settled => break,
+                            crate::lsp::diagnostic_cache::ForwardedRefreshWait::MaxWait {
+                                snapshot: latest,
+                                send_trailing,
+                            } => {
+                                if send_trailing {
+                                    publisher.request_pull_diagnostic_refresh_inner(true, false);
+                                }
+                                snapshot = latest;
+                                deadline = tokio::time::Instant::now()
+                                    + FORWARDED_REFRESH_MAX_WAIT;
+                            }
+                            crate::lsp::diagnostic_cache::ForwardedRefreshWait::Restart(_) => {
+                                unreachable!("the settle waiter consumes restart decisions")
+                            }
+                        }
                     }
                 }
             }
@@ -1710,9 +1733,16 @@ mod tests {
         // implementation would remain parked until 1090 ms. The anchored
         // one-second deadline must release it after just 10 ms.
         tokio::time::advance(std::time::Duration::from_millis(10)).await;
-        assert!(
+        assert!(matches!(
             waiter.await.expect("debounce task completes at max wait"),
-            "continuous activity without another send needs a trailing refresh"
+            crate::lsp::diagnostic_cache::ForwardedRefreshWait::MaxWait {
+                send_trailing: true,
+                ..
+            }
+        ));
+        assert!(
+            aggregator.begin_forwarded_refresh_debounce().is_none(),
+            "a max-wait fire must keep the cycle active until activity becomes quiet"
         );
     }
 
