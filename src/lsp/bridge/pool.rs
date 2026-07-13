@@ -52,6 +52,7 @@ fn same_launch_config(
         workspace_markers: old_workspace_markers,
         on_type_formatting_triggers: old_on_type_formatting_triggers,
         prefer_shared_instance: _,
+        features: _,
         enabled: _,
     } = old;
     let BridgeServerConfig {
@@ -62,6 +63,7 @@ fn same_launch_config(
         workspace_markers: new_workspace_markers,
         on_type_formatting_triggers: new_on_type_formatting_triggers,
         prefer_shared_instance: _,
+        features: _,
         enabled: _,
     } = new;
     old_cmd == new_cmd
@@ -3463,6 +3465,7 @@ mod tests {
             workspace_markers: None,
             on_type_formatting_triggers: None,
             prefer_shared_instance: None,
+            features: Default::default(),
             enabled: None,
             settings: None,
         };
@@ -6666,6 +6669,7 @@ mod tests {
         let inherited = crate::config::settings::BridgeServerConfig::default();
         let explicit = crate::config::settings::BridgeServerConfig {
             prefer_shared_instance: Some(false),
+            features: Default::default(),
             enabled: Some(true),
             ..Default::default()
         };

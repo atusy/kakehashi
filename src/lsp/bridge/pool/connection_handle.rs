@@ -227,6 +227,7 @@ impl ConnectionHandle {
             workspace_markers: config.workspace_markers.clone(),
             on_type_formatting_triggers: config.on_type_formatting_triggers.clone(),
             prefer_shared_instance: config.prefer_shared_instance,
+            features: Default::default(),
             enabled: config.enabled,
         };
         let _ = self.launch_config.set(snapshot);

@@ -439,6 +439,7 @@ mod tests {
             workspace_markers: None,
             on_type_formatting_triggers: None,
             prefer_shared_instance: None,
+            features: Default::default(),
             enabled: None,
             settings: None,
         };
@@ -477,6 +478,7 @@ mod tests {
             prefer_shared_instance: None,
             enabled,
             settings: None,
+            features: Default::default(),
         };
 
         // Directly disabled: not a willSave consumer even with a real cmd.

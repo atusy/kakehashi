@@ -348,6 +348,35 @@ impl RootMarker {
     }
 }
 
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum ForwardLogLevel {
+    Error,
+    Warning,
+    Info,
+    Log,
+    Off,
+}
+
+impl ForwardLogLevel {
+    pub(crate) fn allows(self, message_type: tower_lsp_server::ls_types::MessageType) -> bool {
+        use tower_lsp_server::ls_types::MessageType;
+        match self {
+            Self::Error => message_type == MessageType::ERROR,
+            Self::Warning => matches!(message_type, MessageType::ERROR | MessageType::WARNING),
+            Self::Info => message_type != MessageType::LOG,
+            Self::Log => true,
+            Self::Off => false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct MethodForwardingConfig {
+    pub log_level: Option<ForwardLogLevel>,
+}
+
 /// Configuration for a bridge language server.
 ///
 /// This is used to configure external language servers (like rust-analyzer, pyright)
@@ -382,6 +411,8 @@ pub struct BridgeServerConfig {
     /// kakehashi (passthrough), exactly like `initialization_options`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub settings: Option<Value>,
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub features: HashMap<String, MethodForwardingConfig>,
     /// Marker files/directories that locate the workspace root for this
     /// server, mirroring Neovim's `vim.fs.root` `(string|string[])[]` shape:
     /// entries are tried in list order (earlier = higher priority) and each
@@ -798,6 +829,23 @@ pub const DEFAULT_DEBOUNCE_MS: u64 = 500;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn forwarding_log_level_parses_and_filters_by_severity() {
+        let config: BridgeServerConfig = toml::from_str(
+            r#"
+            [features."window/logMessage"]
+            logLevel = "warning"
+            "#,
+        )
+        .unwrap();
+        let level = config.features["window/logMessage"].log_level.unwrap();
+
+        assert!(level.allows(tower_lsp_server::ls_types::MessageType::ERROR));
+        assert!(level.allows(tower_lsp_server::ls_types::MessageType::WARNING));
+        assert!(!level.allows(tower_lsp_server::ls_types::MessageType::INFO));
+        assert!(!level.allows(tower_lsp_server::ls_types::MessageType::LOG));
+    }
     use crate::config::WILDCARD_KEY;
     use rstest::rstest;
 
@@ -1453,6 +1501,7 @@ mod tests {
             prefer_shared_instance: None,
             enabled,
             settings: None,
+            features: Default::default(),
         };
 
         // Own cmd and enabled, no wildcard needed.
@@ -1569,6 +1618,7 @@ mod tests {
             on_type_formatting_triggers: triggers
                 .map(|t| t.into_iter().map(String::from).collect()),
             prefer_shared_instance: None,
+            features: Default::default(),
             enabled: None,
             settings: None,
         };
@@ -1610,6 +1660,7 @@ mod tests {
             prefer_shared_instance: None,
             enabled,
             settings: None,
+            features: Default::default(),
         };
 
         // A disabled server's own trigger never spawns anything, so it must
@@ -1628,6 +1679,7 @@ mod tests {
             (
                 "_".to_string(),
                 BridgeServerConfig {
+                    features: Default::default(),
                     enabled: Some(false),
                     ..server(None, None)
                 },
@@ -1648,6 +1700,7 @@ mod tests {
         let wildcard_only = HashMap::from([(
             "_".to_string(),
             BridgeServerConfig {
+                features: Default::default(),
                 enabled: Some(true),
                 ..server(Some(vec!["}"]), None)
             },
@@ -1665,6 +1718,7 @@ mod tests {
             (
                 "_".to_string(),
                 BridgeServerConfig {
+                    features: Default::default(),
                     enabled: Some(false),
                     ..server(Some(vec!["}"]), None)
                 },
@@ -1692,6 +1746,7 @@ mod tests {
                 workspace_markers: None,
                 on_type_formatting_triggers: Some(vec![";".to_string()]),
                 prefer_shared_instance: None,
+                features: Default::default(),
                 enabled: None,
                 settings: None,
             },
@@ -1715,6 +1770,7 @@ mod tests {
                 workspace_markers: None,
                 on_type_formatting_triggers: Some(vec![String::new()]),
                 prefer_shared_instance: None,
+                features: Default::default(),
                 enabled: None,
                 settings: None,
             },
@@ -1893,6 +1949,7 @@ mod tests {
             ]),
             on_type_formatting_triggers: None,
             prefer_shared_instance: None,
+            features: Default::default(),
             enabled: None,
             settings: None,
         };

@@ -29,6 +29,7 @@ const KNOWN_BRIDGE_LANGUAGE_SETTING_KEYS: &[&str] = &["aggregation", "enabled"];
 const KNOWN_BRIDGE_SERVER_SETTING_KEYS: &[&str] = &[
     "cmd",
     "enabled",
+    "features",
     "initializationOptions",
     "languages",
     "onTypeFormattingTriggers",
@@ -39,6 +40,8 @@ const KNOWN_BRIDGE_SERVER_SETTING_KEYS: &[&str] = &[
 ];
 
 const KNOWN_CAPTURE_MAPPINGS_SETTING_KEYS: &[&str] = &["folds", "highlights"];
+
+const KNOWN_METHOD_FORWARDING_SETTING_KEYS: &[&str] = &["logLevel"];
 
 const KNOWN_LANGUAGE_SETTING_KEYS: &[&str] =
     &["aliases", "base", "bridge", "layers", "parser", "queries"];
@@ -202,6 +205,16 @@ fn append_unknown_bridge_server_setting_keys(
             server,
             KNOWN_BRIDGE_SERVER_SETTING_KEYS,
         ));
+        let Some(features) = server.get("features").and_then(Value::as_object) else {
+            continue;
+        };
+        for (method, config) in features {
+            unknown_keys.extend(unknown_object_keys(
+                &format!("languageServers.{server_name}.features.{method}"),
+                config,
+                KNOWN_METHOD_FORWARDING_SETTING_KEYS,
+            ));
+        }
     }
 }
 

@@ -1070,6 +1070,7 @@ mod tests {
                 workspace_markers: None,
                 on_type_formatting_triggers: None,
                 prefer_shared_instance: None,
+                features: Default::default(),
                 enabled: None,
                 settings: None,
             },
@@ -1176,6 +1177,7 @@ mod tests {
             "sql_ls".to_string(),
             BridgeServerConfig {
                 cmd: vec!["sql-ls".to_string()],
+                features: Default::default(),
                 enabled: Some(false),
                 ..Default::default()
             },

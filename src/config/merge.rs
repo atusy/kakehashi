@@ -134,6 +134,18 @@ pub(crate) fn merge_bridge_server_configs(
         // Overlay-wins-when-present, mirroring `prefer_shared_instance`: a
         // concrete server's explicit `enabled` overrides the wildcard, so
         // `_.enabled: false` can be opted back into per server.
+        features: {
+            let mut features = base.features.clone();
+            for (method, overlay_config) in &overlay.features {
+                features
+                    .entry(method.clone())
+                    .and_modify(|base_config| {
+                        base_config.log_level = overlay_config.log_level.or(base_config.log_level);
+                    })
+                    .or_insert_with(|| overlay_config.clone());
+            }
+            features
+        },
         enabled: overlay.enabled.or(base.enabled),
     }
 }
@@ -557,6 +569,7 @@ mod tests {
                         workspace_markers: None,
                         on_type_formatting_triggers: None,
                         prefer_shared_instance: None,
+                        features: Default::default(),
                         enabled: None,
                         settings: None,
                     },
@@ -570,6 +583,7 @@ mod tests {
                         workspace_markers: None,
                         on_type_formatting_triggers: None,
                         prefer_shared_instance: None,
+                        features: Default::default(),
                         enabled: None,
                         settings: None,
                     },
@@ -639,6 +653,7 @@ mod tests {
                         workspace_markers: None,
                         on_type_formatting_triggers: None,
                         prefer_shared_instance: None,
+                        features: Default::default(),
                         enabled: None,
                         settings: None,
                     },
@@ -653,6 +668,7 @@ mod tests {
                         workspace_markers: None,
                         on_type_formatting_triggers: None,
                         prefer_shared_instance: None,
+                        features: Default::default(),
                         enabled: None,
                         settings: None,
                     },
@@ -718,6 +734,7 @@ mod tests {
                     workspace_markers: None,
                     on_type_formatting_triggers: None,
                     prefer_shared_instance: None,
+                    features: Default::default(),
                     enabled: None,
                     settings: None,
                 },
@@ -1109,6 +1126,7 @@ mod tests {
                 workspace_markers: None,
                 on_type_formatting_triggers: None,
                 prefer_shared_instance: None,
+                features: Default::default(),
                 enabled: None,
                 settings: None,
             },
@@ -1127,6 +1145,7 @@ mod tests {
                 workspace_markers: None,
                 on_type_formatting_triggers: None,
                 prefer_shared_instance: None,
+                features: Default::default(),
                 enabled: None,
                 settings: None,
             },
@@ -1146,6 +1165,7 @@ mod tests {
                     workspace_markers: None,
                     on_type_formatting_triggers: None,
                     prefer_shared_instance: None,
+                    features: Default::default(),
                     enabled: None,
                     settings: None,
                 },
@@ -1159,6 +1179,7 @@ mod tests {
                     workspace_markers: None,
                     on_type_formatting_triggers: None,
                     prefer_shared_instance: None,
+                    features: Default::default(),
                     enabled: None,
                     settings: None,
                 },
@@ -1190,6 +1211,7 @@ mod tests {
             workspace_markers: Some(vec![RootMarker::Single(".git".to_string())]),
             on_type_formatting_triggers: None,
             prefer_shared_instance: None,
+            features: Default::default(),
             enabled: None,
             settings: None,
         };
@@ -1202,6 +1224,7 @@ mod tests {
             workspace_markers: None,
             on_type_formatting_triggers: None,
             prefer_shared_instance: None,
+            features: Default::default(),
             enabled: None,
             settings: None,
         };
@@ -1248,6 +1271,7 @@ mod tests {
             on_type_formatting_triggers: None,
             prefer_shared_instance: prefer,
             settings: None,
+            features: Default::default(),
             enabled: None,
         };
 
@@ -1290,6 +1314,7 @@ mod tests {
             on_type_formatting_triggers: None,
             prefer_shared_instance: None,
             settings: None,
+            features: Default::default(),
             enabled,
         };
 
@@ -1316,6 +1341,43 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_merge_bridge_server_configs_features_by_method_and_field() {
+        use settings::{BridgeServerConfig, ForwardLogLevel, MethodForwardingConfig};
+
+        let base = BridgeServerConfig {
+            features: HashMap::from([
+                (
+                    "window/logMessage".to_string(),
+                    MethodForwardingConfig {
+                        log_level: Some(ForwardLogLevel::Warning),
+                    },
+                ),
+                (
+                    "other/method".to_string(),
+                    MethodForwardingConfig::default(),
+                ),
+            ]),
+            ..Default::default()
+        };
+        let overlay = BridgeServerConfig {
+            features: HashMap::from([(
+                "window/logMessage".to_string(),
+                MethodForwardingConfig {
+                    log_level: Some(ForwardLogLevel::Info),
+                },
+            )]),
+            ..Default::default()
+        };
+
+        let merged = merge_bridge_server_configs(&base, &overlay);
+        assert_eq!(
+            merged.features["window/logMessage"].log_level,
+            Some(ForwardLogLevel::Info)
+        );
+        assert!(merged.features.contains_key("other/method"));
+    }
+
     // Deep merge for initialization_options (configuration-merging-strategy)
 
     /// configuration-merging-strategy: initialization_options deep merge covers three behaviors:
@@ -1338,6 +1400,7 @@ mod tests {
             workspace_markers: None,
             on_type_formatting_triggers: None,
             prefer_shared_instance: None,
+            features: Default::default(),
             enabled: None,
             settings: None,
         };
@@ -1352,6 +1415,7 @@ mod tests {
             workspace_markers: None,
             on_type_formatting_triggers: None,
             prefer_shared_instance: None,
+            features: Default::default(),
             enabled: None,
             settings: None,
         };
@@ -1442,6 +1506,7 @@ mod tests {
             on_type_formatting_triggers: triggers
                 .map(|t| t.into_iter().map(String::from).collect()),
             prefer_shared_instance: None,
+            features: Default::default(),
             enabled: None,
             settings: None,
         };
@@ -1595,6 +1660,7 @@ mod tests {
                     workspace_markers: None,
                     on_type_formatting_triggers: None,
                     prefer_shared_instance: None,
+                    features: Default::default(),
                     enabled: None,
                     settings: None,
                 },
@@ -1609,6 +1675,7 @@ mod tests {
                     workspace_markers: None,
                     on_type_formatting_triggers: None,
                     prefer_shared_instance: None,
+                    features: Default::default(),
                     enabled: None,
                     settings: None,
                 },
@@ -1650,6 +1717,7 @@ mod tests {
                     workspace_markers: None,
                     on_type_formatting_triggers: None,
                     prefer_shared_instance: None,
+                    features: Default::default(),
                     enabled: None,
                     settings: None,
                 },
@@ -1664,6 +1732,7 @@ mod tests {
                     workspace_markers: None,
                     on_type_formatting_triggers: None,
                     prefer_shared_instance: None,
+                    features: Default::default(),
                     enabled: None,
                     settings: None,
                 },
@@ -1867,6 +1936,7 @@ mod tests {
             prefer_shared_instance: None,
             enabled,
             settings: None,
+            features: Default::default(),
         };
 
         let full_resolution = |servers: &HashMap<String, settings::BridgeServerConfig>,
