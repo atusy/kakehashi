@@ -757,14 +757,19 @@ fn write_uninstall_tombstone(
     queries_parent: &Path,
     language: &str,
 ) -> Result<(), QueryInstallError> {
-    write_uninstall_tombstone_with_before_publish(queries_parent, language, |_, _| {}, |_| Ok(()))
+    write_uninstall_tombstone_with_before_publish(
+        queries_parent,
+        language,
+        |_, _| {},
+        sync_tombstone_parent,
+    )
 }
 
 fn write_uninstall_tombstone_with_before_publish(
     queries_parent: &Path,
     language: &str,
     before_publish: impl FnOnce(&Path, &Path),
-    _sync_parent: impl FnOnce(&Path) -> std::io::Result<()>,
+    sync_parent: impl FnOnce(&Path) -> std::io::Result<()>,
 ) -> Result<(), QueryInstallError> {
     validate_safe_language_name(language)?;
     let path = uninstall_tombstone_path(queries_parent, language);
@@ -805,6 +810,20 @@ fn write_uninstall_tombstone_with_before_publish(
     #[cfg(windows)]
     let published = publish_staged_tombstone(staged, &path, windows_publish)?;
     verify_published_tombstone(published, &path)?;
+    sync_parent(queries_parent)?;
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn sync_tombstone_parent(queries_parent: &Path) -> std::io::Result<()> {
+    fs::File::open(queries_parent)?.sync_all()
+}
+
+#[cfg(windows)]
+fn sync_tombstone_parent(_queries_parent: &Path) -> std::io::Result<()> {
+    // The stage handle carries FILE_FLAG_WRITE_THROUGH before FileRenameInfo
+    // publication. Microsoft documents that metadata changes, including a
+    // rename, issued through such a handle are flushed before return.
     Ok(())
 }
 
@@ -832,8 +851,8 @@ fn prepare_windows_tombstone_publish(
     use std::os::windows::io::{AsRawHandle as _, FromRawHandle as _};
     use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
     use windows_sys::Win32::Storage::FileSystem::{
-        DELETE, FILE_FLAG_BACKUP_SEMANTICS, FILE_GENERIC_READ, FILE_GENERIC_WRITE,
-        FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, ReOpenFile,
+        DELETE, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_WRITE_THROUGH, FILE_GENERIC_READ,
+        FILE_GENERIC_WRITE, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, ReOpenFile,
     };
 
     let directory = fs::OpenOptions::new()
@@ -849,7 +868,7 @@ fn prepare_windows_tombstone_publish(
             staged.as_raw_handle(),
             FILE_GENERIC_READ | FILE_GENERIC_WRITE | DELETE,
             FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-            0,
+            FILE_FLAG_WRITE_THROUGH,
         )
     };
     if handle == INVALID_HANDLE_VALUE {
@@ -1720,6 +1739,30 @@ mod tests {
             names,
             vec![tombstone.file_name().unwrap().to_os_string()],
             "the private stage must be removed on every persist failure"
+        );
+    }
+
+    #[test]
+    fn tombstone_publish_propagates_parent_sync_failure() {
+        let temp = TempDir::new().unwrap();
+        let queries_parent = temp.path().join("queries");
+        fs::create_dir_all(&queries_parent).unwrap();
+        let sync_called = std::cell::Cell::new(false);
+
+        let result = write_uninstall_tombstone_with_before_publish(
+            &queries_parent,
+            "rust",
+            |_, _| {},
+            |_| {
+                sync_called.set(true);
+                Err(std::io::Error::other("injected parent sync failure"))
+            },
+        );
+
+        assert!(sync_called.get(), "publication must cross the sync gate");
+        assert!(
+            matches!(result, Err(QueryInstallError::IoError(_))),
+            "sync failure must prevent uninstall from reaching removal"
         );
     }
 
