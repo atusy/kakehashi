@@ -406,16 +406,11 @@ impl LanguageServerPool {
             return Ok(Vec::new());
         }
         let cache_key = (handle.key().clone(), doc.uri.as_str().to_string());
-        let connection_generation = self.document_connection_generation(handle.key());
-        let document_generation = self.diagnostic_document_generation(&cache_key);
-        let settings_generation = self
-            .diagnostic_pull_generation
-            .load(std::sync::atomic::Ordering::Acquire);
-        let baseline = self
-            .diagnostic_pull_baselines
-            .get(&cache_key)
-            .map(|entry| entry.value().clone());
-        let previous_result_id = baseline.as_ref().map(|entry| entry.result_id.clone());
+        let snapshot = self.diagnostic_pull_snapshot(&cache_key);
+        let previous_result_id = snapshot
+            .baseline
+            .as_ref()
+            .map(|entry| entry.result_id.clone());
         if let Some(result_id) = &previous_result_id {
             params["previousResultId"] = serde_json::Value::String(result_id.clone());
         }
@@ -440,14 +435,7 @@ impl LanguageServerPool {
             .host_documents()
             .await
             .contains_key(&(cache_key.1.clone(), cache_key.0.clone()));
-        let lineage_is_current = document_is_open
-            && connection_generation == self.document_connection_generation(&cache_key.0)
-            && settings_generation
-                == self
-                    .diagnostic_pull_generation
-                    .load(std::sync::atomic::Ordering::Acquire)
-            && document_generation == self.diagnostic_document_generation(&cache_key);
-        Ok(self.resolve_diagnostic_pull_report(&cache_key, baseline, report, lineage_is_current))
+        Ok(self.resolve_diagnostic_pull_report(&cache_key, snapshot, report, document_is_open))
     }
 
     /// Drive a host bridge request end-to-end: register for cancel
