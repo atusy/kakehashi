@@ -677,7 +677,7 @@ impl DiagnosticPublisher {
         Some(host)
     }
 
-    /// Feed the host-event pull's combined result into the cache and republish.
+    /// Feed a proactive pull's combined result into the cache and republish.
     ///
     /// The pull blob is already host-local; it replaces the
     /// [`DiagnosticSource::PullLayer`] slot, then the merge folds in region push

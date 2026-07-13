@@ -1,10 +1,9 @@
-//! Shared fan-out/aggregation for the host-event diagnostic pull
-//! (push-propagation-diagnostic-forwarding): on `didOpen`/`didSave`/`didChange`,
-//! `DiagnosticScheduler` pulls every layer's diagnostics from a prepared snapshot
-//! and the result is fed into the cache as the `PullLayer` blob, then republished.
-//! `DiagnosticScheduler` handles superseding (via `SyntheticDiagnosticsManager` /
-//! `DebouncedDiagnosticsManager`); this module just collects the per-layer
-//! diagnostics.
+//! Shared fan-out/aggregation for proactive diagnostic pulls. Host events
+//! (`didOpen`/`didSave`/`didChange`) and downstream refresh prefetch both pull
+//! every eligible layer from a prepared snapshot and feed the result into the
+//! cached `PullLayer`. Host-event callers treat request failures as log-only;
+//! refresh prefetch supplies an error sink so it can preserve the last good
+//! layer. Scheduling, supersession, and cache commit policy stay with callers.
 
 use std::sync::Arc;
 
@@ -63,7 +62,7 @@ impl DiagnosticSnapshot {
     }
 }
 
-/// What the host-event pull collection wants done to the host's `PullLayer`
+/// What a proactive pull collection wants done to the host's `PullLayer`
 /// slot (push-propagation-diagnostic-forwarding). The three states are
 /// distinct: `Skip` ≠ `Clear` (do nothing vs evict).
 pub(crate) enum PullLayerOutcome {

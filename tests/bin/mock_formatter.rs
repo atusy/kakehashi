@@ -218,6 +218,7 @@ fn main() {
                     | "diagnostics-fail"
                     | "diagnostics-malformed"
                     | "diagnostics-refresh-prefetch"
+                    | "diagnostics-refresh-prefetch-mixed"
                     | "diagnostics-refresh-prefetch-ack-order"
                     | "diagnostics-refresh-prefetch-disabled"
                     | "diagnostics-refresh-prefetch-fail"
@@ -340,6 +341,7 @@ fn main() {
                         || matches!(
                             mode.as_str(),
                             "diagnostics-refresh-prefetch"
+                                | "diagnostics-refresh-prefetch-mixed"
                                 | "diagnostics-refresh-prefetch-disabled"
                                 | "diagnostics-refresh-prefetch-unchanged"
                         )
@@ -831,7 +833,9 @@ fn main() {
             "textDocument/diagnostic" => {
                 if matches!(
                     mode.as_str(),
-                    "diagnostics-refresh-prefetch" | "diagnostics-refresh-prefetch-disabled"
+                    "diagnostics-refresh-prefetch"
+                        | "diagnostics-refresh-prefetch-mixed"
+                        | "diagnostics-refresh-prefetch-disabled"
                 ) {
                     diagnostic_generation += 1;
                     std::thread::sleep(std::time::Duration::from_millis(1000));
@@ -979,7 +983,9 @@ fn main() {
                     format!("mock-diagnostic-generation:{diagnostic_generation}")
                 } else if matches!(
                     mode.as_str(),
-                    "diagnostics-refresh-prefetch" | "diagnostics-refresh-prefetch-disabled"
+                    "diagnostics-refresh-prefetch"
+                        | "diagnostics-refresh-prefetch-mixed"
+                        | "diagnostics-refresh-prefetch-disabled"
                 ) {
                     format!("mock-diagnostic-refresh-prefetched:{diagnostic_generation}")
                 } else {

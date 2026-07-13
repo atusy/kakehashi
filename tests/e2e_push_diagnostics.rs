@@ -42,6 +42,7 @@ const MD_TEXT: &str = "# Test\n\n```lua\nlocal x = 1\n```\n";
 /// so a `didChange` carrying it is NOT skipped by the content-fingerprint guard
 /// (#422) and reaches the downstream mock.
 const MD_TEXT_EDITED: &str = "# Test\n\n```lua\nlocal x = 2\n```\n";
+const MD_MIXED_TEXT: &str = "# Test\n\n```lua\nlocal x = 1\n```\n\n```python\nprint('x')\n```\n";
 const HOST_LINE: i64 = 3;
 
 fn init_client() -> (LspClient, tempfile::TempDir) {
@@ -61,7 +62,25 @@ fn init_client_with_mode_caps(mode: &str, capabilities: Value) -> (LspClient, te
         .arg("--config-file")
         .arg(config_path.to_str().expect("utf8 path"))
         .build();
-    let initialization_options = if matches!(
+    let initialization_options = if mode == "diagnostics-refresh-prefetch-mixed" {
+        json!({
+            "languageServers": {
+                "mock-push": { "cmd": [mock_bin(), mode], "languages": ["lua", "python"] }
+            },
+            "languages": {
+                "markdown": {
+                    "bridge": {
+                        "lua": {},
+                        "python": {
+                            "aggregation": {
+                                "textDocument/publishDiagnostics": { "pullFallback": false }
+                            }
+                        }
+                    }
+                }
+            }
+        })
+    } else if matches!(
         mode,
         "diagnostics-refresh-burst" | "diagnostics-refresh-prefetch-disabled"
     ) {
@@ -866,6 +885,10 @@ fn e2e_publish_seal_delivers_via_refresh_and_pull_only() {
 /// Send a `didOpen` for the markdown host (with its lua region) so the bridge
 /// spawns the downstream mock for that region and forwards the region's events.
 fn open_host(client: &mut LspClient) {
+    open_host_with_text(client, MD_TEXT);
+}
+
+fn open_host_with_text(client: &mut LspClient, text: &str) {
     client.send_notification(
         "textDocument/didOpen",
         json!({
@@ -873,7 +896,7 @@ fn open_host(client: &mut LspClient) {
                 "uri": MD_URI,
                 "languageId": "markdown",
                 "version": 1,
-                "text": MD_TEXT
+                "text": text
             }
         }),
     );
@@ -990,6 +1013,49 @@ fn e2e_downstream_refresh_skips_pull_fallback_disabled_contexts() {
         "pullFallback=false must not publish a prefetched diagnostic set"
     );
 
+    client.send_request("shutdown", json!(null));
+    client.send_notification("exit", json!(null));
+}
+
+#[test]
+fn e2e_downstream_refresh_prefetches_only_eligible_mixed_contexts() {
+    let (mut client, _config_dir) =
+        init_client_with_mode_caps("diagnostics-refresh-prefetch-mixed", refresh_capable_caps());
+    open_host_with_text(&mut client, MD_MIXED_TEXT);
+
+    let (_, published) = client
+        .wait_for_notification_where(
+            &["textDocument/publishDiagnostics"],
+            Duration::from_secs(15),
+            |params| {
+                params["diagnostics"].as_array().is_some_and(|diagnostics| {
+                    diagnostics.iter().any(|diagnostic| {
+                        diagnostic["message"].as_str().is_some_and(|message| {
+                            message.starts_with("mock-diagnostic-refresh-prefetched:")
+                        })
+                    })
+                })
+            },
+        )
+        .expect("the eligible lua context must contribute a prefetched diagnostic");
+    let diagnostics = published["diagnostics"].as_array().unwrap();
+    assert!(
+        diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic["range"]["start"]["line"] == json!(3)),
+        "the pullFallback=true lua context must be prefetched: {diagnostics:?}"
+    );
+    assert!(
+        diagnostics
+            .iter()
+            .all(|diagnostic| diagnostic["range"]["start"]["line"] != json!(7)),
+        "the pullFallback=false python context must not be prefetched: {diagnostics:?}"
+    );
+
+    let (refresh_id, _) = client
+        .wait_for_server_request("workspace/diagnostic/refresh", Duration::from_secs(5))
+        .expect("the mixed-context prefetch must complete before editor refresh");
+    client.send_response(refresh_id, json!(null));
     client.send_request("shutdown", json!(null));
     client.send_notification("exit", json!(null));
 }
