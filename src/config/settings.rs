@@ -675,12 +675,17 @@ impl LogMessageLevel {
     }
 
     pub(crate) fn from_u8(value: u8) -> Self {
+        const ERROR: u8 = LogMessageLevel::Error as u8;
+        const WARNING: u8 = LogMessageLevel::Warning as u8;
+        const INFO: u8 = LogMessageLevel::Info as u8;
+        const LOG: u8 = LogMessageLevel::Log as u8;
+        const OFF: u8 = LogMessageLevel::Off as u8;
         match value {
-            value if value == Self::Error as u8 => Self::Error,
-            value if value == Self::Warning as u8 => Self::Warning,
-            value if value == Self::Info as u8 => Self::Info,
-            value if value == Self::Log as u8 => Self::Log,
-            value if value == Self::Off as u8 => Self::Off,
+            ERROR => Self::Error,
+            WARNING => Self::Warning,
+            INFO => Self::Info,
+            LOG => Self::Log,
+            OFF => Self::Off,
             _ => Self::Off,
         }
     }
