@@ -769,8 +769,29 @@ impl DiagnosticPublisher {
     /// a set recorded while the wire was sealed must be emitted when the new
     /// settings unseal it.
     pub(crate) async fn republish_after_settings_change(&self, host: &Url) -> RepublishOutcome {
+        let Some(expected_incarnation) = self.documents.get(host).map(|doc| doc.incarnation())
+        else {
+            return RepublishOutcome::Unchanged;
+        };
+        // Serialize the final liveness/incarnation check with didClose. If this
+        // wins, close follows and clears the publish; if close wins, this stale
+        // settings snapshot must not recreate last-published state for the
+        // closed URI (or force a publish into a reopened lifetime).
+        let edit_lock = self.documents.edit_lock(host);
+        let edit_guard = edit_lock.lock().await;
+        let current_incarnation = self.documents.get(host).map(|doc| doc.incarnation());
+        if current_incarnation != Some(expected_incarnation) {
+            if current_incarnation.is_none() {
+                self.documents
+                    .remove_edit_lock_if_unshared(host, &edit_lock);
+            }
+            drop(edit_guard);
+            return RepublishOutcome::Unchanged;
+        }
         self.aggregator.forget_published(host);
-        self.republish(host).await
+        let outcome = self.republish(host).await;
+        drop(edit_guard);
+        outcome
     }
 
     /// Whether replacing `previous` with the currently published settings
@@ -1607,6 +1628,36 @@ mod tests {
             "unsealing must force the already-recorded set onto the wire"
         );
         assert!(!server.diagnostics.wire_gate_is_dirty(&uri));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn settings_change_does_not_republish_after_close() {
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+        register_rust(server);
+        let uri = Url::parse("file:///test/settings_close_race.rs").unwrap();
+        server.documents.insert(
+            uri.clone(),
+            "fn main() {}".to_string(),
+            Some("rust".to_string()),
+            None,
+        );
+        let publisher = DiagnosticPublisher::new(server);
+
+        // Model a settings-reload future admitted from the open-document
+        // snapshot but not polled until didClose has completed its cleanup.
+        let task_uri = uri.clone();
+        let task =
+            tokio::spawn(async move { publisher.republish_after_settings_change(&task_uri).await });
+        server.documents.remove(&uri);
+        server.diagnostics.evict_host(&uri);
+        server.diagnostics.forget_published(&uri);
+
+        assert_eq!(task.await.unwrap(), RepublishOutcome::Unchanged);
+        assert!(
+            server.diagnostics.published_set_changed(&uri, &[]),
+            "stale settings work must not recreate closed-host publish state"
+        );
     }
 
     #[tokio::test]
