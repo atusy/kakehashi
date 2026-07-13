@@ -180,6 +180,24 @@ kakehashi keeps answering `textDocument/diagnostic` from the client:
 Path A writes the cache; Path B reads it for push-driven servers — one cache,
 two readers.
 
+Path B also keeps a downstream pull baseline per exact `(connection key,
+downstream document URI)`. A full report with a `resultId` stores that id and
+the server-local diagnostics; the next pull sends it as `previousResultId`.
+An `unchanged` response reuses those items instead of treating the region as
+empty. Region items stay in **virtual-local coordinates** and are transformed
+with the request's current `RegionOffset` on every full or unchanged response,
+so an edit above an otherwise unchanged region re-anchors the cached findings
+without invalidating its downstream content lineage. Host items are already in
+host coordinates and use the same cache without transformation.
+
+The baseline is discarded on downstream `null`/full-without-resultId, virtual
+or host `didClose`, region identity/language replacement, connection respawn,
+and settings replacement. A mere geometry shift of the same stable region id
+does not discard it: virtual-local storage plus lazy re-anchor is precisely what
+makes that reuse correct. Concurrent pulls update a lineage only when the cache
+still matches the `previousResultId` that request sent, so a late response based
+on an older id cannot overwrite a newer baseline.
+
 ### Per-server source and fallback
 
 Each downstream server has exactly one *native* diagnostic source, decided by
