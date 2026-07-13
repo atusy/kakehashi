@@ -768,6 +768,7 @@ fn write_uninstall_tombstone_with_before_publish(
     validate_safe_language_name(language)?;
     let path = uninstall_tombstone_path(queries_parent, language);
     let existing_permissions = validate_existing_tombstone(&path)?;
+    #[cfg(not(windows))]
     let had_existing_tombstone = existing_permissions.is_some();
     let stage_counter = QUERY_TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
     let stage_prefix = format!(
@@ -790,8 +791,13 @@ fn write_uninstall_tombstone_with_before_publish(
     }
     staged.write_all(b"ok\n")?;
     staged.as_file().sync_all()?;
+    #[cfg(windows)]
+    let windows_publish = prepare_windows_tombstone_publish(queries_parent, staged.as_file())?;
     before_publish(&path, staged.path());
+    #[cfg(not(windows))]
     let published = publish_staged_tombstone(staged, &path, had_existing_tombstone)?;
+    #[cfg(windows)]
+    let published = publish_staged_tombstone(staged, &path, windows_publish)?;
     verify_published_tombstone(published, &path)?;
     Ok(())
 }
@@ -806,59 +812,100 @@ fn publish_staged_tombstone(
 }
 
 #[cfg(windows)]
+struct WindowsTombstonePublish {
+    directory: fs::File,
+    rename_handle: fs::File,
+}
+
+#[cfg(windows)]
+fn prepare_windows_tombstone_publish(
+    queries_parent: &Path,
+    staged: &fs::File,
+) -> std::io::Result<WindowsTombstonePublish> {
+    use std::os::windows::fs::OpenOptionsExt as _;
+    use std::os::windows::io::{AsRawHandle as _, FromRawHandle as _};
+    use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+    use windows_sys::Win32::Storage::FileSystem::{
+        DELETE, FILE_FLAG_BACKUP_SEMANTICS, FILE_GENERIC_READ, FILE_GENERIC_WRITE,
+        FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, ReOpenFile,
+    };
+
+    let directory = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+        .open(queries_parent)?;
+    // Reopen the already-created stage BY HANDLE with DELETE access. This
+    // cannot be redirected by replacing its temporary pathname later.
+    // SAFETY: `staged` remains valid for the call; a successful returned
+    // handle is newly owned and converted exactly once into `File`.
+    let handle = unsafe {
+        ReOpenFile(
+            staged.as_raw_handle(),
+            FILE_GENERIC_READ | FILE_GENERIC_WRITE | DELETE,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            0,
+        )
+    };
+    if handle == INVALID_HANDLE_VALUE {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: successful ReOpenFile returned a newly owned handle.
+    let rename_handle = unsafe { fs::File::from_raw_handle(handle) };
+    Ok(WindowsTombstonePublish {
+        directory,
+        rename_handle,
+    })
+}
+
+#[cfg(windows)]
 fn publish_staged_tombstone(
     staged: tempfile::NamedTempFile,
     path: &Path,
-    had_existing_tombstone: bool,
+    publish: WindowsTombstonePublish,
 ) -> std::io::Result<fs::File> {
-    if !had_existing_tombstone {
-        return staged.persist(path).map_err(|error| error.error);
-    }
-
     use std::os::windows::ffi::OsStrExt as _;
+    use std::os::windows::io::AsRawHandle as _;
     use windows_sys::Win32::Storage::FileSystem::{
-        FILE_ATTRIBUTE_NORMAL, REPLACEFILE_WRITE_THROUGH, ReplaceFileW, SetFileAttributesW,
+        FILE_RENAME_INFO, FileRenameInfo, SetFileInformationByHandle,
     };
 
-    let (file, temporary_path) = staged.into_parts();
-    let temporary_wide: Vec<u16> = temporary_path
-        .as_os_str()
+    let filename: Vec<u16> = path
+        .file_name()
+        .ok_or_else(|| std::io::Error::other("tombstone path has no file name"))?
         .encode_wide()
-        .chain(std::iter::once(0))
         .collect();
-    let destination_wide: Vec<u16> = path
-        .as_os_str()
-        .encode_wide()
-        .chain(std::iter::once(0))
-        .collect();
-    // NamedTempFile marks the stage temporary. Normalize it before
-    // publication, matching tempfile::persist's Windows implementation.
-    // SAFETY: both UTF-16 buffers are NUL-terminated and live through calls.
-    if unsafe { SetFileAttributesW(temporary_wide.as_ptr(), FILE_ATTRIBUTE_NORMAL) } == 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    // ReplaceFileW preserves the replaced file's security descriptor and
-    // other metadata that std::fs::Permissions cannot represent on Windows.
-    // WRITE_THROUGH also waits for the replacement to reach disk.
-    // SAFETY: paths are valid NUL-terminated buffers; optional pointers are
-    // null; `file` keeps the staged inode open for later identity checking.
+    let header = std::mem::offset_of!(FILE_RENAME_INFO, FileName);
+    let size = header + filename.len() * std::mem::size_of::<u16>();
+    let units = size.div_ceil(std::mem::size_of::<FILE_RENAME_INFO>());
+    let mut buffer = vec![FILE_RENAME_INFO::default(); units];
+    let information = buffer.as_mut_ptr();
+    // Rename the already-opened stage relative to the parent handle pinned
+    // before the race hook. ReplaceIfExists replaces a reparse-point directory
+    // entry; it never opens/follows that entry's target.
+    // SAFETY: `buffer` covers the header and UTF-16 filename; both file handles
+    // remain alive; the relative name has no separators.
     let succeeded = unsafe {
-        ReplaceFileW(
-            destination_wide.as_ptr(),
-            temporary_wide.as_ptr(),
-            std::ptr::null(),
-            REPLACEFILE_WRITE_THROUGH,
-            std::ptr::null(),
-            std::ptr::null(),
+        (*information).Anonymous.ReplaceIfExists = true;
+        (*information).RootDirectory = publish.directory.as_raw_handle();
+        (*information).FileNameLength = u32::try_from(filename.len() * 2).unwrap();
+        std::ptr::copy_nonoverlapping(
+            filename.as_ptr(),
+            (*information).FileName.as_mut_ptr(),
+            filename.len(),
+        );
+        SetFileInformationByHandle(
+            publish.rename_handle.as_raw_handle(),
+            FileRenameInfo,
+            information.cast(),
+            u32::try_from(size).unwrap(),
         )
     };
     if succeeded == 0 {
         return Err(std::io::Error::last_os_error());
     }
-    // The temporary pathname moved away. Dropping TempPath attempts to unlink
-    // that now-missing old name and must not touch the published destination.
+    let (_original_handle, temporary_path) = staged.into_parts();
     drop(temporary_path);
-    Ok(file)
+    Ok(publish.rename_handle)
 }
 
 /// Open or create the managed tombstone leaf without following a link there.
@@ -1676,6 +1723,36 @@ mod tests {
             fs::read_to_string(uninstall_tombstone_path(&real_queries, "rust")).unwrap(),
             "ok\n"
         );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn windows_tombstone_publish_replaces_raced_symlink_entry() {
+        use std::os::windows::fs::symlink_file;
+
+        let temp = TempDir::new().unwrap();
+        let queries_parent = temp.path().join("queries");
+        fs::create_dir_all(&queries_parent).unwrap();
+        let tombstone = uninstall_tombstone_path(&queries_parent, "rust");
+        fs::write(&tombstone, "old\n").unwrap();
+        let victim = temp.path().join("victim");
+        fs::write(&victim, "keep me\n").unwrap();
+
+        write_uninstall_tombstone_with_before_publish(&queries_parent, "rust", |path, _| {
+            fs::remove_file(path).unwrap();
+            symlink_file(&victim, path).unwrap();
+        })
+        .unwrap();
+
+        assert_eq!(fs::read_to_string(victim).unwrap(), "keep me\n");
+        assert!(
+            fs::symlink_metadata(&tombstone)
+                .unwrap()
+                .file_type()
+                .is_file(),
+            "handle-relative replace must replace the symlink entry itself"
+        );
+        assert_eq!(fs::read_to_string(tombstone).unwrap(), "ok\n");
     }
 
     #[test]
