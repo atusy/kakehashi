@@ -3,6 +3,26 @@
 
 use std::process::Command;
 
+#[cfg(unix)]
+fn create_dir_symlink_or_skip(target: &std::path::Path, link: &std::path::Path) -> bool {
+    std::os::unix::fs::symlink(target, link).expect("Failed to symlink query dir");
+    true
+}
+
+#[cfg(windows)]
+fn create_dir_symlink_or_skip(target: &std::path::Path, link: &std::path::Path) -> bool {
+    match std::os::windows::fs::symlink_dir(target, link) {
+        Ok(()) => true,
+        Err(e)
+            if e.kind() == std::io::ErrorKind::PermissionDenied
+                || e.raw_os_error() == Some(1314) =>
+        {
+            false
+        }
+        Err(e) => panic!("failed to create directory symlink: {e}"),
+    }
+}
+
 /// Test that --help flag shows help message with program description
 #[test]
 fn test_help_flag_shows_help_message() {
@@ -739,10 +759,9 @@ fn test_language_status_ignores_symlinked_query_language_directories() {
         .expect("Failed to write external query");
     let managed = test_dir.path().join("data/queries/lua");
     fs::create_dir_all(managed.parent().unwrap()).expect("Failed to create queries parent");
-    #[cfg(unix)]
-    std::os::unix::fs::symlink(&external, &managed).expect("Failed to symlink query dir");
-    #[cfg(windows)]
-    std::os::windows::fs::symlink_dir(&external, &managed).expect("Failed to symlink query dir");
+    if !create_dir_symlink_or_skip(&external, &managed) {
+        return;
+    }
 
     let output = Command::new(env!("CARGO_BIN_EXE_kakehashi"))
         .args([
@@ -1265,10 +1284,9 @@ fn test_language_uninstall_all_ignores_symlinked_query_language_directories() {
     fs::write(&external_query, "(comment) @comment").expect("Failed to write external query");
     let managed = test_dir.path().join("data/queries/lua");
     fs::create_dir_all(managed.parent().unwrap()).expect("Failed to create queries parent");
-    #[cfg(unix)]
-    std::os::unix::fs::symlink(&external, &managed).expect("Failed to symlink query dir");
-    #[cfg(windows)]
-    std::os::windows::fs::symlink_dir(&external, &managed).expect("Failed to symlink query dir");
+    if !create_dir_symlink_or_skip(&external, &managed) {
+        return;
+    }
 
     let output = Command::new(env!("CARGO_BIN_EXE_kakehashi"))
         .args([

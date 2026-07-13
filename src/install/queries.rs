@@ -1007,6 +1007,26 @@ mod tests {
     use tempfile::TempDir;
 
     #[cfg(unix)]
+    fn create_dir_symlink_or_skip(target: &Path, link: &Path) -> bool {
+        std::os::unix::fs::symlink(target, link).unwrap();
+        true
+    }
+
+    #[cfg(windows)]
+    fn create_dir_symlink_or_skip(target: &Path, link: &Path) -> bool {
+        match std::os::windows::fs::symlink_dir(target, link) {
+            Ok(()) => true,
+            Err(e)
+                if e.kind() == std::io::ErrorKind::PermissionDenied
+                    || e.raw_os_error() == Some(1314) =>
+            {
+                false
+            }
+            Err(e) => panic!("failed to create directory symlink: {e}"),
+        }
+    }
+
+    #[cfg(unix)]
     #[test]
     fn symlinked_highlights_file_is_not_a_complete_install() {
         use std::os::unix::fs::symlink;
@@ -1056,10 +1076,9 @@ mod tests {
         std::fs::write(external.join("highlights.scm"), "(comment) @comment").unwrap();
         let managed = temp.path().join("queries/lua");
         std::fs::create_dir_all(managed.parent().unwrap()).unwrap();
-        #[cfg(unix)]
-        std::os::unix::fs::symlink(&external, &managed).unwrap();
-        #[cfg(windows)]
-        std::os::windows::fs::symlink_dir(&external, &managed).unwrap();
+        if !create_dir_symlink_or_skip(&external, &managed) {
+            return;
+        }
 
         assert!(
             !query_install_is_complete(&managed),
@@ -1575,10 +1594,9 @@ mod tests {
         fs::create_dir_all(&queries_parent).unwrap();
         let queries_dir = queries_parent.join("lua");
         let missing_target = temp_dir.path().join("missing");
-        #[cfg(unix)]
-        std::os::unix::fs::symlink(&missing_target, &queries_dir).unwrap();
-        #[cfg(windows)]
-        std::os::windows::fs::symlink_dir(&missing_target, &queries_dir).unwrap();
+        if !create_dir_symlink_or_skip(&missing_target, &queries_dir) {
+            return;
+        }
         let staged = create_unique_temp_query_dir(&queries_parent, "lua").unwrap();
         fs::write(staged.join("highlights.scm"), "managed").unwrap();
         write_install_marker_for_tests(&staged).unwrap();
@@ -1596,6 +1614,44 @@ mod tests {
         assert_eq!(
             fs::read_to_string(queries_dir.join("highlights.scm")).unwrap(),
             "managed"
+        );
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn replace_query_dir_repairs_a_live_language_directory_symlink() {
+        let temp_dir = TempDir::new().unwrap();
+        let queries_parent = temp_dir.path().join("queries");
+        fs::create_dir_all(&queries_parent).unwrap();
+        let external = temp_dir.path().join("external");
+        fs::create_dir_all(&external).unwrap();
+        fs::write(external.join("highlights.scm"), "external").unwrap();
+        let queries_dir = queries_parent.join("lua");
+        if !create_dir_symlink_or_skip(&external, &queries_dir) {
+            return;
+        }
+        let staged = create_unique_temp_query_dir(&queries_parent, "lua").unwrap();
+        fs::write(staged.join("highlights.scm"), "managed").unwrap();
+        write_install_marker_for_tests(&staged).unwrap();
+
+        let result = replace_query_dir(&staged, &queries_dir, "lua", false);
+
+        assert!(matches!(result, Ok(ReplaceQueryDirResult::Replaced)));
+        assert!(
+            fs::symlink_metadata(&queries_dir)
+                .unwrap()
+                .file_type()
+                .is_dir(),
+            "the live symlink must be replaced by the staged directory"
+        );
+        assert_eq!(
+            fs::read_to_string(queries_dir.join("highlights.scm")).unwrap(),
+            "managed"
+        );
+        assert_eq!(
+            fs::read_to_string(external.join("highlights.scm")).unwrap(),
+            "external",
+            "repair must not modify the symlink target"
         );
     }
 
