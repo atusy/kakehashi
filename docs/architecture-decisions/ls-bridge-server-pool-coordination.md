@@ -226,11 +226,13 @@ downstream ──notification──►  bridge  ──notification──►  ups
                                └─ ...
 ```
 
-**Implemented: `window/*` forwarding (#378, #852).** The reader task parses and
-enqueues both `window/logMessage` and `window/showMessage`. At the common
-client-facing delivery boundary, `window/logMessage` uses the global
-`features."window/logMessage".logLevel` threshold shared with kakehashi's own
-logs (`info` by default); `window/showMessage` remains unfiltered. Both are
+**Implemented: `window/*` forwarding (#378, #852).** The reader task parses both
+methods and applies the live global `features."window/logMessage".logLevel`
+threshold before enqueue, so suppressed logs cannot consume the bounded queue
+needed by allowed logs and unfiltered `window/showMessage`. The common
+client-facing delivery boundary checks the same workspace policy again to close
+live-update races and also shares it with kakehashi's own logs (`info` by
+default). Both forwarded methods are
 prefixed with `[kakehashi:<server>]` for
 distinguishability and need
 no coordinate translation. They reuse the `UpstreamNotification` decoupling
