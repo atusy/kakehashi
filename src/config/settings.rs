@@ -996,22 +996,26 @@ mod tests {
     fn log_message_level_filters_lsp_severity_order() {
         use tower_lsp_server::ls_types::MessageType;
 
-        assert!(LogMessageLevel::Error.allows(MessageType::ERROR));
-        assert!(!LogMessageLevel::Error.allows(MessageType::WARNING));
-        assert!(LogMessageLevel::Warning.allows(MessageType::WARNING));
-        assert!(!LogMessageLevel::Warning.allows(MessageType::INFO));
-        assert!(LogMessageLevel::Info.allows(MessageType::INFO));
-        assert!(!LogMessageLevel::Info.allows(MessageType::LOG));
-        assert!(LogMessageLevel::Log.allows(MessageType::LOG));
         let debug: MessageType = serde_json::from_str("5").unwrap();
-        assert!(LogMessageLevel::Log.allows(debug));
-        assert!(!LogMessageLevel::Info.allows(debug));
-        assert!(!LogMessageLevel::Off.allows(MessageType::ERROR));
-
-        assert_eq!(
-            LogMessageLevel::from_u8(LogMessageLevel::Info.as_u8()),
-            LogMessageLevel::Info
-        );
+        let message_types = [
+            MessageType::ERROR,
+            MessageType::WARNING,
+            MessageType::INFO,
+            MessageType::LOG,
+            debug,
+        ];
+        for (level, expected) in [
+            (LogMessageLevel::Error, [true, false, false, false, false]),
+            (LogMessageLevel::Warning, [true, true, false, false, false]),
+            (LogMessageLevel::Info, [true, true, true, false, false]),
+            (LogMessageLevel::Log, [true, true, true, true, true]),
+            (LogMessageLevel::Off, [false, false, false, false, false]),
+        ] {
+            for (message_type, expected) in message_types.into_iter().zip(expected) {
+                assert_eq!(level.allows(message_type), expected, "level={level:?}");
+            }
+            assert_eq!(LogMessageLevel::from_u8(level.as_u8()), level);
+        }
         assert_eq!(LogMessageLevel::from_u8(u8::MAX), LogMessageLevel::Off);
     }
 
