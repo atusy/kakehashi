@@ -131,9 +131,8 @@ pub(crate) fn merge_bridge_server_configs(
         prefer_shared_instance: overlay
             .prefer_shared_instance
             .or(base.prefer_shared_instance),
-        // Overlay-wins-when-present, mirroring `prefer_shared_instance`: a
-        // concrete server's explicit `enabled` overrides the wildcard, so
-        // `_.enabled: false` can be opted back into per server.
+        // Deep-merge policies by method: a concrete method inherits an unset
+        // field from the wildcard while an explicit value overrides it.
         features: {
             let mut features = base.features.clone();
             for (method, overlay_config) in &overlay.features {
@@ -146,6 +145,9 @@ pub(crate) fn merge_bridge_server_configs(
             }
             features
         },
+        // Overlay-wins-when-present, mirroring `prefer_shared_instance`: a
+        // concrete server's explicit `enabled` overrides the wildcard, so
+        // `_.enabled: false` can be opted back into per server.
         enabled: overlay.enabled.or(base.enabled),
     }
 }

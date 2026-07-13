@@ -45,11 +45,11 @@ fn default_language_servers() -> HashMap<String, BridgeServerConfig> {
             // discoverable (#391). Concrete servers inherit it via the wildcard.
             prefer_shared_instance: Some(false),
             settings: None,
+            features: Default::default(),
             // Spell out the built-in default (every server enabled) so the
             // template documents the opt-out knob: setting this to `false`
             // disables every server by default; a concrete server can then
             // opt back in individually with its own `enabled: true`.
-            features: Default::default(),
             enabled: Some(true),
         },
     )])
