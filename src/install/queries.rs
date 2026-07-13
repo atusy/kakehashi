@@ -932,6 +932,25 @@ fn write_uninstall_tombstone_at_with_hooks(
     before_publish: impl FnOnce(&cap_std::fs::Dir, &str, &str),
     sync_parent: impl FnOnce(&cap_std::fs::Dir) -> std::io::Result<()>,
 ) -> Result<(), QueryInstallError> {
+    write_uninstall_tombstone_at_with_security_copy(
+        queries_parent,
+        _ambient_path,
+        language,
+        before_publish,
+        sync_parent,
+        copy_windows_tombstone_security,
+    )
+}
+
+#[cfg(windows)]
+fn write_uninstall_tombstone_at_with_security_copy(
+    queries_parent: &cap_std::fs::Dir,
+    _ambient_path: &Path,
+    language: &str,
+    before_publish: impl FnOnce(&cap_std::fs::Dir, &str, &str),
+    sync_parent: impl FnOnce(&cap_std::fs::Dir) -> std::io::Result<()>,
+    copy_security: impl FnOnce(&fs::File, &fs::File) -> std::io::Result<()>,
+) -> Result<(), QueryInstallError> {
     use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt};
     use std::os::windows::ffi::OsStrExt as _;
     use std::os::windows::io::{AsRawHandle as _, FromRawHandle as _};
@@ -939,28 +958,29 @@ fn write_uninstall_tombstone_at_with_hooks(
     use windows_sys::Win32::Storage::FileSystem::{
         FILE_FLAG_WRITE_THROUGH, FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_RENAME_INFO,
         FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FileRenameInfo, ReOpenFile,
-        SetFileInformationByHandle,
+        SetFileInformationByHandle, WRITE_DAC,
     };
 
     validate_safe_language_name(language)?;
     let tombstone_name = format!(".{language}{QUERY_UNINSTALL_TOMBSTONE_SUFFIX}");
     let mut existing_options = cap_std::fs::OpenOptions::new();
     existing_options.write(true).follow(FollowSymlinks::No);
-    let existing_permissions = match queries_parent.open_with(&tombstone_name, &existing_options) {
-        Ok(file) => {
-            let file = file.into_std();
-            let metadata = file.metadata()?;
-            if !metadata.is_file() {
-                return Err(QueryInstallError::IoError(std::io::Error::other(
-                    "query uninstall tombstone is not a regular file",
-                )));
+    let (existing_permissions, existing_file) =
+        match queries_parent.open_with(&tombstone_name, &existing_options) {
+            Ok(file) => {
+                let file = file.into_std();
+                let metadata = file.metadata()?;
+                if !metadata.is_file() {
+                    return Err(QueryInstallError::IoError(std::io::Error::other(
+                        "query uninstall tombstone is not a regular file",
+                    )));
+                }
+                require_single_link(u64::from(windows_file_information(&file)?.nNumberOfLinks))?;
+                (Some(metadata.permissions()), Some(file))
             }
-            require_single_link(u64::from(windows_file_information(&file)?.nNumberOfLinks))?;
-            Some(metadata.permissions())
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-        Err(error) => return Err(QueryInstallError::IoError(error)),
-    };
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => (None, None),
+            Err(error) => return Err(QueryInstallError::IoError(error)),
+        };
 
     let (stage_name, mut staged) = loop {
         let counter = QUERY_TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
@@ -988,7 +1008,7 @@ fn write_uninstall_tombstone_at_with_hooks(
         let handle = unsafe {
             ReOpenFile(
                 staged.as_raw_handle(),
-                FILE_GENERIC_READ | FILE_GENERIC_WRITE | DELETE,
+                FILE_GENERIC_READ | FILE_GENERIC_WRITE | DELETE | WRITE_DAC,
                 FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
                 FILE_FLAG_WRITE_THROUGH,
             )
@@ -999,6 +1019,9 @@ fn write_uninstall_tombstone_at_with_hooks(
         // SAFETY: successful ReOpenFile returned a newly owned handle.
         let rename_handle = unsafe { fs::File::from_raw_handle(handle) };
         normalize_windows_stage_attributes(&rename_handle)?;
+        if let Some(existing_file) = &existing_file {
+            copy_security(existing_file, &rename_handle)?;
+        }
         before_publish(queries_parent, &tombstone_name, &stage_name);
         let filename: Vec<u16> = std::ffi::OsStr::new(&tombstone_name)
             .encode_wide()
@@ -1115,6 +1138,152 @@ fn normalize_windows_stage_attributes(file: &fs::File) -> std::io::Result<()> {
     } else {
         Ok(())
     }
+}
+
+#[cfg(windows)]
+fn copy_windows_tombstone_security(source: &fs::File, target: &fs::File) -> std::io::Result<()> {
+    use std::os::windows::io::{AsRawHandle as _, FromRawHandle as _};
+    use windows_sys::Win32::Foundation::{ERROR_SUCCESS, LocalFree};
+    use windows_sys::Win32::Security::Authorization::{
+        GetSecurityInfo, SE_FILE_OBJECT, SetSecurityInfo,
+    };
+    use windows_sys::Win32::Security::{
+        DACL_SECURITY_INFORMATION, EqualSid, GROUP_SECURITY_INFORMATION,
+        GetSecurityDescriptorControl, OWNER_SECURITY_INFORMATION,
+        PROTECTED_DACL_SECURITY_INFORMATION, SE_DACL_PROTECTED,
+        UNPROTECTED_DACL_SECURITY_INFORMATION,
+    };
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, READ_CONTROL, ReOpenFile, WRITE_DAC,
+        WRITE_OWNER,
+    };
+
+    struct SecurityDescriptor(windows_sys::Win32::Security::PSECURITY_DESCRIPTOR);
+    impl Drop for SecurityDescriptor {
+        fn drop(&mut self) {
+            // SAFETY: GetSecurityInfo allocates this descriptor with LocalAlloc.
+            unsafe { LocalFree(self.0.cast()) };
+        }
+    }
+
+    unsafe fn read_security(
+        file: &fs::File,
+    ) -> std::io::Result<(
+        SecurityDescriptor,
+        windows_sys::Win32::Security::PSID,
+        windows_sys::Win32::Security::PSID,
+        *mut windows_sys::Win32::Security::ACL,
+    )> {
+        use std::os::windows::io::AsRawHandle as _;
+
+        let mut owner = std::ptr::null_mut();
+        let mut group = std::ptr::null_mut();
+        let mut dacl = std::ptr::null_mut();
+        let mut descriptor = std::ptr::null_mut();
+        // SAFETY: output pointers remain valid until the returned descriptor is dropped.
+        let status = unsafe {
+            GetSecurityInfo(
+                file.as_raw_handle(),
+                SE_FILE_OBJECT,
+                OWNER_SECURITY_INFORMATION | GROUP_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+                &mut owner,
+                &mut group,
+                &mut dacl,
+                std::ptr::null_mut(),
+                &mut descriptor,
+            )
+        };
+        if status != ERROR_SUCCESS {
+            return Err(std::io::Error::from_raw_os_error(status as i32));
+        }
+        Ok((SecurityDescriptor(descriptor), owner, group, dacl))
+    }
+
+    // SAFETY: both handles remain open and descriptor-owned pointers stay valid.
+    let (source_descriptor, source_owner, source_group, source_dacl) =
+        unsafe { read_security(source)? };
+    // SAFETY: same contract for the already-opened private stage.
+    let (_target_descriptor, target_owner, target_group, _) = unsafe { read_security(target)? };
+    let mut control = 0;
+    let mut revision = 0;
+    // SAFETY: descriptor is valid and outputs are initialized by the API.
+    if unsafe { GetSecurityDescriptorControl(source_descriptor.0, &mut control, &mut revision) }
+        == 0
+    {
+        return Err(std::io::Error::last_os_error());
+    }
+    let dacl_mode = if control & SE_DACL_PROTECTED != 0 {
+        PROTECTED_DACL_SECURITY_INFORMATION
+    } else {
+        UNPROTECTED_DACL_SECURITY_INFORMATION
+    };
+    // SAFETY: target has WRITE_DAC and the source DACL remains descriptor-owned.
+    let dacl_status = unsafe {
+        SetSecurityInfo(
+            target.as_raw_handle(),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION | dacl_mode,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            source_dacl,
+            std::ptr::null_mut(),
+        )
+    };
+    if dacl_status != ERROR_SUCCESS {
+        return Err(std::io::Error::from_raw_os_error(dacl_status as i32));
+    }
+
+    // New stages normally inherit the same owner/group. Only request the
+    // privileged WRITE_OWNER path when either SID actually differs.
+    let sids_differ = |source, target| {
+        if source.is_null() || target.is_null() {
+            source != target
+        } else {
+            // SAFETY: both non-null pointers refer to descriptor-owned SIDs.
+            (unsafe { EqualSid(source, target) }) == 0
+        }
+    };
+    let owner_differs = sids_differ(source_owner, target_owner);
+    let group_differs = sids_differ(source_group, target_group);
+    if owner_differs || group_differs {
+        // SAFETY: successful ReOpenFile returns a distinct owned handle.
+        let handle = unsafe {
+            ReOpenFile(
+                target.as_raw_handle(),
+                READ_CONTROL | WRITE_DAC | WRITE_OWNER,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                0,
+            )
+        };
+        if handle.is_null() || handle == windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE {
+            return Err(std::io::Error::last_os_error());
+        }
+        // SAFETY: successful ReOpenFile returned a newly owned handle.
+        let owner_handle = unsafe { fs::File::from_raw_handle(handle) };
+        let mut information = 0;
+        if owner_differs {
+            information |= OWNER_SECURITY_INFORMATION;
+        }
+        if group_differs {
+            information |= GROUP_SECURITY_INFORMATION;
+        }
+        // SAFETY: selected SID pointers remain owned by source_descriptor.
+        let status = unsafe {
+            SetSecurityInfo(
+                owner_handle.as_raw_handle(),
+                SE_FILE_OBJECT,
+                information,
+                source_owner,
+                source_group,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        };
+        if status != ERROR_SUCCESS {
+            return Err(std::io::Error::from_raw_os_error(status as i32));
+        }
+    }
+    Ok(())
 }
 
 #[cfg(any(unix, windows))]
@@ -1965,6 +2134,117 @@ mod tests {
             0,
             "published tombstone must not retain tempfile cache semantics"
         );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn windows_security_copy_failure_aborts_before_tombstone_publication() {
+        let temp = TempDir::new().unwrap();
+        let queries_parent = temp.path().join("queries");
+        fs::create_dir_all(queries_parent.join("rust")).unwrap();
+        let tombstone = uninstall_tombstone_path(&queries_parent, "rust");
+        fs::write(&tombstone, "old\n").unwrap();
+        let pinned =
+            cap_std::fs::Dir::open_ambient_dir(&queries_parent, cap_std::ambient_authority())
+                .unwrap();
+
+        let result = write_uninstall_tombstone_at_with_security_copy(
+            &pinned,
+            &queries_parent,
+            "rust",
+            |_, _, _| {},
+            |_| Ok(()),
+            |_, _| {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "denied",
+                ))
+            },
+        );
+
+        assert!(matches!(result, Err(QueryInstallError::IoError(_))));
+        assert_eq!(fs::read_to_string(&tombstone).unwrap(), "old\n");
+        assert!(queries_parent.join("rust").exists());
+        assert_eq!(
+            fs::read_dir(&queries_parent)
+                .unwrap()
+                .filter_map(Result::ok)
+                .filter(|entry| entry.file_name().to_string_lossy().ends_with(".tmp"))
+                .count(),
+            0,
+            "a denied security copy must clean the private stage"
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn windows_tombstone_preserves_null_protected_dacl() {
+        use std::os::windows::io::AsRawHandle as _;
+        use windows_sys::Win32::Foundation::{ERROR_SUCCESS, LocalFree};
+        use windows_sys::Win32::Security::Authorization::{
+            GetSecurityInfo, SE_FILE_OBJECT, SetSecurityInfo,
+        };
+        use windows_sys::Win32::Security::{
+            DACL_SECURITY_INFORMATION, GetSecurityDescriptorControl,
+            PROTECTED_DACL_SECURITY_INFORMATION, SE_DACL_PROTECTED,
+        };
+
+        let temp = TempDir::new().unwrap();
+        let queries_parent = temp.path().join("queries");
+        fs::create_dir_all(&queries_parent).unwrap();
+        let tombstone = uninstall_tombstone_path(&queries_parent, "rust");
+        fs::write(&tombstone, "old\n").unwrap();
+        let existing = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&tombstone)
+            .unwrap();
+        // SAFETY: the handle is valid; a null DACL is intentional and grants
+        // full access while remaining observably distinct from an inherited ACL.
+        let status = unsafe {
+            SetSecurityInfo(
+                existing.as_raw_handle(),
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        };
+        assert_eq!(status, ERROR_SUCCESS);
+        drop(existing);
+
+        write_uninstall_tombstone(&queries_parent, "rust").unwrap();
+
+        let published = fs::File::open(&tombstone).unwrap();
+        let mut dacl = std::ptr::null_mut();
+        let mut descriptor = std::ptr::null_mut();
+        // SAFETY: outputs live until descriptor is released below.
+        let status = unsafe {
+            GetSecurityInfo(
+                published.as_raw_handle(),
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                &mut dacl,
+                std::ptr::null_mut(),
+                &mut descriptor,
+            )
+        };
+        assert_eq!(status, ERROR_SUCCESS);
+        let mut control = 0;
+        let mut revision = 0;
+        // SAFETY: descriptor was returned successfully by GetSecurityInfo.
+        assert_ne!(
+            unsafe { GetSecurityDescriptorControl(descriptor, &mut control, &mut revision) },
+            0
+        );
+        assert!(dacl.is_null(), "the explicit null DACL must be preserved");
+        assert_ne!(control & SE_DACL_PROTECTED, 0);
+        // SAFETY: GetSecurityInfo allocates the descriptor with LocalAlloc.
+        unsafe { LocalFree(descriptor.cast()) };
     }
 
     #[test]
