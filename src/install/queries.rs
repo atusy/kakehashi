@@ -414,7 +414,44 @@ fn install_queries_recursive(
     })
 }
 
-#[cfg(unix)]
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn open_directory_nofollow(path: &Path) -> std::io::Result<fs::File> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+
+    fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(nix::libc::O_PATH | nix::libc::O_DIRECTORY | nix::libc::O_NOFOLLOW)
+        .open(path)
+}
+
+#[cfg(any(
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "tvos",
+    target_os = "watchos",
+    target_os = "visionos"
+))]
+fn open_directory_nofollow(path: &Path) -> std::io::Result<fs::File> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+
+    fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(nix::libc::O_SEARCH | nix::libc::O_NOFOLLOW)
+        .open(path)
+}
+
+#[cfg(all(
+    unix,
+    not(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "tvos",
+        target_os = "watchos",
+        target_os = "visionos"
+    ))
+))]
 fn open_directory_nofollow(path: &Path) -> std::io::Result<fs::File> {
     use std::os::unix::fs::OpenOptionsExt as _;
 
@@ -1138,6 +1175,26 @@ mod tests {
         assert!(
             !query_install_is_complete(&managed),
             "managed language-directory symlinks must not redirect completeness checks"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn query_install_completeness_does_not_require_directory_read_permission() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let temp = TempDir::new().unwrap();
+        let queries_dir = temp.path().join("queries/lua");
+        fs::create_dir_all(&queries_dir).unwrap();
+        fs::write(queries_dir.join("highlights.scm"), "(comment) @comment").unwrap();
+        fs::set_permissions(&queries_dir, fs::Permissions::from_mode(0o111)).unwrap();
+
+        let complete = query_install_is_complete(&queries_dir);
+
+        fs::set_permissions(&queries_dir, fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(
+            complete,
+            "known query files in a searchable directory remain inspectable"
         );
     }
 
