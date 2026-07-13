@@ -958,7 +958,7 @@ fn write_uninstall_tombstone_at_with_security_copy(
     use windows_sys::Win32::Storage::FileSystem::{
         DELETE, FILE_FLAG_WRITE_THROUGH, FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_RENAME_INFO,
         FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FileRenameInfo, ReOpenFile,
-        SetFileInformationByHandle, WRITE_DAC,
+        SetFileInformationByHandle,
     };
 
     validate_safe_language_name(language)?;
@@ -1008,7 +1008,7 @@ fn write_uninstall_tombstone_at_with_security_copy(
         let handle = unsafe {
             ReOpenFile(
                 staged.as_raw_handle(),
-                FILE_GENERIC_READ | FILE_GENERIC_WRITE | DELETE | WRITE_DAC,
+                FILE_GENERIC_READ | FILE_GENERIC_WRITE | DELETE,
                 FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
                 FILE_FLAG_WRITE_THROUGH,
             )
@@ -1150,7 +1150,7 @@ fn copy_windows_tombstone_security(source: &fs::File, target: &fs::File) -> std:
     use windows_sys::Win32::Security::{
         DACL_SECURITY_INFORMATION, EqualSid, GROUP_SECURITY_INFORMATION,
         GetSecurityDescriptorControl, OWNER_SECURITY_INFORMATION,
-        PROTECTED_DACL_SECURITY_INFORMATION, SE_DACL_PROTECTED,
+        PROTECTED_DACL_SECURITY_INFORMATION, SE_DACL_PRESENT, SE_DACL_PROTECTED,
         UNPROTECTED_DACL_SECURITY_INFORMATION,
     };
     use windows_sys::Win32::Storage::FileSystem::{
@@ -1218,30 +1218,16 @@ fn copy_windows_tombstone_security(source: &fs::File, target: &fs::File) -> std:
             std::io::Error::last_os_error()
         )));
     }
+    if control & SE_DACL_PRESENT == 0 {
+        return Err(std::io::Error::other(
+            "validated tombstone security descriptor has no DACL presence bit",
+        ));
+    }
     let dacl_mode = if control & SE_DACL_PROTECTED != 0 {
         PROTECTED_DACL_SECURITY_INFORMATION
     } else {
         UNPROTECTED_DACL_SECURITY_INFORMATION
     };
-    // SAFETY: target has WRITE_DAC and the source DACL remains descriptor-owned.
-    let dacl_status = unsafe {
-        SetSecurityInfo(
-            target.as_raw_handle(),
-            SE_FILE_OBJECT,
-            DACL_SECURITY_INFORMATION | dacl_mode,
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-            source_dacl,
-            std::ptr::null_mut(),
-        )
-    };
-    if dacl_status != ERROR_SUCCESS {
-        return Err(std::io::Error::other(format!(
-            "SetSecurityInfo DACL failed: {}",
-            std::io::Error::from_raw_os_error(dacl_status as i32)
-        )));
-    }
-
     // New stages normally inherit the same owner/group. Only request the
     // privileged WRITE_OWNER path when either SID actually differs.
     let sids_differ = |source: windows_sys::Win32::Security::PSID,
@@ -1255,51 +1241,97 @@ fn copy_windows_tombstone_security(source: &fs::File, target: &fs::File) -> std:
     };
     let owner_differs = sids_differ(source_owner, target_owner);
     let group_differs = sids_differ(source_group, target_group);
-    if owner_differs || group_differs {
-        // SAFETY: successful ReOpenFile returns a distinct owned handle.
-        let handle = unsafe {
-            ReOpenFile(
-                target.as_raw_handle(),
-                READ_CONTROL | WRITE_DAC | WRITE_OWNER,
-                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-                0,
-            )
-        };
-        if handle.is_null() || handle == windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE {
-            return Err(std::io::Error::other(format!(
-                "ReOpenFile WRITE_OWNER failed: {}",
-                std::io::Error::last_os_error()
-            )));
-        }
-        // SAFETY: successful ReOpenFile returned a newly owned handle.
-        let owner_handle = unsafe { fs::File::from_raw_handle(handle) };
-        let mut information = 0;
-        if owner_differs {
-            information |= OWNER_SECURITY_INFORMATION;
-        }
-        if group_differs {
-            information |= GROUP_SECURITY_INFORMATION;
-        }
-        // SAFETY: selected SID pointers remain owned by source_descriptor.
-        let status = unsafe {
-            SetSecurityInfo(
-                owner_handle.as_raw_handle(),
-                SE_FILE_OBJECT,
-                information,
-                source_owner,
-                source_group,
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-            )
-        };
-        if status != ERROR_SUCCESS {
-            return Err(std::io::Error::other(format!(
-                "SetSecurityInfo owner/group failed: {}",
-                std::io::Error::from_raw_os_error(status as i32)
-            )));
-        }
+    let mut owner_information = 0;
+    if owner_differs {
+        owner_information |= OWNER_SECURITY_INFORMATION;
     }
-    Ok(())
+    if group_differs {
+        owner_information |= GROUP_SECURITY_INFORMATION;
+    }
+    let mut security_access = READ_CONTROL | WRITE_DAC;
+    if owner_information != 0 {
+        security_access |= WRITE_OWNER;
+    }
+    // Keep security mutation on a distinct handle so the proven
+    // DELETE-capable/write-through rename handle retains its original access
+    // contract. Success returns a new owned handle for the same stage inode.
+    let security_handle = unsafe {
+        ReOpenFile(
+            target.as_raw_handle(),
+            security_access,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            0,
+        )
+    };
+    if security_handle.is_null()
+        || security_handle == windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE
+    {
+        return Err(std::io::Error::other(format!(
+            "ReOpenFile security access failed: {}",
+            std::io::Error::last_os_error()
+        )));
+    }
+    // SAFETY: successful ReOpenFile returned a newly owned handle.
+    let security_file = unsafe { fs::File::from_raw_handle(security_handle) };
+    apply_windows_security_parts(
+        owner_information,
+        || {
+            // SAFETY: selected SID pointers remain owned by source_descriptor.
+            let status = unsafe {
+                SetSecurityInfo(
+                    security_file.as_raw_handle(),
+                    SE_FILE_OBJECT,
+                    owner_information,
+                    source_owner,
+                    source_group,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                )
+            };
+            if status != ERROR_SUCCESS {
+                return Err(std::io::Error::other(format!(
+                    "SetSecurityInfo owner/group failed: {}",
+                    std::io::Error::from_raw_os_error(status as i32)
+                )));
+            }
+            Ok(())
+        },
+        || {
+            // SAFETY: target has WRITE_DAC and the source DACL remains descriptor-owned.
+            let status = unsafe {
+                SetSecurityInfo(
+                    security_file.as_raw_handle(),
+                    SE_FILE_OBJECT,
+                    DACL_SECURITY_INFORMATION | dacl_mode,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    source_dacl,
+                    std::ptr::null_mut(),
+                )
+            };
+            if status != ERROR_SUCCESS {
+                return Err(std::io::Error::other(format!(
+                    "SetSecurityInfo DACL failed: {}",
+                    std::io::Error::from_raw_os_error(status as i32)
+                )));
+            }
+            Ok(())
+        },
+    )
+}
+
+#[cfg(windows)]
+fn apply_windows_security_parts(
+    owner_information: u32,
+    apply_owner_group: impl FnOnce() -> std::io::Result<()>,
+    apply_dacl: impl FnOnce() -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    // A restrictive source DACL may deny reopening with WRITE_OWNER, so owner
+    // and group must be complete before the DACL is installed.
+    if owner_information != 0 {
+        apply_owner_group()?;
+    }
+    apply_dacl()
 }
 
 #[cfg(any(unix, windows))]
@@ -2190,6 +2222,35 @@ mod tests {
             0,
             "a denied security copy must clean the private stage"
         );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn windows_differing_owner_is_applied_before_restrictive_dacl() {
+        use std::cell::RefCell;
+        use windows_sys::Win32::Security::OWNER_SECURITY_INFORMATION;
+
+        let operations = RefCell::new(Vec::new());
+        apply_windows_security_parts(
+            OWNER_SECURITY_INFORMATION,
+            || {
+                if operations.borrow().contains(&"dacl") {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        "restrictive DACL already installed",
+                    ));
+                }
+                operations.borrow_mut().push("owner");
+                Ok(())
+            },
+            || {
+                operations.borrow_mut().push("dacl");
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        assert_eq!(operations.into_inner(), ["owner", "dacl"]);
     }
 
     #[test]
