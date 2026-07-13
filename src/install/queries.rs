@@ -787,6 +787,11 @@ fn write_uninstall_tombstone_with_before_publish(
     }
     let mut staged = builder.tempfile_in(queries_parent)?;
     if let Some(permissions) = existing_permissions {
+        // On Windows this can only carry `readonly = false`: validation
+        // already write-opened the destination, so a readonly leaf fails
+        // before staging exactly as origin/main's File::create did. Keeping
+        // that order avoids making a readonly stage impossible to reopen with
+        // the DELETE-capable handle required for confined publication.
         staged.as_file().set_permissions(permissions)?;
     }
     staged.write_all(b"ok\n")?;
