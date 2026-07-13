@@ -1222,7 +1222,7 @@ mod tests {
         let before = tokio::time::Instant::now();
 
         publisher.request_forwarded_diagnostic_refresh();
-        tokio::task::yield_now().await;
+        tokio::time::advance(std::time::Duration::ZERO).await;
 
         assert_eq!(
             tokio::time::Instant::now(),
@@ -1280,7 +1280,7 @@ mod tests {
         server.shutdown_token.cancel();
 
         tokio::time::advance(FORWARDED_REFRESH_MAX_WAIT).await;
-        tokio::task::yield_now().await;
+        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
 
         let metrics = server.diagnostics.metrics_snapshot();
         assert_eq!(metrics.refreshes_requested, 1);
@@ -1339,7 +1339,7 @@ mod tests {
 
         publisher.request_pull_diagnostic_refresh(true);
         server.shutdown_token.cancel();
-        tokio::task::yield_now().await;
+        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
 
         let metrics = server.diagnostics.metrics_snapshot();
         assert_eq!(metrics.refreshes_requested, 1);
@@ -1745,7 +1745,7 @@ mod tests {
         let waiter = tokio::spawn(async move {
             super::wait_for_forwarded_refresh_settle(&waiter_aggregator, snapshot, deadline).await
         });
-        tokio::task::yield_now().await;
+        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
 
         for _ in 0..11 {
             tokio::time::advance(std::time::Duration::from_millis(90)).await;
