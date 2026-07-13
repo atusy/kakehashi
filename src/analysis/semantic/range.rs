@@ -55,7 +55,7 @@ fn filter_tokens_by_range(tokens: &[SemanticToken], range: &Range) -> Vec<Semant
         // Check if token is within range
         if abs_line >= start_line && abs_line <= end_line {
             // For boundary lines, check column positions
-            if abs_line == end_line && abs_col > range.end.character as usize {
+            if abs_line == end_line && abs_col >= range.end.character as usize {
                 continue;
             }
             if abs_line == start_line
@@ -209,6 +209,32 @@ mod tests {
         assert!(
             filtered.is_empty(),
             "Token starting after range.end should be excluded"
+        );
+    }
+
+    #[test]
+    fn test_filter_tokens_excludes_token_starting_at_exclusive_range_end() {
+        let tokens = vec![SemanticToken {
+            delta_line: 1,
+            delta_start: 5,
+            length: 3,
+            token_type: 0,
+            token_modifiers_bitset: 0,
+        }];
+        let range = Range {
+            start: Position {
+                line: 1,
+                character: 0,
+            },
+            end: Position {
+                line: 1,
+                character: 5,
+            },
+        };
+
+        assert!(
+            filter_tokens_by_range(&tokens, &range).is_empty(),
+            "a token beginning at the end-exclusive boundary is outside the range"
         );
     }
 
