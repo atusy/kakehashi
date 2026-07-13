@@ -881,13 +881,33 @@ fn e2e_downstream_refresh_burst_is_coalesced() {
 
     let (id, _) = client
         .wait_for_server_request("workspace/diagnostic/refresh", Duration::from_secs(15))
-        .expect("a downstream refresh burst must eventually reach the editor");
+        .expect("the leading refresh must reach the editor immediately");
     client.send_response(id, json!(null));
+
+    let (trailing_id, _) = client
+        .wait_for_server_request("workspace/diagnostic/refresh", Duration::from_millis(1200))
+        .expect("activity after the leading edge must produce one trailing refresh");
+    client.send_response(trailing_id, json!(null));
+
+    let response = client.send_request(
+        "textDocument/diagnostic",
+        json!({ "textDocument": { "uri": MD_URI } }),
+    );
+    let items = response["result"]["items"]
+        .as_array()
+        .expect("the pull after a coalesced refresh returns a full report");
+    assert!(
+        items.iter().any(|diagnostic| diagnostic["message"]
+            .as_str()
+            .is_some_and(|message| message.starts_with("mock-diagnostic:"))),
+        "the re-pull must include the refreshing downstream's latest diagnostics"
+    );
+
     assert!(
         client
             .wait_for_server_request("workspace/diagnostic/refresh", Duration::from_millis(2000))
             .is_none(),
-        "one burst must produce at most one editor-visible refresh"
+        "one burst must produce only its leading and trailing refreshes"
     );
 
     client.send_request("shutdown", json!(null));
