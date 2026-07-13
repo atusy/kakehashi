@@ -189,7 +189,7 @@ impl Kakehashi {
             self.home_dir.as_deref(),
             |var| std::env::var(var).ok(),
         );
-        let settings_events = settings_outcome.events.clone();
+        let settings_events = settings_outcome.events;
         let mut default_settings_warning = None;
 
         // Nudge users off the deprecated `rootMarkers` config key. The claim
