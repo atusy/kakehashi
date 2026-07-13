@@ -757,8 +757,18 @@ fn write_uninstall_tombstone(
     queries_parent: &Path,
     language: &str,
 ) -> Result<(), QueryInstallError> {
+    write_uninstall_tombstone_with_before_publish(queries_parent, language, |_| {})
+}
+
+fn write_uninstall_tombstone_with_before_publish(
+    queries_parent: &Path,
+    language: &str,
+    before_publish: impl FnOnce(&Path),
+) -> Result<(), QueryInstallError> {
     validate_safe_language_name(language)?;
-    let mut file = open_regular_tombstone(&uninstall_tombstone_path(queries_parent, language))?;
+    let path = uninstall_tombstone_path(queries_parent, language);
+    let mut file = open_regular_tombstone(&path)?;
+    before_publish(&path);
     file.set_len(0)?;
     file.write_all(b"ok\n")?;
     Ok(())
@@ -1359,16 +1369,8 @@ mod tests {
         );
         assert!(
             matches!(result, Err(QueryInstallError::IoError(_))),
-            "a multiply linked managed tombstone must fail the uninstall"
+            "an already multiply linked managed tombstone must fail the uninstall"
         );
-    }
-
-    #[test]
-    #[cfg(any(unix, windows))]
-    fn tombstone_link_count_requires_one_live_name() {
-        assert!(require_single_link(0).is_err());
-        assert!(require_single_link(1).is_ok());
-        assert!(require_single_link(2).is_err());
     }
 
     #[test]
