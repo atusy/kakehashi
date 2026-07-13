@@ -731,7 +731,7 @@ fn recover_interrupted_query_install(
         return Ok(());
     }
     let queries_dir = queries_parent.join(language);
-    if queries_dir.exists() {
+    if path_entry_exists(&queries_dir)? {
         return Ok(());
     }
 
@@ -739,7 +739,7 @@ fn recover_interrupted_query_install(
     if uninstall_tombstone_path(queries_parent, language).is_file() {
         return Ok(());
     }
-    if queries_dir.exists() {
+    if path_entry_exists(&queries_dir)? {
         return Ok(());
     }
 
@@ -765,6 +765,14 @@ fn recover_interrupted_query_install(
     }
     let _ = fs::remove_file(ownership);
     Ok(())
+}
+
+fn path_entry_exists(path: &Path) -> Result<bool, QueryInstallError> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(QueryInstallError::IoError(e)),
+    }
 }
 
 fn uninstall_tombstone_path(queries_parent: &Path, language: &str) -> PathBuf {
@@ -913,13 +921,9 @@ fn replace_query_dir(
         return Ok(ReplaceQueryDirResult::Uninstalled);
     }
 
-    match fs::symlink_metadata(queries_dir) {
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            fs::rename(tmp_queries_dir, queries_dir)?;
-            return Ok(ReplaceQueryDirResult::Replaced);
-        }
-        Err(e) => return Err(QueryInstallError::IoError(e)),
-        Ok(_) => {}
+    if !path_entry_exists(queries_dir)? {
+        fs::rename(tmp_queries_dir, queries_dir)?;
+        return Ok(ReplaceQueryDirResult::Replaced);
     }
 
     let backup_dir = unique_backup_query_dir(queries_dir, language);
@@ -1310,6 +1314,35 @@ mod tests {
             !tmp.exists(),
             "generated staging dirs from crashed installs should be collected"
         );
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn recovery_does_not_restore_a_backup_over_a_dangling_managed_symlink() {
+        let temp = TempDir::new().unwrap();
+        let queries_parent = temp.path().join("queries");
+        fs::create_dir_all(&queries_parent).unwrap();
+        let queries_dir = queries_parent.join("lua");
+        if !create_dir_symlink_or_skip(&temp.path().join("missing"), &queries_dir) {
+            return;
+        }
+        let backup = queries_parent.join(".lua.1.1.backup");
+        fs::create_dir_all(&backup).unwrap();
+        fs::write(backup.join("highlights.scm"), "backup").unwrap();
+        write_install_marker_for_tests(&backup).unwrap();
+        write_backup_ownership_marker(&backup).unwrap();
+
+        let result = recover_interrupted_query_install(&queries_parent, "lua");
+
+        assert!(result.is_ok(), "recovery failed: {result:?}");
+        assert!(
+            fs::symlink_metadata(&queries_dir)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "recovery must leave the occupied managed entry for normal repair"
+        );
+        assert!(backup.is_dir(), "backup must remain available for recovery");
     }
 
     #[test]
