@@ -782,7 +782,8 @@ fn write_uninstall_tombstone_with_before_publish(
     staged.write_all(b"ok\n")?;
     staged.as_file().sync_all()?;
     before_publish(&path, staged.path());
-    staged.persist(path).map_err(|error| error.error)?;
+    let published = staged.persist(&path).map_err(|error| error.error)?;
+    verify_published_tombstone(published, &path)?;
     Ok(())
 }
 
@@ -846,20 +847,7 @@ fn validate_existing_tombstone(path: &Path) -> std::io::Result<()> {
             "query uninstall tombstone is not a regular file",
         ));
     }
-    use std::os::windows::io::AsRawHandle as _;
-    use windows_sys::Win32::Storage::FileSystem::{
-        BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
-    };
-    let mut information = std::mem::MaybeUninit::<BY_HANDLE_FILE_INFORMATION>::uninit();
-    // SAFETY: `file` keeps this handle valid for the call, and Windows
-    // initializes the complete output structure whenever it reports success.
-    let succeeded =
-        unsafe { GetFileInformationByHandle(file.as_raw_handle(), information.as_mut_ptr()) };
-    if succeeded == 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    // SAFETY: GetFileInformationByHandle succeeded above.
-    let information = unsafe { information.assume_init() };
+    let information = windows_file_information(&file)?;
     require_single_link(u64::from(information.nNumberOfLinks))?;
     Ok(())
 }
@@ -872,6 +860,90 @@ fn require_single_link(links: u64) -> std::io::Result<()> {
         ))
     } else {
         Ok(())
+    }
+}
+
+#[cfg(unix)]
+fn verify_published_tombstone(published: fs::File, path: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
+
+    let expected = published.metadata()?;
+    drop(published);
+    let final_file = fs::OpenOptions::new()
+        .write(true)
+        .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_NONBLOCK)
+        .open(path)?;
+    let actual = final_file.metadata()?;
+    if !actual.file_type().is_file()
+        || actual.nlink() != 1
+        || expected.dev() != actual.dev()
+        || expected.ino() != actual.ino()
+    {
+        return Err(std::io::Error::other(
+            "published query uninstall tombstone changed identity",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn verify_published_tombstone(published: fs::File, path: &Path) -> std::io::Result<()> {
+    use std::os::windows::fs::{MetadataExt as _, OpenOptionsExt as _};
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_OPEN_REPARSE_POINT,
+    };
+
+    let expected = windows_file_information(&published)?;
+    drop(published);
+    let final_file = fs::OpenOptions::new()
+        .write(true)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)?;
+    let metadata = final_file.metadata()?;
+    let actual = windows_file_information(&final_file)?;
+    if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+        || !metadata.file_type().is_file()
+        || actual.nNumberOfLinks != 1
+        || expected.dwVolumeSerialNumber != actual.dwVolumeSerialNumber
+        || expected.nFileIndexHigh != actual.nFileIndexHigh
+        || expected.nFileIndexLow != actual.nFileIndexLow
+    {
+        return Err(std::io::Error::other(
+            "published query uninstall tombstone changed identity",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn windows_file_information(
+    file: &fs::File,
+) -> std::io::Result<windows_sys::Win32::Storage::FileSystem::BY_HANDLE_FILE_INFORMATION> {
+    use std::os::windows::io::AsRawHandle as _;
+    use windows_sys::Win32::Storage::FileSystem::{
+        BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
+    };
+
+    let mut information = std::mem::MaybeUninit::<BY_HANDLE_FILE_INFORMATION>::uninit();
+    // SAFETY: `file` keeps this handle valid for the call, and Windows
+    // initializes the complete output structure whenever it reports success.
+    let succeeded =
+        unsafe { GetFileInformationByHandle(file.as_raw_handle(), information.as_mut_ptr()) };
+    if succeeded == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: GetFileInformationByHandle succeeded above.
+    Ok(unsafe { information.assume_init() })
+}
+
+#[cfg(not(any(unix, windows)))]
+fn verify_published_tombstone(_published: fs::File, path: &Path) -> std::io::Result<()> {
+    if fs::symlink_metadata(path)?.file_type().is_file() {
+        Ok(())
+    } else {
+        Err(std::io::Error::other(
+            "published query uninstall tombstone is not a regular file",
+        ))
     }
 }
 
@@ -1415,6 +1487,33 @@ mod tests {
             "a link raced after validation must retain the old inode contents"
         );
         assert_eq!(fs::read_to_string(tombstone).unwrap(), "ok\n");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn tombstone_publish_rejects_substituted_private_stage() {
+        use std::os::unix::fs::symlink;
+
+        let temp = TempDir::new().unwrap();
+        let queries_parent = temp.path().join("queries");
+        fs::create_dir_all(&queries_parent).unwrap();
+        let victim = temp.path().join("victim");
+        fs::write(&victim, "keep me\n").unwrap();
+
+        let result = write_uninstall_tombstone_with_before_publish(
+            &queries_parent,
+            "rust",
+            |_, staged_path| {
+                fs::remove_file(staged_path).unwrap();
+                symlink(&victim, staged_path).unwrap();
+            },
+        );
+
+        assert!(
+            result.is_err(),
+            "publication must reject a stage path detached from its opened handle"
+        );
+        assert_eq!(fs::read_to_string(victim).unwrap(), "keep me\n");
     }
 
     #[test]
