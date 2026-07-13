@@ -200,18 +200,17 @@ keeps the default `true`. kakehashi never guesses the editor's behavior.
 
 ## Decision–Implementation Gap
 
-**Implemented**: rule 1 (accept always) — kakehashi advertises
+**Implemented**: rules 1 and 3. For rule 1 (accept always), kakehashi advertises
 `workspace.diagnostics.refreshSupport = true` to downstream
 (`src/lsp/bridge/protocol/client_capabilities.rs`), and the downstream
 `workspace/diagnostic/refresh` request handler
 (`src/lsp/bridge/workspace/diagnostic_refresh.rs`) acks it with a `null` result
-while emitting `UpstreamNotification::DiagnosticRefresh` to forward the refresh
-toward the editor (the lifecycle arm that performs that forward is where rule 3's
-gate will live).
+while emitting `UpstreamNotification::DiagnosticRefresh`. For rule 3, the
+lifecycle arm routes that notification through the workspace-wide leading +
+trailing scheduler, which checks `workspace.diagnostics.refreshSupport` before
+admission and sends through the existing detached single-flight path.
 
 **Planned** (this decision):
 
-- Rule 3 — gate the editor forward on `check_diagnostic_refresh_support` (today it
-  forwards unconditionally).
 - Rule 2 — add the downstream-refresh → Path A pull trigger (today a downstream
   refresh never re-pulls).
