@@ -418,10 +418,12 @@ pub(crate) struct DiagnosticAggregator {
     /// that window set `pending`, which fires exactly one more refresh on
     /// completion. Drives [`Self::try_begin_refresh`]/[`Self::finish_refresh`].
     refresh_flight: Mutex<RefreshFlight>,
-    /// Trailing-edge debounce for downstream-forwarded diagnostic refreshes
-    /// (#789). Unlike [`Self::refresh_flight`], which only coalesces while the
-    /// editor's acknowledgement is outstanding, this also collapses bursts
-    /// when the editor answers each request immediately.
+    /// Leading + trailing debounce for downstream-forwarded diagnostic
+    /// refreshes (#789). Unlike [`Self::refresh_flight`], which only coalesces
+    /// while the editor's acknowledgement is outstanding, this also collapses
+    /// bursts when the editor answers each request immediately. The first
+    /// activity after idle sends without waiting; later activity produces a
+    /// trailing send only when no refresh from any origin has covered it.
     forwarded_refresh_debounce: Mutex<ForwardedRefreshDebounce>,
     /// Per-host coverage versions for the refresh **coverage gate** (#497, commit 2).
     /// `current` bumps on every set-changing republish (the editor's pulled view is
@@ -480,6 +482,21 @@ struct RefreshFlight {
 struct ForwardedRefreshDebounce {
     generation: u64,
     task_scheduled: bool,
+    last_activity_at: Option<tokio::time::Instant>,
+    refreshes_sent_at_last_activity: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ForwardedRefreshWaitSnapshot {
+    pub(crate) generation: u64,
+    pub(crate) last_activity_at: tokio::time::Instant,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ForwardedRefreshWait {
+    Restart(ForwardedRefreshWaitSnapshot),
+    SendTrailing,
+    Settled,
 }
 
 /// Per-host coalescing state for the editor-facing `publishDiagnostics` wire
@@ -617,33 +634,56 @@ impl DiagnosticAggregator {
     /// Record downstream refresh activity and claim the single debounce task.
     /// The returned generation is the activity snapshot that task should wait
     /// against; `None` means an existing task will observe this activity.
-    pub(crate) fn begin_forwarded_refresh_debounce(&self) -> Option<u64> {
+    pub(crate) fn begin_forwarded_refresh_debounce(&self) -> Option<ForwardedRefreshWaitSnapshot> {
         let mut debounce = self
             .forwarded_refresh_debounce
             .lock()
             .recover_poison("DiagnosticAggregator::forwarded_refresh_debounce");
         debounce.generation = debounce.generation.wrapping_add(1);
+        let last_activity_at = tokio::time::Instant::now();
+        debounce.last_activity_at = Some(last_activity_at);
+        debounce.refreshes_sent_at_last_activity =
+            self.metrics.refreshes_sent.load(Ordering::Relaxed);
         if debounce.task_scheduled {
             None
         } else {
             debounce.task_scheduled = true;
-            Some(debounce.generation)
+            Some(ForwardedRefreshWaitSnapshot {
+                generation: debounce.generation,
+                last_activity_at,
+            })
         }
     }
 
     /// Check whether activity occurred during the debounce wait. A newer
-    /// generation restarts the settle window; `None` releases the task claim
-    /// and tells the caller to forward exactly one refresh.
-    pub(crate) fn finish_forwarded_refresh_wait(&self, observed: u64, force: bool) -> Option<u64> {
+    /// generation restarts the settle window. Once the wait settles, request a
+    /// trailing refresh only when no refresh send has covered the latest
+    /// downstream activity; the leading send or another refresh origin may
+    /// already have done so.
+    pub(crate) fn finish_forwarded_refresh_wait(
+        &self,
+        observed: u64,
+        force: bool,
+    ) -> ForwardedRefreshWait {
         let mut debounce = self
             .forwarded_refresh_debounce
             .lock()
             .recover_poison("DiagnosticAggregator::forwarded_refresh_debounce");
         if !force && debounce.generation != observed {
-            Some(debounce.generation)
+            ForwardedRefreshWait::Restart(ForwardedRefreshWaitSnapshot {
+                generation: debounce.generation,
+                last_activity_at: debounce
+                    .last_activity_at
+                    .expect("activity generation has a timestamp"),
+            })
         } else {
             debounce.task_scheduled = false;
-            None
+            let refreshes_sent = self.metrics.refreshes_sent.load(Ordering::Relaxed);
+            if refreshes_sent == debounce.refreshes_sent_at_last_activity {
+                ForwardedRefreshWait::SendTrailing
+            } else {
+                ForwardedRefreshWait::Settled
+            }
         }
     }
 
@@ -2351,21 +2391,66 @@ mod tests {
         let first = agg
             .begin_forwarded_refresh_debounce()
             .expect("the first refresh schedules the trailing task");
+        agg.record_refresh_sent();
         assert!(
             agg.begin_forwarded_refresh_debounce().is_none(),
             "burst activity must reuse the scheduled task"
         );
-        let latest = agg
-            .finish_forwarded_refresh_wait(first, false)
-            .expect("activity during the wait restarts the settle window");
+        let ForwardedRefreshWait::Restart(latest) =
+            agg.finish_forwarded_refresh_wait(first.generation, false)
+        else {
+            panic!("activity during the wait must restart the settle window");
+        };
         assert_eq!(
-            agg.finish_forwarded_refresh_wait(latest, false),
-            None,
-            "a quiet window releases exactly one refresh"
+            agg.finish_forwarded_refresh_wait(latest.generation, false),
+            ForwardedRefreshWait::SendTrailing,
+            "activity after the leading send releases exactly one trailing refresh"
         );
         assert!(
             agg.begin_forwarded_refresh_debounce().is_some(),
             "new activity after the quiet window schedules the next refresh"
+        );
+    }
+
+    #[test]
+    fn forwarded_refresh_settles_without_a_duplicate_after_the_leading_send() {
+        let agg = DiagnosticAggregator::new();
+        let first = agg
+            .begin_forwarded_refresh_debounce()
+            .expect("the first refresh schedules the settle task");
+
+        agg.record_refresh_sent();
+
+        assert_eq!(
+            agg.finish_forwarded_refresh_wait(first.generation, false),
+            ForwardedRefreshWait::Settled,
+            "the leading send covers the only activity"
+        );
+    }
+
+    #[test]
+    fn another_refresh_after_the_latest_activity_satisfies_the_trailing_edge() {
+        let agg = DiagnosticAggregator::new();
+        let first = agg
+            .begin_forwarded_refresh_debounce()
+            .expect("the first refresh schedules the settle task");
+        agg.record_refresh_sent();
+        assert!(
+            agg.begin_forwarded_refresh_debounce().is_none(),
+            "later downstream activity remains in the same debounce cycle"
+        );
+        let ForwardedRefreshWait::Restart(latest) =
+            agg.finish_forwarded_refresh_wait(first.generation, false)
+        else {
+            panic!("the waiter must observe the later activity");
+        };
+
+        agg.record_refresh_sent();
+
+        assert_eq!(
+            agg.finish_forwarded_refresh_wait(latest.generation, false),
+            ForwardedRefreshWait::Settled,
+            "a refresh sent after the latest activity makes a forced trailing send redundant"
         );
     }
 

@@ -98,6 +98,16 @@ pull-driven downstream; whether the editor actually re-pulls is its own
 (unadvertised) choice — which is exactly why rule 2's push path is not conditioned
 on it. This gate is orthogonal to rule 2's *pull*.
 
+Forwarding is scheduled once per upstream workspace connection, not once per
+downstream server. The first downstream refresh after idle is the leading edge
+and is forwarded immediately. Further downstream refreshes join one trailing
+debounce cycle: 100 ms of quiet releases the latest activity, while an anchored
+1 s maximum wait prevents a continuously chatty server from postponing it
+forever. If another editor refresh is sent after the latest downstream activity,
+that send already provides the required re-pull nudge and the trailing forward is
+suppressed. This keeps independent downstream servers on the same workspace-wide
+cadence without coupling separate kakehashi workspace connections.
+
 ### Why 2 and 3 are decoupled (not "skip the pull when the editor can pull")
 
 Coupling rule 2 to the editor's refresh capability would save one redundant pull
