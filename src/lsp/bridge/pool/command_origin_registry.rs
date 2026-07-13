@@ -5,9 +5,9 @@
 //! envelope (`command_routing`). But a command the client fires WITHOUT an
 //! action context — from the command palette, keyed off the advertised
 //! `executeCommandProvider.commands` list — arrives as the RAW downstream name.
-//! This registry lets `dispatch_execute_command` resolve that raw name back to
-//! the exact `(server, root)` connection that advertised it, so the command runs
-//! in the same workspace context (not a fresh client-root connection).
+//! This registry preserves the known origins used by `dispatch_execute_command`
+//! when no advertising connection is live; live routing reads exact handle
+//! capabilities so collisions cannot be hidden by handshake timing.
 //!
 //! Global to the editor↔Kakehashi session (one instance on the pool) and keyed
 //! by command name. Every distinct advertising connection is retained so a raw
@@ -98,7 +98,7 @@ mod tests {
     }
 
     #[test]
-    fn colliding_command_name_has_no_arbitrary_route() {
+    fn collision_registers_the_name_once_and_retains_both_origins() {
         let reg = CommandOriginRegistry::default();
         let ruff = ConnectionKey::new("ruff", Some("/w/a".to_string()));
         let eslint = ConnectionKey::new("eslint", Some("/w/b".to_string()));

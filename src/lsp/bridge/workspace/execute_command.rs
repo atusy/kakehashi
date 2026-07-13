@@ -169,13 +169,12 @@ impl LanguageServerPool {
     }
 
     /// Route a PALETTE-fired command (a raw downstream command name, no action
-    /// envelope) to the exact connection that advertised it — recorded in the
-    /// [`command_origins`](Self::command_origins) registry at handshake — so it
-    /// runs in the same `(server, root)` workspace context (#628). Reuses the
-    /// live advertising connection; only if it has since been shut down AND the
-    /// key is a plain client-root fallback does it reconnect. Forwards the command
-    /// name and arguments verbatim; fails soft (foreign command, unspawnable or
-    /// unreachable origin) like every other branch.
+    /// envelope) to the sole live connection advertising that exact name. If no
+    /// advertiser is live, the handshake registry can reconnect one unambiguous
+    /// client-root origin. Multiple live or historical origins fail soft because
+    /// the raw request carries no workspace identity (#823). Forwards the command
+    /// name and arguments verbatim; other failures remain fail-soft like the
+    /// encoded-command path.
     async fn dispatch_palette_command(
         &self,
         params: ExecuteCommandParams,
