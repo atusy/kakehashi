@@ -485,6 +485,7 @@ struct ForwardedRefreshDebounce {
     last_activity_at: Option<tokio::time::Instant>,
     refresh_epoch: u64,
     refresh_epoch_at_last_activity: u64,
+    covered_generation: Option<u64>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -681,7 +682,8 @@ impl DiagnosticAggregator {
                         .last_activity_at
                         .expect("activity generation has a timestamp"),
                 },
-                send_trailing: debounce.refresh_epoch == debounce.refresh_epoch_at_last_activity,
+                send_trailing: debounce.covered_generation != Some(debounce.generation)
+                    && debounce.refresh_epoch == debounce.refresh_epoch_at_last_activity,
             };
         }
         if debounce.generation != observed {
@@ -693,7 +695,9 @@ impl DiagnosticAggregator {
             })
         } else {
             debounce.task_scheduled = false;
-            if debounce.refresh_epoch == debounce.refresh_epoch_at_last_activity {
+            if debounce.covered_generation != Some(debounce.generation)
+                && debounce.refresh_epoch == debounce.refresh_epoch_at_last_activity
+            {
                 ForwardedRefreshWait::SendTrailing
             } else {
                 ForwardedRefreshWait::Settled
@@ -706,6 +710,17 @@ impl DiagnosticAggregator {
             .lock()
             .recover_poison("DiagnosticAggregator::forwarded_refresh_debounce")
             .task_scheduled = false;
+    }
+
+    /// Record that a forced refresh has been admitted for the latest downstream
+    /// activity. Admission is enough: the refresh single-flight guarantees that
+    /// an in-flight request will eventually emit its forced pending successor.
+    pub(crate) fn mark_forwarded_refresh_covered(&self) {
+        let mut debounce = self
+            .forwarded_refresh_debounce
+            .lock()
+            .recover_poison("DiagnosticAggregator::forwarded_refresh_debounce");
+        debounce.covered_generation = Some(debounce.generation);
     }
 
     pub(crate) fn new() -> Self {
@@ -2478,6 +2493,31 @@ mod tests {
             agg.finish_forwarded_refresh_wait(latest.generation, false),
             ForwardedRefreshWait::Settled,
             "a refresh sent after the latest activity makes a forced trailing send redundant"
+        );
+    }
+
+    #[test]
+    fn max_wait_admission_covers_the_generation_before_the_wire_task_runs() {
+        let agg = DiagnosticAggregator::new();
+        let first = agg
+            .begin_forwarded_refresh_debounce()
+            .expect("the first refresh schedules the settle task");
+        agg.mark_forwarded_refresh_covered();
+        assert!(agg.begin_forwarded_refresh_debounce().is_none());
+
+        let ForwardedRefreshWait::MaxWait {
+            snapshot: latest,
+            send_trailing: true,
+        } = agg.finish_forwarded_refresh_wait(first.generation, true)
+        else {
+            panic!("activity after the leading edge needs a max-wait send");
+        };
+        agg.mark_forwarded_refresh_covered();
+
+        assert_eq!(
+            agg.finish_forwarded_refresh_wait(latest.generation, false),
+            ForwardedRefreshWait::Settled,
+            "admission must prevent a delayed waiter from scheduling the same trailing edge twice"
         );
     }
 
