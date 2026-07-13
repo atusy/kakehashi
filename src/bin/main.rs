@@ -679,6 +679,13 @@ fn run_config_init(output: Option<PathBuf>, force: bool) -> Result<(), ExitCode>
         eprintln!("Failed to serialize configuration: {}", e);
         ExitCode::FAILURE
     })?;
+    // TOML 1.1 permits `/` in bare keys, but quote LSP method names in the
+    // generated template so their method-keyed nature is immediately visible
+    // and matches the documented configuration form.
+    let config_toml = config_toml.replace(
+        "[features.workspace/diagnostic/refresh]",
+        "[features.\"workspace/diagnostic/refresh\"]",
+    );
 
     // Prepend documentation link
     let content = format!("{}\n{}", DOC_LINK, config_toml);

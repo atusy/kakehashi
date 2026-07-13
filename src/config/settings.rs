@@ -633,9 +633,63 @@ pub struct RawWorkspaceSettings {
     /// pull it triggers. Higher values cut refresh/pull volume during rapid typing
     /// at the cost of latency. Defaults to [`DEFAULT_DEBOUNCE_MS`] when unset.
     pub diagnostics_debounce_ms: Option<u64>,
+    /// Workspace-wide, client-facing feature policies keyed by LSP method.
+    pub features: Option<FeatureSettings>,
     /// Language servers for bridging LSP requests to injection regions.
     /// Map of server name to server configuration.
     pub language_servers: Option<HashMap<String, BridgeServerConfig>>,
+}
+
+pub const DEFAULT_WORKSPACE_DIAGNOSTIC_REFRESH_DEBOUNCE_MS: u64 = 100;
+pub const DEFAULT_WORKSPACE_DIAGNOSTIC_REFRESH_MAX_WAIT_MS: u64 = 1000;
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct DebounceFeatureSettings {
+    pub debounce_ms: Option<u64>,
+    pub max_wait_ms: Option<u64>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+pub struct FeatureSettings {
+    #[serde(rename = "workspace/diagnostic/refresh")]
+    pub workspace_diagnostic_refresh: Option<DebounceFeatureSettings>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ResolvedDebounceFeatureSettings {
+    pub debounce_ms: u64,
+    pub max_wait_ms: u64,
+}
+
+impl Default for ResolvedDebounceFeatureSettings {
+    fn default() -> Self {
+        Self {
+            debounce_ms: DEFAULT_WORKSPACE_DIAGNOSTIC_REFRESH_DEBOUNCE_MS,
+            max_wait_ms: DEFAULT_WORKSPACE_DIAGNOSTIC_REFRESH_MAX_WAIT_MS,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ResolvedFeatureSettings {
+    pub workspace_diagnostic_refresh: ResolvedDebounceFeatureSettings,
+}
+
+impl FeatureSettings {
+    pub(crate) fn resolve(&self) -> ResolvedFeatureSettings {
+        let refresh = self.workspace_diagnostic_refresh.as_ref();
+        ResolvedFeatureSettings {
+            workspace_diagnostic_refresh: ResolvedDebounceFeatureSettings {
+                debounce_ms: refresh
+                    .and_then(|settings| settings.debounce_ms)
+                    .unwrap_or(DEFAULT_WORKSPACE_DIAGNOSTIC_REFRESH_DEBOUNCE_MS),
+                max_wait_ms: refresh
+                    .and_then(|settings| settings.max_wait_ms)
+                    .unwrap_or(DEFAULT_WORKSPACE_DIAGNOSTIC_REFRESH_MAX_WAIT_MS),
+            },
+        }
+    }
 }
 
 /// Generate JSON Schema for the workspace configuration.
@@ -774,6 +828,7 @@ pub struct WorkspaceSettings {
     pub capture_mappings: CaptureMappings,
     pub auto_install: bool,
     pub diagnostics_debounce_ms: u64,
+    pub features: ResolvedFeatureSettings,
     pub language_servers: HashMap<String, BridgeServerConfig>,
 }
 
@@ -785,6 +840,7 @@ impl Default for WorkspaceSettings {
             capture_mappings: CaptureMappings::default(),
             auto_install: true, // Default to true for zero-config experience
             diagnostics_debounce_ms: DEFAULT_DEBOUNCE_MS,
+            features: ResolvedFeatureSettings::default(),
             language_servers: HashMap::new(),
         }
     }
@@ -1158,6 +1214,7 @@ mod tests {
             capture_mappings: HashMap::new(),
             auto_install: None,
             diagnostics_debounce_ms: None,
+            features: None,
             language_servers: None,
         };
 

@@ -1,6 +1,6 @@
 use super::settings::{
-    AggregationConfig, BridgeLanguageConfig, BridgeServerConfig, LanguageSettings,
-    LayerAggregationConfig, LayersConfig,
+    AggregationConfig, BridgeLanguageConfig, BridgeServerConfig, DebounceFeatureSettings,
+    FeatureSettings, LanguageSettings, LayerAggregationConfig, LayersConfig,
 };
 use super::{CaptureMappings, RawWorkspaceSettings, WILDCARD_KEY};
 use std::collections::{HashMap, HashSet};
@@ -405,6 +405,7 @@ pub(crate) fn merge_workspace_settings(
                 diagnostics_debounce_ms: overlay
                     .diagnostics_debounce_ms
                     .or(base.diagnostics_debounce_ms),
+                features: merge_features(base.features, overlay.features),
                 language_servers: merge_language_servers(
                     base.language_servers,
                     overlay.language_servers,
@@ -413,6 +414,27 @@ pub(crate) fn merge_workspace_settings(
             Some(merged)
         }
         (base, overlay) => base.or(overlay),
+    }
+}
+
+fn merge_features(
+    base: Option<FeatureSettings>,
+    overlay: Option<FeatureSettings>,
+) -> Option<FeatureSettings> {
+    match (base, overlay) {
+        (Some(base), Some(overlay)) => Some(FeatureSettings {
+            workspace_diagnostic_refresh: match (
+                base.workspace_diagnostic_refresh,
+                overlay.workspace_diagnostic_refresh,
+            ) {
+                (Some(base), Some(overlay)) => Some(DebounceFeatureSettings {
+                    debounce_ms: overlay.debounce_ms.or(base.debounce_ms),
+                    max_wait_ms: overlay.max_wait_ms.or(base.max_wait_ms),
+                }),
+                (base, overlay) => overlay.or(base),
+            },
+        }),
+        (base, overlay) => overlay.or(base),
     }
 }
 
@@ -468,6 +490,33 @@ fn merge_capture_mappings(mut base: CaptureMappings, overlay: CaptureMappings) -
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn feature_timing_merge_preserves_unspecified_fields() {
+        let base: RawWorkspaceSettings = toml::from_str(
+            r#"
+            [features."workspace/diagnostic/refresh"]
+            debounceMs = 40
+            maxWaitMs = 400
+            "#,
+        )
+        .unwrap();
+        let overlay: RawWorkspaceSettings = toml::from_str(
+            r#"
+            [features."workspace/diagnostic/refresh"]
+            debounceMs = 80
+            "#,
+        )
+        .unwrap();
+        let merged = merge_workspace_settings(Some(base), Some(overlay)).unwrap();
+        let refresh = merged
+            .features
+            .unwrap()
+            .workspace_diagnostic_refresh
+            .unwrap();
+        assert_eq!(refresh.debounce_ms, Some(80));
+        assert_eq!(refresh.max_wait_ms, Some(400));
+    }
     use crate::config::QueryTypeMappings;
     use crate::config::settings;
     use std::collections::HashMap;
@@ -519,6 +568,7 @@ mod tests {
             search_paths: Some(vec!["/base/path".to_string()]),
             auto_install: Some(true),
             diagnostics_debounce_ms: None,
+            features: None,
             languages: HashMap::from([
                 (
                     "python".to_string(),
@@ -607,6 +657,7 @@ mod tests {
             search_paths: Some(vec!["/overlay/path".to_string()]),
             auto_install: Some(false),
             diagnostics_debounce_ms: None,
+            features: None,
             languages: HashMap::from([
                 (
                     // shared key: python — overlay overrides queries, inherits parser/bridge/aliases
