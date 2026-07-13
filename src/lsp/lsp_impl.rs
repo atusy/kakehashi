@@ -139,8 +139,9 @@ pub(super) async fn apply_shared_settings(
     bridge: &BridgeCoordinator,
     raw_settings: Option<RawWorkspaceSettings>,
     settings: WorkspaceSettings,
-) -> Vec<Url> {
+) -> (Vec<Url>, std::sync::Arc<WorkspaceSettings>) {
     let _reload = SETTINGS_RELOAD_LOCK.lock().await;
+    let previous_settings = settings_manager.load_settings();
     // TRANSITIONAL generation bump BEFORE any query/config mutation: from
     // this instant, every generation-stamped product built from the OLD
     // queries (snapshot-riding discovery/bridge/resolved regions, layer
@@ -231,7 +232,7 @@ pub(super) async fn apply_shared_settings(
     build_notifier(client, settings_manager)
         .log_language_events(&summary.events)
         .await;
-    reparse_uris
+    (reparse_uris, previous_settings)
 }
 
 /// Convert url::Url to ls_types::Uri, the reverse conversion for bridge protocol
@@ -477,8 +478,7 @@ impl Kakehashi {
         raw_settings: RawWorkspaceSettings,
         settings: WorkspaceSettings,
     ) {
-        let previous_settings = self.settings_manager.load_settings();
-        let reparse_uris = apply_shared_settings(
+        let (reparse_uris, previous_settings) = apply_shared_settings(
             &self.client,
             ReloadLanguageState {
                 language: &self.language,
@@ -520,7 +520,7 @@ impl Kakehashi {
         raw_settings: RawWorkspaceSettings,
         settings: WorkspaceSettings,
     ) {
-        apply_shared_settings(
+        let _ = apply_shared_settings(
             &self.client,
             ReloadLanguageState {
                 language: &self.language,
@@ -535,9 +535,7 @@ impl Kakehashi {
             Some(raw_settings),
             settings,
         )
-        .await
-        .into_iter()
-        .for_each(|uri| self.schedule_reparse(uri, None));
+        .await;
         self.warn_on_misconfigured_settings().await;
     }
 

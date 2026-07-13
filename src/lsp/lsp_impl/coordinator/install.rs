@@ -227,7 +227,7 @@ impl InstallCoordinator {
         raw_settings: crate::config::RawWorkspaceSettings,
         settings: WorkspaceSettings,
     ) {
-        let _reparse_uris = apply_shared_settings(
+        let (_reparse_uris, _previous_settings) = apply_shared_settings(
             &self.client,
             ReloadLanguageState {
                 language: &self.language,
