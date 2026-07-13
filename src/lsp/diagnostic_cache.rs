@@ -715,12 +715,14 @@ impl DiagnosticAggregator {
     /// Record that a forced refresh has been admitted for the latest downstream
     /// activity. Admission is enough: the refresh single-flight guarantees that
     /// an in-flight request will eventually emit its forced pending successor.
-    pub(crate) fn mark_forwarded_refresh_covered(&self) {
+    pub(crate) fn mark_forwarded_refresh_covered(&self, generation: u64) {
         let mut debounce = self
             .forwarded_refresh_debounce
             .lock()
             .recover_poison("DiagnosticAggregator::forwarded_refresh_debounce");
-        debounce.covered_generation = Some(debounce.generation);
+        if debounce.generation == generation {
+            debounce.covered_generation = Some(generation);
+        }
     }
 
     pub(crate) fn new() -> Self {
@@ -2502,7 +2504,7 @@ mod tests {
         let first = agg
             .begin_forwarded_refresh_debounce()
             .expect("the first refresh schedules the settle task");
-        agg.mark_forwarded_refresh_covered();
+        agg.mark_forwarded_refresh_covered(first.generation);
         assert!(agg.begin_forwarded_refresh_debounce().is_none());
 
         let ForwardedRefreshWait::MaxWait {
@@ -2512,12 +2514,46 @@ mod tests {
         else {
             panic!("activity after the leading edge needs a max-wait send");
         };
-        agg.mark_forwarded_refresh_covered();
+        agg.mark_forwarded_refresh_covered(latest.generation);
 
         assert_eq!(
             agg.finish_forwarded_refresh_wait(latest.generation, false),
             ForwardedRefreshWait::Settled,
             "admission must prevent a delayed waiter from scheduling the same trailing edge twice"
+        );
+    }
+
+    #[test]
+    fn an_old_admission_never_covers_a_newer_generation() {
+        let agg = DiagnosticAggregator::new();
+        let first = agg
+            .begin_forwarded_refresh_debounce()
+            .expect("the first refresh schedules the settle task");
+        agg.mark_forwarded_refresh_covered(first.generation);
+        assert!(agg.begin_forwarded_refresh_debounce().is_none());
+        let ForwardedRefreshWait::MaxWait {
+            snapshot: admitted,
+            send_trailing: true,
+        } = agg.finish_forwarded_refresh_wait(first.generation, true)
+        else {
+            panic!("the second generation needs a max-wait send");
+        };
+
+        // The admitted send happens before a newer activity, but its coverage
+        // mark loses the race and runs afterward.
+        agg.record_refresh_sent();
+        assert!(agg.begin_forwarded_refresh_debounce().is_none());
+        agg.mark_forwarded_refresh_covered(admitted.generation);
+
+        let ForwardedRefreshWait::Restart(newest) =
+            agg.finish_forwarded_refresh_wait(admitted.generation, false)
+        else {
+            panic!("the waiter must observe the newer activity");
+        };
+        assert_eq!(
+            agg.finish_forwarded_refresh_wait(newest.generation, false),
+            ForwardedRefreshWait::SendTrailing,
+            "an older admission must not suppress the newer generation"
         );
     }
 
