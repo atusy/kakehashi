@@ -269,6 +269,10 @@ pub struct Kakehashi {
     cache: std::sync::Arc<CacheCoordinator>,
     /// Consolidated settings, capabilities, and workspace root management
     settings_manager: std::sync::Arc<SettingsManager>,
+    /// Client-supplied settings kept separate from the merged effective
+    /// snapshot so a workspace-root change can reload project configuration
+    /// without carrying values from the previous project forward.
+    client_settings_override: arc_swap::ArcSwapOption<RawWorkspaceSettings>,
     /// Isolated coordinator for parser auto-installation
     auto_install: AutoInstallManager,
     /// Bridge coordinator for downstream LS pool and node tracking
@@ -416,6 +420,7 @@ impl Kakehashi {
             documents: std::sync::Arc::new(DocumentStore::new()),
             cache: std::sync::Arc::new(CacheCoordinator::new()),
             settings_manager: std::sync::Arc::new(SettingsManager::new()),
+            client_settings_override: arc_swap::ArcSwapOption::empty(),
             auto_install,
             bridge: std::sync::Arc::new(bridge),
             synthetic_diagnostics: std::sync::Arc::new(SyntheticDiagnosticsManager::new()),

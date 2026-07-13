@@ -394,7 +394,8 @@ impl Kakehashi {
         let current_ts = self.settings_manager.load_raw_settings();
         // SAFETY: merge_workspace_settings(Some, Some) always returns Some, so unwrap_or_return is
         // defensive only — the None branch is unreachable under the current implementation.
-        let Some(merged_ts) = merge_workspace_settings(Some((*current_ts).clone()), Some(parsed))
+        let Some(merged_ts) =
+            merge_workspace_settings(Some((*current_ts).clone()), Some(parsed.clone()))
         else {
             log::warn!(
                 "merge_workspace_settings returned None despite two Some inputs; skipping configuration update"
@@ -408,6 +409,11 @@ impl Kakehashi {
             crate::config::expand::with_kakehashi_defaults(|var| std::env::var(var).ok()),
         ) {
             Ok(settings) => {
+                let client_override = self.client_settings_override.load_full();
+                let merged_override =
+                    merge_workspace_settings(client_override.as_deref().cloned(), Some(parsed));
+                self.client_settings_override
+                    .store(merged_override.map(std::sync::Arc::new));
                 self.apply_raw_settings(merged_ts, settings).await;
                 self.notifier().log_info("Configuration updated!").await;
             }

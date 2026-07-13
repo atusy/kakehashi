@@ -2,7 +2,7 @@
 
 use tower_lsp_server::ls_types::DidChangeWorkspaceFoldersParams;
 
-use crate::config::{WorkspaceSettings, merge_workspace_settings};
+use crate::config::WorkspaceSettings;
 use crate::lsp::{SettingsSource, load_settings};
 
 use super::super::Kakehashi;
@@ -28,22 +28,21 @@ impl Kakehashi {
         self.settings_manager.set_root_path(root_path);
 
         let root_path = self.settings_manager.root_path().as_ref().clone();
+        let client_override = self.client_settings_override.load_full();
         let outcome = load_settings(
             root_path.as_deref(),
-            None::<(SettingsSource, serde_json::Value)>,
+            client_override.as_deref().and_then(|settings| {
+                serde_json::to_value(settings)
+                    .ok()
+                    .map(|value| (SettingsSource::InitializationOptions, value))
+            }),
             self.home_dir.as_deref(),
             |var| std::env::var(var).ok(),
         );
         self.notifier().log_settings_events(&outcome.events).await;
-        let root_settings = outcome
+        let raw = outcome
             .raw_settings
             .unwrap_or_else(crate::config::defaults::default_settings);
-        let active_settings = self.settings_manager.load_raw_settings();
-        let Some(raw) =
-            merge_workspace_settings(Some(root_settings), Some((*active_settings).clone()))
-        else {
-            return;
-        };
         match WorkspaceSettings::try_from_settings(
             &raw,
             self.home_dir.as_deref(),

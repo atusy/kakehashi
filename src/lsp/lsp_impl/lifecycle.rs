@@ -191,10 +191,11 @@ impl Kakehashi {
         }
 
         let root_path = self.settings_manager.root_path().as_ref().clone();
+        let initialization_options = params.initialization_options;
         let settings_outcome = load_settings(
             root_path.as_deref(),
-            params
-                .initialization_options
+            initialization_options
+                .clone()
                 .map(|options| (SettingsSource::InitializationOptions, options)),
             self.home_dir.as_deref(),
             |var| std::env::var(var).ok(),
@@ -250,6 +251,11 @@ impl Kakehashi {
             };
             (raw_settings, settings)
         };
+        self.client_settings_override.store(
+            initialization_options
+                .and_then(|value| serde_json::from_value(value).ok())
+                .map(std::sync::Arc::new),
+        );
         // Derive the onTypeFormatting trigger union before settings move into
         // apply_raw_settings: kakehashi cannot know downstream trigger
         // characters at initialize time (servers spawn lazily), so the

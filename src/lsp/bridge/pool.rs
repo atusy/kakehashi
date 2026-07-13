@@ -566,9 +566,20 @@ impl LanguageServerPool {
 
         let mut connections = self.connections.lock().await;
         let mut invalidated = Vec::new();
-        for (key, handle) in connections.iter().filter(|(_, handle)| {
-            handle.state() == ConnectionState::Ready && handle.supports_workspace_folder_changes()
-        }) {
+        for (key, handle) in connections.iter() {
+            if handle.state() == ConnectionState::Initializing {
+                // Its initialize request captured the old snapshot and an LSP
+                // notification cannot be sent until after `initialized`.
+                // Recycle it so the next acquisition handshakes with the
+                // committed snapshot instead of retaining stale folders.
+                invalidated.push(key.clone());
+                continue;
+            }
+            if handle.state() != ConnectionState::Ready
+                || !handle.supports_workspace_folder_changes()
+            {
+                continue;
+            }
             let notification =
                 build_did_change_workspace_folders_notification(added.clone(), removed.to_vec());
             if handle.send_notification(notification) == NotificationSendResult::Queued {
@@ -2945,6 +2956,25 @@ mod tests {
 
         assert_eq!(capable.workspace_folders().snapshot(), Some(vec![added]));
         assert_eq!(incapable.workspace_folders().snapshot(), None);
+    }
+
+    #[tokio::test]
+    async fn workspace_folder_change_recycles_initializing_connection() {
+        let pool = LanguageServerPool::new();
+        let key = ConnectionKey::for_server("initializing");
+        let handle = create_handle_with_key(ConnectionState::Initializing, key.clone()).await;
+        pool.insert_connection(handle).await;
+        let added = tower_lsp_server::ls_types::WorkspaceFolder {
+            uri: "file:///added".parse().unwrap(),
+            name: "added".to_string(),
+        };
+
+        pool.apply_workspace_folder_change(vec![added], &[]).await;
+
+        assert!(
+            !pool.connections.lock().await.contains_key(&key),
+            "a handshake seeded from the old snapshot must not remain reusable"
+        );
     }
 
     fn shared_config() -> crate::config::settings::BridgeServerConfig {
