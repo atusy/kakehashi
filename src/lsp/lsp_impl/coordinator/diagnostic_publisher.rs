@@ -163,7 +163,9 @@ impl DiagnosticPublisher {
         let Some(snapshot) = self.aggregator.begin_forwarded_refresh_debounce() else {
             return;
         };
-        self.request_pull_diagnostic_refresh_inner(true, false);
+        if self.request_pull_diagnostic_refresh_inner(true, false) {
+            self.aggregator.mark_forwarded_refresh_covered();
+        }
         let publisher = self.clone();
         tokio::spawn(async move {
             let mut snapshot = snapshot;
@@ -188,7 +190,9 @@ impl DiagnosticPublisher {
                         }
                         match decision {
                             crate::lsp::diagnostic_cache::ForwardedRefreshWait::SendTrailing => {
-                                publisher.request_pull_diagnostic_refresh_inner(true, false);
+                                if publisher.request_pull_diagnostic_refresh_inner(true, false) {
+                                    publisher.aggregator.mark_forwarded_refresh_covered();
+                                }
                                 break;
                             }
                             crate::lsp::diagnostic_cache::ForwardedRefreshWait::Settled => break,
@@ -196,8 +200,10 @@ impl DiagnosticPublisher {
                                 snapshot: latest,
                                 send_trailing,
                             } => {
-                                if send_trailing {
-                                    publisher.request_pull_diagnostic_refresh_inner(true, false);
+                                if send_trailing
+                                    && publisher.request_pull_diagnostic_refresh_inner(true, false)
+                                {
+                                    publisher.aggregator.mark_forwarded_refresh_covered();
                                 }
                                 snapshot = latest;
                                 deadline = tokio::time::Instant::now()
@@ -995,9 +1001,9 @@ impl DiagnosticPublisher {
         self.request_pull_diagnostic_refresh_inner(forced, true);
     }
 
-    fn request_pull_diagnostic_refresh_inner(&self, forced: bool, record_request: bool) {
+    fn request_pull_diagnostic_refresh_inner(&self, forced: bool, record_request: bool) -> bool {
         if self.shutdown.is_cancelled() || !self.diagnostic_refresh_supported() {
-            return;
+            return false;
         }
         // Count the ask before the gates so `requested - sent` measures total
         // debounce/single-flight/coverage savings (#533, #789).
@@ -1012,7 +1018,7 @@ impl DiagnosticPublisher {
         // refresh (#521) and the degraded-pull recovery (whose per-host debt
         // proves a non-covering answer no coverage version represents).
         if !self.aggregator.try_begin_refresh(forced) {
-            return;
+            return forced;
         }
         let client = self.client.clone();
         let aggregator = Arc::clone(&self.aggregator);
@@ -1070,6 +1076,7 @@ impl DiagnosticPublisher {
                 }
             }
         });
+        true
     }
 
     /// Map each currently-resolvable injection region of the host document to its
