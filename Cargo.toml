@@ -49,7 +49,6 @@ opt-level = 3
 
 [dependencies]
 arc-swap = "1"
-cap-primitives = "4"
 clap = { version = "4", features = ["derive"] }
 dashmap = "6"
 dirs = "6"
@@ -100,6 +99,9 @@ url = "2"
 percent-encoding = "2"
 rayon = "1"
 futures = "0.3.31"
+
+[target.'cfg(not(any(target_os = "aix", target_os = "openbsd", target_os = "dragonfly")))'.dependencies]
+cap-primitives = "4"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem"] }

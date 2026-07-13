@@ -434,37 +434,13 @@ fn query_directory_open_options() -> cap_primitives::fs::OpenOptions {
     target_os = "freebsd",
     target_os = "netbsd",
     target_os = "solaris",
-    target_os = "illumos",
-    target_os = "aix"
+    target_os = "illumos"
 ))]
 fn query_directory_open_options() -> cap_primitives::fs::OpenOptions {
     use cap_primitives::fs::OpenOptionsExt as _;
 
     let mut options = cap_primitives::fs::OpenOptions::new();
     options.read(true).custom_flags(nix::libc::O_SEARCH);
-    options
-}
-
-#[cfg(all(
-    unix,
-    not(any(
-        target_os = "linux",
-        target_os = "android",
-        target_os = "macos",
-        target_os = "ios",
-        target_os = "tvos",
-        target_os = "watchos",
-        target_os = "visionos",
-        target_os = "freebsd",
-        target_os = "netbsd",
-        target_os = "solaris",
-        target_os = "illumos",
-        target_os = "aix"
-    ))
-))]
-fn query_directory_open_options() -> cap_primitives::fs::OpenOptions {
-    let mut options = cap_primitives::fs::OpenOptions::new();
-    options.read(true);
     options
 }
 
@@ -489,6 +465,21 @@ fn query_directory_open_options() -> cap_primitives::fs::OpenOptions {
     options
 }
 
+#[cfg(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "tvos",
+    target_os = "watchos",
+    target_os = "visionos",
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "solaris",
+    target_os = "illumos",
+    windows,
+    not(any(unix, windows))
+))]
 fn open_query_language_dir_nofollow(queries_dir: &Path) -> std::io::Result<fs::File> {
     use cap_primitives::fs::FollowSymlinks;
 
@@ -532,6 +523,21 @@ fn open_query_language_dir_nofollow(queries_dir: &Path) -> std::io::Result<fs::F
     Ok(directory)
 }
 
+#[cfg(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "tvos",
+    target_os = "watchos",
+    target_os = "visionos",
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "solaris",
+    target_os = "illumos",
+    windows,
+    not(any(unix, windows))
+))]
 pub fn query_install_is_complete(queries_dir: &Path) -> bool {
     use cap_primitives::fs::FollowSymlinks;
 
@@ -555,6 +561,36 @@ pub fn query_install_is_complete(queries_dir: &Path) -> bool {
         )
         .is_ok_and(|marker| marker.is_file())
             || metadata.len() > 0)
+}
+
+#[cfg(all(
+    unix,
+    not(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "tvos",
+        target_os = "watchos",
+        target_os = "visionos",
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "solaris",
+        target_os = "illumos"
+    ))
+))]
+pub fn query_install_is_complete(queries_dir: &Path) -> bool {
+    let Ok(directory_metadata) = fs::symlink_metadata(queries_dir) else {
+        return false;
+    };
+    if !directory_metadata.is_dir() {
+        return false;
+    }
+    let Ok(metadata) = fs::symlink_metadata(queries_dir.join("highlights.scm")) else {
+        return false;
+    };
+    metadata.file_type().is_file()
+        && (queries_dir.join(QUERY_INSTALL_COMPLETE_MARKER).is_file() || metadata.len() > 0)
 }
 
 /// Whether a kakehashi-owned crash backup is safe to restore as the exact
@@ -1242,8 +1278,7 @@ mod tests {
         target_os = "freebsd",
         target_os = "netbsd",
         target_os = "solaris",
-        target_os = "illumos",
-        target_os = "aix"
+        target_os = "illumos"
     ))]
     #[test]
     fn query_install_completeness_does_not_require_directory_read_permission() {
