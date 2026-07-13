@@ -767,7 +767,7 @@ fn write_uninstall_tombstone_with_before_publish(
 ) -> Result<(), QueryInstallError> {
     validate_safe_language_name(language)?;
     let path = uninstall_tombstone_path(queries_parent, language);
-    validate_existing_tombstone(&path)?;
+    let existing_permissions = validate_existing_tombstone(&path)?;
     let stage_counter = QUERY_TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
     let stage_prefix = format!(
         ".{language}.uninstalled.{}.{}.",
@@ -784,6 +784,9 @@ fn write_uninstall_tombstone_with_before_publish(
         builder.permissions(fs::Permissions::from_mode(0o666));
     }
     let mut staged = builder.tempfile_in(queries_parent)?;
+    if let Some(permissions) = existing_permissions {
+        staged.as_file().set_permissions(permissions)?;
+    }
     staged.write_all(b"ok\n")?;
     staged.as_file().sync_all()?;
     before_publish(&path, staged.path());
@@ -800,7 +803,7 @@ fn write_uninstall_tombstone_with_before_publish(
 /// then a private same-directory inode atomically replaces its directory entry;
 /// no pre-existing inode is ever truncated.
 #[cfg(unix)]
-fn validate_existing_tombstone(path: &Path) -> std::io::Result<()> {
+fn validate_existing_tombstone(path: &Path) -> std::io::Result<Option<fs::Permissions>> {
     use std::os::unix::fs::OpenOptionsExt;
 
     let file = match fs::OpenOptions::new()
@@ -812,7 +815,7 @@ fn validate_existing_tombstone(path: &Path) -> std::io::Result<()> {
         .open(path)
     {
         Ok(file) => file,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error),
     };
     let metadata = file.metadata()?;
@@ -823,11 +826,11 @@ fn validate_existing_tombstone(path: &Path) -> std::io::Result<()> {
     }
     use std::os::unix::fs::MetadataExt as _;
     require_single_link(metadata.nlink())?;
-    Ok(())
+    Ok(Some(metadata.permissions()))
 }
 
 #[cfg(windows)]
-fn validate_existing_tombstone(path: &Path) -> std::io::Result<()> {
+fn validate_existing_tombstone(path: &Path) -> std::io::Result<Option<fs::Permissions>> {
     use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
     use windows_sys::Win32::Storage::FileSystem::{
         FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_OPEN_REPARSE_POINT,
@@ -842,7 +845,7 @@ fn validate_existing_tombstone(path: &Path) -> std::io::Result<()> {
         .open(path)
     {
         Ok(file) => file,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error),
     };
     let metadata = file.metadata()?;
@@ -855,7 +858,7 @@ fn validate_existing_tombstone(path: &Path) -> std::io::Result<()> {
     }
     let information = windows_file_information(&file)?;
     require_single_link(u64::from(information.nNumberOfLinks))?;
-    Ok(())
+    Ok(Some(metadata.permissions()))
 }
 
 #[cfg(any(unix, windows))]
@@ -954,13 +957,13 @@ fn verify_published_tombstone(_published: fs::File, path: &Path) -> std::io::Res
 }
 
 #[cfg(not(any(unix, windows)))]
-fn validate_existing_tombstone(path: &Path) -> std::io::Result<()> {
+fn validate_existing_tombstone(path: &Path) -> std::io::Result<Option<fs::Permissions>> {
     match fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.file_type().is_file() => Ok(()),
+        Ok(metadata) if metadata.file_type().is_file() => Ok(Some(metadata.permissions())),
         Ok(_) => Err(std::io::Error::other(
             "query uninstall tombstone is not a regular file",
         )),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(error),
     }
 }
@@ -1568,6 +1571,26 @@ mod tests {
             .mode()
             & 0o777;
         assert_eq!(actual, expected);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn tombstone_atomic_publish_preserves_existing_mode() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let temp = TempDir::new().unwrap();
+        let queries_parent = temp.path().join("queries");
+        fs::create_dir_all(&queries_parent).unwrap();
+        let tombstone = uninstall_tombstone_path(&queries_parent, "rust");
+        fs::write(&tombstone, "old\n").unwrap();
+        fs::set_permissions(&tombstone, fs::Permissions::from_mode(0o600)).unwrap();
+
+        write_uninstall_tombstone(&queries_parent, "rust").unwrap();
+
+        assert_eq!(
+            fs::metadata(tombstone).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
     }
 
     #[test]
