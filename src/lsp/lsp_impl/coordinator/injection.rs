@@ -172,20 +172,39 @@ impl InjectionCoordinator {
     /// Resolves injection data once and reuses it across all three steps. Must be
     /// called AFTER parse_document so the AST is available.
     pub(crate) async fn process_injections(&self, uri: &Url, forward_did_change: bool) {
+        let _ = self
+            .process_injections_after_lifecycle_lock(
+                uri,
+                forward_did_change,
+                None,
+                std::future::ready(()),
+            )
+            .await;
+    }
+
+    pub(crate) async fn process_injections_for_incarnation(
+        &self,
+        uri: &Url,
+        forward_did_change: bool,
+        incarnation: u64,
+    ) -> bool {
         self.process_injections_after_lifecycle_lock(
             uri,
             forward_did_change,
+            Some(incarnation),
             std::future::ready(()),
         )
-        .await;
+        .await
     }
 
     async fn process_injections_after_lifecycle_lock<F>(
         &self,
         uri: &Url,
         forward_did_change: bool,
+        required_incarnation: Option<u64>,
         after_lifecycle_lock: F,
-    ) where
+    ) -> bool
+    where
         F: std::future::Future<Output = ()>,
     {
         // Serialize the complete tree-derived downstream pass with didClose and
@@ -199,21 +218,24 @@ impl InjectionCoordinator {
         if self.documents.get(uri).is_none() {
             self.bridge.cancel_eager_open(uri);
             self.documents.remove_edit_lock_if_unshared(uri, &edit_lock);
-            return;
+            return false;
         }
 
         let Some(host_language) = self.get_language_for_document(uri) else {
             self.bridge.cancel_eager_open(uri);
-            return;
+            return false;
         };
         let Some(incarnation) = self.documents.get(uri).map(|doc| doc.incarnation()) else {
             self.bridge.cancel_eager_open(uri);
-            return;
+            return false;
         };
+        if required_incarnation.is_some_and(|required| incarnation != required) {
+            return false;
+        }
         let injections = self.resolve_injection_data(uri, &host_language);
         if injections.is_empty() {
             self.bridge.cancel_eager_open(uri);
-            return;
+            return true;
         }
 
         // Stop the previous pass before closing a replaced language-bearing URI;
@@ -266,6 +288,7 @@ impl InjectionCoordinator {
 
         self.eager_spawn_bridge_servers(uri, incarnation, &host_language, injections)
             .await;
+        true
     }
 
     /// Check injected languages and handle missing parsers: auto-install when enabled,
@@ -342,7 +365,13 @@ impl InjectionCoordinator {
             // host document (is_injection=true), so no host text is needed here.
             if self.documents.get(uri).is_some() {
                 let _ = install
-                    .maybe_auto_install_language(&resolved_lang, uri.clone(), true)
+                    .maybe_auto_install_language(
+                        &resolved_lang,
+                        uri.clone(),
+                        true,
+                        self.documents.get(uri).map(|doc| doc.incarnation()),
+                        true,
+                    )
                     .await;
             }
         }
@@ -445,7 +474,7 @@ mod tests {
         let process_release = Arc::clone(&release);
         let process = tokio::spawn(async move {
             injection
-                .process_injections_after_lifecycle_lock(&process_uri, false, async move {
+                .process_injections_after_lifecycle_lock(&process_uri, false, None, async move {
                     process_entered.notify_one();
                     process_release.notified().await;
                 })

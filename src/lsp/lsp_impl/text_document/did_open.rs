@@ -119,9 +119,18 @@ impl Kakehashi {
                     // spawn is pure wasted work and races the bridge-state sweep.
                     let is_cli_mode = self.is_cli_mode();
                     tokio::spawn(async move {
-                        install
-                            .maybe_auto_install_language(&lang, install_uri.clone(), false)
+                        let same_lifetime = install
+                            .maybe_auto_install_language(
+                                &lang,
+                                install_uri.clone(),
+                                false,
+                                Some(incarnation),
+                                true,
+                            )
                             .await;
+                        if !same_lifetime {
+                            return;
+                        }
                         // The skipped inline parse meant the handler's
                         // process_injections (below) ran with no tree. Now that the
                         // off-ingress reparse may have produced one, run the normal
@@ -133,11 +142,20 @@ impl Kakehashi {
                         // fail or be deduped (AlreadyInstalling) with no reparse, and
                         // process_injections would otherwise cancel the eager-open
                         // for a still-tree-less document.
-                        let has_tree = documents
-                            .get(&install_uri)
-                            .is_some_and(|doc| doc.tree().is_some());
+                        let has_tree = documents.get(&install_uri).is_some_and(|doc| {
+                            doc.incarnation() == incarnation && doc.tree().is_some()
+                        });
                         if has_tree {
-                            injection.process_injections(&install_uri, false).await;
+                            let same_lifetime = injection
+                                .process_injections_for_incarnation(
+                                    &install_uri,
+                                    false,
+                                    incarnation,
+                                )
+                                .await;
+                            if !same_lifetime {
+                                return;
+                            }
                             // Re-fire the proactive synthetic diagnostic now that a
                             // tree exists: the handler's spawn (below) ran in the
                             // skip-parse path with no tree, so its snapshot was None
@@ -145,7 +163,14 @@ impl Kakehashi {
                             // first open of a just-installed parser. Skipped in CLI
                             // mode (#489), matching the handler's own gate.
                             if !is_cli_mode {
-                                diagnostic_scheduler.spawn_synthetic_diagnostic_task(install_uri);
+                                let edit_lock = documents.edit_lock(&install_uri);
+                                let _lifecycle = edit_lock.lock().await;
+                                if documents.get(&install_uri).is_some_and(|doc| {
+                                    doc.incarnation() == incarnation && doc.tree().is_some()
+                                }) {
+                                    diagnostic_scheduler
+                                        .spawn_synthetic_diagnostic_task(install_uri);
+                                }
                             }
                         }
                     });
@@ -1143,7 +1168,7 @@ print("hello")
         // The document was closed during the install: nothing is in the store.
         server
             .parse_coordinator()
-            .reparse_installed_document(uri.clone(), "rust")
+            .reparse_installed_document(uri.clone(), "rust", None)
             .await;
 
         assert!(
@@ -1173,7 +1198,7 @@ print("hello")
 
         server
             .parse_coordinator()
-            .reparse_installed_document(uri.clone(), "rust")
+            .reparse_installed_document(uri.clone(), "rust", None)
             .await;
 
         assert!(
@@ -1263,7 +1288,7 @@ print("hello")
 
         server
             .parse_coordinator()
-            .reparse_installed_document(uri.clone(), "rust")
+            .reparse_installed_document(uri.clone(), "rust", None)
             .await;
 
         let doc = server.documents.get(&uri).unwrap();

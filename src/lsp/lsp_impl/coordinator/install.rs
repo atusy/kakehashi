@@ -9,7 +9,7 @@ use crate::lsp::bridge::BridgeCoordinator;
 use crate::lsp::cache::CacheCoordinator;
 use crate::lsp::client::ClientNotifier;
 use crate::lsp::lsp_impl::{
-    Kakehashi, ReloadLanguageState, apply_shared_settings, build_notifier, detect_document_language,
+    Kakehashi, ReloadLanguageState, apply_shared_settings, build_notifier, lock_settings_reload,
 };
 use crate::lsp::settings_manager::SettingsManager;
 use tower_lsp_server::Client;
@@ -151,35 +151,128 @@ impl InstallCoordinator {
     /// Try to auto-install a language if not already being installed.
     ///
     /// Delegates to `AutoInstallManager::try_install()`, dispatches its events, and
-    /// reloads on success. Returns `true` when installation was triggered, signaling
-    /// the caller to skip `parse_document` (a re-parse happens after reload).
+    /// reloads on success. An `AlreadyInstalling` caller waits for the shared
+    /// install claim, then reloads its own document when the parser artifact exists.
     pub(crate) async fn maybe_auto_install_language(
         &self,
         language: &str,
         uri: Url,
         is_injection: bool,
+        expected_incarnation: Option<u64>,
+        allow_recovery: bool,
     ) -> bool {
-        let result = self.auto_install.try_install(language).await;
+        if self.language.has_parser_available(language) {
+            if !is_injection && self.same_document_incarnation(&uri, expected_incarnation) {
+                self.parse_coordinator()
+                    .reparse_installed_document(uri.clone(), language, expected_incarnation)
+                    .await;
+            }
+            if !self.same_document_incarnation(&uri, expected_incarnation) {
+                return false;
+            }
+            let recovered =
+                self.install_reparse_recovered(language, &uri, is_injection, expected_incarnation);
+            if recovered {
+                return true;
+            }
+        }
+        let mut result = self.auto_install.try_install(language).await;
 
         self.dispatch_install_events(language, &result.events).await;
 
         if let Some(data_dir) = result.outcome.data_dir() {
-            self.reload_language_after_install(language, data_dir, is_injection)
+            self.reload_language_after_install(
+                language,
+                data_dir,
+                uri.clone(),
+                is_injection,
+                expected_incarnation,
+            )
+            .await;
+            let _reload = lock_settings_reload().await;
+            let load_result = self.language.ensure_language_loaded_async(language).await;
+            self.notifier()
+                .log_language_events(&load_result.events)
                 .await;
-            return true;
+            let global_loaded = self.language.has_parser_available(language);
+            if global_loaded {
+                result.complete_claim();
+            }
+            if global_loaded
+                && !is_injection
+                && self.same_document_incarnation(&uri, expected_incarnation)
+            {
+                self.parse_coordinator()
+                    .reparse_installed_document(uri.clone(), language, expected_incarnation)
+                    .await;
+            }
+            let recovered =
+                self.install_reparse_recovered(language, &uri, is_injection, expected_incarnation);
+            drop(_reload);
+            if recovered {
+                return true;
+            }
+            drop(result);
+            return false;
         }
 
         // Every no-reparse outcome lands here — Failed/Unsupported/NoDataDir/
-        // ParserFailed (should_skip_parse() == false, but did_open's
-        // auto-install branch never runs parse_document regardless) as well
-        // as AlreadyInstalling. None of them publishes a snapshot anywhere
+        // ParserFailed (the did_open auto-install branch never runs
+        // parse_document regardless) as well as AlreadyInstalling. None of
+        // them publishes a snapshot anywhere
         // below, so release a parked first-parse waiter with a tree-less
         // snapshot (bootstrap-gated inside) instead of letting every request
         // burn the full first-parse backstop. Harmless for AlreadyInstalling:
         // its eventual reload-reparse lands the same-version tree through the
         // snapshot cell's tree-upgrade clause.
         self.documents.publish_giveup_snapshot(&uri);
-        result.outcome.should_skip_parse()
+        if result.outcome == crate::lsp::auto_install::InstallOutcome::AlreadyInstalling {
+            let completion_token = result
+                .completion
+                .clone()
+                .expect("duplicate install has claim token");
+            let mut completion = completion_token.receiver.clone();
+            let terminal = loop {
+                if let Some(outcome) = completion.borrow().clone() {
+                    break outcome;
+                }
+                if completion.changed().await.is_err() {
+                    break crate::lsp::auto_install::InstallOutcome::Failed;
+                }
+            };
+            if let Some(data_dir) = terminal.data_dir()
+                && self.same_document_incarnation(&uri, expected_incarnation)
+            {
+                let _ = data_dir;
+                if !is_injection {
+                    self.parse_coordinator()
+                        .reparse_installed_document(uri.clone(), language, expected_incarnation)
+                        .await;
+                }
+                if self.install_reparse_recovered(
+                    language,
+                    &uri,
+                    is_injection,
+                    expected_incarnation,
+                ) {
+                    return true;
+                }
+                if allow_recovery {
+                    return Box::pin(self.maybe_auto_install_language(
+                        language,
+                        uri,
+                        is_injection,
+                        expected_incarnation,
+                        false,
+                    ))
+                    .await;
+                }
+                return false;
+            }
+        } else {
+            result.complete_claim();
+        }
+        self.same_document_incarnation(&uri, expected_incarnation)
     }
 
     /// Reload a language after installation and optionally re-parse the document.
@@ -191,7 +284,9 @@ impl InstallCoordinator {
         &self,
         language: &str,
         data_dir: &std::path::Path,
-        _is_injection: bool,
+        uri: Url,
+        is_injection: bool,
+        expected_incarnation: Option<u64>,
     ) {
         let settings_snapshot = self.settings_manager.load_settings_pair();
         let (updated_raw_settings, updated_settings) = updated_settings_after_install(
@@ -208,25 +303,15 @@ impl InstallCoordinator {
             .log_language_events(&load_result.events)
             .await;
 
-        let uris = self
-            .documents
-            .open_uris()
-            .into_iter()
-            .filter(|candidate| {
-                self.documents
-                    .get(candidate)
-                    .is_some_and(|document| document.tree().is_none())
-                    && self.get_language_for_document(candidate).as_deref() == Some(language)
-            })
-            .collect::<Vec<_>>();
-        let parse = self.parse_coordinator();
-        for uri in uris {
+        if !is_injection {
             // Resurrection-safe, off-ingress reparse: re-detects the language from
             // the current document lifetime and persists through a non-inserting
             // CAS, so a didClose/reopen during the install can't receive a tree for
-            // the old language. This runs even when an injection discovered the
-            // parser first: the global install claim may have host-language waiters.
-            parse.reparse_installed_document(uri, language).await;
+            // the old language. A host waiter whose install claim was won by an
+            // injection reaches this same per-URI path after the claim completes.
+            self.parse_coordinator()
+                .reparse_installed_document(uri, language, expected_incarnation)
+                .await;
         }
     }
 
@@ -257,8 +342,24 @@ impl InstallCoordinator {
         build_notifier(&self.client, &self.settings_manager)
     }
 
-    fn get_language_for_document(&self, uri: &Url) -> Option<String> {
-        detect_document_language(&self.language, &self.documents, uri)
+    fn same_document_incarnation(&self, uri: &Url, expected: Option<u64>) -> bool {
+        expected.is_some() && self.documents.get(uri).map(|doc| doc.incarnation()) == expected
+    }
+
+    fn install_reparse_recovered(
+        &self,
+        language: &str,
+        uri: &Url,
+        is_injection: bool,
+        expected_incarnation: Option<u64>,
+    ) -> bool {
+        self.same_document_incarnation(uri, expected_incarnation)
+            && self.language.has_parser_available(language)
+            && (is_injection
+                || self
+                    .documents
+                    .get(uri)
+                    .is_some_and(|document| document.tree().is_some()))
     }
 
     fn parse_coordinator(&self) -> ParseCoordinator {
@@ -397,7 +498,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reload_after_install_reparses_every_open_document_for_the_language() {
+    async fn reload_after_install_reparses_the_requesting_document() {
         let (service, _socket) = LspService::new(Kakehashi::new);
         let server = service.inner();
         server
@@ -405,42 +506,8 @@ mod tests {
             .language_registry_for_parallel()
             .register("rust".to_string(), tree_sitter_rust::LANGUAGE.into());
         let first = Url::parse("file:///workspace/first.rs").unwrap();
-        let waiting = Url::parse("file:///workspace/waiting.rs").unwrap();
-        for uri in [&first, &waiting] {
-            server.documents.insert(
-                uri.clone(),
-                "fn main() {}".to_string(),
-                Some("rust".to_string()),
-                None,
-            );
-        }
-
-        server
-            .install_coordinator()
-            .reload_language_after_install("rust", Path::new("/installed"), false)
-            .await;
-
-        assert!(
-            server.documents.get(&first).unwrap().tree().is_some(),
-            "the document that won the install should be reparsed"
-        );
-        assert!(
-            server.documents.get(&waiting).unwrap().tree().is_some(),
-            "a same-language document that lost the install claim must also be reparsed"
-        );
-    }
-
-    #[tokio::test]
-    async fn injection_install_reparses_waiting_host_documents_for_the_same_language() {
-        let (service, _socket) = LspService::new(Kakehashi::new);
-        let server = service.inner();
-        server
-            .language
-            .language_registry_for_parallel()
-            .register("rust".to_string(), tree_sitter_rust::LANGUAGE.into());
-        let waiting = Url::parse("file:///workspace/waiting.rs").unwrap();
         server.documents.insert(
-            waiting.clone(),
+            first.clone(),
             "fn main() {}".to_string(),
             Some("rust".to_string()),
             None,
@@ -448,10 +515,19 @@ mod tests {
 
         server
             .install_coordinator()
-            .reload_language_after_install("rust", Path::new("/installed"), true)
+            .reload_language_after_install(
+                "rust",
+                Path::new("/installed"),
+                first.clone(),
+                false,
+                server.documents.get(&first).map(|doc| doc.incarnation()),
+            )
             .await;
 
-        assert!(server.documents.get(&waiting).unwrap().tree().is_some());
+        assert!(
+            server.documents.get(&first).unwrap().tree().is_some(),
+            "the document that won the install should be reparsed"
+        );
     }
 
     #[tokio::test]
@@ -476,7 +552,38 @@ mod tests {
 
         server
             .parse_coordinator()
-            .reparse_installed_document(uri.clone(), "rust")
+            .reparse_installed_document(uri.clone(), "rust", None)
+            .await;
+
+        assert!(server.documents.get(&uri).unwrap().tree().is_none());
+    }
+
+    #[tokio::test]
+    async fn old_install_task_rejects_close_reopen_with_the_same_language() {
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+        server
+            .language
+            .language_registry_for_parallel()
+            .register("rust".to_string(), tree_sitter_rust::LANGUAGE.into());
+        let uri = Url::parse("file:///workspace/reopened.rs").unwrap();
+        let original = server.documents.insert(
+            uri.clone(),
+            "fn old() {}".to_string(),
+            Some("rust".to_string()),
+            None,
+        );
+        server.documents.remove(&uri);
+        server.documents.insert(
+            uri.clone(),
+            "fn new() {}".to_string(),
+            Some("rust".to_string()),
+            None,
+        );
+
+        server
+            .parse_coordinator()
+            .reparse_installed_document(uri.clone(), "rust", Some(original))
             .await;
 
         assert!(server.documents.get(&uri).unwrap().tree().is_none());

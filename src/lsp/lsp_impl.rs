@@ -112,6 +112,10 @@ pub(super) struct ReloadLanguageState<'a> {
 /// publication after the synchronous language/query swap.
 static SETTINGS_RELOAD_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
+pub(super) async fn lock_settings_reload() -> tokio::sync::MutexGuard<'static, ()> {
+    SETTINGS_RELOAD_LOCK.lock().await
+}
+
 struct ParserReloadGuard<'a> {
     parser_pool: &'a std::sync::Mutex<DocumentParserPool>,
 }
