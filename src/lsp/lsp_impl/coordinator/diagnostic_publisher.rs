@@ -273,15 +273,17 @@ impl DiagnosticPublisher {
     async fn prefetch_open_pull_fallback_diagnostics(&self) -> bool {
         let mut tasks = tokio::task::JoinSet::new();
         for uri in self.documents.open_uris() {
-            let snapshot = self.snapshot_preparer.prepare_diagnostic_snapshot(&uri);
-            let lineage = snapshot.as_ref().map(|snapshot| snapshot.lineage);
+            let Some(snapshot) = self.snapshot_preparer.prepare_diagnostic_snapshot(&uri) else {
+                continue;
+            };
+            let lineage = Some(snapshot.lineage);
             let pool = self.bridge.pool_arc();
             let publisher = self.clone();
             tasks.spawn(async move {
                 let errors = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
                 let error_sink = Some(std::sync::Arc::clone(&errors));
                 let outcome = collect_push_diagnostics_with_error_sink(
-                    snapshot,
+                    Some(snapshot),
                     &pool,
                     &uri,
                     LOG_TARGET,
