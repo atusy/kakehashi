@@ -542,10 +542,11 @@ fn remove_query_install_and_backups_with_hooks(
 ) -> Result<QueryRemoval, QueryInstallError> {
     validate_safe_language_name(language)?;
     fs::create_dir_all(queries_parent)?;
+    let pinned_parent =
+        cap_std::fs::Dir::open_ambient_dir(queries_parent, cap_std::ambient_authority())?;
     let _replace_lock = QueryReplaceLockGuard::acquire(queries_parent, language)?;
     write_tombstone(queries_parent, language)?;
     before_remove(queries_parent);
-    let queries_dir = queries_parent.join(language);
     let mut removal = QueryRemoval {
         removed_queries: false,
         removed_backups: false,
@@ -555,14 +556,14 @@ fn remove_query_install_and_backups_with_hooks(
     // (e.g. PermissionDenied), which would skip removal and report "not
     // installed" over a still-present unreadable dir. The tolerant removal
     // reports whether anything was actually removed.
-    removal.removed_queries = remove_dir_all_tolerating_vanished(&queries_dir)?;
+    removal.removed_queries = remove_dir_all_at_tolerating_vanished(&pinned_parent, language)?;
 
     // Propagate per-entry read_dir errors: uninstall must not report success
     // while backups it could not even enumerate stay behind.
-    for entry in fs::read_dir(queries_parent)? {
+    for entry in pinned_parent.entries()? {
         let entry = entry?;
-        let path = entry.path();
-        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+        let file_name = entry.file_name();
+        let Some(name) = file_name.to_str() else {
             continue;
         };
         // file_type() over path.is_dir(): is_dir() swallows metadata errors
@@ -570,18 +571,20 @@ fn remove_query_install_and_backups_with_hooks(
         // while uninstall reports success.
         if entry.file_type()?.is_dir()
             && generated_backup_matches_language(name, language)
-            && backup_is_owned(&path)
+            && pinned_parent
+                .metadata(backup_ownership_sidecar_name(name))
+                .is_ok_and(|metadata| metadata.is_file())
         {
-            let ownership = backup_ownership_sidecar(&path);
+            let ownership = backup_ownership_sidecar_name(name);
             // Same NotFound tolerance as the canonical dir above: a backup
             // deleted externally after enumeration is already the end state.
-            let removed_dir = remove_dir_all_tolerating_vanished(&path)?;
+            let removed_dir = remove_dir_all_at_tolerating_vanished(&pinned_parent, &file_name)?;
             // The sidecar is a kakehashi-owned artifact too: deleting it
             // counts as removal even when the dir itself vanished first —
             // and, like every other I/O in this loop, only NotFound is
             // tolerated (an unremovable marker must fail the uninstall, not
             // linger behind a success report).
-            let removed_sidecar = match fs::remove_file(ownership) {
+            let removed_sidecar = match pinned_parent.remove_file(ownership) {
                 Ok(()) => true,
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
                 Err(e) => return Err(QueryInstallError::IoError(e)),
@@ -592,6 +595,23 @@ fn remove_query_install_and_backups_with_hooks(
         }
     }
     Ok(removal)
+}
+
+fn remove_dir_all_at_tolerating_vanished(
+    parent: &cap_std::fs::Dir,
+    name: impl AsRef<Path>,
+) -> Result<bool, QueryInstallError> {
+    let name = name.as_ref();
+    match parent.remove_dir_all(name) {
+        Ok(()) => Ok(true),
+        Err(e)
+            if e.kind() == std::io::ErrorKind::NotFound
+                && matches!(parent.try_exists(name), Ok(false)) =>
+        {
+            Ok(false)
+        }
+        Err(e) => Err(QueryInstallError::IoError(e)),
+    }
 }
 
 /// `fs::remove_dir_all` that treats a CONFIRMED-vanished directory as the
@@ -1259,6 +1279,10 @@ fn backup_ownership_sidecar(backup_dir: &Path) -> PathBuf {
     ))
 }
 
+fn backup_ownership_sidecar_name(backup_name: &str) -> String {
+    format!("{backup_name}{QUERY_BACKUP_OWNERSHIP_MARKER}")
+}
+
 fn write_backup_ownership_marker(backup_dir: &Path) -> Result<(), QueryInstallError> {
     let mut file = fs::File::create(backup_ownership_sidecar(backup_dir))?;
     file.write_all(b"ok\n")?;
@@ -1654,6 +1678,51 @@ mod tests {
         assert_eq!(
             fs::read_to_string(uninstall_tombstone_path(&real_queries, "rust")).unwrap(),
             "ok\n"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn remove_query_install_stays_bound_when_symlinked_parent_is_retargeted() {
+        use std::os::unix::fs::symlink;
+
+        let temp = TempDir::new().unwrap();
+        let original = temp.path().join("original-queries");
+        let replacement = temp.path().join("replacement-queries");
+        fs::create_dir_all(original.join("rust")).unwrap();
+        fs::create_dir_all(replacement.join("rust")).unwrap();
+        fs::write(original.join("rust/highlights.scm"), "original\n").unwrap();
+        fs::write(replacement.join("rust/highlights.scm"), "outside\n").unwrap();
+        let linked = temp.path().join("queries");
+        symlink(&original, &linked).unwrap();
+
+        remove_query_install_and_backups_with_hooks(
+            &linked,
+            "rust",
+            write_uninstall_tombstone,
+            |queries_parent| {
+                fs::remove_file(queries_parent).unwrap();
+                symlink(&replacement, queries_parent).unwrap();
+            },
+        )
+        .unwrap();
+
+        assert!(
+            !original.join("rust").exists(),
+            "cleanup must stay in the directory that received durable intent"
+        );
+        assert_eq!(
+            fs::read_to_string(replacement.join("rust/highlights.scm")).unwrap(),
+            "outside\n",
+            "retargeting must not redirect destructive cleanup"
+        );
+        assert!(
+            uninstall_tombstone_path(&original, "rust").exists(),
+            "the pinned directory retains its uninstall intent"
+        );
+        assert!(
+            !uninstall_tombstone_path(&replacement, "rust").exists(),
+            "the replacement directory must remain untouched"
         );
     }
 

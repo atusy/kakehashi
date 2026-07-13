@@ -49,6 +49,7 @@ opt-level = 3
 
 [dependencies]
 arc-swap = "1"
+cap-std = "4.0.2"
 clap = { version = "4", features = ["derive"] }
 dashmap = "6"
 dirs = "6"
