@@ -148,6 +148,33 @@ pub fn parser_file_is_regular(path: &Path) -> bool {
     true
 }
 
+fn parser_leaf_is_link(metadata: &fs::Metadata) -> bool {
+    #[cfg(unix)]
+    {
+        metadata.file_type().is_symlink()
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt as _;
+        use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
+
+        metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = metadata;
+        false
+    }
+}
+
+fn parser_leaf_requires_force(path: &Path) -> std::io::Result<bool> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => Ok(!parser_leaf_is_link(&metadata)),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(err) => Err(err),
+    }
+}
+
 #[cfg(windows)]
 fn remove_existing_parser_leaf(path: &Path) -> std::io::Result<()> {
     use std::os::windows::fs::MetadataExt as _;
@@ -330,7 +357,7 @@ pub fn install_parser(
     let parser_file = parser_dir.join(format!("{}.{}", language, std::env::consts::DLL_EXTENSION));
 
     // Check if parser already exists
-    if parser_file_is_regular(&parser_file) && !options.force {
+    if !options.force && parser_leaf_requires_force(&parser_file)? {
         return Err(ParserInstallError::AlreadyExists(parser_file));
     }
 
@@ -1015,6 +1042,23 @@ mod tests {
             None,
             "managed parser links must not suppress repair"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_force_install_preserves_a_managed_parser_socket() {
+        use std::os::unix::net::UnixListener;
+
+        let temp = tempdir().unwrap();
+        let managed = temp
+            .path()
+            .join(format!("lua.{}", std::env::consts::DLL_EXTENSION));
+        let listener = UnixListener::bind(&managed).unwrap();
+
+        assert!(parser_leaf_requires_force(&managed).unwrap());
+        assert!(managed.exists());
+
+        drop(listener);
     }
 
     #[cfg(windows)]
