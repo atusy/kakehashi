@@ -56,8 +56,9 @@ client-root connection (the pre-#382 behavior).
 **Shared-instance opt-in** (#391): a per-server `preferSharedInstance` boolean
 (default `false`) routes a server's documents to one shared connection
 (`ConnectionKey::shared`, kept distinct from the client-root fallback) instead
-of one per marker root. It is honored only when the downstream server
-advertises `workspace.workspaceFolders.{supported, changeNotifications}`
+of one per marker root. It is honored when the downstream server either
+advertises `workspace.workspaceFolders.{supported, changeNotifications}` or
+dynamically registers `workspace/didChangeWorkspaceFolders`
 (`ConnectionHandle::supports_workspace_folder_changes`); the acquire path
 (`resolve_acquire`) checks the existing shared connection's capability and, if
 it is `Ready` but incapable, logs once and falls back to the per-root key — so a
@@ -67,8 +68,11 @@ misconfigured opt-in degrades to per-root instances rather than wedging the
 `workspace/workspaceFolders` pulls) grows as new roots join: on acquiring the
 shared connection for a not-yet-known root, the pool CAS-inserts the root and
 emits `workspace/didChangeWorkspaceFolders { added: [root] }` ahead of the
-`didOpen` through the single-writer FIFO. The set is add-only; idle
-removal/eviction is a separate follow-up.
+`didOpen` through the single-writer FIFO. Upstream client additions and removals
+are propagated to capable live shared/fallback connections; incapable
+connections are recycled so reacquisition sees the latest snapshot.
+Marker-owned roots remain while the connection lives. Idle process/folder
+eviction is a separate follow-up.
 
 **Known limitation:** per-root pooling multiplies process count with the number
 of distinct roots opened, and there is no idle-eviction yet — see Consequences.

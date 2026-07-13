@@ -73,34 +73,108 @@ fn same_launch_config(
         && old.is_enabled() == new.is_enabled()
 }
 
-fn shutdown_invalidated_connection(key: ConnectionKey, handle: Arc<ConnectionHandle>) {
-    tokio::spawn(async move {
-        const RELOAD_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
-        let shutdown_handle = Arc::clone(&handle);
-        let shutdown_task = tokio::spawn(async move { shutdown_handle.graceful_shutdown().await });
-        let abort = shutdown_task.abort_handle();
-        match tokio::time::timeout(RELOAD_SHUTDOWN_TIMEOUT, shutdown_task).await {
-            Ok(Ok(_)) => {}
-            Ok(Err(error)) => {
-                log::error!(
-                    target: "kakehashi::bridge",
-                    "Shutdown task for invalidated {} connection failed: {}",
-                    key,
-                    error
-                );
-                handle.complete_shutdown();
-            }
-            Err(_) => {
-                abort.abort();
-                log::warn!(
-                    target: "kakehashi::bridge",
-                    "Timed out shutting down invalidated {} connection",
-                    key
-                );
-                handle.complete_shutdown();
-            }
+async fn shutdown_invalidated_connection(key: ConnectionKey, handle: Arc<ConnectionHandle>) {
+    const RELOAD_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
+    let shutdown_handle = Arc::clone(&handle);
+    let mut shutdown_task = tokio::spawn(async move { shutdown_handle.graceful_shutdown().await });
+    match tokio::time::timeout(RELOAD_SHUTDOWN_TIMEOUT, &mut shutdown_task).await {
+        Ok(Ok(Ok(()))) => {}
+        Ok(Ok(Err(error))) => {
+            log::error!(
+                target: "kakehashi::bridge",
+                "Graceful shutdown for invalidated {} connection failed: {}",
+                key,
+                error
+            );
+            handle.complete_shutdown();
         }
-    });
+        Ok(Err(error)) => {
+            log::error!(
+                target: "kakehashi::bridge",
+                "Shutdown task for invalidated {} connection panicked or was cancelled: {}",
+                key,
+                error
+            );
+            // Dropping the panicked task drops its kill-on-drop child handle.
+            handle.complete_shutdown();
+        }
+        Err(_) => {
+            shutdown_task.abort();
+            let _ = shutdown_task.await;
+            log::warn!(
+                target: "kakehashi::bridge",
+                "Timed out shutting down invalidated {} connection",
+                key
+            );
+            // Aborting drops the reclaimed writer and its kill-on-drop child,
+            // keeping invalidation bounded even when shutdown never responds.
+            handle.complete_shutdown();
+        }
+    }
+}
+
+/// Own invalidation cleanup independently of the request future that triggered
+/// it. The owned map guard prevents a same-key respawn until every key-based
+/// purge is complete; dropping the caller's future only detaches this task.
+async fn cleanup_invalidated_connections(
+    connections: tokio::sync::OwnedMutexGuard<HashMap<ConnectionKey, Arc<ConnectionHandle>>>,
+    connection_map: Arc<Mutex<HashMap<ConnectionKey, Arc<ConnectionHandle>>>>,
+    invalidated: Vec<ConnectionKey>,
+    host_documents: Arc<Mutex<HashMap<(String, ConnectionKey), HostDocSyncState>>>,
+    document_tracker: Arc<DocumentTracker>,
+    open_transition_locks: Arc<OpenTransitionLocks>,
+) {
+    let mut stale_handles = Vec::new();
+    for key in &invalidated {
+        if let Some(handle) = connections.get(key) {
+            handle.begin_shutdown();
+            stale_handles.push((key.clone(), Arc::clone(handle)));
+        }
+    }
+    // Closing entries remain mapped, so same-key respawn is still gated;
+    // release the global map before any purge await so shutdown_all can
+    // snapshot and coordinate these handles under its own deadline.
+    drop(connections);
+
+    for key in invalidated {
+        host_documents
+            .lock()
+            .await
+            .retain(|(_, connection_key), _| connection_key != &key);
+        document_tracker.purge_connection(&key).await;
+        purge_transition_locks(&open_transition_locks, &key).await;
+    }
+    let mut connections = connection_map.lock().await;
+    for (key, stale) in &stale_handles {
+        if connections
+            .get(key)
+            .is_some_and(|current| Arc::ptr_eq(current, stale))
+        {
+            connections.remove(key);
+        }
+    }
+    drop(connections);
+    for (key, handle) in stale_handles {
+        tokio::spawn(shutdown_invalidated_connection(key, handle));
+    }
+}
+
+async fn purge_transition_locks(
+    open_transition_locks: &OpenTransitionLocks,
+    connection_key: &ConnectionKey,
+) {
+    let transitions: Vec<_> = open_transition_locks
+        .iter()
+        .filter(|entry| &entry.key().0 == connection_key)
+        .map(|entry| (entry.key().clone(), Arc::clone(entry.value())))
+        .collect();
+    for (key, transition) in transitions {
+        let guard = transition.lock().await;
+        drop(guard);
+        open_transition_locks.remove_if(&key, |_, current| {
+            Arc::ptr_eq(current, &transition) && Arc::strong_count(current) == 2
+        });
+    }
 }
 
 use std::collections::HashMap;
@@ -120,7 +194,7 @@ use crate::error::LockResultExt;
 use super::protocol::{
     JsonRpcNotification, RequestId, VirtualDocumentUri,
     build_did_change_configuration_notification, build_did_change_workspace_folders_notification,
-    build_didopen_notification,
+    build_didopen_notification, build_workspace_folder_change_notification,
 };
 
 /// Timeout for the LSP initialize handshake and for wait-for-ready on an
@@ -312,7 +386,7 @@ pub struct LanguageServerPool {
     /// multi-root monorepo spawns a separate downstream process per resolved
     /// workspace root (issue #382); documents sharing a root (or the
     /// client-root fallback) still share one process.
-    connections: Mutex<HashMap<ConnectionKey, Arc<ConnectionHandle>>>,
+    connections: Arc<Mutex<HashMap<ConnectionKey, Arc<ConnectionHandle>>>>,
     /// Gate that rejects **new** connection spawns once shutdown has begun.
     ///
     /// `shutdown_all` snapshots the live connections and tears them down, but a
@@ -345,7 +419,7 @@ pub struct LanguageServerPool {
     /// (host-document-bridge): the real-URI documents opened on downstream
     /// servers via `bridge._self`, with their version and content
     /// fingerprint for lazy full-text re-sync.
-    host_documents: Mutex<HashMap<(String, ConnectionKey), HostDocSyncState>>,
+    host_documents: Arc<Mutex<HashMap<(String, ConnectionKey), HostDocSyncState>>>,
     /// Upstream request ID → set of downstream connections, for fan-out cancel
     /// forwarding (ls-bridge-message-ordering). Multiple connections can share an ID when a single
     /// upstream request (e.g. diagnostic) targets several injected languages.
@@ -372,6 +446,9 @@ pub struct LanguageServerPool {
     /// initialize, then updated by `workspace/didChangeWorkspaceFolders` and
     /// snapshotted for each later downstream handshake.
     workspace_folders: super::WorkspaceFolderSet,
+    /// Serializes upstream folder deltas through global state, live connection
+    /// notification queues, and incapable-connection invalidation.
+    workspace_folder_change_lock: Mutex<()>,
     /// Client capabilities forwarded from upstream client.
     ///
     /// Set once via `set_client_capabilities()` after receiving the upstream initialize request.
@@ -447,18 +524,19 @@ impl LanguageServerPool {
             tokio::sync::mpsc::channel(super::actor::WINDOW_NOTIFICATION_QUEUE_CAPACITY);
         let (upstream_request_tx, upstream_request_rx) = tokio::sync::mpsc::unbounded_channel();
         Self {
-            connections: Mutex::new(HashMap::new()),
+            connections: Arc::new(Mutex::new(HashMap::new())),
             shutting_down: AtomicBool::new(false),
             document_tracker: Arc::new(DocumentTracker::new()),
             open_transition_locks: Arc::new(DashMap::new()),
             host_lifecycle_locks: DashMap::new(),
             latest_virtual_contents: DashMap::new(),
-            host_documents: Mutex::new(HashMap::new()),
+            host_documents: Arc::new(Mutex::new(HashMap::new())),
             upstream_request_registry: std::sync::Mutex::new(HashMap::new()),
             cancel_metrics: CancelForwardingMetrics::default(),
             consecutive_panic_counts: std::sync::Mutex::new(HashMap::new()),
             root_uri: arc_swap::ArcSwap::new(Arc::new(None)),
             workspace_folders: super::WorkspaceFolderSet::new(None),
+            workspace_folder_change_lock: Mutex::new(()),
             client_capabilities: OnceLock::new(),
             upstream_tx,
             upstream_rx: std::sync::Mutex::new(Some(upstream_rx)),
@@ -551,33 +629,72 @@ impl LanguageServerPool {
         self.workspace_folders.snapshot()
     }
 
-    /// Update the upstream client workspace snapshot used by future
-    /// client-fallback downstream connections.
+    /// Update the upstream client workspace snapshot, notifying compatible
+    /// live shared/fallback connections and recycling incompatible ones.
     pub(crate) async fn apply_workspace_folder_change(
         &self,
         added: Vec<tower_lsp_server::ls_types::WorkspaceFolder>,
         removed: &[tower_lsp_server::ls_types::WorkspaceFolder],
     ) {
-        self.workspace_folders.apply_change(added.clone(), removed);
+        let _change = self.workspace_folder_change_lock.lock().await;
+        // Acquire every fallible/cancellable prerequisite before committing the
+        // upstream snapshot. Once committed below, all live capable handles are
+        // notified synchronously and every incompatible handle is marked
+        // shutting down before the next await.
+        let (connections, _ordering_guards) = loop {
+            let ordered_handles: Vec<_> = {
+                let connections = self.connections.lock().await;
+                connections
+                    .iter()
+                    .filter(|(key, _)| key.is_client_fallback() || key.is_shared())
+                    .map(|(_, handle)| Arc::clone(handle))
+                    .collect()
+            };
+            let ordering_locks: Vec<_> = ordered_handles
+                .iter()
+                .map(|handle| handle.dynamic_capabilities().workspace_folder_ordering())
+                .collect();
+            let ordering_guards = futures::future::join_all(
+                ordering_locks
+                    .into_iter()
+                    .map(|ordering| ordering.lock_owned()),
+            )
+            .await;
+            let connections = Arc::clone(&self.connections).lock_owned().await;
+            let snapshot_is_current = connections
+                .iter()
+                .filter(|(key, _)| key.is_client_fallback() || key.is_shared())
+                .all(|(_, current)| {
+                    ordered_handles
+                        .iter()
+                        .any(|ordered| Arc::ptr_eq(ordered, current))
+                });
+            if snapshot_is_current {
+                break (connections, ordering_guards);
+            }
+            drop(connections);
+            drop(ordering_guards);
+            // Connection replacement can race the optimistic snapshot. Yield
+            // before retrying so sustained routing churn cannot monopolize the
+            // executor while the workspace-change lock remains held.
+            tokio::task::yield_now().await;
+        };
+        if !self.workspace_folders.apply_change(added.clone(), removed) {
+            return;
+        }
         self.set_root_uri(
             self.workspace_folders()
                 .and_then(|folders| folders.first().map(|folder| folder.uri.to_string())),
         );
 
-        let mut connections = self.connections.lock().await;
         let mut invalidated = Vec::new();
         for (key, handle) in connections.iter() {
-            let follows_client_workspace = key.is_client_fallback();
-            if !follows_client_workspace {
-                // Marker-owned and shared connections derive their folders
-                // from marker-root acquisition, not this client snapshot.
+            if !(key.is_client_fallback() || key.is_shared()) {
                 continue;
             }
             if handle.state() == ConnectionState::Initializing {
-                // Its initialize request captured the old snapshot and an LSP
-                // notification cannot be sent until after `initialized`.
-                // Recycle it so the next acquisition handshakes with the
-                // committed snapshot instead of retaining stale folders.
+                // Its initialize request already captured the old snapshot and
+                // notifications cannot precede `initialized`; respawn lazily.
                 invalidated.push(key.clone());
                 continue;
             }
@@ -588,34 +705,46 @@ impl LanguageServerPool {
                 invalidated.push(key.clone());
                 continue;
             }
-            let notification =
-                build_did_change_workspace_folders_notification(added.clone(), removed.to_vec());
-            if handle.send_notification(notification) == NotificationSendResult::Queued {
-                handle
-                    .workspace_folders()
-                    .apply_change(added.clone(), removed);
-            } else {
+            let queued = handle
+                .workspace_folders()
+                .apply_upstream_change_and_announce(
+                    added.clone(),
+                    removed,
+                    |effective_added, effective_removed| {
+                        handle.send_notification(build_workspace_folder_change_notification(
+                            effective_added.to_vec(),
+                            effective_removed.to_vec(),
+                        )) == NotificationSendResult::Queued
+                    },
+                );
+            if !queued {
+                log::warn!(
+                    target: "kakehashi::bridge",
+                    "[{}] workspace folder delta was not queued; recycling stale connection",
+                    key
+                );
                 invalidated.push(key.clone());
             }
         }
-        let mut stale_handles = Vec::new();
-        for key in invalidated {
-            if let Some(handle) = connections.get(&key) {
-                handle.begin_shutdown();
-            }
-            self.host_documents
-                .lock()
-                .await
-                .retain(|(_, connection_key), _| connection_key != &key);
-            self.document_tracker.purge_connection(&key).await;
-            self.purge_open_transition_locks(&key).await;
-            if let Some(handle) = connections.remove(&key) {
-                stale_handles.push((key, handle));
-            }
-        }
-        drop(connections);
-        for (key, handle) in stale_handles {
-            shutdown_invalidated_connection(key, handle);
+
+        // Capability decisions and notification enqueues are now ordered with
+        // dynamic registration acknowledgements. Cleanup can block on process
+        // I/O, so release the per-connection ordering guards before starting it.
+        drop(_ordering_guards);
+
+        let cleanup = tokio::spawn(cleanup_invalidated_connections(
+            connections,
+            Arc::clone(&self.connections),
+            invalidated,
+            Arc::clone(&self.host_documents),
+            Arc::clone(&self.document_tracker),
+            Arc::clone(&self.open_transition_locks),
+        ));
+        if let Err(error) = cleanup.await {
+            log::error!(
+                target: "kakehashi::bridge",
+                "workspace-folder invalidation cleanup task failed: {error}"
+            );
         }
     }
 
@@ -732,21 +861,9 @@ impl LanguageServerPool {
             }
         }
 
-        let mut stale_handles = Vec::new();
-        for key in invalidated {
-            if let Some(handle) = connections.get(&key) {
-                handle.begin_shutdown();
-            }
-            self.host_documents
-                .lock()
-                .await
-                .retain(|(_, connection_key), _| connection_key != &key);
-            self.document_tracker.purge_connection(&key).await;
-            self.purge_open_transition_locks(&key).await;
-            if let Some(handle) = connections.remove(&key) {
-                stale_handles.push((key, handle));
-            }
-        }
+        let stale_handles = self
+            .remove_and_purge_invalidated_connections(&mut connections, invalidated)
+            .await;
 
         let mut pushed = 0;
         for (key, handle) in connections.iter() {
@@ -787,7 +904,7 @@ impl LanguageServerPool {
         }
         drop(connections);
         for (key, handle) in stale_handles {
-            shutdown_invalidated_connection(key, handle);
+            tokio::spawn(shutdown_invalidated_connection(key, handle));
         }
         pushed
     }
@@ -1140,19 +1257,40 @@ impl LanguageServerPool {
     }
 
     async fn purge_open_transition_locks(&self, connection_key: &ConnectionKey) {
-        let transitions: Vec<_> = self
-            .open_transition_locks
-            .iter()
-            .filter(|entry| &entry.key().0 == connection_key)
-            .map(|entry| (entry.key().clone(), Arc::clone(entry.value())))
-            .collect();
-        for (key, transition) in transitions {
-            let guard = transition.lock().await;
-            drop(guard);
-            self.open_transition_locks.remove_if(&key, |_, current| {
-                Arc::ptr_eq(current, &transition) && Arc::strong_count(current) == 2
-            });
+        purge_transition_locks(&self.open_transition_locks, connection_key).await;
+    }
+
+    /// Stop, purge, and remove invalidated connections while the caller holds
+    /// the connection-map lock. Keeping the map locked through key-based purge
+    /// prevents a replacement with the same key from being spawned and then
+    /// having its fresh tracking state removed as though it belonged to the
+    /// stale handle.
+    async fn remove_and_purge_invalidated_connections(
+        &self,
+        connections: &mut HashMap<ConnectionKey, Arc<ConnectionHandle>>,
+        invalidated: Vec<ConnectionKey>,
+    ) -> Vec<(ConnectionKey, Arc<ConnectionHandle>)> {
+        // Mark the complete set synchronously before cleanup can yield. If the
+        // caller is cancelled during a purge, no unnotified stale handle can be
+        // selected for new work against the already-committed global snapshot.
+        for key in &invalidated {
+            if let Some(handle) = connections.get(key) {
+                handle.begin_shutdown();
+            }
         }
+        let mut stale_handles = Vec::new();
+        for key in invalidated {
+            self.host_documents
+                .lock()
+                .await
+                .retain(|(_, connection_key), _| connection_key != &key);
+            self.document_tracker.purge_connection(&key).await;
+            self.purge_open_transition_locks(&key).await;
+            if let Some(handle) = connections.remove(&key) {
+                stale_handles.push((key, handle));
+            }
+        }
+        stale_handles
     }
 
     /// Resolve the exact `(server, root)` connection a document currently
@@ -1557,6 +1695,26 @@ impl LanguageServerPool {
         document_uri: Option<&Url>,
         timeout: Duration,
     ) -> io::Result<Arc<ConnectionHandle>> {
+        tokio::time::timeout(
+            timeout,
+            self.get_or_create_connection_wait_ready_inner(
+                server_name,
+                server_config,
+                document_uri,
+                timeout,
+            ),
+        )
+        .await
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "bridge: acquisition timed out"))?
+    }
+
+    async fn get_or_create_connection_wait_ready_inner(
+        &self,
+        server_name: &str,
+        server_config: &crate::config::settings::BridgeServerConfig,
+        document_uri: Option<&Url>,
+        timeout: Duration,
+    ) -> io::Result<Arc<ConnectionHandle>> {
         // `timeout` is the caller's overall budget; the incapable-shared divert
         // below acquires a second connection, so track elapsed time and hand it
         // only the remaining budget rather than a fresh full `timeout`.
@@ -1566,37 +1724,22 @@ impl LanguageServerPool {
         let (marker, connection_key) = self
             .resolve_acquire(server_name, server_config, document_uri)
             .await;
+        let remaining = timeout.saturating_sub(start.elapsed());
 
         // Acquire and wait through initialization for the resolved key.
-        let handle = self
+        let handle = match self
             .acquire_resolved_wait_ready(
                 server_name,
                 server_config,
                 connection_key,
                 marker.clone(),
-                timeout,
+                remaining,
             )
-            .await?;
-
-        // The shared connection's capability is only known now that it is Ready.
-        // If it came up incapable and does not already serve this root, the
-        // shared-instance opt-in must degrade to a per-root instance (#391):
-        // opening this document on a server that ignores
-        // didChangeWorkspaceFolders would wedge the 2nd+ root. `resolve_acquire`
-        // now sees the shared connection as Ready+incapable, so it re-resolves
-        // to the per-root key; acquire that connection instead, within the
-        // caller's remaining budget.
-        if handle.key().is_shared() && !handle.supports_workspace_folder_changes() {
-            let serves_this_root = marker
-                .as_ref()
-                .is_some_and(|(_root, folder)| handle.workspace_folders().contains(folder));
-            if !serves_this_root {
-                handle.log_incapable_fallback_once(server_name);
+            .await
+        {
+            Ok(handle) => handle,
+            Err(error) if error.kind() == io::ErrorKind::Unsupported => {
                 let remaining = timeout.saturating_sub(start.elapsed());
-                // Reuse the already-resolved `marker` to build the per-root key
-                // directly — re-running `resolve_acquire` here would redo the
-                // filesystem marker walk and re-lock `connections` for the same
-                // result (the shared connection is now Ready+incapable).
                 let per_root_key = ConnectionKey::new(
                     server_name,
                     marker
@@ -1613,14 +1756,43 @@ impl LanguageServerPool {
                     )
                     .await;
             }
-        }
+            Err(error) => return Err(error),
+        };
 
         // Announce the (possibly newly-joined) root before the caller opens any
         // document. Idempotent if `acquire_resolved_wait_ready`'s ReturnExisting
         // path already announced; on the initializing-retry path it is the only
         // announce. Propagates a queue-full failure so the caller retries rather
         // than open a document for an unannounced root.
-        self.announce_shared_root(&handle, &marker).await?;
+        let remaining = timeout.saturating_sub(start.elapsed());
+        let announced =
+            tokio::time::timeout(remaining, self.announce_shared_root(&handle, &marker))
+                .await
+                .map_err(|_| {
+                    io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "workspace-folder announcement timed out",
+                    )
+                })??;
+        if !announced {
+            handle.log_incapable_fallback_once(server_name);
+            let remaining = timeout.saturating_sub(start.elapsed());
+            let per_root_key = ConnectionKey::new(
+                server_name,
+                marker
+                    .as_ref()
+                    .map(|(root, _folder)| root.as_str().to_owned()),
+            );
+            return self
+                .acquire_resolved_wait_ready(
+                    server_name,
+                    server_config,
+                    per_root_key,
+                    marker,
+                    remaining,
+                )
+                .await;
+        }
         Ok(handle)
     }
 
@@ -1828,7 +2000,9 @@ impl LanguageServerPool {
     /// the same connection follows it on the wire (FIFO), satisfying "announce
     /// the root, then open the document".
     ///
-    /// Returns `Ok(())` when the root is announced (or no announce is needed).
+    /// Returns `Ok(true)` when the root is announced (or no announce is needed),
+    /// and `Ok(false)` when a newly required root cannot join because dynamic
+    /// support disappeared.
     /// Returns an error only when the root is newly required but its
     /// `didChangeWorkspaceFolders` could not be queued (outbound queue full or
     /// closed): the caller must NOT then open documents on this connection,
@@ -1836,38 +2010,33 @@ impl LanguageServerPool {
     /// Surfacing it as an error makes the acquire fail and retry, re-attempting
     /// the announce once the queue drains.
     ///
-    /// `Ok(())` no-op for per-root keys, marker-less acquisitions,
-    /// capability-less servers, or a root already in the set — including a
-    /// connection's own initialize-time root, so the first root never
-    /// re-announces.
+    /// `Ok(true)` is also returned for per-root keys, marker-less acquisitions,
+    /// or a root already in the set — including a connection's own
+    /// initialize-time root, so the first root never re-announces.
     async fn announce_shared_root(
         &self,
         handle: &Arc<ConnectionHandle>,
         marker: &Option<(Url, tower_lsp_server::ls_types::WorkspaceFolder)>,
-    ) -> io::Result<()> {
+    ) -> io::Result<bool> {
         if !handle.key().is_shared() {
-            return Ok(());
+            return Ok(true);
         }
         let Some((_root, folder)) = marker else {
-            return Ok(());
+            return Ok(true);
         };
-        if !handle.supports_workspace_folder_changes() {
-            return Ok(());
-        }
-        let folder = folder.clone();
         // The closure runs under the folder-set lock and reports its send
         // outcome out here so the error kind can distinguish retryable
         // backpressure (queue full) from a dead/serialization-failed connection.
         let mut send_outcome = NotificationSendResult::Queued;
-        // Hold the `connections` lock across the liveness check AND the
-        // add+announce so a concurrent respawn (get_or_create's SpawnNew branch,
-        // which purges this key's state) cannot interleave between verifying the
-        // handle is still the live pool connection and queuing the
-        // `didChangeWorkspaceFolders` — the same Arc::ptr_eq live-handle guard
-        // the request (execute.rs) and eager-open (did_open.rs) send paths use.
-        // `add_and_announce` is fully synchronous (the send is a non-blocking
-        // try_send), so no `.await` is held under either lock; lock order is
-        // connections → folder set, never the reverse.
+        // Wait for registration acknowledgement ordering without holding the
+        // global map. Once ordered, hold `connections` across the liveness
+        // check and synchronous add+announce so a concurrent respawn cannot
+        // interleave between validation and enqueue.
+        let _ordering = handle
+            .dynamic_capabilities()
+            .workspace_folder_ordering()
+            .lock_owned()
+            .await;
         let connections = self.connections.lock().await;
         if !connections
             .get(handle.key())
@@ -1878,6 +2047,16 @@ impl LanguageServerPool {
                 "bridge: connection was replaced before didChangeWorkspaceFolders",
             ));
         }
+        if handle
+            .workspace_folders()
+            .claim_marker_ownership_if_present(folder)
+        {
+            return Ok(true);
+        }
+        if !handle.supports_workspace_folder_changes() {
+            return Ok(false);
+        }
+        let folder = folder.clone();
         // Add + announce atomically under the folder-set lock: the folder is
         // committed only if the `didChangeWorkspaceFolders` actually queued, and
         // a concurrent caller cannot observe it as announced (and skip its own
@@ -1888,11 +2067,9 @@ impl LanguageServerPool {
         let announced = handle
             .workspace_folders()
             .add_and_announce(folder.clone(), || {
-                let result =
-                    handle.send_notification(build_did_change_workspace_folders_notification(
-                        vec![folder.clone()],
-                        Vec::new(),
-                    ));
+                let result = handle.send_notification(
+                    build_did_change_workspace_folders_notification(vec![folder.clone()]),
+                );
                 send_outcome = result;
                 if result == NotificationSendResult::Queued {
                     log::debug!(
@@ -1916,7 +2093,7 @@ impl LanguageServerPool {
         drop(connections);
 
         if announced {
-            return Ok(());
+            return Ok(true);
         }
         // Map the send failure to a faithful error kind so callers recover
         // correctly: queue-full is retryable backpressure, but a closed channel
@@ -1953,14 +2130,22 @@ impl LanguageServerPool {
         let (marker, connection_key) = self
             .resolve_acquire(server_name, server_config, document_uri)
             .await;
-        self.get_or_create_connection_resolved(
-            server_name,
-            server_config,
-            connection_key,
-            marker,
-            timeout,
-        )
-        .await
+        match self
+            .get_or_create_connection_resolved(
+                server_name,
+                server_config,
+                connection_key,
+                marker,
+                timeout,
+            )
+            .await
+        {
+            Err(error) if error.kind() == io::ErrorKind::Unsupported => Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "bridge: shared connection lost workspace-folder support; retry routing",
+            )),
+            result => result,
+        }
     }
 
     /// Get-or-spawn against an ALREADY-resolved `(connection_key, marker)` pair
@@ -2033,7 +2218,21 @@ impl LanguageServerPool {
                 // check, so it must not be held here (the tokio mutex is not
                 // reentrant).
                 drop(connections);
-                self.announce_shared_root(&handle, &marker).await?;
+                let announced =
+                    tokio::time::timeout(timeout, self.announce_shared_root(&handle, &marker))
+                        .await
+                        .map_err(|_| {
+                            io::Error::new(
+                                io::ErrorKind::TimedOut,
+                                "workspace-folder announcement timed out",
+                            )
+                        })??;
+                if !announced {
+                    return Err(io::Error::new(
+                        io::ErrorKind::Unsupported,
+                        "bridge: shared connection lost workspace-folder support; retry per root",
+                    ));
+                }
                 return Ok(handle);
             }
             ConnectionAction::FailFast(err) => {
@@ -2080,7 +2279,10 @@ impl LanguageServerPool {
                     // purge instead of spawning over partial document state.
                     connections.remove(&connection_key);
                     if let Some(handle) = invalidated_handle {
-                        shutdown_invalidated_connection(connection_key.clone(), handle);
+                        tokio::spawn(shutdown_invalidated_connection(
+                            connection_key.clone(),
+                            handle,
+                        ));
                     }
                 }
             }
@@ -2116,6 +2318,7 @@ impl LanguageServerPool {
         // matches `connection_key`.
         // Resolved before the reader task spawns because the reader answers
         // downstream `workspace/workspaceFolders` queries with these folders.
+        let marker_owned = marker.is_some();
         let (root_uri, init_folders) = super::root_markers::workspace_from_marker(marker, || {
             (self.root_uri(), self.workspace_folders())
         });
@@ -2130,7 +2333,11 @@ impl LanguageServerPool {
         // answer downstream `workspace/workspaceFolders` pulls. Shared-instance
         // servers (#391) grow it as new roots join; the immutable spawn-time
         // `init_folders` still seeds the `initialize` handshake.
-        let workspace_folders = super::WorkspaceFolderSet::new(init_folders.clone());
+        let workspace_folders = if marker_owned {
+            super::WorkspaceFolderSet::new_marker_owned(init_folders.clone())
+        } else {
+            super::WorkspaceFolderSet::new(init_folders.clone())
+        };
 
         // Now spawn reader task with liveness timeout - it can route the initialize response immediately
         // Liveness timeout is configured via LivenessTimeout::default() (60s per ls-bridge-timeout-hierarchy Tier 2)
@@ -2920,126 +3127,6 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn workspace_folder_change_updates_primary_root_for_future_spawns() {
-        let pool = LanguageServerPool::new();
-        let folder = |uri: &str| tower_lsp_server::ls_types::WorkspaceFolder {
-            uri: uri.parse().unwrap(),
-            name: uri.to_string(),
-        };
-        let original = folder("file:///original");
-        let replacement = folder("file:///replacement");
-        pool.set_root_uri(Some(original.uri.to_string()));
-        pool.set_workspace_folders(Some(vec![original.clone()]));
-
-        pool.apply_workspace_folder_change(vec![replacement.clone()], &[original])
-            .await;
-
-        assert_eq!(pool.root_uri().as_deref(), Some("file:///replacement"));
-        assert_eq!(pool.workspace_folders(), Some(vec![replacement]));
-    }
-
-    #[tokio::test]
-    async fn workspace_folder_change_forwards_to_capable_and_recycles_incapable_fallback() {
-        let pool = LanguageServerPool::new();
-        let capable =
-            create_handle_with_key(ConnectionState::Ready, ConnectionKey::for_server("capable"))
-                .await;
-        capable.set_server_capabilities(capable_workspace_folders_caps());
-        let incapable = create_handle_with_key(
-            ConnectionState::Ready,
-            ConnectionKey::for_server("incapable"),
-        )
-        .await;
-        incapable.set_server_capabilities(Default::default());
-        pool.insert_connection(Arc::clone(&capable)).await;
-        pool.insert_connection(Arc::clone(&incapable)).await;
-        let added = tower_lsp_server::ls_types::WorkspaceFolder {
-            uri: "file:///added".parse().unwrap(),
-            name: "added".to_string(),
-        };
-
-        pool.apply_workspace_folder_change(vec![added.clone()], &[])
-            .await;
-
-        assert_eq!(capable.workspace_folders().snapshot(), Some(vec![added]));
-        assert!(
-            !pool.connections.lock().await.contains_key(incapable.key()),
-            "an incapable fallback must respawn with the current workspace snapshot"
-        );
-    }
-
-    #[tokio::test]
-    async fn workspace_folder_change_recycles_initializing_connection() {
-        let pool = LanguageServerPool::new();
-        let key = ConnectionKey::for_server("initializing");
-        let handle = create_handle_with_key(ConnectionState::Initializing, key.clone()).await;
-        pool.insert_connection(handle).await;
-        let added = tower_lsp_server::ls_types::WorkspaceFolder {
-            uri: "file:///added".parse().unwrap(),
-            name: "added".to_string(),
-        };
-
-        pool.apply_workspace_folder_change(vec![added], &[]).await;
-
-        assert!(
-            !pool.connections.lock().await.contains_key(&key),
-            "a handshake seeded from the old snapshot must not remain reusable"
-        );
-    }
-
-    #[tokio::test]
-    async fn workspace_folder_change_does_not_touch_marker_owned_connection() {
-        let pool = LanguageServerPool::new();
-        let key = ConnectionKey::new("marker", Some("file:///marker".to_string()));
-        let handle = create_handle_with_key(ConnectionState::Ready, key.clone()).await;
-        handle.set_server_capabilities(capable_workspace_folders_caps());
-        pool.insert_connection(Arc::clone(&handle)).await;
-
-        pool.apply_workspace_folder_change(
-            vec![tower_lsp_server::ls_types::WorkspaceFolder {
-                uri: "file:///client".parse().unwrap(),
-                name: "client".to_string(),
-            }],
-            &[],
-        )
-        .await;
-
-        assert!(pool.connections.lock().await.contains_key(&key));
-        assert_eq!(handle.workspace_folders().snapshot(), None);
-    }
-
-    #[tokio::test]
-    async fn workspace_folder_change_does_not_touch_shared_marker_folders() {
-        let pool = LanguageServerPool::new();
-        let key = ConnectionKey::shared("shared");
-        let handle = create_handle_with_key(ConnectionState::Ready, key.clone()).await;
-        handle.set_server_capabilities(capable_workspace_folders_caps());
-        let marker = tower_lsp_server::ls_types::WorkspaceFolder {
-            uri: "file:///repo/pkg".parse().unwrap(),
-            name: "pkg".to_string(),
-        };
-        handle
-            .workspace_folders()
-            .replace(Some(vec![marker.clone()]));
-        pool.insert_connection(Arc::clone(&handle)).await;
-
-        pool.apply_workspace_folder_change(
-            vec![tower_lsp_server::ls_types::WorkspaceFolder {
-                uri: "file:///other".parse().unwrap(),
-                name: "other".to_string(),
-            }],
-            &[tower_lsp_server::ls_types::WorkspaceFolder {
-                uri: "file:///repo".parse().unwrap(),
-                name: "repo".to_string(),
-            }],
-        )
-        .await;
-
-        assert!(pool.connections.lock().await.contains_key(&key));
-        assert_eq!(handle.workspace_folders().snapshot(), Some(vec![marker]));
-    }
-
     fn shared_config() -> crate::config::settings::BridgeServerConfig {
         crate::config::settings::BridgeServerConfig {
             prefer_shared_instance: Some(true),
@@ -3114,6 +3201,322 @@ mod tests {
 
         let (_marker, key) = pool.resolve_acquire("lua", &config, Some(&doc)).await;
         assert_eq!(key, ConnectionKey::shared("lua"));
+    }
+
+    fn test_workspace_folder(uri: &str) -> tower_lsp_server::ls_types::WorkspaceFolder {
+        use std::str::FromStr as _;
+        tower_lsp_server::ls_types::WorkspaceFolder {
+            uri: tower_lsp_server::ls_types::Uri::from_str(uri).unwrap(),
+            name: uri.rsplit('/').next().unwrap().to_string(),
+        }
+    }
+
+    #[tokio::test]
+    async fn upstream_folder_delta_updates_a_capable_live_fallback_connection() {
+        let pool = LanguageServerPool::new();
+        let key = ConnectionKey::for_server("lua");
+        let handle = create_handle_with_key(ConnectionState::Ready, key.clone()).await;
+        handle.set_server_capabilities(capable_workspace_folders_caps());
+        handle
+            .workspace_folders()
+            .replace(Some(vec![test_workspace_folder("file:///old")]));
+        pool.insert_connection(Arc::clone(&handle)).await;
+
+        pool.apply_workspace_folder_change(
+            vec![test_workspace_folder("file:///new")],
+            &[test_workspace_folder("file:///old")],
+        )
+        .await;
+
+        assert_eq!(
+            handle.workspace_folders().snapshot(),
+            Some(vec![test_workspace_folder("file:///new")])
+        );
+    }
+
+    #[tokio::test]
+    async fn upstream_folder_delta_invalidates_an_incapable_live_fallback_connection() {
+        let pool = LanguageServerPool::new();
+        let key = ConnectionKey::for_server("lua");
+        let handle = create_handle_with_key(ConnectionState::Ready, key.clone()).await;
+        handle.set_server_capabilities(tower_lsp_server::ls_types::ServerCapabilities::default());
+        pool.insert_connection(handle).await;
+
+        pool.apply_workspace_folder_change(vec![test_workspace_folder("file:///new")], &[])
+            .await;
+
+        assert!(!pool.connections.lock().await.contains_key(&key));
+    }
+
+    #[tokio::test]
+    async fn ineffective_upstream_folder_delta_keeps_an_incapable_live_connection() {
+        let pool = LanguageServerPool::new();
+        pool.set_workspace_folders(Some(vec![test_workspace_folder("file:///same")]));
+        let key = ConnectionKey::for_server("lua");
+        let handle = create_handle_with_key(ConnectionState::Ready, key.clone()).await;
+        handle.set_server_capabilities(tower_lsp_server::ls_types::ServerCapabilities::default());
+        pool.insert_connection(handle).await;
+
+        pool.apply_workspace_folder_change(
+            vec![test_workspace_folder("file:///same")],
+            &[test_workspace_folder("file:///unknown")],
+        )
+        .await;
+
+        assert!(pool.connections.lock().await.contains_key(&key));
+    }
+
+    #[tokio::test]
+    async fn cancelled_upstream_folder_change_does_not_commit_before_connection_lock() {
+        let pool = Arc::new(LanguageServerPool::new());
+        let old = test_workspace_folder("file:///old");
+        let new = test_workspace_folder("file:///new");
+        pool.set_workspace_folders(Some(vec![old.clone()]));
+        let connections = pool.connections.lock().await;
+
+        let task = tokio::spawn({
+            let pool = Arc::clone(&pool);
+            async move {
+                pool.apply_workspace_folder_change(vec![new], &[old]).await;
+            }
+        });
+        tokio::task::yield_now().await;
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        drop(connections);
+
+        assert_eq!(
+            pool.workspace_folders(),
+            Some(vec![test_workspace_folder("file:///old")])
+        );
+    }
+
+    #[tokio::test]
+    async fn upstream_folder_change_waits_until_stale_connection_is_unmapped() {
+        let pool = Arc::new(LanguageServerPool::new());
+        let key = ConnectionKey::for_server("lua");
+        let handle = create_handle_with_key(ConnectionState::Ready, key.clone()).await;
+        handle.set_server_capabilities(tower_lsp_server::ls_types::ServerCapabilities::default());
+        pool.insert_connection(Arc::clone(&handle)).await;
+        let host_documents = pool.host_documents.lock().await;
+
+        let mut task = tokio::spawn({
+            let pool = Arc::clone(&pool);
+            async move {
+                pool.apply_workspace_folder_change(vec![test_workspace_folder("file:///new")], &[])
+                    .await;
+            }
+        });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while handle.state() != ConnectionState::Closing {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("owned cleanup must mark the stale handle before its first await");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), &mut task)
+                .await
+                .is_err(),
+            "the update must not return while keyed state is only partially purged"
+        );
+        drop(host_documents);
+
+        tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .expect("cleanup must finish after the blocked purge resumes")
+            .unwrap();
+        assert!(
+            !pool.connections.lock().await.contains_key(&key),
+            "the stale entry must be unavailable when the update returns"
+        );
+
+        tokio::time::timeout(Duration::from_secs(4), async {
+            while handle.state() != ConnectionState::Closed {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("detached cleanup must close the stale handle after caller cancellation");
+        assert_eq!(
+            handle.state(),
+            ConnectionState::Closed,
+            "removal must not become observable before bounded shutdown finishes"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelled_post_commit_folder_change_finishes_owned_cleanup() {
+        let pool = Arc::new(LanguageServerPool::new());
+        let key = ConnectionKey::for_server("lua");
+        let handle = create_handle_with_key(ConnectionState::Ready, key.clone()).await;
+        handle.set_server_capabilities(tower_lsp_server::ls_types::ServerCapabilities::default());
+        pool.insert_connection(Arc::clone(&handle)).await;
+        let host_documents = pool.host_documents.lock().await;
+
+        let task = tokio::spawn({
+            let pool = Arc::clone(&pool);
+            async move {
+                pool.apply_workspace_folder_change(vec![test_workspace_folder("file:///new")], &[])
+                    .await;
+            }
+        });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while handle.state() != ConnectionState::Closing {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("owned cleanup must begin after the snapshot commit");
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        drop(host_documents);
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while pool.connections.lock().await.contains_key(&key) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("owned cleanup must unmap stale state after caller cancellation");
+        assert_eq!(
+            pool.workspace_folders(),
+            Some(vec![test_workspace_folder("file:///new")])
+        );
+    }
+
+    #[tokio::test]
+    async fn upstream_folder_change_releases_capability_ordering_before_cleanup() {
+        let pool = Arc::new(LanguageServerPool::new());
+        let key = ConnectionKey::for_server("lua");
+        let handle = create_handle_with_key(ConnectionState::Ready, key).await;
+        handle.set_server_capabilities(tower_lsp_server::ls_types::ServerCapabilities::default());
+        pool.insert_connection(Arc::clone(&handle)).await;
+
+        // Stall invalidation cleanup after its synchronous capability decision.
+        let host_documents = pool.host_documents.lock().await;
+        let task = tokio::spawn({
+            let pool = Arc::clone(&pool);
+            async move {
+                pool.apply_workspace_folder_change(vec![test_workspace_folder("file:///new")], &[])
+                    .await;
+            }
+        });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while handle.state() != ConnectionState::Closing {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("cleanup must begin before probing capability ordering");
+
+        let ordering = handle.dynamic_capabilities().workspace_folder_ordering();
+        tokio::time::timeout(Duration::from_secs(1), ordering.lock_owned())
+            .await
+            .expect("capability acknowledgements must not wait for connection cleanup");
+
+        drop(host_documents);
+        task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn upstream_folder_change_observes_ordered_dynamic_unregistration() {
+        let pool = Arc::new(LanguageServerPool::new());
+        let key = ConnectionKey::for_server("lua");
+        let handle = create_handle_with_key(ConnectionState::Ready, key.clone()).await;
+        handle
+            .dynamic_capabilities()
+            .register(vec![tower_lsp_server::ls_types::Registration {
+                id: "workspace-folders".to_string(),
+                method: "workspace/didChangeWorkspaceFolders".to_string(),
+                register_options: None,
+            }]);
+        pool.insert_connection(Arc::clone(&handle)).await;
+        let ordering = handle
+            .dynamic_capabilities()
+            .workspace_folder_ordering()
+            .lock_owned()
+            .await;
+
+        let task = tokio::spawn({
+            let pool = Arc::clone(&pool);
+            async move {
+                pool.apply_workspace_folder_change(vec![test_workspace_folder("file:///new")], &[])
+                    .await;
+            }
+        });
+        tokio::task::yield_now().await;
+        assert_eq!(
+            pool.workspace_folders(),
+            None,
+            "propagation must not commit while capability ordering is held"
+        );
+        let connections = tokio::time::timeout(Duration::from_secs(1), pool.connections.lock())
+            .await
+            .expect("capability ordering must not block unrelated connection routing");
+        drop(connections);
+        handle.dynamic_capabilities().unregister(vec![
+            tower_lsp_server::ls_types::Unregistration {
+                id: "workspace-folders".to_string(),
+                method: "workspace/didChangeWorkspaceFolders".to_string(),
+            },
+        ]);
+        drop(ordering);
+        task.await.unwrap();
+
+        tokio::time::timeout(Duration::from_secs(4), async {
+            while pool.connections.lock().await.contains_key(&key) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the post-ack propagation decision must observe unregistration and recycle");
+    }
+
+    #[tokio::test]
+    async fn shared_root_announcement_observes_ordered_dynamic_unregistration() {
+        let pool = Arc::new(LanguageServerPool::new());
+        let handle =
+            create_handle_with_key(ConnectionState::Ready, ConnectionKey::shared("lua")).await;
+        handle
+            .dynamic_capabilities()
+            .register(vec![tower_lsp_server::ls_types::Registration {
+                id: "workspace-folders".to_string(),
+                method: "workspace/didChangeWorkspaceFolders".to_string(),
+                register_options: None,
+            }]);
+        pool.insert_connection(Arc::clone(&handle)).await;
+        let ordering = handle
+            .dynamic_capabilities()
+            .workspace_folder_ordering()
+            .lock_owned()
+            .await;
+        let folder = test_workspace_folder("file:///new");
+        let marker = Some((Url::parse("file:///new").unwrap(), folder.clone()));
+
+        let task = tokio::spawn({
+            let pool = Arc::clone(&pool);
+            let handle = Arc::clone(&handle);
+            async move { pool.announce_shared_root(&handle, &marker).await }
+        });
+        tokio::task::yield_now().await;
+        let connections = tokio::time::timeout(Duration::from_secs(1), pool.connections.lock())
+            .await
+            .expect("capability ordering must not block unrelated connection routing");
+        drop(connections);
+        handle.dynamic_capabilities().unregister(vec![
+            tower_lsp_server::ls_types::Unregistration {
+                id: "workspace-folders".to_string(),
+                method: "workspace/didChangeWorkspaceFolders".to_string(),
+            },
+        ]);
+        drop(ordering);
+
+        assert!(!task.await.unwrap().unwrap());
+        assert!(
+            !handle.workspace_folders().contains(&folder),
+            "a root must not be committed after its capability acknowledgement"
+        );
     }
 
     /// A Ready shared connection whose server never advertised the

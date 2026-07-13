@@ -105,6 +105,14 @@ pub(crate) fn build_didclose_notification(
 /// separate follow-up.
 pub(crate) fn build_did_change_workspace_folders_notification(
     added: Vec<WorkspaceFolder>,
+) -> JsonRpcNotification<DidChangeWorkspaceFoldersParams> {
+    build_workspace_folder_change_notification(added, Vec::new())
+}
+
+/// Build a general upstream-derived workspace-folder delta for a live
+/// downstream connection.
+pub(crate) fn build_workspace_folder_change_notification(
+    added: Vec<WorkspaceFolder>,
     removed: Vec<WorkspaceFolder>,
 ) -> JsonRpcNotification<DidChangeWorkspaceFoldersParams> {
     let params = DidChangeWorkspaceFoldersParams {

@@ -416,10 +416,11 @@ pub struct BridgeServerConfig {
     pub on_type_formatting_triggers: Option<Vec<String>>,
     /// Prefer reusing **one** downstream process across every workspace root for
     /// this server, instead of spawning a separate process per marker root
-    /// (issue #391). It is a *preference*, honored only when the downstream
-    /// server advertises `workspace.workspaceFolders.{supported,
-    /// changeNotifications}`: when it does, kakehashi routes all roots to a
-    /// single connection and announces each new root with
+    /// (issue #391). It is a *preference*, honored when the downstream server
+    /// either advertises `workspace.workspaceFolders.{supported,
+    /// changeNotifications}` or dynamically registers
+    /// `workspace/didChangeWorkspaceFolders`: when it does, kakehashi routes
+    /// all roots to a single connection and announces each new root with
     /// `workspace/didChangeWorkspaceFolders`; when it does not, kakehashi logs
     /// once and silently falls back to the per-root-instance model. That
     /// universal fallback makes a blanket `languageServers._` opt-in safe.

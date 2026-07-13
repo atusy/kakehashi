@@ -355,6 +355,7 @@ impl AsyncBridgeConnection {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
+            .kill_on_drop(true)
             .spawn()?;
 
         let stdin = child
@@ -461,6 +462,26 @@ mod tests {
             .expect("spawn should succeed");
 
         // If spawn succeeded, we have a valid connection
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn dropping_split_writer_kills_child_process() {
+        let mut conn = AsyncBridgeConnection::spawn(vec!["sleep".to_string(), "60".to_string()])
+            .await
+            .expect("spawn should succeed");
+        let (writer, _reader) = conn.split();
+        let pid = writer.child_id().expect("child must have a pid") as i32;
+
+        drop(writer);
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None).is_ok() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("kill-on-drop must terminate the split child");
     }
 
     #[tokio::test]

@@ -33,6 +33,43 @@ use crate::lsp::bridge::protocol::{
 };
 use crate::lsp::bridge::workspace::WorkspaceFolderSet;
 
+struct ShutdownCoordinator {
+    owner: AtomicBool,
+    changed: tokio::sync::Notify,
+}
+
+impl ShutdownCoordinator {
+    fn new() -> Self {
+        Self {
+            owner: AtomicBool::new(false),
+            changed: tokio::sync::Notify::new(),
+        }
+    }
+}
+
+struct ShutdownOwner {
+    coordinator: Arc<ShutdownCoordinator>,
+}
+
+impl ShutdownOwner {
+    fn claim(coordinator: &Arc<ShutdownCoordinator>) -> Option<Self> {
+        coordinator
+            .owner
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .ok()
+            .map(|_| Self {
+                coordinator: Arc::clone(coordinator),
+            })
+    }
+}
+
+impl Drop for ShutdownOwner {
+    fn drop(&mut self) {
+        self.coordinator.owner.store(false, Ordering::Release);
+        self.coordinator.changed.notify_waiters();
+    }
+}
+
 /// Whether `caps` advertises everything the shared-instance opt-in (#391)
 /// needs to drive one connection across roots via
 /// `workspace/didChangeWorkspaceFolders`: `workspace.workspaceFolders` with
@@ -90,6 +127,10 @@ pub(crate) struct ConnectionHandle {
     /// using `wait_for_ready()`. The Sender is stored here; receivers are created
     /// via `state_watch.subscribe()`.
     state_watch: tokio::sync::watch::Sender<ConnectionState>,
+    /// Exactly one caller owns writer reclamation and child termination. Other
+    /// shutdown callers wait through `ShutdownCoordinator::changed` instead of
+    /// competing for the sole writer or publishing completion early.
+    shutdown_coordinator: Arc<ShutdownCoordinator>,
     /// Channel sender for outbound messages (ls-bridge-message-ordering single-writer pattern).
     ///
     /// All notifications and requests are queued here and written to stdin
@@ -124,10 +165,11 @@ pub(crate) struct ConnectionHandle {
     connection_key: ConnectionKey,
     /// The workspace folders this connection currently serves, shared with the
     /// reader task (which answers downstream `workspace/workspaceFolders`
-    /// pulls). For a `preferSharedInstance` connection (#391) the pool grows it
-    /// as new marker roots join, each addition paired with a
-    /// `workspace/didChangeWorkspaceFolders`; for a per-root connection it is
-    /// seeded once and never mutated.
+    /// pulls). Shared and client-fallback connections track live upstream
+    /// deltas while preserving marker-owned roots; a `preferSharedInstance`
+    /// connection (#391) also grows as new marker roots join. Each live change
+    /// is paired with `workspace/didChangeWorkspaceFolders`. Per-root
+    /// connections are seeded once and never mutated.
     workspace_folders: WorkspaceFolderSet,
     /// Guards the one-time "opt-in server lacks `workspaceFolders` capability,
     /// falling back to per-root instances" log for this server (#391), so the
@@ -198,6 +240,7 @@ impl ConnectionHandle {
         Self {
             state: std::sync::RwLock::new(initial_state),
             state_watch,
+            shutdown_coordinator: Arc::new(ShutdownCoordinator::new()),
             tx,
             writer_handle: std::sync::Mutex::new(Some(writer_handle)),
             router,
@@ -490,20 +533,36 @@ impl ConnectionHandle {
     }
 
     /// The workspace folders this connection currently serves (#391), shared
-    /// with the reader task. The pool grows it (and announces the new root)
-    /// when a `preferSharedInstance` connection takes on another marker root.
+    /// with the reader task. Shared and client-fallback sets follow live
+    /// upstream deltas without removing marker-owned roots; shared sets also
+    /// grow and announce when another marker root joins.
     pub(crate) fn workspace_folders(&self) -> &WorkspaceFolderSet {
         &self.workspace_folders
     }
 
-    /// Whether the downstream server advertised support for receiving
-    /// `workspace/didChangeWorkspaceFolders` notifications — the capability
-    /// the shared-instance opt-in (#391) requires. Returns `false` until the
-    /// initialize handshake stores capabilities, so a still-initializing
-    /// connection is treated as not-yet-capable.
+    /// Whether the downstream server statically advertised or dynamically
+    /// registered support for receiving `workspace/didChangeWorkspaceFolders`
+    /// notifications — the capability the shared-instance opt-in (#391)
+    /// requires. Before initialize completes, only a dynamic registration can
+    /// make this return `true`.
     pub(crate) fn supports_workspace_folder_changes(&self) -> bool {
-        self.server_capabilities()
-            .is_some_and(supports_workspace_folder_changes)
+        self.dynamic_capabilities()
+            .has_registration("workspace/didChangeWorkspaceFolders")
+            || self.server_capabilities().is_some_and(|caps| {
+                supports_workspace_folder_changes(caps)
+                    && !caps
+                        .workspace
+                        .as_ref()
+                        .and_then(|workspace| workspace.workspace_folders.as_ref())
+                        .and_then(|folders| match &folders.change_notifications {
+                            Some(OneOf::Right(id)) => Some(id.as_str()),
+                            _ => None,
+                        })
+                        .is_some_and(|id| {
+                            self.dynamic_capabilities()
+                                .is_registration_revoked(id, "workspace/didChangeWorkspaceFolders")
+                        })
+            })
     }
 
     /// Log, at most once per connection, that a `preferSharedInstance` server
@@ -762,11 +821,20 @@ impl ConnectionHandle {
     /// running to receive the shutdown response. Valid from Ready or Initializing
     /// (ls-bridge-message-ordering/ls-bridge-graceful-shutdown).
     pub(crate) fn begin_shutdown(&self) {
+        let mut state = self
+            .state
+            .write()
+            .recover_poison("ConnectionHandle::begin_shutdown");
+        if matches!(*state, ConnectionState::Closed | ConnectionState::Failed) {
+            return;
+        }
         // Stop the liveness timer (but not the reader task) per ls-bridge-timeout-hierarchy
         // Global shutdown (Tier 3) overrides liveness timeout (Tier 2)
         // Reader continues running to receive shutdown response
         self.reader_handle.stop_liveness_timer();
-        self.set_state(ConnectionState::Closing);
+        *state = ConnectionState::Closing;
+        drop(state);
+        self.state_watch.send_replace(ConnectionState::Closing);
     }
 
     /// Complete the shutdown sequence.
@@ -777,6 +845,19 @@ impl ConnectionHandle {
     /// Valid from Closing or Failed states per ls-bridge-message-ordering/ls-bridge-graceful-shutdown.
     pub(crate) fn complete_shutdown(&self) {
         self.set_state(ConnectionState::Closed);
+        self.shutdown_coordinator.changed.notify_waiters();
+    }
+
+    async fn wait_for_shutdown_turn(&self) {
+        loop {
+            let notified = self.shutdown_coordinator.changed.notified();
+            if self.state() == ConnectionState::Closed
+                || !self.shutdown_coordinator.owner.load(Ordering::Acquire)
+            {
+                return;
+            }
+            notified.await;
+        }
     }
 
     /// LSP graceful shutdown: Closing → stop writer → shutdown/exit → force-kill → Closed (ls-bridge-graceful-shutdown).
@@ -789,6 +870,15 @@ impl ConnectionHandle {
     /// No internal timeout (ls-bridge-timeout-hierarchy): the caller (`shutdown_all_with_timeout`) enforces the
     /// global budget so a slow server can use leftover time without N×timeout multiplication.
     pub(crate) async fn graceful_shutdown(&self) -> io::Result<()> {
+        let _owner = loop {
+            if self.state() == ConnectionState::Closed {
+                return Ok(());
+            }
+            if let Some(owner) = ShutdownOwner::claim(&self.shutdown_coordinator) {
+                break owner;
+            }
+            self.wait_for_shutdown_turn().await;
+        };
         // 1. Transition to Closing state
         self.begin_shutdown();
 
@@ -1251,6 +1341,59 @@ mod tests {
             ConnectionState::Closing,
             "State should be Closing, not Failed - liveness timer should have been cancelled"
         );
+    }
+
+    #[tokio::test]
+    async fn shutdown_waiter_observes_owner_completion_without_regressing_closed() {
+        let handle = Arc::new(spawn_sink_handle().await);
+        let owner = ShutdownOwner::claim(&handle.shutdown_coordinator).unwrap();
+        assert!(ShutdownOwner::claim(&handle.shutdown_coordinator).is_none());
+
+        let mut waiter = tokio::spawn({
+            let handle = Arc::clone(&handle);
+            async move { handle.graceful_shutdown().await }
+        });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), &mut waiter)
+                .await
+                .is_err(),
+            "a non-owner must wait instead of publishing completion"
+        );
+
+        handle.complete_shutdown();
+        drop(owner);
+        waiter.await.unwrap().unwrap();
+        handle.begin_shutdown();
+        assert_eq!(handle.state(), ConnectionState::Closed);
+    }
+
+    #[tokio::test]
+    async fn begin_shutdown_does_not_regress_failed_to_closing() {
+        let handle = spawn_sink_handle().await;
+        handle.set_state(ConnectionState::Failed);
+
+        handle.begin_shutdown();
+
+        assert_eq!(handle.state(), ConnectionState::Failed);
+    }
+
+    #[tokio::test]
+    async fn aborted_shutdown_owner_relinquishes_ownership() {
+        let handle = Arc::new(spawn_sink_handle().await);
+        let (claimed_tx, claimed_rx) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn({
+            let coordinator = Arc::clone(&handle.shutdown_coordinator);
+            async move {
+                let _owner = ShutdownOwner::claim(&coordinator).unwrap();
+                let _ = claimed_tx.send(());
+                std::future::pending::<()>().await;
+            }
+        });
+        claimed_rx.await.unwrap();
+        task.abort();
+        let _ = task.await;
+
+        assert!(ShutdownOwner::claim(&handle.shutdown_coordinator).is_some());
     }
 
     /// Test that liveness timer does not start in Closing state (ls-bridge-timeout-hierarchy Phase 4).
@@ -1921,6 +2064,40 @@ mod tests {
             Some(OneOf::Left(true)),
         ))));
         assert!(handle.supports_workspace_folder_changes());
+    }
+
+    #[tokio::test]
+    async fn handle_accepts_dynamic_workspace_folder_registration() {
+        let handle = spawn_sink_handle().await;
+        handle.set_server_capabilities(ServerCapabilities::default());
+        handle
+            .dynamic_capabilities()
+            .register(vec![tower_lsp_server::ls_types::Registration {
+                id: "workspace-folders".to_string(),
+                method: "workspace/didChangeWorkspaceFolders".to_string(),
+                register_options: None,
+            }]);
+
+        assert!(handle.supports_workspace_folder_changes());
+    }
+
+    #[tokio::test]
+    async fn handle_honors_initialize_workspace_folder_unregistration() {
+        let handle = spawn_sink_handle().await;
+        handle.set_server_capabilities(caps_with_workspace_folders(Some(folders_cap(
+            Some(true),
+            Some(OneOf::Right("wf-id".to_string())),
+        ))));
+        assert!(handle.supports_workspace_folder_changes());
+
+        handle.dynamic_capabilities().unregister(vec![
+            tower_lsp_server::ls_types::Unregistration {
+                id: "wf-id".to_string(),
+                method: "workspace/didChangeWorkspaceFolders".to_string(),
+            },
+        ]);
+
+        assert!(!handle.supports_workspace_folder_changes());
     }
 
     #[tokio::test]
