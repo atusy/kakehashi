@@ -364,8 +364,17 @@ impl ForwardLogLevel {
         match self {
             Self::Error => message_type == MessageType::ERROR,
             Self::Warning => matches!(message_type, MessageType::ERROR | MessageType::WARNING),
-            Self::Info => message_type != MessageType::LOG,
-            Self::Log => true,
+            Self::Info => matches!(
+                message_type,
+                MessageType::ERROR | MessageType::WARNING | MessageType::INFO
+            ),
+            Self::Log => matches!(
+                message_type,
+                MessageType::ERROR
+                    | MessageType::WARNING
+                    | MessageType::INFO
+                    | MessageType::LOG
+            ),
             Self::Off => false,
         }
     }
@@ -860,6 +869,14 @@ mod tests {
             .is_err(),
             "unknown levels must be rejected"
         );
+    }
+
+    #[test]
+    fn forwarding_log_level_rejects_unknown_message_types() {
+        let unknown = serde_json::from_value(serde_json::json!(5)).unwrap();
+
+        assert!(!ForwardLogLevel::Info.allows(unknown));
+        assert!(!ForwardLogLevel::Log.allows(unknown));
     }
     use crate::config::WILDCARD_KEY;
     use rstest::rstest;
