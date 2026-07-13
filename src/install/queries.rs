@@ -769,9 +769,14 @@ fn write_uninstall_tombstone_with_before_publish(
     remove_stale_uninstall_stages(queries_parent, language)?;
     let path = uninstall_tombstone_path(queries_parent, language);
     validate_existing_tombstone(&path)?;
-    let stage_prefix = format!(".{language}.uninstalled.");
+    let stage_counter = QUERY_TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let stage_prefix = format!(
+        ".{language}.uninstalled.{}.{}.",
+        std::process::id(),
+        stage_counter
+    );
     let mut builder = tempfile::Builder::new();
-    builder.prefix(&stage_prefix).suffix(".tmp");
+    builder.prefix(&stage_prefix).suffix(".tmp").rand_bytes(12);
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt as _;
@@ -798,14 +803,13 @@ fn remove_stale_uninstall_stages(
     queries_parent: &Path,
     language: &str,
 ) -> Result<(), QueryInstallError> {
-    let prefix = format!(".{language}.uninstalled.");
     for entry in fs::read_dir(queries_parent)? {
         let entry = entry?;
         let name = entry.file_name();
         let Some(name) = name.to_str() else {
             continue;
         };
-        if !name.starts_with(&prefix) || !name.ends_with(".tmp") {
+        if !generated_uninstall_stage_matches_language(name, language) {
             continue;
         }
         let file_type = entry.file_type()?;
@@ -819,6 +823,28 @@ fn remove_stale_uninstall_stages(
         }
     }
     Ok(())
+}
+
+fn generated_uninstall_stage_matches_language(name: &str, language: &str) -> bool {
+    let prefix = format!(".{language}.uninstalled.");
+    let Some(rest) = name
+        .strip_prefix(&prefix)
+        .and_then(|rest| rest.strip_suffix(".tmp"))
+    else {
+        return false;
+    };
+    let mut parts = rest.split('.');
+    let (Some(pid), Some(counter), Some(random), None) =
+        (parts.next(), parts.next(), parts.next(), parts.next())
+    else {
+        return false;
+    };
+    !pid.is_empty()
+        && pid.bytes().all(|byte| byte.is_ascii_digit())
+        && !counter.is_empty()
+        && counter.bytes().all(|byte| byte.is_ascii_digit())
+        && random.len() == 12
+        && random.bytes().all(|byte| byte.is_ascii_alphanumeric())
 }
 
 /// Open or create the managed tombstone leaf without following a link there.
@@ -1581,14 +1607,20 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let queries_parent = temp.path().join("queries");
         fs::create_dir_all(&queries_parent).unwrap();
-        let stale = queries_parent.join(".rust.uninstalled.crashed.tmp");
+        let stale = queries_parent.join(".rust.uninstalled.123.7.ABCDEFGHIJKL.tmp");
         fs::write(&stale, "partial\n").unwrap();
-        let unrelated = queries_parent.join(".lua.uninstalled.crashed.tmp");
+        let same_language_unrelated = queries_parent.join(".rust.uninstalled.notes.tmp");
+        fs::write(&same_language_unrelated, "keep notes\n").unwrap();
+        let unrelated = queries_parent.join(".lua.uninstalled.123.7.ABCDEFGHIJKL.tmp");
         fs::write(&unrelated, "keep\n").unwrap();
 
         write_uninstall_tombstone(&queries_parent, "rust").unwrap();
 
         assert!(!stale.exists(), "same-language stale stage is managed");
+        assert!(
+            same_language_unrelated.exists(),
+            "a wildcard-like name is not proof of kakehashi ownership"
+        );
         assert!(unrelated.exists(), "other languages have separate locks");
     }
 
