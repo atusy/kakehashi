@@ -16,6 +16,10 @@
 
 use std::path::{Path, PathBuf};
 
+fn format_walk_error(error: &str) -> String {
+    format!("error: skipping unreadable entry (will exit 2): {error}")
+}
+
 /// Files collected from CLI paths plus any non-fatal directory walk errors
 /// encountered while discovering them.
 pub(crate) struct CollectedFiles {
@@ -166,10 +170,7 @@ fn walk_directory(
                 // closed stderr (`… 2>&1 | head`) would panic (exit 101).
                 // There is nowhere to report a failed error message, so drop it.
                 use std::io::Write as _;
-                let _ = writeln!(
-                    std::io::stderr(),
-                    "error: skipping unreadable entry (will exit 2): {e}"
-                );
+                let _ = writeln!(std::io::stderr(), "{}", format_walk_error(&e.to_string()));
                 errors += 1;
             }
         }

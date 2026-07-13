@@ -40,6 +40,7 @@ use tower_lsp_server::LspService;
 use tower_lsp_server::ls_types::{Diagnostic, DiagnosticSeverity, NumberOrString};
 
 use crate::cli::files::collect_files;
+use crate::cli::terminal::{escape_terminal_controls, is_bidi_control, is_line_separator};
 use crate::lsp::Kakehashi;
 
 /// Write one line to stderr, tolerating a closed pipe.
@@ -528,42 +529,6 @@ fn one_line(message: &str) -> std::borrow::Cow<'_, str> {
         }
     }
     std::borrow::Cow::Owned(out)
-}
-
-/// Visibly escape terminal and bidirectional controls without changing other
-/// characters. Paths use this instead of [`one_line`] because spaces and other
-/// non-control whitespace are valid filename characters and must retain their
-/// identity in diagnostic locations.
-fn escape_terminal_controls(text: &str) -> std::borrow::Cow<'_, str> {
-    if !text
-        .chars()
-        .any(|ch| ch.is_control() || is_bidi_control(ch) || is_line_separator(ch))
-    {
-        return std::borrow::Cow::Borrowed(text);
-    }
-
-    let mut escaped = String::with_capacity(text.len());
-    for ch in text.chars() {
-        if is_bidi_control(ch) || is_line_separator(ch) {
-            escaped.extend(ch.escape_unicode());
-        } else if ch.is_control() {
-            escaped.extend(ch.escape_default());
-        } else {
-            escaped.push(ch);
-        }
-    }
-    std::borrow::Cow::Owned(escaped)
-}
-
-fn is_bidi_control(ch: char) -> bool {
-    matches!(
-        ch,
-        '\u{061c}' | '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}'
-    )
-}
-
-fn is_line_separator(ch: char) -> bool {
-    matches!(ch, '\u{2028}' | '\u{2029}')
 }
 
 fn escape_jsonl_terminal_controls(json: String) -> String {
