@@ -148,6 +148,23 @@ pub fn parser_file_is_regular(path: &Path) -> bool {
     true
 }
 
+#[cfg(windows)]
+fn remove_existing_parser_leaf(path: &Path) -> std::io::Result<()> {
+    use std::os::windows::fs::MetadataExt as _;
+    use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_DIRECTORY;
+
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => return Err(err),
+    };
+    if metadata.file_attributes() & FILE_ATTRIBUTE_DIRECTORY != 0 {
+        fs::remove_dir(path)
+    } else {
+        fs::remove_file(path)
+    }
+}
+
 /// Upper bound for a single parser compile.
 ///
 /// The loader shells out to `cc` with no timeout of its own; a pathological
@@ -374,7 +391,7 @@ pub fn install_parser(
             // first there (a small non-atomic window, acceptable on the
             // non-primary platform).
             #[cfg(windows)]
-            let _ = fs::remove_file(&parser_file);
+            remove_existing_parser_leaf(&parser_file)?;
             if let Err(e) = fs::rename(&tmp_file, &parser_file) {
                 let _ = fs::remove_file(&tmp_file);
                 return Err(ParserInstallError::IoError(e));
@@ -984,6 +1001,31 @@ mod tests {
             parser_file_exists("lua", temp.path()),
             None,
             "managed parser links must not suppress repair"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn replacement_removes_a_managed_parser_directory_link() {
+        let temp = tempdir().unwrap();
+        let external = temp.path().join("external");
+        fs::create_dir(&external).unwrap();
+        let managed = temp
+            .path()
+            .join(format!("lua.{}", std::env::consts::DLL_EXTENSION));
+        if let Err(e) = std::os::windows::fs::symlink_dir(&external, &managed) {
+            if e.kind() == std::io::ErrorKind::PermissionDenied || e.raw_os_error() == Some(1314) {
+                return;
+            }
+            panic!("failed to create parser directory link: {e}");
+        }
+
+        remove_existing_parser_leaf(&managed).unwrap();
+
+        assert!(!managed.exists());
+        assert!(
+            external.is_dir(),
+            "removing the link must preserve its target"
         );
     }
     use tempfile::tempdir;
