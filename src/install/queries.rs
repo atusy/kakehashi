@@ -954,9 +954,9 @@ fn write_uninstall_tombstone_at_with_security_copy(
     use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt};
     use std::os::windows::ffi::OsStrExt as _;
     use std::os::windows::io::{AsRawHandle as _, FromRawHandle as _};
-    use windows_sys::Win32::Foundation::{DELETE, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
     use windows_sys::Win32::Storage::FileSystem::{
-        FILE_FLAG_WRITE_THROUGH, FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_RENAME_INFO,
+        DELETE, FILE_FLAG_WRITE_THROUGH, FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_RENAME_INFO,
         FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FileRenameInfo, ReOpenFile,
         SetFileInformationByHandle, WRITE_DAC,
     };
@@ -1235,7 +1235,8 @@ fn copy_windows_tombstone_security(source: &fs::File, target: &fs::File) -> std:
 
     // New stages normally inherit the same owner/group. Only request the
     // privileged WRITE_OWNER path when either SID actually differs.
-    let sids_differ = |source, target| {
+    let sids_differ = |source: windows_sys::Win32::Security::PSID,
+                       target: windows_sys::Win32::Security::PSID| {
         if source.is_null() || target.is_null() {
             source != target
         } else {
