@@ -230,6 +230,7 @@ fn main() {
                             "interFileDependencies": false,
                             "workspaceDiagnostics": false
                         },
+                        "hoverProvider": mode == "diagnostics-refresh-prefetch-mixed",
                         "textDocumentSync": 1
                     }),
                     "on-type" => json!({
@@ -341,7 +342,6 @@ fn main() {
                         || matches!(
                             mode.as_str(),
                             "diagnostics-refresh-prefetch"
-                                | "diagnostics-refresh-prefetch-mixed"
                                 | "diagnostics-refresh-prefetch-disabled"
                                 | "diagnostics-refresh-prefetch-unchanged"
                         )
@@ -512,6 +512,9 @@ fn main() {
                         .unwrap_or(Value::Null)
                 };
                 respond(&mut writer, id, result);
+                if mode == "diagnostics-refresh-prefetch-mixed" {
+                    request(&mut writer, json!(1000), "workspace/diagnostic/refresh");
+                }
             }
             "textDocument/codeLens" => {
                 // One UNRESOLVED lens (data only, no command) on the first

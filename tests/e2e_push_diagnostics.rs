@@ -1023,7 +1023,7 @@ fn e2e_downstream_refresh_prefetches_only_eligible_mixed_contexts() {
         init_client_with_mode_caps("diagnostics-refresh-prefetch-mixed", refresh_capable_caps());
     open_host_with_text(&mut client, MD_MIXED_TEXT);
 
-    let (_, published) = client
+    client
         .wait_for_notification_where(
             &["textDocument/publishDiagnostics"],
             Duration::from_secs(15),
@@ -1031,13 +1031,37 @@ fn e2e_downstream_refresh_prefetches_only_eligible_mixed_contexts() {
                 params["diagnostics"].as_array().is_some_and(|diagnostics| {
                     diagnostics.iter().any(|diagnostic| {
                         diagnostic["message"].as_str().is_some_and(|message| {
-                            message.starts_with("mock-diagnostic-refresh-prefetched:")
+                            message == "mock-diagnostic-refresh-prefetched:1"
                         })
                     })
                 })
             },
         )
-        .expect("the eligible lua context must contribute a prefetched diagnostic");
+        .expect("precondition: consume the initial didOpen diagnostic publish");
+
+    // The mixed mock requests refresh only after this hover round-trip.
+    // Its subsequent refresh prefetch is therefore generation 2 and cannot be
+    // confused with the generation-1 didOpen publish above.
+    client.send_request(
+        "textDocument/hover",
+        json!({
+            "textDocument": { "uri": MD_URI },
+            "position": { "line": 3, "character": 0 }
+        }),
+    );
+    let (_, published) = client
+        .wait_for_notification_where(
+            &["textDocument/publishDiagnostics"],
+            Duration::from_secs(15),
+            |params| {
+                params["diagnostics"].as_array().is_some_and(|diagnostics| {
+                    diagnostics.iter().any(|diagnostic| {
+                        diagnostic["message"] == json!("mock-diagnostic-refresh-prefetched:2")
+                    })
+                })
+            },
+        )
+        .expect("the refresh-specific prefetch must publish generation 2");
     let diagnostics = published["diagnostics"].as_array().unwrap();
     assert!(
         diagnostics
