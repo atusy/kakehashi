@@ -1239,7 +1239,7 @@ impl DiagnosticAggregator {
         };
         let was_quiet = gate
             .last_activity_at
-            .is_some_and(|at| now.duration_since(at) >= gate.debounce);
+            .is_some_and(|at| now.saturating_duration_since(at) >= gate.debounce);
         if record_activity {
             gate.last_activity_at = Some(now);
         }
