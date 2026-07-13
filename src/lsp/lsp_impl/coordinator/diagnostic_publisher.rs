@@ -864,6 +864,14 @@ impl DiagnosticPublisher {
             return changed;
         }
 
+        // The logical recorded set may change inside a burst and then revert
+        // to the set already on the wire (A -> pending B -> A). In that case
+        // there is no wire work left: settle the dirty debt so the parked
+        // trailing task does not emit duplicate A.
+        if self.aggregator.settle_wire_reversion(host, &diagnostics) {
+            return changed;
+        }
+
         // Coalesce the wire sends per host (the quiet window): a burst of
         // set-changing feeds — spontaneous pushes, the pull-layer completion,
         // the post-parse geometry re-merge, each ~1 MB on a diagnostics-heavy
@@ -2003,6 +2011,59 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(1)).await;
         assert!(!server.diagnostics.wire_gate_is_dirty(&uri));
         assert!(!server.diagnostics.wire_gate_take_pending(&uri));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn pending_publish_reversion_does_not_duplicate_the_wire_set() {
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+        register_rust(server);
+        server.settings_manager.apply_settings(rust_settings(true));
+        let uri = Url::parse("file:///test/host_reversion.rs").unwrap();
+        server.documents.insert(
+            uri.clone(),
+            "fn main() {}".to_string(),
+            Some("rust".to_string()),
+            None,
+        );
+        let publisher = DiagnosticPublisher::new(server);
+
+        server.diagnostics.record(
+            &uri,
+            DiagnosticSource::Host,
+            "rust_ls".to_string(),
+            Some(ProgressConnectionId::for_test(1)),
+            vec![diag("A")],
+        );
+        assert_eq!(publisher.republish(&uri).await, RepublishOutcome::Changed);
+
+        server.diagnostics.record(
+            &uri,
+            DiagnosticSource::Host,
+            "rust_ls".to_string(),
+            Some(ProgressConnectionId::for_test(1)),
+            vec![diag("B")],
+        );
+        assert_eq!(publisher.republish(&uri).await, RepublishOutcome::Changed);
+        assert!(server.diagnostics.wire_gate_is_dirty(&uri));
+
+        server.diagnostics.record(
+            &uri,
+            DiagnosticSource::Host,
+            "rust_ls".to_string(),
+            Some(ProgressConnectionId::for_test(1)),
+            vec![diag("A")],
+        );
+        assert_eq!(publisher.republish(&uri).await, RepublishOutcome::Changed);
+        assert!(
+            !server.diagnostics.wire_gate_is_dirty(&uri),
+            "reverting to the wire set cancels the withheld debt"
+        );
+
+        tokio::time::advance(super::WIRE_PUBLISH_QUIET_WINDOW).await;
+        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        assert!(!server.diagnostics.wire_gate_is_dirty(&uri));
+        assert_eq!(publisher.republish(&uri).await, RepublishOutcome::Unchanged);
     }
 
     #[tokio::test]
