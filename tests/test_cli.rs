@@ -725,6 +725,47 @@ fn test_language_status_shows_installed() {
     );
 }
 
+/// Parser artifacts with stems outside the installer language-name contract
+/// are unmanaged files and must not become status rows.
+#[test]
+fn test_language_status_ignores_invalid_parser_language_names() {
+    use std::fs;
+
+    let test_dir = tempfile::tempdir().expect("Failed to create temp dir");
+    let ext = std::env::consts::DLL_EXTENSION;
+    fs::create_dir_all(test_dir.path().join("parser")).expect("Failed to create parser dir");
+    fs::write(
+        test_dir.path().join(format!("parser/not-a-language.{ext}")),
+        "unmanaged",
+    )
+    .expect("Failed to create invalid parser artifact");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_kakehashi"))
+        .args([
+            "language",
+            "status",
+            "--data-dir",
+            test_dir.path().to_str().unwrap(),
+        ])
+        .output()
+        .expect("Failed to execute command");
+
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.status.success(), "status failed: {combined}");
+    assert!(
+        combined.contains("No languages installed"),
+        "invalid parser stems must be ignored: {combined}"
+    );
+    assert!(
+        !combined.contains("not-a-language"),
+        "invalid parser stem became a status row: {combined}"
+    );
+}
+
 /// Test that language status shows missing queries
 #[test]
 fn test_language_status_missing_queries() {
