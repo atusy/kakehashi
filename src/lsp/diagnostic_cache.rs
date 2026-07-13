@@ -1002,14 +1002,15 @@ impl DiagnosticAggregator {
     /// what the editor already received. The parked task may still wake, but
     /// `dirty = false` makes its unchanged republish a no-op.
     pub(crate) fn settle_wire_reversion(&self, host: &Url, diagnostics: &[Diagnostic]) -> bool {
-        let matches_wire = self
+        let wire = self
             .last_wire_published
             .lock()
             .recover_poison("DiagnosticAggregator::last_wire_published")
             .get(host)
-            .is_some_and(|wire| {
-                wire.as_slice() == diagnostics || same_diagnostic_multiset(wire, diagnostics)
-            });
+            .cloned();
+        let matches_wire = wire.is_some_and(|wire| {
+            wire.as_slice() == diagnostics || same_diagnostic_multiset(&wire, diagnostics)
+        });
         if !matches_wire {
             return false;
         }
@@ -1335,13 +1336,13 @@ impl DiagnosticAggregator {
 
         // Called under the per-host republish lock after the send await, so the
         // last-recorded set is exactly the set that just reached the wire.
-        if let Some(sent) = self
+        let sent = self
             .last_published
             .lock()
             .recover_poison("DiagnosticAggregator::last_published")
             .get(host)
-            .cloned()
-        {
+            .cloned();
+        if let Some(sent) = sent {
             self.last_wire_published
                 .lock()
                 .recover_poison("DiagnosticAggregator::last_wire_published")
