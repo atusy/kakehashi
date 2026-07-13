@@ -657,11 +657,50 @@ pub struct DebounceFeatureSettings {
     pub max_wait_ms: Option<u64>,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum LogMessageLevel {
+    Error,
+    Warning,
+    #[default]
+    Info,
+    Log,
+    Off,
+}
+
+impl LogMessageLevel {
+    pub(crate) fn allows(self, message_type: tower_lsp_server::ls_types::MessageType) -> bool {
+        use tower_lsp_server::ls_types::MessageType;
+
+        match self {
+            Self::Error => message_type == MessageType::ERROR,
+            Self::Warning => matches!(message_type, MessageType::ERROR | MessageType::WARNING),
+            Self::Info => matches!(
+                message_type,
+                MessageType::ERROR | MessageType::WARNING | MessageType::INFO
+            ),
+            Self::Log => matches!(
+                message_type,
+                MessageType::ERROR | MessageType::WARNING | MessageType::INFO | MessageType::LOG
+            ),
+            Self::Off => false,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct LogMessageFeatureSettings {
+    pub log_level: Option<LogMessageLevel>,
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct FeatureSettings {
     #[serde(rename = "textDocument/publishDiagnostics")]
     pub text_document_publish_diagnostics: Option<DebounceFeatureSettings>,
+    #[serde(rename = "window/logMessage")]
+    pub window_log_message: Option<LogMessageFeatureSettings>,
     #[serde(rename = "workspace/diagnostic/refresh")]
     pub workspace_diagnostic_refresh: Option<DebounceFeatureSettings>,
 }
@@ -704,6 +743,7 @@ impl Default for ResolvedDebounceFeatureSettings {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ResolvedFeatureSettings {
     pub text_document_publish_diagnostics: ResolvedDebounceFeatureSettings,
+    pub window_log_message: LogMessageLevel,
     pub workspace_diagnostic_refresh: ResolvedDebounceFeatureSettings,
 }
 
@@ -720,6 +760,11 @@ impl FeatureSettings {
                     .and_then(|settings| settings.max_wait_ms)
                     .unwrap_or(DEFAULT_PUBLISH_DIAGNOSTICS_MAX_WAIT_MS),
             },
+            window_log_message: self
+                .window_log_message
+                .as_ref()
+                .and_then(|settings| settings.log_level)
+                .unwrap_or_default(),
             workspace_diagnostic_refresh: ResolvedDebounceFeatureSettings {
                 debounce_ms: refresh
                     .and_then(|settings| settings.debounce_ms)
@@ -896,6 +941,54 @@ mod tests {
     use super::*;
     use crate::config::WILDCARD_KEY;
     use rstest::rstest;
+
+    #[rstest]
+    #[case("error", LogMessageLevel::Error)]
+    #[case("warning", LogMessageLevel::Warning)]
+    #[case("info", LogMessageLevel::Info)]
+    #[case("log", LogMessageLevel::Log)]
+    #[case("off", LogMessageLevel::Off)]
+    fn log_message_level_parses_all_supported_values(
+        #[case] value: &str,
+        #[case] expected: LogMessageLevel,
+    ) {
+        let input = format!("[features.\"window/logMessage\"]\nlogLevel = \"{value}\"");
+        let raw: RawWorkspaceSettings = toml::from_str(&input).unwrap();
+        assert_eq!(
+            raw.features.unwrap().window_log_message.unwrap().log_level,
+            Some(expected)
+        );
+    }
+
+    #[test]
+    fn log_message_level_rejects_unknown_values_and_fields() {
+        assert!(
+            toml::from_str::<RawWorkspaceSettings>(
+                "[features.\"window/logMessage\"]\nlogLevel = \"debug\""
+            )
+            .is_err()
+        );
+        assert!(
+            toml::from_str::<RawWorkspaceSettings>(
+                "[features.\"window/logMessage\"]\nlevel = \"info\""
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn log_message_level_filters_lsp_severity_order() {
+        use tower_lsp_server::ls_types::MessageType;
+
+        assert!(LogMessageLevel::Error.allows(MessageType::ERROR));
+        assert!(!LogMessageLevel::Error.allows(MessageType::WARNING));
+        assert!(LogMessageLevel::Warning.allows(MessageType::WARNING));
+        assert!(!LogMessageLevel::Warning.allows(MessageType::INFO));
+        assert!(LogMessageLevel::Info.allows(MessageType::INFO));
+        assert!(!LogMessageLevel::Info.allows(MessageType::LOG));
+        assert!(LogMessageLevel::Log.allows(MessageType::LOG));
+        assert!(!LogMessageLevel::Off.allows(MessageType::ERROR));
+    }
 
     #[test]
     fn test_json_schema_generation() {
