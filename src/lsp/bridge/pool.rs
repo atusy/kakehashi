@@ -676,6 +676,10 @@ impl LanguageServerPool {
             }
             drop(connections);
             drop(ordering_guards);
+            // Connection replacement can race the optimistic snapshot. Yield
+            // before retrying so sustained routing churn cannot monopolize the
+            // executor while the workspace-change lock remains held.
+            tokio::task::yield_now().await;
         };
         if !self.workspace_folders.apply_change(added.clone(), removed) {
             return;

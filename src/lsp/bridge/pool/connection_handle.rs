@@ -825,7 +825,7 @@ impl ConnectionHandle {
             .state
             .write()
             .recover_poison("ConnectionHandle::begin_shutdown");
-        if *state == ConnectionState::Closed {
+        if matches!(*state, ConnectionState::Closed | ConnectionState::Failed) {
             return;
         }
         // Stop the liveness timer (but not the reader task) per ls-bridge-timeout-hierarchy
@@ -1365,6 +1365,16 @@ mod tests {
         waiter.await.unwrap().unwrap();
         handle.begin_shutdown();
         assert_eq!(handle.state(), ConnectionState::Closed);
+    }
+
+    #[tokio::test]
+    async fn begin_shutdown_does_not_regress_failed_to_closing() {
+        let handle = spawn_sink_handle().await;
+        handle.set_state(ConnectionState::Failed);
+
+        handle.begin_shutdown();
+
+        assert_eq!(handle.state(), ConnectionState::Failed);
     }
 
     #[tokio::test]
