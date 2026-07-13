@@ -757,13 +757,13 @@ fn write_uninstall_tombstone(
     queries_parent: &Path,
     language: &str,
 ) -> Result<(), QueryInstallError> {
-    write_uninstall_tombstone_with_before_publish(queries_parent, language, |_| {})
+    write_uninstall_tombstone_with_before_publish(queries_parent, language, |_, _| {})
 }
 
 fn write_uninstall_tombstone_with_before_publish(
     queries_parent: &Path,
     language: &str,
-    before_publish: impl FnOnce(&Path),
+    before_publish: impl FnOnce(&Path, &Path),
 ) -> Result<(), QueryInstallError> {
     validate_safe_language_name(language)?;
     let path = uninstall_tombstone_path(queries_parent, language);
@@ -781,7 +781,7 @@ fn write_uninstall_tombstone_with_before_publish(
     let mut staged = builder.tempfile_in(queries_parent)?;
     staged.write_all(b"ok\n")?;
     staged.as_file().sync_all()?;
-    before_publish(&path);
+    before_publish(&path, staged.path());
     staged.persist(path).map_err(|error| error.error)?;
     Ok(())
 }
@@ -1404,7 +1404,7 @@ mod tests {
         fs::write(&tombstone, "old tombstone\n").unwrap();
         let outside_alias = temp.path().join("outside-alias");
 
-        write_uninstall_tombstone_with_before_publish(&queries_parent, "rust", |path| {
+        write_uninstall_tombstone_with_before_publish(&queries_parent, "rust", |path, _| {
             fs::hard_link(path, &outside_alias).unwrap();
         })
         .unwrap();
@@ -1426,7 +1426,7 @@ mod tests {
         fs::write(&tombstone, "old tombstone\n").unwrap();
 
         let result =
-            write_uninstall_tombstone_with_before_publish(&queries_parent, "rust", |path| {
+            write_uninstall_tombstone_with_before_publish(&queries_parent, "rust", |path, _| {
                 fs::remove_file(path).unwrap();
                 fs::create_dir(path).unwrap();
             });
