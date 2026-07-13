@@ -1251,6 +1251,57 @@ fn test_language_uninstall_all() {
     assert!(queries.is_empty(), "All queries should be removed");
 }
 
+/// Bulk uninstall discovery must not follow a managed query-language symlink
+/// or claim that removing external query content is in scope.
+#[cfg(any(unix, windows))]
+#[test]
+fn test_language_uninstall_all_ignores_symlinked_query_language_directories() {
+    use std::fs;
+
+    let test_dir = tempfile::tempdir().expect("Failed to create temp dir");
+    let external = test_dir.path().join("external/lua");
+    fs::create_dir_all(&external).expect("Failed to create external query dir");
+    let external_query = external.join("highlights.scm");
+    fs::write(&external_query, "(comment) @comment").expect("Failed to write external query");
+    let managed = test_dir.path().join("data/queries/lua");
+    fs::create_dir_all(managed.parent().unwrap()).expect("Failed to create queries parent");
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(&external, &managed).expect("Failed to symlink query dir");
+    #[cfg(windows)]
+    std::os::windows::fs::symlink_dir(&external, &managed).expect("Failed to symlink query dir");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_kakehashi"))
+        .args([
+            "language",
+            "uninstall",
+            "--all",
+            "--force",
+            "--data-dir",
+            test_dir.path().join("data").to_str().unwrap(),
+        ])
+        .output()
+        .expect("Failed to execute command");
+
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.status.success(), "uninstall failed: {combined}");
+    assert!(
+        combined.contains("No languages installed to uninstall"),
+        "query-directory symlinks must not enter uninstall discovery: {combined}"
+    );
+    assert!(
+        managed.is_symlink(),
+        "managed symlink must remain untouched"
+    );
+    assert!(
+        external_query.is_file(),
+        "external query must remain intact"
+    );
+}
+
 /// Test that language uninstall --all ignores internal query staging directories
 #[test]
 fn test_language_uninstall_all_ignores_internal_query_dirs() {
