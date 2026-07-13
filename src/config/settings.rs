@@ -194,7 +194,7 @@ fn dedup_layer_priorities(priorities: Vec<LayerSource>) -> Vec<LayerSource> {
 ///
 /// Produced by [`LanguageSettings::resolve_layers`]; all optional fields are
 /// resolved with their defaults.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ResolvedLayerConfig {
     pub(crate) priorities: Vec<LayerSource>,
     pub(crate) strategy: AggregationStrategy,
@@ -2458,6 +2458,7 @@ kind = "locals""#;
         let resolved = settings.resolve_layers("textDocument/hover");
         assert_eq!(resolved.priorities, vec![LayerSource::Native]);
         assert_eq!(resolved.strategy, AggregationStrategy::Concatenated);
+        assert_eq!(resolved.min_publish_interval_ms, Some(750));
     }
 
     #[test]

@@ -773,6 +773,29 @@ impl DiagnosticPublisher {
         self.republish(host).await
     }
 
+    /// Whether replacing `previous` with the currently published settings
+    /// changes this host's editor-facing `publishDiagnostics` contract.
+    pub(crate) fn publish_contract_changed(
+        &self,
+        host: &Url,
+        previous: &crate::config::WorkspaceSettings,
+    ) -> bool {
+        let Some(language_name) = self.open_document_language(host) else {
+            return true;
+        };
+        let previous = crate::lsp::lsp_impl::bridge_context::resolve_layer_config_from_settings(
+            previous,
+            &language_name,
+            "textDocument/publishDiagnostics",
+        );
+        let current = crate::lsp::lsp_impl::bridge_context::resolve_layer_config_from_settings(
+            &self.settings_manager.load_settings(),
+            &language_name,
+            "textDocument/publishDiagnostics",
+        );
+        previous != current
+    }
+
     /// Re-run [`Self::republish`] for `host` once the quiet window elapses or
     /// settings change, sending or re-gating the latest withheld set. At most one
     /// task is parked per host at a time ([`WireAdmit::Defer`]'s
@@ -1576,6 +1599,46 @@ mod tests {
             "unsealing must force the already-recorded set onto the wire"
         );
         assert!(!server.diagnostics.wire_gate_is_dirty(&uri));
+    }
+
+    #[tokio::test]
+    async fn publish_contract_change_ignores_unrelated_settings() {
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+        register_rust(server);
+        let previous = rust_settings(true);
+        server.settings_manager.apply_settings(previous.clone());
+        let uri = Url::parse("file:///test/unchanged_contract.rs").unwrap();
+        server.documents.insert(
+            uri.clone(),
+            "fn main() {}".to_string(),
+            Some("rust".to_string()),
+            None,
+        );
+        let mut current = previous.clone();
+        current.diagnostics_debounce_ms += 1;
+        server.settings_manager.apply_settings(current);
+
+        assert!(!DiagnosticPublisher::new(server).publish_contract_changed(&uri, &previous));
+    }
+
+    #[tokio::test]
+    async fn publish_contract_change_detects_wire_unseal() {
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+        register_rust(server);
+        let previous = rust_settings_with_publish_seal();
+        server.settings_manager.apply_settings(previous.clone());
+        let uri = Url::parse("file:///test/changed_contract.rs").unwrap();
+        server.documents.insert(
+            uri.clone(),
+            "fn main() {}".to_string(),
+            Some("rust".to_string()),
+            None,
+        );
+        server.settings_manager.apply_settings(rust_settings(true));
+
+        assert!(DiagnosticPublisher::new(server).publish_contract_changed(&uri, &previous));
     }
 
     #[tokio::test]

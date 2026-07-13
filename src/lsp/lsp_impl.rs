@@ -477,6 +477,7 @@ impl Kakehashi {
         raw_settings: RawWorkspaceSettings,
         settings: WorkspaceSettings,
     ) {
+        let previous_settings = self.settings_manager.load_settings();
         let reparse_uris = apply_shared_settings(
             &self.client,
             ReloadLanguageState {
@@ -507,6 +508,7 @@ impl Kakehashi {
         futures::future::join_all(
             reparse_uris
                 .iter()
+                .filter(|uri| publisher.publish_contract_changed(uri, &previous_settings))
                 .map(|uri| publisher.republish_after_settings_change(uri)),
         )
         .await;
