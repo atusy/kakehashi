@@ -467,8 +467,18 @@ fn run_language_status(verbose: bool) -> Result<(), ExitCode> {
 }
 
 fn installed_query_language_name(path: &Path) -> Option<String> {
-    if !std::fs::symlink_metadata(path).ok()?.is_dir() {
+    let metadata = std::fs::symlink_metadata(path).ok()?;
+    if !metadata.is_dir() {
         return None;
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt as _;
+        use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
+
+        if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return None;
+        }
     }
     let name = path.file_name()?.to_string_lossy();
     if name.starts_with('.') {
@@ -1095,5 +1105,18 @@ mod tests {
         );
         assert_eq!(installed_query_language_name(&unsafe_name), None);
         assert_eq!(installed_query_language_name(&hidden), None);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn installed_query_language_name_rejects_directory_junctions() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let external = temp.path().join("external");
+        let managed = temp.path().join("queries/lua");
+        std::fs::create_dir_all(&external).unwrap();
+        std::fs::create_dir_all(managed.parent().unwrap()).unwrap();
+        junction::create(&external, &managed).unwrap();
+
+        assert_eq!(installed_query_language_name(&managed), None);
     }
 }
