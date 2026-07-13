@@ -642,15 +642,21 @@ pub struct RawWorkspaceSettings {
 
 pub const DEFAULT_WORKSPACE_DIAGNOSTIC_REFRESH_DEBOUNCE_MS: u64 = 100;
 pub const DEFAULT_WORKSPACE_DIAGNOSTIC_REFRESH_MAX_WAIT_MS: u64 = 1000;
+/// Largest accepted debounce/max-wait duration (24 hours). This keeps timer
+/// arithmetic within a practical, platform-independent Instant range.
+pub const MAX_FEATURE_TIMING_MS: u64 = 86_400_000;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct DebounceFeatureSettings {
+    #[schemars(range(max = 86_400_000))]
     pub debounce_ms: Option<u64>,
+    #[schemars(range(min = 1, max = 86_400_000))]
     pub max_wait_ms: Option<u64>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct FeatureSettings {
     #[serde(rename = "workspace/diagnostic/refresh")]
     pub workspace_diagnostic_refresh: Option<DebounceFeatureSettings>,

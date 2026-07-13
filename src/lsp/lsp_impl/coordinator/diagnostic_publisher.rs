@@ -154,6 +154,22 @@ impl DiagnosticPublisher {
         )
     }
 
+    fn admit_forwarded_refresh(
+        &self,
+    ) -> Option<(
+        crate::lsp::diagnostic_cache::ForwardedRefreshWaitSnapshot,
+        std::time::Duration,
+        std::time::Duration,
+    )> {
+        // Read timing before the idle→active state transition. Once begin()
+        // admits this cycle, its timing is already an owned snapshot; a live
+        // settings swap can only affect a later admission.
+        let (settle_window, max_wait) = self.forwarded_refresh_timing();
+        self.aggregator
+            .begin_forwarded_refresh_debounce()
+            .map(|snapshot| (snapshot, settle_window, max_wait))
+    }
+
     /// Forward the first downstream `workspace/diagnostic/refresh` immediately,
     /// then coalesce later burst activity into at most one trailing refresh
     /// after quiet or the max-wait deadline (#789).
@@ -167,13 +183,12 @@ impl DiagnosticPublisher {
         // Preserve the metrics contract: each capability-eligible downstream
         // ask is counted before this debounce decides how many wire sends survive.
         self.aggregator.record_refresh_requested();
-        let Some(snapshot) = self.aggregator.begin_forwarded_refresh_debounce() else {
+        let Some((snapshot, settle_window, max_wait)) = self.admit_forwarded_refresh() else {
             return;
         };
         // Snapshot timing once per admitted cycle. Live configuration updates
         // affect the next idle→active admission without moving this cycle's
         // already-established quiet/max-wait boundaries.
-        let (settle_window, max_wait) = self.forwarded_refresh_timing();
         if self.request_pull_diagnostic_refresh_inner(true, false) {
             self.aggregator
                 .mark_forwarded_refresh_covered(snapshot.generation);
@@ -1296,24 +1311,33 @@ mod tests {
         server.settings_manager.apply_settings(settings);
         let publisher = DiagnosticPublisher::new(server);
 
-        assert_eq!(
-            publisher.forwarded_refresh_timing(),
-            (
-                std::time::Duration::from_millis(250),
-                std::time::Duration::from_millis(800)
-            )
-        );
+        let (_, admitted_settle, admitted_max_wait) = publisher
+            .admit_forwarded_refresh()
+            .expect("idle scheduler admits the old timing snapshot");
 
         let mut settings = (*server.settings_manager.load_settings()).clone();
         settings.features.workspace_diagnostic_refresh.debounce_ms = 20;
         settings.features.workspace_diagnostic_refresh.max_wait_ms = 40;
         server.settings_manager.apply_settings(settings);
         assert_eq!(
-            publisher.forwarded_refresh_timing(),
+            (admitted_settle, admitted_max_wait),
+            (
+                std::time::Duration::from_millis(250),
+                std::time::Duration::from_millis(800)
+            ),
+            "an update after admission must not change the active cycle"
+        );
+        server.diagnostics.cancel_forwarded_refresh_debounce();
+        let (_, next_settle, next_max_wait) = publisher
+            .admit_forwarded_refresh()
+            .expect("the next idle cycle reads the live settings");
+        assert_eq!(
+            (next_settle, next_max_wait),
             (
                 std::time::Duration::from_millis(20),
                 std::time::Duration::from_millis(40)
-            )
+            ),
+            "the next cycle must use the live update"
         );
     }
 
