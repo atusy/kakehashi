@@ -725,6 +725,43 @@ fn test_language_status_shows_installed() {
     );
 }
 
+/// Parser-shaped directories are not loadable shared libraries and must not
+/// be reported as installed parsers.
+#[test]
+fn test_language_status_ignores_parser_shaped_directories() {
+    use std::fs;
+
+    let test_dir = tempfile::tempdir().expect("Failed to create temp dir");
+    let ext = std::env::consts::DLL_EXTENSION;
+    fs::create_dir_all(test_dir.path().join(format!("parser/not-a-parser.{ext}")))
+        .expect("Failed to create parser-shaped directory");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_kakehashi"))
+        .args([
+            "language",
+            "status",
+            "--data-dir",
+            test_dir.path().to_str().unwrap(),
+        ])
+        .output()
+        .expect("Failed to execute command");
+
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.status.success(), "status failed: {combined}");
+    assert!(
+        combined.contains("No languages installed"),
+        "parser-shaped directories must be ignored: {combined}"
+    );
+    assert!(
+        !combined.contains("not-a-parser"),
+        "parser-shaped directory was reported as a language: {combined}"
+    );
+}
+
 /// Test that language status shows missing queries
 #[test]
 fn test_language_status_missing_queries() {
