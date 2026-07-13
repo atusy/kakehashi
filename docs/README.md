@@ -146,8 +146,10 @@ positive and at least `debounceMs`. Both values are limited to 86,400,000 ms
 `features."window/logMessage".logLevel` is one workspace-wide threshold for
 both messages forwarded from downstream servers and messages emitted by
 kakehashi itself. Values are `error`, `warning`, `info`, `log`, and `off`; the
-default `info` suppresses only LSP `Log` messages. Live updates affect subsequent
-messages. `window/showMessage` is never filtered by this policy.
+default `info` forwards Error, Warning, and Info while suppressing LSP `Log` and
+`Debug`. The `log` threshold passes through Log, LSP 3.18 Debug, and future
+`MessageType` values. Live updates affect subsequent messages.
+`window/showMessage` is never filtered by this policy.
 
 ```json
 {
