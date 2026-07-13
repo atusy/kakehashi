@@ -453,10 +453,10 @@ pub struct LanguageServerPool {
     consecutive_panic_counts: std::sync::Mutex<HashMap<ConnectionKey, u32>>,
     /// Workspace root URI forwarded from upstream client.
     ///
-    /// Set once via `set_root_uri()` after receiving the upstream initialize request.
+    /// Seeded during initialize and updated when the primary workspace folder changes.
     /// Passed to downstream servers during LSP handshake so they can provide
     /// workspace-aware features (diagnostics, go-to-definition, etc.).
-    root_uri: OnceLock<Option<String>>,
+    root_uri: arc_swap::ArcSwap<Option<String>>,
     /// Current workspace folders from the upstream client. Seeded during
     /// initialize, then updated by `workspace/didChangeWorkspaceFolders` and
     /// snapshotted for each later downstream handshake.
@@ -549,7 +549,7 @@ impl LanguageServerPool {
             upstream_request_registry: std::sync::Mutex::new(HashMap::new()),
             cancel_metrics: CancelForwardingMetrics::default(),
             consecutive_panic_counts: std::sync::Mutex::new(HashMap::new()),
-            root_uri: OnceLock::new(),
+            root_uri: arc_swap::ArcSwap::new(Arc::new(None)),
             workspace_folders: super::WorkspaceFolderSet::new(None),
             workspace_folder_change_lock: Mutex::new(()),
             client_capabilities: OnceLock::new(),
@@ -617,15 +617,14 @@ impl LanguageServerPool {
 
     /// Set the workspace root URI.
     ///
-    /// Called once during upstream initialize to forward the root URI to downstream servers.
-    /// Subsequent calls are ignored (OnceLock semantics).
+    /// Called during initialize and when the primary workspace folder changes.
     pub(crate) fn set_root_uri(&self, uri: Option<String>) {
-        let _ = self.root_uri.set(uri);
+        self.root_uri.store(Arc::new(uri));
     }
 
     /// Get the workspace root URI.
     fn root_uri(&self) -> Option<String> {
-        self.root_uri.get().and_then(|v| v.clone())
+        self.root_uri.load().as_ref().clone()
     }
 
     /// Set the workspace folders.
@@ -639,7 +638,9 @@ impl LanguageServerPool {
     }
 
     /// Get the workspace folders.
-    fn workspace_folders(&self) -> Option<Vec<tower_lsp_server::ls_types::WorkspaceFolder>> {
+    pub(crate) fn workspace_folders(
+        &self,
+    ) -> Option<Vec<tower_lsp_server::ls_types::WorkspaceFolder>> {
         self.workspace_folders.snapshot()
     }
 
@@ -692,6 +693,10 @@ impl LanguageServerPool {
         if !self.workspace_folders.apply_change(added.clone(), removed) {
             return;
         }
+        self.set_root_uri(
+            self.workspace_folders()
+                .and_then(|folders| folders.first().map(|folder| folder.uri.to_string())),
+        );
 
         let mut invalidated = Vec::new();
         for (key, handle) in connections.iter() {
