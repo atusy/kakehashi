@@ -77,6 +77,40 @@ fn shutdown(client: &mut LspClient) {
     client.send_notification("exit", json!(null));
 }
 
+#[test]
+fn e2e_log_off_suppresses_internal_messages_during_initialize() {
+    let config_dir = tempfile::TempDir::new().expect("Failed to create config temp dir");
+    let config_path = config_dir.path().join("window_notifications_off.toml");
+    std::fs::write(&config_path, "").expect("Failed to write config");
+    let mut client = LspClient::builder()
+        .arg("--config-file")
+        .arg(config_path.to_str().expect("temp path should be UTF-8"))
+        .build();
+
+    let initialize_id = client.send_request_async(
+        "initialize",
+        json!({
+            "processId": std::process::id(),
+            "rootUri": null,
+            "capabilities": {},
+            "workspaceFolders": null,
+            "initializationOptions": {
+                "features": {
+                    "window/logMessage": { "logLevel": "off" }
+                }
+            }
+        }),
+    );
+    let (_, logs) = client
+        .receive_response_for_id_watching_notifications(initialize_id, &["window/logMessage"]);
+    assert!(
+        logs.is_empty(),
+        "the resolved off policy must suppress kakehashi startup logs: {logs:?}"
+    );
+    client.send_notification("initialized", json!({}));
+    shutdown(&mut client);
+}
+
 /// Matches only notifications forwarded from the mock downstream server,
 /// ignoring kakehashi's own window/logMessage output.
 ///

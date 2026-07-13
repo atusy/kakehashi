@@ -79,10 +79,13 @@ impl Kakehashi {
             check_semantic_tokens_refresh_support(&params.capabilities)
         );
 
-        // Debug: Log initialization
-        self.notifier()
-            .log_info("Received initialization request")
-            .await;
+        // Client-facing startup logs are held until settings are resolved and
+        // applied, so initializationOptions can suppress them with the same
+        // global policy as every subsequent internal message.
+        let mut startup_logs = vec![(
+            tower_lsp_server::ls_types::MessageType::INFO,
+            "Received initialization request".to_string(),
+        )];
 
         // Extract first workspace folder for reuse
         let first_folder = params.workspace_folders.as_ref().and_then(|f| f.first());
@@ -165,18 +168,16 @@ impl Kakehashi {
                 "current working directory (fallback)"
             };
 
-            self.notifier()
-                .log_info(format!(
-                    "Using workspace root from {}: {}",
-                    source,
-                    path.display()
-                ))
-                .await;
+            startup_logs.push((
+                tower_lsp_server::ls_types::MessageType::INFO,
+                format!("Using workspace root from {}: {}", source, path.display()),
+            ));
             self.settings_manager.set_root_path(Some(path.clone()));
         } else {
-            self.notifier()
-                .log_warning("Failed to determine workspace root - config file will not be loaded")
-                .await;
+            startup_logs.push((
+                tower_lsp_server::ls_types::MessageType::WARNING,
+                "Failed to determine workspace root - config file will not be loaded".to_string(),
+            ));
         }
 
         let root_path = self.settings_manager.root_path().as_ref().clone();
@@ -188,9 +189,8 @@ impl Kakehashi {
             self.home_dir.as_deref(),
             |var| std::env::var(var).ok(),
         );
-        self.notifier()
-            .log_settings_events(&settings_outcome.events)
-            .await;
+        let settings_events = settings_outcome.events.clone();
+        let mut default_settings_warning = None;
 
         // Nudge users off the deprecated `rootMarkers` config key. The claim
         // guard latches session-wide so a later didChangeConfiguration carrying
@@ -229,11 +229,9 @@ impl Kakehashi {
                     log::error!(
                         "Failed to expand default settings: {e}. Falling back to empty defaults."
                     );
-                    self.notifier()
-                        .log_warning(format!(
-                            "Failed to expand default settings: {e}. Some features (e.g., semantic highlighting, parser detection) may be degraded."
-                        ))
-                        .await;
+                    default_settings_warning = Some(format!(
+                        "Failed to expand default settings: {e}. Some features (e.g., semantic highlighting, parser detection) may be degraded."
+                    ));
                     WorkspaceSettings::default()
                 }
             };
@@ -260,6 +258,13 @@ impl Kakehashi {
         let will_save_advertised = host_bridging_enabled || settings.any_bridge_server_runnable();
         self.apply_initial_settings(raw_settings, settings).await;
 
+        for (level, message) in startup_logs {
+            self.notifier().log(level, message).await;
+        }
+        self.notifier().log_settings_events(&settings_events).await;
+        if let Some(message) = default_settings_warning {
+            self.notifier().log_warning(message).await;
+        }
         self.notifier().log_info("server initialized!").await;
         Ok(InitializeResult {
             server_info: Some(ServerInfo {
@@ -723,8 +728,8 @@ async fn forward_upstream_request(
 ///   editor's response relayed back; loss-intolerant (a dropped request hangs
 ///   the downstream). Serviced via [`spawn_upstream_request`] so a slow/human
 ///   editor never stalls the loop.
-/// - `window_rx` (bounded, reader drops on full): `LogMessage`/`ShowMessage` and
-///   `telemetry/event` — best-effort notifications, forwarded unconditionally.
+/// - `window_rx` (bounded, reader drops on full): threshold-admitted `LogMessage`,
+///   unfiltered `ShowMessage`, and `telemetry/event` — best-effort notifications.
 ///
 /// Notification dispatch awaits tower-lsp's internal bounded channel, so a slow
 /// editor stalls the loop — but the `biased` select drains the two loss-intolerant

@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::sync::RwLock;
+use std::sync::atomic::{AtomicU8, Ordering};
 
 use tower_lsp_server::ls_types::{Registration, Unregistration};
 
@@ -17,12 +18,18 @@ use crate::error::LockResultExt;
 /// with different document selectors).
 pub(crate) struct DynamicCapabilityRegistry {
     registrations: RwLock<HashMap<String, Registration>>,
+    /// Live workspace policy copied into every connection. The reader checks
+    /// it before a suppressed log can consume bounded window-queue capacity.
+    log_message_level: AtomicU8,
 }
 
 impl DynamicCapabilityRegistry {
     pub(crate) fn new() -> Self {
         Self {
             registrations: RwLock::new(HashMap::new()),
+            log_message_level: AtomicU8::new(
+                crate::config::settings::LogMessageLevel::Info.as_u8(),
+            ),
         }
     }
 
@@ -52,6 +59,21 @@ impl DynamicCapabilityRegistry {
             .recover_poison("DynamicCapabilityRegistry::has_registration")
             .values()
             .any(|r| r.method == method)
+    }
+
+    pub(crate) fn store_log_message_level(&self, level: crate::config::settings::LogMessageLevel) {
+        self.log_message_level
+            .store(level.as_u8(), Ordering::Release);
+    }
+
+    pub(crate) fn allows_log_message(
+        &self,
+        message_type: tower_lsp_server::ls_types::MessageType,
+    ) -> bool {
+        crate::config::settings::LogMessageLevel::from_u8(
+            self.log_message_level.load(Ordering::Acquire),
+        )
+        .allows(message_type)
     }
 }
 

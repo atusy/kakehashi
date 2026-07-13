@@ -659,6 +659,7 @@ pub struct DebounceFeatureSettings {
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
 #[serde(rename_all = "lowercase")]
+#[repr(u8)]
 pub enum LogMessageLevel {
     Error,
     Warning,
@@ -669,6 +670,20 @@ pub enum LogMessageLevel {
 }
 
 impl LogMessageLevel {
+    pub(crate) const fn as_u8(self) -> u8 {
+        self as u8
+    }
+
+    pub(crate) fn from_u8(value: u8) -> Self {
+        match value {
+            value if value == Self::Error as u8 => Self::Error,
+            value if value == Self::Warning as u8 => Self::Warning,
+            value if value == Self::Log as u8 => Self::Log,
+            value if value == Self::Off as u8 => Self::Off,
+            _ => Self::Info,
+        }
+    }
+
     pub(crate) fn allows(self, message_type: tower_lsp_server::ls_types::MessageType) -> bool {
         use tower_lsp_server::ls_types::MessageType;
 
