@@ -537,14 +537,14 @@ fn one_line(message: &str) -> std::borrow::Cow<'_, str> {
 fn escape_terminal_controls(text: &str) -> std::borrow::Cow<'_, str> {
     if !text
         .chars()
-        .any(|ch| ch.is_control() || is_bidi_control(ch))
+        .any(|ch| ch.is_control() || is_bidi_control(ch) || is_line_separator(ch))
     {
         return std::borrow::Cow::Borrowed(text);
     }
 
     let mut escaped = String::with_capacity(text.len());
     for ch in text.chars() {
-        if is_bidi_control(ch) {
+        if is_bidi_control(ch) || is_line_separator(ch) {
             escaped.extend(ch.escape_unicode());
         } else if ch.is_control() {
             escaped.extend(ch.escape_default());
@@ -562,11 +562,13 @@ fn is_bidi_control(ch: char) -> bool {
     )
 }
 
+fn is_line_separator(ch: char) -> bool {
+    matches!(ch, '\u{2028}' | '\u{2029}')
+}
+
 fn escape_jsonl_terminal_controls(json: String) -> String {
     let requires_escape = |ch: char| {
-        (ch.is_control() && ch >= '\u{7f}')
-            || is_bidi_control(ch)
-            || matches!(ch, '\u{2028}' | '\u{2029}')
+        (ch.is_control() && ch >= '\u{7f}') || is_bidi_control(ch) || is_line_separator(ch)
     };
     if !json.chars().any(requires_escape) {
         return json;
@@ -756,8 +758,8 @@ mod tests {
     #[test]
     fn server_failure_escapes_untrusted_fields() {
         assert_eq!(
-            format_server_failure(" dir/\u{1b}  f ", "server\nspoof\u{1b}"),
-            "error:  dir/\\u{1b}  f : server\\nspoof\\u{1b}"
+            format_server_failure(" dir/\u{1b}\u{2028} f ", "server\nspoof\u{1b}\u{2029}"),
+            "error:  dir/\\u{1b}\\u{2028} f : server\\nspoof\\u{1b}\\u{2029}"
         );
     }
 
