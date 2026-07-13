@@ -1,8 +1,9 @@
 use std::collections::HashMap;
 use std::sync::RwLock;
 
-use tower_lsp_server::ls_types::{Registration, Unregistration};
+use tower_lsp_server::ls_types::{MessageType, Registration, Unregistration};
 
+use crate::config::settings::ForwardLogLevel;
 use crate::error::LockResultExt;
 
 /// Thread-safe store for dynamically registered LSP capabilities.
@@ -17,12 +18,14 @@ use crate::error::LockResultExt;
 /// with different document selectors).
 pub(crate) struct DynamicCapabilityRegistry {
     registrations: RwLock<HashMap<String, Registration>>,
+    forward_log_level: RwLock<Option<ForwardLogLevel>>,
 }
 
 impl DynamicCapabilityRegistry {
     pub(crate) fn new() -> Self {
         Self {
             registrations: RwLock::new(HashMap::new()),
+            forward_log_level: RwLock::new(None),
         }
     }
 
@@ -53,6 +56,20 @@ impl DynamicCapabilityRegistry {
             .values()
             .any(|r| r.method == method)
     }
+
+    pub(crate) fn store_forward_log_level(&self, level: Option<ForwardLogLevel>) {
+        *self
+            .forward_log_level
+            .write()
+            .recover_poison("DynamicCapabilityRegistry::store_forward_log_level") = level;
+    }
+
+    pub(crate) fn allows_log_message(&self, message_type: MessageType) -> bool {
+        self.forward_log_level
+            .read()
+            .recover_poison("DynamicCapabilityRegistry::allows_log_message")
+            .is_none_or(|level| level.allows(message_type))
+    }
 }
 
 #[cfg(test)]
@@ -60,9 +77,10 @@ mod tests {
     use std::sync::Arc;
     use std::thread;
 
-    use tower_lsp_server::ls_types::{Registration, Unregistration};
+    use tower_lsp_server::ls_types::{MessageType, Registration, Unregistration};
 
     use super::DynamicCapabilityRegistry;
+    use crate::config::settings::ForwardLogLevel;
 
     fn make_registration(id: &str, method: &str) -> Registration {
         Registration {
@@ -106,6 +124,28 @@ mod tests {
         let registry = DynamicCapabilityRegistry::new();
 
         assert!(!registry.has_registration("textDocument/hover"));
+    }
+
+    #[test]
+    fn log_messages_pass_through_without_a_configured_threshold() {
+        let registry = DynamicCapabilityRegistry::new();
+
+        assert!(registry.allows_log_message(MessageType::INFO));
+        assert!(registry.allows_log_message(MessageType::LOG));
+    }
+
+    #[test]
+    fn log_message_threshold_updates_live() {
+        let registry = DynamicCapabilityRegistry::new();
+        registry.store_forward_log_level(Some(ForwardLogLevel::Warning));
+
+        assert!(registry.allows_log_message(MessageType::ERROR));
+        assert!(registry.allows_log_message(MessageType::WARNING));
+        assert!(!registry.allows_log_message(MessageType::INFO));
+        assert!(!registry.allows_log_message(MessageType::LOG));
+
+        registry.store_forward_log_level(Some(ForwardLogLevel::Off));
+        assert!(!registry.allows_log_message(MessageType::ERROR));
     }
 
     #[test]

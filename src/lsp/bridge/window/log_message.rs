@@ -1,8 +1,7 @@
 //! `window/logMessage` notification forwarder.
 //!
-//! Inbound (downstream → editor). Forwarded unconditionally so the bridge stays
-//! transparent: messages a direct connection would surface are not silently
-//! swallowed. A downstream flood cannot harm the bridge because the window
+//! Inbound (downstream → editor). Forwarded transparently by default, with an
+//! optional per-server severity gate. A downstream flood cannot harm the bridge because the window
 //! channel is bounded and drop-on-full (see [`UpstreamNotification`]). The text
 //! is prefixed with the originating server name so output from multiple bridged
 //! servers stays distinguishable.
@@ -24,14 +23,22 @@ pub(in crate::lsp::bridge) fn forward(
 ) {
     // Deserialize from a reference to avoid cloning the params value.
     match LogMessageParams::deserialize(&message["params"]) {
-        Ok(params) => send_window_notification(
-            deps,
+        Ok(params) if deps.dynamic_capabilities.allows_log_message(params.typ) => {
+            send_window_notification(
+                deps,
+                server_prefix,
+                "window/logMessage",
+                UpstreamNotification::LogMessage {
+                    typ: params.typ,
+                    message: prefixed_message(deps.server_name.as_deref(), &params.message),
+                },
+            )
+        }
+        Ok(params) => debug!(
+            target: "kakehashi::bridge::reader",
+            "{}Dropping window/logMessage type {:?} below configured threshold",
             server_prefix,
-            "window/logMessage",
-            UpstreamNotification::LogMessage {
-                typ: params.typ,
-                message: prefixed_message(deps.server_name.as_deref(), &params.message),
-            },
+            params.typ
         ),
         Err(e) => debug!(
             target: "kakehashi::bridge::reader",

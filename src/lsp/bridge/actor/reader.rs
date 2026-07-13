@@ -1285,6 +1285,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn handle_message_applies_window_log_message_threshold_only() {
+        use crate::config::settings::ForwardLogLevel;
+
+        let router = ResponseRouter::new();
+        let (deps, mut window_rx, _keep) = server_request_deps_for(Some("mock-ls"));
+        deps.dynamic_capabilities
+            .store_forward_log_level(Some(ForwardLogLevel::Warning));
+
+        let notification = |typ| {
+            json!({
+                "jsonrpc": "2.0",
+                "method": "window/logMessage",
+                "params": { "type": typ, "message": "downstream message" }
+            })
+        };
+        handle_message(notification(3), &router, "", &deps).await;
+        handle_message(notification(2), &router, "", &deps).await;
+
+        assert_eq!(
+            window_rx.try_recv().expect("warning should be forwarded"),
+            UpstreamNotification::LogMessage {
+                typ: tower_lsp_server::ls_types::MessageType::WARNING,
+                message: "[kakehashi:mock-ls] downstream message".to_string(),
+            }
+        );
+        assert!(window_rx.try_recv().is_err(), "info should be dropped");
+
+        let show = json!({
+            "jsonrpc": "2.0",
+            "method": "window/showMessage",
+            "params": { "type": 3, "message": "still visible" }
+        });
+        handle_message(show, &router, "", &deps).await;
+        assert!(matches!(
+            window_rx.try_recv(),
+            Ok(UpstreamNotification::ShowMessage { .. })
+        ));
+    }
+
+    #[tokio::test]
     async fn handle_message_drops_window_log_message_with_invalid_params() {
         let router = ResponseRouter::new();
         let (deps, mut window_rx, _keep) = server_request_deps_for(Some("mock-ls"));

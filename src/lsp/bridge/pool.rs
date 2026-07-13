@@ -663,7 +663,16 @@ impl LanguageServerPool {
             if launch_changed {
                 invalidated.push(key.clone());
             } else {
-                resolved.insert(key.clone(), config.and_then(|config| config.settings));
+                resolved.insert(
+                    key.clone(),
+                    config.map(|config| {
+                        let log_level = config
+                            .features
+                            .get("window/logMessage")
+                            .and_then(|feature| feature.log_level);
+                        (config.settings, log_level)
+                    }),
+                );
             }
         }
 
@@ -685,7 +694,10 @@ impl LanguageServerPool {
 
         let mut pushed = 0;
         for (key, handle) in connections.iter() {
-            let resolved = resolved.remove(key).flatten();
+            let (resolved, log_level) = resolved.remove(key).flatten().unwrap_or((None, None));
+            handle
+                .dynamic_capabilities()
+                .store_forward_log_level(log_level);
             // Diff by value (Arc identity is irrelevant); skip unchanged servers
             // so an unchanged config reload pushes nothing.
             if resolved.as_ref() == handle.current_settings().as_deref() {
@@ -2040,6 +2052,12 @@ impl LanguageServerPool {
 
         // Create dynamic capability registry (shared between reader and connection handle)
         let dynamic_capabilities = Arc::new(DynamicCapabilityRegistry::new());
+        dynamic_capabilities.store_forward_log_level(
+            server_config
+                .features
+                .get("window/logMessage")
+                .and_then(|feature| feature.log_level),
+        );
 
         // workspaceMarkers workspace-root detection (root_markers module): the same
         // marker workspace resolved for the pool key above (entry-priority
@@ -6609,6 +6627,51 @@ mod tests {
             })
             .await;
         assert_eq!(pushed_again, 0, "an unchanged reload pushes nothing");
+    }
+
+    #[tokio::test]
+    async fn propagate_settings_updates_log_threshold_without_respawning_or_notifying() {
+        use crate::config::settings::{
+            BridgeServerConfig, ForwardLogLevel, MethodForwardingConfig,
+        };
+        use tower_lsp_server::ls_types::MessageType;
+
+        let pool = LanguageServerPool::new();
+        let handle =
+            create_handle_with_key(ConnectionState::Ready, ConnectionKey::for_server("mock-ls"))
+                .await;
+        handle.record_launch_config(&BridgeServerConfig::default());
+        pool.insert_connection(Arc::clone(&handle)).await;
+
+        let pushed = pool
+            .propagate_settings(|_| {
+                Some(BridgeServerConfig {
+                    features: HashMap::from([(
+                        "window/logMessage".to_string(),
+                        MethodForwardingConfig {
+                            log_level: Some(ForwardLogLevel::Warning),
+                        },
+                    )]),
+                    ..Default::default()
+                })
+            })
+            .await;
+
+        assert_eq!(
+            pushed, 0,
+            "feature-only reload sends no downstream settings"
+        );
+        assert!(
+            handle
+                .dynamic_capabilities()
+                .allows_log_message(MessageType::WARNING)
+        );
+        assert!(
+            !handle
+                .dynamic_capabilities()
+                .allows_log_message(MessageType::INFO)
+        );
+        assert_eq!(pool.connections().await.len(), 1, "live handle is retained");
     }
 
     /// Path c does NOT notify a still-initializing connection (that would
