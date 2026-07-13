@@ -205,6 +205,10 @@ fn transform_diagnostic_response_to_host(
     Ok(diagnostics)
 }
 
+fn diagnostics_for_unchanged_baseline(baseline: Option<&[Diagnostic]>) -> Vec<Diagnostic> {
+    baseline.unwrap_or_default().to_vec()
+}
+
 /// Transform a single typed Diagnostic by applying the region offset to its range.
 ///
 /// Also transforms relatedInformation locations if present, filtering out entries
@@ -238,6 +242,30 @@ mod tests {
     use super::super::test_helpers::*;
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn unchanged_baseline_is_reanchored_with_the_current_offset() {
+        let baseline = vec![Diagnostic {
+            range: tower_lsp_server::ls_types::Range::new(
+                tower_lsp_server::ls_types::Position::new(1, 2),
+                tower_lsp_server::ls_types::Position::new(1, 5),
+            ),
+            message: "cached".to_string(),
+            ..Default::default()
+        }];
+
+        let mut diagnostics = diagnostics_for_unchanged_baseline(Some(&baseline));
+        for diagnostic in &mut diagnostics {
+            transform_diagnostic(diagnostic, &RegionOffset::new(20, 0), "file:///host.md");
+        }
+
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].range.start.line, 21);
+        assert_eq!(
+            baseline[0].range.start.line, 1,
+            "cache remains virtual-local"
+        );
+    }
 
     #[test]
     fn diagnostic_response_transforms_range_to_host_coordinates() {
