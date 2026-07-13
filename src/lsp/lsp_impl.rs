@@ -106,6 +106,11 @@ pub(super) struct ReloadLanguageState<'a> {
     request_semantic_refresh: bool,
 }
 
+pub(super) struct SettingsReloadInput {
+    raw_settings: Option<RawWorkspaceSettings>,
+    settings: WorkspaceSettings,
+}
+
 /// One server process owns one effective workspace settings snapshot. Keep the
 /// complete async reload transaction ordered across didChangeConfiguration and
 /// post-install reloads, including downstream propagation and SettingsManager
@@ -148,7 +153,35 @@ pub(super) async fn apply_shared_settings(
     raw_settings: Option<RawWorkspaceSettings>,
     settings: WorkspaceSettings,
 ) -> Vec<Url> {
-    let _reload = SETTINGS_RELOAD_LOCK.lock().await;
+    let reload = lock_settings_reload().await;
+    apply_shared_settings_locked(
+        &reload,
+        client,
+        language_state,
+        settings_manager,
+        cache,
+        bridge,
+        SettingsReloadInput {
+            raw_settings,
+            settings,
+        },
+    )
+    .await
+}
+
+pub(super) async fn apply_shared_settings_locked(
+    _reload: &tokio::sync::MutexGuard<'static, ()>,
+    client: &Client,
+    language_state: ReloadLanguageState<'_>,
+    settings_manager: &SettingsManager,
+    cache: &CacheCoordinator,
+    bridge: &BridgeCoordinator,
+    input: SettingsReloadInput,
+) -> Vec<Url> {
+    let SettingsReloadInput {
+        raw_settings,
+        settings,
+    } = input;
     // TRANSITIONAL generation bump BEFORE any query/config mutation: from
     // this instant, every generation-stamped product built from the OLD
     // queries (snapshot-riding discovery/bridge/resolved regions, layer

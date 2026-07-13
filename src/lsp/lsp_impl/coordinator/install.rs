@@ -4,12 +4,13 @@ use crate::lsp::auto_install::AutoInstallManager;
 use url::Url;
 
 use crate::config::WorkspaceSettings;
-use crate::lsp::auto_install::InstallEvent;
+use crate::lsp::auto_install::{InstallEvent, InstallResult};
 use crate::lsp::bridge::BridgeCoordinator;
 use crate::lsp::cache::CacheCoordinator;
 use crate::lsp::client::ClientNotifier;
 use crate::lsp::lsp_impl::{
-    Kakehashi, ReloadLanguageState, apply_shared_settings, build_notifier, lock_settings_reload,
+    Kakehashi, ReloadLanguageState, SettingsReloadInput, apply_shared_settings_locked,
+    build_notifier, lock_settings_reload,
 };
 use crate::lsp::settings_manager::SettingsManager;
 use tower_lsp_server::Client;
@@ -180,35 +181,18 @@ impl InstallCoordinator {
 
         self.dispatch_install_events(language, &result.events).await;
 
-        if let Some(data_dir) = result.outcome.data_dir() {
+        if let Some(data_dir) = result.outcome.data_dir().cloned() {
             self.reload_language_after_install(
                 language,
-                data_dir,
+                &data_dir,
                 uri.clone(),
                 is_injection,
                 expected_incarnation,
+                Some(&mut result),
             )
             .await;
-            let _reload = lock_settings_reload().await;
-            let load_result = self.language.ensure_language_loaded_async(language).await;
-            self.notifier()
-                .log_language_events(&load_result.events)
-                .await;
-            let global_loaded = self.language.has_parser_available(language);
-            if global_loaded {
-                result.complete_claim();
-            }
-            if global_loaded
-                && !is_injection
-                && self.same_document_incarnation(&uri, expected_incarnation)
-            {
-                self.parse_coordinator()
-                    .reparse_installed_document(uri.clone(), language, expected_incarnation)
-                    .await;
-            }
             let recovered =
                 self.install_reparse_recovered(language, &uri, is_injection, expected_incarnation);
-            drop(_reload);
             if recovered {
                 return true;
             }
@@ -287,7 +271,9 @@ impl InstallCoordinator {
         uri: Url,
         is_injection: bool,
         expected_incarnation: Option<u64>,
+        claim: Option<&mut InstallResult>,
     ) {
+        let reload = lock_settings_reload().await;
         let settings_snapshot = self.settings_manager.load_settings_pair();
         let (updated_raw_settings, updated_settings) = updated_settings_after_install(
             &settings_snapshot.raw_settings,
@@ -295,15 +281,21 @@ impl InstallCoordinator {
             data_dir,
         );
 
-        self.apply_raw_settings(updated_raw_settings, updated_settings)
+        self.apply_raw_settings_locked(&reload, updated_raw_settings, updated_settings)
             .await;
 
         let load_result = self.language.ensure_language_loaded_async(language).await;
+        let global_loaded = self.language.has_parser_available(language);
+        if global_loaded && let Some(claim) = claim {
+            claim.complete_claim();
+        }
+        drop(reload);
+
         self.notifier()
             .log_language_events(&load_result.events)
             .await;
 
-        if !is_injection {
+        if global_loaded && !is_injection {
             // Resurrection-safe, off-ingress reparse: re-detects the language from
             // the current document lifetime and persists through a non-inserting
             // CAS, so a didClose/reopen during the install can't receive a tree for
@@ -315,12 +307,14 @@ impl InstallCoordinator {
         }
     }
 
-    async fn apply_raw_settings(
+    async fn apply_raw_settings_locked(
         &self,
+        reload: &tokio::sync::MutexGuard<'static, ()>,
         raw_settings: crate::config::RawWorkspaceSettings,
         settings: WorkspaceSettings,
     ) {
-        let _reparse_uris = apply_shared_settings(
+        let _reparse_uris = apply_shared_settings_locked(
+            reload,
             &self.client,
             ReloadLanguageState {
                 language: &self.language,
@@ -332,8 +326,10 @@ impl InstallCoordinator {
             &self.settings_manager,
             &self.cache,
             &self.bridge,
-            Some(raw_settings),
-            settings,
+            SettingsReloadInput {
+                raw_settings: Some(raw_settings),
+                settings,
+            },
         )
         .await;
     }
@@ -382,7 +378,9 @@ mod tests {
     use super::*;
     use crate::config::{LanguageSettings, RawWorkspaceSettings, WILDCARD_KEY, WorkspaceSettings};
     use std::collections::HashMap;
+    use std::future::Future;
     use std::path::Path;
+    use std::task::Poll;
     use tower_lsp_server::LspService;
 
     #[test]
@@ -521,12 +519,70 @@ mod tests {
                 first.clone(),
                 false,
                 server.documents.get(&first).map(|doc| doc.incarnation()),
+                None,
             )
             .await;
 
         assert!(
             server.documents.get(&first).unwrap().tree().is_some(),
             "the document that won the install should be reparsed"
+        );
+    }
+
+    #[tokio::test]
+    async fn reload_after_install_merges_into_settings_published_while_waiting() {
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+        let initial_raw = RawWorkspaceSettings {
+            search_paths: Some(vec!["/initial".to_string()]),
+            ..Default::default()
+        };
+        let initial = WorkspaceSettings {
+            search_paths: vec!["/initial".to_string()],
+            ..Default::default()
+        };
+        server
+            .settings_manager
+            .apply_settings_with_raw(initial_raw, initial);
+
+        let reload_guard = lock_settings_reload().await;
+        let install = server.install_coordinator();
+        let mut reload = Box::pin(install.reload_language_after_install(
+            "test-language",
+            Path::new("/installed"),
+            Url::parse("file:///workspace/test.txt").unwrap(),
+            true,
+            None,
+            None,
+        ));
+        std::future::poll_fn(|cx| {
+            assert!(reload.as_mut().poll(cx).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+
+        let newer_raw = RawWorkspaceSettings {
+            search_paths: Some(vec!["/newer".to_string()]),
+            ..Default::default()
+        };
+        let newer = WorkspaceSettings {
+            search_paths: vec!["/newer".to_string()],
+            ..Default::default()
+        };
+        server
+            .settings_manager
+            .apply_settings_with_raw(newer_raw, newer);
+        drop(reload_guard);
+        reload.await;
+
+        let snapshot = server.settings_manager.load_settings_pair();
+        assert_eq!(
+            snapshot.raw_settings.search_paths,
+            Some(vec!["/newer".to_string(), "/installed".to_string()])
+        );
+        assert_eq!(
+            snapshot.settings.search_paths,
+            vec!["/newer".to_string(), "/installed".to_string()]
         );
     }
 
