@@ -851,10 +851,53 @@ fn prepare_windows_tombstone_publish(
     }
     // SAFETY: successful ReOpenFile returned a newly owned handle.
     let rename_handle = unsafe { fs::File::from_raw_handle(handle) };
+    normalize_windows_stage_attributes(&rename_handle)?;
     Ok(WindowsTombstonePublish {
         directory,
         rename_handle,
     })
+}
+
+#[cfg(windows)]
+fn normalize_windows_stage_attributes(file: &fs::File) -> std::io::Result<()> {
+    use std::os::windows::io::AsRawHandle as _;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_TEMPORARY, FILE_BASIC_INFO, FileBasicInfo,
+        GetFileInformationByHandleEx, SetFileInformationByHandle,
+    };
+
+    let mut information = FILE_BASIC_INFO::default();
+    // SAFETY: `information` is the exact buffer for FileBasicInfo and `file`
+    // keeps the handle valid throughout both calls.
+    let read = unsafe {
+        GetFileInformationByHandleEx(
+            file.as_raw_handle(),
+            FileBasicInfo,
+            (&mut information as *mut FILE_BASIC_INFO).cast(),
+            u32::try_from(std::mem::size_of::<FILE_BASIC_INFO>()).unwrap(),
+        )
+    };
+    if read == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    information.FileAttributes &= !FILE_ATTRIBUTE_TEMPORARY;
+    if information.FileAttributes == 0 {
+        information.FileAttributes = FILE_ATTRIBUTE_NORMAL;
+    }
+    // SAFETY: same valid handle and correctly sized initialized structure.
+    let written = unsafe {
+        SetFileInformationByHandle(
+            file.as_raw_handle(),
+            FileBasicInfo,
+            (&information as *const FILE_BASIC_INFO).cast(),
+            u32::try_from(std::mem::size_of::<FILE_BASIC_INFO>()).unwrap(),
+        )
+    };
+    if written == 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
 }
 
 #[cfg(windows)]
@@ -1728,7 +1771,9 @@ mod tests {
     #[test]
     #[cfg(windows)]
     fn windows_tombstone_publish_replaces_raced_symlink_entry() {
+        use std::os::windows::fs::MetadataExt as _;
         use std::os::windows::fs::symlink_file;
+        use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_TEMPORARY;
 
         let temp = TempDir::new().unwrap();
         let queries_parent = temp.path().join("queries");
@@ -1753,6 +1798,14 @@ mod tests {
             "handle-relative replace must replace the symlink entry itself"
         );
         assert_eq!(fs::read_to_string(tombstone).unwrap(), "ok\n");
+        assert_eq!(
+            fs::metadata(uninstall_tombstone_path(&queries_parent, "rust"))
+                .unwrap()
+                .file_attributes()
+                & FILE_ATTRIBUTE_TEMPORARY,
+            0,
+            "published tombstone must not retain tempfile cache semantics"
+        );
     }
 
     #[test]
