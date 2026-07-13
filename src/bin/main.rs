@@ -408,15 +408,8 @@ fn run_language_status(verbose: bool) -> Result<(), ExitCode> {
     if let Ok(entries) = fs::read_dir(&parser_dir) {
         for entry in entries.flatten() {
             let path = entry.path();
-            let is_parser = path
-                .extension()
-                .map(|ext| ext == std::env::consts::DLL_EXTENSION)
-                .unwrap_or(false);
-            if is_parser && let Some(stem) = path.file_stem() {
-                let language = stem.to_string_lossy();
-                if queries::is_safe_language_name(&language) {
-                    languages.insert(language.into_owned());
-                }
+            if let Some(language) = installed_parser_language_name(&path) {
+                languages.insert(language);
             }
         }
     }
@@ -483,6 +476,17 @@ fn installed_query_language_name(path: &Path) -> Option<String> {
     Some(name.to_string())
 }
 
+fn installed_parser_language_name(path: &Path) -> Option<String> {
+    if path.extension()? != std::env::consts::DLL_EXTENSION {
+        return None;
+    }
+    let name = path.file_stem()?.to_string_lossy();
+    if !queries::is_safe_language_name(&name) {
+        return None;
+    }
+    Some(name.into_owned())
+}
+
 /// Run the language uninstall command
 fn run_language_uninstall(
     language: Option<String>,
@@ -512,15 +516,8 @@ fn run_language_uninstall(
         if let Ok(entries) = fs::read_dir(&parser_dir) {
             for entry in entries.flatten() {
                 let path = entry.path();
-                let is_parser = path
-                    .extension()
-                    .map(|ext| ext == std::env::consts::DLL_EXTENSION)
-                    .unwrap_or(false);
-                if is_parser && let Some(stem) = path.file_stem() {
-                    let language = stem.to_string_lossy();
-                    if queries::is_safe_language_name(&language) {
-                        languages.insert(language.into_owned());
-                    }
+                if let Some(language) = installed_parser_language_name(&path) {
+                    languages.insert(language);
                 }
             }
         }
