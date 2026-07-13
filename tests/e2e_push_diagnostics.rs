@@ -953,6 +953,12 @@ fn e2e_downstream_refresh_burst_is_coalesced() {
         "expected one progress barrier: {barriers:?}"
     );
     client.send_response(barriers.remove(0).0, json!(null));
+    assert!(
+        client
+            .wait_for_server_request("workspace/diagnostic/refresh", Duration::from_millis(250),)
+            .is_none(),
+        "the settled trailing edge must remain pending while the leading refresh is in flight"
+    );
     client.send_response(id, json!(null));
 
     let (trailing_id, _) = client
