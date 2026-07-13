@@ -41,17 +41,16 @@ impl WorkspaceFolderSet {
         }
     }
 
-    fn deduplicate(mut folders: Option<Vec<WorkspaceFolder>>) -> Option<Vec<WorkspaceFolder>> {
-        if let Some(folders) = folders.as_mut() {
+    fn deduplicate(folders: Option<Vec<WorkspaceFolder>>) -> Option<Vec<WorkspaceFolder>> {
+        folders.map(|folders| {
             let mut unique = Vec::<WorkspaceFolder>::with_capacity(folders.len());
-            for folder in folders.drain(..) {
+            for folder in folders {
                 if !unique.iter().any(|existing| existing.uri == folder.uri) {
                     unique.push(folder);
                 }
             }
-            *folders = unique;
-        }
-        folders
+            unique
+        })
     }
 
     /// Snapshot the current folders for answering a `workspace/workspaceFolders`
@@ -93,7 +92,7 @@ impl WorkspaceFolderSet {
             return;
         }
         let folders = guard.get_or_insert_with(Vec::new);
-        folders.retain(|existing| !removed.iter().any(|removed| removed.uri == existing.uri));
+        folders.retain(|existing| !removed.iter().any(|item| item.uri == existing.uri));
         for folder in added {
             if !folders.iter().any(|existing| existing.uri == folder.uri) {
                 folders.push(folder);
@@ -233,6 +232,15 @@ mod tests {
             set.snapshot(),
             Some(vec![folder("file:///b"), folder("file:///c")])
         );
+    }
+
+    #[test]
+    fn add_to_none_materializes_folder_set() {
+        let set = WorkspaceFolderSet::new(None);
+
+        set.apply_change(vec![folder("file:///a")], &[]);
+
+        assert_eq!(set.snapshot(), Some(vec![folder("file:///a")]));
     }
 
     #[test]
