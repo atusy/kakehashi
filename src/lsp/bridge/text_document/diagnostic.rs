@@ -17,6 +17,7 @@ use std::io;
 use std::time::Duration;
 
 use crate::config::settings::BridgeServerConfig;
+use crate::error::LockResultExt;
 use tower_lsp_server::ls_types::{Diagnostic, DocumentDiagnosticReport};
 use url::Url;
 
@@ -48,8 +49,8 @@ impl LanguageServerPool {
         offset: RegionOffset,
         virtual_content: &str,
         upstream_request_id: Option<UpstreamId>,
-        previous_result_id: Option<&str>,
     ) -> io::Result<Vec<Diagnostic>> {
+        let (host_generation, request_sequence) = self.begin_diagnostic_pull(host_uri);
         // Pre-work: wait for server to become Ready (unlike other handlers that fail fast).
         let handle = self
             .get_or_create_connection_wait_ready(
@@ -74,36 +75,235 @@ impl LanguageServerPool {
         // Server is Ready and supports diagnostics — proceed with standard lifecycle.
         // Use execute_bridge_request_with_handle to reuse the pre-fetched handle,
         // avoiding a redundant HashMap lookup.
-        self.execute_bridge_request_with_handle(
-            handle,
-            host_uri,
-            injection_language,
-            region_id,
-            &offset,
-            virtual_content,
-            upstream_request_id,
-            |virtual_uri, request_id| {
-                build_diagnostic_request(virtual_uri, request_id, previous_result_id)
-            },
-            |response, ctx| {
-                // A downstream JSON-RPC error response is a request failure, not
-                // "no diagnostics" — propagate it as `Err` so CLI mode's
-                // request-error sink can surface it (mirrors the formatting
-                // path; LSP mode just logs and the layer stays empty).
-                if response_has_jsonrpc_error(&response, "textDocument/diagnostic") {
-                    return Err(io::Error::other(format!(
-                        "downstream server '{server_name}' answered textDocument/diagnostic \
+        let host_uri_lsp = crate::lsp::lsp_impl::url_to_uri(host_uri)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?;
+        let virtual_uri = VirtualDocumentUri::new(&host_uri_lsp, injection_language, region_id);
+        let cache_key = (handle.key().clone(), virtual_uri.to_uri_string());
+        let snapshot = self.diagnostic_pull_snapshot(
+            &cache_key,
+            host_uri.as_str(),
+            host_generation,
+            request_sequence,
+        );
+        let previous_result_id = snapshot
+            .baseline
+            .as_ref()
+            .map(|entry| entry.result_id.clone());
+
+        let report = self
+            .execute_bridge_request_with_handle(
+                handle,
+                host_uri,
+                injection_language,
+                region_id,
+                &offset,
+                virtual_content,
+                upstream_request_id,
+                |virtual_uri, request_id| {
+                    build_diagnostic_request(virtual_uri, request_id, previous_result_id.as_deref())
+                },
+                |response, _ctx| {
+                    // A downstream JSON-RPC error response is a request failure, not
+                    // "no diagnostics" — propagate it as `Err` so CLI mode's
+                    // request-error sink can surface it (mirrors the formatting
+                    // path; LSP mode just logs and the layer stays empty).
+                    if response_has_jsonrpc_error(&response, "textDocument/diagnostic") {
+                        return Err(io::Error::other(format!(
+                            "downstream server '{server_name}' answered textDocument/diagnostic \
                          with an error response: {}",
-                        jsonrpc_error_summary(&response)
-                    )));
+                            jsonrpc_error_summary(&response)
+                        )));
+                    }
+                    // A present-but-malformed payload (absent `result`, unknown
+                    // report kind, missing/garbled `items`) is likewise a request
+                    // failure; `null` clears the baseline and `unchanged` reuses it.
+                    parse_downstream_diagnostic_report(response)
+                },
+            )
+            .await?;
+
+        let report = match report {
+            Ok(report) => report,
+            Err(error) => {
+                self.record_failed_diagnostic_pull(
+                    &cache_key,
+                    snapshot,
+                    self.is_virtual_doc_open_on_connection(&cache_key.1, &cache_key.0),
+                );
+                return Err(error);
+            }
+        };
+
+        let mut diagnostics = self.resolve_diagnostic_pull_report(
+            &cache_key,
+            snapshot,
+            report,
+            self.is_virtual_doc_open_on_connection(&cache_key.1, &cache_key.0),
+        );
+        for diagnostic in &mut diagnostics {
+            transform_diagnostic(diagnostic, &offset, host_uri.as_str());
+        }
+        Ok(diagnostics)
+    }
+
+    pub(super) fn resolve_diagnostic_pull_report(
+        &self,
+        cache_key: &(super::super::pool::ConnectionKey, String),
+        snapshot: super::super::pool::DiagnosticPullSnapshot,
+        report: DownstreamDiagnosticReport,
+        document_is_open: bool,
+    ) -> Vec<Diagnostic> {
+        let _guard = self
+            .diagnostic_pull_lock
+            .lock()
+            .recover_poison("LanguageServerPool::diagnostic_pull_lock");
+        let lineage_is_current =
+            self.diagnostic_pull_lineage_is_current(cache_key, &snapshot, document_is_open);
+        if !lineage_is_current {
+            return match report {
+                DownstreamDiagnosticReport::Full { diagnostics, .. } => diagnostics,
+                DownstreamDiagnosticReport::Unchanged { .. } | DownstreamDiagnosticReport::Null => {
+                    Vec::new()
                 }
-                // A present-but-malformed payload (absent `result`, unknown
-                // report kind, missing/garbled `items`) is likewise a request
-                // failure; only `null`/`unchanged` stays an empty layer.
-                transform_diagnostic_response_to_host(response, ctx.offset, host_uri.as_str())
-            },
-        )
-        .await?
+            };
+        }
+        let may_apply = self
+            .diagnostic_pull_applied_sequences
+            .get(cache_key)
+            .is_none_or(|sequence| *sequence < snapshot.request_sequence);
+        match report {
+            DownstreamDiagnosticReport::Full {
+                result_id,
+                diagnostics,
+            } => {
+                if may_apply && let Some(result_id) = result_id {
+                    self.store_diagnostic_baseline_if_current(
+                        cache_key,
+                        snapshot.request_sequence,
+                        result_id,
+                        diagnostics.clone(),
+                    );
+                } else if may_apply {
+                    self.diagnostic_pull_baselines.remove(cache_key);
+                }
+                if may_apply {
+                    self.diagnostic_pull_applied_sequences
+                        .insert(cache_key.clone(), snapshot.request_sequence);
+                }
+                diagnostics
+            }
+            DownstreamDiagnosticReport::Unchanged { result_id } => {
+                // A compliant server returns Unchanged only after we supplied a
+                // previousResultId. Without a baseline, the empty result below
+                // is deliberately non-cacheable; advancing the sequence merely
+                // prevents this malformed older response from outranking a
+                // concurrent newer pull. A later Full report can still apply.
+                if may_apply && let Some(baseline) = &snapshot.baseline {
+                    self.store_diagnostic_baseline_if_current(
+                        cache_key,
+                        snapshot.request_sequence,
+                        result_id,
+                        baseline.diagnostics.as_ref().clone(),
+                    );
+                }
+                if may_apply {
+                    self.diagnostic_pull_applied_sequences
+                        .insert(cache_key.clone(), snapshot.request_sequence);
+                }
+                diagnostics_for_unchanged_baseline(
+                    snapshot
+                        .baseline
+                        .as_ref()
+                        .map(|entry| entry.diagnostics.as_slice()),
+                )
+            }
+            DownstreamDiagnosticReport::Null => {
+                if may_apply {
+                    self.diagnostic_pull_baselines.remove(cache_key);
+                    self.diagnostic_pull_applied_sequences
+                        .insert(cache_key.clone(), snapshot.request_sequence);
+                }
+                Vec::new()
+            }
+        }
+    }
+
+    pub(super) fn record_failed_diagnostic_pull(
+        &self,
+        cache_key: &(super::super::pool::ConnectionKey, String),
+        snapshot: super::super::pool::DiagnosticPullSnapshot,
+        document_is_open: bool,
+    ) {
+        let _guard = self
+            .diagnostic_pull_lock
+            .lock()
+            .recover_poison("LanguageServerPool::diagnostic_pull_lock");
+        if self.diagnostic_pull_lineage_is_current(cache_key, &snapshot, document_is_open)
+            && self
+                .diagnostic_pull_applied_sequences
+                .get(cache_key)
+                .is_none_or(|sequence| *sequence < snapshot.request_sequence)
+        {
+            self.diagnostic_pull_applied_sequences
+                .insert(cache_key.clone(), snapshot.request_sequence);
+        }
+    }
+
+    fn diagnostic_pull_lineage_is_current(
+        &self,
+        cache_key: &(super::super::pool::ConnectionKey, String),
+        snapshot: &super::super::pool::DiagnosticPullSnapshot,
+        document_is_open: bool,
+    ) -> bool {
+        let current_document_generation = self
+            .diagnostic_document_generations
+            .get(cache_key)
+            .map(|entry| *entry)
+            .unwrap_or(0);
+        document_is_open
+            && snapshot.settings_generation
+                == self
+                    .diagnostic_pull_generations
+                    .get(&cache_key.0)
+                    .map(|entry| *entry)
+                    .unwrap_or(0)
+            && snapshot.document_generation == current_document_generation
+            && snapshot.connection_generation == self.document_connection_generation(&cache_key.0)
+            && snapshot.host_generation
+                == self
+                    .diagnostic_host_generations
+                    .get(&snapshot.host_uri)
+                    .map(|entry| *entry)
+                    .unwrap_or(0)
+    }
+
+    fn store_diagnostic_baseline_if_current(
+        &self,
+        cache_key: &(super::super::pool::ConnectionKey, String),
+        request_sequence: u64,
+        result_id: String,
+        diagnostics: Vec<Diagnostic>,
+    ) -> bool {
+        use dashmap::mapref::entry::Entry;
+        match self.diagnostic_pull_baselines.entry(cache_key.clone()) {
+            Entry::Occupied(mut entry) if entry.get().request_sequence < request_sequence => {
+                entry.insert(super::super::pool::DiagnosticPullBaseline {
+                    result_id,
+                    diagnostics: std::sync::Arc::new(diagnostics),
+                    request_sequence,
+                });
+                true
+            }
+            Entry::Vacant(entry) => {
+                entry.insert(super::super::pool::DiagnosticPullBaseline {
+                    result_id,
+                    diagnostics: std::sync::Arc::new(diagnostics),
+                    request_sequence,
+                });
+                true
+            }
+            Entry::Occupied(_) => false,
+        }
     }
 }
 
@@ -151,18 +351,46 @@ fn build_diagnostic_request(
 /// deserialize as a `DocumentDiagnosticReport` (no/unknown `kind`, a `full`
 /// report missing `items`, a malformed `unchanged` report, or `items` that
 /// aren't `Diagnostic[]`) — validated by the same typed deserialize the host
-/// parser uses. A `null` result or a valid `unchanged` report is the
-/// authoritative "no diagnostics" answer and stays an empty `Vec` (`Ok`).
+/// parser uses. A `null` result is authoritative empty; a valid `unchanged`
+/// report is resolved against the request's cached baseline by the caller.
 /// Collapsing a malformed payload into the same empty value as "no
 /// capability" would let a broken downstream server pass as "nothing wrong" —
 /// the fan-in counts `Err`s, which CLI mode maps onto its `2` exit code and
 /// the editor path logs at WARNING. Only related info matching `host_uri` is
 /// transformed.
+#[cfg(test)]
 fn transform_diagnostic_response_to_host(
-    mut response: serde_json::Value,
+    response: serde_json::Value,
     offset: &RegionOffset,
     host_uri: &str,
 ) -> io::Result<Vec<Diagnostic>> {
+    let report = parse_downstream_diagnostic_report(response)?;
+    let mut diagnostics = match report {
+        DownstreamDiagnosticReport::Full { diagnostics, .. } => diagnostics,
+        DownstreamDiagnosticReport::Unchanged { .. } | DownstreamDiagnosticReport::Null => {
+            Vec::new()
+        }
+    };
+    for diag in &mut diagnostics {
+        transform_diagnostic(diag, offset, host_uri);
+    }
+    Ok(diagnostics)
+}
+
+pub(super) enum DownstreamDiagnosticReport {
+    Full {
+        result_id: Option<String>,
+        diagnostics: Vec<Diagnostic>,
+    },
+    Unchanged {
+        result_id: String,
+    },
+    Null,
+}
+
+pub(super) fn parse_downstream_diagnostic_report(
+    mut response: serde_json::Value,
+) -> io::Result<DownstreamDiagnosticReport> {
     // Absent `result` with no error (the caller already promoted an error
     // response to `Err`) is a protocol violation — a request failure.
     let Some(result) = response.get_mut("result").map(serde_json::Value::take) else {
@@ -171,8 +399,7 @@ fn transform_diagnostic_response_to_host(
         ));
     };
     if result.is_null() {
-        // Authoritative "no diagnostics" — a handled response, not a failure.
-        return Ok(Vec::new());
+        return Ok(DownstreamDiagnosticReport::Null);
     }
 
     // Validate the whole report via the typed `DocumentDiagnosticReport`
@@ -180,29 +407,34 @@ fn transform_diagnostic_response_to_host(
     // two paths reject the same shapes): an absent/unknown `kind`, a `full`
     // report missing `items`, a malformed `unchanged` report or
     // `relatedDocuments`, or `items` that don't deserialize as `Diagnostic[]`
-    // is a malformed payload (request failure). A valid `unchanged` report is
-    // the authoritative empty. `relatedDocuments` (diagnostics for OTHER
-    // documents) are dropped — they have no place in this region's report.
-    let mut diagnostics = match serde_json::from_value::<DocumentDiagnosticReport>(result) {
-        Ok(DocumentDiagnosticReport::Full(report)) => report.full_document_diagnostic_report.items,
-        Ok(DocumentDiagnosticReport::Unchanged(_)) => return Ok(Vec::new()),
+    // is a malformed payload (request failure). A valid `unchanged` report and
+    // its result ID are returned for the caller to resolve against the request's
+    // baseline. `relatedDocuments` (diagnostics for OTHER documents) are
+    // dropped — they have no place in this region's report.
+    match serde_json::from_value::<DocumentDiagnosticReport>(result) {
+        Ok(DocumentDiagnosticReport::Full(report)) => Ok(DownstreamDiagnosticReport::Full {
+            result_id: report.full_document_diagnostic_report.result_id,
+            diagnostics: report.full_document_diagnostic_report.items,
+        }),
+        Ok(DocumentDiagnosticReport::Unchanged(report)) => {
+            Ok(DownstreamDiagnosticReport::Unchanged {
+                result_id: report.unchanged_document_diagnostic_report.result_id,
+            })
+        }
         Err(err) => {
             log::warn!(
                 target: "kakehashi::bridge",
                 "Failed to deserialize diagnostic report: {err}"
             );
-            return Err(io::Error::other(format!(
+            Err(io::Error::other(format!(
                 "malformed diagnostic result from downstream server: {err}"
-            )));
+            )))
         }
-    };
-
-    // Transform coordinates on typed structs
-    for diag in &mut diagnostics {
-        transform_diagnostic(diag, offset, host_uri);
     }
+}
 
-    Ok(diagnostics)
+fn diagnostics_for_unchanged_baseline(baseline: Option<&[Diagnostic]>) -> Vec<Diagnostic> {
+    baseline.unwrap_or_default().to_vec()
 }
 
 /// Transform a single typed Diagnostic by applying the region offset to its range.
@@ -238,6 +470,394 @@ mod tests {
     use super::super::test_helpers::*;
     use super::*;
     use serde_json::json;
+
+    fn test_snapshot(
+        pool: &LanguageServerPool,
+        key: &(super::super::super::pool::ConnectionKey, String),
+    ) -> super::super::super::pool::DiagnosticPullSnapshot {
+        let host = Url::parse("file:///host.md").unwrap();
+        let (host_generation, request_sequence) = pool.begin_diagnostic_pull(&host);
+        pool.diagnostic_pull_snapshot(key, host.as_str(), host_generation, request_sequence)
+    }
+
+    fn resolve_current(
+        pool: &LanguageServerPool,
+        key: &(super::super::super::pool::ConnectionKey, String),
+        baseline: Option<super::super::super::pool::DiagnosticPullBaseline>,
+        report: DownstreamDiagnosticReport,
+    ) -> Vec<Diagnostic> {
+        let mut snapshot = test_snapshot(pool, key);
+        snapshot.baseline = baseline;
+        pool.resolve_diagnostic_pull_report(key, snapshot, report, true)
+    }
+
+    #[test]
+    fn unchanged_baseline_is_reanchored_with_the_current_offset() {
+        let baseline = vec![Diagnostic {
+            range: tower_lsp_server::ls_types::Range::new(
+                tower_lsp_server::ls_types::Position::new(1, 2),
+                tower_lsp_server::ls_types::Position::new(1, 5),
+            ),
+            message: "cached".to_string(),
+            ..Default::default()
+        }];
+
+        let mut diagnostics = diagnostics_for_unchanged_baseline(Some(&baseline));
+        for diagnostic in &mut diagnostics {
+            transform_diagnostic(diagnostic, &RegionOffset::new(20, 0), "file:///host.md");
+        }
+
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].range.start.line, 21);
+        assert_eq!(
+            baseline[0].range.start.line, 1,
+            "cache remains virtual-local"
+        );
+    }
+
+    #[test]
+    fn full_report_establishes_baseline_and_unchanged_reuses_it() {
+        let pool = LanguageServerPool::new();
+        let key = (
+            super::super::super::pool::ConnectionKey::for_server("lua_ls"),
+            "kakehashi-virtual://region-1".to_string(),
+        );
+        let diagnostics = vec![Diagnostic {
+            message: "cached".to_string(),
+            ..Default::default()
+        }];
+
+        assert_eq!(
+            resolve_current(
+                &pool,
+                &key,
+                None,
+                DownstreamDiagnosticReport::Full {
+                    result_id: Some("r1".to_string()),
+                    diagnostics: diagnostics.clone(),
+                },
+            ),
+            diagnostics
+        );
+        let baseline = pool
+            .diagnostic_pull_baselines
+            .get(&key)
+            .map(|entry| entry.value().clone());
+        assert_eq!(
+            baseline.as_ref().map(|entry| entry.result_id.as_str()),
+            Some("r1")
+        );
+        assert_eq!(
+            resolve_current(
+                &pool,
+                &key,
+                baseline,
+                DownstreamDiagnosticReport::Unchanged {
+                    result_id: "r2".to_string(),
+                },
+            ),
+            diagnostics
+        );
+        assert_eq!(
+            pool.diagnostic_pull_baselines.get(&key).unwrap().result_id,
+            "r2",
+            "unchanged advances to the resultId returned for the next pull"
+        );
+    }
+
+    #[test]
+    fn late_full_report_cannot_replace_a_newer_baseline() {
+        let pool = LanguageServerPool::new();
+        let key = (
+            super::super::super::pool::ConnectionKey::for_server("lua_ls"),
+            "kakehashi-virtual://region-1".to_string(),
+        );
+        let old = super::super::super::pool::DiagnosticPullBaseline {
+            result_id: "r1".to_string(),
+            diagnostics: std::sync::Arc::new(vec![Diagnostic::default()]),
+            request_sequence: 1,
+        };
+        pool.diagnostic_pull_baselines.insert(
+            key.clone(),
+            super::super::super::pool::DiagnosticPullBaseline {
+                result_id: "r2".to_string(),
+                diagnostics: std::sync::Arc::new(vec![Diagnostic {
+                    message: "new".to_string(),
+                    ..Default::default()
+                }]),
+                request_sequence: 2,
+            },
+        );
+
+        resolve_current(
+            &pool,
+            &key,
+            Some(old),
+            DownstreamDiagnosticReport::Full {
+                result_id: Some("late".to_string()),
+                diagnostics: vec![Diagnostic {
+                    message: "late".to_string(),
+                    ..Default::default()
+                }],
+            },
+        );
+
+        let current = pool.diagnostic_pull_baselines.get(&key).unwrap();
+        assert_eq!(current.result_id, "r2");
+        assert_eq!(current.diagnostics[0].message, "new");
+    }
+
+    #[test]
+    fn newer_request_wins_in_both_response_completion_orders() {
+        fn final_result_id(newer_completes_first: bool) -> String {
+            let pool = LanguageServerPool::new();
+            let key = (
+                super::super::super::pool::ConnectionKey::for_server("lua_ls"),
+                "kakehashi-virtual://region-1".to_string(),
+            );
+            pool.diagnostic_pull_baselines.insert(
+                key.clone(),
+                super::super::super::pool::DiagnosticPullBaseline {
+                    result_id: "r1".to_string(),
+                    diagnostics: std::sync::Arc::new(Vec::new()),
+                    request_sequence: 0,
+                },
+            );
+            pool.diagnostic_pull_applied_sequences
+                .insert(key.clone(), 0);
+            let older = test_snapshot(&pool, &key);
+            let newer = test_snapshot(&pool, &key);
+            let resolve = |snapshot, result_id: &str| {
+                pool.resolve_diagnostic_pull_report(
+                    &key,
+                    snapshot,
+                    DownstreamDiagnosticReport::Full {
+                        result_id: Some(result_id.to_string()),
+                        diagnostics: Vec::new(),
+                    },
+                    true,
+                );
+            };
+            if newer_completes_first {
+                resolve(newer, "r3");
+                resolve(older, "r2");
+            } else {
+                resolve(older, "r2");
+                resolve(newer, "r3");
+            }
+            pool.diagnostic_pull_baselines
+                .get(&key)
+                .unwrap()
+                .result_id
+                .clone()
+        }
+
+        assert_eq!(final_result_id(false), "r3");
+        assert_eq!(final_result_id(true), "r3");
+    }
+
+    #[test]
+    fn newer_malformed_report_fences_an_older_full_report() {
+        let pool = LanguageServerPool::new();
+        let key = (
+            super::super::super::pool::ConnectionKey::for_server("lua_ls"),
+            "kakehashi-virtual://region-1".to_string(),
+        );
+        pool.diagnostic_pull_baselines.insert(
+            key.clone(),
+            super::super::super::pool::DiagnosticPullBaseline {
+                result_id: "r1".to_string(),
+                diagnostics: std::sync::Arc::new(Vec::new()),
+                request_sequence: 0,
+            },
+        );
+        let older = test_snapshot(&pool, &key);
+        let newer = test_snapshot(&pool, &key);
+
+        pool.record_failed_diagnostic_pull(&key, newer, true);
+        pool.resolve_diagnostic_pull_report(
+            &key,
+            older,
+            DownstreamDiagnosticReport::Full {
+                result_id: Some("late".to_string()),
+                diagnostics: Vec::new(),
+            },
+            true,
+        );
+
+        assert_eq!(
+            pool.diagnostic_pull_baselines.get(&key).unwrap().result_id,
+            "r1",
+            "the older successful response must not supersede a newer malformed response"
+        );
+    }
+
+    #[test]
+    fn stale_lineage_cannot_remove_a_newer_baseline() {
+        let pool = LanguageServerPool::new();
+        let key = (
+            super::super::super::pool::ConnectionKey::for_server("lua_ls"),
+            "kakehashi-virtual://region-1".to_string(),
+        );
+        pool.diagnostic_pull_baselines.insert(
+            key.clone(),
+            super::super::super::pool::DiagnosticPullBaseline {
+                result_id: "r1".to_string(),
+                diagnostics: std::sync::Arc::new(Vec::new()),
+                request_sequence: 3,
+            },
+        );
+        pool.diagnostic_pull_applied_sequences
+            .insert(key.clone(), 3);
+        let old = super::super::super::pool::DiagnosticPullBaseline {
+            result_id: "r1".to_string(),
+            diagnostics: std::sync::Arc::new(Vec::new()),
+            request_sequence: 1,
+        };
+
+        resolve_current(&pool, &key, Some(old), DownstreamDiagnosticReport::Null);
+
+        assert_eq!(
+            pool.diagnostic_pull_baselines.get(&key).unwrap().result_id,
+            "r1"
+        );
+    }
+
+    #[test]
+    fn document_close_fences_a_response_from_the_previous_incarnation() {
+        let pool = LanguageServerPool::new();
+        let key = (
+            super::super::super::pool::ConnectionKey::for_server("lua_ls"),
+            "kakehashi-virtual://region-1".to_string(),
+        );
+        let snapshot = test_snapshot(&pool, &key);
+        pool.invalidate_diagnostic_document(&key);
+
+        pool.resolve_diagnostic_pull_report(
+            &key,
+            snapshot,
+            DownstreamDiagnosticReport::Full {
+                result_id: Some("old".to_string()),
+                diagnostics: Vec::new(),
+            },
+            true,
+        );
+
+        assert!(!pool.diagnostic_pull_baselines.contains_key(&key));
+    }
+
+    #[test]
+    fn host_close_fences_a_first_pull_not_yet_tracked_downstream() {
+        let pool = LanguageServerPool::new();
+        let host = Url::parse("file:///host.md").unwrap();
+        let key = (
+            super::super::super::pool::ConnectionKey::for_server("lua_ls"),
+            "kakehashi-virtual://region-1".to_string(),
+        );
+        let (host_generation, request_sequence) = pool.begin_diagnostic_pull(&host);
+        // Close lands while the first pull awaits connection readiness, before
+        // it can create a downstream cache key/snapshot.
+        pool.invalidate_diagnostic_host(&host);
+        assert!(
+            !pool.diagnostic_host_generations.contains_key(host.as_str()),
+            "closed hosts must not remain retained"
+        );
+        let snapshot =
+            pool.diagnostic_pull_snapshot(&key, host.as_str(), host_generation, request_sequence);
+
+        // No downstream document/baseline existed when close ran.
+        pool.resolve_diagnostic_pull_report(
+            &key,
+            snapshot,
+            DownstreamDiagnosticReport::Full {
+                result_id: Some("old-incarnation".to_string()),
+                diagnostics: Vec::new(),
+            },
+            true,
+        );
+
+        assert!(!pool.diagnostic_pull_baselines.contains_key(&key));
+
+        let (reopened_generation, _) = pool.begin_diagnostic_pull(&host);
+        assert_ne!(
+            reopened_generation, host_generation,
+            "a reopen must receive a fresh incarnation after pruning"
+        );
+    }
+
+    #[test]
+    fn settings_invalidation_is_atomic_with_baseline_snapshot_and_resolution() {
+        let pool = LanguageServerPool::new();
+        let key = (
+            super::super::super::pool::ConnectionKey::for_server("lua_ls"),
+            "kakehashi-virtual://region-1".to_string(),
+        );
+        pool.diagnostic_pull_baselines.insert(
+            key.clone(),
+            super::super::super::pool::DiagnosticPullBaseline {
+                result_id: "r1".to_string(),
+                diagnostics: std::sync::Arc::new(vec![Diagnostic {
+                    message: "old settings".to_string(),
+                    ..Default::default()
+                }]),
+                request_sequence: 1,
+            },
+        );
+        let snapshot = test_snapshot(&pool, &key);
+
+        pool.invalidate_diagnostic_connections(std::slice::from_ref(&key.0));
+        let diagnostics = pool.resolve_diagnostic_pull_report(
+            &key,
+            snapshot,
+            DownstreamDiagnosticReport::Unchanged {
+                result_id: "r2".to_string(),
+            },
+            true,
+        );
+
+        assert!(diagnostics.is_empty());
+        assert!(!pool.diagnostic_pull_baselines.contains_key(&key));
+    }
+
+    #[test]
+    fn unrelated_connection_invalidation_preserves_in_flight_unchanged() {
+        let pool = LanguageServerPool::new();
+        let affected = super::super::super::pool::ConnectionKey::for_server("lua_ls_a");
+        let key = (
+            super::super::super::pool::ConnectionKey::for_server("lua_ls_b"),
+            "kakehashi-virtual://region-1".to_string(),
+        );
+        pool.diagnostic_pull_baselines.insert(
+            key.clone(),
+            super::super::super::pool::DiagnosticPullBaseline {
+                result_id: "r1".to_string(),
+                diagnostics: std::sync::Arc::new(vec![Diagnostic {
+                    message: "unrelated".to_string(),
+                    ..Default::default()
+                }]),
+                request_sequence: 0,
+            },
+        );
+        pool.diagnostic_pull_applied_sequences
+            .insert(key.clone(), 0);
+        let snapshot = test_snapshot(&pool, &key);
+
+        pool.invalidate_diagnostic_connections(std::slice::from_ref(&affected));
+        let diagnostics = pool.resolve_diagnostic_pull_report(
+            &key,
+            snapshot,
+            DownstreamDiagnosticReport::Unchanged {
+                result_id: "r2".to_string(),
+            },
+            true,
+        );
+
+        assert_eq!(diagnostics[0].message, "unrelated");
+        assert_eq!(
+            pool.diagnostic_pull_baselines.get(&key).unwrap().result_id,
+            "r2"
+        );
+    }
 
     #[test]
     fn diagnostic_response_transforms_range_to_host_coordinates() {
@@ -386,7 +1006,7 @@ mod tests {
     }
 
     #[test]
-    fn diagnostic_response_unchanged_kind_returns_empty() {
+    fn spurious_diagnostic_unchanged_without_baseline_returns_empty() {
         let response = json!({
             "jsonrpc": "2.0",
             "id": 42,
@@ -398,7 +1018,7 @@ mod tests {
 
         let diagnostics =
             transform_diagnostic_response_to_host(response, &RegionOffset::new(5, 0), "unused")
-                .expect("unchanged is an authoritative empty result, not a failure");
+                .expect("spurious unchanged without a baseline stays empty, not a failure");
         assert!(diagnostics.is_empty());
     }
 
