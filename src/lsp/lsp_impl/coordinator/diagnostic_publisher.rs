@@ -764,6 +764,15 @@ impl DiagnosticPublisher {
         changed
     }
 
+    /// Re-evaluate the editor-facing publish contract after a settings reload,
+    /// even when the cached diagnostic set itself is unchanged. In particular,
+    /// a set recorded while the wire was sealed must be emitted when the new
+    /// settings unseal it.
+    pub(crate) async fn republish_after_settings_change(&self, host: &Url) -> RepublishOutcome {
+        self.aggregator.forget_published(host);
+        self.republish(host).await
+    }
+
     /// Re-run [`Self::republish`] for `host` once the quiet window elapses or
     /// settings change, sending or re-gating the latest withheld set. At most one
     /// task is parked per host at a time ([`WireAdmit::Defer`]'s
@@ -1531,6 +1540,42 @@ mod tests {
             RepublishOutcome::Unchanged,
             "the sealed set was recorded as last-published, so a re-merge is unchanged"
         );
+    }
+
+    #[tokio::test]
+    async fn settings_change_republishes_an_unchanged_set_after_unsealing() {
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+        register_rust(server);
+        server
+            .settings_manager
+            .apply_settings(rust_settings_with_publish_seal());
+        let uri = Url::parse("file:///test/live_unseal.rs").unwrap();
+        server.documents.insert(
+            uri.clone(),
+            "fn main() {}".to_string(),
+            Some("rust".to_string()),
+            None,
+        );
+        let publisher = DiagnosticPublisher::new(server);
+        server.diagnostics.record(
+            &uri,
+            DiagnosticSource::Host,
+            "rust_ls".to_string(),
+            Some(ProgressConnectionId::for_test(1)),
+            vec![diag("boom")],
+        );
+
+        assert_eq!(publisher.republish(&uri).await, RepublishOutcome::Changed);
+        assert_eq!(publisher.republish(&uri).await, RepublishOutcome::Unchanged);
+
+        server.settings_manager.apply_settings(rust_settings(true));
+        assert_eq!(
+            publisher.republish_after_settings_change(&uri).await,
+            RepublishOutcome::Changed,
+            "unsealing must force the already-recorded set onto the wire"
+        );
+        assert!(!server.diagnostics.wire_gate_is_dirty(&uri));
     }
 
     #[tokio::test]

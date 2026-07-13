@@ -477,7 +477,7 @@ impl Kakehashi {
         raw_settings: RawWorkspaceSettings,
         settings: WorkspaceSettings,
     ) {
-        apply_shared_settings(
+        let reparse_uris = apply_shared_settings(
             &self.client,
             ReloadLanguageState {
                 language: &self.language,
@@ -492,9 +492,24 @@ impl Kakehashi {
             Some(raw_settings),
             settings,
         )
-        .await
-        .into_iter()
-        .for_each(|uri| self.schedule_reparse(uri, None));
+        .await;
+        let publisher = DiagnosticPublisher::new(self);
+        // Preserve the old prompt scheduling contract: outbound notification
+        // backpressure for one host must not delay reparsing every later host.
+        for uri in &reparse_uris {
+            self.schedule_reparse(uri.clone(), None);
+        }
+        // A configuration replacement can change the proactive diagnostic wire
+        // contract even when the cached merge is byte-identical (for example,
+        // unsealing publishDiagnostics). Re-evaluate every host concurrently;
+        // the scheduled reparses remain the geometry backstop where invalidated
+        // region offsets make an immediate republish defer.
+        futures::future::join_all(
+            reparse_uris
+                .iter()
+                .map(|uri| publisher.republish_after_settings_change(uri)),
+        )
+        .await;
         self.warn_on_misconfigured_settings().await;
     }
 
