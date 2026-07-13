@@ -1953,18 +1953,31 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn advertises_execute_command_checks_the_exact_name() {
-        let handle = spawn_sink_handle().await;
-        handle.set_server_capabilities(ServerCapabilities {
+    async fn replacement_rejects_a_removed_execute_command_name() {
+        let original = spawn_sink_handle().await;
+        original.set_server_capabilities(ServerCapabilities {
             execute_command_provider: Some(tower_lsp_server::ls_types::ExecuteCommandOptions {
                 commands: vec!["source.fixAll".to_string()],
                 work_done_progress_options: Default::default(),
             }),
             ..Default::default()
         });
+        assert!(original.advertises_execute_command("source.fixAll"));
 
-        assert!(handle.advertises_execute_command("source.fixAll"));
-        assert!(!handle.advertises_execute_command("source.organizeImports"));
+        let replacement = spawn_sink_handle().await;
+        replacement.set_server_capabilities(ServerCapabilities {
+            execute_command_provider: Some(tower_lsp_server::ls_types::ExecuteCommandOptions {
+                commands: vec!["source.organizeImports".to_string()],
+                work_done_progress_options: Default::default(),
+            }),
+            ..Default::default()
+        });
+
+        assert!(replacement.advertises_execute_command("source.organizeImports"));
+        assert!(
+            !replacement.advertises_execute_command("source.fixAll"),
+            "a replacement must not inherit a historical raw command name"
+        );
     }
 
     /// Test has_capability returns true with static capability only.

@@ -306,15 +306,15 @@ impl LanguageServerPool {
                 return None;
             }
         };
-        if !handle.has_capability(METHOD) {
-            // The advertising connection was Ready (capabilities set) when it
-            // registered the command, but the RECONNECT path can hand back a
-            // still-`Initializing` handle whose capabilities aren't set yet, so
-            // this is reachable. Warn rather than drop silently (every other
-            // failure branch warns) so a fail-soft `null` is diagnosable.
+        if !handle.advertises_execute_command(&params.command) {
+            // Revalidate the exact command on the handle fetched after the live
+            // snapshot. A no-live fallback may reconnect to an upgraded server,
+            // or the snapshotted handle may be replaced under the same key; mere
+            // provider presence must not forward a historical command the new
+            // process removed (#823).
             warn!(
                 target: "kakehashi::bridge",
-                "executeCommand: origin {origin:?} for palette command {:?} does not (yet) advertise executeCommandProvider; ignoring",
+                "executeCommand: origin {origin:?} no longer advertises palette command {:?}; ignoring",
                 params.command
             );
             return None;
