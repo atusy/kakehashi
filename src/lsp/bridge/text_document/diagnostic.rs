@@ -154,7 +154,7 @@ impl LanguageServerPool {
         if !lineage_is_current {
             return match report {
                 DownstreamDiagnosticReport::Full { diagnostics, .. } => diagnostics,
-                DownstreamDiagnosticReport::Unchanged | DownstreamDiagnosticReport::Null => {
+                DownstreamDiagnosticReport::Unchanged { .. } | DownstreamDiagnosticReport::Null => {
                     Vec::new()
                 }
             };
@@ -180,12 +180,22 @@ impl LanguageServerPool {
                 }
                 diagnostics
             }
-            DownstreamDiagnosticReport::Unchanged => diagnostics_for_unchanged_baseline(
-                snapshot
-                    .baseline
-                    .as_ref()
-                    .map(|entry| entry.diagnostics.as_slice()),
-            ),
+            DownstreamDiagnosticReport::Unchanged { result_id } => {
+                if let Some(baseline) = &snapshot.baseline {
+                    self.store_diagnostic_baseline_if_current(
+                        cache_key,
+                        previous_revision,
+                        result_id,
+                        baseline.diagnostics.as_ref().clone(),
+                    );
+                }
+                diagnostics_for_unchanged_baseline(
+                    snapshot
+                        .baseline
+                        .as_ref()
+                        .map(|entry| entry.diagnostics.as_slice()),
+                )
+            }
             DownstreamDiagnosticReport::Null => {
                 self.diagnostic_pull_baselines
                     .remove_if(cache_key, |_, entry| {
@@ -292,7 +302,9 @@ fn transform_diagnostic_response_to_host(
     let report = parse_downstream_diagnostic_report(response)?;
     let mut diagnostics = match report {
         DownstreamDiagnosticReport::Full { diagnostics, .. } => diagnostics,
-        DownstreamDiagnosticReport::Unchanged | DownstreamDiagnosticReport::Null => Vec::new(),
+        DownstreamDiagnosticReport::Unchanged { .. } | DownstreamDiagnosticReport::Null => {
+            Vec::new()
+        }
     };
     for diag in &mut diagnostics {
         transform_diagnostic(diag, offset, host_uri);
@@ -305,7 +317,9 @@ pub(super) enum DownstreamDiagnosticReport {
         result_id: Option<String>,
         diagnostics: Vec<Diagnostic>,
     },
-    Unchanged,
+    Unchanged {
+        result_id: String,
+    },
     Null,
 }
 
@@ -336,7 +350,11 @@ pub(super) fn parse_downstream_diagnostic_report(
             result_id: report.full_document_diagnostic_report.result_id,
             diagnostics: report.full_document_diagnostic_report.items,
         }),
-        Ok(DocumentDiagnosticReport::Unchanged(_)) => Ok(DownstreamDiagnosticReport::Unchanged),
+        Ok(DocumentDiagnosticReport::Unchanged(report)) => {
+            Ok(DownstreamDiagnosticReport::Unchanged {
+                result_id: report.unchanged_document_diagnostic_report.result_id,
+            })
+        }
         Err(err) => {
             log::warn!(
                 target: "kakehashi::bridge",
@@ -455,8 +473,20 @@ mod tests {
             Some("r1")
         );
         assert_eq!(
-            resolve_current(&pool, &key, baseline, DownstreamDiagnosticReport::Unchanged,),
+            resolve_current(
+                &pool,
+                &key,
+                baseline,
+                DownstreamDiagnosticReport::Unchanged {
+                    result_id: "r2".to_string(),
+                },
+            ),
             diagnostics
+        );
+        assert_eq!(
+            pool.diagnostic_pull_baselines.get(&key).unwrap().result_id,
+            "r2",
+            "unchanged advances to the resultId returned for the next pull"
         );
     }
 
@@ -623,7 +653,9 @@ mod tests {
         let diagnostics = pool.resolve_diagnostic_pull_report(
             &key,
             snapshot,
-            DownstreamDiagnosticReport::Unchanged,
+            DownstreamDiagnosticReport::Unchanged {
+                result_id: "r2".to_string(),
+            },
             true,
         );
 

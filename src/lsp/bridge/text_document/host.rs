@@ -652,7 +652,7 @@ fn parse_host_diagnostic_response(
     }
     match super::diagnostic::parse_downstream_diagnostic_report(response)? {
         super::diagnostic::DownstreamDiagnosticReport::Full { diagnostics, .. } => Ok(diagnostics),
-        super::diagnostic::DownstreamDiagnosticReport::Unchanged
+        super::diagnostic::DownstreamDiagnosticReport::Unchanged { .. }
         | super::diagnostic::DownstreamDiagnosticReport::Null => Ok(Vec::new()),
     }
 }
