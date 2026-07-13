@@ -37,8 +37,20 @@ impl WorkspaceFolderSet {
     /// the connection has no folders to advertise).
     pub(crate) fn new(initial: Option<Vec<WorkspaceFolder>>) -> Self {
         Self {
-            inner: Arc::new(Mutex::new(initial)),
+            inner: Arc::new(Mutex::new(Self::deduplicate(initial))),
         }
+    }
+
+    fn deduplicate(folders: Option<Vec<WorkspaceFolder>>) -> Option<Vec<WorkspaceFolder>> {
+        folders.map(|folders| {
+            let mut unique = Vec::<WorkspaceFolder>::with_capacity(folders.len());
+            for folder in folders {
+                if !unique.iter().any(|existing| existing.uri == folder.uri) {
+                    unique.push(folder);
+                }
+            }
+            unique
+        })
     }
 
     /// Snapshot the current folders for answering a `workspace/workspaceFolders`
@@ -50,6 +62,15 @@ impl WorkspaceFolderSet {
             .clone()
     }
 
+    /// Replace the complete set, preserving the protocol distinction between
+    /// `None` (`null`) and `Some(vec![])` (an explicitly empty folder list).
+    pub(crate) fn replace(&self, folders: Option<Vec<WorkspaceFolder>>) {
+        *self
+            .inner
+            .lock()
+            .recover_poison("WorkspaceFolderSet::replace") = Self::deduplicate(folders);
+    }
+
     /// Whether a folder with `folder`'s URI is already in the set.
     pub(crate) fn contains(&self, folder: &WorkspaceFolder) -> bool {
         self.inner
@@ -57,6 +78,26 @@ impl WorkspaceFolderSet {
             .recover_poison("WorkspaceFolderSet::contains")
             .as_ref()
             .is_some_and(|folders| folders.iter().any(|existing| existing.uri == folder.uri))
+    }
+
+    /// Apply an upstream workspace-folder change atomically. Removals match by
+    /// URI (folder names are display metadata), then additions append in event
+    /// order while preserving URI uniqueness.
+    pub(crate) fn apply_change(&self, added: Vec<WorkspaceFolder>, removed: &[WorkspaceFolder]) {
+        let mut guard = self
+            .inner
+            .lock()
+            .recover_poison("WorkspaceFolderSet::apply_change");
+        if guard.is_none() && added.is_empty() {
+            return;
+        }
+        let folders = guard.get_or_insert_with(Vec::new);
+        folders.retain(|existing| !removed.iter().any(|item| item.uri == existing.uri));
+        for folder in added {
+            if !folders.iter().any(|existing| existing.uri == folder.uri) {
+                folders.push(folder);
+            }
+        }
     }
 
     /// Atomically add `folder` and announce it, returning whether the set now
@@ -119,6 +160,19 @@ mod tests {
     }
 
     #[test]
+    fn initial_and_replacement_snapshots_are_uri_unique() {
+        let renamed_a = WorkspaceFolder {
+            uri: folder("file:///a").uri,
+            name: "renamed".to_string(),
+        };
+        let set = WorkspaceFolderSet::new(Some(vec![folder("file:///a"), renamed_a.clone()]));
+        assert_eq!(set.snapshot(), Some(vec![folder("file:///a")]));
+
+        set.replace(Some(vec![renamed_a.clone(), folder("file:///a")]));
+        assert_eq!(set.snapshot(), Some(vec![renamed_a]));
+    }
+
+    #[test]
     fn add_and_announce_commits_only_on_successful_announce() {
         let set = WorkspaceFolderSet::new(Some(vec![folder("file:///a")]));
 
@@ -163,5 +217,47 @@ mod tests {
         let set = WorkspaceFolderSet::new(None);
         assert!(set.add_and_announce(folder("file:///a"), || true));
         assert_eq!(set.snapshot(), Some(vec![folder("file:///a")]));
+    }
+
+    #[test]
+    fn apply_change_removes_by_uri_and_adds_without_duplicates() {
+        let set = WorkspaceFolderSet::new(Some(vec![folder("file:///a"), folder("file:///b")]));
+
+        set.apply_change(
+            vec![folder("file:///b"), folder("file:///c")],
+            &[folder("file:///a")],
+        );
+
+        assert_eq!(
+            set.snapshot(),
+            Some(vec![folder("file:///b"), folder("file:///c")])
+        );
+    }
+
+    #[test]
+    fn add_to_none_materializes_folder_set() {
+        let set = WorkspaceFolderSet::new(None);
+
+        set.apply_change(vec![folder("file:///a")], &[]);
+
+        assert_eq!(set.snapshot(), Some(vec![folder("file:///a")]));
+    }
+
+    #[test]
+    fn removal_only_change_preserves_a_none_set() {
+        let set = WorkspaceFolderSet::new(None);
+
+        set.apply_change(Vec::new(), &[folder("file:///absent")]);
+
+        assert_eq!(set.snapshot(), None);
+    }
+
+    #[test]
+    fn replace_preserves_an_explicit_empty_set() {
+        let set = WorkspaceFolderSet::new(None);
+
+        set.replace(Some(Vec::new()));
+
+        assert_eq!(set.snapshot(), Some(Vec::new()));
     }
 }

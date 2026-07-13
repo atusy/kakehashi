@@ -19,6 +19,7 @@ use tower_lsp_server::ls_types::{
     SemanticTokensServerCapabilities, ServerCapabilities, ServerInfo, SignatureHelpOptions,
     TextDocumentSyncCapability, TextDocumentSyncKind, TextDocumentSyncOptions,
     TextDocumentSyncSaveOptions, TypeDefinitionProviderCapability, Uri, WorkDoneProgressOptions,
+    WorkspaceFoldersServerCapabilities, WorkspaceServerCapabilities,
 };
 use url::Url;
 
@@ -60,6 +61,16 @@ fn host_position_encoding(capabilities: &ClientCapabilities) -> Option<PositionE
         .as_ref()
         .and_then(|general| general.position_encodings.as_ref())
         .map(|_| PositionEncodingKind::UTF16)
+}
+
+fn workspace_server_capabilities() -> WorkspaceServerCapabilities {
+    WorkspaceServerCapabilities {
+        workspace_folders: Some(WorkspaceFoldersServerCapabilities {
+            supported: Some(true),
+            change_notifications: Some(OneOf::Left(true)),
+        }),
+        file_operations: None,
+    }
 }
 
 impl Kakehashi {
@@ -180,10 +191,11 @@ impl Kakehashi {
         }
 
         let root_path = self.settings_manager.root_path().as_ref().clone();
+        let initialization_options = params.initialization_options;
         let settings_outcome = load_settings(
             root_path.as_deref(),
-            params
-                .initialization_options
+            initialization_options
+                .clone()
                 .map(|options| (SettingsSource::InitializationOptions, options)),
             self.home_dir.as_deref(),
             |var| std::env::var(var).ok(),
@@ -239,6 +251,11 @@ impl Kakehashi {
             };
             (raw_settings, settings)
         };
+        self.client_settings_override.store(
+            initialization_options
+                .and_then(|value| serde_json::from_value(value).ok())
+                .map(std::sync::Arc::new),
+        );
         // Derive the onTypeFormatting trigger union before settings move into
         // apply_raw_settings: kakehashi cannot know downstream trigger
         // characters at initialize time (servers spawn lazily), so the
@@ -451,6 +468,7 @@ impl Kakehashi {
                         ..Default::default()
                     },
                 )),
+                workspace: Some(workspace_server_capabilities()),
                 experimental: Some(serde_json::json!({
                     "kakehashi": {
                         "wrappedDidChangeConfigurationSettings": true,
@@ -1630,6 +1648,16 @@ mod tests {
             None,
             "omitted capability uses the protocol's UTF-16 default",
         );
+    }
+
+    #[test]
+    fn workspace_capabilities_request_folder_change_notifications() {
+        let workspace = workspace_server_capabilities();
+        let folders = workspace
+            .workspace_folders
+            .expect("workspace folder capability");
+        assert_eq!(folders.supported, Some(true));
+        assert_eq!(folders.change_notifications, Some(OneOf::Left(true)));
     }
 
     /// A throwaway cancel context for tests that don't exercise cancellation.

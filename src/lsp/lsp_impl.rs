@@ -22,19 +22,19 @@ use tower_lsp_server::ls_types::request::{
 use tower_lsp_server::ls_types::{
     CodeAction, CodeActionParams, CodeActionResponse, CodeLens, CodeLensParams, CompletionItem,
     CompletionParams, CompletionResponse, DidChangeConfigurationParams,
-    DidChangeTextDocumentParams, DidCloseTextDocumentParams, DidOpenTextDocumentParams,
-    DidSaveTextDocumentParams, DocumentDiagnosticParams, DocumentDiagnosticReportResult,
-    DocumentFormattingParams, DocumentHighlight, DocumentHighlightParams, DocumentLink,
-    DocumentLinkParams, DocumentOnTypeFormattingParams, DocumentRangeFormattingParams,
-    DocumentSymbolParams, DocumentSymbolResponse, ExecuteCommandParams, FoldingRange,
-    FoldingRangeParams, GotoDefinitionParams, GotoDefinitionResponse, Hover, HoverParams,
-    InitializeParams, InitializeResult, InitializedParams, InlayHint, InlayHintParams,
-    LinkedEditingRangeParams, LinkedEditingRanges, Location, Moniker, MonikerParams,
-    PrepareRenameResponse, ReferenceParams, RenameParams, SelectionRange, SelectionRangeParams,
-    SemanticTokensDeltaParams, SemanticTokensFullDeltaResult, SemanticTokensParams,
-    SemanticTokensRangeParams, SemanticTokensRangeResult, SemanticTokensResult, SignatureHelp,
-    SignatureHelpParams, TextDocumentPositionParams, TextEdit, Uri, WillSaveTextDocumentParams,
-    WorkspaceEdit,
+    DidChangeTextDocumentParams, DidChangeWorkspaceFoldersParams, DidCloseTextDocumentParams,
+    DidOpenTextDocumentParams, DidSaveTextDocumentParams, DocumentDiagnosticParams,
+    DocumentDiagnosticReportResult, DocumentFormattingParams, DocumentHighlight,
+    DocumentHighlightParams, DocumentLink, DocumentLinkParams, DocumentOnTypeFormattingParams,
+    DocumentRangeFormattingParams, DocumentSymbolParams, DocumentSymbolResponse,
+    ExecuteCommandParams, FoldingRange, FoldingRangeParams, GotoDefinitionParams,
+    GotoDefinitionResponse, Hover, HoverParams, InitializeParams, InitializeResult,
+    InitializedParams, InlayHint, InlayHintParams, LinkedEditingRangeParams, LinkedEditingRanges,
+    Location, Moniker, MonikerParams, PrepareRenameResponse, ReferenceParams, RenameParams,
+    SelectionRange, SelectionRangeParams, SemanticTokensDeltaParams, SemanticTokensFullDeltaResult,
+    SemanticTokensParams, SemanticTokensRangeParams, SemanticTokensRangeResult,
+    SemanticTokensResult, SignatureHelp, SignatureHelpParams, TextDocumentPositionParams, TextEdit,
+    Uri, WillSaveTextDocumentParams, WorkspaceEdit,
 };
 use tower_lsp_server::ls_types::{
     ColorInformation, ColorPresentation, ColorPresentationParams, DocumentColorParams,
@@ -269,6 +269,10 @@ pub struct Kakehashi {
     cache: std::sync::Arc<CacheCoordinator>,
     /// Consolidated settings, capabilities, and workspace root management
     settings_manager: std::sync::Arc<SettingsManager>,
+    /// Client-supplied settings kept separate from the merged effective
+    /// snapshot so a workspace-root change can reload project configuration
+    /// without carrying values from the previous project forward.
+    client_settings_override: arc_swap::ArcSwapOption<RawWorkspaceSettings>,
     /// Isolated coordinator for parser auto-installation
     auto_install: AutoInstallManager,
     /// Bridge coordinator for downstream LS pool and node tracking
@@ -416,6 +420,7 @@ impl Kakehashi {
             documents: std::sync::Arc::new(DocumentStore::new()),
             cache: std::sync::Arc::new(CacheCoordinator::new()),
             settings_manager: std::sync::Arc::new(SettingsManager::new()),
+            client_settings_override: arc_swap::ArcSwapOption::empty(),
             auto_install,
             bridge: std::sync::Arc::new(bridge),
             synthetic_diagnostics: std::sync::Arc::new(SyntheticDiagnosticsManager::new()),
@@ -752,6 +757,10 @@ impl LanguageServer for Kakehashi {
 
     async fn did_change_configuration(&self, params: DidChangeConfigurationParams) {
         self.did_change_configuration_impl(params).await
+    }
+
+    async fn did_change_workspace_folders(&self, params: DidChangeWorkspaceFoldersParams) {
+        self.did_change_workspace_folders_impl(params).await
     }
 
     async fn semantic_tokens_full(
