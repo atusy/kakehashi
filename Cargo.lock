@@ -171,18 +171,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "cap-std"
-version = "4.0.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7281235d6e96d3544ca18bba9049be92f4190f8d923e3caef1b5f66cfa752608"
-dependencies = [
- "cap-primitives",
- "io-extras",
- "io-lifetimes 3.0.1",
- "rustix 1.1.4",
-]
-
-[[package]]
 name = "cc"
 version = "1.2.66"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1037,7 +1025,6 @@ version = "0.8.0"
 dependencies = [
  "arc-swap",
  "cap-primitives",
- "cap-std",
  "clap",
  "dashmap",
  "dirs",

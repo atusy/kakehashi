@@ -498,8 +498,16 @@ fn open_query_language_dir_nofollow(queries_dir: &Path) -> std::io::Result<fs::F
     let name = queries_dir
         .file_name()
         .ok_or_else(|| std::io::Error::other("query language directory has no name"))?;
-    let parent = cap_std::fs::Dir::open_ambient_dir(parent, cap_std::ambient_authority())?;
-    let parent = parent.into_std_file();
+    let mut parent_options = query_directory_open_options();
+    parent_options._cap_fs_ext_maybe_dir(true);
+    let parent = cap_primitives::fs::open_ambient(
+        parent,
+        &parent_options,
+        cap_primitives::ambient_authority(),
+    )?;
+    if !parent.metadata()?.is_dir() {
+        return Err(std::io::Error::other("queries parent is not a directory"));
+    }
     let mut options = query_directory_open_options();
     options
         ._cap_fs_ext_follow(FollowSymlinks::No)
@@ -1246,13 +1254,23 @@ mod tests {
         fs::create_dir_all(&queries_dir).unwrap();
         fs::write(queries_dir.join("highlights.scm"), "(comment) @comment").unwrap();
         fs::set_permissions(&queries_dir, fs::Permissions::from_mode(0o111)).unwrap();
+        fs::set_permissions(
+            queries_dir.parent().unwrap(),
+            fs::Permissions::from_mode(0o111),
+        )
+        .unwrap();
 
         let complete = query_install_is_complete(&queries_dir);
 
+        fs::set_permissions(
+            queries_dir.parent().unwrap(),
+            fs::Permissions::from_mode(0o700),
+        )
+        .unwrap();
         fs::set_permissions(&queries_dir, fs::Permissions::from_mode(0o700)).unwrap();
         assert!(
             complete,
-            "known query files in a searchable directory remain inspectable"
+            "known query files under searchable directories remain inspectable"
         );
     }
 
