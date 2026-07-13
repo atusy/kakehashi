@@ -545,7 +545,11 @@ fn is_bidi_control(ch: char) -> bool {
 }
 
 fn escape_jsonl_terminal_controls(json: String) -> String {
-    let requires_escape = |ch: char| (ch.is_control() && ch >= '\u{7f}') || is_bidi_control(ch);
+    let requires_escape = |ch: char| {
+        (ch.is_control() && ch >= '\u{7f}')
+            || is_bidi_control(ch)
+            || matches!(ch, '\u{2028}' | '\u{2029}')
+    };
     if !json.chars().any(requires_escape) {
         return json;
     }
@@ -788,6 +792,22 @@ mod tests {
         assert_eq!(value["file"], "dir/\u{1b}[2Jfile");
         assert_eq!(value["message"], "boom\u{1b}[31m\u{202e}");
         assert_eq!(value["source"], "tool\u{7f}\u{009b}\u{2066}");
+    }
+
+    #[test]
+    fn jsonl_escapes_unicode_line_separators() {
+        let d = diag(
+            0,
+            0,
+            Some(DiagnosticSeverity::ERROR),
+            "before\u{2028}middle\u{2029}after",
+        );
+
+        let rendered = format_diagnostic(OutputFormat::Jsonl, "x", &d);
+        assert!(rendered.contains("\\u2028"), "rendered: {rendered}");
+        assert!(rendered.contains("\\u2029"), "rendered: {rendered}");
+        let value: serde_json::Value = serde_json::from_str(&rendered).unwrap();
+        assert_eq!(value["message"], "before\u{2028}middle\u{2029}after");
     }
 
     #[test]
