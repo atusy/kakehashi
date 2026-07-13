@@ -564,8 +564,9 @@ impl LanguageServerPool {
                 .and_then(|folders| folders.first().map(|folder| folder.uri.to_string())),
         );
 
-        let connections = self.connections.lock().await;
-        for handle in connections.values().filter(|handle| {
+        let mut connections = self.connections.lock().await;
+        let mut invalidated = Vec::new();
+        for (key, handle) in connections.iter().filter(|(_, handle)| {
             handle.state() == ConnectionState::Ready && handle.supports_workspace_folder_changes()
         }) {
             let notification =
@@ -574,7 +575,28 @@ impl LanguageServerPool {
                 handle
                     .workspace_folders()
                     .apply_change(added.clone(), removed);
+            } else {
+                invalidated.push(key.clone());
             }
+        }
+        let mut stale_handles = Vec::new();
+        for key in invalidated {
+            if let Some(handle) = connections.get(&key) {
+                handle.begin_shutdown();
+            }
+            self.host_documents
+                .lock()
+                .await
+                .retain(|(_, connection_key), _| connection_key != &key);
+            self.document_tracker.purge_connection(&key).await;
+            self.purge_open_transition_locks(&key).await;
+            if let Some(handle) = connections.remove(&key) {
+                stale_handles.push((key, handle));
+            }
+        }
+        drop(connections);
+        for (key, handle) in stale_handles {
+            shutdown_invalidated_connection(key, handle);
         }
     }
 

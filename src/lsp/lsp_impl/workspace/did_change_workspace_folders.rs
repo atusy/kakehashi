@@ -2,7 +2,7 @@
 
 use tower_lsp_server::ls_types::DidChangeWorkspaceFoldersParams;
 
-use crate::config::WorkspaceSettings;
+use crate::config::{WorkspaceSettings, merge_workspace_settings};
 use crate::lsp::{SettingsSource, load_settings};
 
 use super::super::Kakehashi;
@@ -35,23 +35,28 @@ impl Kakehashi {
             |var| std::env::var(var).ok(),
         );
         self.notifier().log_settings_events(&outcome.events).await;
-        let (raw, settings) = if let Some(settings) = outcome.settings {
-            (
-                outcome
-                    .raw_settings
-                    .unwrap_or_else(|| crate::config::RawWorkspaceSettings::from(&settings)),
-                settings,
-            )
-        } else {
-            let raw = crate::config::defaults::default_settings();
-            let settings = WorkspaceSettings::try_from_settings(
-                &raw,
-                self.home_dir.as_deref(),
-                crate::config::expand::with_kakehashi_defaults(|var| std::env::var(var).ok()),
-            )
-            .unwrap_or_default();
-            (raw, settings)
+        let root_settings = outcome
+            .raw_settings
+            .unwrap_or_else(crate::config::defaults::default_settings);
+        let active_settings = self.settings_manager.load_raw_settings();
+        let Some(raw) =
+            merge_workspace_settings(Some(root_settings), Some((*active_settings).clone()))
+        else {
+            return;
         };
-        self.apply_initial_settings(raw, settings).await;
+        match WorkspaceSettings::try_from_settings(
+            &raw,
+            self.home_dir.as_deref(),
+            crate::config::expand::with_kakehashi_defaults(|var| std::env::var(var).ok()),
+        ) {
+            Ok(settings) => self.apply_raw_settings(raw, settings).await,
+            Err(error) => {
+                self.notifier()
+                    .log_warning(format!(
+                        "Workspace root changed, but reloaded settings were invalid: {error}"
+                    ))
+                    .await;
+            }
+        }
     }
 }
