@@ -224,10 +224,9 @@ impl InstallCoordinator {
                     break crate::lsp::auto_install::InstallOutcome::Failed;
                 }
             };
-            if let Some(data_dir) = terminal.data_dir()
+            if terminal.data_dir().is_some()
                 && self.same_document_incarnation(&uri, expected_incarnation)
             {
-                let _ = data_dir;
                 if !is_injection {
                     self.parse_coordinator()
                         .reparse_installed_document(uri.clone(), language, expected_incarnation)
