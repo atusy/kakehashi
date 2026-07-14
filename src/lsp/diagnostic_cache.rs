@@ -1156,6 +1156,7 @@ impl DiagnosticAggregator {
             .get_mut(host)
         {
             gate.last_activity_at = Some(tokio::time::Instant::now());
+            gate.stale_retry_started = false;
             gate.dirty = false;
         }
         true
@@ -1194,6 +1195,7 @@ impl DiagnosticAggregator {
             .get_mut(host)
         {
             gate.last_activity_at = Some(tokio::time::Instant::now());
+            gate.stale_retry_started = false;
             gate.dirty = false;
         }
         Some(true)
@@ -2208,10 +2210,24 @@ mod tests {
             agg.wire_debounce_admit(&host, debounce, max_wait, true),
             WireAdmit::Defer { .. }
         ));
+        assert!(agg.wire_gate_take_pending(&host));
+        assert!(
+            agg.wire_gate_schedule_latest(&host, debounce, max_wait)
+                .is_some()
+        );
 
         tokio::time::advance(std::time::Duration::from_millis(40)).await;
         assert!(agg.published_set_changed(&host, &[diag("A")]));
         assert!(agg.settle_wire_reversion(&host, &[diag("A")]));
+        assert!(
+            !agg.wire_gate
+                .lock()
+                .unwrap()
+                .get(&host)
+                .unwrap()
+                .stale_retry_started,
+            "settling all wire debt must reset stale retry backoff for the next cycle"
+        );
 
         tokio::time::advance(std::time::Duration::from_millis(65)).await;
         assert!(agg.published_set_changed(&host, &[diag("C")]));
