@@ -16,11 +16,69 @@
 
 use std::path::{Path, PathBuf};
 
+fn has_symlink_ancestor(
+    path: &Path,
+    boundary: Option<&Path>,
+    cache: &mut std::collections::HashMap<PathBuf, bool>,
+) -> bool {
+    let is_within_boundary = boundary.is_some_and(|boundary| path.starts_with(boundary));
+    path.ancestors()
+        .skip(1)
+        .take_while(|ancestor| {
+            !is_within_boundary || boundary.is_some_and(|boundary| ancestor.starts_with(boundary))
+        })
+        .any(|ancestor| {
+            if let Some(&is_symlink) = cache.get(ancestor) {
+                return is_symlink;
+            }
+            let is_symlink = std::fs::symlink_metadata(ancestor)
+                .is_ok_and(|metadata| metadata.file_type().is_symlink());
+            cache.insert(ancestor.to_path_buf(), is_symlink);
+            is_symlink
+        })
+}
+
 /// Files collected from CLI paths plus any non-fatal directory walk errors
 /// encountered while discovering them.
 pub(crate) struct CollectedFiles {
     pub(crate) files: Vec<PathBuf>,
     pub(crate) walk_errors: usize,
+}
+
+fn explicit_inputs_have_alias(inputs: &mut [(PathBuf, PathBuf, bool)]) -> bool {
+    inputs.sort_by(|left, right| left.1.cmp(&right.1).then_with(|| left.0.cmp(&right.0)));
+    let mut ancestors: Vec<usize> = Vec::new();
+    let mut previous = None;
+
+    for index in 0..inputs.len() {
+        let (lexical, resolved, is_dir) = &inputs[index];
+        if let Some(previous_index) = previous {
+            let previous: &(PathBuf, PathBuf, bool) = &inputs[previous_index];
+            if previous.1 == *resolved && previous.0 != *lexical {
+                return true;
+            }
+        }
+        while ancestors
+            .last()
+            .is_some_and(|&ancestor| !resolved.starts_with(&inputs[ancestor].1))
+        {
+            ancestors.pop();
+        }
+        for &ancestor in &ancestors {
+            let (ancestor_lexical, ancestor_resolved, _) = &inputs[ancestor];
+            let suffix = resolved
+                .strip_prefix(ancestor_resolved)
+                .expect("ancestor stack only contains resolved path prefixes");
+            if ancestor_lexical.join(suffix) != *lexical {
+                return true;
+            }
+        }
+        if *is_dir {
+            ancestors.push(index);
+        }
+        previous = Some(index);
+    }
+    false
 }
 
 /// Build the `--excludes` matcher: gitignore-style patterns rooted at `base`
@@ -61,26 +119,86 @@ pub(crate) fn collect_files(
 
     let mut files = Vec::new();
     let mut walk_errors = 0usize;
+    let mut explicit_inputs = Vec::new();
+    let mut ancestor_symlinks = std::collections::HashMap::new();
+    let mut has_outside_input = false;
     for path in paths {
         // Normalize before stat: a relative path must resolve against
         // `base`, not against whatever the process cwd happens to be.
         let path = normalize_path(base, path);
-        let metadata = std::fs::metadata(&path)
+        let link_metadata = std::fs::symlink_metadata(&path)
             .map_err(|e| format!("cannot access '{}': {e}", path.display()))?;
+        let is_symlink = link_metadata.file_type().is_symlink();
+        let metadata = if is_symlink {
+            std::fs::metadata(&path)
+                .map_err(|e| format!("cannot access '{}': {e}", path.display()))?
+        } else {
+            link_metadata
+        };
         if metadata.is_dir() {
             if is_excluded(&exclude_matcher, base, &path, true) {
                 continue;
+            }
+            if paths.len() > 1 {
+                has_outside_input |= !path.starts_with(base);
+                let has_alias =
+                    is_symlink || has_symlink_ancestor(&path, Some(base), &mut ancestor_symlinks);
+                explicit_inputs.push((path.clone(), true, has_alias));
             }
             walk_errors += walk_directory(&path, &exclude_matcher, is_supported, &mut files);
         } else {
             if is_excluded(&exclude_matcher, base, &path, false) {
                 continue;
             }
+            if paths.len() > 1 {
+                has_outside_input |= !path.starts_with(base);
+                let has_alias =
+                    is_symlink || has_symlink_ancestor(&path, Some(base), &mut ancestor_symlinks);
+                explicit_inputs.push((path.clone(), false, has_alias));
+            }
             files.push(path);
         }
     }
     files.sort();
-    files.dedup();
+    let may_have_explicit_alias = explicit_inputs.iter().any(|input| input.2)
+        || (has_outside_input && has_symlink_ancestor(base, None, &mut ancestor_symlinks));
+    let has_explicit_alias = if may_have_explicit_alias {
+        let mut identities = explicit_inputs
+            .into_iter()
+            .map(|(path, is_dir, _)| {
+                let resolved = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
+                (path, resolved, is_dir)
+            })
+            .collect::<Vec<_>>();
+        explicit_inputs_have_alias(&mut identities)
+    } else {
+        false
+    };
+    if has_explicit_alias {
+        let mut representatives = std::collections::HashMap::with_capacity(files.len());
+        for path in files.drain(..) {
+            let identity = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
+            let is_alias = std::fs::symlink_metadata(&path)
+                .is_ok_and(|metadata| metadata.file_type().is_symlink())
+                || has_symlink_ancestor(&path, Some(base), &mut ancestor_symlinks);
+            representatives
+                .entry(identity)
+                .and_modify(|representative: &mut (PathBuf, bool)| {
+                    if representative.1 && !is_alias {
+                        *representative = (path.clone(), false);
+                    }
+                })
+                .or_insert((path, is_alias));
+        }
+        files.extend(
+            representatives
+                .into_values()
+                .map(|(representative, _)| representative),
+        );
+        files.sort();
+    } else {
+        files.dedup();
+    }
     Ok(CollectedFiles { files, walk_errors })
 }
 
@@ -181,6 +299,34 @@ fn walk_directory(
 mod tests {
     use super::*;
 
+    #[test]
+    fn large_explicit_file_lists_have_no_alias_relationship() {
+        let mut inputs = (0..4096)
+            .map(|index| {
+                let path = PathBuf::from(format!("/workspace/file-{index}.md"));
+                (path.clone(), path, false)
+            })
+            .collect::<Vec<_>>();
+
+        assert!(!explicit_inputs_have_alias(&mut inputs));
+    }
+
+    #[test]
+    fn large_ordinary_explicit_file_list_is_collected() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = (0..256)
+            .map(|index| {
+                let path = tmp.path().join(format!("file-{index}.md"));
+                write(&path, "x");
+                path
+            })
+            .collect::<Vec<_>>();
+
+        let files = collect_paths(tmp.path(), &paths, &[], &markdown_only);
+
+        assert_eq!(files.len(), paths.len());
+    }
+
     fn write(path: &Path, content: &str) {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).unwrap();
@@ -260,6 +406,28 @@ mod tests {
         );
 
         assert!(files.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn excluded_symlink_does_not_affect_collected_directory() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let docs = tmp.path().join("docs");
+        let document = docs.join("kept.md");
+        let alias = tmp.path().join("alias.md");
+        write(&document, "x");
+        symlink(&document, &alias).unwrap();
+
+        let files = collect_paths(
+            tmp.path(),
+            &[docs, alias],
+            &["alias.md".to_string()],
+            &markdown_only,
+        );
+
+        assert_eq!(files, vec![document]);
     }
 
     #[test]
@@ -446,6 +614,156 @@ mod tests {
         );
 
         assert_eq!(files, vec![tmp.path().join("doc.md")]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_aliases_are_deduplicated() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let document = tmp.path().join("doc.md");
+        let alias = tmp.path().join("alias.md");
+        write(&document, "x");
+        symlink(&document, &alias).unwrap();
+
+        let files = collect_paths(tmp.path(), &[document.clone(), alias], &[], &markdown_only);
+
+        assert_eq!(files.len(), 1, "one filesystem file must be processed once");
+        assert_eq!(
+            std::fs::canonicalize(&files[0]).unwrap(),
+            std::fs::canonicalize(document).unwrap()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_ancestor_aliases_are_deduplicated() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let real = tmp.path().join("real");
+        let alias = tmp.path().join("alias");
+        let document = real.join("doc.md");
+        write(&document, "x");
+        symlink(&real, &alias).unwrap();
+
+        let files = collect_paths(
+            tmp.path(),
+            &[document.clone(), alias.join("doc.md")],
+            &[],
+            &markdown_only,
+        );
+
+        assert_eq!(files.len(), 1, "one filesystem file must be processed once");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn aliases_above_the_collection_base_are_deduplicated() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let real_parent = tmp.path().join("real-parent");
+        let real_base = real_parent.join("cwd");
+        let document = real_base.join("doc.md");
+        write(&document, "x");
+
+        let alias_parent = tmp.path().join("alias-parent");
+        symlink(&real_parent, &alias_parent).unwrap();
+        let alias_base = alias_parent.join("cwd");
+
+        let files = collect_paths(
+            &alias_base,
+            &[PathBuf::from("doc.md"), document.clone()],
+            &[],
+            &markdown_only,
+        );
+
+        assert_eq!(files.len(), 1, "one filesystem file must be processed once");
+        assert_eq!(
+            std::fs::canonicalize(&files[0]).unwrap(),
+            std::fs::canonicalize(document).unwrap()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn nested_symlink_directory_aliases_are_deduplicated() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let real = tmp.path().join("real");
+        let alias = tmp.path().join("alias");
+        write(&real.join("doc.md"), "x");
+        symlink(&real, &alias).unwrap();
+
+        let files = collect_paths(
+            tmp.path(),
+            &[tmp.path().to_path_buf(), alias],
+            &[],
+            &markdown_only,
+        );
+
+        assert_eq!(files.len(), 1, "one filesystem file must be processed once");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dedup_prefers_non_symlink_processing_path() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let real = tmp.path().join("real");
+        let document = real.join("doc.md");
+        let alias = tmp.path().join("alias.txt");
+        write(&document, "x");
+        symlink(&document, &alias).unwrap();
+
+        let files = collect_paths(tmp.path(), &[real, alias], &[], &markdown_only);
+
+        assert_eq!(files, vec![document]);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_file_symlink_aliases_are_deduplicated() {
+        use std::os::windows::fs::symlink_file;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let document = tmp.path().join("doc.md");
+        let alias = tmp.path().join("alias.md");
+        write(&document, "x");
+        if symlink_file(&document, &alias).is_err() {
+            return;
+        }
+
+        let files = collect_paths(tmp.path(), &[document, alias], &[], &markdown_only);
+
+        assert_eq!(files.len(), 1, "one filesystem file must be processed once");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_directory_symlink_aliases_are_deduplicated() {
+        use std::os::windows::fs::symlink_dir;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let real = tmp.path().join("real");
+        let alias = tmp.path().join("alias");
+        write(&real.join("doc.md"), "x");
+        if symlink_dir(&real, &alias).is_err() {
+            return;
+        }
+
+        let files = collect_paths(
+            tmp.path(),
+            &[tmp.path().to_path_buf(), alias],
+            &[],
+            &markdown_only,
+        );
+
+        assert_eq!(files.len(), 1, "one filesystem file must be processed once");
     }
 
     #[test]
