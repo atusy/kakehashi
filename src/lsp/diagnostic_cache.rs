@@ -1357,11 +1357,12 @@ impl DiagnosticAggregator {
             );
             return WireAdmit::SendNow;
         };
-        let record_activity = record_activity || gate.last_cache_revision != cache_revision;
+        let discovered_cache_activity = gate.last_cache_revision != cache_revision;
+        let any_activity = record_activity || discovered_cache_activity;
         let was_quiet = gate
             .last_activity_at
             .is_some_and(|at| now.saturating_duration_since(at) >= gate.debounce);
-        if record_activity {
+        if any_activity {
             gate.last_activity_at = Some(now);
             gate.last_cache_revision = cache_revision;
         }
@@ -1371,7 +1372,7 @@ impl DiagnosticAggregator {
         let send_now = gate.last_sent_at.is_none()
             || (record_activity && was_quiet)
             || reached_max_wait
-            || (!record_activity && now >= quiet_deadline);
+            || (!any_activity && now >= quiet_deadline);
         if send_now {
             // The send ends the admitted cycle. A real activity that starts a
             // quiet leading edge, recovers an uncommitted first send, or rolls
@@ -1819,7 +1820,7 @@ mod tests {
             WireAdmit::Defer { .. }
         ));
 
-        tokio::time::advance(std::time::Duration::from_millis(90)).await;
+        tokio::time::advance(std::time::Duration::from_millis(100)).await;
         assert!(matches!(
             agg.wire_debounce_admit_for_revision(&host, debounce, max_wait, false, 3),
             WireAdmit::Defer { remaining, .. } if remaining == debounce
