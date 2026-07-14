@@ -526,9 +526,18 @@ mod tests {
     #[test]
     fn default_settings_emit_workspace_refresh_feature_policy() {
         let toml = toml::to_string_pretty(&default_settings()).unwrap();
-        assert!(toml.contains("[features.workspace/diagnostic/refresh]"));
+        let parsed: RawWorkspaceSettings =
+            toml::from_str(&toml).expect("serialized defaults must be valid TOML");
+        assert!(toml.contains("[features.\"workspace/diagnostic/refresh\"]"));
         assert!(toml.contains("debounceMs = 100"));
         assert!(toml.contains("maxWaitMs = 1000"));
+        assert_eq!(
+            parsed
+                .features
+                .and_then(|features| features.workspace_diagnostic_refresh)
+                .and_then(|refresh| refresh.max_wait_ms),
+            Some(1000)
+        );
     }
 
     #[test]

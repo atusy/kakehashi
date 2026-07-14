@@ -655,11 +655,27 @@ pub struct DebounceFeatureSettings {
     pub max_wait_ms: Option<u64>,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct FeatureSettings {
     #[serde(rename = "workspace/diagnostic/refresh")]
     pub workspace_diagnostic_refresh: Option<DebounceFeatureSettings>,
+}
+
+impl Serialize for FeatureSettings {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeMap;
+
+        let mut map = serializer.serialize_map(Some(1))?;
+        map.serialize_entry(
+            "workspace/diagnostic/refresh",
+            &self.workspace_diagnostic_refresh,
+        )?;
+        map.end()
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
