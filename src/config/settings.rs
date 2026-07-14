@@ -733,11 +733,12 @@ impl Serialize for FeatureSettings {
     {
         use serde::ser::SerializeMap;
 
-        let mut map = serializer.serialize_map(Some(2))?;
+        let mut map = serializer.serialize_map(Some(3))?;
         map.serialize_entry(
             "textDocument/publishDiagnostics",
             &self.text_document_publish_diagnostics,
         )?;
+        map.serialize_entry("window/logMessage", &self.window_log_message)?;
         map.serialize_entry(
             "workspace/diagnostic/refresh",
             &self.workspace_diagnostic_refresh,
@@ -995,6 +996,22 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn log_message_feature_policy_survives_serialization_round_trip() {
+        let settings = RawWorkspaceSettings {
+            features: Some(FeatureSettings {
+                window_log_message: Some(LogMessageFeatureSettings {
+                    log_level: Some(LogMessageLevel::Warning),
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let serialized = toml::to_string(&settings).unwrap();
+        let reparsed: RawWorkspaceSettings = toml::from_str(&serialized).unwrap();
+        assert_eq!(reparsed.features, settings.features);
     }
 
     #[test]

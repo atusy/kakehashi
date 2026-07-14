@@ -567,7 +567,7 @@ mod tests {
     #[test]
     fn default_settings_emit_log_message_feature_policy() {
         let toml = toml::to_string_pretty(&default_settings()).unwrap();
-        assert!(toml.contains("[features.window/logMessage]\nlogLevel = \"info\""));
+        assert!(toml.contains("[features.\"window/logMessage\"]\nlogLevel = \"info\""));
     }
 
     #[test]
