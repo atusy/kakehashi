@@ -685,6 +685,16 @@ mod tests {
     fn install_language_reports_tombstone_cleanup_as_query_error_only() {
         let temp = tempfile::TempDir::new().unwrap();
         let data_dir = temp.path();
+
+        // Keep the parser side successful without fetching metadata or source:
+        // this test isolates how a query tombstone failure is classified.
+        let parser_dir = data_dir.join("parser");
+        std::fs::create_dir_all(&parser_dir).unwrap();
+        std::fs::write(
+            parser_dir.join(format!("lua.{}", std::env::consts::DLL_EXTENSION)),
+            "",
+        )
+        .unwrap();
         std::fs::write(data_dir.join("queries"), "not a directory").unwrap();
 
         let result = install_language_blocking(
