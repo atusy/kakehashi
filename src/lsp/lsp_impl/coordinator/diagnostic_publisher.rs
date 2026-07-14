@@ -1090,7 +1090,16 @@ impl DiagnosticPublisher {
     }
 
     fn schedule_stale_wire_retry(&self, host: &Url) {
-        if let Some((remaining, cancellation)) = self.aggregator.wire_gate_schedule_latest(host) {
+        let timing = self
+            .settings_manager
+            .load_settings()
+            .features
+            .text_document_publish_diagnostics;
+        if let Some((remaining, cancellation)) = self.aggregator.wire_gate_schedule_latest(
+            host,
+            std::time::Duration::from_millis(timing.debounce_ms),
+            std::time::Duration::from_millis(timing.max_wait_ms),
+        ) {
             self.spawn_trailing_wire_publish(host.clone(), remaining, cancellation);
         }
     }

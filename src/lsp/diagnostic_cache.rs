@@ -1628,14 +1628,31 @@ impl DiagnosticAggregator {
     pub(crate) fn wire_gate_schedule_latest(
         &self,
         host: &Url,
+        debounce: std::time::Duration,
+        max_wait: std::time::Duration,
     ) -> Option<(std::time::Duration, tokio_util::sync::CancellationToken)> {
         let now = tokio::time::Instant::now();
+        let revisions = self
+            .cache_revisions
+            .lock()
+            .recover_poison("DiagnosticAggregator::cache_revisions");
+        let cache_revision = revisions.get(host).copied().unwrap_or(0);
         let mut gates = self
             .wire_gate
             .lock()
             .recover_poison("DiagnosticAggregator::wire_gate");
-        let gate = gates.get_mut(host)?;
+        let gate = gates.entry(host.clone()).or_insert_with(|| WireGate {
+            debounce,
+            max_wait,
+            last_sent_at: None,
+            last_activity_at: Some(now),
+            last_cache_revision: cache_revision,
+            pending: false,
+            cancellation: tokio_util::sync::CancellationToken::new(),
+            dirty: true,
+        });
         gate.last_activity_at = Some(now);
+        gate.last_cache_revision = cache_revision;
         gate.dirty = true;
         if gate.pending {
             return None;
@@ -1645,11 +1662,17 @@ impl DiagnosticAggregator {
             .last_sent_at
             .map(|sent| quiet_deadline.min(sent + gate.max_wait))
             .unwrap_or(quiet_deadline);
+        // A max-wait attempt that itself became stale must not self-spawn an
+        // unbounded zero-delay full-merge chain. Back off by the active
+        // debounce (at least one millisecond); once churn settles, that retry
+        // sends the latest set.
+        let remaining = if deadline <= now {
+            gate.debounce.max(std::time::Duration::from_millis(1))
+        } else {
+            deadline - now
+        };
         gate.pending = true;
-        Some((
-            deadline.saturating_duration_since(now),
-            gate.cancellation.clone(),
-        ))
+        Some((remaining, gate.cancellation.clone()))
     }
 
     /// Forget the wire-gate state for `host` so the entry doesn't linger and a
@@ -1922,21 +1945,62 @@ mod tests {
         let host = host();
         let debounce = std::time::Duration::from_millis(100);
         let max_wait = std::time::Duration::from_secs(1);
+        agg.set_pull_layer(&host, vec![diag("A")]);
+        let revision = agg.snapshot_with_revision(&host).1;
         assert_eq!(
-            agg.wire_debounce_admit(&host, debounce, max_wait, true),
+            agg.wire_debounce_admit_for_revision(&host, debounce, max_wait, true, revision),
             WireAdmit::SendNow
         );
         agg.wire_gate_commit_send(&host);
 
+        agg.set_pull_layer(&host, vec![diag("B")]);
         let (remaining, _) = agg
-            .wire_gate_schedule_latest(&host)
+            .wire_gate_schedule_latest(&host, debounce, max_wait)
             .expect("the stale handoff owns one retry");
         assert_eq!(remaining, debounce);
         assert!(
-            agg.wire_gate_schedule_latest(&host).is_none(),
+            agg.wire_gate_schedule_latest(&host, debounce, max_wait)
+                .is_none(),
             "a second stale handoff shares the pending retry"
         );
         assert!(agg.wire_gate_is_dirty(&host));
+
+        tokio::time::advance(debounce).await;
+        assert_eq!(agg.wire_gate_trailing_wake(&host), WireTrailingWake::Ready);
+        let latest_revision = agg.snapshot_with_revision(&host).1;
+        assert_eq!(
+            agg.wire_debounce_admit_for_revision(
+                &host,
+                debounce,
+                max_wait,
+                false,
+                latest_revision,
+            ),
+            WireAdmit::SendNow,
+            "the scheduled revision is not debounced a second time"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stale_handoff_mints_a_first_gate_and_backs_off_after_max_wait() {
+        let agg = DiagnosticAggregator::new();
+        let host = host();
+        let debounce = std::time::Duration::from_millis(100);
+        let max_wait = std::time::Duration::from_millis(500);
+
+        let (remaining, _) = agg
+            .wire_gate_schedule_latest(&host, debounce, max_wait)
+            .expect("a stale first publish mints retry debt");
+        assert_eq!(remaining, debounce);
+        assert!(agg.wire_gate_is_dirty(&host));
+
+        assert!(agg.wire_gate_take_pending(&host));
+        agg.wire_gate_commit_send(&host);
+        tokio::time::advance(max_wait).await;
+        let (remaining, _) = agg
+            .wire_gate_schedule_latest(&host, debounce, max_wait)
+            .expect("a stale max-wait attempt schedules one successor");
+        assert_eq!(remaining, debounce, "past max-wait retries back off");
     }
 
     #[tokio::test(start_paused = true)]
