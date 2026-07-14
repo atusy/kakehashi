@@ -1006,10 +1006,10 @@ impl DiagnosticPublisher {
             return changed;
         }
 
-        // Coalesce the wire sends per host (the quiet window): a burst of
+        // Coalesce the wire sends per host (debounce plus max-wait): a burst of
         // set-changing feeds — spontaneous pushes, the pull-layer completion,
         // the post-parse geometry re-merge, each ~1 MB on a diagnostics-heavy
-        // host — collapses into at most one publish per window, re-merged from
+        // host — collapses until the next deadline, re-merged from
         // the LATEST cache by the trailing republish. An isolated change sends
         // immediately. Deferral withholds only the wire: the set was already
         // recorded above, so the return value (and with it the push-origin
@@ -1051,7 +1051,7 @@ impl DiagnosticPublisher {
             } => {
                 log::debug!(
                     target: LOG_TARGET,
-                    "withholding publish of {} merged diagnostics for {} ({}ms of quiet window left)",
+                    "withholding publish of {} merged diagnostics for {} ({}ms until debounce/max-wait deadline)",
                     diagnostics.len(),
                     host,
                     remaining.as_millis()
@@ -1064,7 +1064,7 @@ impl DiagnosticPublisher {
         changed
     }
 
-    /// Re-run [`Self::republish`] for `host` once the quiet window elapses,
+    /// Re-run [`Self::republish`] for `host` at the next debounce/max-wait deadline,
     /// sending the (re-merged, latest) withheld set to the wire. At most one
     /// task is parked per host at a time ([`WireAdmit::Defer`]'s
     /// `schedule_trailing`). Clears the gate's `pending` marker *before*

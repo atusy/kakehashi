@@ -518,11 +518,11 @@ pub(crate) enum ForwardedRefreshWait {
 }
 
 /// Per-host coalescing state for the editor-facing `publishDiagnostics` wire
-/// sends. A changed merge inside the quiet window after the last send is
+/// sends. A changed merge before the active debounce/max-wait deadline is
 /// **withheld** from the wire (`dirty`) and a single trailing republish is
 /// scheduled (`pending`); the trailing run re-merges the *latest* cache, so
-/// every state change inside the window collapses into one send. An isolated
-/// change (window already elapsed, or first publish) passes through
+/// every state change before that deadline collapses into one send. An
+/// isolated change (no active burst, or first publish) passes through
 /// immediately — the gate adds no latency outside bursts.
 struct WireGate {
     /// Timing snapshot for the active burst. Live configuration updates are
@@ -541,7 +541,7 @@ struct WireGate {
     /// not advance it, so `debounce` measures quiet since real activity.
     last_activity_at: Option<tokio::time::Instant>,
     /// A trailing republish task is scheduled; bounds the tasks to one per
-    /// host per window.
+    /// host per active deadline.
     pending: bool,
     /// Wakes a parked trailing task when didClose or a publish seal forgets
     /// this gate, so long configured windows do not retain the publisher.
@@ -556,13 +556,13 @@ struct WireGate {
 }
 
 /// The wire-gate decision for one republish attempt: send now, or withhold
-/// until the quiet window elapses (scheduling the trailing republish iff no
-/// task is already parked).
+/// until the earlier debounce/max-wait deadline (scheduling the trailing
+/// republish iff no task is already parked).
 #[derive(Debug)]
 pub(crate) enum WireAdmit {
     /// Window clear: write to the wire now.
     SendNow,
-    /// Inside the quiet window: withhold. `schedule_trailing` is `true` for
+    /// Before the active deadline: withhold. `schedule_trailing` is `true` for
     /// at most one caller at a time — the first defer while no trailing task
     /// is parked (it must spawn the trailing republish after `remaining`);
     /// attempts while one is parked get `false`.
