@@ -573,6 +573,13 @@ pub(crate) enum WireAdmit {
     },
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum WireTrailingWake {
+    Gone,
+    Wait(std::time::Duration),
+    Ready,
+}
+
 impl PartialEq for WireAdmit {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
@@ -1420,6 +1427,34 @@ impl DiagnosticAggregator {
         }
     }
 
+    /// Revalidate a parked trailing task's deadline before it performs the
+    /// expensive snapshot/merge path. Later activity may have moved the quiet
+    /// deadline since the task was spawned; in that case keep ownership of the
+    /// pending slot and sleep again. Max-wait still caps the reschedule.
+    pub(crate) fn wire_gate_trailing_wake(&self, host: &Url) -> WireTrailingWake {
+        let now = tokio::time::Instant::now();
+        let mut gates = self
+            .wire_gate
+            .lock()
+            .recover_poison("DiagnosticAggregator::wire_gate");
+        let Some(gate) = gates.get_mut(host) else {
+            return WireTrailingWake::Gone;
+        };
+        if !gate.pending {
+            return WireTrailingWake::Gone;
+        }
+        let quiet_deadline = gate.last_activity_at.unwrap_or(now) + gate.debounce;
+        let deadline = gate
+            .last_sent_at
+            .map(|sent| quiet_deadline.min(sent + gate.max_wait))
+            .unwrap_or(quiet_deadline);
+        if now < deadline {
+            return WireTrailingWake::Wait(deadline - now);
+        }
+        gate.pending = false;
+        WireTrailingWake::Ready
+    }
+
     /// Forget the wire-gate state for `host` so the entry doesn't linger and a
     /// parked trailing task bails ([`Self::wire_gate_take_pending`] returns
     /// `false`). Called on `didClose` (`clear_host`, next to
@@ -1634,6 +1669,38 @@ mod tests {
             agg.wire_debounce_admit(&host(), debounce, max_wait, false),
             WireAdmit::SendNow
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stale_wire_timer_resleeps_without_consuming_pending() {
+        let agg = DiagnosticAggregator::new();
+        let host = host();
+        let debounce = std::time::Duration::from_millis(100);
+        let max_wait = std::time::Duration::from_secs(1);
+
+        assert_eq!(
+            agg.wire_debounce_admit(&host, debounce, max_wait, true),
+            WireAdmit::SendNow
+        );
+        agg.wire_gate_commit_send(&host);
+        tokio::time::advance(std::time::Duration::from_millis(10)).await;
+        assert!(matches!(
+            agg.wire_debounce_admit(&host, debounce, max_wait, true),
+            WireAdmit::Defer { .. }
+        ));
+        tokio::time::advance(std::time::Duration::from_millis(70)).await;
+        assert!(matches!(
+            agg.wire_debounce_admit(&host, debounce, max_wait, true),
+            WireAdmit::Defer { .. }
+        ));
+
+        tokio::time::advance(std::time::Duration::from_millis(30)).await;
+        assert_eq!(
+            agg.wire_gate_trailing_wake(&host),
+            WireTrailingWake::Wait(std::time::Duration::from_millis(70))
+        );
+        tokio::time::advance(std::time::Duration::from_millis(70)).await;
+        assert_eq!(agg.wire_gate_trailing_wake(&host), WireTrailingWake::Ready);
     }
 
     #[tokio::test(start_paused = true)]

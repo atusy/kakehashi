@@ -1086,22 +1086,29 @@ impl DiagnosticPublisher {
         cancellation: tokio_util::sync::CancellationToken,
     ) {
         let publisher = self.clone();
-        // Anchor the deadline NOW (at defer time), not at the task's first poll
-        // — under load the first poll can lag, which would silently stretch the
-        // quiet window.
-        let deadline = tokio::time::Instant::now() + remaining;
+        // Anchor before spawning: under load the task's first poll may lag,
+        // which must not stretch the admitted deadline.
+        let mut deadline = tokio::time::Instant::now() + remaining;
         tokio::spawn(async move {
-            tokio::select! {
-                biased;
-                _ = publisher.shutdown.cancelled() => {
-                    publisher.aggregator.forget_wire_gate(&host);
-                    return;
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = publisher.shutdown.cancelled() => {
+                        publisher.aggregator.forget_wire_gate(&host);
+                        return;
+                    }
+                    _ = cancellation.cancelled() => return,
+                    _ = tokio::time::sleep_until(deadline) => {}
                 }
-                _ = cancellation.cancelled() => return,
-                _ = tokio::time::sleep_until(deadline) => {}
-            }
-            if !publisher.aggregator.wire_gate_take_pending(&host) {
-                return; // gate forgotten while parked: debt cancelled
+                match publisher.aggregator.wire_gate_trailing_wake(&host) {
+                    crate::lsp::diagnostic_cache::WireTrailingWake::Gone => return,
+                    crate::lsp::diagnostic_cache::WireTrailingWake::Wait(next) => {
+                        // Later activity moved the quiet deadline. Resleep
+                        // without rebuilding the diagnostic set.
+                        deadline = tokio::time::Instant::now() + next;
+                    }
+                    crate::lsp::diagnostic_cache::WireTrailingWake::Ready => break,
+                }
             }
             // Belt to the bail above: a host closed while this task was parked
             // (but not yet forgotten) is `clear_host`'s to finish — its
