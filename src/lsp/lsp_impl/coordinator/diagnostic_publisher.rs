@@ -1047,6 +1047,7 @@ impl DiagnosticPublisher {
             crate::lsp::diagnostic_cache::WireAdmit::Defer {
                 schedule_trailing,
                 remaining,
+                cancellation,
             } => {
                 log::debug!(
                     target: LOG_TARGET,
@@ -1056,7 +1057,7 @@ impl DiagnosticPublisher {
                     remaining.as_millis()
                 );
                 if schedule_trailing {
-                    self.spawn_trailing_wire_publish(host.clone(), remaining);
+                    self.spawn_trailing_wire_publish(host.clone(), remaining, cancellation);
                 }
             }
         }
@@ -1078,7 +1079,12 @@ impl DiagnosticPublisher {
     /// this host's gate state, and exits without a wire send.
     ///
     /// [`WireAdmit::Defer`]: crate::lsp::diagnostic_cache::WireAdmit::Defer
-    fn spawn_trailing_wire_publish(&self, host: Url, remaining: std::time::Duration) {
+    fn spawn_trailing_wire_publish(
+        &self,
+        host: Url,
+        remaining: std::time::Duration,
+        cancellation: tokio_util::sync::CancellationToken,
+    ) {
         let publisher = self.clone();
         // Anchor the deadline NOW (at defer time), not at the task's first poll
         // — under load the first poll can lag, which would silently stretch the
@@ -1091,6 +1097,7 @@ impl DiagnosticPublisher {
                     publisher.aggregator.forget_wire_gate(&host);
                     return;
                 }
+                _ = cancellation.cancelled() => return,
                 _ = tokio::time::sleep_until(deadline) => {}
             }
             if !publisher.aggregator.wire_gate_take_pending(&host) {
@@ -2196,6 +2203,54 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(1)).await;
         assert!(!server.diagnostics.wire_gate_is_dirty(&uri));
         assert_eq!(publisher.republish(&uri).await, RepublishOutcome::Unchanged);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn forgetting_wire_gate_wakes_the_trailing_task() {
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+        register_rust(server);
+        server.settings_manager.apply_settings(rust_settings(true));
+        let uri = Url::parse("file:///test/host_forget_wire_gate.rs").unwrap();
+        server.documents.insert(
+            uri.clone(),
+            "fn main() {}".to_string(),
+            Some("rust".to_string()),
+            None,
+        );
+        let publisher = DiagnosticPublisher::new(server);
+
+        server.diagnostics.record(
+            &uri,
+            DiagnosticSource::Host,
+            "rust_ls".to_string(),
+            Some(ProgressConnectionId::for_test(1)),
+            vec![diag("A")],
+        );
+        publisher.republish(&uri).await;
+        let baseline = Arc::strong_count(&server.diagnostics);
+
+        server.diagnostics.record(
+            &uri,
+            DiagnosticSource::Host,
+            "rust_ls".to_string(),
+            Some(ProgressConnectionId::for_test(1)),
+            vec![diag("B")],
+        );
+        publisher.republish(&uri).await;
+        tokio::task::yield_now().await;
+        assert!(
+            Arc::strong_count(&server.diagnostics) > baseline,
+            "the parked task holds a publisher clone"
+        );
+
+        server.diagnostics.forget_wire_gate(&uri);
+        tokio::task::yield_now().await;
+        assert_eq!(
+            Arc::strong_count(&server.diagnostics),
+            baseline,
+            "forgetting the gate must wake and release its parked task"
+        );
     }
 
     #[tokio::test]

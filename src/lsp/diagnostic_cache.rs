@@ -543,6 +543,9 @@ struct WireGate {
     /// A trailing republish task is scheduled; bounds the tasks to one per
     /// host per window.
     pending: bool,
+    /// Wakes a parked trailing task when didClose or a publish seal forgets
+    /// this gate, so long configured windows do not retain the publisher.
+    cancellation: tokio_util::sync::CancellationToken,
     /// The recorded last-published set may not have reached the editor's
     /// push namespace: either a changed merge was withheld by the quiet
     /// window, or a send was admitted but its commit never happened (aborted
@@ -555,7 +558,7 @@ struct WireGate {
 /// The wire-gate decision for one republish attempt: send now, or withhold
 /// until the quiet window elapses (scheduling the trailing republish iff no
 /// task is already parked).
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug)]
 pub(crate) enum WireAdmit {
     /// Window clear: write to the wire now.
     SendNow,
@@ -566,8 +569,32 @@ pub(crate) enum WireAdmit {
     Defer {
         schedule_trailing: bool,
         remaining: std::time::Duration,
+        cancellation: tokio_util::sync::CancellationToken,
     },
 }
+
+impl PartialEq for WireAdmit {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::SendNow, Self::SendNow) => true,
+            (
+                Self::Defer {
+                    schedule_trailing: left_schedule,
+                    remaining: left_remaining,
+                    ..
+                },
+                Self::Defer {
+                    schedule_trailing: right_schedule,
+                    remaining: right_remaining,
+                    ..
+                },
+            ) => left_schedule == right_schedule && left_remaining == right_remaining,
+            _ => false,
+        }
+    }
+}
+
+impl Eq for WireAdmit {}
 
 /// Per-host coverage versions for the refresh gate (#497, commit 2).
 #[derive(Default, Clone, Copy)]
@@ -1266,6 +1293,7 @@ impl DiagnosticAggregator {
                     last_sent_at: None,
                     last_activity_at: Some(now),
                     pending: false,
+                    cancellation: tokio_util::sync::CancellationToken::new(),
                     dirty: true,
                 },
             );
@@ -1302,6 +1330,7 @@ impl DiagnosticAggregator {
             WireAdmit::Defer {
                 schedule_trailing,
                 remaining: deadline.saturating_duration_since(now),
+                cancellation: gate.cancellation.clone(),
             }
         }
     }
@@ -1331,6 +1360,7 @@ impl DiagnosticAggregator {
                     last_sent_at: Some(now),
                     last_activity_at: Some(now),
                     pending: false,
+                    cancellation: tokio_util::sync::CancellationToken::new(),
                     dirty: false,
                 },
             );
@@ -1396,10 +1426,14 @@ impl DiagnosticAggregator {
     /// bypasses the gate for closed hosts) and when the publish seal renders
     /// the gate state moot.
     pub(crate) fn forget_wire_gate(&self, host: &Url) {
-        self.wire_gate
+        let gate = self
+            .wire_gate
             .lock()
             .recover_poison("DiagnosticAggregator::wire_gate")
             .remove(host);
+        if let Some(gate) = gate {
+            gate.cancellation.cancel();
+        }
     }
 
     /// Drop one `source`'s slots (every server) under `host` — e.g. a region
