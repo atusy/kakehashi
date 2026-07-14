@@ -129,9 +129,9 @@ pub fn load_settings(
                 Ok(ws) => Some(ws),
                 Err(errs) => {
                     events.push(SettingsEvent::error(format!(
-                        "Path expansion failed: {errs}. \
+                        "Invalid configuration: {errs}. \
                      This configuration has been discarded; previous settings remain in effect. \
-                     Please correct the affected paths and environment variables or remove them from your config.",
+                     Please correct the invalid settings or remove them from your config.",
                     )));
                     None
                 }
@@ -553,10 +553,11 @@ mod tests {
             "Settings should be None when expansion fails"
         );
 
-        let has_error_event = outcome
-            .events
-            .iter()
-            .any(|e| e.kind == SettingsEventKind::Error && e.message.contains("expansion failed"));
+        let has_error_event = outcome.events.iter().any(|e| {
+            e.kind == SettingsEventKind::Error
+                && e.message.contains("Invalid configuration")
+                && e.message.contains("UNDEFINED_VAR")
+        });
 
         assert!(
             has_error_event,

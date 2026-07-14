@@ -71,6 +71,10 @@ fn base_convert(settings: &RawWorkspaceSettings) -> WorkspaceSettings {
         diagnostics_debounce_ms: settings
             .diagnostics_debounce_ms
             .unwrap_or(DEFAULT_DEBOUNCE_MS),
+        features: settings.features.as_ref().map_or_else(
+            settings::ResolvedFeatureSettings::default,
+            settings::FeatureSettings::resolve,
+        ),
         language_servers: settings.language_servers.clone().unwrap_or_default(),
     }
 }
@@ -255,6 +259,20 @@ impl WorkspaceSettings {
         let mut ws = base_convert(settings);
         let mut errors = Vec::new();
 
+        let refresh = ws.features.workspace_diagnostic_refresh;
+        if refresh.max_wait_ms == 0
+            || refresh.debounce_ms > settings::MAX_FEATURE_TIMING_MS
+            || refresh.max_wait_ms > settings::MAX_FEATURE_TIMING_MS
+            || refresh.max_wait_ms < refresh.debounce_ms
+        {
+            errors.push(expand::ExpandError::InvalidSetting {
+                message: format!(
+                    "features.\"workspace/diagnostic/refresh\" requires 0 <= debounceMs <= maxWaitMs <= {} and maxWaitMs > 0 (got debounceMs={}, maxWaitMs={})",
+                    settings::MAX_FEATURE_TIMING_MS, refresh.debounce_ms, refresh.max_wait_ms
+                ),
+            });
+        }
+
         // Resolve base configs first so expansion only sees effective parser/query paths.
         ws.languages = merge::resolve_base_configs(&ws.languages);
 
@@ -367,6 +385,12 @@ impl From<&WorkspaceSettings> for RawWorkspaceSettings {
             capture_mappings,
             auto_install: Some(settings.auto_install),
             diagnostics_debounce_ms: Some(settings.diagnostics_debounce_ms),
+            features: Some(settings::FeatureSettings {
+                workspace_diagnostic_refresh: Some(settings::DebounceFeatureSettings {
+                    debounce_ms: Some(settings.features.workspace_diagnostic_refresh.debounce_ms),
+                    max_wait_ms: Some(settings.features.workspace_diagnostic_refresh.max_wait_ms),
+                }),
+            }),
             language_servers: Some(settings.language_servers.clone()),
         }
     }
@@ -564,6 +588,7 @@ mod tests {
             capture_mappings: HashMap::new(),
             auto_install: None,
             diagnostics_debounce_ms: None,
+            features: None,
             language_servers: None,
         };
 
@@ -593,6 +618,7 @@ mod tests {
             capture_mappings: HashMap::new(),
             auto_install: None,
             diagnostics_debounce_ms: None,
+            features: None,
             language_servers: None,
         };
 
@@ -615,6 +641,7 @@ mod tests {
             capture_mappings: HashMap::new(),
             auto_install: None,
             diagnostics_debounce_ms: None,
+            features: None,
             language_servers: None,
         };
 
@@ -641,6 +668,7 @@ mod tests {
             capture_mappings: HashMap::new(),
             auto_install,
             diagnostics_debounce_ms: None,
+            features: None,
             language_servers: None,
         };
 
@@ -660,11 +688,78 @@ mod tests {
             capture_mappings: HashMap::new(),
             auto_install: None,
             diagnostics_debounce_ms: raw,
+            features: None,
             language_servers: None,
         };
 
         let workspace: WorkspaceSettings = base_convert(&settings);
         assert_eq!(workspace.diagnostics_debounce_ms, expected);
+    }
+
+    #[test]
+    fn workspace_diagnostic_refresh_feature_resolves_defaults_and_custom_values() {
+        let defaults = base_convert(&RawWorkspaceSettings::default());
+        assert_eq!(
+            defaults.features.workspace_diagnostic_refresh,
+            settings::ResolvedDebounceFeatureSettings::default()
+        );
+
+        let raw: RawWorkspaceSettings = toml::from_str(
+            r#"
+            [features."workspace/diagnostic/refresh"]
+            debounceMs = 25
+            maxWaitMs = 250
+            "#,
+        )
+        .unwrap();
+        let custom = WorkspaceSettings::try_from_settings(&raw, None, |_| None).unwrap();
+        assert_eq!(custom.features.workspace_diagnostic_refresh.debounce_ms, 25);
+        assert_eq!(
+            custom.features.workspace_diagnostic_refresh.max_wait_ms,
+            250
+        );
+    }
+
+    #[test]
+    fn workspace_diagnostic_refresh_rejects_invalid_timing() {
+        let raw: RawWorkspaceSettings = toml::from_str(
+            r#"
+            [features."workspace/diagnostic/refresh"]
+            debounceMs = 101
+            maxWaitMs = 100
+            "#,
+        )
+        .unwrap();
+        let error = WorkspaceSettings::try_from_settings(&raw, None, |_| None).unwrap_err();
+        assert!(error.to_string().contains("debounceMs=101, maxWaitMs=100"));
+    }
+
+    #[test]
+    fn workspace_diagnostic_refresh_rejects_zero_and_unbounded_max_wait() {
+        for max_wait_ms in [0, settings::MAX_FEATURE_TIMING_MS + 1] {
+            let raw = RawWorkspaceSettings {
+                features: Some(settings::FeatureSettings {
+                    workspace_diagnostic_refresh: Some(settings::DebounceFeatureSettings {
+                        debounce_ms: Some(0),
+                        max_wait_ms: Some(max_wait_ms),
+                    }),
+                }),
+                ..Default::default()
+            };
+            assert!(WorkspaceSettings::try_from_settings(&raw, None, |_| None).is_err());
+        }
+    }
+
+    #[test]
+    fn feature_policy_rejects_unknown_methods_and_fields() {
+        for invalid in [
+            r#"[features."workspace/diagnostic/refresh"]
+               debouncMs = 100"#,
+            r#"[features."workspace/diagnostics/refresh"]
+               debounceMs = 100"#,
+        ] {
+            assert!(toml::from_str::<RawWorkspaceSettings>(invalid).is_err());
+        }
     }
 
     #[test]
@@ -948,6 +1043,7 @@ mod try_from_settings_tests {
             capture_mappings: HashMap::new(),
             auto_install: None,
             diagnostics_debounce_ms: None,
+            features: None,
             language_servers: None,
         };
         let env = make_env(&[("TEST_VAR", "/home/user")]);
@@ -971,6 +1067,7 @@ mod try_from_settings_tests {
             capture_mappings: HashMap::new(),
             auto_install: None,
             diagnostics_debounce_ms: None,
+            features: None,
             language_servers: None,
         };
         let env = make_env(&[("TEST_VAR", "/opt/parsers")]);
@@ -1000,6 +1097,7 @@ mod try_from_settings_tests {
             capture_mappings: HashMap::new(),
             auto_install: None,
             diagnostics_debounce_ms: None,
+            features: None,
             language_servers: None,
         };
         let env = make_env(&[("TEST_VAR", "/queries")]);
@@ -1035,6 +1133,7 @@ mod try_from_settings_tests {
             capture_mappings: HashMap::new(),
             auto_install: None,
             diagnostics_debounce_ms: None,
+            features: None,
             language_servers: None,
         };
 
@@ -1056,6 +1155,7 @@ mod try_from_settings_tests {
             capture_mappings: HashMap::new(),
             auto_install: None,
             diagnostics_debounce_ms: None,
+            features: None,
             language_servers: None,
         };
         let env = make_env(&[]);
@@ -1085,6 +1185,7 @@ mod try_from_settings_tests {
             capture_mappings: HashMap::new(),
             auto_install: None,
             diagnostics_debounce_ms: None,
+            features: None,
             language_servers: None,
         };
         let env = make_env(&[]);
@@ -1104,6 +1205,7 @@ mod try_from_settings_tests {
             capture_mappings: HashMap::new(),
             auto_install: None,
             diagnostics_debounce_ms: None,
+            features: None,
             language_servers: None,
         };
         let env = make_env(&[]);

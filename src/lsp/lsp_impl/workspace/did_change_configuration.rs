@@ -13,6 +13,7 @@ const KNOWN_WORKSPACE_SETTING_KEYS: &[&str] = &[
     "captureMappings",
     "autoInstall",
     "diagnosticsDebounceMs",
+    "features",
     "languageServers",
 ];
 
@@ -64,8 +65,7 @@ fn settings_payload(settings: Value) -> (Value, Vec<String>) {
 
         let mut unknown_keys = object
             .into_iter()
-            .map(|(key, _)| key)
-            .filter(|key| is_workspace_setting_key_or_typo(key))
+            .filter_map(|(key, value)| is_kakehashi_workspace_entry(&key, &value).then_some(key))
             .collect::<Vec<_>>();
         unknown_keys.extend(unknown_workspace_setting_keys(&kakehashi));
         sort_and_dedup_unknown_keys(&mut unknown_keys);
@@ -99,7 +99,7 @@ fn uses_deprecated_unwrapped_didchange_shape(settings: &Value) -> bool {
 fn kakehashi_targeted_payload(object: serde_json::Map<String, Value>) -> serde_json::Value {
     let object = object
         .into_iter()
-        .filter(|(key, _)| is_workspace_setting_key_or_typo(key))
+        .filter(|(key, value)| is_kakehashi_workspace_entry(key, value))
         .collect();
     Value::Object(object)
 }
@@ -128,6 +128,15 @@ fn is_workspace_setting_key_or_typo(key: &str) -> bool {
         || KNOWN_WORKSPACE_SETTING_KEYS
             .iter()
             .any(|known_key| is_one_edit_apart(key, known_key))
+}
+
+fn is_kakehashi_workspace_entry(key: &str, value: &Value) -> bool {
+    if key == "features" {
+        return value
+            .as_object()
+            .is_some_and(|features| features.contains_key("workspace/diagnostic/refresh"));
+    }
+    is_workspace_setting_key_or_typo(key)
 }
 
 fn is_one_edit_apart(candidate: &str, known: &str) -> bool {
@@ -413,9 +422,9 @@ impl Kakehashi {
             }
             Err(errs) => {
                 let event = crate::lsp::SettingsEvent::error(format!(
-                    "Path expansion failed: {errs}. \
+                    "Invalid configuration: {errs}. \
                      This configuration has been discarded; previous settings remain in effect. \
-                     Please correct the affected paths and environment variables or remove them from your config.",
+                     Please correct the invalid settings or remove them from your config.",
                 ));
                 self.notifier().log_settings_events(&[event]).await;
             }
@@ -467,6 +476,50 @@ mod tests {
         assert!(!is_workspace_setting_key_or_typo("editor"));
         assert!(!is_workspace_setting_key_or_typo("files"));
         assert!(!is_workspace_setting_key_or_typo("workbench"));
+    }
+
+    #[test]
+    fn settings_payload_ignores_unrelated_features_section_sibling() {
+        let (payload, unknown_keys) = settings_payload(serde_json::json!({
+            "kakehashi": {
+                "autoInstall": true
+            },
+            "features": {
+                "someOtherClientFeature": true
+            }
+        }));
+
+        assert_eq!(payload, serde_json::json!({ "autoInstall": true }));
+        assert!(unknown_keys.is_empty());
+    }
+
+    #[test]
+    fn settings_payload_rejects_kakehashi_features_section_sibling() {
+        let (_payload, unknown_keys) = settings_payload(serde_json::json!({
+            "kakehashi": {
+                "autoInstall": true
+            },
+            "features": {
+                "workspace/diagnostic/refresh": {
+                    "debounceMs": 20
+                }
+            }
+        }));
+
+        assert_eq!(unknown_keys, ["features"]);
+    }
+
+    #[test]
+    fn settings_payload_ignores_unrelated_unwrapped_features() {
+        let (payload, unknown_keys) = settings_payload(serde_json::json!({
+            "autoInstall": true,
+            "features": {
+                "someOtherClientFeature": true
+            }
+        }));
+
+        assert_eq!(payload, serde_json::json!({ "autoInstall": true }));
+        assert!(unknown_keys.is_empty());
     }
 
     #[test]

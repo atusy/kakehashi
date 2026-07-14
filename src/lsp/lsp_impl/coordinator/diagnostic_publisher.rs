@@ -92,24 +92,19 @@ impl RepublishOutcome {
 /// chose existing config surfaces over new ones — revisit if a real setup
 /// needs a different cadence.
 const WIRE_PUBLISH_QUIET_WINDOW: std::time::Duration = std::time::Duration::from_secs(1);
-/// Short enough that a downstream re-analysis still prompts a timely editor
-/// pull, but longer than the 1 ms-scale refresh bursts observed in #789.
+#[cfg(test)]
 const FORWARDED_REFRESH_SETTLE_WINDOW: std::time::Duration = std::time::Duration::from_millis(100);
-/// Bound staleness when a server emits refreshes continuously. This matches the
-/// existing diagnostics publish cadence and still reduces a sustained stream
-/// from an unbounded rate to at most one refresh per second.
+#[cfg(test)]
 const FORWARDED_REFRESH_MAX_WAIT: std::time::Duration = std::time::Duration::from_secs(1);
 
 async fn wait_for_forwarded_refresh_settle(
     aggregator: &DiagnosticAggregator,
     mut snapshot: crate::lsp::diagnostic_cache::ForwardedRefreshWaitSnapshot,
     deadline: tokio::time::Instant,
+    settle_window: std::time::Duration,
 ) -> crate::lsp::diagnostic_cache::ForwardedRefreshWait {
     loop {
-        tokio::time::sleep_until(
-            (snapshot.last_activity_at + FORWARDED_REFRESH_SETTLE_WINDOW).min(deadline),
-        )
-        .await;
+        tokio::time::sleep_until((snapshot.last_activity_at + settle_window).min(deadline)).await;
         let force = tokio::time::Instant::now() >= deadline;
         match aggregator.finish_forwarded_refresh_wait(snapshot.generation, force) {
             crate::lsp::diagnostic_cache::ForwardedRefreshWait::Restart(latest) => {
@@ -153,6 +148,46 @@ impl DiagnosticPublisher {
         }
     }
 
+    fn forwarded_refresh_timing(&self) -> (std::time::Duration, std::time::Duration) {
+        let timing = self
+            .settings_manager
+            .load_settings()
+            .features
+            .workspace_diagnostic_refresh;
+        (
+            std::time::Duration::from_millis(timing.debounce_ms),
+            std::time::Duration::from_millis(timing.max_wait_ms),
+        )
+    }
+
+    fn admit_forwarded_refresh(
+        &self,
+    ) -> Option<(
+        crate::lsp::diagnostic_cache::ForwardedRefreshWaitSnapshot,
+        std::time::Duration,
+        std::time::Duration,
+    )> {
+        let snapshot = self.aggregator.begin_forwarded_refresh_debounce()?;
+        Some(self.snapshot_forwarded_refresh_cycle(snapshot))
+    }
+
+    fn snapshot_forwarded_refresh_cycle(
+        &self,
+        snapshot: crate::lsp::diagnostic_cache::ForwardedRefreshWaitSnapshot,
+    ) -> (
+        crate::lsp::diagnostic_cache::ForwardedRefreshWaitSnapshot,
+        std::time::Duration,
+        std::time::Duration,
+    ) {
+        // This ArcSwap load is the cycle-admission linearization point. The
+        // initial scheduler claim is internal bookkeeping, and continued-stream
+        // callers arrive only after the previous cycle completes. No timing for
+        // this cycle is consumed before the snapshot, so an earlier settings
+        // store affects this cycle and a later one affects the next cycle.
+        let (settle_window, max_wait) = self.forwarded_refresh_timing();
+        (snapshot, settle_window, max_wait)
+    }
+
     /// Forward the first downstream `workspace/diagnostic/refresh` immediately,
     /// then coalesce later burst activity into at most one trailing refresh
     /// after quiet or the max-wait deadline (#789).
@@ -166,13 +201,17 @@ impl DiagnosticPublisher {
         if self.diagnostic_refresh_supported() {
             self.aggregator.record_refresh_requested();
         }
-        let Some(snapshot) = self.aggregator.begin_forwarded_refresh_debounce() else {
+        let Some((snapshot, settle_window, max_wait)) = self.admit_forwarded_refresh() else {
             return;
         };
+        // Timing was snapshotted at admission; later live updates cannot move
+        // this cycle's already-established quiet/max-wait boundaries.
         let publisher = self.clone();
         tokio::spawn(async move {
             let mut snapshot = snapshot;
-            let mut deadline = snapshot.last_activity_at + FORWARDED_REFRESH_MAX_WAIT;
+            let mut settle_window = settle_window;
+            let mut max_wait = max_wait;
+            let mut deadline = snapshot.last_activity_at + max_wait;
             if !publisher
                 .complete_forwarded_refresh_cycle(snapshot.generation)
                 .await
@@ -191,6 +230,7 @@ impl DiagnosticPublisher {
                         &publisher.aggregator,
                         snapshot,
                         deadline,
+                        settle_window,
                     ) => {
                         // Cancellation can race immediately after `select!` chose the
                         // timer branch, so re-check at the refresh admission boundary.
@@ -210,9 +250,9 @@ impl DiagnosticPublisher {
                                         .aggregator
                                         .finish_forwarded_refresh_admission(admitted.generation)
                                     {
-                                        snapshot = latest;
-                                        deadline = tokio::time::Instant::now()
-                                            + FORWARDED_REFRESH_MAX_WAIT;
+                                        (snapshot, settle_window, max_wait) = publisher
+                                            .snapshot_forwarded_refresh_cycle(latest);
+                                        deadline = tokio::time::Instant::now() + max_wait;
                                         continue;
                                     }
                                 } else {
@@ -233,9 +273,9 @@ impl DiagnosticPublisher {
                                     publisher.aggregator.cancel_forwarded_refresh_debounce();
                                     break;
                                 }
-                                snapshot = latest;
-                                deadline = tokio::time::Instant::now()
-                                    + FORWARDED_REFRESH_MAX_WAIT;
+                                (snapshot, settle_window, max_wait) = publisher
+                                    .snapshot_forwarded_refresh_cycle(latest);
+                                deadline = tokio::time::Instant::now() + max_wait;
                             }
                             crate::lsp::diagnostic_cache::ForwardedRefreshWait::Restart(_) => {
                                 unreachable!("the settle waiter consumes restart decisions")
@@ -1385,6 +1425,55 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn forwarded_refresh_timing_reads_live_settings_for_next_cycle() {
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+        server
+            .settings_manager
+            .set_capabilities(ClientCapabilities {
+                workspace: Some(WorkspaceClientCapabilities {
+                    diagnostics: Some(DiagnosticWorkspaceClientCapabilities {
+                        refresh_support: Some(true),
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            });
+        let mut settings = (*server.settings_manager.load_settings()).clone();
+        settings.features.workspace_diagnostic_refresh.debounce_ms = 250;
+        settings.features.workspace_diagnostic_refresh.max_wait_ms = 800;
+        server.settings_manager.apply_settings(settings);
+        let publisher = DiagnosticPublisher::new(server);
+
+        let (snapshot, admitted_settle, admitted_max_wait) = publisher
+            .admit_forwarded_refresh()
+            .expect("idle scheduler admits the old timing snapshot");
+
+        let mut settings = (*server.settings_manager.load_settings()).clone();
+        settings.features.workspace_diagnostic_refresh.debounce_ms = 20;
+        settings.features.workspace_diagnostic_refresh.max_wait_ms = 40;
+        server.settings_manager.apply_settings(settings);
+        assert_eq!(
+            (admitted_settle, admitted_max_wait),
+            (
+                std::time::Duration::from_millis(250),
+                std::time::Duration::from_millis(800)
+            ),
+            "an update after admission must not change the active cycle"
+        );
+        let (_, next_settle, next_max_wait) = publisher.snapshot_forwarded_refresh_cycle(snapshot);
+        assert_eq!(
+            (next_settle, next_max_wait),
+            (
+                std::time::Duration::from_millis(20),
+                std::time::Duration::from_millis(40)
+            ),
+            "the next continuous-stream cycle must use the live update"
+        );
+        server.diagnostics.cancel_forwarded_refresh_debounce();
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn shutdown_cancels_pending_forwarded_refresh() {
         let (service, _socket) = LspService::new(Kakehashi::new);
         let server = service.inner();
@@ -1867,7 +1956,13 @@ mod tests {
         let deadline = snapshot.last_activity_at + FORWARDED_REFRESH_MAX_WAIT;
         let waiter_aggregator = Arc::clone(&aggregator);
         let waiter = tokio::spawn(async move {
-            super::wait_for_forwarded_refresh_settle(&waiter_aggregator, snapshot, deadline).await
+            super::wait_for_forwarded_refresh_settle(
+                &waiter_aggregator,
+                snapshot,
+                deadline,
+                FORWARDED_REFRESH_SETTLE_WINDOW,
+            )
+            .await
         });
         tokio::time::sleep(std::time::Duration::from_millis(1)).await;
 
@@ -1893,6 +1988,35 @@ mod tests {
             aggregator.begin_forwarded_refresh_debounce().is_none(),
             "a max-wait fire must keep the cycle active until activity becomes quiet"
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn forwarded_refresh_waiter_uses_custom_quiet_window() {
+        let aggregator = Arc::new(DiagnosticAggregator::new());
+        let snapshot = aggregator
+            .begin_forwarded_refresh_debounce()
+            .expect("first refresh claims the debounce task");
+        aggregator.mark_forwarded_refresh_covered(snapshot.generation);
+        assert!(aggregator.begin_forwarded_refresh_debounce().is_none());
+        let deadline = snapshot.last_activity_at + std::time::Duration::from_millis(800);
+        let waiter_aggregator = Arc::clone(&aggregator);
+        let waiter = tokio::spawn(async move {
+            super::wait_for_forwarded_refresh_settle(
+                &waiter_aggregator,
+                snapshot,
+                deadline,
+                std::time::Duration::from_millis(250),
+            )
+            .await
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        tokio::time::advance(std::time::Duration::from_millis(248)).await;
+        assert!(!waiter.is_finished());
+        tokio::time::advance(std::time::Duration::from_millis(1)).await;
+        assert!(matches!(
+            waiter.await.unwrap(),
+            crate::lsp::diagnostic_cache::ForwardedRefreshWait::SendTrailing(_)
+        ));
     }
 
     #[tokio::test(start_paused = true)]

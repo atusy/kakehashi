@@ -71,6 +71,7 @@ expression: result
   },
   "autoInstall": false,
   "diagnosticsDebounceMs": null,
+  "features": null,
   "languageServers": {
     "lua-language-server": {
       "cmd": [

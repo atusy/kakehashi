@@ -112,6 +112,21 @@ This section is a practical reference. For the exhaustive field list and types, 
 
 ### Configuration Options
 
+Workspace-wide client-facing policies live under top-level `features`, keyed by
+the LSP method they govern. Diagnostic refresh bursts use one scheduler shared by
+all downstream servers in the workspace:
+
+```toml
+[features."workspace/diagnostic/refresh"]
+debounceMs = 100
+maxWaitMs = 1000
+```
+
+The first refresh after idle is immediate. Later activity is released after
+`debounceMs` of quiet, with `maxWaitMs` bounding a continuous burst. The values
+apply to cycles admitted after a live configuration update; an active cycle keeps
+the timing snapshot it started with. `maxWaitMs` must be at least `debounceMs`.
+
 ```json
 {
   "searchPaths": ["$HOME/.local/share/kakehashi", "/another/path"],
