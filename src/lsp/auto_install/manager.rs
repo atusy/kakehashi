@@ -535,6 +535,13 @@ mod tests {
 
     #[test]
     fn unit_test_crash_state_is_separate_from_shared_install_assets() {
+        const PARENT_STATE_DIR: &str = "KAKEHASHI_TEST_PARENT_CRASH_STATE_DIR";
+
+        if let Some(parent_state_dir) = std::env::var_os(PARENT_STATE_DIR) {
+            assert_ne!(failed_parser_state_dir(), PathBuf::from(parent_state_dir));
+            return;
+        }
+
         let shared_install_dir = crate::install::test_support::test_data_dir_path();
         let state_dir = failed_parser_state_dir();
         let _registry = AutoInstallManager::init_failed_parser_registry();
@@ -542,6 +549,21 @@ mod tests {
         assert_ne!(state_dir, shared_install_dir);
         assert_eq!(state_dir, failed_parser_state_dir());
         assert!(state_dir.join("crash_recovery.lock").is_file());
+
+        let child_status = std::process::Command::new(
+            std::env::current_exe().expect("resolve current test executable"),
+        )
+        .arg(stringify!(
+            unit_test_crash_state_is_separate_from_shared_install_assets
+        ))
+        .env(PARENT_STATE_DIR, &state_dir)
+        .status()
+        .expect("run crash-state isolation test in child process");
+
+        assert!(
+            child_status.success(),
+            "child test process must use a different crash-state directory"
+        );
     }
 
     fn create_test_manager() -> (AutoInstallManager, tempfile::TempDir) {
