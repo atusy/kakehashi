@@ -1176,7 +1176,6 @@ impl DiagnosticAggregator {
             .lock()
             .recover_poison("DiagnosticAggregator::last_wire_published")
             .get(host)
-            .cloned()
             .is_some_and(|wire| wire.as_ref() == diagnostics);
         let revisions = self
             .cache_revisions
