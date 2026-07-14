@@ -1009,12 +1009,10 @@ impl DiagnosticAggregator {
     pub(crate) fn evict_host(&self, host: &Url) -> bool {
         let mut cache = self.lock();
         let removed = cache.remove(host).is_some();
-        if removed {
-            self.cache_revisions
-                .lock()
-                .recover_poison("DiagnosticAggregator::cache_revisions")
-                .remove(host);
-        }
+        self.cache_revisions
+            .lock()
+            .recover_poison("DiagnosticAggregator::cache_revisions")
+            .remove(host);
         removed
     }
 
@@ -2721,6 +2719,15 @@ mod tests {
         assert!(
             !agg.evict_source(&host(), &region),
             "evicting a source from an absent host is a no-op"
+        );
+        assert!(
+            !agg.evict_host(&host()),
+            "the source eviction already removed the cache entry"
+        );
+        assert_eq!(
+            agg.snapshot_with_revision(&host()).1,
+            0,
+            "didClose-style host eviction forgets a revision even when slots were already empty"
         );
     }
 
