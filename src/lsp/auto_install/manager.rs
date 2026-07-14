@@ -138,6 +138,25 @@ impl Drop for InstallMarkerGuard {
     }
 }
 
+#[cfg(test)]
+fn failed_parser_state_dir() -> PathBuf {
+    crate::install::test_state_dir()
+}
+
+#[cfg(not(test))]
+fn failed_parser_state_dir() -> PathBuf {
+    std::env::var_os("KAKEHASHI_STATE_DIR")
+        // An empty value resolves to the process cwd (writing crash files
+        // wherever it was started), so treat it as unset — matching how
+        // `resolve_data_dir` handles an empty `KAKEHASHI_DATA_DIR`.
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+        .or_else(crate::install::default_data_dir)
+        // Platform-aware last resort (not a hard-coded `/tmp`, which doesn't
+        // exist on Windows); only reached if the data dir can't resolve.
+        .unwrap_or_else(|| std::env::temp_dir().join("kakehashi"))
+}
+
 impl AutoInstallManager {
     /// Create a new `AutoInstallManager`.
     pub fn new(
@@ -154,8 +173,10 @@ impl AutoInstallManager {
     ///
     /// State storage location: `KAKEHASHI_STATE_DIR` if set, else the default
     /// data directory, falling back to a `kakehashi` dir under the OS temp dir
-    /// if neither resolves. Crash-recovery state (`parsing_in_progress`,
-    /// `failed_parsers`) is ephemeral and conceptually distinct from the
+    /// if neither resolves. Unit-test builds instead use a stable process-owned
+    /// temp directory, independent of the shared parser assets. Crash-recovery
+    /// state (`parsing_in_progress`, `failed_parsers`) is ephemeral and
+    /// conceptually distinct from the
     /// persistent parser/query install assets in the data dir; the override
     /// lets it live elsewhere — e.g. so concurrent test processes that share one
     /// read-only install dir can isolate their crash state and not poison each
@@ -164,16 +185,7 @@ impl AutoInstallManager {
     /// If initialization fails, returns an uninitialized registry whose
     /// `begin_parsing` calls fail closed before entering native parser code.
     pub fn init_failed_parser_registry() -> FailedParserRegistry {
-        let state_dir = std::env::var_os("KAKEHASHI_STATE_DIR")
-            // An empty value resolves to the process cwd (writing crash files
-            // wherever it was started), so treat it as unset — matching how
-            // `resolve_data_dir` handles an empty `KAKEHASHI_DATA_DIR`.
-            .filter(|v| !v.is_empty())
-            .map(PathBuf::from)
-            .or_else(crate::install::default_data_dir)
-            // Platform-aware last resort (not a hard-coded `/tmp`, which doesn't
-            // exist on Windows); only reached if the data dir can't resolve.
-            .unwrap_or_else(|| std::env::temp_dir().join("kakehashi"));
+        let state_dir = failed_parser_state_dir();
 
         let registry = FailedParserRegistry::new(&state_dir);
 
@@ -520,6 +532,58 @@ impl AutoInstallManager {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    const PARENT_STATE_DIR: &str = "KAKEHASHI_TEST_PARENT_CRASH_STATE_DIR";
+    const CHILD_HANDSHAKE_PATH: &str = "KAKEHASHI_TEST_CRASH_STATE_HANDSHAKE_PATH";
+
+    #[test]
+    fn unit_test_crash_state_is_separate_from_shared_install_assets() {
+        const CHILD_TEST: &str =
+            "lsp::auto_install::manager::tests::child_process_uses_distinct_crash_state";
+
+        let shared_install_dir = crate::install::test_support::test_data_dir_path();
+        let state_dir = failed_parser_state_dir();
+        let _registry = AutoInstallManager::init_failed_parser_registry();
+
+        assert_ne!(state_dir, shared_install_dir);
+        assert_eq!(state_dir, failed_parser_state_dir());
+        assert!(state_dir.join("crash_recovery.lock").is_file());
+
+        let handshake_dir = tempdir().expect("create crash-state handshake directory");
+        let handshake_path = handshake_dir.path().join("child-ran");
+        let child_status = std::process::Command::new(
+            std::env::current_exe().expect("resolve current test executable"),
+        )
+        .args(["--ignored", "--exact", CHILD_TEST])
+        .env(PARENT_STATE_DIR, &state_dir)
+        .env(CHILD_HANDSHAKE_PATH, &handshake_path)
+        .status()
+        .expect("run crash-state isolation test in child process");
+
+        assert!(
+            child_status.success(),
+            "child test process must use a different crash-state directory"
+        );
+        assert!(
+            handshake_path.is_file(),
+            "child test process must execute the isolation assertion"
+        );
+    }
+
+    #[test]
+    #[ignore = "run only as a child of the crash-state isolation test"]
+    fn child_process_uses_distinct_crash_state() {
+        let (Some(parent_state_dir), Some(handshake_path)) = (
+            std::env::var_os(PARENT_STATE_DIR),
+            std::env::var_os(CHILD_HANDSHAKE_PATH),
+        ) else {
+            return;
+        };
+
+        assert_ne!(failed_parser_state_dir(), PathBuf::from(parent_state_dir));
+        std::fs::write(handshake_path, b"child assertion passed")
+            .expect("write crash-state child handshake");
+    }
 
     fn create_test_manager() -> (AutoInstallManager, tempfile::TempDir) {
         let temp = tempdir().expect("Failed to create temp dir");
