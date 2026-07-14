@@ -1561,7 +1561,9 @@ impl DiagnosticAggregator {
         if let Some(gate) = gates.get_mut(host) {
             gate.last_sent_at = Some(now);
             gate.cycle_started_at = now;
-            gate.stale_retry_started = false;
+            if !preserve_debt {
+                gate.stale_retry_started = false;
+            }
             gate.dirty = preserve_debt;
         } else {
             // The admit minted an entry, but a `forget_wire_gate` (seal) can
@@ -2298,14 +2300,40 @@ mod tests {
             "a send admitted before the cache mutation must not settle newer debt"
         );
         assert!(agg.wire_gate_is_dirty(&host));
-        assert!(
-            agg.wire_gate_schedule_latest(
+        let (first_retry, _) = agg
+            .wire_gate_schedule_latest(
                 &host,
                 std::time::Duration::ZERO,
                 std::time::Duration::from_secs(1),
             )
-            .is_some(),
-            "the preserved debt must be eligible for a latest-snapshot retry"
+            .expect("the preserved debt must be eligible for a latest-snapshot retry");
+        assert_eq!(first_retry, std::time::Duration::ZERO);
+        assert_eq!(agg.wire_gate_trailing_wake(&host), WireTrailingWake::Ready);
+
+        let next_revision = agg.snapshot_with_revision(&host).1;
+        assert_eq!(
+            agg.wire_debounce_admit_current_revision(
+                &host,
+                std::time::Duration::ZERO,
+                std::time::Duration::from_secs(1),
+                false,
+                next_revision,
+            ),
+            WireAdmit::SendNow
+        );
+        agg.set_pull_layer(&host, vec![diag("C")]);
+        assert!(!agg.wire_gate_commit_send_current_revision(&host, next_revision));
+        let (repeated_retry, _) = agg
+            .wire_gate_schedule_latest(
+                &host,
+                std::time::Duration::ZERO,
+                std::time::Duration::from_secs(1),
+            )
+            .expect("repeated stale sends retain their retry duty");
+        assert_eq!(
+            repeated_retry,
+            std::time::Duration::from_millis(50),
+            "continuous zero-debounce stale sends must remain rate-limited"
         );
     }
 
