@@ -939,7 +939,11 @@ impl DiagnosticPublisher {
             &diagnostics,
             cache_revision,
         ) {
-            None => return RepublishOutcome::Unchanged,
+            // A newer cache writer owns the wire handoff, but it may be an
+            // editor-originated pull-layer update whose caller deliberately
+            // does not nudge pull clients. Preserve this caller's
+            // push-origin refresh responsibility conservatively.
+            None => return RepublishOutcome::Deferred,
             Some(true) => RepublishOutcome::Changed,
             Some(false) => RepublishOutcome::Unchanged,
         };
