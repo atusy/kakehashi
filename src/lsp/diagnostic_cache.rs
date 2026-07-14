@@ -379,6 +379,10 @@ fn transform_region_diagnostic(diag: &mut Diagnostic, offset: &RegionOffset, hos
 #[derive(Default)]
 pub(crate) struct DiagnosticAggregator {
     cache: Mutex<HashMap<Url, SourceSlots>>,
+    /// Allocates process-unique cache incarnations so a reopened URI never
+    /// reuses a pre-close snapshot revision while closed-URI map entries can
+    /// still be reclaimed.
+    next_cache_revision: AtomicU64,
     /// Per-host cache mutation revision. Writers and snapshots lock this map
     /// before `cache`, making a revision and its slots one atomic state. A
     /// trailing wire task uses it to notice activity whose foreground
@@ -969,8 +973,7 @@ impl DiagnosticAggregator {
             },
         );
         if changed {
-            let revision = revisions.entry(host.clone()).or_default();
-            *revision = revision.wrapping_add(1);
+            revisions.insert(host.clone(), self.allocate_cache_revision());
         }
     }
 
@@ -1029,12 +1032,7 @@ impl DiagnosticAggregator {
             .recover_poison("DiagnosticAggregator::cache_revisions");
         let mut cache = self.lock();
         let removed = cache.remove(host).is_some();
-        // Keep advancing the host's incarnation even after its slots disappear.
-        // Otherwise a pre-close snapshot can validate after reopen when the new
-        // document happens to reach the same small revision again.
-        if let Some(revision) = revisions.get_mut(host) {
-            *revision = revision.wrapping_add(1);
-        }
+        revisions.remove(host);
         removed
     }
 
@@ -1750,8 +1748,7 @@ impl DiagnosticAggregator {
             cache.remove(host);
         }
         if removed {
-            let revision = revisions.entry(host.clone()).or_default();
-            *revision = revision.wrapping_add(1);
+            revisions.insert(host.clone(), self.allocate_cache_revision());
         }
         removed
     }
@@ -1811,10 +1808,23 @@ impl DiagnosticAggregator {
             !sources.is_empty()
         });
         for host in &affected {
-            let revision = revisions.entry(host.clone()).or_default();
-            *revision = revision.wrapping_add(1);
+            revisions.insert(host.clone(), self.allocate_cache_revision());
         }
         affected
+    }
+
+    fn allocate_cache_revision(&self) -> u64 {
+        self.next_cache_revision
+            .fetch_add(1, Ordering::Relaxed)
+            .wrapping_add(1)
+    }
+
+    #[cfg(test)]
+    fn cache_revision_count(&self) -> usize {
+        self.cache_revisions
+            .lock()
+            .recover_poison("DiagnosticAggregator::cache_revisions")
+            .len()
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<Url, SourceSlots>> {
@@ -3067,6 +3077,21 @@ mod tests {
     }
 
     #[test]
+    fn evict_host_reclaims_distinct_uri_revisions() {
+        let agg = DiagnosticAggregator::new();
+        for index in 0..100 {
+            let uri = Url::parse(&format!("file:///closed-{index}.rs")).unwrap();
+            agg.set_pull_layer(&uri, vec![diag("diagnostic")]);
+            assert!(agg.evict_host(&uri));
+        }
+        assert_eq!(
+            agg.cache_revision_count(),
+            0,
+            "closed URI generations must not accumulate tombstones"
+        );
+    }
+
+    #[test]
     fn evict_source_drops_only_that_source() {
         let agg = DiagnosticAggregator::new();
         let region = DiagnosticSource::Region("R1".to_string());
@@ -3116,9 +3141,10 @@ mod tests {
             !agg.evict_host(&host()),
             "the source eviction already removed the cache entry"
         );
-        assert!(
-            agg.snapshot_with_revision(&host()).1 > 0,
-            "didClose-style host eviction preserves an incarnation even when slots were already empty"
+        assert_eq!(
+            agg.snapshot_with_revision(&host()).1,
+            0,
+            "didClose-style host eviction reclaims the closed host's revision tombstone"
         );
     }
 
