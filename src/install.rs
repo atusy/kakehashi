@@ -696,13 +696,31 @@ mod tests {
         )
         .unwrap();
         std::fs::write(data_dir.join("queries"), "not a directory").unwrap();
+        let expected_queries_error =
+            queries::clear_uninstall_tombstone_for_install(data_dir, "lua")
+                .unwrap_err()
+                .to_string();
 
-        let result = install_language_blocking(
+        fn successful_query_install(
+            _base_url: &str,
+            language: &str,
+            data_dir: &std::path::Path,
+            _force: bool,
+        ) -> Result<queries::QueryInstallResult, queries::QueryInstallError> {
+            Ok(queries::QueryInstallResult {
+                language: language.to_string(),
+                install_path: data_dir.join("queries").join(language),
+                files_downloaded: Vec::new(),
+            })
+        }
+
+        let result = install_language_blocking_with_query_installer(
             "lua",
             data_dir,
             false,
-            "http://127.0.0.1:1",
+            "https://example.invalid",
             parser::ParserCompile::InProcess,
+            successful_query_install,
         );
 
         assert!(
@@ -713,6 +731,9 @@ mod tests {
             result.parser_path.is_some(),
             "query tombstone cleanup failures must preserve the available parser result"
         );
-        assert!(result.queries_error.is_some());
+        assert_eq!(
+            result.queries_error.as_deref(),
+            Some(expected_queries_error.as_str())
+        );
     }
 }
