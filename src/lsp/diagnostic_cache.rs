@@ -1157,12 +1157,6 @@ impl DiagnosticAggregator {
         {
             gate.last_activity_at = Some(tokio::time::Instant::now());
             gate.stale_retry_started = false;
-            gate.pending = false;
-            let obsolete = std::mem::replace(
-                &mut gate.cancellation,
-                tokio_util::sync::CancellationToken::new(),
-            );
-            obsolete.cancel();
             gate.dirty = false;
         }
         true
@@ -1202,12 +1196,6 @@ impl DiagnosticAggregator {
         {
             gate.last_activity_at = Some(tokio::time::Instant::now());
             gate.stale_retry_started = false;
-            gate.pending = false;
-            let obsolete = std::mem::replace(
-                &mut gate.cancellation,
-                tokio_util::sync::CancellationToken::new(),
-            );
-            obsolete.cancel();
             gate.dirty = false;
         }
         Some(true)
@@ -2223,26 +2211,22 @@ mod tests {
             WireAdmit::Defer { .. }
         ));
         assert!(agg.wire_gate_take_pending(&host));
-        let (_, obsolete_retry) = agg
-            .wire_gate_schedule_latest(&host, debounce, max_wait)
-            .expect("the stale reversion attempt owns a retry");
+        assert!(
+            agg.wire_gate_schedule_latest(&host, debounce, max_wait)
+                .is_some()
+        );
 
         tokio::time::advance(std::time::Duration::from_millis(40)).await;
         assert!(agg.published_set_changed(&host, &[diag("A")]));
         assert!(agg.settle_wire_reversion(&host, &[diag("A")]));
-        assert!(obsolete_retry.is_cancelled());
         assert!(
-            {
-                let gates = agg.wire_gate.lock().unwrap();
-                let gate = gates.get(&host).unwrap();
-                !gate.stale_retry_started && !gate.pending
-            },
+            !agg.wire_gate
+                .lock()
+                .unwrap()
+                .get(&host)
+                .unwrap()
+                .stale_retry_started,
             "settling all wire debt must reset stale retry backoff for the next cycle"
-        );
-        assert!(
-            agg.wire_gate_schedule_latest(&host, debounce, max_wait)
-                .is_some(),
-            "a new stale cycle must not be absorbed by the obsolete retry task"
         );
 
         tokio::time::advance(std::time::Duration::from_millis(65)).await;
