@@ -1047,6 +1047,7 @@ impl DiagnosticAggregator {
     /// the merge order shuffled — while a genuine change in any field is still
     /// detected. The per-host diagnostic count is small, so the O(n²) match is cheap
     /// and avoids serializing every diagnostic.
+    #[cfg(test)]
     pub(crate) fn published_set_changed(&self, host: &Url, diagnostics: &[Diagnostic]) -> bool {
         let mut last = self
             .last_published
@@ -1133,6 +1134,7 @@ impl DiagnosticAggregator {
     /// makes direct slice equality sufficient here; avoiding a clone and the
     /// multiset fallback keeps large diagnostic bursts off the allocation and
     /// JSON-serialization path.
+    #[cfg(test)]
     pub(crate) fn settle_wire_reversion(&self, host: &Url, diagnostics: &[Diagnostic]) -> bool {
         let matches_wire = self
             .last_wire_published
@@ -1404,6 +1406,7 @@ impl DiagnosticAggregator {
         self.wire_debounce_admit(host, window, window, true)
     }
 
+    #[cfg(test)]
     pub(crate) fn wire_debounce_admit(
         &self,
         host: &Url,
@@ -1593,6 +1596,7 @@ impl DiagnosticAggregator {
     /// fresh entry gets `true` and clears its `pending`, which at worst
     /// schedules one extra trailing task — the defer-reschedule design, not
     /// this bail, is what keeps that safe.)
+    #[cfg(test)]
     pub(crate) fn wire_gate_take_pending(&self, host: &Url) -> bool {
         if let Some(gate) = self
             .wire_gate
