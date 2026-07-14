@@ -412,12 +412,12 @@ pub(crate) struct DiagnosticAggregator {
     /// set via re-pull instead). Updated under the host's republish lock
     /// (same-host republishes are serialized), and forgotten on `didClose`
     /// ([`Self::forget_published`]).
-    last_published: Mutex<HashMap<Url, Vec<Diagnostic>>>,
+    last_published: Mutex<HashMap<Url, Arc<[Diagnostic]>>>,
     /// The last set that actually completed a client-facing wire send. This is
     /// distinct from `last_published`, which advances when a set is recorded
     /// even if debounce withholds it. Keeping both lets an A -> pending B -> A
     /// reversion cancel the wire debt instead of sending duplicate A.
-    last_wire_published: Mutex<HashMap<Url, Vec<Diagnostic>>>,
+    last_wire_published: Mutex<HashMap<Url, Arc<[Diagnostic]>>>,
     /// Single-flight guard for the **workspace-wide** `workspace/diagnostic/refresh`
     /// nudge (#497). `workspace/diagnostic/refresh` is param-less and workspace-wide,
     /// so concurrent refreshes are redundant; without this, a burst of set-changing
@@ -1047,13 +1047,14 @@ impl DiagnosticAggregator {
             // arrive slice-equal — the O(n²) multiset walk below is only the
             // fallback for order variation a future unsorted caller could
             // introduce.
-            if prev.as_slice() == diagnostics || same_diagnostic_multiset(prev, diagnostics) {
+            if prev.as_ref() == diagnostics || same_diagnostic_multiset(prev.as_ref(), diagnostics)
+            {
                 return false;
             }
-            *prev = diagnostics.to_vec();
+            *prev = Arc::from(diagnostics);
             return true;
         }
-        last.insert(host.clone(), diagnostics.to_vec());
+        last.insert(host.clone(), Arc::from(diagnostics));
         true
     }
 
@@ -1085,7 +1086,7 @@ impl DiagnosticAggregator {
             .lock()
             .recover_poison("DiagnosticAggregator::last_wire_published")
             .get(host)
-            .is_some_and(|wire| wire.as_slice() == diagnostics);
+            .is_some_and(|wire| wire.as_ref() == diagnostics);
         if !matches_wire {
             return false;
         }
@@ -1902,6 +1903,34 @@ mod tests {
             !agg.settle_wire_reversion(&host, &[diag("B"), diag("A")]),
             "the wire fast path compares canonical slices directly"
         );
+    }
+
+    #[test]
+    fn wire_commit_shares_the_recorded_diagnostic_snapshot() {
+        let agg = DiagnosticAggregator::new();
+        let host = host();
+        assert!(agg.published_set_changed(&host, &[diag("A")]));
+        assert_eq!(
+            agg.wire_gate_admit(&host, std::time::Duration::ZERO),
+            WireAdmit::SendNow
+        );
+        agg.wire_gate_commit_send(&host);
+
+        let recorded = agg
+            .last_published
+            .lock()
+            .unwrap()
+            .get(&host)
+            .cloned()
+            .unwrap();
+        let wire = agg
+            .last_wire_published
+            .lock()
+            .unwrap()
+            .get(&host)
+            .cloned()
+            .unwrap();
+        assert!(Arc::ptr_eq(&recorded, &wire));
     }
 
     #[tokio::test(start_paused = true)]
