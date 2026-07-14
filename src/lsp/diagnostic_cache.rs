@@ -379,6 +379,10 @@ fn transform_region_diagnostic(diag: &mut Diagnostic, offset: &RegionOffset, hos
 #[derive(Default)]
 pub(crate) struct DiagnosticAggregator {
     cache: Mutex<HashMap<Url, SourceSlots>>,
+    /// Per-host cache mutation revision, updated while `cache` is locked and
+    /// snapshotted under the same lock. A trailing wire task uses it to notice
+    /// activity whose foreground republish is still queued on the host lock.
+    cache_revisions: Mutex<HashMap<Url, u64>>,
     /// Per-host republish locks. The publisher holds a host's lock across its
     /// snapshot→merge→publish so two concurrent republishes for the **same** host
     /// (a region push vs a host-event pull, on different tasks) cannot interleave
@@ -540,6 +544,10 @@ struct WireGate {
     /// Latest set-changing feed admitted for this host. Trailing retries do
     /// not advance it, so `debounce` measures quiet since real activity.
     last_activity_at: Option<tokio::time::Instant>,
+    /// Cache revision whose activity was last admitted. This prevents a
+    /// trailing task from mistaking newly snapshotted cache data for its own
+    /// timer-only retry.
+    last_cache_revision: u64,
     /// A trailing republish task is scheduled; bounds the tasks to one per
     /// host per active deadline.
     pending: bool,
@@ -932,6 +940,10 @@ impl DiagnosticAggregator {
         } else {
             cache.entry(host.clone()).or_default()
         };
+        let changed = source_slots
+            .get(&source)
+            .and_then(|servers| servers.get(&server))
+            .is_none_or(|slot| slot.diagnostics != diagnostics);
         source_slots.entry(source).or_default().insert(
             server,
             SlotEntry {
@@ -939,6 +951,9 @@ impl DiagnosticAggregator {
                 connection_id,
             },
         );
+        if changed {
+            self.bump_cache_revision(host);
+        }
     }
 
     /// Replace the cached host-event pull blob for a host
@@ -959,8 +974,22 @@ impl DiagnosticAggregator {
     /// Snapshot every source/server slot for a host, cloned for merging off-lock.
     /// Empty when the host has no slots.
     pub(crate) fn snapshot(&self, host: &Url) -> SourceSlots {
+        self.snapshot_with_revision(host).0
+    }
+
+    /// Snapshot slots and their mutation revision atomically with respect to
+    /// cache writers.
+    pub(crate) fn snapshot_with_revision(&self, host: &Url) -> (SourceSlots, u64) {
         let cache = self.lock();
-        cache.get(host).cloned().unwrap_or_default()
+        let snapshot = cache.get(host).cloned().unwrap_or_default();
+        let revision = self
+            .cache_revisions
+            .lock()
+            .recover_poison("DiagnosticAggregator::cache_revisions")
+            .get(host)
+            .copied()
+            .unwrap_or(0);
+        (snapshot, revision)
     }
 
     /// Whether `host` has a cached `Region` push slot with **non-empty** diagnostics
@@ -979,7 +1008,14 @@ impl DiagnosticAggregator {
     /// Drop everything for a host (host `didClose`). Returns whether it existed.
     pub(crate) fn evict_host(&self, host: &Url) -> bool {
         let mut cache = self.lock();
-        cache.remove(host).is_some()
+        let removed = cache.remove(host).is_some();
+        if removed {
+            self.cache_revisions
+                .lock()
+                .recover_poison("DiagnosticAggregator::cache_revisions")
+                .remove(host);
+        }
+        removed
     }
 
     /// Whether `diagnostics` differs from the last merged-and-recorded set for
@@ -1281,6 +1317,17 @@ impl DiagnosticAggregator {
         max_wait: std::time::Duration,
         record_activity: bool,
     ) -> WireAdmit {
+        self.wire_debounce_admit_for_revision(host, debounce, max_wait, record_activity, 0)
+    }
+
+    pub(crate) fn wire_debounce_admit_for_revision(
+        &self,
+        host: &Url,
+        debounce: std::time::Duration,
+        max_wait: std::time::Duration,
+        record_activity: bool,
+        cache_revision: u64,
+    ) -> WireAdmit {
         let now = tokio::time::Instant::now();
         let mut gates = self
             .wire_gate
@@ -1300,6 +1347,7 @@ impl DiagnosticAggregator {
                     max_wait,
                     last_sent_at: None,
                     last_activity_at: Some(now),
+                    last_cache_revision: cache_revision,
                     pending: false,
                     cancellation: tokio_util::sync::CancellationToken::new(),
                     dirty: true,
@@ -1307,11 +1355,13 @@ impl DiagnosticAggregator {
             );
             return WireAdmit::SendNow;
         };
+        let record_activity = record_activity || gate.last_cache_revision != cache_revision;
         let was_quiet = gate
             .last_activity_at
             .is_some_and(|at| now.saturating_duration_since(at) >= gate.debounce);
         if record_activity {
             gate.last_activity_at = Some(now);
+            gate.last_cache_revision = cache_revision;
         }
         let quiet_deadline = gate.last_activity_at.unwrap_or(now) + gate.debounce;
         let max_deadline = gate.last_sent_at.map(|at| at + gate.max_wait);
@@ -1367,6 +1417,7 @@ impl DiagnosticAggregator {
                     max_wait: std::time::Duration::ZERO,
                     last_sent_at: Some(now),
                     last_activity_at: Some(now),
+                    last_cache_revision: 0,
                     pending: false,
                     cancellation: tokio_util::sync::CancellationToken::new(),
                     dirty: false,
@@ -1488,6 +1539,9 @@ impl DiagnosticAggregator {
         if slots.is_empty() {
             cache.remove(host);
         }
+        if removed {
+            self.bump_cache_revision(host);
+        }
         removed
     }
 
@@ -1541,6 +1595,9 @@ impl DiagnosticAggregator {
             }
             !sources.is_empty()
         });
+        for host in &affected {
+            self.bump_cache_revision(host);
+        }
         affected
     }
 
@@ -1551,6 +1608,17 @@ impl DiagnosticAggregator {
         self.cache
             .lock()
             .recover_poison("DiagnosticAggregator::cache")
+    }
+
+    /// Advance a host revision while the caller still holds `cache`, keeping
+    /// [`Self::snapshot_with_revision`] atomic with the corresponding mutation.
+    fn bump_cache_revision(&self, host: &Url) {
+        let mut revisions = self
+            .cache_revisions
+            .lock()
+            .recover_poison("DiagnosticAggregator::cache_revisions");
+        let revision = revisions.entry(host.clone()).or_default();
+        *revision = revision.wrapping_add(1);
     }
 }
 
@@ -1701,6 +1769,31 @@ mod tests {
         );
         tokio::time::advance(std::time::Duration::from_millis(70)).await;
         assert_eq!(agg.wire_gate_trailing_wake(&host), WireTrailingWake::Ready);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn trailing_observation_of_new_cache_revision_counts_as_activity() {
+        let agg = DiagnosticAggregator::new();
+        let host = host();
+        let debounce = std::time::Duration::from_millis(100);
+        let max_wait = std::time::Duration::from_secs(1);
+
+        assert_eq!(
+            agg.wire_debounce_admit_for_revision(&host, debounce, max_wait, true, 1),
+            WireAdmit::SendNow
+        );
+        agg.wire_gate_commit_send(&host);
+        tokio::time::advance(std::time::Duration::from_millis(10)).await;
+        assert!(matches!(
+            agg.wire_debounce_admit_for_revision(&host, debounce, max_wait, true, 2),
+            WireAdmit::Defer { .. }
+        ));
+
+        tokio::time::advance(std::time::Duration::from_millis(90)).await;
+        assert!(matches!(
+            agg.wire_debounce_admit_for_revision(&host, debounce, max_wait, false, 3),
+            WireAdmit::Defer { remaining, .. } if remaining == debounce
+        ));
     }
 
     #[tokio::test(start_paused = true)]

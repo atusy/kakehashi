@@ -860,7 +860,7 @@ impl DiagnosticPublisher {
         // is the client's outbound-channel send, not a round-trip.
         let _guard = self.aggregator.lock_republish(host).await;
 
-        let mut snapshot = self.aggregator.snapshot(host);
+        let (mut snapshot, cache_revision) = self.aggregator.snapshot_with_revision(host);
         // Drop Host push slots whose server is no longer a configured `_self` host
         // server for the document's current language — so a host server's pushed
         // diagnostics don't linger in the editor after the user disables `_self`
@@ -1019,11 +1019,12 @@ impl DiagnosticPublisher {
             .load_settings()
             .features
             .text_document_publish_diagnostics;
-        match self.aggregator.wire_debounce_admit(
+        match self.aggregator.wire_debounce_admit_for_revision(
             host,
             std::time::Duration::from_millis(timing.debounce_ms),
             std::time::Duration::from_millis(timing.max_wait_ms),
             wire_activity && changed == RepublishOutcome::Changed,
+            cache_revision,
         ) {
             crate::lsp::diagnostic_cache::WireAdmit::SendNow => {
                 log::debug!(
