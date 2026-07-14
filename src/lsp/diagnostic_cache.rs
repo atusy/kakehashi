@@ -1702,12 +1702,16 @@ impl DiagnosticAggregator {
             cancellation: tokio_util::sync::CancellationToken::new(),
             dirty: true,
         });
-        let starts_idle_cycle = !gate.pending
-            && !gate.dirty
+        let starts_idle_cycle = !gate.dirty
             && gate
                 .last_activity_at
                 .is_none_or(|at| now.saturating_duration_since(at) >= gate.debounce);
         if starts_idle_cycle {
+            if gate.pending {
+                gate.cancellation.cancel();
+                gate.cancellation = tokio_util::sync::CancellationToken::new();
+                gate.pending = false;
+            }
             gate.debounce = debounce;
             gate.max_wait = max_wait;
             gate.cycle_started_at = now;
@@ -2211,23 +2215,22 @@ mod tests {
             WireAdmit::Defer { .. }
         ));
         assert!(agg.wire_gate_take_pending(&host));
-        assert!(
-            agg.wire_gate_schedule_latest(&host, debounce, max_wait)
-                .is_some()
-        );
+        let (_, fallback) = agg
+            .wire_gate_schedule_latest(&host, debounce, max_wait)
+            .expect("the stale attempt owns a fallback");
 
         tokio::time::advance(std::time::Duration::from_millis(40)).await;
         assert!(agg.published_set_changed(&host, &[diag("A")]));
         assert!(agg.settle_wire_reversion(&host, &[diag("A")]));
         assert!(
-            !agg.wire_gate
-                .lock()
-                .unwrap()
-                .get(&host)
-                .unwrap()
-                .stale_retry_started,
-            "settling all wire debt must reset stale retry backoff for the next cycle"
+            {
+                let gates = agg.wire_gate.lock().unwrap();
+                let gate = gates.get(&host).unwrap();
+                !gate.stale_retry_started && gate.pending
+            },
+            "settlement resets backoff but retains the parked abort fallback"
         );
+        assert!(!fallback.is_cancelled());
 
         tokio::time::advance(std::time::Duration::from_millis(65)).await;
         assert!(agg.published_set_changed(&host, &[diag("C")]));
@@ -2236,6 +2239,34 @@ mod tests {
             WireAdmit::Defer { remaining, .. }
                 if remaining == debounce
         ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn idle_stale_handoff_transfers_settled_fallback_to_live_timing() {
+        let agg = DiagnosticAggregator::new();
+        let host = host();
+        let old_debounce = std::time::Duration::from_millis(100);
+        let old_max_wait = std::time::Duration::from_secs(1);
+        assert!(agg.published_set_changed(&host, &[diag("A")]));
+        assert_eq!(
+            agg.wire_debounce_admit(&host, old_debounce, old_max_wait, true),
+            WireAdmit::SendNow
+        );
+        agg.wire_gate_commit_send(&host);
+        let (_, old_fallback) = agg
+            .wire_gate_schedule_latest(&host, old_debounce, old_max_wait)
+            .expect("stale work parks a fallback");
+        assert!(agg.settle_wire_reversion(&host, &[diag("A")]));
+        assert!(!old_fallback.is_cancelled());
+
+        tokio::time::advance(old_debounce).await;
+        let new_debounce = std::time::Duration::from_millis(250);
+        let (remaining, replacement) = agg
+            .wire_gate_schedule_latest(&host, new_debounce, std::time::Duration::from_secs(2))
+            .expect("the new handoff atomically replaces the settled fallback");
+        assert!(old_fallback.is_cancelled());
+        assert!(!replacement.is_cancelled());
+        assert_eq!(remaining, new_debounce);
     }
 
     #[test]
