@@ -379,9 +379,10 @@ fn transform_region_diagnostic(diag: &mut Diagnostic, offset: &RegionOffset, hos
 #[derive(Default)]
 pub(crate) struct DiagnosticAggregator {
     cache: Mutex<HashMap<Url, SourceSlots>>,
-    /// Per-host cache mutation revision, updated while `cache` is locked and
-    /// snapshotted under the same lock. A trailing wire task uses it to notice
-    /// activity whose foreground republish is still queued on the host lock.
+    /// Per-host cache mutation revision. Writers and snapshots lock this map
+    /// before `cache`, making a revision and its slots one atomic state. A
+    /// trailing wire task uses it to notice activity whose foreground
+    /// republish is still queued on the host lock.
     cache_revisions: Mutex<HashMap<Url, u64>>,
     /// Per-host republish locks. The publisher holds a host's lock across its
     /// snapshot→merge→publish so two concurrent republishes for the **same** host
@@ -936,6 +937,10 @@ impl DiagnosticAggregator {
         connection_id: Option<ProgressConnectionId>,
         diagnostics: Vec<Diagnostic>,
     ) {
+        let mut revisions = self
+            .cache_revisions
+            .lock()
+            .recover_poison("DiagnosticAggregator::cache_revisions");
         let mut cache = self.lock();
         // Look up by `&Url` first and clone the host key only when inserting a new
         // host entry, rather than `entry(host.clone())` cloning on every call.
@@ -956,7 +961,8 @@ impl DiagnosticAggregator {
             },
         );
         if changed {
-            self.bump_cache_revision(host);
+            let revision = revisions.entry(host.clone()).or_default();
+            *revision = revision.wrapping_add(1);
         }
     }
 
@@ -984,15 +990,13 @@ impl DiagnosticAggregator {
     /// Snapshot slots and their mutation revision atomically with respect to
     /// cache writers.
     pub(crate) fn snapshot_with_revision(&self, host: &Url) -> (SourceSlots, u64) {
-        let cache = self.lock();
-        let snapshot = cache.get(host).cloned().unwrap_or_default();
-        let revision = self
+        let revisions = self
             .cache_revisions
             .lock()
-            .recover_poison("DiagnosticAggregator::cache_revisions")
-            .get(host)
-            .copied()
-            .unwrap_or(0);
+            .recover_poison("DiagnosticAggregator::cache_revisions");
+        let cache = self.lock();
+        let snapshot = cache.get(host).cloned().unwrap_or_default();
+        let revision = revisions.get(host).copied().unwrap_or(0);
         (snapshot, revision)
     }
 
@@ -1011,12 +1015,13 @@ impl DiagnosticAggregator {
 
     /// Drop everything for a host (host `didClose`). Returns whether it existed.
     pub(crate) fn evict_host(&self, host: &Url) -> bool {
+        let mut revisions = self
+            .cache_revisions
+            .lock()
+            .recover_poison("DiagnosticAggregator::cache_revisions");
         let mut cache = self.lock();
         let removed = cache.remove(host).is_some();
-        self.cache_revisions
-            .lock()
-            .recover_poison("DiagnosticAggregator::cache_revisions")
-            .remove(host);
+        revisions.remove(host);
         removed
     }
 
@@ -1056,6 +1061,25 @@ impl DiagnosticAggregator {
         }
         last.insert(host.clone(), Arc::from(diagnostics));
         true
+    }
+
+    /// Compare-and-record only while `cache_revision` is still current. Cache
+    /// writers take the revision lock before changing slots, so `None` means
+    /// the caller must hand off to the republish paired with the newer write.
+    pub(crate) fn published_set_changed_current_revision(
+        &self,
+        host: &Url,
+        diagnostics: &[Diagnostic],
+        cache_revision: u64,
+    ) -> Option<bool> {
+        let revisions = self
+            .cache_revisions
+            .lock()
+            .recover_poison("DiagnosticAggregator::cache_revisions");
+        if revisions.get(host).copied().unwrap_or(0) != cache_revision {
+            return None;
+        }
+        Some(self.published_set_changed(host, diagnostics))
     }
 
     /// Forget the last-recorded set for `host` (host `didClose`), so its entry
@@ -1100,6 +1124,25 @@ impl DiagnosticAggregator {
             gate.dirty = false;
         }
         true
+    }
+
+    /// Revision-validated form of [`Self::settle_wire_reversion`]. The
+    /// revision lock remains held while clearing wire debt, so a newer cache
+    /// mutation cannot be hidden by a stale reversion snapshot.
+    pub(crate) fn settle_wire_reversion_current_revision(
+        &self,
+        host: &Url,
+        diagnostics: &[Diagnostic],
+        cache_revision: u64,
+    ) -> Option<bool> {
+        let revisions = self
+            .cache_revisions
+            .lock()
+            .recover_poison("DiagnosticAggregator::cache_revisions");
+        if revisions.get(host).copied().unwrap_or(0) != cache_revision {
+            return None;
+        }
+        Some(self.settle_wire_reversion(host, diagnostics))
     }
 
     /// Begin a workspace-wide refresh under the single-flight + coverage guard
@@ -1560,6 +1603,10 @@ impl DiagnosticAggregator {
     /// until the whole host is closed (#424). Returns whether the source existed.
     /// The host entry is removed if it becomes empty.
     pub(crate) fn evict_source(&self, host: &Url, source: &DiagnosticSource) -> bool {
+        let mut revisions = self
+            .cache_revisions
+            .lock()
+            .recover_poison("DiagnosticAggregator::cache_revisions");
         let mut cache = self.lock();
         // Borrow by `&Url` (no key clone) — the common case (host present, other
         // sources remain) is a single lookup. The host entry is removed only when
@@ -1572,7 +1619,8 @@ impl DiagnosticAggregator {
             cache.remove(host);
         }
         if removed {
-            self.bump_cache_revision(host);
+            let revision = revisions.entry(host.clone()).or_default();
+            *revision = revision.wrapping_add(1);
         }
         removed
     }
@@ -1612,6 +1660,10 @@ impl DiagnosticAggregator {
     /// host-event pull recomputes it — an intentional asymmetry (#469 targets the
     /// push path; the pull layer self-refreshes on the next pull).
     pub(crate) fn evict_connection(&self, connection_id: ProgressConnectionId) -> Vec<Url> {
+        let mut revisions = self
+            .cache_revisions
+            .lock()
+            .recover_poison("DiagnosticAggregator::cache_revisions");
         let mut cache = self.lock();
         let mut affected = Vec::new();
         cache.retain(|host, sources| {
@@ -1628,7 +1680,8 @@ impl DiagnosticAggregator {
             !sources.is_empty()
         });
         for host in &affected {
-            self.bump_cache_revision(host);
+            let revision = revisions.entry(host.clone()).or_default();
+            *revision = revision.wrapping_add(1);
         }
         affected
     }
@@ -1640,17 +1693,6 @@ impl DiagnosticAggregator {
         self.cache
             .lock()
             .recover_poison("DiagnosticAggregator::cache")
-    }
-
-    /// Advance a host revision while the caller still holds `cache`, keeping
-    /// [`Self::snapshot_with_revision`] atomic with the corresponding mutation.
-    fn bump_cache_revision(&self, host: &Url) {
-        let mut revisions = self
-            .cache_revisions
-            .lock()
-            .recover_poison("DiagnosticAggregator::cache_revisions");
-        let revision = revisions.entry(host.clone()).or_default();
-        *revision = revision.wrapping_add(1);
     }
 }
 
