@@ -168,12 +168,24 @@ impl DiagnosticPublisher {
         std::time::Duration,
     )> {
         let snapshot = self.aggregator.begin_forwarded_refresh_debounce()?;
-        // This ArcSwap load is the admission linearization point. The preceding
-        // claim is internal bookkeeping only: no task starts and no timing is
-        // consumed before this snapshot, so an earlier settings store affects
-        // this cycle and a later one affects the next cycle.
+        Some(self.snapshot_forwarded_refresh_cycle(snapshot))
+    }
+
+    fn snapshot_forwarded_refresh_cycle(
+        &self,
+        snapshot: crate::lsp::diagnostic_cache::ForwardedRefreshWaitSnapshot,
+    ) -> (
+        crate::lsp::diagnostic_cache::ForwardedRefreshWaitSnapshot,
+        std::time::Duration,
+        std::time::Duration,
+    ) {
+        // This ArcSwap load is the cycle-admission linearization point. The
+        // initial scheduler claim is internal bookkeeping, and continued-stream
+        // callers arrive only after the previous cycle completes. No timing for
+        // this cycle is consumed before the snapshot, so an earlier settings
+        // store affects this cycle and a later one affects the next cycle.
         let (settle_window, max_wait) = self.forwarded_refresh_timing();
-        Some((snapshot, settle_window, max_wait))
+        (snapshot, settle_window, max_wait)
     }
 
     /// Forward the first downstream `workspace/diagnostic/refresh` immediately,
@@ -197,6 +209,8 @@ impl DiagnosticPublisher {
         let publisher = self.clone();
         tokio::spawn(async move {
             let mut snapshot = snapshot;
+            let mut settle_window = settle_window;
+            let mut max_wait = max_wait;
             let mut deadline = snapshot.last_activity_at + max_wait;
             if !publisher
                 .complete_forwarded_refresh_cycle(snapshot.generation)
@@ -236,7 +250,8 @@ impl DiagnosticPublisher {
                                         .aggregator
                                         .finish_forwarded_refresh_admission(admitted.generation)
                                     {
-                                        snapshot = latest;
+                                        (snapshot, settle_window, max_wait) = publisher
+                                            .snapshot_forwarded_refresh_cycle(latest);
                                         deadline = tokio::time::Instant::now() + max_wait;
                                         continue;
                                     }
@@ -258,7 +273,8 @@ impl DiagnosticPublisher {
                                     publisher.aggregator.cancel_forwarded_refresh_debounce();
                                     break;
                                 }
-                                snapshot = latest;
+                                (snapshot, settle_window, max_wait) = publisher
+                                    .snapshot_forwarded_refresh_cycle(latest);
                                 deadline = tokio::time::Instant::now() + max_wait;
                             }
                             crate::lsp::diagnostic_cache::ForwardedRefreshWait::Restart(_) => {
@@ -1429,7 +1445,7 @@ mod tests {
         server.settings_manager.apply_settings(settings);
         let publisher = DiagnosticPublisher::new(server);
 
-        let (_, admitted_settle, admitted_max_wait) = publisher
+        let (snapshot, admitted_settle, admitted_max_wait) = publisher
             .admit_forwarded_refresh()
             .expect("idle scheduler admits the old timing snapshot");
 
@@ -1445,18 +1461,16 @@ mod tests {
             ),
             "an update after admission must not change the active cycle"
         );
-        server.diagnostics.cancel_forwarded_refresh_debounce();
-        let (_, next_settle, next_max_wait) = publisher
-            .admit_forwarded_refresh()
-            .expect("the next idle cycle reads the live settings");
+        let (_, next_settle, next_max_wait) = publisher.snapshot_forwarded_refresh_cycle(snapshot);
         assert_eq!(
             (next_settle, next_max_wait),
             (
                 std::time::Duration::from_millis(20),
                 std::time::Duration::from_millis(40)
             ),
-            "the next cycle must use the live update"
+            "the next continuous-stream cycle must use the live update"
         );
+        server.diagnostics.cancel_forwarded_refresh_debounce();
     }
 
     #[tokio::test(start_paused = true)]
