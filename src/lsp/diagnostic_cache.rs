@@ -1666,18 +1666,19 @@ impl DiagnosticAggregator {
             return None;
         }
         let quiet_deadline = now + gate.debounce;
-        let deadline = gate
+        let max_deadline = gate
             .cycle_started_at
             .checked_add(gate.max_wait)
-            .map_or(quiet_deadline, |max| quiet_deadline.min(max));
+            .unwrap_or(quiet_deadline);
+        let deadline = quiet_deadline.min(max_deadline);
         // A max-wait attempt that itself became stale must not self-spawn an
         // unbounded zero-delay full-merge chain. Back off by the active
         // debounce (at least one millisecond); once churn settles, that retry
         // sends the latest set.
-        let remaining = if deadline <= now {
+        let remaining = if max_deadline <= now {
             gate.debounce.max(std::time::Duration::from_millis(50))
         } else {
-            deadline - now
+            deadline.saturating_duration_since(now)
         };
         gate.pending = true;
         Some((remaining, gate.cancellation.clone()))
@@ -2022,12 +2023,14 @@ mod tests {
 
         let zero = DiagnosticAggregator::new();
         let zero_host = Url::parse("file:///zero-debounce.rs").unwrap();
-        zero.wire_gate_schedule_latest(
-            &zero_host,
-            std::time::Duration::ZERO,
-            std::time::Duration::from_millis(1),
-        )
-        .unwrap();
+        let (initial_remaining, _) = zero
+            .wire_gate_schedule_latest(
+                &zero_host,
+                std::time::Duration::ZERO,
+                std::time::Duration::from_millis(1),
+            )
+            .unwrap();
+        assert_eq!(initial_remaining, std::time::Duration::ZERO);
         assert!(zero.wire_gate_take_pending(&zero_host));
         zero.wire_gate_commit_send(&zero_host);
         tokio::time::advance(std::time::Duration::from_millis(1)).await;

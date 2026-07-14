@@ -109,8 +109,11 @@ maxWaitMs = 1000
 
 The first changed merge after idle passes immediately. Later changes update the
 cached latest set and one trailing republish re-merges it after `debounceMs` of
-quiet; continuous activity is forced no later than `maxWaitMs` after the previous
-send. State is per URI, so a noisy document cannot delay another. Only the wire
+quiet; continuous activity starts a flush attempt no later than `maxWaitMs` after
+the cycle begins. If the cache changes during that merge, the stale attempt is
+discarded and retried at a bounded rate rather than sending an already-superseded
+set, so max-wait bounds the attempt rather than completion under uninterrupted
+concurrent mutation. State is per URI, so a noisy document cannot delay another. Only the wire
 waits: change detection, the coverage bump, and the refresh nudge fire at the same
 points as before. `didClose` forgets pending state and sends its clearing publish
 outside the debounce; shutdown cancels pending tasks. Pull diagnostics are outside

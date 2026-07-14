@@ -128,7 +128,11 @@ maxWaitMs = 1000
 ```
 
 Both schedulers send the first activity after idle immediately. Later activity is
-released after `debounceMs` of quiet, with `maxWaitMs` bounding a continuous burst.
+released after `debounceMs` of quiet, with `maxWaitMs` bounding when a continuous
+burst must attempt a flush. If the cache changes while a publish set is being
+assembled, Kakehashi discards that stale attempt and retries at a bounded rate so
+it never sends an internally superseded set; therefore `maxWaitMs` bounds the
+attempt, not completion under uninterrupted concurrent mutation.
 Publish diagnostics keep only the latest merged set per URI, and different URIs
 never delay one another. Pull diagnostics are unaffected. The values
 apply to cycles admitted after a live configuration update; an active cycle keeps
