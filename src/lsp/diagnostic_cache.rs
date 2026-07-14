@@ -1029,17 +1029,18 @@ impl DiagnosticAggregator {
     /// what the editor already received. The reversion is still set-changing
     /// activity for the quiet-window cadence, so advance its activity clock
     /// without recreating wire debt. The parked task may still wake, but
-    /// `dirty = false` makes its unchanged republish a no-op.
+    /// `dirty = false` makes its unchanged republish a no-op. Both stored and
+    /// current sets come from [`merge_cached_diagnostics`], whose total sort
+    /// makes direct slice equality sufficient here; avoiding a clone and the
+    /// multiset fallback keeps large diagnostic bursts off the allocation and
+    /// JSON-serialization path.
     pub(crate) fn settle_wire_reversion(&self, host: &Url, diagnostics: &[Diagnostic]) -> bool {
-        let wire = self
+        let matches_wire = self
             .last_wire_published
             .lock()
             .recover_poison("DiagnosticAggregator::last_wire_published")
             .get(host)
-            .cloned();
-        let matches_wire = wire.is_some_and(|wire| {
-            wire.as_slice() == diagnostics || same_diagnostic_multiset(&wire, diagnostics)
-        });
+            .is_some_and(|wire| wire.as_slice() == diagnostics);
         if !matches_wire {
             return false;
         }
@@ -1667,6 +1668,29 @@ mod tests {
             WireAdmit::Defer { remaining, .. }
                 if remaining == debounce
         ));
+    }
+
+    #[test]
+    fn wire_reversion_requires_canonical_diagnostic_order() {
+        let agg = DiagnosticAggregator::new();
+        let host = host();
+
+        assert!(agg.published_set_changed(&host, &[diag("A"), diag("B")]));
+        assert_eq!(
+            agg.wire_debounce_admit(
+                &host,
+                std::time::Duration::ZERO,
+                std::time::Duration::from_secs(1),
+                true,
+            ),
+            WireAdmit::SendNow
+        );
+        agg.wire_gate_commit_send(&host);
+
+        assert!(
+            !agg.settle_wire_reversion(&host, &[diag("B"), diag("A")]),
+            "the wire fast path compares canonical slices directly"
+        );
     }
 
     #[tokio::test(start_paused = true)]
