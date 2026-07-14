@@ -1477,7 +1477,7 @@ async fn deliver_upstream_notification(
             }
         }
         UpstreamNotification::LogMessage { typ, message } => {
-            if delivery_context.is_none_or(|context| {
+            if delivery_context.is_some_and(|context| {
                 context
                     .settings_manager
                     .load_settings()
@@ -2996,6 +2996,33 @@ mod tests {
 
         cancel.cancel();
         let _ = loop_handle.await;
+    }
+
+    #[tokio::test]
+    async fn log_message_without_delivery_context_fails_closed() {
+        use crate::lsp::bridge::UpstreamNotification;
+        use futures::StreamExt;
+        use tower_lsp_server::ls_types::MessageType;
+
+        let (client, mut requests, _responses) = init_client_and_socket().await;
+        deliver_upstream_notification(
+            &client,
+            UpstreamNotification::LogMessage {
+                typ: MessageType::ERROR,
+                message: "must be gated".to_string(),
+            },
+            &mut std::collections::HashSet::new(),
+            &mut std::collections::HashSet::new(),
+            None,
+        )
+        .await;
+
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), requests.next())
+                .await
+                .is_err(),
+            "missing policy context must not bypass the global log gate"
+        );
     }
 
     #[tokio::test]
