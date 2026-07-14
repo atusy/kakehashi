@@ -623,9 +623,16 @@ impl LspClient {
                 !remaining.is_zero(),
                 "timed out waiting for response {expected_id}"
             );
-            let message = self
-                .try_receive_message(remaining)
-                .expect("server closed before the expected response");
+            let message = match self.rx.recv_timeout(remaining) {
+                Ok(ReaderEvent::Message(value)) => value,
+                Ok(ReaderEvent::Error(error)) => panic!("{error}"),
+                Err(RecvTimeoutError::Timeout) => {
+                    panic!("timed out waiting for response {expected_id}")
+                }
+                Err(RecvTimeoutError::Disconnected) => {
+                    panic!("server closed before the expected response {expected_id}")
+                }
+            };
             if message.get("id").and_then(Value::as_i64) == Some(expected_id)
                 && message.get("method").is_none()
             {
