@@ -1943,22 +1943,14 @@ mod tests {
 
     #[test]
     fn process_injection_sync_returns_incomplete_on_mid_region_cancel() {
-        use crate::config::WorkspaceSettings;
-
         let coordinator = LanguageCoordinator::new();
-        let settings = WorkspaceSettings {
-            search_paths: vec![test_search_path()],
-            ..Default::default()
-        };
-        let _summary = coordinator.load_settings(&settings);
-        assert!(
-            coordinator.ensure_language_loaded("rust").success,
-            "rust fixture must be installed for cancellation coverage"
+        let registry = create_test_registry();
+        let language = registry.get("rust").expect("rust must be registered");
+        let highlight_query = Arc::new(
+            Query::new(&language, "(identifier) @variable")
+                .expect("inline rust highlight query must compile"),
         );
-        let highlight_query = coordinator
-            .highlight_query("rust")
-            .expect("rust highlight query must be installed for cancellation coverage");
-        let factory = ThreadLocalParserFactory::new(coordinator.language_registry_for_parallel());
+        let factory = ThreadLocalParserFactory::new(registry);
         let declarations = (0..256)
             .map(|index| format!("let value_{index} = {index};"))
             .collect::<Vec<_>>()
