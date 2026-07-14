@@ -29,13 +29,17 @@ pub(in crate::lsp::bridge) fn forward(
     server_prefix: &str,
     deps: &ServerRequestDeps,
 ) {
-    let Ok(params) = BorrowedLogMessageParams::deserialize(&message["params"]) else {
-        debug!(
-            target: "kakehashi::bridge::reader",
-            "{}Dropping window/logMessage with invalid params",
-            server_prefix
-        );
-        return;
+    let params = match BorrowedLogMessageParams::deserialize(&message["params"]) {
+        Ok(params) => params,
+        Err(error) => {
+            debug!(
+                target: "kakehashi::bridge::reader",
+                "{}Dropping window/logMessage with invalid params: {}",
+                server_prefix,
+                error
+            );
+            return;
+        }
     };
     if !deps.dynamic_capabilities.allows_log_message(params.typ) {
         return;
