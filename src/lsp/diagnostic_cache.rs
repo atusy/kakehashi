@@ -568,6 +568,9 @@ struct WireGate {
 /// republish iff no task is already parked).
 #[derive(Debug)]
 pub(crate) enum WireAdmit {
+    /// The cache changed after the caller's snapshot; rebuild before making a
+    /// wire decision so stale diagnostics never reach the editor.
+    RetryLatest,
     /// Window clear: write to the wire now.
     SendNow,
     /// Before the active deadline: withhold. `schedule_trailing` is `true` for
@@ -591,6 +594,7 @@ pub(crate) enum WireTrailingWake {
 impl PartialEq for WireAdmit {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
+            (Self::RetryLatest, Self::RetryLatest) => true,
             (Self::SendNow, Self::SendNow) => true,
             (
                 Self::Defer {
@@ -1391,6 +1395,34 @@ impl DiagnosticAggregator {
         }
     }
 
+    /// Admit only if `cache_revision` still names the latest cache snapshot.
+    /// Holding the revision lock through the gate mutation closes the
+    /// snapshot→admission gap without taking the heavier cache lock.
+    pub(crate) fn wire_debounce_admit_current_revision(
+        &self,
+        host: &Url,
+        debounce: std::time::Duration,
+        max_wait: std::time::Duration,
+        record_activity: bool,
+        cache_revision: u64,
+    ) -> WireAdmit {
+        let revisions = self
+            .cache_revisions
+            .lock()
+            .recover_poison("DiagnosticAggregator::cache_revisions");
+        let current = revisions.get(host).copied().unwrap_or(0);
+        if current != cache_revision {
+            return WireAdmit::RetryLatest;
+        }
+        self.wire_debounce_admit_for_revision(
+            host,
+            debounce,
+            max_wait,
+            record_activity,
+            cache_revision,
+        )
+    }
+
     /// Record that a wire `publishDiagnostics` for `host` was actually sent:
     /// stamp the send time (anchoring max-wait for the active cycle) and settle
     /// the `dirty` debt. Called right after the send await, under the same
@@ -1792,6 +1824,26 @@ mod tests {
             agg.wire_debounce_admit_for_revision(&host, debounce, max_wait, false, 3),
             WireAdmit::Defer { remaining, .. } if remaining == debounce
         ));
+    }
+
+    #[test]
+    fn wire_admission_rejects_a_stale_cache_snapshot() {
+        let agg = DiagnosticAggregator::new();
+        let host = host();
+        agg.set_pull_layer(&host, vec![diag("A")]);
+        let (_, stale_revision) = agg.snapshot_with_revision(&host);
+        agg.set_pull_layer(&host, vec![diag("B")]);
+
+        assert_eq!(
+            agg.wire_debounce_admit_current_revision(
+                &host,
+                std::time::Duration::from_millis(100),
+                std::time::Duration::from_secs(1),
+                false,
+                stale_revision,
+            ),
+            WireAdmit::RetryLatest
+        );
     }
 
     #[tokio::test(start_paused = true)]
