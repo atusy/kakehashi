@@ -711,7 +711,7 @@ mod tests {
         );
         assert!(
             result.parser_path.is_some(),
-            "query tombstone cleanup failures must not prevent parser installation"
+            "query tombstone cleanup failures must preserve the available parser result"
         );
         assert!(result.queries_error.is_some());
     }
