@@ -132,7 +132,9 @@ released after `debounceMs` of quiet, with `maxWaitMs` bounding a continuous bur
 Publish diagnostics keep only the latest merged set per URI, and different URIs
 never delay one another. Pull diagnostics are unaffected. The values
 apply to cycles admitted after a live configuration update; an active cycle keeps
-the timing snapshot it started with. `maxWaitMs` must be at least `debounceMs`.
+the timing snapshot it started with. `debounceMs` may be zero; `maxWaitMs` must be
+positive and at least `debounceMs`. Both values are limited to 86,400,000 ms
+(24 hours).
 
 ```json
 {
