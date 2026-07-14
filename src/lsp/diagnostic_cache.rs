@@ -542,6 +542,10 @@ struct WireGate {
     /// passes immediately, and the `dirty` debt below records that the
     /// last-recorded set may never have reached the wire.
     last_sent_at: Option<tokio::time::Instant>,
+    /// Start of the current max-wait cycle. Unlike `last_sent_at`, this also
+    /// exists before the first send commits, so an aborted/stale first publish
+    /// cannot postpone delivery forever under continuous activity.
+    cycle_started_at: tokio::time::Instant,
     /// Latest set-changing feed admitted for this host. Trailing retries do
     /// not advance it, so `debounce` measures quiet since real activity.
     last_activity_at: Option<tokio::time::Instant>,
@@ -1432,6 +1436,7 @@ impl DiagnosticAggregator {
                     debounce,
                     max_wait,
                     last_sent_at: None,
+                    cycle_started_at: now,
                     last_activity_at: Some(now),
                     last_cache_revision: cache_revision,
                     pending: false,
@@ -1451,8 +1456,8 @@ impl DiagnosticAggregator {
             gate.last_cache_revision = cache_revision;
         }
         let quiet_deadline = gate.last_activity_at.unwrap_or(now) + gate.debounce;
-        let max_deadline = gate.last_sent_at.map(|at| at + gate.max_wait);
-        let reached_max_wait = max_deadline.is_some_and(|deadline| now >= deadline);
+        let max_deadline = gate.cycle_started_at + gate.max_wait;
+        let reached_max_wait = now >= max_deadline;
         let send_now = gate.last_sent_at.is_none()
             || (record_activity && was_quiet)
             || reached_max_wait
@@ -1468,7 +1473,7 @@ impl DiagnosticAggregator {
             gate.dirty = true;
             WireAdmit::SendNow
         } else {
-            let deadline = max_deadline.map_or(quiet_deadline, |max| quiet_deadline.min(max));
+            let deadline = quiet_deadline.min(max_deadline);
             gate.dirty = true;
             let schedule_trailing = !gate.pending;
             gate.pending = true;
@@ -1521,6 +1526,7 @@ impl DiagnosticAggregator {
             .recover_poison("DiagnosticAggregator::wire_gate");
         if let Some(gate) = gates.get_mut(host) {
             gate.last_sent_at = Some(now);
+            gate.cycle_started_at = now;
             gate.dirty = false;
         } else {
             // The admit minted an entry, but a `forget_wire_gate` (seal) can
@@ -1531,6 +1537,7 @@ impl DiagnosticAggregator {
                     debounce: std::time::Duration::ZERO,
                     max_wait: std::time::Duration::ZERO,
                     last_sent_at: Some(now),
+                    cycle_started_at: now,
                     last_activity_at: Some(now),
                     last_cache_revision: 0,
                     pending: false,
@@ -1611,9 +1618,9 @@ impl DiagnosticAggregator {
         }
         let quiet_deadline = gate.last_activity_at.unwrap_or(now) + gate.debounce;
         let deadline = gate
-            .last_sent_at
-            .map(|sent| quiet_deadline.min(sent + gate.max_wait))
-            .unwrap_or(quiet_deadline);
+            .cycle_started_at
+            .checked_add(gate.max_wait)
+            .map_or(quiet_deadline, |max| quiet_deadline.min(max));
         if now < deadline {
             return WireTrailingWake::Wait(deadline - now);
         }
@@ -1645,6 +1652,7 @@ impl DiagnosticAggregator {
             debounce,
             max_wait,
             last_sent_at: None,
+            cycle_started_at: now,
             last_activity_at: Some(now),
             last_cache_revision: cache_revision,
             pending: false,
@@ -1659,15 +1667,15 @@ impl DiagnosticAggregator {
         }
         let quiet_deadline = now + gate.debounce;
         let deadline = gate
-            .last_sent_at
-            .map(|sent| quiet_deadline.min(sent + gate.max_wait))
-            .unwrap_or(quiet_deadline);
+            .cycle_started_at
+            .checked_add(gate.max_wait)
+            .map_or(quiet_deadline, |max| quiet_deadline.min(max));
         // A max-wait attempt that itself became stale must not self-spawn an
         // unbounded zero-delay full-merge chain. Back off by the active
         // debounce (at least one millisecond); once churn settles, that retry
         // sends the latest set.
         let remaining = if deadline <= now {
-            gate.debounce.max(std::time::Duration::from_millis(1))
+            gate.debounce.max(std::time::Duration::from_millis(50))
         } else {
             deadline - now
         };
@@ -1994,13 +2002,43 @@ mod tests {
         assert_eq!(remaining, debounce);
         assert!(agg.wire_gate_is_dirty(&host));
 
-        assert!(agg.wire_gate_take_pending(&host));
+        tokio::time::advance(std::time::Duration::from_millis(400)).await;
+        assert!(
+            agg.wire_gate_schedule_latest(&host, debounce, max_wait)
+                .is_none()
+        );
+        tokio::time::advance(std::time::Duration::from_millis(100)).await;
+        assert_eq!(
+            agg.wire_gate_trailing_wake(&host),
+            WireTrailingWake::Ready,
+            "continuous first-send churn is capped by max-wait"
+        );
         agg.wire_gate_commit_send(&host);
         tokio::time::advance(max_wait).await;
         let (remaining, _) = agg
             .wire_gate_schedule_latest(&host, debounce, max_wait)
             .expect("a stale max-wait attempt schedules one successor");
         assert_eq!(remaining, debounce, "past max-wait retries back off");
+
+        let zero = DiagnosticAggregator::new();
+        let zero_host = Url::parse("file:///zero-debounce.rs").unwrap();
+        zero.wire_gate_schedule_latest(
+            &zero_host,
+            std::time::Duration::ZERO,
+            std::time::Duration::from_millis(1),
+        )
+        .unwrap();
+        assert!(zero.wire_gate_take_pending(&zero_host));
+        zero.wire_gate_commit_send(&zero_host);
+        tokio::time::advance(std::time::Duration::from_millis(1)).await;
+        let (remaining, _) = zero
+            .wire_gate_schedule_latest(
+                &zero_host,
+                std::time::Duration::ZERO,
+                std::time::Duration::from_millis(1),
+            )
+            .unwrap();
+        assert_eq!(remaining, std::time::Duration::from_millis(50));
     }
 
     #[tokio::test(start_paused = true)]
