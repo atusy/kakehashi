@@ -943,7 +943,10 @@ impl DiagnosticPublisher {
             // editor-originated pull-layer update whose caller deliberately
             // does not nudge pull clients. Preserve this caller's
             // push-origin refresh responsibility conservatively.
-            None => return RepublishOutcome::Deferred,
+            None => {
+                self.schedule_stale_wire_retry(host);
+                return RepublishOutcome::Deferred;
+            }
             Some(true) => RepublishOutcome::Changed,
             Some(false) => RepublishOutcome::Unchanged,
         };
@@ -1015,7 +1018,10 @@ impl DiagnosticPublisher {
             &diagnostics,
             cache_revision,
         ) {
-            None => return changed,
+            None => {
+                self.schedule_stale_wire_retry(host);
+                return changed;
+            }
             Some(true) => return changed,
             Some(false) => {}
         }
@@ -1040,7 +1046,10 @@ impl DiagnosticPublisher {
             wire_activity && changed == RepublishOutcome::Changed,
             cache_revision,
         ) {
-            crate::lsp::diagnostic_cache::WireAdmit::RetryLatest => return changed,
+            crate::lsp::diagnostic_cache::WireAdmit::RetryLatest => {
+                self.schedule_stale_wire_retry(host);
+                return changed;
+            }
             crate::lsp::diagnostic_cache::WireAdmit::SendNow => {
                 log::debug!(
                     target: LOG_TARGET,
@@ -1078,6 +1087,12 @@ impl DiagnosticPublisher {
             }
         }
         changed
+    }
+
+    fn schedule_stale_wire_retry(&self, host: &Url) {
+        if let Some((remaining, cancellation)) = self.aggregator.wire_gate_schedule_latest(host) {
+            self.spawn_trailing_wire_publish(host.clone(), remaining, cancellation);
+        }
     }
 
     /// Re-run [`Self::republish`] for `host` at the next debounce/max-wait deadline,

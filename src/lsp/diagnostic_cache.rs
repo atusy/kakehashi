@@ -1621,6 +1621,37 @@ impl DiagnosticAggregator {
         WireTrailingWake::Ready
     }
 
+    /// Preserve wire debt when a republish discovers that its merged snapshot
+    /// became stale. The newer cache writer owns the content handoff, while
+    /// this bounded trailing task guarantees quiet/max-wait progress even if
+    /// that writer's abortable republish never reaches admission.
+    pub(crate) fn wire_gate_schedule_latest(
+        &self,
+        host: &Url,
+    ) -> Option<(std::time::Duration, tokio_util::sync::CancellationToken)> {
+        let now = tokio::time::Instant::now();
+        let mut gates = self
+            .wire_gate
+            .lock()
+            .recover_poison("DiagnosticAggregator::wire_gate");
+        let gate = gates.get_mut(host)?;
+        gate.last_activity_at = Some(now);
+        gate.dirty = true;
+        if gate.pending {
+            return None;
+        }
+        let quiet_deadline = now + gate.debounce;
+        let deadline = gate
+            .last_sent_at
+            .map(|sent| quiet_deadline.min(sent + gate.max_wait))
+            .unwrap_or(quiet_deadline);
+        gate.pending = true;
+        Some((
+            deadline.saturating_duration_since(now),
+            gate.cancellation.clone(),
+        ))
+    }
+
     /// Forget the wire-gate state for `host` so the entry doesn't linger and a
     /// parked trailing task bails ([`Self::wire_gate_take_pending`] returns
     /// `false`). Called on `didClose` (`clear_host`, next to
@@ -1883,6 +1914,29 @@ mod tests {
         );
         tokio::time::advance(std::time::Duration::from_millis(70)).await;
         assert_eq!(agg.wire_gate_trailing_wake(&host), WireTrailingWake::Ready);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stale_handoff_schedules_one_latest_wire_retry() {
+        let agg = DiagnosticAggregator::new();
+        let host = host();
+        let debounce = std::time::Duration::from_millis(100);
+        let max_wait = std::time::Duration::from_secs(1);
+        assert_eq!(
+            agg.wire_debounce_admit(&host, debounce, max_wait, true),
+            WireAdmit::SendNow
+        );
+        agg.wire_gate_commit_send(&host);
+
+        let (remaining, _) = agg
+            .wire_gate_schedule_latest(&host)
+            .expect("the stale handoff owns one retry");
+        assert_eq!(remaining, debounce);
+        assert!(
+            agg.wire_gate_schedule_latest(&host).is_none(),
+            "a second stale handoff shares the pending retry"
+        );
+        assert!(agg.wire_gate_is_dirty(&host));
     }
 
     #[tokio::test(start_paused = true)]
