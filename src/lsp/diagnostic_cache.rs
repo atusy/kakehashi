@@ -999,7 +999,9 @@ impl DiagnosticAggregator {
     }
 
     /// Settle a withheld wire debt when the latest merged set has reverted to
-    /// what the editor already received. The parked task may still wake, but
+    /// what the editor already received. The reversion is still set-changing
+    /// activity for the quiet-window cadence, so advance its activity clock
+    /// without recreating wire debt. The parked task may still wake, but
     /// `dirty = false` makes its unchanged republish a no-op.
     pub(crate) fn settle_wire_reversion(&self, host: &Url, diagnostics: &[Diagnostic]) -> bool {
         let wire = self
@@ -1020,6 +1022,7 @@ impl DiagnosticAggregator {
             .recover_poison("DiagnosticAggregator::wire_gate")
             .get_mut(host)
         {
+            gate.last_activity_at = Some(tokio::time::Instant::now());
             gate.dirty = false;
         }
         true
@@ -1596,6 +1599,40 @@ mod tests {
             agg.wire_debounce_admit(&host(), debounce, max_wait, false),
             WireAdmit::SendNow
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn wire_reversion_advances_the_quiet_activity_clock() {
+        let agg = DiagnosticAggregator::new();
+        let host = host();
+        let debounce = std::time::Duration::from_millis(100);
+        let max_wait = std::time::Duration::from_secs(1);
+
+        assert!(agg.published_set_changed(&host, &[diag("A")]));
+        assert_eq!(
+            agg.wire_debounce_admit(&host, debounce, max_wait, true),
+            WireAdmit::SendNow
+        );
+        agg.wire_gate_commit_send(&host);
+
+        tokio::time::advance(std::time::Duration::from_millis(10)).await;
+        assert!(agg.published_set_changed(&host, &[diag("B")]));
+        assert!(matches!(
+            agg.wire_debounce_admit(&host, debounce, max_wait, true),
+            WireAdmit::Defer { .. }
+        ));
+
+        tokio::time::advance(std::time::Duration::from_millis(40)).await;
+        assert!(agg.published_set_changed(&host, &[diag("A")]));
+        assert!(agg.settle_wire_reversion(&host, &[diag("A")]));
+
+        tokio::time::advance(std::time::Duration::from_millis(65)).await;
+        assert!(agg.published_set_changed(&host, &[diag("C")]));
+        assert!(matches!(
+            agg.wire_debounce_admit(&host, debounce, max_wait, true),
+            WireAdmit::Defer { remaining, .. }
+                if remaining == debounce
+        ));
     }
 
     #[tokio::test(start_paused = true)]
