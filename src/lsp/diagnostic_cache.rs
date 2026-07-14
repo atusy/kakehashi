@@ -1029,7 +1029,12 @@ impl DiagnosticAggregator {
             .recover_poison("DiagnosticAggregator::cache_revisions");
         let mut cache = self.lock();
         let removed = cache.remove(host).is_some();
-        revisions.remove(host);
+        // Keep advancing the host's incarnation even after its slots disappear.
+        // Otherwise a pre-close snapshot can validate after reopen when the new
+        // document happens to reach the same small revision again.
+        if let Some(revision) = revisions.get_mut(host) {
+            *revision = revision.wrapping_add(1);
+        }
         removed
     }
 
@@ -3014,9 +3019,16 @@ mod tests {
     fn evict_host_drops_all() {
         let agg = DiagnosticAggregator::new();
         agg.set_pull_layer(&host(), vec![diag("h")]);
+        let before_close = agg.snapshot_with_revision(&host()).1;
         assert!(agg.evict_host(&host()));
         assert!(agg.snapshot(&host()).is_empty());
         assert!(!agg.evict_host(&host()), "second evict is a no-op");
+        agg.set_pull_layer(&host(), vec![diag("reopened")]);
+        assert_ne!(
+            agg.snapshot_with_revision(&host()).1,
+            before_close,
+            "a reopened host must not reuse a pre-close snapshot revision"
+        );
     }
 
     #[test]
@@ -3069,10 +3081,9 @@ mod tests {
             !agg.evict_host(&host()),
             "the source eviction already removed the cache entry"
         );
-        assert_eq!(
-            agg.snapshot_with_revision(&host()).1,
-            0,
-            "didClose-style host eviction forgets a revision even when slots were already empty"
+        assert!(
+            agg.snapshot_with_revision(&host()).1 > 0,
+            "didClose-style host eviction preserves an incarnation even when slots were already empty"
         );
     }
 
