@@ -1394,8 +1394,8 @@ impl DiagnosticAggregator {
     }
 
     /// Record that a wire `publishDiagnostics` for `host` was actually sent:
-    /// stamp the send time (opening a fresh quiet window) and settle the
-    /// `dirty` debt. Called right after the send await, under the same
+    /// stamp the send time (anchoring max-wait for the active cycle) and settle
+    /// the `dirty` debt. Called right after the send await, under the same
     /// republish-lock hold as the [`Self::wire_gate_admit`] that admitted it.
     /// Clones the key only on first insert.
     pub(crate) fn wire_gate_commit_send(&self, host: &Url) {

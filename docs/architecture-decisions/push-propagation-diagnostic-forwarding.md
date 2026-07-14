@@ -290,8 +290,9 @@ Re-merging on every push republishes the cumulative host set: when region A
 publishes, then the host layer, then region C, each event re-runs the merge and
 records `{A}`, `{A, host}`, `{A, host, C}` — a slot is *replaced* by its
 source's latest push, never accumulated. (The wire sends are subject to the
-quiet window below, so the editor may see `{A}` and then `{A, host, C}`
-directly, the intermediate state coalesced into the trailing flush.)
+leading + trailing debounce below, so the editor may see `{A}` and then
+`{A, host, C}` directly, the intermediate state coalesced until the next
+debounce/max-wait deadline.)
 
 ### Versioning and staleness (the crux)
 
@@ -586,9 +587,9 @@ because the #380 benefit now outweighs it:
 - Re-publish is unthrottled at the merge level (the `didChange` debounce is
   gone): a no-op push is suppressed (winner content unchanged), and a chatty
   linter emitting distinct results across separate loop wakes re-merges and
-  re-records each time — but the WIRE sends are coalesced by the per-host quiet
-  window (see "Wire quiet window"), so the editor sees at most one publish per
-  window. To bound the
+  re-records each time — but the WIRE sends are coalesced by the per-host
+  debounce/max-wait scheduler (see "Wire leading + trailing debounce"), so the
+  editor sees the latest set at the next admitted deadline. To bound the
   cost of a push-happy/misbehaving downstream, the forwarding loop first coalesces a
   drained burst of `publishDiagnostics` by `(connection, uri)` to the latest
   (`coalesce_upstream_batch`, #426), then records each surviving push in a
