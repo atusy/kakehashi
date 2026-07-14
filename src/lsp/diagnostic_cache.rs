@@ -1525,12 +1525,34 @@ impl DiagnosticAggregator {
         )
     }
 
-    /// Record that a wire `publishDiagnostics` for `host` was actually sent:
-    /// stamp the send time (anchoring max-wait for the active cycle) and settle
-    /// the `dirty` debt. Called right after the send await, under the same
-    /// republish-lock hold as the [`Self::wire_gate_admit`] that admitted it.
-    /// Clones the key only on first insert.
-    pub(crate) fn wire_gate_commit_send(&self, host: &Url) {
+    /// Record that a wire `publishDiagnostics` for `host` was actually sent,
+    /// settling debt only while the admitted cache revision is still current.
+    /// Returns `false` when cache activity landed during the send await, so the
+    /// caller must schedule a latest-snapshot retry. The revision lock remains
+    /// held through the gate mutation, closing the admission-to-commit gap.
+    pub(crate) fn wire_gate_commit_send_current_revision(
+        &self,
+        host: &Url,
+        cache_revision: u64,
+    ) -> bool {
+        let revisions = self
+            .cache_revisions
+            .lock()
+            .recover_poison("DiagnosticAggregator::cache_revisions");
+        let revision_is_current = revisions.get(host).copied().unwrap_or(0) == cache_revision;
+        self.commit_wire_gate_state(host, !revision_is_current);
+        drop(revisions);
+        self.record_committed_wire_snapshot(host);
+        revision_is_current
+    }
+
+    #[cfg(test)]
+    fn wire_gate_commit_send(&self, host: &Url) {
+        self.commit_wire_gate_state(host, false);
+        self.record_committed_wire_snapshot(host);
+    }
+
+    fn commit_wire_gate_state(&self, host: &Url, preserve_debt: bool) {
         let now = tokio::time::Instant::now();
         let mut gates = self
             .wire_gate
@@ -1540,7 +1562,7 @@ impl DiagnosticAggregator {
             gate.last_sent_at = Some(now);
             gate.cycle_started_at = now;
             gate.stale_retry_started = false;
-            gate.dirty = false;
+            gate.dirty = preserve_debt;
         } else {
             // The admit minted an entry, but a `forget_wire_gate` (seal) can
             // race in off the happy path; re-minting settled is fine.
@@ -1556,12 +1578,13 @@ impl DiagnosticAggregator {
                     last_cache_revision: 0,
                     pending: false,
                     cancellation: tokio_util::sync::CancellationToken::new(),
-                    dirty: false,
+                    dirty: preserve_debt,
                 },
             );
         }
-        drop(gates);
+    }
 
+    fn record_committed_wire_snapshot(&self, host: &Url) {
         // Called under the per-host republish lock after the send await, so the
         // last-recorded set is exactly the set that just reached the wire.
         let sent = self
@@ -2246,6 +2269,44 @@ mod tests {
             .cloned()
             .unwrap();
         assert!(Arc::ptr_eq(&recorded, &wire));
+    }
+
+    #[test]
+    fn wire_commit_preserves_debt_when_cache_advances_during_send() {
+        let agg = DiagnosticAggregator::new();
+        let host = host();
+        agg.set_pull_layer(&host, vec![diag("A")]);
+        let admitted_revision = agg.snapshot_with_revision(&host).1;
+        assert_eq!(
+            agg.published_set_changed_current_revision(&host, &[diag("A")], admitted_revision),
+            Some(true)
+        );
+        assert_eq!(
+            agg.wire_debounce_admit_current_revision(
+                &host,
+                std::time::Duration::ZERO,
+                std::time::Duration::from_secs(1),
+                true,
+                admitted_revision,
+            ),
+            WireAdmit::SendNow
+        );
+
+        agg.set_pull_layer(&host, vec![diag("B")]);
+        assert!(
+            !agg.wire_gate_commit_send_current_revision(&host, admitted_revision),
+            "a send admitted before the cache mutation must not settle newer debt"
+        );
+        assert!(agg.wire_gate_is_dirty(&host));
+        assert!(
+            agg.wire_gate_schedule_latest(
+                &host,
+                std::time::Duration::ZERO,
+                std::time::Duration::from_secs(1),
+            )
+            .is_some(),
+            "the preserved debt must be eligible for a latest-snapshot retry"
+        );
     }
 
     #[tokio::test(start_paused = true)]

@@ -1067,7 +1067,12 @@ impl DiagnosticPublisher {
                 // would both defer the next change and consume a withheld
                 // `dirty` debt. Same lock hold as the admit, so the pair is
                 // atomic per host.
-                self.aggregator.wire_gate_commit_send(host);
+                if !self
+                    .aggregator
+                    .wire_gate_commit_send_current_revision(host, cache_revision)
+                {
+                    self.schedule_stale_wire_retry(host);
+                }
             }
             crate::lsp::diagnostic_cache::WireAdmit::Defer {
                 schedule_trailing,
