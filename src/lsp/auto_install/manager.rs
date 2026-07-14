@@ -533,9 +533,11 @@ mod tests {
     use super::*;
     use tempfile::tempdir;
 
+    const PARENT_STATE_DIR: &str = "KAKEHASHI_TEST_PARENT_CRASH_STATE_DIR";
+    const CHILD_HANDSHAKE_PATH: &str = "KAKEHASHI_TEST_CRASH_STATE_HANDSHAKE_PATH";
+
     #[test]
     fn unit_test_crash_state_is_separate_from_shared_install_assets() {
-        const PARENT_STATE_DIR: &str = "KAKEHASHI_TEST_PARENT_CRASH_STATE_DIR";
         const CHILD_TEST: &str =
             "lsp::auto_install::manager::tests::child_process_uses_distinct_crash_state";
 
@@ -547,11 +549,14 @@ mod tests {
         assert_eq!(state_dir, failed_parser_state_dir());
         assert!(state_dir.join("crash_recovery.lock").is_file());
 
+        let handshake_dir = tempdir().expect("create crash-state handshake directory");
+        let handshake_path = handshake_dir.path().join("child-ran");
         let child_status = std::process::Command::new(
             std::env::current_exe().expect("resolve current test executable"),
         )
         .args(["--ignored", "--exact", CHILD_TEST])
         .env(PARENT_STATE_DIR, &state_dir)
+        .env(CHILD_HANDSHAKE_PATH, &handshake_path)
         .status()
         .expect("run crash-state isolation test in child process");
 
@@ -559,15 +564,25 @@ mod tests {
             child_status.success(),
             "child test process must use a different crash-state directory"
         );
+        assert!(
+            handshake_path.is_file(),
+            "child test process must execute the isolation assertion"
+        );
     }
 
     #[test]
     #[ignore = "run only as a child of the crash-state isolation test"]
     fn child_process_uses_distinct_crash_state() {
-        let parent_state_dir = std::env::var_os("KAKEHASHI_TEST_PARENT_CRASH_STATE_DIR")
-            .expect("parent crash-state directory must be provided");
+        let (Some(parent_state_dir), Some(handshake_path)) = (
+            std::env::var_os(PARENT_STATE_DIR),
+            std::env::var_os(CHILD_HANDSHAKE_PATH),
+        ) else {
+            return;
+        };
 
         assert_ne!(failed_parser_state_dir(), PathBuf::from(parent_state_dir));
+        std::fs::write(handshake_path, b"child assertion passed")
+            .expect("write crash-state child handshake");
     }
 
     fn create_test_manager() -> (AutoInstallManager, tempfile::TempDir) {
