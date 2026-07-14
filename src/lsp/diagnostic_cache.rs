@@ -1072,6 +1072,21 @@ impl DiagnosticAggregator {
         diagnostics: &[Diagnostic],
         cache_revision: u64,
     ) -> Option<bool> {
+        // Same-host callers hold the republish lock, so compare against an Arc
+        // snapshot off the global map locks. Large multiset comparison and the
+        // replacement allocation must not block cache activity for other URIs.
+        let previous = self
+            .last_published
+            .lock()
+            .recover_poison("DiagnosticAggregator::last_published")
+            .get(host)
+            .cloned();
+        let changed = previous.as_ref().is_none_or(|previous| {
+            previous.as_ref() != diagnostics
+                && !same_diagnostic_multiset(previous.as_ref(), diagnostics)
+        });
+        let replacement = changed.then(|| Arc::from(diagnostics));
+
         let revisions = self
             .cache_revisions
             .lock()
@@ -1079,7 +1094,13 @@ impl DiagnosticAggregator {
         if revisions.get(host).copied().unwrap_or(0) != cache_revision {
             return None;
         }
-        Some(self.published_set_changed(host, diagnostics))
+        if let Some(replacement) = replacement {
+            self.last_published
+                .lock()
+                .recover_poison("DiagnosticAggregator::last_published")
+                .insert(host.clone(), replacement);
+        }
+        Some(changed)
     }
 
     /// Forget the last-recorded set for `host` (host `didClose`), so its entry
@@ -1135,6 +1156,13 @@ impl DiagnosticAggregator {
         diagnostics: &[Diagnostic],
         cache_revision: u64,
     ) -> Option<bool> {
+        let matches_wire = self
+            .last_wire_published
+            .lock()
+            .recover_poison("DiagnosticAggregator::last_wire_published")
+            .get(host)
+            .cloned()
+            .is_some_and(|wire| wire.as_ref() == diagnostics);
         let revisions = self
             .cache_revisions
             .lock()
@@ -1142,7 +1170,19 @@ impl DiagnosticAggregator {
         if revisions.get(host).copied().unwrap_or(0) != cache_revision {
             return None;
         }
-        Some(self.settle_wire_reversion(host, diagnostics))
+        if !matches_wire {
+            return Some(false);
+        }
+        if let Some(gate) = self
+            .wire_gate
+            .lock()
+            .recover_poison("DiagnosticAggregator::wire_gate")
+            .get_mut(host)
+        {
+            gate.last_activity_at = Some(tokio::time::Instant::now());
+            gate.dirty = false;
+        }
+        Some(true)
     }
 
     /// Begin a workspace-wide refresh under the single-flight + coverage guard
