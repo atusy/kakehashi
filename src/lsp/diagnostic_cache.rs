@@ -1139,12 +1139,13 @@ impl DiagnosticAggregator {
     /// JSON-serialization path.
     #[cfg(test)]
     pub(crate) fn settle_wire_reversion(&self, host: &Url, diagnostics: &[Diagnostic]) -> bool {
-        let matches_wire = self
+        let wire = self
             .last_wire_published
             .lock()
             .recover_poison("DiagnosticAggregator::last_wire_published")
             .get(host)
-            .is_some_and(|wire| wire.as_ref() == diagnostics);
+            .cloned();
+        let matches_wire = wire.is_some_and(|wire| wire.as_ref() == diagnostics);
         if !matches_wire {
             return false;
         }
@@ -1169,12 +1170,13 @@ impl DiagnosticAggregator {
         diagnostics: &[Diagnostic],
         cache_revision: u64,
     ) -> Option<bool> {
-        let matches_wire = self
+        let wire = self
             .last_wire_published
             .lock()
             .recover_poison("DiagnosticAggregator::last_wire_published")
             .get(host)
-            .is_some_and(|wire| wire.as_ref() == diagnostics);
+            .cloned();
+        let matches_wire = wire.is_some_and(|wire| wire.as_ref() == diagnostics);
         let revisions = self
             .cache_revisions
             .lock()
