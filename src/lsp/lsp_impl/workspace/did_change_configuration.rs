@@ -17,6 +17,11 @@ const KNOWN_WORKSPACE_SETTING_KEYS: &[&str] = &[
     "languageServers",
 ];
 
+const KNOWN_FEATURE_SETTING_KEYS: &[&str] = &[
+    "textDocument/publishDiagnostics",
+    "workspace/diagnostic/refresh",
+];
+
 const KNOWN_AGGREGATION_SETTING_KEYS: &[&str] = &[
     "maxFanOut",
     "priorities",
@@ -99,7 +104,18 @@ fn uses_deprecated_unwrapped_didchange_shape(settings: &Value) -> bool {
 fn kakehashi_targeted_payload(object: serde_json::Map<String, Value>) -> serde_json::Value {
     let object = object
         .into_iter()
-        .filter(|(key, value)| is_kakehashi_workspace_entry(key, value))
+        .filter_map(|(key, mut value)| {
+            if !is_kakehashi_workspace_entry(&key, &value) {
+                return None;
+            }
+            if key == "features"
+                && let Some(features) = value.as_object_mut()
+            {
+                features
+                    .retain(|feature, _| KNOWN_FEATURE_SETTING_KEYS.contains(&feature.as_str()));
+            }
+            Some((key, value))
+        })
         .collect();
     Value::Object(object)
 }
@@ -132,9 +148,11 @@ fn is_workspace_setting_key_or_typo(key: &str) -> bool {
 
 fn is_kakehashi_workspace_entry(key: &str, value: &Value) -> bool {
     if key == "features" {
-        return value
-            .as_object()
-            .is_some_and(|features| features.contains_key("workspace/diagnostic/refresh"));
+        return value.as_object().is_some_and(|features| {
+            KNOWN_FEATURE_SETTING_KEYS
+                .iter()
+                .any(|key| features.contains_key(*key))
+        });
     }
     is_workspace_setting_key_or_typo(key)
 }
@@ -436,8 +454,8 @@ impl Kakehashi {
 mod tests {
     use super::*;
     use crate::config::settings::{
-        AggregationConfig, BridgeLanguageConfig, BridgeServerConfig, LanguageSettings,
-        LayerAggregationConfig, LayersConfig, QueryItem, QueryTypeMappings,
+        AggregationConfig, BridgeLanguageConfig, BridgeServerConfig, FeatureSettings,
+        LanguageSettings, LayerAggregationConfig, LayersConfig, QueryItem, QueryTypeMappings,
     };
     use std::collections::BTreeSet;
 
@@ -464,6 +482,11 @@ mod tests {
     #[test]
     fn known_workspace_setting_keys_match_schema_properties() {
         assert_known_keys_match_schema::<RawWorkspaceSettings>(KNOWN_WORKSPACE_SETTING_KEYS, &[]);
+    }
+
+    #[test]
+    fn known_feature_setting_keys_match_schema_properties() {
+        assert_known_keys_match_schema::<FeatureSettings>(KNOWN_FEATURE_SETTING_KEYS, &[]);
     }
 
     #[test]
@@ -519,6 +542,48 @@ mod tests {
         }));
 
         assert_eq!(payload, serde_json::json!({ "autoInstall": true }));
+        assert!(unknown_keys.is_empty());
+    }
+
+    #[test]
+    fn settings_payload_keeps_unwrapped_publish_diagnostics_features() {
+        let features = serde_json::json!({
+            "textDocument/publishDiagnostics": {
+                "debounceMs": 30,
+                "maxWaitMs": 300
+            }
+        });
+        let (payload, unknown_keys) = settings_payload(serde_json::json!({
+            "features": features
+        }));
+
+        assert_eq!(payload, serde_json::json!({ "features": features }));
+        assert!(unknown_keys.is_empty());
+    }
+
+    #[test]
+    fn settings_payload_projects_mixed_unwrapped_features() {
+        let (payload, unknown_keys) = settings_payload(serde_json::json!({
+            "features": {
+                "textDocument/publishDiagnostics": {
+                    "debounceMs": 30,
+                    "maxWaitMs": 300
+                },
+                "someOtherClientFeature": true
+            }
+        }));
+
+        assert_eq!(
+            payload,
+            serde_json::json!({
+                "features": {
+                    "textDocument/publishDiagnostics": {
+                        "debounceMs": 30,
+                        "maxWaitMs": 300
+                    }
+                }
+            })
+        );
         assert!(unknown_keys.is_empty());
     }
 
