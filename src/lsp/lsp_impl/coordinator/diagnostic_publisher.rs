@@ -2285,14 +2285,14 @@ mod tests {
             vec![diag("B")],
         );
         publisher.republish(&uri).await;
-        tokio::task::yield_now().await;
+        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
         assert!(
             Arc::strong_count(&server.diagnostics) > baseline,
             "the parked task holds a publisher clone"
         );
 
         server.diagnostics.forget_wire_gate(&uri);
-        tokio::task::yield_now().await;
+        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
         assert_eq!(
             Arc::strong_count(&server.diagnostics),
             baseline,
