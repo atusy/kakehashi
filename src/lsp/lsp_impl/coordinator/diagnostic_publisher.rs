@@ -167,13 +167,13 @@ impl DiagnosticPublisher {
         std::time::Duration,
         std::time::Duration,
     )> {
-        // Read timing before the idle→active state transition. Once begin()
-        // admits this cycle, its timing is already an owned snapshot; a live
-        // settings swap can only affect a later admission.
+        let snapshot = self.aggregator.begin_forwarded_refresh_debounce()?;
+        // This ArcSwap load is the admission linearization point. The preceding
+        // claim is internal bookkeeping only: no task starts and no timing is
+        // consumed before this snapshot, so an earlier settings store affects
+        // this cycle and a later one affects the next cycle.
         let (settle_window, max_wait) = self.forwarded_refresh_timing();
-        self.aggregator
-            .begin_forwarded_refresh_debounce()
-            .map(|snapshot| (snapshot, settle_window, max_wait))
+        Some((snapshot, settle_window, max_wait))
     }
 
     /// Forward the first downstream `workspace/diagnostic/refresh` immediately,
@@ -192,9 +192,8 @@ impl DiagnosticPublisher {
         let Some((snapshot, settle_window, max_wait)) = self.admit_forwarded_refresh() else {
             return;
         };
-        // Snapshot timing once per admitted cycle. Live configuration updates
-        // affect the next idle→active admission without moving this cycle's
-        // already-established quiet/max-wait boundaries.
+        // Timing was snapshotted at admission; later live updates cannot move
+        // this cycle's already-established quiet/max-wait boundaries.
         let publisher = self.clone();
         tokio::spawn(async move {
             let mut snapshot = snapshot;
