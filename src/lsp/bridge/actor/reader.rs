@@ -938,8 +938,9 @@ fn handle_cancel_request(message: &serde_json::Value, deps: &ServerRequestDeps) 
 ///
 /// Routes `window/logMessage`, `window/showMessage`, and `telemetry/event` to
 /// their per-method modules ([`window::log_message`], [`window::show_message`],
-/// [`telemetry::event`]); all are forwarded unconditionally so the bridge stays
-/// transparent.
+/// [`telemetry::event`]). Suppressed log messages are rejected before they can
+/// occupy the bounded queue; the upstream delivery boundary rechecks the live
+/// policy to close a concurrent configuration-update race.
 ///
 /// `$/progress`, `$/cancelRequest`, and non-scratch `textDocument/publishDiagnostics`
 /// (routed to the diagnostics cache — push-propagation-diagnostic-forwarding) are
@@ -1243,10 +1244,21 @@ mod tests {
         mpsc::Receiver<UpstreamNotification>,
         impl std::any::Any,
     ) {
+        server_request_deps_with_window_capacity(server_name, 16)
+    }
+
+    fn server_request_deps_with_window_capacity(
+        server_name: Option<&str>,
+        capacity: usize,
+    ) -> (
+        ServerRequestDeps,
+        mpsc::Receiver<UpstreamNotification>,
+        impl std::any::Any,
+    ) {
         let (tx, rx) = mpsc::channel(16);
         let caps = Arc::new(DynamicCapabilityRegistry::new());
         let (upstream_tx, upstream_rx) = mpsc::unbounded_channel();
-        let (window_tx, window_rx) = mpsc::channel(16);
+        let (window_tx, window_rx) = mpsc::channel(capacity);
         let progress_registry = Arc::new(crate::lsp::bridge::ProgressRegistry::new());
         let progress_connection_id = progress_registry.new_connection_id();
         let deps = ServerRequestDeps {
@@ -1265,6 +1277,44 @@ mod tests {
             progress_connection_id,
         };
         (deps, window_rx, (rx, upstream_rx))
+    }
+
+    #[tokio::test]
+    async fn suppressed_log_does_not_consume_window_queue_capacity() {
+        let router = ResponseRouter::new();
+        let (deps, mut window_rx, _keep) =
+            server_request_deps_with_window_capacity(Some("mock-ls"), 1);
+        deps.dynamic_capabilities
+            .store_log_message_level(crate::config::settings::LogMessageLevel::Off);
+
+        handle_message(
+            json!({
+                "jsonrpc": "2.0",
+                "method": "window/logMessage",
+                "params": { "type": 4, "message": "suppressed" }
+            }),
+            &router,
+            "",
+            &deps,
+        )
+        .await;
+        handle_message(
+            json!({
+                "jsonrpc": "2.0",
+                "method": "window/showMessage",
+                "params": { "type": 1, "message": "visible" }
+            }),
+            &router,
+            "",
+            &deps,
+        )
+        .await;
+
+        assert!(matches!(
+            window_rx.try_recv(),
+            Ok(UpstreamNotification::ShowMessage { message, .. })
+                if message == "[kakehashi:mock-ls] visible"
+        ));
     }
 
     #[tokio::test]

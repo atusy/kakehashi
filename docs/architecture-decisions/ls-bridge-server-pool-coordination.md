@@ -226,10 +226,14 @@ downstream ──notification──►  bridge  ──notification──►  ups
                                └─ ...
 ```
 
-**Implemented: `window/*` forwarding (#378).** The reader task forwards both
-`window/logMessage` and `window/showMessage` unconditionally — the bridge
-stays transparent, so messages a direct connection would surface are not
-silently swallowed. Both are prefixed with `[kakehashi:<server>]` for
+**Implemented: `window/*` forwarding (#378, #852).** The reader task parses both
+methods and applies the live global `features."window/logMessage".logLevel`
+threshold before enqueue, so suppressed logs cannot consume the bounded queue
+needed by allowed logs and unfiltered `window/showMessage`. The common
+client-facing delivery boundary checks the same workspace policy again to close
+live-update races and also shares it with kakehashi's own logs (`info` by
+default). Both forwarded methods are
+prefixed with `[kakehashi:<server>]` for
 distinguishability and need
 no coordinate translation. They reuse the `UpstreamNotification` decoupling
 (reader task -> forwarding loop -> tower-lsp `Client`) but travel on a
@@ -481,6 +485,9 @@ languageServers:
 
 ## Amendment History
 
+- **2026-07-13**: Added one workspace-wide `window/logMessage` severity policy
+  for downstream-forwarded and kakehashi-originated messages (#852). The
+  default is `info`; `window/showMessage` remains unaffected.
 - **2026-07-01**: Renamed the `languageServers.*.rootMarkers` config key to
   `workspaceMarkers` (aligning with the LSP spec's `workspaceFolders`); the old
   `rootMarkers` is accepted as a deprecated serde alias for backward

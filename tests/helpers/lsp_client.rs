@@ -607,6 +607,64 @@ impl LspClient {
         self.receive_response_for_id(expected_id)
     }
 
+    /// Receive a client-request response while retaining selected notifications
+    /// that arrived before it. Useful for initialization tests, where the normal
+    /// synchronous response helper intentionally discards notifications.
+    pub(crate) fn receive_response_for_id_watching_notifications(
+        &mut self,
+        expected_id: i64,
+        watched_methods: &[&str],
+    ) -> (Value, Vec<(String, Value)>) {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let mut watched = Vec::new();
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            assert!(
+                !remaining.is_zero(),
+                "timed out waiting for response {expected_id}"
+            );
+            let message = match self.rx.recv_timeout(remaining) {
+                Ok(ReaderEvent::Message(value)) => value,
+                Ok(ReaderEvent::Error(error)) => panic!("{error}"),
+                Err(RecvTimeoutError::Timeout) => {
+                    panic!("timed out waiting for response {expected_id}")
+                }
+                Err(RecvTimeoutError::Disconnected) => {
+                    panic!("server closed before the expected response {expected_id}")
+                }
+            };
+            if message.get("id").and_then(Value::as_i64) == Some(expected_id)
+                && message.get("method").is_none()
+            {
+                return (message, watched);
+            }
+            if let (Some(id), Some(method)) = (
+                message.get("id").cloned(),
+                message.get("method").and_then(Value::as_str),
+            ) {
+                if method == "window/showMessageRequest" {
+                    // This request is explicitly permitted during initialize;
+                    // null means the user dismissed it. Reply immediately so
+                    // a server awaiting the choice can finish initialization.
+                    self.send_response(id, Value::Null);
+                    continue;
+                }
+                panic!(
+                    "unexpected server request {method} while waiting for response {expected_id}"
+                );
+            }
+            if message.get("id").is_none()
+                && let Some(method) = message.get("method").and_then(Value::as_str)
+                && watched_methods.contains(&method)
+            {
+                watched.push((
+                    method.to_string(),
+                    message.get("params").cloned().unwrap_or(Value::Null),
+                ));
+            }
+        }
+    }
+
     /// Receive one client-request response while preserving server requests of
     /// `watched_method` that arrived before it. This prevents exact-sequence E2E
     /// assertions from losing concurrent server requests in the ordinary

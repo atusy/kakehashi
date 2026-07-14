@@ -292,6 +292,35 @@ fn test_config_init_emits_publish_diagnostics_feature_defaults() {
     ));
 }
 
+#[test]
+fn test_config_init_emits_log_message_feature_default() {
+    let output = Command::new(env!("CARGO_BIN_EXE_kakehashi"))
+        .args(["config", "init"])
+        .output()
+        .expect("run config init");
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("[features.\"window/logMessage\"]\nlogLevel = \"info\""));
+}
+
+#[test]
+fn test_config_init_orders_global_feature_blocks() {
+    let output = Command::new(env!("CARGO_BIN_EXE_kakehashi"))
+        .args(["config", "init"])
+        .output()
+        .expect("run config init");
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let publish = stdout
+        .find("[features.\"textDocument/publishDiagnostics\"]")
+        .unwrap();
+    let log = stdout.find("[features.\"window/logMessage\"]").unwrap();
+    let refresh = stdout
+        .find("[features.\"workspace/diagnostic/refresh\"]")
+        .unwrap();
+    assert!(publish < log && log < refresh);
+}
+
 /// Test that config init documents the per-root-instance default by emitting
 /// `preferSharedInstance = false` under the `languageServers._` wildcard, so
 /// the opt-in (#391) is discoverable in the generated template.

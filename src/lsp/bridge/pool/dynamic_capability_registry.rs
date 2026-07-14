@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::sync::RwLock;
+use std::sync::atomic::{AtomicU8, Ordering};
 
 use tower_lsp_server::ls_types::{Registration, Unregistration};
 
@@ -17,12 +18,18 @@ use crate::error::LockResultExt;
 /// with different document selectors).
 pub(crate) struct DynamicCapabilityRegistry {
     registrations: RwLock<HashMap<String, Registration>>,
+    /// Live workspace policy copied into every connection. The reader checks
+    /// it before a suppressed log can consume bounded window-queue capacity.
+    log_message_level: AtomicU8,
 }
 
 impl DynamicCapabilityRegistry {
     pub(crate) fn new() -> Self {
         Self {
             registrations: RwLock::new(HashMap::new()),
+            log_message_level: AtomicU8::new(
+                crate::config::settings::LogMessageLevel::Info.as_u8(),
+            ),
         }
     }
 
@@ -53,6 +60,21 @@ impl DynamicCapabilityRegistry {
             .values()
             .any(|r| r.method == method)
     }
+
+    pub(crate) fn store_log_message_level(&self, level: crate::config::settings::LogMessageLevel) {
+        self.log_message_level
+            .store(level.as_u8(), Ordering::Release);
+    }
+
+    pub(crate) fn allows_log_message(
+        &self,
+        message_type: tower_lsp_server::ls_types::MessageType,
+    ) -> bool {
+        crate::config::settings::LogMessageLevel::from_u8(
+            self.log_message_level.load(Ordering::Acquire),
+        )
+        .allows(message_type)
+    }
 }
 
 #[cfg(test)]
@@ -60,7 +82,7 @@ mod tests {
     use std::sync::Arc;
     use std::thread;
 
-    use tower_lsp_server::ls_types::{Registration, Unregistration};
+    use tower_lsp_server::ls_types::{MessageType, Registration, Unregistration};
 
     use super::DynamicCapabilityRegistry;
 
@@ -138,6 +160,37 @@ mod tests {
 
         // "diag-2" should still be registered
         assert!(registry.has_registration("textDocument/diagnostic"));
+    }
+
+    #[test]
+    fn downstream_log_gate_matches_every_global_level() {
+        use crate::config::settings::LogMessageLevel;
+
+        let registry = DynamicCapabilityRegistry::new();
+        let debug: MessageType = serde_json::from_str("5").unwrap();
+        let message_types = [
+            MessageType::ERROR,
+            MessageType::WARNING,
+            MessageType::INFO,
+            MessageType::LOG,
+            debug,
+        ];
+        for level in [
+            LogMessageLevel::Error,
+            LogMessageLevel::Warning,
+            LogMessageLevel::Info,
+            LogMessageLevel::Log,
+            LogMessageLevel::Off,
+        ] {
+            registry.store_log_message_level(level);
+            for message_type in message_types {
+                assert_eq!(
+                    registry.allows_log_message(message_type),
+                    level.allows(message_type),
+                    "downstream atomic gate diverged at {level:?}"
+                );
+            }
+        }
     }
 
     #[test]

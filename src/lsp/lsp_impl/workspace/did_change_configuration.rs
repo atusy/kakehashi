@@ -19,6 +19,7 @@ const KNOWN_WORKSPACE_SETTING_KEYS: &[&str] = &[
 
 const KNOWN_FEATURE_SETTING_KEYS: &[&str] = &[
     "textDocument/publishDiagnostics",
+    "window/logMessage",
     "workspace/diagnostic/refresh",
 ];
 
@@ -551,6 +552,21 @@ mod tests {
             "textDocument/publishDiagnostics": {
                 "debounceMs": 30,
                 "maxWaitMs": 300
+            }
+        });
+        let (payload, unknown_keys) = settings_payload(serde_json::json!({
+            "features": features
+        }));
+
+        assert_eq!(payload, serde_json::json!({ "features": features }));
+        assert!(unknown_keys.is_empty());
+    }
+
+    #[test]
+    fn settings_payload_keeps_unwrapped_log_message_feature() {
+        let features = serde_json::json!({
+            "window/logMessage": {
+                "logLevel": "off"
             }
         });
         let (payload, unknown_keys) = settings_payload(serde_json::json!({

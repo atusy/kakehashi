@@ -76,6 +76,6 @@ impl Kakehashi {
         )
         .await;
 
-        result.handle(&self.client, "moniker", None, Ok).await
+        result.handle(&self.notifier(), "moniker", None, Ok).await
     }
 }

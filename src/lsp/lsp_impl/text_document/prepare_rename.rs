@@ -84,6 +84,8 @@ impl Kakehashi {
             cancel_rx,
         )
         .await;
-        result.handle(&self.client, "prepareRename", None, Ok).await
+        result
+            .handle(&self.notifier(), "prepareRename", None, Ok)
+            .await
     }
 }

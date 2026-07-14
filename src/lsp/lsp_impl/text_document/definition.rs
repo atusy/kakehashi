@@ -92,7 +92,9 @@ impl Kakehashi {
             cancel_rx,
         )
         .await;
-        result.handle(&self.client, "definition", None, Ok).await
+        result
+            .handle(&self.notifier(), "definition", None, Ok)
+            .await
     }
 
     /// Shape the winning links per the client's `LocationLink` support.

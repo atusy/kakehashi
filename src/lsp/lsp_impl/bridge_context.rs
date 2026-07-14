@@ -1048,8 +1048,8 @@ impl Kakehashi {
             crate::lsp::aggregation::server::FanInResult::Done(value) => Ok(value),
             crate::lsp::aggregation::server::FanInResult::NoResult { errors } => {
                 if errors > 0 {
-                    self.client
-                        .log_message(
+                    self.notifier()
+                        .log(
                             tower_lsp_server::ls_types::MessageType::WARNING,
                             format!("No {request_method} response from any host bridge server"),
                         )
