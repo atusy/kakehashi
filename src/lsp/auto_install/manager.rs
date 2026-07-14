@@ -536,11 +536,8 @@ mod tests {
     #[test]
     fn unit_test_crash_state_is_separate_from_shared_install_assets() {
         const PARENT_STATE_DIR: &str = "KAKEHASHI_TEST_PARENT_CRASH_STATE_DIR";
-
-        if let Some(parent_state_dir) = std::env::var_os(PARENT_STATE_DIR) {
-            assert_ne!(failed_parser_state_dir(), PathBuf::from(parent_state_dir));
-            return;
-        }
+        const CHILD_TEST: &str =
+            "lsp::auto_install::manager::tests::child_process_uses_distinct_crash_state";
 
         let shared_install_dir = crate::install::test_support::test_data_dir_path();
         let state_dir = failed_parser_state_dir();
@@ -553,9 +550,7 @@ mod tests {
         let child_status = std::process::Command::new(
             std::env::current_exe().expect("resolve current test executable"),
         )
-        .arg(stringify!(
-            unit_test_crash_state_is_separate_from_shared_install_assets
-        ))
+        .args(["--ignored", "--exact", CHILD_TEST])
         .env(PARENT_STATE_DIR, &state_dir)
         .status()
         .expect("run crash-state isolation test in child process");
@@ -564,6 +559,15 @@ mod tests {
             child_status.success(),
             "child test process must use a different crash-state directory"
         );
+    }
+
+    #[test]
+    #[ignore = "run only as a child of the crash-state isolation test"]
+    fn child_process_uses_distinct_crash_state() {
+        let parent_state_dir = std::env::var_os("KAKEHASHI_TEST_PARENT_CRASH_STATE_DIR")
+            .expect("parent crash-state directory must be provided");
+
+        assert_ne!(failed_parser_state_dir(), PathBuf::from(parent_state_dir));
     }
 
     fn create_test_manager() -> (AutoInstallManager, tempfile::TempDir) {
