@@ -546,6 +546,10 @@ struct WireGate {
     /// exists before the first send commits, so an aborted/stale first publish
     /// cannot postpone delivery forever under continuous activity.
     cycle_started_at: tokio::time::Instant,
+    /// Whether this cycle has already scheduled one stale-snapshot retry. The
+    /// first zero-debounce retry may run immediately; later stale retries are
+    /// rate-limited even before max-wait.
+    stale_retry_started: bool,
     /// Latest set-changing feed admitted for this host. Trailing retries do
     /// not advance it, so `debounce` measures quiet since real activity.
     last_activity_at: Option<tokio::time::Instant>,
@@ -1437,6 +1441,7 @@ impl DiagnosticAggregator {
                     max_wait,
                     last_sent_at: None,
                     cycle_started_at: now,
+                    stale_retry_started: false,
                     last_activity_at: Some(now),
                     last_cache_revision: cache_revision,
                     pending: false,
@@ -1527,6 +1532,7 @@ impl DiagnosticAggregator {
         if let Some(gate) = gates.get_mut(host) {
             gate.last_sent_at = Some(now);
             gate.cycle_started_at = now;
+            gate.stale_retry_started = false;
             gate.dirty = false;
         } else {
             // The admit minted an entry, but a `forget_wire_gate` (seal) can
@@ -1538,6 +1544,7 @@ impl DiagnosticAggregator {
                     max_wait: std::time::Duration::ZERO,
                     last_sent_at: Some(now),
                     cycle_started_at: now,
+                    stale_retry_started: false,
                     last_activity_at: Some(now),
                     last_cache_revision: 0,
                     pending: false,
@@ -1653,6 +1660,7 @@ impl DiagnosticAggregator {
             max_wait,
             last_sent_at: None,
             cycle_started_at: now,
+            stale_retry_started: false,
             last_activity_at: Some(now),
             last_cache_revision: cache_revision,
             pending: false,
@@ -1673,13 +1681,14 @@ impl DiagnosticAggregator {
         let deadline = quiet_deadline.min(max_deadline);
         // A max-wait attempt that itself became stale must not self-spawn an
         // unbounded zero-delay full-merge chain. Back off by the active
-        // debounce (at least one millisecond); once churn settles, that retry
+        // debounce (at least 50 milliseconds); once churn settles, that retry
         // sends the latest set.
-        let remaining = if max_deadline <= now {
+        let remaining = if max_deadline <= now || (gate.stale_retry_started && deadline <= now) {
             gate.debounce.max(std::time::Duration::from_millis(50))
         } else {
             deadline.saturating_duration_since(now)
         };
+        gate.stale_retry_started = true;
         gate.pending = true;
         Some((remaining, gate.cancellation.clone()))
     }
@@ -2031,6 +2040,15 @@ mod tests {
             )
             .unwrap();
         assert_eq!(initial_remaining, std::time::Duration::ZERO);
+        assert!(zero.wire_gate_take_pending(&zero_host));
+        let (second_remaining, _) = zero
+            .wire_gate_schedule_latest(
+                &zero_host,
+                std::time::Duration::ZERO,
+                std::time::Duration::from_millis(1),
+            )
+            .unwrap();
+        assert_eq!(second_remaining, std::time::Duration::from_millis(50));
         assert!(zero.wire_gate_take_pending(&zero_host));
         zero.wire_gate_commit_send(&zero_host);
         tokio::time::advance(std::time::Duration::from_millis(1)).await;
