@@ -1676,6 +1676,17 @@ impl DiagnosticAggregator {
             cancellation: tokio_util::sync::CancellationToken::new(),
             dirty: true,
         });
+        let starts_idle_cycle = !gate.pending
+            && !gate.dirty
+            && gate
+                .last_activity_at
+                .is_none_or(|at| now.saturating_duration_since(at) >= gate.debounce);
+        if starts_idle_cycle {
+            gate.debounce = debounce;
+            gate.max_wait = max_wait;
+            gate.cycle_started_at = now;
+            gate.stale_retry_started = false;
+        }
         gate.last_activity_at = Some(now);
         gate.last_cache_revision = cache_revision;
         gate.dirty = true;
@@ -2009,6 +2020,27 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn stale_handoff_snapshots_live_timing_at_an_idle_cycle_boundary() {
+        let agg = DiagnosticAggregator::new();
+        let host = host();
+        let old_debounce = std::time::Duration::from_millis(100);
+        let old_max_wait = std::time::Duration::from_secs(1);
+        assert_eq!(
+            agg.wire_debounce_admit(&host, old_debounce, old_max_wait, true),
+            WireAdmit::SendNow
+        );
+        agg.wire_gate_commit_send(&host);
+        tokio::time::advance(old_debounce).await;
+
+        let new_debounce = std::time::Duration::from_millis(250);
+        let new_max_wait = std::time::Duration::from_secs(2);
+        let (remaining, _) = agg
+            .wire_gate_schedule_latest(&host, new_debounce, new_max_wait)
+            .expect("an idle stale handoff starts a fresh cycle");
+        assert_eq!(remaining, new_debounce);
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn stale_handoff_mints_a_first_gate_and_backs_off_after_max_wait() {
         let agg = DiagnosticAggregator::new();
         let host = host();
@@ -2068,7 +2100,11 @@ mod tests {
                 std::time::Duration::from_millis(1),
             )
             .unwrap();
-        assert_eq!(remaining, std::time::Duration::from_millis(50));
+        assert_eq!(
+            remaining,
+            std::time::Duration::ZERO,
+            "a settled idle gate starts a fresh cycle instead of inheriting max-wait debt"
+        );
     }
 
     #[tokio::test(start_paused = true)]
