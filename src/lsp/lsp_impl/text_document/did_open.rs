@@ -6,21 +6,6 @@ use super::super::{Kakehashi, build_notifier, uri_to_url};
 use crate::document::DocumentStore;
 use crate::language::LanguageEvent;
 
-#[cfg(test)]
-async fn has_tree_for_incarnation(
-    documents: &DocumentStore,
-    uri: &url::Url,
-    incarnation: u64,
-) -> bool {
-    let edit_lock = documents.edit_lock(uri);
-    let _lifecycle = edit_lock.lock().await;
-    let Some(document) = documents.get(uri) else {
-        documents.remove_edit_lock_if_unshared(uri, &edit_lock);
-        return false;
-    };
-    document.incarnation() == incarnation && document.tree().is_some()
-}
-
 async fn spawn_synthetic_diagnostic_for_incarnation<F>(
     documents: &DocumentStore,
     diagnostic_scheduler: &crate::lsp::lsp_impl::coordinator::DiagnosticScheduler,
@@ -367,13 +352,21 @@ mod tests {
 
     #[tokio::test]
     async fn missing_install_recovery_document_reclaims_inserted_edit_lock() {
-        let documents = DocumentStore::new();
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
         let uri = Url::parse("file:///test/closed-during-install.rs").unwrap();
-        let edit_lock = documents.edit_lock(&uri);
+        let edit_lock = server.documents.edit_lock(&uri);
         let weak_lock = std::sync::Arc::downgrade(&edit_lock);
         drop(edit_lock);
 
-        assert!(!has_tree_for_incarnation(&documents, &uri, 1).await);
+        spawn_synthetic_diagnostic_for_incarnation(
+            &server.documents,
+            &server.diagnostic_scheduler(),
+            uri,
+            1,
+            std::future::ready(()),
+        )
+        .await;
         assert!(
             weak_lock.upgrade().is_none(),
             "the missing-document path must remove its inserted edit lock"
