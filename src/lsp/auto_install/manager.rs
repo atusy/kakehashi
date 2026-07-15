@@ -244,6 +244,20 @@ impl AutoInstallManager {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn begin_test_result(
+        &self,
+        language: &str,
+        outcome: InstallOutcome,
+    ) -> InstallResult {
+        let TestInstallClaim { guard } = self.begin_test_claim(language);
+        InstallResult::with_claim(
+            outcome,
+            Vec::new(),
+            guard.expect("test result claim is present"),
+        )
+    }
+
     /// Initialize the failed parser registry with crash detection.
     ///
     /// State storage location: `KAKEHASHI_STATE_DIR` if set, else the default

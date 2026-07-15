@@ -783,7 +783,7 @@ impl ParseCoordinator {
             let language_name =
                 self.language
                     .detect_language(uri.path(), doc.text(), None, doc.language_id());
-            if language_name.as_deref() != Some(installed_language) {
+            if language_name.is_some() && language_name.as_deref() != Some(installed_language) {
                 return;
             }
             (
@@ -1179,6 +1179,31 @@ impl ParseCoordinator {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tower_lsp_server::LspService;
+
+    #[tokio::test]
+    async fn reparse_without_detectable_language_publishes_giveup_snapshot() {
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+        let uri = Url::parse("file:///workspace/no-language.unknown").unwrap();
+        let incarnation =
+            server
+                .documents
+                .insert(uri.clone(), "plain text".to_string(), None, None);
+
+        server
+            .parse_coordinator()
+            .reparse_installed_document(uri.clone(), "rust", Some(incarnation))
+            .await;
+
+        let snapshot = server
+            .documents
+            .latest_snapshot(&uri)
+            .and_then(|view| view.slot.snapshot)
+            .expect("undetectable language must release first-parse waiters");
+        assert!(snapshot.tree.is_none());
+        assert_eq!(snapshot.incarnation, incarnation);
+    }
 
     /// The four documented invariants of the settle-refresh gate.
     #[test]

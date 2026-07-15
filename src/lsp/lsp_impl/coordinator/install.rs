@@ -305,7 +305,14 @@ impl InstallCoordinator {
 
         let load_result = self.language.ensure_language_loaded_async(language).await;
         let global_loaded = self.language.has_parser_available(language);
-        if global_loaded && let Some(claim) = claim {
+        if !global_loaded && let Some(expected_incarnation) = expected_incarnation {
+            self.documents
+                .publish_giveup_snapshot(&uri, expected_incarnation);
+        }
+        if let Some(claim) = claim {
+            if !global_loaded {
+                claim.outcome = crate::lsp::auto_install::InstallOutcome::Failed;
+            }
             claim.complete_claim();
         }
         drop(reload);
@@ -547,6 +554,64 @@ mod tests {
             server.documents.get(&first).unwrap().tree().is_some(),
             "the document that won the install should be reparsed"
         );
+    }
+
+    #[tokio::test]
+    async fn reload_failure_completes_claim_as_failed() {
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+        let language = "missing-after-install";
+        let uri = Url::parse("file:///workspace/missing.txt").unwrap();
+        let incarnation = server.documents.insert(
+            uri.clone(),
+            "missing parser".to_string(),
+            Some(language.to_string()),
+            None,
+        );
+        let mut claim = server.auto_install.begin_test_result(
+            language,
+            crate::lsp::auto_install::InstallOutcome::Success {
+                data_dir: std::path::PathBuf::from("/installed"),
+            },
+        );
+        let duplicate = server.auto_install.try_install(language).await;
+        assert_eq!(
+            duplicate.outcome,
+            crate::lsp::auto_install::InstallOutcome::AlreadyInstalling
+        );
+        let mut completion = duplicate
+            .completion
+            .clone()
+            .expect("exact waiter observes the reload claim")
+            .receiver;
+
+        server
+            .install_coordinator()
+            .reload_language_after_install(
+                language,
+                Path::new("/installed"),
+                uri.clone(),
+                true,
+                Some(incarnation),
+                Some(&mut claim),
+            )
+            .await;
+
+        assert_eq!(
+            claim.outcome,
+            crate::lsp::auto_install::InstallOutcome::Failed
+        );
+        assert_eq!(
+            completion.borrow_and_update().clone(),
+            Some(crate::lsp::auto_install::InstallOutcome::Failed),
+            "the exact waiter must observe the failed reload"
+        );
+        let snapshot = server
+            .documents
+            .latest_snapshot(&uri)
+            .and_then(|view| view.slot.snapshot)
+            .expect("failed reload must release the owner's first-parse waiters");
+        assert!(snapshot.tree.is_none());
     }
 
     #[tokio::test]
