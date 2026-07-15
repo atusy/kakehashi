@@ -209,7 +209,10 @@ impl InstallCoordinator {
         // burn the full first-parse backstop. Harmless for AlreadyInstalling:
         // its eventual reload-reparse lands the same-version tree through the
         // snapshot cell's tree-upgrade clause.
-        self.documents.publish_giveup_snapshot(&uri);
+        if let Some(expected_incarnation) = expected_incarnation {
+            self.documents
+                .publish_giveup_snapshot(&uri, expected_incarnation);
+        }
         if result.outcome == crate::lsp::auto_install::InstallOutcome::AlreadyInstalling {
             let completion_token = result
                 .completion

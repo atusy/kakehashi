@@ -794,11 +794,13 @@ impl ParseCoordinator {
         };
         let Some(language_name) = language_name else {
             // Give-up: release a parked first-parse waiter (bootstrap-gated).
-            self.documents.publish_giveup_snapshot(&uri);
+            self.documents
+                .publish_giveup_snapshot(&uri, expected_incarnation);
             return;
         };
         if self.auto_install.is_parser_failed(&language_name) {
-            self.documents.publish_giveup_snapshot(&uri);
+            self.documents
+                .publish_giveup_snapshot(&uri, expected_incarnation);
             return;
         }
         let load_result = self
@@ -807,7 +809,8 @@ impl ParseCoordinator {
             .await;
         let mut events = load_result.events;
         if !load_result.success {
-            self.documents.publish_giveup_snapshot(&uri);
+            self.documents
+                .publish_giveup_snapshot(&uri, expected_incarnation);
             self.notifier().log_language_events(&events).await;
             return;
         }
@@ -930,7 +933,8 @@ impl ParseCoordinator {
         // unavailable after the install, exhausted attempts): a no-op after
         // a successful publish (bootstrap gate), otherwise it releases a
         // parked first-parse waiter.
-        self.documents.publish_giveup_snapshot(&uri);
+        self.documents
+            .publish_giveup_snapshot(&uri, expected_incarnation);
         self.notifier().log_language_events(&events).await;
     }
 
@@ -1011,12 +1015,12 @@ impl ParseCoordinator {
             // Give-up: release a parked first-parse waiter with a tree-less
             // snapshot (bootstrap-gated inside) rather than letting every
             // request burn the full first-parse backstop.
-            self.documents.publish_giveup_snapshot(uri);
+            self.documents.publish_giveup_snapshot(uri, incarnation);
             advance_watermark();
             return;
         };
         if self.auto_install.is_parser_failed(&language_name) {
-            self.documents.publish_giveup_snapshot(uri);
+            self.documents.publish_giveup_snapshot(uri, incarnation);
             advance_watermark();
             return;
         }
@@ -1025,7 +1029,7 @@ impl ParseCoordinator {
             .ensure_language_loaded_async(&language_name)
             .await;
         if !load_result.success {
-            self.documents.publish_giveup_snapshot(uri);
+            self.documents.publish_giveup_snapshot(uri, incarnation);
             advance_watermark();
             self.notifier()
                 .log_language_events(&load_result.events)
@@ -1162,7 +1166,7 @@ impl ParseCoordinator {
         // Covers the parse-produced-no-tree path (timeout / parser
         // unavailable): a no-op after a successful publish (bootstrap gate),
         // otherwise it releases a parked first-parse waiter.
-        self.documents.publish_giveup_snapshot(uri);
+        self.documents.publish_giveup_snapshot(uri, incarnation);
         advance_watermark();
         self.notifier().log_language_events(&events).await;
     }
