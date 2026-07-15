@@ -215,9 +215,12 @@ impl InjectionCoordinator {
         let edit_lock = self.documents.edit_lock(uri);
         let _lifecycle_guard = edit_lock.lock().await;
         after_lifecycle_lock.await;
-        if self.documents.get(uri).is_none() {
+        let Some(incarnation) = self.documents.get(uri).map(|doc| doc.incarnation()) else {
             self.bridge.cancel_eager_open(uri);
             self.documents.remove_edit_lock_if_unshared(uri, &edit_lock);
+            return false;
+        };
+        if required_incarnation.is_some_and(|required| incarnation != required) {
             return false;
         }
 
@@ -225,13 +228,6 @@ impl InjectionCoordinator {
             self.bridge.cancel_eager_open(uri);
             return false;
         };
-        let Some(incarnation) = self.documents.get(uri).map(|doc| doc.incarnation()) else {
-            self.bridge.cancel_eager_open(uri);
-            return false;
-        };
-        if required_incarnation.is_some_and(|required| incarnation != required) {
-            return false;
-        }
         let injections = self.resolve_injection_data(uri, &host_language);
         if injections.is_empty() {
             self.bridge.cancel_eager_open(uri);
@@ -569,6 +565,41 @@ mod tests {
         assert!(
             !reached_side_effects.load(std::sync::atomic::Ordering::SeqCst),
             "a stale detached task must stop before parser load or notification side effects"
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_injection_pass_does_not_cancel_reopened_eager_batch() {
+        let (service, _socket) = LspService::new(crate::lsp::lsp_impl::Kakehashi::new);
+        let server = service.inner();
+        let uri = Url::parse("file:///stale-injection-pass.unknown").unwrap();
+        let old_incarnation = server.documents.insert(
+            uri.clone(),
+            "# old".to_string(),
+            Some("markdown".to_string()),
+            None,
+        );
+        let (token_tx, token_rx) = tokio::sync::oneshot::channel();
+
+        let processed = server
+            .injection_coordinator()
+            .process_injections_after_lifecycle_lock(&uri, false, Some(old_incarnation), async {
+                server.documents.remove_preserving_edit_lock(&uri);
+                let new_incarnation =
+                    server
+                        .documents
+                        .insert(uri.clone(), "new".to_string(), None, None);
+                assert_ne!(new_incarnation, old_incarnation);
+                let token = server.bridge.begin_test_eager_open_batch(&uri);
+                let _ = token_tx.send(token);
+            })
+            .await;
+        let token = token_rx.await.unwrap();
+
+        assert!(!processed);
+        assert!(
+            !token.is_cancelled(),
+            "a stale pass must not cancel the reopened lifetime's eager batch"
         );
     }
 

@@ -1196,6 +1196,11 @@ impl BridgeCoordinator {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn begin_test_eager_open_batch(&self, uri: &Url) -> CancellationToken {
+        self.supersede_eager_open_tasks(uri).1
+    }
+
     /// Whether every eager-open task registered for `uri` has finished
     /// (no batch counts as finished).
     ///
