@@ -162,6 +162,10 @@ impl InstallCoordinator {
         expected_incarnation: Option<u64>,
         allow_recovery: bool,
     ) -> bool {
+        if !self.same_document_incarnation(&uri, expected_incarnation) {
+            return false;
+        }
+
         if self.language.has_parser_available(language) {
             if !is_injection && self.same_document_incarnation(&uri, expected_incarnation) {
                 self.parse_coordinator()
@@ -379,6 +383,7 @@ impl InstallCoordinator {
 mod tests {
     use super::*;
     use crate::config::{LanguageSettings, RawWorkspaceSettings, WILDCARD_KEY, WorkspaceSettings};
+    use futures::StreamExt;
     use std::collections::HashMap;
     use std::future::Future;
     use std::path::Path;
@@ -645,5 +650,45 @@ mod tests {
             .await;
 
         assert!(server.documents.get(&uri).unwrap().tree().is_none());
+    }
+
+    #[tokio::test]
+    async fn stale_install_task_stops_before_install_events() {
+        let (service, mut socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+        let language = "stale-install-language";
+        server
+            .auto_install
+            .failed_parsers_handle()
+            .mark_failed(language)
+            .unwrap();
+        let uri = Url::parse("file:///workspace/stale-install.txt").unwrap();
+        let old_incarnation = server.documents.insert(
+            uri.clone(),
+            "old".to_string(),
+            Some(language.to_string()),
+            None,
+        );
+        server.documents.remove(&uri);
+        let new_incarnation = server.documents.insert(
+            uri.clone(),
+            "new".to_string(),
+            Some(language.to_string()),
+            None,
+        );
+        assert_ne!(new_incarnation, old_incarnation);
+
+        assert!(
+            !server
+                .install_coordinator()
+                .maybe_auto_install_language(language, uri, false, Some(old_incarnation), true,)
+                .await
+        );
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(10), socket.next())
+                .await
+                .is_err(),
+            "a stale task must not emit parser failure or install progress events"
+        );
     }
 }
