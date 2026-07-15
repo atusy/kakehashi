@@ -426,19 +426,16 @@ mod tests {
         });
         close_started_rx.await.unwrap();
         tokio::task::yield_now().await;
-        let close_finished_before_release = tokio::select! {
-            result = &mut close => {
-                result.unwrap();
-                true
-            }
-            () = tokio::time::sleep(std::time::Duration::from_millis(100)) => false,
-        };
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), &mut close)
+                .await
+                .is_err(),
+            "didClose must wait until install recovery registers diagnostics"
+        );
 
         let _ = release_tx.send(());
         recovery.await.unwrap();
-        if !close_finished_before_release {
-            close.await.unwrap();
-        }
+        close.await.unwrap();
 
         assert!(
             !server.synthetic_diagnostics.has_active_task(&uri),
