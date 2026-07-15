@@ -273,14 +273,14 @@ impl InjectionCoordinator {
         //   promptly without waiting on the compile.
         // - `maybe_auto_install_language`'s `InstallingLanguages` tracker dedupes
         //   concurrent attempts, and the injected install (`is_injection=true`) never
-        //   reparses or resurrects the host document, so a `didClose` racing this
-        //   spawn is benign (it just finishes installing a global parser).
+        //   reparses or resurrects the host document. The detached task retains this
+        //   pass's incarnation so a close/reopen cannot apply its stale language set.
         let install_task = {
             let coordinator = self.clone();
             let uri = uri.clone();
             async move {
                 coordinator
-                    .check_injected_languages_auto_install(&uri, &languages)
+                    .check_injected_languages_auto_install(&uri, &languages, incarnation)
                     .await;
             }
         };
@@ -300,7 +300,30 @@ impl InjectionCoordinator {
         &self,
         uri: &Url,
         languages: &HashSet<String>,
+        expected_incarnation: u64,
     ) {
+        self.check_injected_languages_auto_install_after_incarnation_check(
+            uri,
+            languages,
+            expected_incarnation,
+            std::future::ready(()),
+        )
+        .await;
+    }
+
+    async fn check_injected_languages_auto_install_after_incarnation_check<F>(
+        &self,
+        uri: &Url,
+        languages: &HashSet<String>,
+        expected_incarnation: u64,
+        after_incarnation_check: F,
+    ) where
+        F: std::future::Future<Output = ()>,
+    {
+        if !self.same_document_incarnation(uri, expected_incarnation) {
+            return;
+        }
+        after_incarnation_check.await;
         let install = self.install_coordinator();
         let auto_install_enabled = self.settings_manager.is_auto_install_enabled();
 
@@ -338,6 +361,9 @@ impl InjectionCoordinator {
             .iter()
             .filter(|lang| parser_enabled_injection_language(lang))
         {
+            if !self.same_document_incarnation(uri, expected_incarnation) {
+                return;
+            }
             let resolved_lang = if self.language.has_parser_available(lang) {
                 lang.clone()
             } else if let Some(normalized) = crate::language::heuristic::detect_from_token(lang) {
@@ -350,6 +376,9 @@ impl InjectionCoordinator {
                 .language
                 .ensure_language_loaded_async(&resolved_lang)
                 .await;
+            if !self.same_document_incarnation(uri, expected_incarnation) {
+                return;
+            }
             if load_result.success {
                 load_events.extend(load_result.events);
                 continue;
@@ -363,24 +392,28 @@ impl InjectionCoordinator {
             // Only attempt the (injected-language) install while the host document
             // is still open. The injected-language install does not reparse the
             // host document (is_injection=true), so no host text is needed here.
-            if self.documents.get(uri).is_some() {
-                let _ = install
-                    .maybe_auto_install_language(
-                        &resolved_lang,
-                        uri.clone(),
-                        true,
-                        self.documents.get(uri).map(|doc| doc.incarnation()),
-                        true,
-                    )
-                    .await;
-            }
+            let _ = install
+                .maybe_auto_install_language(
+                    &resolved_lang,
+                    uri.clone(),
+                    true,
+                    Some(expected_incarnation),
+                    true,
+                )
+                .await;
         }
 
         // Forward the collected load events (deduped to ≤1 refresh by #531) so the
         // editor re-pulls tokens for any injected language loaded just now.
-        if !load_events.is_empty() {
+        if !load_events.is_empty() && self.same_document_incarnation(uri, expected_incarnation) {
             self.notifier().log_language_events(&load_events).await;
         }
+    }
+
+    fn same_document_incarnation(&self, uri: &Url, expected: u64) -> bool {
+        self.documents
+            .get(uri)
+            .is_some_and(|document| document.incarnation() == expected)
     }
 
     fn notifier(&self) -> ClientNotifier<'_> {
@@ -449,7 +482,7 @@ mod tests {
         assert!(!parser_enabled_injection_language("plaintext"));
         assert!(parser_enabled_injection_language("python"));
     }
-    use std::sync::Arc;
+    use std::{collections::HashSet, sync::Arc};
     use tokio::sync::Notify;
     use tower_lsp_server::LspService;
     use url::Url;
@@ -497,6 +530,46 @@ mod tests {
                 .insert(uri, "# new".to_string(), Some("markdown".to_string()), None);
 
         assert_ne!(new_incarnation, old_incarnation);
+    }
+
+    #[tokio::test]
+    async fn stale_injection_install_task_stops_before_side_effects() {
+        let (service, _socket) = LspService::new(crate::lsp::lsp_impl::Kakehashi::new);
+        let server = service.inner();
+        let uri = Url::parse("file:///stale-injection-install.md").unwrap();
+        let old_incarnation = server.documents.insert(
+            uri.clone(),
+            "# old".to_string(),
+            Some("markdown".to_string()),
+            None,
+        );
+        server.documents.remove(&uri);
+        let new_incarnation = server.documents.insert(
+            uri.clone(),
+            "# new".to_string(),
+            Some("markdown".to_string()),
+            None,
+        );
+        assert_ne!(new_incarnation, old_incarnation);
+
+        let reached_side_effects = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let observed = std::sync::Arc::clone(&reached_side_effects);
+        server
+            .injection_coordinator()
+            .check_injected_languages_auto_install_after_incarnation_check(
+                &uri,
+                &HashSet::new(),
+                old_incarnation,
+                async move {
+                    observed.store(true, std::sync::atomic::Ordering::SeqCst);
+                },
+            )
+            .await;
+
+        assert!(
+            !reached_side_effects.load(std::sync::atomic::Ordering::SeqCst),
+            "a stale detached task must stop before parser load or notification side effects"
+        );
     }
 
     /// The snapshot fast path of `resolve_injection_data` must produce

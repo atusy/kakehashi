@@ -224,7 +224,7 @@ impl Kakehashi {
         // mint a ULID: a `didChange` processed while grammars install would
         // adjust the tracker, leaving our stale byte ranges un-adjusted and
         // minting an id for bytes the edit moved.
-        self.ensure_injection_languages_loaded(&uri, &host_language, text, tree, byte)
+        self.ensure_injection_languages_loaded(&uri, &host_language, text, tree, byte, incarnation)
             .await;
 
         // Re-resolve a CURRENT snapshot after the await and recompute the
@@ -368,6 +368,7 @@ impl Kakehashi {
         text: &str,
         host_tree: &tree_sitter::Tree,
         byte: usize,
+        incarnation: u64,
     ) {
         use std::collections::HashSet;
 
@@ -408,7 +409,7 @@ impl Kakehashi {
                 break;
             }
             coordinator
-                .check_injected_languages_auto_install(uri, &fresh)
+                .check_injected_languages_auto_install(uri, &fresh, incarnation)
                 .await;
             seen.extend(fresh);
         }
