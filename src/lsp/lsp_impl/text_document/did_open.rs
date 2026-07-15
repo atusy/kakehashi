@@ -6,6 +6,7 @@ use super::super::{Kakehashi, build_notifier, uri_to_url};
 use crate::document::DocumentStore;
 use crate::language::LanguageEvent;
 
+#[cfg(test)]
 async fn has_tree_for_incarnation(
     documents: &DocumentStore,
     uri: &url::Url,
@@ -18,6 +19,27 @@ async fn has_tree_for_incarnation(
         return false;
     };
     document.incarnation() == incarnation && document.tree().is_some()
+}
+
+async fn spawn_synthetic_diagnostic_for_incarnation<F>(
+    documents: &DocumentStore,
+    diagnostic_scheduler: &crate::lsp::lsp_impl::coordinator::DiagnosticScheduler,
+    uri: url::Url,
+    incarnation: u64,
+    after_lifecycle_lock: F,
+) where
+    F: std::future::Future<Output = ()>,
+{
+    let edit_lock = documents.edit_lock(&uri);
+    let _lifecycle = edit_lock.lock().await;
+    after_lifecycle_lock.await;
+    let Some(document) = documents.get(&uri) else {
+        documents.remove_edit_lock_if_unshared(&uri, &edit_lock);
+        return;
+    };
+    if document.incarnation() == incarnation && document.tree().is_some() {
+        diagnostic_scheduler.spawn_synthetic_diagnostic_task(uri);
+    }
 }
 
 impl Kakehashi {
@@ -177,11 +199,15 @@ impl Kakehashi {
                             // and the pull-layer diagnostics were skipped on this
                             // first open of a just-installed parser. Skipped in CLI
                             // mode (#489), matching the handler's own gate.
-                            if !is_cli_mode
-                                && has_tree_for_incarnation(&documents, &install_uri, incarnation)
-                                    .await
-                            {
-                                diagnostic_scheduler.spawn_synthetic_diagnostic_task(install_uri);
+                            if !is_cli_mode {
+                                spawn_synthetic_diagnostic_for_incarnation(
+                                    &documents,
+                                    &diagnostic_scheduler,
+                                    install_uri,
+                                    incarnation,
+                                    std::future::ready(()),
+                                )
+                                .await;
                             }
                         }
                     });
@@ -349,6 +375,79 @@ mod tests {
         assert!(
             weak_lock.upgrade().is_none(),
             "the missing-document path must remove its inserted edit lock"
+        );
+    }
+
+    #[tokio::test]
+    async fn install_recovery_diagnostic_registration_is_ordered_before_close() {
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+        server
+            .language
+            .language_registry_for_parallel()
+            .register("rust".to_string(), tree_sitter_rust::LANGUAGE.into());
+        let uri = Url::parse("file:///test/close-at-install-diagnostic.rs").unwrap();
+        let incarnation = server.documents.insert(
+            uri.clone(),
+            "fn main() {}".to_string(),
+            Some("rust".to_string()),
+            None,
+        );
+        server
+            .parse_coordinator()
+            .parse_document(uri.clone(), Some("rust"), None)
+            .await;
+
+        let (locked_tx, locked_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let documents = std::sync::Arc::clone(&server.documents);
+        let scheduler = server.diagnostic_scheduler();
+        let recovery_uri = uri.clone();
+        let recovery = tokio::spawn(async move {
+            spawn_synthetic_diagnostic_for_incarnation(
+                &documents,
+                &scheduler,
+                recovery_uri,
+                incarnation,
+                async move {
+                    let _ = locked_tx.send(());
+                    let _ = release_rx.await;
+                },
+            )
+            .await;
+        });
+        locked_rx.await.unwrap();
+
+        let close_documents = std::sync::Arc::clone(&server.documents);
+        let close_diagnostics = std::sync::Arc::clone(&server.synthetic_diagnostics);
+        let close_uri = uri.clone();
+        let (close_started_tx, close_started_rx) = tokio::sync::oneshot::channel();
+        let mut close = tokio::spawn(async move {
+            let edit_lock = close_documents.edit_lock(&close_uri);
+            let _ = close_started_tx.send(());
+            let _lifecycle = edit_lock.lock().await;
+            close_documents.remove_preserving_edit_lock(&close_uri);
+            close_diagnostics.remove_document(&close_uri);
+        });
+        close_started_rx.await.unwrap();
+        tokio::task::yield_now().await;
+        let close_finished_before_release = tokio::select! {
+            result = &mut close => {
+                result.unwrap();
+                true
+            }
+            () = tokio::time::sleep(std::time::Duration::from_millis(100)) => false,
+        };
+
+        let _ = release_tx.send(());
+        recovery.await.unwrap();
+        if !close_finished_before_release {
+            close.await.unwrap();
+        }
+
+        assert!(
+            !server.synthetic_diagnostics.has_active_task(&uri),
+            "didClose must remove the install recovery diagnostic registration"
         );
     }
 
