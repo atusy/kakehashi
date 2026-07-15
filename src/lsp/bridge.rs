@@ -110,6 +110,7 @@ mod tests {
         let server_config = lua_ls_config();
 
         let host_uri = Url::parse("file:///test/doc.md").unwrap();
+        pool.open_host_incarnation(&host_uri, 1).await;
         let host_position = Position {
             line: 3,
             character: 9,
@@ -144,6 +145,7 @@ mod tests {
         let server_config = lua_ls_config();
 
         let host_uri = Url::parse("file:///test/doc.md").unwrap();
+        pool.open_host_incarnation(&host_uri, 1).await;
         let host_position = Position {
             line: 3,
             character: 3,
@@ -185,6 +187,7 @@ mod tests {
         let server_config = lua_ls_config();
 
         let host_uri = Url::parse("file:///test/doc.md").unwrap();
+        pool.open_host_incarnation(&host_uri, 1).await;
         let host_position = Position {
             line: 3,
             character: 9,
@@ -225,6 +228,7 @@ mod tests {
         let server_config = lua_ls_config();
 
         let host_uri = Url::parse("file:///test/doc.md").unwrap();
+        pool.open_host_incarnation(&host_uri, 1).await;
         let host_position = Position {
             line: 3,
             character: 3,
@@ -261,6 +265,7 @@ mod tests {
         let server_config = lua_ls_config();
 
         let host_uri = Url::parse("file:///test/doc.md").unwrap();
+        pool.open_host_incarnation(&host_uri, 1).await;
         // Lua code with require statement - lua-ls may return document links for requires
         let virtual_content = "local mod = require(\"mymodule\")\nprint(mod)";
 
