@@ -37,7 +37,9 @@ async fn spawn_synthetic_diagnostic_for_incarnation<F>(
         documents.remove_edit_lock_if_unshared(&uri, &edit_lock);
         return;
     };
-    if document.incarnation() == incarnation && document.tree().is_some() {
+    let eligible = document.incarnation() == incarnation && document.tree().is_some();
+    drop(document);
+    if eligible {
         diagnostic_scheduler.spawn_synthetic_diagnostic_task(uri);
     }
 }
