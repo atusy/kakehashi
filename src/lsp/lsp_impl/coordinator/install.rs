@@ -259,6 +259,19 @@ impl InstallCoordinator {
                 }
                 return false;
             }
+            if terminal == crate::lsp::auto_install::InstallOutcome::Abandoned
+                && self.same_document_incarnation(&uri, expected_incarnation)
+                && allow_recovery
+            {
+                return Box::pin(self.maybe_auto_install_language(
+                    language,
+                    uri,
+                    is_injection,
+                    expected_incarnation,
+                    false,
+                ))
+                .await;
+            }
         } else {
             result.complete_claim();
         }
@@ -534,6 +547,99 @@ mod tests {
             server.documents.get(&first).unwrap().tree().is_some(),
             "the document that won the install should be reparsed"
         );
+    }
+
+    #[tokio::test]
+    async fn successful_claim_reparses_owner_and_waiter_documents() {
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+        let first = Url::parse("file:///workspace/first.rs").unwrap();
+        let second = Url::parse("file:///workspace/second.rs").unwrap();
+        let first_incarnation = server.documents.insert(
+            first.clone(),
+            "fn first() {}".to_string(),
+            Some("rust".to_string()),
+            None,
+        );
+        let second_incarnation = server.documents.insert(
+            second.clone(),
+            "fn second() {}".to_string(),
+            Some("rust".to_string()),
+            None,
+        );
+        let claim = server.auto_install.begin_test_claim("rust");
+        let install = server.install_coordinator();
+        let mut waiter = Box::pin(install.maybe_auto_install_language(
+            "rust",
+            second.clone(),
+            false,
+            Some(second_incarnation),
+            true,
+        ));
+        std::future::poll_fn(|cx| {
+            assert!(waiter.as_mut().poll(cx).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+
+        server
+            .language
+            .language_registry_for_parallel()
+            .register("rust".to_string(), tree_sitter_rust::LANGUAGE.into());
+        server
+            .install_coordinator()
+            .reload_language_after_install(
+                "rust",
+                Path::new("/installed"),
+                first.clone(),
+                false,
+                Some(first_incarnation),
+                None,
+            )
+            .await;
+        claim.complete(crate::lsp::auto_install::InstallOutcome::Success {
+            data_dir: std::path::PathBuf::from("/installed"),
+        });
+
+        assert!(waiter.await);
+        assert!(server.documents.get(&first).unwrap().tree().is_some());
+        assert!(server.documents.get(&second).unwrap().tree().is_some());
+    }
+
+    #[tokio::test]
+    async fn abandoned_claim_waiter_takes_over_reparse() {
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+        let uri = Url::parse("file:///workspace/waiter.rs").unwrap();
+        let incarnation = server.documents.insert(
+            uri.clone(),
+            "fn waiter() {}".to_string(),
+            Some("rust".to_string()),
+            None,
+        );
+        let claim = server.auto_install.begin_test_claim("rust");
+        let install = server.install_coordinator();
+        let mut waiter = Box::pin(install.maybe_auto_install_language(
+            "rust",
+            uri.clone(),
+            false,
+            Some(incarnation),
+            true,
+        ));
+        std::future::poll_fn(|cx| {
+            assert!(waiter.as_mut().poll(cx).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+
+        server
+            .language
+            .language_registry_for_parallel()
+            .register("rust".to_string(), tree_sitter_rust::LANGUAGE.into());
+        drop(claim);
+
+        assert!(waiter.await);
+        assert!(server.documents.get(&uri).unwrap().tree().is_some());
     }
 
     #[tokio::test]

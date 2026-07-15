@@ -44,6 +44,21 @@ struct ClaimState {
     completion: tokio::sync::watch::Sender<Option<InstallOutcome>>,
 }
 
+#[cfg(test)]
+pub(crate) struct TestInstallClaim {
+    guard: Option<InstallMarkerGuard>,
+}
+
+#[cfg(test)]
+impl TestInstallClaim {
+    pub(crate) fn complete(mut self, outcome: InstallOutcome) {
+        self.guard
+            .take()
+            .expect("test claim is present")
+            .complete(outcome);
+    }
+}
+
 impl Drop for InstallResult {
     fn drop(&mut self) {
         // An uncompleted claim fails closed through InstallMarkerGuard::drop.
@@ -52,6 +67,20 @@ impl Drop for InstallResult {
 }
 
 impl InstallResult {
+    fn with_claim(
+        outcome: InstallOutcome,
+        events: Vec<InstallEvent>,
+        mut claim: InstallMarkerGuard,
+    ) -> Self {
+        claim.preserve_terminal(outcome.clone());
+        Self {
+            outcome,
+            events,
+            completion: None,
+            claim: Some(claim),
+        }
+    }
+
     pub(crate) fn complete_claim(&mut self) {
         if let Some(claim) = self.claim.take() {
             claim.complete(self.outcome.clone());
@@ -79,6 +108,8 @@ pub(crate) enum InstallOutcome {
     },
     /// Installation already in progress for this language
     AlreadyInstalling,
+    /// The owner disappeared before producing a terminal install result
+    Abandoned,
     /// Parser previously crashed, skipping to protect system
     ParserFailed,
     /// Language not supported by nvim-treesitter
@@ -153,6 +184,10 @@ struct InstallMarkerGuard {
 }
 
 impl InstallMarkerGuard {
+    fn preserve_terminal(&mut self, outcome: InstallOutcome) {
+        self.terminal = Some(outcome);
+    }
+
     fn complete(mut self, outcome: InstallOutcome) {
         self.terminal = Some(outcome);
     }
@@ -160,7 +195,7 @@ impl InstallMarkerGuard {
 
 impl Drop for InstallMarkerGuard {
     fn drop(&mut self) {
-        let terminal = self.terminal.take().unwrap_or(InstallOutcome::Failed);
+        let terminal = self.terminal.take().unwrap_or(InstallOutcome::Abandoned);
         self.installing.finish_install(&self.language);
         self.claims
             .lock()
@@ -180,6 +215,32 @@ impl AutoInstallManager {
             installing_languages,
             failed_parsers,
             claims: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn begin_test_claim(&self, language: &str) -> TestInstallClaim {
+        let mut claims = self
+            .claims
+            .lock()
+            .recover_poison("AutoInstallManager::begin_test_claim");
+        assert!(!claims.contains_key(language));
+        let (completion, _) = tokio::sync::watch::channel(None);
+        claims.insert(
+            language.to_string(),
+            ClaimState {
+                completion: completion.clone(),
+            },
+        );
+        assert!(self.installing_languages.try_start_install(language));
+        TestInstallClaim {
+            guard: Some(InstallMarkerGuard {
+                installing: self.installing_languages.clone(),
+                claims: Arc::clone(&self.claims),
+                completion,
+                language: language.to_string(),
+                terminal: None,
+            }),
         }
     }
 
@@ -282,6 +343,34 @@ impl AutoInstallManager {
     where
         F: FnOnce(String, Option<PathBuf>) -> Fut + Send + 'static,
         Fut: Future<Output = TrackedSupportCheck> + Send + 'static,
+    {
+        self.try_install_with_support_check_and_executor(
+            language,
+            support_check,
+            |language, data_dir| async move {
+                crate::install::install_language_async(
+                    language,
+                    data_dir,
+                    false,
+                    crate::install::parser::ParserCompile::KillableSubprocess,
+                )
+                .await
+            },
+        )
+        .await
+    }
+
+    async fn try_install_with_support_check_and_executor<F, Fut, I, IFut>(
+        &self,
+        language: &str,
+        support_check: F,
+        install_executor: I,
+    ) -> InstallResult
+    where
+        F: FnOnce(String, Option<PathBuf>) -> Fut + Send + 'static,
+        Fut: Future<Output = TrackedSupportCheck> + Send + 'static,
+        I: FnOnce(String, PathBuf) -> IFut + Send + 'static,
+        IFut: Future<Output = crate::install::InstallResult> + Send + 'static,
     {
         let mut events = Vec::new();
 
@@ -414,11 +503,16 @@ impl AutoInstallManager {
         }
 
         if should_skip {
-            return InstallResult {
-                outcome: InstallOutcome::Unsupported,
-                events,
-                completion: None,
-                claim: install_marker,
+            return match install_marker {
+                Some(claim) => {
+                    InstallResult::with_claim(InstallOutcome::Unsupported, events, claim)
+                }
+                None => InstallResult {
+                    outcome: InstallOutcome::Unsupported,
+                    events,
+                    completion: None,
+                    claim: None,
+                },
             };
         }
         let Some(install_marker) = install_marker else {
@@ -449,12 +543,11 @@ impl AutoInstallManager {
                     message: "Could not determine data directory for auto-install".to_string(),
                 });
                 events.push(InstallEvent::ProgressEnd { success: false });
-                return InstallResult {
-                    outcome: InstallOutcome::NoDataDir,
+                return InstallResult::with_claim(
+                    InstallOutcome::NoDataDir,
                     events,
-                    completion: None,
-                    claim: Some(install_marker),
-                };
+                    install_marker,
+                );
             }
         };
 
@@ -471,12 +564,7 @@ impl AutoInstallManager {
             let outcome = InstallOutcome::AlreadyExists {
                 data_dir: data_dir.clone(),
             };
-            return InstallResult {
-                outcome,
-                events,
-                completion: None,
-                claim: Some(install_marker),
-            };
+            return InstallResult::with_claim(outcome, events, install_marker);
         }
 
         // Log installation start
@@ -498,16 +586,28 @@ impl AutoInstallManager {
             // Auto-install runs inside the LSP server, whose `current_exe()` is the
             // kakehashi binary — so the killable subprocess (re-exec
             // `__compile-parser`) is valid and bounds a hung `cc`.
-            let result = crate::install::install_language_async(
-                task_lang,
-                task_data_dir,
-                false,
-                crate::install::parser::ParserCompile::KillableSubprocess,
-            )
-            .await;
-            (result, install_marker)
+            let result = install_executor(task_lang.clone(), task_data_dir.clone()).await;
+            let parser_exists =
+                crate::install::parser_file_exists(&task_lang, &task_data_dir).is_some();
+            let terminal = if result.is_success() {
+                InstallOutcome::Success {
+                    data_dir: task_data_dir.clone(),
+                }
+            } else if parser_exists {
+                InstallOutcome::SuccessWithWarnings {
+                    data_dir: task_data_dir.clone(),
+                }
+            } else {
+                InstallOutcome::Failed
+            };
+            let mut install_marker = install_marker;
+            // If the caller awaiting this task is cancelled, the task output is
+            // dropped. Keep the real install result on the guard so waiters see
+            // success rather than the guard's fail-closed fallback.
+            install_marker.preserve_terminal(terminal);
+            (result, parser_exists, install_marker)
         });
-        let (result, install_marker) = match install_task.await {
+        let (result, parser_exists, install_marker) = match install_task.await {
             Ok(result) => result,
             Err(join_error) => {
                 events.push(InstallEvent::ProgressEnd { success: false });
@@ -524,9 +624,6 @@ impl AutoInstallManager {
             }
         };
 
-        // Check if parser file exists after install attempt (even if queries failed)
-        let parser_exists = crate::install::parser_file_exists(&lang, &data_dir).is_some();
-
         if result.is_success() {
             events.push(InstallEvent::ProgressEnd { success: true });
             events.push(InstallEvent::Log {
@@ -536,12 +633,7 @@ impl AutoInstallManager {
             let outcome = InstallOutcome::Success {
                 data_dir: data_dir.clone(),
             };
-            InstallResult {
-                outcome,
-                events,
-                completion: None,
-                claim: Some(install_marker),
-            }
+            InstallResult::with_claim(outcome, events, install_marker)
         } else if parser_exists {
             // Parser compiled but queries had issues - still usable
             events.push(InstallEvent::ProgressEnd { success: true });
@@ -562,12 +654,7 @@ impl AutoInstallManager {
             let outcome = InstallOutcome::SuccessWithWarnings {
                 data_dir: data_dir.clone(),
             };
-            InstallResult {
-                outcome,
-                events,
-                completion: None,
-                claim: Some(install_marker),
-            }
+            InstallResult::with_claim(outcome, events, install_marker)
         } else {
             // Installation failed
             events.push(InstallEvent::ProgressEnd { success: false });
@@ -589,12 +676,7 @@ impl AutoInstallManager {
             });
 
             let outcome = InstallOutcome::Failed;
-            InstallResult {
-                outcome,
-                events,
-                completion: None,
-                claim: Some(install_marker),
-            }
+            InstallResult::with_claim(outcome, events, install_marker)
         }
     }
 }
@@ -659,6 +741,61 @@ mod tests {
             "marker must be released when the guard drops, even if try_install \
              is cancelled at its install await"
         );
+    }
+
+    #[tokio::test]
+    async fn cancelled_owner_preserves_detached_install_success_for_exact_waiter() {
+        let (manager, _temp) = create_test_manager();
+        let owner_manager = manager.clone();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let owner = tokio::spawn(async move {
+            owner_manager
+                .try_install_with_support_check_and_executor(
+                    "controlled-detached-success",
+                    |_, _| async { TrackedSupportCheck::completed(false, None) },
+                    |_, _| async move {
+                        let _ = started_tx.send(());
+                        let _ = release_rx.await;
+                        crate::install::InstallResult {
+                            parser_path: Some(PathBuf::from("/installed/parser")),
+                            queries_path: Some(PathBuf::from("/installed/queries")),
+                            parser_error: None,
+                            queries_error: None,
+                        }
+                    },
+                )
+                .await
+        });
+        started_rx.await.expect("install executor must start");
+
+        let duplicate = manager
+            .try_install_with_support_check("controlled-detached-success", |_, _| async {
+                panic!("the exact waiter must not start another support check")
+            })
+            .await;
+        assert_eq!(duplicate.outcome, InstallOutcome::AlreadyInstalling);
+        let mut completion = duplicate
+            .completion
+            .clone()
+            .expect("waiter observes the owner's exact claim")
+            .receiver;
+
+        owner.abort();
+        let _ = owner.await;
+        let _ = release_tx.send(());
+        let terminal = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                if let Some(outcome) = completion.borrow().clone() {
+                    break outcome;
+                }
+                completion.changed().await.unwrap();
+            }
+        })
+        .await
+        .expect("detached install must publish its actual result");
+
+        assert!(matches!(terminal, InstallOutcome::Success { .. }));
     }
 
     #[tokio::test]
@@ -880,8 +1017,24 @@ mod tests {
             .await;
         assert_eq!(duplicate.outcome, InstallOutcome::AlreadyInstalling);
         assert_eq!(duplicate_lookups.load(Ordering::SeqCst), 0);
+        let mut completion = duplicate
+            .completion
+            .clone()
+            .expect("waiter observes the abandoned owner's exact claim")
+            .receiver;
 
         let _ = release_tx.send(());
+        let terminal = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                if let Some(outcome) = completion.borrow().clone() {
+                    break outcome;
+                }
+                completion.changed().await.unwrap();
+            }
+        })
+        .await
+        .expect("abandoned support owner must publish a retryable outcome");
+        assert_eq!(terminal, InstallOutcome::Abandoned);
         tokio::time::timeout(std::time::Duration::from_secs(1), async {
             while !manager.installing_languages.try_start_install("lua") {
                 tokio::task::yield_now().await;
