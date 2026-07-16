@@ -25,7 +25,7 @@ use url::Url;
 
 #[cfg(test)]
 use tower_lsp_server::ls_types::{
-    PartialResultParams, TextDocumentIdentifier, WorkDoneProgressParams,
+    PartialResultParams, Position, Range, TextDocumentIdentifier, WorkDoneProgressParams,
 };
 
 use crate::analysis::{
@@ -1063,6 +1063,14 @@ impl Kakehashi {
         };
 
         let domain_range = range;
+        if (domain_range.start.line, domain_range.start.character)
+            >= (domain_range.end.line, domain_range.end.character)
+        {
+            return Ok(Some(SemanticTokensRangeResult::Tokens(SemanticTokens {
+                result_id: None,
+                data: vec![],
+            })));
+        }
 
         // Snapshot the settings generation at the top, before any await (#535): a
         // reload that bumps the generation after this leaves this request's stored
@@ -1341,6 +1349,55 @@ mod tests {
             work_done_progress_params: WorkDoneProgressParams::default(),
             partial_result_params: PartialResultParams::default(),
         }
+    }
+
+    fn range_params(uri: &Url, range: Range) -> SemanticTokensRangeParams {
+        SemanticTokensRangeParams {
+            text_document: TextDocumentIdentifier {
+                uri: crate::lsp::lsp_impl::url_to_uri(uri).expect("test URI should convert"),
+            },
+            range,
+            work_done_progress_params: WorkDoneProgressParams::default(),
+            partial_result_params: PartialResultParams::default(),
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn semantic_tokens_empty_range_does_not_wait_for_first_parse() {
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let uri = Url::parse("file:///empty_semantic_range.rs").expect("valid test uri");
+        service.inner().documents.insert(
+            uri.clone(),
+            "fn main() {}".to_string(),
+            Some("rust".to_string()),
+            None,
+        );
+
+        let result = timeout(
+            Duration::from_millis(1),
+            service.inner().semantic_tokens_range_impl(range_params(
+                &uri,
+                Range {
+                    start: Position {
+                        line: 0,
+                        character: 3,
+                    },
+                    end: Position {
+                        line: 0,
+                        character: 3,
+                    },
+                },
+            )),
+        )
+        .await
+        .expect("an empty range must not wait for the first parse")
+        .expect("empty range request should succeed")
+        .expect("empty range request should return a token result");
+
+        let SemanticTokensRangeResult::Tokens(tokens) = result else {
+            panic!("empty range must return a complete empty token result");
+        };
+        assert!(tokens.data.is_empty());
     }
 
     /// Serve-current (the Neovim client contract): a full request arriving

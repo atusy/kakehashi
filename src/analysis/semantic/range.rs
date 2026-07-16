@@ -27,20 +27,24 @@ pub(crate) fn filter_semantic_tokens_by_range(
     }
 }
 
-/// Filter semantic tokens to only those within the specified range.
+/// Filter semantic tokens to only those intersecting the specified range.
 ///
 /// This function:
 /// 1. Converts delta-encoded tokens to absolute positions
-/// 2. Filters to tokens within the range (inclusive)
+/// 2. Keeps tokens that intersect the end-exclusive range
 /// 3. Re-encodes as delta-encoded tokens
 fn filter_tokens_by_range(tokens: &[SemanticToken], range: &Range) -> Vec<SemanticToken> {
+    if (range.start.line, range.start.character) >= (range.end.line, range.end.character) {
+        return Vec::new();
+    }
+
     let start_line = range.start.line as usize;
     let end_line = range.end.line as usize;
 
     let mut abs_line = 0usize;
     let mut abs_col = 0usize;
 
-    // Collect tokens that are within the range (with absolute positions)
+    // Collect tokens intersecting the range (with absolute positions)
     let mut filtered_tokens: Vec<(usize, usize, u32, u32, u32)> = Vec::new();
 
     for token in tokens {
@@ -52,11 +56,17 @@ fn filter_tokens_by_range(tokens: &[SemanticToken], range: &Range) -> Vec<Semant
             abs_col += token.delta_start as usize;
         }
 
-        // Check if token is within range
-        if abs_line >= start_line && abs_line <= end_line {
+        // Delta encoding orders tokens monotonically, so later tokens cannot
+        // re-enter the range after either end boundary has been reached.
+        if abs_line > end_line {
+            break;
+        }
+
+        // Check if token intersects the range
+        if abs_line >= start_line {
             // For boundary lines, check column positions
-            if abs_line == end_line && abs_col > range.end.character as usize {
-                continue;
+            if abs_line == end_line && abs_col >= range.end.character as usize {
+                break;
             }
             if abs_line == start_line
                 && abs_col + token.length as usize <= range.start.character as usize
@@ -209,6 +219,84 @@ mod tests {
         assert!(
             filtered.is_empty(),
             "Token starting after range.end should be excluded"
+        );
+    }
+
+    #[test]
+    fn test_filter_tokens_excludes_token_starting_at_exclusive_range_end() {
+        let tokens = vec![SemanticToken {
+            delta_line: 1,
+            delta_start: 5,
+            length: 3,
+            token_type: 0,
+            token_modifiers_bitset: 0,
+        }];
+        let range = Range {
+            start: Position {
+                line: 1,
+                character: 0,
+            },
+            end: Position {
+                line: 1,
+                character: 5,
+            },
+        };
+
+        assert!(
+            filter_tokens_by_range(&tokens, &range).is_empty(),
+            "a token beginning at the end-exclusive boundary is outside the range"
+        );
+    }
+
+    #[test]
+    fn test_filter_tokens_excludes_end_boundary_on_multiline_range() {
+        let tokens = vec![SemanticToken {
+            delta_line: 1,
+            delta_start: 5,
+            length: 3,
+            token_type: 0,
+            token_modifiers_bitset: 0,
+        }];
+        let range = Range {
+            start: Position {
+                line: 0,
+                character: 0,
+            },
+            end: Position {
+                line: 1,
+                character: 5,
+            },
+        };
+
+        assert!(
+            filter_tokens_by_range(&tokens, &range).is_empty(),
+            "the end line retains the range's exclusive character boundary"
+        );
+    }
+
+    #[test]
+    fn test_filter_tokens_returns_nothing_for_empty_range_inside_token() {
+        let tokens = vec![SemanticToken {
+            delta_line: 1,
+            delta_start: 5,
+            length: 3,
+            token_type: 0,
+            token_modifiers_bitset: 0,
+        }];
+        let range = Range {
+            start: Position {
+                line: 1,
+                character: 6,
+            },
+            end: Position {
+                line: 1,
+                character: 6,
+            },
+        };
+
+        assert!(
+            filter_tokens_by_range(&tokens, &range).is_empty(),
+            "an empty range intersects no semantic token"
         );
     }
 
