@@ -11,6 +11,7 @@
 use std::{
     collections::HashMap,
     future::Future,
+    io::Write,
     path::PathBuf,
     sync::{Arc, Mutex},
 };
@@ -439,7 +440,30 @@ impl AutoInstallManager {
                     completion: completion.clone(),
                 },
             );
-            assert!(self.installing_languages.try_start_install(language));
+            if !self.installing_languages.try_start_install(language) {
+                let _ = writeln!(
+                    std::io::stderr(),
+                    "Auto-install state mismatch for '{}': repairing a stale installing marker",
+                    language
+                );
+                events.push(InstallEvent::Log {
+                    level: MessageType::WARNING,
+                    message: format!(
+                        "Auto-install state for '{}' was inconsistent; retrying with repaired state",
+                        language
+                    ),
+                });
+                self.installing_languages.finish_install(language);
+                if !self.installing_languages.try_start_install(language) {
+                    claims.remove(language);
+                    return InstallResult {
+                        outcome: InstallOutcome::Failed,
+                        events,
+                        completion: None,
+                        claim: None,
+                    };
+                }
+            }
             InstallMarkerGuard {
                 installing: self.installing_languages.clone(),
                 claims: Arc::clone(&self.claims),
@@ -921,6 +945,26 @@ mod tests {
                 .try_start_install("unsupported"),
             "unsupported and metadata-error exits share this skip path and must release the claim"
         );
+    }
+
+    #[tokio::test]
+    async fn stale_installing_marker_is_repaired_without_panicking() {
+        let temp = tempdir().unwrap();
+        let installing = InstallingLanguages::new();
+        assert!(installing.try_start_install("stale-marker"));
+        let failed = FailedParserRegistry::new(temp.path());
+        failed.init().unwrap();
+        let manager = AutoInstallManager::new(installing.clone(), failed);
+
+        let result = manager
+            .try_install_with_support_check("stale-marker", |_, _| async {
+                TrackedSupportCheck::completed(true, None)
+            })
+            .await;
+
+        assert_eq!(result.outcome, InstallOutcome::Unsupported);
+        drop(result);
+        assert!(installing.try_start_install("stale-marker"));
     }
 
     #[tokio::test]
