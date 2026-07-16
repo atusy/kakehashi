@@ -11,7 +11,7 @@
 
 mod manager;
 
-pub(crate) use manager::{AutoInstallManager, InstallEvent};
+pub(crate) use manager::{AutoInstallManager, InstallEvent, InstallOutcome, InstallResult};
 
 use crate::lsp::in_progress_set::InProgressSet;
 

@@ -172,20 +172,39 @@ impl InjectionCoordinator {
     /// Resolves injection data once and reuses it across all three steps. Must be
     /// called AFTER parse_document so the AST is available.
     pub(crate) async fn process_injections(&self, uri: &Url, forward_did_change: bool) {
+        let _ = self
+            .process_injections_after_lifecycle_lock(
+                uri,
+                forward_did_change,
+                None,
+                std::future::ready(()),
+            )
+            .await;
+    }
+
+    pub(crate) async fn process_injections_for_incarnation(
+        &self,
+        uri: &Url,
+        forward_did_change: bool,
+        incarnation: u64,
+    ) -> bool {
         self.process_injections_after_lifecycle_lock(
             uri,
             forward_did_change,
+            Some(incarnation),
             std::future::ready(()),
         )
-        .await;
+        .await
     }
 
     async fn process_injections_after_lifecycle_lock<F>(
         &self,
         uri: &Url,
         forward_did_change: bool,
+        required_incarnation: Option<u64>,
         after_lifecycle_lock: F,
-    ) where
+    ) -> bool
+    where
         F: std::future::Future<Output = ()>,
     {
         // Serialize the complete tree-derived downstream pass with didClose and
@@ -196,24 +215,23 @@ impl InjectionCoordinator {
         let edit_lock = self.documents.edit_lock(uri);
         let _lifecycle_guard = edit_lock.lock().await;
         after_lifecycle_lock.await;
-        if self.documents.get(uri).is_none() {
+        let Some(incarnation) = self.documents.get(uri).map(|doc| doc.incarnation()) else {
             self.bridge.cancel_eager_open(uri);
             self.documents.remove_edit_lock_if_unshared(uri, &edit_lock);
-            return;
+            return false;
+        };
+        if required_incarnation.is_some_and(|required| incarnation != required) {
+            return false;
         }
 
         let Some(host_language) = self.get_language_for_document(uri) else {
             self.bridge.cancel_eager_open(uri);
-            return;
-        };
-        let Some(incarnation) = self.documents.get(uri).map(|doc| doc.incarnation()) else {
-            self.bridge.cancel_eager_open(uri);
-            return;
+            return false;
         };
         let injections = self.resolve_injection_data(uri, &host_language);
         if injections.is_empty() {
             self.bridge.cancel_eager_open(uri);
-            return;
+            return true;
         }
 
         // Stop the previous pass before closing a replaced language-bearing URI;
@@ -251,14 +269,14 @@ impl InjectionCoordinator {
         //   promptly without waiting on the compile.
         // - `maybe_auto_install_language`'s `InstallingLanguages` tracker dedupes
         //   concurrent attempts, and the injected install (`is_injection=true`) never
-        //   reparses or resurrects the host document, so a `didClose` racing this
-        //   spawn is benign (it just finishes installing a global parser).
+        //   reparses or resurrects the host document. The detached task retains this
+        //   pass's incarnation so a close/reopen cannot apply its stale language set.
         let install_task = {
             let coordinator = self.clone();
             let uri = uri.clone();
             async move {
                 coordinator
-                    .check_injected_languages_auto_install(&uri, &languages)
+                    .check_injected_languages_auto_install(&uri, &languages, incarnation)
                     .await;
             }
         };
@@ -266,6 +284,7 @@ impl InjectionCoordinator {
 
         self.eager_spawn_bridge_servers(uri, incarnation, &host_language, injections)
             .await;
+        true
     }
 
     /// Check injected languages and handle missing parsers: auto-install when enabled,
@@ -277,7 +296,30 @@ impl InjectionCoordinator {
         &self,
         uri: &Url,
         languages: &HashSet<String>,
+        expected_incarnation: u64,
     ) {
+        self.check_injected_languages_auto_install_after_incarnation_check(
+            uri,
+            languages,
+            expected_incarnation,
+            std::future::ready(()),
+        )
+        .await;
+    }
+
+    async fn check_injected_languages_auto_install_after_incarnation_check<F>(
+        &self,
+        uri: &Url,
+        languages: &HashSet<String>,
+        expected_incarnation: u64,
+        after_incarnation_check: F,
+    ) where
+        F: std::future::Future<Output = ()>,
+    {
+        if !self.same_document_incarnation(uri, expected_incarnation) {
+            return;
+        }
+        after_incarnation_check.await;
         let install = self.install_coordinator();
         let auto_install_enabled = self.settings_manager.is_auto_install_enabled();
 
@@ -315,6 +357,9 @@ impl InjectionCoordinator {
             .iter()
             .filter(|lang| parser_enabled_injection_language(lang))
         {
+            if !self.same_document_incarnation(uri, expected_incarnation) {
+                return;
+            }
             let resolved_lang = if self.language.has_parser_available(lang) {
                 lang.clone()
             } else if let Some(normalized) = crate::language::heuristic::detect_from_token(lang) {
@@ -327,6 +372,9 @@ impl InjectionCoordinator {
                 .language
                 .ensure_language_loaded_async(&resolved_lang)
                 .await;
+            if !self.same_document_incarnation(uri, expected_incarnation) {
+                return;
+            }
             if load_result.success {
                 load_events.extend(load_result.events);
                 continue;
@@ -340,18 +388,28 @@ impl InjectionCoordinator {
             // Only attempt the (injected-language) install while the host document
             // is still open. The injected-language install does not reparse the
             // host document (is_injection=true), so no host text is needed here.
-            if self.documents.get(uri).is_some() {
-                let _ = install
-                    .maybe_auto_install_language(&resolved_lang, uri.clone(), true)
-                    .await;
-            }
+            let _ = install
+                .maybe_auto_install_language(
+                    &resolved_lang,
+                    uri.clone(),
+                    true,
+                    Some(expected_incarnation),
+                    true,
+                )
+                .await;
         }
 
         // Forward the collected load events (deduped to ≤1 refresh by #531) so the
         // editor re-pulls tokens for any injected language loaded just now.
-        if !load_events.is_empty() {
+        if !load_events.is_empty() && self.same_document_incarnation(uri, expected_incarnation) {
             self.notifier().log_language_events(&load_events).await;
         }
+    }
+
+    fn same_document_incarnation(&self, uri: &Url, expected: u64) -> bool {
+        self.documents
+            .get(uri)
+            .is_some_and(|document| document.incarnation() == expected)
     }
 
     fn notifier(&self) -> ClientNotifier<'_> {
@@ -420,7 +478,7 @@ mod tests {
         assert!(!parser_enabled_injection_language("plaintext"));
         assert!(parser_enabled_injection_language("python"));
     }
-    use std::sync::Arc;
+    use std::{collections::HashSet, sync::Arc};
     use tokio::sync::Notify;
     use tower_lsp_server::LspService;
     use url::Url;
@@ -445,7 +503,7 @@ mod tests {
         let process_release = Arc::clone(&release);
         let process = tokio::spawn(async move {
             injection
-                .process_injections_after_lifecycle_lock(&process_uri, false, async move {
+                .process_injections_after_lifecycle_lock(&process_uri, false, None, async move {
                     process_entered.notify_one();
                     process_release.notified().await;
                 })
@@ -468,6 +526,81 @@ mod tests {
                 .insert(uri, "# new".to_string(), Some("markdown".to_string()), None);
 
         assert_ne!(new_incarnation, old_incarnation);
+    }
+
+    #[tokio::test]
+    async fn stale_injection_install_task_stops_before_side_effects() {
+        let (service, _socket) = LspService::new(crate::lsp::lsp_impl::Kakehashi::new);
+        let server = service.inner();
+        let uri = Url::parse("file:///stale-injection-install.md").unwrap();
+        let old_incarnation = server.documents.insert(
+            uri.clone(),
+            "# old".to_string(),
+            Some("markdown".to_string()),
+            None,
+        );
+        server.documents.remove(&uri);
+        let new_incarnation = server.documents.insert(
+            uri.clone(),
+            "# new".to_string(),
+            Some("markdown".to_string()),
+            None,
+        );
+        assert_ne!(new_incarnation, old_incarnation);
+
+        let reached_side_effects = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let observed = std::sync::Arc::clone(&reached_side_effects);
+        server
+            .injection_coordinator()
+            .check_injected_languages_auto_install_after_incarnation_check(
+                &uri,
+                &HashSet::new(),
+                old_incarnation,
+                async move {
+                    observed.store(true, std::sync::atomic::Ordering::SeqCst);
+                },
+            )
+            .await;
+
+        assert!(
+            !reached_side_effects.load(std::sync::atomic::Ordering::SeqCst),
+            "a stale detached task must stop before parser load or notification side effects"
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_injection_pass_does_not_cancel_reopened_eager_batch() {
+        let (service, _socket) = LspService::new(crate::lsp::lsp_impl::Kakehashi::new);
+        let server = service.inner();
+        let uri = Url::parse("file:///stale-injection-pass.unknown").unwrap();
+        let old_incarnation = server.documents.insert(
+            uri.clone(),
+            "# old".to_string(),
+            Some("markdown".to_string()),
+            None,
+        );
+        let (token_tx, token_rx) = tokio::sync::oneshot::channel();
+
+        let processed = server
+            .injection_coordinator()
+            .process_injections_after_lifecycle_lock(&uri, false, Some(old_incarnation), async {
+                server.documents.remove_preserving_edit_lock(&uri);
+                let new_incarnation =
+                    server
+                        .documents
+                        .insert(uri.clone(), "new".to_string(), None, None);
+                assert_ne!(new_incarnation, old_incarnation);
+                let token = server.bridge.begin_test_eager_open_batch(&uri);
+                let _ = token_tx.send(token);
+            })
+            .await;
+        let token = token_rx.await.unwrap();
+
+        assert!(!processed);
+        assert!(
+            !token.is_cancelled(),
+            "a stale pass must not cancel the reopened lifetime's eager batch"
+        );
     }
 
     /// The snapshot fast path of `resolve_injection_data` must produce

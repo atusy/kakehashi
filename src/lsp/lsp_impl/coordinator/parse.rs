@@ -746,7 +746,12 @@ impl ParseCoordinator {
     /// tree lands (or another parse wins). Sustained editing falls back to the
     /// reader's on-demand parse; the parse actor replaces this with a proper
     /// coalescing loop.
-    pub(crate) async fn reparse_installed_document(&self, uri: Url, language_id: Option<String>) {
+    pub(crate) async fn reparse_installed_document(
+        &self,
+        uri: Url,
+        installed_language: &str,
+        required_incarnation: Option<u64>,
+    ) {
         /// Bound on the convergence retries (a burst of edits landing exactly as
         /// the install completes); past this the reader on-demand parse covers it.
         const MAX_REPARSE_ATTEMPTS: usize = 8;
@@ -772,9 +777,15 @@ impl ParseCoordinator {
             if doc.tree().is_some() {
                 return;
             }
+            if required_incarnation.is_some_and(|required| doc.incarnation() != required) {
+                return;
+            }
             let language_name =
                 self.language
-                    .detect_language(uri.path(), doc.text(), None, language_id.as_deref());
+                    .detect_language(uri.path(), doc.text(), None, doc.language_id());
+            if language_name.is_some() && language_name.as_deref() != Some(installed_language) {
+                return;
+            }
             (
                 language_name,
                 doc.language_id().map(|s| s.to_string()),
@@ -783,11 +794,13 @@ impl ParseCoordinator {
         };
         let Some(language_name) = language_name else {
             // Give-up: release a parked first-parse waiter (bootstrap-gated).
-            self.documents.publish_giveup_snapshot(&uri);
+            self.documents
+                .publish_giveup_snapshot(&uri, expected_incarnation);
             return;
         };
         if self.auto_install.is_parser_failed(&language_name) {
-            self.documents.publish_giveup_snapshot(&uri);
+            self.documents
+                .publish_giveup_snapshot(&uri, expected_incarnation);
             return;
         }
         let load_result = self
@@ -796,7 +809,8 @@ impl ParseCoordinator {
             .await;
         let mut events = load_result.events;
         if !load_result.success {
-            self.documents.publish_giveup_snapshot(&uri);
+            self.documents
+                .publish_giveup_snapshot(&uri, expected_incarnation);
             self.notifier().log_language_events(&events).await;
             return;
         }
@@ -919,7 +933,8 @@ impl ParseCoordinator {
         // unavailable after the install, exhausted attempts): a no-op after
         // a successful publish (bootstrap gate), otherwise it releases a
         // parked first-parse waiter.
-        self.documents.publish_giveup_snapshot(&uri);
+        self.documents
+            .publish_giveup_snapshot(&uri, expected_incarnation);
         self.notifier().log_language_events(&events).await;
     }
 
@@ -1000,12 +1015,12 @@ impl ParseCoordinator {
             // Give-up: release a parked first-parse waiter with a tree-less
             // snapshot (bootstrap-gated inside) rather than letting every
             // request burn the full first-parse backstop.
-            self.documents.publish_giveup_snapshot(uri);
+            self.documents.publish_giveup_snapshot(uri, incarnation);
             advance_watermark();
             return;
         };
         if self.auto_install.is_parser_failed(&language_name) {
-            self.documents.publish_giveup_snapshot(uri);
+            self.documents.publish_giveup_snapshot(uri, incarnation);
             advance_watermark();
             return;
         }
@@ -1014,7 +1029,7 @@ impl ParseCoordinator {
             .ensure_language_loaded_async(&language_name)
             .await;
         if !load_result.success {
-            self.documents.publish_giveup_snapshot(uri);
+            self.documents.publish_giveup_snapshot(uri, incarnation);
             advance_watermark();
             self.notifier()
                 .log_language_events(&load_result.events)
@@ -1151,7 +1166,7 @@ impl ParseCoordinator {
         // Covers the parse-produced-no-tree path (timeout / parser
         // unavailable): a no-op after a successful publish (bootstrap gate),
         // otherwise it releases a parked first-parse waiter.
-        self.documents.publish_giveup_snapshot(uri);
+        self.documents.publish_giveup_snapshot(uri, incarnation);
         advance_watermark();
         self.notifier().log_language_events(&events).await;
     }
@@ -1164,6 +1179,31 @@ impl ParseCoordinator {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tower_lsp_server::LspService;
+
+    #[tokio::test]
+    async fn reparse_without_detectable_language_publishes_giveup_snapshot() {
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+        let uri = Url::parse("file:///workspace/no-language.unknown").unwrap();
+        let incarnation =
+            server
+                .documents
+                .insert(uri.clone(), "plain text".to_string(), None, None);
+
+        server
+            .parse_coordinator()
+            .reparse_installed_document(uri.clone(), "rust", Some(incarnation))
+            .await;
+
+        let snapshot = server
+            .documents
+            .latest_snapshot(&uri)
+            .and_then(|view| view.slot.snapshot)
+            .expect("undetectable language must release first-parse waiters");
+        assert!(snapshot.tree.is_none());
+        assert_eq!(snapshot.incarnation, incarnation);
+    }
 
     /// The four documented invariants of the settle-refresh gate.
     #[test]

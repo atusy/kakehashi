@@ -142,6 +142,18 @@ fn resolve_index(n: i64, stack_len: usize) -> Option<usize> {
 impl Kakehashi {
     /// Handler for `kakehashi/node`.
     pub async fn kakehashi_node(&self, params: NodeParams) -> Result<Value> {
+        self.kakehashi_node_after_injection_load(params, std::future::ready(()))
+            .await
+    }
+
+    async fn kakehashi_node_after_injection_load<F>(
+        &self,
+        params: NodeParams,
+        after_injection_load: F,
+    ) -> Result<Value>
+    where
+        F: std::future::Future<Output = ()>,
+    {
         let lsp_uri = params.text_document.uri;
         let position = params.position;
         let injection = params.injection;
@@ -224,8 +236,9 @@ impl Kakehashi {
         // mint a ULID: a `didChange` processed while grammars install would
         // adjust the tracker, leaving our stale byte ranges un-adjusted and
         // minting an id for bytes the edit moved.
-        self.ensure_injection_languages_loaded(&uri, &host_language, text, tree, byte)
+        self.ensure_injection_languages_loaded(&uri, &host_language, text, tree, byte, incarnation)
             .await;
+        after_injection_load.await;
 
         // Re-resolve a CURRENT snapshot after the await and recompute the
         // position mapping: a `didChange` processed during the (awaited)
@@ -234,6 +247,12 @@ impl Kakehashi {
         // post-await snapshot.
         let Some(snapshot) = self.current_snapshot(&uri).await else {
             log::debug!(target: "kakehashi::node", "no current parse snapshot for {} after load", uri);
+            return Ok(Value::Null);
+        };
+        if snapshot.incarnation != incarnation {
+            return Ok(Value::Null);
+        }
+        let Some(host_language) = snapshot.language.clone() else {
             return Ok(Value::Null);
         };
         let incarnation = snapshot.incarnation;
@@ -368,6 +387,7 @@ impl Kakehashi {
         text: &str,
         host_tree: &tree_sitter::Tree,
         byte: usize,
+        incarnation: u64,
     ) {
         use std::collections::HashSet;
 
@@ -408,7 +428,7 @@ impl Kakehashi {
                 break;
             }
             coordinator
-                .check_injected_languages_auto_install(uri, &fresh)
+                .check_injected_languages_auto_install(uri, &fresh, incarnation)
                 .await;
             seen.extend(fresh);
         }
@@ -426,6 +446,68 @@ impl Kakehashi {
         let _ = self
             .wait_for_current_snapshot(uri, std::time::Duration::from_millis(200))
             .await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tower_lsp_server::LspService;
+
+    #[tokio::test]
+    async fn injection_node_rejects_close_reopen_during_language_load() {
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+        server
+            .language
+            .language_registry_for_parallel()
+            .register("rust".to_string(), tree_sitter_rust::LANGUAGE.into());
+        server
+            .language
+            .language_registry_for_parallel()
+            .register("go".to_string(), tree_sitter_go::LANGUAGE.into());
+        let uri = Url::parse("file:///workspace/reopened.rs").unwrap();
+        let old_incarnation = server.documents.insert(
+            uri.clone(),
+            "fn old() {}".to_string(),
+            Some("rust".to_string()),
+            None,
+        );
+        assert!(
+            server
+                .parse_coordinator()
+                .parse_document(uri.clone(), Some("rust"), None)
+                .await
+        );
+        let params = NodeParams {
+            text_document: TextDocumentIdentifier {
+                uri: uri.as_str().parse().unwrap(),
+            },
+            position: Position::new(0, 0),
+            injection: Some(Value::Bool(true)),
+        };
+
+        let result = server
+            .kakehashi_node_after_injection_load(params, async {
+                server.documents.remove(&uri);
+                let new_incarnation = server.documents.insert(
+                    uri.clone(),
+                    "package main".to_string(),
+                    Some("go".to_string()),
+                    None,
+                );
+                assert_ne!(new_incarnation, old_incarnation);
+                assert!(
+                    server
+                        .parse_coordinator()
+                        .parse_document(uri.clone(), Some("go"), None)
+                        .await
+                );
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(result, Value::Null);
     }
 }
 
