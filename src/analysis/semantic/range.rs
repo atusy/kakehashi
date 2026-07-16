@@ -27,7 +27,7 @@ pub(crate) fn filter_semantic_tokens_by_range(
     }
 }
 
-/// Filter semantic tokens to only those within the specified range.
+/// Filter semantic tokens to only those intersecting the specified range.
 ///
 /// This function:
 /// 1. Converts delta-encoded tokens to absolute positions
@@ -44,7 +44,7 @@ fn filter_tokens_by_range(tokens: &[SemanticToken], range: &Range) -> Vec<Semant
     let mut abs_line = 0usize;
     let mut abs_col = 0usize;
 
-    // Collect tokens that are within the range (with absolute positions)
+    // Collect tokens intersecting the range (with absolute positions)
     let mut filtered_tokens: Vec<(usize, usize, u32, u32, u32)> = Vec::new();
 
     for token in tokens {
@@ -56,11 +56,17 @@ fn filter_tokens_by_range(tokens: &[SemanticToken], range: &Range) -> Vec<Semant
             abs_col += token.delta_start as usize;
         }
 
-        // Check if token is within range
-        if abs_line >= start_line && abs_line <= end_line {
+        // Delta encoding orders tokens monotonically, so later tokens cannot
+        // re-enter the range after either end boundary has been reached.
+        if abs_line > end_line {
+            break;
+        }
+
+        // Check if token intersects the range
+        if abs_line >= start_line {
             // For boundary lines, check column positions
             if abs_line == end_line && abs_col >= range.end.character as usize {
-                continue;
+                break;
             }
             if abs_line == start_line
                 && abs_col + token.length as usize <= range.start.character as usize
