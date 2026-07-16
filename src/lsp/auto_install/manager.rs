@@ -732,6 +732,21 @@ mod tests {
         (AutoInstallManager::new(installing, failed), temp)
     }
 
+    async fn wait_for_terminal(
+        receiver: &mut tokio::sync::watch::Receiver<Option<InstallOutcome>>,
+    ) -> InstallOutcome {
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                if let Some(outcome) = receiver.borrow().clone() {
+                    break outcome;
+                }
+                receiver.changed().await.unwrap();
+            }
+        })
+        .await
+        .expect("install claim must publish a terminal outcome")
+    }
+
     #[test]
     fn test_is_parser_failed_returns_false_for_new_parser() {
         let (manager, _temp) = create_test_manager();
@@ -834,6 +849,84 @@ mod tests {
         .expect("detached install must publish its actual result");
 
         assert!(matches!(terminal, InstallOutcome::Success { .. }));
+    }
+
+    #[tokio::test]
+    async fn panicked_support_task_abandons_exact_claim_and_allows_retry() {
+        let (manager, _temp) = create_test_manager();
+        let owner_manager = manager.clone();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let owner = tokio::spawn(async move {
+            owner_manager
+                .try_install_with_support_check("panic-support", |_, _| async move {
+                    let _ = started_tx.send(());
+                    let _ = release_rx.await;
+                    panic!("controlled support panic");
+                })
+                .await
+        });
+        started_rx.await.unwrap();
+        let duplicate = manager
+            .try_install_with_support_check("panic-support", |_, _| async {
+                panic!("exact waiter must not run support check")
+            })
+            .await;
+        let mut completion = duplicate.completion.clone().unwrap().receiver;
+
+        let _ = release_tx.send(());
+        assert_eq!(owner.await.unwrap().outcome, InstallOutcome::Failed);
+        assert_eq!(
+            wait_for_terminal(&mut completion).await,
+            InstallOutcome::Abandoned
+        );
+        let retry = manager
+            .try_install_with_support_check("panic-support", |_, _| async {
+                TrackedSupportCheck::completed(true, None)
+            })
+            .await;
+        assert_eq!(retry.outcome, InstallOutcome::Unsupported);
+    }
+
+    #[tokio::test]
+    async fn panicked_install_task_abandons_exact_claim_and_allows_retry() {
+        let (manager, _temp) = create_test_manager();
+        let owner_manager = manager.clone();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let owner = tokio::spawn(async move {
+            owner_manager
+                .try_install_with_support_check_and_executor(
+                    "panic-install",
+                    |_, _| async { TrackedSupportCheck::completed(false, None) },
+                    |_, _| async move {
+                        let _ = started_tx.send(());
+                        let _ = release_rx.await;
+                        panic!("controlled install panic");
+                    },
+                )
+                .await
+        });
+        started_rx.await.unwrap();
+        let duplicate = manager
+            .try_install_with_support_check("panic-install", |_, _| async {
+                panic!("exact waiter must not run support check")
+            })
+            .await;
+        let mut completion = duplicate.completion.clone().unwrap().receiver;
+
+        let _ = release_tx.send(());
+        assert_eq!(owner.await.unwrap().outcome, InstallOutcome::Failed);
+        assert_eq!(
+            wait_for_terminal(&mut completion).await,
+            InstallOutcome::Abandoned
+        );
+        let retry = manager
+            .try_install_with_support_check("panic-install", |_, _| async {
+                TrackedSupportCheck::completed(true, None)
+            })
+            .await;
+        assert_eq!(retry.outcome, InstallOutcome::Unsupported);
     }
 
     #[tokio::test]
