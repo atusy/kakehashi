@@ -243,6 +243,32 @@ mod tests {
     }
 
     #[test]
+    fn test_filter_tokens_excludes_end_boundary_on_multiline_range() {
+        let tokens = vec![SemanticToken {
+            delta_line: 1,
+            delta_start: 5,
+            length: 3,
+            token_type: 0,
+            token_modifiers_bitset: 0,
+        }];
+        let range = Range {
+            start: Position {
+                line: 0,
+                character: 0,
+            },
+            end: Position {
+                line: 1,
+                character: 5,
+            },
+        };
+
+        assert!(
+            filter_tokens_by_range(&tokens, &range).is_empty(),
+            "the end line retains the range's exclusive character boundary"
+        );
+    }
+
+    #[test]
     fn test_filter_tokens_returns_nothing_for_empty_range_inside_token() {
         let tokens = vec![SemanticToken {
             delta_line: 1,
