@@ -224,7 +224,16 @@ impl CancelForwarder {
         upstream_id: &UpstreamId,
         generation: Option<u64>,
     ) -> bool {
-        let sender = {
+        self.notify_cancel_for_generation_with_hook(upstream_id, generation, || {})
+    }
+
+    fn notify_cancel_for_generation_with_hook(
+        &self,
+        upstream_id: &UpstreamId,
+        generation: Option<u64>,
+        after_registry: impl FnOnce(),
+    ) -> bool {
+        let handled = {
             let mut subscribers = self
                 .subscribers
                 .lock()
@@ -246,42 +255,28 @@ impl CancelForwarder {
                 .remove(upstream_id)
                 .filter(|(subscriber_generation, _)| *subscriber_generation == generation)
                 .map(|(_, sender)| sender);
-            if sender.is_some()
-                && let Some(generation) = generation
-            {
-                subscribers
-                    .delivered_cancellations
-                    .insert(upstream_id.clone(), generation);
-            }
-            if sender.is_none()
-                && let Some(generation) = generation
-            {
+            if let Some(tx) = sender {
+                let delivered = tx.send(()).is_ok();
+                if let Some(generation) = generation {
+                    let cancellations = if delivered {
+                        &mut subscribers.delivered_cancellations
+                    } else {
+                        &mut subscribers.pending_cancellations
+                    };
+                    cancellations.insert(upstream_id.clone(), generation);
+                }
+                true
+            } else if let Some(generation) = generation {
                 subscribers
                     .pending_cancellations
                     .insert(upstream_id.clone(), generation);
-                return true;
+                true
+            } else {
+                false
             }
-            sender
         };
-        if let Some(tx) = sender {
-            if tx.send(()).is_err()
-                && let Some(generation) = generation
-            {
-                let mut subscribers = self
-                    .subscribers
-                    .lock()
-                    .recover_poison("CancelForwarder::retain_failed_cancel_delivery");
-                if subscribers.active_requests.get(upstream_id) == Some(&generation) {
-                    subscribers.delivered_cancellations.remove(upstream_id);
-                    subscribers
-                        .pending_cancellations
-                        .insert(upstream_id.clone(), generation);
-                }
-            }
-            true
-        } else {
-            false
-        }
+        after_registry();
+        handled
     }
 
     fn register_request(&self, upstream_id: UpstreamId) -> u64 {
@@ -807,6 +802,51 @@ mod tests {
             .expect("failed delivery must be retained")
             .await
             .expect("retained cancellation is delivered");
+
+        drop(request_future);
+    }
+
+    #[tokio::test]
+    async fn failed_delivery_recovery_is_atomic_with_resubscription() {
+        let mock = MockService::new();
+        let pool = Arc::new(LanguageServerPool::new());
+        let forwarder = CancelForwarder::new(pool);
+        let mut service = RequestIdCapture::with_cancel_forwarder(mock, forwarder.clone());
+        let upstream_id = UpstreamId::Number(123);
+        let request = Request::build("textDocument/hover")
+            .params(serde_json::json!({}))
+            .id(123i64)
+            .finish();
+        let request_future = service.call(request);
+        let generation = forwarder.request_generation(&upstream_id);
+
+        drop(forwarder.subscribe(upstream_id.clone()).unwrap());
+        let replacement = std::thread::scope(|scope| {
+            let (registry_done_tx, registry_done_rx) = std::sync::mpsc::sync_channel(0);
+            let (resume_tx, resume_rx) = std::sync::mpsc::sync_channel(0);
+            let notify_id = upstream_id.clone();
+            let notify_forwarder = forwarder.clone();
+            let notify = scope.spawn(move || {
+                notify_forwarder.notify_cancel_for_generation_with_hook(
+                    &notify_id,
+                    generation,
+                    || {
+                        registry_done_tx.send(()).unwrap();
+                        resume_rx.recv().unwrap();
+                    },
+                )
+            });
+
+            registry_done_rx.recv().unwrap();
+            let replacement = forwarder.subscribe(upstream_id.clone());
+            resume_tx.send(()).unwrap();
+            assert!(notify.join().unwrap());
+            replacement
+        })
+        .expect("failed delivery must become pending before resubscription");
+        replacement
+            .await
+            .expect("replacement observes cancellation");
 
         drop(request_future);
     }
