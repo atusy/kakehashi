@@ -8,6 +8,7 @@
 pub mod diagnose;
 pub(crate) mod files;
 pub mod format;
+pub(crate) mod terminal;
 
 /// Drain server→client traffic so `Client` calls never block while a CLI
 /// command drives the LSP handlers in-process: notifications (logMessage etc.)

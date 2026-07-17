@@ -686,6 +686,17 @@ kakehashi diagnose . --fail-on-warning
 cat README.md | kakehashi diagnose --stdin-filename README.md
 ```
 
+The default format is presentation-oriented and intentionally lossy. The file
+field preserves ordinary characters but renders terminal/bidirectional controls
+as visible Rust-style escapes (for example, `\u{1b}`). In message and source
+fields, leading and trailing whitespace is removed and internal runs become
+single spaces before remaining controls are escaped. Use
+`--output-format jsonl` when consumers need the original field values. JSON
+escapes controls on the wire, but parsing each JSONL record recovers the exact
+emitted Unicode field values. In path mode, `file` is cwd-relative when it is
+under the current directory and absolute otherwise. It uses Rust's display
+representation, which can be lossy for a non-UTF-8 filename.
+
 Diagnostics go to stdout; the one-line summary, any errors, and `RUST_LOG`
 output go to stderr — so stdout stays a clean data channel for `| jq` / `| head`
 (redirect or ignore stderr in CI if the summary is unwanted).

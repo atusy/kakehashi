@@ -16,6 +16,13 @@
 
 use std::path::{Path, PathBuf};
 
+use crate::cli::terminal::escape_terminal_controls;
+
+fn format_walk_error(error: &str) -> String {
+    let error = escape_terminal_controls(error);
+    format!("error: skipping unreadable entry (will exit 2): {error}")
+}
+
 /// Files collected from CLI paths plus any non-fatal directory walk errors
 /// encountered while discovering them.
 pub(crate) struct CollectedFiles {
@@ -166,10 +173,7 @@ fn walk_directory(
                 // closed stderr (`… 2>&1 | head`) would panic (exit 101).
                 // There is nowhere to report a failed error message, so drop it.
                 use std::io::Write as _;
-                let _ = writeln!(
-                    std::io::stderr(),
-                    "error: skipping unreadable entry (will exit 2): {e}"
-                );
+                let _ = writeln!(std::io::stderr(), "{}", format_walk_error(&e.to_string()));
                 errors += 1;
             }
         }
@@ -190,6 +194,14 @@ mod tests {
 
     fn markdown_only(path: &Path) -> bool {
         path.extension().is_some_and(|e| e == "md")
+    }
+
+    #[test]
+    fn walk_errors_escape_terminal_controls() {
+        assert_eq!(
+            format_walk_error("dir/\u{1b}\u{2028}entry: denied"),
+            "error: skipping unreadable entry (will exit 2): dir/\\u{1b}\\u{2028}entry: denied"
+        );
     }
 
     fn collect_paths(

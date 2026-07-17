@@ -40,6 +40,7 @@ use tower_lsp_server::LspService;
 use tower_lsp_server::ls_types::{Diagnostic, DiagnosticSeverity, NumberOrString};
 
 use crate::cli::files::collect_files;
+use crate::cli::terminal::{escape_terminal_controls, is_bidi_control, is_line_separator};
 use crate::lsp::Kakehashi;
 
 /// Write one line to stderr, tolerating a closed pipe.
@@ -189,8 +190,9 @@ impl Report {
         // position, then tie-break by severity, source, code, and message so
         // two findings at the same spot always print in the same order.
         diagnostics.sort_by(|a, b| sort_key(a).cmp(&sort_key(b)));
+        let display = prepare_display(format, display);
         for diagnostic in &diagnostics {
-            out.push_str(&format_diagnostic(format, display, diagnostic));
+            out.push_str(&format_diagnostic_prepared(format, &display, diagnostic));
             out.push('\n');
             self.tally(diagnostic, fail_on_warning);
         }
@@ -231,7 +233,7 @@ async fn run_paths(server: &Kakehashi, cwd: &Path, options: &DiagnoseOptions) ->
     }) {
         Ok(collected) => collected,
         Err(e) => {
-            elnln!("error: {e}");
+            elnln!("error: {}", escape_terminal_controls(&e.to_string()));
             return EXIT_ERROR;
         }
     };
@@ -262,7 +264,10 @@ async fn run_paths(server: &Kakehashi, cwd: &Path, options: &DiagnoseOptions) ->
         let text = match std::fs::read_to_string(file) {
             Ok(text) => text,
             Err(e) => {
-                elnln!("error: cannot read '{display}': {e}");
+                elnln!(
+                    "error: cannot read '{}': {e}",
+                    escape_terminal_controls(&display)
+                );
                 report.operational_error = true;
                 continue;
             }
@@ -271,7 +276,7 @@ async fn run_paths(server: &Kakehashi, cwd: &Path, options: &DiagnoseOptions) ->
             .cli_diagnose_text(file, &text, SERVER_READY_TIMEOUT)
             .await;
         for failure in &outcome.server_failures {
-            elnln!("error: {display}: {failure}");
+            elnln!("{}", format_server_failure(&display, failure));
             report.operational_error = true;
         }
         if pipe_closed {
@@ -339,7 +344,7 @@ async fn run_stdin(server: &Kakehashi, cwd: &Path, options: &DiagnoseOptions) ->
     let mut report = Report::default();
     let display = name.display().to_string();
     for failure in &outcome.server_failures {
-        elnln!("error: {display}: {failure}");
+        elnln!("{}", format_server_failure(&display, failure));
         report.operational_error = true;
     }
     let mut buf = String::new();
@@ -412,9 +417,26 @@ fn summarize(report: &Report, file_count: usize) -> u8 {
     report.exit_code()
 }
 
-/// Render one diagnostic in the requested format. `display` is the
-/// already-formatted (cwd-relative or stdin) path.
-fn format_diagnostic(format: OutputFormat, display: &str, diagnostic: &Diagnostic) -> String {
+fn format_server_failure(display: &str, failure: &str) -> String {
+    let display = escape_terminal_controls(display);
+    let failure = escape_terminal_controls(failure);
+    format!("error: {display}: {failure}")
+}
+
+fn prepare_display(format: OutputFormat, display: &str) -> std::borrow::Cow<'_, str> {
+    match format {
+        OutputFormat::Default => escape_terminal_controls(display),
+        OutputFormat::Jsonl => std::borrow::Cow::Borrowed(display),
+    }
+}
+
+/// Render one diagnostic in the requested format. `display` has already been
+/// prepared for the selected format so callers can reuse it across a file.
+fn format_diagnostic_prepared(
+    format: OutputFormat,
+    display: &str,
+    diagnostic: &Diagnostic,
+) -> String {
     // LSP positions are 0-based; editors and quickfix consumers expect 1-based
     // line and column. `character` is a UTF-16 offset — presenting it as a
     // column is the same approximation grep/ripgrep make.
@@ -429,11 +451,7 @@ fn format_diagnostic(format: OutputFormat, display: &str, diagnostic: &Diagnosti
             // source.
             match diagnostic.source.as_deref() {
                 Some(source) => {
-                    let source = if source.chars().any(char::is_whitespace) {
-                        std::borrow::Cow::Owned(one_line(source))
-                    } else {
-                        std::borrow::Cow::Borrowed(source)
-                    };
+                    let source = one_line(source);
                     format!("{display}:{line}:{col}: {severity}: {message} [{source}]")
                 }
                 None => format!("{display}:{line}:{col}: {severity}: {message}"),
@@ -458,23 +476,79 @@ fn format_diagnostic(format: OutputFormat, display: &str, diagnostic: &Diagnosti
                 "source": diagnostic.source.as_deref(),
                 "message": diagnostic.message.as_str(),
             });
-            value.to_string()
+            escape_jsonl_terminal_controls(value.to_string())
         }
     }
 }
 
-/// Collapse a (possibly multi-line) diagnostic message onto one line so it
-/// stays parseable in the line-oriented `default` format. Single-pass: no
-/// intermediate `Vec` of words.
-fn one_line(message: &str) -> String {
-    let mut out = String::with_capacity(message.len());
-    for word in message.split_whitespace() {
-        if !out.is_empty() {
-            out.push(' ');
+#[cfg(test)]
+fn format_diagnostic(format: OutputFormat, display: &str, diagnostic: &Diagnostic) -> String {
+    let display = prepare_display(format, display);
+    format_diagnostic_prepared(format, &display, diagnostic)
+}
+
+/// Make an untrusted diagnostic field safe for the line-oriented `default`
+/// format: collapse whitespace runs and visibly escape remaining terminal
+/// controls.
+/// A validation pass borrows already-safe text; only rewritten fields need a
+/// second pass and an allocation.
+fn one_line(message: &str) -> std::borrow::Cow<'_, str> {
+    let mut previous_whitespace = false;
+    let mut needs_rewrite = false;
+    for (index, ch) in message.chars().enumerate() {
+        if ch.is_whitespace() {
+            needs_rewrite |= ch != ' ' || index == 0 || previous_whitespace;
+            previous_whitespace = true;
+        } else {
+            needs_rewrite |= ch.is_control() || is_bidi_control(ch);
+            previous_whitespace = false;
         }
-        out.push_str(word);
     }
-    out
+    needs_rewrite |= previous_whitespace;
+    if !needs_rewrite {
+        return std::borrow::Cow::Borrowed(message);
+    }
+
+    let mut out = String::with_capacity(message.len());
+    let mut pending_space = false;
+    for ch in message.chars() {
+        if ch.is_whitespace() {
+            pending_space = !out.is_empty();
+            continue;
+        }
+        if pending_space {
+            out.push(' ');
+            pending_space = false;
+        }
+        if is_bidi_control(ch) {
+            out.extend(ch.escape_unicode());
+        } else if ch.is_control() {
+            out.extend(ch.escape_default());
+        } else {
+            out.push(ch);
+        }
+    }
+    std::borrow::Cow::Owned(out)
+}
+
+fn escape_jsonl_terminal_controls(json: String) -> String {
+    let requires_escape = |ch: char| {
+        (ch.is_control() && ch >= '\u{7f}') || is_bidi_control(ch) || is_line_separator(ch)
+    };
+    if !json.chars().any(requires_escape) {
+        return json;
+    }
+
+    use std::fmt::Write as _;
+    let mut escaped = String::with_capacity(json.len());
+    for ch in json.chars() {
+        if requires_escape(ch) {
+            write!(escaped, "\\u{:04x}", ch as u32).expect("writing to String cannot fail");
+        } else {
+            escaped.push(ch);
+        }
+    }
+    escaped
 }
 
 /// The lower-case severity word. Both an absent severity and an out-of-spec
@@ -627,6 +701,34 @@ mod tests {
     }
 
     #[test]
+    fn default_format_escapes_controls_in_display_path() {
+        let d = diag(0, 0, Some(DiagnosticSeverity::ERROR), "boom");
+
+        assert_eq!(
+            format_diagnostic(OutputFormat::Default, "dir/\u{1b}[2Jfile\nname", &d),
+            "dir/\\u{1b}[2Jfile\\nname:1:1: error: boom"
+        );
+    }
+
+    #[test]
+    fn default_format_preserves_spaces_in_display_path() {
+        let d = diag(0, 0, Some(DiagnosticSeverity::ERROR), "boom");
+
+        assert_eq!(
+            format_diagnostic(OutputFormat::Default, " dir/a  b.rs ", &d),
+            " dir/a  b.rs :1:1: error: boom"
+        );
+    }
+
+    #[test]
+    fn server_failure_escapes_untrusted_fields() {
+        assert_eq!(
+            format_server_failure(" dir/\u{1b}\u{2028} f ", "server\nspoof\u{1b}\u{2029}"),
+            "error:  dir/\\u{1b}\\u{2028} f : server\\nspoof\\u{1b}\\u{2029}"
+        );
+    }
+
+    #[test]
     fn jsonl_format_is_structured_and_one_based() {
         let mut d = diag(2, 5, Some(DiagnosticSeverity::WARNING), "msg");
         d.source = Some("ruff".to_string());
@@ -653,6 +755,44 @@ mod tests {
             serde_json::from_str(&format_diagnostic(OutputFormat::Jsonl, "x.lua", &d)).unwrap();
 
         assert_eq!(value["source"], "lua-ls\nsecond\tfield");
+    }
+
+    #[test]
+    fn jsonl_format_preserves_control_characters() {
+        let mut d = diag(
+            0,
+            0,
+            Some(DiagnosticSeverity::ERROR),
+            "boom\u{1b}[31m\u{202e}",
+        );
+        d.source = Some("tool\u{7f}\u{009b}\u{2066}".to_string());
+
+        let rendered = format_diagnostic(OutputFormat::Jsonl, "dir/\u{1b}[2Jfile", &d);
+        assert!(rendered.contains("\\u007f"), "rendered: {rendered}");
+        assert!(rendered.contains("\\u009b"), "rendered: {rendered}");
+        assert!(rendered.contains("\\u202e"), "rendered: {rendered}");
+        assert!(rendered.contains("\\u2066"), "rendered: {rendered}");
+        let value: serde_json::Value = serde_json::from_str(&rendered).unwrap();
+
+        assert_eq!(value["file"], "dir/\u{1b}[2Jfile");
+        assert_eq!(value["message"], "boom\u{1b}[31m\u{202e}");
+        assert_eq!(value["source"], "tool\u{7f}\u{009b}\u{2066}");
+    }
+
+    #[test]
+    fn jsonl_escapes_unicode_line_separators() {
+        let d = diag(
+            0,
+            0,
+            Some(DiagnosticSeverity::ERROR),
+            "before\u{2028}middle\u{2029}after",
+        );
+
+        let rendered = format_diagnostic(OutputFormat::Jsonl, "x", &d);
+        assert!(rendered.contains("\\u2028"), "rendered: {rendered}");
+        assert!(rendered.contains("\\u2029"), "rendered: {rendered}");
+        let value: serde_json::Value = serde_json::from_str(&rendered).unwrap();
+        assert_eq!(value["message"], "before\u{2028}middle\u{2029}after");
     }
 
     #[test]
@@ -685,6 +825,26 @@ mod tests {
             format_diagnostic(OutputFormat::Default, "f", &d),
             "f:1:1: error: line one line two"
         );
+    }
+
+    #[test]
+    fn default_fields_escape_non_whitespace_controls() {
+        assert_eq!(
+            one_line("before\u{1b}[31mred\u{7f}\u{009b}\u{202e}\u{2066}after"),
+            "before\\u{1b}[31mred\\u{7f}\\u{9b}\\u{202e}\\u{2066}after"
+        );
+    }
+
+    #[test]
+    fn safe_default_fields_stay_borrowed() {
+        assert!(matches!(
+            one_line("ordinary Unicode: 日本語"),
+            std::borrow::Cow::Borrowed(_)
+        ));
+        assert!(matches!(
+            one_line("unsafe\u{1b}"),
+            std::borrow::Cow::Owned(_)
+        ));
     }
 
     #[test]
