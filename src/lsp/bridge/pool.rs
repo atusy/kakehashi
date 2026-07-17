@@ -2641,11 +2641,11 @@ impl LanguageServerPool {
         }
     }
 
-    /// Fan out `$/cancelRequest` to every server registered for `upstream_id`,
-    /// invoking `notify` after every `(connection, downstream ids)` target has
-    /// been captured and before any cancel is sent. Invoked by
-    /// `RequestIdCapture` (via `CancelForwarder::forward_cancel`) when the
-    /// client cancels.
+    /// Test-only compatibility wrapper that fans out `$/cancelRequest` to
+    /// every server registered for `upstream_id`, invoking `notify` after every
+    /// `(connection, downstream ids)` target has been captured and before any
+    /// cancel is sent. Production `RequestIdCapture` uses the generation-aware
+    /// [`Self::forward_cancel_by_upstream_id_if_current`] path instead.
     ///
     /// LSP cancel is best-effort, so we silently return `Ok(())` (rather than
     /// erroring) when: the ID is unknown, the connection is still initializing,
@@ -2660,72 +2660,89 @@ impl LanguageServerPool {
     /// first atomically marks queued work for writer-side skipping and captures
     /// only already-writing/sent IDs that still need a FIFO cancel notification;
     /// the later cleanup is then harmless.
+    #[cfg(test)]
     pub(crate) async fn forward_cancel_by_upstream_id_with_notify(
         &self,
         upstream_id: UpstreamId,
         notify: impl FnOnce(),
     ) -> io::Result<()> {
-        // 1. Snapshot the connections registered for this upstream id.
-        let connection_keys: Vec<ConnectionKey> = {
+        self.forward_cancel_by_upstream_id_if_current(upstream_id, || true, notify)
+            .await
+    }
+
+    /// Generation-aware cancellation used by the upstream middleware. The
+    /// validity check runs while the upstream registry is locked, so request-ID
+    /// reuse cannot replace the old request's downstream mappings between the
+    /// check and target capture.
+    pub(crate) async fn forward_cancel_by_upstream_id_if_current(
+        &self,
+        upstream_id: UpstreamId,
+        is_current: impl FnOnce() -> bool,
+        notify: impl FnOnce(),
+    ) -> io::Result<()> {
+        // Acquire the async connections lock first, then keep the synchronous
+        // upstream registry locked from generation validation through router
+        // target capture. Registration/unregistration uses that registry lock,
+        // so an ID cannot change request lifetime in the middle of this block.
+        let connections = self.connections().await;
+        let mut targets: Vec<(ConnectionKey, Arc<ConnectionHandle>, Vec<RequestId>)> = Vec::new();
+        let registered = {
             let registry = self
                 .upstream_request_registry
                 .lock()
-                .recover_poison("LanguageServerPool::forward_cancel_by_upstream_id");
-            match registry.get(&upstream_id) {
-                Some(connections) => connections.keys().cloned().collect(),
-                None => {
-                    // Request not registered yet (still initializing) or already completed.
-                    // This is expected - silently drop the cancel per best-effort semantics.
-                    self.cancel_metrics.record_not_in_registry();
-                    log::debug!(
-                        target: "kakehashi::bridge::cancel",
-                        "Cancel dropped: upstream ID {} not in registry (expected during init or after completion)",
-                        upstream_id
-                    );
-                    notify();
-                    return Ok(());
+                .recover_poison("LanguageServerPool::forward_cancel_by_upstream_id_if_current");
+            if !is_current() {
+                return Ok(());
+            }
+            if let Some(connection_counts) = registry.get(&upstream_id) {
+                for connection_key in connection_counts.keys() {
+                    let Some(handle) = self.ready_handle_for_cancel_in(
+                        &connections,
+                        connection_key,
+                        &format!("upstream_id: {upstream_id}"),
+                    ) else {
+                        continue;
+                    };
+                    let (known, downstream_ids) =
+                        handle.router().prepare_cancel_by_upstream(&upstream_id);
+                    if !known {
+                        // Request already completed or ID never registered.
+                        // Silently drop per best-effort semantics.
+                        self.cancel_metrics.record_unknown_id();
+                        log::debug!(
+                            target: "kakehashi::bridge::cancel",
+                            "Cancel dropped: upstream ID {} not found for '{}' (request may have completed)",
+                            upstream_id,
+                            connection_key
+                        );
+                        continue;
+                    }
+                    if !downstream_ids.is_empty() {
+                        targets.push((connection_key.clone(), handle, downstream_ids));
+                    }
                 }
+                true
+            } else {
+                false
             }
         };
+        drop(connections);
 
-        // 2. Capture each server's connection handle and atomically classify its
-        //    downstream ids under one connections-lock acquisition. Queued requests
-        //    are marked for writer-side skipping before `notify`, and the time to
-        //    wake the handler is bounded by one lock wait rather than one per server
-        //    (PR #359 review).
-        let mut targets: Vec<(ConnectionKey, Arc<ConnectionHandle>, Vec<RequestId>)> = Vec::new();
-        {
-            let connections = self.connections().await;
-            for connection_key in connection_keys {
-                let Some(handle) = self.ready_handle_for_cancel_in(
-                    &connections,
-                    &connection_key,
-                    &format!("upstream_id: {upstream_id}"),
-                ) else {
-                    continue;
-                };
-                let (known, downstream_ids) =
-                    handle.router().prepare_cancel_by_upstream(&upstream_id);
-                if !known {
-                    // Request already completed or ID never registered.
-                    // Silently drop per best-effort semantics.
-                    self.cancel_metrics.record_unknown_id();
-                    log::debug!(
-                        target: "kakehashi::bridge::cancel",
-                        "Cancel dropped: upstream ID {} not found for '{}' (request may have completed)",
-                        upstream_id,
-                        connection_key
-                    );
-                    continue;
-                }
-                if !downstream_ids.is_empty() {
-                    targets.push((connection_key, handle, downstream_ids));
-                }
-            }
-            // Lock dropped here — notify and the sends below run without it.
+        if !registered {
+            // Request not registered yet (still initializing) or already completed.
+            // This is expected - silently drop the downstream cancel, but still
+            // notify the active local handler.
+            self.cancel_metrics.record_not_in_registry();
+            log::debug!(
+                target: "kakehashi::bridge::cancel",
+                "Cancel dropped: upstream ID {} not in registry (expected during init or after completion)",
+                upstream_id
+            );
+            notify();
+            return Ok(());
         }
 
-        // 3. Wake the upstream handler only now that targets are captured.
+        // Wake the upstream handler only now that targets are captured.
         notify();
 
         // 4. Send the cancels (best-effort, log I/O errors).
