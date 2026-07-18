@@ -10,6 +10,7 @@ from collect_worker_proxy import (
     build_driver_command,
     controlled_environment,
     estimated_tree_compute_budget,
+    artifact_provenance,
     parse_driver_summary,
     run_order,
     shasum_tree_digest,
@@ -17,6 +18,15 @@ from collect_worker_proxy import (
 
 
 class CollectionHelpersTest(unittest.TestCase):
+    def test_artifact_provenance_requires_full_git_revision(self):
+        revision = "4916d6592ede8c07973490d9322f187e07dfefac"
+
+        provenance = artifact_provenance(revision)
+
+        self.assertEqual(provenance["nvim_treesitter_revision"], revision)
+        with self.assertRaisesRegex(ValueError, "40-character"):
+            artifact_provenance("main")
+
     def test_controlled_environment_drops_behavior_overrides(self):
         environment = controlled_environment({
             "PATH": "/bin",

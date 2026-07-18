@@ -47,6 +47,18 @@ def controlled_environment(source):
     }
 
 
+def artifact_provenance(nvim_treesitter_revision):
+    if not re.fullmatch(r"[0-9a-fA-F]{40}", nvim_treesitter_revision):
+        raise ValueError("nvim-treesitter revision must be a 40-character Git SHA")
+    return {
+        "nvim_treesitter_repository": (
+            "https://github.com/nvim-treesitter/nvim-treesitter"
+        ),
+        "nvim_treesitter_revision": nvim_treesitter_revision.lower(),
+        "scope": "parser metadata and query sources",
+    }
+
+
 def run_order(zero_based_run):
     return ("direct", "relay") if zero_based_run % 2 == 0 else ("relay", "direct")
 
@@ -190,6 +202,11 @@ def main():
     parser.add_argument("--output", type=pathlib.Path, required=True)
     parser.add_argument("--pairs", type=int, default=10)
     parser.add_argument(
+        "--nvim-treesitter-revision",
+        required=True,
+        help="full Git revision supplying parser metadata and query sources",
+    )
+    parser.add_argument(
         "--scenario",
         action="append",
         choices=sorted(SCENARIOS),
@@ -229,6 +246,7 @@ def main():
             "parser_query_tree_sha256": shasum_tree_digest(args.data_dir),
             "retained_environment": controlled_environment(os.environ),
         },
+        "artifacts": artifact_provenance(args.nvim_treesitter_revision),
         "collector": {
             "pairs": args.pairs,
             "order": "direct-relay on odd runs; relay-direct on even runs",

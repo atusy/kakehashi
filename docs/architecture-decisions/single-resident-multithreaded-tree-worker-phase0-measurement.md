@@ -171,8 +171,36 @@ transcription using:
 python3 benches/profile/collect_worker_proxy.py \
   --bin ./target/release/kakehashi \
   --data-dir ./deps/test/kakehashi \
+  --nvim-treesitter-revision 4916d6592ede8c07973490d9322f187e07dfefac \
   --output /tmp/single-worker-phase0.json
 ```
+
+The measured metadata cache and every installed query file byte-match
+`nvim-treesitter` revision
+`4916d6592ede8c07973490d9322f187e07dfefac`. Reconstruct the parser/query
+sources at that revision rather than installing from a moving `main` branch:
+
+```sh
+revision=4916d6592ede8c07973490d9322f187e07dfefac
+source_dir=/tmp/kakehashi-nvim-treesitter
+data_dir=./deps/profile/kakehashi
+git clone --filter=blob:none \
+  https://github.com/nvim-treesitter/nvim-treesitter "$source_dir"
+git -C "$source_dir" checkout "$revision"
+mkdir -p "$data_dir/cache" "$data_dir/queries"
+cp "$source_dir/lua/nvim-treesitter/parsers.lua" "$data_dir/cache/parsers.lua"
+for lang in comment lua markdown markdown_inline python rust yaml; do
+  ./target/release/kakehashi language install "$lang" \
+    --data-dir "$data_dir" --force
+  rm -rf "$data_dir/queries/$lang"
+  cp -R "$source_dir/runtime/queries/$lang" "$data_dir/queries/$lang"
+done
+```
+
+Run the digest command below and compare it with the committed dataset before
+using a reconstructed tree for comparison. Compiler and platform differences
+can change shared-library bytes even from identical grammar revisions, so the
+committed digest remains the identity check for the exact measured artifacts.
 
 The analyzer uses seed `123456789`, 100,000 paired-bootstrap resamples, and
 nearest-rank 2.5th/97.5th percentiles. The parser/query tree digest was computed
