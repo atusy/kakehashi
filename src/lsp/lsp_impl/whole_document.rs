@@ -306,6 +306,11 @@ pub(super) fn flatten_ordered_region_items<T>(
     mut region_items: Vec<(usize, Option<Vec<T>>)>,
 ) -> Vec<T> {
     region_items.sort_unstable_by_key(|(region_index, _)| *region_index);
+    let total_len = region_items
+        .iter()
+        .filter_map(|(_, items)| items.as_ref())
+        .map(Vec::len)
+        .sum::<usize>();
     let mut ordered_items = region_items
         .into_iter()
         .filter_map(|(_, items)| items)
@@ -313,6 +318,7 @@ pub(super) fn flatten_ordered_region_items<T>(
     let Some(mut flattened) = ordered_items.next() else {
         return Vec::new();
     };
+    flattened.reserve(total_len - flattened.len());
     for mut items in ordered_items {
         flattened.append(&mut items);
     }
