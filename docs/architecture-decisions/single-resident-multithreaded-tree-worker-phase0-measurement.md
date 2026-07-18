@@ -240,8 +240,10 @@ collector fetches the hard-coded official HTTPS `main` into a fresh bare
 repository with local/system Git configuration and replacement objects
 disabled, requires the selected revision to be in that isolated history, and
 reads the expected metadata/query blobs from that same isolated repository.
-Every staged runtime file must byte-match those official blobs. The committed
-dataset was verified against `nvim-treesitter` revision
+Every staged metadata and query file must byte-match those official blobs;
+compiled parser libraries are covered by the staged tree digest, not upstream
+blob comparison. The committed dataset was verified against `nvim-treesitter`
+revision
 `4916d6592ede8c07973490d9322f187e07dfefac`.
 
 Run the digest command below and compare it with the committed dataset before
