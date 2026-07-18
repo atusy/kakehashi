@@ -541,9 +541,10 @@ Every worker-generation startup, including crash recovery, planned replacement,
 rollback, and a circuit-breaker half-open probe, re-reads each relevant manifest
 revision under its per-grammar lock and snapshots `(grammar, revision,
 digest-or-tombstone)` before sending worker configuration. A changed revision
-invalidates the parent's cached descriptor and advances its local configuration
-generation; a tombstone removes the selection and a newer digest is re-imported
-and verified.
+first advances the parent's local configuration generation, then invalidates its
+cached descriptor; a tombstone removes the selection and a newer digest is
+re-imported and verified. Advancing the publish guard first prevents old-
+generation in-flight work from repopulating the cleared cache.
 
 The uncommitted target of `Validation` mode is the sole exception to the serving
 selection rule. It is tied to the observed predecessor revision for CAS and is
