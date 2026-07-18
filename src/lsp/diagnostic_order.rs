@@ -2,7 +2,10 @@ use tower_lsp_server::ls_types::Diagnostic;
 
 // Cache enough canonical keys to cover thousands of ordinary diagnostics,
 // while staying well below the roughly 1 MiB full reports observed in the
-// pull hot path. Oversized tie groups fall back to transient pairwise keys.
+// pull hot path. `Diagnostic.data` is unbounded, so caching every key could
+// duplicate an arbitrarily large result. Oversized mixed tie groups therefore
+// trade repeated serialization for bounded retained memory; oversized
+// canonical-duplicate groups exit through the linear prepass below.
 const MAX_CACHED_TIE_KEY_CAPACITY_BYTES: usize = 256 * 1024;
 
 pub(crate) fn sort_diagnostics_deterministically(diagnostics: &mut [Diagnostic]) {
