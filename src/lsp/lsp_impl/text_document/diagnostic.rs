@@ -788,23 +788,6 @@ fn finalize_pull_items(mut items: Vec<Diagnostic>) -> (Vec<Diagnostic>, String) 
     (items, id)
 }
 
-/// FNV-1a 64-bit writer used to hash canonical JSON incrementally without
-/// materializing the full diagnostic array.
-struct FnvWriter(u64);
-
-impl std::io::Write for FnvWriter {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        const FNV_PRIME: u64 = 0x100000001b3;
-        for &byte in buf {
-            self.0 = (self.0 ^ u64::from(byte)).wrapping_mul(FNV_PRIME);
-        }
-        Ok(buf.len())
-    }
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
-}
-
 /// Content-address a **sorted** pull result: the deterministic sort
 /// ([`sort_diagnostics_deterministically`], applied by [`finalize_pull_items`]) makes the
 /// serialization canonical, so the same logical set always hashes to the same
@@ -816,8 +799,7 @@ impl std::io::Write for FnvWriter {
 ///
 /// [`sort_diagnostics_deterministically`]: crate::lsp::diagnostic_order::sort_diagnostics_deterministically
 fn diagnostic_result_id(items: &[Diagnostic]) -> String {
-    const FNV_OFFSET: u64 = 0xcbf29ce484222325;
-    let mut writer = FnvWriter(FNV_OFFSET);
+    let mut writer = crate::text::Fnv1aWriter::new();
     std::io::Write::write_all(&mut writer, b"[").expect("FNV writer is infallible");
     for (index, item) in items.iter().enumerate() {
         if index > 0 {
@@ -834,7 +816,7 @@ fn diagnostic_result_id(items: &[Diagnostic]) -> String {
         }
     }
     std::io::Write::write_all(&mut writer, b"]").expect("FNV writer is infallible");
-    format!("{:016x}-{}", writer.0, items.len())
+    format!("{:016x}-{}", writer.finish(), items.len())
 }
 
 /// Create a full diagnostic report from aggregated diagnostics. `result_id`

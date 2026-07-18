@@ -1,10 +1,15 @@
 use tower_lsp_server::ls_types::Diagnostic;
 
+// Cache enough canonical keys to cover thousands of ordinary diagnostics,
+// while staying well below the roughly 1 MiB full reports observed in the
+// pull hot path. Oversized tie groups fall back to transient pairwise keys.
+const MAX_CACHED_TIE_KEY_CAPACITY_BYTES: usize = 256 * 1024;
+
 pub(crate) fn sort_diagnostics_deterministically(diagnostics: &mut [Diagnostic]) {
     // Establish the common-case order without allocating. Only true ties on
-    // every cheap field need the full-value tiebreaker; caching that key within
-    // each tie group avoids both serializing unrelated diagnostics and
-    // repeating serialization per comparison for tie-heavy inputs.
+    // every cheap field need the full-value tiebreaker; each tie group caches
+    // canonical keys up to a fixed byte budget, then uses transient pairwise
+    // keys so neither repeated work nor retained memory grows unchecked.
     diagnostics.sort_unstable_by(diagnostic_cheap_cmp);
 
     let mut start = 0;
@@ -16,9 +21,56 @@ pub(crate) fn sort_diagnostics_deterministically(diagnostics: &mut [Diagnostic])
             end += 1;
         }
         if end - start > 1 {
-            diagnostics[start..end].sort_by_cached_key(canonical_json_string);
+            sort_diagnostic_tie_group(&mut diagnostics[start..end]);
         }
         start = end;
+    }
+}
+
+fn sort_diagnostic_tie_group(diagnostics: &mut [Diagnostic]) {
+    // Structural equality is only a cheap candidate filter: serde_json treats
+    // 0.0 and -0.0 as equal even though their canonical bytes differ. Confirm
+    // canonical equality once per item before skipping an all-duplicate group.
+    if diagnostics[1..]
+        .iter()
+        .all(|diagnostic| diagnostic == &diagnostics[0])
+    {
+        let first_key = canonical_json_string(&diagnostics[0]);
+        if diagnostics[1..]
+            .iter()
+            .all(|diagnostic| canonical_json_string(diagnostic) == first_key)
+        {
+            return;
+        }
+    }
+
+    let mut cached_capacity = 0usize;
+    let mut keyed: Vec<_> = diagnostics
+        .iter_mut()
+        .map(|diagnostic| {
+            let key = canonical_json_string(diagnostic);
+            let key_capacity = key.capacity();
+            let key = if cached_capacity.saturating_add(key_capacity)
+                <= MAX_CACHED_TIE_KEY_CAPACITY_BYTES
+            {
+                cached_capacity += key_capacity;
+                Some(key)
+            } else {
+                None
+            };
+            (key, std::mem::take(diagnostic))
+        })
+        .collect();
+
+    keyed.sort_unstable_by(|left, right| match (&left.0, &right.0) {
+        (Some(left), Some(right)) => left.cmp(right),
+        (Some(left), None) => left.cmp(&canonical_json_string(&right.1)),
+        (None, Some(right)) => canonical_json_string(&left.1).cmp(right),
+        (None, None) => canonical_json_string(&left.1).cmp(&canonical_json_string(&right.1)),
+    });
+
+    for (slot, (_, diagnostic)) in diagnostics.iter_mut().zip(keyed) {
+        *slot = diagnostic;
     }
 }
 
@@ -155,6 +207,56 @@ mod tests {
         assert_eq!(
             String::from_utf8(written).unwrap(),
             canonical_json_string(&diagnostic)
+        );
+    }
+
+    #[test]
+    fn tie_sort_preserves_canonical_order_after_key_budget() {
+        let padding = "x".repeat(MAX_CACHED_TIE_KEY_CAPACITY_BYTES + 1);
+        let with_value = |value| {
+            let mut diagnostic = diag("same");
+            diagnostic.data = Some(serde_json::json!({
+                "padding": padding,
+                "value": value,
+            }));
+            diagnostic
+        };
+        let first = with_value(1);
+        let second = with_value(2);
+        let mut diagnostics = vec![second, first.clone()];
+
+        sort_diagnostics_deterministically(&mut diagnostics);
+
+        assert_eq!(diagnostics[0], first);
+    }
+
+    #[test]
+    fn tie_sort_distinguishes_signed_zero_serialization() {
+        let with_data = |value| {
+            let mut diagnostic = diag("same");
+            diagnostic.data = Some(value);
+            diagnostic
+        };
+        let positive = with_data(serde_json::json!(0.0));
+        let negative = with_data(serde_json::json!(-0.0));
+        assert_eq!(
+            positive, negative,
+            "JSON number equality ignores zero's sign"
+        );
+        assert_ne!(
+            canonical_json_string(&positive),
+            canonical_json_string(&negative),
+            "canonical JSON preserves zero's sign"
+        );
+        let mut first = vec![positive.clone(), negative.clone()];
+        let mut second = vec![negative, positive];
+
+        sort_diagnostics_deterministically(&mut first);
+        sort_diagnostics_deterministically(&mut second);
+
+        assert_eq!(
+            first.iter().map(canonical_json_string).collect::<Vec<_>>(),
+            second.iter().map(canonical_json_string).collect::<Vec<_>>()
         );
     }
 }
