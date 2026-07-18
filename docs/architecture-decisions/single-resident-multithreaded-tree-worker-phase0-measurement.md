@@ -39,9 +39,9 @@ and must use the platform-specific lifecycle mechanisms specified by the ADR.
   fresh target and Cargo-home directories with an allowlisted, recorded build
   environment. Before building, it rejects a temporary source inside the
   checkout or beneath any ancestor Cargo configuration. It records the
-  Rust/Cargo versions, verbose Rust host/LLVM metadata, native compiler, macOS
-  SDK path/version, and locked build command, and matches the measured binary's
-  SHA-256 digest.
+  Rust/Cargo versions, verbose Rust host/LLVM metadata, native compiler and
+  linker identities, macOS SDK path/version, and locked build command, and
+  matches the measured binary's SHA-256 digest.
 * Parser/query data was preinstalled outside the measured interval.
 * Each collector copied the attested binary and digest-verified runtime tree to
   a private temporary directory before warmup, then executed only those staged

@@ -9,12 +9,21 @@ sys.path.insert(0, str(pathlib.Path(__file__).parent))
 from attest_worker_binary import (
     archive_source,
     controlled_build_environment,
+    environment_tool_version,
     native_toolchain_metadata,
     require_isolated_source,
 )
 
 
 class BinaryAttestationTest(unittest.TestCase):
+    def test_tool_version_captures_stderr_only_tools(self):
+        output = environment_tool_version(
+            [sys.executable, "-c", "import sys; print('linker 1.0', file=sys.stderr)"],
+            {},
+        )
+
+        self.assertEqual(output, "linker 1.0")
+
     def test_build_environment_drops_ambient_build_overrides(self):
         environment = controlled_build_environment(
             {
@@ -93,6 +102,7 @@ class BinaryAttestationTest(unittest.TestCase):
         versions = {
             ("rustc", "-vV"): "rustc 1.95.0\nhost: aarch64-apple-darwin",
             ("cc", "--version"): "Apple clang version 17.0.0",
+            ("ld", "-v"): "@(#)PROGRAM:ld PROJECT:ld-1234",
             ("xcrun", "--show-sdk-path"): "/SDKs/MacOSX.sdk",
             ("xcrun", "--show-sdk-version"): "26.5",
         }
@@ -106,6 +116,7 @@ class BinaryAttestationTest(unittest.TestCase):
         self.assertEqual(metadata, {
             "rustc_verbose": "rustc 1.95.0\nhost: aarch64-apple-darwin",
             "cc": "Apple clang version 17.0.0",
+            "linker": "@(#)PROGRAM:ld PROJECT:ld-1234",
             "sdk_path": "/SDKs/MacOSX.sdk",
             "sdk_version": "26.5",
         })

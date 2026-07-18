@@ -31,7 +31,8 @@ def controlled_build_environment(source, target_dir):
 
 def environment_tool_version(command, environment):
     return subprocess.run(
-        command, check=True, text=True, stdout=subprocess.PIPE, env=environment
+        command, check=True, text=True, stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT, env=environment,
     ).stdout.strip()
 
 
@@ -44,6 +45,10 @@ def native_toolchain_metadata(
     metadata = {
         "rustc_verbose": version(["rustc", "-vV"], environment),
         "cc": version(["cc", "--version"], environment),
+        "linker": version(
+            ["ld", "-v"] if system == "Darwin" else ["ld", "--version"],
+            environment,
+        ),
         "sdk_path": "not applicable",
         "sdk_version": "not applicable",
     }

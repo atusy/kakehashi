@@ -406,6 +406,7 @@ class CollectionHelpersTest(unittest.TestCase):
                 "native_toolchain": {
                     "rustc_verbose": "rustc 1.95.0\nhost: test-target",
                     "cc": "cc 1.0",
+                    "linker": "ld 1.0",
                     "sdk_path": "not applicable",
                     "sdk_version": "not applicable",
                 },

@@ -391,7 +391,7 @@ def load_binary_attestation(path, binary):
         and bool(attestation["cargo"])
         and isinstance(attestation["native_toolchain"], dict)
         and set(attestation["native_toolchain"]) == {
-            "rustc_verbose", "cc", "sdk_path", "sdk_version",
+            "rustc_verbose", "cc", "linker", "sdk_path", "sdk_version",
         }
         and all(
             isinstance(value, str) and bool(value)
