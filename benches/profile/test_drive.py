@@ -23,6 +23,7 @@ from drive import (
     terminate_server,
     warm_semantic_tokens,
 )
+from process_test_utils import readline_with_timeout
 
 
 class RequestSummaryTest(unittest.TestCase):
@@ -129,7 +130,7 @@ class RequestSummaryTest(unittest.TestCase):
             env=environment,
             text=True,
         )
-        child_pid = int(process.stdout.readline())
+        child_pid = int(readline_with_timeout(process.stdout))
         try:
             terminate_server(process)
             with self.assertRaises(ProcessLookupError):

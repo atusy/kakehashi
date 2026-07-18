@@ -11,6 +11,7 @@ from unittest import mock
 sys.path.insert(0, str(pathlib.Path(__file__).parent))
 
 from worker_proxy import copy_stream, require_posix, run_relay, terminate_child
+from process_test_utils import read_count_with_timeout, readline_with_timeout
 
 
 class CopyStreamTest(unittest.TestCase):
@@ -121,7 +122,7 @@ class CopyStreamTest(unittest.TestCase):
             env=env,
         )
         try:
-            self.assertEqual(process.stdout.read(2), b"ok")
+            self.assertEqual(read_count_with_timeout(process.stdout, 2), b"ok")
             return_code = process.wait(timeout=5)
             stderr = process.stderr.read().decode()
         except subprocess.TimeoutExpired:
@@ -176,7 +177,7 @@ class CopyStreamTest(unittest.TestCase):
             env=env,
             text=True,
         )
-        child_pid = int(process.stdout.readline())
+        child_pid = int(readline_with_timeout(process.stdout))
         try:
             process.terminate()
             process.wait(timeout=5)
@@ -214,7 +215,7 @@ class CopyStreamTest(unittest.TestCase):
             env=env,
             text=True,
         )
-        child_pid = int(process.stdout.readline())
+        child_pid = int(readline_with_timeout(process.stdout))
         try:
             for _ in range(8):
                 if process.poll() is not None:
