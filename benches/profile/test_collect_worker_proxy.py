@@ -148,12 +148,13 @@ class CollectionHelpersTest(unittest.TestCase):
             sys.executable,
             "-c",
             "import signal; blocked=signal.pthread_sigmask(signal.SIG_BLOCK, []); "
-            "print(signal.SIGTERM in blocked, signal.SIGHUP in blocked)",
+            "print(signal.SIGTERM in blocked, signal.SIGHUP in blocked, "
+            "signal.SIGINT in blocked)",
         ]
 
         completed = bounded_run(command, {}, timeout_seconds=5)
 
-        self.assertEqual(completed.stdout, "False False\n")
+        self.assertEqual(completed.stdout, "False False False\n")
 
     def test_parser_suffix_matches_supported_posix_platform(self):
         self.assertEqual(parser_library_suffix("Darwin"), ".dylib")
@@ -297,6 +298,34 @@ class CollectionHelpersTest(unittest.TestCase):
                 bounded_run(["driver"], {}, timeout_seconds=5)
 
         terminate.assert_called_once_with(process, 3)
+
+    def test_partial_handler_installation_is_rolled_back(self):
+        termination_signals = (signal.SIGINT, signal.SIGTERM)
+        first = termination_signals[0]
+        original = signal.SIG_DFL
+        calls = []
+
+        def set_handler(signum, handler):
+            calls.append((signum, handler))
+            if len(calls) == 2:
+                raise KeyboardInterrupt
+
+        with (
+            mock.patch.object(
+                collector, "TERMINATION_SIGNALS", termination_signals
+            ),
+            mock.patch.object(collector.signal, "getsignal", return_value=original),
+            mock.patch.object(
+                collector.signal, "signal", side_effect=set_handler
+            ),
+            self.assertRaises(KeyboardInterrupt),
+        ):
+            collector.install_termination_handlers()
+
+        self.assertEqual(
+            calls[2:],
+            [(signum, original) for signum in termination_signals],
+        )
 
     def test_cleanup_signals_include_interrupt(self):
         self.assertIn(signal.SIGINT, CLEANUP_SIGNALS)

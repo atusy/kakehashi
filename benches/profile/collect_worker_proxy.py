@@ -617,9 +617,13 @@ def install_termination_handlers():
     def exit_on_signal(signum, _frame):
         raise SystemExit(128 + signum)
 
-    for signum in TERMINATION_SIGNALS:
-        previous[signum] = signal.getsignal(signum)
-        signal.signal(signum, exit_on_signal)
+    try:
+        for signum in TERMINATION_SIGNALS:
+            previous[signum] = signal.getsignal(signum)
+            signal.signal(signum, exit_on_signal)
+    except BaseException:
+        restore_signal_handlers(previous)
+        raise
     return previous
 
 
@@ -641,7 +645,7 @@ def suppress_termination_signals():
 
 
 def unblock_termination_signals_in_child():
-    signal.pthread_sigmask(signal.SIG_UNBLOCK, TERMINATION_SIGNALS)
+    signal.pthread_sigmask(signal.SIG_UNBLOCK, CLEANUP_SIGNALS)
 
 
 def bounded_run(
@@ -652,7 +656,7 @@ def bounded_run(
 ):
     process = None
     previous_mask = signal.pthread_sigmask(
-        signal.SIG_BLOCK, TERMINATION_SIGNALS
+        signal.SIG_BLOCK, CLEANUP_SIGNALS
     )
     try:
         process = subprocess.Popen(
