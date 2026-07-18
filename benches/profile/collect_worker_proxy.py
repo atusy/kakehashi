@@ -8,6 +8,7 @@ import os
 import pathlib
 import platform
 import re
+import signal
 import subprocess
 import sys
 
@@ -242,6 +243,54 @@ def build_driver_command(kind, binary, data_dir, scenario_args, script_dir):
     ]
 
 
+def signal_process_group(process, signum):
+    try:
+        os.killpg(process.pid, signum)
+    except ProcessLookupError:
+        pass
+
+
+def bounded_run(
+    command,
+    environment,
+    timeout_seconds,
+    termination_grace_seconds=3,
+):
+    process = subprocess.Popen(
+        command,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env=environment,
+        start_new_session=True,
+    )
+    try:
+        stdout, stderr = process.communicate(timeout=timeout_seconds)
+    except subprocess.TimeoutExpired as timeout:
+        signal_process_group(process, signal.SIGTERM)
+        try:
+            stdout, stderr = process.communicate(
+                timeout=termination_grace_seconds
+            )
+        except subprocess.TimeoutExpired:
+            stdout = stderr = None
+        signal_process_group(process, signal.SIGKILL)
+        final_stdout, final_stderr = process.communicate()
+        raise subprocess.TimeoutExpired(
+            command,
+            timeout_seconds,
+            output=stdout if stdout is not None else final_stdout,
+            stderr=stderr if stderr is not None else final_stderr,
+        ) from timeout
+    if process.returncode:
+        raise subprocess.CalledProcessError(
+            process.returncode, command, output=stdout, stderr=stderr
+        )
+    return subprocess.CompletedProcess(
+        command, process.returncode, stdout=stdout, stderr=stderr
+    )
+
+
 def option_int(arguments, option, default):
     for index, argument in enumerate(arguments):
         if argument == option:
@@ -252,20 +301,17 @@ def option_int(arguments, option, default):
     return default
 
 
-def run_driver(kind, binary, data_dir, scenario_args, script_dir):
+def run_driver(
+    kind, binary, data_dir, scenario_args, script_dir, timeout_seconds
+):
     env = controlled_environment(os.environ)
     if kind == "relay":
         env["KAKEHASHI_WORKER_PROXY_BIN"] = str(binary)
     command = build_driver_command(
         kind, binary, data_dir, scenario_args, script_dir
     )
-    completed = subprocess.run(
-        command,
-        check=True,
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        env=env,
+    completed = bounded_run(
+        command, env, timeout_seconds=timeout_seconds
     )
     expected_count = option_int(scenario_args, "--requests", 300) * option_int(
         scenario_args, "--burst", 1
@@ -281,6 +327,12 @@ def main():
     parser.add_argument("--output", type=pathlib.Path, required=True)
     parser.add_argument("--pairs", type=int, default=10)
     parser.add_argument(
+        "--run-timeout",
+        type=float,
+        default=60,
+        help="seconds before a driver and its process group are terminated",
+    )
+    parser.add_argument(
         "--nvim-treesitter-checkout",
         type=pathlib.Path,
         required=True,
@@ -295,6 +347,8 @@ def main():
     args = parser.parse_args()
     if args.pairs <= 0:
         parser.error("--pairs must be positive")
+    if args.run_timeout <= 0:
+        parser.error("--run-timeout must be positive")
 
     script_dir = pathlib.Path(__file__).resolve().parent
     selected = args.scenarios or list(SCENARIOS)
@@ -348,6 +402,7 @@ def main():
                     args.data_dir,
                     SCENARIOS[scenario],
                     script_dir,
+                    args.run_timeout,
                 )
             pairs.append(pair)
             print(f"{scenario}: pair {index + 1}/{args.pairs}", file=sys.stderr)

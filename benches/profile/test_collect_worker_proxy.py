@@ -1,4 +1,5 @@
 import hashlib
+import os
 import pathlib
 import subprocess
 import sys
@@ -9,6 +10,7 @@ sys.path.insert(0, str(pathlib.Path(__file__).parent))
 
 from collect_worker_proxy import (
     build_driver_command,
+    bounded_run,
     controlled_environment,
     estimated_tree_compute_budget,
     artifact_provenance,
@@ -21,6 +23,33 @@ from collect_worker_proxy import (
 
 
 class CollectionHelpersTest(unittest.TestCase):
+    @unittest.skipUnless(os.name == "posix", "requires POSIX process groups")
+    def test_bounded_run_reaps_term_ignoring_descendant(self):
+        with tempfile.TemporaryDirectory() as directory:
+            pid_file = pathlib.Path(directory) / "child.pid"
+            child_script = (
+                "import os,signal,time; "
+                "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+                f"open({str(pid_file)!r}, 'w').write(str(os.getpid())); "
+                "time.sleep(30)"
+            )
+            script = (
+                "import subprocess,sys,time; "
+                f"subprocess.Popen([sys.executable, '-c', {child_script!r}]); "
+                "time.sleep(30)"
+            )
+
+            with self.assertRaises(subprocess.TimeoutExpired):
+                bounded_run(
+                    [sys.executable, "-c", script],
+                    {},
+                    timeout_seconds=0.2,
+                    termination_grace_seconds=0.2,
+                )
+            child_pid = int(pid_file.read_text())
+            with self.assertRaises(ProcessLookupError):
+                os.kill(child_pid, 0)
+
     def test_collector_rejects_non_posix_lifecycle(self):
         with self.assertRaisesRegex(SystemExit, "POSIX"):
             require_collector_posix("nt")
