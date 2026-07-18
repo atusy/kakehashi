@@ -404,7 +404,7 @@ post-install runtime reload crosses into the worker.
   locality while retaining bounded multicore execution.
 * A hard worker kill reclaims a native hang that cooperative cancellation
   cannot stop.
-* Killing an idle or failed worker releases loaded libraries, trees, caches, and
+* Killing a failed worker releases loaded libraries, trees, caches, and
   allocator fragmentation that the current process-lifetime loader cannot
   reclaim safely.
 * Fixed worker count avoids load-balancing and migration state until a measured
@@ -436,9 +436,27 @@ post-install runtime reload crosses into the worker.
 
 **Neutral:**
 
-* Public LSP and kakehashi protocol shapes remain unchanged. Only timing around
-  worker failure becomes explicitly observable through logs and temporary empty
-  results.
+* Public LSP and kakehashi protocol shapes remain unchanged, but worker
+  availability maps through each existing reader contract rather than one
+  universal empty result:
+  * current-only LSP position/range readers keep their bounded-wait policy where
+    applicable and otherwise reject stale/unavailable derivation with
+    `ContentModified`;
+  * captures range and unavailable captures lineage keep the captures protocol's
+    `null` resynchronization signal;
+  * whole-document serve-stale readers may use the latest admitted serialized
+    artifact retained by the parent and otherwise use their existing method-
+    specific empty or `null` fallback;
+  * semantic tokens and captures full/delta retain their serve-current wait and
+    existing backstop behavior; and
+  * a quarantined grammar publishes the same resolved-but-tree-less state as an
+    unavailable parser, releasing first-parse waiters without claiming a tree.
+* Worker restart permanently invalidates worker-local node IDs. A subsequent
+  navigation request returns `null`; the client reacquires an ID through a fresh
+  `kakehashi/node` lookup after derivation recovers. Because this is externally
+  observable even though it uses an existing protocol result, the initial
+  architecture keeps a healthy worker resident and does not recycle it merely
+  for idleness or memory pressure.
 * Wasm grammars remain a compatible future optimization or stronger sandbox for
   grammars that support them; they are not required by this decision.
 * Multiple worker processes remain a possible follow-up, but worker count is not
