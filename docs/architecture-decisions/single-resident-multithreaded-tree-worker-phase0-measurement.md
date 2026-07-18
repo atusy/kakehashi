@@ -236,12 +236,14 @@ test -d "$workspace_dir"
 trap 'rm -rf "$workspace_dir"' EXIT
 source_dir="$workspace_dir/nvim-treesitter"
 data_dir="$workspace_dir/data"
+results_dir="$workspace_dir/results"
+mkdir -p "$results_dir"
 git clone --filter=blob:none \
   https://github.com/nvim-treesitter/nvim-treesitter "$source_dir"
 git -C "$source_dir" checkout "$revision"
 python3 benches/profile/attest_worker_binary.py \
   --checkout . \
-  --output /tmp/single-worker-binary-attestation.json
+  --output "$results_dir/single-worker-binary-attestation.json"
 mkdir -p "$data_dir/cache" "$data_dir/queries"
 cp "$source_dir/lua/nvim-treesitter/parsers.lua" "$data_dir/cache/parsers.lua"
 for lang in comment lua markdown markdown_inline python rust yaml; do
@@ -253,23 +255,23 @@ done
 
 python3 benches/profile/collect_worker_proxy.py \
   --bin ./target/release/kakehashi \
-  --binary-attestation /tmp/single-worker-binary-attestation.json \
+  --binary-attestation "$results_dir/single-worker-binary-attestation.json" \
   --data-dir "$data_dir" \
   --nvim-treesitter-checkout "$source_dir" \
-  --output /tmp/single-worker-phase0.json
+  --output "$results_dir/single-worker-phase0.json"
 python3 benches/profile/collect_worker_cold_start.py \
   --bin ./target/release/kakehashi \
-  --binary-attestation /tmp/single-worker-binary-attestation.json \
+  --binary-attestation "$results_dir/single-worker-binary-attestation.json" \
   --data-dir "$data_dir" \
   --nvim-treesitter-checkout "$source_dir" \
   --pairs 20 --warmups 3 \
-  --output /tmp/single-worker-phase0-cold-start.json
+  --output "$results_dir/single-worker-phase0-cold-start.json"
 python3 benches/profile/collect_worker_capture_pilot.py \
   --bin ./target/release/kakehashi \
-  --binary-attestation /tmp/single-worker-binary-attestation.json \
+  --binary-attestation "$results_dir/single-worker-binary-attestation.json" \
   --data-dir "$data_dir" \
   --nvim-treesitter-checkout "$source_dir" \
-  --output /tmp/single-worker-phase0-captures-pilot.json
+  --output "$results_dir/single-worker-phase0-captures-pilot.json"
 
 (cd "$data_dir" && \
   find ./cache ./parser ./queries -type f -print0 | LC_ALL=C sort -z | \
