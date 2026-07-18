@@ -375,7 +375,22 @@ worker/protocol failure and does not invent a parser quarantine.
 
 After quarantine, the parent starts a fresh worker with bounded backoff, sends
 the versioned quarantine set before enabling document derivation, and full-syncs
-all open documents. Every host and injected parser acquisition in the worker
+all open documents. Restarts are also governed by a per-session circuit breaker:
+three worker-generation failures without an intervening 60 seconds of healthy
+service exhaust the budget for the current configuration generation. This
+counts startup, handshake, protocol, resync, native-timeout, and delayed
+post-return failures, whether or not a grammar could be attributed.
+
+When the budget is exhausted, the parent stops spawning workers and marks the
+tree tier unavailable for that configuration generation. It wakes all tree
+waiters through their existing tree-less or method-specific failure contracts,
+rejects new tree work without queueing it, logs the terminal degraded state once,
+and continues host-tier service. A relevant parser artifact replacement or
+configuration generation change permits one half-open probe generation; only
+60 seconds of healthy service closes the breaker and resets the full budget.
+Ordinary document edits and requests cannot reset it or create a respawn loop.
+
+Every host and injected parser acquisition in the worker
 must reject a quarantined `grammar_key`; a document with a quarantined injected
 layer degrades only that layer rather than being omitted from resync. Host-tier
 service continues throughout recovery. Reload and auto-install events cannot
@@ -539,6 +554,10 @@ Implementation is accepted only when all of the following hold:
   not only two outer requests, and separately covers the one-thread degradation.
 * Protocol tests cover truncated frames, oversized frames, unknown versions,
   invalid edit bases, duplicate responses, EOF, and child startup failure.
+* Repeated startup, handshake, protocol, and delayed-post-return failures prove
+  the restart budget converges to one logged tree-tier-unavailable state, wakes
+  waiters, stops respawning, and leaves host-tier service usable. A relevant
+  configuration or artifact change permits exactly one half-open probe.
 * Install/reload tests cover missing host and injected grammars, concurrent
   install deduplication, cache invalidation, latest-version re-derivation, and
   refusal to load the same quarantined artifact. Same-path parser replacement,
