@@ -8,12 +8,17 @@ on:
 env:
   CARGO_TERM_COLOR: always
 
+permissions:
+  contents: read
+
 jobs:
   check:
     name: Check
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
       - run: cargo check
 
   test:
@@ -21,6 +26,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
       - run: rustup component add rust-analyzer
       - run: make deps/tree-sitter
       - run: cargo test
@@ -33,6 +40,8 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
       - name: Test benchmark tooling
         run: python3 -m unittest discover -s benches/profile -p 'test_*.py'
 
@@ -41,6 +50,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
       - run: cargo fmt --all --check
 
   clippy:
@@ -48,6 +59,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
       - run: cargo clippy -- -D warnings
 
   audit:
@@ -55,5 +68,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
       - run: cargo install cargo-audit --locked
       - run: cargo audit
