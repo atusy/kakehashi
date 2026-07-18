@@ -6,7 +6,7 @@
     "python": "3.12.13",
     "binary": "/Users/atusy/ghq/github.com/atusy/kakehashi___worker_adr/target/release/kakehashi",
     "binary_execution": "private staged copy",
-    "binary_sha256": "ae73b12dcbf56d0e9cdd94beb61178142c6d26ecee8d899d6f5bbc793d27cd5c",
+    "binary_sha256": "192d8c3d5fbee9db04742c9e2f38b74b917a84ef3b2153397c58eec8187f9335",
     "data_dir": "/private/tmp/kakehashi-phase0-data.WIU8dk",
     "data_dir_execution": "private staged copy",
     "parser_query_file_count": 25,
@@ -21,7 +21,7 @@
   "artifacts": {
     "nvim_treesitter_repository": "https://github.com/nvim-treesitter/nvim-treesitter",
     "nvim_treesitter_revision": "4916d6592ede8c07973490d9322f187e07dfefac",
-    "nvim_treesitter_fetched_main": "4916d6592ede8c07973490d9322f187e07dfefac",
+    "nvim_treesitter_fetched_main": "24977147550d53589e53b874ec75e14e4fbc304e",
     "verification": "parser metadata and every installed query byte-matched"
   },
   "binary_attestation": {
@@ -32,6 +32,7 @@
     "build_command": [
       "cargo",
       "build",
+      "--locked",
       "--release",
       "--bin",
       "kakehashi"
@@ -43,14 +44,14 @@
       "TMPDIR": "/var/folders/t3/_nc24_w90zq79l3xyz3xzc7c0000gn/T/",
       "LANG": "C.UTF-8",
       "LC_ALL": "C.UTF-8",
-      "CARGO_TARGET_DIR": "/var/folders/t3/_nc24_w90zq79l3xyz3xzc7c0000gn/T/kakehashi-attested-build-9qvxuk_w/target",
-      "CARGO_HOME": "/var/folders/t3/_nc24_w90zq79l3xyz3xzc7c0000gn/T/kakehashi-attested-build-9qvxuk_w/target/cargo-home"
+      "CARGO_TARGET_DIR": "/var/folders/t3/_nc24_w90zq79l3xyz3xzc7c0000gn/T/kakehashi-attested-build-euhg2o4m/target",
+      "CARGO_HOME": "/var/folders/t3/_nc24_w90zq79l3xyz3xzc7c0000gn/T/kakehashi-attested-build-euhg2o4m/target/cargo-home"
     },
     "built_in_fresh_target": true,
     "source_isolated_archive": true,
     "cargo_config_ancestry_clean": true,
     "binary_relative": "target/release/kakehashi",
-    "binary_sha256": "ae73b12dcbf56d0e9cdd94beb61178142c6d26ecee8d899d6f5bbc793d27cd5c"
+    "binary_sha256": "192d8c3d5fbee9db04742c9e2f38b74b917a84ef3b2153397c58eec8187f9335"
   },
   "arguments": [
     "--lang",
@@ -66,10 +67,10 @@
   "independent_pairs": 1,
   "order": "direct then relay; smoke result only",
   "direct": {
-    "semantic_p50": 5.7,
-    "semantic_p95": 6.6,
-    "captures_p50": 36.8,
-    "captures_p95": 41.2,
+    "semantic_p50": 5.3,
+    "semantic_p95": 6.7,
+    "captures_p50": 35.8,
+    "captures_p95": 39.1,
     "semantic_outcomes": {
       "count": 100,
       "ok": 100,
@@ -90,10 +91,10 @@
     "capture_full_fallbacks": 0
   },
   "relay": {
-    "semantic_p50": 4.4,
-    "semantic_p95": 5.8,
-    "captures_p50": 29.7,
-    "captures_p95": 34.5,
+    "semantic_p50": 4.6,
+    "semantic_p95": 6.2,
+    "captures_p50": 29.1,
+    "captures_p95": 38.2,
     "semantic_outcomes": {
       "count": 100,
       "ok": 100,

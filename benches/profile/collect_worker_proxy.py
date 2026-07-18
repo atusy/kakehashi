@@ -46,7 +46,7 @@ OFFICIAL_NVIM_TREESITTER_URL = (
     "https://github.com/nvim-treesitter/nvim-treesitter"
 )
 ATTESTED_BUILD_COMMAND = [
-    "cargo", "build", "--release", "--bin", "kakehashi"
+    "cargo", "build", "--locked", "--release", "--bin", "kakehashi"
 ]
 
 

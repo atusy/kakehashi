@@ -37,6 +37,9 @@ from collect_worker_proxy import (
 
 
 class CollectionHelpersTest(unittest.TestCase):
+    def test_attested_build_requires_committed_lockfile(self):
+        self.assertIn("--locked", collector.ATTESTED_BUILD_COMMAND)
+
     @unittest.skipUnless(os.name == "posix", "requires POSIX signal masks")
     def test_bounded_run_unblocks_termination_signals_in_child(self):
         command = [
@@ -396,7 +399,7 @@ class CollectionHelpersTest(unittest.TestCase):
                 "source_commit": "a" * 40,
                 "source_checkout_clean": True,
                 "build_command": [
-                    "cargo", "build", "--release", "--bin", "kakehashi"
+                    "cargo", "build", "--locked", "--release", "--bin", "kakehashi"
                 ],
                 "rustc": "rustc 1.95.0",
                 "cargo": "cargo 1.95.0",
