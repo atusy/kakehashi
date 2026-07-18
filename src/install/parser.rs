@@ -4,12 +4,14 @@
 //! compiling them with tree-sitter-loader, and installing the resulting shared library.
 
 use std::fs;
+use std::io::Write;
 use std::path::Component;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
 
 use flate2::read::GzDecoder;
+use fs4::fs_std::FileExt;
 use tar::Archive;
 use tree_sitter_loader::Loader;
 
@@ -18,6 +20,7 @@ use super::metadata::{FetchOptions, MetadataError, fetch_parser_metadata};
 
 /// HTTP timeout for archive downloads.
 const ARCHIVE_HTTP_TIMEOUT: Duration = Duration::from_secs(120);
+const PARSER_OPERATION_MARKER_SUFFIX: &str = ".operation";
 
 /// Error types for parser installation.
 #[derive(Debug)]
@@ -261,30 +264,186 @@ fn compile_parser(grammar_path: &Path, output_path: &Path) -> Result<(), ParserI
     Ok(())
 }
 
+struct ParserReplaceLockGuard {
+    _file: fs::File,
+}
+
+impl ParserReplaceLockGuard {
+    fn acquire(parser_dir: &Path, language: &str) -> Result<Self, ParserInstallError> {
+        if !super::queries::is_safe_language_name(language) {
+            return Err(unsafe_language_name_error(language));
+        }
+        fs::create_dir_all(parser_dir)?;
+        let file = fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(parser_dir.join(format!(".{language}.replace.lock")))?;
+        file.lock_exclusive()?;
+        Ok(Self { _file: file })
+    }
+}
+
+fn parser_operation_marker_path(parser_dir: &Path, language: &str) -> PathBuf {
+    parser_dir.join(format!(".{language}{PARSER_OPERATION_MARKER_SUFFIX}"))
+}
+
+fn unsafe_language_name_error(language: &str) -> ParserInstallError {
+    ParserInstallError::IoError(std::io::Error::new(
+        std::io::ErrorKind::InvalidInput,
+        format!("unsafe language name '{}'", language.escape_default()),
+    ))
+}
+
+fn begin_parser_install(
+    parser_dir: &Path,
+    parser_file: &Path,
+    language: &str,
+    force: bool,
+) -> Result<String, ParserInstallError> {
+    let _replace_lock = ParserReplaceLockGuard::acquire(parser_dir, language)?;
+    if parser_file.exists() && !force {
+        return Err(ParserInstallError::AlreadyExists(parser_file.to_path_buf()));
+    }
+    let token = format!("install:{}", ulid::Ulid::new());
+    let mut marker = fs::File::create(parser_operation_marker_path(parser_dir, language))?;
+    marker.write_all(token.as_bytes())?;
+    Ok(token)
+}
+
+fn publish_compiled_parser(
+    tmp_file: &Path,
+    parser_file: &Path,
+    language: &str,
+    install_token: &str,
+) -> Result<(), ParserInstallError> {
+    let parser_dir = parser_file.parent().ok_or_else(|| {
+        ParserInstallError::IoError(std::io::Error::other("parser path has no parent"))
+    })?;
+    let _replace_lock = ParserReplaceLockGuard::acquire(parser_dir, language)?;
+    let current_token = match fs::read_to_string(parser_operation_marker_path(parser_dir, language))
+    {
+        Ok(token) => Some(token),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(ParserInstallError::IoError(error)),
+    };
+    if current_token.as_deref() != Some(install_token) {
+        let _ = fs::remove_file(tmp_file);
+        return Err(ParserInstallError::IoError(std::io::Error::new(
+            std::io::ErrorKind::Interrupted,
+            format!("Parser install for {language} was superseded by a newer parser operation"),
+        )));
+    }
+    // On unix `rename` atomically replaces an existing parser. Windows
+    // `rename` instead fails if the destination exists, which would make a
+    // `force` reinstall fail after a good compile — remove the old file
+    // first there (a small non-atomic window, acceptable on the
+    // non-primary platform).
+    #[cfg(windows)]
+    let _ = fs::remove_file(parser_file);
+    if let Err(e) = fs::rename(tmp_file, parser_file) {
+        let _ = fs::remove_file(tmp_file);
+        return Err(ParserInstallError::IoError(e));
+    }
+    Ok(())
+}
+
+/// Remove a parser while preventing an already-running install from publishing later.
+pub fn remove_parser_install(
+    parser_dir: &Path,
+    language: &str,
+) -> Result<bool, ParserInstallError> {
+    if !super::queries::is_safe_language_name(language) {
+        return Err(unsafe_language_name_error(language));
+    }
+    let data_dir = parser_dir.parent().ok_or_else(|| {
+        ParserInstallError::IoError(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "parser directory must have a data-directory parent",
+        ))
+    })?;
+    let _operation_lock = super::LanguageOperationLockGuard::acquire(data_dir, language)?;
+    remove_parser_install_after_operation_started(
+        parser_dir,
+        language,
+        super::LanguageOperationPermit::Language(&_operation_lock),
+    )
+}
+
+/// Remove a parser while the caller holds this language's operation lock.
+#[doc(hidden)]
+pub fn remove_parser_install_after_operation_started(
+    parser_dir: &Path,
+    language: &str,
+    permit: super::LanguageOperationPermit<'_>,
+) -> Result<bool, ParserInstallError> {
+    let Some(data_dir) = parser_dir.parent() else {
+        return Err(ParserInstallError::IoError(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "parser directory must have a data-directory parent",
+        )));
+    };
+    if !permit.covers(data_dir, language) {
+        return Err(ParserInstallError::IoError(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "operation permit does not cover this parser removal",
+        )));
+    }
+    let _replace_lock = ParserReplaceLockGuard::acquire(parser_dir, language)?;
+    let mut marker = fs::File::create(parser_operation_marker_path(parser_dir, language))?;
+    writeln!(marker, "uninstall:{}", ulid::Ulid::new())?;
+    let parser_file = parser_dir.join(format!("{language}.{}", std::env::consts::DLL_EXTENSION));
+    match fs::remove_file(parser_file) {
+        Ok(()) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(ParserInstallError::IoError(error)),
+    }
+}
+
 /// Install a Tree-sitter parser for a language.
 pub fn install_parser(
     language: &str,
     options: &InstallOptions,
 ) -> Result<ParserInstallResult, ParserInstallError> {
+    if !super::queries::is_safe_language_name(language) {
+        return Err(unsafe_language_name_error(language));
+    }
+    let _operation_lock = super::LanguageOperationLockGuard::acquire(&options.data_dir, language)?;
+    install_parser_after_operation_started(
+        language,
+        options,
+        super::LanguageOperationPermit::Language(&_operation_lock),
+    )
+}
+
+/// Install a parser while the caller holds this language's operation lock.
+///
+/// Most callers should use [`install_parser`]. This entry point exists for a
+/// combined parser-and-query operation that must retain one lock across both.
+#[doc(hidden)]
+pub fn install_parser_after_operation_started(
+    language: &str,
+    options: &InstallOptions,
+    permit: super::LanguageOperationPermit<'_>,
+) -> Result<ParserInstallResult, ParserInstallError> {
+    if !permit.covers(&options.data_dir, language) {
+        return Err(ParserInstallError::IoError(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "operation permit does not cover this parser install",
+        )));
+    }
     // `language` becomes path segments (`parser/<language>.<ext>` and the temp
     // file) and a URL/metadata key, so reject traversal-capable names before
     // touching the filesystem. Higher-level callers (auto-install) already gate
     // this, but `install_parser` is a public entry point and must be safe on its
     // own — a name like `../../evil` would otherwise write outside the data dir.
     if !super::queries::is_safe_language_name(language) {
-        return Err(ParserInstallError::IoError(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            format!("unsafe language name '{}'", language.escape_default()),
-        )));
+        return Err(unsafe_language_name_error(language));
     }
 
     let parser_dir = options.data_dir.join("parser");
     let parser_file = parser_dir.join(format!("{}.{}", language, std::env::consts::DLL_EXTENSION));
-
-    // Check if parser already exists
-    if parser_file.exists() && !options.force {
-        return Err(ParserInstallError::AlreadyExists(parser_file));
-    }
+    let install_token = begin_parser_install(&parser_dir, &parser_file, language, options.force)?;
 
     // Fetch metadata (with caching support)
     if options.verbose {
@@ -346,19 +505,7 @@ pub fn install_parser(
         ParserCompile::InProcess => compile_parser_inprocess(&source_dir, &tmp_file),
     };
     match compiled {
-        Ok(()) => {
-            // On unix `rename` atomically replaces an existing parser. Windows
-            // `rename` instead fails if the destination exists, which would make a
-            // `force` reinstall fail after a good compile — remove the old file
-            // first there (a small non-atomic window, acceptable on the
-            // non-primary platform).
-            #[cfg(windows)]
-            let _ = fs::remove_file(&parser_file);
-            if let Err(e) = fs::rename(&tmp_file, &parser_file) {
-                let _ = fs::remove_file(&tmp_file);
-                return Err(ParserInstallError::IoError(e));
-            }
-        }
+        Ok(()) => publish_compiled_parser(&tmp_file, &parser_file, language, &install_token)?,
         Err(e) => {
             let _ = fs::remove_file(&tmp_file);
             return Err(e);
@@ -1383,6 +1530,132 @@ mod tests {
         let result = parser_file_exists("lua", temp.path());
         assert!(result.is_some());
         assert_eq!(result.unwrap(), parser_file);
+    }
+
+    #[test]
+    fn an_already_installed_parser_does_not_supersede_an_inflight_force_install() {
+        let temp = tempdir().expect("temp dir");
+        let parser_dir = temp.path().join("parser");
+        fs::create_dir_all(&parser_dir).expect("create parser dir");
+        let parser_file = parser_dir.join(format!("lua.{}", std::env::consts::DLL_EXTENSION));
+        fs::write(&parser_file, b"installed parser").expect("write installed parser");
+        let first_token = begin_parser_install(&parser_dir, &parser_file, "lua", true)
+            .expect("start force install");
+        let options = InstallOptions {
+            data_dir: temp.path().to_path_buf(),
+            force: false,
+            verbose: false,
+            no_cache: false,
+            compile: ParserCompile::InProcess,
+        };
+
+        let result = install_parser("lua", &options);
+
+        assert!(
+            matches!(result, Err(ParserInstallError::AlreadyExists(path)) if path == parser_file)
+        );
+        assert_eq!(
+            fs::read_to_string(parser_operation_marker_path(&parser_dir, "lua")).unwrap(),
+            first_token,
+            "a no-op install must not cancel the in-flight force install"
+        );
+    }
+
+    #[test]
+    fn uninstall_marker_prevents_staged_parser_publication() {
+        let temp = tempdir().expect("temp dir");
+        let parser_dir = temp.path().join("parser");
+        fs::create_dir_all(&parser_dir).expect("create parser dir");
+        let parser_file = parser_dir.join(format!("lua.{}", std::env::consts::DLL_EXTENSION));
+        let tmp_file = parser_dir.join(".lua.staged.tmp");
+        fs::write(&tmp_file, b"compiled parser").expect("write staged parser");
+        fs::write(parser_operation_marker_path(&parser_dir, "lua"), b"ok\n")
+            .expect("record later uninstall");
+
+        let result = publish_compiled_parser(&tmp_file, &parser_file, "lua", "install:first");
+
+        assert!(
+            matches!(
+                result,
+                Err(ParserInstallError::IoError(ref error))
+                    if error.kind() == std::io::ErrorKind::Interrupted
+            ),
+            "a later uninstall must supersede staged publication: {result:?}"
+        );
+        assert!(!parser_file.exists(), "the parser must remain uninstalled");
+        assert!(!tmp_file.exists(), "the superseded staging file is cleaned");
+    }
+
+    #[test]
+    fn removing_a_missing_parser_still_supersedes_an_inflight_install() {
+        let temp = tempdir().expect("temp dir");
+        let parser_dir = temp.path().join("parser");
+        let parser_file = parser_dir.join(format!("lua.{}", std::env::consts::DLL_EXTENSION));
+        let tmp_file = parser_dir.join(".lua.staged.tmp");
+        fs::create_dir_all(&parser_dir).expect("create parser dir");
+        fs::write(&tmp_file, b"compiled parser").expect("write staged parser");
+        let install_token =
+            begin_parser_install(&parser_dir, &parser_file, "lua", true).expect("start install");
+
+        assert!(!remove_parser_install(&parser_dir, "lua").expect("uninstall succeeds"));
+        let publish = publish_compiled_parser(&tmp_file, &parser_file, "lua", &install_token);
+
+        assert!(
+            matches!(
+                publish,
+                Err(ParserInstallError::IoError(ref error))
+                    if error.kind() == std::io::ErrorKind::Interrupted
+            ),
+            "uninstall must win even when no old parser existed: {publish:?}"
+        );
+        assert!(!parser_file.exists(), "the parser must remain absent");
+    }
+
+    #[test]
+    fn a_later_install_replaces_the_uninstall_marker_with_its_token() {
+        let temp = tempdir().expect("temp dir");
+        let parser_dir = temp.path().join("parser");
+        let parser_file = parser_dir.join(format!("lua.{}", std::env::consts::DLL_EXTENSION));
+        let tmp_file = parser_dir.join(".lua.staged.tmp");
+        remove_parser_install(&parser_dir, "lua").expect("record uninstall");
+        let install_token = begin_parser_install(&parser_dir, &parser_file, "lua", true)
+            .expect("start later install");
+        fs::write(&tmp_file, b"compiled parser").expect("write staged parser");
+
+        publish_compiled_parser(&tmp_file, &parser_file, "lua", &install_token)
+            .expect("later install may publish");
+
+        assert_eq!(fs::read(parser_file).unwrap(), b"compiled parser");
+        assert_eq!(
+            fs::read_to_string(parser_operation_marker_path(&parser_dir, "lua")).unwrap(),
+            install_token
+        );
+    }
+
+    #[test]
+    fn a_later_install_does_not_authorize_an_older_staged_parser() {
+        let temp = tempdir().expect("temp dir");
+        let parser_dir = temp.path().join("parser");
+        let parser_file = parser_dir.join(format!("lua.{}", std::env::consts::DLL_EXTENSION));
+        let first_token = begin_parser_install(&parser_dir, &parser_file, "lua", true)
+            .expect("start first install");
+        remove_parser_install(&parser_dir, "lua").expect("superseding uninstall");
+        begin_parser_install(&parser_dir, &parser_file, "lua", true).expect("start second install");
+        let first_tmp_file = parser_dir.join(".lua.first.staged.tmp");
+        fs::write(&first_tmp_file, b"first parser").expect("stage first parser");
+
+        let first_publish =
+            publish_compiled_parser(&first_tmp_file, &parser_file, "lua", &first_token);
+
+        assert!(
+            matches!(
+                first_publish,
+                Err(ParserInstallError::IoError(ref error))
+                    if error.kind() == std::io::ErrorKind::Interrupted
+            ),
+            "the second install must not clear the first install's supersession: {first_publish:?}"
+        );
+        assert!(!parser_file.exists(), "the stale parser must not publish");
     }
 
     #[test]

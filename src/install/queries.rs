@@ -154,6 +154,8 @@ pub fn install_queries_with_dependencies(
     data_dir: &Path,
     force: bool,
 ) -> Result<QueryInstallResult, QueryInstallError> {
+    validate_safe_language_name(language)?;
+    let _operation_lock = super::AllLanguageOperationsLockGuard::acquire(data_dir)?;
     clear_uninstall_tombstone_for_install(data_dir, language)?;
     install_queries_with_dependencies_from_with_http_policy(
         NVIM_TREESITTER_QUERIES_URL,
@@ -169,6 +171,31 @@ pub fn install_queries_with_dependencies_after_install_started(
     data_dir: &Path,
     force: bool,
 ) -> Result<QueryInstallResult, QueryInstallError> {
+    validate_safe_language_name(language)?;
+    let _operation_lock = super::AllLanguageOperationsLockGuard::acquire(data_dir)?;
+    clear_uninstall_tombstone_for_install(data_dir, language)?;
+    install_queries_with_dependencies_after_install_started_with_permit(
+        language,
+        data_dir,
+        force,
+        super::LanguageOperationPermit::All(&_operation_lock),
+    )
+}
+
+/// Continue query installation while the caller holds the operation lock.
+#[doc(hidden)]
+pub fn install_queries_with_dependencies_after_install_started_with_permit(
+    language: &str,
+    data_dir: &Path,
+    force: bool,
+    permit: super::LanguageOperationPermit<'_>,
+) -> Result<QueryInstallResult, QueryInstallError> {
+    if !permit.covers(data_dir, language) {
+        return Err(QueryInstallError::IoError(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "operation permit does not cover this query install",
+        )));
+    }
     install_queries_with_dependencies_from_with_http_policy(
         NVIM_TREESITTER_QUERIES_URL,
         language,
@@ -476,6 +503,42 @@ fn unique_backup_query_dir(queries_dir: &Path, language: &str) -> PathBuf {
 
 /// Recover query directories stranded by a process exit during replacement.
 pub fn recover_interrupted_query_installs(queries_parent: &Path) -> Result<(), QueryInstallError> {
+    let Some(data_dir) = queries_parent.parent() else {
+        return Err(QueryInstallError::IoError(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "queries directory must have a data-directory parent",
+        )));
+    };
+    match fs::metadata(queries_parent) {
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(QueryInstallError::IoError(error)),
+    }
+    let all_lock = super::AllLanguageOperationsLockGuard::acquire(data_dir)?;
+    recover_interrupted_query_installs_with_permit(
+        queries_parent,
+        super::LanguageOperationPermit::All(&all_lock),
+    )
+}
+
+/// Recover all query installs while the caller holds the all-language lock.
+#[doc(hidden)]
+pub fn recover_interrupted_query_installs_with_permit(
+    queries_parent: &Path,
+    permit: super::LanguageOperationPermit<'_>,
+) -> Result<(), QueryInstallError> {
+    let Some(data_dir) = queries_parent.parent() else {
+        return Err(QueryInstallError::IoError(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "queries directory must have a data-directory parent",
+        )));
+    };
+    if !permit.covers_all(data_dir) {
+        return Err(QueryInstallError::IoError(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "operation permit does not cover all-language query recovery",
+        )));
+    }
     let entries = match fs::read_dir(queries_parent) {
         Ok(entries) => entries,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
@@ -520,6 +583,39 @@ pub fn remove_query_install_and_backups(
     language: &str,
 ) -> Result<QueryRemoval, QueryInstallError> {
     validate_safe_language_name(language)?;
+    let data_dir = queries_parent.parent().ok_or_else(|| {
+        QueryInstallError::IoError(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "queries directory must have a data-directory parent",
+        ))
+    })?;
+    let _operation_lock = super::LanguageOperationLockGuard::acquire(data_dir, language)?;
+    remove_query_install_and_backups_after_operation_started(
+        queries_parent,
+        language,
+        super::LanguageOperationPermit::Language(&_operation_lock),
+    )
+}
+
+/// Remove queries while the caller holds this language's operation lock.
+#[doc(hidden)]
+pub fn remove_query_install_and_backups_after_operation_started(
+    queries_parent: &Path,
+    language: &str,
+    permit: super::LanguageOperationPermit<'_>,
+) -> Result<QueryRemoval, QueryInstallError> {
+    let Some(data_dir) = queries_parent.parent() else {
+        return Err(QueryInstallError::IoError(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "queries directory must have a data-directory parent",
+        )));
+    };
+    if !permit.covers(data_dir, language) {
+        return Err(QueryInstallError::IoError(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "operation permit does not cover this query removal",
+        )));
+    }
     fs::create_dir_all(queries_parent)?;
     let _replace_lock = QueryReplaceLockGuard::acquire(queries_parent, language)?;
     write_uninstall_tombstone(queries_parent, language)?;
@@ -1128,6 +1224,33 @@ mod tests {
     }
 
     #[test]
+    fn compatibility_install_restarts_intent_under_operation_lock() {
+        let temp = TempDir::new().unwrap();
+        let data_dir = temp.path();
+        let queries_parent = data_dir.join("queries");
+        let queries_dir = queries_parent.join("lua");
+        fs::create_dir_all(&queries_dir).unwrap();
+        fs::write(
+            queries_dir.join("highlights.scm"),
+            "(identifier) @variable\n",
+        )
+        .unwrap();
+        write_install_marker_for_tests(&queries_dir).unwrap();
+        write_uninstall_tombstone(&queries_parent, "lua").unwrap();
+
+        let result =
+            install_queries_with_dependencies_after_install_started("lua", data_dir, false);
+
+        assert!(
+            matches!(result, Err(QueryInstallError::AlreadyExists(path)) if path == queries_dir)
+        );
+        assert!(
+            !uninstall_tombstone_path(&queries_parent, "lua").exists(),
+            "the compatibility entry point must establish a new install intent after locking"
+        );
+    }
+
+    #[test]
     fn installed_queries_skip_plain_http_sentinel_base_url() {
         let temp = TempDir::new().unwrap();
         let queries_dir = temp.path().join("queries").join("lua");
@@ -1224,6 +1347,19 @@ mod tests {
         assert!(
             tmp.exists(),
             "generated staging dirs from live installers must not be collected"
+        );
+    }
+
+    #[test]
+    fn recover_interrupted_query_installs_does_not_create_locks_when_absent() {
+        let temp = TempDir::new().unwrap();
+        let queries_parent = temp.path().join("queries");
+
+        recover_interrupted_query_installs(&queries_parent).unwrap();
+
+        assert!(
+            !temp.path().join(".operation-locks").exists(),
+            "no-op recovery must not mutate a fresh data directory"
         );
     }
 

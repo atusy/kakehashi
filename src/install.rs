@@ -28,7 +28,100 @@ pub mod test_helpers {
 
 pub(crate) use parser::parser_file_exists;
 
+use fs4::fs_std::FileExt;
+use std::fs;
 use std::path::PathBuf;
+
+/// Cross-process lock that makes parser and query changes one language operation.
+pub struct LanguageOperationLockGuard {
+    _all_file: fs::File,
+    _file: fs::File,
+    data_dir: PathBuf,
+    language: String,
+}
+
+/// Cross-process exclusive lock for operations that affect every language.
+pub struct AllLanguageOperationsLockGuard {
+    _file: fs::File,
+    data_dir: PathBuf,
+}
+
+/// Proof that the caller holds an operation lock covering one language.
+pub enum LanguageOperationPermit<'a> {
+    Language(&'a LanguageOperationLockGuard),
+    All(&'a AllLanguageOperationsLockGuard),
+}
+
+impl LanguageOperationPermit<'_> {
+    pub(crate) fn covers(&self, data_dir: &std::path::Path, language: &str) -> bool {
+        let Ok(data_dir) = fs::canonicalize(data_dir) else {
+            return false;
+        };
+        match self {
+            Self::Language(guard) => guard.data_dir == data_dir && guard.language == language,
+            Self::All(guard) => guard.data_dir == data_dir,
+        }
+    }
+
+    pub(crate) fn covers_all(&self, data_dir: &std::path::Path) -> bool {
+        let Ok(data_dir) = fs::canonicalize(data_dir) else {
+            return false;
+        };
+        matches!(self, Self::All(guard) if guard.data_dir == data_dir)
+    }
+}
+
+fn open_all_language_operations_lock(data_dir: &std::path::Path) -> std::io::Result<fs::File> {
+    let lock_dir = data_dir.join(".operation-locks");
+    fs::create_dir_all(&lock_dir)?;
+    fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(lock_dir.join(".all.lock"))
+}
+
+impl AllLanguageOperationsLockGuard {
+    /// Exclude every per-language operation while an all-language operation runs.
+    pub fn acquire(data_dir: &std::path::Path) -> std::io::Result<AllLanguageOperationsLockGuard> {
+        let file = open_all_language_operations_lock(data_dir)?;
+        file.lock_exclusive()?;
+        Ok(Self {
+            _file: file,
+            data_dir: fs::canonicalize(data_dir)?,
+        })
+    }
+}
+
+impl LanguageOperationLockGuard {
+    /// Serialize install and uninstall for one language across processes.
+    pub fn acquire(
+        data_dir: &std::path::Path,
+        language: &str,
+    ) -> std::io::Result<LanguageOperationLockGuard> {
+        if !queries::is_safe_language_name(language) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("unsafe language name '{}'", language.escape_default()),
+            ));
+        }
+        let all_file = open_all_language_operations_lock(data_dir)?;
+        all_file.lock_shared()?;
+        let lock_dir = data_dir.join(".operation-locks");
+        let file = fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(lock_dir.join(format!("{language}.lock")))?;
+        file.lock_exclusive()?;
+        Ok(Self {
+            _all_file: all_file,
+            _file: file,
+            data_dir: fs::canonicalize(data_dir)?,
+            language: language.to_string(),
+        })
+    }
+}
 
 /// Get the default data directory for kakehashi.
 ///
@@ -279,6 +372,19 @@ fn install_language_blocking_with_query_installer(
         return result;
     }
 
+    // Query inheritance can publish multiple languages. Hold the all-language
+    // operation lock across parser and query publication so every inherited
+    // parent is ordered against targeted uninstall without lock-order cycles.
+    let _operation_lock = match AllLanguageOperationsLockGuard::acquire(data_dir) {
+        Ok(lock) => lock,
+        Err(error) => {
+            let reason = format!("Failed to lock language operation: {error}");
+            result.parser_error = Some(reason.clone());
+            result.queries_error = Some(reason);
+            return result;
+        }
+    };
+
     if let Err(e) = queries::clear_uninstall_tombstone_for_install(data_dir, language) {
         let reason = e.to_string();
         result.queries_error = Some(reason);
@@ -301,7 +407,11 @@ fn install_language_blocking_with_query_installer(
     // AlreadyExists means the artifact is present and usable — success,
     // not failure; treating it as an error made the auto-install manager
     // degrade a fully-installed language to "installed but with warnings".
-    match parser::install_parser(language, &parser_options) {
+    match parser::install_parser_after_operation_started(
+        language,
+        &parser_options,
+        LanguageOperationPermit::All(&_operation_lock),
+    ) {
         Ok(parser_result) => {
             result.parser_path = Some(parser_result.install_path);
         }
@@ -380,6 +490,73 @@ fn install_language_blocking_allowing_http_queries_for_tests(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn language_operation_lock_serializes_the_same_language() {
+        let temp = tempfile::tempdir().unwrap();
+        let first = LanguageOperationLockGuard::acquire(temp.path(), "lua").unwrap();
+        let second = fs::OpenOptions::new()
+            .write(true)
+            .open(temp.path().join(".operation-locks/lua.lock"))
+            .unwrap();
+        assert!(
+            second.try_lock_exclusive().is_err(),
+            "the same-language lock must be unavailable while held"
+        );
+        drop(first);
+        second
+            .try_lock_exclusive()
+            .expect("the same-language lock becomes available after release");
+    }
+
+    #[test]
+    fn all_language_lock_excludes_per_language_operations() {
+        let temp = tempfile::tempdir().unwrap();
+        let language = LanguageOperationLockGuard::acquire(temp.path(), "lua").unwrap();
+        let all_file = open_all_language_operations_lock(temp.path()).unwrap();
+        assert!(
+            all_file.try_lock_exclusive().is_err(),
+            "an all-language operation must wait for an active language operation"
+        );
+        drop(language);
+        all_file
+            .try_lock_exclusive()
+            .expect("the all-language lock becomes available after the language operation");
+    }
+
+    #[test]
+    fn operation_permit_is_bound_to_its_scope() {
+        let temp = tempfile::tempdir().unwrap();
+        let other = tempfile::tempdir().unwrap();
+        let language = LanguageOperationLockGuard::acquire(temp.path(), "lua").unwrap();
+        let permit = LanguageOperationPermit::Language(&language);
+        assert!(permit.covers(temp.path(), "lua"));
+        assert!(!permit.covers(temp.path(), "python"));
+        assert!(!permit.covers(other.path(), "lua"));
+        drop(language);
+
+        let all = AllLanguageOperationsLockGuard::acquire(temp.path()).unwrap();
+        let permit = LanguageOperationPermit::All(&all);
+        assert!(permit.covers(temp.path(), "lua"));
+        assert!(permit.covers(temp.path(), "python"));
+        assert!(!permit.covers(other.path(), "lua"));
+    }
+
+    #[test]
+    fn operation_permit_uses_canonical_directory_identity() {
+        let temp = tempfile::tempdir().unwrap();
+        let data_dir = temp.path().join("data");
+        fs::create_dir_all(&data_dir).unwrap();
+        let equivalent = data_dir.join("nested/..");
+        fs::create_dir_all(data_dir.join("nested")).unwrap();
+
+        let language = LanguageOperationLockGuard::acquire(&equivalent, "lua").unwrap();
+        let permit = LanguageOperationPermit::Language(&language);
+        assert!(
+            permit.covers(&data_dir, "lua"),
+            "equivalent path spellings must identify the same locked directory"
+        );
+    }
 
     #[test]
     fn test_default_data_dir_returns_some() {

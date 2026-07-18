@@ -1239,9 +1239,20 @@ fn test_language_uninstall_all() {
         String::from_utf8_lossy(&output.stderr)
     );
 
-    // All parsers should be removed
+    // All parser shared libraries should be removed; internal lock/operation-marker
+    // files may remain hidden under parser/.
     let parsers: Vec<_> = fs::read_dir(test_dir.path().join("parser"))
-        .map(|entries| entries.filter_map(|e| e.ok()).collect())
+        .map(|entries| {
+            entries
+                .filter_map(|e| e.ok())
+                .filter(|entry| {
+                    entry
+                        .file_name()
+                        .to_str()
+                        .is_none_or(|name| !name.starts_with('.'))
+                })
+                .collect()
+        })
         .unwrap_or_default();
     assert!(parsers.is_empty(), "All parsers should be removed");
 
