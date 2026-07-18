@@ -27,10 +27,15 @@ class RequestSummaryTest(unittest.TestCase):
     def test_capture_result_validates_full_and_delta_lineage(self):
         self.assertEqual(capture_result_id({
             "result": {"resultId": "full", "matches": [], "skipped": []}
-        }), "full")
+        }, expected_shape="full"), "full")
         self.assertEqual(capture_result_id({
             "result": {"resultId": "delta", "edits": []}
-        }), "delta")
+        }, expected_shape="delta"), "delta")
+        with self.assertRaisesRegex(RuntimeError, "expected delta"):
+            capture_result_id(
+                {"result": {"resultId": "fallback", "matches": [], "skipped": []}},
+                expected_shape="delta",
+            )
         with self.assertRaisesRegex(RuntimeError, "advance capture lineage"):
             capture_result_id(
                 {"result": {"resultId": "same", "edits": []}},
