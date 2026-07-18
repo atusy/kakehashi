@@ -36,11 +36,11 @@ of Tree-sitter computation and caches.
 * The collector removed ambient Rust/kakehashi behavior overrides and retained
   only the recorded path, temporary-directory, locale, and loader variables.
 
-For each steady-state scenario, direct and relay order alternated across 10
-independent process pairs. Cache-hit runs first issued one unmeasured warmup,
-then 1,000 measured requests per process;
+For each steady-state scenario, direct and relay order alternated across 20
+independent process pairs collected in two 10-pair batches. Cache-hit runs first
+issued one unmeasured warmup, then 1,000 measured requests per process;
 edit runs issued 100 requests per process. Reported confidence intervals are a
-deterministic paired bootstrap over the 10 run-level summaries. Percentiles are
+deterministic paired bootstrap over the 20 run-level summaries. Percentiles are
 rounded to 0.1 ms by the driver, so sub-0.1-ms percentile differences are below
 its reporting resolution.
 
@@ -51,19 +51,19 @@ its reporting resolution.
 | Scenario | Metric | Direct mean | Relay mean | Paired delta | 95% CI for delta |
 |---|---:|---:|---:|---:|---:|
 | Rust small, unchanged cache hit | p50 | 0.40 ms | 0.41 ms | +0.01 ms | [0.00, 0.03] ms |
-| Rust small, unchanged cache hit | p95 | 0.45 ms | 0.50 ms | +0.05 ms | [0.02, 0.08] ms |
+| Rust small, unchanged cache hit | p95 | 0.45 ms | 0.50 ms | +0.06 ms | [0.04, 0.08] ms |
 | Rust small, unchanged cache hit | p99 | 0.49 ms | 0.50 ms | +0.01 ms | [0.00, 0.03] ms |
-| Rust small, one edit/request | p50 | 1.62 ms | 1.65 ms | +0.03 ms | [-0.01, 0.07] ms |
-| Rust small, one edit/request | p95 | 1.72 ms | 1.75 ms | +0.03 ms | [-0.01, 0.07] ms |
-| Rust small, one edit/request | p99 | 1.80 ms | 1.84 ms | +0.04 ms | [-0.04, 0.12] ms |
-| Markdown injections, one edit/request | p50 | 3.42 ms | 3.39 ms | -0.03 ms | [-0.13, 0.05] ms |
-| Markdown injections, one edit/request | p95 | 3.55 ms | 3.56 ms | +0.01 ms | [-0.10, 0.09] ms |
-| Markdown injections, one edit/request | p99 | 3.64 ms | 3.68 ms | +0.04 ms | [-0.08, 0.14] ms |
+| Rust small, one edit/request | p50 | 1.64 ms | 1.65 ms | +0.02 ms | [-0.01, 0.04] ms |
+| Rust small, one edit/request | p95 | 1.74 ms | 1.76 ms | +0.03 ms | [-0.01, 0.05] ms |
+| Rust small, one edit/request | p99 | 1.89 ms | 1.85 ms | -0.04 ms | [-0.22, 0.08] ms |
+| Markdown injections, one edit/request | p50 | 3.43 ms | 3.45 ms | +0.03 ms | [-0.05, 0.09] ms |
+| Markdown injections, one edit/request | p95 | 3.61 ms | 3.73 ms | +0.12 ms | [0.005, 0.255] ms |
+| Markdown injections, one edit/request | p99 | 3.70 ms | 3.95 ms | +0.26 ms | [0.03, 0.61] ms |
 
-The cache-hit p95 interval excludes zero, consistent with a small relay cost;
-the other tail-latency intervals do not distinguish the relay from run-level
-scheduling noise at the driver's reporting resolution. This concrete relay
-cost is not a bound on the future worker protocol.
+The cache-hit p95 and Markdown p95/p99 intervals exclude zero, consistent with
+small relay tail costs. The other tail-latency intervals do not distinguish the
+relay from run-level scheduling noise at the driver's reporting resolution.
+These concrete relay costs are not bounds on the future worker protocol.
 
 ### Throughput-sensitive cache-hit path
 
@@ -72,8 +72,8 @@ The cache-hit path transferred approximately 14.0 MiB of response bodies per
 
 | Metric | Direct mean | Relay mean | Paired delta | 95% CI for delta |
 |---|---:|---:|---:|---:|
-| Wall time / 1,000 requests | 424.6 ms | 438.3 ms | +13.7 ms (+3.2%) | [4.6, 26.0] ms |
-| Amortized extra wall time | — | — | +13.7 µs/request | [4.6, 26.0] µs/request |
+| Wall time / 1,000 requests | 427.4 ms | 441.5 ms | +14.1 ms (+3.3%) | [7.9, 21.7] ms |
+| Amortized extra wall time | — | — | +14.1 µs/request | [7.9, 21.7] µs/request |
 
 This is the most sensitive raw-relay estimate in this experiment. It is neither
 a lower nor an upper bound for the future worker transport: the Python
@@ -87,8 +87,8 @@ end-to-end cycle times are nevertheless disclosed below.
 
 | Scenario | Direct / 100 cycles | Relay / 100 cycles | Paired delta | 95% CI for delta |
 |---|---:|---:|---:|---:|
-| Rust small | 1490.1 ms | 1510.7 ms | +20.6 ms (+206 µs/cycle) | [8.2, 32.2] ms |
-| Markdown injections | 1684.5 ms | 1678.3 ms | -6.2 ms (-62 µs/cycle) | [-13.7, 1.4] ms |
+| Rust small | 1486.3 ms | 1512.0 ms | +25.7 ms (+257 µs/cycle) | [16.5, 35.3] ms |
+| Markdown injections | 1684.7 ms | 1689.7 ms | +5.1 ms (+51 µs/cycle) | [-7.3, 18.5] ms |
 
 The Rust interval excludes zero, but this experiment cannot attribute the
 difference to pipe transport: every cycle includes the fixed edit-settle delay,
@@ -125,7 +125,7 @@ used as a smoke test, not an independently repeated result:
 This particular raw process/pipe relay did not expose a clear steady-state
 transport blocker on this machine. Its median and p95 costs were at or below the
 driver's 0.1-ms reporting resolution, while the most sensitive cache-hit
-throughput run estimated about 13.7 microseconds of amortized extra wall time
+throughput run estimated about 14.1 microseconds of amortized extra wall time
 per request. The actual Stage 1 worker cost may be above or below that relay
 delta.
 
@@ -150,7 +150,7 @@ matrix.
 ## Reproduction
 
 The tail-percentile driver and relay are in `benches/profile/drive.py` and
-`benches/profile/worker_proxy.py`. The 10 paired run summaries, execution order,
+`benches/profile/worker_proxy.py`. The 20 paired run summaries, execution order,
 commands, environment, artifact-tree digest, cold-start result, and captures
 pilot are committed in
 `benches/profile/results/single_worker_phase0_2026-07-18.json`. Recompute every
@@ -160,13 +160,13 @@ steady-state table value and confidence interval with:
 python3 benches/profile/analyze_worker_proxy.py
 ```
 
-The July 19 steady-state section was written directly by the collector below;
+The July 19 steady-state section combines two collector batches;
 it preserves every run summary and status count but not each raw stderr stream.
 The July 18 cold-start and captures-pilot sections predate that recollection.
 The cold-start section preserves all 20 timing samples and is recomputed by the
 same analyzer; the single captures pilot remains a smoke test only.
 
-Collect a new alternating 10-pair steady-state dataset without hand
+Collect a new alternating 10-pair steady-state batch without hand
 transcription using:
 
 ```sh

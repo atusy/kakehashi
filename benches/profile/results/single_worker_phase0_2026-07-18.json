@@ -14,8 +14,8 @@
     "release_binary_commit": "ccbd8ffd13c4817eda62e1de6f8cfd3eeb3259d0",
     "release_binary_sha256": "4ea51e25b3bbe30360772789996ff4076c4f01e84663975c0a71004e4501cf5a",
     "origin_main_commit": "a1278be5fdff24d109d9e03134c6bdb880577f64",
-    "parser_query_file_count": 28,
-    "parser_query_tree_sha256": "3258dea73fef01a75ad7dcf3c513fbc83ec5702c27b255b0feb882f59b208cc7",
+    "parser_query_file_count": 25,
+    "parser_query_tree_sha256": "1572967b352c7b24ec872bff02c3c9808374a0d5cab2c707368cb5f32be58115",
     "platform": "macOS-26.5.1-arm64-arm-64bit",
     "cpu_model": "Apple M4",
     "estimated_tree_compute_budget": 8,
@@ -31,8 +31,9 @@
     }
   },
   "collector": {
-    "pairs": 10,
-    "order": "direct-relay on odd runs; relay-direct on even runs"
+    "pairs": 20,
+    "order": "direct-relay on odd runs; relay-direct on even runs",
+    "batches": 2
   },
   "steady_state": {
     "rust_cache_hit": {
@@ -363,6 +364,326 @@
             "p99": 0.5,
             "max": 0.5,
             "wall": 424.0,
+            "wire_kib": 14295.8
+          }
+        },
+        {
+          "run": 11,
+          "order": "direct-relay",
+          "direct": {
+            "count": 1000,
+            "ok": 1000,
+            "canceled": 0,
+            "null": 0,
+            "errors": 0,
+            "p50": 0.4,
+            "p90": 0.4,
+            "p95": 0.4,
+            "p99": 0.4,
+            "max": 0.5,
+            "wall": 395.0,
+            "wire_kib": 14295.8
+          },
+          "relay": {
+            "count": 1000,
+            "ok": 1000,
+            "canceled": 0,
+            "null": 0,
+            "errors": 0,
+            "p50": 0.4,
+            "p90": 0.5,
+            "p95": 0.5,
+            "p99": 0.5,
+            "max": 0.5,
+            "wall": 449.0,
+            "wire_kib": 14295.8
+          }
+        },
+        {
+          "run": 12,
+          "order": "relay-direct",
+          "relay": {
+            "count": 1000,
+            "ok": 1000,
+            "canceled": 0,
+            "null": 0,
+            "errors": 0,
+            "p50": 0.5,
+            "p90": 0.5,
+            "p95": 0.5,
+            "p99": 0.5,
+            "max": 0.5,
+            "wall": 460.0,
+            "wire_kib": 14295.8
+          },
+          "direct": {
+            "count": 1000,
+            "ok": 1000,
+            "canceled": 0,
+            "null": 0,
+            "errors": 0,
+            "p50": 0.4,
+            "p90": 0.5,
+            "p95": 0.5,
+            "p99": 0.5,
+            "max": 0.6,
+            "wall": 446.0,
+            "wire_kib": 14295.8
+          }
+        },
+        {
+          "run": 13,
+          "order": "direct-relay",
+          "direct": {
+            "count": 1000,
+            "ok": 1000,
+            "canceled": 0,
+            "null": 0,
+            "errors": 0,
+            "p50": 0.4,
+            "p90": 0.4,
+            "p95": 0.4,
+            "p99": 0.5,
+            "max": 0.5,
+            "wall": 443.0,
+            "wire_kib": 14295.8
+          },
+          "relay": {
+            "count": 1000,
+            "ok": 1000,
+            "canceled": 0,
+            "null": 0,
+            "errors": 0,
+            "p50": 0.4,
+            "p90": 0.5,
+            "p95": 0.5,
+            "p99": 0.5,
+            "max": 0.5,
+            "wall": 451.0,
+            "wire_kib": 14295.8
+          }
+        },
+        {
+          "run": 14,
+          "order": "relay-direct",
+          "relay": {
+            "count": 1000,
+            "ok": 1000,
+            "canceled": 0,
+            "null": 0,
+            "errors": 0,
+            "p50": 0.4,
+            "p90": 0.5,
+            "p95": 0.5,
+            "p99": 0.5,
+            "max": 0.5,
+            "wall": 439.0,
+            "wire_kib": 14295.8
+          },
+          "direct": {
+            "count": 1000,
+            "ok": 1000,
+            "canceled": 0,
+            "null": 0,
+            "errors": 0,
+            "p50": 0.4,
+            "p90": 0.4,
+            "p95": 0.4,
+            "p99": 0.5,
+            "max": 0.5,
+            "wall": 424.0,
+            "wire_kib": 14295.8
+          }
+        },
+        {
+          "run": 15,
+          "order": "direct-relay",
+          "direct": {
+            "count": 1000,
+            "ok": 1000,
+            "canceled": 0,
+            "null": 0,
+            "errors": 0,
+            "p50": 0.4,
+            "p90": 0.4,
+            "p95": 0.4,
+            "p99": 0.5,
+            "max": 0.5,
+            "wall": 434.0,
+            "wire_kib": 14295.8
+          },
+          "relay": {
+            "count": 1000,
+            "ok": 1000,
+            "canceled": 0,
+            "null": 0,
+            "errors": 0,
+            "p50": 0.4,
+            "p90": 0.5,
+            "p95": 0.5,
+            "p99": 0.5,
+            "max": 0.5,
+            "wall": 446.0,
+            "wire_kib": 14295.8
+          }
+        },
+        {
+          "run": 16,
+          "order": "relay-direct",
+          "relay": {
+            "count": 1000,
+            "ok": 1000,
+            "canceled": 0,
+            "null": 0,
+            "errors": 0,
+            "p50": 0.4,
+            "p90": 0.5,
+            "p95": 0.5,
+            "p99": 0.5,
+            "max": 0.5,
+            "wall": 444.0,
+            "wire_kib": 14295.8
+          },
+          "direct": {
+            "count": 1000,
+            "ok": 1000,
+            "canceled": 0,
+            "null": 0,
+            "errors": 0,
+            "p50": 0.4,
+            "p90": 0.4,
+            "p95": 0.5,
+            "p99": 0.5,
+            "max": 0.5,
+            "wall": 427.0,
+            "wire_kib": 14295.8
+          }
+        },
+        {
+          "run": 17,
+          "order": "direct-relay",
+          "direct": {
+            "count": 1000,
+            "ok": 1000,
+            "canceled": 0,
+            "null": 0,
+            "errors": 0,
+            "p50": 0.4,
+            "p90": 0.4,
+            "p95": 0.5,
+            "p99": 0.5,
+            "max": 0.5,
+            "wall": 432.0,
+            "wire_kib": 14295.8
+          },
+          "relay": {
+            "count": 1000,
+            "ok": 1000,
+            "canceled": 0,
+            "null": 0,
+            "errors": 0,
+            "p50": 0.4,
+            "p90": 0.5,
+            "p95": 0.5,
+            "p99": 0.5,
+            "max": 0.5,
+            "wall": 434.0,
+            "wire_kib": 14295.8
+          }
+        },
+        {
+          "run": 18,
+          "order": "relay-direct",
+          "relay": {
+            "count": 1000,
+            "ok": 1000,
+            "canceled": 0,
+            "null": 0,
+            "errors": 0,
+            "p50": 0.4,
+            "p90": 0.5,
+            "p95": 0.5,
+            "p99": 0.5,
+            "max": 0.5,
+            "wall": 443.0,
+            "wire_kib": 14295.8
+          },
+          "direct": {
+            "count": 1000,
+            "ok": 1000,
+            "canceled": 0,
+            "null": 0,
+            "errors": 0,
+            "p50": 0.4,
+            "p90": 0.4,
+            "p95": 0.4,
+            "p99": 0.5,
+            "max": 0.5,
+            "wall": 434.0,
+            "wire_kib": 14295.8
+          }
+        },
+        {
+          "run": 19,
+          "order": "direct-relay",
+          "direct": {
+            "count": 1000,
+            "ok": 1000,
+            "canceled": 0,
+            "null": 0,
+            "errors": 0,
+            "p50": 0.4,
+            "p90": 0.4,
+            "p95": 0.4,
+            "p99": 0.5,
+            "max": 0.5,
+            "wall": 430.0,
+            "wire_kib": 14295.8
+          },
+          "relay": {
+            "count": 1000,
+            "ok": 1000,
+            "canceled": 0,
+            "null": 0,
+            "errors": 0,
+            "p50": 0.4,
+            "p90": 0.5,
+            "p95": 0.5,
+            "p99": 0.5,
+            "max": 0.5,
+            "wall": 439.0,
+            "wire_kib": 14295.8
+          }
+        },
+        {
+          "run": 20,
+          "order": "relay-direct",
+          "relay": {
+            "count": 1000,
+            "ok": 1000,
+            "canceled": 0,
+            "null": 0,
+            "errors": 0,
+            "p50": 0.4,
+            "p90": 0.5,
+            "p95": 0.5,
+            "p99": 0.5,
+            "max": 0.5,
+            "wall": 441.0,
+            "wire_kib": 14295.8
+          },
+          "direct": {
+            "count": 1000,
+            "ok": 1000,
+            "canceled": 0,
+            "null": 0,
+            "errors": 0,
+            "p50": 0.4,
+            "p90": 0.5,
+            "p95": 0.5,
+            "p99": 0.5,
+            "max": 0.5,
+            "wall": 437.0,
             "wire_kib": 14295.8
           }
         }
@@ -699,6 +1020,326 @@
             "wall": 1491.0,
             "wire_kib": 1430.1
           }
+        },
+        {
+          "run": 11,
+          "order": "direct-relay",
+          "direct": {
+            "count": 100,
+            "ok": 100,
+            "canceled": 0,
+            "null": 0,
+            "errors": 0,
+            "p50": 1.7,
+            "p90": 1.7,
+            "p95": 1.8,
+            "p99": 2.0,
+            "max": 2.1,
+            "wall": 1492.0,
+            "wire_kib": 1430.1
+          },
+          "relay": {
+            "count": 100,
+            "ok": 100,
+            "canceled": 0,
+            "null": 0,
+            "errors": 0,
+            "p50": 1.7,
+            "p90": 1.8,
+            "p95": 1.8,
+            "p99": 2.1,
+            "max": 2.2,
+            "wall": 1566.0,
+            "wire_kib": 1430.1
+          }
+        },
+        {
+          "run": 12,
+          "order": "relay-direct",
+          "relay": {
+            "count": 100,
+            "ok": 100,
+            "canceled": 0,
+            "null": 0,
+            "errors": 0,
+            "p50": 1.7,
+            "p90": 1.7,
+            "p95": 1.8,
+            "p99": 1.8,
+            "max": 2.0,
+            "wall": 1498.0,
+            "wire_kib": 1430.1
+          },
+          "direct": {
+            "count": 100,
+            "ok": 100,
+            "canceled": 0,
+            "null": 0,
+            "errors": 0,
+            "p50": 1.7,
+            "p90": 1.7,
+            "p95": 1.7,
+            "p99": 1.9,
+            "max": 2.0,
+            "wall": 1479.0,
+            "wire_kib": 1430.1
+          }
+        },
+        {
+          "run": 13,
+          "order": "direct-relay",
+          "direct": {
+            "count": 100,
+            "ok": 100,
+            "canceled": 0,
+            "null": 0,
+            "errors": 0,
+            "p50": 1.7,
+            "p90": 1.8,
+            "p95": 1.9,
+            "p99": 3.3,
+            "max": 6.0,
+            "wall": 1485.0,
+            "wire_kib": 1430.1
+          },
+          "relay": {
+            "count": 100,
+            "ok": 100,
+            "canceled": 0,
+            "null": 0,
+            "errors": 0,
+            "p50": 1.6,
+            "p90": 1.7,
+            "p95": 1.8,
+            "p99": 1.8,
+            "max": 2.0,
+            "wall": 1522.0,
+            "wire_kib": 1430.1
+          }
+        },
+        {
+          "run": 14,
+          "order": "relay-direct",
+          "relay": {
+            "count": 100,
+            "ok": 100,
+            "canceled": 0,
+            "null": 0,
+            "errors": 0,
+            "p50": 1.7,
+            "p90": 1.8,
+            "p95": 1.8,
+            "p99": 1.9,
+            "max": 2.0,
+            "wall": 1541.0,
+            "wire_kib": 1430.1
+          },
+          "direct": {
+            "count": 100,
+            "ok": 100,
+            "canceled": 0,
+            "null": 0,
+            "errors": 0,
+            "p50": 1.6,
+            "p90": 1.7,
+            "p95": 1.7,
+            "p99": 1.7,
+            "max": 2.1,
+            "wall": 1481.0,
+            "wire_kib": 1430.1
+          }
+        },
+        {
+          "run": 15,
+          "order": "direct-relay",
+          "direct": {
+            "count": 100,
+            "ok": 100,
+            "canceled": 0,
+            "null": 0,
+            "errors": 0,
+            "p50": 1.7,
+            "p90": 1.7,
+            "p95": 1.8,
+            "p99": 1.8,
+            "max": 2.2,
+            "wall": 1508.0,
+            "wire_kib": 1430.1
+          },
+          "relay": {
+            "count": 100,
+            "ok": 100,
+            "canceled": 0,
+            "null": 0,
+            "errors": 0,
+            "p50": 1.7,
+            "p90": 1.7,
+            "p95": 1.8,
+            "p99": 1.9,
+            "max": 2.1,
+            "wall": 1508.0,
+            "wire_kib": 1430.1
+          }
+        },
+        {
+          "run": 16,
+          "order": "relay-direct",
+          "relay": {
+            "count": 100,
+            "ok": 100,
+            "canceled": 0,
+            "null": 0,
+            "errors": 0,
+            "p50": 1.7,
+            "p90": 1.7,
+            "p95": 1.8,
+            "p99": 1.9,
+            "max": 2.2,
+            "wall": 1490.0,
+            "wire_kib": 1430.1
+          },
+          "direct": {
+            "count": 100,
+            "ok": 100,
+            "canceled": 0,
+            "null": 0,
+            "errors": 0,
+            "p50": 1.7,
+            "p90": 1.7,
+            "p95": 1.8,
+            "p99": 1.8,
+            "max": 1.9,
+            "wall": 1477.0,
+            "wire_kib": 1430.1
+          }
+        },
+        {
+          "run": 17,
+          "order": "direct-relay",
+          "direct": {
+            "count": 100,
+            "ok": 100,
+            "canceled": 0,
+            "null": 0,
+            "errors": 0,
+            "p50": 1.6,
+            "p90": 1.7,
+            "p95": 1.7,
+            "p99": 1.7,
+            "max": 2.1,
+            "wall": 1496.0,
+            "wire_kib": 1430.1
+          },
+          "relay": {
+            "count": 100,
+            "ok": 100,
+            "canceled": 0,
+            "null": 0,
+            "errors": 0,
+            "p50": 1.6,
+            "p90": 1.7,
+            "p95": 1.7,
+            "p99": 1.8,
+            "max": 2.2,
+            "wall": 1510.0,
+            "wire_kib": 1430.1
+          }
+        },
+        {
+          "run": 18,
+          "order": "relay-direct",
+          "relay": {
+            "count": 100,
+            "ok": 100,
+            "canceled": 0,
+            "null": 0,
+            "errors": 0,
+            "p50": 1.6,
+            "p90": 1.7,
+            "p95": 1.8,
+            "p99": 1.9,
+            "max": 1.9,
+            "wall": 1502.0,
+            "wire_kib": 1430.1
+          },
+          "direct": {
+            "count": 100,
+            "ok": 100,
+            "canceled": 0,
+            "null": 0,
+            "errors": 0,
+            "p50": 1.6,
+            "p90": 1.7,
+            "p95": 1.7,
+            "p99": 1.9,
+            "max": 2.0,
+            "wall": 1456.0,
+            "wire_kib": 1430.1
+          }
+        },
+        {
+          "run": 19,
+          "order": "direct-relay",
+          "direct": {
+            "count": 100,
+            "ok": 100,
+            "canceled": 0,
+            "null": 0,
+            "errors": 0,
+            "p50": 1.6,
+            "p90": 1.7,
+            "p95": 1.7,
+            "p99": 1.8,
+            "max": 1.9,
+            "wall": 1471.0,
+            "wire_kib": 1430.1
+          },
+          "relay": {
+            "count": 100,
+            "ok": 100,
+            "canceled": 0,
+            "null": 0,
+            "errors": 0,
+            "p50": 1.6,
+            "p90": 1.7,
+            "p95": 1.7,
+            "p99": 1.7,
+            "max": 1.9,
+            "wall": 1485.0,
+            "wire_kib": 1430.1
+          }
+        },
+        {
+          "run": 20,
+          "order": "relay-direct",
+          "relay": {
+            "count": 100,
+            "ok": 100,
+            "canceled": 0,
+            "null": 0,
+            "errors": 0,
+            "p50": 1.6,
+            "p90": 1.7,
+            "p95": 1.7,
+            "p99": 1.8,
+            "max": 1.9,
+            "wall": 1510.0,
+            "wire_kib": 1430.1
+          },
+          "direct": {
+            "count": 100,
+            "ok": 100,
+            "canceled": 0,
+            "null": 0,
+            "errors": 0,
+            "p50": 1.6,
+            "p90": 1.7,
+            "p95": 1.7,
+            "p99": 1.8,
+            "max": 1.9,
+            "wall": 1479.0,
+            "wire_kib": 1430.1
+          }
         }
       ]
     },
@@ -1033,6 +1674,326 @@
             "wall": 1674.0,
             "wire_kib": 3858.5
           }
+        },
+        {
+          "run": 11,
+          "order": "direct-relay",
+          "direct": {
+            "count": 100,
+            "ok": 100,
+            "canceled": 0,
+            "null": 0,
+            "errors": 0,
+            "p50": 3.4,
+            "p90": 3.8,
+            "p95": 3.8,
+            "p99": 3.8,
+            "max": 5.4,
+            "wall": 1711.0,
+            "wire_kib": 3858.5
+          },
+          "relay": {
+            "count": 100,
+            "ok": 100,
+            "canceled": 0,
+            "null": 0,
+            "errors": 0,
+            "p50": 3.5,
+            "p90": 3.8,
+            "p95": 3.8,
+            "p99": 3.9,
+            "max": 6.6,
+            "wall": 1707.0,
+            "wire_kib": 3858.5
+          }
+        },
+        {
+          "run": 12,
+          "order": "relay-direct",
+          "relay": {
+            "count": 100,
+            "ok": 100,
+            "canceled": 0,
+            "null": 0,
+            "errors": 0,
+            "p50": 3.4,
+            "p90": 3.8,
+            "p95": 3.8,
+            "p99": 4.0,
+            "max": 5.6,
+            "wall": 1698.0,
+            "wire_kib": 3858.5
+          },
+          "direct": {
+            "count": 100,
+            "ok": 100,
+            "canceled": 0,
+            "null": 0,
+            "errors": 0,
+            "p50": 3.4,
+            "p90": 3.5,
+            "p95": 3.5,
+            "p99": 3.5,
+            "max": 6.0,
+            "wall": 1675.0,
+            "wire_kib": 3858.5
+          }
+        },
+        {
+          "run": 13,
+          "order": "direct-relay",
+          "direct": {
+            "count": 100,
+            "ok": 100,
+            "canceled": 0,
+            "null": 0,
+            "errors": 0,
+            "p50": 3.4,
+            "p90": 3.6,
+            "p95": 3.7,
+            "p99": 3.9,
+            "max": 6.1,
+            "wall": 1691.0,
+            "wire_kib": 3858.5
+          },
+          "relay": {
+            "count": 100,
+            "ok": 100,
+            "canceled": 0,
+            "null": 0,
+            "errors": 0,
+            "p50": 3.5,
+            "p90": 3.9,
+            "p95": 3.9,
+            "p99": 4.0,
+            "max": 5.9,
+            "wall": 1686.0,
+            "wire_kib": 3858.5
+          }
+        },
+        {
+          "run": 14,
+          "order": "relay-direct",
+          "relay": {
+            "count": 100,
+            "ok": 100,
+            "canceled": 0,
+            "null": 0,
+            "errors": 0,
+            "p50": 3.4,
+            "p90": 3.6,
+            "p95": 3.8,
+            "p99": 3.9,
+            "max": 6.1,
+            "wall": 1659.0,
+            "wire_kib": 3858.5
+          },
+          "direct": {
+            "count": 100,
+            "ok": 100,
+            "canceled": 0,
+            "null": 0,
+            "errors": 0,
+            "p50": 3.6,
+            "p90": 3.9,
+            "p95": 3.9,
+            "p99": 4.0,
+            "max": 6.0,
+            "wall": 1713.0,
+            "wire_kib": 3858.5
+          }
+        },
+        {
+          "run": 15,
+          "order": "direct-relay",
+          "direct": {
+            "count": 100,
+            "ok": 100,
+            "canceled": 0,
+            "null": 0,
+            "errors": 0,
+            "p50": 3.4,
+            "p90": 3.5,
+            "p95": 3.6,
+            "p99": 3.6,
+            "max": 6.2,
+            "wall": 1698.0,
+            "wire_kib": 3858.5
+          },
+          "relay": {
+            "count": 100,
+            "ok": 100,
+            "canceled": 0,
+            "null": 0,
+            "errors": 0,
+            "p50": 3.5,
+            "p90": 3.6,
+            "p95": 3.6,
+            "p99": 3.6,
+            "max": 5.8,
+            "wall": 1720.0,
+            "wire_kib": 3858.5
+          }
+        },
+        {
+          "run": 16,
+          "order": "relay-direct",
+          "relay": {
+            "count": 100,
+            "ok": 100,
+            "canceled": 0,
+            "null": 0,
+            "errors": 0,
+            "p50": 3.8,
+            "p90": 4.5,
+            "p95": 4.8,
+            "p99": 7.2,
+            "max": 38.0,
+            "wall": 1740.0,
+            "wire_kib": 3858.5
+          },
+          "direct": {
+            "count": 100,
+            "ok": 100,
+            "canceled": 0,
+            "null": 0,
+            "errors": 0,
+            "p50": 3.5,
+            "p90": 3.5,
+            "p95": 3.8,
+            "p99": 4.1,
+            "max": 6.1,
+            "wall": 1666.0,
+            "wire_kib": 3858.5
+          }
+        },
+        {
+          "run": 17,
+          "order": "direct-relay",
+          "direct": {
+            "count": 100,
+            "ok": 100,
+            "canceled": 0,
+            "null": 0,
+            "errors": 0,
+            "p50": 3.4,
+            "p90": 3.7,
+            "p95": 3.7,
+            "p99": 3.8,
+            "max": 6.4,
+            "wall": 1697.0,
+            "wire_kib": 3858.5
+          },
+          "relay": {
+            "count": 100,
+            "ok": 100,
+            "canceled": 0,
+            "null": 0,
+            "errors": 0,
+            "p50": 3.5,
+            "p90": 3.5,
+            "p95": 3.6,
+            "p99": 3.7,
+            "max": 6.1,
+            "wall": 1691.0,
+            "wire_kib": 3858.5
+          }
+        },
+        {
+          "run": 18,
+          "order": "relay-direct",
+          "relay": {
+            "count": 100,
+            "ok": 100,
+            "canceled": 0,
+            "null": 0,
+            "errors": 0,
+            "p50": 3.4,
+            "p90": 3.6,
+            "p95": 3.9,
+            "p99": 4.0,
+            "max": 6.0,
+            "wall": 1685.0,
+            "wire_kib": 3858.5
+          },
+          "direct": {
+            "count": 100,
+            "ok": 100,
+            "canceled": 0,
+            "null": 0,
+            "errors": 0,
+            "p50": 3.4,
+            "p90": 3.5,
+            "p95": 3.5,
+            "p99": 3.6,
+            "max": 6.6,
+            "wall": 1675.0,
+            "wire_kib": 3858.5
+          }
+        },
+        {
+          "run": 19,
+          "order": "direct-relay",
+          "direct": {
+            "count": 100,
+            "ok": 100,
+            "canceled": 0,
+            "null": 0,
+            "errors": 0,
+            "p50": 3.4,
+            "p90": 3.5,
+            "p95": 3.5,
+            "p99": 3.6,
+            "max": 5.8,
+            "wall": 1664.0,
+            "wire_kib": 3858.5
+          },
+          "relay": {
+            "count": 100,
+            "ok": 100,
+            "canceled": 0,
+            "null": 0,
+            "errors": 0,
+            "p50": 3.4,
+            "p90": 3.5,
+            "p95": 3.5,
+            "p99": 3.6,
+            "max": 5.8,
+            "wall": 1693.0,
+            "wire_kib": 3858.5
+          }
+        },
+        {
+          "run": 20,
+          "order": "relay-direct",
+          "relay": {
+            "count": 100,
+            "ok": 100,
+            "canceled": 0,
+            "null": 0,
+            "errors": 0,
+            "p50": 3.7,
+            "p90": 3.9,
+            "p95": 4.2,
+            "p99": 4.4,
+            "max": 6.4,
+            "wall": 1732.0,
+            "wire_kib": 3858.5
+          },
+          "direct": {
+            "count": 100,
+            "ok": 100,
+            "canceled": 0,
+            "null": 0,
+            "errors": 0,
+            "p50": 3.4,
+            "p90": 3.5,
+            "p95": 3.6,
+            "p99": 3.6,
+            "max": 6.1,
+            "wall": 1658.0,
+            "wire_kib": 3858.5
+          }
         }
       ]
     }
@@ -1170,6 +2131,6 @@
   "artifacts": {
     "nvim_treesitter_repository": "https://github.com/nvim-treesitter/nvim-treesitter",
     "nvim_treesitter_revision": "4916d6592ede8c07973490d9322f187e07dfefac",
-    "scope": "parser metadata and query sources"
+    "verification": "parser metadata and every installed query byte-matched"
   }
 }
