@@ -29,6 +29,7 @@ from collect_worker_proxy import (
     require_posix as require_collector_posix,
     require_benchmark_artifacts,
     run_order,
+    run_with_staging_cleanup,
     signal_process_group,
     shasum_tree_digest,
     stage_measurement_inputs,
@@ -38,6 +39,17 @@ from collect_worker_proxy import (
 
 
 class CollectionHelpersTest(unittest.TestCase):
+    def test_staging_cleanup_runs_when_collection_fails(self):
+        staging = mock.Mock()
+
+        with self.assertRaisesRegex(RuntimeError, "collection failed"):
+            run_with_staging_cleanup(
+                staging,
+                lambda: (_ for _ in ()).throw(RuntimeError("collection failed")),
+            )
+
+        staging.cleanup.assert_called_once_with()
+
     def test_process_group_signal_tolerates_os_cleanup_races(self):
         process = mock.Mock(pid=12345)
 
