@@ -73,6 +73,18 @@ def committed_blob(checkout, revision, relative):
 
 
 def artifact_provenance(data_dir, nvim_treesitter_checkout):
+    origin = tool_version([
+        "git", "-C", str(nvim_treesitter_checkout),
+        "remote", "get-url", "origin",
+    ])
+    canonical_origin = origin.rstrip("/").removesuffix(".git")
+    expected_origins = {
+        "https://github.com/nvim-treesitter/nvim-treesitter",
+        "git@github.com:nvim-treesitter/nvim-treesitter",
+        "ssh://git@github.com/nvim-treesitter/nvim-treesitter",
+    }
+    if canonical_origin not in expected_origins:
+        raise ValueError(f"unexpected nvim-treesitter origin: {origin}")
     revision = tool_version([
         "git", "-C", str(nvim_treesitter_checkout), "rev-parse", "HEAD"
     ])
@@ -103,9 +115,7 @@ def artifact_provenance(data_dir, nvim_treesitter_checkout):
                 f"{installed} does not match {revision}:{upstream_relative}"
             )
     return {
-        "nvim_treesitter_repository": (
-            "https://github.com/nvim-treesitter/nvim-treesitter"
-        ),
+        "nvim_treesitter_repository": origin,
         "nvim_treesitter_revision": revision,
         "verification": "parser metadata and every installed query byte-matched",
     }

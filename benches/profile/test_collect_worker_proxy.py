@@ -217,6 +217,13 @@ class CollectionHelpersTest(unittest.TestCase):
                 path.parent.mkdir(parents=True, exist_ok=True)
                 path.write_bytes(content)
             subprocess.run(["git", "init", "-q", checkout], check=True)
+            subprocess.run(
+                [
+                    "git", "-C", checkout, "remote", "add", "origin",
+                    "https://github.com/nvim-treesitter/nvim-treesitter",
+                ],
+                check=True,
+            )
             subprocess.run(["git", "-C", checkout, "add", "."], check=True)
             subprocess.run(
                 [
@@ -236,6 +243,22 @@ class CollectionHelpersTest(unittest.TestCase):
             (data / "queries/rust/highlights.scm").write_bytes(b"different")
             with self.assertRaisesRegex(ValueError, "does not match"):
                 artifact_provenance(data, checkout)
+
+    def test_artifact_provenance_rejects_unofficial_checkout_origin(self):
+        with tempfile.TemporaryDirectory() as directory:
+            checkout = pathlib.Path(directory) / "nvim-treesitter"
+            checkout.mkdir()
+            subprocess.run(["git", "init", "-q", checkout], check=True)
+            subprocess.run(
+                [
+                    "git", "-C", checkout, "remote", "add", "origin",
+                    "https://github.com/example/fork",
+                ],
+                check=True,
+            )
+
+            with self.assertRaisesRegex(ValueError, "unexpected.*origin"):
+                artifact_provenance(pathlib.Path(directory) / "data", checkout)
 
     def test_controlled_environment_drops_behavior_overrides(self):
         environment = controlled_environment({
