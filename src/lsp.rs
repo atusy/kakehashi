@@ -4,6 +4,7 @@ mod cache;
 mod client;
 mod debounced_diagnostics;
 mod diagnostic_cache;
+mod diagnostic_order;
 pub(crate) mod in_progress_set;
 mod settings_manager;
 mod synthetic_diagnostics;

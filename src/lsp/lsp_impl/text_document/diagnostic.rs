@@ -783,32 +783,13 @@ async fn dispatch_preferred_diagnostics(
 /// handler cannot hash unsorted items — an order-unstable id would make
 /// `unchanged` reports silently never fire on multi-server hosts.
 fn finalize_pull_items(mut items: Vec<Diagnostic>) -> (Vec<Diagnostic>, String) {
-    crate::lsp::diagnostic_cache::sort_diagnostics(&mut items);
+    crate::lsp::diagnostic_order::sort_diagnostics_deterministically(&mut items);
     let id = diagnostic_result_id(&items);
     (items, id)
 }
 
-/// FNV-1a 64-bit over a serde serialization stream: hashes without
-/// materializing the serialized form (a full pull set is ~1 MB — see
-/// [`diagnostic_result_id`]). Byte-identical to `fnv1a_hash(to_string(..))`
-/// because `to_writer` produces the same bytes as `to_string`.
-struct FnvWriter(u64);
-
-impl std::io::Write for FnvWriter {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        const FNV_PRIME: u64 = 0x100000001b3;
-        for &byte in buf {
-            self.0 = (self.0 ^ u64::from(byte)).wrapping_mul(FNV_PRIME);
-        }
-        Ok(buf.len())
-    }
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
-}
-
 /// Content-address a **sorted** pull result: the deterministic sort
-/// ([`sort_diagnostics`], applied by [`finalize_pull_items`]) makes the
+/// ([`sort_diagnostics_deterministically`], applied by [`finalize_pull_items`]) makes the
 /// serialization canonical, so the same logical set always hashes to the same
 /// id and any field change produces a different one. The length suffix is
 /// cheap insurance against a 64-bit collision making a changed set read as
@@ -816,21 +797,26 @@ impl std::io::Write for FnvWriter {
 /// content fingerprint). Stateless: the client echoes the id back as
 /// `previousResultId` and the handler just recomputes — nothing to invalidate.
 ///
-/// [`sort_diagnostics`]: crate::lsp::diagnostic_cache::sort_diagnostics
+/// [`sort_diagnostics_deterministically`]: crate::lsp::diagnostic_order::sort_diagnostics_deterministically
 fn diagnostic_result_id(items: &[Diagnostic]) -> String {
-    const FNV_OFFSET: u64 = 0xcbf29ce484222325;
-    let mut writer = FnvWriter(FNV_OFFSET);
-    // Serialization of ls_types values cannot realistically fail (no non-string
-    // map keys, and JSON numbers cannot be non-finite) and `FnvWriter` never
-    // errors; if it ever fails anyway, FAIL OPEN with an id that can never
-    // match a previous one — two differing sets could share a partial-stream
-    // prefix hash, and a false "unchanged" must stay impossible.
-    if serde_json::to_writer(&mut writer, items).is_err() {
-        static UNHASHABLE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let nonce = UNHASHABLE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        return format!("unhashable-{nonce}-{}", items.len());
+    let mut writer = crate::text::Fnv1aWriter::new();
+    std::io::Write::write_all(&mut writer, b"[").expect("FNV writer is infallible");
+    for (index, item) in items.iter().enumerate() {
+        if index > 0 {
+            std::io::Write::write_all(&mut writer, b",").expect("FNV writer is infallible");
+        }
+        // Keep peak canonicalization memory bounded to one diagnostic and
+        // stream its JSON directly into the hash. If serialization ever fails,
+        // fail open: a fresh id is safer than falsely reporting `unchanged`.
+        if crate::lsp::diagnostic_order::write_diagnostic_canonical_json(&mut writer, item).is_err()
+        {
+            static UNHASHABLE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let nonce = UNHASHABLE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return format!("unhashable-{nonce}-{}", items.len());
+        }
     }
-    format!("{:016x}-{}", writer.0, items.len())
+    std::io::Write::write_all(&mut writer, b"]").expect("FNV writer is infallible");
+    format!("{:016x}-{}", writer.finish(), items.len())
 }
 
 /// Create a full diagnostic report from aggregated diagnostics. `result_id`
@@ -970,19 +956,62 @@ mod tests {
     }
 
     #[test]
+    fn result_id_is_stable_across_deep_tie_order() {
+        let with_data = |value| {
+            let mut diagnostic = diag("same");
+            diagnostic.data = Some(serde_json::json!({"nested": {"value": value}}));
+            diagnostic
+        };
+        let first = with_data(1);
+        let second = with_data(2);
+
+        // These diagnostics tie on every cheap sort field and differ only in
+        // nested data, so reversing them exercises the canonical tiebreaker.
+        let (sorted_a, id_a) = finalize_pull_items(vec![first.clone(), second.clone()]);
+        let (sorted_b, id_b) = finalize_pull_items(vec![second, first]);
+
+        assert_eq!(sorted_a, sorted_b);
+        assert_eq!(id_a, id_b);
+    }
+
+    #[test]
     fn result_id_streaming_hash_matches_the_materialized_form() {
-        // `diagnostic_result_id` hashes through a serde writer to avoid a ~1 MB
-        // transient; the id must stay byte-identical to hashing the
-        // materialized serialization (the stateless contract: clients hold ids
-        // across server restarts, so the id algorithm is wire-format).
+        // `diagnostic_result_id` hashes one canonical item at a time to avoid a
+        // ~1 MB array transient; it must stay byte-identical to hashing the
+        // equivalent materialized canonical array.
         let items = vec![diag("x"), diag("y")];
-        let materialized = serde_json::to_string(&items).expect("serializes");
+        let materialized = format!(
+            "[{},{}]",
+            crate::lsp::diagnostic_order::canonical_json_string(&items[0]),
+            crate::lsp::diagnostic_order::canonical_json_string(&items[1])
+        );
         let expected = format!(
             "{:016x}-{}",
             crate::text::fnv1a_hash(&materialized),
             items.len()
         );
         assert_eq!(diagnostic_result_id(&items), expected);
+    }
+
+    #[test]
+    fn result_id_ignores_json_object_insertion_order() {
+        let with_data = |keys: [&str; 2]| {
+            let mut diagnostic = diag("same");
+            let mut data = serde_json::Map::new();
+            for key in keys {
+                data.insert(key.to_string(), serde_json::json!(1));
+            }
+            diagnostic.data = Some(serde_json::Value::Object(data));
+            diagnostic
+        };
+
+        let first = vec![with_data(["z", "a"])];
+        let second = vec![with_data(["a", "z"])];
+        assert_ne!(
+            serde_json::to_string(&first).unwrap(),
+            serde_json::to_string(&second).unwrap()
+        );
+        assert_eq!(diagnostic_result_id(&first), diagnostic_result_id(&second));
     }
 
     #[test]
