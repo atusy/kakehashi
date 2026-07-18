@@ -44,28 +44,41 @@ pub(crate) fn canonical_json_string<T: serde::Serialize + std::fmt::Debug>(value
     // serialization failure instead of a shared sentinel: distinct
     // diagnostics must not collapse to one cached sort key, or the final
     // order would silently degrade to input order for them.
-    let Ok(json) = serde_json::to_value(value) else {
+    let Ok(json) = canonical_json_value(value) else {
         return format!("{value:?}");
     };
-    serde_json::to_string(&canonicalize_json(json)).unwrap_or_else(|_| format!("{value:?}"))
+    serde_json::to_string(&json).unwrap_or_else(|_| format!("{value:?}"))
 }
 
-fn canonicalize_json(value: serde_json::Value) -> serde_json::Value {
+/// Write one diagnostic in the same canonical form used by the total-order
+/// tiebreaker, without allocating an intermediate serialized `String`.
+pub(crate) fn write_diagnostic_canonical_json<W: std::io::Write>(
+    writer: W,
+    diagnostic: &Diagnostic,
+) -> serde_json::Result<()> {
+    serde_json::to_writer(writer, &canonical_json_value(diagnostic)?)
+}
+
+fn canonical_json_value<T: serde::Serialize>(value: &T) -> serde_json::Result<serde_json::Value> {
+    let mut json = serde_json::to_value(value)?;
+    canonicalize_json_in_place(&mut json);
+    Ok(json)
+}
+
+fn canonicalize_json_in_place(value: &mut serde_json::Value) {
     match value {
         serde_json::Value::Array(values) => {
-            serde_json::Value::Array(values.into_iter().map(canonicalize_json).collect())
+            for value in values {
+                canonicalize_json_in_place(value);
+            }
         }
         serde_json::Value::Object(map) => {
-            let mut entries: Vec<_> = map.into_iter().collect();
-            entries.sort_unstable_by(|(left, _), (right, _)| left.cmp(right));
-
-            let mut sorted = serde_json::Map::new();
-            for (key, value) in entries {
-                sorted.insert(key, canonicalize_json(value));
+            for value in map.values_mut() {
+                canonicalize_json_in_place(value);
             }
-            serde_json::Value::Object(sorted)
+            map.sort_keys();
         }
-        value => value,
+        _ => {}
     }
 }
 
@@ -128,6 +141,20 @@ mod tests {
         assert_eq!(
             canonical_json_string(&first),
             canonical_json_string(&second)
+        );
+    }
+
+    #[test]
+    fn canonical_diagnostic_writer_matches_canonical_string() {
+        let mut diagnostic = diag("same");
+        diagnostic.data = Some(serde_json::json!({"z": 1, "nested": {"z": 2, "a": 1}}));
+
+        let mut written = Vec::new();
+        write_diagnostic_canonical_json(&mut written, &diagnostic).unwrap();
+
+        assert_eq!(
+            String::from_utf8(written).unwrap(),
+            canonical_json_string(&diagnostic)
         );
     }
 }

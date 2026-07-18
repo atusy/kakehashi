@@ -823,9 +823,15 @@ fn diagnostic_result_id(items: &[Diagnostic]) -> String {
         if index > 0 {
             std::io::Write::write_all(&mut writer, b",").expect("FNV writer is infallible");
         }
-        let canonical = crate::lsp::diagnostic_order::canonical_json_string(item);
-        std::io::Write::write_all(&mut writer, canonical.as_bytes())
-            .expect("FNV writer is infallible");
+        // Keep peak canonicalization memory bounded to one diagnostic and
+        // stream its JSON directly into the hash. If serialization ever fails,
+        // fail open: a fresh id is safer than falsely reporting `unchanged`.
+        if crate::lsp::diagnostic_order::write_diagnostic_canonical_json(&mut writer, item).is_err()
+        {
+            static UNHASHABLE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let nonce = UNHASHABLE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return format!("unhashable-{nonce}-{}", items.len());
+        }
     }
     std::io::Write::write_all(&mut writer, b"]").expect("FNV writer is infallible");
     format!("{:016x}-{}", writer.0, items.len())
@@ -964,6 +970,25 @@ mod tests {
         let (sorted_a, id_a) = finalize_pull_items(a);
         let (sorted_b, id_b) = finalize_pull_items(b);
         assert_eq!(sorted_a, sorted_b, "the sort canonicalizes permutations");
+        assert_eq!(id_a, id_b);
+    }
+
+    #[test]
+    fn result_id_is_stable_across_deep_tie_order() {
+        let with_data = |value| {
+            let mut diagnostic = diag("same");
+            diagnostic.data = Some(serde_json::json!({"nested": {"value": value}}));
+            diagnostic
+        };
+        let first = with_data(1);
+        let second = with_data(2);
+
+        // These diagnostics tie on every cheap sort field and differ only in
+        // nested data, so reversing them exercises the canonical tiebreaker.
+        let (sorted_a, id_a) = finalize_pull_items(vec![first.clone(), second.clone()]);
+        let (sorted_b, id_b) = finalize_pull_items(vec![second, first]);
+
+        assert_eq!(sorted_a, sorted_b);
         assert_eq!(id_a, id_b);
     }
 
