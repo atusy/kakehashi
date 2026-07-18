@@ -7,7 +7,7 @@ import unittest
 
 sys.path.insert(0, str(pathlib.Path(__file__).parent))
 
-from worker_proxy import copy_stream
+from worker_proxy import copy_stream, terminate_child
 
 
 class CopyStreamTest(unittest.TestCase):
@@ -28,6 +28,16 @@ class CopyStreamTest(unittest.TestCase):
         copied = copy_stream(io.BytesIO(b"payload"), ResettingDestination())
 
         self.assertEqual(copied, 0)
+
+    def test_cleanup_tolerates_child_exit_after_poll(self):
+        class ExitedChild:
+            def poll(self):
+                return None
+
+            def terminate(self):
+                raise ProcessLookupError("already exited")
+
+        terminate_child(ExitedChild())
 
     def test_child_may_exit_while_proxy_stdin_remains_open(self):
         proxy = pathlib.Path(__file__).with_name("worker_proxy.py")

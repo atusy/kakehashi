@@ -31,6 +31,21 @@ def copy_stream(
             destination.close()
 
 
+def terminate_child(child):
+    if child.poll() is not None:
+        return
+    try:
+        child.terminate()
+        try:
+            child.wait(timeout=1)
+        except subprocess.TimeoutExpired:
+            child.kill()
+            child.wait()
+    except OSError:
+        # The child may exit between poll and signal delivery.
+        pass
+
+
 def main():
     child_bin = os.environ.get("KAKEHASHI_WORKER_PROXY_BIN")
     if not child_bin:
@@ -64,13 +79,7 @@ def main():
         stdout_thread.join()
         return return_code
     finally:
-        if child.poll() is None:
-            child.terminate()
-            try:
-                child.wait(timeout=1)
-            except subprocess.TimeoutExpired:
-                child.kill()
-                child.wait()
+        terminate_child(child)
 
 
 if __name__ == "__main__":
