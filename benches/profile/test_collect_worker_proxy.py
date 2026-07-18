@@ -290,6 +290,15 @@ class CollectionHelpersTest(unittest.TestCase):
     def test_cleanup_signals_include_interrupt(self):
         self.assertIn(signal.SIGINT, CLEANUP_SIGNALS)
 
+    def test_termination_signals_only_use_available_platform_signals(self):
+        expected = tuple(
+            getattr(signal, name)
+            for name in ("SIGHUP", "SIGTERM")
+            if hasattr(signal, name)
+        )
+
+        self.assertEqual(collector.TERMINATION_SIGNALS, expected)
+
     def test_collector_rejects_non_posix_lifecycle(self):
         with self.assertRaisesRegex(SystemExit, "POSIX"):
             require_collector_posix("nt")

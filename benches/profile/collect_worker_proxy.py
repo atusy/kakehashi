@@ -40,7 +40,11 @@ CONTROLLED_ENVIRONMENT_KEYS = (
     "LD_LIBRARY_PATH",
     "DYLD_LIBRARY_PATH",
 )
-TERMINATION_SIGNALS = (signal.SIGHUP, signal.SIGTERM)
+TERMINATION_SIGNALS = tuple(
+    signum
+    for name in ("SIGHUP", "SIGTERM")
+    if (signum := getattr(signal, name, None)) is not None
+)
 CLEANUP_SIGNALS = (*TERMINATION_SIGNALS, signal.SIGINT)
 OFFICIAL_NVIM_TREESITTER_URL = (
     "https://github.com/nvim-treesitter/nvim-treesitter"
