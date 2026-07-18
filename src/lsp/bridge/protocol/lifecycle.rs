@@ -5,10 +5,11 @@
 
 use std::str::FromStr;
 
+use serde::de::IntoDeserializer;
 use tower_lsp_server::ls_types::{
     ClientCapabilities, DidChangeConfigurationParams, DidChangeWorkspaceFoldersParams,
-    DidCloseTextDocumentParams, InitializeParams, InitializedParams, TextDocumentIdentifier, Uri,
-    WorkspaceFolder, WorkspaceFoldersChangeEvent,
+    DidCloseTextDocumentParams, InitializeParams, InitializedParams, ServerCapabilities,
+    TextDocumentIdentifier, Uri, WorkspaceFolder, WorkspaceFoldersChangeEvent,
 };
 
 use super::client_capabilities::build_bridge_client_capabilities;
@@ -130,12 +131,28 @@ pub(crate) fn build_did_change_configuration_notification(
     )
 }
 
-/// Validates a JSON-RPC initialize response.
+#[derive(Debug)]
+pub(crate) struct DroppedCapability {
+    pub(crate) field: String,
+    pub(crate) error: String,
+}
+
+#[derive(Debug)]
+pub(crate) struct ParsedInitializeCapabilities {
+    pub(crate) capabilities: ServerCapabilities,
+    pub(crate) dropped: Vec<DroppedCapability>,
+}
+
+/// Validates a JSON-RPC initialize response and extracts usable capabilities.
 ///
 /// Uses lenient interpretation to maximize compatibility with non-conformant
 /// servers: a non-null `error` field is prioritized, a null `error` alongside a
-/// result is accepted, and a null/missing result is rejected.
-pub(crate) fn validate_initialize_response(response: &serde_json::Value) -> std::io::Result<()> {
+/// result is accepted, and a null/missing result is rejected. Malformed fields
+/// within an object-shaped capabilities payload are dropped independently so
+/// they do not erase unrelated valid features.
+pub(crate) fn parse_initialize_response_capabilities(
+    response: &serde_json::Value,
+) -> std::io::Result<ParsedInitializeCapabilities> {
     // 1. Check for error response (prioritize error if present)
     if let Some(error) = response.get("error").filter(|e| !e.is_null()) {
         // Error field is non-null: treat as error regardless of result
@@ -152,8 +169,13 @@ pub(crate) fn validate_initialize_response(response: &serde_json::Value) -> std:
     }
 
     // 2. Reject if result is absent or null
-    let Some(result) = response.get("result").filter(|r| !r.is_null()) else {
-        return Err(std::io::Error::other(
+    let Some(result) = response
+        .get("result")
+        .filter(|result| !result.is_null())
+        .and_then(serde_json::Value::as_object)
+    else {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
             "bridge: initialize response missing valid result",
         ));
     };
@@ -166,7 +188,56 @@ pub(crate) fn validate_initialize_response(response: &serde_json::Value) -> std:
     )?;
     validate_utf16_encoding(result.get("offsetEncoding"), "offsetEncoding")?;
 
-    Ok(())
+    let Some(capabilities) = result
+        .get("capabilities")
+        .filter(|capabilities| !capabilities.is_null())
+    else {
+        return Ok(ParsedInitializeCapabilities {
+            capabilities: ServerCapabilities::default(),
+            dropped: Vec::new(),
+        });
+    };
+    let Some(capabilities) = capabilities.as_object() else {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "bridge: invalid initialize capabilities: expected an object",
+        ));
+    };
+
+    let mut candidate = serde_json::Value::Object(capabilities.clone());
+    let mut dropped = Vec::new();
+    loop {
+        match serde_path_to_error::deserialize(candidate.clone().into_deserializer()) {
+            Ok(capabilities) => {
+                return Ok(ParsedInitializeCapabilities {
+                    capabilities,
+                    dropped,
+                });
+            }
+            Err(error) => {
+                let Some(serde_path_to_error::Segment::Map { key: field }) =
+                    error.path().iter().next()
+                else {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("bridge: invalid initialize capabilities: {error}"),
+                    ));
+                };
+                let field = field.clone();
+                let error = error.to_string();
+                let removed = candidate
+                    .as_object_mut()
+                    .and_then(|capabilities| capabilities.remove(&field));
+                if removed.is_none() {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("bridge: invalid initialize capabilities: {error}"),
+                    ));
+                }
+                dropped.push(DroppedCapability { field, error });
+            }
+        }
+    }
 }
 
 fn validate_utf16_encoding(
@@ -182,14 +253,18 @@ fn validate_utf16_encoding(
         return Ok(());
     }
     let Some(encoding) = announced.as_str() else {
-        return Err(std::io::Error::other(format!(
-            "bridge: downstream initialize {field} is non-string; UTF-16 is required"
-        )));
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("bridge: downstream initialize {field} is non-string; UTF-16 is required"),
+        ));
     };
     if encoding != "utf-16" {
-        return Err(std::io::Error::other(format!(
-            "bridge: downstream initialize {field} announced {encoding:?}; UTF-16 is required"
-        )));
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "bridge: downstream initialize {field} announced {encoding:?}; UTF-16 is required"
+            ),
+        ));
     }
     Ok(())
 }
@@ -469,10 +544,40 @@ mod tests {
     #[trace]
     fn validate_accepts_valid_response(#[case] response: serde_json::Value) {
         assert!(
-            validate_initialize_response(&response).is_ok(),
+            parse_initialize_response_capabilities(&response).is_ok(),
             "Expected valid response to be accepted: {:?}",
             response
         );
+    }
+
+    #[test]
+    fn malformed_capability_does_not_discard_valid_capabilities() {
+        let response = serde_json::json!({
+            "result": {
+                "capabilities": {
+                    "hoverProvider": 42,
+                    "completionProvider": {
+                        "triggerCharacters": ["."]
+                    }
+                }
+            }
+        });
+
+        let parsed = parse_initialize_response_capabilities(&response)
+            .expect("one malformed capability must not fail the handshake");
+
+        assert!(parsed.capabilities.hover_provider.is_none());
+        assert_eq!(
+            parsed
+                .capabilities
+                .completion_provider
+                .expect("valid completion capability must survive")
+                .trigger_characters,
+            Some(vec![".".to_string()])
+        );
+        assert_eq!(parsed.dropped.len(), 1);
+        assert_eq!(parsed.dropped[0].field, "hoverProvider");
+        assert!(parsed.dropped[0].error.contains("invalid type"));
     }
 
     #[rstest]
@@ -493,7 +598,7 @@ mod tests {
         #[case] response: serde_json::Value,
         #[case] expected_error: &str,
     ) {
-        let result = validate_initialize_response(&response);
+        let result = parse_initialize_response_capabilities(&response);
         assert!(result.is_err(), "Expected rejection for: {:?}", response);
         let err_msg = result.unwrap_err().to_string();
         assert!(
@@ -532,7 +637,7 @@ mod tests {
         #[case] field: &str,
         #[case] announced: &str,
     ) {
-        let error = validate_initialize_response(&response)
+        let error = parse_initialize_response_capabilities(&response)
             .expect_err("non-UTF-16 downstream encoding must fail initialization");
         let message = error.to_string();
         assert!(message.contains(field), "unexpected error: {message}");
@@ -600,7 +705,7 @@ mod tests {
         #[case] expected_code: &str,
         #[case] expected_message: &str,
     ) {
-        let result = validate_initialize_response(&response);
+        let result = parse_initialize_response_capabilities(&response);
         assert!(result.is_err(), "Expected rejection for: {:?}", response);
         let err_msg = result.unwrap_err().to_string();
         assert!(

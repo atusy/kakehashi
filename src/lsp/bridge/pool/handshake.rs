@@ -20,7 +20,7 @@ use super::ConnectionHandle;
 use super::connection_handle::NotificationSendResult;
 use crate::lsp::bridge::protocol::{
     RequestId, build_initialize_request, build_initialized_notification,
-    validate_initialize_response,
+    parse_initialize_response_capabilities,
 };
 
 /// Send `initialize`, await the response, send `initialized`, return the typed
@@ -62,13 +62,17 @@ pub(super) async fn perform_lsp_handshake(
         .map_err(|_| io::Error::other("bridge: initialize response channel closed"))?;
 
     // 3. Validate response and extract typed capabilities
-    validate_initialize_response(&response)?;
-    let caps_value = response
-        .get("result")
-        .and_then(|r| r.get("capabilities"))
-        .cloned()
-        .unwrap_or_default();
-    let capabilities = serde_json::from_value::<ServerCapabilities>(caps_value).unwrap_or_default();
+    let parsed = parse_initialize_response_capabilities(&response)?;
+    for dropped in parsed.dropped {
+        log::warn!(
+            target: "kakehashi::bridge",
+            "Downstream {} advertised malformed capability {:?}; ignoring it: {}",
+            handle.key(),
+            dropped.field,
+            dropped.error,
+        );
+    }
+    let capabilities = parsed.capabilities;
 
     // 4. Send initialized notification via the single-writer loop
     let initialized = build_initialized_notification();
