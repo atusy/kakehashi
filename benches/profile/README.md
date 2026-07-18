@@ -39,7 +39,7 @@ python3 benches/profile/drive.py \
   --file path/to/input.md --requests 20 --burst 8 --burst-edits
 ```
 
-The driver reports per-method p50/p90/max request-to-response latency both
+The driver reports per-method p50/p90/p95/p99/max request-to-response latency both
 overall and split by outcome (`ok`, cancelled, `null`, error), time to the last
 successful semantic response in each cycle, exact JSON response-body bytes,
 and server notifications/requests grouped separately. This keeps completed
