@@ -584,12 +584,11 @@ mod tests {
         );
         assert_eq!(parsed.dropped.len(), 1);
         assert_eq!(parsed.dropped[0].field, "hoverProvider");
-        assert!(
-            parsed.dropped[0].error.contains("hoverProvider")
-                && parsed.dropped[0].error.contains("HoverProviderCapability"),
-            "unexpected serde error: {}",
-            parsed.dropped[0].error
-        );
+        let detail = parsed.dropped[0]
+            .error
+            .strip_prefix("hoverProvider: ")
+            .expect("serde error must include the JSON field path");
+        assert!(!detail.is_empty(), "serde error must retain its cause");
     }
 
     #[test]

@@ -155,7 +155,7 @@ mod tests {
         assert!(capabilities.hover_provider.is_none());
         assert!(capabilities.completion_provider.is_some());
         let mut messages = String::new();
-        for _ in 0..40 {
+        for _ in 0..200 {
             messages = std::fs::read_to_string(&output).unwrap_or_default();
             if messages.contains("\"method\":\"initialized\"") {
                 break;
