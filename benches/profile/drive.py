@@ -109,6 +109,26 @@ def response_result_id(message: dict):
     return result.get("resultId") if isinstance(result, dict) else None
 
 
+def capture_result_id(response):
+    if response_status(response) != "ok":
+        raise RuntimeError(f"capture request failed: {response}")
+    result = response.get("result")
+    result_id = result.get("resultId") if isinstance(result, dict) else None
+    full_shape = (
+        isinstance(result, dict)
+        and isinstance(result.get("matches"), list)
+        and isinstance(result.get("skipped"), list)
+    )
+    delta_shape = isinstance(result, dict) and isinstance(
+        result.get("edits"), list
+    )
+    if not isinstance(result_id, str) or not result_id or not (
+        full_shape or delta_shape
+    ):
+        raise RuntimeError(f"invalid capture result or lineage: {response}")
+    return result_id
+
+
 def semantic_token_data(response):
     result = response.get("result")
     data = result.get("data") if isinstance(result, dict) else None
@@ -463,12 +483,7 @@ def main() -> None:
                     "injection": True,
                 },
             )
-            captures_result_id = response_result_id(seed)
-            if captures_result_id is None:
-                raise RuntimeError(
-                    "captures warmup did not return a resultId; "
-                    "cannot measure a real delta lineage"
-                )
+            captures_result_id = capture_result_id(seed)
 
         ok, canceled, superseded, tokens = 0, 0, 0, 0
         version = 1
@@ -537,12 +552,12 @@ def main() -> None:
                             *captures_request
                         )
             for method, _ in reversed(captures_requests):
-                next_result_id = response_result_id(
-                    captures_responses.get(method, {})
+                if method not in captures_responses:
+                    continue
+                captures_result_id = capture_result_id(
+                    captures_responses[method]
                 )
-                if next_result_id is not None:
-                    captures_result_id = next_result_id
-                    break
+                break
             req_times.append(time.perf_counter() - t_req)
             cycle_semantic_samples = request_samples[
                 "textDocument/semanticTokens/full"

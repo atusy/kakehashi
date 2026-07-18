@@ -10,6 +10,7 @@ sys.path.insert(0, str(pathlib.Path(__file__).parent))
 
 from drive import (
     benchmark_clock,
+    capture_result_id,
     RequestSample,
     count_semantic_outcomes,
     next_toggle_change,
@@ -23,6 +24,23 @@ from drive import (
 
 
 class RequestSummaryTest(unittest.TestCase):
+    def test_capture_result_validates_full_and_delta_lineage(self):
+        self.assertEqual(capture_result_id({
+            "result": {"resultId": "full", "matches": [], "skipped": []}
+        }), "full")
+        self.assertEqual(capture_result_id({
+            "result": {"resultId": "delta", "edits": []}
+        }), "delta")
+        for response in (
+            {"error": {"code": -32800}},
+            {"result": None},
+            {"result": {"resultId": "", "edits": []}},
+            {"result": {"resultId": "bad"}},
+        ):
+            with self.subTest(response=response):
+                with self.assertRaisesRegex(RuntimeError, "capture"):
+                    capture_result_id(response)
+
     def test_server_termination_escalates_after_bounded_grace(self):
         class StubbornServer:
             def __init__(self):
