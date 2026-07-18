@@ -253,19 +253,27 @@ Parent-to-worker state has one ordered writer and a per-document state machine
 for each worker generation:
 
 ```text
-Unsynced -> SyncPending(version) -> Synced(version)
-Synced(base) -> EditPending(base, target) -> Synced(target)
+Unsynced -> SyncQueued(version) -> SyncPending(version) -> Synced(version)
+Synced(base) -> EditQueued(base, target) -> EditPending(base, target)
+EditPending(base, target) -> Synced(target)
+EditQueued(base, target) -> SyncQueued(latest)
 ```
 
 After startup or restart, the parent first waits for configuration and
-quarantine acknowledgments. Every open document then starts `Unsynced`. While a
-document is `Unsynced` or `SyncPending`, concurrent edits update the
-authoritative parent text and coalesce into the latest full-sync candidate;
-incremental messages are not emitted from an unacknowledged base. Once
-`SyncDocumentAck` arrives, the parent may send one incremental chain from that
-exact acknowledged version and enters `EditPending`. While its ack is pending,
-later client edits are retained and coalesced behind that chain; the parent does
-not send another edit with either an optimistic or stale base. On
+quarantine acknowledgments. Every open document then starts `Unsynced` and
+enqueues a full sync. `Queued` means the per-document queue still owns and may
+replace the frame; `Pending` begins only when the writer atomically claims that
+frame for transmission. While a document is `Unsynced`, `SyncQueued`, or
+`SyncPending`, concurrent edits update the authoritative parent text. An
+unclaimed `SyncQueued` frame is replaced with the latest full text. Once claimed,
+its version is fixed and later edits are deferred; after its ack they enqueue a
+new latest sync unless a safe retained incremental base is available.
+
+Once `SyncDocumentAck` arrives, the parent may enqueue one incremental chain from
+that exact acknowledged version and enters `EditQueued`; writer claim changes it
+to `EditPending`. While its ack is pending, later client edits are retained and
+coalesced behind that chain; the parent does not send another edit with either
+an optimistic or stale base. On
 `ApplyEditsAck(target)`, it first enters `Synced(target)`, then sends a composed
 incremental from the retained target snapshot to the latest parent version when
 that edit history remains available. Otherwise it returns to `Unsynced` and
@@ -288,10 +296,17 @@ event and falsely consume a native deadline. The control channel has one ordered
 writer in each direction and is serviced independently of the compute pool.
 
 Bulk state writes run on a dedicated async writer and never hold an LSP ingress
-ticket while waiting for pipe capacity. Its queue is bounded. When bulk backpressure
-would retain an obsolete chain of unsent document edits, the parent replaces
-that chain with one latest full-sync candidate rather than blocking ingress or
-replaying every intermediate version. `DeriveSnapshot` and other document work
+ticket while waiting for pipe capacity. Its queue is bounded. Queue replacement
+and writer dequeue arbitrate under the same per-document state lock. If
+replacement wins while an edit is `EditQueued`, it atomically removes that frame
+and transitions to `SyncQueued(latest)`; no acknowledgment for the removed edit
+is expected. If dequeue wins, the state is already `EditPending`, the frame must
+be sent, and later edits wait behind its exact acknowledgment. The same rule
+lets an unclaimed `SyncQueued` payload advance to the latest version but never
+mutates a claimed `SyncPending` frame. A wrong or stale acknowledgment takes the
+existing `Unsynced` recovery path. Thus backpressure coalesces unsent work without
+changing the expected acknowledgment of in-flight work or blocking ingress.
+`DeriveSnapshot` and other document work
 is admitted only for a version the worker has acknowledged; the worker control
 loop applies state messages in stream order before scheduling the corresponding
 tree work.
@@ -771,6 +786,9 @@ Implementation is accepted only when all of the following hold:
   not only two outer requests, and separately covers the one-thread degradation.
 * Protocol tests cover truncated frames, oversized frames, unknown versions,
   invalid edit bases, duplicate responses, EOF, and child startup failure.
+  Queue-race tests cover replacement winning before dequeue, dequeue winning
+  before replacement, and stale acknowledgments after resync, proving the state
+  and expected acknowledgment change atomically.
 * Repeated startup, handshake, protocol, and delayed-post-return failures prove
   the restart budget converges to one logged tree-tier-unavailable state, wakes
   waiters, stops respawning, and leaves host-tier service usable. A relevant
