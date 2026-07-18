@@ -306,8 +306,19 @@ request admission, cancellation, shutdown, liveness, grammar-hazard leases, and
 every native-segment frame, including `NativeSegmentExited`. Bulk document state
 and derived response payloads use a different bounded transport. A large
 full-sync or serialized result therefore cannot sit ahead of an arm or exit
-event and falsely consume a native deadline. The control channel has one ordered
+event and falsely consume a native deadline. The control channel has one causal
 writer in each direction and is serviced independently of the compute pool.
+
+Within that transport, timer and liveness frames use preallocated high-priority
+capacity that ordinary admissions, cancellations, and handshakes cannot consume.
+The reserved bound covers at least `Entered` plus `Exited`/`Aborted` for every
+compute permit and fixed lifecycle headroom. Per-segment order is preserved:
+`NativeSegmentEntered` must be flushed onto the control transport before the
+worker enters FFI, and its exit/abort is the next high-priority frame for that
+segment. The reader drains this lane first. Prototype measurements establish a
+worst-case control delivery bound below the hard deadline with explicit margin;
+failure to enqueue or flush within the control-liveness bound is a systemic
+protocol failure, not evidence that the grammar exceeded its native budget.
 
 Bulk state writes run on a dedicated async writer and never hold an LSP ingress
 ticket while waiting for pipe capacity. Its queue is bounded. Queue replacement
@@ -789,6 +800,9 @@ Implementation is accepted only when all of the following hold:
 * A saturated worker-to-parent derived-result stream likewise proves
   `NativeSegmentExited` and hazard release remain deliverable before their
   deadlines and cannot be trapped behind a large response.
+* Saturating ordinary control admission/cancellation traffic proves reserved
+  capacity and causal ordering deliver all simultaneously active segment exits
+  within the control bound and cannot falsely trigger a native timeout.
 * A long, cooperatively chunked derivation may exceed the native-segment
   threshold in total wall time without any individual segment exceeding it; it
   is canceled or rejected through the request contract without killing the
