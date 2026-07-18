@@ -95,6 +95,10 @@ The LSP server process owns the authoritative, reconstructable inputs:
   parser-independent routing; and
 * worker lifecycle, request priority, deadlines, and session quarantine state.
 
+The parent also retains the process-wide installer: source acquisition,
+compilation, install deduplication, and the settings transaction mutate global
+filesystem/configuration state and are not document-worker responsibilities.
+
 The parent applies LSP edits to its authoritative text before notifying the
 worker. It retains enough input state to rebuild the worker after a crash; the
 worker is never the only owner of client text. This deliberately keeps worker
@@ -184,6 +188,9 @@ UpdateConfiguration(configuration_generation, settings)
 ConfigurationReady(configuration_generation, worker_generation)
 UpdateQuarantine(quarantine_generation, grammar_keys)
 QuarantineReady(quarantine_generation, worker_generation)
+GrammarMissing(request_id, language, document_context)
+ReloadGrammar(configuration_generation, grammar_descriptor)
+GrammarReady(configuration_generation, grammar_key, worker_generation)
 ```
 
 Tree work uses high-level operations rather than remote Tree-sitter primitives:
@@ -294,6 +301,18 @@ round trip to every native entry and is included in the performance acceptance
 measurements. Replacing it with shared-memory activity slots is a separate
 optimization that must preserve the same parent-visible-before-entry ordering.
 
+The worker never downloads or compiles a missing grammar. It returns
+`GrammarMissing`, and the parent's existing global installer deduplicates and
+performs that work. After a successful install or configured parser replacement,
+the parent first advances the configuration generation and then sends
+`ReloadGrammar`. The worker invalidates the old language, parser, query, and
+derived caches, acknowledges the new grammar identity, and re-derives the
+latest acknowledged versions of documents that had recorded a dependency on
+that language. A reload of the same quarantined `grammar_key` is refused; a
+genuinely replaced artifact has a different key and may be loaded. Missing host
+and injected grammars use the same event path, so an injected install cannot
+bypass quarantine or the configuration-generation publish guard.
+
 ### 6. Crash, hang, and restart policy
 
 The parent supervises the worker as a child process and treats EOF, abnormal
@@ -358,7 +377,9 @@ It does not reverse
 [replace-tree-sitter-cli-with-loader](replace-tree-sitter-cli-with-loader.md).
 The loader remains responsible for compiling grammars; runtime loading of the
 resulting native library moves into the worker. The existing killable compiler
-subprocess and the resident runtime worker are separate lifecycles.
+subprocess and the resident runtime worker are separate lifecycles. Source
+acquisition, compilation, and atomic installation remain parent-owned; only the
+post-install runtime reload crosses into the worker.
 
 ### Consequences
 
@@ -444,6 +465,9 @@ Implementation is accepted only when all of the following hold:
   not only two outer requests, and separately covers the one-thread degradation.
 * Protocol tests cover truncated frames, oversized frames, unknown versions,
   invalid edit bases, duplicate responses, EOF, and child startup failure.
+* Install/reload tests cover missing host and injected grammars, concurrent
+  install deduplication, cache invalidation, latest-version re-derivation, parser
+  replacement, and refusal to reload the same quarantined artifact.
 * Cancellation tests cover queued and running work for client cancellation,
   supersession, handler drop, and `didClose`, including completion races and the
   rule that canceled work publishes and caches nothing.
