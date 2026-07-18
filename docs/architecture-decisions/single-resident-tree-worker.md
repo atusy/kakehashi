@@ -164,10 +164,15 @@ The state-changing message family is conceptually:
 
 ```text
 SyncDocument(uri, incarnation, version, language, full_text)
+SyncDocumentAck(uri, incarnation, version, worker_generation)
 ApplyEdits(uri, incarnation, base_version, version, edits)
+ApplyEditsAck(uri, incarnation, version, worker_generation)
+ResyncRequired(uri, incarnation, worker_version)
 CloseDocument(uri, incarnation)
 UpdateConfiguration(configuration_generation, settings)
+ConfigurationReady(configuration_generation, worker_generation)
 UpdateQuarantine(quarantine_generation, grammar_keys)
+QuarantineReady(quarantine_generation, worker_generation)
 ```
 
 Tree work uses high-level operations rather than remote Tree-sitter primitives:
@@ -194,6 +199,32 @@ after worker restart, or when a base-version mismatch makes incremental replay
 unsafe. Large-message copies and serialization cost are measured explicitly;
 shared memory is not part of the initial decision and requires separate evidence
 if framed streaming proves material.
+
+Parent-to-worker state has one ordered writer and a per-document state machine
+for each worker generation:
+
+```text
+Unsynced -> SyncPending(version) -> Synced(version)
+```
+
+After startup or restart, the parent first waits for configuration and
+quarantine acknowledgments. Every open document then starts `Unsynced`. While a
+document is `Unsynced` or `SyncPending`, concurrent edits update the
+authoritative parent text and coalesce into the latest full-sync candidate;
+incremental messages are not emitted from an unacknowledged base. Once
+`SyncDocumentAck` arrives, the parent may send incrementals only from that exact
+acknowledged version. A worker receiving any other base returns
+`ResyncRequired` without applying the edit or deriving from partial state, and
+the parent returns the document to `Unsynced`.
+
+Protocol writes run on a dedicated async writer and never hold an LSP ingress
+ticket while waiting for pipe capacity. Its queue is bounded. When backpressure
+would retain an obsolete chain of unsent document edits, the parent replaces
+that chain with one latest full-sync candidate rather than blocking ingress or
+replaying every intermediate version. `DeriveSnapshot` and other document work
+is admitted only for a version the worker has acknowledged; the worker control
+loop applies state messages in stream order before scheduling the corresponding
+tree work.
 
 ### 5. Derived stages are fused when their inputs coincide
 
