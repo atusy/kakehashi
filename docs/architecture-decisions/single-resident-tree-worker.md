@@ -178,10 +178,14 @@ QuarantineReady(quarantine_generation, worker_generation)
 Tree work uses high-level operations rather than remote Tree-sitter primitives:
 
 ```text
-DeriveSnapshot(uri, incarnation, version, requested_artifacts)
-ResolveNode(uri, incarnation, version, selector)
-NavigateNode(uri, opaque_node_id, operation)
-RunCaptures(uri, incarnation, version, query, range)
+RequestContext {
+  request_id, worker_generation, uri, incarnation,
+  content_version, configuration_generation
+}
+DeriveSnapshot(context, requested_artifacts)
+ResolveNode(context, selector)
+NavigateNode(context, opaque_node_id, operation)
+RunCaptures(context, query, range)
 CancelRequest(request_id, worker_generation)
 NativeCallStarting(call_id, request_id, grammar_key)
 NativeCallArmed(call_id, worker_generation)
@@ -192,8 +196,17 @@ NativeCallFinished(call_id)
 eager derived artifacts into one admitted work unit. It returns one internally
 consistent response tagged with the exact incarnation, content version,
 configuration generation, and worker generation from which it was derived.
-The parent publishes the response only if all live input guards still match.
-Stale responses are discarded without mutating parent caches or node state.
+Every tree-operation response carries those same guards. The parent admits or
+publishes any response only if all live input guards still match. Stale
+responses are discarded without mutating parent caches or node state.
+
+The worker also validates the request context against the exact immutable tree
+snapshot selected for the operation. A node lookup or walk collects newly
+minted identities in a temporary batch, then commits that batch only under a
+document-version latch proving that incarnation, content version, configuration
+generation, and worker generation did not advance during the walk. A failed
+latch discards both identities and response. Applying edits and committing a
+node batch therefore cannot interleave into a mixed-version tracker state.
 
 The normal edit path sends incremental edits. Full text is sent on first sync,
 after worker restart, or when a base-version mismatch makes incremental replay
@@ -408,7 +421,8 @@ Implementation is accepted only when all of the following hold:
   documents.
 * Close/reopen and edit races prove that worker replies with a stale
   incarnation, content version, configuration generation, or worker generation
-  cannot publish data or resurrect a document.
+  cannot publish data, commit node identities, or resurrect a document, for
+  snapshots and every demand-driven tree operation.
 * Restart tests prove the parent can reconstruct every worker-side document
   from authoritative full text and that pre-restart node IDs resolve to `null`.
 * Concurrency tests prove the worker uses more than one compute thread while
