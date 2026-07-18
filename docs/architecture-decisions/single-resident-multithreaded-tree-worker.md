@@ -463,11 +463,15 @@ phase.
 The manifest is also the source of truth for parser-facing CLI discovery.
 `language list`, parser status, and `language uninstall --all` enumerate logical
 grammar names from non-tombstoned manifests, never filenames in the immutable
-blob directory. A legacy fixed-path file is a pre-migration candidate only when
-no manifest revision or tombstone exists for that grammar; after migration or
-uninstall it is ignored even though retained on disk. Query-only languages are
-enumerated from the query store and unioned separately, preserving their current
-status and uninstall behavior without treating a query as a parser selection.
+blob directory. For upgrade compatibility they also scan only the canonical
+legacy fixed-path namespace for a grammar that has no manifest revision or
+tombstone. List/status report that file as a logical legacy selection without
+loading native code. `uninstall --all` takes the per-grammar lock and CAS-creates
+a tombstone for it, so a later LSP cannot migrate and resurrect an uninstalled
+legacy parser. After migration or uninstall the retained legacy file is ignored.
+Query-only languages are enumerated from the query store and unioned separately,
+preserving their current status and uninstall behavior without treating a query
+as a parser selection.
 
 Every worker-generation startup, including crash recovery, planned replacement,
 rollback, and a circuit-breaker half-open probe, re-reads each relevant manifest
@@ -764,7 +768,8 @@ Implementation is accepted only when all of the following hold:
 * CLI tests cover migrated selections, tombstones, retained legacy files,
   immutable-blob-only files, and query-only languages, proving list/status and
   `uninstall --all` operate on logical manifest selections rather than storage
-  filenames.
+  filenames. A fresh pre-migration data directory still lists its canonical
+  legacy parsers, and `uninstall --all` tombstones them without loading code.
 * Cancellation tests cover queued and running work for client cancellation,
   supersession, handler drop, and `didClose`, including completion races and the
   rule that canceled work publishes and caches nothing.
