@@ -205,10 +205,13 @@ ResolveNode(context, selector)
 NavigateNode(context, opaque_node_id, operation)
 RunCaptures(context, query, range)
 CancelRequest(request_id, worker_generation)
-NativeCallStarting(call_id, request_id, grammar_key)
-NativeCallArmed(call_id, worker_generation)
-NativeCallEntered(call_id, worker_generation)
-NativeCallFinished(call_id)
+GrammarHazardStarting(lease_id, request_id, grammar_key)
+GrammarHazardArmed(lease_id, worker_generation)
+GrammarHazardReleased(lease_id)
+NativeSegmentStarting(segment_id, lease_id)
+NativeSegmentArmed(segment_id, worker_generation)
+NativeSegmentEntered(segment_id, worker_generation)
+NativeSegmentExited(segment_id)
 ```
 
 `DeriveSnapshot` may fuse parse, injection discovery, cache reconciliation, and
@@ -266,7 +269,7 @@ than attempting to replay old acknowledgments.
 Bulk state writes run on a dedicated async writer and never hold an LSP ingress
 ticket while waiting for pipe capacity. Its queue is bounded. A separately
 bounded priority control path carries arm, cancel, shutdown, and liveness frames;
-bulk full-text frames cannot sit ahead of `NativeCallArmed`. If both classes are
+bulk full-text frames cannot sit ahead of hazard or segment arm traffic. If both classes are
 multiplexed onto one OS stream, bulk frames are chunked to a measured maximum so
 the control-latency bound is preserved between chunks. When bulk backpressure
 would retain an obsolete chain of unsent document edits, the parent replaces
@@ -309,18 +312,27 @@ whose raw pointers ultimately depend on the grammar mapping. It is intentionally
 broader than the lexical call into `Parser::parse`: native corruption may become
 observable only during a later tree walk.
 
-Before the first such dereference, the worker sends `NativeCallStarting` with
-the actual runtime grammar identity and waits. The parent records the call in
-its session-local active set before replying with `NativeCallArmed`; the worker
-must not enter the hazard scope without that reply. After receiving the arm and
-immediately before its first hazardous dereference, the worker emits
-`NativeCallEntered`. Each grammar encountered by a fused host/injection
-operation is armed separately and remains active until
-the complete high-level operation has stopped consuming every value backed by
-that grammar. Only then does `NativeCallFinished` remove it from the parent set.
-A worker that dies after the arm therefore cannot make a relevant grammar
-invisible merely because parsing returned before the delayed failure, while a
-worker that dies before the arm has not entered that grammar-backed boundary.
+Before the first such dereference, the worker sends `GrammarHazardStarting` with
+the actual runtime grammar identity and waits. The parent records the lease in
+its session-local active set before replying with `GrammarHazardArmed`; the
+worker must not enter the hazard scope without that reply. Each grammar
+encountered by a fused host/injection operation is leased separately and remains
+active until the complete high-level operation has stopped consuming every
+value backed by that grammar. Only then does `GrammarHazardReleased` remove it
+from the parent set. A worker that dies after the arm therefore cannot make a
+relevant grammar invisible merely because parsing returned before the delayed
+failure, while a worker that dies before the arm has not entered that
+grammar-backed boundary.
+
+The broad attribution lease is distinct from hard-hang timing. Immediately
+before each non-cooperative native segment, such as library loading, grammar
+initialization, or `Parser::parse`, the worker performs the separate
+`NativeSegmentStarting`/`NativeSegmentArmed` handshake and emits
+`NativeSegmentEntered`; it emits `NativeSegmentExited` immediately on return.
+Queue time, fair-scheduler waits, cooperative tree-walk chunks, Rust-side
+derivation, and response serialization remain inside the attribution lease but
+outside the native-segment timer. They use the end-to-end request deadline and
+cancellation checkpoints instead of causing a worker kill.
 
 `grammar_key` identifies the resolved artifact and exported grammar, not merely
 a configured language alias. Aliases that load the same artifact share a key;
@@ -365,12 +377,12 @@ It logs:
 * the session quarantine action.
 
 With internal parallelism, an externally observed process crash may leave more
-than one acknowledged native call active. The initial safe policy quarantines
-the complete set of active `grammar_key` values recorded by the parent. This can
+than one acknowledged grammar hazard lease active. The initial safe policy
+quarantines the complete set of active `grammar_key` values recorded by the parent. This can
 conservatively disable an innocent concurrently active grammar, but only for the
 current session. Exact cross-platform identification of the faulting thread
 would require a separate crash-reporting design and is not assumed by this
-decision. A worker failure with no acknowledged native call is treated as a
+decision. A worker failure with no acknowledged grammar hazard lease is treated as a
 worker/protocol failure and does not invent a parser quarantine.
 
 After quarantine, the parent starts a fresh worker with bounded backoff, sends
@@ -400,15 +412,17 @@ set or an active-parse marker across server sessions. A fresh kakehashi process
 therefore retries every installed parser.
 
 An end-to-end request deadline starts at request admission and can release the
-client without killing the worker. A separate hard native-call deadline starts
-only when the parent receives `NativeCallEntered`, not while an arm frame is
-queued or in transit. The already recorded active key still provides crash
-attribution between arm and entry. Missing entry and control-protocol progress
-use the supervisor's bounded handshake/liveness timeout rather than consuming a
-grammar's native execution budget. A cooperative timeout that returns control
-from Tree-sitter does not require a worker restart. If an entered call exceeds
-the hard deadline, the parent kills and restarts the worker and quarantines the
-complete acknowledged active grammar set. This remains correct when one
+client without killing the worker. A separate hard native-segment deadline
+starts only when the parent receives `NativeSegmentEntered` and ends at
+`NativeSegmentExited`, not while an arm frame is queued or in transit and not
+for the lifetime of the surrounding grammar hazard lease. The already recorded
+lease still provides crash attribution between arm and entry. Missing entry and
+control-protocol progress use the supervisor's bounded handshake/liveness
+timeout rather than consuming a grammar's native execution budget. A
+cooperative timeout that returns control from Tree-sitter does not require a
+worker restart. If an entered segment exceeds the hard deadline, the parent
+kills and restarts the worker and quarantines the complete acknowledged active
+grammar set. This remains correct when one
 `DeriveSnapshot` reaches several injected grammars or when unrelated documents
 parse concurrently.
 
@@ -540,12 +554,16 @@ Implementation is accepted only when all of the following hold:
   grammar set
   for the session, restarts the worker, and successfully reparses an open
   document in another language.
-* Failure injection immediately after `NativeCallArmed` proves that the parent
+* Failure injection immediately after `GrammarHazardArmed` proves that the parent
   already holds the crashing grammar key and that the replacement worker refuses
   it for host and injected parser acquisition.
 * A saturated bulk full-sync queue proves arm control traffic remains bounded
-  and that the native hard deadline begins only after `NativeCallEntered`, so
+  and that the native hard deadline begins only after `NativeSegmentEntered`, so
   transport delay alone cannot quarantine a healthy grammar.
+* A long, cooperatively chunked derivation may exceed the native-segment
+  threshold in total wall time without any individual segment exceeding it; it
+  is canceled or rejected through the request contract without killing the
+  worker or quarantining its grammar.
 * A fixture that returns from parsing and fails during query construction or a
   later tree/node walk proves that the grammar remains parent-visible until the
   entire high-level operation leaves its grammar-backed hazard scope.
