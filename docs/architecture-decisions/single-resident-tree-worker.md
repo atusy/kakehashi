@@ -167,6 +167,7 @@ SyncDocument(uri, incarnation, version, language, full_text)
 ApplyEdits(uri, incarnation, base_version, version, edits)
 CloseDocument(uri, incarnation)
 UpdateConfiguration(configuration_generation, settings)
+UpdateQuarantine(quarantine_generation, grammar_keys)
 ```
 
 Tree work uses high-level operations rather than remote Tree-sitter primitives:
@@ -176,6 +177,9 @@ DeriveSnapshot(uri, incarnation, version, requested_artifacts)
 ResolveNode(uri, incarnation, version, selector)
 NavigateNode(uri, opaque_node_id, operation)
 RunCaptures(uri, incarnation, version, query, range)
+NativeCallStarting(call_id, request_id, grammar_key)
+NativeCallArmed(call_id, worker_generation)
+NativeCallFinished(call_id)
 ```
 
 `DeriveSnapshot` may fuse parse, injection discovery, cache reconciliation, and
@@ -205,10 +209,29 @@ remain separate messages, but each message performs its complete tree walk in
 the worker. The parent never asks for a raw tree and then remotely walks it one
 node at a time to implement a single public request.
 
+Every entry into untrusted native grammar code has a two-phase parent-visible
+boundary. This includes dynamic-library loading and symbol initialization as
+well as parsing that can invoke an external scanner. Before entry, the worker
+sends `NativeCallStarting` with the actual runtime grammar identity and waits.
+The parent records the call in its session-local active set before replying with
+`NativeCallArmed`; the worker must not enter native code without that reply. On
+normal return, `NativeCallFinished` removes the call from the parent set. A
+worker that dies after the arm therefore cannot make the implicated grammar
+invisible to recovery, while a worker that dies before the arm has not entered
+that native boundary.
+
+`grammar_key` identifies the resolved artifact and exported grammar, not merely
+a configured language alias. Aliases that load the same artifact share a key;
+replacing the parser artifact produces a new key. The handshake adds one local
+round trip to every native entry and is included in the performance acceptance
+measurements. Replacing it with shared-memory activity slots is a separate
+optimization that must preserve the same parent-visible-before-entry ordering.
+
 ### 6. Crash, hang, and restart policy
 
 The parent supervises the worker as a child process and treats EOF, abnormal
-exit, protocol corruption, and a hard deadline as worker failure. It logs:
+exit, protocol corruption, and a hard native-call deadline as worker failure.
+It logs:
 
 * process exit status or terminating signal when available;
 * worker generation;
@@ -217,23 +240,33 @@ exit, protocol corruption, and a hard deadline as worker failure. It logs:
 * the session quarantine action.
 
 With internal parallelism, an externally observed process crash may leave more
-than one native parser call in flight. The initial safe policy quarantines all
-languages with admitted native calls that had started but not completed. This
-can conservatively disable an innocent concurrently active language, but only
-for the current session. Exact cross-platform identification of the faulting
-thread would require a separate crash-reporting design and is not assumed by
-this decision.
+than one acknowledged native call active. The initial safe policy quarantines
+the complete set of active `grammar_key` values recorded by the parent. This can
+conservatively disable an innocent concurrently active grammar, but only for the
+current session. Exact cross-platform identification of the faulting thread
+would require a separate crash-reporting design and is not assumed by this
+decision. A worker failure with no acknowledged native call is treated as a
+worker/protocol failure and does not invent a parser quarantine.
 
-After quarantine, the parent starts a fresh worker with bounded backoff and
-full-syncs open documents whose languages remain usable. Host-tier service
-continues throughout recovery. The parent does not persist a `failed_parsers`
+After quarantine, the parent starts a fresh worker with bounded backoff, sends
+the versioned quarantine set before enabling document derivation, and full-syncs
+all open documents. Every host and injected parser acquisition in the worker
+must reject a quarantined `grammar_key`; a document with a quarantined injected
+layer degrades only that layer rather than being omitted from resync. Host-tier
+service continues throughout recovery. Reload and auto-install events cannot
+re-enable the same quarantined artifact, while an actually replaced artifact
+has a new key and may be tried. The parent does not persist a `failed_parsers`
 set or an active-parse marker across server sessions. A fresh kakehashi process
 therefore retries every installed parser.
 
+An end-to-end request deadline starts at request admission and can release the
+client without killing the worker. A separate hard native-call deadline starts
+only when the parent records `NativeCallStarting` and sends `NativeCallArmed`.
 A cooperative timeout that returns control from Tree-sitter does not require a
-worker restart. A native call that exceeds the hard process deadline causes the
-parent to kill and restart the worker; because the parent selected the timed-out
-request, its language is known and quarantined for the session before resync.
+worker restart. If an armed call exceeds the hard deadline, the parent kills and
+restarts the worker and quarantines the complete acknowledged active grammar
+set. This remains correct when one `DeriveSnapshot` reaches several injected
+grammars or when unrelated documents parse concurrently.
 
 The worker belongs to the parent process lifetime. Shutdown closes the protocol,
 waits for a short graceful exit, then kills and reaps the process (and its process
@@ -320,9 +353,13 @@ subprocess and the resident runtime worker are separate lifecycles.
 Implementation is accepted only when all of the following hold:
 
 * A child grammar fixture that calls `abort` proves that the LSP process stays
-  alive, emits an attributable crash log, quarantines the active language set
+  alive, emits an attributable crash log, quarantines the acknowledged active
+  grammar set
   for the session, restarts the worker, and successfully reparses an open
   document in another language.
+* Failure injection immediately after `NativeCallArmed` proves that the parent
+  already holds the crashing grammar key and that the replacement worker refuses
+  it for host and injected parser acquisition.
 * A child grammar fixture that hangs proves the hard deadline kills and reaps
   the worker and its descendants, then restores service for non-quarantined
   documents.
