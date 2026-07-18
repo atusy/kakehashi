@@ -188,7 +188,7 @@ ConfigurationReady(configuration_generation, worker_generation)
 UpdateQuarantine(quarantine_generation, grammar_keys)
 QuarantineReady(quarantine_generation, worker_generation)
 GrammarMissing(request_id, language, document_context)
-ReloadGrammar(configuration_generation, grammar_descriptor)
+LoadNewGrammar(configuration_generation, grammar_descriptor)
 GrammarReady(configuration_generation, grammar_key, worker_generation)
 ```
 
@@ -302,15 +302,26 @@ optimization that must preserve the same parent-visible-before-entry ordering.
 
 The worker never downloads or compiles a missing grammar. It returns
 `GrammarMissing`, and the parent's existing global installer deduplicates and
-performs that work. After a successful install or configured parser replacement,
-the parent first advances the configuration generation and then sends
-`ReloadGrammar`. The worker invalidates the old language, parser, query, and
-derived caches, acknowledges the new grammar identity, and re-derives the
-latest acknowledged versions of documents that had recorded a dependency on
-that language. A reload of the same quarantined `grammar_key` is refused; a
-genuinely replaced artifact has a different key and may be loaded. Missing host
-and injected grammars use the same event path, so an injected install cannot
-bypass quarantine or the configuration-generation publish guard.
+performs that work. A newly installed artifact that has never been mapped in
+the current worker may be introduced with `LoadNewGrammar`; the worker
+acknowledges its content-derived identity and re-derives the latest acknowledged
+versions of documents that recorded the missing dependency.
+
+Replacing an artifact already loaded by the worker is a planned worker restart,
+not an in-place reload. The current native loader intentionally keeps libraries
+mapped for process lifetime because `Language`, `Parser`, `Tree`, and queries may
+retain raw pointers into them, and loading the same canonical path again may
+return the old image. After compilation and atomic installation, the parent
+advances the configuration generation, drains or cancels public tree requests,
+starts a fresh worker generation, sends configuration and quarantine state, and
+full-syncs open documents. Only the fresh worker loads the replacement. This
+also avoids replacing a loaded DLL in place on platforms that prohibit it.
+
+Loading the same quarantined `grammar_key` is refused; a genuinely replaced
+artifact has a different content identity and may be loaded by the fresh
+worker. Missing host and injected grammars use the same event path, so an
+injected install cannot bypass quarantine or the configuration-generation
+publish guard.
 
 ### 6. Crash, hang, and restart policy
 
@@ -490,8 +501,10 @@ Implementation is accepted only when all of the following hold:
 * Protocol tests cover truncated frames, oversized frames, unknown versions,
   invalid edit bases, duplicate responses, EOF, and child startup failure.
 * Install/reload tests cover missing host and injected grammars, concurrent
-  install deduplication, cache invalidation, latest-version re-derivation, parser
-  replacement, and refusal to reload the same quarantined artifact.
+  install deduplication, cache invalidation, latest-version re-derivation, and
+  refusal to load the same quarantined artifact. Same-path parser replacement,
+  including the loaded-DLL case on Windows, proves that a fresh worker executes
+  the new artifact rather than acknowledging a new key while retaining old code.
 * Cancellation tests cover queued and running work for client cancellation,
   supersession, handler drop, and `didClose`, including completion races and the
   rule that canceled work publishes and caches nothing.
