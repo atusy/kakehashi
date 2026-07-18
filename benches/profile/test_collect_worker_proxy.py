@@ -404,6 +404,7 @@ class CollectionHelpersTest(unittest.TestCase):
                     "CARGO_HOME": "/tmp/fresh-target/cargo-home",
                 },
                 "built_in_fresh_target": True,
+                "source_isolated_archive": True,
                 "binary_relative": "target/release/kakehashi",
                 "binary_sha256": hashlib.sha256(b"release").hexdigest(),
             }))
@@ -431,6 +432,7 @@ class CollectionHelpersTest(unittest.TestCase):
                 "cargo": "",
                 "build_environment": {},
                 "built_in_fresh_target": False,
+                "source_isolated_archive": False,
                 "binary_relative": "target/release/kakehashi",
                 "binary_sha256": hashlib.sha256(b"release").hexdigest(),
             }))

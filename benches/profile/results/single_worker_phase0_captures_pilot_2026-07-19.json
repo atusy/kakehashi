@@ -6,7 +6,7 @@
     "python": "3.12.13",
     "binary": "/Users/atusy/ghq/github.com/atusy/kakehashi___worker_adr/target/release/kakehashi",
     "binary_execution": "private staged copy",
-    "binary_sha256": "f13b937624e059498b41bde258e82c259f8b401c327e0051bee84453ebfe6b72",
+    "binary_sha256": "65dd4ee0520cd313a82e66b8b4f1a7a0e559c56c6a891a119286487689ddb8a1",
     "data_dir": "/private/tmp/kakehashi-phase0-data.WIU8dk",
     "data_dir_execution": "private staged copy",
     "parser_query_file_count": 25,
@@ -43,12 +43,13 @@
       "TMPDIR": "/var/folders/t3/_nc24_w90zq79l3xyz3xzc7c0000gn/T/",
       "LANG": "C.UTF-8",
       "LC_ALL": "C.UTF-8",
-      "CARGO_TARGET_DIR": "/var/folders/t3/_nc24_w90zq79l3xyz3xzc7c0000gn/T/kakehashi-attested-target-ihjxxrgo",
-      "CARGO_HOME": "/var/folders/t3/_nc24_w90zq79l3xyz3xzc7c0000gn/T/kakehashi-attested-target-ihjxxrgo/cargo-home"
+      "CARGO_TARGET_DIR": "/var/folders/t3/_nc24_w90zq79l3xyz3xzc7c0000gn/T/kakehashi-attested-build-8k8g3ey_/target",
+      "CARGO_HOME": "/var/folders/t3/_nc24_w90zq79l3xyz3xzc7c0000gn/T/kakehashi-attested-build-8k8g3ey_/target/cargo-home"
     },
     "built_in_fresh_target": true,
+    "source_isolated_archive": true,
     "binary_relative": "target/release/kakehashi",
-    "binary_sha256": "f13b937624e059498b41bde258e82c259f8b401c327e0051bee84453ebfe6b72"
+    "binary_sha256": "65dd4ee0520cd313a82e66b8b4f1a7a0e559c56c6a891a119286487689ddb8a1"
   },
   "arguments": [
     "--lang",
@@ -64,10 +65,10 @@
   "independent_pairs": 1,
   "order": "direct then relay; smoke result only",
   "direct": {
-    "semantic_p50": 5.4,
-    "semantic_p95": 6.8,
-    "captures_p50": 37.1,
-    "captures_p95": 40.6,
+    "semantic_p50": 5.8,
+    "semantic_p95": 7.4,
+    "captures_p50": 37.9,
+    "captures_p95": 41.2,
     "semantic_outcomes": {
       "count": 100,
       "ok": 100,
@@ -88,10 +89,10 @@
     "capture_full_fallbacks": 0
   },
   "relay": {
-    "semantic_p50": 4.5,
-    "semantic_p95": 5.7,
-    "captures_p50": 29.7,
-    "captures_p95": 36.6,
+    "semantic_p50": 4.8,
+    "semantic_p95": 6.4,
+    "captures_p50": 31.6,
+    "captures_p95": 38.4,
     "semantic_outcomes": {
       "count": 100,
       "ok": 100,

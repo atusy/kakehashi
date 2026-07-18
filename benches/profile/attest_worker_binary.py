@@ -7,6 +7,7 @@ import os
 import pathlib
 import shutil
 import subprocess
+import tarfile
 import tempfile
 
 from collect_worker_proxy import ATTESTED_BUILD_COMMAND, sha256_file, tool_version
@@ -33,6 +34,22 @@ def environment_tool_version(command, environment):
     ).stdout.strip()
 
 
+def archive_source(checkout, revision, destination):
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    archive = destination.parent / "source.tar"
+    subprocess.run(
+        [
+            "git", "-C", str(checkout), "archive", "--format=tar",
+            "--output", str(archive), revision,
+        ],
+        check=True,
+    )
+    destination.mkdir()
+    with tarfile.open(archive) as source:
+        source.extractall(destination, filter="data")
+    archive.unlink()
+
+
 def git(checkout, *arguments):
     return tool_version(["git", "-C", str(checkout), *arguments])
 
@@ -52,15 +69,19 @@ def main():
     require_clean(args.checkout)
     source_commit = git(args.checkout, "rev-parse", "HEAD")
     source_repository = git(args.checkout, "remote", "get-url", "origin")
-    with tempfile.TemporaryDirectory(prefix="kakehashi-attested-target-") as target:
+    with tempfile.TemporaryDirectory(prefix="kakehashi-attested-build-") as root:
+        isolated_root = pathlib.Path(root)
+        source = isolated_root / "source"
+        archive_source(args.checkout, source_commit, source)
+        target = isolated_root / "target"
         build_environment = controlled_build_environment(os.environ, target)
         subprocess.run(
             ATTESTED_BUILD_COMMAND,
-            cwd=args.checkout,
+            cwd=source,
             check=True,
             env=build_environment,
         )
-        built_binary = pathlib.Path(target) / "release/kakehashi"
+        built_binary = target / "release/kakehashi"
         binary = args.checkout / BINARY_RELATIVE
         binary.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(built_binary, binary)
@@ -77,6 +98,7 @@ def main():
         "cargo": cargo,
         "build_environment": build_environment,
         "built_in_fresh_target": True,
+        "source_isolated_archive": True,
         "binary_relative": BINARY_RELATIVE.as_posix(),
         "binary_sha256": sha256_file(binary),
     }
