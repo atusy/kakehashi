@@ -237,6 +237,7 @@ for each worker generation:
 
 ```text
 Unsynced -> SyncPending(version) -> Synced(version)
+Synced(base) -> EditPending(base, target) -> Synced(target)
 ```
 
 After startup or restart, the parent first waits for configuration and
@@ -244,10 +245,22 @@ quarantine acknowledgments. Every open document then starts `Unsynced`. While a
 document is `Unsynced` or `SyncPending`, concurrent edits update the
 authoritative parent text and coalesce into the latest full-sync candidate;
 incremental messages are not emitted from an unacknowledged base. Once
-`SyncDocumentAck` arrives, the parent may send incrementals only from that exact
-acknowledged version. A worker receiving any other base returns
-`ResyncRequired` without applying the edit or deriving from partial state, and
-the parent returns the document to `Unsynced`.
+`SyncDocumentAck` arrives, the parent may send one incremental chain from that
+exact acknowledged version and enters `EditPending`. While its ack is pending,
+later client edits are retained and coalesced behind that chain; the parent does
+not send another edit with either an optimistic or stale base. On
+`ApplyEditsAck(target)`, it first enters `Synced(target)`, then sends a composed
+incremental from the retained target snapshot to the latest parent version when
+that edit history remains available. Otherwise it returns to `Unsynced` and
+sends the latest full text. Thus at most one edit chain is unacknowledged per
+document without forcing a full sync for every keystroke.
+
+An acknowledgment with the wrong generation, incarnation, base, or target is
+discarded and forces `Unsynced`; a worker receiving an invalid base returns
+`ResyncRequired` without applying the edit or deriving from partial state, with
+the same transition. Close removes every pending state and deferred edit for
+that incarnation. Restart creates new per-generation `Unsynced` states rather
+than attempting to replay old acknowledgments.
 
 Protocol writes run on a dedicated async writer and never hold an LSP ingress
 ticket while waiting for pipe capacity. Its queue is bounded. When backpressure
