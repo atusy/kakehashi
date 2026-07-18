@@ -51,6 +51,28 @@ def summarize_cold_start(times):
     }
 
 
+def analyze_data(data, seed=123_456_789, resamples=100_000):
+    if data.get("experiment") == "single-tree-worker-phase0-cold-start":
+        return {
+            "cold_start": summarize_pairs(
+                data["pairs"], "elapsed_seconds", seed, resamples
+            )
+        }
+    summaries = {}
+    for scenario, details in data["steady_state"].items():
+        summaries[scenario] = {
+            metric: summarize_pairs(details["pairs"], metric, seed, resamples)
+            for metric in ("p50", "p95", "p99", "wall")
+        }
+    if data.get("cold_start"):
+        summaries["cold_start"] = {
+            path: summarize_cold_start(details["times"])
+            for path, details in data["cold_start"].items()
+            if path in ("direct", "relay")
+        }
+    return summaries
+
+
 def main():
     default_data = pathlib.Path(__file__).with_name("results") / (
         "single_worker_phase0_2026-07-19.json"
@@ -62,19 +84,7 @@ def main():
     args = parser.parse_args()
 
     data = json.loads(args.data.read_text())
-    summaries = {}
-    for scenario, details in data["steady_state"].items():
-        summaries[scenario] = {
-            metric: summarize_pairs(
-                details["pairs"], metric, args.seed, args.resamples
-            )
-            for metric in ("p50", "p95", "p99", "wall")
-        }
-    summaries["cold_start"] = {
-        path: summarize_cold_start(details["times"])
-        for path, details in data["cold_start"].items()
-        if path in ("direct", "relay")
-    }
+    summaries = analyze_data(data, args.seed, args.resamples)
     print(json.dumps(summaries, indent=2, sort_keys=True))
 
 

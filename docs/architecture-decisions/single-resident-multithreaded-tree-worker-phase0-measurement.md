@@ -104,21 +104,18 @@ parse scheduling, derivation, response relay, and parent/child scheduling. The
 real worker benchmark must separate enqueue, queue, compute, serialization, and
 resume time before treating this as a protocol cost.
 
-### Non-comparative fresh-process observations
+### Validated fresh-process probe
 
-`hyperfine` ran 20 direct processes followed by 20 relay processes, after three
-warmups per condition, with one immediate Rust request:
+The bounded collector ran 20 alternating direct/relay process pairs after three
+warmup pairs, with one immediate validated Rust request:
 
-| Path | Mean | Standard deviation | Range |
-|---|---:|---:|---:|
-| Direct | 123.4 ms | 10.1 ms | 101.2–132.9 ms |
-| Relay | 156.9 ms | 6.0 ms | 147.3–167.1 ms |
+| Direct mean | Relay mean | Paired delta | 95% CI for delta |
+|---:|---:|---:|---:|
+| 128.6 ms | 163.8 ms | +35.2 ms | [34.3, 36.2] ms |
 
-The series were not interleaved: direct timings rose during their series while
-relay timings fell during theirs. They are retained as environment-specific
-observations, not as a comparative delta. The relay series also includes Python
-interpreter startup and is not an estimate of a Rust worker's spawn/handshake
-time. Stage 1 must measure cold start with alternating pairs.
+The relay series includes Python interpreter startup and is not an estimate of
+a Rust worker's spawn/handshake time. Stage 1 must repeat this measurement with
+the real worker executable and protocol.
 
 ### Concurrent captures pilot
 
@@ -169,9 +166,10 @@ matrix.
 
 The tail-percentile driver and relay are in `benches/profile/drive.py` and
 `benches/profile/worker_proxy.py`. The 20 paired run summaries, execution order,
-commands, environment, artifact-tree digest, and cold-start result are committed
-in `benches/profile/results/single_worker_phase0_2026-07-19.json`. The separately
-generated captures smoke result is in
+commands, environment, and artifact-tree digest are committed in
+`benches/profile/results/single_worker_phase0_2026-07-19.json`. The separately
+generated cold-start and captures results are in
+`benches/profile/results/single_worker_phase0_cold_start_2026-07-19.json` and
 `benches/profile/results/single_worker_phase0_captures_pilot_2026-07-19.json`.
 The binary build attestation used by both collectors is in
 `benches/profile/results/single_worker_phase0_binary_attestation_2026-07-19.json`.
@@ -183,10 +181,10 @@ python3 benches/profile/analyze_worker_proxy.py
 
 The July 19 steady-state section comes from one final 20-pair collector run and
 preserves every run summary and status count but not each raw stderr stream.
-Cold start was recollected under the same controlled environment and artifact
-identity; all 20 timing samples per non-interleaved condition are recomputed by
-the analyzer but are explicitly non-comparative. The captures
-pilot was rerun with `collect_worker_capture_pilot.py`, which fails unless both
+Cold start was recollected as 20 alternating pairs with
+`collect_worker_cold_start.py`; every process is bounded and its semantic
+response validated. The captures pilot was rerun with
+`collect_worker_capture_pilot.py`, which fails unless both
 methods return 100 successful responses and the driver validates every delta
 shape and advancing lineage. It remains a single-pair smoke test rather than an
 independently repeated result.

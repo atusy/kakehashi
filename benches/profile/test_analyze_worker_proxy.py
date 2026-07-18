@@ -6,7 +6,7 @@ from unittest import mock
 
 sys.path.insert(0, str(pathlib.Path(__file__).parent))
 
-from analyze_worker_proxy import summarize_cold_start, summarize_pairs
+from analyze_worker_proxy import analyze_data, summarize_cold_start, summarize_pairs
 
 
 class PairedSummaryTest(unittest.TestCase):
@@ -45,6 +45,25 @@ class PairedSummaryTest(unittest.TestCase):
             random.Random, "choice", side_effect=AssertionError("scalar sampling")
         ):
             summarize_pairs(pairs, "p50", seed=7, resamples=10)
+
+    def test_analyzes_dedicated_cold_start_pairs(self):
+        data = {
+            "experiment": "single-tree-worker-phase0-cold-start",
+            "pairs": [
+                {
+                    "direct": {"elapsed_seconds": 0.1},
+                    "relay": {"elapsed_seconds": 0.13},
+                },
+                {
+                    "direct": {"elapsed_seconds": 0.11},
+                    "relay": {"elapsed_seconds": 0.15},
+                },
+            ],
+        }
+
+        summary = analyze_data(data, seed=7, resamples=100)
+
+        self.assertAlmostEqual(summary["cold_start"]["mean_delta"], 0.035)
 
 
 if __name__ == "__main__":

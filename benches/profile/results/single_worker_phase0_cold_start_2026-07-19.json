@@ -1,0 +1,336 @@
+{
+  "schema": 1,
+  "experiment": "single-tree-worker-phase0-cold-start",
+  "environment": {
+    "platform": "macOS-26.5.1-arm64-arm-64bit",
+    "python": "3.12.13",
+    "binary": "/Users/atusy/ghq/github.com/atusy/kakehashi___worker_adr/target/release/kakehashi",
+    "binary_sha256": "4ea51e25b3bbe30360772789996ff4076c4f01e84663975c0a71004e4501cf5a",
+    "data_dir": "/private/tmp/kakehashi-phase0-data.WIU8dk",
+    "parser_query_file_count": 25,
+    "parser_query_tree_sha256": "1572967b352c7b24ec872bff02c3c9808374a0d5cab2c707368cb5f32be58115",
+    "retained_environment": {
+      "PATH": "/Users/atusy/.local/bin:/Users/atusy/.bun/install/global/node_modules/@openai/codex-darwin-arm64/vendor/aarch64-apple-darwin/codex-path:/Users/atusy/.codex/tmp/arg0/codex-arg0wMKckG:/opt/homebrew/bin:/opt/homebrew/sbin:/nix/var/nix/profiles/default/bin:/Users/atusy/.nix-profile/bin:/run/current-system/sw/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/Users/atusy/.local/lastresort/bin",
+      "TMPDIR": "/var/folders/t3/_nc24_w90zq79l3xyz3xzc7c0000gn/T/",
+      "LANG": "C.UTF-8",
+      "LC_ALL": "C.UTF-8"
+    }
+  },
+  "artifacts": {
+    "nvim_treesitter_repository": "https://github.com/nvim-treesitter/nvim-treesitter",
+    "nvim_treesitter_revision": "4916d6592ede8c07973490d9322f187e07dfefac",
+    "verification": "parser metadata and every installed query byte-matched"
+  },
+  "binary_attestation": {
+    "schema": 1,
+    "source_repository": "https://github.com/atusy/kakehashi",
+    "source_commit": "ccbd8ffd13c4817eda62e1de6f8cfd3eeb3259d0",
+    "source_checkout_clean": true,
+    "build_command": [
+      "cargo",
+      "build",
+      "--release",
+      "--bin",
+      "kakehashi"
+    ],
+    "rustc": "rustc 1.95.0 (59807616e 2026-04-14) (built from a source tarball)",
+    "cargo": "cargo 1.95.0 (f2d3ce0bd 2026-03-21)",
+    "binary_relative": "target/release/kakehashi",
+    "binary_sha256": "4ea51e25b3bbe30360772789996ff4076c4f01e84663975c0a71004e4501cf5a"
+  },
+  "arguments": [
+    "--lang",
+    "rust",
+    "--size",
+    "15",
+    "--requests",
+    "1",
+    "--settle",
+    "0"
+  ],
+  "warmup_pairs": 3,
+  "measured_pairs": 20,
+  "order": "alternating direct-relay and relay-direct pairs",
+  "pairs": [
+    {
+      "run": 1,
+      "order": "direct-relay",
+      "direct": {
+        "elapsed_seconds": 0.12635304196737707,
+        "validated_responses": 1,
+        "tokens_per_request": 1342
+      },
+      "relay": {
+        "elapsed_seconds": 0.16417554207146168,
+        "validated_responses": 1,
+        "tokens_per_request": 1342
+      }
+    },
+    {
+      "run": 2,
+      "order": "relay-direct",
+      "relay": {
+        "elapsed_seconds": 0.16266024997457862,
+        "validated_responses": 1,
+        "tokens_per_request": 1342
+      },
+      "direct": {
+        "elapsed_seconds": 0.1279275839915499,
+        "validated_responses": 1,
+        "tokens_per_request": 1342
+      }
+    },
+    {
+      "run": 3,
+      "order": "direct-relay",
+      "direct": {
+        "elapsed_seconds": 0.12744137493427843,
+        "validated_responses": 1,
+        "tokens_per_request": 1342
+      },
+      "relay": {
+        "elapsed_seconds": 0.16324470797553658,
+        "validated_responses": 1,
+        "tokens_per_request": 1342
+      }
+    },
+    {
+      "run": 4,
+      "order": "relay-direct",
+      "relay": {
+        "elapsed_seconds": 0.1687217919388786,
+        "validated_responses": 1,
+        "tokens_per_request": 1342
+      },
+      "direct": {
+        "elapsed_seconds": 0.1307332500582561,
+        "validated_responses": 1,
+        "tokens_per_request": 1342
+      }
+    },
+    {
+      "run": 5,
+      "order": "direct-relay",
+      "direct": {
+        "elapsed_seconds": 0.13636399991810322,
+        "validated_responses": 1,
+        "tokens_per_request": 1342
+      },
+      "relay": {
+        "elapsed_seconds": 0.1674485410330817,
+        "validated_responses": 1,
+        "tokens_per_request": 1342
+      }
+    },
+    {
+      "run": 6,
+      "order": "relay-direct",
+      "relay": {
+        "elapsed_seconds": 0.16557366598863155,
+        "validated_responses": 1,
+        "tokens_per_request": 1342
+      },
+      "direct": {
+        "elapsed_seconds": 0.13398608297575265,
+        "validated_responses": 1,
+        "tokens_per_request": 1342
+      }
+    },
+    {
+      "run": 7,
+      "order": "direct-relay",
+      "direct": {
+        "elapsed_seconds": 0.1292312500299886,
+        "validated_responses": 1,
+        "tokens_per_request": 1342
+      },
+      "relay": {
+        "elapsed_seconds": 0.1666427080053836,
+        "validated_responses": 1,
+        "tokens_per_request": 1342
+      }
+    },
+    {
+      "run": 8,
+      "order": "relay-direct",
+      "relay": {
+        "elapsed_seconds": 0.16960000002291054,
+        "validated_responses": 1,
+        "tokens_per_request": 1342
+      },
+      "direct": {
+        "elapsed_seconds": 0.13007170904893428,
+        "validated_responses": 1,
+        "tokens_per_request": 1342
+      }
+    },
+    {
+      "run": 9,
+      "order": "direct-relay",
+      "direct": {
+        "elapsed_seconds": 0.12772679200861603,
+        "validated_responses": 1,
+        "tokens_per_request": 1342
+      },
+      "relay": {
+        "elapsed_seconds": 0.16367362497840077,
+        "validated_responses": 1,
+        "tokens_per_request": 1342
+      }
+    },
+    {
+      "run": 10,
+      "order": "relay-direct",
+      "relay": {
+        "elapsed_seconds": 0.1619413330918178,
+        "validated_responses": 1,
+        "tokens_per_request": 1342
+      },
+      "direct": {
+        "elapsed_seconds": 0.1288900829385966,
+        "validated_responses": 1,
+        "tokens_per_request": 1342
+      }
+    },
+    {
+      "run": 11,
+      "order": "direct-relay",
+      "direct": {
+        "elapsed_seconds": 0.12855145905632526,
+        "validated_responses": 1,
+        "tokens_per_request": 1342
+      },
+      "relay": {
+        "elapsed_seconds": 0.16126016597263515,
+        "validated_responses": 1,
+        "tokens_per_request": 1342
+      }
+    },
+    {
+      "run": 12,
+      "order": "relay-direct",
+      "relay": {
+        "elapsed_seconds": 0.16228479205165058,
+        "validated_responses": 1,
+        "tokens_per_request": 1342
+      },
+      "direct": {
+        "elapsed_seconds": 0.12671824998687953,
+        "validated_responses": 1,
+        "tokens_per_request": 1342
+      }
+    },
+    {
+      "run": 13,
+      "order": "direct-relay",
+      "direct": {
+        "elapsed_seconds": 0.12750362500082701,
+        "validated_responses": 1,
+        "tokens_per_request": 1342
+      },
+      "relay": {
+        "elapsed_seconds": 0.16188404196873307,
+        "validated_responses": 1,
+        "tokens_per_request": 1342
+      }
+    },
+    {
+      "run": 14,
+      "order": "relay-direct",
+      "relay": {
+        "elapsed_seconds": 0.16298829205334187,
+        "validated_responses": 1,
+        "tokens_per_request": 1342
+      },
+      "direct": {
+        "elapsed_seconds": 0.12768762500490993,
+        "validated_responses": 1,
+        "tokens_per_request": 1342
+      }
+    },
+    {
+      "run": 15,
+      "order": "direct-relay",
+      "direct": {
+        "elapsed_seconds": 0.1270574158988893,
+        "validated_responses": 1,
+        "tokens_per_request": 1342
+      },
+      "relay": {
+        "elapsed_seconds": 0.16106470802333206,
+        "validated_responses": 1,
+        "tokens_per_request": 1342
+      }
+    },
+    {
+      "run": 16,
+      "order": "relay-direct",
+      "relay": {
+        "elapsed_seconds": 0.16242512490134686,
+        "validated_responses": 1,
+        "tokens_per_request": 1342
+      },
+      "direct": {
+        "elapsed_seconds": 0.12770800001453608,
+        "validated_responses": 1,
+        "tokens_per_request": 1342
+      }
+    },
+    {
+      "run": 17,
+      "order": "direct-relay",
+      "direct": {
+        "elapsed_seconds": 0.12730833305977285,
+        "validated_responses": 1,
+        "tokens_per_request": 1342
+      },
+      "relay": {
+        "elapsed_seconds": 0.16229720797855407,
+        "validated_responses": 1,
+        "tokens_per_request": 1342
+      }
+    },
+    {
+      "run": 18,
+      "order": "relay-direct",
+      "relay": {
+        "elapsed_seconds": 0.1625341670587659,
+        "validated_responses": 1,
+        "tokens_per_request": 1342
+      },
+      "direct": {
+        "elapsed_seconds": 0.12636991601902992,
+        "validated_responses": 1,
+        "tokens_per_request": 1342
+      }
+    },
+    {
+      "run": 19,
+      "order": "direct-relay",
+      "direct": {
+        "elapsed_seconds": 0.1271157079609111,
+        "validated_responses": 1,
+        "tokens_per_request": 1342
+      },
+      "relay": {
+        "elapsed_seconds": 0.1624005000339821,
+        "validated_responses": 1,
+        "tokens_per_request": 1342
+      }
+    },
+    {
+      "run": 20,
+      "order": "relay-direct",
+      "relay": {
+        "elapsed_seconds": 0.163930083042942,
+        "validated_responses": 1,
+        "tokens_per_request": 1342
+      },
+      "direct": {
+        "elapsed_seconds": 0.1270879580406472,
+        "validated_responses": 1,
+        "tokens_per_request": 1342
+      }
+    }
+  ]
+}
