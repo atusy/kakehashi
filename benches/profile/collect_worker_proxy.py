@@ -34,24 +34,43 @@ def estimated_tree_compute_budget(logical_cpus):
     return max(1, logical_cpus - 2)
 
 
-def parse_driver_summary(output):
+def parse_driver_summary(output, expected_count):
     wall_match = re.search(r"\bwall=([\d.]+)ms", output)
     method_match = re.search(
-        r"method=textDocument/semanticTokens/full count=\d+ .*?"
+        r"method=textDocument/semanticTokens/full "
+        r"count=(\d+) ok=(\d+) canceled=(\d+) null=(\d+) errors=(\d+) "
         r"p50=([\d.]+)ms p90=([\d.]+)ms p95=([\d.]+)ms "
         r"p99=([\d.]+)ms max=([\d.]+)ms wire=([\d.]+)KiB",
         output,
     )
     if not wall_match or not method_match:
         raise ValueError(f"could not parse driver output:\n{output}")
+    count, ok, canceled, null, errors = map(
+        int, method_match.groups()[:5]
+    )
+    if count != expected_count:
+        raise ValueError(
+            f"expected {expected_count} responses, got {count}"
+        )
+    if ok != count or canceled or null or errors:
+        raise ValueError(
+            "driver reported non-success responses: "
+            f"count={count} ok={ok} canceled={canceled} "
+            f"null={null} errors={errors}"
+        )
     return {
-        "p50": float(method_match.group(1)),
-        "p90": float(method_match.group(2)),
-        "p95": float(method_match.group(3)),
-        "p99": float(method_match.group(4)),
-        "max": float(method_match.group(5)),
+        "count": count,
+        "ok": ok,
+        "canceled": canceled,
+        "null": null,
+        "errors": errors,
+        "p50": float(method_match.group(6)),
+        "p90": float(method_match.group(7)),
+        "p95": float(method_match.group(8)),
+        "p99": float(method_match.group(9)),
+        "max": float(method_match.group(10)),
         "wall": float(wall_match.group(1)),
-        "wire_kib": float(method_match.group(6)),
+        "wire_kib": float(method_match.group(11)),
     }
 
 
@@ -112,6 +131,16 @@ def build_driver_command(kind, binary, data_dir, scenario_args, script_dir):
     ]
 
 
+def option_int(arguments, option, default):
+    for index, argument in enumerate(arguments):
+        if argument == option:
+            return int(arguments[index + 1])
+        prefix = f"{option}="
+        if argument.startswith(prefix):
+            return int(argument.removeprefix(prefix))
+    return default
+
+
 def run_driver(kind, binary, data_dir, scenario_args, script_dir):
     env = os.environ.copy()
     if kind == "relay":
@@ -127,7 +156,10 @@ def run_driver(kind, binary, data_dir, scenario_args, script_dir):
         stderr=subprocess.PIPE,
         env=env,
     )
-    return parse_driver_summary(completed.stderr)
+    expected_count = option_int(scenario_args, "--requests", 300) * option_int(
+        scenario_args, "--burst", 1
+    )
+    return parse_driver_summary(completed.stderr, expected_count)
 
 
 def main():

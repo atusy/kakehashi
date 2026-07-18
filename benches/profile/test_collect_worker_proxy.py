@@ -45,13 +45,33 @@ class CollectionHelpersTest(unittest.TestCase):
 [drive] method=textDocument/semanticTokens/full count=100 ok=100 canceled=0 null=0 errors=0 p50=3.6ms p90=4.0ms p95=4.3ms p99=5.2ms max=7.8ms wire=1430.1KiB
 """
 
-        summary = parse_driver_summary(output)
+        summary = parse_driver_summary(output, expected_count=100)
 
         self.assertEqual(summary["wall"], 1574)
         self.assertEqual(summary["p50"], 3.6)
         self.assertEqual(summary["p95"], 4.3)
         self.assertEqual(summary["p99"], 5.2)
         self.assertEqual(summary["wire_kib"], 1430.1)
+        self.assertEqual(summary["count"], 100)
+        self.assertEqual(summary["ok"], 100)
+
+    def test_rejects_driver_summary_with_failed_responses(self):
+        output = """
+[drive] lang=rust cycles=100 wall=10ms
+[drive] method=textDocument/semanticTokens/full count=100 ok=0 canceled=0 null=0 errors=100 p50=0.1ms p90=0.1ms p95=0.1ms p99=0.1ms max=0.1ms wire=1.0KiB
+"""
+
+        with self.assertRaisesRegex(ValueError, "non-success responses"):
+            parse_driver_summary(output, expected_count=100)
+
+    def test_rejects_incomplete_driver_summary(self):
+        output = """
+[drive] lang=rust cycles=100 wall=10ms
+[drive] method=textDocument/semanticTokens/full count=99 ok=99 canceled=0 null=0 errors=0 p50=0.1ms p90=0.1ms p95=0.1ms p99=0.1ms max=0.1ms wire=1.0KiB
+"""
+
+        with self.assertRaisesRegex(ValueError, "expected 100 responses"):
+            parse_driver_summary(output, expected_count=100)
 
     def test_data_tree_digest_is_stable_and_content_sensitive(self):
         with tempfile.TemporaryDirectory() as directory:
