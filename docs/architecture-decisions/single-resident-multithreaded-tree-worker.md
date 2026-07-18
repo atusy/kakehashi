@@ -1112,6 +1112,11 @@ pool.
 
 ## More Information
 
+The [Phase 0 process-hop measurement](single-resident-multithreaded-tree-worker-phase0-measurement.md)
+records a preliminary lower bound for an additional resident child-process
+transport hop. It is not a worker prototype result and does not change this
+decision's `proposed` status.
+
 The implementation should proceed in measured stages:
 
 1. Prototype the framed transport, supervision, and one high-level
