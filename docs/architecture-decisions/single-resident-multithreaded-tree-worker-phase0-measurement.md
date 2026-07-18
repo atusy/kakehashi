@@ -125,8 +125,8 @@ used as a smoke test, not an independently repeated result:
 
 | Metric | Direct | Relay |
 |---|---:|---:|
-| Semantic tokens p50 / p95 | 4.8 / 4.9 ms | 4.4 / 4.9 ms |
-| Captures delta p50 / p95 | 31.0 / 34.1 ms | 30.0 / 32.1 ms |
+| Semantic tokens p50 / p95 | 4.8 / 5.0 ms | 4.3 / 4.9 ms |
+| Captures delta p50 / p95 | 30.7 / 32.5 ms | 29.6 / 32.7 ms |
 
 All 100 semantic and 100 capture-delta responses per path were successful. The
 final driver validated every capture result as the delta `edits` shape and an
@@ -167,10 +167,11 @@ matrix.
 
 The tail-percentile driver and relay are in `benches/profile/drive.py` and
 `benches/profile/worker_proxy.py`. The 20 paired run summaries, execution order,
-commands, environment, artifact-tree digest, cold-start result, and captures
-pilot are committed in
-`benches/profile/results/single_worker_phase0_2026-07-19.json`. Recompute every
-steady-state table value and confidence interval with:
+commands, environment, artifact-tree digest, and cold-start result are committed
+in `benches/profile/results/single_worker_phase0_2026-07-19.json`. The separately
+generated captures smoke result is in
+`benches/profile/results/single_worker_phase0_captures_pilot_2026-07-19.json`.
+Recompute every steady-state table value and confidence interval with:
 
 ```sh
 python3 benches/profile/analyze_worker_proxy.py
@@ -181,8 +182,10 @@ preserves every run summary and status count but not each raw stderr stream.
 Cold start was recollected under the same controlled environment and artifact
 identity; all 20 timing samples per non-interleaved condition are recomputed by
 the analyzer but are explicitly non-comparative. The captures
-pilot was also rerun with the final harness, but remains a single-pair smoke
-test rather than an independently repeated result.
+pilot was rerun with `collect_worker_capture_pilot.py`, which fails unless both
+methods return 100 successful responses and the driver validates every delta
+shape and advancing lineage. It remains a single-pair smoke test rather than an
+independently repeated result.
 
 Reconstruct a dedicated parser/query tree at the pinned revision rather than
 installing from a moving `main` branch, then collect a new alternating 10-pair

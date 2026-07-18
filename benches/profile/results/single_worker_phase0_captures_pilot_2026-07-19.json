@@ -1,0 +1,81 @@
+{
+  "schema": 1,
+  "experiment": "single-tree-worker-phase0-concurrent-captures-pilot",
+  "environment": {
+    "platform": "macOS-26.5.1-arm64-arm-64bit",
+    "python": "3.12.13",
+    "binary": "/Users/atusy/ghq/github.com/atusy/kakehashi___worker_adr/target/release/kakehashi",
+    "binary_sha256": "4ea51e25b3bbe30360772789996ff4076c4f01e84663975c0a71004e4501cf5a",
+    "data_dir": "/private/tmp/kakehashi-phase0-data.WIU8dk",
+    "parser_query_file_count": 25,
+    "parser_query_tree_sha256": "1572967b352c7b24ec872bff02c3c9808374a0d5cab2c707368cb5f32be58115",
+    "retained_environment": {
+      "PATH": "/Users/atusy/.local/bin:/Users/atusy/.bun/install/global/node_modules/@openai/codex-darwin-arm64/vendor/aarch64-apple-darwin/codex-path:/Users/atusy/.codex/tmp/arg0/codex-arg0wMKckG:/opt/homebrew/bin:/opt/homebrew/sbin:/nix/var/nix/profiles/default/bin:/Users/atusy/.nix-profile/bin:/run/current-system/sw/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/Users/atusy/.local/lastresort/bin",
+      "TMPDIR": "/var/folders/t3/_nc24_w90zq79l3xyz3xzc7c0000gn/T/",
+      "LANG": "C.UTF-8",
+      "LC_ALL": "C.UTF-8"
+    }
+  },
+  "artifacts": {
+    "nvim_treesitter_repository": "https://github.com/nvim-treesitter/nvim-treesitter",
+    "nvim_treesitter_revision": "4916d6592ede8c07973490d9322f187e07dfefac",
+    "verification": "parser metadata and every installed query byte-matched"
+  },
+  "arguments": [
+    "--lang",
+    "markdown",
+    "--size",
+    "150",
+    "--requests",
+    "100",
+    "--edits",
+    "1",
+    "--concurrent-captures"
+  ],
+  "independent_pairs": 1,
+  "order": "direct then relay; smoke result only",
+  "direct": {
+    "semantic_p50": 4.8,
+    "semantic_p95": 5.0,
+    "captures_p50": 30.7,
+    "captures_p95": 32.5,
+    "semantic_outcomes": {
+      "count": 100,
+      "ok": 100,
+      "canceled": 0,
+      "null": 0,
+      "errors": 0
+    },
+    "capture_outcomes": {
+      "count": 100,
+      "ok": 100,
+      "canceled": 0,
+      "null": 0,
+      "errors": 0
+    },
+    "capture_full_fallbacks": 0
+  },
+  "relay": {
+    "semantic_p50": 4.3,
+    "semantic_p95": 4.9,
+    "captures_p50": 29.6,
+    "captures_p95": 32.7,
+    "semantic_outcomes": {
+      "count": 100,
+      "ok": 100,
+      "canceled": 0,
+      "null": 0,
+      "errors": 0
+    },
+    "capture_outcomes": {
+      "count": 100,
+      "ok": 100,
+      "canceled": 0,
+      "null": 0,
+      "errors": 0
+    },
+    "capture_full_fallbacks": 0
+  },
+  "capture_lineage_validated": true,
+  "capture_delta_shape_validated": true
+}

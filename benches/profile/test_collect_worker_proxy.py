@@ -15,6 +15,7 @@ from collect_worker_proxy import (
     controlled_environment,
     estimated_tree_compute_budget,
     artifact_provenance,
+    parse_capture_pilot_summary,
     parse_driver_summary,
     parser_library_suffix,
     require_posix as require_collector_posix,
@@ -258,6 +259,23 @@ class CollectionHelpersTest(unittest.TestCase):
         self.assertEqual(summary["count"], 100)
         self.assertEqual(summary["ok"], 100)
         self.assertEqual(summary["tokens_per_request"], 42)
+
+    def test_parses_and_validates_capture_pilot_summary(self):
+        output = """
+[drive] lang=markdown cycles=100 tokens/req=42 wall=1574ms
+[drive] method=kakehashi/captures/full/delta count=100 ok=100 canceled=0 null=0 errors=0 p50=31.0ms p90=33.0ms p95=34.1ms p99=35.2ms max=36.0ms wire=1430.1KiB
+[drive] method=textDocument/semanticTokens/full count=100 ok=100 canceled=0 null=0 errors=0 p50=4.8ms p90=4.9ms p95=4.9ms p99=5.2ms max=7.8ms wire=1430.1KiB
+"""
+
+        summary = parse_capture_pilot_summary(output, expected_count=100)
+
+        self.assertEqual(summary["semantic_p50"], 4.8)
+        self.assertEqual(summary["semantic_p95"], 4.9)
+        self.assertEqual(summary["captures_p50"], 31.0)
+        self.assertEqual(summary["captures_p95"], 34.1)
+        self.assertEqual(summary["semantic_outcomes"]["ok"], 100)
+        self.assertEqual(summary["capture_outcomes"]["ok"], 100)
+        self.assertEqual(summary["capture_full_fallbacks"], 0)
 
     def test_rejects_driver_summary_with_failed_responses(self):
         output = """

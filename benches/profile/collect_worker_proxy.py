@@ -160,6 +160,66 @@ def parse_driver_summary(output, expected_count):
     }
 
 
+def parse_method_summary(output, method, expected_count):
+    match = re.search(
+        rf"method={re.escape(method)} "
+        r"count=(\d+) ok=(\d+) canceled=(\d+) null=(\d+) errors=(\d+) "
+        r"p50=([\d.]+)ms p90=([\d.]+)ms p95=([\d.]+)ms "
+        r"p99=([\d.]+)ms max=([\d.]+)ms wire=([\d.]+)KiB",
+        output,
+    )
+    if not match:
+        raise ValueError(f"could not parse {method} summary:\n{output}")
+    count, ok, canceled, null, errors = map(int, match.groups()[:5])
+    if count != expected_count:
+        raise ValueError(
+            f"expected {expected_count} {method} responses, got {count}"
+        )
+    if ok != count or canceled or null or errors:
+        raise ValueError(
+            f"{method} reported non-success responses: "
+            f"count={count} ok={ok} canceled={canceled} "
+            f"null={null} errors={errors}"
+        )
+    return {
+        "count": count,
+        "ok": ok,
+        "canceled": canceled,
+        "null": null,
+        "errors": errors,
+        "p50": float(match.group(6)),
+        "p90": float(match.group(7)),
+        "p95": float(match.group(8)),
+        "p99": float(match.group(9)),
+        "max": float(match.group(10)),
+        "wire_kib": float(match.group(11)),
+    }
+
+
+def parse_capture_pilot_summary(output, expected_count):
+    semantic = parse_method_summary(
+        output, "textDocument/semanticTokens/full", expected_count
+    )
+    captures = parse_method_summary(
+        output, "kakehashi/captures/full/delta", expected_count
+    )
+    return {
+        "semantic_p50": semantic["p50"],
+        "semantic_p95": semantic["p95"],
+        "captures_p50": captures["p50"],
+        "captures_p95": captures["p95"],
+        "semantic_outcomes": {
+            key: semantic[key]
+            for key in ("count", "ok", "canceled", "null", "errors")
+        },
+        "capture_outcomes": {
+            key: captures[key]
+            for key in ("count", "ok", "canceled", "null", "errors")
+        },
+        "capture_full_fallbacks": 0,
+    }
+
+
 def sha256_file(path):
     digest = hashlib.sha256()
     with path.open("rb") as source:
