@@ -14,10 +14,27 @@ from attest_worker_binary import (
     environment_tool_version,
     native_toolchain_metadata,
     require_isolated_source,
+    require_uncredentialed_repository_url,
 )
 
 
 class BinaryAttestationTest(unittest.TestCase):
+    def test_rejects_credential_bearing_repository_url(self):
+        for repository in (
+            "https://token@github.com/atusy/kakehashi.git",
+            "https://user:token@github.com/atusy/kakehashi.git",
+        ):
+            with self.subTest(repository=repository):
+                with self.assertRaisesRegex(ValueError, "credentials"):
+                    require_uncredentialed_repository_url(repository)
+
+    def test_accepts_normal_ssh_repository_identity(self):
+        repository = "ssh://git@github.com/atusy/kakehashi.git"
+
+        self.assertEqual(
+            require_uncredentialed_repository_url(repository), repository
+        )
+
     def test_source_archive_ignores_local_replacement_refs(self):
         with tempfile.TemporaryDirectory() as directory:
             root = pathlib.Path(directory)

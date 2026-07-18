@@ -10,6 +10,7 @@ import shutil
 import subprocess
 import tarfile
 import tempfile
+import urllib.parse
 
 from collect_worker_proxy import ATTESTED_BUILD_COMMAND, sha256_file, tool_version
 
@@ -131,6 +132,13 @@ def require_clean(checkout):
         raise ValueError(f"binary source checkout is dirty:\n{status}")
 
 
+def require_uncredentialed_repository_url(repository):
+    parsed = urllib.parse.urlsplit(repository)
+    if parsed.scheme in ("http", "https") and parsed.username is not None:
+        raise ValueError("source repository URL must not contain credentials")
+    return repository
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--checkout", type=pathlib.Path, required=True)
@@ -139,7 +147,9 @@ def main():
 
     require_clean(args.checkout)
     source_commit = git(args.checkout, "rev-parse", "HEAD")
-    source_repository = git(args.checkout, "remote", "get-url", "origin")
+    source_repository = require_uncredentialed_repository_url(
+        git(args.checkout, "remote", "get-url", "origin")
+    )
     with tempfile.TemporaryDirectory(prefix="kakehashi-attested-build-") as root:
         isolated_root = pathlib.Path(root)
         source = isolated_root / "source"
