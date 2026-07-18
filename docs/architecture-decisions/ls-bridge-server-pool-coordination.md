@@ -179,6 +179,31 @@ Multiple downstream servers initialize in parallel since each is independent:
 
 **Future Extension (Phase 2)**: Rate-limited respawn to prevent respawn storms.
 
+**Malformed Initialize Capability Recovery:**
+
+An object-shaped `result.capabilities` is decoded with field-level recovery. If
+one top-level capability cannot be deserialized, the bridge logs the capability
+name and serde error, drops that capability, and retries. Independently valid
+capabilities remain available for routing, and the bridge completes the
+downstream handshake.
+
+The recovery boundary follows the scope of the damaged state:
+
+| Failure | Behavior |
+|----------|----------|
+| Malformed feature capability, such as `hoverProvider` | Drop that top-level capability, warn, continue |
+| Several malformed feature capabilities | Drop and warn for each one, preserve the rest |
+| Missing or null `capabilities` | Continue with empty capabilities for compatibility |
+| Non-object `result` or non-object `capabilities` | Fail initialization; no reliable capability boundary exists |
+| Invalid `positionEncoding` or legacy `offsetEncoding` | Fail initialization; position translation affects every bridged feature |
+
+Rejecting the whole server for one independent feature maximizes protocol
+strictness but sacrifices all otherwise usable functionality. Silently falling
+back to empty capabilities preserves the process but hides the defect and loses
+the same functionality. Field-level recovery accepts extra parsing complexity
+to keep the decision stateless and the failure scope aligned with the malformed
+advertisement.
+
 **Per-Downstream Document Lifecycle:**
 
 Maintain the latest host-document snapshot per downstream. When a slower server reaches `didOpen`, send the full text as of "now", not as of when the first downstream opened.
@@ -485,6 +510,10 @@ languageServers:
 
 ## Amendment History
 
+- **2026-07-18**: Added field-level recovery for malformed downstream
+  initialize capabilities (#860). Structurally unusable envelopes and global
+  position-encoding violations still fail initialization; independent malformed
+  feature fields are warned and dropped so valid routing capabilities survive.
 - **2026-07-13**: Added one workspace-wide `window/logMessage` severity policy
   for downstream-forwarded and kakehashi-originated messages (#852). The
   default is `info`; `window/showMessage` remains unaffected.
