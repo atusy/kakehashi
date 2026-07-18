@@ -245,8 +245,15 @@ class CollectionHelpersTest(unittest.TestCase):
             attestation = root / "attestation.json"
             attestation.write_text(json.dumps({
                 "schema": 1,
+                "source_repository": "https://github.com/atusy/kakehashi",
                 "source_commit": "a" * 40,
-                "build_command": ["cargo", "build", "--release"],
+                "source_checkout_clean": True,
+                "build_command": [
+                    "cargo", "build", "--release", "--bin", "kakehashi"
+                ],
+                "rustc": "rustc 1.95.0",
+                "cargo": "cargo 1.95.0",
+                "binary_relative": "target/release/kakehashi",
                 "binary_sha256": hashlib.sha256(b"release").hexdigest(),
             }))
 
@@ -255,6 +262,27 @@ class CollectionHelpersTest(unittest.TestCase):
             self.assertEqual(loaded["source_commit"], "a" * 40)
             binary.write_bytes(b"other")
             with self.assertRaisesRegex(ValueError, "attested binary digest"):
+                load_binary_attestation(attestation, binary)
+
+    def test_rejects_attestation_without_clean_release_build(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            binary = root / "kakehashi"
+            binary.write_bytes(b"release")
+            attestation = root / "attestation.json"
+            attestation.write_text(json.dumps({
+                "schema": 1,
+                "source_repository": "https://github.com/atusy/kakehashi",
+                "source_commit": "a" * 40,
+                "source_checkout_clean": False,
+                "build_command": ["cargo", "build"],
+                "rustc": "",
+                "cargo": "",
+                "binary_relative": "target/release/kakehashi",
+                "binary_sha256": hashlib.sha256(b"release").hexdigest(),
+            }))
+
+            with self.assertRaisesRegex(ValueError, "attestation schema"):
                 load_binary_attestation(attestation, binary)
 
     def test_relay_invokes_proxy_through_python(self):

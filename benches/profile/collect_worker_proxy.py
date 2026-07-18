@@ -39,6 +39,9 @@ CONTROLLED_ENVIRONMENT_KEYS = (
     "DYLD_LIBRARY_PATH",
 )
 TERMINATION_SIGNALS = (signal.SIGHUP, signal.SIGTERM)
+ATTESTED_BUILD_COMMAND = [
+    "cargo", "build", "--release", "--bin", "kakehashi"
+]
 
 
 def require_posix(platform_name=os.name):
@@ -254,11 +257,31 @@ def verify_file_sha256(path, expected):
 
 def load_binary_attestation(path, binary):
     attestation = json.loads(path.read_text())
-    required = ("schema", "source_commit", "build_command", "binary_sha256")
+    required = (
+        "schema", "source_repository", "source_commit",
+        "source_checkout_clean", "build_command", "rustc", "cargo",
+        "binary_relative", "binary_sha256",
+    )
     if any(key not in attestation for key in required):
         raise ValueError("binary attestation is missing required fields")
-    if not re.fullmatch(r"[0-9a-f]{40}", attestation["source_commit"]):
-        raise ValueError("binary attestation has an invalid source commit")
+    valid_schema = (
+        attestation["schema"] == 1
+        and isinstance(attestation["source_repository"], str)
+        and bool(attestation["source_repository"])
+        and isinstance(attestation["source_commit"], str)
+        and re.fullmatch(r"[0-9a-f]{40}", attestation["source_commit"])
+        and attestation["source_checkout_clean"] is True
+        and attestation["build_command"] == ATTESTED_BUILD_COMMAND
+        and isinstance(attestation["rustc"], str)
+        and bool(attestation["rustc"])
+        and isinstance(attestation["cargo"], str)
+        and bool(attestation["cargo"])
+        and attestation["binary_relative"] == "target/release/kakehashi"
+        and isinstance(attestation["binary_sha256"], str)
+        and re.fullmatch(r"[0-9a-f]{64}", attestation["binary_sha256"])
+    )
+    if not valid_schema:
+        raise ValueError("binary attestation schema is invalid")
     actual = sha256_file(binary)
     if attestation["binary_sha256"] != actual:
         raise ValueError(

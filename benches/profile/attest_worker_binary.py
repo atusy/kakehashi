@@ -6,10 +6,7 @@ import json
 import pathlib
 import subprocess
 
-from collect_worker_proxy import sha256_file, tool_version
-
-
-BUILD_COMMAND = ["cargo", "build", "--release", "--bin", "kakehashi"]
+from collect_worker_proxy import ATTESTED_BUILD_COMMAND, sha256_file, tool_version
 
 
 def git(checkout, *arguments):
@@ -36,7 +33,7 @@ def main():
     require_clean(args.checkout)
     source_commit = git(args.checkout, "rev-parse", "HEAD")
     source_repository = git(args.checkout, "remote", "get-url", "origin")
-    subprocess.run(BUILD_COMMAND, cwd=args.checkout, check=True)
+    subprocess.run(ATTESTED_BUILD_COMMAND, cwd=args.checkout, check=True)
     require_clean(args.checkout)
     binary = args.checkout / args.binary_relative
     result = {
@@ -44,7 +41,7 @@ def main():
         "source_repository": source_repository,
         "source_commit": source_commit,
         "source_checkout_clean": True,
-        "build_command": BUILD_COMMAND,
+        "build_command": ATTESTED_BUILD_COMMAND,
         "rustc": tool_version(["rustc", "--version"]),
         "cargo": tool_version(["cargo", "--version"]),
         "binary_relative": args.binary_relative.as_posix(),
