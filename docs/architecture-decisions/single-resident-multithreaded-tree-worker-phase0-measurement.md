@@ -173,11 +173,12 @@ transcription using:
 python3 benches/profile/collect_worker_proxy.py \
   --bin ./target/release/kakehashi \
   --data-dir ./deps/test/kakehashi \
-  --nvim-treesitter-revision 4916d6592ede8c07973490d9322f187e07dfefac \
+  --nvim-treesitter-checkout /path/to/pinned/nvim-treesitter \
   --output /tmp/single-worker-phase0.json
 ```
 
-The measured metadata cache and every installed query file byte-match
+The collector verified that the measured metadata cache and every installed
+query file byte-match
 `nvim-treesitter` revision
 `4916d6592ede8c07973490d9322f187e07dfefac`. Reconstruct the parser/query
 sources at that revision rather than installing from a moving `main` branch:
@@ -205,11 +206,13 @@ can change shared-library bytes even from identical grammar revisions, so the
 committed digest remains the identity check for the exact measured artifacts.
 
 The analyzer uses seed `123456789`, 100,000 paired-bootstrap resamples, and
-nearest-rank 2.5th/97.5th percentiles. The parser/query tree digest was computed
-from paths relative to the data directory:
+nearest-rank 2.5th/97.5th percentiles. The parser/query tree digest covers only
+the runtime `cache`, `parser`, and `queries` roots, excluding setup markers and
+unrelated `query-assets`. It was computed from paths relative to the data
+directory:
 
 ```sh
-find . -type f -print0 | sort -z | \
+find cache parser queries -type f -print0 | sort -z | \
   xargs -0 shasum -a 256 | shasum -a 256
 ```
 

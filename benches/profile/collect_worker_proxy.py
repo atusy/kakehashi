@@ -47,15 +47,56 @@ def controlled_environment(source):
     }
 
 
-def artifact_provenance(nvim_treesitter_revision):
-    if not re.fullmatch(r"[0-9a-fA-F]{40}", nvim_treesitter_revision):
-        raise ValueError("nvim-treesitter revision must be a 40-character Git SHA")
+def committed_blob(checkout, revision, relative):
+    try:
+        return subprocess.run(
+            ["git", "-C", checkout, "show", f"{revision}:{relative}"],
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        ).stdout
+    except subprocess.CalledProcessError as error:
+        raise ValueError(
+            f"nvim-treesitter revision lacks {relative}"
+        ) from error
+
+
+def artifact_provenance(data_dir, nvim_treesitter_checkout):
+    revision = tool_version([
+        "git", "-C", str(nvim_treesitter_checkout), "rev-parse", "HEAD"
+    ])
+    comparisons = [
+        (
+            data_dir / "cache/parsers.lua",
+            "lua/nvim-treesitter/parsers.lua",
+        )
+    ]
+    comparisons.extend(
+        (
+            query,
+            "runtime/queries/" + query.relative_to(
+                data_dir / "queries"
+            ).as_posix(),
+        )
+        for query in runtime_artifact_files(data_dir)
+        if query.is_relative_to(data_dir / "queries")
+    )
+    for installed, upstream_relative in comparisons:
+        if not installed.is_file() or installed.is_symlink():
+            raise ValueError(f"missing runtime artifact: {installed}")
+        expected = committed_blob(
+            str(nvim_treesitter_checkout), revision, upstream_relative
+        )
+        if installed.read_bytes() != expected:
+            raise ValueError(
+                f"{installed} does not match {revision}:{upstream_relative}"
+            )
     return {
         "nvim_treesitter_repository": (
             "https://github.com/nvim-treesitter/nvim-treesitter"
         ),
-        "nvim_treesitter_revision": nvim_treesitter_revision.lower(),
-        "scope": "parser metadata and query sources",
+        "nvim_treesitter_revision": revision,
+        "verification": "parser metadata and every installed query byte-matched",
     }
 
 
@@ -115,16 +156,25 @@ def sha256_file(path):
     return digest.hexdigest()
 
 
+def runtime_artifact_files(root):
+    files = []
+    for relative_root in ("cache", "parser", "queries"):
+        artifact_root = root / relative_root
+        if not artifact_root.exists():
+            continue
+        files.extend(
+            item for item in artifact_root.rglob("*")
+            if item.is_file() and not item.is_symlink()
+        )
+    return sorted(
+        files, key=lambda item: item.relative_to(root).as_posix()
+    )
+
+
 def shasum_tree_digest(root):
     """Match `find . | sort | xargs shasum | shasum` from the report."""
     digest = hashlib.sha256()
-    for path in sorted(
-        (
-            item for item in root.rglob("*")
-            if item.is_file() and not item.is_symlink()
-        ),
-        key=lambda item: item.relative_to(root).as_posix(),
-    ):
+    for path in runtime_artifact_files(root):
         relative = path.relative_to(root).as_posix()
         digest.update(f"{sha256_file(path)}  ./{relative}\n".encode())
     return digest.hexdigest()
@@ -202,9 +252,10 @@ def main():
     parser.add_argument("--output", type=pathlib.Path, required=True)
     parser.add_argument("--pairs", type=int, default=10)
     parser.add_argument(
-        "--nvim-treesitter-revision",
+        "--nvim-treesitter-checkout",
+        type=pathlib.Path,
         required=True,
-        help="full Git revision supplying parser metadata and query sources",
+        help="Git checkout whose HEAD supplies parser metadata and queries",
     )
     parser.add_argument(
         "--scenario",
@@ -219,10 +270,7 @@ def main():
     script_dir = pathlib.Path(__file__).resolve().parent
     selected = args.scenarios or list(SCENARIOS)
     logical_cpus = os.cpu_count() or 1
-    data_files = [
-        path for path in args.data_dir.rglob("*")
-        if path.is_file() and not path.is_symlink()
-    ]
+    data_files = runtime_artifact_files(args.data_dir)
     result = {
         "schema": 1,
         "experiment": "single-tree-worker-phase0-raw-relay",
@@ -246,7 +294,9 @@ def main():
             "parser_query_tree_sha256": shasum_tree_digest(args.data_dir),
             "retained_environment": controlled_environment(os.environ),
         },
-        "artifacts": artifact_provenance(args.nvim_treesitter_revision),
+        "artifacts": artifact_provenance(
+            args.data_dir, args.nvim_treesitter_checkout
+        ),
         "collector": {
             "pairs": args.pairs,
             "order": "direct-relay on odd runs; relay-direct on even runs",

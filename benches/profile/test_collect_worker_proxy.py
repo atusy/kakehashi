@@ -1,5 +1,6 @@
 import hashlib
 import pathlib
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -18,14 +19,42 @@ from collect_worker_proxy import (
 
 
 class CollectionHelpersTest(unittest.TestCase):
-    def test_artifact_provenance_requires_full_git_revision(self):
-        revision = "4916d6592ede8c07973490d9322f187e07dfefac"
+    def test_artifact_provenance_verifies_metadata_and_queries_at_revision(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            checkout = root / "nvim-treesitter"
+            data = root / "data"
+            metadata = b"return { rust = {} }\n"
+            query = b"(identifier) @variable\n"
+            for base, relative, content in (
+                (checkout, "lua/nvim-treesitter/parsers.lua", metadata),
+                (checkout, "runtime/queries/rust/highlights.scm", query),
+                (data, "cache/parsers.lua", metadata),
+                (data, "queries/rust/highlights.scm", query),
+            ):
+                path = base / relative
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(content)
+            subprocess.run(["git", "init", "-q", checkout], check=True)
+            subprocess.run(["git", "-C", checkout, "add", "."], check=True)
+            subprocess.run(
+                [
+                    "git", "-C", checkout,
+                    "-c", "user.name=benchmark-test",
+                    "-c", "user.email=benchmark@example.invalid",
+                    "commit", "-qm", "fixture",
+                ],
+                check=True,
+            )
 
-        provenance = artifact_provenance(revision)
+            provenance = artifact_provenance(data, checkout)
 
-        self.assertEqual(provenance["nvim_treesitter_revision"], revision)
-        with self.assertRaisesRegex(ValueError, "40-character"):
-            artifact_provenance("main")
+            self.assertRegex(
+                provenance["nvim_treesitter_revision"], r"^[0-9a-f]{40}$"
+            )
+            (data / "queries/rust/highlights.scm").write_bytes(b"different")
+            with self.assertRaisesRegex(ValueError, "does not match"):
+                artifact_provenance(data, checkout)
 
     def test_controlled_environment_drops_behavior_overrides(self):
         environment = controlled_environment({
@@ -98,12 +127,14 @@ class CollectionHelpersTest(unittest.TestCase):
     def test_data_tree_digest_is_stable_and_content_sensitive(self):
         with tempfile.TemporaryDirectory() as directory:
             root = pathlib.Path(directory)
-            (root / "b").write_bytes(b"two")
-            (root / "a").write_bytes(b"one")
+            queries = root / "queries"
+            queries.mkdir()
+            (queries / "b").write_bytes(b"two")
+            (queries / "a").write_bytes(b"one")
 
             first = shasum_tree_digest(root)
             second = shasum_tree_digest(root)
-            (root / "a").write_bytes(b"changed")
+            (queries / "a").write_bytes(b"changed")
 
             self.assertEqual(first, second)
             self.assertNotEqual(first, shasum_tree_digest(root))
@@ -111,14 +142,14 @@ class CollectionHelpersTest(unittest.TestCase):
     def test_data_tree_digest_sorts_relative_posix_paths(self):
         with tempfile.TemporaryDirectory() as directory:
             root = pathlib.Path(directory)
-            for relative in ("a-/x", "a/x"):
+            for relative in ("queries/a-/x", "queries/a/x"):
                 path = root / relative
                 path.parent.mkdir(parents=True, exist_ok=True)
                 path.write_bytes(relative.encode())
 
             expected_input = b"".join(
                 f"{hashlib.sha256(relative.encode()).hexdigest()}  ./{relative}\n".encode()
-                for relative in ("a-/x", "a/x")
+                for relative in ("queries/a-/x", "queries/a/x")
             )
 
             self.assertEqual(
@@ -128,15 +159,30 @@ class CollectionHelpersTest(unittest.TestCase):
     def test_data_tree_digest_excludes_file_symlinks_like_find_type_f(self):
         with tempfile.TemporaryDirectory() as directory:
             root = pathlib.Path(directory)
-            target = root / "target"
+            target = root / "parser/target"
+            target.parent.mkdir()
             target.write_bytes(b"content")
             without_link = shasum_tree_digest(root)
             try:
-                (root / "link").symlink_to(target)
+                (root / "parser/link").symlink_to(target)
             except OSError as error:
                 self.skipTest(f"symlinks unavailable: {error}")
 
             self.assertEqual(shasum_tree_digest(root), without_link)
+
+    def test_data_tree_digest_ignores_non_runtime_artifacts(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            query = root / "queries/rust/highlights.scm"
+            query.parent.mkdir(parents=True)
+            query.write_bytes(b"query")
+            runtime_digest = shasum_tree_digest(root)
+            extra = root / "query-assets/parser/dockerfile.dylib"
+            extra.parent.mkdir(parents=True)
+            extra.write_bytes(b"unrelated")
+            (root / ".installed").touch()
+
+            self.assertEqual(shasum_tree_digest(root), runtime_digest)
 
 
 if __name__ == "__main__":
