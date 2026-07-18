@@ -210,6 +210,7 @@ installing from a moving `main` branch, then collect a new alternating 10-pair
 steady-state batch without hand transcription:
 
 ```sh
+(
 revision=4916d6592ede8c07973490d9322f187e07dfefac
 workspace_dir="$(mktemp -d "${TMPDIR:-/tmp}/kakehashi-phase0.XXXXXX")"
 trap 'rm -rf "$workspace_dir"' EXIT
@@ -249,6 +250,7 @@ python3 benches/profile/collect_worker_capture_pilot.py \
   --data-dir "$data_dir" \
   --nvim-treesitter-checkout "$source_dir" \
   --output /tmp/single-worker-phase0-captures-pilot.json
+)
 ```
 
 The checkout supplies only the selected revision and declared origin. The
