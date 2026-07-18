@@ -528,19 +528,29 @@ worker/protocol failure and does not invent a parser quarantine.
 After quarantine, the parent starts a fresh worker with bounded backoff, sends
 the versioned quarantine set before enabling document derivation, and full-syncs
 all open documents. Restarts are also governed by a per-session systemic-failure
-circuit breaker. A failure that attributes and newly quarantines one or more
-previously allowed grammar keys does not consume this global budget: quarantine
-has removed a concrete cause, so healthy grammars must still recover even if
-several distinct bad artifacts are encountered. Such restarts remain rate
-limited by backoff.
+circuit breaker. Quarantine and breaker accounting are separate decisions. Any
+active hazard leases at worker loss are conservatively quarantined, but that
+fact alone does not classify the cause as native or exempt the restart.
+
+Classification precedence is explicit. A supervisor-observed startup,
+handshake, framing/protocol, resync, parent-liveness, or reported Rust panic/
+invariant failure is systemic even if hazard leases are active. Otherwise, a
+hard `NativeSegment` deadline or an OS crash signal/exception while at least one
+hazard lease is active is native-evidenced. Every remaining unattributed or
+normally exiting failure is systemic. A native-evidenced failure that newly
+quarantines one or more previously allowed grammar keys does not consume the
+global budget: quarantine has removed a concrete cause. Its restart remains
+rate limited by backoff. A protocol failure may still conservatively quarantine
+active keys, but it always consumes the systemic budget.
 
 Three systemic worker-generation failures without an intervening 60 seconds of
 healthy service exhaust the budget for the current configuration generation.
-Systemic failures include startup, handshake, protocol, and resync failures;
-failures with no active grammar lease; and any failure that again involves an
-already quarantined key, which demonstrates a quarantine or routing violation.
-A native timeout or delayed post-return failure consumes the systemic budget
-only when it cannot newly quarantine its attributed cause.
+Systemic failures include the precedence cases above, failures with no active
+grammar lease, and any failure that again involves an already quarantined key,
+which demonstrates a quarantine or routing violation. A delayed post-return
+native crash is exempt only when its OS failure evidence and still-active lease
+satisfy the native-evidenced rule; merely being inside Rust derivation or
+serialization under a broad lease is not sufficient.
 
 When the budget is exhausted, the parent stops spawning workers and marks the
 tree tier unavailable for that configuration generation. It wakes all tree
@@ -743,10 +753,14 @@ Implementation is accepted only when all of the following hold:
   the restart budget converges to one logged tree-tier-unavailable state, wakes
   waiters, stops respawning, and leaves host-tier service usable. A relevant
   configuration or artifact change permits exactly one half-open probe.
-* Three distinct crashing grammars are each newly quarantined without consuming
-  the systemic circuit-breaker budget; a following healthy grammar still derives
-  successfully. Re-entry by an already quarantined grammar instead consumes the
-  budget and is reported as an invariant violation.
+* Three distinct OS-signaled or native-segment-timed-out grammars are each newly
+  quarantined without consuming the systemic circuit-breaker budget; a following
+  healthy grammar still derives successfully. Re-entry by an already quarantined
+  grammar instead consumes the budget and is reported as an invariant violation.
+* A protocol-corruption or reported Rust-panic fixture while a grammar lease is
+  active may conservatively quarantine that key but still consumes the systemic
+  budget; a signaled native crash with the same lease follows the native-evidence
+  exemption instead.
 * Install/reload tests cover missing host and injected grammars, concurrent
   install deduplication, cache invalidation, latest-version re-derivation, and
   refusal to load the same quarantined artifact. Same-path parser replacement,
