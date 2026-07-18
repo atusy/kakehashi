@@ -40,6 +40,19 @@ from collect_worker_proxy import (
 
 
 class CollectionHelpersTest(unittest.TestCase):
+    def test_driver_summary_accepts_scientific_wall_time(self):
+        output = (
+            "tokens/req=42 wall=1.25e-05ms\n"
+            "method=textDocument/semanticTokens/full "
+            "count=1 ok=1 canceled=0 null=0 errors=0 "
+            "p50=1.0ms p90=1.0ms p95=1.0ms p99=1.0ms "
+            "max=1.0ms wire=1.0KiB"
+        )
+
+        summary = parse_driver_summary(output, expected_count=1)
+
+        self.assertEqual(summary["wall"], 1.25e-05)
+
     @unittest.skipUnless(os.name == "posix", "requires POSIX process groups")
     def test_bounded_run_does_not_wait_for_escaped_pipe_holder(self):
         with tempfile.TemporaryDirectory() as directory:

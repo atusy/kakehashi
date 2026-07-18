@@ -238,7 +238,10 @@ def estimated_tree_compute_budget(logical_cpus):
 
 
 def parse_driver_summary(output, expected_count):
-    wall_match = re.search(r"\bwall=([\d.]+)ms", output)
+    wall_match = re.search(
+        r"\bwall=([+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?)ms",
+        output,
+    )
     tokens_match = re.search(r"\btokens/req=(\d+)\b", output)
     method_match = re.search(
         r"method=textDocument/semanticTokens/full "
