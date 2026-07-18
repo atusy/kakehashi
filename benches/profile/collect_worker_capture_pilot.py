@@ -80,8 +80,6 @@ def main():
         "relay": collect_path(
             "relay", args.bin, args.data_dir, script_dir, args.run_timeout
         ),
-        "capture_lineage_validated": True,
-        "capture_delta_shape_validated": True,
     }
     final_identity = artifact_identity(args.data_dir)
     if final_identity != initial_identity:

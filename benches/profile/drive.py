@@ -503,6 +503,7 @@ def main() -> None:
         t0 = benchmark_clock()
         req_times = []
         cycle_success_times = []
+        capture_validations = 0
         line_has_extra = False
 
         def send_toggle_edit():
@@ -569,6 +570,7 @@ def main() -> None:
                     previous_result_id=captures_result_id,
                     expected_shape="delta",
                 )
+                capture_validations += 1
                 break
             req_times.append(time.perf_counter() - t_req)
             cycle_semantic_samples = request_samples[
@@ -626,6 +628,12 @@ def main() -> None:
                 f"p99={status_summary.p99_ms:.1f}ms "
                 f"max={status_summary.max_ms:.1f}ms\n"
             )
+    if args.captures:
+        sys.stderr.write(
+            f"[drive] capture-validation count={capture_validations} "
+            f"delta_shapes={capture_validations} "
+            f"lineage_advances={capture_validations} full_fallbacks=0\n"
+        )
     if cycle_success_times:
         success_samples = [
             RequestSample(seconds=seconds, wire_bytes=0, status="ok")

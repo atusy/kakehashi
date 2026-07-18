@@ -203,6 +203,19 @@ def parse_capture_pilot_summary(output, expected_count):
     captures = parse_method_summary(
         output, "kakehashi/captures/full/delta", expected_count
     )
+    validation = re.search(
+        r"capture-validation count=(\d+) delta_shapes=(\d+) "
+        r"lineage_advances=(\d+) full_fallbacks=(\d+)",
+        output,
+    )
+    if not validation:
+        raise ValueError("could not parse capture validation summary")
+    validation_counts = tuple(map(int, validation.groups()))
+    if validation_counts != (expected_count, expected_count, expected_count, 0):
+        raise ValueError(
+            "capture validation did not prove every measured delta: "
+            f"{validation_counts}"
+        )
     return {
         "semantic_p50": semantic["p50"],
         "semantic_p95": semantic["p95"],
@@ -216,7 +229,10 @@ def parse_capture_pilot_summary(output, expected_count):
             key: captures[key]
             for key in ("count", "ok", "canceled", "null", "errors")
         },
-        "capture_full_fallbacks": 0,
+        "capture_validation_count": validation_counts[0],
+        "capture_delta_shapes": validation_counts[1],
+        "capture_lineage_advances": validation_counts[2],
+        "capture_full_fallbacks": validation_counts[3],
     }
 
 

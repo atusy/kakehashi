@@ -36,9 +36,9 @@
   "order": "direct then relay; smoke result only",
   "direct": {
     "semantic_p50": 4.8,
-    "semantic_p95": 5.0,
-    "captures_p50": 30.7,
-    "captures_p95": 32.5,
+    "semantic_p95": 5.1,
+    "captures_p50": 31.0,
+    "captures_p95": 32.6,
     "semantic_outcomes": {
       "count": 100,
       "ok": 100,
@@ -53,13 +53,16 @@
       "null": 0,
       "errors": 0
     },
+    "capture_validation_count": 100,
+    "capture_delta_shapes": 100,
+    "capture_lineage_advances": 100,
     "capture_full_fallbacks": 0
   },
   "relay": {
-    "semantic_p50": 4.3,
-    "semantic_p95": 4.9,
-    "captures_p50": 29.6,
-    "captures_p95": 32.7,
+    "semantic_p50": 4.5,
+    "semantic_p95": 5.2,
+    "captures_p50": 29.9,
+    "captures_p95": 33.7,
     "semantic_outcomes": {
       "count": 100,
       "ok": 100,
@@ -74,8 +77,9 @@
       "null": 0,
       "errors": 0
     },
+    "capture_validation_count": 100,
+    "capture_delta_shapes": 100,
+    "capture_lineage_advances": 100,
     "capture_full_fallbacks": 0
-  },
-  "capture_lineage_validated": true,
-  "capture_delta_shape_validated": true
+  }
 }

@@ -265,6 +265,7 @@ class CollectionHelpersTest(unittest.TestCase):
 [drive] lang=markdown cycles=100 tokens/req=42 wall=1574ms
 [drive] method=kakehashi/captures/full/delta count=100 ok=100 canceled=0 null=0 errors=0 p50=31.0ms p90=33.0ms p95=34.1ms p99=35.2ms max=36.0ms wire=1430.1KiB
 [drive] method=textDocument/semanticTokens/full count=100 ok=100 canceled=0 null=0 errors=0 p50=4.8ms p90=4.9ms p95=4.9ms p99=5.2ms max=7.8ms wire=1430.1KiB
+[drive] capture-validation count=100 delta_shapes=100 lineage_advances=100 full_fallbacks=0
 """
 
         summary = parse_capture_pilot_summary(output, expected_count=100)
@@ -276,6 +277,17 @@ class CollectionHelpersTest(unittest.TestCase):
         self.assertEqual(summary["semantic_outcomes"]["ok"], 100)
         self.assertEqual(summary["capture_outcomes"]["ok"], 100)
         self.assertEqual(summary["capture_full_fallbacks"], 0)
+        self.assertEqual(summary["capture_delta_shapes"], 100)
+        self.assertEqual(summary["capture_lineage_advances"], 100)
+
+    def test_rejects_capture_pilot_without_validation_summary(self):
+        output = """
+[drive] method=kakehashi/captures/full/delta count=1 ok=1 canceled=0 null=0 errors=0 p50=1.0ms p90=1.0ms p95=1.0ms p99=1.0ms max=1.0ms wire=1.0KiB
+[drive] method=textDocument/semanticTokens/full count=1 ok=1 canceled=0 null=0 errors=0 p50=1.0ms p90=1.0ms p95=1.0ms p99=1.0ms max=1.0ms wire=1.0KiB
+"""
+
+        with self.assertRaisesRegex(ValueError, "capture validation"):
+            parse_capture_pilot_summary(output, expected_count=1)
 
     def test_rejects_driver_summary_with_failed_responses(self):
         output = """
