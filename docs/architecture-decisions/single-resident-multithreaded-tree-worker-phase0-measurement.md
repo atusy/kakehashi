@@ -252,6 +252,22 @@ python3 benches/profile/collect_worker_capture_pilot.py \
   --data-dir "$data_dir" \
   --nvim-treesitter-checkout "$source_dir" \
   --output /tmp/single-worker-phase0-captures-pilot.json
+
+(cd "$data_dir" && \
+  find ./cache ./parser ./queries -type f -print0 | sort -z | \
+  xargs -0 shasum -a 256 | shasum -a 256)
+
+python3 benches/profile/drive.py \
+  --bin ./target/release/kakehashi \
+  --data-dir "$data_dir" \
+  --lang rust --size 15 --requests 100 --edits 1
+
+KAKEHASHI_WORKER_PROXY_BIN=./target/release/kakehashi \
+python3 benches/profile/drive.py \
+  --bin python3 \
+  --server-arg ./benches/profile/worker_proxy.py \
+  --data-dir "$data_dir" \
+  --lang rust --size 15 --requests 100 --edits 1
 )
 ```
 
@@ -272,29 +288,8 @@ can change shared-library bytes even from identical grammar revisions, so the
 committed digest remains the identity check for the exact measured artifacts.
 
 The analyzer uses seed `123456789`, 100,000 paired-bootstrap resamples, and
-nearest-rank 2.5th/97.5th percentiles. The parser/query tree digest covers only
-the runtime `cache`, `parser`, and `queries` roots, excluding setup markers and
-unrelated `query-assets`. It was computed from paths relative to the data
-directory:
-
-```sh
-(cd "$data_dir" && \
-  find ./cache ./parser ./queries -type f -print0 | sort -z | \
-  xargs -0 shasum -a 256 | shasum -a 256)
-```
-
-A representative direct/relay pair is:
-
-```sh
-python3 benches/profile/drive.py \
-  --bin ./target/release/kakehashi \
-  --data-dir "$data_dir" \
-  --lang rust --size 15 --requests 100 --edits 1
-
-KAKEHASHI_WORKER_PROXY_BIN=./target/release/kakehashi \
-python3 benches/profile/drive.py \
-  --bin python3 \
-  --server-arg ./benches/profile/worker_proxy.py \
-  --data-dir "$data_dir" \
-  --lang rust --size 15 --requests 100 --edits 1
-```
+nearest-rank 2.5th/97.5th percentiles. Before cleanup, the recipe computes the
+parser/query tree digest and runs a representative direct/relay pair. The
+digest covers only the runtime `cache`, `parser`, and `queries` roots, excluding
+setup markers and unrelated `query-assets`, with paths relative to the data
+directory.
