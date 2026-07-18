@@ -386,25 +386,47 @@ Installed parser artifacts become immutable and content-addressed. The installer
 compiles and validates a candidate at a staged same-filesystem path, computes
 its cryptographic digest, fsyncs it, and renames it to a path containing that
 digest without replacing the currently selected file. A small checksummed
-manifest maps the configured grammar to the active artifact and export; it is
-updated by fsync-and-atomic-rename, followed by directory fsync. Startup accepts
-only a complete manifest that names an existing matching artifact, so a process
-or power failure observes either the old committed selection or the new one,
-never an unrecognized rollback filename or absent canonical parser.
+manifest per installer-managed grammar maps its default selection to an artifact
+digest and export. Manifest transactions take the existing process-shared
+installer lock, compare the expected manifest revision, and publish a new
+checksummed revision by fsync-and-atomic-rename followed by directory fsync.
+Concurrent parents must re-read and reconcile after a compare-and-swap failure;
+they cannot silently overwrite a selection observed after their transaction
+started. Startup accepts only a complete manifest that names an existing
+matching artifact, so a process or power failure observes either the old
+committed selection or the new one, never an unrecognized rollback filename or
+absent canonical parser.
 
-For replacement, the parent stages the immutable candidate, drains or cancels
-public tree requests, terminates and reaps the old worker, atomically switches
-the manifest, advances the configuration generation, and starts a fresh worker.
-Only the fresh worker loads the newly selected path before configuration and
-quarantine acknowledgment and document full-sync. If initial loading, exported-
-symbol lookup, or query initialization fails after the candidate library was
-mapped, the parent first terminates and reaps that candidate worker. It then
-atomically switches the manifest back to the previous content address and may
-start one rollback worker under the circuit-breaker budget. Immutable candidate
-files are garbage-collected only when no manifest or live worker generation can
-reference them. If rollback selection or loading also fails, the tree tier
-enters the terminal degraded state rather than running with an ambiguous
-artifact. This ordering never replaces or removes a mapped DLL.
+An arbitrary native path from `LanguageSettings.parser` is compatibility input,
+not a path the worker maps directly. At startup and each relevant configuration
+transaction, the parent opens the resolved source, copies it to staging while
+hashing, verifies that source identity/size/mtime did not change across the
+copy, and imports the bytes under their digest. A changed source retries rather
+than publishing mixed bytes. The resulting session descriptor contains the
+immutable path, digest, and export; aliases with identical bytes and export
+share a `grammar_key`. Source mutation cannot change code already mapped by a
+worker. A configuration reload or watched source-identity change triggers a new
+import and, when the digest changes, the same planned worker transition as an
+installed replacement. The external source itself is never modified.
+
+For an installer-managed replacement, the parent stages the immutable candidate,
+drains or cancels public tree requests, terminates and reaps the old worker, and
+starts a candidate worker with the exact digest without changing the manifest.
+Only after loading, exported-symbol lookup, and initial query validation succeed
+does the parent commit the expected manifest revision, advance configuration,
+and enable quarantine acknowledgment and document full-sync. If candidate load
+fails, the parent first terminates and reaps that worker, leaves the old manifest
+untouched, and may start one rollback worker under the circuit-breaker budget.
+If manifest CAS loses to another parent, it also reaps the uncommitted candidate,
+re-resolves the winning selection, and starts from that committed state rather
+than overwriting it.
+
+The initial architecture performs no runtime artifact garbage collection.
+Immutable files may accumulate; reclaiming them later requires a separate
+cross-process live-artifact lease design and cannot infer safety merely from one
+parent's worker set. This avoids deleting a DLL mapped by another kakehashi
+process. If the old committed selection or candidate cannot load, the tree tier
+enters the terminal degraded state rather than running with ambiguous code.
 
 Loading the same quarantined `grammar_key` is refused; a genuinely replaced
 artifact has a different content identity and may be loaded by the fresh
@@ -658,11 +680,17 @@ Implementation is accepted only when all of the following hold:
   including migration from the current fixed destination and the loaded-DLL
   case on Windows, proves a fresh worker executes the content-addressed new
   artifact rather than acknowledging a new key while retaining old code.
+  Explicit parser-path tests prove the worker maps an imported immutable copy,
+  source mutation cannot alter a live generation, and configuration/source
+  refresh adopts changed bytes through a new digest and worker generation.
   Failure injection after every artifact/manifest filesystem step proves the
   next startup selects a complete old or new commit. Post-`dlopen` symbol and
   query-initialization failures prove the candidate worker is reaped before
-  manifest rollback, which either restores the prior artifact or converges to
-  the tree-tier-degraded state.
+  the unchanged prior manifest is used or the tree tier degrades.
+* Concurrent-parent installer tests prove the process-shared lock and manifest
+  revision CAS prevent lost selection updates. A losing candidate follows the
+  committed winner, and old immutable artifacts remain present while any other
+  process may still map them; runtime GC is absent.
 * Cancellation tests cover queued and running work for client cancellation,
   supersession, handler drop, and `didClose`, including completion races and the
   rule that canceled work publishes and caches nothing.
