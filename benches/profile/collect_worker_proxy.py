@@ -116,6 +116,7 @@ def estimated_tree_compute_budget(logical_cpus):
 
 def parse_driver_summary(output, expected_count):
     wall_match = re.search(r"\bwall=([\d.]+)ms", output)
+    tokens_match = re.search(r"\btokens/req=(\d+)\b", output)
     method_match = re.search(
         r"method=textDocument/semanticTokens/full "
         r"count=(\d+) ok=(\d+) canceled=(\d+) null=(\d+) errors=(\d+) "
@@ -123,7 +124,7 @@ def parse_driver_summary(output, expected_count):
         r"p99=([\d.]+)ms max=([\d.]+)ms wire=([\d.]+)KiB",
         output,
     )
-    if not wall_match or not method_match:
+    if not wall_match or not tokens_match or not method_match:
         raise ValueError(f"could not parse driver output:\n{output}")
     count, ok, canceled, null, errors = map(
         int, method_match.groups()[:5]
@@ -138,12 +139,16 @@ def parse_driver_summary(output, expected_count):
             f"count={count} ok={ok} canceled={canceled} "
             f"null={null} errors={errors}"
         )
+    tokens_per_request = int(tokens_match.group(1))
+    if tokens_per_request <= 0:
+        raise ValueError("driver reported an empty semantic-token workload")
     return {
         "count": count,
         "ok": ok,
         "canceled": canceled,
         "null": null,
         "errors": errors,
+        "tokens_per_request": tokens_per_request,
         "p50": float(method_match.group(6)),
         "p90": float(method_match.group(7)),
         "p95": float(method_match.group(8)),
@@ -177,18 +182,17 @@ def runtime_artifact_files(root):
     )
 
 
+def parser_library_suffix(system_name=platform.system()):
+    return ".dylib" if system_name == "Darwin" else ".so"
+
+
 def require_benchmark_artifacts(root):
     required_files = [root / "cache/parsers.lua"]
     for language in ("rust", "markdown", "markdown_inline", "lua", "python"):
         required_files.append(root / f"queries/{language}/highlights.scm")
-        parser_candidates = [
-            path for path in (root / "parser").glob(f"{language}.*")
-            if path.is_file() and not path.is_symlink()
-        ]
-        if not parser_candidates:
-            raise ValueError(
-                f"missing benchmark artifact: parser for {language}"
-            )
+        required_files.append(
+            root / f"parser/{language}{parser_library_suffix()}"
+        )
     required_files.append(root / "queries/markdown/injections.scm")
     for path in required_files:
         if not path.is_file() or path.is_symlink():

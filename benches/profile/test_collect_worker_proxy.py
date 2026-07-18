@@ -15,6 +15,7 @@ from collect_worker_proxy import (
     estimated_tree_compute_budget,
     artifact_provenance,
     parse_driver_summary,
+    parser_library_suffix,
     require_posix as require_collector_posix,
     require_benchmark_artifacts,
     run_order,
@@ -23,6 +24,10 @@ from collect_worker_proxy import (
 
 
 class CollectionHelpersTest(unittest.TestCase):
+    def test_parser_suffix_matches_supported_posix_platform(self):
+        self.assertEqual(parser_library_suffix("Darwin"), ".dylib")
+        self.assertEqual(parser_library_suffix("Linux"), ".so")
+
     @unittest.skipUnless(os.name == "posix", "requires POSIX process groups")
     def test_bounded_run_reaps_term_ignoring_descendant(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -132,7 +137,7 @@ class CollectionHelpersTest(unittest.TestCase):
 
     def test_parses_driver_summary(self):
         output = """
-[drive] lang=rust cycles=100 wall=1574ms
+[drive] lang=rust cycles=100 tokens/req=42 wall=1574ms
 [drive] method=textDocument/semanticTokens/full count=100 ok=100 canceled=0 null=0 errors=0 p50=3.6ms p90=4.0ms p95=4.3ms p99=5.2ms max=7.8ms wire=1430.1KiB
 """
 
@@ -145,10 +150,11 @@ class CollectionHelpersTest(unittest.TestCase):
         self.assertEqual(summary["wire_kib"], 1430.1)
         self.assertEqual(summary["count"], 100)
         self.assertEqual(summary["ok"], 100)
+        self.assertEqual(summary["tokens_per_request"], 42)
 
     def test_rejects_driver_summary_with_failed_responses(self):
         output = """
-[drive] lang=rust cycles=100 wall=10ms
+[drive] lang=rust cycles=100 tokens/req=42 wall=10ms
 [drive] method=textDocument/semanticTokens/full count=100 ok=0 canceled=0 null=0 errors=100 p50=0.1ms p90=0.1ms p95=0.1ms p99=0.1ms max=0.1ms wire=1.0KiB
 """
 
@@ -157,11 +163,20 @@ class CollectionHelpersTest(unittest.TestCase):
 
     def test_rejects_incomplete_driver_summary(self):
         output = """
-[drive] lang=rust cycles=100 wall=10ms
+[drive] lang=rust cycles=100 tokens/req=42 wall=10ms
 [drive] method=textDocument/semanticTokens/full count=99 ok=99 canceled=0 null=0 errors=0 p50=0.1ms p90=0.1ms p95=0.1ms p99=0.1ms max=0.1ms wire=1.0KiB
 """
 
         with self.assertRaisesRegex(ValueError, "expected 100 responses"):
+            parse_driver_summary(output, expected_count=100)
+
+    def test_rejects_empty_known_workload(self):
+        output = """
+[drive] lang=rust cycles=100 tokens/req=0 wall=10ms
+[drive] method=textDocument/semanticTokens/full count=100 ok=100 canceled=0 null=0 errors=0 p50=0.1ms p90=0.1ms p95=0.1ms p99=0.1ms max=0.1ms wire=1.0KiB
+"""
+
+        with self.assertRaisesRegex(ValueError, "empty semantic-token"):
             parse_driver_summary(output, expected_count=100)
 
     def test_data_tree_digest_is_stable_and_content_sensitive(self):
