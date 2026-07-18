@@ -1,3 +1,4 @@
+import hashlib
 import pathlib
 import sys
 import tempfile
@@ -39,6 +40,23 @@ class CollectionHelpersTest(unittest.TestCase):
 
             self.assertEqual(first, second)
             self.assertNotEqual(first, shasum_tree_digest(root))
+
+    def test_data_tree_digest_sorts_relative_posix_paths(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            for relative in ("a-/x", "a/x"):
+                path = root / relative
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(relative.encode())
+
+            expected_input = b"".join(
+                f"{hashlib.sha256(relative.encode()).hexdigest()}  ./{relative}\n".encode()
+                for relative in ("a-/x", "a/x")
+            )
+
+            self.assertEqual(
+                shasum_tree_digest(root), hashlib.sha256(expected_input).hexdigest()
+            )
 
 
 if __name__ == "__main__":

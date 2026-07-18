@@ -59,7 +59,10 @@ def sha256_file(path):
 def shasum_tree_digest(root):
     """Match `find . | sort | xargs shasum | shasum` from the report."""
     digest = hashlib.sha256()
-    for path in sorted(item for item in root.rglob("*") if item.is_file()):
+    for path in sorted(
+        (item for item in root.rglob("*") if item.is_file()),
+        key=lambda item: item.relative_to(root).as_posix(),
+    ):
         relative = path.relative_to(root).as_posix()
         digest.update(f"{sha256_file(path)}  ./{relative}\n".encode())
     return digest.hexdigest()
