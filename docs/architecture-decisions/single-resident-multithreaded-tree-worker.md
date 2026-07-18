@@ -315,8 +315,8 @@ Once `SyncDocumentAck` arrives, the parent may enqueue one incremental chain fro
 that exact acknowledged version and enters `EditQueued`; writer claim changes it
 to `EditPending`. While its ack is pending, later client edits are retained and
 coalesced behind that chain; the parent does not send another edit with either
-an optimistic or stale base. On
-`ApplyEditsAck(target)`, it first enters `Synced(target)`, then sends a composed
+an optimistic or stale base. Upon receiving `ApplyEditsAck(target)`, it first
+enters `Synced(target)`, then sends a composed
 incremental from the retained target snapshot to the latest parent version when
 that edit history remains available. Otherwise it returns to `Unsynced` and
 sends the latest full text. Thus at most one edit chain is unacknowledged per
@@ -528,10 +528,11 @@ parent then reopens and reads the complete source a second time, computing a
 second cryptographic digest and length. File identity metadata is checked before
 and after both passes, but metadata alone is not accepted: the staged bytes are
 imported only when both full-content digests and lengths match. Any mismatch or
-read mutation retries rather than publishing potentially mixed bytes. The resulting session descriptor contains the
-immutable path, digest, and export; aliases with identical bytes and export
-share a `grammar_key`. Source mutation cannot change code already mapped by a
-worker. A configuration reload or watched source-identity change triggers a new
+read mutation triggers a retry rather than publishing potentially mixed bytes.
+The resulting session descriptor contains the immutable path, digest, and
+export; aliases with identical bytes and export share a `grammar_key`. Source
+mutation cannot change code already mapped by a worker. A configuration reload
+or watched source-identity change triggers a new
 import and, when the digest changes, the same planned worker transition as an
 installed replacement. The external source itself is never modified.
 
@@ -655,8 +656,8 @@ fact alone does not classify the cause as native or exempt the restart.
 
 Classification precedence is explicit. A supervisor-observed startup,
 handshake, framing/protocol, failed bounded resynchronization, parent-liveness,
-or reported Rust panic/
-invariant failure is systemic even if hazard leases are active. Otherwise, a
+or reported Rust panic or invariant failure is systemic even if hazard leases
+are active. Otherwise, a
 hard `NativeSegment` deadline or an OS crash signal/exception while at least one
 hazard lease is active is native-evidenced. Every remaining unattributed or
 normally exiting failure is systemic. A native-evidenced failure that newly
@@ -726,9 +727,10 @@ An end-to-end request deadline starts at request admission and can release the
 client without killing the worker. A separate hard native-segment deadline
 starts with the handoff allowance when the parent receives
 `NativeSegmentEntered`; only after that allowance does it consume the native
-budget, and it ends at `NativeSegmentExited`. It does not run while an arm frame is queued or in transit and not
-for the lifetime of the surrounding grammar hazard lease. The already recorded
-lease still provides crash attribution between arm and entry. Missing entry and
+budget, and it ends at `NativeSegmentExited`. It does not run while an arm frame
+is queued or in transit, nor does it run for the lifetime of the surrounding
+grammar hazard lease. The already recorded lease still provides crash
+attribution between arm and entry. Missing entry and
 control-protocol progress use the supervisor's bounded handshake/liveness
 timeout rather than consuming a grammar's native execution budget. A
 cooperative timeout that returns control from Tree-sitter does not require a
