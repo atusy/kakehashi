@@ -30,6 +30,8 @@ class RequestSummaryTest(unittest.TestCase):
         self.assertEqual(summary.canceled, 1)
         self.assertEqual(summary.p50_ms, 20.0)
         self.assertEqual(summary.p90_ms, 30.0)
+        self.assertEqual(summary.p95_ms, 30.0)
+        self.assertEqual(summary.p99_ms, 30.0)
         self.assertEqual(summary.max_ms, 30.0)
         self.assertEqual(summary.wire_bytes, 600)
 
@@ -37,6 +39,8 @@ class RequestSummaryTest(unittest.TestCase):
         self.assertEqual(by_status["ok"].count, 2)
         self.assertEqual(by_status["ok"].p50_ms, 10.0)
         self.assertEqual(by_status["ok"].p90_ms, 20.0)
+        self.assertEqual(by_status["ok"].p95_ms, 20.0)
+        self.assertEqual(by_status["ok"].p99_ms, 20.0)
         self.assertEqual(by_status["canceled"].count, 1)
         self.assertEqual(by_status["canceled"].p50_ms, 30.0)
 

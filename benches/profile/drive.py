@@ -42,6 +42,8 @@ class RequestSummary:
     errors: int
     p50_ms: float
     p90_ms: float
+    p95_ms: float
+    p99_ms: float
     max_ms: float
     wire_bytes: int
 
@@ -63,6 +65,8 @@ def summarize_samples(samples: list[RequestSample]) -> RequestSummary:
         errors=statuses["error"],
         p50_ms=percentile(0.5),
         p90_ms=percentile(0.9),
+        p95_ms=percentile(0.95),
+        p99_ms=percentile(0.99),
         max_ms=latencies[-1],
         wire_bytes=sum(sample.wire_bytes for sample in samples),
     )
@@ -545,12 +549,15 @@ def main() -> None:
             f"[drive] method={method} count={summary.count} ok={summary.ok} "
             f"canceled={summary.canceled} null={summary.null} errors={summary.errors} "
             f"p50={summary.p50_ms:.1f}ms p90={summary.p90_ms:.1f}ms "
+            f"p95={summary.p95_ms:.1f}ms p99={summary.p99_ms:.1f}ms "
             f"max={summary.max_ms:.1f}ms wire={summary.wire_bytes / 1024:.1f}KiB\n")
         for status, status_summary in summarize_samples_by_status(samples).items():
             sys.stderr.write(
                 f"[drive] method={method} status={status} "
                 f"count={status_summary.count} p50={status_summary.p50_ms:.1f}ms "
                 f"p90={status_summary.p90_ms:.1f}ms "
+                f"p95={status_summary.p95_ms:.1f}ms "
+                f"p99={status_summary.p99_ms:.1f}ms "
                 f"max={status_summary.max_ms:.1f}ms\n"
             )
     if cycle_success_times:
@@ -562,6 +569,7 @@ def main() -> None:
         sys.stderr.write(
             f"[drive] time-to-last-semantic-success cycles={summary.count} "
             f"p50={summary.p50_ms:.1f}ms p90={summary.p90_ms:.1f}ms "
+            f"p95={summary.p95_ms:.1f}ms p99={summary.p99_ms:.1f}ms "
             f"max={summary.max_ms:.1f}ms\n"
         )
     if notification_counts:
