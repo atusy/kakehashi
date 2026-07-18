@@ -56,6 +56,22 @@ def sha256_file(path):
     return digest.hexdigest()
 
 
+def shasum_tree_digest(root):
+    """Match `find . | sort | xargs shasum | shasum` from the report."""
+    digest = hashlib.sha256()
+    for path in sorted(item for item in root.rglob("*") if item.is_file()):
+        relative = path.relative_to(root).as_posix()
+        digest.update(f"{sha256_file(path)}  ./{relative}\n".encode())
+    return digest.hexdigest()
+
+
+def cpu_model():
+    try:
+        return tool_version(["sysctl", "-n", "machdep.cpu.brand_string"])
+    except (FileNotFoundError, subprocess.CalledProcessError):
+        return platform.processor() or "unknown"
+
+
 def tool_version(command):
     return subprocess.run(
         command, check=True, text=True, stdout=subprocess.PIPE
@@ -107,6 +123,8 @@ def main():
 
     script_dir = pathlib.Path(__file__).resolve().parent
     selected = args.scenarios or list(SCENARIOS)
+    logical_cpus = os.cpu_count() or 1
+    data_files = [path for path in args.data_dir.rglob("*") if path.is_file()]
     result = {
         "schema": 1,
         "experiment": "single-tree-worker-phase0-raw-relay",
@@ -114,9 +132,15 @@ def main():
             "platform": platform.platform(),
             "python": platform.python_version(),
             "rustc": tool_version(["rustc", "--version"]),
+            "cpu_model": cpu_model(),
+            "logical_cpus": logical_cpus,
+            "tree_compute_budget": max(1, logical_cpus - 2),
+            "tree_compute_budget_source": "current available_parallelism - 2 policy",
             "binary": str(args.bin.resolve()),
             "binary_sha256": sha256_file(args.bin),
             "data_dir": str(args.data_dir.resolve()),
+            "parser_query_file_count": len(data_files),
+            "parser_query_tree_sha256": shasum_tree_digest(args.data_dir),
         },
         "collector": {
             "pairs": args.pairs,

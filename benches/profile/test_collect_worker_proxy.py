@@ -1,10 +1,11 @@
 import pathlib
 import sys
+import tempfile
 import unittest
 
 sys.path.insert(0, str(pathlib.Path(__file__).parent))
 
-from collect_worker_proxy import parse_driver_summary, run_order
+from collect_worker_proxy import parse_driver_summary, run_order, shasum_tree_digest
 
 
 class CollectionHelpersTest(unittest.TestCase):
@@ -25,6 +26,19 @@ class CollectionHelpersTest(unittest.TestCase):
         self.assertEqual(summary["p95"], 4.3)
         self.assertEqual(summary["p99"], 5.2)
         self.assertEqual(summary["wire_kib"], 1430.1)
+
+    def test_data_tree_digest_is_stable_and_content_sensitive(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            (root / "b").write_bytes(b"two")
+            (root / "a").write_bytes(b"one")
+
+            first = shasum_tree_digest(root)
+            second = shasum_tree_digest(root)
+            (root / "a").write_bytes(b"changed")
+
+            self.assertEqual(first, second)
+            self.assertNotEqual(first, shasum_tree_digest(root))
 
 
 if __name__ == "__main__":
