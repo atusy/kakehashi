@@ -179,12 +179,14 @@ semantic fan-out must be split into bounded, cancelable chunks and returned to
 the scheduler with their document tag; an admitted work unit cannot launch an
 unconstrained nested `par_iter` that bypasses admission. For a compute budget
 `P > 1`, a document may use all `P` permits only while no competing or
-user-blocking work is queued. Once such work is queued, that document receives
-no new chunk above `P - 1` running permits, reserving the next available permit
-for the competitor. Idle capacity is therefore borrowed only chunk by chunk;
-already running native work is not preempted. For `P == 1`, cross-document
-concurrency is impossible and the guarantee degrades to priority between bounded
-cooperative chunks.
+user-blocking work is queued. Once work for `N` documents is runnable, admission
+is max-min fair: each runnable document receives one chunk before any document
+receives another, up to the shared `P`-permit budget, with user-blocking work
+winning ties. This dynamically reduces a heavy document's cap as competitors
+arrive and prevents a fixed `P - 1` share from starving multiple competitors.
+Idle capacity is therefore borrowed only chunk by chunk; already running native
+work is not preempted. For `P == 1`, cross-document concurrency is impossible
+and the guarantee degrades to priority between bounded cooperative chunks.
 
 ### 4. IPC is versioned and coarse grained
 
