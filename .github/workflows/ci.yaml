@@ -24,6 +24,15 @@ jobs:
       - run: rustup component add rust-analyzer
       - run: make deps/tree-sitter
       - run: cargo test
+
+  benchmark-tools:
+    name: Benchmark tools (${{ matrix.os }})
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
       - name: Test benchmark tooling
         run: python3 -m unittest discover -s benches/profile -p 'test_*.py'
 
