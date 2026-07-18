@@ -212,7 +212,7 @@ unrelated `query-assets`. It was computed from paths relative to the data
 directory:
 
 ```sh
-find cache parser queries -type f -print0 | sort -z | \
+find ./cache ./parser ./queries -type f -print0 | sort -z | \
   xargs -0 shasum -a 256 | shasum -a 256
 ```
 
