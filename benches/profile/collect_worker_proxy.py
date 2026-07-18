@@ -483,7 +483,28 @@ def shasum_tree_digest(root):
     return digest.hexdigest()
 
 
+def parse_linux_cpu_model(cpuinfo):
+    fields = {}
+    for line in cpuinfo.splitlines():
+        key, separator, value = line.partition(":")
+        if separator and key.strip() not in fields:
+            fields[key.strip()] = value.strip()
+    for key in ("model name", "Hardware", "Processor"):
+        if fields.get(key):
+            return fields[key]
+    return None
+
+
 def cpu_model():
+    if platform.system() == "Linux":
+        try:
+            model = parse_linux_cpu_model(
+                pathlib.Path("/proc/cpuinfo").read_text()
+            )
+            if model:
+                return model
+        except OSError:
+            pass
     try:
         return tool_version(["sysctl", "-n", "machdep.cpu.brand_string"])
     except (FileNotFoundError, subprocess.CalledProcessError):

@@ -22,6 +22,7 @@ from collect_worker_proxy import (
     artifact_provenance,
     parse_capture_pilot_summary,
     parse_driver_summary,
+    parse_linux_cpu_model,
     official_revision_blobs,
     load_binary_attestation,
     parser_library_suffix,
@@ -467,6 +468,19 @@ class CollectionHelpersTest(unittest.TestCase):
     def test_alternates_direct_and_relay_order(self):
         self.assertEqual(run_order(0), ("direct", "relay"))
         self.assertEqual(run_order(1), ("relay", "direct"))
+
+    def test_reads_linux_cpu_model_name(self):
+        cpuinfo = """processor : 0
+vendor_id : GenuineIntel
+model name : Example CPU 9000 @ 3.00GHz
+processor : 1
+model name : Example CPU 9000 @ 3.00GHz
+"""
+
+        self.assertEqual(
+            parse_linux_cpu_model(cpuinfo),
+            "Example CPU 9000 @ 3.00GHz",
+        )
 
     def test_warms_both_paths_before_collecting_measured_pairs(self):
         calls = []
