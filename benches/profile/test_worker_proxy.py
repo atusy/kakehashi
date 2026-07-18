@@ -14,6 +14,24 @@ from worker_proxy import copy_stream, require_posix, run_relay, terminate_child
 
 
 class CopyStreamTest(unittest.TestCase):
+    def test_stdout_relay_cannot_block_process_exit(self):
+        child = mock.Mock()
+        child.stdin = io.BytesIO()
+        child.stdout = io.BytesIO()
+        child.wait.return_value = 0
+        child.poll.return_value = 0
+        stdin_thread = mock.Mock()
+        stdout_thread = mock.Mock()
+
+        with mock.patch(
+            "worker_proxy.threading.Thread",
+            side_effect=(stdin_thread, stdout_thread),
+        ) as thread:
+            self.assertEqual(run_relay(child, io.BytesIO(), io.BytesIO()), 0)
+
+        self.assertTrue(thread.call_args_list[1].kwargs["daemon"])
+        stdout_thread.join.assert_called_once_with(timeout=2.0)
+
     def test_thread_setup_interruption_reaps_child(self):
         class Child:
             stdin = io.BytesIO()

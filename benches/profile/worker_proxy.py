@@ -76,11 +76,12 @@ def run_relay(child, input_stream, output_stream):
         stdout_thread = threading.Thread(
             target=copy_stream,
             args=(child.stdout, output_stream),
+            daemon=True,
         )
         stdin_thread.start()
         stdout_thread.start()
         return_code = child.wait()
-        stdout_thread.join()
+        stdout_thread.join(timeout=2.0)
         return return_code
     finally:
         terminate_child(child)
