@@ -15,6 +15,7 @@ import collect_worker_proxy as collector
 from collect_worker_proxy import (
     CLEANUP_SIGNALS,
     build_driver_command,
+    collect_pairs,
     bounded_run,
     controlled_environment,
     estimated_tree_compute_budget,
@@ -466,6 +467,23 @@ class CollectionHelpersTest(unittest.TestCase):
     def test_alternates_direct_and_relay_order(self):
         self.assertEqual(run_order(0), ("direct", "relay"))
         self.assertEqual(run_order(1), ("relay", "direct"))
+
+    def test_warms_both_paths_before_collecting_measured_pairs(self):
+        calls = []
+
+        def run(kind):
+            calls.append(kind)
+            return {"call": len(calls)}
+
+        pairs = collect_pairs(run, 2)
+
+        self.assertEqual(calls, [
+            "direct", "relay",
+            "direct", "relay",
+            "relay", "direct",
+        ])
+        self.assertEqual(pairs[0]["direct"], {"call": 3})
+        self.assertEqual(pairs[1]["relay"], {"call": 5})
 
     def test_parses_driver_summary(self):
         output = """

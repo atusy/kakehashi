@@ -209,6 +209,22 @@ def run_order(zero_based_run):
     return ("direct", "relay") if zero_based_run % 2 == 0 else ("relay", "direct")
 
 
+def collect_pairs(run, pair_count, on_pair=lambda _pair: None):
+    for kind in run_order(0):
+        run(kind)
+    pairs = []
+    for index in range(pair_count):
+        pair = {
+            "run": index + 1,
+            "order": "-".join(run_order(index)),
+        }
+        for kind in run_order(index):
+            pair[kind] = run(kind)
+        pairs.append(pair)
+        on_pair(index + 1)
+    return pairs
+
+
 def estimated_tree_compute_budget(logical_cpus):
     return max(1, logical_cpus - 2)
 
@@ -722,27 +738,25 @@ def main():
         "collector": {
             "pairs": args.pairs,
             "order": "direct-relay on odd runs; relay-direct on even runs",
+            "scenario_warmup": "one unmeasured direct-relay pair",
         },
         "steady_state": {},
     }
     for scenario in selected:
-        pairs = []
-        for index in range(args.pairs):
-            pair = {
-                "run": index + 1,
-                "order": "-".join(run_order(index)),
-            }
-            for kind in run_order(index):
-                pair[kind] = run_driver(
-                    kind,
-                    binary,
-                    data_dir,
-                    SCENARIOS[scenario],
-                    script_dir,
-                    args.run_timeout,
-                )
-            pairs.append(pair)
-            print(f"{scenario}: pair {index + 1}/{args.pairs}", file=sys.stderr)
+        def run(kind):
+            return run_driver(
+                kind,
+                binary,
+                data_dir,
+                SCENARIOS[scenario],
+                script_dir,
+                args.run_timeout,
+            )
+
+        def report_progress(pair):
+            print(f"{scenario}: pair {pair}/{args.pairs}", file=sys.stderr)
+
+        pairs = collect_pairs(run, args.pairs, report_progress)
         result["steady_state"][scenario] = {
             "arguments": SCENARIOS[scenario],
             "pairs": pairs,
