@@ -378,6 +378,7 @@ lets an unclaimed `SyncQueued` payload advance to the latest version but never
 mutates a claimed `SyncPending` frame. A wrong or stale acknowledgment takes the
 existing `Unsynced` recovery path. Thus backpressure coalesces unsent work without
 changing the expected acknowledgment of in-flight work or blocking ingress.
+
 `DeriveSnapshot` and other document work
 is admitted only for a version the worker has acknowledged; the worker control
 loop applies state messages in stream order before scheduling the corresponding
@@ -873,9 +874,8 @@ Implementation is accepted only when all of the following hold:
 
 * A child grammar fixture that calls `abort` proves that the LSP process stays
   alive, emits an attributable crash log, quarantines the acknowledged active
-  grammar set
-  for the session, restarts the worker, and successfully reparses an open
-  document in another language.
+  grammar set for the session, restarts the worker, and successfully reparses an
+  open document in another language.
 * Failure injection immediately after `GrammarHazardArmed` proves that the parent
   already holds the crashing grammar key and that the replacement worker refuses
   it for host and injected parser acquisition.
