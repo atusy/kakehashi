@@ -399,15 +399,23 @@ matching artifact, so a process or power failure observes either the old
 committed selection or the new one, never an unrecognized rollback filename or
 absent canonical parser.
 
-A manifest-less legacy `parser/<language>.<ext>` installation is migrated on
-first resolution. Under the per-grammar lock, the parent rechecks that no
-manifest exists and snapshots the legacy file identity, then imports its bytes
-without modifying the legacy path. A candidate worker validates the exact
-digest. The parent reacquires the lock and CAS-creates revision 1 only if the
-manifest is still absent and the legacy identity is unchanged. A concurrent
-migrator that loses this CAS reaps its candidate and follows the committed
-winner. If import or validation fails, the candidate is reaped, no manifest is
-created, and the untouched legacy file remains available for diagnosis or a
+Manifest-less legacy `parser/<language>.<ext>` installations known from current
+configuration are migrated before the lazy resident worker is first enabled.
+Under the per-grammar lock, the parent rechecks that no manifest exists and
+snapshots the legacy file identity, then imports its bytes without modifying the
+legacy path. The single candidate worker validates the exact digest while it is
+still the only worker process and before it can serve public tree requests. The
+parent reacquires the lock and CAS-creates revision 1 only if the manifest is
+still absent and the legacy identity is unchanged. A concurrent migrator that
+loses this CAS reaps its candidate and follows the committed winner.
+
+If a previously unknown legacy grammar is discovered after the resident worker
+is serving, migration uses the same planned transition as replacement: drain or
+cancel, terminate and reap the resident worker, validate with the one fresh
+candidate, then commit and enable it. It never starts a second validator beside
+the resident worker and never loads unvalidated legacy code into a serving
+generation. If import or validation fails, the candidate is reaped, no manifest
+is created, and the untouched legacy file remains available for diagnosis or a
 later successful migration; it is not loaded directly into the production
 worker. Legacy files are not removed by runtime migration or GC.
 
@@ -715,7 +723,9 @@ Implementation is accepted only when all of the following hold:
   artifact rather than acknowledging a new key while retaining old code.
   Concurrent first-start migration proves exactly one revision-1 manifest wins,
   losers follow it, the legacy file remains intact through every failure point,
-  and failed validation leaves no selectable partial migration.
+  and failed validation leaves no selectable partial migration. Late legacy
+  discovery proves the resident is reaped before the sole candidate starts, so
+  migration never creates two worker processes or exposes unvalidated code.
   Explicit parser-path tests prove the worker maps an imported immutable copy,
   source mutation cannot alter a live generation, and configuration/source
   refresh adopts changed bytes through a new digest and worker generation.
