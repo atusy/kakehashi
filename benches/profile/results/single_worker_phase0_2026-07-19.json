@@ -2242,17 +2242,46 @@
     "data_dir": "/private/tmp/kakehashi-phase0-data.WIU8dk",
     "parser_query_tree_sha256": "1572967b352c7b24ec872bff02c3c9808374a0d5cab2c707368cb5f32be58115",
     "direct": {
-      "semantic_p50": 4.3,
+      "semantic_p50": 4.4,
       "semantic_p95": 5.0,
-      "captures_p50": 29.4,
-      "captures_p95": 32.6
+      "captures_p50": 29.7,
+      "captures_p95": 32.7,
+      "semantic_outcomes": {
+        "count": 100,
+        "ok": 100,
+        "canceled": 0,
+        "null": 0,
+        "errors": 0
+      },
+      "capture_outcomes": {
+        "count": 100,
+        "ok": 100,
+        "canceled": 0,
+        "null": 0,
+        "errors": 0
+      }
     },
     "relay": {
       "semantic_p50": 4.3,
-      "semantic_p95": 4.7,
-      "captures_p50": 27.8,
-      "captures_p95": 29.4
-    }
+      "semantic_p95": 4.9,
+      "captures_p50": 29.0,
+      "captures_p95": 32.0,
+      "semantic_outcomes": {
+        "count": 100,
+        "ok": 100,
+        "canceled": 0,
+        "null": 0,
+        "errors": 0
+      },
+      "capture_outcomes": {
+        "count": 100,
+        "ok": 100,
+        "canceled": 0,
+        "null": 0,
+        "errors": 0
+      }
+    },
+    "capture_lineage_validated": true
   },
   "steady_state_date": "2026-07-19",
   "artifacts": {
