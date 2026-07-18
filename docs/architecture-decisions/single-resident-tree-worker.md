@@ -360,12 +360,20 @@ group or platform equivalent) so orphan workers cannot survive the LSP server.
 
 ### 7. Relationship to existing decisions
 
-This decision preserves the versioned-input and immutable-derived-snapshot
-model in [parse-snapshot-architecture](parse-snapshot-architecture.md). Once
-implemented, it supersedes only that ADR's placement of all tree CPU in an
-in-process bounded Rayon pool; the bounded-pool, cancellation, coalescing,
-publish-guard, and serve-stale principles move into or across the worker
-boundary.
+This decision preserves the semantic contracts of parse-snapshot-architecture:
+authoritative versioned inputs, immutable internally consistent derivation,
+strict publish guards, reader-specific freshness behavior, cancellation, and
+bounded tree CPU. It changes more than CPU placement. The parent-held
+`ParseSnapshot { text, tree, ... }`, wait-free direct Tree readers, shared
+edit-shifted `NodeTracker`, and in-process derivation/cache ownership all require
+new serialized or worker-local representations.
+
+Because this record is still proposed, it does not yet supersede the existing
+decision. The production cutover must revise parse-snapshot-architecture and
+the affected node-identity decisions in the same change, removing or rewriting
+the overtaken ownership and local-reader passages according to this repository's
+delete-on-supersede convention. Until that coordinated update lands, the
+existing in-process snapshot decision remains authoritative.
 
 It preserves the single per-document lifecycle owner from
 [per-document-parse-scheduler](per-document-parse-scheduler.md), but places that
@@ -555,17 +563,22 @@ pool.
 
 The implementation should proceed in measured stages:
 
-1. Prototype the framed transport and one high-level `DeriveSnapshot` path
-   behind a development-only switch; record the confirmation metrics before
-   selecting an encoding.
-2. Add supervised self-reexecution as a hidden tree-worker mode and move dynamic
-   loading, parser ownership, parsing, injection discovery, and snapshot
-   derivation into it.
-3. Move remaining tree readers (semantic tokens, captures, selection ranges,
-   symbols, and node operations) behind high-level worker requests.
-4. Remove native grammar loading and tree-CPU execution from the parent, then
-   remove restart-time active-parser persistence after crash/restart tests prove
-   the new boundary.
+1. Prototype the framed transport, supervision, and one high-level
+   `DeriveSnapshot` path behind a development-only switch; record the
+   confirmation metrics before selecting an encoding.
+2. Build the complete worker-side ownership and high-level reader operations in
+   shadow mode while the current in-process path remains the only public source
+   of results. Compare serialized worker outputs against the current path; do
+   not move the sole Tree away from a parent reader that still needs it.
+3. Cut over dynamic loading, parser/Tree/cache ownership, snapshot derivation,
+   node tracking, and every tree-dependent handler together behind one guarded
+   rollout switch. At this boundary the parent stops serving or traversing a
+   local `Tree`; rollback selects the complete legacy path, not a half-migrated
+   ownership mix.
+4. After failure injection, protocol, compatibility, and benchmark gates pass,
+   remove the legacy in-process path and restart-time active-parser persistence.
+   Update the existing snapshot, scheduler, and node-identity ADRs in the same
+   structural change so their ownership and reader descriptions match reality.
 5. Revisit worker sharding only if queue, CPU, or recovery measurements show
    that the fixed worker is the limiting resource.
 
