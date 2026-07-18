@@ -200,6 +200,9 @@ data_dir=./deps/profile/kakehashi
 git clone --filter=blob:none \
   https://github.com/nvim-treesitter/nvim-treesitter "$source_dir"
 git -C "$source_dir" checkout "$revision"
+python3 benches/profile/attest_worker_binary.py \
+  --checkout . \
+  --output /tmp/single-worker-binary-attestation.json
 mkdir -p "$data_dir/cache" "$data_dir/queries"
 cp "$source_dir/lua/nvim-treesitter/parsers.lua" "$data_dir/cache/parsers.lua"
 for lang in comment lua markdown markdown_inline python rust yaml; do
@@ -209,9 +212,6 @@ for lang in comment lua markdown markdown_inline python rust yaml; do
   cp -R "$source_dir/runtime/queries/$lang" "$data_dir/queries/$lang"
 done
 
-python3 benches/profile/attest_worker_binary.py \
-  --checkout . \
-  --output /tmp/single-worker-binary-attestation.json
 python3 benches/profile/collect_worker_proxy.py \
   --bin ./target/release/kakehashi \
   --binary-attestation /tmp/single-worker-binary-attestation.json \
