@@ -22,6 +22,7 @@ from collect_worker_proxy import (
     require_benchmark_artifacts,
     run_order,
     shasum_tree_digest,
+    verify_file_sha256,
 )
 
 
@@ -223,6 +224,16 @@ class CollectionHelpersTest(unittest.TestCase):
     def test_estimated_budget_applies_current_policy(self):
         self.assertEqual(estimated_tree_compute_budget(10), 8)
         self.assertEqual(estimated_tree_compute_budget(1), 1)
+
+    def test_rejects_binary_changed_during_collection(self):
+        with tempfile.TemporaryDirectory() as directory:
+            binary = pathlib.Path(directory) / "kakehashi"
+            binary.write_bytes(b"initial")
+            expected = hashlib.sha256(b"initial").hexdigest()
+            binary.write_bytes(b"replacement")
+
+            with self.assertRaisesRegex(RuntimeError, "binary changed"):
+                verify_file_sha256(binary, expected)
 
     def test_relay_invokes_proxy_through_python(self):
         command = build_driver_command(

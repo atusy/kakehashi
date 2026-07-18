@@ -244,6 +244,14 @@ def sha256_file(path):
     return digest.hexdigest()
 
 
+def verify_file_sha256(path, expected):
+    actual = sha256_file(path)
+    if actual != expected:
+        raise RuntimeError(
+            f"binary changed during collection: expected={expected} actual={actual}"
+        )
+
+
 def runtime_artifact_files(root):
     files = []
     for relative_root in ("cache", "parser", "queries"):
@@ -488,6 +496,7 @@ def main():
     selected = args.scenarios or list(SCENARIOS)
     require_benchmark_artifacts(args.data_dir)
     initial_artifact_identity = artifact_identity(args.data_dir)
+    initial_binary_sha256 = sha256_file(args.bin)
     logical_cpus = os.cpu_count() or 1
     result = {
         "schema": 1,
@@ -506,7 +515,7 @@ def main():
                 "not the binary's reported effective pool size"
             ),
             "binary": str(args.bin.resolve()),
-            "binary_sha256": sha256_file(args.bin),
+            "binary_sha256": initial_binary_sha256,
             "data_dir": str(args.data_dir.resolve()),
             "parser_query_file_count": initial_artifact_identity[0],
             "parser_query_tree_sha256": initial_artifact_identity[1],
@@ -550,6 +559,7 @@ def main():
             "runtime artifacts changed during collection: "
             f"before={initial_artifact_identity} after={final_artifact_identity}"
         )
+    verify_file_sha256(args.bin, initial_binary_sha256)
     args.output.write_text(json.dumps(result, indent=2) + "\n")
 
 

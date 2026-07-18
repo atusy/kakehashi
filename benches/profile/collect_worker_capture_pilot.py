@@ -18,6 +18,7 @@ from collect_worker_proxy import (
     require_benchmark_artifacts,
     require_posix,
     sha256_file,
+    verify_file_sha256,
 )
 
 
@@ -54,6 +55,7 @@ def main():
 
     require_benchmark_artifacts(args.data_dir)
     initial_identity = artifact_identity(args.data_dir)
+    initial_binary_sha256 = sha256_file(args.bin)
     script_dir = pathlib.Path(__file__).resolve().parent
     result = {
         "schema": 1,
@@ -62,7 +64,7 @@ def main():
             "platform": platform.platform(),
             "python": platform.python_version(),
             "binary": str(args.bin.resolve()),
-            "binary_sha256": sha256_file(args.bin),
+            "binary_sha256": initial_binary_sha256,
             "data_dir": str(args.data_dir.resolve()),
             "parser_query_file_count": initial_identity[0],
             "parser_query_tree_sha256": initial_identity[1],
@@ -87,6 +89,7 @@ def main():
             "runtime artifacts changed during collection: "
             f"before={initial_identity} after={final_identity}"
         )
+    verify_file_sha256(args.bin, initial_binary_sha256)
     args.output.write_text(json.dumps(result, indent=2) + "\n")
 
 
