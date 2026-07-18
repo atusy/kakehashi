@@ -139,6 +139,7 @@ class RequestSummaryTest(unittest.TestCase):
         for response in (
             {},
             {"result": {}},
+            {"result": {"data": []}},
             {"result": {"data": [0, 0]}},
             {"result": {"data": [0, 0, 1, "type", 0]}},
         ):
@@ -187,7 +188,8 @@ class RequestSummaryTest(unittest.TestCase):
 
         warm_semantic_tokens(
             lambda method, params: (
-                calls.append((method, params)) or ({"result": {"data": []}}, 0)
+                calls.append((method, params))
+                or ({"result": {"data": [0, 0, 1, 0, 0]}}, 0)
             ),
             "file:///profile/input.rs",
         )

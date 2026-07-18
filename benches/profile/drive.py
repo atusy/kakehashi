@@ -114,6 +114,7 @@ def semantic_token_data(response):
     data = result.get("data") if isinstance(result, dict) else None
     if (
         not isinstance(data, list)
+        or not data
         or len(data) % 5 != 0
         or any(type(value) is not int or value < 0 for value in data)
     ):
