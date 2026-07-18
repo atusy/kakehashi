@@ -20,6 +20,10 @@ byte copying. It does not include the future worker protocol's encoding,
 document replica, configuration fences, queueing, hazard handshakes, or movement
 of Tree-sitter computation and caches.
 
+This Phase 0 relay is POSIX-only because bounded descendant cleanup depends on
+POSIX signals and process groups. The production worker remains cross-platform
+and must use the platform-specific lifecycle mechanisms specified by the ADR.
+
 ## Environment
 
 * Initial cold-start and pilot date: 2026-07-18

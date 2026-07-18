@@ -14,6 +14,11 @@ import sys
 import threading
 
 
+def require_posix(platform_name=os.name):
+    if platform_name != "posix":
+        raise SystemExit("worker_proxy Phase 0 relay requires POSIX lifecycle semantics")
+
+
 def copy_stream(
     source, destination, chunk_size=64 * 1024, close_destination=False
 ):
@@ -51,6 +56,7 @@ def terminate_child(child):
 
 
 def main():
+    require_posix()
     child_bin = os.environ.get("KAKEHASHI_WORKER_PROXY_BIN")
     if not child_bin:
         raise SystemExit("KAKEHASHI_WORKER_PROXY_BIN is required")

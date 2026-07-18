@@ -13,6 +13,7 @@ from collect_worker_proxy import (
     estimated_tree_compute_budget,
     artifact_provenance,
     parse_driver_summary,
+    require_posix as require_collector_posix,
     require_benchmark_artifacts,
     run_order,
     shasum_tree_digest,
@@ -20,6 +21,10 @@ from collect_worker_proxy import (
 
 
 class CollectionHelpersTest(unittest.TestCase):
+    def test_collector_rejects_non_posix_lifecycle(self):
+        with self.assertRaisesRegex(SystemExit, "POSIX"):
+            require_collector_posix("nt")
+
     def test_benchmark_artifacts_require_every_exercised_language(self):
         with tempfile.TemporaryDirectory() as directory:
             with self.assertRaisesRegex(ValueError, "missing benchmark artifact"):

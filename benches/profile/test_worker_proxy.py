@@ -8,10 +8,14 @@ import unittest
 
 sys.path.insert(0, str(pathlib.Path(__file__).parent))
 
-from worker_proxy import copy_stream, terminate_child
+from worker_proxy import copy_stream, require_posix, terminate_child
 
 
 class CopyStreamTest(unittest.TestCase):
+    def test_relay_rejects_non_posix_lifecycle(self):
+        with self.assertRaisesRegex(SystemExit, "POSIX"):
+            require_posix("nt")
+
     def test_copies_until_eof_and_flushes_each_chunk(self):
         source = io.BytesIO(b"Content-Length: 2\r\n\r\n{}")
         destination = io.BytesIO()
@@ -104,7 +108,10 @@ class CopyStreamTest(unittest.TestCase):
         self.assertEqual(completed.returncode, 0, completed.stderr.decode())
         self.assertEqual(completed.stdout, b"3\n")
 
-    @unittest.skipUnless(hasattr(signal, "SIGTERM"), "requires SIGTERM")
+    @unittest.skipUnless(
+        os.name == "posix" and hasattr(signal, "SIGTERM"),
+        "requires POSIX SIGTERM",
+    )
     def test_terminating_proxy_reaps_child(self):
         proxy = pathlib.Path(__file__).with_name("worker_proxy.py")
         env = dict(os.environ, KAKEHASHI_WORKER_PROXY_BIN=sys.executable)

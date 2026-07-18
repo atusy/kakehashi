@@ -39,6 +39,11 @@ CONTROLLED_ENVIRONMENT_KEYS = (
 )
 
 
+def require_posix(platform_name=os.name):
+    if platform_name != "posix":
+        raise SystemExit("Phase 0 relay collection requires POSIX lifecycle semantics")
+
+
 def controlled_environment(source):
     return {
         key: source[key]
@@ -269,6 +274,7 @@ def run_driver(kind, binary, data_dir, scenario_args, script_dir):
 
 
 def main():
+    require_posix()
     parser = argparse.ArgumentParser()
     parser.add_argument("--bin", type=pathlib.Path, required=True)
     parser.add_argument("--data-dir", type=pathlib.Path, required=True)
