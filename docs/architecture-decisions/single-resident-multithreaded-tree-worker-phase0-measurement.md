@@ -171,22 +171,9 @@ The July 18 cold-start and captures-pilot sections predate that recollection.
 The cold-start section preserves all 20 timing samples and is recomputed by the
 same analyzer; the single captures pilot remains a smoke test only.
 
-Collect a new alternating 10-pair steady-state batch without hand
-transcription using:
-
-```sh
-python3 benches/profile/collect_worker_proxy.py \
-  --bin ./target/release/kakehashi \
-  --data-dir ./deps/test/kakehashi \
-  --nvim-treesitter-checkout /path/to/pinned/nvim-treesitter \
-  --output /tmp/single-worker-phase0.json
-```
-
-The collector verified that the measured metadata cache and every installed
-query file byte-match
-`nvim-treesitter` revision
-`4916d6592ede8c07973490d9322f187e07dfefac`. Reconstruct the parser/query
-sources at that revision rather than installing from a moving `main` branch:
+Reconstruct a dedicated parser/query tree at the pinned revision rather than
+installing from a moving `main` branch, then collect a new alternating 10-pair
+steady-state batch without hand transcription:
 
 ```sh
 revision=4916d6592ede8c07973490d9322f187e07dfefac
@@ -203,7 +190,18 @@ for lang in comment lua markdown markdown_inline python rust yaml; do
   rm -rf "$data_dir/queries/$lang"
   cp -R "$source_dir/runtime/queries/$lang" "$data_dir/queries/$lang"
 done
+
+python3 benches/profile/collect_worker_proxy.py \
+  --bin ./target/release/kakehashi \
+  --data-dir "$data_dir" \
+  --nvim-treesitter-checkout "$source_dir" \
+  --output /tmp/single-worker-phase0.json
 ```
+
+The collector verifies that the metadata cache and every installed query file
+byte-match the checkout's HEAD. The committed dataset was verified against
+`nvim-treesitter` revision
+`4916d6592ede8c07973490d9322f187e07dfefac`.
 
 Run the digest command below and compare it with the committed dataset before
 using a reconstructed tree for comparison. Compiler and platform differences
@@ -217,8 +215,9 @@ unrelated `query-assets`. It was computed from paths relative to the data
 directory:
 
 ```sh
-find ./cache ./parser ./queries -type f -print0 | sort -z | \
-  xargs -0 shasum -a 256 | shasum -a 256
+(cd "$data_dir" && \
+  find ./cache ./parser ./queries -type f -print0 | sort -z | \
+  xargs -0 shasum -a 256 | shasum -a 256)
 ```
 
 A representative direct/relay pair is:
@@ -226,13 +225,13 @@ A representative direct/relay pair is:
 ```sh
 python3 benches/profile/drive.py \
   --bin ./target/release/kakehashi \
-  --data-dir ./deps/test/kakehashi \
+  --data-dir "$data_dir" \
   --lang rust --size 15 --requests 100 --edits 1
 
 KAKEHASHI_WORKER_PROXY_BIN=./target/release/kakehashi \
 python3 benches/profile/drive.py \
   --bin python3 \
   --server-arg ./benches/profile/worker_proxy.py \
-  --data-dir ./deps/test/kakehashi \
+  --data-dir "$data_dir" \
   --lang rust --size 15 --requests 100 --edits 1
 ```
