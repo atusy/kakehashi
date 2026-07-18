@@ -486,9 +486,13 @@ loaded and validated its configuration but before `QuarantineReady`, document
 sync, or public request admission, the parent re-reads every snapshotted revision
 under a deterministic lock order. Any mismatch is a failed startup fence: the
 candidate is terminated and reaped, selections are reconciled, and a new
-generation is attempted under the restart budget. This post-load/pre-enable
-fence prevents a running parent from enabling a descriptor superseded by another
-process's uninstall or replacement during startup.
+generation is attempted from the latest coalesced snapshot. A fence mismatch is
+normal cross-process configuration churn, not a worker failure, and does not
+consume the systemic circuit-breaker budget. Reconciliation has its own bounded
+backoff so continuous manifest writers cannot create a tight spawn loop; only an
+actual startup, handshake, load, or protocol failure is charged. This post-load/
+pre-enable fence prevents a running parent from enabling a descriptor superseded
+by another process's uninstall or replacement during startup.
 
 Loading the same quarantined `grammar_key` is refused; a genuinely replaced
 artifact has a different content identity and may be loaded by the fresh
@@ -765,6 +769,8 @@ Implementation is accepted only when all of the following hold:
   worker revalidates the manifest and cannot select the uninstalled digest.
   A tombstone or replacement committed between the pre-start snapshot and
   enable fence forces candidate reap and reconciliation before public service.
+  Several consecutive revision races followed by a stable snapshot eventually
+  enable service without consuming the systemic failure budget.
 * CLI tests cover migrated selections, tombstones, retained legacy files,
   immutable-blob-only files, and query-only languages, proving list/status and
   `uninstall --all` operate on logical manifest selections rather than storage
