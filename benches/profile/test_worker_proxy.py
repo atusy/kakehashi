@@ -29,6 +29,19 @@ class CopyStreamTest(unittest.TestCase):
 
         self.assertEqual(copied, 0)
 
+    def test_close_reset_ends_relay_without_traceback(self):
+        class CloseResettingDestination(io.BytesIO):
+            def close(self):
+                raise ConnectionResetError("peer reset while closing")
+
+        copied = copy_stream(
+            io.BytesIO(b"payload"),
+            CloseResettingDestination(),
+            close_destination=True,
+        )
+
+        self.assertEqual(copied, len(b"payload"))
+
     def test_cleanup_tolerates_child_exit_after_poll(self):
         class ExitedChild:
             def poll(self):

@@ -28,7 +28,10 @@ def copy_stream(
         return copied
     finally:
         if close_destination:
-            destination.close()
+            try:
+                destination.close()
+            except OSError:
+                pass
 
 
 def terminate_child(child):
