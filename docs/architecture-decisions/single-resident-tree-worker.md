@@ -501,11 +501,24 @@ Implementation is accepted only when all of the following hold:
   do not leave an orphan worker.
 * Benchmarks report, separately, IPC enqueue, queue wait, compute, serialization,
   parent resume, bytes transferred, stale-work discard, and cache-hit costs.
-* Against the current in-process baseline, representative small single-language
-  edits show no material median regression, while an injection-heavy sustained
-  edit workload demonstrates lower obsolete CPU work or lower tail latency.
-  Exact thresholds are set before implementation from repeated baseline runs;
-  the architecture does not claim a performance win until those thresholds pass.
+* The prototype commits versioned representative corpora and records repeated
+  current-main baselines for all of these independent gates:
+  * small single-language edit median and p95 derivation latency;
+  * injection-heavy sustained-edit p50/p95/p99 latency, obsolete CPU work, and
+    total CPU time;
+  * concurrent multi-document throughput and the start latency of a small
+    user-blocking request behind saturated fan-out;
+  * steady-state and peak total parent-plus-worker proportional/resident memory,
+    including duplicated document text;
+  * worker cold start and full-resync recovery time and bytes copied; and
+  * fine-grained node/captures p50/p95 round-trip latency plus the native-call
+    arm-handshake cost.
+* Before Stage 2 production migration begins, the prototype updates this ADR
+  with a numeric non-regression or improvement threshold for every gate above,
+  including platform variance and sample-count rules. Passing one improved
+  metric cannot waive a failed latency, throughput, fairness, or memory gate.
+  The architecture remains proposed and makes no performance-win claim until
+  the complete matrix passes.
 
 ## Pros and Cons of the Options
 
