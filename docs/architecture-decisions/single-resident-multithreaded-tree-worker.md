@@ -132,6 +132,16 @@ An old node ID presented after a worker restart is unresolved and follows the
 node protocol's existing `null` semantics. The parent does not attempt to
 reconstruct worker-local node identity.
 
+A worker generation starts in exactly one internal mode. `Serving` mode accepts
+only manifest-selected/configured descriptors and may sync documents and serve
+tree requests. `Validation` mode accepts one explicitly content-addressed
+candidate descriptor, performs only loading, exported-symbol, grammar, and
+initial query checks, and rejects document sync and every public tree operation.
+It is still supervised and uses hazard/segment attribution, but cannot publish
+derived state. A validated process may enter `Serving` only through the
+manifest-promotion fence defined below; otherwise it is reaped. Validation is a
+mode of the single resident process, not an additional worker.
+
 ### 3. One process retains bounded internal parallelism
 
 The worker contains one control/scheduling loop plus a bounded compute pool.
@@ -398,7 +408,7 @@ take this lock. Manifest transactions compare the expected revision and publish 
 checksummed revision by fsync-and-atomic-rename followed by directory fsync.
 Concurrent parents must re-read and reconcile after a compare-and-swap failure;
 they cannot silently overwrite a selection observed after their transaction
-started. Startup accepts only a complete manifest that names an existing
+started. Serving startup accepts only a complete manifest that names an existing
 matching artifact, so a process or power failure observes either the old
 committed selection or the new one, never an unrecognized rollback filename or
 absent canonical parser.
@@ -437,11 +447,17 @@ installed replacement. The external source itself is never modified.
 
 For an installer-managed replacement, the parent stages the immutable candidate,
 drains or cancels public tree requests, terminates and reaps the old worker, and
-starts a candidate worker with the exact digest without changing the manifest.
-Only after loading, exported-symbol lookup, and initial query validation succeed
-does the parent commit the expected manifest revision, advance configuration,
-and enable quarantine acknowledgment and document full-sync. If candidate load
-fails, the parent first terminates and reaps that worker, leaves the old manifest
+starts the sole worker in non-serving `Validation` mode with the exact digest
+without changing the manifest. Only after loading, exported-symbol lookup, and
+initial query validation succeed does the parent CAS-commit the expected target
+manifest revision. It then constructs a promotion snapshot containing that new
+revision plus the unchanged revisions for every other configured grammar and
+applies the post-load fence below. On an exact match it advances configuration,
+sends `PromoteServing` with the fenced selection and quarantine generations, and
+waits for acknowledgment before document sync or public admission. The
+candidate's own expected manifest commit is therefore promotion input, not a
+revision mismatch. If candidate load fails, the parent first terminates and
+reaps that worker, leaves the old manifest
 untouched, and may start one rollback worker under the circuit-breaker budget.
 If manifest CAS loses to another parent, it also reaps the uncommitted candidate,
 re-resolves the winning selection, and starts from that committed state rather
@@ -484,6 +500,12 @@ digest-or-tombstone)` before sending worker configuration. A changed revision
 invalidates the parent's cached descriptor and advances its local configuration
 generation; a tombstone removes the selection and a newer digest is re-imported
 and verified.
+
+The uncommitted target of `Validation` mode is the sole exception to the serving
+selection rule. It is tied to the observed predecessor revision for CAS and is
+never part of a serving snapshot until that CAS commits. Promotion then fences
+the committed successor revision, so the candidate's expected commit does not
+invalidate itself.
 
 Those locks are not held across process startup. After the candidate worker has
 loaded and validated its configuration but before `QuarantineReady`, document
@@ -779,6 +801,9 @@ Implementation is accepted only when all of the following hold:
   next startup selects a complete old or new commit. Post-`dlopen` symbol and
   query-initialization failures prove the candidate worker is reaped before
   the unchanged prior manifest is used or the tree tier degrades.
+  Validation-mode tests prove an uncommitted digest cannot receive document or
+  public work, its successful CAS is incorporated into the promotion fence, and
+  its own expected commit does not invalidate the candidate being promoted.
 * Concurrent-parent installer tests prove the process-shared lock and manifest
   revision CAS prevent lost selection updates. A losing candidate follows the
   committed winner, and old immutable artifacts remain present while any other
