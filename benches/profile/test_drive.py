@@ -36,6 +36,14 @@ class RequestSummaryTest(unittest.TestCase):
                 {"result": {"resultId": "fallback", "matches": [], "skipped": []}},
                 expected_shape="delta",
             )
+        with self.assertRaisesRegex(RuntimeError, "expected delta"):
+            capture_result_id(
+                {"result": {
+                    "resultId": "hybrid", "matches": [], "skipped": [],
+                    "edits": [],
+                }},
+                expected_shape="delta",
+            )
         with self.assertRaisesRegex(RuntimeError, "advance capture lineage"):
             capture_result_id(
                 {"result": {"resultId": "same", "edits": []}},
