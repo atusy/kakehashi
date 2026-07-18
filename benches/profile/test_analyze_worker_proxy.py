@@ -35,6 +35,11 @@ class PairedSummaryTest(unittest.TestCase):
         self.assertAlmostEqual(summary["min_ms"], 100.0)
         self.assertAlmostEqual(summary["max_ms"], 120.0)
 
+    def test_single_cold_start_sample_has_zero_dispersion(self):
+        summary = summarize_cold_start([0.100])
+
+        self.assertEqual(summary["stddev_ms"], 0.0)
+
     def test_bootstrap_uses_bulk_sampling(self):
         pairs = [
             {"direct": {"p50": 1.0}, "relay": {"p50": 1.1}},

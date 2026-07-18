@@ -45,7 +45,7 @@ def summarize_pairs(pairs, metric, seed=123_456_789, resamples=100_000):
 def summarize_cold_start(times):
     return {
         "mean_ms": mean(times) * 1_000,
-        "stddev_ms": statistics.stdev(times) * 1_000,
+        "stddev_ms": statistics.stdev(times) * 1_000 if len(times) > 1 else 0.0,
         "min_ms": min(times) * 1_000,
         "max_ms": max(times) * 1_000,
     }
