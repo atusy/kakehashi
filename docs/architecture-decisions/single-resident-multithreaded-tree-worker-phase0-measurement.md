@@ -100,19 +100,21 @@ parse scheduling, derivation, response relay, and parent/child scheduling. The
 real worker benchmark must separate enqueue, queue, compute, serialization, and
 resume time before treating this as a protocol cost.
 
-### Fresh-process path
+### Non-comparative fresh-process observations
 
-`hyperfine` ran 20 fresh processes per condition, after three warmups, with one
-immediate Rust request:
+`hyperfine` ran 20 direct processes followed by 20 relay processes, after three
+warmups per condition, with one immediate Rust request:
 
 | Path | Mean | Standard deviation | Range |
 |---|---:|---:|---:|
 | Direct | 123.4 ms | 10.1 ms | 101.2–132.9 ms |
 | Relay | 156.9 ms | 6.0 ms | 147.3–167.1 ms |
 
-The observed +33.5 ms includes starting a Python interpreter and is not an
-estimate of a Rust worker's spawn/handshake time. It only shows that cold-start
-cost is visible and must be measured separately in the Stage 1 prototype.
+The series were not interleaved: direct timings rose during their series while
+relay timings fell during theirs. They are retained as environment-specific
+observations, not as a comparative delta. The relay series also includes Python
+interpreter startup and is not an estimate of a Rust worker's spawn/handshake
+time. Stage 1 must measure cold start with alternating pairs.
 
 ### Concurrent captures pilot
 
@@ -173,7 +175,8 @@ python3 benches/profile/analyze_worker_proxy.py
 The July 19 steady-state section comes from one final 20-pair collector run and
 preserves every run summary and status count but not each raw stderr stream.
 Cold start was recollected under the same controlled environment and artifact
-identity; all 20 timing samples are recomputed by the analyzer. The captures
+identity; all 20 timing samples per non-interleaved condition are recomputed by
+the analyzer but are explicitly non-comparative. The captures
 pilot was also rerun with the final harness, but remains a single-pair smoke
 test rather than an independently repeated result.
 

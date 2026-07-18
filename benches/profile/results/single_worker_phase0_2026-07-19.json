@@ -2216,7 +2216,9 @@
       ]
     },
     "direct_command": "env -i PATH=\"$PATH\" TMPDIR=\"$TMPDIR\" LANG=C.UTF-8 LC_ALL=C.UTF-8 python3 benches/profile/drive.py --bin /Users/atusy/ghq/github.com/atusy/kakehashi___worker_adr/target/release/kakehashi --data-dir /tmp/kakehashi-phase0-data.WIU8dk --lang rust --size 15 --requests 1 --settle 0 >/dev/null 2>&1",
-    "relay_command": "env -i PATH=\"$PATH\" TMPDIR=\"$TMPDIR\" LANG=C.UTF-8 LC_ALL=C.UTF-8 KAKEHASHI_WORKER_PROXY_BIN=/Users/atusy/ghq/github.com/atusy/kakehashi___worker_adr/target/release/kakehashi python3 benches/profile/drive.py --bin python3 --server-arg benches/profile/worker_proxy.py --data-dir /tmp/kakehashi-phase0-data.WIU8dk --lang rust --size 15 --requests 1 --settle 0 >/dev/null 2>&1"
+    "relay_command": "env -i PATH=\"$PATH\" TMPDIR=\"$TMPDIR\" LANG=C.UTF-8 LC_ALL=C.UTF-8 KAKEHASHI_WORKER_PROXY_BIN=/Users/atusy/ghq/github.com/atusy/kakehashi___worker_adr/target/release/kakehashi python3 benches/profile/drive.py --bin python3 --server-arg benches/profile/worker_proxy.py --data-dir /tmp/kakehashi-phase0-data.WIU8dk --lang rust --size 15 --requests 1 --settle 0 >/dev/null 2>&1",
+    "comparative": false,
+    "order": "20 direct runs followed by 20 relay runs; not interleaved"
   },
   "date": "2026-07-19",
   "analysis": {
