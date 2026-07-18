@@ -507,6 +507,14 @@ If manifest CAS loses to another parent, it also reaps the uncommitted candidate
 re-resolves the winning selection, and starts from that committed state rather
 than overwriting it.
 
+This planned transition intentionally makes the tree tier temporarily
+unavailable for unrelated documents while the sole worker validates and changes
+generation; host-tier service and reader-specific stale/failure contracts remain
+available. A transient validator beside the serving worker is not used because
+it would violate the fixed one-worker process and CPU/memory budget selected by
+this decision. If measured replacement availability later justifies a second
+short-lived process, that is a worker-count change requiring an ADR update.
+
 The initial architecture performs no runtime artifact garbage collection.
 Immutable files may accumulate; reclaiming them later requires a separate
 cross-process live-artifact lease design and cannot infer safety merely from one
@@ -745,6 +753,9 @@ runtime reload crosses into the worker.
 * A worker crash discards trees and caches for every open document, including
   documents unrelated to the crashing grammar, and recovery causes full parses
   and a temporary CPU/latency spike.
+* Planned parser validation/replacement also pauses fresh tree derivation for
+  unrelated documents because the architecture never overlaps a validator with
+  the serving worker.
 * Concurrent native calls make exact crash attribution unavailable without
   additional platform-specific machinery; conservative session quarantine can
   produce false positives.
