@@ -52,12 +52,13 @@ fn test_data_dir() -> &'static Path {
 }
 
 /// A fresh, unique directory for ONE spawned server's crash-recovery state
-/// (`parsing_in_progress`, `failed_parsers`), passed via `KAKEHASHI_STATE_DIR`.
+/// (per-session parsing markers and `failed_parsers`), passed via
+/// `KAKEHASHI_STATE_DIR`.
 ///
 /// Kept OUT of the shared [`test_data_dir`] so servers never poison each other:
-/// the server's `FailedParserRegistry::init()` reads a leftover
-/// `parsing_in_progress` as a crash and marks that parser failed. A per-SPAWN
-/// (not per-process) dir is what makes the test suite safe under both
+/// the server's `FailedParserRegistry::init()` reads an unlocked parsing marker
+/// as evidence of a crash and marks that parser failed. A
+/// per-SPAWN (not per-process) dir is what makes the test suite safe under both
 /// cross-process AND intra-process concurrency (parallel test threads in one
 /// binary): no two concurrently-running servers ever share these files, so a
 /// server that persists state on a shutdown-while-parsing can't be read as a

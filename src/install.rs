@@ -37,14 +37,13 @@ use std::path::PathBuf;
 /// - macOS: ~/Library/Application Support/kakehashi/
 /// - Windows: %APPDATA%/kakehashi/
 pub fn default_data_dir() -> Option<PathBuf> {
-    // In `cfg(test)`, redirect every caller (Kakehashi::new -> failed
-    // parser registry, search-path defaulting, etc.) to a project-local
-    // persistent dir under `deps/` so the developer's real
+    // In `cfg(test)`, redirect install assets, search-path defaults, and
+    // other persistent data callers to a project-local dir under `deps/`
+    // so the developer's real
     // `~/.local/share/kakehashi/` is never read or written. The dir is
-    // shared across the test process to keep parser/query installs
-    // cached between runs; transient crash-recovery files
-    // (`parsing_in_progress`, `failed_parsers`) are cleared once per
-    // process at first call so a prior E2E shutdown can't taint this run.
+    // shared across test processes to keep parser/query installs cached
+    // between runs. Crash-recovery state is stored separately in the
+    // process-local `test_state_dir`.
     #[cfg(test)]
     {
         return Some(test_data_dir());
@@ -63,10 +62,8 @@ pub fn default_data_dir() -> Option<PathBuf> {
 /// Project-local persistent data directory used by unit tests.
 ///
 /// Lives under `deps/` (already gitignored). Parser/query installs persist
-/// across runs to avoid re-downloading, while crash-recovery state files
-/// are cleared once per test process so a previous test's leftovers
-/// (typically from an E2E binary that exited mid-parse) don't poison this
-/// run. Returns the same path every call within a process via `OnceLock`.
+/// across runs to avoid re-downloading. Returns the same path every call
+/// within a process via `OnceLock`.
 #[cfg(test)]
 pub(crate) fn test_data_dir() -> PathBuf {
     use std::sync::OnceLock;
@@ -74,11 +71,6 @@ pub(crate) fn test_data_dir() -> PathBuf {
     DIR.get_or_init(|| {
         let dir = test_support::test_data_dir_path();
         let _ = std::fs::create_dir_all(&dir);
-        // Crash-recovery state can be left over from a previous E2E
-        // shutdown; clear it once per test process so init() doesn't
-        // pre-mark languages as failed.
-        let _ = std::fs::remove_file(dir.join("parsing_in_progress"));
-        let _ = std::fs::remove_file(dir.join("failed_parsers"));
         // Auto-install required parsers + queries on first call per
         // process. Cached on disk via the `.installed` marker so
         // subsequent test processes are fast.
@@ -86,6 +78,27 @@ pub(crate) fn test_data_dir() -> PathBuf {
         dir
     })
     .clone()
+}
+
+/// Process-local crash-recovery directory used by unit-test builds.
+///
+/// Parser/query assets remain shared in [`test_data_dir`], but marker files
+/// must not: deleting stale-looking markers from that shared directory can
+/// unlink a concurrently running test process's live, locked marker. A temp
+/// directory owned for the lifetime of this process gives recovery tests a
+/// stable location without environment-variable mutation or peer cleanup.
+#[cfg(test)]
+pub(crate) fn test_state_dir() -> PathBuf {
+    use std::sync::OnceLock;
+    // Rust does not drop statics, so this small directory intentionally remains
+    // in the OS temp tree after the test process exits. Keeping the `TempDir`
+    // guard (rather than only its path) prevents premature cleanup while tests
+    // are still using the shared process-local registry state; this matches the
+    // E2E helpers' accepted lifetime policy.
+    static DIR: OnceLock<tempfile::TempDir> = OnceLock::new();
+    DIR.get_or_init(|| tempfile::tempdir().expect("create unit-test crash state directory"))
+        .path()
+        .to_path_buf()
 }
 
 /// Test-support helpers exposed to integration tests under `tests/`.

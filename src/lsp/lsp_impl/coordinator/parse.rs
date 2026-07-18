@@ -60,6 +60,49 @@ fn parse_text_with_deadline(
     crate::language::injection::parse_with_deadline(parser, text, old_tree, deadline)
 }
 
+/// Run native parser code only after its crash marker is durable. Failing open
+/// would recreate the restart loop the marker exists to prevent.
+struct CrashMarkerGuard<'a> {
+    auto_install: &'a AutoInstallManager,
+    language: &'a str,
+}
+
+impl Drop for CrashMarkerGuard<'_> {
+    fn drop(&mut self) {
+        if let Err(error) = self.auto_install.end_parsing(self.language) {
+            log::warn!(
+                target: "kakehashi::crash_recovery",
+                "Failed to clear crash marker for parser '{}': {}",
+                self.language,
+                error
+            );
+        }
+    }
+}
+
+fn run_crash_tracked_parse<T>(
+    auto_install: &AutoInstallManager,
+    language: &str,
+    parse: impl FnOnce() -> T,
+) -> Option<T> {
+    if let Err(error) = auto_install.begin_parsing(language) {
+        log::error!(
+            target: "kakehashi::crash_recovery",
+            "Skipping parser '{}': failed to persist crash marker: {}",
+            language,
+            error
+        );
+        return None;
+    }
+    let guard = CrashMarkerGuard {
+        auto_install,
+        language,
+    };
+    let result = parse();
+    drop(guard);
+    Some(result)
+}
+
 /// The settled+stale gate for the parse loop's `semanticTokens/refresh`
 /// emission (its full rationale lives at the call site): emit only when the
 /// published parse is still the LIVE content version (settled — mid-burst
@@ -565,10 +608,16 @@ impl ParseCoordinator {
                     &uri,
                     text.len(),
                     move |mut parser, deadline, _generation_retry| {
-                        let _ = auto_install.begin_parsing(&language_name_clone);
                         let parse_result =
-                            parse_text_with_deadline(&mut parser, &text_for_parse, None, deadline);
-                        let _ = auto_install.end_parsing(&language_name_clone);
+                            run_crash_tracked_parse(&auto_install, &language_name_clone, || {
+                                parse_text_with_deadline(
+                                    &mut parser,
+                                    &text_for_parse,
+                                    None,
+                                    deadline,
+                                )
+                            })
+                            .flatten();
                         (parser, parse_result)
                     },
                 )
@@ -851,10 +900,16 @@ impl ParseCoordinator {
                     &uri,
                     text_len,
                     move |mut parser, deadline, _generation_retry| {
-                        let _ = auto_install.begin_parsing(&language_name_clone);
                         let result =
-                            parse_text_with_deadline(&mut parser, &text_for_parse, None, deadline);
-                        let _ = auto_install.end_parsing(&language_name_clone);
+                            run_crash_tracked_parse(&auto_install, &language_name_clone, || {
+                                parse_text_with_deadline(
+                                    &mut parser,
+                                    &text_for_parse,
+                                    None,
+                                    deadline,
+                                )
+                            })
+                            .flatten();
                         (parser, result)
                     },
                 )
@@ -1054,18 +1109,20 @@ impl ParseCoordinator {
                 uri,
                 text_len,
                 move |mut parser, deadline, generation_retry| {
-                    let _ = auto_install.begin_parsing(&language_name_clone);
-                    let result = parse_text_with_deadline(
-                        &mut parser,
-                        &text_for_parse,
-                        if generation_retry {
-                            None
-                        } else {
-                            seed.as_ref()
-                        },
-                        deadline,
-                    );
-                    let _ = auto_install.end_parsing(&language_name_clone);
+                    let result =
+                        run_crash_tracked_parse(&auto_install, &language_name_clone, || {
+                            parse_text_with_deadline(
+                                &mut parser,
+                                &text_for_parse,
+                                if generation_retry {
+                                    None
+                                } else {
+                                    seed.as_ref()
+                                },
+                                deadline,
+                            )
+                        })
+                        .flatten();
                     (parser, result)
                 },
             )
@@ -1203,6 +1260,55 @@ mod tests {
             .expect("undetectable language must release first-parse waiters");
         assert!(snapshot.tree.is_none());
         assert_eq!(snapshot.incarnation, incarnation);
+    }
+
+    #[test]
+    fn crash_marker_failure_skips_native_parser() {
+        let temp = tempfile::tempdir().unwrap();
+        // Deliberately do not initialize the registry: begin_parsing must fail
+        // before the parser closure can execute.
+        let manager = AutoInstallManager::new(
+            crate::lsp::auto_install::InstallingLanguages::new(),
+            crate::language::FailedParserRegistry::new(temp.path()),
+        );
+        let parser_called = std::cell::Cell::new(false);
+
+        let result = run_crash_tracked_parse(&manager, "lua", || {
+            parser_called.set(true);
+            42
+        });
+
+        assert_eq!(result, None);
+        assert!(!parser_called.get());
+    }
+
+    #[test]
+    fn panic_unwind_clears_crash_marker() {
+        let temp = tempfile::tempdir().unwrap();
+        let registry = crate::language::FailedParserRegistry::new(temp.path());
+        registry.init().unwrap();
+        let manager = AutoInstallManager::new(
+            crate::lsp::auto_install::InstallingLanguages::new(),
+            registry,
+        );
+
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            run_crash_tracked_parse(&manager, "lua", || panic!("parse panic"));
+        }));
+
+        assert!(panic.is_err());
+        let marker_contents: Vec<String> = std::fs::read_dir(temp.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("parsing_in_progress.")
+            })
+            .map(|entry| std::fs::read_to_string(entry.path()).unwrap())
+            .collect();
+        assert_eq!(marker_contents, vec![""]);
     }
 
     /// The four documented invariants of the settle-refresh gate.
