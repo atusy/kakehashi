@@ -6,7 +6,7 @@
     "python": "3.12.13",
     "binary": "/Users/atusy/ghq/github.com/atusy/kakehashi___worker_measure/target/release/kakehashi",
     "binary_execution": "private staged copy",
-    "binary_sha256": "d5efc26895b2b6664cb5f510bc0149436764ddcba3fd65b521a0dc1fe1eda48e",
+    "binary_sha256": "4ffbec29a26cf16cc8087c399af8f43afdccbdc67cf0d0113d7fd7196955546a",
     "data_dir": "/private/var/folders/t3/_nc24_w90zq79l3xyz3xzc7c0000gn/T/kakehashi-phase0-final.6tiXV5/data",
     "data_dir_execution": "private staged copy",
     "parser_query_file_count": 35,
@@ -27,7 +27,7 @@
   "binary_attestation": {
     "schema": 1,
     "source_repository": "https://github.com/atusy/kakehashi",
-    "source_commit": "a8efccc6da9393e8551ca225b9c6828e5cde9d09",
+    "source_commit": "181a0c801fea62c426ca78bc0d559493cb8ac830",
     "source_checkout_clean": true,
     "build_command": [
       "cargo",
@@ -51,23 +51,23 @@
       "TMPDIR": "/var/folders/t3/_nc24_w90zq79l3xyz3xzc7c0000gn/T/",
       "LANG": "C.UTF-8",
       "LC_ALL": "C.UTF-8",
-      "CARGO_TARGET_DIR": "/var/folders/t3/_nc24_w90zq79l3xyz3xzc7c0000gn/T/kakehashi-attested-build-9ar9u57b/target",
-      "CARGO_HOME": "/var/folders/t3/_nc24_w90zq79l3xyz3xzc7c0000gn/T/kakehashi-attested-build-9ar9u57b/target/cargo-home"
+      "CARGO_TARGET_DIR": "/var/folders/t3/_nc24_w90zq79l3xyz3xzc7c0000gn/T/kakehashi-attested-build-6o23u_nb/target",
+      "CARGO_HOME": "/var/folders/t3/_nc24_w90zq79l3xyz3xzc7c0000gn/T/kakehashi-attested-build-6o23u_nb/target/cargo-home"
     },
     "built_in_fresh_target": true,
     "source_isolated_archive": true,
     "cargo_config_ancestry_clean": true,
     "binary_relative": "target/release/kakehashi",
-    "binary_sha256": "d5efc26895b2b6664cb5f510bc0149436764ddcba3fd65b521a0dc1fe1eda48e"
+    "binary_sha256": "4ffbec29a26cf16cc8087c399af8f43afdccbdc67cf0d0113d7fd7196955546a"
   },
   "harness": {
     "execution": "private staged driver and relay helpers",
     "source_files_sha256": {
-      "collect_worker_proxy.py": "babe20baa4b0550607b6bc51145e0d55265b8f90fbfa64e0bd3e86a28eb52dbb",
+      "collect_worker_proxy.py": "0a4e3360ce2182ea4f76ba4cb2e1f0a81a0c78c030b5df67bad9c0f70431c8c0",
       "collect_worker_cold_start.py": "7bdfd26d28e874a02bd79b22669bbff028ea1b1d03bbb672f2a2be69617a49ca",
       "collect_worker_capture_pilot.py": "8b9f8d8873f367a8dd4fddbc431e7571df9cef51322f4dbe9f329592ef4469c2",
       "drive.py": "8722d78a1eddc87d2f62818967c0624b0a7ece5b48f3bdac1d27d0c82a776e0d",
-      "worker_proxy.py": "903d5cd3ed44e64f0825bffc2c4892798726545a661d1d0b7455b43d6e22e554",
+      "worker_proxy.py": "24cc8fc29f4c90195f22a22c63a7ec3f9c0286a03b4f53eb6c49681b57b9db66",
       "gen_session.py": "6f4f6b8388c607db1c70fe29579ce14fe00d57668cab17601432ff123cfb15a3"
     }
   },
@@ -89,12 +89,12 @@
       "run": 1,
       "order": "direct-relay",
       "direct": {
-        "elapsed_seconds": 0.11655116605106741,
+        "elapsed_seconds": 0.12633700005244464,
         "validated_responses": 1,
         "tokens_per_request": 1342
       },
       "relay": {
-        "elapsed_seconds": 0.14307116600684822,
+        "elapsed_seconds": 0.15997383301146328,
         "validated_responses": 1,
         "tokens_per_request": 1342
       }
@@ -103,12 +103,12 @@
       "run": 2,
       "order": "relay-direct",
       "relay": {
-        "elapsed_seconds": 0.14714983408339322,
+        "elapsed_seconds": 0.1602325839921832,
         "validated_responses": 1,
         "tokens_per_request": 1342
       },
       "direct": {
-        "elapsed_seconds": 0.11629475001245737,
+        "elapsed_seconds": 0.12545287504326552,
         "validated_responses": 1,
         "tokens_per_request": 1342
       }
@@ -117,12 +117,12 @@
       "run": 3,
       "order": "direct-relay",
       "direct": {
-        "elapsed_seconds": 0.1193258750718087,
+        "elapsed_seconds": 0.1258278749883175,
         "validated_responses": 1,
         "tokens_per_request": 1342
       },
       "relay": {
-        "elapsed_seconds": 0.15674695803318173,
+        "elapsed_seconds": 0.16276829200796783,
         "validated_responses": 1,
         "tokens_per_request": 1342
       }
@@ -131,12 +131,12 @@
       "run": 4,
       "order": "relay-direct",
       "relay": {
-        "elapsed_seconds": 0.16020283405669034,
+        "elapsed_seconds": 0.16586316691245884,
         "validated_responses": 1,
         "tokens_per_request": 1342
       },
       "direct": {
-        "elapsed_seconds": 0.12766279105562717,
+        "elapsed_seconds": 0.128290000022389,
         "validated_responses": 1,
         "tokens_per_request": 1342
       }
@@ -145,12 +145,12 @@
       "run": 5,
       "order": "direct-relay",
       "direct": {
-        "elapsed_seconds": 0.12626216700300574,
+        "elapsed_seconds": 0.12950429203920066,
         "validated_responses": 1,
         "tokens_per_request": 1342
       },
       "relay": {
-        "elapsed_seconds": 0.1617769169388339,
+        "elapsed_seconds": 0.17736583307851106,
         "validated_responses": 1,
         "tokens_per_request": 1342
       }
@@ -159,12 +159,12 @@
       "run": 6,
       "order": "relay-direct",
       "relay": {
-        "elapsed_seconds": 0.16378041706047952,
+        "elapsed_seconds": 0.16478975000791252,
         "validated_responses": 1,
         "tokens_per_request": 1342
       },
       "direct": {
-        "elapsed_seconds": 0.1275729590561241,
+        "elapsed_seconds": 0.13229899993166327,
         "validated_responses": 1,
         "tokens_per_request": 1342
       }
@@ -173,12 +173,12 @@
       "run": 7,
       "order": "direct-relay",
       "direct": {
-        "elapsed_seconds": 0.12731262494344264,
+        "elapsed_seconds": 0.13279062509536743,
         "validated_responses": 1,
         "tokens_per_request": 1342
       },
       "relay": {
-        "elapsed_seconds": 0.16194379201624542,
+        "elapsed_seconds": 0.1668133339844644,
         "validated_responses": 1,
         "tokens_per_request": 1342
       }
@@ -187,12 +187,12 @@
       "run": 8,
       "order": "relay-direct",
       "relay": {
-        "elapsed_seconds": 0.16183841694146395,
+        "elapsed_seconds": 0.16858349996618927,
         "validated_responses": 1,
         "tokens_per_request": 1342
       },
       "direct": {
-        "elapsed_seconds": 0.1270029169972986,
+        "elapsed_seconds": 0.13148700003512204,
         "validated_responses": 1,
         "tokens_per_request": 1342
       }
@@ -201,12 +201,12 @@
       "run": 9,
       "order": "direct-relay",
       "direct": {
-        "elapsed_seconds": 0.12716974993236363,
+        "elapsed_seconds": 0.13301279209554195,
         "validated_responses": 1,
         "tokens_per_request": 1342
       },
       "relay": {
-        "elapsed_seconds": 0.16226533299777657,
+        "elapsed_seconds": 0.17222270905040205,
         "validated_responses": 1,
         "tokens_per_request": 1342
       }
@@ -215,12 +215,12 @@
       "run": 10,
       "order": "relay-direct",
       "relay": {
-        "elapsed_seconds": 0.16324712499044836,
+        "elapsed_seconds": 0.1700801249826327,
         "validated_responses": 1,
         "tokens_per_request": 1342
       },
       "direct": {
-        "elapsed_seconds": 0.12802929198369384,
+        "elapsed_seconds": 0.13101533404551446,
         "validated_responses": 1,
         "tokens_per_request": 1342
       }
@@ -229,12 +229,12 @@
       "run": 11,
       "order": "direct-relay",
       "direct": {
-        "elapsed_seconds": 0.1283501669531688,
+        "elapsed_seconds": 0.14066454104613513,
         "validated_responses": 1,
         "tokens_per_request": 1342
       },
       "relay": {
-        "elapsed_seconds": 0.16430991608649492,
+        "elapsed_seconds": 0.17266879102680832,
         "validated_responses": 1,
         "tokens_per_request": 1342
       }
@@ -243,12 +243,12 @@
       "run": 12,
       "order": "relay-direct",
       "relay": {
-        "elapsed_seconds": 0.1615846659988165,
+        "elapsed_seconds": 0.17020699998829514,
         "validated_responses": 1,
         "tokens_per_request": 1342
       },
       "direct": {
-        "elapsed_seconds": 0.12916020792908967,
+        "elapsed_seconds": 0.1316153339575976,
         "validated_responses": 1,
         "tokens_per_request": 1342
       }
@@ -257,12 +257,12 @@
       "run": 13,
       "order": "direct-relay",
       "direct": {
-        "elapsed_seconds": 0.12769599992316216,
+        "elapsed_seconds": 0.1325125410221517,
         "validated_responses": 1,
         "tokens_per_request": 1342
       },
       "relay": {
-        "elapsed_seconds": 0.16439791698940098,
+        "elapsed_seconds": 0.1692439999897033,
         "validated_responses": 1,
         "tokens_per_request": 1342
       }
@@ -271,12 +271,12 @@
       "run": 14,
       "order": "relay-direct",
       "relay": {
-        "elapsed_seconds": 0.16482429194729775,
+        "elapsed_seconds": 0.16421058389823884,
         "validated_responses": 1,
         "tokens_per_request": 1342
       },
       "direct": {
-        "elapsed_seconds": 0.1272822089958936,
+        "elapsed_seconds": 0.13085054093971848,
         "validated_responses": 1,
         "tokens_per_request": 1342
       }
@@ -285,12 +285,12 @@
       "run": 15,
       "order": "direct-relay",
       "direct": {
-        "elapsed_seconds": 0.12879083305597305,
+        "elapsed_seconds": 0.1303975839400664,
         "validated_responses": 1,
         "tokens_per_request": 1342
       },
       "relay": {
-        "elapsed_seconds": 0.16515183297451586,
+        "elapsed_seconds": 0.16740245802793652,
         "validated_responses": 1,
         "tokens_per_request": 1342
       }
@@ -299,12 +299,12 @@
       "run": 16,
       "order": "relay-direct",
       "relay": {
-        "elapsed_seconds": 0.1689369579544291,
+        "elapsed_seconds": 0.16229070792905986,
         "validated_responses": 1,
         "tokens_per_request": 1342
       },
       "direct": {
-        "elapsed_seconds": 0.13962895807344466,
+        "elapsed_seconds": 0.1295760830398649,
         "validated_responses": 1,
         "tokens_per_request": 1342
       }
@@ -313,12 +313,12 @@
       "run": 17,
       "order": "direct-relay",
       "direct": {
-        "elapsed_seconds": 0.1323253329610452,
+        "elapsed_seconds": 0.1313171659130603,
         "validated_responses": 1,
         "tokens_per_request": 1342
       },
       "relay": {
-        "elapsed_seconds": 0.1669677080353722,
+        "elapsed_seconds": 0.16643166705034673,
         "validated_responses": 1,
         "tokens_per_request": 1342
       }
@@ -327,12 +327,12 @@
       "run": 18,
       "order": "relay-direct",
       "relay": {
-        "elapsed_seconds": 0.17455849994439632,
+        "elapsed_seconds": 0.1634373749839142,
         "validated_responses": 1,
         "tokens_per_request": 1342
       },
       "direct": {
-        "elapsed_seconds": 0.14381470798980445,
+        "elapsed_seconds": 0.13438333407975733,
         "validated_responses": 1,
         "tokens_per_request": 1342
       }
@@ -341,12 +341,12 @@
       "run": 19,
       "order": "direct-relay",
       "direct": {
-        "elapsed_seconds": 0.14306620904244483,
+        "elapsed_seconds": 0.12988475000020117,
         "validated_responses": 1,
         "tokens_per_request": 1342
       },
       "relay": {
-        "elapsed_seconds": 0.1695433750282973,
+        "elapsed_seconds": 0.1643423750065267,
         "validated_responses": 1,
         "tokens_per_request": 1342
       }
@@ -355,12 +355,12 @@
       "run": 20,
       "order": "relay-direct",
       "relay": {
-        "elapsed_seconds": 0.16583520802669227,
+        "elapsed_seconds": 0.17125295801088214,
         "validated_responses": 1,
         "tokens_per_request": 1342
       },
       "direct": {
-        "elapsed_seconds": 0.1380223329178989,
+        "elapsed_seconds": 0.13092033402062953,
         "validated_responses": 1,
         "tokens_per_request": 1342
       }

@@ -31,9 +31,9 @@ and must use the platform-specific lifecycle mechanisms specified by the ADR.
 * OS: macOS 26.5.1
 * Estimated tree compute budget under the current policy: 8 threads. This uses
   Python's logical CPU count and is not a binary-reported effective pool size.
-* Attested source commit: `a8efccc6da9393e8551ca225b9c6828e5cde9d09`;
+* Attested source commit: `181a0c801fea62c426ca78bc0d559493cb8ac830`;
   measured binary SHA-256:
-  `d5efc26895b2b6664cb5f510bc0149436764ddcba3fd65b521a0dc1fe1eda48e`.
+  `4ffbec29a26cf16cc8087c399af8f43afdccbdc67cf0d0113d7fd7196955546a`.
   Production Rust source and Cargo build inputs match `origin/main` at
   `a1278be5fdff24d109d9e03134c6bdb880577f64`; the intervening branch changes
   are benchmark tooling, tests, workflow, and documentation only. The committed
@@ -71,22 +71,23 @@ millisecond rounding before analysis.
 
 | Scenario | Metric | Direct mean | Relay mean | Paired delta | 95% CI for delta |
 |---|---:|---:|---:|---:|---:|
-| Rust small, unchanged cache hit | p50 | 0.530 ms | 0.580 ms | +0.050 ms | [0.015, 0.080] ms |
-| Rust small, unchanged cache hit | p95 | 0.605 ms | 0.620 ms | +0.015 ms | [0.000, 0.030] ms |
-| Rust small, unchanged cache hit | p99 | 0.610 ms | 0.645 ms | +0.035 ms | [0.010, 0.060] ms |
-| Rust small, one edit/request | p50 | 2.000 ms | 2.040 ms | +0.040 ms | [-0.035, 0.110] ms |
-| Rust small, one edit/request | p95 | 2.235 ms | 2.270 ms | +0.035 ms | [-0.040, 0.115] ms |
-| Rust small, one edit/request | p99 | 2.330 ms | 2.690 ms | +0.360 ms | [-0.040, 1.045] ms |
-| Markdown injections, one edit/request | p50 | 4.615 ms | 4.720 ms | +0.105 ms | [-0.160, 0.355] ms |
-| Markdown injections, one edit/request | p95 | 5.480 ms | 5.250 ms | -0.230 ms | [-0.925, 0.260] ms |
-| Markdown injections, one edit/request | p99 | 6.115 ms | 5.680 ms | -0.435 ms | [-1.455, 0.375] ms |
+| Rust small, unchanged cache hit | p50 | 0.535 ms | 0.610 ms | +0.075 ms | [0.055, 0.090] ms |
+| Rust small, unchanged cache hit | p95 | 0.610 ms | 0.635 ms | +0.025 ms | [0.000, 0.050] ms |
+| Rust small, unchanged cache hit | p99 | 0.650 ms | 0.700 ms | +0.050 ms | [-0.010, 0.095] ms |
+| Rust small, one edit/request | p50 | 2.090 ms | 2.010 ms | -0.080 ms | [-0.185, 0.020] ms |
+| Rust small, one edit/request | p95 | 2.385 ms | 2.240 ms | -0.145 ms | [-0.305, -0.015] ms |
+| Rust small, one edit/request | p99 | 2.800 ms | 2.355 ms | -0.445 ms | [-1.035, -0.015] ms |
+| Markdown injections, one edit/request | p50 | 4.550 ms | 4.695 ms | +0.145 ms | [-0.050, 0.345] ms |
+| Markdown injections, one edit/request | p95 | 5.040 ms | 5.160 ms | +0.120 ms | [-0.100, 0.350] ms |
+| Markdown injections, one edit/request | p99 | 5.415 ms | 5.810 ms | +0.395 ms | [-0.200, 0.980] ms |
 
-Batch A's cache-hit p50/p99 intervals exclude zero, but their point deltas are
-at or below the driver's 0.1-ms percentile reporting resolution. Batch B
-reported +0.020 ms [-0.010, 0.050] at p50, +0.015 ms [-0.015, 0.050] at p95,
-and +0.000 ms [-0.020, 0.020] at p99. All edit-latency intervals cross zero in
-both batches. These rounded percentile results do not establish a stable tail
-effect and are not bounds on the future worker protocol.
+Batch A's cache-hit p50 interval excludes zero, but its point delta is below
+the driver's 0.1-ms percentile reporting resolution. Batch B reported +0.050
+ms [0.025, 0.075] at p50, +0.040 ms [0.015, 0.065] at p95, and +0.030 ms
+[-0.010, 0.070] at p99. The p99 intervals cross zero in both batches, and the
+edit percentile effects change direction across batches. These rounded
+percentile results do not establish a stable tail effect and are not bounds on
+the future worker protocol.
 
 ### Throughput-sensitive cache-hit path
 
@@ -95,12 +96,13 @@ The cache-hit path transferred approximately 14.0 MiB of response bodies per
 
 | Metric | Direct mean | Relay mean | Paired delta | 95% CI for delta |
 |---|---:|---:|---:|---:|
-| Wall time / 1,000 requests | 824.6 ms | 839.4 ms | +14.8 ms (+1.8%) | [-14.5, 45.5] ms |
-| Amortized wall-time delta | — | — | +14.8 µs/request | [-14.5, 45.5] µs/request |
+| Wall time / 1,000 requests | 845.5 ms | 896.3 ms | +50.8 ms (+6.0%) | [27.6, 74.6] ms |
+| Amortized wall-time delta | — | — | +50.8 µs/request | [27.6, 74.6] µs/request |
 
 This is the most sensitive raw-relay estimate in batch A. Batch B measured a
-same-direction but smaller +3.8-ms delta with an interval crossing zero
-[-27.6, 31.7]. It is neither a lower nor an upper bound for
+same-direction +41.2-ms delta [15.1, 72.1]. Both independently collected
+intervals exclude zero. This observed Python-relay cost is neither a lower nor
+an upper bound for
 the future worker transport: the Python relay adds interpreter, threads, an
 extra buffering boundary, and flush costs, while the real protocol adds
 different payloads, encoding, queueing, and scheduling. The edit scenarios
@@ -112,11 +114,12 @@ end-to-end cycle times are nevertheless disclosed below.
 
 | Scenario | Direct / 100 cycles | Relay / 100 cycles | Paired delta | 95% CI for delta |
 |---|---:|---:|---:|---:|
-| Rust small | 1565.1 ms | 1568.6 ms | +3.5 ms (+35 µs/cycle) | [-8.0, 14.6] ms |
-| Markdown injections | 1874.3 ms | 1881.5 ms | +7.1 ms (+71 µs/cycle) | [-36.2, 48.9] ms |
+| Rust small | 1580.3 ms | 1560.7 ms | -19.6 ms (-196 µs/cycle) | [-36.6, -3.2] ms |
+| Markdown injections | 1852.6 ms | 1870.0 ms | +17.4 ms (+174 µs/cycle) | [-7.7, 45.0] ms |
 
-Batch B measured Rust at -6.3 ms [-20.5, 8.3] and Markdown at +35.3 ms
-[-4.0, 72.0]. Neither edit-cycle effect excludes zero in either batch.
+Batch B measured Rust at +7.5 ms [-4.1, 18.9] and Markdown at +50.3 ms
+[18.7, 85.0]. The apparent Rust improvement in batch A reverses, while the
+Markdown interval excludes zero only in batch B.
 This experiment cannot attribute either difference to pipe transport: every cycle includes the fixed edit-settle delay,
 parse scheduling, derivation, response relay, and parent/child scheduling. The
 real worker benchmark must separate enqueue, queue, compute, serialization, and
@@ -129,7 +132,7 @@ warmup pairs, with one immediate validated Rust request:
 
 | Direct mean | Relay mean | Paired delta | 95% CI for delta |
 |---:|---:|---:|---:|
-| 129.1 ms | 162.4 ms | +33.3 ms | [31.8, 34.8] ms |
+| 130.9 ms | 167.0 ms | +36.1 ms | [34.5, 37.9] ms |
 
 The relay series includes Python interpreter startup and is not an estimate of
 a Rust worker's spawn/handshake time. Stage 1 must repeat this measurement with
@@ -143,8 +146,8 @@ used as a smoke test, not an independently repeated result:
 
 | Metric | Direct | Relay |
 |---|---:|---:|
-| Semantic tokens p50 / p95 | 5.0 / 7.1 ms | 5.0 / 6.0 ms |
-| Captures delta p50 / p95 | 33.5 / 48.6 ms | 32.5 / 38.4 ms |
+| Semantic tokens p50 / p95 | 4.9 / 5.5 ms | 4.9 / 6.1 ms |
+| Captures delta p50 / p95 | 31.2 / 33.7 ms | 32.0 / 40.3 ms |
 
 All 100 semantic and 100 capture-delta responses per path were successful. The
 final driver validated every capture result as the delta `edits` shape and an
@@ -154,12 +157,13 @@ both methods' outcome and fallback counts.
 ## Interpretation
 
 This raw process/pipe relay did not expose a prohibitive steady-state transport
-cost on this machine. The most sensitive cache-hit workload measured +14.8
-microseconds/request in batch A and +3.8 microseconds/request in batch B; both
-intervals crossed zero. Edit-cycle effects did not exclude zero, and rounded
+cost on this machine. The most sensitive cache-hit workload measured +50.8
+microseconds/request in batch A and +41.2 microseconds/request in batch B; both
+intervals excluded zero. Edit-cycle effects changed across batches, and rounded
 request percentiles did not establish a stable tail effect. This front-of-server
-relay therefore provides no measured performance improvement and cannot locate
-either cost or benefit in tree work.
+relay therefore provides no measured performance improvement, but does provide
+a reproducible raw-relay overhead baseline. It cannot locate either cost or
+benefit in tree work.
 
 The Stage 1 benchmark must therefore report transport enqueue/copy time and
 worker compute/queue/resume time separately and must include independent batch
