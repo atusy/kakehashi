@@ -357,10 +357,11 @@ cancellation checkpoints instead of causing a worker kill.
 
 `grammar_key` identifies the resolved artifact and exported grammar, not merely
 a configured language alias. Aliases that load the same artifact share a key;
-replacing the parser artifact produces a new key. The handshake adds one local
-round trip to every native entry and is included in the performance acceptance
-measurements. Replacing it with shared-memory activity slots is a separate
-optimization that must preserve the same parent-visible-before-entry ordering.
+replacing the parser artifact produces a new key. Hazard acquisition and native
+segment arming add local control round trips and are included in the performance
+acceptance measurements. Replacing them with shared-memory activity slots is a
+separate optimization that must preserve the same parent-visible-before-entry
+ordering.
 
 The worker never downloads or compiles a missing grammar. It returns
 `GrammarMissing`, and the parent's existing global installer deduplicates and
@@ -375,17 +376,29 @@ mapped for process lifetime because `Language`, `Parser`, `Tree`, and queries ma
 retain raw pointers into them, and loading the same canonical path again may
 return the old image.
 
-Replacement is ordered as a transaction: compile and validate the candidate at
-a staged same-filesystem path; drain or cancel public tree requests; terminate
-and reap the old worker so no DLL remains mapped; move the old installed artifact
-to a rollback path and atomically publish the staged candidate; then advance the
-configuration generation and start a fresh worker. Only the fresh worker loads
-the replacement before configuration/quarantine acknowledgment and document
-full-sync. If publication or initial load fails, the parent removes the failed
-candidate, restores the previous artifact, and may start one rollback worker
-under the circuit-breaker budget. If restoration also fails, the tree tier
+Installed parser artifacts become immutable and content-addressed. The installer
+compiles and validates a candidate at a staged same-filesystem path, computes
+its cryptographic digest, fsyncs it, and renames it to a path containing that
+digest without replacing the currently selected file. A small checksummed
+manifest maps the configured grammar to the active artifact and export; it is
+updated by fsync-and-atomic-rename, followed by directory fsync. Startup accepts
+only a complete manifest that names an existing matching artifact, so a process
+or power failure observes either the old committed selection or the new one,
+never an unrecognized rollback filename or absent canonical parser.
+
+For replacement, the parent stages the immutable candidate, drains or cancels
+public tree requests, terminates and reaps the old worker, atomically switches
+the manifest, advances the configuration generation, and starts a fresh worker.
+Only the fresh worker loads the newly selected path before configuration and
+quarantine acknowledgment and document full-sync. If initial loading, exported-
+symbol lookup, or query initialization fails after the candidate library was
+mapped, the parent first terminates and reaps that candidate worker. It then
+atomically switches the manifest back to the previous content address and may
+start one rollback worker under the circuit-breaker budget. Immutable candidate
+files are garbage-collected only when no manifest or live worker generation can
+reference them. If rollback selection or loading also fails, the tree tier
 enters the terminal degraded state rather than running with an ambiguous
-artifact. This ordering handles platforms that prohibit replacing a loaded DLL.
+artifact. This ordering never replaces or removes a mapped DLL.
 
 Loading the same quarantined `grammar_key` is refused; a genuinely replaced
 artifact has a different content identity and may be loaded by the fresh
@@ -636,11 +649,14 @@ Implementation is accepted only when all of the following hold:
 * Install/reload tests cover missing host and injected grammars, concurrent
   install deduplication, cache invalidation, latest-version re-derivation, and
   refusal to load the same quarantined artifact. Same-path parser replacement,
-  including the loaded-DLL case on Windows, proves the old worker is reaped
-  before publication and that a fresh worker executes the new artifact rather
-  than acknowledging a new key while retaining old code. Publication and load
-  failure tests prove rollback either restores the prior artifact or converges
-  to the tree-tier-degraded state.
+  including migration from the current fixed destination and the loaded-DLL
+  case on Windows, proves a fresh worker executes the content-addressed new
+  artifact rather than acknowledging a new key while retaining old code.
+  Failure injection after every artifact/manifest filesystem step proves the
+  next startup selects a complete old or new commit. Post-`dlopen` symbol and
+  query-initialization failures prove the candidate worker is reaped before
+  manifest rollback, which either restores the prior artifact or converges to
+  the tree-tier-degraded state.
 * Cancellation tests cover queued and running work for client cancellation,
   supersession, handler drop, and `didClose`, including completion races and the
   rule that canceled work publishes and caches nothing.
