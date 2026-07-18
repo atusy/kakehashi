@@ -587,14 +587,17 @@ impl Kakehashi {
         self.warn_on_misconfigured_settings(&warnings).await;
     }
 
-    /// Emit a single client-visible warning summarizing all (host, injection)
-    /// pairs whose configured `textDocument/formatting` aggregation is the
-    /// misconfigured `Concatenated`-with-empty-`priorities` combination. The
-    /// concatenated formatting pipeline requires a non-empty `priorities`
-    /// list (it defines pipeline membership and order — ADR
-    /// concatenated-formatting-pipeline Decision point 2); without one the
-    /// region falls back to `preferred`. Surfacing the mismatch at
-    /// settings-apply time avoids silent misbehavior on every format request.
+    /// Build client-visible warnings for settings misconfigurations.
+    ///
+    /// One warning summarizes all (host, injection) pairs whose configured
+    /// `textDocument/formatting` aggregation is the misconfigured
+    /// `Concatenated`-with-empty-`priorities` combination. The concatenated
+    /// formatting pipeline requires a non-empty `priorities` list (it defines
+    /// pipeline membership and order — ADR concatenated-formatting-pipeline
+    /// Decision point 2); without one the region falls back to `preferred`.
+    /// Another warning summarizes all language servers that cannot be spawned.
+    /// Surfacing these mismatches at settings-apply time avoids silent
+    /// misbehavior on every affected request.
     ///
     /// Previously this emitted one notification per pair, which floods the
     /// editor log on `didChangeConfiguration` reloads for workspaces with
