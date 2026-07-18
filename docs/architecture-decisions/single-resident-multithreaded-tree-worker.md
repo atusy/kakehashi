@@ -378,17 +378,21 @@ grammar-backed boundary.
 
 The broad attribution lease is distinct from hard-hang timing. Immediately
 before each non-cooperative Tree-sitter FFI segment, such as library loading,
-grammar initialization, `Parser::parse`, query-cursor advancement, or a
-`Tree`/`Node` primitive, the worker performs the separate
+grammar initialization, `Parser::parse`, or a bounded batch of adjacent query-
+cursor and `Tree`/`Node` calls, the worker performs the separate
 `NativeSegmentStarting`/`NativeSegmentArmed` handshake and emits
 `NativeSegmentEntered`; it emits `NativeSegmentExited` immediately on return.
-Potentially long query and tree walks are divided into bounded chunks, but each
-FFI call or iterator advancement inside a chunk is still a timed native segment;
-chunking alone is not assumed to make corrupted native state cooperative. Queue
-time, fair-scheduler waits, Rust work between FFI segments, derivation, and
-response serialization remain inside the attribution lease but outside the
-native-segment timer. They use the end-to-end request deadline and cancellation
-checkpoints instead of causing a worker kill.
+Potentially long query and tree walks are divided into bounded chunks. One
+native segment may cover the adjacent FFI calls in a chunk, so traversal does
+not add a parent round trip for every match, capture, or node accessor. Chunk
+bounds include a maximum number of cursor advances/node operations and a local
+CPU budget; the segment contains no scheduler wait, IPC, cache publication, or
+response serialization. A hang in any contained FFI call still expires the
+batch timer, while normal completion returns to a cancellation/fairness
+checkpoint before the next arm. Queue time, fair-scheduler waits, Rust work
+between batches, derivation, and response serialization remain inside the
+attribution lease but outside the native-segment timer. They use the end-to-end
+request deadline and cancellation checkpoints instead of causing a worker kill.
 
 `grammar_key` identifies the resolved artifact and exported grammar, not merely
 a configured language alias. Aliases that load the same artifact share a key;
@@ -764,8 +768,10 @@ Implementation is accepted only when all of the following hold:
   is canceled or rejected through the request contract without killing the
   worker or quarantining its grammar.
 * Non-parse hang fixtures cover query-cursor advancement and representative
-  `Tree`/`Node` FFI operations, proving each is independently segment-timed and
-  can trigger worker recovery even when no parser call is running.
+  `Tree`/`Node` FFI operations inside bounded batches, proving they can trigger
+  worker recovery even when no parser call is running. Traversal benchmarks also
+  prove control round trips scale with admitted chunks, not matches, captures,
+  or individual node accessors.
 * A fixture that returns from parsing and fails during query construction or a
   later tree/node walk proves that the grammar remains parent-visible until the
   entire high-level operation leaves its grammar-backed hazard scope.
