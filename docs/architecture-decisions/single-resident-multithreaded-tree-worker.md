@@ -452,6 +452,15 @@ the tombstone only through a later authorized install transaction using its
 observed revision. Immutable bytes remain untouched during the no-runtime-GC
 phase.
 
+Every worker-generation startup, including crash recovery, planned replacement,
+rollback, and a circuit-breaker half-open probe, re-reads each relevant manifest
+revision under its per-grammar lock before sending worker configuration. A
+changed revision invalidates the parent's cached descriptor and advances its
+local configuration generation; a tombstone removes the selection and a newer
+digest is re-imported and verified. A running parent therefore cannot restart a
+worker from a descriptor captured before another process uninstalled or replaced
+the grammar.
+
 Loading the same quarantined `grammar_key` is refused; a genuinely replaced
 artifact has a different content identity and may be loaded by the fresh
 worker. Missing host and injected grammars use the same event path, so an
@@ -721,7 +730,8 @@ Implementation is accepted only when all of the following hold:
 * Concurrent install-versus-uninstall and uninstall-with-live-worker tests prove
   the manifest tombstone wins or loses by revision rather than file timing,
   affected local workers transition generations, other live generations keep
-  their mapped bytes safely, and restart cannot select the uninstalled digest.
+  their mapped bytes safely, and restarting another still-running parent's
+  worker revalidates the manifest and cannot select the uninstalled digest.
 * Cancellation tests cover queued and running work for client cancellation,
   supersession, handler drop, and `didClose`, including completion races and the
   rule that canceled work publishes and caches nothing.
