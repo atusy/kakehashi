@@ -25,6 +25,8 @@ jobs:
       - run: rustup component add rust-analyzer
       - run: make deps/tree-sitter
       - run: cargo test
+      - name: Test benchmark tooling
+        run: python3 -m unittest discover -s benches/profile -p 'test_*.py'
 
   fmt:
     name: Format
