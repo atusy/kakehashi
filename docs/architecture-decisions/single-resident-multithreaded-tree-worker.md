@@ -387,8 +387,10 @@ compiles and validates a candidate at a staged same-filesystem path, computes
 its cryptographic digest, fsyncs it, and renames it to a path containing that
 digest without replacing the currently selected file. A small checksummed
 manifest per installer-managed grammar maps its default selection to an artifact
-digest and export. Manifest transactions take the existing process-shared
-installer lock, compare the expected manifest revision, and publish a new
+digest and export. This decision introduces a process-shared per-grammar parser-
+manifest lock; the current query replacement lock is not reused. Install,
+explicit-path import metadata, legacy migration, manifest CAS, and uninstall all
+take this lock. Manifest transactions compare the expected revision and publish a new
 checksummed revision by fsync-and-atomic-rename followed by directory fsync.
 Concurrent parents must re-read and reconcile after a compare-and-swap failure;
 they cannot silently overwrite a selection observed after their transaction
@@ -427,6 +429,16 @@ cross-process live-artifact lease design and cannot infer safety merely from one
 parent's worker set. This avoids deleting a DLL mapped by another kakehashi
 process. If the old committed selection or candidate cannot load, the tree tier
 enters the terminal degraded state rather than running with ambiguous code.
+
+Uninstall is a logical selection transaction, not deletion of a parser file. It
+takes the same per-grammar lock and CAS-publishes a revisioned tombstone, then
+advances configuration and performs the planned worker transition for affected
+documents. Existing workers in other kakehashi processes may finish using their
+already selected immutable blob, but future generations and fresh processes see
+the tombstone and cannot resurrect the previous digest. Auto-install may replace
+the tombstone only through a later authorized install transaction using its
+observed revision. Immutable bytes remain untouched during the no-runtime-GC
+phase.
 
 Loading the same quarantined `grammar_key` is refused; a genuinely replaced
 artifact has a different content identity and may be loaded by the fresh
@@ -691,6 +703,10 @@ Implementation is accepted only when all of the following hold:
   revision CAS prevent lost selection updates. A losing candidate follows the
   committed winner, and old immutable artifacts remain present while any other
   process may still map them; runtime GC is absent.
+* Concurrent install-versus-uninstall and uninstall-with-live-worker tests prove
+  the manifest tombstone wins or loses by revision rather than file timing,
+  affected local workers transition generations, other live generations keep
+  their mapped bytes safely, and restart cannot select the uninstalled digest.
 * Cancellation tests cover queued and running work for client cancellation,
   supersession, handler drop, and `didClose`, including completion races and the
   rule that canceled work publishes and caches nothing.
