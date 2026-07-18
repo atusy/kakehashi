@@ -659,6 +659,11 @@ would require a separate crash-reporting design and is not assumed by this
 decision. A worker failure with no acknowledged grammar hazard lease is treated as a
 worker/protocol failure and does not invent a parser quarantine.
 
+After recording attribution and updating quarantine, the parent clears every
+hazard lease and native-segment record belonging to the dead `worker_gen` before
+allocating the next generation. These records are never carried forward or
+matched against messages from a replacement worker.
+
 After quarantine, the parent starts a fresh worker with bounded backoff, sends
 the versioned quarantine set before enabling document derivation, and full-syncs
 all open documents. Restarts are also governed by a per-session systemic-failure
