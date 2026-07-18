@@ -151,6 +151,17 @@ One worker process is not a promise to serialize all documents. Independent
 documents and injection regions may execute on different worker threads within
 the shared budget.
 
+Fair admission covers nested work, not only the outer request. Injection and
+semantic fan-out must be split into bounded, cancelable chunks and returned to
+the scheduler with their document tag; an admitted work unit cannot launch an
+unconstrained nested `par_iter` that bypasses admission. For a compute budget
+`P > 1`, one document may hold at most `P - 1` running permits, reserving one
+permit for another document or user-blocking work. Idle capacity may be borrowed
+only chunk by chunk; once competing work arrives, the borrower receives no new
+chunk until the competitor starts. For `P == 1`, cross-document concurrency is
+impossible and the guarantee degrades to priority between bounded cooperative
+chunks.
+
 ### 4. IPC is versioned and coarse grained
 
 The worker is a hidden mode of the same kakehashi executable, so parent and
@@ -426,7 +437,11 @@ Implementation is accepted only when all of the following hold:
 * Restart tests prove the parent can reconstruct every worker-side document
   from authoritative full text and that pre-restart node IDs resolve to `null`.
 * Concurrency tests prove the worker uses more than one compute thread while
-  enforcing per-document admission and preserving latest-wins coalescing.
+  enforcing per-document admission and preserving latest-wins coalescing when
+  the configured test budget is at least two.
+* A saturated injection fan-out for document A proves that document B starts a
+  user-blocking tree operation before A completes. The test covers nested chunks,
+  not only two outer requests, and separately covers the one-thread degradation.
 * Protocol tests cover truncated frames, oversized frames, unknown versions,
   invalid edit bases, duplicate responses, EOF, and child startup failure.
 * Cancellation tests cover queued and running work for client cancellation,
