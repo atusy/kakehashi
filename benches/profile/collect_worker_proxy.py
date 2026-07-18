@@ -574,7 +574,7 @@ def build_driver_command(kind, binary, data_dir, scenario_args, script_dir):
 def signal_process_group(process, signum):
     try:
         os.killpg(process.pid, signum)
-    except OSError:
+    except ProcessLookupError:
         pass
 
 

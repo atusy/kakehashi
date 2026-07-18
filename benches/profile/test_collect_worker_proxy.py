@@ -98,11 +98,22 @@ class CollectionHelpersTest(unittest.TestCase):
 
         staging.cleanup.assert_called_once_with()
 
-    def test_process_group_signal_tolerates_os_cleanup_races(self):
+    def test_process_group_signal_tolerates_disappearing_process(self):
         process = mock.Mock(pid=12345)
 
         with mock.patch.object(
-            collector.os, "killpg", side_effect=PermissionError("gone")
+            collector.os, "killpg", side_effect=ProcessLookupError("gone")
+        ):
+            signal_process_group(process, signal.SIGTERM)
+
+    def test_process_group_signal_does_not_hide_permission_errors(self):
+        process = mock.Mock(pid=12345)
+
+        with (
+            mock.patch.object(
+                collector.os, "killpg", side_effect=PermissionError("denied")
+            ),
+            self.assertRaises(PermissionError),
         ):
             signal_process_group(process, signal.SIGTERM)
 
