@@ -25,6 +25,19 @@ from collect_worker_proxy import (
 
 
 class CollectionHelpersTest(unittest.TestCase):
+    @unittest.skipUnless(os.name == "posix", "requires POSIX signal masks")
+    def test_bounded_run_unblocks_termination_signals_in_child(self):
+        command = [
+            sys.executable,
+            "-c",
+            "import signal; blocked=signal.pthread_sigmask(signal.SIG_BLOCK, []); "
+            "print(signal.SIGTERM in blocked, signal.SIGHUP in blocked)",
+        ]
+
+        completed = bounded_run(command, {}, timeout_seconds=5)
+
+        self.assertEqual(completed.stdout, "False False\n")
+
     def test_parser_suffix_matches_supported_posix_platform(self):
         self.assertEqual(parser_library_suffix("Darwin"), ".dylib")
         self.assertEqual(parser_library_suffix("Linux"), ".so")

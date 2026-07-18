@@ -291,6 +291,10 @@ def suppress_termination_signals():
         signal.signal(signum, signal.SIG_IGN)
 
 
+def unblock_termination_signals_in_child():
+    signal.pthread_sigmask(signal.SIG_UNBLOCK, TERMINATION_SIGNALS)
+
+
 def bounded_run(
     command,
     environment,
@@ -308,6 +312,7 @@ def bounded_run(
             stderr=subprocess.PIPE,
             env=environment,
             start_new_session=True,
+            preexec_fn=unblock_termination_signals_in_child,
         )
         previous_handlers = install_termination_handlers()
     except BaseException:
