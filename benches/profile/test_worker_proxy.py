@@ -1,6 +1,7 @@
 import io
 import os
 import pathlib
+import signal
 import subprocess
 import sys
 import unittest
@@ -102,6 +103,39 @@ class CopyStreamTest(unittest.TestCase):
 
         self.assertEqual(completed.returncode, 0, completed.stderr.decode())
         self.assertEqual(completed.stdout, b"3\n")
+
+    @unittest.skipUnless(hasattr(signal, "SIGTERM"), "requires SIGTERM")
+    def test_terminating_proxy_reaps_child(self):
+        proxy = pathlib.Path(__file__).with_name("worker_proxy.py")
+        env = dict(os.environ, KAKEHASHI_WORKER_PROXY_BIN=sys.executable)
+        process = subprocess.Popen(
+            [
+                sys.executable,
+                str(proxy),
+                "-c",
+                "import os,time; print(os.getpid(), flush=True); time.sleep(30)",
+            ],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=env,
+            text=True,
+        )
+        child_pid = int(process.stdout.readline())
+        try:
+            process.terminate()
+            process.wait(timeout=5)
+            with self.assertRaises(ProcessLookupError):
+                os.kill(child_pid, 0)
+        finally:
+            terminate_child(process)
+            try:
+                os.kill(child_pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            process.stdin.close()
+            process.stdout.close()
+            process.stderr.close()
 
 
 if __name__ == "__main__":

@@ -8,6 +8,7 @@ arguments are forwarded to that child.
 """
 
 import os
+import signal
 import subprocess
 import sys
 import threading
@@ -53,6 +54,11 @@ def main():
     child_bin = os.environ.get("KAKEHASHI_WORKER_PROXY_BIN")
     if not child_bin:
         raise SystemExit("KAKEHASHI_WORKER_PROXY_BIN is required")
+
+    def exit_after_cleanup(signum, _frame):
+        raise SystemExit(128 + signum)
+
+    signal.signal(signal.SIGTERM, exit_after_cleanup)
 
     child = subprocess.Popen(
         [child_bin, *sys.argv[1:]],
