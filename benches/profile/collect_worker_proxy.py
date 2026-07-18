@@ -254,6 +254,20 @@ def signal_process_group(process, signum):
         pass
 
 
+def terminate_process_group(process, grace_seconds):
+    signal_process_group(process, signal.SIGTERM)
+    try:
+        stdout, stderr = process.communicate(timeout=grace_seconds)
+    except subprocess.TimeoutExpired:
+        stdout = stderr = None
+    signal_process_group(process, signal.SIGKILL)
+    final_stdout, final_stderr = process.communicate()
+    return (
+        stdout if stdout is not None else final_stdout,
+        stderr if stderr is not None else final_stderr,
+    )
+
+
 def bounded_run(
     command,
     environment,
@@ -271,21 +285,18 @@ def bounded_run(
     try:
         stdout, stderr = process.communicate(timeout=timeout_seconds)
     except subprocess.TimeoutExpired as timeout:
-        signal_process_group(process, signal.SIGTERM)
-        try:
-            stdout, stderr = process.communicate(
-                timeout=termination_grace_seconds
-            )
-        except subprocess.TimeoutExpired:
-            stdout = stderr = None
-        signal_process_group(process, signal.SIGKILL)
-        final_stdout, final_stderr = process.communicate()
+        stdout, stderr = terminate_process_group(
+            process, termination_grace_seconds
+        )
         raise subprocess.TimeoutExpired(
             command,
             timeout_seconds,
-            output=stdout if stdout is not None else final_stdout,
-            stderr=stderr if stderr is not None else final_stderr,
+            output=stdout,
+            stderr=stderr,
         ) from timeout
+    except BaseException:
+        terminate_process_group(process, termination_grace_seconds)
+        raise
     if process.returncode:
         raise subprocess.CalledProcessError(
             process.returncode, command, output=stdout, stderr=stderr
