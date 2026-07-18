@@ -41,7 +41,7 @@ and must use the platform-specific lifecycle mechanisms specified by the ADR.
   only the recorded path, temporary-directory, locale, and loader variables.
 
 For each steady-state scenario, direct and relay order alternated across 20
-independent process pairs collected in two 10-pair batches. Cache-hit runs first
+independent process pairs collected by the final fail-closed harness. Cache-hit runs first
 issued one unmeasured warmup, then 1,000 measured requests per process;
 edit runs issued 100 requests per process. Reported confidence intervals are a
 deterministic paired bootstrap over the 20 run-level summaries. Percentiles are
@@ -54,20 +54,21 @@ its reporting resolution.
 
 | Scenario | Metric | Direct mean | Relay mean | Paired delta | 95% CI for delta |
 |---|---:|---:|---:|---:|---:|
-| Rust small, unchanged cache hit | p50 | 0.40 ms | 0.41 ms | +0.01 ms | [0.00, 0.03] ms |
-| Rust small, unchanged cache hit | p95 | 0.45 ms | 0.50 ms | +0.06 ms | [0.04, 0.08] ms |
-| Rust small, unchanged cache hit | p99 | 0.49 ms | 0.50 ms | +0.01 ms | [0.00, 0.03] ms |
-| Rust small, one edit/request | p50 | 1.64 ms | 1.65 ms | +0.02 ms | [-0.01, 0.04] ms |
-| Rust small, one edit/request | p95 | 1.74 ms | 1.76 ms | +0.03 ms | [-0.01, 0.05] ms |
-| Rust small, one edit/request | p99 | 1.89 ms | 1.85 ms | -0.04 ms | [-0.22, 0.08] ms |
-| Markdown injections, one edit/request | p50 | 3.43 ms | 3.45 ms | +0.03 ms | [-0.05, 0.09] ms |
-| Markdown injections, one edit/request | p95 | 3.61 ms | 3.73 ms | +0.12 ms | [0.005, 0.255] ms |
-| Markdown injections, one edit/request | p99 | 3.70 ms | 3.95 ms | +0.26 ms | [0.03, 0.61] ms |
+| Rust small, unchanged cache hit | p50 | 0.495 ms | 0.500 ms | +0.005 ms | [0.000, 0.015] ms |
+| Rust small, unchanged cache hit | p95 | 0.500 ms | 0.515 ms | +0.015 ms | [0.000, 0.030] ms |
+| Rust small, unchanged cache hit | p99 | 0.520 ms | 0.520 ms | 0.000 ms | [-0.040, 0.030] ms |
+| Rust small, one edit/request | p50 | 1.710 ms | 1.725 ms | +0.015 ms | [-0.010, 0.040] ms |
+| Rust small, one edit/request | p95 | 1.785 ms | 1.845 ms | +0.060 ms | [0.020, 0.095] ms |
+| Rust small, one edit/request | p99 | 1.885 ms | 1.905 ms | +0.020 ms | [-0.035, 0.075] ms |
+| Markdown injections, one edit/request | p50 | 3.735 ms | 3.785 ms | +0.050 ms | [-0.005, 0.110] ms |
+| Markdown injections, one edit/request | p95 | 3.925 ms | 3.950 ms | +0.025 ms | [-0.045, 0.095] ms |
+| Markdown injections, one edit/request | p99 | 4.015 ms | 4.735 ms | +0.720 ms | [-0.015, 2.015] ms |
 
-The cache-hit p95 and Markdown p95/p99 intervals exclude zero, consistent with
-small relay tail costs. The other tail-latency intervals do not distinguish the
-relay from run-level scheduling noise at the driver's reporting resolution.
-These concrete relay costs are not bounds on the future worker protocol.
+Only the Rust edit p95 interval excludes zero, consistent with a small relay
+tail cost. Markdown p99 has a larger +0.720-ms point estimate but a wide interval
+that crosses zero. The other tail-latency intervals do not distinguish the relay
+from run-level scheduling noise. These concrete relay results are not bounds on
+the future worker protocol.
 
 ### Throughput-sensitive cache-hit path
 
@@ -76,8 +77,8 @@ The cache-hit path transferred approximately 14.0 MiB of response bodies per
 
 | Metric | Direct mean | Relay mean | Paired delta | 95% CI for delta |
 |---|---:|---:|---:|---:|
-| Wall time / 1,000 requests | 427.4 ms | 441.5 ms | +14.1 ms (+3.3%) | [7.9, 21.7] ms |
-| Amortized extra wall time | — | — | +14.1 µs/request | [7.9, 21.7] µs/request |
+| Wall time / 1,000 requests | 704.3 ms | 714.6 ms | +10.4 ms (+1.5%) | [-0.5, 23.9] ms |
+| Amortized extra wall time | — | — | +10.4 µs/request | [-0.5, 23.9] µs/request |
 
 This is the most sensitive raw-relay estimate in this experiment. It is neither
 a lower nor an upper bound for the future worker transport: the Python
@@ -91,8 +92,8 @@ end-to-end cycle times are nevertheless disclosed below.
 
 | Scenario | Direct / 100 cycles | Relay / 100 cycles | Paired delta | 95% CI for delta |
 |---|---:|---:|---:|---:|
-| Rust small | 1486.3 ms | 1512.0 ms | +25.7 ms (+257 µs/cycle) | [16.5, 35.3] ms |
-| Markdown injections | 1684.7 ms | 1689.7 ms | +5.1 ms (+51 µs/cycle) | [-7.3, 18.5] ms |
+| Rust small | 1506.9 ms | 1533.6 ms | +26.7 ms (+267 µs/cycle) | [16.5, 36.9] ms |
+| Markdown injections | 1821.8 ms | 1779.5 ms | -42.3 ms (-423 µs/cycle) | [-154.9, 20.8] ms |
 
 The Rust interval excludes zero, but this experiment cannot attribute the
 difference to pipe transport: every cycle includes the fixed edit-settle delay,
@@ -127,12 +128,13 @@ used as a smoke test, not an independently repeated result:
 ## Interpretation
 
 This particular raw process/pipe relay did not expose a clear steady-state
-transport blocker on this machine. Its median and cache-hit p95 deltas were at
-or below the driver's 0.1-ms reporting resolution. Markdown edit p95 and p99
-were measurable above that resolution at +0.12 ms and +0.26 ms, respectively,
-and the cache-hit throughput run estimated about 14.1 microseconds of amortized
-extra wall time per request. The actual Stage 1 worker cost may be above or
-below these relay deltas.
+transport blocker on this machine. Its median and p95 point deltas were at or
+below the driver's 0.1-ms reporting resolution; Rust edit p95 nevertheless had
+an interval above zero. Markdown edit p99 had a +0.720-ms point estimate with an
+interval crossing zero. The cache-hit throughput run estimated about 10.4
+microseconds of amortized extra wall time per request, also with an interval
+crossing zero. The actual Stage 1 worker cost may be above or below these relay
+deltas.
 
 This result is preliminary and insufficient evidence for the ADR. It does not
 show a worker performance improvement, and it cannot detect costs or benefits
@@ -165,7 +167,7 @@ steady-state table value and confidence interval with:
 python3 benches/profile/analyze_worker_proxy.py
 ```
 
-The July 19 steady-state section combines two collector batches;
+The July 19 steady-state section comes from one final 20-pair collector run;
 it preserves every run summary and status count but not each raw stderr stream.
 The July 18 cold-start and captures-pilot sections predate that recollection.
 The cold-start section preserves all 20 timing samples and is recomputed by the
