@@ -24,7 +24,7 @@ def copy_stream(
             destination.flush()
             copied += len(chunk)
         return copied
-    except BrokenPipeError:
+    except OSError:
         return copied
     finally:
         if close_destination:

@@ -20,6 +20,15 @@ class CopyStreamTest(unittest.TestCase):
         self.assertEqual(copied, len(source.getvalue()))
         self.assertEqual(destination.getvalue(), source.getvalue())
 
+    def test_stream_reset_ends_relay_without_traceback(self):
+        class ResettingDestination(io.BytesIO):
+            def flush(self):
+                raise ConnectionResetError("peer reset")
+
+        copied = copy_stream(io.BytesIO(b"payload"), ResettingDestination())
+
+        self.assertEqual(copied, 0)
+
     def test_child_may_exit_while_proxy_stdin_remains_open(self):
         proxy = pathlib.Path(__file__).with_name("worker_proxy.py")
         env = dict(os.environ, KAKEHASHI_WORKER_PROXY_BIN=sys.executable)
