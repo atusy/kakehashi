@@ -53,9 +53,9 @@
   "order": "direct then relay; smoke result only",
   "direct": {
     "semantic_p50": 4.8,
-    "semantic_p95": 5.7,
-    "captures_p50": 31.7,
-    "captures_p95": 37.9,
+    "semantic_p95": 5.9,
+    "captures_p50": 31.1,
+    "captures_p95": 39.3,
     "semantic_outcomes": {
       "count": 100,
       "ok": 100,
@@ -77,9 +77,9 @@
   },
   "relay": {
     "semantic_p50": 4.4,
-    "semantic_p95": 5.0,
-    "captures_p50": 30.0,
-    "captures_p95": 32.0,
+    "semantic_p95": 5.8,
+    "captures_p50": 30.1,
+    "captures_p95": 37.8,
     "semantic_outcomes": {
       "count": 100,
       "ok": 100,

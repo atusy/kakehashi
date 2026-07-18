@@ -128,9 +128,13 @@ def capture_result_id(
         full_shape or delta_shape
     ):
         raise RuntimeError(f"invalid capture result or lineage: {response}")
-    if expected_shape == "full" and (not full_shape or delta_shape):
+    has_full_fields = isinstance(result, dict) and (
+        "matches" in result or "skipped" in result
+    )
+    has_delta_fields = isinstance(result, dict) and "edits" in result
+    if expected_shape == "full" and (not full_shape or has_delta_fields):
         raise RuntimeError(f"expected full capture result: {response}")
-    if expected_shape == "delta" and (not delta_shape or full_shape):
+    if expected_shape == "delta" and (not delta_shape or has_full_fields):
         raise RuntimeError(f"expected delta capture result: {response}")
     if previous_result_id is not None and result_id == previous_result_id:
         raise RuntimeError(

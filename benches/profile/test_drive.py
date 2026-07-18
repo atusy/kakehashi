@@ -36,6 +36,22 @@ class RequestSummaryTest(unittest.TestCase):
                 {"result": {"resultId": "fallback", "matches": [], "skipped": []}},
                 expected_shape="delta",
             )
+        with self.assertRaisesRegex(RuntimeError, "expected full"):
+            capture_result_id(
+                {"result": {
+                    "resultId": "full-with-delta-key", "matches": [],
+                    "skipped": [], "edits": None,
+                }},
+                expected_shape="full",
+            )
+        with self.assertRaisesRegex(RuntimeError, "expected delta"):
+            capture_result_id(
+                {"result": {
+                    "resultId": "delta-with-full-key", "edits": [],
+                    "matches": None,
+                }},
+                expected_shape="delta",
+            )
         with self.assertRaisesRegex(RuntimeError, "expected delta"):
             capture_result_id(
                 {"result": {

@@ -124,8 +124,8 @@ used as a smoke test, not an independently repeated result:
 
 | Metric | Direct | Relay |
 |---|---:|---:|
-| Semantic tokens p50 / p95 | 4.8 / 5.7 ms | 4.4 / 5.0 ms |
-| Captures delta p50 / p95 | 31.7 / 37.9 ms | 30.0 / 32.0 ms |
+| Semantic tokens p50 / p95 | 4.8 / 5.9 ms | 4.4 / 5.8 ms |
+| Captures delta p50 / p95 | 31.1 / 39.3 ms | 30.1 / 37.8 ms |
 
 All 100 semantic and 100 capture-delta responses per path were successful. The
 final driver validated every capture result as the delta `edits` shape and an
