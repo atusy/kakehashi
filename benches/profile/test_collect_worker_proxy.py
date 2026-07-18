@@ -106,6 +106,17 @@ class CollectionHelpersTest(unittest.TestCase):
         ):
             signal_process_group(process, signal.SIGTERM)
 
+    def test_process_group_termination_stops_after_graceful_exit(self):
+        process = mock.Mock(pid=12345)
+        process.communicate.return_value = ("stdout", "stderr")
+
+        with mock.patch.object(collector, "signal_process_group") as send_signal:
+            output = collector.terminate_process_group(process, 3)
+
+        self.assertEqual(output, ("stdout", "stderr"))
+        send_signal.assert_called_once_with(process, signal.SIGTERM)
+        process.communicate.assert_called_once_with(timeout=3)
+
     def test_attested_build_requires_committed_lockfile(self):
         self.assertIn("--locked", collector.ATTESTED_BUILD_COMMAND)
 

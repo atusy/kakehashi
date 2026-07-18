@@ -581,9 +581,9 @@ def signal_process_group(process, signum):
 def terminate_process_group(process, grace_seconds):
     signal_process_group(process, signal.SIGTERM)
     try:
-        stdout, stderr = process.communicate(timeout=grace_seconds)
+        return process.communicate(timeout=grace_seconds)
     except subprocess.TimeoutExpired:
-        stdout = stderr = None
+        pass
     signal_process_group(process, signal.SIGKILL)
     try:
         final_stdout, final_stderr = process.communicate(timeout=grace_seconds)
@@ -599,10 +599,7 @@ def terminate_process_group(process, grace_seconds):
                 except OSError:
                     pass
         process.wait(timeout=grace_seconds)
-    return (
-        stdout if stdout is not None else final_stdout,
-        stderr if stderr is not None else final_stderr,
-    )
+    return final_stdout, final_stderr
 
 
 def install_termination_handlers():
