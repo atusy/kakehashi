@@ -62,6 +62,7 @@ path-clean = "1"
 regex = "1"
 schemars = { version = "1", features = ["preserve_order"] }
 serde = { version = "1", features = ["derive"] }
+serde_path_to_error = "0.1"
 # regex-fancy (pure Rust) over regex-onig (C oniguruma): we only compile
 # first-line-match regexes for language detection, never highlighting, so
 # fancy-regex's rare Sublime-syntax incompatibilities don't apply (covered by
