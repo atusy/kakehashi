@@ -212,6 +212,8 @@ NativeSegmentStarting(segment_id, lease_id)
 NativeSegmentArmed(segment_id, worker_generation)
 NativeSegmentEntered(segment_id, worker_generation)
 NativeSegmentExited(segment_id)
+NativeSegmentAborted(segment_id)
+RequestFinished(request_id, worker_generation)
 ```
 
 `DeriveSnapshot` may fuse parse, injection discovery, cache reconciliation, and
@@ -293,6 +295,21 @@ but a canceled or stale result cannot populate a cache, mint node state, or be
 published in the parent. Canceling an unknown, completed, or prior-generation
 request is a no-op. A non-cooperative native call remains governed by its hard
 native-call deadline; cancellation alone does not kill the whole worker.
+
+High-level request admission and cancellation share the parent-to-worker control
+writer. If cancellation wins before admission is enqueued, the request is never
+sent. Otherwise the request frame precedes its cancel frame on that ordered
+stream, so an unknown-cancel no-op cannot be followed by first observation of
+the canceled request. Duplicate terminal and cancel frames remain harmless.
+
+Cancellation during a handshake has explicit cleanup. A hazard that was armed
+but never entered its grammar-backed scope is released; a native segment that
+was started or armed but never entered emits `NativeSegmentAborted`; an entered
+segment must exit before its hazard can be released. `RequestFinished` is sent
+only after every lease and segment owned by that request is released, exited, or
+aborted. The parent then removes any remaining request bookkeeping. Worker EOF
+does not perform that cleanup: the still-recorded leases are intentionally kept
+for crash attribution.
 
 ### 5. Derived stages are fused when their inputs coincide
 
@@ -627,6 +644,9 @@ Implementation is accepted only when all of the following hold:
 * Cancellation tests cover queued and running work for client cancellation,
   supersession, handler drop, and `didClose`, including completion races and the
   rule that canceled work publishes and caches nothing.
+* Cancellation tests also cover cancellation before request delivery and at
+  every hazard/segment handshake phase, proving that no later request executes
+  after an overtaking cancel and no lease or timer survives `RequestFinished`.
 * Cross-platform lifecycle tests prove normal shutdown and parent `SIGKILL` or
   platform-equivalent abnormal exit do not leave an orphan worker, including
   while a separate compute thread is hung in native code. Tests cover the macOS
