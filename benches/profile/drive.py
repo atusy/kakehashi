@@ -21,6 +21,8 @@ import sys
 import threading
 import time
 
+benchmark_clock = time.perf_counter
+
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from gen_session import gen_rust, gen_markdown_injections  # noqa: E402
 
@@ -445,7 +447,7 @@ def main() -> None:
         # LSP `character` offsets are UTF-16 code units, not Unicode code
         # points — a non-ASCII first line would make the edit range invalid.
         first_line_len = len(text.split("\n", 1)[0].encode("utf-16-le")) // 2
-        t0 = time.time()
+        t0 = benchmark_clock()
         req_times = []
         cycle_success_times = []
         line_has_extra = False
@@ -530,7 +532,7 @@ def main() -> None:
             ok += cycle_ok
             canceled += cycle_canceled
             superseded += cycle_superseded
-        elapsed = time.time() - t0
+        elapsed = benchmark_clock() - t0
 
         request("shutdown", None)
         notify("exit", {})

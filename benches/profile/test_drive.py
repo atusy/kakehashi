@@ -1,10 +1,12 @@
 import pathlib
 import sys
+import time
 import unittest
 
 sys.path.insert(0, str(pathlib.Path(__file__).parent))
 
 from drive import (
+    benchmark_clock,
     RequestSample,
     count_semantic_outcomes,
     next_toggle_change,
@@ -17,6 +19,9 @@ from drive import (
 
 
 class RequestSummaryTest(unittest.TestCase):
+    def test_aggregate_timing_uses_monotonic_clock(self):
+        self.assertIs(benchmark_clock, time.perf_counter)
+
     def test_summarizes_latency_status_and_wire_bytes(self):
         samples = [
             RequestSample(seconds=0.010, wire_bytes=100, status="ok"),
