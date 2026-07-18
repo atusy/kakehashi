@@ -399,6 +399,18 @@ matching artifact, so a process or power failure observes either the old
 committed selection or the new one, never an unrecognized rollback filename or
 absent canonical parser.
 
+A manifest-less legacy `parser/<language>.<ext>` installation is migrated on
+first resolution. Under the per-grammar lock, the parent rechecks that no
+manifest exists and snapshots the legacy file identity, then imports its bytes
+without modifying the legacy path. A candidate worker validates the exact
+digest. The parent reacquires the lock and CAS-creates revision 1 only if the
+manifest is still absent and the legacy identity is unchanged. A concurrent
+migrator that loses this CAS reaps its candidate and follows the committed
+winner. If import or validation fails, the candidate is reaped, no manifest is
+created, and the untouched legacy file remains available for diagnosis or a
+later successful migration; it is not loaded directly into the production
+worker. Legacy files are not removed by runtime migration or GC.
+
 An arbitrary native path from `LanguageSettings.parser` is compatibility input,
 not a path the worker maps directly. At startup and each relevant configuration
 transaction, the parent opens the resolved source, copies it to staging while
@@ -692,6 +704,9 @@ Implementation is accepted only when all of the following hold:
   including migration from the current fixed destination and the loaded-DLL
   case on Windows, proves a fresh worker executes the content-addressed new
   artifact rather than acknowledging a new key while retaining old code.
+  Concurrent first-start migration proves exactly one revision-1 manifest wins,
+  losers follow it, the legacy file remains intact through every failure point,
+  and failed validation leaves no selectable partial migration.
   Explicit parser-path tests prove the worker maps an imported immutable copy,
   source mutation cannot alter a live generation, and configuration/source
   refresh adopts changed bytes through a new digest and worker generation.
