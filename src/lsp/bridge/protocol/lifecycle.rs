@@ -204,6 +204,12 @@ pub(crate) fn parse_initialize_response_capabilities(
         ));
     };
 
+    recover_server_capabilities(capabilities)
+}
+
+fn recover_server_capabilities(
+    capabilities: &serde_json::Map<String, serde_json::Value>,
+) -> std::io::Result<ParsedInitializeCapabilities> {
     let mut candidate = serde_json::Value::Object(capabilities.clone());
     let mut dropped = Vec::new();
     loop {
@@ -577,7 +583,12 @@ mod tests {
         );
         assert_eq!(parsed.dropped.len(), 1);
         assert_eq!(parsed.dropped[0].field, "hoverProvider");
-        assert!(parsed.dropped[0].error.contains("invalid type"));
+        assert!(
+            parsed.dropped[0].error.contains("hoverProvider")
+                && parsed.dropped[0].error.contains("HoverProviderCapability"),
+            "unexpected serde error: {}",
+            parsed.dropped[0].error
+        );
     }
 
     #[rstest]
