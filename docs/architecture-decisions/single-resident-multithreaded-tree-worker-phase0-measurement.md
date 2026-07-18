@@ -254,7 +254,7 @@ python3 benches/profile/collect_worker_capture_pilot.py \
   --output /tmp/single-worker-phase0-captures-pilot.json
 
 (cd "$data_dir" && \
-  find ./cache ./parser ./queries -type f -print0 | sort -z | \
+  find ./cache ./parser ./queries -type f -print0 | LC_ALL=C sort -z | \
   xargs -0 shasum -a 256 | shasum -a 256)
 
 python3 benches/profile/drive.py \
