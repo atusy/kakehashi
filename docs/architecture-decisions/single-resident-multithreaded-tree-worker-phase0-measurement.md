@@ -33,6 +33,8 @@ of Tree-sitter computation and caches.
   `a1278be5fdff24d109d9e03134c6bdb880577f64`; the intervening change is
   documentation only)
 * Parser/query data was preinstalled outside the measured interval.
+* The collector removed ambient Rust/kakehashi behavior overrides and retained
+  only the recorded path, temporary-directory, locale, and loader variables.
 
 For each steady-state scenario, direct and relay order alternated across 10
 independent process pairs. Cache-hit runs first issued one unmeasured warmup,
@@ -48,19 +50,20 @@ its reporting resolution.
 
 | Scenario | Metric | Direct mean | Relay mean | Paired delta | 95% CI for delta |
 |---|---:|---:|---:|---:|---:|
-| Rust small, unchanged cache hit | p50 | 0.39 ms | 0.40 ms | +0.01 ms | [0.00, 0.03] ms |
-| Rust small, unchanged cache hit | p95 | 0.41 ms | 0.43 ms | +0.02 ms | [-0.02, 0.06] ms |
-| Rust small, unchanged cache hit | p99 | 0.46 ms | 0.45 ms | -0.01 ms | [-0.11, 0.06] ms |
-| Rust small, one edit/request | p50 | 1.54 ms | 1.54 ms | 0.00 ms | [-0.03, 0.03] ms |
-| Rust small, one edit/request | p95 | 1.68 ms | 1.67 ms | -0.01 ms | [-0.05, 0.03] ms |
-| Rust small, one edit/request | p99 | 1.78 ms | 2.37 ms | +0.59 ms | [-0.05, 1.81] ms |
-| Markdown injections, one edit/request | p50 | 3.31 ms | 3.36 ms | +0.05 ms | [-0.05, 0.19] ms |
-| Markdown injections, one edit/request | p95 | 3.51 ms | 3.59 ms | +0.08 ms | [-0.03, 0.22] ms |
-| Markdown injections, one edit/request | p99 | 3.81 ms | 3.91 ms | +0.10 ms | [-0.49, 0.80] ms |
+| Rust small, unchanged cache hit | p50 | 0.40 ms | 0.41 ms | +0.01 ms | [0.00, 0.03] ms |
+| Rust small, unchanged cache hit | p95 | 0.45 ms | 0.50 ms | +0.05 ms | [0.02, 0.08] ms |
+| Rust small, unchanged cache hit | p99 | 0.49 ms | 0.50 ms | +0.01 ms | [0.00, 0.03] ms |
+| Rust small, one edit/request | p50 | 1.62 ms | 1.65 ms | +0.03 ms | [-0.01, 0.07] ms |
+| Rust small, one edit/request | p95 | 1.72 ms | 1.75 ms | +0.03 ms | [-0.01, 0.07] ms |
+| Rust small, one edit/request | p99 | 1.80 ms | 1.84 ms | +0.04 ms | [-0.04, 0.12] ms |
+| Markdown injections, one edit/request | p50 | 3.42 ms | 3.39 ms | -0.03 ms | [-0.13, 0.05] ms |
+| Markdown injections, one edit/request | p95 | 3.55 ms | 3.56 ms | +0.01 ms | [-0.10, 0.09] ms |
+| Markdown injections, one edit/request | p99 | 3.64 ms | 3.68 ms | +0.04 ms | [-0.08, 0.14] ms |
 
-No tail-latency delta is interpreted as an improvement or regression: the relay
-does no useful work and the intervals are consistent with run-level scheduling
-noise at the driver's reporting resolution.
+The cache-hit p95 interval excludes zero, consistent with a small relay cost;
+the other tail-latency intervals do not distinguish the relay from run-level
+scheduling noise at the driver's reporting resolution. This concrete relay
+cost is not a bound on the future worker protocol.
 
 ### Throughput-sensitive cache-hit path
 
@@ -69,12 +72,11 @@ The cache-hit path transferred approximately 14.0 MiB of response bodies per
 
 | Metric | Direct mean | Relay mean | Paired delta | 95% CI for delta |
 |---|---:|---:|---:|---:|
-| Wall time / 1,000 requests | 405.1 ms | 416.1 ms | +11.0 ms (+2.7%) | [-1.3, 23.6] ms |
-| Amortized extra wall time | — | — | +11.0 µs/request | [-1.3, 23.6] µs/request |
+| Wall time / 1,000 requests | 424.6 ms | 438.3 ms | +13.7 ms (+3.2%) | [4.6, 26.0] ms |
+| Amortized extra wall time | — | — | +13.7 µs/request | [4.6, 26.0] µs/request |
 
-This is the most sensitive raw-relay estimate in this experiment, although its
-run-level confidence interval includes zero. It is
-neither a lower nor an upper bound for the future worker transport: the Python
+This is the most sensitive raw-relay estimate in this experiment. It is neither
+a lower nor an upper bound for the future worker transport: the Python
 relay adds interpreter, thread, and flush costs, while the real protocol adds
 different payloads, encoding, queueing, and scheduling. The edit scenarios
 include a fixed 10-ms delay after each edit, so their total wall times
@@ -85,8 +87,8 @@ end-to-end cycle times are nevertheless disclosed below.
 
 | Scenario | Direct / 100 cycles | Relay / 100 cycles | Paired delta | 95% CI for delta |
 |---|---:|---:|---:|---:|
-| Rust small | 1488.7 ms | 1510.1 ms | +21.4 ms (+214 µs/cycle) | [6.1, 35.1] ms |
-| Markdown injections | 1675.6 ms | 1688.4 ms | +12.8 ms (+128 µs/cycle) | [-3.6, 28.9] ms |
+| Rust small | 1490.1 ms | 1510.7 ms | +20.6 ms (+206 µs/cycle) | [8.2, 32.2] ms |
+| Markdown injections | 1684.5 ms | 1678.3 ms | -6.2 ms (-62 µs/cycle) | [-13.7, 1.4] ms |
 
 The Rust interval excludes zero, but this experiment cannot attribute the
 difference to pipe transport: every cycle includes the fixed edit-settle delay,
@@ -123,9 +125,9 @@ used as a smoke test, not an independently repeated result:
 This particular raw process/pipe relay did not expose a clear steady-state
 transport blocker on this machine. Its median and p95 costs were at or below the
 driver's 0.1-ms reporting resolution, while the most sensitive cache-hit
-throughput run estimated about 11.0 microseconds of amortized extra wall time
-per request, with a confidence interval that includes zero. The actual Stage 1
-worker cost may be above or below that relay delta.
+throughput run estimated about 13.7 microseconds of amortized extra wall time
+per request. The actual Stage 1 worker cost may be above or below that relay
+delta.
 
 This result is preliminary and insufficient evidence for the ADR. It does not
 show a worker performance improvement, and it cannot detect costs or benefits
