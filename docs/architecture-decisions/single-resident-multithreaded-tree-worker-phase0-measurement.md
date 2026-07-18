@@ -123,11 +123,12 @@ used as a smoke test, not an independently repeated result:
 ## Interpretation
 
 This particular raw process/pipe relay did not expose a clear steady-state
-transport blocker on this machine. Its median and p95 costs were at or below the
-driver's 0.1-ms reporting resolution, while the most sensitive cache-hit
-throughput run estimated about 14.1 microseconds of amortized extra wall time
-per request. The actual Stage 1 worker cost may be above or below that relay
-delta.
+transport blocker on this machine. Its median and cache-hit p95 deltas were at
+or below the driver's 0.1-ms reporting resolution. Markdown edit p95 and p99
+were measurable above that resolution at +0.12 ms and +0.26 ms, respectively,
+and the cache-hit throughput run estimated about 14.1 microseconds of amortized
+extra wall time per request. The actual Stage 1 worker cost may be above or
+below these relay deltas.
 
 This result is preliminary and insufficient evidence for the ADR. It does not
 show a worker performance improvement, and it cannot detect costs or benefits
