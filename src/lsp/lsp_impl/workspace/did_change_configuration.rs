@@ -5,7 +5,7 @@ use tower_lsp_server::ls_types::DidChangeConfigurationParams;
 
 use crate::config::{RawWorkspaceSettings, WorkspaceSettings, merge_workspace_settings};
 
-use super::super::Kakehashi;
+use super::super::{Kakehashi, lock_settings_reload};
 
 const KNOWN_WORKSPACE_SETTING_KEYS: &[&str] = &[
     "searchPaths",
@@ -416,10 +416,10 @@ impl Kakehashi {
             }
         };
 
-        // Serialize the snapshot read and publication as one transaction. The
-        // reload lock inside apply_shared_settings starts too late to prevent
-        // two callers deriving replacements from the same old snapshot.
-        let settings_transaction = self.settings_manager.begin_settings_transaction().await;
+        // Snapshot read, derivation, and publication must share the same reload
+        // transaction as post-install search-path updates, or either path can
+        // overwrite a concurrent update derived from a stale snapshot.
+        let reload = lock_settings_reload().await;
 
         // Merge onto current effective settings (not from scratch).
         // The current settings already reflect defaults < user < project < initializationOptions,
@@ -442,13 +442,14 @@ impl Kakehashi {
         ) {
             Ok(settings) => {
                 let warnings = Self::misconfigured_settings_warnings(&settings);
-                self.apply_raw_settings(merged_ts, settings, settings_transaction)
+                self.apply_raw_settings_locked(&reload, merged_ts, settings)
                     .await;
+                drop(reload);
                 self.warn_on_misconfigured_settings(&warnings).await;
                 self.notifier().log_info("Configuration updated!").await;
             }
             Err(errs) => {
-                drop(settings_transaction);
+                drop(reload);
                 let event = crate::lsp::SettingsEvent::error(format!(
                     "Invalid configuration: {errs}. \
                      This configuration has been discarded; previous settings remain in effect. \
@@ -468,6 +469,9 @@ mod tests {
         LanguageSettings, LayerAggregationConfig, LayersConfig, QueryItem, QueryTypeMappings,
     };
     use std::collections::BTreeSet;
+    use std::future::Future;
+    use std::task::Poll;
+    use tower_lsp_server::LspService;
 
     fn assert_known_keys_match_schema<T: schemars::JsonSchema>(
         known_keys: &[&str],
@@ -686,5 +690,61 @@ mod tests {
             KNOWN_LAYER_AGGREGATION_SETTING_KEYS,
             &[],
         );
+    }
+
+    #[tokio::test]
+    async fn did_change_configuration_merges_into_settings_published_while_waiting() {
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+        server.settings_manager.apply_settings_with_raw(
+            RawWorkspaceSettings {
+                auto_install: Some(true),
+                search_paths: Some(vec!["/initial".to_string()]),
+                ..Default::default()
+            },
+            WorkspaceSettings {
+                auto_install: true,
+                search_paths: vec!["/initial".to_string()],
+                ..Default::default()
+            },
+        );
+
+        let reload_guard = crate::lsp::lsp_impl::lock_settings_reload().await;
+        let mut update = Box::pin(server.did_change_configuration_impl(
+            DidChangeConfigurationParams {
+                settings: serde_json::json!({
+                    "kakehashi": { "autoInstall": false }
+                }),
+            },
+        ));
+        std::future::poll_fn(|cx| {
+            assert!(update.as_mut().poll(cx).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+
+        server.settings_manager.apply_settings_with_raw(
+            RawWorkspaceSettings {
+                auto_install: Some(true),
+                search_paths: Some(vec!["/newer".to_string()]),
+                ..Default::default()
+            },
+            WorkspaceSettings {
+                auto_install: true,
+                search_paths: vec!["/newer".to_string()],
+                ..Default::default()
+            },
+        );
+        drop(reload_guard);
+        update.await;
+
+        let snapshot = server.settings_manager.load_settings_pair();
+        assert_eq!(snapshot.raw_settings.auto_install, Some(false));
+        assert_eq!(
+            snapshot.raw_settings.search_paths,
+            Some(vec!["/newer".to_string()])
+        );
+        assert!(!snapshot.settings.auto_install);
+        assert_eq!(snapshot.settings.search_paths, vec!["/newer".to_string()]);
     }
 }
