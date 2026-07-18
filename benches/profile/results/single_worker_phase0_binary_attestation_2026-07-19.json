@@ -17,11 +17,12 @@
     "TMPDIR": "/var/folders/t3/_nc24_w90zq79l3xyz3xzc7c0000gn/T/",
     "LANG": "C.UTF-8",
     "LC_ALL": "C.UTF-8",
-    "CARGO_TARGET_DIR": "/var/folders/t3/_nc24_w90zq79l3xyz3xzc7c0000gn/T/kakehashi-attested-build-8k8g3ey_/target",
-    "CARGO_HOME": "/var/folders/t3/_nc24_w90zq79l3xyz3xzc7c0000gn/T/kakehashi-attested-build-8k8g3ey_/target/cargo-home"
+    "CARGO_TARGET_DIR": "/var/folders/t3/_nc24_w90zq79l3xyz3xzc7c0000gn/T/kakehashi-attested-build-9qvxuk_w/target",
+    "CARGO_HOME": "/var/folders/t3/_nc24_w90zq79l3xyz3xzc7c0000gn/T/kakehashi-attested-build-9qvxuk_w/target/cargo-home"
   },
   "built_in_fresh_target": true,
   "source_isolated_archive": true,
+  "cargo_config_ancestry_clean": true,
   "binary_relative": "target/release/kakehashi",
-  "binary_sha256": "65dd4ee0520cd313a82e66b8b4f1a7a0e559c56c6a891a119286487689ddb8a1"
+  "binary_sha256": "ae73b12dcbf56d0e9cdd94beb61178142c6d26ecee8d899d6f5bbc793d27cd5c"
 }

@@ -356,7 +356,8 @@ def load_binary_attestation(path, binary):
         "schema", "source_repository", "source_commit",
         "source_checkout_clean", "build_command", "rustc", "cargo",
         "build_environment", "built_in_fresh_target", "binary_relative",
-        "source_isolated_archive", "binary_sha256",
+        "source_isolated_archive", "cargo_config_ancestry_clean",
+        "binary_sha256",
     )
     if any(key not in attestation for key in required):
         raise ValueError("binary attestation is missing required fields")
@@ -390,6 +391,7 @@ def load_binary_attestation(path, binary):
         )
         and attestation["built_in_fresh_target"] is True
         and attestation["source_isolated_archive"] is True
+        and attestation["cargo_config_ancestry_clean"] is True
         and attestation["binary_relative"] == "target/release/kakehashi"
         and isinstance(attestation["binary_sha256"], str)
         and re.fullmatch(r"[0-9a-f]{64}", attestation["binary_sha256"])

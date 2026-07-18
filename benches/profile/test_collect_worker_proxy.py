@@ -405,6 +405,7 @@ class CollectionHelpersTest(unittest.TestCase):
                 },
                 "built_in_fresh_target": True,
                 "source_isolated_archive": True,
+                "cargo_config_ancestry_clean": True,
                 "binary_relative": "target/release/kakehashi",
                 "binary_sha256": hashlib.sha256(b"release").hexdigest(),
             }))
@@ -412,6 +413,12 @@ class CollectionHelpersTest(unittest.TestCase):
             loaded = load_binary_attestation(attestation, binary)
 
             self.assertEqual(loaded["source_commit"], "a" * 40)
+            without_ancestry_proof = json.loads(attestation.read_text())
+            del without_ancestry_proof["cargo_config_ancestry_clean"]
+            attestation.write_text(json.dumps(without_ancestry_proof))
+            with self.assertRaisesRegex(ValueError, "missing required fields"):
+                load_binary_attestation(attestation, binary)
+            attestation.write_text(json.dumps(loaded))
             binary.write_bytes(b"other")
             with self.assertRaisesRegex(ValueError, "attested binary digest"):
                 load_binary_attestation(attestation, binary)
@@ -433,6 +440,7 @@ class CollectionHelpersTest(unittest.TestCase):
                 "build_environment": {},
                 "built_in_fresh_target": False,
                 "source_isolated_archive": False,
+                "cargo_config_ancestry_clean": False,
                 "binary_relative": "target/release/kakehashi",
                 "binary_sha256": hashlib.sha256(b"release").hexdigest(),
             }))

@@ -6,7 +6,11 @@ import unittest
 
 sys.path.insert(0, str(pathlib.Path(__file__).parent))
 
-from attest_worker_binary import archive_source, controlled_build_environment
+from attest_worker_binary import (
+    archive_source,
+    controlled_build_environment,
+    require_isolated_source,
+)
 
 
 class BinaryAttestationTest(unittest.TestCase):
@@ -60,6 +64,29 @@ class BinaryAttestationTest(unittest.TestCase):
 
             self.assertEqual((destination / "source.txt").read_text(), "committed")
             self.assertFalse((destination / ".cargo/config.toml").exists())
+
+    def test_isolated_source_rejects_checkout_descendant(self):
+        with tempfile.TemporaryDirectory() as directory:
+            checkout = pathlib.Path(directory) / "repository"
+            source = checkout / "tmp/source"
+            source.mkdir(parents=True)
+
+            with self.assertRaisesRegex(ValueError, "inside source checkout"):
+                require_isolated_source(source, checkout)
+
+    def test_isolated_source_rejects_ancestor_cargo_configuration(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            checkout = root / "repository"
+            checkout.mkdir()
+            source = root / "temporary/source"
+            source.mkdir(parents=True)
+            cargo_config = root / "temporary/.cargo/config.toml"
+            cargo_config.parent.mkdir()
+            cargo_config.write_text("[build]\n")
+
+            with self.assertRaisesRegex(ValueError, "Cargo configuration"):
+                require_isolated_source(source, checkout)
 
 
 if __name__ == "__main__":

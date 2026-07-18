@@ -50,6 +50,20 @@ def archive_source(checkout, revision, destination):
     archive.unlink()
 
 
+def require_isolated_source(source, checkout):
+    source = source.resolve()
+    checkout = checkout.resolve()
+    if source == checkout or checkout in source.parents:
+        raise ValueError(f"temporary build source is inside source checkout: {source}")
+    for directory in (source, *source.parents):
+        for name in ("config", "config.toml"):
+            config = directory / ".cargo" / name
+            if config.is_file():
+                raise ValueError(
+                    f"temporary build source inherits Cargo configuration: {config}"
+                )
+
+
 def git(checkout, *arguments):
     return tool_version(["git", "-C", str(checkout), *arguments])
 
@@ -72,6 +86,7 @@ def main():
     with tempfile.TemporaryDirectory(prefix="kakehashi-attested-build-") as root:
         isolated_root = pathlib.Path(root)
         source = isolated_root / "source"
+        require_isolated_source(source, args.checkout)
         archive_source(args.checkout, source_commit, source)
         target = isolated_root / "target"
         build_environment = controlled_build_environment(os.environ, target)
@@ -99,6 +114,7 @@ def main():
         "build_environment": build_environment,
         "built_in_fresh_target": True,
         "source_isolated_archive": True,
+        "cargo_config_ancestry_clean": True,
         "binary_relative": BINARY_RELATIVE.as_posix(),
         "binary_sha256": sha256_file(binary),
     }
