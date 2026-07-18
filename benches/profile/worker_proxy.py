@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Add one resident child-process and pipe hop in front of kakehashi.
 
-This is a transport lower-bound experiment, not the proposed worker protocol:
+This is a raw-relay feasibility experiment, not the proposed worker protocol:
 it relays the existing framed LSP byte stream without decoding it. Set
 ``KAKEHASHI_WORKER_PROXY_BIN`` to the real kakehashi executable. All command-line
 arguments are forwarded to that child.
