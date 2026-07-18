@@ -35,7 +35,9 @@ def main():
     )
     stdin_thread = threading.Thread(
         target=copy_stream,
-        args=(sys.stdin.buffer, child.stdin),
+        # Read the raw descriptor so a blocked daemon thread cannot retain the
+        # BufferedReader lock while the proxy exits after its child.
+        args=(getattr(sys.stdin.buffer, "raw", sys.stdin.buffer), child.stdin),
         daemon=True,
     )
     stdout_thread = threading.Thread(

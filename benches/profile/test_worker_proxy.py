@@ -1,5 +1,7 @@
 import io
+import os
 import pathlib
+import subprocess
 import sys
 import unittest
 
@@ -17,6 +19,33 @@ class CopyStreamTest(unittest.TestCase):
 
         self.assertEqual(copied, len(source.getvalue()))
         self.assertEqual(destination.getvalue(), source.getvalue())
+
+    def test_child_may_exit_while_proxy_stdin_remains_open(self):
+        proxy = pathlib.Path(__file__).with_name("worker_proxy.py")
+        env = dict(os.environ, KAKEHASHI_WORKER_PROXY_BIN=sys.executable)
+        process = subprocess.Popen(
+            [
+                sys.executable,
+                str(proxy),
+                "-c",
+                "import sys; sys.stdout.buffer.write(b'ok'); sys.stdout.flush()",
+            ],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=env,
+        )
+        try:
+            self.assertEqual(process.stdout.read(2), b"ok")
+            return_code = process.wait(timeout=5)
+            stderr = process.stderr.read().decode()
+        finally:
+            process.stdin.close()
+            process.stdout.close()
+            process.stderr.close()
+
+        self.assertEqual(return_code, 0, stderr)
+        self.assertNotIn("Fatal Python error", stderr)
 
 
 if __name__ == "__main__":
