@@ -13,7 +13,10 @@ import sys
 
 
 SCENARIOS = {
-    "rust_cache_hit": ["--lang", "rust", "--size", "15", "--requests", "1000"],
+    "rust_cache_hit": [
+        "--lang", "rust", "--size", "15", "--requests", "1000",
+        "--warm-semantic-cache",
+    ],
     "rust_edit": [
         "--lang", "rust", "--size", "15", "--requests", "100", "--edits", "1"
     ],

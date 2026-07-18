@@ -12,6 +12,7 @@ from drive import (
     server_request_result,
     summarize_samples,
     summarize_samples_by_status,
+    warm_semantic_tokens,
 )
 
 
@@ -93,6 +94,19 @@ class RequestSummaryTest(unittest.TestCase):
         )
         self.assertIsNone(response_result_id({"result": None}))
         self.assertIsNone(response_result_id({"error": {"code": -32800}}))
+
+    def test_semantic_warmup_is_an_unmeasured_full_request(self):
+        calls = []
+
+        warm_semantic_tokens(
+            lambda method, params: calls.append((method, params)),
+            "file:///profile/input.rs",
+        )
+
+        self.assertEqual(calls, [(
+            "textDocument/semanticTokens/full",
+            {"textDocument": {"uri": "file:///profile/input.rs"}},
+        )])
 
 
 if __name__ == "__main__":

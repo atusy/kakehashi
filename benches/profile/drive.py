@@ -153,6 +153,14 @@ def next_toggle_change(
     return change, grow
 
 
+def warm_semantic_tokens(request, uri):
+    """Populate the semantic-token cache without adding a measured sample."""
+    request(
+        "textDocument/semanticTokens/full",
+        {"textDocument": {"uri": uri}},
+    )
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--bin", required=True)
@@ -163,6 +171,9 @@ def main() -> None:
     ap.add_argument("--lang", choices=["rust", "markdown"], default="rust")
     ap.add_argument("--size", type=int, default=150)
     ap.add_argument("--requests", type=int, default=300)
+    ap.add_argument(
+        "--warm-semantic-cache", action="store_true",
+        help="issue one unmeasured semanticTokens/full request before timing")
     ap.add_argument(
         "--burst", type=int, default=1,
         help="send this many semantic-token requests back-to-back per cycle; "
@@ -409,6 +420,8 @@ def main() -> None:
             "uri": uri, "languageId": lang, "version": 1, "text": text}})
         if args.settle > 0:
             time.sleep(args.settle)  # let the initial parse settle
+        if args.warm_semantic_cache:
+            warm_semantic_tokens(request, uri)
 
         captures_result_id = None
         if args.captures:
