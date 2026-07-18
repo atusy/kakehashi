@@ -28,7 +28,7 @@ and must use the platform-specific lifecycle mechanisms specified by the ADR.
 
 * Final fail-closed collection date: 2026-07-19
 * Machine: Apple M4, 10 physical/logical CPUs
-* OS: macOS 26.5.1 (25F80)
+* OS: macOS 26.5.1
 * Estimated tree compute budget under the current policy: 8 threads. This uses
   Python's logical CPU count and is not a binary-reported effective pool size.
 * Release binary: `ccbd8ffd13c4817eda62e1de6f8cfd3eeb3259d0`
