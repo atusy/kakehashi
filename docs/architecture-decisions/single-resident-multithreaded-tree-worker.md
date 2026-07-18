@@ -536,7 +536,11 @@ parent then reopens and reads the complete source a second time, computing a
 second cryptographic digest and length. File identity metadata is checked before
 and after both passes, but metadata alone is not accepted: the staged bytes are
 imported only when both full-content digests and lengths match. Any mismatch or
-read mutation triggers a retry rather than publishing potentially mixed bytes.
+read mutation triggers an exponentially backed-off retry, capped by both attempt
+count and elapsed time, rather than publishing potentially mixed bytes. If that
+budget is exhausted, the parent aborts the configuration transaction, removes
+the staging candidate, logs the unstable source, and retains the last validated
+grammar (or leaves the language unavailable when none exists).
 The resulting session descriptor contains the immutable path, digest, and
 export; aliases with identical bytes and export share a `grammar_key`. Source
 mutation cannot change code already mapped by a worker. A configuration reload
