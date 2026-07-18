@@ -225,6 +225,15 @@ QuarantineReady(quarantine_generation, worker_generation)
 GrammarMissing(request_id, language, document_context)
 LoadNewGrammar(configuration_generation, grammar_descriptor)
 GrammarReady(configuration_generation, grammar_key, worker_generation)
+PromoteServing(
+  worker_generation, configuration_generation,
+  fenced_manifest_snapshot, quarantine_generation, grammar_keys
+)
+ServingReady(
+  worker_generation, configuration_generation,
+  manifest_snapshot_digest, quarantine_generation
+)
+PromotionRejected(worker_generation, reason)
 ```
 
 Tree work uses high-level operations rather than remote Tree-sitter primitives:
@@ -258,6 +267,15 @@ configuration generation, and worker generation from which it was derived.
 Every tree-operation response carries those same guards. The parent admits or
 publishes any response only if all live input guards still match. Stale
 responses are discarded without mutating parent caches or node state.
+
+`PromoteServing` is accepted only in `Validation` mode, for the current worker
+generation, when the loaded candidate identity appears in the fenced manifest
+snapshot and none of its grammar keys is quarantined. The worker validates the
+complete snapshot/configuration/quarantine tuple atomically before changing
+mode. `ServingReady` echoes its digest and generations; only an exact match lets
+the parent enable document sync or public admission. Any mismatch, unsupported
+state, newly quarantined key, or validation error returns `PromotionRejected`,
+leaves the process non-serving, and causes the parent to reap and reconcile it.
 
 The worker also validates the request context against the exact immutable tree
 snapshot selected for the operation. A node lookup or walk collects newly
