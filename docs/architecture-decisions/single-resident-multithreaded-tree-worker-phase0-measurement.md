@@ -217,6 +217,19 @@ python3 benches/profile/collect_worker_proxy.py \
   --data-dir "$data_dir" \
   --nvim-treesitter-checkout "$source_dir" \
   --output /tmp/single-worker-phase0.json
+python3 benches/profile/collect_worker_cold_start.py \
+  --bin ./target/release/kakehashi \
+  --binary-attestation /tmp/single-worker-binary-attestation.json \
+  --data-dir "$data_dir" \
+  --nvim-treesitter-checkout "$source_dir" \
+  --pairs 20 --warmups 3 \
+  --output /tmp/single-worker-phase0-cold-start.json
+python3 benches/profile/collect_worker_capture_pilot.py \
+  --bin ./target/release/kakehashi \
+  --binary-attestation /tmp/single-worker-binary-attestation.json \
+  --data-dir "$data_dir" \
+  --nvim-treesitter-checkout "$source_dir" \
+  --output /tmp/single-worker-phase0-captures-pilot.json
 ```
 
 The collector verifies that the metadata cache and every installed query file
