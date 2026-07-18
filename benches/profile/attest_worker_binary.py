@@ -36,19 +36,30 @@ def environment_tool_version(command, environment):
     ).stdout.strip()
 
 
+def compiler_linker_version(environment, system):
+    linker_flag = "-Wl,-v" if system == "Darwin" else "-Wl,--version"
+    return subprocess.run(
+        ["cc", linker_flag, "-x", "c", "-", "-o", os.devnull],
+        check=True,
+        text=True,
+        input="int main(void) { return 0; }\n",
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        env=environment,
+    ).stdout.strip()
+
+
 def native_toolchain_metadata(
     environment,
     system=None,
     version=environment_tool_version,
+    linker_version=compiler_linker_version,
 ):
     system = system or platform.system()
     metadata = {
         "rustc_verbose": version(["rustc", "-vV"], environment),
         "cc": version(["cc", "--version"], environment),
-        "linker": version(
-            ["ld", "-v"] if system == "Darwin" else ["ld", "--version"],
-            environment,
-        ),
+        "linker": linker_version(environment, system),
         "sdk_path": "not applicable",
         "sdk_version": "not applicable",
     }

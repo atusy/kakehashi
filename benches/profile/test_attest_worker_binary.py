@@ -102,7 +102,6 @@ class BinaryAttestationTest(unittest.TestCase):
         versions = {
             ("rustc", "-vV"): "rustc 1.95.0\nhost: aarch64-apple-darwin",
             ("cc", "--version"): "Apple clang version 17.0.0",
-            ("ld", "-v"): "@(#)PROGRAM:ld PROJECT:ld-1234",
             ("xcrun", "--show-sdk-path"): "/SDKs/MacOSX.sdk",
             ("xcrun", "--show-sdk-version"): "26.5",
         }
@@ -111,6 +110,9 @@ class BinaryAttestationTest(unittest.TestCase):
             {},
             system="Darwin",
             version=lambda command, _environment: versions[tuple(command)],
+            linker_version=lambda _environment, _system: (
+                "@(#)PROGRAM:ld PROJECT:ld-1234"
+            ),
         )
 
         self.assertEqual(metadata, {
