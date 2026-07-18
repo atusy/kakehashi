@@ -232,12 +232,13 @@ python3 benches/profile/collect_worker_capture_pilot.py \
   --output /tmp/single-worker-phase0-captures-pilot.json
 ```
 
-The collector verifies that the metadata cache and every installed query file
-byte-match the checkout's HEAD. It also fetches the hard-coded official HTTPS
-`main` into a fresh bare repository with local/system Git configuration and
-replacement objects disabled, then requires the selected revision to be in that
-isolated history. The committed dataset was verified against `nvim-treesitter`
-revision
+The checkout supplies only the selected revision and declared origin. The
+collector fetches the hard-coded official HTTPS `main` into a fresh bare
+repository with local/system Git configuration and replacement objects
+disabled, requires the selected revision to be in that isolated history, and
+reads the expected metadata/query blobs from that same isolated repository.
+Every staged runtime file must byte-match those official blobs. The committed
+dataset was verified against `nvim-treesitter` revision
 `4916d6592ede8c07973490d9322f187e07dfefac`.
 
 Run the digest command below and compare it with the committed dataset before

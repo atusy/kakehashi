@@ -63,22 +63,8 @@ def controlled_environment(source):
     }
 
 
-def committed_blob(checkout, revision, relative):
-    try:
-        return subprocess.run(
-            ["git", "-C", checkout, "show", f"{revision}:{relative}"],
-            check=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-        ).stdout
-    except subprocess.CalledProcessError as error:
-        raise ValueError(
-            f"nvim-treesitter revision lacks {relative}"
-        ) from error
-
-
-def verify_official_revision(
-    revision, official_url=OFFICIAL_NVIM_TREESITTER_URL
+def official_revision_blobs(
+    revision, relative_paths, official_url=OFFICIAL_NVIM_TREESITTER_URL
 ):
     environment = controlled_environment(os.environ)
     environment.update({
@@ -139,7 +125,33 @@ def verify_official_revision(
             raise ValueError(
                 f"nvim-treesitter revision {revision} is not in official origin/main"
             )
-        return fetched_revision
+        blobs = {}
+        for relative in relative_paths:
+            try:
+                blobs[relative] = subprocess.run(
+                    [
+                        "git", "--git-dir", repository, "show",
+                        f"{revision}:{relative}",
+                    ],
+                    check=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    env=environment,
+                ).stdout
+            except subprocess.CalledProcessError as error:
+                raise ValueError(
+                    f"nvim-treesitter revision lacks {relative}"
+                ) from error
+        return fetched_revision, blobs
+
+
+def verify_official_revision(
+    revision, official_url=OFFICIAL_NVIM_TREESITTER_URL
+):
+    fetched_revision, _ = official_revision_blobs(
+        revision, (), official_url
+    )
+    return fetched_revision
 
 
 def artifact_provenance(data_dir, nvim_treesitter_checkout):
@@ -158,7 +170,6 @@ def artifact_provenance(data_dir, nvim_treesitter_checkout):
     revision = tool_version([
         "git", "-C", str(nvim_treesitter_checkout), "rev-parse", "HEAD"
     ])
-    fetched_revision = verify_official_revision(revision)
     comparisons = [
         (
             data_dir / "cache/parsers.lua",
@@ -175,12 +186,13 @@ def artifact_provenance(data_dir, nvim_treesitter_checkout):
         for query in runtime_artifact_files(data_dir)
         if query.is_relative_to(data_dir / "queries")
     )
+    fetched_revision, official_blobs = official_revision_blobs(
+        revision, [relative for _, relative in comparisons]
+    )
     for installed, upstream_relative in comparisons:
         if not installed.is_file() or installed.is_symlink():
             raise ValueError(f"missing runtime artifact: {installed}")
-        expected = committed_blob(
-            str(nvim_treesitter_checkout), revision, upstream_relative
-        )
+        expected = official_blobs[upstream_relative]
         if installed.read_bytes() != expected:
             raise ValueError(
                 f"{installed} does not match {revision}:{upstream_relative}"

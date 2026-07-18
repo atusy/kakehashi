@@ -21,6 +21,7 @@ from collect_worker_proxy import (
     artifact_provenance,
     parse_capture_pilot_summary,
     parse_driver_summary,
+    official_revision_blobs,
     load_binary_attestation,
     parser_library_suffix,
     require_posix as require_collector_posix,
@@ -202,12 +203,7 @@ class CollectionHelpersTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "missing benchmark artifact"):
                 require_benchmark_artifacts(pathlib.Path(directory))
 
-    @mock.patch.object(
-        collector, "verify_official_revision", return_value="f" * 40
-    )
-    def test_artifact_provenance_verifies_metadata_and_queries_at_revision(
-        self, _verify_official_revision
-    ):
+    def test_artifact_provenance_verifies_metadata_and_queries_at_revision(self):
         with tempfile.TemporaryDirectory() as directory:
             root = pathlib.Path(directory)
             checkout = root / "nvim-treesitter"
@@ -242,14 +238,22 @@ class CollectionHelpersTest(unittest.TestCase):
                 check=True,
             )
 
-            provenance = artifact_provenance(data, checkout)
+            official_blobs = {
+                "lua/nvim-treesitter/parsers.lua": metadata,
+                "runtime/queries/rust/highlights.scm": query,
+            }
+            with mock.patch.object(
+                collector, "official_revision_blobs",
+                return_value=("f" * 40, official_blobs),
+            ):
+                provenance = artifact_provenance(data, checkout)
 
-            self.assertRegex(
-                provenance["nvim_treesitter_revision"], r"^[0-9a-f]{40}$"
-            )
-            (data / "queries/rust/highlights.scm").write_bytes(b"different")
-            with self.assertRaisesRegex(ValueError, "does not match"):
-                artifact_provenance(data, checkout)
+                self.assertRegex(
+                    provenance["nvim_treesitter_revision"], r"^[0-9a-f]{40}$"
+                )
+                (data / "queries/rust/highlights.scm").write_bytes(b"different")
+                with self.assertRaisesRegex(ValueError, "does not match"):
+                    artifact_provenance(data, checkout)
 
     def test_artifact_provenance_rejects_unofficial_checkout_origin(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -318,8 +322,14 @@ class CollectionHelpersTest(unittest.TestCase):
                 check=True, text=True, stdout=subprocess.PIPE,
             ).stdout.strip()
             subprocess.run(
-                ["git", "-C", checkout, "replace", local, official], check=True
+                ["git", "-C", checkout, "replace", official, local], check=True
             )
+
+            fetched, blobs = official_revision_blobs(
+                official, ["file"], str(upstream)
+            )
+            self.assertEqual(fetched, official)
+            self.assertEqual(blobs["file"], b"official")
 
             with self.assertRaisesRegex(ValueError, "official origin/main"):
                 verify_official_revision(local, str(upstream))
