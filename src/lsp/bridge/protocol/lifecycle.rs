@@ -168,14 +168,16 @@ pub(crate) fn parse_initialize_response_capabilities(
     }
 
     // 2. Reject if result is absent or null
-    let Some(result) = response
-        .get("result")
-        .filter(|result| !result.is_null())
-        .and_then(serde_json::Value::as_object)
-    else {
+    let Some(result) = response.get("result").filter(|result| !result.is_null()) else {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             "bridge: initialize response missing valid result",
+        ));
+    };
+    let Some(result) = result.as_object() else {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "bridge: invalid initialize result: expected an object",
         ));
     };
 
@@ -629,17 +631,34 @@ mod tests {
     }
 
     #[rstest]
-    #[case::scalar_result(serde_json::json!({"result": 42}))]
-    #[case::array_result(serde_json::json!({"result": []}))]
-    #[case::scalar_capabilities(
-        serde_json::json!({"result": {"capabilities": "not-an-object"}})
+    #[case::scalar_result(
+        serde_json::json!({"result": 42}),
+        "initialize result: expected an object"
     )]
-    #[case::array_capabilities(serde_json::json!({"result": {"capabilities": []}}))]
-    fn structurally_invalid_initialize_payload_fails(#[case] response: serde_json::Value) {
+    #[case::array_result(
+        serde_json::json!({"result": []}),
+        "initialize result: expected an object"
+    )]
+    #[case::scalar_capabilities(
+        serde_json::json!({"result": {"capabilities": "not-an-object"}}),
+        "initialize capabilities: expected an object"
+    )]
+    #[case::array_capabilities(
+        serde_json::json!({"result": {"capabilities": []}}),
+        "initialize capabilities: expected an object"
+    )]
+    fn structurally_invalid_initialize_payload_fails(
+        #[case] response: serde_json::Value,
+        #[case] expected: &str,
+    ) {
         let error = parse_initialize_response_capabilities(&response)
             .expect_err("structural corruption must fail the handshake");
 
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(
+            error.to_string().contains(expected),
+            "unexpected error: {error}"
+        );
     }
 
     #[rstest]
