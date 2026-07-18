@@ -93,6 +93,9 @@ def main():
         raise SystemExit("KAKEHASHI_WORKER_PROXY_BIN is required")
 
     def exit_after_cleanup(signum, _frame):
+        # The first termination owns cleanup. Repeats must not interrupt the
+        # bounded TERM -> KILL -> reap sequence below.
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
         raise SystemExit(128 + signum)
 
     signal.signal(signal.SIGTERM, exit_after_cleanup)

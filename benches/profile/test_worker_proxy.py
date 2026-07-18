@@ -4,6 +4,7 @@ import pathlib
 import signal
 import subprocess
 import sys
+import time
 import unittest
 from unittest import mock
 
@@ -160,6 +161,48 @@ class CopyStreamTest(unittest.TestCase):
         child_pid = int(process.stdout.readline())
         try:
             process.terminate()
+            process.wait(timeout=5)
+            with self.assertRaises(ProcessLookupError):
+                os.kill(child_pid, 0)
+        finally:
+            terminate_child(process)
+            try:
+                os.kill(child_pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            process.stdin.close()
+            process.stdout.close()
+            process.stderr.close()
+
+    @unittest.skipUnless(
+        os.name == "posix" and hasattr(signal, "SIGTERM"),
+        "requires POSIX SIGTERM",
+    )
+    def test_repeated_termination_reaps_term_ignoring_child(self):
+        proxy = pathlib.Path(__file__).with_name("worker_proxy.py")
+        env = dict(os.environ, KAKEHASHI_WORKER_PROXY_BIN=sys.executable)
+        process = subprocess.Popen(
+            [
+                sys.executable,
+                str(proxy),
+                "-c",
+                "import os,signal,time; "
+                "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+                "print(os.getpid(), flush=True); time.sleep(30)",
+            ],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=env,
+            text=True,
+        )
+        child_pid = int(process.stdout.readline())
+        try:
+            for _ in range(8):
+                if process.poll() is not None:
+                    break
+                process.terminate()
+                time.sleep(0.08)
             process.wait(timeout=5)
             with self.assertRaises(ProcessLookupError):
                 os.kill(child_pid, 0)
