@@ -351,6 +351,17 @@ worst-case control delivery bound below the hard deadline with explicit margin;
 failure to enqueue or flush within the control-liveness bound is a systemic
 protocol failure, not evidence that the grammar exceeded its native budget.
 
+Receipt of `NativeSegmentEntered` starts a separate platform-calibrated pre-FFI
+handoff allowance before the native execution budget. This allowance covers the
+worker being descheduled after flushing the frame but before executing the FFI
+call; the parent cannot observe that final instruction boundary causally. The
+kill threshold is `handoff_allowance + native_budget`, and no grammar timeout is
+declared during the allowance. The prototype measures the allowance under
+compute and system saturation for each supported platform and fails closed if a
+safe configured bound is unavailable. This trades a bounded increase in hang-
+recovery latency for avoiding false quarantine of a healthy but descheduled
+worker.
+
 Bulk state writes run on a dedicated async writer and never hold an LSP ingress
 ticket while waiting for pipe capacity. Its queue is bounded. Queue replacement
 and writer dequeue arbitrate under the same per-document state lock. If
@@ -709,8 +720,9 @@ therefore retries every installed parser.
 
 An end-to-end request deadline starts at request admission and can release the
 client without killing the worker. A separate hard native-segment deadline
-starts only when the parent receives `NativeSegmentEntered` and ends at
-`NativeSegmentExited`, not while an arm frame is queued or in transit and not
+starts with the handoff allowance when the parent receives
+`NativeSegmentEntered`; only after that allowance does it consume the native
+budget, and it ends at `NativeSegmentExited`. It does not run while an arm frame is queued or in transit and not
 for the lifetime of the surrounding grammar hazard lease. The already recorded
 lease still provides crash attribution between arm and entry. Missing entry and
 control-protocol progress use the supervisor's bounded handshake/liveness
@@ -865,6 +877,9 @@ Implementation is accepted only when all of the following hold:
 * Saturating ordinary control admission/cancellation traffic proves reserved
   capacity and causal ordering deliver all simultaneously active segment exits
   within the control bound and cannot falsely trigger a native timeout.
+* Saturation tests deschedule a worker after its entered frame is flushed but
+  before FFI, proving the calibrated handoff allowance prevents false grammar
+  quarantine while preserving the bounded combined kill threshold.
 * A long, cooperatively chunked derivation may exceed the native-segment
   threshold in total wall time without any individual segment exceeding it; it
   is canceled or rejected through the request contract without killing the
