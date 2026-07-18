@@ -5,7 +5,7 @@ pub(crate) fn sort_diagnostics_deterministically(diagnostics: &mut [Diagnostic])
     // every cheap field need the full-value tiebreaker; caching that key within
     // each tie group avoids both serializing unrelated diagnostics and
     // repeating serialization per comparison for tie-heavy inputs.
-    diagnostics.sort_by(diagnostic_cheap_cmp);
+    diagnostics.sort_unstable_by(diagnostic_cheap_cmp);
 
     let mut start = 0;
     while start < diagnostics.len() {
