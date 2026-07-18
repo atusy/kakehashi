@@ -6,6 +6,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from unittest import mock
 
@@ -39,6 +40,40 @@ from collect_worker_proxy import (
 
 
 class CollectionHelpersTest(unittest.TestCase):
+    @unittest.skipUnless(os.name == "posix", "requires POSIX process groups")
+    def test_bounded_run_does_not_wait_for_escaped_pipe_holder(self):
+        with tempfile.TemporaryDirectory() as directory:
+            pid_file = pathlib.Path(directory) / "escaped.pid"
+            escaped = (
+                "import os,time; "
+                f"open({str(pid_file)!r}, 'w').write(str(os.getpid())); "
+                "time.sleep(2)"
+            )
+            driver = (
+                "import subprocess,sys,time; "
+                f"subprocess.Popen([sys.executable, '-c', {escaped!r}], "
+                "start_new_session=True); time.sleep(30)"
+            )
+            started = time.monotonic()
+            escaped_pid = None
+            try:
+                with self.assertRaises(subprocess.TimeoutExpired):
+                    bounded_run(
+                        [sys.executable, "-c", driver],
+                        {},
+                        timeout_seconds=0.1,
+                        termination_grace_seconds=0.1,
+                    )
+                self.assertLess(time.monotonic() - started, 1.0)
+            finally:
+                if pid_file.exists():
+                    escaped_pid = int(pid_file.read_text())
+                if escaped_pid is not None:
+                    try:
+                        os.kill(escaped_pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+
     def test_staging_cleanup_runs_when_collection_fails(self):
         staging = mock.Mock()
 

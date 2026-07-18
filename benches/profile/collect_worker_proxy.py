@@ -582,7 +582,20 @@ def terminate_process_group(process, grace_seconds):
     except subprocess.TimeoutExpired:
         stdout = stderr = None
     signal_process_group(process, signal.SIGKILL)
-    final_stdout, final_stderr = process.communicate()
+    try:
+        final_stdout, final_stderr = process.communicate(timeout=grace_seconds)
+    except subprocess.TimeoutExpired as timeout:
+        # A descendant may have escaped the process group while retaining a
+        # pipe descriptor. Do not let that unrelated lifetime defeat the
+        # collector's deadline after the group leader has been killed.
+        final_stdout, final_stderr = timeout.output, timeout.stderr
+        for stream in (process.stdout, process.stderr):
+            if stream is not None:
+                try:
+                    stream.close()
+                except OSError:
+                    pass
+        process.wait(timeout=grace_seconds)
     return (
         stdout if stdout is not None else final_stdout,
         stderr if stderr is not None else final_stderr,
