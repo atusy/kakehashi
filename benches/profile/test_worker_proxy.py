@@ -106,6 +106,14 @@ class CopyStreamTest(unittest.TestCase):
 
         terminate_child(ExitedChild())
 
+    def test_cleanup_does_not_hide_permission_failure(self):
+        child = mock.Mock()
+        child.poll.return_value = None
+        child.terminate.side_effect = PermissionError("denied")
+
+        with self.assertRaises(PermissionError):
+            terminate_child(child)
+
     def test_child_may_exit_while_proxy_stdin_remains_open(self):
         proxy = pathlib.Path(__file__).with_name("worker_proxy.py")
         env = dict(os.environ, KAKEHASHI_WORKER_PROXY_BIN=sys.executable)
