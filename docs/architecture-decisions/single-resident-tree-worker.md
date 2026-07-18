@@ -182,6 +182,7 @@ DeriveSnapshot(uri, incarnation, version, requested_artifacts)
 ResolveNode(uri, incarnation, version, selector)
 NavigateNode(uri, opaque_node_id, operation)
 RunCaptures(uri, incarnation, version, query, range)
+CancelRequest(request_id, worker_generation)
 NativeCallStarting(call_id, request_id, grammar_key)
 NativeCallArmed(call_id, worker_generation)
 NativeCallFinished(call_id)
@@ -225,6 +226,17 @@ replaying every intermediate version. `DeriveSnapshot` and other document work
 is admitted only for a version the worker has acknowledged; the worker control
 loop applies state messages in stream order before scheduling the corresponding
 tree work.
+
+Cancellation is an explicit idempotent protocol operation, not an effect of
+dropping the parent-side response future. Supersession, `$/cancelRequest`,
+`didClose`, and handler drop send `CancelRequest` for the matching worker
+generation. A queued request is removed before execution; a running request
+flips the same cancellation token polled by its tree walks and nested fan-out.
+Cancellation racing a terminal response may observe either terminal outcome,
+but a canceled or stale result cannot populate a cache, mint node state, or be
+published in the parent. Canceling an unknown, completed, or prior-generation
+request is a no-op. A non-cooperative native call remains governed by its hard
+native-call deadline; cancellation alone does not kill the whole worker.
 
 ### 5. Derived stages are fused when their inputs coincide
 
@@ -403,6 +415,9 @@ Implementation is accepted only when all of the following hold:
   enforcing per-document admission and preserving latest-wins coalescing.
 * Protocol tests cover truncated frames, oversized frames, unknown versions,
   invalid edit bases, duplicate responses, EOF, and child startup failure.
+* Cancellation tests cover queued and running work for client cancellation,
+  supersession, handler drop, and `didClose`, including completion races and the
+  rule that canceled work publishes and caches nothing.
 * Cross-platform lifecycle tests prove normal shutdown and abnormal parent exit
   do not leave an orphan worker.
 * Benchmarks report, separately, IPC enqueue, queue wait, compute, serialization,
