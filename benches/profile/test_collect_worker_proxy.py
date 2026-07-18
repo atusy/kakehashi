@@ -8,6 +8,7 @@ sys.path.insert(0, str(pathlib.Path(__file__).parent))
 
 from collect_worker_proxy import (
     build_driver_command,
+    controlled_environment,
     estimated_tree_compute_budget,
     parse_driver_summary,
     run_order,
@@ -16,6 +17,17 @@ from collect_worker_proxy import (
 
 
 class CollectionHelpersTest(unittest.TestCase):
+    def test_controlled_environment_drops_behavior_overrides(self):
+        environment = controlled_environment({
+            "PATH": "/bin",
+            "TMPDIR": "/tmp",
+            "RUST_LOG": "trace",
+            "KAKEHASHI_EXPERIMENTAL": "1",
+            "RAYON_NUM_THREADS": "99",
+        })
+
+        self.assertEqual(environment, {"PATH": "/bin", "TMPDIR": "/tmp"})
+
     def test_estimated_budget_applies_current_policy(self):
         self.assertEqual(estimated_tree_compute_budget(10), 8)
         self.assertEqual(estimated_tree_compute_budget(1), 1)

@@ -25,6 +25,27 @@ SCENARIOS = {
     ],
 }
 
+CONTROLLED_ENVIRONMENT_KEYS = (
+    "PATH",
+    "SYSTEMROOT",
+    "WINDIR",
+    "TMPDIR",
+    "TMP",
+    "TEMP",
+    "LANG",
+    "LC_ALL",
+    "LD_LIBRARY_PATH",
+    "DYLD_LIBRARY_PATH",
+)
+
+
+def controlled_environment(source):
+    return {
+        key: source[key]
+        for key in CONTROLLED_ENVIRONMENT_KEYS
+        if key in source
+    }
+
 
 def run_order(zero_based_run):
     return ("direct", "relay") if zero_based_run % 2 == 0 else ("relay", "direct")
@@ -142,7 +163,7 @@ def option_int(arguments, option, default):
 
 
 def run_driver(kind, binary, data_dir, scenario_args, script_dir):
-    env = os.environ.copy()
+    env = controlled_environment(os.environ)
     if kind == "relay":
         env["KAKEHASHI_WORKER_PROXY_BIN"] = str(binary)
     command = build_driver_command(
@@ -206,6 +227,7 @@ def main():
             "data_dir": str(args.data_dir.resolve()),
             "parser_query_file_count": len(data_files),
             "parser_query_tree_sha256": shasum_tree_digest(args.data_dir),
+            "retained_environment": controlled_environment(os.environ),
         },
         "collector": {
             "pairs": args.pairs,
