@@ -471,12 +471,20 @@ status and uninstall behavior without treating a query as a parser selection.
 
 Every worker-generation startup, including crash recovery, planned replacement,
 rollback, and a circuit-breaker half-open probe, re-reads each relevant manifest
-revision under its per-grammar lock before sending worker configuration. A
-changed revision invalidates the parent's cached descriptor and advances its
-local configuration generation; a tombstone removes the selection and a newer
-digest is re-imported and verified. A running parent therefore cannot restart a
-worker from a descriptor captured before another process uninstalled or replaced
-the grammar.
+revision under its per-grammar lock and snapshots `(grammar, revision,
+digest-or-tombstone)` before sending worker configuration. A changed revision
+invalidates the parent's cached descriptor and advances its local configuration
+generation; a tombstone removes the selection and a newer digest is re-imported
+and verified.
+
+Those locks are not held across process startup. After the candidate worker has
+loaded and validated its configuration but before `QuarantineReady`, document
+sync, or public request admission, the parent re-reads every snapshotted revision
+under a deterministic lock order. Any mismatch is a failed startup fence: the
+candidate is terminated and reaped, selections are reconciled, and a new
+generation is attempted under the restart budget. This post-load/pre-enable
+fence prevents a running parent from enabling a descriptor superseded by another
+process's uninstall or replacement during startup.
 
 Loading the same quarantined `grammar_key` is refused; a genuinely replaced
 artifact has a different content identity and may be loaded by the fresh
@@ -751,6 +759,8 @@ Implementation is accepted only when all of the following hold:
   affected local workers transition generations, other live generations keep
   their mapped bytes safely, and restarting another still-running parent's
   worker revalidates the manifest and cannot select the uninstalled digest.
+  A tombstone or replacement committed between the pre-start snapshot and
+  enable fence forces candidate reap and reconciliation before public service.
 * CLI tests cover migrated selections, tombstones, retained legacy files,
   immutable-blob-only files, and query-only languages, proving list/status and
   `uninstall --all` operate on logical manifest selections rather than storage
