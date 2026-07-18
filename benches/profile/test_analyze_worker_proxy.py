@@ -1,6 +1,8 @@
 import pathlib
+import random
 import sys
 import unittest
+from unittest import mock
 
 sys.path.insert(0, str(pathlib.Path(__file__).parent))
 
@@ -32,6 +34,17 @@ class PairedSummaryTest(unittest.TestCase):
         self.assertAlmostEqual(summary["stddev_ms"], 10.0)
         self.assertAlmostEqual(summary["min_ms"], 100.0)
         self.assertAlmostEqual(summary["max_ms"], 120.0)
+
+    def test_bootstrap_uses_bulk_sampling(self):
+        pairs = [
+            {"direct": {"p50": 1.0}, "relay": {"p50": 1.1}},
+            {"direct": {"p50": 2.0}, "relay": {"p50": 2.2}},
+        ]
+
+        with mock.patch.object(
+            random.Random, "choice", side_effect=AssertionError("scalar sampling")
+        ):
+            summarize_pairs(pairs, "p50", seed=7, resamples=10)
 
 
 if __name__ == "__main__":

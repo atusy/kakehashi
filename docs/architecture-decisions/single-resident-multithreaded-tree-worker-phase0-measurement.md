@@ -50,7 +50,7 @@ its reporting resolution.
 | Rust small, unchanged cache hit | p99 | 0.87 ms | 0.94 ms | +0.07 ms | [-0.01, 0.16] ms |
 | Rust small, one edit/request | p50 | 3.67 ms | 3.73 ms | +0.06 ms | [0.01, 0.12] ms |
 | Rust small, one edit/request | p95 | 4.33 ms | 4.42 ms | +0.09 ms | [-0.10, 0.29] ms |
-| Rust small, one edit/request | p99 | 5.08 ms | 5.29 ms | +0.21 ms | [-0.28, 0.82] ms |
+| Rust small, one edit/request | p99 | 5.08 ms | 5.29 ms | +0.21 ms | [-0.28, 0.83] ms |
 | Markdown injections, one edit/request | p50 | 2.54 ms | 2.53 ms | -0.01 ms | [-0.03, 0.00] ms |
 | Markdown injections, one edit/request | p95 | 2.83 ms | 2.72 ms | -0.11 ms | [-0.26, 0.00] ms |
 | Markdown injections, one edit/request | p99 | 5.04 ms | 5.45 ms | +0.41 ms | [-0.26, 1.08] ms |

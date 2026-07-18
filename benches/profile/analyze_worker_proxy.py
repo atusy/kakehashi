@@ -24,7 +24,7 @@ def summarize_pairs(pairs, metric, seed=123_456_789, resamples=100_000):
     deltas = [right - left for left, right in zip(direct, relay)]
     rng = random.Random(seed)
     bootstrapped_means = [
-        mean([rng.choice(deltas) for _ in deltas])
+        mean(rng.choices(deltas, k=len(deltas)))
         for _ in range(resamples)
     ]
     direct_mean = mean(direct)
