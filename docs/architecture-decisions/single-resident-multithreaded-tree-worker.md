@@ -1,4 +1,4 @@
-# Run Tree-Derived Computation in One Resident Multithreaded Worker
+# Single Resident Multithreaded Tree Worker
 
 | | |
 |---|---|
@@ -106,9 +106,8 @@ state disposable. The duplicated worker-side text is a derived cache maintained
 by versioned full-sync and incremental-edit messages, not a second source of
 truth.
 
-Host-tier operations defined by
-[parse-decoupled-document-lifecycle](parse-decoupled-document-lifecycle.md)
-remain entirely in the parent and do not wait for the worker.
+Host-tier operations defined by parse-decoupled-document-lifecycle remain
+entirely in the parent and do not wait for the worker.
 
 ### 2. Worker is the tree-derived data plane
 
@@ -376,18 +375,17 @@ delete-on-supersede convention. Until that coordinated update lands, the
 existing in-process snapshot decision remains authoritative.
 
 It preserves the single per-document lifecycle owner from
-[per-document-parse-scheduler](per-document-parse-scheduler.md), but places that
-owner in the worker for tree-derived work. The parent remains authoritative for
-document input and lifetime, so a worker-owned parse task cannot resurrect a
-closed or reopened document.
+per-document-parse-scheduler, but places that owner in the worker for
+tree-derived work. The parent remains authoritative for document input and
+lifetime, so a worker-owned parse task cannot resurrect a closed or reopened
+document.
 
-It does not reverse
-[replace-tree-sitter-cli-with-loader](replace-tree-sitter-cli-with-loader.md).
-The loader remains responsible for compiling grammars; runtime loading of the
-resulting native library moves into the worker. The existing killable compiler
-subprocess and the resident runtime worker are separate lifecycles. Source
-acquisition, compilation, and atomic installation remain parent-owned; only the
-post-install runtime reload crosses into the worker.
+It does not reverse replace-tree-sitter-cli-with-loader. The loader remains
+responsible for compiling grammars; runtime loading of the resulting native
+library moves into the worker. The existing killable compiler subprocess and
+the resident runtime worker are separate lifecycles. Source acquisition,
+compilation, and atomic installation remain parent-owned; only the post-install
+runtime reload crosses into the worker.
 
 ### Consequences
 
