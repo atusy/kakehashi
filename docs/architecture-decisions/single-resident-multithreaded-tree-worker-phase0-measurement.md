@@ -209,9 +209,9 @@ Reconstruct a dedicated parser/query tree at the pinned revision rather than
 installing from a moving `main` branch, then collect a new alternating 10-pair
 steady-state batch without hand transcription:
 
-```sh
+```bash
 (
-set -eu
+set -euo pipefail
 revision=4916d6592ede8c07973490d9322f187e07dfefac
 workspace_dir="$(mktemp -d "${TMPDIR:-/tmp}/kakehashi-phase0.XXXXXX")"
 test -n "$workspace_dir" && test -d "$workspace_dir"
