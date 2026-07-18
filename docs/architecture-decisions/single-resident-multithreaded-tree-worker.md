@@ -619,10 +619,12 @@ native crash is exempt only when its OS failure evidence and still-active lease
 satisfy the native-evidenced rule; merely being inside Rust derivation or
 serialization under a broad lease is not sufficient.
 
-Native-evidenced recovery has a separate rolling budget: at most eight worker
-restarts that newly quarantine grammar keys in any 60-second window. The ninth
-opens a native-storm breaker and leaves the tree tier unavailable for the current
-configuration generation even though each individual cause was attributable.
+Native-evidenced recovery has a separate consecutive budget of eight worker
+restarts that newly quarantine grammar keys. The count does not decay merely
+because failures are spaced apart; only 60 continuous seconds of healthy worker
+service resets it. The ninth failure before that reset opens a native-storm
+breaker and leaves the tree tier unavailable for the current configuration
+generation even though each individual cause was attributable.
 After at least 60 seconds without spawning a worker, an explicit parser artifact
 or relevant configuration change permits one half-open probe; ordinary requests,
 document edits, and new grammar aliases do not. A successful 60-second healthy
@@ -847,10 +849,10 @@ Implementation is accepted only when all of the following hold:
   quarantined without consuming the systemic circuit-breaker budget; a following
   healthy grammar still derives successfully. Re-entry by an already quarantined
   grammar instead consumes the budget and is reported as an invariant violation.
-* More than eight distinct native-evidenced grammar failures within one minute
-  trip the independent native-storm breaker and stop respawning; a permitted
-  half-open probe after cooldown either restores stable service or returns to
-  the degraded state.
+* More than eight distinct native-evidenced grammar failures without an
+  intervening healthy interval trip the independent native-storm breaker and
+  stop respawning regardless of their spacing; a permitted half-open probe after
+  cooldown either restores stable service or returns to the degraded state.
 * A protocol-corruption or reported Rust-panic fixture while a grammar lease is
   active may conservatively quarantine that key but still consumes the systemic
   budget; a signaled native crash with the same lease follows the native-evidence
