@@ -6,10 +6,19 @@ import unittest
 
 sys.path.insert(0, str(pathlib.Path(__file__).parent))
 
-from collect_worker_proxy import parse_driver_summary, run_order, shasum_tree_digest
+from collect_worker_proxy import (
+    estimated_tree_compute_budget,
+    parse_driver_summary,
+    run_order,
+    shasum_tree_digest,
+)
 
 
 class CollectionHelpersTest(unittest.TestCase):
+    def test_estimated_budget_applies_current_policy(self):
+        self.assertEqual(estimated_tree_compute_budget(10), 8)
+        self.assertEqual(estimated_tree_compute_budget(1), 1)
+
     def test_alternates_direct_and_relay_order(self):
         self.assertEqual(run_order(0), ("direct", "relay"))
         self.assertEqual(run_order(1), ("relay", "direct"))

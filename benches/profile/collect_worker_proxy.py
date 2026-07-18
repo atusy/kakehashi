@@ -30,6 +30,10 @@ def run_order(zero_based_run):
     return ("direct", "relay") if zero_based_run % 2 == 0 else ("relay", "direct")
 
 
+def estimated_tree_compute_budget(logical_cpus):
+    return max(1, logical_cpus - 2)
+
+
 def parse_driver_summary(output):
     wall_match = re.search(r"\bwall=([\d.]+)ms", output)
     method_match = re.search(
@@ -140,8 +144,13 @@ def main():
             "rustc": tool_version(["rustc", "--version"]),
             "cpu_model": cpu_model(),
             "logical_cpus": logical_cpus,
-            "tree_compute_budget": max(1, logical_cpus - 2),
-            "tree_compute_budget_source": "current available_parallelism - 2 policy",
+            "estimated_tree_compute_budget": estimated_tree_compute_budget(
+                logical_cpus
+            ),
+            "estimated_tree_compute_budget_source": (
+                "os.cpu_count approximation of available_parallelism - 2 policy; "
+                "not the binary's reported effective pool size"
+            ),
             "binary": str(args.bin.resolve()),
             "binary_sha256": sha256_file(args.bin),
             "data_dir": str(args.data_dir.resolve()),
