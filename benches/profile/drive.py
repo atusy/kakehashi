@@ -23,6 +23,10 @@ import time
 
 benchmark_clock = time.perf_counter
 
+
+def format_wall_milliseconds(seconds):
+    return repr(seconds * 1_000)
+
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from gen_session import gen_rust, gen_markdown_injections  # noqa: E402
 
@@ -612,7 +616,7 @@ def main() -> None:
         f"[drive] lang={lang} {source} cycles={args.requests} burst={args.burst} "
         f"responses={measured_responses} "
         f"ok={ok} canceled={canceled} superseded={superseded} tokens/req={tokens} "
-        f"wall={elapsed*1000:.0f}ms "
+        f"wall={format_wall_milliseconds(elapsed)}ms "
         f"({elapsed/args.requests*1000:.2f}ms/cycle, "
         f"{elapsed/measured_responses*1000:.2f}ms/measured-response)\n")
     for method, samples in request_samples.items():

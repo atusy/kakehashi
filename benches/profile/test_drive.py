@@ -11,6 +11,7 @@ sys.path.insert(0, str(pathlib.Path(__file__).parent))
 from drive import (
     benchmark_clock,
     capture_result_id,
+    format_wall_milliseconds,
     RequestSample,
     count_semantic_outcomes,
     next_toggle_change,
@@ -144,6 +145,12 @@ class RequestSummaryTest(unittest.TestCase):
 
     def test_aggregate_timing_uses_monotonic_clock(self):
         self.assertIs(benchmark_clock, time.perf_counter)
+
+    def test_wall_time_format_preserves_sub_millisecond_precision(self):
+        formatted = format_wall_milliseconds(1.23456789)
+
+        self.assertAlmostEqual(float(formatted), 1234.56789, places=9)
+        self.assertIn(".", formatted)
 
     def test_summarizes_latency_status_and_wire_bytes(self):
         samples = [
