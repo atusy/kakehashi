@@ -266,12 +266,16 @@ the same transition. Close removes every pending state and deferred edit for
 that incarnation. Restart creates new per-generation `Unsynced` states rather
 than attempting to replay old acknowledgments.
 
+Parent and worker use a separately bounded, bidirectional control transport for
+request admission, cancellation, shutdown, liveness, grammar-hazard leases, and
+every native-segment frame, including `NativeSegmentExited`. Bulk document state
+and derived response payloads use a different bounded transport. A large
+full-sync or serialized result therefore cannot sit ahead of an arm or exit
+event and falsely consume a native deadline. The control channel has one ordered
+writer in each direction and is serviced independently of the compute pool.
+
 Bulk state writes run on a dedicated async writer and never hold an LSP ingress
-ticket while waiting for pipe capacity. Its queue is bounded. A separately
-bounded priority control path carries arm, cancel, shutdown, and liveness frames;
-bulk full-text frames cannot sit ahead of hazard or segment arm traffic. If both classes are
-multiplexed onto one OS stream, bulk frames are chunked to a measured maximum so
-the control-latency bound is preserved between chunks. When bulk backpressure
+ticket while waiting for pipe capacity. Its queue is bounded. When bulk backpressure
 would retain an obsolete chain of unsent document edits, the parent replaces
 that chain with one latest full-sync candidate rather than blocking ingress or
 replaying every intermediate version. `DeriveSnapshot` and other document work
@@ -577,6 +581,9 @@ Implementation is accepted only when all of the following hold:
 * A saturated bulk full-sync queue proves arm control traffic remains bounded
   and that the native hard deadline begins only after `NativeSegmentEntered`, so
   transport delay alone cannot quarantine a healthy grammar.
+* A saturated worker-to-parent derived-result stream likewise proves
+  `NativeSegmentExited` and hazard release remain deliverable before their
+  deadlines and cannot be trapped behind a large response.
 * A long, cooperatively chunked derivation may exceed the native-segment
   threshold in total wall time without any individual segment exceeding it; it
   is canceled or rejected through the request contract without killing the
