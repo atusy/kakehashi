@@ -591,6 +591,58 @@ mod tests {
         );
     }
 
+    #[test]
+    fn multiple_malformed_capabilities_are_dropped_independently() {
+        let response = serde_json::json!({
+            "result": {
+                "capabilities": {
+                    "textDocumentSync": 1,
+                    "hoverProvider": 42,
+                    "completionProvider": true
+                }
+            }
+        });
+
+        let parsed = parse_initialize_response_capabilities(&response)
+            .expect("malformed feature capabilities must degrade independently");
+
+        assert!(parsed.capabilities.text_document_sync.is_some());
+        assert!(parsed.capabilities.hover_provider.is_none());
+        assert!(parsed.capabilities.completion_provider.is_none());
+        let mut dropped = parsed
+            .dropped
+            .iter()
+            .map(|dropped| dropped.field.as_str())
+            .collect::<Vec<_>>();
+        dropped.sort_unstable();
+        assert_eq!(dropped, ["completionProvider", "hoverProvider"]);
+    }
+
+    #[rstest]
+    #[case::omitted(serde_json::json!({"result": {}}))]
+    #[case::null(serde_json::json!({"result": {"capabilities": null}}))]
+    fn omitted_or_null_capabilities_remain_compatible(#[case] response: serde_json::Value) {
+        let parsed = parse_initialize_response_capabilities(&response)
+            .expect("omitted or null capabilities remain compatible");
+
+        assert_eq!(parsed.capabilities, ServerCapabilities::default());
+        assert!(parsed.dropped.is_empty());
+    }
+
+    #[rstest]
+    #[case::scalar_result(serde_json::json!({"result": 42}))]
+    #[case::array_result(serde_json::json!({"result": []}))]
+    #[case::scalar_capabilities(
+        serde_json::json!({"result": {"capabilities": "not-an-object"}})
+    )]
+    #[case::array_capabilities(serde_json::json!({"result": {"capabilities": []}}))]
+    fn structurally_invalid_initialize_payload_fails(#[case] response: serde_json::Value) {
+        let error = parse_initialize_response_capabilities(&response)
+            .expect_err("structural corruption must fail the handshake");
+
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    }
+
     #[rstest]
     #[case::null_result(
         serde_json::json!({"result": null}),
@@ -650,6 +702,7 @@ mod tests {
     ) {
         let error = parse_initialize_response_capabilities(&response)
             .expect_err("non-UTF-16 downstream encoding must fail initialization");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
         let message = error.to_string();
         assert!(message.contains(field), "unexpected error: {message}");
         assert!(message.contains(announced), "unexpected error: {message}");

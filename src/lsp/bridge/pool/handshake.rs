@@ -100,3 +100,71 @@ pub(super) async fn perform_lsp_handshake(
 
     Ok(capabilities)
 }
+
+#[cfg(all(test, unix))]
+mod tests {
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use super::*;
+    use crate::lsp::bridge::actor::{ResponseRouter, spawn_reader_task};
+    use crate::lsp::bridge::connection::AsyncBridgeConnection;
+
+    #[tokio::test]
+    async fn recovered_capabilities_complete_the_handshake() {
+        let temp = tempfile::tempdir().unwrap();
+        let output = temp.path().join("messages");
+        let mut connection = AsyncBridgeConnection::spawn(vec![
+            "sh".to_string(),
+            "-c".to_string(),
+            "cat > \"$1\"".to_string(),
+            "sh".to_string(),
+            output.display().to_string(),
+        ])
+        .await
+        .unwrap();
+        let (writer, reader) = connection.split();
+        let router = Arc::new(ResponseRouter::new());
+        let reader_handle = spawn_reader_task(reader, Arc::clone(&router));
+        let handle = ConnectionHandle::new(writer, router, reader_handle);
+        let (response_tx, response_rx) = tokio::sync::oneshot::channel();
+        response_tx
+            .send(serde_json::json!({
+                "result": {
+                    "capabilities": {
+                        "hoverProvider": 42,
+                        "completionProvider": {"triggerCharacters": ["."]}
+                    }
+                }
+            }))
+            .unwrap();
+
+        let capabilities = perform_lsp_handshake(
+            &handle,
+            RequestId::new(1),
+            response_rx,
+            None,
+            None,
+            None,
+            None,
+            false,
+        )
+        .await
+        .expect("recoverable capability errors must not stop the handshake");
+
+        assert!(capabilities.hover_provider.is_none());
+        assert!(capabilities.completion_provider.is_some());
+        let mut messages = String::new();
+        for _ in 0..40 {
+            messages = std::fs::read_to_string(&output).unwrap_or_default();
+            if messages.contains("\"method\":\"initialized\"") {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert!(
+            messages.contains("\"method\":\"initialized\""),
+            "initialized notification was not written: {messages:?}"
+        );
+    }
+}
