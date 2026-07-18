@@ -1011,7 +1011,8 @@ impl DiagnosticAggregator {
         // present (the common path), cloning the `host` key only on first insert.
         if let Some(prev) = last.get_mut(host) {
             // Fast path: `merge_cached_diagnostics` output is deterministically
-            // sorted (#423 / `sort_diagnostics`, a total order), so equal sets
+            // sorted (#423 / `sort_diagnostics_deterministically`, a total order),
+            // so equal sets
             // arrive slice-equal — the O(n²) multiset walk below is only the
             // fallback for order variation a future unsorted caller could
             // introduce.
