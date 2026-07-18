@@ -10,6 +10,14 @@ from analyze_worker_proxy import analyze_data, summarize_cold_start, summarize_p
 
 
 class PairedSummaryTest(unittest.TestCase):
+    def test_rejects_non_positive_resample_count(self):
+        pairs = [{"direct": {"p50": 1.0}, "relay": {"p50": 1.1}}]
+
+        for resamples in (0, -1):
+            with self.subTest(resamples=resamples):
+                with self.assertRaisesRegex(ValueError, "resamples must be positive"):
+                    summarize_pairs(pairs, "p50", resamples=resamples)
+
     def test_reports_deterministic_paired_mean_and_interval(self):
         pairs = [
             {"direct": {"p50": 1.0}, "relay": {"p50": 1.1}},

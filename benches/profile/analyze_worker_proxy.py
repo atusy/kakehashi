@@ -19,6 +19,8 @@ def nearest_rank(values, quantile):
 
 
 def summarize_pairs(pairs, metric, seed=123_456_789, resamples=100_000):
+    if resamples <= 0:
+        raise ValueError("resamples must be positive")
     direct = [pair["direct"][metric] for pair in pairs]
     relay = [pair["relay"][metric] for pair in pairs]
     deltas = [right - left for left, right in zip(direct, relay)]
@@ -108,6 +110,8 @@ def main():
         args.last_pairs is not None and args.last_pairs <= 0
     ):
         parser.error("pair slice counts must be positive (or zero for drop-first)")
+    if args.resamples <= 0:
+        parser.error("resamples must be positive")
 
     data = json.loads(args.data.read_text())
     summaries = analyze_data(
