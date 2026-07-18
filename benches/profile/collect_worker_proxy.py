@@ -171,6 +171,29 @@ def runtime_artifact_files(root):
     )
 
 
+def require_benchmark_artifacts(root):
+    required_files = [root / "cache/parsers.lua"]
+    for language in ("rust", "markdown", "markdown_inline", "lua", "python"):
+        required_files.append(root / f"queries/{language}/highlights.scm")
+        parser_candidates = [
+            path for path in (root / "parser").glob(f"{language}.*")
+            if path.is_file() and not path.is_symlink()
+        ]
+        if not parser_candidates:
+            raise ValueError(
+                f"missing benchmark artifact: parser for {language}"
+            )
+    required_files.append(root / "queries/markdown/injections.scm")
+    for path in required_files:
+        if not path.is_file() or path.is_symlink():
+            raise ValueError(f"missing benchmark artifact: {path}")
+
+
+def artifact_identity(root):
+    files = runtime_artifact_files(root)
+    return len(files), shasum_tree_digest(root)
+
+
 def shasum_tree_digest(root):
     """Match `find . | sort | xargs shasum | shasum` from the report."""
     digest = hashlib.sha256()
@@ -269,8 +292,9 @@ def main():
 
     script_dir = pathlib.Path(__file__).resolve().parent
     selected = args.scenarios or list(SCENARIOS)
+    require_benchmark_artifacts(args.data_dir)
+    initial_artifact_identity = artifact_identity(args.data_dir)
     logical_cpus = os.cpu_count() or 1
-    data_files = runtime_artifact_files(args.data_dir)
     result = {
         "schema": 1,
         "experiment": "single-tree-worker-phase0-raw-relay",
@@ -290,8 +314,8 @@ def main():
             "binary": str(args.bin.resolve()),
             "binary_sha256": sha256_file(args.bin),
             "data_dir": str(args.data_dir.resolve()),
-            "parser_query_file_count": len(data_files),
-            "parser_query_tree_sha256": shasum_tree_digest(args.data_dir),
+            "parser_query_file_count": initial_artifact_identity[0],
+            "parser_query_tree_sha256": initial_artifact_identity[1],
             "retained_environment": controlled_environment(os.environ),
         },
         "artifacts": artifact_provenance(
@@ -325,6 +349,12 @@ def main():
             "arguments": SCENARIOS[scenario],
             "pairs": pairs,
         }
+    final_artifact_identity = artifact_identity(args.data_dir)
+    if final_artifact_identity != initial_artifact_identity:
+        raise RuntimeError(
+            "runtime artifacts changed during collection: "
+            f"before={initial_artifact_identity} after={final_artifact_identity}"
+        )
     args.output.write_text(json.dumps(result, indent=2) + "\n")
 
 

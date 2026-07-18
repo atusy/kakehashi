@@ -13,12 +13,18 @@ from collect_worker_proxy import (
     estimated_tree_compute_budget,
     artifact_provenance,
     parse_driver_summary,
+    require_benchmark_artifacts,
     run_order,
     shasum_tree_digest,
 )
 
 
 class CollectionHelpersTest(unittest.TestCase):
+    def test_benchmark_artifacts_require_every_exercised_language(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaisesRegex(ValueError, "missing benchmark artifact"):
+                require_benchmark_artifacts(pathlib.Path(directory))
+
     def test_artifact_provenance_verifies_metadata_and_queries_at_revision(self):
         with tempfile.TemporaryDirectory() as directory:
             root = pathlib.Path(directory)
