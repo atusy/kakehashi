@@ -170,7 +170,7 @@ scenario arguments, environment, and artifact-tree digest are committed in
 generated cold-start and captures results are in
 `benches/profile/results/single_worker_phase0_cold_start_2026-07-19.json` and
 `benches/profile/results/single_worker_phase0_captures_pilot_2026-07-19.json`.
-The binary build attestation used by both collectors is in
+The binary build attestation used by all three collectors is in
 `benches/profile/results/single_worker_phase0_binary_attestation_2026-07-19.json`.
 Recompute every steady-state table value and confidence interval with:
 
