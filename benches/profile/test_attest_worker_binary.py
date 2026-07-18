@@ -15,10 +15,53 @@ from attest_worker_binary import (
     native_toolchain_metadata,
     require_isolated_source,
     require_uncredentialed_repository_url,
+    verify_remote_commit,
 )
 
 
 class BinaryAttestationTest(unittest.TestCase):
+    def test_source_commit_must_be_reachable_from_recorded_remote(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            remote = root / "remote.git"
+            checkout = root / "checkout"
+            subprocess.run(["git", "init", "--bare", "-q", remote], check=True)
+            subprocess.run(["git", "init", "-q", checkout], check=True)
+            source = checkout / "source.txt"
+            source.write_text("pushed")
+            subprocess.run(["git", "-C", checkout, "add", "."], check=True)
+            commit = [
+                "git", "-C", checkout,
+                "-c", "user.name=benchmark-test",
+                "-c", "user.email=benchmark@example.invalid",
+                "commit", "-qm",
+            ]
+            subprocess.run([*commit, "pushed"], check=True)
+            pushed = subprocess.run(
+                ["git", "-C", checkout, "rev-parse", "HEAD"],
+                check=True, text=True, stdout=subprocess.PIPE,
+            ).stdout.strip()
+            subprocess.run(
+                [
+                    "git", "-C", checkout, "push", "-q", str(remote),
+                    "HEAD:refs/heads/main",
+                ],
+                check=True,
+            )
+
+            refs = verify_remote_commit(str(remote), pushed)
+
+            self.assertEqual(refs, ["refs/remotes/origin/main"])
+            source.write_text("local only")
+            subprocess.run(["git", "-C", checkout, "add", "."], check=True)
+            subprocess.run([*commit, "local"], check=True)
+            local = subprocess.run(
+                ["git", "-C", checkout, "rev-parse", "HEAD"],
+                check=True, text=True, stdout=subprocess.PIPE,
+            ).stdout.strip()
+            with self.assertRaisesRegex(ValueError, "not reachable"):
+                verify_remote_commit(str(remote), local)
+
     def test_rejects_credential_bearing_repository_url(self):
         for repository in (
             "https://token@github.com/atusy/kakehashi.git",

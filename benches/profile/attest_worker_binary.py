@@ -12,7 +12,12 @@ import tarfile
 import tempfile
 import urllib.parse
 
-from collect_worker_proxy import ATTESTED_BUILD_COMMAND, sha256_file, tool_version
+from collect_worker_proxy import (
+    ATTESTED_BUILD_COMMAND,
+    controlled_environment,
+    sha256_file,
+    tool_version,
+)
 
 BINARY_RELATIVE = pathlib.Path("target/release/kakehashi")
 BUILD_ENVIRONMENT_KEYS = (
@@ -139,6 +144,67 @@ def require_uncredentialed_repository_url(repository):
     return repository
 
 
+def verify_remote_commit(repository, revision):
+    environment = controlled_environment(os.environ)
+    environment.update({
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_CONFIG_GLOBAL": os.devnull,
+        "GIT_NO_REPLACE_OBJECTS": "1",
+    })
+    with tempfile.TemporaryDirectory(
+        prefix="kakehashi-attested-origin-"
+    ) as directory:
+        isolated = pathlib.Path(directory) / "repository.git"
+        subprocess.run(
+            ["git", "init", "--bare", "-q", isolated],
+            check=True,
+            env=environment,
+        )
+        fetched = subprocess.run(
+            [
+                "git", "--git-dir", isolated, "fetch", "--no-tags",
+                repository, "+refs/heads/*:refs/remotes/origin/*",
+            ],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=environment,
+        )
+        if fetched.returncode:
+            raise ValueError(
+                f"could not fetch attested source repository: {fetched.stderr}"
+            )
+        revision_exists = subprocess.run(
+            [
+                "git", "--git-dir", isolated, "cat-file", "-e",
+                f"{revision}^{{commit}}",
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=environment,
+        )
+        if revision_exists.returncode:
+            raise ValueError(
+                f"source commit {revision} is not reachable from {repository}"
+            )
+        containing = subprocess.run(
+            [
+                "git", "--git-dir", isolated, "for-each-ref",
+                "--format=%(refname)", "--contains", revision,
+                "refs/remotes/origin",
+            ],
+            check=True,
+            text=True,
+            stdout=subprocess.PIPE,
+            env=environment,
+        ).stdout.splitlines()
+        if not containing:
+            raise ValueError(
+                f"source commit {revision} is not reachable from {repository}"
+            )
+        return containing
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--checkout", type=pathlib.Path, required=True)
@@ -149,6 +215,9 @@ def main():
     source_commit = git(args.checkout, "rev-parse", "HEAD")
     source_repository = require_uncredentialed_repository_url(
         git(args.checkout, "remote", "get-url", "origin")
+    )
+    source_remote_refs = verify_remote_commit(
+        source_repository, source_commit
     )
     with tempfile.TemporaryDirectory(prefix="kakehashi-attested-build-") as root:
         isolated_root = pathlib.Path(root)
@@ -175,6 +244,7 @@ def main():
         "schema": 1,
         "source_repository": source_repository,
         "source_commit": source_commit,
+        "source_remote_refs_containing_commit": source_remote_refs,
         "source_checkout_clean": True,
         "build_command": ATTESTED_BUILD_COMMAND,
         "rustc": rustc,
