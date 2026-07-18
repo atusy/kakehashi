@@ -395,11 +395,20 @@ worker/protocol failure and does not invent a parser quarantine.
 
 After quarantine, the parent starts a fresh worker with bounded backoff, sends
 the versioned quarantine set before enabling document derivation, and full-syncs
-all open documents. Restarts are also governed by a per-session circuit breaker:
-three worker-generation failures without an intervening 60 seconds of healthy
-service exhaust the budget for the current configuration generation. This
-counts startup, handshake, protocol, resync, native-timeout, and delayed
-post-return failures, whether or not a grammar could be attributed.
+all open documents. Restarts are also governed by a per-session systemic-failure
+circuit breaker. A failure that attributes and newly quarantines one or more
+previously allowed grammar keys does not consume this global budget: quarantine
+has removed a concrete cause, so healthy grammars must still recover even if
+several distinct bad artifacts are encountered. Such restarts remain rate
+limited by backoff.
+
+Three systemic worker-generation failures without an intervening 60 seconds of
+healthy service exhaust the budget for the current configuration generation.
+Systemic failures include startup, handshake, protocol, and resync failures;
+failures with no active grammar lease; and any failure that again involves an
+already quarantined key, which demonstrates a quarantine or routing violation.
+A native timeout or delayed post-return failure consumes the systemic budget
+only when it cannot newly quarantine its attributed cause.
 
 When the budget is exhausted, the parent stops spawning workers and marks the
 tree tier unavailable for that configuration generation. It wakes all tree
@@ -596,6 +605,10 @@ Implementation is accepted only when all of the following hold:
   the restart budget converges to one logged tree-tier-unavailable state, wakes
   waiters, stops respawning, and leaves host-tier service usable. A relevant
   configuration or artifact change permits exactly one half-open probe.
+* Three distinct crashing grammars are each newly quarantined without consuming
+  the systemic circuit-breaker budget; a following healthy grammar still derives
+  successfully. Re-entry by an already quarantined grammar instead consumes the
+  budget and is reported as an invariant violation.
 * Install/reload tests cover missing host and injected grammars, concurrent
   install deduplication, cache invalidation, latest-version re-derivation, and
   refusal to load the same quarantined artifact. Same-path parser replacement,
