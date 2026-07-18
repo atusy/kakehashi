@@ -1,0 +1,94 @@
+{
+  "schema": 1,
+  "experiment": "single-tree-worker-phase0-raw-relay",
+  "date": "2026-07-18",
+  "environment": {
+    "machine": "Apple M4",
+    "physical_cpus": 10,
+    "logical_cpus": 10,
+    "tree_compute_budget": 8,
+    "os": "macOS 26.5.1 (25F80)",
+    "release_binary_commit": "ccbd8ffd13c4817eda62e1de6f8cfd3eeb3259d0",
+    "origin_main_commit": "a1278be5fdff24d109d9e03134c6bdb880577f64",
+    "parser_query_file_count": 28,
+    "parser_query_tree_sha256": "3258dea73fef01a75ad7dcf3c513fbc83ec5702c27b255b0feb882f59b208cc7"
+  },
+  "analysis": {
+    "method": "paired bootstrap of run-level summaries",
+    "seed": 123456789,
+    "resamples": 100000,
+    "interval": "nearest-rank 2.5th and 97.5th percentiles"
+  },
+  "commands": {
+    "common": "python3 benches/profile/drive.py --data-dir $DATA_DIR",
+    "direct_suffix": "--bin $KAKEHASHI_BIN",
+    "relay_prefix": "KAKEHASHI_WORKER_PROXY_BIN=$KAKEHASHI_BIN",
+    "relay_suffix": "--bin ./benches/profile/worker_proxy.py",
+    "rust_cache_hit": "--lang rust --size 15 --requests 1000",
+    "rust_edit": "--lang rust --size 15 --requests 100 --edits 1",
+    "markdown_edit": "--lang markdown --size 150 --requests 100 --edits 1",
+    "captures_pilot": "--lang markdown --size 150 --requests 100 --edits 1 --concurrent-captures",
+    "cold_start": "hyperfine --warmup 3 --runs 20 --shell zsh '<direct --requests 1 --settle 0>' '<relay --requests 1 --settle 0>'"
+  },
+  "steady_state": {
+    "rust_cache_hit": {
+      "requests_per_process": 1000,
+      "response_wire_kib_per_process": 14295.8,
+      "pairs": [
+        {"run": 1, "order": "direct-relay", "direct": {"p50": 0.3, "p90": 0.4, "p95": 0.5, "p99": 0.6, "max": 3.9, "wall": 339}, "relay": {"p50": 0.3, "p90": 0.4, "p95": 0.5, "p99": 1.0, "max": 7.5, "wall": 369}},
+        {"run": 2, "order": "relay-direct", "direct": {"p50": 0.3, "p90": 0.4, "p95": 0.5, "p99": 1.0, "max": 9.6, "wall": 356}, "relay": {"p50": 0.3, "p90": 0.4, "p95": 0.5, "p99": 0.9, "max": 9.1, "wall": 363}},
+        {"run": 3, "order": "direct-relay", "direct": {"p50": 0.3, "p90": 0.4, "p95": 0.5, "p99": 0.9, "max": 9.1, "wall": 359}, "relay": {"p50": 0.3, "p90": 0.4, "p95": 0.6, "p99": 1.0, "max": 8.8, "wall": 375}},
+        {"run": 4, "order": "relay-direct", "direct": {"p50": 0.3, "p90": 0.4, "p95": 0.5, "p99": 0.8, "max": 8.9, "wall": 356}, "relay": {"p50": 0.3, "p90": 0.4, "p95": 0.5, "p99": 0.8, "max": 5.0, "wall": 359}},
+        {"run": 5, "order": "direct-relay", "direct": {"p50": 0.3, "p90": 0.5, "p95": 0.7, "p99": 1.0, "max": 10.2, "wall": 394}, "relay": {"p50": 0.3, "p90": 0.5, "p95": 0.7, "p99": 1.1, "max": 9.1, "wall": 401}},
+        {"run": 6, "order": "relay-direct", "direct": {"p50": 0.3, "p90": 0.4, "p95": 0.5, "p99": 0.8, "max": 6.7, "wall": 366}, "relay": {"p50": 0.3, "p90": 0.4, "p95": 0.5, "p99": 0.9, "max": 7.6, "wall": 376}},
+        {"run": 7, "order": "direct-relay", "direct": {"p50": 0.3, "p90": 0.4, "p95": 0.6, "p99": 1.0, "max": 7.5, "wall": 367}, "relay": {"p50": 0.3, "p90": 0.4, "p95": 0.6, "p99": 0.9, "max": 6.9, "wall": 366}},
+        {"run": 8, "order": "relay-direct", "direct": {"p50": 0.3, "p90": 0.4, "p95": 0.5, "p99": 0.8, "max": 8.2, "wall": 356}, "relay": {"p50": 0.3, "p90": 0.4, "p95": 0.5, "p99": 1.0, "max": 7.0, "wall": 368}},
+        {"run": 9, "order": "direct-relay", "direct": {"p50": 0.3, "p90": 0.4, "p95": 0.5, "p99": 0.9, "max": 11.1, "wall": 359}, "relay": {"p50": 0.3, "p90": 0.4, "p95": 0.4, "p99": 0.9, "max": 8.7, "wall": 366}},
+        {"run": 10, "order": "relay-direct", "direct": {"p50": 0.3, "p90": 0.4, "p95": 0.5, "p99": 0.9, "max": 5.1, "wall": 353}, "relay": {"p50": 0.3, "p90": 0.4, "p95": 0.5, "p99": 0.9, "max": 9.0, "wall": 371}}
+      ]
+    },
+    "rust_edit": {
+      "requests_per_process": 100,
+      "response_wire_kib_per_process": 1430.1,
+      "pairs": [
+        {"run": 1, "order": "direct-relay", "direct": {"p50": 3.6, "p90": 4.0, "p95": 4.1, "p99": 4.7, "max": 7.3, "wall": 1562}, "relay": {"p50": 3.7, "p90": 4.0, "p95": 4.3, "p99": 4.8, "max": 7.9, "wall": 1560}},
+        {"run": 2, "order": "relay-direct", "direct": {"p50": 3.7, "p90": 4.0, "p95": 4.1, "p99": 5.6, "max": 8.8, "wall": 1580}, "relay": {"p50": 3.7, "p90": 4.1, "p95": 4.3, "p99": 5.1, "max": 8.6, "wall": 1571}},
+        {"run": 3, "order": "direct-relay", "direct": {"p50": 3.6, "p90": 4.1, "p95": 4.4, "p99": 4.6, "max": 7.1, "wall": 1588}, "relay": {"p50": 3.7, "p90": 4.3, "p95": 4.6, "p99": 5.4, "max": 7.1, "wall": 1570}},
+        {"run": 4, "order": "relay-direct", "direct": {"p50": 3.7, "p90": 4.5, "p95": 4.9, "p99": 5.1, "max": 7.8, "wall": 1579}, "relay": {"p50": 3.7, "p90": 4.1, "p95": 4.4, "p99": 4.8, "max": 7.0, "wall": 1584}},
+        {"run": 5, "order": "direct-relay", "direct": {"p50": 3.7, "p90": 4.1, "p95": 4.3, "p99": 5.2, "max": 8.0, "wall": 1550}, "relay": {"p50": 3.7, "p90": 4.0, "p95": 4.2, "p99": 4.6, "max": 7.2, "wall": 1572}},
+        {"run": 6, "order": "relay-direct", "direct": {"p50": 3.7, "p90": 4.1, "p95": 4.3, "p99": 4.6, "max": 7.8, "wall": 1590}, "relay": {"p50": 3.7, "p90": 4.0, "p95": 4.2, "p99": 4.5, "max": 6.0, "wall": 1561}},
+        {"run": 7, "order": "direct-relay", "direct": {"p50": 3.7, "p90": 4.1, "p95": 4.3, "p99": 4.6, "max": 7.7, "wall": 1586}, "relay": {"p50": 3.8, "p90": 4.4, "p95": 4.5, "p99": 5.2, "max": 6.9, "wall": 1585}},
+        {"run": 8, "order": "relay-direct", "direct": {"p50": 3.6, "p90": 3.9, "p95": 4.1, "p99": 4.6, "max": 8.0, "wall": 1555}, "relay": {"p50": 3.9, "p90": 4.4, "p95": 4.9, "p99": 7.1, "max": 15.6, "wall": 1598}},
+        {"run": 9, "order": "direct-relay", "direct": {"p50": 3.7, "p90": 4.1, "p95": 4.5, "p99": 5.3, "max": 7.2, "wall": 1595}, "relay": {"p50": 3.7, "p90": 4.0, "p95": 4.4, "p99": 5.6, "max": 6.4, "wall": 1568}},
+        {"run": 10, "order": "relay-direct", "direct": {"p50": 3.7, "p90": 4.2, "p95": 4.3, "p99": 6.5, "max": 10.9, "wall": 1597}, "relay": {"p50": 3.7, "p90": 4.1, "p95": 4.4, "p99": 5.8, "max": 10.3, "wall": 1597}}
+      ]
+    },
+    "markdown_edit": {
+      "requests_per_process": 100,
+      "response_wire_kib_per_process": 4020.7,
+      "pairs": [
+        {"run": 1, "order": "direct-relay", "direct": {"p50": 2.5, "p90": 2.6, "p95": 2.7, "p99": 2.9, "max": 17.4, "wall": 1471}, "relay": {"p50": 2.5, "p90": 2.6, "p95": 2.8, "p99": 5.2, "max": 24.7, "wall": 1470}},
+        {"run": 2, "order": "relay-direct", "direct": {"p50": 2.5, "p90": 2.6, "p95": 2.7, "p99": 5.3, "max": 19.1, "wall": 1462}, "relay": {"p50": 2.5, "p90": 2.6, "p95": 2.7, "p99": 5.1, "max": 25.6, "wall": 1481}},
+        {"run": 3, "order": "direct-relay", "direct": {"p50": 2.5, "p90": 2.6, "p95": 2.7, "p99": 4.5, "max": 26.3, "wall": 1474}, "relay": {"p50": 2.5, "p90": 2.7, "p95": 2.8, "p99": 4.7, "max": 26.3, "wall": 1485}},
+        {"run": 4, "order": "relay-direct", "direct": {"p50": 2.6, "p90": 2.7, "p95": 2.7, "p99": 4.7, "max": 23.5, "wall": 1477}, "relay": {"p50": 2.5, "p90": 2.6, "p95": 2.7, "p99": 5.6, "max": 23.5, "wall": 1485}},
+        {"run": 5, "order": "direct-relay", "direct": {"p50": 2.5, "p90": 2.6, "p95": 2.8, "p99": 5.3, "max": 25.1, "wall": 1483}, "relay": {"p50": 2.5, "p90": 2.6, "p95": 2.7, "p99": 5.2, "max": 25.0, "wall": 1474}},
+        {"run": 6, "order": "relay-direct", "direct": {"p50": 2.5, "p90": 2.7, "p95": 2.8, "p99": 4.8, "max": 17.4, "wall": 1474}, "relay": {"p50": 2.5, "p90": 2.6, "p95": 2.6, "p99": 5.1, "max": 24.9, "wall": 1471}},
+        {"run": 7, "order": "direct-relay", "direct": {"p50": 2.5, "p90": 2.7, "p95": 2.7, "p99": 4.6, "max": 24.6, "wall": 1475}, "relay": {"p50": 2.5, "p90": 2.6, "p95": 2.6, "p99": 6.5, "max": 19.0, "wall": 1468}},
+        {"run": 8, "order": "relay-direct", "direct": {"p50": 2.6, "p90": 3.0, "p95": 3.6, "p99": 6.4, "max": 24.5, "wall": 1505}, "relay": {"p50": 2.6, "p90": 2.7, "p95": 2.9, "p99": 4.7, "max": 26.1, "wall": 1471}},
+        {"run": 9, "order": "direct-relay", "direct": {"p50": 2.6, "p90": 2.7, "p95": 2.8, "p99": 5.4, "max": 23.1, "wall": 1494}, "relay": {"p50": 2.6, "p90": 2.7, "p95": 2.7, "p99": 6.2, "max": 26.7, "wall": 1467}},
+        {"run": 10, "order": "relay-direct", "direct": {"p50": 2.6, "p90": 2.7, "p95": 2.8, "p99": 6.5, "max": 24.9, "wall": 1474}, "relay": {"p50": 2.6, "p90": 2.6, "p95": 2.7, "p99": 6.2, "max": 20.6, "wall": 1482}}
+      ]
+    }
+  },
+  "cold_start": {
+    "warmup_runs": 3,
+    "measured_runs": 20,
+    "direct": {"mean_ms": 96.6, "stddev_ms": 6.6, "min_ms": 87.1, "max_ms": 108.0},
+    "relay": {"mean_ms": 115.0, "stddev_ms": 6.0, "min_ms": 106.6, "max_ms": 124.7}
+  },
+  "captures_pilot": {
+    "independent_pairs": 1,
+    "direct": {"semantic_p50": 2.6, "semantic_p95": 2.7, "captures_p50": 16.8, "captures_p95": 17.7},
+    "relay": {"semantic_p50": 2.6, "semantic_p95": 2.8, "captures_p50": 16.8, "captures_p95": 17.2}
+  }
+}

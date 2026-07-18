@@ -2,10 +2,10 @@
 
 ## Scope
 
-This experiment measures a lower bound for adding one resident child-process
-transport hop before the Stage 1 tree-worker prototype exists. It does **not**
-measure the proposed worker architecture or establish that it improves
-performance.
+This experiment records one concrete feasibility datapoint for adding a
+resident child-process transport hop before the Stage 1 tree-worker prototype
+exists. It does **not** measure the proposed worker architecture or establish
+that it improves performance.
 
 The direct and relayed paths were:
 
@@ -53,7 +53,7 @@ its reporting resolution.
 | Rust small, one edit/request | p99 | 5.08 ms | 5.29 ms | +0.21 ms | [-0.28, 0.82] ms |
 | Markdown injections, one edit/request | p50 | 2.54 ms | 2.53 ms | -0.01 ms | [-0.03, 0.00] ms |
 | Markdown injections, one edit/request | p95 | 2.83 ms | 2.72 ms | -0.11 ms | [-0.26, 0.00] ms |
-| Markdown injections, one edit/request | p99 | 5.04 ms | 5.45 ms | +0.41 ms | [-0.26, 1.09] ms |
+| Markdown injections, one edit/request | p99 | 5.04 ms | 5.45 ms | +0.41 ms | [-0.26, 1.08] ms |
 
 The negative Markdown deltas are not interpreted as an improvement: the relay
 does no useful work, the intervals are dominated by run-level scheduling noise,
@@ -69,9 +69,12 @@ The cache-hit path transferred approximately 14.3 MiB of response bodies per
 | Wall time / 1,000 requests | 360.5 ms | 371.4 ms | +10.9 ms (+3.0%) | [6.1, 16.4] ms |
 | Amortized extra wall time | — | — | +10.9 µs/request | [6.1, 16.4] µs/request |
 
-This is the clearest measured lower bound for the resident transport hop. The
-edit scenarios include a fixed 10-ms delay after each edit, so their total wall
-times intentionally cannot isolate a similarly small transport cost.
+This is the clearest measured raw-relay estimate in this experiment. It is
+neither a lower nor an upper bound for the future worker transport: the Python
+relay adds interpreter, thread, and flush costs, while the real protocol adds
+different payloads, encoding, queueing, and scheduling. The edit scenarios
+include a fixed 10-ms delay after each edit, so their total wall times
+intentionally cannot isolate a similarly small transport cost.
 
 ### Fresh-process path
 
@@ -99,10 +102,11 @@ used as a smoke test, not an independently repeated result:
 
 ## Interpretation
 
-The additional raw process/pipe hop is not a steady-state performance blocker
-on this machine. Its median and p95 costs were at or below the driver's 0.1-ms
-reporting resolution, while the most sensitive cache-hit throughput run showed
-about 10.9 microseconds of amortized extra wall time per request.
+This particular raw process/pipe relay did not expose a clear steady-state
+transport blocker on this machine. Its median and p95 costs were at or below the
+driver's 0.1-ms reporting resolution, while the most sensitive cache-hit
+throughput run showed about 10.9 microseconds of amortized extra wall time per
+request. The actual Stage 1 worker cost may be above or below that relay delta.
 
 This result is necessary but insufficient evidence for the ADR. It does not
 show a worker performance improvement, and it cannot detect costs or benefits
@@ -116,15 +120,35 @@ from:
 * worker memory, cold start, crash recovery, and full resynchronization; or
 * hazard and native-segment control handshakes.
 
-The result supports proceeding to ADR Stage 1 because the unavoidable raw
-transport lower bound is small enough that higher-level architectural gains
-could dominate it. The ADR must remain `proposed` until the real
-`DeriveSnapshot` prototype measures the complete gate matrix.
+The result does not provide a transport-based reason to reject Stage 1, but it
+does not justify the architecture either. Stage 1 remains necessary to measure
+the actual protocol and tree-data-plane boundary. The ADR must remain
+`proposed` until the real `DeriveSnapshot` prototype measures the complete gate
+matrix.
 
 ## Reproduction
 
 The tail-percentile driver and relay are in `benches/profile/drive.py` and
-`benches/profile/worker_proxy.py`. A representative pair is:
+`benches/profile/worker_proxy.py`. The 10 paired run summaries, execution order,
+commands, environment, artifact-tree digest, cold-start result, and captures
+pilot are committed in
+`benches/profile/results/single_worker_phase0_2026-07-18.json`. Recompute every
+steady-state table value and confidence interval with:
+
+```sh
+python3 benches/profile/analyze_worker_proxy.py
+```
+
+The analyzer uses seed `123456789`, 100,000 paired-bootstrap resamples, and
+nearest-rank 2.5th/97.5th percentiles. The parser/query tree digest was computed
+from paths relative to the data directory:
+
+```sh
+find . -type f -print0 | sort -z | \
+  xargs -0 shasum -a 256 | shasum -a 256
+```
+
+A representative direct/relay pair is:
 
 ```sh
 python3 benches/profile/drive.py \
