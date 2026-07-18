@@ -581,8 +581,9 @@ hazard lease is active is native-evidenced. Every remaining unattributed or
 normally exiting failure is systemic. A native-evidenced failure that newly
 quarantines one or more previously allowed grammar keys does not consume the
 global budget: quarantine has removed a concrete cause. Its restart remains
-rate limited by backoff. A protocol failure may still conservatively quarantine
-active keys, but it always consumes the systemic budget.
+rate limited by backoff and the independent native-storm budget below. A
+protocol failure may still conservatively quarantine active keys, but it always
+consumes the systemic budget.
 
 Three systemic worker-generation failures without an intervening 60 seconds of
 healthy service exhaust the budget for the current configuration generation.
@@ -592,6 +593,17 @@ which demonstrates a quarantine or routing violation. A delayed post-return
 native crash is exempt only when its OS failure evidence and still-active lease
 satisfy the native-evidenced rule; merely being inside Rust derivation or
 serialization under a broad lease is not sufficient.
+
+Native-evidenced recovery has a separate rolling budget: at most eight worker
+restarts that newly quarantine grammar keys in any 60-second window. The ninth
+opens a native-storm breaker and leaves the tree tier unavailable for the current
+configuration generation even though each individual cause was attributable.
+After at least 60 seconds without spawning a worker, an explicit parser artifact
+or relevant configuration change permits one half-open probe; ordinary requests,
+document edits, and new grammar aliases do not. A successful 60-second healthy
+interval resets both the native-storm window and the systemic breaker. Thus
+quarantine normally preserves service for healthy grammars without allowing an
+unbounded sequence of distinct bad artifacts to create a kill/resync loop.
 
 When the budget is exhausted, the parent stops spawning workers and marks the
 tree tier unavailable for that configuration generation. It wakes all tree
@@ -803,6 +815,10 @@ Implementation is accepted only when all of the following hold:
   quarantined without consuming the systemic circuit-breaker budget; a following
   healthy grammar still derives successfully. Re-entry by an already quarantined
   grammar instead consumes the budget and is reported as an invariant violation.
+* More than eight distinct native-evidenced grammar failures within one minute
+  trip the independent native-storm breaker and stop respawning; a permitted
+  half-open probe after cooldown either restores stable service or returns to
+  the degraded state.
 * A protocol-corruption or reported Rust-panic fixture while a grammar lease is
   active may conservatively quarantine that key but still consumes the systemic
   budget; a signaled native crash with the same lease follows the native-evidence
