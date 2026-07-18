@@ -8,7 +8,13 @@
     "logical_cpus": 10,
     "tree_compute_budget": 8,
     "os": "macOS 26.5.1 (25F80)",
+    "python": "3.12.13",
+    "rustc": "rustc 1.95.0 (59807616e 2026-04-14)",
+    "cargo": "cargo 1.95.0 (f2d3ce0bd 2026-03-21)",
+    "hyperfine": "1.20.0",
+    "release_build_command": "cargo build --release --bin kakehashi",
     "release_binary_commit": "ccbd8ffd13c4817eda62e1de6f8cfd3eeb3259d0",
+    "release_binary_sha256": "4ea51e25b3bbe30360772789996ff4076c4f01e84663975c0a71004e4501cf5a",
     "origin_main_commit": "a1278be5fdff24d109d9e03134c6bdb880577f64",
     "parser_query_file_count": 28,
     "parser_query_tree_sha256": "3258dea73fef01a75ad7dcf3c513fbc83ec5702c27b255b0feb882f59b208cc7"
@@ -28,7 +34,7 @@
     "rust_edit": "--lang rust --size 15 --requests 100 --edits 1",
     "markdown_edit": "--lang markdown --size 150 --requests 100 --edits 1",
     "captures_pilot": "--lang markdown --size 150 --requests 100 --edits 1 --concurrent-captures",
-    "cold_start": "hyperfine --warmup 3 --runs 20 --shell zsh '<direct --requests 1 --settle 0>' '<relay --requests 1 --settle 0>'"
+    "cold_start": "hyperfine --warmup 3 --runs 20 --shell zsh --export-json /tmp/kakehashi-phase0-cold.json 'python3 benches/profile/drive.py --bin /Users/atusy/ghq/github.com/atusy/kakehashi___worker_adr/target/release/kakehashi --data-dir /Users/atusy/ghq/github.com/atusy/kakehashi/deps/test/kakehashi --lang rust --size 15 --requests 1 --settle 0 >/dev/null 2>&1' 'KAKEHASHI_WORKER_PROXY_BIN=/Users/atusy/ghq/github.com/atusy/kakehashi___worker_adr/target/release/kakehashi python3 benches/profile/drive.py --bin ./benches/profile/worker_proxy.py --data-dir /Users/atusy/ghq/github.com/atusy/kakehashi/deps/test/kakehashi --lang rust --size 15 --requests 1 --settle 0 >/dev/null 2>&1'"
   },
   "steady_state": {
     "rust_cache_hit": {
@@ -83,8 +89,14 @@
   "cold_start": {
     "warmup_runs": 3,
     "measured_runs": 20,
-    "direct": {"mean_ms": 96.6, "stddev_ms": 6.6, "min_ms": 87.1, "max_ms": 108.0},
-    "relay": {"mean_ms": 115.0, "stddev_ms": 6.0, "min_ms": 106.6, "max_ms": 124.7}
+    "direct": {
+      "times": [0.08976448634, 0.08767548634, 0.08632177834, 0.08648432034, 0.08593627834, 0.08605940334, 0.08614702834, 0.08638631934, 0.08678819434, 0.08675548634, 0.08728144534, 0.08670273734, 0.08631194534, 0.08628990334, 0.08667944534, 0.08900440334, 0.09122702834, 0.09115506934, 0.08800952834, 0.08766694534],
+      "exit_codes": [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    },
+    "relay": {
+      "times": [0.10773936234, 0.10639023634, 0.10692907034, 0.10615686234, 0.10583994434, 0.10661832034, 0.10542490334, 0.10626869534, 0.10679461134, 0.10616844434, 0.10626786134, 0.10631257034, 0.10645227834, 0.10652073734, 0.10710606934, 0.10653857034, 0.10725082034, 0.11118311234, 0.10621615334, 0.10621719534],
+      "exit_codes": [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    }
   },
   "captures_pilot": {
     "independent_pairs": 1,

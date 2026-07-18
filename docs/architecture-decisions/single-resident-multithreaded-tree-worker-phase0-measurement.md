@@ -83,10 +83,10 @@ immediate Rust request:
 
 | Path | Mean | Standard deviation | Range |
 |---|---:|---:|---:|
-| Direct | 96.6 ms | 6.6 ms | 87.1–108.0 ms |
-| Relay | 115.0 ms | 6.0 ms | 106.6–124.7 ms |
+| Direct | 87.4 ms | 1.6 ms | 85.9–91.2 ms |
+| Relay | 106.7 ms | 1.2 ms | 105.4–111.2 ms |
 
-The observed +18.4 ms includes starting a Python interpreter and is not an
+The observed +19.3 ms includes starting a Python interpreter and is not an
 estimate of a Rust worker's spawn/handshake time. It only shows that cold-start
 cost is visible and must be measured separately in the Stage 1 prototype.
 
@@ -108,7 +108,7 @@ driver's 0.1-ms reporting resolution, while the most sensitive cache-hit
 throughput run showed about 10.9 microseconds of amortized extra wall time per
 request. The actual Stage 1 worker cost may be above or below that relay delta.
 
-This result is necessary but insufficient evidence for the ADR. It does not
+This result is preliminary and insufficient evidence for the ADR. It does not
 show a worker performance improvement, and it cannot detect costs or benefits
 from:
 
@@ -137,6 +137,22 @@ steady-state table value and confidence interval with:
 
 ```sh
 python3 benches/profile/analyze_worker_proxy.py
+```
+
+The steady-state file preserves the run-level summaries transcribed from this
+experiment's driver output; it does not preserve each raw stderr stream. The
+collector below was added after the experiment so subsequent datasets avoid
+that manual transcription boundary. The cold-start section does preserve all
+20 timing samples and is recomputed by the same analyzer.
+
+Collect a new alternating 10-pair steady-state dataset without hand
+transcription using:
+
+```sh
+python3 benches/profile/collect_worker_proxy.py \
+  --bin ./target/release/kakehashi \
+  --data-dir ./deps/test/kakehashi \
+  --output /tmp/single-worker-phase0.json
 ```
 
 The analyzer uses seed `123456789`, 100,000 paired-bootstrap resamples, and
