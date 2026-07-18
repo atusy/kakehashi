@@ -1,8 +1,10 @@
 import pathlib
 import subprocess
 import sys
+import tarfile
 import tempfile
 import unittest
+from unittest import mock
 
 sys.path.insert(0, str(pathlib.Path(__file__).parent))
 
@@ -16,6 +18,49 @@ from attest_worker_binary import (
 
 
 class BinaryAttestationTest(unittest.TestCase):
+    def test_source_archive_extraction_supports_python_without_data_filter(self):
+        source = mock.Mock()
+        destination = pathlib.Path("isolated-source")
+
+        with mock.patch.object(tarfile, "data_filter", None, create=True):
+            from attest_worker_binary import extract_source_archive
+
+            extract_source_archive(source, destination)
+
+        source.extractall.assert_called_once_with(destination)
+
+    def test_source_archive_is_removed_when_extraction_fails(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            checkout = root / "repository"
+            checkout.mkdir()
+            (checkout / "source.txt").write_text("committed")
+            subprocess.run(["git", "init", "-q", checkout], check=True)
+            subprocess.run(["git", "-C", checkout, "add", "."], check=True)
+            subprocess.run(
+                [
+                    "git", "-C", checkout,
+                    "-c", "user.name=benchmark-test",
+                    "-c", "user.email=benchmark@example.invalid",
+                    "commit", "-qm", "source",
+                ],
+                check=True,
+            )
+            revision = subprocess.run(
+                ["git", "-C", checkout, "rev-parse", "HEAD"],
+                check=True, text=True, stdout=subprocess.PIPE,
+            ).stdout.strip()
+            destination = root / "isolated/source"
+
+            with mock.patch(
+                "attest_worker_binary.extract_source_archive",
+                side_effect=RuntimeError("extract failed"),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "extract failed"):
+                    archive_source(checkout, revision, destination)
+
+            self.assertFalse((destination.parent / "source.tar").exists())
+
     def test_tool_version_captures_stderr_only_tools(self):
         output = environment_tool_version(
             [sys.executable, "-c", "import sys; print('linker 1.0', file=sys.stderr)"],

@@ -73,6 +73,15 @@ def native_toolchain_metadata(
     return metadata
 
 
+def extract_source_archive(source, destination):
+    if getattr(tarfile, "data_filter", None) is None:
+        # The archive is produced from this already-trusted local Git commit.
+        # Python < 3.12 lacks PEP 706's extraction filter.
+        source.extractall(destination)
+    else:
+        source.extractall(destination, filter="data")
+
+
 def archive_source(checkout, revision, destination):
     destination.parent.mkdir(parents=True, exist_ok=True)
     archive = destination.parent / "source.tar"
@@ -84,9 +93,11 @@ def archive_source(checkout, revision, destination):
         check=True,
     )
     destination.mkdir()
-    with tarfile.open(archive) as source:
-        source.extractall(destination, filter="data")
-    archive.unlink()
+    try:
+        with tarfile.open(archive) as source:
+            extract_source_archive(source, destination)
+    finally:
+        archive.unlink(missing_ok=True)
 
 
 def require_isolated_source(source, checkout):
