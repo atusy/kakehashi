@@ -299,6 +299,11 @@ Unsynced -> SyncQueued(version) -> SyncPending(version) -> Synced(version)
 Synced(base) -> EditQueued(base, target) -> EditPending(base, target)
 EditPending(base, target) -> Synced(target)
 EditQueued(base, target) -> SyncQueued(latest)
+{SyncQueued, SyncPending, Synced, EditQueued, EditPending}
+  -- wrong/stale acknowledgment --> Unsynced
+EditPending -- ResyncRequired --> Unsynced
+any open state -- worker restart --> Unsynced(new worker generation)
+any open state -- CloseDocument --> Removed
 ```
 
 After startup or restart, the parent first waits for configuration and
