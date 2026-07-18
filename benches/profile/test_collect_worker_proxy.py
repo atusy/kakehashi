@@ -29,6 +29,7 @@ from collect_worker_proxy import (
     require_posix as require_collector_posix,
     require_benchmark_artifacts,
     run_order,
+    signal_process_group,
     shasum_tree_digest,
     stage_measurement_inputs,
     verify_file_sha256,
@@ -37,6 +38,14 @@ from collect_worker_proxy import (
 
 
 class CollectionHelpersTest(unittest.TestCase):
+    def test_process_group_signal_tolerates_os_cleanup_races(self):
+        process = mock.Mock(pid=12345)
+
+        with mock.patch.object(
+            collector.os, "killpg", side_effect=PermissionError("gone")
+        ):
+            signal_process_group(process, signal.SIGTERM)
+
     def test_attested_build_requires_committed_lockfile(self):
         self.assertIn("--locked", collector.ATTESTED_BUILD_COMMAND)
 
