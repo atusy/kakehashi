@@ -211,8 +211,9 @@ steady-state batch without hand transcription:
 
 ```sh
 revision=4916d6592ede8c07973490d9322f187e07dfefac
-source_dir=/tmp/kakehashi-nvim-treesitter
-data_dir=./deps/profile/kakehashi
+workspace_dir="$(mktemp -d "${TMPDIR:-/tmp}/kakehashi-phase0.XXXXXX")"
+source_dir="$workspace_dir/nvim-treesitter"
+data_dir="$workspace_dir/data"
 git clone --filter=blob:none \
   https://github.com/nvim-treesitter/nvim-treesitter "$source_dir"
 git -C "$source_dir" checkout "$revision"
