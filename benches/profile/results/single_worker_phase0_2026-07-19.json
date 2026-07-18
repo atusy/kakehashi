@@ -10,9 +10,6 @@
     "rustc": "rustc 1.95.0 (59807616e 2026-04-14) (built from a source tarball)",
     "cargo": "cargo 1.95.0 (f2d3ce0bd 2026-03-21)",
     "hyperfine": "1.20.0",
-    "release_build_command": "cargo build --release --bin kakehashi",
-    "release_binary_commit": "ccbd8ffd13c4817eda62e1de6f8cfd3eeb3259d0",
-    "release_binary_sha256": "4ea51e25b3bbe30360772789996ff4076c4f01e84663975c0a71004e4501cf5a",
     "origin_main_commit": "a1278be5fdff24d109d9e03134c6bdb880577f64",
     "parser_query_file_count": 25,
     "parser_query_tree_sha256": "1572967b352c7b24ec872bff02c3c9808374a0d5cab2c707368cb5f32be58115",
@@ -29,6 +26,23 @@
       "LANG": "C.UTF-8",
       "LC_ALL": "C.UTF-8"
     }
+  },
+  "binary_attestation": {
+    "schema": 1,
+    "source_repository": "https://github.com/atusy/kakehashi",
+    "source_commit": "ccbd8ffd13c4817eda62e1de6f8cfd3eeb3259d0",
+    "source_checkout_clean": true,
+    "build_command": [
+      "cargo",
+      "build",
+      "--release",
+      "--bin",
+      "kakehashi"
+    ],
+    "rustc": "rustc 1.95.0 (59807616e 2026-04-14) (built from a source tarball)",
+    "cargo": "cargo 1.95.0 (f2d3ce0bd 2026-03-21)",
+    "binary_relative": "target/release/kakehashi",
+    "binary_sha256": "4ea51e25b3bbe30360772789996ff4076c4f01e84663975c0a71004e4501cf5a"
   },
   "collector": {
     "pairs": 20,

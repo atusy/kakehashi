@@ -1,4 +1,5 @@
 import hashlib
+import json
 import os
 import pathlib
 import signal
@@ -17,6 +18,7 @@ from collect_worker_proxy import (
     artifact_provenance,
     parse_capture_pilot_summary,
     parse_driver_summary,
+    load_binary_attestation,
     parser_library_suffix,
     require_posix as require_collector_posix,
     require_benchmark_artifacts,
@@ -234,6 +236,26 @@ class CollectionHelpersTest(unittest.TestCase):
 
             with self.assertRaisesRegex(RuntimeError, "binary changed"):
                 verify_file_sha256(binary, expected)
+
+    def test_loads_attestation_only_for_matching_binary(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            binary = root / "kakehashi"
+            binary.write_bytes(b"release")
+            attestation = root / "attestation.json"
+            attestation.write_text(json.dumps({
+                "schema": 1,
+                "source_commit": "a" * 40,
+                "build_command": ["cargo", "build", "--release"],
+                "binary_sha256": hashlib.sha256(b"release").hexdigest(),
+            }))
+
+            loaded = load_binary_attestation(attestation, binary)
+
+            self.assertEqual(loaded["source_commit"], "a" * 40)
+            binary.write_bytes(b"other")
+            with self.assertRaisesRegex(ValueError, "attested binary digest"):
+                load_binary_attestation(attestation, binary)
 
     def test_relay_invokes_proxy_through_python(self):
         command = build_driver_command(

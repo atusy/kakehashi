@@ -34,7 +34,9 @@ and must use the platform-specific lifecycle mechanisms specified by the ADR.
 * Release binary: `ccbd8ffd13c4817eda62e1de6f8cfd3eeb3259d0`
   (execution code matches `origin/main` at
   `a1278be5fdff24d109d9e03134c6bdb880577f64`; the intervening change is
-  documentation only)
+  documentation only). The committed attestation rebuilds this clean checkout,
+  records the toolchain and build command, and matches the measured binary's
+  SHA-256 digest.
 * Parser/query data was preinstalled outside the measured interval.
 * The collector removed ambient Rust/kakehashi behavior overrides and retained
   only the recorded path, temporary-directory, locale, and loader variables.
@@ -125,8 +127,8 @@ used as a smoke test, not an independently repeated result:
 
 | Metric | Direct | Relay |
 |---|---:|---:|
-| Semantic tokens p50 / p95 | 4.8 / 5.1 ms | 4.5 / 5.2 ms |
-| Captures delta p50 / p95 | 31.0 / 32.6 ms | 29.9 / 33.7 ms |
+| Semantic tokens p50 / p95 | 4.8 / 5.7 ms | 4.4 / 5.0 ms |
+| Captures delta p50 / p95 | 31.7 / 37.9 ms | 30.0 / 32.0 ms |
 
 All 100 semantic and 100 capture-delta responses per path were successful. The
 final driver validated every capture result as the delta `edits` shape and an
@@ -171,6 +173,8 @@ commands, environment, artifact-tree digest, and cold-start result are committed
 in `benches/profile/results/single_worker_phase0_2026-07-19.json`. The separately
 generated captures smoke result is in
 `benches/profile/results/single_worker_phase0_captures_pilot_2026-07-19.json`.
+The binary build attestation used by both collectors is in
+`benches/profile/results/single_worker_phase0_binary_attestation_2026-07-19.json`.
 Recompute every steady-state table value and confidence interval with:
 
 ```sh
@@ -207,8 +211,12 @@ for lang in comment lua markdown markdown_inline python rust yaml; do
   cp -R "$source_dir/runtime/queries/$lang" "$data_dir/queries/$lang"
 done
 
+python3 benches/profile/attest_worker_binary.py \
+  --checkout . \
+  --output /tmp/single-worker-binary-attestation.json
 python3 benches/profile/collect_worker_proxy.py \
   --bin ./target/release/kakehashi \
+  --binary-attestation /tmp/single-worker-binary-attestation.json \
   --data-dir "$data_dir" \
   --nvim-treesitter-checkout "$source_dir" \
   --output /tmp/single-worker-phase0.json

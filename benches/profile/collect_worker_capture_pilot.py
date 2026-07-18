@@ -15,6 +15,7 @@ from collect_worker_proxy import (
     build_driver_command,
     controlled_environment,
     parse_capture_pilot_summary,
+    load_binary_attestation,
     require_benchmark_artifacts,
     require_posix,
     sha256_file,
@@ -45,6 +46,9 @@ def main():
     parser.add_argument("--bin", type=pathlib.Path, required=True)
     parser.add_argument("--data-dir", type=pathlib.Path, required=True)
     parser.add_argument("--output", type=pathlib.Path, required=True)
+    parser.add_argument(
+        "--binary-attestation", type=pathlib.Path, required=True
+    )
     parser.add_argument("--run-timeout", type=float, default=60)
     parser.add_argument(
         "--nvim-treesitter-checkout", type=pathlib.Path, required=True
@@ -56,6 +60,9 @@ def main():
     require_benchmark_artifacts(args.data_dir)
     initial_identity = artifact_identity(args.data_dir)
     initial_binary_sha256 = sha256_file(args.bin)
+    binary_attestation = load_binary_attestation(
+        args.binary_attestation, args.bin
+    )
     script_dir = pathlib.Path(__file__).resolve().parent
     result = {
         "schema": 1,
@@ -73,6 +80,7 @@ def main():
         "artifacts": artifact_provenance(
             args.data_dir, args.nvim_treesitter_checkout
         ),
+        "binary_attestation": binary_attestation,
         "arguments": CAPTURE_ARGUMENTS,
         "independent_pairs": 1,
         "order": "direct then relay; smoke result only",

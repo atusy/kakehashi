@@ -21,6 +21,23 @@
     "nvim_treesitter_revision": "4916d6592ede8c07973490d9322f187e07dfefac",
     "verification": "parser metadata and every installed query byte-matched"
   },
+  "binary_attestation": {
+    "schema": 1,
+    "source_repository": "https://github.com/atusy/kakehashi",
+    "source_commit": "ccbd8ffd13c4817eda62e1de6f8cfd3eeb3259d0",
+    "source_checkout_clean": true,
+    "build_command": [
+      "cargo",
+      "build",
+      "--release",
+      "--bin",
+      "kakehashi"
+    ],
+    "rustc": "rustc 1.95.0 (59807616e 2026-04-14) (built from a source tarball)",
+    "cargo": "cargo 1.95.0 (f2d3ce0bd 2026-03-21)",
+    "binary_relative": "target/release/kakehashi",
+    "binary_sha256": "4ea51e25b3bbe30360772789996ff4076c4f01e84663975c0a71004e4501cf5a"
+  },
   "arguments": [
     "--lang",
     "markdown",
@@ -36,9 +53,9 @@
   "order": "direct then relay; smoke result only",
   "direct": {
     "semantic_p50": 4.8,
-    "semantic_p95": 5.1,
-    "captures_p50": 31.0,
-    "captures_p95": 32.6,
+    "semantic_p95": 5.7,
+    "captures_p50": 31.7,
+    "captures_p95": 37.9,
     "semantic_outcomes": {
       "count": 100,
       "ok": 100,
@@ -59,10 +76,10 @@
     "capture_full_fallbacks": 0
   },
   "relay": {
-    "semantic_p50": 4.5,
-    "semantic_p95": 5.2,
-    "captures_p50": 29.9,
-    "captures_p95": 33.7,
+    "semantic_p50": 4.4,
+    "semantic_p95": 5.0,
+    "captures_p50": 30.0,
+    "captures_p95": 32.0,
     "semantic_outcomes": {
       "count": 100,
       "ok": 100,

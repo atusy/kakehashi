@@ -94,6 +94,7 @@ the kakehashi/tree-sitter/regex frames for the actual CPU cost.
 | `xctrace.sh` | end-to-end: build → Instruments Time Profiler → XML summary |
 | `drive.py` | synchronous/batched LSP driver with per-method latency and wire-volume output |
 | `test_drive.py` | unit tests for driver metric aggregation |
+| `attest_worker_binary.py` | clean-checkout release build and binary/source attestation |
 | `collect_worker_capture_pilot.py` | fail-closed direct/relay concurrent-captures smoke collector |
 | `gen_session.py` | document generators + a framed-session emitter |
 | `analyze.py` | atos symbolication, self/inclusive report, collapsed stacks |

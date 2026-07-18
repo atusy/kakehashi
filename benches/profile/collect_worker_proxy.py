@@ -252,6 +252,22 @@ def verify_file_sha256(path, expected):
         )
 
 
+def load_binary_attestation(path, binary):
+    attestation = json.loads(path.read_text())
+    required = ("schema", "source_commit", "build_command", "binary_sha256")
+    if any(key not in attestation for key in required):
+        raise ValueError("binary attestation is missing required fields")
+    if not re.fullmatch(r"[0-9a-f]{40}", attestation["source_commit"]):
+        raise ValueError("binary attestation has an invalid source commit")
+    actual = sha256_file(binary)
+    if attestation["binary_sha256"] != actual:
+        raise ValueError(
+            "attested binary digest does not match measured binary: "
+            f"attested={attestation['binary_sha256']} actual={actual}"
+        )
+    return attestation
+
+
 def runtime_artifact_files(root):
     files = []
     for relative_root in ("cache", "parser", "queries"):
@@ -467,6 +483,9 @@ def main():
     parser.add_argument("--bin", type=pathlib.Path, required=True)
     parser.add_argument("--data-dir", type=pathlib.Path, required=True)
     parser.add_argument("--output", type=pathlib.Path, required=True)
+    parser.add_argument(
+        "--binary-attestation", type=pathlib.Path, required=True
+    )
     parser.add_argument("--pairs", type=int, default=10)
     parser.add_argument(
         "--run-timeout",
@@ -497,6 +516,9 @@ def main():
     require_benchmark_artifacts(args.data_dir)
     initial_artifact_identity = artifact_identity(args.data_dir)
     initial_binary_sha256 = sha256_file(args.bin)
+    binary_attestation = load_binary_attestation(
+        args.binary_attestation, args.bin
+    )
     logical_cpus = os.cpu_count() or 1
     result = {
         "schema": 1,
@@ -524,6 +546,7 @@ def main():
         "artifacts": artifact_provenance(
             args.data_dir, args.nvim_treesitter_checkout
         ),
+        "binary_attestation": binary_attestation,
         "collector": {
             "pairs": args.pairs,
             "order": "direct-relay on odd runs; relay-direct on even runs",
