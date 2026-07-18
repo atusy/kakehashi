@@ -78,7 +78,21 @@ neither a lower nor an upper bound for the future worker transport: the Python
 relay adds interpreter, thread, and flush costs, while the real protocol adds
 different payloads, encoding, queueing, and scheduling. The edit scenarios
 include a fixed 10-ms delay after each edit, so their total wall times
-intentionally cannot isolate a similarly small transport cost.
+intentionally cannot isolate a similarly small transport cost. Their observed
+end-to-end cycle times are nevertheless disclosed below.
+
+### End-to-end edit cycles
+
+| Scenario | Direct / 100 cycles | Relay / 100 cycles | Paired delta | 95% CI for delta |
+|---|---:|---:|---:|---:|
+| Rust small | 1488.7 ms | 1510.1 ms | +21.4 ms (+214 µs/cycle) | [6.1, 35.1] ms |
+| Markdown injections | 1675.6 ms | 1688.4 ms | +12.8 ms (+128 µs/cycle) | [-3.6, 28.9] ms |
+
+The Rust interval excludes zero, but this experiment cannot attribute the
+difference to pipe transport: every cycle includes the fixed edit-settle delay,
+parse scheduling, derivation, response relay, and parent/child scheduling. The
+real worker benchmark must separate enqueue, queue, compute, serialization, and
+resume time before treating this as a protocol cost.
 
 ### Fresh-process path
 
