@@ -50,7 +50,10 @@ class RequestSummaryTest(unittest.TestCase):
             "terminate", ("wait", 0.25), "kill", ("wait", None),
         ])
 
-    @unittest.skipUnless(hasattr(signal, "SIGTERM"), "requires SIGTERM")
+    @unittest.skipUnless(
+        os.name == "posix" and hasattr(signal, "SIGTERM"),
+        "requires POSIX SIGTERM",
+    )
     def test_server_termination_lets_relay_reap_term_ignoring_child(self):
         proxy = pathlib.Path(__file__).with_name("worker_proxy.py")
         environment = dict(
