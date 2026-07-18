@@ -5,6 +5,7 @@ import argparse
 import json
 import os
 import pathlib
+import platform
 import shutil
 import subprocess
 import tarfile
@@ -32,6 +33,28 @@ def environment_tool_version(command, environment):
     return subprocess.run(
         command, check=True, text=True, stdout=subprocess.PIPE, env=environment
     ).stdout.strip()
+
+
+def native_toolchain_metadata(
+    environment,
+    system=None,
+    version=environment_tool_version,
+):
+    system = system or platform.system()
+    metadata = {
+        "rustc_verbose": version(["rustc", "-vV"], environment),
+        "cc": version(["cc", "--version"], environment),
+        "sdk_path": "not applicable",
+        "sdk_version": "not applicable",
+    }
+    if system == "Darwin":
+        metadata["sdk_path"] = version(
+            ["xcrun", "--show-sdk-path"], environment
+        )
+        metadata["sdk_version"] = version(
+            ["xcrun", "--show-sdk-version"], environment
+        )
+    return metadata
 
 
 def archive_source(checkout, revision, destination):
@@ -102,6 +125,7 @@ def main():
         shutil.copy2(built_binary, binary)
         rustc = environment_tool_version(["rustc", "--version"], build_environment)
         cargo = environment_tool_version(["cargo", "--version"], build_environment)
+        native_toolchain = native_toolchain_metadata(build_environment)
     require_clean(args.checkout)
     result = {
         "schema": 1,
@@ -111,6 +135,7 @@ def main():
         "build_command": ATTESTED_BUILD_COMMAND,
         "rustc": rustc,
         "cargo": cargo,
+        "native_toolchain": native_toolchain,
         "build_environment": build_environment,
         "built_in_fresh_target": True,
         "source_isolated_archive": True,

@@ -9,6 +9,7 @@ sys.path.insert(0, str(pathlib.Path(__file__).parent))
 from attest_worker_binary import (
     archive_source,
     controlled_build_environment,
+    native_toolchain_metadata,
     require_isolated_source,
 )
 
@@ -87,6 +88,27 @@ class BinaryAttestationTest(unittest.TestCase):
 
             with self.assertRaisesRegex(ValueError, "Cargo configuration"):
                 require_isolated_source(source, checkout)
+
+    def test_records_native_compiler_target_and_sdk(self):
+        versions = {
+            ("rustc", "-vV"): "rustc 1.95.0\nhost: aarch64-apple-darwin",
+            ("cc", "--version"): "Apple clang version 17.0.0",
+            ("xcrun", "--show-sdk-path"): "/SDKs/MacOSX.sdk",
+            ("xcrun", "--show-sdk-version"): "26.5",
+        }
+
+        metadata = native_toolchain_metadata(
+            {},
+            system="Darwin",
+            version=lambda command, _environment: versions[tuple(command)],
+        )
+
+        self.assertEqual(metadata, {
+            "rustc_verbose": "rustc 1.95.0\nhost: aarch64-apple-darwin",
+            "cc": "Apple clang version 17.0.0",
+            "sdk_path": "/SDKs/MacOSX.sdk",
+            "sdk_version": "26.5",
+        })
 
 
 if __name__ == "__main__":

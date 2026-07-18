@@ -403,6 +403,12 @@ class CollectionHelpersTest(unittest.TestCase):
                 ],
                 "rustc": "rustc 1.95.0",
                 "cargo": "cargo 1.95.0",
+                "native_toolchain": {
+                    "rustc_verbose": "rustc 1.95.0\nhost: test-target",
+                    "cc": "cc 1.0",
+                    "sdk_path": "not applicable",
+                    "sdk_version": "not applicable",
+                },
                 "build_environment": {
                     "PATH": "/bin",
                     "CARGO_TARGET_DIR": "/tmp/fresh-target",
@@ -442,6 +448,7 @@ class CollectionHelpersTest(unittest.TestCase):
                 "build_command": ["cargo", "build"],
                 "rustc": "",
                 "cargo": "",
+                "native_toolchain": {},
                 "build_environment": {},
                 "built_in_fresh_target": False,
                 "source_isolated_archive": False,

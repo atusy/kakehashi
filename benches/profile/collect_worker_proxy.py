@@ -371,7 +371,7 @@ def load_binary_attestation(path, binary):
     required = (
         "schema", "source_repository", "source_commit",
         "source_checkout_clean", "build_command", "rustc", "cargo",
-        "build_environment", "built_in_fresh_target", "binary_relative",
+        "native_toolchain", "build_environment", "built_in_fresh_target", "binary_relative",
         "source_isolated_archive", "cargo_config_ancestry_clean",
         "binary_sha256",
     )
@@ -389,6 +389,14 @@ def load_binary_attestation(path, binary):
         and bool(attestation["rustc"])
         and isinstance(attestation["cargo"], str)
         and bool(attestation["cargo"])
+        and isinstance(attestation["native_toolchain"], dict)
+        and set(attestation["native_toolchain"]) == {
+            "rustc_verbose", "cc", "sdk_path", "sdk_version",
+        }
+        and all(
+            isinstance(value, str) and bool(value)
+            for value in attestation["native_toolchain"].values()
+        )
         and isinstance(attestation["build_environment"], dict)
         and "PATH" in attestation["build_environment"]
         and "CARGO_TARGET_DIR" in attestation["build_environment"]
