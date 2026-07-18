@@ -325,8 +325,11 @@ document without forcing a full sync for every keystroke.
 An acknowledgment with the wrong generation, incarnation, base, or target is
 discarded and forces `Unsynced`; a worker receiving an invalid base returns
 `ResyncRequired` without applying the edit or deriving from partial state, with
-the same transition. Close removes every pending state and deferred edit for
-that incarnation. Restart creates new per-generation `Unsynced` states rather
+the same transition. An expected `ResyncRequired` caused by edit/base races is a
+normal recovery event and does not consume any restart or systemic-failure
+budget. Only failure to complete a bounded full resync or a response that
+violates the state-machine invariants is a protocol failure. Close removes every
+pending state and deferred edit for that incarnation. Restart creates new per-generation `Unsynced` states rather
 than attempting to replay old acknowledgments.
 
 Parent and worker use a separately bounded, bidirectional control transport for
@@ -636,7 +639,8 @@ active hazard leases at worker loss are conservatively quarantined, but that
 fact alone does not classify the cause as native or exempt the restart.
 
 Classification precedence is explicit. A supervisor-observed startup,
-handshake, framing/protocol, resync, parent-liveness, or reported Rust panic/
+handshake, framing/protocol, failed bounded resynchronization, parent-liveness,
+or reported Rust panic/
 invariant failure is systemic even if hazard leases are active. Otherwise, a
 hard `NativeSegment` deadline or an OS crash signal/exception while at least one
 hazard lease is active is native-evidenced. Every remaining unattributed or
@@ -900,6 +904,8 @@ Implementation is accepted only when all of the following hold:
   Queue-race tests cover replacement winning before dequeue, dequeue winning
   before replacement, and stale acknowledgments after resync, proving the state
   and expected acknowledgment change atomically.
+  Ordinary invalid-base `ResyncRequired` recovery never charges the breaker;
+  repeated failed full resync and invariant-violating replies do.
 * Repeated startup, handshake, protocol, and delayed-post-return failures prove
   the restart budget converges to one logged tree-tier-unavailable state, wakes
   waiters, stops respawning, and leaves host-tier service usable. A relevant
