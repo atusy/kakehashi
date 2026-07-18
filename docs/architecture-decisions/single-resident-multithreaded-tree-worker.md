@@ -296,16 +296,24 @@ remain separate messages, but each message performs its complete tree walk in
 the worker. The parent never asks for a raw tree and then remotely walks it one
 node at a time to implement a single public request.
 
-Every entry into untrusted native grammar code has a two-phase parent-visible
-boundary. This includes dynamic-library loading and symbol initialization as
-well as parsing that can invoke an external scanner. Before entry, the worker
-sends `NativeCallStarting` with the actual runtime grammar identity and waits.
-The parent records the call in its session-local active set before replying with
-`NativeCallArmed`; the worker must not enter native code without that reply. On
-normal return, `NativeCallFinished` removes the call from the parent set. A
-worker that dies after the arm therefore cannot make the implicated grammar
-invisible to recovery, while a worker that dies before the arm has not entered
-that native boundary.
+Every operation that can consume grammar-backed native state has a two-phase
+parent-visible boundary. The hazard scope includes dynamic-library loading and
+symbol initialization, `Parser::set_language`, query construction, parsing and
+external scanners, and every `Tree`, `Node`, query, or node-identity operation
+whose raw pointers ultimately depend on the grammar mapping. It is intentionally
+broader than the lexical call into `Parser::parse`: native corruption may become
+observable only during a later tree walk.
+
+Before the first such dereference, the worker sends `NativeCallStarting` with
+the actual runtime grammar identity and waits. The parent records the call in
+its session-local active set before replying with `NativeCallArmed`; the worker
+must not enter the hazard scope without that reply. Each grammar encountered by
+a fused host/injection operation is armed separately and remains active until
+the complete high-level operation has stopped consuming every value backed by
+that grammar. Only then does `NativeCallFinished` remove it from the parent set.
+A worker that dies after the arm therefore cannot make a relevant grammar
+invisible merely because parsing returned before the delayed failure, while a
+worker that dies before the arm has not entered that grammar-backed boundary.
 
 `grammar_key` identifies the resolved artifact and exported grammar, not merely
 a configured language alias. Aliases that load the same artifact share a key;
@@ -497,6 +505,9 @@ Implementation is accepted only when all of the following hold:
 * Failure injection immediately after `NativeCallArmed` proves that the parent
   already holds the crashing grammar key and that the replacement worker refuses
   it for host and injected parser acquisition.
+* A fixture that returns from parsing and fails during query construction or a
+  later tree/node walk proves that the grammar remains parent-visible until the
+  entire high-level operation leaves its grammar-backed hazard scope.
 * A child grammar fixture that hangs proves the hard deadline kills and reaps
   the worker and its descendants, then restores service for non-quarantined
   documents.
