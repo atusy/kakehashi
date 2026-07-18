@@ -207,6 +207,7 @@ RunCaptures(context, query, range)
 CancelRequest(request_id, worker_generation)
 NativeCallStarting(call_id, request_id, grammar_key)
 NativeCallArmed(call_id, worker_generation)
+NativeCallEntered(call_id, worker_generation)
 NativeCallFinished(call_id)
 ```
 
@@ -262,8 +263,12 @@ the same transition. Close removes every pending state and deferred edit for
 that incarnation. Restart creates new per-generation `Unsynced` states rather
 than attempting to replay old acknowledgments.
 
-Protocol writes run on a dedicated async writer and never hold an LSP ingress
-ticket while waiting for pipe capacity. Its queue is bounded. When backpressure
+Bulk state writes run on a dedicated async writer and never hold an LSP ingress
+ticket while waiting for pipe capacity. Its queue is bounded. A separately
+bounded priority control path carries arm, cancel, shutdown, and liveness frames;
+bulk full-text frames cannot sit ahead of `NativeCallArmed`. If both classes are
+multiplexed onto one OS stream, bulk frames are chunked to a measured maximum so
+the control-latency bound is preserved between chunks. When bulk backpressure
 would retain an obsolete chain of unsent document edits, the parent replaces
 that chain with one latest full-sync candidate rather than blocking ingress or
 replaying every intermediate version. `DeriveSnapshot` and other document work
@@ -307,8 +312,10 @@ observable only during a later tree walk.
 Before the first such dereference, the worker sends `NativeCallStarting` with
 the actual runtime grammar identity and waits. The parent records the call in
 its session-local active set before replying with `NativeCallArmed`; the worker
-must not enter the hazard scope without that reply. Each grammar encountered by
-a fused host/injection operation is armed separately and remains active until
+must not enter the hazard scope without that reply. After receiving the arm and
+immediately before its first hazardous dereference, the worker emits
+`NativeCallEntered`. Each grammar encountered by a fused host/injection
+operation is armed separately and remains active until
 the complete high-level operation has stopped consuming every value backed by
 that grammar. Only then does `NativeCallFinished` remove it from the parent set.
 A worker that dies after the arm therefore cannot make a relevant grammar
@@ -379,12 +386,16 @@ therefore retries every installed parser.
 
 An end-to-end request deadline starts at request admission and can release the
 client without killing the worker. A separate hard native-call deadline starts
-only when the parent records `NativeCallStarting` and sends `NativeCallArmed`.
-A cooperative timeout that returns control from Tree-sitter does not require a
-worker restart. If an armed call exceeds the hard deadline, the parent kills and
-restarts the worker and quarantines the complete acknowledged active grammar
-set. This remains correct when one `DeriveSnapshot` reaches several injected
-grammars or when unrelated documents parse concurrently.
+only when the parent receives `NativeCallEntered`, not while an arm frame is
+queued or in transit. The already recorded active key still provides crash
+attribution between arm and entry. Missing entry and control-protocol progress
+use the supervisor's bounded handshake/liveness timeout rather than consuming a
+grammar's native execution budget. A cooperative timeout that returns control
+from Tree-sitter does not require a worker restart. If an entered call exceeds
+the hard deadline, the parent kills and restarts the worker and quarantines the
+complete acknowledged active grammar set. This remains correct when one
+`DeriveSnapshot` reaches several injected grammars or when unrelated documents
+parse concurrently.
 
 The worker belongs to the parent process lifetime. Shutdown closes the protocol,
 waits for a short graceful exit, then kills and reaps the process (and its process
@@ -505,6 +516,9 @@ Implementation is accepted only when all of the following hold:
 * Failure injection immediately after `NativeCallArmed` proves that the parent
   already holds the crashing grammar key and that the replacement worker refuses
   it for host and injected parser acquisition.
+* A saturated bulk full-sync queue proves arm control traffic remains bounded
+  and that the native hard deadline begins only after `NativeCallEntered`, so
+  transport delay alone cannot quarantine a healthy grammar.
 * A fixture that returns from parsing and fails during query construction or a
   later tree/node walk proves that the grammar remains parent-visible until the
   entire high-level operation leaves its grammar-backed hazard scope.
