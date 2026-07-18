@@ -460,6 +460,15 @@ the tombstone only through a later authorized install transaction using its
 observed revision. Immutable bytes remain untouched during the no-runtime-GC
 phase.
 
+The manifest is also the source of truth for parser-facing CLI discovery.
+`language list`, parser status, and `language uninstall --all` enumerate logical
+grammar names from non-tombstoned manifests, never filenames in the immutable
+blob directory. A legacy fixed-path file is a pre-migration candidate only when
+no manifest revision or tombstone exists for that grammar; after migration or
+uninstall it is ignored even though retained on disk. Query-only languages are
+enumerated from the query store and unioned separately, preserving their current
+status and uninstall behavior without treating a query as a parser selection.
+
 Every worker-generation startup, including crash recovery, planned replacement,
 rollback, and a circuit-breaker half-open probe, re-reads each relevant manifest
 revision under its per-grammar lock before sending worker configuration. A
@@ -742,6 +751,10 @@ Implementation is accepted only when all of the following hold:
   affected local workers transition generations, other live generations keep
   their mapped bytes safely, and restarting another still-running parent's
   worker revalidates the manifest and cannot select the uninstalled digest.
+* CLI tests cover migrated selections, tombstones, retained legacy files,
+  immutable-blob-only files, and query-only languages, proving list/status and
+  `uninstall --all` operate on logical manifest selections rather than storage
+  filenames.
 * Cancellation tests cover queued and running work for client cancellation,
   supersession, handler drop, and `didClose`, including completion races and the
   rule that canceled work publishes and caches nothing.
