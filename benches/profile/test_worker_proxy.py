@@ -58,6 +58,9 @@ class CopyStreamTest(unittest.TestCase):
             self.assertEqual(process.stdout.read(2), b"ok")
             return_code = process.wait(timeout=5)
             stderr = process.stderr.read().decode()
+        except subprocess.TimeoutExpired:
+            terminate_child(process)
+            raise
         finally:
             process.stdin.close()
             process.stdout.close()
