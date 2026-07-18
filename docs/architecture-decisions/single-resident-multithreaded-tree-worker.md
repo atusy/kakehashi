@@ -522,9 +522,13 @@ worker. Legacy files are not removed by runtime migration or GC.
 An arbitrary native path from `LanguageSettings.parser` is compatibility input,
 not a path the worker maps directly. At startup and each relevant configuration
 transaction, the parent opens the resolved source, copies it to staging while
-hashing, verifies that source identity/size/mtime did not change across the
-copy, and imports the bytes under their digest. A changed source retries rather
-than publishing mixed bytes. The resulting session descriptor contains the
+hashing, and uses an OS snapshot/shared lock when the platform and source
+filesystem provide one. Because external writers may ignore advisory locks, the
+parent then reopens and reads the complete source a second time, computing a
+second cryptographic digest and length. File identity metadata is checked before
+and after both passes, but metadata alone is not accepted: the staged bytes are
+imported only when both full-content digests and lengths match. Any mismatch or
+read mutation retries rather than publishing potentially mixed bytes. The resulting session descriptor contains the
 immutable path, digest, and export; aliases with identical bytes and export
 share a `grammar_key`. Source mutation cannot change code already mapped by a
 worker. A configuration reload or watched source-identity change triggers a new
@@ -954,7 +958,9 @@ Implementation is accepted only when all of the following hold:
   migration never creates two worker processes or exposes unvalidated code.
   Explicit parser-path tests prove the worker maps an imported immutable copy,
   source mutation cannot alter a live generation, and configuration/source
-  refresh adopts changed bytes through a new digest and worker generation.
+  refresh adopts changed bytes through a new digest and worker generation. A
+  concurrent same-size rewrite that preserves coarse mtime fails full-content
+  revalidation and cannot publish a mixed artifact.
   Failure injection after every artifact/manifest filesystem step proves the
   next startup selects a complete old or new commit. Post-`dlopen` symbol and
   query-initialization failures prove the candidate worker is reaped before
