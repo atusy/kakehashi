@@ -92,7 +92,8 @@ The LSP server process owns the authoritative, reconstructable inputs:
 * document incarnation and monotonic content version;
 * workspace/language configuration generation;
 * the latest admitted serialized derived results needed for serve-stale and
-  parser-independent routing; and
+  parser-independent routing, classified by whether they contain worker-local
+  identity; and
 * worker lifecycle, request priority, deadlines, and session quarantine state.
 
 The parent also retains the process-wide installer: source acquisition,
@@ -131,6 +132,15 @@ ranges, captures, tokens, regions, symbols, or opaque node IDs.
 An old node ID presented after a worker restart is unresolved and follows the
 node protocol's existing `null` semantics. The parent does not attempt to
 reconstruct worker-local node identity.
+
+Every serialized artifact schema declares whether it is generation-independent
+or contains an opaque node ID or other worker-local handle. Before publishing a
+worker-loss transition, the parent atomically invalidates all retained artifacts
+in the latter class and removes their response-router/cache entries. Only plain
+ranges, tokens, symbols, text, or other handle-free data may remain eligible for
+serve-stale, subject to their existing document/configuration guards. Node-
+bearing results are never served across worker generations even when their text
+version still matches.
 
 A worker generation starts in exactly one internal mode. `Serving` mode accepts
 only manifest-selected/configured descriptors and may sync documents and serve
@@ -854,6 +864,9 @@ Implementation is accepted only when all of the following hold:
   snapshots and every demand-driven tree operation.
 * Restart tests prove the parent can reconstruct every worker-side document
   from authoritative full text and that pre-restart node IDs resolve to `null`.
+  They also prove node-bearing retained artifacts are invalidated before recovery
+  publication while generation-independent stale artifacts retain their existing
+  method-specific eligibility.
 * Concurrency tests prove the worker uses more than one compute thread while
   enforcing per-document admission and preserving latest-wins coalescing when
   the configured test budget is at least two.
