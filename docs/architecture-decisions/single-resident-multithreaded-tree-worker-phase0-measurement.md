@@ -77,9 +77,12 @@ The cache-hit p95 interval excludes zero when rounded values are treated as an
 exact observation, but its +0.035-ms estimate is smaller than the driver's
 0.1-ms reporting resolution. It therefore does not establish a non-zero tail
 effect. The other cache-hit intervals include zero. Rust edit p99 has a larger
-+0.260-ms estimate and [0.010, 0.710]-ms interval; the other edit-latency
-intervals cross or include zero. These concrete relay results are not bounds on
-the future worker protocol.
++0.260-ms nominal estimate and [0.010, 0.710]-ms interval, but that result is
+not stable under pair-slice sensitivity analysis. Dropping the first measured
+pair gives +0.047 ms [-0.005, 0.100], while the final ten pairs give +0.000 ms
+[-0.050, 0.050]. It is therefore treated as a transient-sensitive result, not a
+non-zero tail effect. The other edit-latency intervals cross or include zero.
+These concrete relay results are not bounds on the future worker protocol.
 
 ### Throughput-sensitive cache-hit path
 
@@ -144,8 +147,10 @@ both methods' outcome and fallback counts.
 
 This particular raw process/pipe relay did not expose a clear steady-state
 transport blocker on this machine. Cache-hit request-tail point deltas were
-below the driver's 0.1-ms reporting resolution or had intervals crossing zero;
-Rust edit p99 was the exception at +0.260 ms with a [0.010, 0.710]-ms interval.
+below the driver's 0.1-ms reporting resolution or had intervals crossing zero.
+The nominal Rust edit p99 interval excluded zero, but its dependence on the
+first measured pair and reversal under pair-slice sensitivity analysis means it
+does not establish a tail effect.
 The cache-hit throughput run estimated 0.5 microseconds of amortized extra wall
 time per request with a [-10.6, 10.3]-microsecond interval for this concrete
 relay. The actual Stage 1 worker cost may be above or below these relay deltas.
@@ -183,6 +188,10 @@ Recompute every steady-state table value and confidence interval with:
 
 ```sh
 python3 benches/profile/analyze_worker_proxy.py
+python3 benches/profile/analyze_worker_proxy.py --drop-first-pairs 1 \
+  | jq '.rust_edit.p99'
+python3 benches/profile/analyze_worker_proxy.py --last-pairs 10 \
+  | jq '.rust_edit.p99'
 ```
 
 The July 19 steady-state section comes from one final 20-pair collector run and

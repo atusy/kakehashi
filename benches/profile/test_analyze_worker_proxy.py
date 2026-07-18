@@ -65,6 +65,31 @@ class PairedSummaryTest(unittest.TestCase):
 
         self.assertAlmostEqual(summary["cold_start"]["mean_delta"], 0.035)
 
+    def test_can_slice_steady_state_pairs_for_sensitivity_analysis(self):
+        def result(value):
+            return {metric: value for metric in ("p50", "p95", "p99", "wall")}
+
+        data = {
+            "experiment": "single-tree-worker-phase0-raw-relay",
+            "steady_state": {
+                "rust_edit": {
+                    "pairs": [
+                        {"direct": result(1.0), "relay": result(4.0)},
+                        {"direct": result(2.0), "relay": result(2.1)},
+                        {"direct": result(3.0), "relay": result(3.1)},
+                    ]
+                }
+            },
+        }
+
+        without_first = analyze_data(
+            data, seed=7, resamples=100, drop_first_pairs=1
+        )
+        last_two = analyze_data(data, seed=7, resamples=100, last_pairs=2)
+
+        self.assertAlmostEqual(without_first["rust_edit"]["p99"]["mean_delta"], 0.1)
+        self.assertEqual(without_first, last_two)
+
 
 if __name__ == "__main__":
     unittest.main()

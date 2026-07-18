@@ -51,17 +51,36 @@ def summarize_cold_start(times):
     }
 
 
-def analyze_data(data, seed=123_456_789, resamples=100_000):
+def select_pairs(pairs, drop_first_pairs=0, last_pairs=None):
+    if drop_first_pairs and last_pairs is not None:
+        raise ValueError("pair sensitivity slices are mutually exclusive")
+    selected = pairs[-last_pairs:] if last_pairs is not None else pairs[drop_first_pairs:]
+    if not selected:
+        raise ValueError("pair sensitivity slice is empty")
+    return selected
+
+
+def analyze_data(
+    data,
+    seed=123_456_789,
+    resamples=100_000,
+    drop_first_pairs=0,
+    last_pairs=None,
+):
     if data.get("experiment") == "single-tree-worker-phase0-cold-start":
         return {
             "cold_start": summarize_pairs(
-                data["pairs"], "elapsed_seconds", seed, resamples
+                select_pairs(data["pairs"], drop_first_pairs, last_pairs),
+                "elapsed_seconds", seed, resamples,
             )
         }
     summaries = {}
     for scenario, details in data["steady_state"].items():
         summaries[scenario] = {
-            metric: summarize_pairs(details["pairs"], metric, seed, resamples)
+            metric: summarize_pairs(
+                select_pairs(details["pairs"], drop_first_pairs, last_pairs),
+                metric, seed, resamples,
+            )
             for metric in ("p50", "p95", "p99", "wall")
         }
     if data.get("cold_start"):
@@ -81,10 +100,23 @@ def main():
     parser.add_argument("data", nargs="?", type=pathlib.Path, default=default_data)
     parser.add_argument("--seed", type=int, default=123_456_789)
     parser.add_argument("--resamples", type=int, default=100_000)
+    sensitivity = parser.add_mutually_exclusive_group()
+    sensitivity.add_argument("--drop-first-pairs", type=int, default=0)
+    sensitivity.add_argument("--last-pairs", type=int)
     args = parser.parse_args()
+    if args.drop_first_pairs < 0 or (
+        args.last_pairs is not None and args.last_pairs <= 0
+    ):
+        parser.error("pair slice counts must be positive (or zero for drop-first)")
 
     data = json.loads(args.data.read_text())
-    summaries = analyze_data(data, args.seed, args.resamples)
+    summaries = analyze_data(
+        data,
+        args.seed,
+        args.resamples,
+        args.drop_first_pairs,
+        args.last_pairs,
+    )
     print(json.dumps(summaries, indent=2, sort_keys=True))
 
 
