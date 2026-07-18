@@ -178,9 +178,23 @@ cooperative chunks.
 
 ### 4. IPC is versioned and coarse grained
 
-The worker is a hidden mode of the same kakehashi executable, so parent and
-worker versions normally match. They still perform a protocol-version handshake
-before accepting document state. The transport is a framed local byte stream;
+The worker is a hidden mode of the same kakehashi build, but lazy startup never
+resolves and executes the install path again. During earliest parent
+initialization, kakehashi opens its running image (using `/proc/self/exe` on
+Linux where available, and the platform's current-image handle/path otherwise),
+materializes a permission-restricted session-private executable snapshot, fsyncs
+it, and retains that immutable path/handle for every worker generation. An
+in-place package upgrade or deletion of the original path therefore cannot
+change the worker build used by an already running parent. If the platform
+cannot materialize or execute a snapshot whose embedded build/protocol identity
+matches the parent, the tree tier fails closed rather than launching an
+unproven image. Normal and abnormal cleanup follows the same parent-lifetime
+rules as the worker; stale snapshots are safe startup garbage, not executable
+selection inputs.
+
+Parent and worker still perform a build-identity and protocol-version handshake
+before accepting document state. A mismatch is a systemic startup failure. The
+transport is a framed local byte stream;
 the encoding is an implementation choice to be selected by prototype
 measurement, but framing, request IDs, version fields, size limits, and unknown
 message rejection are protocol requirements.
@@ -804,6 +818,10 @@ Implementation is accepted only when all of the following hold:
   not only two outer requests, and separately covers the one-thread degradation.
 * Protocol tests cover truncated frames, oversized frames, unknown versions,
   invalid edit bases, duplicate responses, EOF, and child startup failure.
+  Lifecycle tests replace or delete the installed executable after parent
+  initialization but before lazy worker start and crash recovery, proving every
+  generation executes the retained parent-build snapshot; unverifiable or
+  non-executable snapshots fail closed.
   Queue-race tests cover replacement winning before dequeue, dequeue winning
   before replacement, and stale acknowledgments after resync, proving the state
   and expected acknowledgment change atomically.
