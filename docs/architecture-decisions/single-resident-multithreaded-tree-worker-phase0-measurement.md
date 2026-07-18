@@ -63,11 +63,13 @@ its reporting resolution.
 | Markdown injections, one edit/request | p95 | 3.925 ms | 3.950 ms | +0.025 ms | [-0.045, 0.095] ms |
 | Markdown injections, one edit/request | p99 | 4.015 ms | 4.735 ms | +0.720 ms | [-0.015, 2.015] ms |
 
-Only the Rust edit p95 interval excludes zero, consistent with a small relay
-tail cost. Markdown p99 has a larger +0.720-ms point estimate but a wide interval
-that crosses zero. The other tail-latency intervals do not distinguish the relay
-from run-level scheduling noise. These concrete relay results are not bounds on
-the future worker protocol.
+The bootstrap interval for Rust edit p95 excludes zero when the rounded values
+are treated as exact observations, but the +0.060-ms estimate is smaller than
+the driver's 0.1-ms reporting resolution. It therefore does not establish a
+non-zero relay effect. Markdown p99 has a larger +0.720-ms point estimate but a
+wide interval that crosses zero. The other tail-latency intervals do not
+distinguish the relay from run-level scheduling noise. These concrete relay
+results are not bounds on the future worker protocol.
 
 ### Throughput-sensitive cache-hit path
 
@@ -135,9 +137,10 @@ both methods' outcome and fallback counts.
 
 This particular raw process/pipe relay did not expose a clear steady-state
 transport blocker on this machine. Its median and p95 point deltas were at or
-below the driver's 0.1-ms reporting resolution; Rust edit p95 nevertheless had
-an interval above zero. Markdown edit p99 had a +0.720-ms point estimate with an
-interval crossing zero. The cache-hit throughput run estimated about 10.4
+below the driver's 0.1-ms reporting resolution; the Rust edit p95 interval above
+zero is not evidence of a non-zero effect at that precision. Markdown edit p99
+had a +0.720-ms point estimate with an interval crossing zero. The cache-hit
+throughput run estimated about 10.4
 microseconds of amortized extra wall time per request, also with an interval
 crossing zero. The actual Stage 1 worker cost may be above or below these relay
 deltas.
