@@ -352,11 +352,19 @@ Replacing an artifact already loaded by the worker is a planned worker restart,
 not an in-place reload. The current native loader intentionally keeps libraries
 mapped for process lifetime because `Language`, `Parser`, `Tree`, and queries may
 retain raw pointers into them, and loading the same canonical path again may
-return the old image. After compilation and atomic installation, the parent
-advances the configuration generation, drains or cancels public tree requests,
-starts a fresh worker generation, sends configuration and quarantine state, and
-full-syncs open documents. Only the fresh worker loads the replacement. This
-also avoids replacing a loaded DLL in place on platforms that prohibit it.
+return the old image.
+
+Replacement is ordered as a transaction: compile and validate the candidate at
+a staged same-filesystem path; drain or cancel public tree requests; terminate
+and reap the old worker so no DLL remains mapped; move the old installed artifact
+to a rollback path and atomically publish the staged candidate; then advance the
+configuration generation and start a fresh worker. Only the fresh worker loads
+the replacement before configuration/quarantine acknowledgment and document
+full-sync. If publication or initial load fails, the parent removes the failed
+candidate, restores the previous artifact, and may start one rollback worker
+under the circuit-breaker budget. If restoration also fails, the tree tier
+enters the terminal degraded state rather than running with an ambiguous
+artifact. This ordering handles platforms that prohibit replacing a loaded DLL.
 
 Loading the same quarantined `grammar_key` is refused; a genuinely replaced
 artifact has a different content identity and may be loaded by the fresh
@@ -591,8 +599,11 @@ Implementation is accepted only when all of the following hold:
 * Install/reload tests cover missing host and injected grammars, concurrent
   install deduplication, cache invalidation, latest-version re-derivation, and
   refusal to load the same quarantined artifact. Same-path parser replacement,
-  including the loaded-DLL case on Windows, proves that a fresh worker executes
-  the new artifact rather than acknowledging a new key while retaining old code.
+  including the loaded-DLL case on Windows, proves the old worker is reaped
+  before publication and that a fresh worker executes the new artifact rather
+  than acknowledging a new key while retaining old code. Publication and load
+  failure tests prove rollback either restores the prior artifact or converges
+  to the tree-tier-degraded state.
 * Cancellation tests cover queued and running work for client cancellation,
   supersession, handler drop, and `didClose`, including completion races and the
   rule that canceled work publishes and caches nothing.
