@@ -81,7 +81,7 @@ millisecond rounding before analysis.
 | Markdown injections, one edit/request | p95 | 5.480 ms | 5.250 ms | -0.230 ms | [-0.925, 0.260] ms |
 | Markdown injections, one edit/request | p99 | 6.115 ms | 5.680 ms | -0.435 ms | [-1.455, 0.375] ms |
 
-Batch A's cache-hit p50/p95 intervals exclude zero, but their point deltas are
+Batch A's cache-hit p50/p99 intervals exclude zero, but their point deltas are
 at or below the driver's 0.1-ms percentile reporting resolution. Batch B
 reported +0.020 ms [-0.010, 0.050] at p50, +0.015 ms [-0.015, 0.050] at p95,
 and +0.000 ms [-0.020, 0.020] at p99. All edit-latency intervals cross zero in
