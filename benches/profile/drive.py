@@ -109,7 +109,7 @@ def response_result_id(message: dict):
     return result.get("resultId") if isinstance(result, dict) else None
 
 
-def capture_result_id(response):
+def capture_result_id(response, previous_result_id=None):
     if response_status(response) != "ok":
         raise RuntimeError(f"capture request failed: {response}")
     result = response.get("result")
@@ -126,6 +126,10 @@ def capture_result_id(response):
         full_shape or delta_shape
     ):
         raise RuntimeError(f"invalid capture result or lineage: {response}")
+    if previous_result_id is not None and result_id == previous_result_id:
+        raise RuntimeError(
+            f"capture response did not advance capture lineage: {response}"
+        )
     return result_id
 
 
@@ -555,7 +559,8 @@ def main() -> None:
                 if method not in captures_responses:
                     continue
                 captures_result_id = capture_result_id(
-                    captures_responses[method]
+                    captures_responses[method],
+                    previous_result_id=captures_result_id,
                 )
                 break
             req_times.append(time.perf_counter() - t_req)

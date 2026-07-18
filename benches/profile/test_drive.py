@@ -31,6 +31,11 @@ class RequestSummaryTest(unittest.TestCase):
         self.assertEqual(capture_result_id({
             "result": {"resultId": "delta", "edits": []}
         }), "delta")
+        with self.assertRaisesRegex(RuntimeError, "advance capture lineage"):
+            capture_result_id(
+                {"result": {"resultId": "same", "edits": []}},
+                previous_result_id="same",
+            )
         for response in (
             {"error": {"code": -32800}},
             {"result": None},
