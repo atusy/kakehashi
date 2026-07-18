@@ -48,17 +48,17 @@ its reporting resolution.
 
 | Scenario | Metric | Direct mean | Relay mean | Paired delta | 95% CI for delta |
 |---|---:|---:|---:|---:|---:|
-| Rust small, unchanged cache hit | p50 | 0.38 ms | 0.38 ms | 0.00 ms | [0.00, 0.00] ms |
-| Rust small, unchanged cache hit | p95 | 0.41 ms | 0.39 ms | -0.02 ms | [-0.05, 0.00] ms |
-| Rust small, unchanged cache hit | p99 | 0.45 ms | 0.40 ms | -0.05 ms | [-0.13, 0.00] ms |
-| Rust small, one edit/request | p50 | 1.54 ms | 1.52 ms | -0.02 ms | [-0.09, 0.04] ms |
-| Rust small, one edit/request | p95 | 1.68 ms | 1.68 ms | 0.00 ms | [-0.10, 0.11] ms |
-| Rust small, one edit/request | p99 | 1.79 ms | 1.79 ms | 0.00 ms | [-0.06, 0.06] ms |
-| Markdown injections, one edit/request | p50 | 3.48 ms | 3.44 ms | -0.04 ms | [-0.16, 0.07] ms |
-| Markdown injections, one edit/request | p95 | 3.77 ms | 3.72 ms | -0.05 ms | [-0.35, 0.21] ms |
-| Markdown injections, one edit/request | p99 | 4.31 ms | 3.89 ms | -0.42 ms | [-1.60, 0.37] ms |
+| Rust small, unchanged cache hit | p50 | 0.39 ms | 0.40 ms | +0.01 ms | [0.00, 0.03] ms |
+| Rust small, unchanged cache hit | p95 | 0.41 ms | 0.43 ms | +0.02 ms | [-0.02, 0.06] ms |
+| Rust small, unchanged cache hit | p99 | 0.46 ms | 0.45 ms | -0.01 ms | [-0.11, 0.06] ms |
+| Rust small, one edit/request | p50 | 1.54 ms | 1.54 ms | 0.00 ms | [-0.03, 0.03] ms |
+| Rust small, one edit/request | p95 | 1.68 ms | 1.67 ms | -0.01 ms | [-0.05, 0.03] ms |
+| Rust small, one edit/request | p99 | 1.78 ms | 2.37 ms | +0.59 ms | [-0.05, 1.81] ms |
+| Markdown injections, one edit/request | p50 | 3.31 ms | 3.36 ms | +0.05 ms | [-0.05, 0.19] ms |
+| Markdown injections, one edit/request | p95 | 3.51 ms | 3.59 ms | +0.08 ms | [-0.03, 0.22] ms |
+| Markdown injections, one edit/request | p99 | 3.81 ms | 3.91 ms | +0.10 ms | [-0.49, 0.80] ms |
 
-The negative latency deltas are not interpreted as an improvement: the relay
+No tail-latency delta is interpreted as an improvement or regression: the relay
 does no useful work and the intervals are consistent with run-level scheduling
 noise at the driver's reporting resolution.
 
@@ -69,10 +69,11 @@ The cache-hit path transferred approximately 14.3 MiB of response bodies per
 
 | Metric | Direct mean | Relay mean | Paired delta | 95% CI for delta |
 |---|---:|---:|---:|---:|
-| Wall time / 1,000 requests | 379.0 ms | 391.2 ms | +12.2 ms (+3.2%) | [1.7, 23.3] ms |
-| Amortized extra wall time | — | — | +12.2 µs/request | [1.7, 23.3] µs/request |
+| Wall time / 1,000 requests | 405.1 ms | 416.1 ms | +11.0 ms (+2.7%) | [-1.3, 23.6] ms |
+| Amortized extra wall time | — | — | +11.0 µs/request | [-1.3, 23.6] µs/request |
 
-This is the clearest measured raw-relay estimate in this experiment. It is
+This is the most sensitive raw-relay estimate in this experiment, although its
+run-level confidence interval includes zero. It is
 neither a lower nor an upper bound for the future worker transport: the Python
 relay adds interpreter, thread, and flush costs, while the real protocol adds
 different payloads, encoding, queueing, and scheduling. The edit scenarios
@@ -108,8 +109,9 @@ used as a smoke test, not an independently repeated result:
 This particular raw process/pipe relay did not expose a clear steady-state
 transport blocker on this machine. Its median and p95 costs were at or below the
 driver's 0.1-ms reporting resolution, while the most sensitive cache-hit
-throughput run showed about 12.2 microseconds of amortized extra wall time per
-request. The actual Stage 1 worker cost may be above or below that relay delta.
+throughput run estimated about 11.0 microseconds of amortized extra wall time
+per request, with a confidence interval that includes zero. The actual Stage 1
+worker cost may be above or below that relay delta.
 
 This result is preliminary and insufficient evidence for the ADR. It does not
 show a worker performance improvement, and it cannot detect costs or benefits
@@ -142,11 +144,11 @@ steady-state table value and confidence interval with:
 python3 benches/profile/analyze_worker_proxy.py
 ```
 
-The steady-state file preserves the run-level summaries transcribed from this
-experiment's driver output; it does not preserve each raw stderr stream. The
-collector below was added after the experiment so subsequent datasets avoid
-that manual transcription boundary. The cold-start section does preserve all
-20 timing samples and is recomputed by the same analyzer.
+The July 19 steady-state section was written directly by the collector below;
+it preserves every run summary and status count but not each raw stderr stream.
+The July 18 cold-start and captures-pilot sections predate that recollection.
+The cold-start section preserves all 20 timing samples and is recomputed by the
+same analyzer; the single captures pilot remains a smoke test only.
 
 Collect a new alternating 10-pair steady-state dataset without hand
 transcription using:
