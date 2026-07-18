@@ -5,13 +5,42 @@ import signal
 import subprocess
 import sys
 import unittest
+from unittest import mock
 
 sys.path.insert(0, str(pathlib.Path(__file__).parent))
 
-from worker_proxy import copy_stream, require_posix, terminate_child
+from worker_proxy import copy_stream, require_posix, run_relay, terminate_child
 
 
 class CopyStreamTest(unittest.TestCase):
+    def test_thread_setup_interruption_reaps_child(self):
+        class Child:
+            stdin = io.BytesIO()
+            stdout = io.BytesIO()
+
+            def __init__(self):
+                self.terminated = False
+
+            def poll(self):
+                return None
+
+            def terminate(self):
+                self.terminated = True
+
+            def wait(self, timeout=None):
+                return 0
+
+        child = Child()
+
+        with mock.patch(
+            "worker_proxy.threading.Thread",
+            side_effect=SystemExit(128 + signal.SIGTERM),
+        ):
+            with self.assertRaises(SystemExit):
+                run_relay(child, io.BytesIO(), io.BytesIO())
+
+        self.assertTrue(child.terminated)
+
     def test_relay_rejects_non_posix_lifecycle(self):
         with self.assertRaisesRegex(SystemExit, "POSIX"):
             require_posix("nt")
