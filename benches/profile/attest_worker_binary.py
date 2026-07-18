@@ -23,6 +23,7 @@ def controlled_build_environment(source, target_dir):
         key: source[key] for key in BUILD_ENVIRONMENT_KEYS if key in source
     }
     environment["CARGO_TARGET_DIR"] = str(target_dir)
+    environment["CARGO_HOME"] = str(pathlib.Path(target_dir) / "cargo-home")
     return environment
 
 

@@ -401,6 +401,7 @@ class CollectionHelpersTest(unittest.TestCase):
                 "build_environment": {
                     "PATH": "/bin",
                     "CARGO_TARGET_DIR": "/tmp/fresh-target",
+                    "CARGO_HOME": "/tmp/fresh-target/cargo-home",
                 },
                 "built_in_fresh_target": True,
                 "binary_relative": "target/release/kakehashi",

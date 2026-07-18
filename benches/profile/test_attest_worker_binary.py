@@ -25,6 +25,7 @@ class BinaryAttestationTest(unittest.TestCase):
             "PATH": "/bin",
             "TMPDIR": "/tmp",
             "CARGO_TARGET_DIR": "/tmp/fresh-target",
+            "CARGO_HOME": "/tmp/fresh-target/cargo-home",
         })
 
 

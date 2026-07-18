@@ -6,7 +6,7 @@
     "python": "3.12.13",
     "binary": "/Users/atusy/ghq/github.com/atusy/kakehashi___worker_adr/target/release/kakehashi",
     "binary_execution": "private staged copy",
-    "binary_sha256": "ac9ea2da44cbe81ca4298f7636cd81c4c89967af6872af98bad9feb5f5e63fc5",
+    "binary_sha256": "f13b937624e059498b41bde258e82c259f8b401c327e0051bee84453ebfe6b72",
     "data_dir": "/private/tmp/kakehashi-phase0-data.WIU8dk",
     "data_dir_execution": "private staged copy",
     "parser_query_file_count": 25,
@@ -43,11 +43,12 @@
       "TMPDIR": "/var/folders/t3/_nc24_w90zq79l3xyz3xzc7c0000gn/T/",
       "LANG": "C.UTF-8",
       "LC_ALL": "C.UTF-8",
-      "CARGO_TARGET_DIR": "/var/folders/t3/_nc24_w90zq79l3xyz3xzc7c0000gn/T/kakehashi-attested-target-2wx0y4v8"
+      "CARGO_TARGET_DIR": "/var/folders/t3/_nc24_w90zq79l3xyz3xzc7c0000gn/T/kakehashi-attested-target-ihjxxrgo",
+      "CARGO_HOME": "/var/folders/t3/_nc24_w90zq79l3xyz3xzc7c0000gn/T/kakehashi-attested-target-ihjxxrgo/cargo-home"
     },
     "built_in_fresh_target": true,
     "binary_relative": "target/release/kakehashi",
-    "binary_sha256": "ac9ea2da44cbe81ca4298f7636cd81c4c89967af6872af98bad9feb5f5e63fc5"
+    "binary_sha256": "f13b937624e059498b41bde258e82c259f8b401c327e0051bee84453ebfe6b72"
   },
   "arguments": [
     "--lang",
@@ -67,12 +68,12 @@
       "run": 1,
       "order": "direct-relay",
       "direct": {
-        "elapsed_seconds": 0.14661966601852328,
+        "elapsed_seconds": 0.1433302500518039,
         "validated_responses": 1,
         "tokens_per_request": 1342
       },
       "relay": {
-        "elapsed_seconds": 0.1813138750148937,
+        "elapsed_seconds": 0.18102962500415742,
         "validated_responses": 1,
         "tokens_per_request": 1342
       }
@@ -81,12 +82,12 @@
       "run": 2,
       "order": "relay-direct",
       "relay": {
-        "elapsed_seconds": 0.19548458396457136,
+        "elapsed_seconds": 0.1841363749699667,
         "validated_responses": 1,
         "tokens_per_request": 1342
       },
       "direct": {
-        "elapsed_seconds": 0.16167750000022352,
+        "elapsed_seconds": 0.1460511659970507,
         "validated_responses": 1,
         "tokens_per_request": 1342
       }
@@ -95,12 +96,12 @@
       "run": 3,
       "order": "direct-relay",
       "direct": {
-        "elapsed_seconds": 0.1571199579630047,
+        "elapsed_seconds": 0.15033574996050447,
         "validated_responses": 1,
         "tokens_per_request": 1342
       },
       "relay": {
-        "elapsed_seconds": 0.19837562495376915,
+        "elapsed_seconds": 0.18898608395829797,
         "validated_responses": 1,
         "tokens_per_request": 1342
       }
@@ -109,12 +110,12 @@
       "run": 4,
       "order": "relay-direct",
       "relay": {
-        "elapsed_seconds": 0.2956758749205619,
+        "elapsed_seconds": 0.1900414580013603,
         "validated_responses": 1,
         "tokens_per_request": 1342
       },
       "direct": {
-        "elapsed_seconds": 0.17548724997323006,
+        "elapsed_seconds": 0.15033383306581527,
         "validated_responses": 1,
         "tokens_per_request": 1342
       }
@@ -123,12 +124,12 @@
       "run": 5,
       "order": "direct-relay",
       "direct": {
-        "elapsed_seconds": 0.16784624999854714,
+        "elapsed_seconds": 0.15553429198917001,
         "validated_responses": 1,
         "tokens_per_request": 1342
       },
       "relay": {
-        "elapsed_seconds": 0.21167270792648196,
+        "elapsed_seconds": 0.18721058301161975,
         "validated_responses": 1,
         "tokens_per_request": 1342
       }
@@ -137,12 +138,12 @@
       "run": 6,
       "order": "relay-direct",
       "relay": {
-        "elapsed_seconds": 0.21138458407949656,
+        "elapsed_seconds": 0.1907952909823507,
         "validated_responses": 1,
         "tokens_per_request": 1342
       },
       "direct": {
-        "elapsed_seconds": 0.16939150006510317,
+        "elapsed_seconds": 0.14613004098646343,
         "validated_responses": 1,
         "tokens_per_request": 1342
       }
@@ -151,12 +152,12 @@
       "run": 7,
       "order": "direct-relay",
       "direct": {
-        "elapsed_seconds": 0.1676554159494117,
+        "elapsed_seconds": 0.15462154196575284,
         "validated_responses": 1,
         "tokens_per_request": 1342
       },
       "relay": {
-        "elapsed_seconds": 0.21044725005049258,
+        "elapsed_seconds": 0.20169616700150073,
         "validated_responses": 1,
         "tokens_per_request": 1342
       }
@@ -165,12 +166,12 @@
       "run": 8,
       "order": "relay-direct",
       "relay": {
-        "elapsed_seconds": 0.21205541607923806,
+        "elapsed_seconds": 0.1956924160476774,
         "validated_responses": 1,
         "tokens_per_request": 1342
       },
       "direct": {
-        "elapsed_seconds": 0.16352416609879583,
+        "elapsed_seconds": 0.15600962506141514,
         "validated_responses": 1,
         "tokens_per_request": 1342
       }
@@ -179,12 +180,12 @@
       "run": 9,
       "order": "direct-relay",
       "direct": {
-        "elapsed_seconds": 0.15532995795365423,
+        "elapsed_seconds": 0.15538949996698648,
         "validated_responses": 1,
         "tokens_per_request": 1342
       },
       "relay": {
-        "elapsed_seconds": 0.20809054200071841,
+        "elapsed_seconds": 0.19691729207988828,
         "validated_responses": 1,
         "tokens_per_request": 1342
       }
@@ -193,12 +194,12 @@
       "run": 10,
       "order": "relay-direct",
       "relay": {
-        "elapsed_seconds": 0.19453083397820592,
+        "elapsed_seconds": 0.19499945791903883,
         "validated_responses": 1,
         "tokens_per_request": 1342
       },
       "direct": {
-        "elapsed_seconds": 0.15109970804769546,
+        "elapsed_seconds": 0.1545011670095846,
         "validated_responses": 1,
         "tokens_per_request": 1342
       }
@@ -207,12 +208,12 @@
       "run": 11,
       "order": "direct-relay",
       "direct": {
-        "elapsed_seconds": 0.15060216700658202,
+        "elapsed_seconds": 0.15909141604788601,
         "validated_responses": 1,
         "tokens_per_request": 1342
       },
       "relay": {
-        "elapsed_seconds": 0.19389287498779595,
+        "elapsed_seconds": 0.2007552080322057,
         "validated_responses": 1,
         "tokens_per_request": 1342
       }
@@ -221,12 +222,12 @@
       "run": 12,
       "order": "relay-direct",
       "relay": {
-        "elapsed_seconds": 0.19051687500905246,
+        "elapsed_seconds": 0.2006067499751225,
         "validated_responses": 1,
         "tokens_per_request": 1342
       },
       "direct": {
-        "elapsed_seconds": 0.1560320840217173,
+        "elapsed_seconds": 0.1516895000822842,
         "validated_responses": 1,
         "tokens_per_request": 1342
       }
@@ -235,12 +236,12 @@
       "run": 13,
       "order": "direct-relay",
       "direct": {
-        "elapsed_seconds": 0.1643315829569474,
+        "elapsed_seconds": 0.15297874994575977,
         "validated_responses": 1,
         "tokens_per_request": 1342
       },
       "relay": {
-        "elapsed_seconds": 0.18883462494704872,
+        "elapsed_seconds": 0.196025374927558,
         "validated_responses": 1,
         "tokens_per_request": 1342
       }
@@ -249,12 +250,12 @@
       "run": 14,
       "order": "relay-direct",
       "relay": {
-        "elapsed_seconds": 0.19182950002141297,
+        "elapsed_seconds": 0.19454304198734462,
         "validated_responses": 1,
         "tokens_per_request": 1342
       },
       "direct": {
-        "elapsed_seconds": 0.15880958293564618,
+        "elapsed_seconds": 0.15273366693872958,
         "validated_responses": 1,
         "tokens_per_request": 1342
       }
@@ -263,12 +264,12 @@
       "run": 15,
       "order": "direct-relay",
       "direct": {
-        "elapsed_seconds": 0.15225204196758568,
+        "elapsed_seconds": 0.15354445797856897,
         "validated_responses": 1,
         "tokens_per_request": 1342
       },
       "relay": {
-        "elapsed_seconds": 0.1918323750142008,
+        "elapsed_seconds": 0.19425545807462186,
         "validated_responses": 1,
         "tokens_per_request": 1342
       }
@@ -277,12 +278,12 @@
       "run": 16,
       "order": "relay-direct",
       "relay": {
-        "elapsed_seconds": 0.18508437497075647,
+        "elapsed_seconds": 0.1931938340421766,
         "validated_responses": 1,
         "tokens_per_request": 1342
       },
       "direct": {
-        "elapsed_seconds": 0.14198787498753518,
+        "elapsed_seconds": 0.1556682080263272,
         "validated_responses": 1,
         "tokens_per_request": 1342
       }
@@ -291,12 +292,12 @@
       "run": 17,
       "order": "direct-relay",
       "direct": {
-        "elapsed_seconds": 0.14248549996409565,
+        "elapsed_seconds": 0.15568274992983788,
         "validated_responses": 1,
         "tokens_per_request": 1342
       },
       "relay": {
-        "elapsed_seconds": 0.17953604203648865,
+        "elapsed_seconds": 0.19363320898264647,
         "validated_responses": 1,
         "tokens_per_request": 1342
       }
@@ -305,12 +306,12 @@
       "run": 18,
       "order": "relay-direct",
       "relay": {
-        "elapsed_seconds": 0.1844670840073377,
+        "elapsed_seconds": 0.19291445799171925,
         "validated_responses": 1,
         "tokens_per_request": 1342
       },
       "direct": {
-        "elapsed_seconds": 0.1517731670755893,
+        "elapsed_seconds": 0.15263775002676994,
         "validated_responses": 1,
         "tokens_per_request": 1342
       }
@@ -319,12 +320,12 @@
       "run": 19,
       "order": "direct-relay",
       "direct": {
-        "elapsed_seconds": 0.148468374973163,
+        "elapsed_seconds": 0.15412074991036206,
         "validated_responses": 1,
         "tokens_per_request": 1342
       },
       "relay": {
-        "elapsed_seconds": 0.19427437509875745,
+        "elapsed_seconds": 0.19447075005155057,
         "validated_responses": 1,
         "tokens_per_request": 1342
       }
@@ -333,12 +334,12 @@
       "run": 20,
       "order": "relay-direct",
       "relay": {
-        "elapsed_seconds": 0.1911049580667168,
+        "elapsed_seconds": 0.1992952920263633,
         "validated_responses": 1,
         "tokens_per_request": 1342
       },
       "direct": {
-        "elapsed_seconds": 0.15246825001668185,
+        "elapsed_seconds": 0.1637144999112934,
         "validated_responses": 1,
         "tokens_per_request": 1342
       }

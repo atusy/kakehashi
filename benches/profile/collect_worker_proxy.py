@@ -375,6 +375,7 @@ def load_binary_attestation(path, binary):
         and isinstance(attestation["build_environment"], dict)
         and "PATH" in attestation["build_environment"]
         and "CARGO_TARGET_DIR" in attestation["build_environment"]
+        and "CARGO_HOME" in attestation["build_environment"]
         and all(
             isinstance(key, str) and isinstance(value, str)
             for key, value in attestation["build_environment"].items()
@@ -384,7 +385,7 @@ def load_binary_attestation(path, binary):
             - {
                 "PATH", "SYSTEMROOT", "WINDIR", "TMPDIR", "TMP", "TEMP",
                 "LANG", "LC_ALL", "SDKROOT", "MACOSX_DEPLOYMENT_TARGET",
-                "CARGO_TARGET_DIR",
+                "CARGO_TARGET_DIR", "CARGO_HOME",
             }
         )
         and attestation["built_in_fresh_target"] is True
