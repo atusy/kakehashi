@@ -2243,9 +2243,9 @@
     "parser_query_tree_sha256": "1572967b352c7b24ec872bff02c3c9808374a0d5cab2c707368cb5f32be58115",
     "direct": {
       "semantic_p50": 4.4,
-      "semantic_p95": 5.0,
-      "captures_p50": 29.7,
-      "captures_p95": 32.7,
+      "semantic_p95": 5.2,
+      "captures_p50": 29.8,
+      "captures_p95": 32.1,
       "semantic_outcomes": {
         "count": 100,
         "ok": 100,
@@ -2262,10 +2262,10 @@
       }
     },
     "relay": {
-      "semantic_p50": 4.3,
-      "semantic_p95": 4.9,
-      "captures_p50": 29.0,
-      "captures_p95": 32.0,
+      "semantic_p50": 4.4,
+      "semantic_p95": 5.0,
+      "captures_p50": 29.3,
+      "captures_p95": 32.3,
       "semantic_outcomes": {
         "count": 100,
         "ok": 100,
