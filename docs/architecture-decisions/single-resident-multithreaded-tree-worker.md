@@ -138,8 +138,8 @@ or contains an opaque node ID or other worker-local handle. Before publishing a
 worker-loss transition, the parent atomically invalidates all retained artifacts
 in the latter class and removes their response-router/cache entries. Only plain
 ranges, tokens, symbols, text, or other handle-free data may remain eligible for
-serve-stale, subject to their existing document/configuration guards. Node-
-bearing results are never served across worker generations even when their text
+serve-stale, subject to their existing document/configuration guards.
+Node-bearing results are never served across worker generations even when their text
 version still matches.
 
 A worker generation starts in exactly one internal mode. `Serving` mode accepts
@@ -365,8 +365,8 @@ call; the parent cannot observe that final instruction boundary causally. The
 kill threshold is `handoff_allowance + native_budget`, and no grammar timeout is
 declared during the allowance. The prototype measures the allowance under
 compute and system saturation for each supported platform and fails closed if a
-safe configured bound is unavailable. This trades a bounded increase in hang-
-recovery latency for avoiding false quarantine of a healthy but descheduled
+safe configured bound is unavailable. This trades a bounded increase in
+hang-recovery latency for avoiding false quarantine of a healthy but descheduled
 worker.
 
 Bulk state writes run on a dedicated async writer and never hold an LSP ingress
@@ -453,8 +453,8 @@ grammar-backed boundary.
 
 The broad attribution lease is distinct from hard-hang timing. Immediately
 before each non-cooperative Tree-sitter FFI segment, such as library loading,
-grammar initialization, `Parser::parse`, or a bounded batch of adjacent query-
-cursor and `Tree`/`Node` calls, the worker performs the separate
+grammar initialization, `Parser::parse`, or a bounded batch of adjacent
+query-cursor and `Tree`/`Node` calls, the worker performs the separate
 `NativeSegmentStarting`/`NativeSegmentArmed` handshake and emits
 `NativeSegmentEntered`; it emits `NativeSegmentExited` immediately on return.
 Potentially long query and tree walks are divided into bounded chunks. One
@@ -495,8 +495,8 @@ compiles and validates a candidate at a staged same-filesystem path, computes
 its cryptographic digest, fsyncs it, and renames it to a path containing that
 digest without replacing the currently selected file. A small checksummed
 manifest per installer-managed grammar maps its default selection to an artifact
-digest and export. This decision introduces a process-shared per-grammar parser-
-manifest lock; the current query replacement lock is not reused. Install,
+digest and export. This decision introduces a process-shared per-grammar
+parser-manifest lock; the current query replacement lock is not reused. Install,
 explicit-path import metadata, legacy migration, manifest CAS, and uninstall all
 take this lock. Manifest transactions compare the expected revision and publish a new
 checksummed revision by fsync-and-atomic-rename followed by directory fsync.
@@ -610,8 +610,8 @@ revision under its per-grammar lock and snapshots `(grammar, revision,
 digest-or-tombstone)` before sending worker configuration. A changed revision
 first advances the parent's local configuration generation, then invalidates its
 cached descriptor; a tombstone removes the selection and a newer digest is
-re-imported and verified. Advancing the publish guard first prevents old-
-generation in-flight work from repopulating the cleared cache.
+re-imported and verified. Advancing the publish guard first prevents
+old-generation in-flight work from repopulating the cleared cache.
 
 The uncommitted target of `Validation` mode is the sole exception to the serving
 selection rule. It is tied to the observed predecessor revision for CAS and is
@@ -710,8 +710,8 @@ All worker restarts, regardless of classification, also consume a session-wide
 long-horizon token bucket with capacity 16. Tokens do not refill with elapsed
 wall time or the 60-second fast-budget reset; one token is restored only after
 10 continuous minutes of healthy worker service, up to capacity. Restart delay
-uses exponential backoff beginning at 250 milliseconds and doubling to a five-
-minute cap, and resets only after the same 10-minute healthy interval. A worker
+uses exponential backoff beginning at 250 milliseconds and doubling to a
+five-minute cap, and resets only after the same 10-minute healthy interval. A worker
 that deterministically fails every 70 seconds therefore drains the bucket rather
 than resetting forever.
 
