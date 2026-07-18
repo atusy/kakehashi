@@ -67,7 +67,10 @@ def shasum_tree_digest(root):
     """Match `find . | sort | xargs shasum | shasum` from the report."""
     digest = hashlib.sha256()
     for path in sorted(
-        (item for item in root.rglob("*") if item.is_file()),
+        (
+            item for item in root.rglob("*")
+            if item.is_file() and not item.is_symlink()
+        ),
         key=lambda item: item.relative_to(root).as_posix(),
     ):
         relative = path.relative_to(root).as_posix()
@@ -134,7 +137,10 @@ def main():
     script_dir = pathlib.Path(__file__).resolve().parent
     selected = args.scenarios or list(SCENARIOS)
     logical_cpus = os.cpu_count() or 1
-    data_files = [path for path in args.data_dir.rglob("*") if path.is_file()]
+    data_files = [
+        path for path in args.data_dir.rglob("*")
+        if path.is_file() and not path.is_symlink()
+    ]
     result = {
         "schema": 1,
         "experiment": "single-tree-worker-phase0-raw-relay",

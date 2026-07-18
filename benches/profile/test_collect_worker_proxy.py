@@ -67,6 +67,19 @@ class CollectionHelpersTest(unittest.TestCase):
                 shasum_tree_digest(root), hashlib.sha256(expected_input).hexdigest()
             )
 
+    def test_data_tree_digest_excludes_file_symlinks_like_find_type_f(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            target = root / "target"
+            target.write_bytes(b"content")
+            without_link = shasum_tree_digest(root)
+            try:
+                (root / "link").symlink_to(target)
+            except OSError as error:
+                self.skipTest(f"symlinks unavailable: {error}")
+
+            self.assertEqual(shasum_tree_digest(root), without_link)
+
 
 if __name__ == "__main__":
     unittest.main()
