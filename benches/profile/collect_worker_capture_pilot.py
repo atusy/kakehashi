@@ -19,6 +19,7 @@ from collect_worker_proxy import (
     require_benchmark_artifacts,
     require_posix,
     sha256_file,
+    stage_measurement_inputs,
     verify_file_sha256,
 )
 
@@ -63,6 +64,15 @@ def main():
     binary_attestation = load_binary_attestation(
         args.binary_attestation, args.bin
     )
+    staging, binary, data_dir = stage_measurement_inputs(
+        args.bin, args.data_dir
+    )
+    if sha256_file(binary) != initial_binary_sha256:
+        raise RuntimeError("staged binary does not match attested source")
+    if artifact_identity(data_dir) != initial_identity:
+        raise RuntimeError("staged runtime artifacts do not match source")
+    require_benchmark_artifacts(data_dir)
+    load_binary_attestation(args.binary_attestation, binary)
     script_dir = pathlib.Path(__file__).resolve().parent
     result = {
         "schema": 1,
@@ -71,34 +81,37 @@ def main():
             "platform": platform.platform(),
             "python": platform.python_version(),
             "binary": str(args.bin.resolve()),
+            "binary_execution": "private staged copy",
             "binary_sha256": initial_binary_sha256,
             "data_dir": str(args.data_dir.resolve()),
+            "data_dir_execution": "private staged copy",
             "parser_query_file_count": initial_identity[0],
             "parser_query_tree_sha256": initial_identity[1],
             "retained_environment": controlled_environment(os.environ),
         },
         "artifacts": artifact_provenance(
-            args.data_dir, args.nvim_treesitter_checkout
+            data_dir, args.nvim_treesitter_checkout
         ),
         "binary_attestation": binary_attestation,
         "arguments": CAPTURE_ARGUMENTS,
         "independent_pairs": 1,
         "order": "direct then relay; smoke result only",
         "direct": collect_path(
-            "direct", args.bin, args.data_dir, script_dir, args.run_timeout
+            "direct", binary, data_dir, script_dir, args.run_timeout
         ),
         "relay": collect_path(
-            "relay", args.bin, args.data_dir, script_dir, args.run_timeout
+            "relay", binary, data_dir, script_dir, args.run_timeout
         ),
     }
-    final_identity = artifact_identity(args.data_dir)
+    final_identity = artifact_identity(data_dir)
     if final_identity != initial_identity:
         raise RuntimeError(
             "runtime artifacts changed during collection: "
             f"before={initial_identity} after={final_identity}"
         )
-    verify_file_sha256(args.bin, initial_binary_sha256)
+    verify_file_sha256(binary, initial_binary_sha256)
     args.output.write_text(json.dumps(result, indent=2) + "\n")
+    staging.cleanup()
 
 
 if __name__ == "__main__":

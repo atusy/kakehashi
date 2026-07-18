@@ -9,8 +9,10 @@ import pathlib
 import platform
 import re
 import signal
+import shutil
 import subprocess
 import sys
+import tempfile
 
 
 SCENARIOS = {
@@ -334,6 +336,20 @@ def runtime_artifact_files(root):
     )
 
 
+def stage_measurement_inputs(binary, data_dir):
+    staging = tempfile.TemporaryDirectory(prefix="kakehashi-phase0-inputs-")
+    root = pathlib.Path(staging.name)
+    staged_binary = root / "bin/kakehashi"
+    staged_binary.parent.mkdir(parents=True)
+    shutil.copy2(binary, staged_binary)
+    staged_data = root / "data"
+    for source in runtime_artifact_files(data_dir):
+        destination = staged_data / source.relative_to(data_dir)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source, destination)
+    return staging, staged_binary, staged_data
+
+
 def parser_library_suffix(system_name=platform.system()):
     return ".dylib" if system_name == "Darwin" else ".so"
 
@@ -578,6 +594,15 @@ def main():
     binary_attestation = load_binary_attestation(
         args.binary_attestation, args.bin
     )
+    staging, binary, data_dir = stage_measurement_inputs(
+        args.bin, args.data_dir
+    )
+    if sha256_file(binary) != initial_binary_sha256:
+        raise RuntimeError("staged binary does not match attested source")
+    if artifact_identity(data_dir) != initial_artifact_identity:
+        raise RuntimeError("staged runtime artifacts do not match source")
+    require_benchmark_artifacts(data_dir)
+    load_binary_attestation(args.binary_attestation, binary)
     logical_cpus = os.cpu_count() or 1
     result = {
         "schema": 1,
@@ -596,14 +621,16 @@ def main():
                 "not the binary's reported effective pool size"
             ),
             "binary": str(args.bin.resolve()),
+            "binary_execution": "private staged copy",
             "binary_sha256": initial_binary_sha256,
             "data_dir": str(args.data_dir.resolve()),
+            "data_dir_execution": "private staged copy",
             "parser_query_file_count": initial_artifact_identity[0],
             "parser_query_tree_sha256": initial_artifact_identity[1],
             "retained_environment": controlled_environment(os.environ),
         },
         "artifacts": artifact_provenance(
-            args.data_dir, args.nvim_treesitter_checkout
+            data_dir, args.nvim_treesitter_checkout
         ),
         "binary_attestation": binary_attestation,
         "collector": {
@@ -622,8 +649,8 @@ def main():
             for kind in run_order(index):
                 pair[kind] = run_driver(
                     kind,
-                    args.bin,
-                    args.data_dir,
+                    binary,
+                    data_dir,
                     SCENARIOS[scenario],
                     script_dir,
                     args.run_timeout,
@@ -634,14 +661,15 @@ def main():
             "arguments": SCENARIOS[scenario],
             "pairs": pairs,
         }
-    final_artifact_identity = artifact_identity(args.data_dir)
+    final_artifact_identity = artifact_identity(data_dir)
     if final_artifact_identity != initial_artifact_identity:
         raise RuntimeError(
             "runtime artifacts changed during collection: "
             f"before={initial_artifact_identity} after={final_artifact_identity}"
         )
-    verify_file_sha256(args.bin, initial_binary_sha256)
+    verify_file_sha256(binary, initial_binary_sha256)
     args.output.write_text(json.dumps(result, indent=2) + "\n")
+    staging.cleanup()
 
 
 if __name__ == "__main__":

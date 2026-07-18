@@ -27,6 +27,7 @@ from collect_worker_proxy import (
     require_benchmark_artifacts,
     run_order,
     shasum_tree_digest,
+    stage_measurement_inputs,
     verify_file_sha256,
 )
 
@@ -284,6 +285,29 @@ class CollectionHelpersTest(unittest.TestCase):
 
             with self.assertRaisesRegex(RuntimeError, "binary changed"):
                 verify_file_sha256(binary, expected)
+
+    def test_stages_private_measurement_inputs(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            binary = root / "kakehashi"
+            binary.write_bytes(b"binary-v1")
+            data = root / "data"
+            query = data / "queries/rust/highlights.scm"
+            query.parent.mkdir(parents=True)
+            query.write_bytes(b"query-v1")
+
+            staging, staged_binary, staged_data = stage_measurement_inputs(
+                binary, data
+            )
+            self.addCleanup(staging.cleanup)
+            binary.write_bytes(b"binary-v2")
+            query.write_bytes(b"query-v2")
+
+            self.assertEqual(staged_binary.read_bytes(), b"binary-v1")
+            self.assertEqual(
+                (staged_data / "queries/rust/highlights.scm").read_bytes(),
+                b"query-v1",
+            )
 
     def test_loads_attestation_only_for_matching_binary(self):
         with tempfile.TemporaryDirectory() as directory:
