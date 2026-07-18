@@ -15,6 +15,7 @@ from collect_worker_proxy import (
     bounded_run,
     build_driver_command,
     controlled_environment,
+    harness_identity,
     load_binary_attestation,
     parse_driver_summary,
     require_benchmark_artifacts,
@@ -81,11 +82,13 @@ def main():
     require_benchmark_artifacts(args.data_dir)
     initial_artifact_identity = artifact_identity(args.data_dir)
     initial_binary_sha256 = sha256_file(args.bin)
+    script_dir = pathlib.Path(__file__).resolve().parent
+    initial_harness_identity = harness_identity(script_dir)
     binary_attestation = load_binary_attestation(
         args.binary_attestation, args.bin
     )
-    staging, binary, data_dir = stage_measurement_inputs(
-        args.bin, args.data_dir
+    staging, binary, data_dir, staged_script_dir = stage_measurement_inputs(
+        args.bin, args.data_dir, script_dir
     )
     if sha256_file(binary) != initial_binary_sha256:
         raise RuntimeError("staged binary does not match attested source")
@@ -93,11 +96,12 @@ def main():
         raise RuntimeError("staged runtime artifacts do not match source")
     require_benchmark_artifacts(data_dir)
     load_binary_attestation(args.binary_attestation, binary)
-    script_dir = pathlib.Path(__file__).resolve().parent
+    if harness_identity(staged_script_dir) != initial_harness_identity:
+        raise RuntimeError("staged harness does not match source")
 
     def run(kind):
         return timed_driver(
-            kind, binary, data_dir, script_dir, args.run_timeout
+            kind, binary, data_dir, staged_script_dir, args.run_timeout
         )
 
     for index in range(args.warmups):
@@ -123,6 +127,10 @@ def main():
             data_dir, args.nvim_treesitter_checkout
         ),
         "binary_attestation": binary_attestation,
+        "harness": {
+            "execution": "private staged driver and relay helpers",
+            "source_files_sha256": initial_harness_identity,
+        },
         "arguments": COLD_START_ARGUMENTS,
         "warmup_pairs": args.warmups,
         "measured_pairs": args.pairs,
@@ -132,6 +140,10 @@ def main():
     if artifact_identity(data_dir) != initial_artifact_identity:
         raise RuntimeError("runtime artifacts changed during cold-start collection")
     verify_file_sha256(binary, initial_binary_sha256)
+    if harness_identity(script_dir) != initial_harness_identity:
+        raise RuntimeError("benchmark harness changed during collection")
+    if harness_identity(staged_script_dir) != initial_harness_identity:
+        raise RuntimeError("staged benchmark harness changed during collection")
     args.output.write_text(json.dumps(result, indent=2) + "\n")
     staging.cleanup()
 

@@ -48,6 +48,14 @@ OFFICIAL_NVIM_TREESITTER_URL = (
 ATTESTED_BUILD_COMMAND = [
     "cargo", "build", "--locked", "--release", "--bin", "kakehashi"
 ]
+HARNESS_SCRIPT_NAMES = (
+    "collect_worker_proxy.py",
+    "collect_worker_cold_start.py",
+    "collect_worker_capture_pilot.py",
+    "drive.py",
+    "worker_proxy.py",
+    "gen_session.py",
+)
 
 
 def require_posix(platform_name=os.name):
@@ -446,7 +454,17 @@ def runtime_artifact_files(root):
     )
 
 
-def stage_measurement_inputs(binary, data_dir):
+def harness_identity(script_dir):
+    identity = {}
+    for name in HARNESS_SCRIPT_NAMES:
+        path = script_dir / name
+        if not path.is_file() or path.is_symlink():
+            raise ValueError(f"missing benchmark harness script: {path}")
+        identity[name] = sha256_file(path)
+    return identity
+
+
+def stage_measurement_inputs(binary, data_dir, script_dir):
     staging = tempfile.TemporaryDirectory(prefix="kakehashi-phase0-inputs-")
     root = pathlib.Path(staging.name)
     staged_binary = root / "bin/kakehashi"
@@ -457,7 +475,11 @@ def stage_measurement_inputs(binary, data_dir):
         destination = staged_data / source.relative_to(data_dir)
         destination.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(source, destination)
-    return staging, staged_binary, staged_data
+    staged_scripts = root / "harness"
+    staged_scripts.mkdir()
+    for name in HARNESS_SCRIPT_NAMES:
+        shutil.copy2(script_dir / name, staged_scripts / name)
+    return staging, staged_binary, staged_data, staged_scripts
 
 
 def parser_library_suffix(system_name=platform.system()):
@@ -718,6 +740,7 @@ def main():
         parser.error("--run-timeout must be positive")
 
     script_dir = pathlib.Path(__file__).resolve().parent
+    initial_harness_identity = harness_identity(script_dir)
     selected = args.scenarios or list(SCENARIOS)
     require_benchmark_artifacts(args.data_dir)
     initial_artifact_identity = artifact_identity(args.data_dir)
@@ -725,13 +748,15 @@ def main():
     binary_attestation = load_binary_attestation(
         args.binary_attestation, args.bin
     )
-    staging, binary, data_dir = stage_measurement_inputs(
-        args.bin, args.data_dir
+    staging, binary, data_dir, staged_script_dir = stage_measurement_inputs(
+        args.bin, args.data_dir, script_dir
     )
     if sha256_file(binary) != initial_binary_sha256:
         raise RuntimeError("staged binary does not match attested source")
     if artifact_identity(data_dir) != initial_artifact_identity:
         raise RuntimeError("staged runtime artifacts do not match source")
+    if harness_identity(staged_script_dir) != initial_harness_identity:
+        raise RuntimeError("staged harness does not match source")
     require_benchmark_artifacts(data_dir)
     load_binary_attestation(args.binary_attestation, binary)
     logical_cpus = os.cpu_count() or 1
@@ -764,6 +789,10 @@ def main():
             data_dir, args.nvim_treesitter_checkout
         ),
         "binary_attestation": binary_attestation,
+        "harness": {
+            "execution": "private staged driver and relay helpers",
+            "source_files_sha256": initial_harness_identity,
+        },
         "collector": {
             "pairs": args.pairs,
             "order": "direct-relay on odd runs; relay-direct on even runs",
@@ -778,7 +807,7 @@ def main():
                 binary,
                 data_dir,
                 SCENARIOS[scenario],
-                script_dir,
+                staged_script_dir,
                 args.run_timeout,
             )
 
@@ -797,6 +826,10 @@ def main():
             f"before={initial_artifact_identity} after={final_artifact_identity}"
         )
     verify_file_sha256(binary, initial_binary_sha256)
+    if harness_identity(script_dir) != initial_harness_identity:
+        raise RuntimeError("benchmark harness changed during collection")
+    if harness_identity(staged_script_dir) != initial_harness_identity:
+        raise RuntimeError("staged benchmark harness changed during collection")
     args.output.write_text(json.dumps(result, indent=2) + "\n")
     staging.cleanup()
 

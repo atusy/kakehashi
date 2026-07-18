@@ -373,18 +373,27 @@ class CollectionHelpersTest(unittest.TestCase):
             query = data / "queries/rust/highlights.scm"
             query.parent.mkdir(parents=True)
             query.write_bytes(b"query-v1")
+            scripts = root / "scripts"
+            scripts.mkdir()
+            for name in collector.HARNESS_SCRIPT_NAMES:
+                (scripts / name).write_text(f"# {name} v1\n")
 
-            staging, staged_binary, staged_data = stage_measurement_inputs(
-                binary, data
+            staging, staged_binary, staged_data, staged_scripts = (
+                stage_measurement_inputs(binary, data, scripts)
             )
             self.addCleanup(staging.cleanup)
             binary.write_bytes(b"binary-v2")
             query.write_bytes(b"query-v2")
+            (scripts / "drive.py").write_text("# drive v2\n")
 
             self.assertEqual(staged_binary.read_bytes(), b"binary-v1")
             self.assertEqual(
                 (staged_data / "queries/rust/highlights.scm").read_bytes(),
                 b"query-v1",
+            )
+            self.assertEqual(
+                (staged_scripts / "drive.py").read_text(),
+                "# drive.py v1\n",
             )
 
     def test_loads_attestation_only_for_matching_binary(self):

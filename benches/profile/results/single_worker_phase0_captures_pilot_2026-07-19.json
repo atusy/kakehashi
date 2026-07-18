@@ -60,6 +60,17 @@
     "binary_relative": "target/release/kakehashi",
     "binary_sha256": "192d8c3d5fbee9db04742c9e2f38b74b917a84ef3b2153397c58eec8187f9335"
   },
+  "harness": {
+    "execution": "private staged driver and relay helpers",
+    "source_files_sha256": {
+      "collect_worker_proxy.py": "3a0e1e591f2e552007d1e63965d780fb81aa4116b92295004513ebc8c3daa363",
+      "collect_worker_cold_start.py": "023a26b8add1904fa78e3487e2f4b4ae46c43cb33f70a5f082187e45efd4cf00",
+      "collect_worker_capture_pilot.py": "816e7863877fdb12a9222443af4af12bb417aa609ee5d2c7b9a780715565c4ca",
+      "drive.py": "8722d78a1eddc87d2f62818967c0624b0a7ece5b48f3bdac1d27d0c82a776e0d",
+      "worker_proxy.py": "461f9777c6fab4d88149c28bf3fa1c3e92bb5add15ea5a4d884741f2b6f73a7b",
+      "gen_session.py": "6f4f6b8388c607db1c70fe29579ce14fe00d57668cab17601432ff123cfb15a3"
+    }
+  },
   "arguments": [
     "--lang",
     "markdown",
@@ -74,10 +85,10 @@
   "independent_pairs": 1,
   "order": "direct then relay; smoke result only",
   "direct": {
-    "semantic_p50": 4.7,
-    "semantic_p95": 5.2,
-    "captures_p50": 30.9,
-    "captures_p95": 33.3,
+    "semantic_p50": 6.0,
+    "semantic_p95": 7.7,
+    "captures_p50": 37.6,
+    "captures_p95": 40.7,
     "semantic_outcomes": {
       "count": 100,
       "ok": 100,
@@ -99,9 +110,9 @@
   },
   "relay": {
     "semantic_p50": 4.5,
-    "semantic_p95": 5.3,
-    "captures_p50": 30.5,
-    "captures_p95": 33.4,
+    "semantic_p95": 6.6,
+    "captures_p50": 29.4,
+    "captures_p95": 37.6,
     "semantic_outcomes": {
       "count": 100,
       "ok": 100,
