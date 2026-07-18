@@ -149,8 +149,8 @@ This particular raw process/pipe relay did not expose a clear steady-state
 transport blocker on this machine. Cache-hit request-tail point deltas were
 below the driver's 0.1-ms reporting resolution or had intervals crossing zero.
 The nominal Rust edit p99 interval excluded zero, but its dependence on the
-first measured pair and reversal under pair-slice sensitivity analysis means it
-does not establish a tail effect.
+first measured pair and disappearance under pair-slice sensitivity analysis
+mean it does not establish a tail effect.
 The cache-hit throughput run estimated 0.5 microseconds of amortized extra wall
 time per request with a [-10.6, 10.3]-microsecond interval for this concrete
 relay. The actual Stage 1 worker cost may be above or below these relay deltas.
