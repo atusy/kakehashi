@@ -7,6 +7,7 @@ import unittest
 sys.path.insert(0, str(pathlib.Path(__file__).parent))
 
 from collect_worker_proxy import (
+    build_driver_command,
     estimated_tree_compute_budget,
     parse_driver_summary,
     run_order,
@@ -18,6 +19,21 @@ class CollectionHelpersTest(unittest.TestCase):
     def test_estimated_budget_applies_current_policy(self):
         self.assertEqual(estimated_tree_compute_budget(10), 8)
         self.assertEqual(estimated_tree_compute_budget(1), 1)
+
+    def test_relay_invokes_proxy_through_python(self):
+        command = build_driver_command(
+            "relay",
+            pathlib.Path("/tmp/kakehashi"),
+            pathlib.Path("/tmp/data"),
+            ["--requests", "1"],
+            pathlib.Path("/tmp/profile"),
+        )
+
+        self.assertEqual(command[0], sys.executable)
+        self.assertEqual(command[2:6], [
+            "--bin", sys.executable,
+            "--server-arg", "/tmp/profile/worker_proxy.py",
+        ])
 
     def test_alternates_direct_and_relay_order(self):
         self.assertEqual(run_order(0), ("direct", "relay"))

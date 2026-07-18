@@ -91,22 +91,34 @@ def tool_version(command):
     ).stdout.strip()
 
 
-def run_driver(kind, binary, data_dir, scenario_args, script_dir):
-    env = os.environ.copy()
+def build_driver_command(kind, binary, data_dir, scenario_args, script_dir):
     if kind == "direct":
-        server = binary
+        server = str(binary)
+        server_args = []
     else:
-        server = script_dir / "worker_proxy.py"
-        env["KAKEHASHI_WORKER_PROXY_BIN"] = str(binary)
-    command = [
+        server = sys.executable
+        server_args = [
+            "--server-arg", str(script_dir / "worker_proxy.py")
+        ]
+    return [
         sys.executable,
         str(script_dir / "drive.py"),
         "--bin",
-        str(server),
+        server,
+        *server_args,
         "--data-dir",
         str(data_dir),
         *scenario_args,
     ]
+
+
+def run_driver(kind, binary, data_dir, scenario_args, script_dir):
+    env = os.environ.copy()
+    if kind == "relay":
+        env["KAKEHASHI_WORKER_PROXY_BIN"] = str(binary)
+    command = build_driver_command(
+        kind, binary, data_dir, scenario_args, script_dir
+    )
     completed = subprocess.run(
         command,
         check=True,
