@@ -170,6 +170,18 @@ def warm_semantic_tokens(request, uri):
         )
 
 
+def terminate_server(server, timeout_seconds=1):
+    """Give a server (and relay cleanup handler) a bounded graceful exit."""
+    if server.poll() is not None:
+        return
+    server.terminate()
+    try:
+        server.wait(timeout=timeout_seconds)
+    except subprocess.TimeoutExpired:
+        server.kill()
+        server.wait()
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--bin", required=True)
@@ -544,12 +556,8 @@ def main() -> None:
         request("shutdown", None)
         notify("exit", {})
         srv.wait(timeout=5)
-    except subprocess.TimeoutExpired:
-        pass  # graceful shutdown didn't land in time; the finally kills it
     finally:
-        if srv.poll() is None:
-            srv.kill()
-            srv.wait()
+        terminate_server(srv)
 
     n_bytes = len(text.encode("utf-8"))
     n_lines = len(text.splitlines())

@@ -2,6 +2,7 @@ import pathlib
 import sys
 import time
 import unittest
+import subprocess
 
 sys.path.insert(0, str(pathlib.Path(__file__).parent))
 
@@ -14,11 +15,39 @@ from drive import (
     server_request_result,
     summarize_samples,
     summarize_samples_by_status,
+    terminate_server,
     warm_semantic_tokens,
 )
 
 
 class RequestSummaryTest(unittest.TestCase):
+    def test_server_termination_escalates_after_bounded_grace(self):
+        class StubbornServer:
+            def __init__(self):
+                self.actions = []
+
+            def poll(self):
+                return None
+
+            def terminate(self):
+                self.actions.append("terminate")
+
+            def wait(self, timeout=None):
+                self.actions.append(("wait", timeout))
+                if timeout is not None:
+                    raise subprocess.TimeoutExpired("server", timeout)
+
+            def kill(self):
+                self.actions.append("kill")
+
+        server = StubbornServer()
+
+        terminate_server(server, timeout_seconds=0.25)
+
+        self.assertEqual(server.actions, [
+            "terminate", ("wait", 0.25), "kill", ("wait", None),
+        ])
+
     def test_aggregate_timing_uses_monotonic_clock(self):
         self.assertIs(benchmark_clock, time.perf_counter)
 
