@@ -211,40 +211,44 @@ pub(crate) fn parse_initialize_response_capabilities(
 fn recover_server_capabilities(
     capabilities: &serde_json::Map<String, serde_json::Value>,
 ) -> std::io::Result<ParsedInitializeCapabilities> {
-    let mut candidate = serde_json::Value::Object(capabilities.clone());
+    let mut recovered = serde_json::Map::new();
     let mut dropped = Vec::new();
-    loop {
-        match serde_path_to_error::deserialize(&candidate) {
-            Ok(capabilities) => {
-                return Ok(ParsedInitializeCapabilities {
-                    capabilities,
-                    dropped,
-                });
+    for (field, value) in capabilities {
+        let mut probe = serde_json::Map::new();
+        probe.insert(field.clone(), value.clone());
+        let probe = serde_json::Value::Object(probe);
+        match serde_path_to_error::deserialize::<_, ServerCapabilities>(&probe) {
+            Ok(_) => {
+                let serde_json::Value::Object(mut probe) = probe else {
+                    unreachable!("capability probe is always an object");
+                };
+                recovered.insert(
+                    field.clone(),
+                    probe
+                        .remove(field)
+                        .expect("capability probe retains its only field"),
+                );
             }
             Err(error) => {
-                let Some(serde_path_to_error::Segment::Map { key: field }) =
-                    error.path().iter().next()
-                else {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
-                        format!("bridge: invalid initialize capabilities: {error}"),
-                    ));
-                };
-                let field = field.clone();
-                let error = error.to_string();
-                let removed = candidate
-                    .as_object_mut()
-                    .and_then(|capabilities| capabilities.remove(&field));
-                if removed.is_none() {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
-                        format!("bridge: invalid initialize capabilities: {error}"),
-                    ));
-                }
-                dropped.push(DroppedCapability { field, error });
+                dropped.push(DroppedCapability {
+                    field: field.clone(),
+                    error: error.to_string(),
+                });
             }
         }
     }
+
+    let capabilities =
+        serde_json::from_value(serde_json::Value::Object(recovered)).map_err(|error| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("bridge: invalid recovered initialize capabilities: {error}"),
+            )
+        })?;
+    Ok(ParsedInitializeCapabilities {
+        capabilities,
+        dropped,
+    })
 }
 
 fn validate_utf16_encoding(

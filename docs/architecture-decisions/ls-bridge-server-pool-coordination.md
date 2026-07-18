@@ -181,11 +181,12 @@ Multiple downstream servers initialize in parallel since each is independent:
 
 **Malformed Initialize Capability Recovery:**
 
-An object-shaped `result.capabilities` is decoded with field-level recovery. If
-one top-level capability cannot be deserialized, the bridge logs the capability
-name and serde error, drops that capability, and retries. Independently valid
-capabilities remain available for routing, and the bridge completes the
-downstream handshake.
+An object-shaped `result.capabilities` is decoded with field-level recovery.
+Each top-level capability is validated once in isolation; invalid fields are
+logged with their serde errors, while the valid raw fields are assembled and
+decoded together into `ServerCapabilities`. Independently valid capabilities
+remain available for routing, and the bridge completes the downstream
+handshake without repeatedly traversing valid fields for every malformed one.
 
 The recovery boundary follows the scope of the damaged state:
 
