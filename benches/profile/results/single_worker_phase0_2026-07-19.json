@@ -2120,28 +2120,31 @@
   "cold_start": {
     "warmup_runs": 3,
     "measured_runs": 20,
+    "validated_with_current_harness": true,
+    "data_dir": "/private/tmp/kakehashi-phase0-data.WIU8dk",
+    "parser_query_tree_sha256": "1572967b352c7b24ec872bff02c3c9808374a0d5cab2c707368cb5f32be58115",
     "direct": {
       "times": [
-        0.08976448634,
-        0.08767548634,
-        0.08632177834,
-        0.08648432034,
-        0.08593627834,
-        0.08605940334,
-        0.08614702834,
-        0.08638631934,
-        0.08678819434,
-        0.08675548634,
-        0.08728144534,
-        0.08670273734,
-        0.08631194534,
-        0.08628990334,
-        0.08667944534,
-        0.08900440334,
-        0.09122702834,
-        0.09115506934,
-        0.08800952834,
-        0.08766694534
+        0.1011798978,
+        0.1084730648,
+        0.1087763558,
+        0.1101834388,
+        0.1181783138,
+        0.1185056058,
+        0.1180321058,
+        0.1182080228,
+        0.1209743558,
+        0.1301716058,
+        0.13177439780000003,
+        0.13172993880000003,
+        0.13141560580000003,
+        0.1320127728,
+        0.13041460580000003,
+        0.1308588558,
+        0.1317678978,
+        0.13290560580000002,
+        0.13169868880000002,
+        0.13155727180000001
       ],
       "exit_codes": [
         0,
@@ -2168,26 +2171,26 @@
     },
     "relay": {
       "times": [
-        0.10773936234,
-        0.10639023634,
-        0.10692907034,
-        0.10615686234,
-        0.10583994434,
-        0.10661832034,
-        0.10542490334,
-        0.10626869534,
-        0.10679461134,
-        0.10616844434,
-        0.10626786134,
-        0.10631257034,
-        0.10645227834,
-        0.10652073734,
-        0.10710606934,
-        0.10653857034,
-        0.10725082034,
-        0.11118311234,
-        0.10621615334,
-        0.10621719534
+        0.16702614680000002,
+        0.16675827280000002,
+        0.16662781480000002,
+        0.16712993980000002,
+        0.15616956380000002,
+        0.15653914780000003,
+        0.15385777280000001,
+        0.15653935580000003,
+        0.16517864780000002,
+        0.15453098080000002,
+        0.15342435580000002,
+        0.15441873080000001,
+        0.15414377280000002,
+        0.15430543880000003,
+        0.15252043880000002,
+        0.15297773080000002,
+        0.15266714680000001,
+        0.15398198080000003,
+        0.1528249808,
+        0.1472536898
       ],
       "exit_codes": [
         0,
@@ -2211,9 +2214,11 @@
         0,
         0
       ]
-    }
+    },
+    "direct_command": "env -i PATH=\"$PATH\" TMPDIR=\"$TMPDIR\" LANG=C.UTF-8 LC_ALL=C.UTF-8 python3 benches/profile/drive.py --bin /Users/atusy/ghq/github.com/atusy/kakehashi___worker_adr/target/release/kakehashi --data-dir /tmp/kakehashi-phase0-data.WIU8dk --lang rust --size 15 --requests 1 --settle 0 >/dev/null 2>&1",
+    "relay_command": "env -i PATH=\"$PATH\" TMPDIR=\"$TMPDIR\" LANG=C.UTF-8 LC_ALL=C.UTF-8 KAKEHASHI_WORKER_PROXY_BIN=/Users/atusy/ghq/github.com/atusy/kakehashi___worker_adr/target/release/kakehashi python3 benches/profile/drive.py --bin python3 --server-arg benches/profile/worker_proxy.py --data-dir /tmp/kakehashi-phase0-data.WIU8dk --lang rust --size 15 --requests 1 --settle 0 >/dev/null 2>&1"
   },
-  "date": "2026-07-18",
+  "date": "2026-07-19",
   "analysis": {
     "method": "paired bootstrap of run-level summaries",
     "seed": 123456789,
@@ -2229,21 +2234,24 @@
     "rust_edit": "--lang rust --size 15 --requests 100 --edits 1",
     "markdown_edit": "--lang markdown --size 150 --requests 100 --edits 1",
     "captures_pilot": "--lang markdown --size 150 --requests 100 --edits 1 --concurrent-captures",
-    "cold_start": "hyperfine --warmup 3 --runs 20 --shell zsh --export-json /tmp/kakehashi-phase0-cold.json 'python3 benches/profile/drive.py --bin /Users/atusy/ghq/github.com/atusy/kakehashi___worker_adr/target/release/kakehashi --data-dir /Users/atusy/ghq/github.com/atusy/kakehashi/deps/test/kakehashi --lang rust --size 15 --requests 1 --settle 0 >/dev/null 2>&1' 'KAKEHASHI_WORKER_PROXY_BIN=/Users/atusy/ghq/github.com/atusy/kakehashi___worker_adr/target/release/kakehashi python3 benches/profile/drive.py --bin ./benches/profile/worker_proxy.py --data-dir /Users/atusy/ghq/github.com/atusy/kakehashi/deps/test/kakehashi --lang rust --size 15 --requests 1 --settle 0 >/dev/null 2>&1'"
+    "cold_start": "see cold_start.direct_command and cold_start.relay_command"
   },
   "captures_pilot": {
     "independent_pairs": 1,
+    "validated_with_current_harness": true,
+    "data_dir": "/private/tmp/kakehashi-phase0-data.WIU8dk",
+    "parser_query_tree_sha256": "1572967b352c7b24ec872bff02c3c9808374a0d5cab2c707368cb5f32be58115",
     "direct": {
-      "semantic_p50": 2.6,
-      "semantic_p95": 2.7,
-      "captures_p50": 16.8,
-      "captures_p95": 17.7
+      "semantic_p50": 4.3,
+      "semantic_p95": 5.0,
+      "captures_p50": 29.4,
+      "captures_p95": 32.6
     },
     "relay": {
-      "semantic_p50": 2.6,
-      "semantic_p95": 2.8,
-      "captures_p50": 16.8,
-      "captures_p95": 17.2
+      "semantic_p50": 4.3,
+      "semantic_p95": 4.7,
+      "captures_p50": 27.8,
+      "captures_p95": 29.4
     }
   },
   "steady_state_date": "2026-07-19",

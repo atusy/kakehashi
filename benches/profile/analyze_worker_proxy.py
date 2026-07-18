@@ -53,7 +53,7 @@ def summarize_cold_start(times):
 
 def main():
     default_data = pathlib.Path(__file__).with_name("results") / (
-        "single_worker_phase0_2026-07-18.json"
+        "single_worker_phase0_2026-07-19.json"
     )
     parser = argparse.ArgumentParser()
     parser.add_argument("data", nargs="?", type=pathlib.Path, default=default_data)

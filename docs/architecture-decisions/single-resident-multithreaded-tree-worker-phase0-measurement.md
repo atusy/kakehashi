@@ -26,8 +26,7 @@ and must use the platform-specific lifecycle mechanisms specified by the ADR.
 
 ## Environment
 
-* Initial cold-start and pilot date: 2026-07-18
-* Corrected steady-state collection date: 2026-07-19
+* Final fail-closed collection date: 2026-07-19
 * Machine: Apple M4, 10 physical/logical CPUs
 * OS: macOS 26.5.1 (25F80)
 * Estimated tree compute budget under the current policy: 8 threads. This uses
@@ -108,10 +107,10 @@ immediate Rust request:
 
 | Path | Mean | Standard deviation | Range |
 |---|---:|---:|---:|
-| Direct | 87.4 ms | 1.6 ms | 85.9–91.2 ms |
-| Relay | 106.7 ms | 1.2 ms | 105.4–111.2 ms |
+| Direct | 123.4 ms | 10.1 ms | 101.2–132.9 ms |
+| Relay | 156.9 ms | 6.0 ms | 147.3–167.1 ms |
 
-The observed +19.3 ms includes starting a Python interpreter and is not an
+The observed +33.5 ms includes starting a Python interpreter and is not an
 estimate of a Rust worker's spawn/handshake time. It only shows that cold-start
 cost is visible and must be measured separately in the Stage 1 prototype.
 
@@ -122,8 +121,8 @@ used as a smoke test, not an independently repeated result:
 
 | Metric | Direct | Relay |
 |---|---:|---:|
-| Semantic tokens p50 / p95 | 2.6 / 2.7 ms | 2.6 / 2.8 ms |
-| Captures delta p50 / p95 | 16.8 / 17.7 ms | 16.8 / 17.2 ms |
+| Semantic tokens p50 / p95 | 4.3 / 5.0 ms | 4.3 / 4.7 ms |
+| Captures delta p50 / p95 | 29.4 / 32.6 ms | 27.8 / 29.4 ms |
 
 ## Interpretation
 
@@ -160,18 +159,19 @@ The tail-percentile driver and relay are in `benches/profile/drive.py` and
 `benches/profile/worker_proxy.py`. The 20 paired run summaries, execution order,
 commands, environment, artifact-tree digest, cold-start result, and captures
 pilot are committed in
-`benches/profile/results/single_worker_phase0_2026-07-18.json`. Recompute every
+`benches/profile/results/single_worker_phase0_2026-07-19.json`. Recompute every
 steady-state table value and confidence interval with:
 
 ```sh
 python3 benches/profile/analyze_worker_proxy.py
 ```
 
-The July 19 steady-state section comes from one final 20-pair collector run;
-it preserves every run summary and status count but not each raw stderr stream.
-The July 18 cold-start and captures-pilot sections predate that recollection.
-The cold-start section preserves all 20 timing samples and is recomputed by the
-same analyzer; the single captures pilot remains a smoke test only.
+The July 19 steady-state section comes from one final 20-pair collector run and
+preserves every run summary and status count but not each raw stderr stream.
+Cold start was recollected under the same controlled environment and artifact
+identity; all 20 timing samples are recomputed by the analyzer. The captures
+pilot was also rerun with the final harness, but remains a single-pair smoke
+test rather than an independently repeated result.
 
 Reconstruct a dedicated parser/query tree at the pinned revision rather than
 installing from a moving `main` branch, then collect a new alternating 10-pair
