@@ -6,6 +6,7 @@ import json
 import math
 import pathlib
 import random
+import statistics
 
 
 def mean(values):
@@ -41,6 +42,15 @@ def summarize_pairs(pairs, metric, seed=123_456_789, resamples=100_000):
     }
 
 
+def summarize_cold_start(times):
+    return {
+        "mean_ms": mean(times) * 1_000,
+        "stddev_ms": statistics.stdev(times) * 1_000,
+        "min_ms": min(times) * 1_000,
+        "max_ms": max(times) * 1_000,
+    }
+
+
 def main():
     default_data = pathlib.Path(__file__).with_name("results") / (
         "single_worker_phase0_2026-07-18.json"
@@ -60,6 +70,11 @@ def main():
             )
             for metric in ("p50", "p95", "p99", "wall")
         }
+    summaries["cold_start"] = {
+        path: summarize_cold_start(details["times"])
+        for path, details in data["cold_start"].items()
+        if path in ("direct", "relay")
+    }
     print(json.dumps(summaries, indent=2, sort_keys=True))
 
 

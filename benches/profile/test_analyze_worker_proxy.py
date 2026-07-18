@@ -4,7 +4,7 @@ import unittest
 
 sys.path.insert(0, str(pathlib.Path(__file__).parent))
 
-from analyze_worker_proxy import summarize_pairs
+from analyze_worker_proxy import summarize_cold_start, summarize_pairs
 
 
 class PairedSummaryTest(unittest.TestCase):
@@ -24,6 +24,14 @@ class PairedSummaryTest(unittest.TestCase):
         self.assertAlmostEqual(first["mean_delta"], 0.2)
         self.assertLessEqual(first["ci95"][0], first["mean_delta"])
         self.assertGreaterEqual(first["ci95"][1], first["mean_delta"])
+
+    def test_summarizes_cold_start_samples_in_milliseconds(self):
+        summary = summarize_cold_start([0.100, 0.110, 0.120])
+
+        self.assertAlmostEqual(summary["mean_ms"], 110.0)
+        self.assertAlmostEqual(summary["stddev_ms"], 10.0)
+        self.assertAlmostEqual(summary["min_ms"], 100.0)
+        self.assertAlmostEqual(summary["max_ms"], 120.0)
 
 
 if __name__ == "__main__":
