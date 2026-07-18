@@ -641,6 +641,22 @@ interval resets both the native-storm window and the systemic breaker. Thus
 quarantine normally preserves service for healthy grammars without allowing an
 unbounded sequence of distinct bad artifacts to create a kill/resync loop.
 
+All worker restarts, regardless of classification, also consume a session-wide
+long-horizon token bucket with capacity 16. Tokens do not refill with elapsed
+wall time or the 60-second fast-budget reset; one token is restored only after
+10 continuous minutes of healthy worker service, up to capacity. Restart delay
+uses exponential backoff beginning at 250 milliseconds and doubling to a five-
+minute cap, and resets only after the same 10-minute healthy interval. A worker
+that deterministically fails every 70 seconds therefore drains the bucket rather
+than resetting forever.
+
+An empty long-horizon bucket opens the tree-tier breaker independently of the
+two fast budgets. After a 10-minute no-spawn cooldown, an explicit parser
+artifact or relevant configuration change may borrow one half-open probe; a
+failure immediately reopens the breaker, while 10 healthy minutes earns the
+first replacement token. Host-tier service and waiter failure contracts remain
+available throughout backoff and cooldown.
+
 When the budget is exhausted, the parent stops spawning workers and marks the
 tree tier unavailable for that configuration generation. It wakes all tree
 waiters through their existing tree-less or method-specific failure contracts,
@@ -865,6 +881,10 @@ Implementation is accepted only when all of the following hold:
   intervening healthy interval trip the independent native-storm breaker and
   stop respawning regardless of their spacing; a permitted half-open probe after
   cooldown either restores stable service or returns to the degraded state.
+* A deterministic failure every 70 seconds and other slow-frequency patterns
+  prove every restart consumes the long-horizon bucket, exponential backoff does
+  not reset at the 60-second fast threshold, and the session converges to the
+  degraded state instead of resyncing forever.
 * A protocol-corruption or reported Rust-panic fixture while a grammar lease is
   active may conservatively quarantine that key but still consumes the systemic
   budget; a signaled native crash with the same lease follows the native-evidence
