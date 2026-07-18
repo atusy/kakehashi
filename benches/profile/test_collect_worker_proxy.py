@@ -93,6 +93,44 @@ class CollectionHelpersTest(unittest.TestCase):
                     except ProcessLookupError:
                         pass
 
+    @unittest.skipUnless(os.name == "posix", "requires POSIX process groups")
+    def test_bounded_run_reaps_group_on_external_termination_signal(self):
+        with tempfile.TemporaryDirectory() as directory:
+            pid_file = pathlib.Path(directory) / "child.pid"
+            descendant = (
+                "import os,signal,time; "
+                "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+                f"open({str(pid_file)!r}, 'w').write(str(os.getpid())); "
+                "time.sleep(30)"
+            )
+            driver = (
+                "import os,signal,subprocess,sys,time; "
+                f"subprocess.Popen([sys.executable, '-c', {descendant!r}]); "
+                "time.sleep(0.1); os.kill(os.getppid(), signal.SIGTERM); "
+                "time.sleep(30)"
+            )
+            child_pid = None
+            try:
+                with self.assertRaises(SystemExit) as exit_context:
+                    bounded_run(
+                        [sys.executable, "-c", driver],
+                        {},
+                        timeout_seconds=5,
+                        termination_grace_seconds=0.2,
+                    )
+                self.assertEqual(exit_context.exception.code, 128 + signal.SIGTERM)
+                child_pid = int(pid_file.read_text())
+                with self.assertRaises(ProcessLookupError):
+                    os.kill(child_pid, 0)
+            finally:
+                if child_pid is None and pid_file.exists():
+                    child_pid = int(pid_file.read_text())
+                if child_pid is not None:
+                    try:
+                        os.kill(child_pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+
     def test_collector_rejects_non_posix_lifecycle(self):
         with self.assertRaisesRegex(SystemExit, "POSIX"):
             require_collector_posix("nt")

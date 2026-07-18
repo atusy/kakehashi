@@ -268,6 +268,23 @@ def terminate_process_group(process, grace_seconds):
     )
 
 
+def install_termination_handlers():
+    previous = {}
+
+    def exit_on_signal(signum, _frame):
+        raise SystemExit(128 + signum)
+
+    for signum in (signal.SIGHUP, signal.SIGTERM):
+        previous[signum] = signal.getsignal(signum)
+        signal.signal(signum, exit_on_signal)
+    return previous
+
+
+def restore_signal_handlers(previous):
+    for signum, handler in previous.items():
+        signal.signal(signum, handler)
+
+
 def bounded_run(
     command,
     environment,
@@ -282,21 +299,25 @@ def bounded_run(
         env=environment,
         start_new_session=True,
     )
+    previous_handlers = install_termination_handlers()
     try:
-        stdout, stderr = process.communicate(timeout=timeout_seconds)
-    except subprocess.TimeoutExpired as timeout:
-        stdout, stderr = terminate_process_group(
-            process, termination_grace_seconds
-        )
-        raise subprocess.TimeoutExpired(
-            command,
-            timeout_seconds,
-            output=stdout,
-            stderr=stderr,
-        ) from timeout
-    except BaseException:
-        terminate_process_group(process, termination_grace_seconds)
-        raise
+        try:
+            stdout, stderr = process.communicate(timeout=timeout_seconds)
+        except subprocess.TimeoutExpired as timeout:
+            stdout, stderr = terminate_process_group(
+                process, termination_grace_seconds
+            )
+            raise subprocess.TimeoutExpired(
+                command,
+                timeout_seconds,
+                output=stdout,
+                stderr=stderr,
+            ) from timeout
+        except BaseException:
+            terminate_process_group(process, termination_grace_seconds)
+            raise
+    finally:
+        restore_signal_handlers(previous_handlers)
     if process.returncode:
         raise subprocess.CalledProcessError(
             process.returncode, command, output=stdout, stderr=stderr
