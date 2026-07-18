@@ -39,6 +39,7 @@ CONTROLLED_ENVIRONMENT_KEYS = (
     "DYLD_LIBRARY_PATH",
 )
 TERMINATION_SIGNALS = (signal.SIGHUP, signal.SIGTERM)
+CLEANUP_SIGNALS = (*TERMINATION_SIGNALS, signal.SIGINT)
 ATTESTED_BUILD_COMMAND = [
     "cargo", "build", "--release", "--bin", "kakehashi"
 ]
@@ -459,6 +460,7 @@ def bounded_run(
     except BaseException:
         try:
             if process is not None:
+                signal.pthread_sigmask(signal.SIG_BLOCK, CLEANUP_SIGNALS)
                 terminate_process_group(process, termination_grace_seconds)
         finally:
             signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
@@ -468,6 +470,7 @@ def bounded_run(
             signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
             stdout, stderr = process.communicate(timeout=timeout_seconds)
         except subprocess.TimeoutExpired as timeout:
+            signal.pthread_sigmask(signal.SIG_BLOCK, CLEANUP_SIGNALS)
             suppress_termination_signals()
             stdout, stderr = terminate_process_group(
                 process, termination_grace_seconds
@@ -479,6 +482,7 @@ def bounded_run(
                 stderr=stderr,
             ) from timeout
         except BaseException:
+            signal.pthread_sigmask(signal.SIG_BLOCK, CLEANUP_SIGNALS)
             suppress_termination_signals()
             terminate_process_group(process, termination_grace_seconds)
             raise

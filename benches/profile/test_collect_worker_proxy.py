@@ -13,6 +13,7 @@ sys.path.insert(0, str(pathlib.Path(__file__).parent))
 
 import collect_worker_proxy as collector
 from collect_worker_proxy import (
+    CLEANUP_SIGNALS,
     build_driver_command,
     bounded_run,
     controlled_environment,
@@ -81,14 +82,17 @@ class CollectionHelpersTest(unittest.TestCase):
             pid_file = pathlib.Path(directory) / "child.pid"
             descendant = (
                 "import os,signal,time; "
+                "target=int(__import__('sys').argv[1]); "
                 "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
                 f"open({str(pid_file)!r}, 'w').write(str(os.getpid())); "
+                "time.sleep(0.1); os.kill(target, signal.SIGINT); "
+                "time.sleep(0.05); os.kill(target, signal.SIGINT); "
                 "time.sleep(30)"
             )
             driver = (
-                "import os,signal,subprocess,sys,time; "
-                f"subprocess.Popen([sys.executable, '-c', {descendant!r}]); "
-                "time.sleep(0.1); os.kill(os.getppid(), signal.SIGINT); "
+                "import os,subprocess,sys,time; "
+                f"subprocess.Popen([sys.executable, '-c', {descendant!r}, "
+                "str(os.getppid())]); "
                 "time.sleep(30)"
             )
             child_pid = None
@@ -183,6 +187,9 @@ class CollectionHelpersTest(unittest.TestCase):
                 bounded_run(["driver"], {}, timeout_seconds=5)
 
         terminate.assert_called_once_with(process, 3)
+
+    def test_cleanup_signals_include_interrupt(self):
+        self.assertIn(signal.SIGINT, CLEANUP_SIGNALS)
 
     def test_collector_rejects_non_posix_lifecycle(self):
         with self.assertRaisesRegex(SystemExit, "POSIX"):
