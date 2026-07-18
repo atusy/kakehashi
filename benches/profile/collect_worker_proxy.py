@@ -580,6 +580,11 @@ def signal_process_group(process, signum):
         os.killpg(process.pid, signum)
     except ProcessLookupError:
         pass
+    except PermissionError:
+        # macOS may report EPERM when the group leader exited and its PID was
+        # already reused by a process that is not our process-group leader.
+        if process.poll() is None:
+            raise
 
 
 def terminate_process_group(process, grace_seconds):

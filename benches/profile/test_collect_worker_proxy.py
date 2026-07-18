@@ -109,12 +109,22 @@ class CollectionHelpersTest(unittest.TestCase):
 
     def test_process_group_signal_does_not_hide_permission_errors(self):
         process = mock.Mock(pid=12345)
+        process.poll.return_value = None
 
         with (
             mock.patch.object(
                 collector.os, "killpg", side_effect=PermissionError("denied")
             ),
             self.assertRaises(PermissionError),
+        ):
+            signal_process_group(process, signal.SIGTERM)
+
+    def test_process_group_signal_tolerates_permission_race_after_exit(self):
+        process = mock.Mock(pid=12345)
+        process.poll.return_value = 0
+
+        with mock.patch.object(
+            collector.os, "killpg", side_effect=PermissionError("stale group")
         ):
             signal_process_group(process, signal.SIGTERM)
 
