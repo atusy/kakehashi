@@ -89,6 +89,14 @@ edit percentile effects change direction across batches. These rounded
 percentile results do not establish a stable tail effect and are not bounds on
 the future worker protocol.
 
+For Rust edit latency, batch B measured p50/p95/p99 deltas of +0.105 ms
+[-0.005, 0.215], +0.105 ms [0.005, 0.215], and +0.345 ms [0.110, 0.630],
+reversing batch A's negative point estimates. For Markdown, batch B measured
++0.160 ms [0.030, 0.310], +0.535 ms [0.035, 1.175], and +1.170 ms
+[0.015, 2.520]. Those Markdown point estimates share batch A's positive
+direction, but only batch B's intervals exclude zero. This batch dependence is
+why neither edit result is treated as a stable relay effect.
+
 ### Throughput-sensitive cache-hit path
 
 The cache-hit path transferred approximately 14.0 MiB of response bodies per
