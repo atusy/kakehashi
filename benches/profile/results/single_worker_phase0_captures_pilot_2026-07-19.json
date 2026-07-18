@@ -5,7 +5,7 @@
     "platform": "macOS-26.5.1-arm64-arm-64bit",
     "python": "3.12.13",
     "binary": "/Users/atusy/ghq/github.com/atusy/kakehashi___worker_adr/target/release/kakehashi",
-    "binary_sha256": "4ea51e25b3bbe30360772789996ff4076c4f01e84663975c0a71004e4501cf5a",
+    "binary_sha256": "ac9ea2da44cbe81ca4298f7636cd81c4c89967af6872af98bad9feb5f5e63fc5",
     "data_dir": "/private/tmp/kakehashi-phase0-data.WIU8dk",
     "parser_query_file_count": 25,
     "parser_query_tree_sha256": "1572967b352c7b24ec872bff02c3c9808374a0d5cab2c707368cb5f32be58115",
@@ -35,8 +35,16 @@
     ],
     "rustc": "rustc 1.95.0 (59807616e 2026-04-14) (built from a source tarball)",
     "cargo": "cargo 1.95.0 (f2d3ce0bd 2026-03-21)",
+    "build_environment": {
+      "PATH": "/Users/atusy/.local/bin:/Users/atusy/.bun/install/global/node_modules/@openai/codex-darwin-arm64/vendor/aarch64-apple-darwin/codex-path:/Users/atusy/.codex/tmp/arg0/codex-arg0wMKckG:/opt/homebrew/bin:/opt/homebrew/sbin:/nix/var/nix/profiles/default/bin:/Users/atusy/.nix-profile/bin:/run/current-system/sw/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/Users/atusy/.local/lastresort/bin",
+      "TMPDIR": "/var/folders/t3/_nc24_w90zq79l3xyz3xzc7c0000gn/T/",
+      "LANG": "C.UTF-8",
+      "LC_ALL": "C.UTF-8",
+      "CARGO_TARGET_DIR": "/var/folders/t3/_nc24_w90zq79l3xyz3xzc7c0000gn/T/kakehashi-attested-target-2wx0y4v8"
+    },
+    "built_in_fresh_target": true,
     "binary_relative": "target/release/kakehashi",
-    "binary_sha256": "4ea51e25b3bbe30360772789996ff4076c4f01e84663975c0a71004e4501cf5a"
+    "binary_sha256": "ac9ea2da44cbe81ca4298f7636cd81c4c89967af6872af98bad9feb5f5e63fc5"
   },
   "arguments": [
     "--lang",
@@ -52,10 +60,10 @@
   "independent_pairs": 1,
   "order": "direct then relay; smoke result only",
   "direct": {
-    "semantic_p50": 4.8,
-    "semantic_p95": 5.9,
-    "captures_p50": 31.1,
-    "captures_p95": 39.3,
+    "semantic_p50": 5.9,
+    "semantic_p95": 7.6,
+    "captures_p50": 37.4,
+    "captures_p95": 40.5,
     "semantic_outcomes": {
       "count": 100,
       "ok": 100,
@@ -76,10 +84,10 @@
     "capture_full_fallbacks": 0
   },
   "relay": {
-    "semantic_p50": 4.4,
-    "semantic_p95": 5.8,
-    "captures_p50": 30.1,
-    "captures_p95": 37.8,
+    "semantic_p50": 5.0,
+    "semantic_p95": 6.5,
+    "captures_p50": 32.5,
+    "captures_p95": 37.1,
     "semantic_outcomes": {
       "count": 100,
       "ok": 100,

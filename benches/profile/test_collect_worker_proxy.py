@@ -271,6 +271,11 @@ class CollectionHelpersTest(unittest.TestCase):
                 ],
                 "rustc": "rustc 1.95.0",
                 "cargo": "cargo 1.95.0",
+                "build_environment": {
+                    "PATH": "/bin",
+                    "CARGO_TARGET_DIR": "/tmp/fresh-target",
+                },
+                "built_in_fresh_target": True,
                 "binary_relative": "target/release/kakehashi",
                 "binary_sha256": hashlib.sha256(b"release").hexdigest(),
             }))
@@ -296,6 +301,8 @@ class CollectionHelpersTest(unittest.TestCase):
                 "build_command": ["cargo", "build"],
                 "rustc": "",
                 "cargo": "",
+                "build_environment": {},
+                "built_in_fresh_target": False,
                 "binary_relative": "target/release/kakehashi",
                 "binary_sha256": hashlib.sha256(b"release").hexdigest(),
             }))

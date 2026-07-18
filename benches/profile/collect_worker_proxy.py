@@ -260,7 +260,8 @@ def load_binary_attestation(path, binary):
     required = (
         "schema", "source_repository", "source_commit",
         "source_checkout_clean", "build_command", "rustc", "cargo",
-        "binary_relative", "binary_sha256",
+        "build_environment", "built_in_fresh_target", "binary_relative",
+        "binary_sha256",
     )
     if any(key not in attestation for key in required):
         raise ValueError("binary attestation is missing required fields")
@@ -276,6 +277,22 @@ def load_binary_attestation(path, binary):
         and bool(attestation["rustc"])
         and isinstance(attestation["cargo"], str)
         and bool(attestation["cargo"])
+        and isinstance(attestation["build_environment"], dict)
+        and "PATH" in attestation["build_environment"]
+        and "CARGO_TARGET_DIR" in attestation["build_environment"]
+        and all(
+            isinstance(key, str) and isinstance(value, str)
+            for key, value in attestation["build_environment"].items()
+        )
+        and not (
+            set(attestation["build_environment"])
+            - {
+                "PATH", "SYSTEMROOT", "WINDIR", "TMPDIR", "TMP", "TEMP",
+                "LANG", "LC_ALL", "SDKROOT", "MACOSX_DEPLOYMENT_TARGET",
+                "CARGO_TARGET_DIR",
+            }
+        )
+        and attestation["built_in_fresh_target"] is True
         and attestation["binary_relative"] == "target/release/kakehashi"
         and isinstance(attestation["binary_sha256"], str)
         and re.fullmatch(r"[0-9a-f]{64}", attestation["binary_sha256"])
@@ -580,7 +597,6 @@ def main():
             "order": "direct-relay on odd runs; relay-direct on even runs",
         },
         "steady_state": {},
-        "cold_start": {},
     }
     for scenario in selected:
         pairs = []

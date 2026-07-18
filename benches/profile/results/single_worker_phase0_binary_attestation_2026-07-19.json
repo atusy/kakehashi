@@ -12,6 +12,14 @@
   ],
   "rustc": "rustc 1.95.0 (59807616e 2026-04-14) (built from a source tarball)",
   "cargo": "cargo 1.95.0 (f2d3ce0bd 2026-03-21)",
+  "build_environment": {
+    "PATH": "/Users/atusy/.local/bin:/Users/atusy/.bun/install/global/node_modules/@openai/codex-darwin-arm64/vendor/aarch64-apple-darwin/codex-path:/Users/atusy/.codex/tmp/arg0/codex-arg0wMKckG:/opt/homebrew/bin:/opt/homebrew/sbin:/nix/var/nix/profiles/default/bin:/Users/atusy/.nix-profile/bin:/run/current-system/sw/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/Users/atusy/.local/lastresort/bin",
+    "TMPDIR": "/var/folders/t3/_nc24_w90zq79l3xyz3xzc7c0000gn/T/",
+    "LANG": "C.UTF-8",
+    "LC_ALL": "C.UTF-8",
+    "CARGO_TARGET_DIR": "/var/folders/t3/_nc24_w90zq79l3xyz3xzc7c0000gn/T/kakehashi-attested-target-2wx0y4v8"
+  },
+  "built_in_fresh_target": true,
   "binary_relative": "target/release/kakehashi",
-  "binary_sha256": "4ea51e25b3bbe30360772789996ff4076c4f01e84663975c0a71004e4501cf5a"
+  "binary_sha256": "ac9ea2da44cbe81ca4298f7636cd81c4c89967af6872af98bad9feb5f5e63fc5"
 }

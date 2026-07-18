@@ -3,12 +3,33 @@
 
 import argparse
 import json
+import os
 import pathlib
+import shutil
 import subprocess
+import tempfile
 
 from collect_worker_proxy import ATTESTED_BUILD_COMMAND, sha256_file, tool_version
 
 BINARY_RELATIVE = pathlib.Path("target/release/kakehashi")
+BUILD_ENVIRONMENT_KEYS = (
+    "PATH", "SYSTEMROOT", "WINDIR", "TMPDIR", "TMP", "TEMP", "LANG",
+    "LC_ALL", "SDKROOT", "MACOSX_DEPLOYMENT_TARGET",
+)
+
+
+def controlled_build_environment(source, target_dir):
+    environment = {
+        key: source[key] for key in BUILD_ENVIRONMENT_KEYS if key in source
+    }
+    environment["CARGO_TARGET_DIR"] = str(target_dir)
+    return environment
+
+
+def environment_tool_version(command, environment):
+    return subprocess.run(
+        command, check=True, text=True, stdout=subprocess.PIPE, env=environment
+    ).stdout.strip()
 
 
 def git(checkout, *arguments):
@@ -30,17 +51,31 @@ def main():
     require_clean(args.checkout)
     source_commit = git(args.checkout, "rev-parse", "HEAD")
     source_repository = git(args.checkout, "remote", "get-url", "origin")
-    subprocess.run(ATTESTED_BUILD_COMMAND, cwd=args.checkout, check=True)
+    with tempfile.TemporaryDirectory(prefix="kakehashi-attested-target-") as target:
+        build_environment = controlled_build_environment(os.environ, target)
+        subprocess.run(
+            ATTESTED_BUILD_COMMAND,
+            cwd=args.checkout,
+            check=True,
+            env=build_environment,
+        )
+        built_binary = pathlib.Path(target) / "release/kakehashi"
+        binary = args.checkout / BINARY_RELATIVE
+        binary.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(built_binary, binary)
+        rustc = environment_tool_version(["rustc", "--version"], build_environment)
+        cargo = environment_tool_version(["cargo", "--version"], build_environment)
     require_clean(args.checkout)
-    binary = args.checkout / BINARY_RELATIVE
     result = {
         "schema": 1,
         "source_repository": source_repository,
         "source_commit": source_commit,
         "source_checkout_clean": True,
         "build_command": ATTESTED_BUILD_COMMAND,
-        "rustc": tool_version(["rustc", "--version"]),
-        "cargo": tool_version(["cargo", "--version"]),
+        "rustc": rustc,
+        "cargo": cargo,
+        "build_environment": build_environment,
+        "built_in_fresh_target": True,
         "binary_relative": BINARY_RELATIVE.as_posix(),
         "binary_sha256": sha256_file(binary),
     }
