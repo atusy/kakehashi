@@ -64,7 +64,7 @@ noise at the driver's reporting resolution.
 
 ### Throughput-sensitive cache-hit path
 
-The cache-hit path transferred approximately 14.3 MiB of response bodies per
+The cache-hit path transferred approximately 14.0 MiB of response bodies per
 1,000-request run.
 
 | Metric | Direct mean | Relay mean | Paired delta | 95% CI for delta |
