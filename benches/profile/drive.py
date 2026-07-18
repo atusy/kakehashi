@@ -157,10 +157,17 @@ def next_toggle_change(
 
 def warm_semantic_tokens(request, uri):
     """Populate the semantic-token cache without adding a measured sample."""
-    request(
+    response, _wire_bytes = request(
         "textDocument/semanticTokens/full",
         {"textDocument": {"uri": uri}},
     )
+    result = response.get("result")
+    if response_status(response) != "ok" or not isinstance(result, dict):
+        raise RuntimeError(f"semantic-token warmup failed: {response}")
+    if not isinstance(result.get("data"), list):
+        raise RuntimeError(
+            f"semantic-token warmup returned an invalid payload: {response}"
+        )
 
 
 def main() -> None:

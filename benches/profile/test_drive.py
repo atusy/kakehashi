@@ -104,7 +104,9 @@ class RequestSummaryTest(unittest.TestCase):
         calls = []
 
         warm_semantic_tokens(
-            lambda method, params: calls.append((method, params)),
+            lambda method, params: (
+                calls.append((method, params)) or ({"result": {"data": []}}, 0)
+            ),
             "file:///profile/input.rs",
         )
 
@@ -112,6 +114,13 @@ class RequestSummaryTest(unittest.TestCase):
             "textDocument/semanticTokens/full",
             {"textDocument": {"uri": "file:///profile/input.rs"}},
         )])
+
+    def test_semantic_warmup_rejects_non_result_response(self):
+        def canceled(_method, _params):
+            return {"error": {"code": -32800, "message": "cancelled"}}, 0
+
+        with self.assertRaisesRegex(RuntimeError, "warmup failed"):
+            warm_semantic_tokens(canceled, "file:///profile/input.rs")
 
 
 if __name__ == "__main__":
