@@ -170,7 +170,7 @@ def warm_semantic_tokens(request, uri):
         )
 
 
-def terminate_server(server, timeout_seconds=1):
+def terminate_server(server, timeout_seconds=3):
     """Give a server (and relay cleanup handler) a bounded graceful exit."""
     if server.poll() is not None:
         return

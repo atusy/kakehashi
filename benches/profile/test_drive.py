@@ -1,4 +1,6 @@
 import pathlib
+import os
+import signal
 import sys
 import time
 import unittest
@@ -47,6 +49,43 @@ class RequestSummaryTest(unittest.TestCase):
         self.assertEqual(server.actions, [
             "terminate", ("wait", 0.25), "kill", ("wait", None),
         ])
+
+    @unittest.skipUnless(hasattr(signal, "SIGTERM"), "requires SIGTERM")
+    def test_server_termination_lets_relay_reap_term_ignoring_child(self):
+        proxy = pathlib.Path(__file__).with_name("worker_proxy.py")
+        environment = dict(
+            os.environ,
+            KAKEHASHI_WORKER_PROXY_BIN=sys.executable,
+        )
+        process = subprocess.Popen(
+            [
+                sys.executable,
+                str(proxy),
+                "-c",
+                "import os,signal,time; "
+                "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+                "print(os.getpid(), flush=True); time.sleep(30)",
+            ],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=environment,
+            text=True,
+        )
+        child_pid = int(process.stdout.readline())
+        try:
+            terminate_server(process)
+            with self.assertRaises(ProcessLookupError):
+                os.kill(child_pid, 0)
+        finally:
+            terminate_server(process)
+            try:
+                os.kill(child_pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            process.stdin.close()
+            process.stdout.close()
+            process.stderr.close()
 
     def test_aggregate_timing_uses_monotonic_clock(self):
         self.assertIs(benchmark_clock, time.perf_counter)
