@@ -520,12 +520,25 @@ impl Kakehashi {
         build_notifier(&self.client, &self.settings_manager)
     }
 
+    #[cfg(test)]
     async fn apply_raw_settings(
         &self,
         raw_settings: RawWorkspaceSettings,
         settings: WorkspaceSettings,
     ) {
-        apply_shared_settings(
+        let reload = lock_settings_reload().await;
+        self.apply_raw_settings_locked(&reload, raw_settings, settings)
+            .await;
+    }
+
+    async fn apply_raw_settings_locked(
+        &self,
+        reload: &tokio::sync::MutexGuard<'static, ()>,
+        raw_settings: RawWorkspaceSettings,
+        settings: WorkspaceSettings,
+    ) {
+        apply_shared_settings_locked(
+            reload,
             &self.client,
             ReloadLanguageState {
                 language: &self.language,
@@ -537,13 +550,14 @@ impl Kakehashi {
             &self.settings_manager,
             &self.cache,
             &self.bridge,
-            Some(raw_settings),
-            settings,
+            SettingsReloadInput {
+                raw_settings: Some(raw_settings),
+                settings,
+            },
         )
         .await
         .into_iter()
         .for_each(|uri| self.schedule_reparse(uri, None));
-        self.warn_on_misconfigured_settings().await;
     }
 
     async fn apply_initial_settings(
@@ -551,6 +565,7 @@ impl Kakehashi {
         raw_settings: RawWorkspaceSettings,
         settings: WorkspaceSettings,
     ) {
+        let warnings = Self::misconfigured_settings_warnings(&settings);
         apply_shared_settings(
             &self.client,
             ReloadLanguageState {
@@ -569,30 +584,40 @@ impl Kakehashi {
         .await
         .into_iter()
         .for_each(|uri| self.schedule_reparse(uri, None));
-        self.warn_on_misconfigured_settings().await;
+        self.warn_on_misconfigured_settings(&warnings).await;
     }
 
-    /// Emit a single client-visible warning summarizing all (host, injection)
-    /// pairs whose configured `textDocument/formatting` aggregation is the
-    /// misconfigured `Concatenated`-with-empty-`priorities` combination. The
-    /// concatenated formatting pipeline requires a non-empty `priorities`
-    /// list (it defines pipeline membership and order — ADR
-    /// concatenated-formatting-pipeline Decision point 2); without one the
-    /// region falls back to `preferred`. Surfacing the mismatch at
-    /// settings-apply time avoids silent misbehavior on every format request.
+    /// Build client-visible warnings for settings misconfigurations.
+    ///
+    /// One warning summarizes all (host, injection) pairs whose configured
+    /// `textDocument/formatting` aggregation is the misconfigured
+    /// `Concatenated`-with-empty-`priorities` combination. The concatenated
+    /// formatting pipeline requires a non-empty `priorities` list (it defines
+    /// pipeline membership and order — ADR concatenated-formatting-pipeline
+    /// Decision point 2); without one the region falls back to `preferred`.
+    /// Another warning summarizes all language servers that cannot be spawned.
+    /// Surfacing these mismatches at settings-apply time avoids silent
+    /// misbehavior on every affected request.
     ///
     /// Previously this emitted one notification per pair, which floods the
     /// editor log on `didChangeConfiguration` reloads for workspaces with
     /// many bridge entries.
-    async fn warn_on_misconfigured_settings(&self) {
-        let settings = self.settings_manager.load_settings();
-        let pairs = bridge_context::concatenated_formatting_pairs(&settings);
+    fn misconfigured_settings_warnings(settings: &WorkspaceSettings) -> Vec<String> {
+        let mut warnings = Vec::new();
+        let pairs = bridge_context::concatenated_formatting_pairs(settings);
         if let Some(msg) = bridge_context::format_concatenated_formatting_warning(&pairs) {
-            self.notifier().log_warning(msg).await;
+            warnings.push(msg);
         }
-        let unspawnable = bridge_context::unspawnable_language_servers(&settings);
+        let unspawnable = bridge_context::unspawnable_language_servers(settings);
         if let Some(msg) = bridge_context::format_unspawnable_servers_warning(&unspawnable) {
-            self.notifier().log_warning(msg).await;
+            warnings.push(msg);
+        }
+        warnings
+    }
+
+    async fn warn_on_misconfigured_settings(&self, warnings: &[String]) {
+        for warning in warnings {
+            self.notifier().log_warning(warning).await;
         }
     }
 
