@@ -212,6 +212,7 @@ steady-state batch without hand transcription:
 ```sh
 revision=4916d6592ede8c07973490d9322f187e07dfefac
 workspace_dir="$(mktemp -d "${TMPDIR:-/tmp}/kakehashi-phase0.XXXXXX")"
+trap 'rm -rf "$workspace_dir"' EXIT
 source_dir="$workspace_dir/nvim-treesitter"
 data_dir="$workspace_dir/data"
 git clone --filter=blob:none \
