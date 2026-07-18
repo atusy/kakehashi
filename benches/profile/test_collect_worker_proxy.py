@@ -31,6 +31,7 @@ from collect_worker_proxy import (
     require_benchmark_artifacts,
     run_order,
     run_with_staging_cleanup,
+    restore_signal_state,
     signal_process_group,
     shasum_tree_digest,
     stage_measurement_inputs,
@@ -289,6 +290,29 @@ class CollectionHelpersTest(unittest.TestCase):
 
     def test_cleanup_signals_include_interrupt(self):
         self.assertIn(signal.SIGINT, CLEANUP_SIGNALS)
+
+    def test_signal_handlers_are_restored_before_signals_are_unblocked(self):
+        calls = []
+        handlers = {signal.SIGTERM: signal.SIG_DFL}
+        previous_mask = {signal.SIGINT}
+        with (
+            mock.patch.object(
+                collector, "restore_signal_handlers",
+                side_effect=lambda value: calls.append(("handlers", value)),
+            ),
+            mock.patch.object(
+                collector.signal, "pthread_sigmask",
+                side_effect=lambda operation, value: calls.append(
+                    ("mask", operation, value)
+                ),
+            ),
+        ):
+            restore_signal_state(handlers, previous_mask)
+
+        self.assertEqual(calls, [
+            ("handlers", handlers),
+            ("mask", signal.SIG_SETMASK, previous_mask),
+        ])
 
     def test_termination_signals_only_use_available_platform_signals(self):
         expected = tuple(

@@ -623,6 +623,13 @@ def restore_signal_handlers(previous):
         signal.signal(signum, handler)
 
 
+def restore_signal_state(previous_handlers, previous_mask):
+    # Keep cleanup signals blocked until their original handlers are back.
+    # Otherwise a pending repeated SIGINT can interrupt handler restoration.
+    restore_signal_handlers(previous_handlers)
+    signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
+
+
 def suppress_termination_signals():
     for signum in TERMINATION_SIGNALS:
         signal.signal(signum, signal.SIG_IGN)
@@ -683,8 +690,7 @@ def bounded_run(
             terminate_process_group(process, termination_grace_seconds)
             raise
     finally:
-        signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
-        restore_signal_handlers(previous_handlers)
+        restore_signal_state(previous_handlers, previous_mask)
     if process.returncode:
         raise subprocess.CalledProcessError(
             process.returncode, command, output=stdout, stderr=stderr
