@@ -658,7 +658,9 @@ because the #380 benefit now outweighs it:
   there is no stale-overwrite guard and a brief wrong-content window after edits
   (lazy re-anchor still keeps *positions* current via the retained pull trigger).
 - Per-source strategy fan-in (`preferred` sticky / `concatenated` visible-walk);
-  the staged merge concatenates, with HashMap-nondeterministic cross-source order.
+  the staged merge currently concatenates every eligible source. The shared
+  diagnostic sorter makes the final wire order deterministic, but does not
+  implement per-source selection or precedence.
   This also subsumes the **interim `pullFallback` dedup limitation**: because
   `PullLayer` is one host-wide blob with no per-server identity,
   `filter_pull_driven_push_slots` triggers on "any `PullLayer` present" rather
