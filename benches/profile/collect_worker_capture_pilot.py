@@ -19,6 +19,7 @@ from collect_worker_proxy import (
     load_binary_attestation,
     require_benchmark_artifacts,
     require_posix,
+    run_with_staging_cleanup,
     sha256_file,
     stage_measurement_inputs,
     verify_file_sha256,
@@ -70,6 +71,33 @@ def main():
     staging, binary, data_dir, staged_script_dir = stage_measurement_inputs(
         args.bin, args.data_dir, script_dir
     )
+    run_with_staging_cleanup(
+        staging,
+        lambda: collect_staged(
+            args,
+            binary,
+            data_dir,
+            staged_script_dir,
+            script_dir,
+            initial_harness_identity,
+            initial_identity,
+            initial_binary_sha256,
+            binary_attestation,
+        ),
+    )
+
+
+def collect_staged(
+    args,
+    binary,
+    data_dir,
+    staged_script_dir,
+    script_dir,
+    initial_harness_identity,
+    initial_identity,
+    initial_binary_sha256,
+    binary_attestation,
+):
     if sha256_file(binary) != initial_binary_sha256:
         raise RuntimeError("staged binary does not match attested source")
     if artifact_identity(data_dir) != initial_identity:
@@ -123,7 +151,6 @@ def main():
     if harness_identity(staged_script_dir) != initial_harness_identity:
         raise RuntimeError("staged benchmark harness changed during collection")
     args.output.write_text(json.dumps(result, indent=2) + "\n")
-    staging.cleanup()
 
 
 if __name__ == "__main__":
