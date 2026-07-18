@@ -7,9 +7,11 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 sys.path.insert(0, str(pathlib.Path(__file__).parent))
 
+import collect_worker_proxy as collector
 from collect_worker_proxy import (
     build_driver_command,
     bounded_run,
@@ -165,6 +167,22 @@ class CollectionHelpersTest(unittest.TestCase):
             )
 
         self.assertEqual(exit_context.exception.code, 128 + signal.SIGTERM)
+
+    @unittest.skipUnless(os.name == "posix", "requires POSIX signal masks")
+    def test_bounded_run_reaps_when_handler_installation_is_interrupted(self):
+        process = mock.Mock(pid=12345)
+        with (
+            mock.patch.object(collector.subprocess, "Popen", return_value=process),
+            mock.patch.object(
+                collector, "install_termination_handlers",
+                side_effect=KeyboardInterrupt,
+            ),
+            mock.patch.object(collector, "terminate_process_group") as terminate,
+        ):
+            with self.assertRaises(KeyboardInterrupt):
+                bounded_run(["driver"], {}, timeout_seconds=5)
+
+        terminate.assert_called_once_with(process, 3)
 
     def test_collector_rejects_non_posix_lifecycle(self):
         with self.assertRaisesRegex(SystemExit, "POSIX"):

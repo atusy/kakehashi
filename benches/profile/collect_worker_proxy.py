@@ -424,6 +424,7 @@ def bounded_run(
     timeout_seconds,
     termination_grace_seconds=3,
 ):
+    process = None
     previous_mask = signal.pthread_sigmask(
         signal.SIG_BLOCK, TERMINATION_SIGNALS
     )
@@ -439,7 +440,11 @@ def bounded_run(
         )
         previous_handlers = install_termination_handlers()
     except BaseException:
-        signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
+        try:
+            if process is not None:
+                terminate_process_group(process, termination_grace_seconds)
+        finally:
+            signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
         raise
     try:
         try:
