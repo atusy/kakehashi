@@ -74,6 +74,35 @@ def committed_blob(checkout, revision, relative):
         ) from error
 
 
+def verify_official_revision(checkout, revision):
+    fetched = subprocess.run(
+        ["git", "-C", str(checkout), "fetch", "--no-tags", "origin", "main"],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    if fetched.returncode:
+        raise ValueError(
+            f"could not fetch official nvim-treesitter origin/main: {fetched.stderr}"
+        )
+    fetched_revision = tool_version([
+        "git", "-C", str(checkout), "rev-parse", "FETCH_HEAD"
+    ])
+    ancestry = subprocess.run(
+        [
+            "git", "-C", str(checkout), "merge-base", "--is-ancestor",
+            revision, fetched_revision,
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    if ancestry.returncode:
+        raise ValueError(
+            f"nvim-treesitter revision {revision} is not in official origin/main"
+        )
+    return fetched_revision
+
+
 def artifact_provenance(data_dir, nvim_treesitter_checkout):
     origin = tool_version([
         "git", "-C", str(nvim_treesitter_checkout),
@@ -90,6 +119,9 @@ def artifact_provenance(data_dir, nvim_treesitter_checkout):
     revision = tool_version([
         "git", "-C", str(nvim_treesitter_checkout), "rev-parse", "HEAD"
     ])
+    fetched_revision = verify_official_revision(
+        nvim_treesitter_checkout, revision
+    )
     comparisons = [
         (
             data_dir / "cache/parsers.lua",
@@ -119,6 +151,7 @@ def artifact_provenance(data_dir, nvim_treesitter_checkout):
     return {
         "nvim_treesitter_repository": origin,
         "nvim_treesitter_revision": revision,
+        "nvim_treesitter_fetched_main": fetched_revision,
         "verification": "parser metadata and every installed query byte-matched",
     }
 

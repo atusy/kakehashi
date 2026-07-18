@@ -233,8 +233,9 @@ python3 benches/profile/collect_worker_capture_pilot.py \
 ```
 
 The collector verifies that the metadata cache and every installed query file
-byte-match the checkout's HEAD. The committed dataset was verified against
-`nvim-treesitter` revision
+byte-match the checkout's HEAD. It also fetches the official `origin/main` and
+requires the selected revision to be in that fetched history. The committed
+dataset was verified against `nvim-treesitter` revision
 `4916d6592ede8c07973490d9322f187e07dfefac`.
 
 Run the digest command below and compare it with the committed dataset before

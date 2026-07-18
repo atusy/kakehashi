@@ -26,6 +26,7 @@
   "artifacts": {
     "nvim_treesitter_repository": "https://github.com/nvim-treesitter/nvim-treesitter",
     "nvim_treesitter_revision": "4916d6592ede8c07973490d9322f187e07dfefac",
+    "nvim_treesitter_fetched_main": "4916d6592ede8c07973490d9322f187e07dfefac",
     "verification": "parser metadata and every installed query byte-matched"
   },
   "binary_attestation": {

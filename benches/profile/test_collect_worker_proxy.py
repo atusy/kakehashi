@@ -29,6 +29,7 @@ from collect_worker_proxy import (
     shasum_tree_digest,
     stage_measurement_inputs,
     verify_file_sha256,
+    verify_official_revision,
 )
 
 
@@ -201,7 +202,12 @@ class CollectionHelpersTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "missing benchmark artifact"):
                 require_benchmark_artifacts(pathlib.Path(directory))
 
-    def test_artifact_provenance_verifies_metadata_and_queries_at_revision(self):
+    @mock.patch.object(
+        collector, "verify_official_revision", return_value="f" * 40
+    )
+    def test_artifact_provenance_verifies_metadata_and_queries_at_revision(
+        self, _verify_official_revision
+    ):
         with tempfile.TemporaryDirectory() as directory:
             root = pathlib.Path(directory)
             checkout = root / "nvim-treesitter"
@@ -260,6 +266,51 @@ class CollectionHelpersTest(unittest.TestCase):
 
             with self.assertRaisesRegex(ValueError, "unexpected.*origin"):
                 artifact_provenance(pathlib.Path(directory) / "data", checkout)
+
+    def test_official_revision_must_be_ancestor_of_fetched_main(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            upstream = root / "upstream"
+            checkout = root / "checkout"
+            upstream.mkdir()
+            subprocess.run(["git", "init", "-q", "-b", "main", upstream], check=True)
+            (upstream / "file").write_text("official")
+            subprocess.run(["git", "-C", upstream, "add", "."], check=True)
+            subprocess.run(
+                [
+                    "git", "-C", upstream,
+                    "-c", "user.name=benchmark-test",
+                    "-c", "user.email=benchmark@example.invalid",
+                    "commit", "-qm", "official",
+                ],
+                check=True,
+            )
+            subprocess.run(["git", "clone", "-q", upstream, checkout], check=True)
+            official = subprocess.run(
+                ["git", "-C", checkout, "rev-parse", "HEAD"],
+                check=True, text=True, stdout=subprocess.PIPE,
+            ).stdout.strip()
+
+            self.assertEqual(verify_official_revision(checkout, official), official)
+            subprocess.run(["git", "-C", checkout, "checkout", "-q", "--orphan", "local"], check=True)
+            (checkout / "file").write_text("local")
+            subprocess.run(["git", "-C", checkout, "add", "."], check=True)
+            subprocess.run(
+                [
+                    "git", "-C", checkout,
+                    "-c", "user.name=benchmark-test",
+                    "-c", "user.email=benchmark@example.invalid",
+                    "commit", "-qm", "local",
+                ],
+                check=True,
+            )
+            local = subprocess.run(
+                ["git", "-C", checkout, "rev-parse", "HEAD"],
+                check=True, text=True, stdout=subprocess.PIPE,
+            ).stdout.strip()
+
+            with self.assertRaisesRegex(ValueError, "official origin/main"):
+                verify_official_revision(checkout, local)
 
     def test_controlled_environment_drops_behavior_overrides(self):
         environment = controlled_environment({
