@@ -412,9 +412,21 @@ complete acknowledged active grammar set. This remains correct when one
 `DeriveSnapshot` reaches several injected grammars or when unrelated documents
 parse concurrently.
 
-The worker belongs to the parent process lifetime. Shutdown closes the protocol,
-waits for a short graceful exit, then kills and reaps the process (and its process
-group or platform equivalent) so orphan workers cannot survive the LSP server.
+The worker belongs to the parent process lifetime. A dedicated worker control
+thread, independent of the compute pool, blocks on a parent-liveness handle. EOF
+or handle closure terminates the worker process immediately without waiting to
+join a potentially hung native compute thread. On macOS and other Unix targets
+the baseline mechanism is a close-on-exec liveness pipe whose write end exists
+only in the parent. Linux additionally uses `PR_SET_PDEATHSIG` with the standard
+post-registration parent-PID race check where available. Windows assigns the
+worker to a Job Object with kill-on-job-close and also watches the inherited
+parent handle. Process-group membership is used only to target explicit cleanup;
+it is not treated as a parent-death signal.
+
+On normal shutdown the parent closes the protocol, waits for a short graceful
+exit, then kills and reaps the worker and any owned descendants. On abnormal
+parent death, the liveness thread or platform primitive performs the termination
+without requiring parent cleanup code to run.
 
 ### 7. Relationship to existing decisions
 
@@ -566,8 +578,11 @@ Implementation is accepted only when all of the following hold:
 * Cancellation tests cover queued and running work for client cancellation,
   supersession, handler drop, and `didClose`, including completion races and the
   rule that canceled work publishes and caches nothing.
-* Cross-platform lifecycle tests prove normal shutdown and abnormal parent exit
-  do not leave an orphan worker.
+* Cross-platform lifecycle tests prove normal shutdown and parent `SIGKILL` or
+  platform-equivalent abnormal exit do not leave an orphan worker, including
+  while a separate compute thread is hung in native code. Tests cover the macOS
+  liveness-pipe path, Linux parent-death signal where enabled, and Windows Job
+  Object kill-on-close behavior.
 * Benchmarks report, separately, IPC enqueue, queue wait, compute, serialization,
   parent resume, bytes transferred, stale-work discard, and cache-hit costs.
 * The prototype commits versioned representative corpora and records repeated
