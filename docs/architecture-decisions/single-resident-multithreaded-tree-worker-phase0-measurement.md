@@ -22,10 +22,12 @@ of Tree-sitter computation and caches.
 
 ## Environment
 
-* Date: 2026-07-18
+* Initial cold-start and pilot date: 2026-07-18
+* Corrected steady-state collection date: 2026-07-19
 * Machine: Apple M4, 10 physical/logical CPUs
 * OS: macOS 26.5.1 (25F80)
-* Current tree compute budget: 8 threads
+* Estimated tree compute budget under the current policy: 8 threads. This uses
+  Python's logical CPU count and is not a binary-reported effective pool size.
 * Release binary: `ccbd8ffd13c4817eda62e1de6f8cfd3eeb3259d0`
   (execution code matches `origin/main` at
   `a1278be5fdff24d109d9e03134c6bdb880577f64`; the intervening change is
@@ -33,7 +35,8 @@ of Tree-sitter computation and caches.
 * Parser/query data was preinstalled outside the measured interval.
 
 For each steady-state scenario, direct and relay order alternated across 10
-independent process pairs. Cache-hit runs issued 1,000 requests per process;
+independent process pairs. Cache-hit runs first issued one unmeasured warmup,
+then 1,000 measured requests per process;
 edit runs issued 100 requests per process. Reported confidence intervals are a
 deterministic paired bootstrap over the 10 run-level summaries. Percentiles are
 rounded to 0.1 ms by the driver, so sub-0.1-ms percentile differences are below
@@ -45,19 +48,19 @@ its reporting resolution.
 
 | Scenario | Metric | Direct mean | Relay mean | Paired delta | 95% CI for delta |
 |---|---:|---:|---:|---:|---:|
-| Rust small, unchanged cache hit | p50 | 0.30 ms | 0.30 ms | 0.00 ms | [0.00, 0.00] ms |
-| Rust small, unchanged cache hit | p95 | 0.53 ms | 0.53 ms | 0.00 ms | [-0.03, 0.03] ms |
-| Rust small, unchanged cache hit | p99 | 0.87 ms | 0.94 ms | +0.07 ms | [-0.01, 0.16] ms |
-| Rust small, one edit/request | p50 | 3.67 ms | 3.73 ms | +0.06 ms | [0.01, 0.12] ms |
-| Rust small, one edit/request | p95 | 4.33 ms | 4.42 ms | +0.09 ms | [-0.10, 0.29] ms |
-| Rust small, one edit/request | p99 | 5.08 ms | 5.29 ms | +0.21 ms | [-0.28, 0.83] ms |
-| Markdown injections, one edit/request | p50 | 2.54 ms | 2.53 ms | -0.01 ms | [-0.03, 0.00] ms |
-| Markdown injections, one edit/request | p95 | 2.83 ms | 2.72 ms | -0.11 ms | [-0.26, 0.00] ms |
-| Markdown injections, one edit/request | p99 | 5.04 ms | 5.45 ms | +0.41 ms | [-0.26, 1.08] ms |
+| Rust small, unchanged cache hit | p50 | 0.38 ms | 0.38 ms | 0.00 ms | [0.00, 0.00] ms |
+| Rust small, unchanged cache hit | p95 | 0.41 ms | 0.39 ms | -0.02 ms | [-0.05, 0.00] ms |
+| Rust small, unchanged cache hit | p99 | 0.45 ms | 0.40 ms | -0.05 ms | [-0.13, 0.00] ms |
+| Rust small, one edit/request | p50 | 1.54 ms | 1.52 ms | -0.02 ms | [-0.09, 0.04] ms |
+| Rust small, one edit/request | p95 | 1.68 ms | 1.68 ms | 0.00 ms | [-0.10, 0.11] ms |
+| Rust small, one edit/request | p99 | 1.79 ms | 1.79 ms | 0.00 ms | [-0.06, 0.06] ms |
+| Markdown injections, one edit/request | p50 | 3.48 ms | 3.44 ms | -0.04 ms | [-0.16, 0.07] ms |
+| Markdown injections, one edit/request | p95 | 3.77 ms | 3.72 ms | -0.05 ms | [-0.35, 0.21] ms |
+| Markdown injections, one edit/request | p99 | 4.31 ms | 3.89 ms | -0.42 ms | [-1.60, 0.37] ms |
 
-The negative Markdown deltas are not interpreted as an improvement: the relay
-does no useful work, the intervals are dominated by run-level scheduling noise,
-and one direct run had an elevated p95.
+The negative latency deltas are not interpreted as an improvement: the relay
+does no useful work and the intervals are consistent with run-level scheduling
+noise at the driver's reporting resolution.
 
 ### Throughput-sensitive cache-hit path
 
@@ -66,8 +69,8 @@ The cache-hit path transferred approximately 14.3 MiB of response bodies per
 
 | Metric | Direct mean | Relay mean | Paired delta | 95% CI for delta |
 |---|---:|---:|---:|---:|
-| Wall time / 1,000 requests | 360.5 ms | 371.4 ms | +10.9 ms (+3.0%) | [6.1, 16.4] ms |
-| Amortized extra wall time | — | — | +10.9 µs/request | [6.1, 16.4] µs/request |
+| Wall time / 1,000 requests | 379.0 ms | 391.2 ms | +12.2 ms (+3.2%) | [1.7, 23.3] ms |
+| Amortized extra wall time | — | — | +12.2 µs/request | [1.7, 23.3] µs/request |
 
 This is the clearest measured raw-relay estimate in this experiment. It is
 neither a lower nor an upper bound for the future worker transport: the Python
@@ -105,7 +108,7 @@ used as a smoke test, not an independently repeated result:
 This particular raw process/pipe relay did not expose a clear steady-state
 transport blocker on this machine. Its median and p95 costs were at or below the
 driver's 0.1-ms reporting resolution, while the most sensitive cache-hit
-throughput run showed about 10.9 microseconds of amortized extra wall time per
+throughput run showed about 12.2 microseconds of amortized extra wall time per
 request. The actual Stage 1 worker cost may be above or below that relay delta.
 
 This result is preliminary and insufficient evidence for the ADR. It does not
@@ -174,7 +177,8 @@ python3 benches/profile/drive.py \
 
 KAKEHASHI_WORKER_PROXY_BIN=./target/release/kakehashi \
 python3 benches/profile/drive.py \
-  --bin ./benches/profile/worker_proxy.py \
+  --bin python3 \
+  --server-arg ./benches/profile/worker_proxy.py \
   --data-dir ./deps/test/kakehashi \
   --lang rust --size 15 --requests 100 --edits 1
 ```
