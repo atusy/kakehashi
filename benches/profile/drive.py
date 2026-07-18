@@ -109,6 +109,18 @@ def response_result_id(message: dict):
     return result.get("resultId") if isinstance(result, dict) else None
 
 
+def semantic_token_data(response):
+    result = response.get("result")
+    data = result.get("data") if isinstance(result, dict) else None
+    if (
+        not isinstance(data, list)
+        or len(data) % 5 != 0
+        or any(type(value) is not int or value < 0 for value in data)
+    ):
+        raise RuntimeError(f"invalid semantic-token response: {response}")
+    return data
+
+
 def count_semantic_outcomes(
     responses: list[dict], previous_tokens: int
 ) -> tuple[int, int, int, int]:
@@ -128,7 +140,7 @@ def count_semantic_outcomes(
             )
         else:
             ok += 1
-            tokens = len((response.get("result") or {}).get("data", [])) // 5
+            tokens = len(semantic_token_data(response)) // 5
     return ok, canceled, superseded, tokens
 
 
@@ -161,13 +173,9 @@ def warm_semantic_tokens(request, uri):
         "textDocument/semanticTokens/full",
         {"textDocument": {"uri": uri}},
     )
-    result = response.get("result")
-    if response_status(response) != "ok" or not isinstance(result, dict):
+    if response_status(response) != "ok":
         raise RuntimeError(f"semantic-token warmup failed: {response}")
-    if not isinstance(result.get("data"), list):
-        raise RuntimeError(
-            f"semantic-token warmup returned an invalid payload: {response}"
-        )
+    semantic_token_data(response)
 
 
 def terminate_server(server, timeout_seconds=3):

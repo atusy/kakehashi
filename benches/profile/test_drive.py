@@ -132,6 +132,17 @@ class RequestSummaryTest(unittest.TestCase):
 
         self.assertEqual((ok, canceled, superseded, tokens), (1, 2, 1, 2))
 
+    def test_rejects_malformed_successful_semantic_response(self):
+        for response in (
+            {},
+            {"result": {}},
+            {"result": {"data": [0, 0]}},
+            {"result": {"data": [0, 0, 1, "type", 0]}},
+        ):
+            with self.subTest(response=response):
+                with self.assertRaisesRegex(RuntimeError, "invalid semantic-token"):
+                    count_semantic_outcomes([response], previous_tokens=0)
+
     def test_toggle_change_alternates_insert_and_delete(self):
         insert, has_extra = next_toggle_change(first_line_len=5, line_has_extra=False)
         delete, has_extra = next_toggle_change(5, has_extra)
