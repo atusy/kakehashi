@@ -5,7 +5,6 @@
 
 use std::str::FromStr;
 
-use serde::de::IntoDeserializer;
 use tower_lsp_server::ls_types::{
     ClientCapabilities, DidChangeConfigurationParams, DidChangeWorkspaceFoldersParams,
     DidCloseTextDocumentParams, InitializeParams, InitializedParams, ServerCapabilities,
@@ -213,7 +212,7 @@ fn recover_server_capabilities(
     let mut candidate = serde_json::Value::Object(capabilities.clone());
     let mut dropped = Vec::new();
     loop {
-        match serde_path_to_error::deserialize(candidate.clone().into_deserializer()) {
+        match serde_path_to_error::deserialize(&candidate) {
             Ok(capabilities) => {
                 return Ok(ParsedInitializeCapabilities {
                     capabilities,
