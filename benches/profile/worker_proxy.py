@@ -13,14 +13,22 @@ import sys
 import threading
 
 
-def copy_stream(source, destination, chunk_size=64 * 1024):
+def copy_stream(
+    source, destination, chunk_size=64 * 1024, close_destination=False
+):
     copied = 0
     read = getattr(source, "read1", source.read)
-    while chunk := read(chunk_size):
-        destination.write(chunk)
-        destination.flush()
-        copied += len(chunk)
-    return copied
+    try:
+        while chunk := read(chunk_size):
+            destination.write(chunk)
+            destination.flush()
+            copied += len(chunk)
+        return copied
+    except BrokenPipeError:
+        return copied
+    finally:
+        if close_destination:
+            destination.close()
 
 
 def main():
@@ -37,7 +45,12 @@ def main():
         target=copy_stream,
         # Read the raw descriptor so a blocked daemon thread cannot retain the
         # BufferedReader lock while the proxy exits after its child.
-        args=(getattr(sys.stdin.buffer, "raw", sys.stdin.buffer), child.stdin),
+        args=(
+            getattr(sys.stdin.buffer, "raw", sys.stdin.buffer),
+            child.stdin,
+            64 * 1024,
+            True,
+        ),
         daemon=True,
     )
     stdout_thread = threading.Thread(

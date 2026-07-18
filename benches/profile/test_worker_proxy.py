@@ -47,6 +47,27 @@ class CopyStreamTest(unittest.TestCase):
         self.assertEqual(return_code, 0, stderr)
         self.assertNotIn("Fatal Python error", stderr)
 
+    def test_proxy_forwards_stdin_eof_to_child(self):
+        proxy = pathlib.Path(__file__).with_name("worker_proxy.py")
+        env = dict(os.environ, KAKEHASHI_WORKER_PROXY_BIN=sys.executable)
+
+        completed = subprocess.run(
+            [
+                sys.executable,
+                str(proxy),
+                "-c",
+                "import sys; data=sys.stdin.buffer.read(); print(len(data))",
+            ],
+            input=b"abc",
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=env,
+            timeout=5,
+        )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr.decode())
+        self.assertEqual(completed.stdout, b"3\n")
+
 
 if __name__ == "__main__":
     unittest.main()
