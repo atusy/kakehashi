@@ -4,13 +4,13 @@
   "environment": {
     "platform": "macOS-26.5.1-arm64-arm-64bit",
     "python": "3.12.13",
-    "binary": "/Users/atusy/ghq/github.com/atusy/kakehashi___worker_adr/target/release/kakehashi",
+    "binary": "/Users/atusy/ghq/github.com/atusy/kakehashi___worker_measure/target/release/kakehashi",
     "binary_execution": "private staged copy",
-    "binary_sha256": "192d8c3d5fbee9db04742c9e2f38b74b917a84ef3b2153397c58eec8187f9335",
-    "data_dir": "/private/tmp/kakehashi-phase0-data.WIU8dk",
+    "binary_sha256": "617511683fb5b47802203a8d4a6127c141e8545bc3e14a391430a5b0208941c1",
+    "data_dir": "/private/var/folders/t3/_nc24_w90zq79l3xyz3xzc7c0000gn/T/kakehashi-phase0-rerun.gryYAZ/data",
     "data_dir_execution": "private staged copy",
-    "parser_query_file_count": 25,
-    "parser_query_tree_sha256": "1572967b352c7b24ec872bff02c3c9808374a0d5cab2c707368cb5f32be58115",
+    "parser_query_file_count": 35,
+    "parser_query_tree_sha256": "72a9a79d7e223f71757ad80953853b3f612454792fa48a1a557c75e1e47a4ae1",
     "retained_environment": {
       "PATH": "/Users/atusy/.local/bin:/Users/atusy/.bun/install/global/node_modules/@openai/codex-darwin-arm64/vendor/aarch64-apple-darwin/codex-path:/Users/atusy/.codex/tmp/arg0/codex-arg0wMKckG:/opt/homebrew/bin:/opt/homebrew/sbin:/nix/var/nix/profiles/default/bin:/Users/atusy/.nix-profile/bin:/run/current-system/sw/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/Users/atusy/.local/lastresort/bin",
       "TMPDIR": "/var/folders/t3/_nc24_w90zq79l3xyz3xzc7c0000gn/T/",
@@ -27,7 +27,7 @@
   "binary_attestation": {
     "schema": 1,
     "source_repository": "https://github.com/atusy/kakehashi",
-    "source_commit": "ccbd8ffd13c4817eda62e1de6f8cfd3eeb3259d0",
+    "source_commit": "32b039f58e336c198c4e77f4427d040204d5f51d",
     "source_checkout_clean": true,
     "build_command": [
       "cargo",
@@ -51,23 +51,23 @@
       "TMPDIR": "/var/folders/t3/_nc24_w90zq79l3xyz3xzc7c0000gn/T/",
       "LANG": "C.UTF-8",
       "LC_ALL": "C.UTF-8",
-      "CARGO_TARGET_DIR": "/var/folders/t3/_nc24_w90zq79l3xyz3xzc7c0000gn/T/kakehashi-attested-build-euhg2o4m/target",
-      "CARGO_HOME": "/var/folders/t3/_nc24_w90zq79l3xyz3xzc7c0000gn/T/kakehashi-attested-build-euhg2o4m/target/cargo-home"
+      "CARGO_TARGET_DIR": "/var/folders/t3/_nc24_w90zq79l3xyz3xzc7c0000gn/T/kakehashi-attested-build-3reyx8m9/target",
+      "CARGO_HOME": "/var/folders/t3/_nc24_w90zq79l3xyz3xzc7c0000gn/T/kakehashi-attested-build-3reyx8m9/target/cargo-home"
     },
     "built_in_fresh_target": true,
     "source_isolated_archive": true,
     "cargo_config_ancestry_clean": true,
     "binary_relative": "target/release/kakehashi",
-    "binary_sha256": "192d8c3d5fbee9db04742c9e2f38b74b917a84ef3b2153397c58eec8187f9335"
+    "binary_sha256": "617511683fb5b47802203a8d4a6127c141e8545bc3e14a391430a5b0208941c1"
   },
   "harness": {
     "execution": "private staged driver and relay helpers",
     "source_files_sha256": {
-      "collect_worker_proxy.py": "3a0e1e591f2e552007d1e63965d780fb81aa4116b92295004513ebc8c3daa363",
-      "collect_worker_cold_start.py": "023a26b8add1904fa78e3487e2f4b4ae46c43cb33f70a5f082187e45efd4cf00",
-      "collect_worker_capture_pilot.py": "816e7863877fdb12a9222443af4af12bb417aa609ee5d2c7b9a780715565c4ca",
+      "collect_worker_proxy.py": "bcdebd15c80a1c088671b8d6052a4ddaba95099a423512d311de4713b1b22c4d",
+      "collect_worker_cold_start.py": "7bdfd26d28e874a02bd79b22669bbff028ea1b1d03bbb672f2a2be69617a49ca",
+      "collect_worker_capture_pilot.py": "8b9f8d8873f367a8dd4fddbc431e7571df9cef51322f4dbe9f329592ef4469c2",
       "drive.py": "8722d78a1eddc87d2f62818967c0624b0a7ece5b48f3bdac1d27d0c82a776e0d",
-      "worker_proxy.py": "461f9777c6fab4d88149c28bf3fa1c3e92bb5add15ea5a4d884741f2b6f73a7b",
+      "worker_proxy.py": "903d5cd3ed44e64f0825bffc2c4892798726545a661d1d0b7455b43d6e22e554",
       "gen_session.py": "6f4f6b8388c607db1c70fe29579ce14fe00d57668cab17601432ff123cfb15a3"
     }
   },
@@ -85,10 +85,10 @@
   "independent_pairs": 1,
   "order": "direct then relay; smoke result only",
   "direct": {
-    "semantic_p50": 6.0,
-    "semantic_p95": 7.7,
-    "captures_p50": 37.6,
-    "captures_p95": 40.7,
+    "semantic_p50": 5.6,
+    "semantic_p95": 6.5,
+    "captures_p50": 37.2,
+    "captures_p95": 40.8,
     "semantic_outcomes": {
       "count": 100,
       "ok": 100,
@@ -109,10 +109,10 @@
     "capture_full_fallbacks": 0
   },
   "relay": {
-    "semantic_p50": 4.5,
-    "semantic_p95": 6.6,
-    "captures_p50": 29.4,
-    "captures_p95": 37.6,
+    "semantic_p50": 5.1,
+    "semantic_p95": 5.9,
+    "captures_p50": 35.9,
+    "captures_p95": 39.9,
     "semantic_outcomes": {
       "count": 100,
       "ok": 100,

@@ -67,26 +67,26 @@ millisecond rounding before analysis.
 
 | Scenario | Metric | Direct mean | Relay mean | Paired delta | 95% CI for delta |
 |---|---:|---:|---:|---:|---:|
-| Rust small, unchanged cache hit | p50 | 0.500 ms | 0.505 ms | +0.005 ms | [0.000, 0.015] ms |
-| Rust small, unchanged cache hit | p95 | 0.540 ms | 0.600 ms | +0.060 ms | [0.040, 0.080] ms |
-| Rust small, unchanged cache hit | p99 | 0.585 ms | 0.600 ms | +0.015 ms | [0.000, 0.030] ms |
-| Rust small, one edit/request | p50 | 1.820 ms | 1.810 ms | -0.010 ms | [-0.040, 0.015] ms |
-| Rust small, one edit/request | p95 | 1.930 ms | 1.940 ms | +0.010 ms | [-0.030, 0.045] ms |
-| Rust small, one edit/request | p99 | 2.150 ms | 2.030 ms | -0.120 ms | [-0.480, 0.085] ms |
-| Markdown injections, one edit/request | p50 | 4.125 ms | 4.130 ms | +0.005 ms | [-0.070, 0.080] ms |
-| Markdown injections, one edit/request | p95 | 4.280 ms | 4.345 ms | +0.065 ms | [0.015, 0.125] ms |
-| Markdown injections, one edit/request | p99 | 4.565 ms | 4.480 ms | -0.085 ms | [-0.470, 0.155] ms |
+| Rust small, unchanged cache hit | p50 | 0.775 ms | 0.710 ms | -0.065 ms | [-0.110, -0.020] ms |
+| Rust small, unchanged cache hit | p95 | 0.935 ms | 0.780 ms | -0.155 ms | [-0.240, -0.075] ms |
+| Rust small, unchanged cache hit | p99 | 1.060 ms | 0.845 ms | -0.215 ms | [-0.360, -0.085] ms |
+| Rust small, one edit/request | p50 | 2.835 ms | 2.535 ms | -0.300 ms | [-0.605, -0.005] ms |
+| Rust small, one edit/request | p95 | 3.275 ms | 2.945 ms | -0.330 ms | [-0.650, -0.025] ms |
+| Rust small, one edit/request | p99 | 3.420 ms | 3.135 ms | -0.285 ms | [-0.620, 0.050] ms |
+| Markdown injections, one edit/request | p50 | 6.915 ms | 6.085 ms | -0.830 ms | [-1.770, 0.050] ms |
+| Markdown injections, one edit/request | p95 | 9.690 ms | 8.440 ms | -1.250 ms | [-2.700, 0.245] ms |
+| Markdown injections, one edit/request | p99 | 11.015 ms | 10.020 ms | -0.995 ms | [-2.530, 0.545] ms |
 
-The cache-hit p95 interval excludes zero when rounded values are treated as an
-exact observation, but its +0.060-ms estimate is smaller than the driver's
-0.1-ms reporting resolution. It therefore does not establish a non-zero tail
-effect. The other cache-hit intervals include zero. Rust edit p99 has a
--0.120-ms nominal estimate with a wide [-0.480, 0.085]-ms interval; dropping the
-first pair gives +0.047 ms [-0.005, 0.100], and the final ten give +0.030 ms
-[-0.010, 0.070]. It is therefore treated as transient-sensitive, not a tail
-effect. Markdown p95 also remains below reporting resolution. The other
-edit-latency intervals cross zero. These concrete relay results are not bounds
-on the future worker protocol.
+Batch A reports lower relay point estimates, including intervals excluding zero
+for every cache-hit percentile and Rust p50/p95. That is not evidence that an
+extra transport hop intrinsically reduces latency: the relay also inserts two
+copy threads and an additional pipe, changing buffering, wakeups, and scheduling
+around the unchanged server. An immediately repeated independent 20-pair batch
+reversed every cache-hit delta (relay wall time +28.1 ms, 95% CI [7.1, 56.6])
+and reduced the Rust wall delta to -6.4 ms [-23.3, 10.9]. The batch-to-batch
+variation is much larger than a simple within-batch paired interval captures.
+These concrete relay results are therefore scheduling evidence, not bounds on
+the future worker protocol.
 
 ### Throughput-sensitive cache-hit path
 
@@ -95,12 +95,13 @@ The cache-hit path transferred approximately 14.0 MiB of response bodies per
 
 | Metric | Direct mean | Relay mean | Paired delta | 95% CI for delta |
 |---|---:|---:|---:|---:|
-| Wall time / 1,000 requests | 764.2 ms | 773.8 ms | +9.6 ms (+1.3%) | [2.0, 17.0] ms |
-| Amortized extra wall time | — | — | +9.6 µs/request | [2.0, 17.0] µs/request |
+| Wall time / 1,000 requests | 1178.6 ms | 1050.7 ms | -127.9 ms (-10.8%) | [-200.4, -58.8] ms |
+| Amortized wall-time delta | — | — | -127.9 µs/request | [-200.4, -58.8] µs/request |
 
-This is the most sensitive raw-relay estimate in this experiment. It is neither
-a lower nor an upper bound for the future worker transport: the Python
-relay adds interpreter, thread, and flush costs, while the real protocol adds
+This is the most sensitive raw-relay estimate in batch A, but batch B measured
+the opposite +28.1-ms wall delta. It is neither a lower nor an upper bound for
+the future worker transport: the Python relay adds interpreter, threads, an
+extra buffering boundary, and flush costs, while the real protocol adds
 different payloads, encoding, queueing, and scheduling. The edit scenarios
 include a fixed 10-ms delay after each edit, so their total wall times
 intentionally cannot isolate a similarly small transport cost. Their observed
@@ -110,11 +111,12 @@ end-to-end cycle times are nevertheless disclosed below.
 
 | Scenario | Direct / 100 cycles | Relay / 100 cycles | Paired delta | 95% CI for delta |
 |---|---:|---:|---:|---:|
-| Rust small | 1520.5 ms | 1544.1 ms | +23.6 ms (+236 µs/cycle) | [9.1, 38.4] ms |
-| Markdown injections | 1801.6 ms | 1822.4 ms | +20.8 ms (+208 µs/cycle) | [8.8, 32.2] ms |
+| Rust small | 1646.5 ms | 1603.1 ms | -43.4 ms (-434 µs/cycle) | [-70.4, -17.6] ms |
+| Markdown injections | 2157.3 ms | 2073.4 ms | -83.9 ms (-839 µs/cycle) | [-181.0, 10.6] ms |
 
-Both intervals exclude zero, but this experiment cannot attribute the
-differences to pipe transport: every cycle includes the fixed edit-settle delay,
+The Rust interval excludes zero in batch A, but batch B did not reproduce it;
+Markdown stayed negative in batch B (-58.1 ms [-115.7, -1.2]). This experiment
+cannot attribute either difference to pipe transport: every cycle includes the fixed edit-settle delay,
 parse scheduling, derivation, response relay, and parent/child scheduling. The
 real worker benchmark must separate enqueue, queue, compute, serialization, and
 resume time before treating them as protocol costs.
@@ -126,7 +128,7 @@ warmup pairs, with one immediate validated Rust request:
 
 | Direct mean | Relay mean | Paired delta | 95% CI for delta |
 |---:|---:|---:|---:|
-| 159.7 ms | 201.4 ms | +41.6 ms | [38.7, 44.5] ms |
+| 152.7 ms | 194.6 ms | +41.9 ms | [39.7, 44.4] ms |
 
 The relay series includes Python interpreter startup and is not an estimate of
 a Rust worker's spawn/handshake time. Stage 1 must repeat this measurement with
@@ -140,8 +142,8 @@ used as a smoke test, not an independently repeated result:
 
 | Metric | Direct | Relay |
 |---|---:|---:|
-| Semantic tokens p50 / p95 | 6.0 / 7.7 ms | 4.5 / 6.6 ms |
-| Captures delta p50 / p95 | 37.6 / 40.7 ms | 29.4 / 37.6 ms |
+| Semantic tokens p50 / p95 | 5.6 / 6.5 ms | 5.1 / 5.9 ms |
+| Captures delta p50 / p95 | 37.2 / 40.8 ms | 35.9 / 39.9 ms |
 
 All 100 semantic and 100 capture-delta responses per path were successful. The
 final driver validated every capture result as the delta `edits` shape and an
@@ -150,14 +152,20 @@ both methods' outcome and fallback counts.
 
 ## Interpretation
 
-This particular raw process/pipe relay did not expose a clear steady-state
-transport blocker on this machine. Cache-hit request-tail point deltas were
-below the driver's 0.1-ms reporting resolution or had intervals crossing zero.
-Rust edit p99 changed sign under pair-slice sensitivity analysis and did not
-establish a stable tail effect. The cache-hit throughput run estimated 9.6
-microseconds of amortized extra wall time per request with a [2.0,
-17.0]-microsecond interval for this concrete
-relay. The actual Stage 1 worker cost may be above or below these relay deltas.
+This raw process/pipe relay did not expose a stable steady-state transport
+blocker on this machine. More importantly, it exposed a confounder: inserting a
+resident copying process can change scheduling and buffering enough to make the
+unchanged server appear materially faster in one batch and slower in the next.
+Batch A measured -127.9 microseconds/request for cache-hit wall time; batch B
+measured +28.1 microseconds/request. Markdown edit wall time improved in both
+batches, which makes a decoupled buffering/scheduling benefit plausible, but
+this front-of-server relay cannot locate the mechanism in tree work.
+
+The Stage 1 benchmark must therefore report transport enqueue/copy time and
+worker compute/queue/resume time separately and must include independent batch
+repetition. A single paired batch, even with a narrow bootstrap interval, is not
+an acceptable performance gate. The actual Stage 1 worker cost or benefit may
+be above or below any one relay delta.
 
 This result is preliminary and insufficient evidence for the ADR. It does not
 show a worker performance improvement, and it cannot detect costs or benefits
@@ -182,8 +190,10 @@ matrix.
 The tail-percentile driver and relay are in `benches/profile/drive.py` and
 `benches/profile/worker_proxy.py`. The 20 paired run summaries, execution order,
 scenario arguments, environment, and artifact-tree digest are committed in
-`benches/profile/results/single_worker_phase0_2026-07-19.json`. The separately
-generated cold-start and captures results are in
+`benches/profile/results/single_worker_phase0_2026-07-19.json`. The independent
+20-pair repeat is in
+`benches/profile/results/single_worker_phase0_repeat_2026-07-19.json`. The
+separately generated cold-start and captures results are in
 `benches/profile/results/single_worker_phase0_cold_start_2026-07-19.json` and
 `benches/profile/results/single_worker_phase0_captures_pilot_2026-07-19.json`.
 The binary build attestation used by all three collectors is in
@@ -192,14 +202,18 @@ Recompute every steady-state table value and confidence interval with:
 
 ```sh
 python3 benches/profile/analyze_worker_proxy.py
+python3 benches/profile/analyze_worker_proxy.py \
+  benches/profile/results/single_worker_phase0_repeat_2026-07-19.json
 python3 benches/profile/analyze_worker_proxy.py --drop-first-pairs 1 \
   | jq '.rust_edit.p99'
 python3 benches/profile/analyze_worker_proxy.py --last-pairs 10 \
   | jq '.rust_edit.p99'
 ```
 
-The July 19 steady-state section comes from one final 20-pair collector run and
-preserves every run summary and status count but not each raw stderr stream.
+The July 19 steady-state section comes from two independent 20-pair collector
+runs and preserves every run summary and status count but not each raw stderr
+stream. The tables report batch A and the prose discloses batch B; they are not
+silently pooled across the observed non-stationarity.
 Cold start was recollected as 20 alternating pairs with
 `collect_worker_cold_start.py`; every process is bounded and its semantic
 response validated. The captures pilot was rerun with

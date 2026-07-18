@@ -1,7 +1,7 @@
 {
   "schema": 1,
   "source_repository": "https://github.com/atusy/kakehashi",
-  "source_commit": "ccbd8ffd13c4817eda62e1de6f8cfd3eeb3259d0",
+  "source_commit": "32b039f58e336c198c4e77f4427d040204d5f51d",
   "source_checkout_clean": true,
   "build_command": [
     "cargo",
@@ -25,12 +25,12 @@
     "TMPDIR": "/var/folders/t3/_nc24_w90zq79l3xyz3xzc7c0000gn/T/",
     "LANG": "C.UTF-8",
     "LC_ALL": "C.UTF-8",
-    "CARGO_TARGET_DIR": "/var/folders/t3/_nc24_w90zq79l3xyz3xzc7c0000gn/T/kakehashi-attested-build-euhg2o4m/target",
-    "CARGO_HOME": "/var/folders/t3/_nc24_w90zq79l3xyz3xzc7c0000gn/T/kakehashi-attested-build-euhg2o4m/target/cargo-home"
+    "CARGO_TARGET_DIR": "/var/folders/t3/_nc24_w90zq79l3xyz3xzc7c0000gn/T/kakehashi-attested-build-3reyx8m9/target",
+    "CARGO_HOME": "/var/folders/t3/_nc24_w90zq79l3xyz3xzc7c0000gn/T/kakehashi-attested-build-3reyx8m9/target/cargo-home"
   },
   "built_in_fresh_target": true,
   "source_isolated_archive": true,
   "cargo_config_ancestry_clean": true,
   "binary_relative": "target/release/kakehashi",
-  "binary_sha256": "192d8c3d5fbee9db04742c9e2f38b74b917a84ef3b2153397c58eec8187f9335"
+  "binary_sha256": "617511683fb5b47802203a8d4a6127c141e8545bc3e14a391430a5b0208941c1"
 }
