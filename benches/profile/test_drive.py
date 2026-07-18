@@ -16,6 +16,7 @@ from drive import (
     count_semantic_outcomes,
     next_toggle_change,
     response_result_id,
+    send_timed_request,
     server_request_result,
     summarize_samples,
     summarize_samples_by_status,
@@ -151,6 +152,20 @@ class RequestSummaryTest(unittest.TestCase):
 
         self.assertAlmostEqual(float(formatted), 1234.56789, places=9)
         self.assertIn(".", formatted)
+
+    def test_batch_timer_starts_before_request_is_sent(self):
+        events = []
+
+        request_id, started = send_timed_request(
+            lambda method, params: events.append((method, params)) or 42,
+            "example/request",
+            {"value": 1},
+            clock=lambda: events.append("clock") or 12.5,
+        )
+
+        self.assertEqual(events, ["clock", ("example/request", {"value": 1})])
+        self.assertEqual(request_id, 42)
+        self.assertEqual(started, 12.5)
 
     def test_summarizes_latency_status_and_wire_bytes(self):
         samples = [

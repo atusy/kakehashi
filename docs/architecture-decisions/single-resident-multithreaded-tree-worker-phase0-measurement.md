@@ -131,13 +131,14 @@ the real worker executable and protocol.
 
 ### Concurrent captures pilot
 
-A single 100-cycle Markdown run queued captures before semantic tokens. It was
+A single 100-cycle Markdown run queued captures before semantic tokens, with
+each timer starting before request serialization, pipe write, and flush. It was
 used as a smoke test, not an independently repeated result:
 
 | Metric | Direct | Relay |
 |---|---:|---:|
-| Semantic tokens p50 / p95 | 5.3 / 6.7 ms | 4.6 / 6.2 ms |
-| Captures delta p50 / p95 | 35.8 / 39.1 ms | 29.1 / 38.2 ms |
+| Semantic tokens p50 / p95 | 4.7 / 5.2 ms | 4.5 / 5.3 ms |
+| Captures delta p50 / p95 | 30.9 / 33.3 ms | 30.5 / 33.4 ms |
 
 All 100 semantic and 100 capture-delta responses per path were successful. The
 final driver validated every capture result as the delta `edits` shape and an

@@ -73,10 +73,10 @@
   "independent_pairs": 1,
   "order": "direct then relay; smoke result only",
   "direct": {
-    "semantic_p50": 5.3,
-    "semantic_p95": 6.7,
-    "captures_p50": 35.8,
-    "captures_p95": 39.1,
+    "semantic_p50": 4.7,
+    "semantic_p95": 5.2,
+    "captures_p50": 30.9,
+    "captures_p95": 33.3,
     "semantic_outcomes": {
       "count": 100,
       "ok": 100,
@@ -97,10 +97,10 @@
     "capture_full_fallbacks": 0
   },
   "relay": {
-    "semantic_p50": 4.6,
-    "semantic_p95": 6.2,
-    "captures_p50": 29.1,
-    "captures_p95": 38.2,
+    "semantic_p50": 4.5,
+    "semantic_p95": 5.3,
+    "captures_p50": 30.5,
+    "captures_p95": 33.4,
     "semantic_outcomes": {
       "count": 100,
       "ok": 100,

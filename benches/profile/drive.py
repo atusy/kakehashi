@@ -27,6 +27,11 @@ benchmark_clock = time.perf_counter
 def format_wall_milliseconds(seconds):
     return repr(seconds * 1_000)
 
+
+def send_timed_request(send_request, method, params, clock=benchmark_clock):
+    started = clock()
+    return send_request(method, params), started
+
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from gen_session import gen_rust, gen_markdown_injections  # noqa: E402
 
@@ -402,8 +407,10 @@ def main() -> None:
     def measured_batch(requests):
         pending = {}
         for method, params in requests:
-            request_id = send_request(method, params)
-            pending[request_id] = (method, time.perf_counter())
+            request_id, started = send_timed_request(
+                send_request, method, params
+            )
+            pending[request_id] = (method, started)
 
         responses = {}
         while pending:
