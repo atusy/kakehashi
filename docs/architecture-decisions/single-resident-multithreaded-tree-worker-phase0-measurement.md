@@ -306,7 +306,7 @@ blob comparison. The committed dataset was verified against `nvim-treesitter`
 revision
 `4916d6592ede8c07973490d9322f187e07dfefac`.
 
-Run the digest command below and compare it with the committed dataset before
+Run the digest command in the recipe above and compare it with the committed dataset before
 using a reconstructed tree for comparison. Compiler and platform differences
 can change shared-library bytes even from identical grammar revisions, so the
 committed digest remains the identity check for the exact measured artifacts.
