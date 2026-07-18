@@ -38,6 +38,7 @@ CONTROLLED_ENVIRONMENT_KEYS = (
     "LD_LIBRARY_PATH",
     "DYLD_LIBRARY_PATH",
 )
+TERMINATION_SIGNALS = (signal.SIGHUP, signal.SIGTERM)
 
 
 def require_posix(platform_name=os.name):
@@ -274,7 +275,7 @@ def install_termination_handlers():
     def exit_on_signal(signum, _frame):
         raise SystemExit(128 + signum)
 
-    for signum in (signal.SIGHUP, signal.SIGTERM):
+    for signum in TERMINATION_SIGNALS:
         previous[signum] = signal.getsignal(signum)
         signal.signal(signum, exit_on_signal)
     return previous
@@ -285,25 +286,39 @@ def restore_signal_handlers(previous):
         signal.signal(signum, handler)
 
 
+def suppress_termination_signals():
+    for signum in TERMINATION_SIGNALS:
+        signal.signal(signum, signal.SIG_IGN)
+
+
 def bounded_run(
     command,
     environment,
     timeout_seconds,
     termination_grace_seconds=3,
 ):
-    process = subprocess.Popen(
-        command,
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        env=environment,
-        start_new_session=True,
+    previous_mask = signal.pthread_sigmask(
+        signal.SIG_BLOCK, TERMINATION_SIGNALS
     )
-    previous_handlers = install_termination_handlers()
+    try:
+        process = subprocess.Popen(
+            command,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=environment,
+            start_new_session=True,
+        )
+        previous_handlers = install_termination_handlers()
+    except BaseException:
+        signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
+        raise
     try:
         try:
+            signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
             stdout, stderr = process.communicate(timeout=timeout_seconds)
         except subprocess.TimeoutExpired as timeout:
+            suppress_termination_signals()
             stdout, stderr = terminate_process_group(
                 process, termination_grace_seconds
             )
@@ -314,9 +329,11 @@ def bounded_run(
                 stderr=stderr,
             ) from timeout
         except BaseException:
+            suppress_termination_signals()
             terminate_process_group(process, termination_grace_seconds)
             raise
     finally:
+        signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
         restore_signal_handlers(previous_handlers)
     if process.returncode:
         raise subprocess.CalledProcessError(

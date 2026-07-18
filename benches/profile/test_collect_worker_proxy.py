@@ -107,6 +107,7 @@ class CollectionHelpersTest(unittest.TestCase):
                 "import os,signal,subprocess,sys,time; "
                 f"subprocess.Popen([sys.executable, '-c', {descendant!r}]); "
                 "time.sleep(0.1); os.kill(os.getppid(), signal.SIGTERM); "
+                "time.sleep(0.05); os.kill(os.getppid(), signal.SIGTERM); "
                 "time.sleep(30)"
             )
             child_pid = None
@@ -130,6 +131,23 @@ class CollectionHelpersTest(unittest.TestCase):
                         os.kill(child_pid, signal.SIGKILL)
                     except ProcessLookupError:
                         pass
+
+    @unittest.skipUnless(os.name == "posix", "requires POSIX signal masking")
+    def test_bounded_run_handles_signal_racing_process_launch(self):
+        driver = (
+            "import os,signal,time; "
+            "os.kill(os.getppid(), signal.SIGTERM); time.sleep(30)"
+        )
+
+        with self.assertRaises(SystemExit) as exit_context:
+            bounded_run(
+                [sys.executable, "-c", driver],
+                {},
+                timeout_seconds=5,
+                termination_grace_seconds=0.2,
+            )
+
+        self.assertEqual(exit_context.exception.code, 128 + signal.SIGTERM)
 
     def test_collector_rejects_non_posix_lifecycle(self):
         with self.assertRaisesRegex(SystemExit, "POSIX"):
