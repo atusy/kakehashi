@@ -291,7 +291,16 @@ class CollectionHelpersTest(unittest.TestCase):
                 check=True, text=True, stdout=subprocess.PIPE,
             ).stdout.strip()
 
-            self.assertEqual(verify_official_revision(checkout, official), official)
+            subprocess.run(
+                [
+                    "git", "-C", checkout, "config",
+                    "remote.origin.uploadpack", "/bin/false",
+                ],
+                check=True,
+            )
+            self.assertEqual(
+                verify_official_revision(official, str(upstream)), official
+            )
             subprocess.run(["git", "-C", checkout, "checkout", "-q", "--orphan", "local"], check=True)
             (checkout / "file").write_text("local")
             subprocess.run(["git", "-C", checkout, "add", "."], check=True)
@@ -308,9 +317,12 @@ class CollectionHelpersTest(unittest.TestCase):
                 ["git", "-C", checkout, "rev-parse", "HEAD"],
                 check=True, text=True, stdout=subprocess.PIPE,
             ).stdout.strip()
+            subprocess.run(
+                ["git", "-C", checkout, "replace", local, official], check=True
+            )
 
             with self.assertRaisesRegex(ValueError, "official origin/main"):
-                verify_official_revision(checkout, local)
+                verify_official_revision(local, str(upstream))
 
     def test_controlled_environment_drops_behavior_overrides(self):
         environment = controlled_environment({

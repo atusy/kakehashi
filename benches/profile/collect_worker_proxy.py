@@ -42,6 +42,9 @@ CONTROLLED_ENVIRONMENT_KEYS = (
 )
 TERMINATION_SIGNALS = (signal.SIGHUP, signal.SIGTERM)
 CLEANUP_SIGNALS = (*TERMINATION_SIGNALS, signal.SIGINT)
+OFFICIAL_NVIM_TREESITTER_URL = (
+    "https://github.com/nvim-treesitter/nvim-treesitter"
+)
 ATTESTED_BUILD_COMMAND = [
     "cargo", "build", "--release", "--bin", "kakehashi"
 ]
@@ -74,33 +77,69 @@ def committed_blob(checkout, revision, relative):
         ) from error
 
 
-def verify_official_revision(checkout, revision):
-    fetched = subprocess.run(
-        ["git", "-C", str(checkout), "fetch", "--no-tags", "origin", "main"],
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-    )
-    if fetched.returncode:
-        raise ValueError(
-            f"could not fetch official nvim-treesitter origin/main: {fetched.stderr}"
+def verify_official_revision(
+    revision, official_url=OFFICIAL_NVIM_TREESITTER_URL
+):
+    environment = controlled_environment(os.environ)
+    environment.update({
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_CONFIG_GLOBAL": os.devnull,
+        "GIT_NO_REPLACE_OBJECTS": "1",
+    })
+    with tempfile.TemporaryDirectory(
+        prefix="kakehashi-official-nvim-treesitter-"
+    ) as directory:
+        repository = pathlib.Path(directory) / "repository.git"
+        subprocess.run(
+            ["git", "init", "--bare", "-q", repository],
+            check=True,
+            env=environment,
         )
-    fetched_revision = tool_version([
-        "git", "-C", str(checkout), "rev-parse", "FETCH_HEAD"
-    ])
-    ancestry = subprocess.run(
-        [
-            "git", "-C", str(checkout), "merge-base", "--is-ancestor",
-            revision, fetched_revision,
-        ],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-    )
-    if ancestry.returncode:
-        raise ValueError(
-            f"nvim-treesitter revision {revision} is not in official origin/main"
+        fetched = subprocess.run(
+            [
+                "git", "--git-dir", repository, "fetch", "--no-tags",
+                official_url, "main",
+            ],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=environment,
         )
-    return fetched_revision
+        if fetched.returncode:
+            raise ValueError(
+                "could not fetch official nvim-treesitter main: "
+                f"{fetched.stderr}"
+            )
+        fetched_revision = subprocess.run(
+            ["git", "--git-dir", repository, "rev-parse", "FETCH_HEAD"],
+            check=True,
+            text=True,
+            stdout=subprocess.PIPE,
+            env=environment,
+        ).stdout.strip()
+        revision_exists = subprocess.run(
+            [
+                "git", "--git-dir", repository, "cat-file", "-e",
+                f"{revision}^{{commit}}",
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=environment,
+        )
+        ancestry = subprocess.run(
+            [
+                "git", "--git-dir", repository, "merge-base",
+                "--is-ancestor", revision, fetched_revision,
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=environment,
+        )
+        if revision_exists.returncode or ancestry.returncode:
+            raise ValueError(
+                f"nvim-treesitter revision {revision} is not in official origin/main"
+            )
+        return fetched_revision
 
 
 def artifact_provenance(data_dir, nvim_treesitter_checkout):
@@ -119,9 +158,7 @@ def artifact_provenance(data_dir, nvim_treesitter_checkout):
     revision = tool_version([
         "git", "-C", str(nvim_treesitter_checkout), "rev-parse", "HEAD"
     ])
-    fetched_revision = verify_official_revision(
-        nvim_treesitter_checkout, revision
-    )
+    fetched_revision = verify_official_revision(revision)
     comparisons = [
         (
             data_dir / "cache/parsers.lua",
