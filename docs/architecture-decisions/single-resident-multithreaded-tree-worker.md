@@ -213,7 +213,8 @@ NativeSegmentArmed(segment_id, worker_generation)
 NativeSegmentEntered(segment_id, worker_generation)
 NativeSegmentExited(segment_id)
 NativeSegmentAborted(segment_id)
-RequestFinished(request_id, worker_generation)
+RequestHazardsReleased(request_id, worker_generation)
+RequestTerminal(request_id, worker_generation, error_or_cancel)
 ```
 
 `DeriveSnapshot` may fuse parse, injection discovery, cache reconciliation, and
@@ -305,11 +306,16 @@ the canceled request. Duplicate terminal and cancel frames remain harmless.
 Cancellation during a handshake has explicit cleanup. A hazard that was armed
 but never entered its grammar-backed scope is released; a native segment that
 was started or armed but never entered emits `NativeSegmentAborted`; an entered
-segment must exit before its hazard can be released. `RequestFinished` is sent
+segment must exit before its hazard can be released. `RequestHazardsReleased` is sent
 only after every lease and segment owned by that request is released, exited, or
-aborted. The parent then removes any remaining request bookkeeping. Worker EOF
-does not perform that cleanup: the still-recorded leases are intentionally kept
-for crash attribution.
+aborted. It clears only crash-attribution and timer bookkeeping. It does not
+remove the response router or complete the public request, because the
+independent bulk response may legitimately arrive later. Response routing stays
+alive until the guarded bulk response is decoded or an explicit
+`RequestTerminal` error/cancellation frame arrives on the control channel.
+Worker EOF does not perform hazard cleanup: the still-recorded leases are
+intentionally kept for crash attribution, while the supervisor separately fails
+the response waiter through its existing reader contract.
 
 ### 5. Derived stages are fused when their inputs coincide
 
@@ -662,7 +668,11 @@ Implementation is accepted only when all of the following hold:
   rule that canceled work publishes and caches nothing.
 * Cancellation tests also cover cancellation before request delivery and at
   every hazard/segment handshake phase, proving that no later request executes
-  after an overtaking cancel and no lease or timer survives `RequestFinished`.
+  after an overtaking cancel and no lease or timer survives
+  `RequestHazardsReleased`.
+* A saturated worker-to-parent bulk stream proves hazard cleanup may overtake a
+  successful response without removing its router, losing the payload, or
+  leaving the public request unresolved.
 * Cross-platform lifecycle tests prove normal shutdown and parent `SIGKILL` or
   platform-equivalent abnormal exit do not leave an orphan worker, including
   while a separate compute thread is hung in native code. Tests cover the macOS
