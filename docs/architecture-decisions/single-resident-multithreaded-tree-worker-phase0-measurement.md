@@ -123,12 +123,13 @@ used as a smoke test, not an independently repeated result:
 
 | Metric | Direct | Relay |
 |---|---:|---:|
-| Semantic tokens p50 / p95 | 4.4 / 5.2 ms | 4.4 / 5.0 ms |
-| Captures delta p50 / p95 | 29.8 / 32.1 ms | 29.3 / 32.3 ms |
+| Semantic tokens p50 / p95 | 4.8 / 4.9 ms | 4.4 / 4.9 ms |
+| Captures delta p50 / p95 | 31.0 / 34.1 ms | 30.0 / 32.1 ms |
 
 All 100 semantic and 100 capture-delta responses per path were successful. The
-final driver validated every capture result shape and advancing `resultId`
-lineage; the dataset retains both methods' outcome counts.
+final driver validated every capture result as the delta `edits` shape and an
+advancing `resultId` lineage; no full fallback occurred. The dataset retains
+both methods' outcome and fallback counts.
 
 ## Interpretation
 

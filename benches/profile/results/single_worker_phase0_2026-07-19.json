@@ -2244,9 +2244,30 @@
     "data_dir": "/private/tmp/kakehashi-phase0-data.WIU8dk",
     "parser_query_tree_sha256": "1572967b352c7b24ec872bff02c3c9808374a0d5cab2c707368cb5f32be58115",
     "direct": {
+      "semantic_p50": 4.8,
+      "semantic_p95": 4.9,
+      "captures_p50": 31.0,
+      "captures_p95": 34.1,
+      "semantic_outcomes": {
+        "count": 100,
+        "ok": 100,
+        "canceled": 0,
+        "null": 0,
+        "errors": 0
+      },
+      "capture_outcomes": {
+        "count": 100,
+        "ok": 100,
+        "canceled": 0,
+        "null": 0,
+        "errors": 0
+      },
+      "capture_full_fallbacks": 0
+    },
+    "relay": {
       "semantic_p50": 4.4,
-      "semantic_p95": 5.2,
-      "captures_p50": 29.8,
+      "semantic_p95": 4.9,
+      "captures_p50": 30.0,
       "captures_p95": 32.1,
       "semantic_outcomes": {
         "count": 100,
@@ -2261,29 +2282,11 @@
         "canceled": 0,
         "null": 0,
         "errors": 0
-      }
-    },
-    "relay": {
-      "semantic_p50": 4.4,
-      "semantic_p95": 5.0,
-      "captures_p50": 29.3,
-      "captures_p95": 32.3,
-      "semantic_outcomes": {
-        "count": 100,
-        "ok": 100,
-        "canceled": 0,
-        "null": 0,
-        "errors": 0
       },
-      "capture_outcomes": {
-        "count": 100,
-        "ok": 100,
-        "canceled": 0,
-        "null": 0,
-        "errors": 0
-      }
+      "capture_full_fallbacks": 0
     },
-    "capture_lineage_validated": true
+    "capture_lineage_validated": true,
+    "capture_delta_shape_validated": true
   },
   "steady_state_date": "2026-07-19",
   "artifacts": {
