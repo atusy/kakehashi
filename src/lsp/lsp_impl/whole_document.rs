@@ -306,16 +306,15 @@ pub(super) fn flatten_ordered_region_items<T>(
     mut region_items: Vec<(usize, Option<Vec<T>>)>,
 ) -> Vec<T> {
     region_items.sort_unstable_by_key(|(region_index, _)| *region_index);
-    let item_count = region_items
-        .iter()
-        .filter_map(|(_, items)| items.as_ref())
-        .map(Vec::len)
-        .sum();
-    let mut flattened = Vec::with_capacity(item_count);
-    for (_, items) in region_items {
-        if let Some(items) = items {
-            flattened.extend(items);
-        }
+    let mut ordered_items = region_items
+        .into_iter()
+        .filter_map(|(_, items)| items)
+        .filter(|items| !items.is_empty());
+    let Some(mut flattened) = ordered_items.next() else {
+        return Vec::new();
+    };
+    for mut items in ordered_items {
+        flattened.append(&mut items);
     }
     flattened
 }
