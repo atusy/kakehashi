@@ -18,6 +18,45 @@ from attest_worker_binary import (
 
 
 class BinaryAttestationTest(unittest.TestCase):
+    def test_source_archive_ignores_local_replacement_refs(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            checkout = root / "repository"
+            checkout.mkdir()
+            subprocess.run(["git", "init", "-q", checkout], check=True)
+            source = checkout / "source.txt"
+            source.write_text("attested")
+            subprocess.run(["git", "-C", checkout, "add", "."], check=True)
+            commit = [
+                "git", "-C", checkout,
+                "-c", "user.name=benchmark-test",
+                "-c", "user.email=benchmark@example.invalid",
+                "commit", "-qm",
+            ]
+            subprocess.run([*commit, "attested"], check=True)
+            attested = subprocess.run(
+                ["git", "-C", checkout, "rev-parse", "HEAD"],
+                check=True, text=True, stdout=subprocess.PIPE,
+            ).stdout.strip()
+            source.write_text("replacement")
+            subprocess.run(["git", "-C", checkout, "add", "."], check=True)
+            subprocess.run([*commit, "replacement"], check=True)
+            replacement = subprocess.run(
+                ["git", "-C", checkout, "rev-parse", "HEAD"],
+                check=True, text=True, stdout=subprocess.PIPE,
+            ).stdout.strip()
+            subprocess.run(
+                ["git", "-C", checkout, "replace", attested, replacement],
+                check=True,
+            )
+            destination = root / "isolated/source"
+
+            archive_source(checkout, attested, destination)
+
+            self.assertEqual(
+                (destination / "source.txt").read_text(), "attested"
+            )
+
     def test_source_archive_extraction_supports_python_without_data_filter(self):
         source = mock.Mock()
         destination = pathlib.Path("isolated-source")
