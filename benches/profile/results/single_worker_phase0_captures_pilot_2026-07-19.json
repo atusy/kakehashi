@@ -6,7 +6,7 @@
     "python": "3.12.13",
     "binary": "<provided-binary>",
     "binary_execution": "private staged copy",
-    "binary_sha256": "1c4fbea2083c27eb76bf78b4d0eb74fb7753d03b8b4936a6b4c19e2b120a7c8a",
+    "binary_sha256": "1450d1fc0fecd324d7ea46a24f5b783ff7b9e941bd1a2a0e2d96a7f79c2a8e79",
     "data_dir": "<provided-data-dir>",
     "data_dir_execution": "private staged copy",
     "parser_query_file_count": 35,
@@ -27,7 +27,7 @@
   "binary_attestation": {
     "schema": 1,
     "source_repository": "https://github.com/atusy/kakehashi",
-    "source_commit": "11a55faa56ffee5cb7d7144456f14afea1da03eb",
+    "source_commit": "02ebb5963c9775414b99df0b233061890e259c43",
     "source_remote_refs_containing_commit": [
       "refs/remotes/origin/perf/single-tree-worker-measurement"
     ],
@@ -61,16 +61,16 @@
     "source_isolated_archive": true,
     "cargo_config_ancestry_clean": true,
     "binary_relative": "target/release/kakehashi",
-    "binary_sha256": "1c4fbea2083c27eb76bf78b4d0eb74fb7753d03b8b4936a6b4c19e2b120a7c8a"
+    "binary_sha256": "1450d1fc0fecd324d7ea46a24f5b783ff7b9e941bd1a2a0e2d96a7f79c2a8e79"
   },
   "harness": {
     "execution": "private staged driver and relay helpers",
     "source_files_sha256": {
-      "collect_worker_proxy.py": "b165995b13008abb061fc654425175f7a8480219fd3a4fb4831094dac6203e83",
+      "collect_worker_proxy.py": "2889d76eb7de24159249b335d79e1e198159c9a732ba5d7fd2d2c31ea7ce245b",
       "collect_worker_cold_start.py": "7648e2b0eba60b20b7f11a641c07c6ccdd5a1d3b75bc91492f32acfa90750109",
       "collect_worker_capture_pilot.py": "3a709d50253dc23060ca99f885978e71a8b58f07a71af6c492d2fa73916a75f5",
-      "drive.py": "03125dc45da371f7933cf6ce1fb1af422c6ed0b6dcb847d6a2c70fe1ddb646bd",
-      "worker_proxy.py": "24cc8fc29f4c90195f22a22c63a7ec3f9c0286a03b4f53eb6c49681b57b9db66",
+      "drive.py": "3e9e2d8d84b6a2c4704c41f2e4efbd3a54499b1a6882d4f648c0c6ef2e178c12",
+      "worker_proxy.py": "e3fe07d73168835e71fb976109e034b121b1112d6c7a746be1575ac07a6fd542",
       "gen_session.py": "6f4f6b8388c607db1c70fe29579ce14fe00d57668cab17601432ff123cfb15a3"
     }
   },
@@ -88,10 +88,10 @@
   "independent_pairs": 1,
   "order": "direct then relay; smoke result only",
   "direct": {
-    "semantic_p50": 4.9,
-    "semantic_p95": 5.7,
-    "captures_p50": 34.3,
-    "captures_p95": 37.7,
+    "semantic_p50": 5.7,
+    "semantic_p95": 6.8,
+    "captures_p50": 37.1,
+    "captures_p95": 45.0,
     "semantic_outcomes": {
       "count": 100,
       "ok": 100,
@@ -112,10 +112,10 @@
     "capture_full_fallbacks": 0
   },
   "relay": {
-    "semantic_p50": 5.0,
-    "semantic_p95": 5.8,
-    "captures_p50": 35.2,
-    "captures_p95": 39.4,
+    "semantic_p50": 5.7,
+    "semantic_p95": 8.0,
+    "captures_p50": 40.2,
+    "captures_p95": 49.6,
     "semantic_outcomes": {
       "count": 100,
       "ok": 100,
