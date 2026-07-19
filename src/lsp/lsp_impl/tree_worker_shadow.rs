@@ -77,27 +77,84 @@ enum FailureClass {
     NativeEvidenced,
 }
 
-#[derive(Default)]
 struct RestartBudget {
     systemic: u8,
     native: u8,
-    total: u8,
+    tokens: u8,
+    backoff_count: u8,
+    last_restart: Option<Instant>,
+    last_long_restore: Option<Instant>,
+}
+
+impl Default for RestartBudget {
+    fn default() -> Self {
+        Self {
+            systemic: 0,
+            native: 0,
+            tokens: MAX_SESSION_RESTARTS,
+            backoff_count: 0,
+            last_restart: None,
+            last_long_restore: None,
+        }
+    }
 }
 
 impl RestartBudget {
     fn consume(&mut self, class: FailureClass) -> bool {
-        self.total = self.total.saturating_add(1);
+        self.consume_at(class, Instant::now())
+    }
+
+    fn consume_at(&mut self, class: FailureClass, now: Instant) -> bool {
+        self.observe_healthy(now);
+        let class_available = match class {
+            FailureClass::Systemic => self.systemic < MAX_SYSTEMIC_RESTARTS,
+            FailureClass::NativeEvidenced => self.native < MAX_NATIVE_RESTARTS,
+        };
+        if self.tokens == 0 || !class_available {
+            return false;
+        }
         match class {
             FailureClass::Systemic => self.systemic = self.systemic.saturating_add(1),
             FailureClass::NativeEvidenced => self.native = self.native.saturating_add(1),
         }
-        self.total <= MAX_SESSION_RESTARTS
-            && self.systemic <= MAX_SYSTEMIC_RESTARTS
-            && self.native <= MAX_NATIVE_RESTARTS
+        self.tokens -= 1;
+        self.backoff_count = self.backoff_count.saturating_add(1);
+        self.last_restart = Some(now);
+        self.last_long_restore = Some(now);
+        true
+    }
+
+    fn observe_healthy(&mut self, now: Instant) {
+        const FAST_RESET: Duration = Duration::from_secs(60);
+        const LONG_RESET: Duration = Duration::from_secs(10 * 60);
+
+        if self
+            .last_restart
+            .is_some_and(|last_restart| now.saturating_duration_since(last_restart) >= FAST_RESET)
+        {
+            self.systemic = 0;
+            self.native = 0;
+        }
+        let Some(last_restore) = self.last_long_restore else {
+            return;
+        };
+        let elapsed = now.saturating_duration_since(last_restore);
+        let intervals = elapsed.as_secs() / LONG_RESET.as_secs();
+        if intervals == 0 {
+            return;
+        }
+        let restored = intervals.min(u64::from(MAX_SESSION_RESTARTS - self.tokens)) as u8;
+        self.tokens = self.tokens.saturating_add(restored);
+        self.backoff_count = 0;
+        self.last_long_restore = Some(last_restore + LONG_RESET.saturating_mul(intervals as u32));
+    }
+
+    fn tokens_remaining(&self) -> u8 {
+        self.tokens
     }
 
     fn backoff(&self) -> Duration {
-        let exponent = self.total.saturating_sub(1).min(10) as u32;
+        let exponent = self.backoff_count.saturating_sub(1).min(10) as u32;
         INITIAL_RESTART_BACKOFF
             .saturating_mul(1_u32 << exponent)
             .min(MAX_RESTART_BACKOFF)
@@ -565,7 +622,10 @@ fn run_actor(
                     .expect("an enabled shadow actor has a worker client")
                     .try_wait();
                 match status {
-                    Ok(None) => continue,
+                    Ok(None) => {
+                        state.restart_budget.observe_healthy(Instant::now());
+                        continue;
+                    }
                     Ok(Some(status)) => log::error!(
                         target: "kakehashi::tree_worker_shadow",
                         "worker generation {} exited while idle: {status}",
@@ -599,6 +659,7 @@ fn run_actor(
         if disabled.load(Ordering::Acquire) {
             break;
         }
+        state.restart_budget.observe_healthy(Instant::now());
         let implicated_grammar = command_grammar(&command).or_else(|| {
             command_uri(&command).and_then(|uri| state.open_documents.grammar_for(uri))
         });
@@ -770,10 +831,10 @@ fn recover_worker(
         if !state.restart_budget.consume(class) {
             log::error!(
                 target: "kakehashi::tree_worker_shadow",
-                "disabled shadow tree tier after restart budget exhaustion: systemic={} native={} total={}",
+                "disabled shadow tree tier after restart budget exhaustion: systemic={} native={} tokens_remaining={}",
                 state.restart_budget.systemic,
                 state.restart_budget.native,
-                state.restart_budget.total,
+                state.restart_budget.tokens_remaining(),
             );
             return false;
         }
@@ -1272,19 +1333,40 @@ mod tests {
 
     #[test]
     fn restart_budgets_are_independent_and_session_bounded() {
+        let started = Instant::now();
         let mut systemic = RestartBudget::default();
-        assert!(systemic.consume(FailureClass::Systemic));
-        assert!(systemic.consume(FailureClass::Systemic));
-        assert!(systemic.consume(FailureClass::Systemic));
-        assert!(!systemic.consume(FailureClass::Systemic));
+        assert!(systemic.consume_at(FailureClass::Systemic, started));
+        assert!(systemic.consume_at(FailureClass::Systemic, started));
+        assert!(systemic.consume_at(FailureClass::Systemic, started));
+        assert!(!systemic.consume_at(FailureClass::Systemic, started));
+        assert_eq!(systemic.tokens_remaining(), MAX_SESSION_RESTARTS - 3);
 
         let mut native = RestartBudget::default();
         for _ in 0..MAX_NATIVE_RESTARTS {
-            assert!(native.consume(FailureClass::NativeEvidenced));
+            assert!(native.consume_at(FailureClass::NativeEvidenced, started));
         }
-        assert!(!native.consume(FailureClass::NativeEvidenced));
+        assert!(!native.consume_at(FailureClass::NativeEvidenced, started));
 
-        assert_eq!(systemic.backoff(), Duration::from_secs(2));
+        assert_eq!(systemic.backoff(), Duration::from_secs(1));
+    }
+
+    #[test]
+    fn healthy_intervals_reset_fast_budgets_but_restore_long_tokens_slowly() {
+        let started = Instant::now();
+        let mut budget = RestartBudget::default();
+        for _ in 0..MAX_SYSTEMIC_RESTARTS {
+            assert!(budget.consume_at(FailureClass::Systemic, started));
+        }
+        assert_eq!(budget.tokens_remaining(), MAX_SESSION_RESTARTS - 3);
+
+        budget.observe_healthy(started + Duration::from_secs(60));
+        assert!(budget.consume_at(FailureClass::Systemic, started + Duration::from_secs(60)));
+        assert_eq!(budget.tokens_remaining(), MAX_SESSION_RESTARTS - 4);
+        assert_eq!(budget.backoff(), Duration::from_secs(2));
+
+        budget.observe_healthy(started + Duration::from_secs(660));
+        assert_eq!(budget.tokens_remaining(), MAX_SESSION_RESTARTS - 3);
+        assert_eq!(budget.backoff(), INITIAL_RESTART_BACKOFF);
     }
 
     #[test]
