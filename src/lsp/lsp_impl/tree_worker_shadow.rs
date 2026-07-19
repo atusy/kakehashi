@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, mpsc};
@@ -15,6 +15,12 @@ const SHADOW_ENV: &str = "KAKEHASHI_TREE_WORKER_SHADOW";
 const SHADOW_THREADS_ENV: &str = "KAKEHASHI_TREE_WORKER_THREADS";
 const SHADOW_QUEUE_CAPACITY: usize = 256;
 const SHADOW_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+const MAX_SYSTEMIC_RESTARTS: u8 = 3;
+const MAX_NATIVE_RESTARTS: u8 = 8;
+const MAX_SESSION_RESTARTS: u8 = 16;
+const INITIAL_RESTART_BACKOFF: Duration = Duration::from_millis(250);
+const MAX_RESTART_BACKOFF: Duration = Duration::from_secs(300);
+const WORKER_LIVENESS_POLL: Duration = Duration::from_millis(250);
 static NEXT_WORKER_GENERATION: AtomicU64 = AtomicU64::new(1);
 
 enum ShadowCommand {
@@ -45,6 +51,99 @@ impl ReplicaIdentity {
             parser_path: request.parser_path.clone(),
             configuration_generation: request.context.configuration_generation,
         }
+    }
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct GrammarIdentity {
+    grammar_symbol: String,
+    parser_path: PathBuf,
+    configuration_generation: u64,
+}
+
+impl GrammarIdentity {
+    fn from_sync(request: &SyncDocument) -> Self {
+        Self {
+            grammar_symbol: request.grammar_symbol.clone(),
+            parser_path: request.parser_path.clone(),
+            configuration_generation: request.context.configuration_generation,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FailureClass {
+    Systemic,
+    NativeEvidenced,
+}
+
+#[derive(Default)]
+struct RestartBudget {
+    systemic: u8,
+    native: u8,
+    total: u8,
+}
+
+impl RestartBudget {
+    fn consume(&mut self, class: FailureClass) -> bool {
+        self.total = self.total.saturating_add(1);
+        match class {
+            FailureClass::Systemic => self.systemic = self.systemic.saturating_add(1),
+            FailureClass::NativeEvidenced => self.native = self.native.saturating_add(1),
+        }
+        self.total <= MAX_SESSION_RESTARTS
+            && self.systemic <= MAX_SYSTEMIC_RESTARTS
+            && self.native <= MAX_NATIVE_RESTARTS
+    }
+
+    fn backoff(&self) -> Duration {
+        let exponent = self.total.saturating_sub(1).min(10) as u32;
+        INITIAL_RESTART_BACKOFF
+            .saturating_mul(1_u32 << exponent)
+            .min(MAX_RESTART_BACKOFF)
+    }
+}
+
+#[derive(Default)]
+struct OpenDocuments {
+    current: HashMap<String, SyncDocument>,
+}
+
+struct SupervisorState {
+    client: Option<Client>,
+    worker_generation: u64,
+    replicas: HashMap<String, ReplicaIdentity>,
+    open_documents: OpenDocuments,
+    quarantined: HashSet<GrammarIdentity>,
+    restart_budget: RestartBudget,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct ResyncStats {
+    documents: usize,
+    bytes: usize,
+}
+
+impl OpenDocuments {
+    fn observe(&mut self, command: &ShadowCommand) {
+        match command {
+            ShadowCommand::Sync(request) => {
+                self.current
+                    .insert(request.context.uri.clone(), request.clone());
+            }
+            ShadowCommand::Apply { fallback, .. } => {
+                self.current
+                    .insert(fallback.context.uri.clone(), fallback.clone());
+            }
+            ShadowCommand::Close(request) => {
+                self.current.remove(&request.context.uri);
+            }
+            ShadowCommand::Shutdown(_) => {}
+        }
+    }
+
+    fn grammar_for(&self, uri: &str) -> Option<GrammarIdentity> {
+        self.current.get(uri).map(GrammarIdentity::from_sync)
     }
 }
 
@@ -413,17 +512,72 @@ fn run_actor(
     disabled: Arc<AtomicBool>,
     comparisons: Arc<ComparisonStore>,
 ) {
-    let client = match Client::spawn(&executable, compute_threads, worker_generation) {
-        Ok(client) => client,
+    let initial_client = match Client::spawn(&executable, compute_threads, worker_generation) {
+        Ok(client) => Some(client),
         Err(error) => {
-            disabled.store(true, Ordering::Release);
             log::error!(target: "kakehashi::tree_worker_shadow", "worker spawn failed: {error}");
-            return;
+            None
         }
     };
-    let mut replicas = HashMap::<String, ReplicaIdentity>::new();
+    let mut state = SupervisorState {
+        client: initial_client,
+        worker_generation,
+        replicas: HashMap::new(),
+        open_documents: OpenDocuments::default(),
+        quarantined: HashSet::new(),
+        restart_budget: RestartBudget::default(),
+    };
+    if state.client.is_none()
+        && !recover_worker(
+            &mut state,
+            &executable,
+            compute_threads,
+            FailureClass::Systemic,
+            None,
+            &comparisons,
+        )
+    {
+        disabled.store(true, Ordering::Release);
+        return;
+    }
     let mut shutdown_ack = None;
-    while let Ok(command) = receiver.recv() {
+    loop {
+        let mut command = match receiver.recv_timeout(WORKER_LIVENESS_POLL) {
+            Ok(command) => command,
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                let status = state
+                    .client
+                    .as_ref()
+                    .expect("an enabled shadow actor has a worker client")
+                    .try_wait();
+                match status {
+                    Ok(None) => continue,
+                    Ok(Some(status)) => log::error!(
+                        target: "kakehashi::tree_worker_shadow",
+                        "worker generation {} exited while idle: {status}",
+                        state.worker_generation,
+                    ),
+                    Err(error) => log::error!(
+                        target: "kakehashi::tree_worker_shadow",
+                        "worker generation {} liveness check failed: {error}",
+                        state.worker_generation,
+                    ),
+                }
+                if !recover_worker(
+                    &mut state,
+                    &executable,
+                    compute_threads,
+                    FailureClass::Systemic,
+                    None,
+                    &comparisons,
+                ) {
+                    disabled.store(true, Ordering::Release);
+                    break;
+                }
+                continue;
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        };
         if let ShadowCommand::Shutdown(ack) = command {
             shutdown_ack = Some(ack);
             break;
@@ -431,42 +585,36 @@ fn run_actor(
         if disabled.load(Ordering::Acquire) {
             break;
         }
+        let implicated_grammar = command_grammar(&command).or_else(|| {
+            command_uri(&command).and_then(|uri| state.open_documents.grammar_for(uri))
+        });
+        state.open_documents.observe(&command);
+        retag_command(&mut command, state.worker_generation);
+        if implicated_grammar
+            .as_ref()
+            .is_some_and(|grammar| state.quarantined.contains(grammar))
+        {
+            if let Some((uri, incarnation)) = command_document(&command) {
+                comparisons.mark_closed(uri, incarnation);
+            }
+            continue;
+        }
         let started = Instant::now();
-        let (response, synced_identity) = match command {
-            ShadowCommand::Sync(request) => {
-                let identity = ReplicaIdentity::from_sync(&request);
-                comparisons.open(&request.context.uri, request.context.incarnation);
-                (sync_and_derive(&client, request), Some(identity))
-            }
-            ShadowCommand::Apply { request, fallback } => {
-                let uri = fallback.context.uri.clone();
-                let identity = ReplicaIdentity::from_sync(&fallback);
-                if replica_requires_sync(&replicas, &uri, &identity) {
-                    (sync_and_derive(&client, fallback), Some(identity))
-                } else {
-                    match client.apply_document_edits_and_derive(request) {
-                        Ok(Response::Snapshot(snapshot)) => {
-                            (Ok(Response::Snapshot(snapshot)), None)
-                        }
-                        Ok(Response::WorkerRestartRequired(required)) => {
-                            (Ok(Response::WorkerRestartRequired(required)), None)
-                        }
-                        Ok(_) => (sync_and_derive(&client, fallback), Some(identity)),
-                        Err(error) => (Err(error), None),
-                    }
-                }
-            }
-            ShadowCommand::Close(request) => {
-                replicas.remove(&request.context.uri);
-                comparisons.mark_closed(&request.context.uri, request.context.incarnation);
-                (client.close_document(request), None)
-            }
-            ShadowCommand::Shutdown(_) => unreachable!(),
-        };
+        let (response, synced_identity) = execute_command(
+            state
+                .client
+                .as_ref()
+                .expect("an enabled shadow actor has a worker client"),
+            command,
+            &mut state.replicas,
+            &comparisons,
+        );
         match response {
             Ok(Response::Snapshot(snapshot)) => {
                 if let Some(identity) = synced_identity {
-                    replicas.insert(snapshot.context.uri.clone(), identity);
+                    state
+                        .replicas
+                        .insert(snapshot.context.uri.clone(), identity);
                 }
                 log::debug!(
                     target: "kakehashi::tree_worker_shadow_metrics",
@@ -485,13 +633,23 @@ fn run_actor(
                 );
             }
             Ok(Response::WorkerRestartRequired(required)) => {
-                disabled.store(true, Ordering::Release);
-                log::error!(
+                log::warn!(
                     target: "kakehashi::tree_worker_shadow",
-                    "disabled shadow worker pending restart: {}",
+                    "worker generation {} requested restart: {}",
+                    state.worker_generation,
                     required.reason
                 );
-                break;
+                if !recover_worker(
+                    &mut state,
+                    &executable,
+                    compute_threads,
+                    FailureClass::Systemic,
+                    None,
+                    &comparisons,
+                ) {
+                    disabled.store(true, Ordering::Release);
+                    break;
+                }
             }
             Ok(Response::Error(error)) => log::warn!(
                 target: "kakehashi::tree_worker_shadow",
@@ -500,17 +658,277 @@ fn run_actor(
             ),
             Ok(_) => {}
             Err(error) => {
-                disabled.store(true, Ordering::Release);
-                log::error!(target: "kakehashi::tree_worker_shadow", "worker transport failed: {error}");
-                break;
+                let class = classify_transport_failure(
+                    state
+                        .client
+                        .as_ref()
+                        .expect("failed request retains its worker client"),
+                    &error,
+                    implicated_grammar.as_ref(),
+                );
+                log::error!(
+                    target: "kakehashi::tree_worker_shadow",
+                    "worker generation {} transport failed: {error}",
+                    state.worker_generation,
+                );
+                if !recover_worker(
+                    &mut state,
+                    &executable,
+                    compute_threads,
+                    class,
+                    implicated_grammar,
+                    &comparisons,
+                ) {
+                    disabled.store(true, Ordering::Release);
+                    break;
+                }
             }
         }
     }
-    if let Err(error) = client.shutdown() {
+    if let Some(client) = state.client
+        && let Err(error) = client.shutdown()
+    {
         log::warn!(target: "kakehashi::tree_worker_shadow", "worker shutdown failed: {error}");
     }
     if let Some(ack) = shutdown_ack {
         let _ = ack.send(());
+    }
+}
+
+fn execute_command(
+    client: &Client,
+    command: ShadowCommand,
+    replicas: &mut HashMap<String, ReplicaIdentity>,
+    comparisons: &ComparisonStore,
+) -> (std::io::Result<Response>, Option<ReplicaIdentity>) {
+    match command {
+        ShadowCommand::Sync(request) => {
+            let identity = ReplicaIdentity::from_sync(&request);
+            comparisons.open(&request.context.uri, request.context.incarnation);
+            (sync_and_derive(client, request), Some(identity))
+        }
+        ShadowCommand::Apply { request, fallback } => {
+            let uri = fallback.context.uri.clone();
+            let identity = ReplicaIdentity::from_sync(&fallback);
+            if replica_requires_sync(replicas, &uri, &identity) {
+                (sync_and_derive(client, fallback), Some(identity))
+            } else {
+                match client.apply_document_edits_and_derive(request) {
+                    Ok(Response::Snapshot(snapshot)) => (Ok(Response::Snapshot(snapshot)), None),
+                    Ok(Response::WorkerRestartRequired(required)) => {
+                        (Ok(Response::WorkerRestartRequired(required)), None)
+                    }
+                    Ok(_) => (sync_and_derive(client, fallback), Some(identity)),
+                    Err(error) => (Err(error), None),
+                }
+            }
+        }
+        ShadowCommand::Close(request) => {
+            replicas.remove(&request.context.uri);
+            comparisons.mark_closed(&request.context.uri, request.context.incarnation);
+            (client.close_document(request), None)
+        }
+        ShadowCommand::Shutdown(_) => unreachable!(),
+    }
+}
+
+fn recover_worker(
+    state: &mut SupervisorState,
+    executable: &std::path::Path,
+    compute_threads: usize,
+    mut class: FailureClass,
+    implicated_grammar: Option<GrammarIdentity>,
+    comparisons: &ComparisonStore,
+) -> bool {
+    let recovery_started = Instant::now();
+    if let Some(grammar) = implicated_grammar
+        && state.quarantined.insert(grammar.clone())
+    {
+        for request in state.open_documents.current.values() {
+            if GrammarIdentity::from_sync(request) == grammar {
+                comparisons.mark_closed(&request.context.uri, request.context.incarnation);
+            }
+        }
+        log::error!(
+            target: "kakehashi::tree_worker_shadow",
+            "quarantined grammar conservatively for this session after {:?} worker loss: symbol={} path={} configuration_generation={}",
+            class,
+            grammar.grammar_symbol,
+            grammar.parser_path.display(),
+            grammar.configuration_generation,
+        );
+    }
+
+    loop {
+        if !state.restart_budget.consume(class) {
+            log::error!(
+                target: "kakehashi::tree_worker_shadow",
+                "disabled shadow tree tier after restart budget exhaustion: systemic={} native={} total={}",
+                state.restart_budget.systemic,
+                state.restart_budget.native,
+                state.restart_budget.total,
+            );
+            return false;
+        }
+        if let Some(old_client) = state.client.take()
+            && let Err(error) = old_client.shutdown()
+        {
+            log::warn!(target: "kakehashi::tree_worker_shadow", "failed worker cleanup: {error}");
+        }
+        std::thread::sleep(state.restart_budget.backoff());
+        let generation = NEXT_WORKER_GENERATION.fetch_add(1, Ordering::Relaxed);
+        let replacement = match Client::spawn(executable, compute_threads, generation) {
+            Ok(client) => client,
+            Err(error) => {
+                log::error!(
+                    target: "kakehashi::tree_worker_shadow",
+                    "worker generation {generation} restart failed: {error}"
+                );
+                class = FailureClass::Systemic;
+                continue;
+            }
+        };
+        state.replicas.clear();
+        match resync_open_documents(
+            &replacement,
+            generation,
+            &state.open_documents,
+            &state.quarantined,
+            &mut state.replicas,
+            comparisons,
+        ) {
+            Ok(resynced) => {
+                state.worker_generation = generation;
+                state.client = Some(replacement);
+                log::info!(
+                    target: "kakehashi::tree_worker_shadow",
+                    "restarted worker generation {generation} and full-resynced {} open documents (bytes={} recovery_ms={})",
+                    resynced.documents,
+                    resynced.bytes,
+                    recovery_started.elapsed().as_millis(),
+                );
+                return true;
+            }
+            Err(error) => {
+                state.client = Some(replacement);
+                log::error!(
+                    target: "kakehashi::tree_worker_shadow",
+                    "worker generation {generation} full resync failed: {error}"
+                );
+                class = FailureClass::Systemic;
+            }
+        }
+    }
+}
+
+fn resync_open_documents(
+    client: &Client,
+    generation: u64,
+    open_documents: &OpenDocuments,
+    quarantined: &HashSet<GrammarIdentity>,
+    replicas: &mut HashMap<String, ReplicaIdentity>,
+    comparisons: &ComparisonStore,
+) -> std::io::Result<ResyncStats> {
+    let mut requests = open_documents.current.values().cloned().collect::<Vec<_>>();
+    requests.sort_unstable_by(|left, right| left.context.uri.cmp(&right.context.uri));
+    let mut resynced = ResyncStats::default();
+    for mut request in requests {
+        if quarantined.contains(&GrammarIdentity::from_sync(&request)) {
+            continue;
+        }
+        resynced.bytes = resynced.bytes.saturating_add(request.text.len());
+        request.context.worker_generation = generation;
+        let identity = ReplicaIdentity::from_sync(&request);
+        comparisons.open(&request.context.uri, request.context.incarnation);
+        match sync_and_derive(client, request)? {
+            Response::Snapshot(snapshot) => {
+                replicas.insert(snapshot.context.uri.clone(), identity);
+                comparisons.record(
+                    &snapshot.context.uri,
+                    snapshot.context.incarnation,
+                    snapshot.context.content_version,
+                    ComparisonSide::Shadow(TreeSummary::from_snapshot(&snapshot)),
+                );
+                resynced.documents += 1;
+            }
+            Response::WorkerRestartRequired(required) => {
+                return Err(std::io::Error::other(required.reason));
+            }
+            Response::Error(error) => return Err(std::io::Error::other(error.message)),
+            response => {
+                return Err(std::io::Error::other(format!(
+                    "unexpected resync response: {response:?}"
+                )));
+            }
+        }
+    }
+    Ok(resynced)
+}
+
+fn retag_command(command: &mut ShadowCommand, generation: u64) {
+    match command {
+        ShadowCommand::Sync(request) => request.context.worker_generation = generation,
+        ShadowCommand::Apply { request, fallback } => {
+            request.context.worker_generation = generation;
+            fallback.context.worker_generation = generation;
+        }
+        ShadowCommand::Close(request) => request.context.worker_generation = generation,
+        ShadowCommand::Shutdown(_) => {}
+    }
+}
+
+fn classify_transport_failure(
+    client: &Client,
+    error: &std::io::Error,
+    implicated_grammar: Option<&GrammarIdentity>,
+) -> FailureClass {
+    if implicated_grammar.is_none() {
+        return FailureClass::Systemic;
+    }
+    if error.kind() == std::io::ErrorKind::TimedOut {
+        return FailureClass::NativeEvidenced;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+
+        if client
+            .try_wait()
+            .ok()
+            .flatten()
+            .is_some_and(|status| status.signal().is_some())
+        {
+            return FailureClass::NativeEvidenced;
+        }
+    }
+    FailureClass::Systemic
+}
+
+fn command_uri(command: &ShadowCommand) -> Option<&str> {
+    match command {
+        ShadowCommand::Sync(request) => Some(&request.context.uri),
+        ShadowCommand::Apply { fallback, .. } => Some(&fallback.context.uri),
+        ShadowCommand::Close(request) => Some(&request.context.uri),
+        ShadowCommand::Shutdown(_) => None,
+    }
+}
+
+fn command_document(command: &ShadowCommand) -> Option<(&str, u64)> {
+    match command {
+        ShadowCommand::Sync(request) => Some((&request.context.uri, request.context.incarnation)),
+        ShadowCommand::Apply { fallback, .. } => {
+            Some((&fallback.context.uri, fallback.context.incarnation))
+        }
+        ShadowCommand::Close(request) => Some((&request.context.uri, request.context.incarnation)),
+        ShadowCommand::Shutdown(_) => None,
+    }
+}
+
+fn command_grammar(command: &ShadowCommand) -> Option<GrammarIdentity> {
+    match command {
+        ShadowCommand::Sync(request) => Some(GrammarIdentity::from_sync(request)),
+        ShadowCommand::Apply { fallback, .. } => Some(GrammarIdentity::from_sync(fallback)),
+        ShadowCommand::Close(_) | ShadowCommand::Shutdown(_) => None,
     }
 }
 
@@ -706,6 +1124,82 @@ mod tests {
             has_error: false,
             named_node_count: 3,
         }
+    }
+
+    fn sync(uri: &str, incarnation: u64, version: u64, generation: u64) -> SyncDocument {
+        SyncDocument {
+            context: RequestContext {
+                request_id: version,
+                worker_generation: generation,
+                uri: uri.into(),
+                incarnation,
+                content_version: version,
+                configuration_generation: 3,
+            },
+            language: "rust".into(),
+            grammar_symbol: "rust".into(),
+            parser_path: "/parser/rust.so".into(),
+            text: format!("version {version}"),
+        }
+    }
+
+    #[test]
+    fn open_document_registry_keeps_only_latest_authoritative_text() {
+        let mut documents = OpenDocuments::default();
+        documents.observe(&ShadowCommand::Sync(sync("file:///a.rs", 1, 1, 7)));
+        documents.observe(&ShadowCommand::Apply {
+            request: ApplyDocumentEditsAndDerive {
+                context: sync("file:///a.rs", 1, 2, 7).context,
+                base_version: 1,
+                edits: Vec::new(),
+            },
+            fallback: sync("file:///a.rs", 1, 2, 7),
+        });
+
+        let latest = documents.current.get("file:///a.rs").unwrap();
+        assert_eq!(latest.context.content_version, 2);
+        assert_eq!(latest.text, "version 2");
+
+        documents.observe(&ShadowCommand::Close(CloseDocument {
+            context: latest.context.clone(),
+        }));
+        assert!(documents.current.is_empty());
+    }
+
+    #[test]
+    fn command_retagging_fences_queued_work_to_replacement_generation() {
+        let mut command = ShadowCommand::Apply {
+            request: ApplyDocumentEditsAndDerive {
+                context: sync("file:///a.rs", 1, 2, 7).context,
+                base_version: 1,
+                edits: Vec::new(),
+            },
+            fallback: sync("file:///a.rs", 1, 2, 7),
+        };
+        retag_command(&mut command, 11);
+
+        let ShadowCommand::Apply { request, fallback } = command else {
+            unreachable!();
+        };
+        assert_eq!(request.context.worker_generation, 11);
+        assert_eq!(fallback.context.worker_generation, 11);
+    }
+
+    #[test]
+    fn restart_budgets_are_independent_and_session_bounded() {
+        let mut systemic = RestartBudget::default();
+        assert!(systemic.consume(FailureClass::Systemic));
+        assert!(systemic.consume(FailureClass::Systemic));
+        assert!(systemic.consume(FailureClass::Systemic));
+        assert!(!systemic.consume(FailureClass::Systemic));
+
+        let mut native = RestartBudget::default();
+        for _ in 0..MAX_NATIVE_RESTARTS {
+            assert!(native.consume(FailureClass::NativeEvidenced));
+        }
+        assert!(!native.consume(FailureClass::NativeEvidenced));
+
+        assert_eq!(systemic.backoff(), Duration::from_secs(2));
     }
 
     #[test]

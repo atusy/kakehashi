@@ -1330,6 +1330,8 @@ where
             None,
         ))
         .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "worker writer stopped"))?;
+    #[cfg(feature = "e2e")]
+    inject_idle_worker_crash_once();
 
     let documents = Arc::new(dashmap::DashMap::new());
     let closed_documents = Arc::new(dashmap::DashMap::new());
@@ -1352,6 +1354,13 @@ where
                     }),
                     None,
                 ))
+                .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "worker writer stopped"))?;
+            continue;
+        }
+        #[cfg(feature = "e2e")]
+        if let Some(response) = inject_worker_failure_once(&request) {
+            responses
+                .send((response, None))
                 .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "worker writer stopped"))?;
             continue;
         }
@@ -1402,6 +1411,54 @@ where
     }
     drop(responses);
     join_writer(writer_thread)
+}
+
+#[cfg(feature = "e2e")]
+fn inject_worker_failure_once(request: &Request) -> Option<Response> {
+    let Request::SyncDocument(sync) = request else {
+        return None;
+    };
+    if let Ok(marker) = std::env::var("KAKEHASHI_TREE_WORKER_CRASH_ONCE_FILE")
+        && std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(marker)
+            .is_ok()
+    {
+        std::process::exit(86);
+    }
+    if let Ok(marker) = std::env::var("KAKEHASHI_TREE_WORKER_RESTART_ONCE_FILE")
+        && std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(marker)
+            .is_ok()
+    {
+        return Some(Response::WorkerRestartRequired(WorkerRestartRequired {
+            context: sync.context.clone(),
+            reason: "injected systemic restart".into(),
+        }));
+    }
+    None
+}
+
+#[cfg(feature = "e2e")]
+fn inject_idle_worker_crash_once() {
+    let Ok(marker) = std::env::var("KAKEHASHI_TREE_WORKER_IDLE_CRASH_ONCE_FILE") else {
+        return;
+    };
+    if std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(marker)
+        .is_err()
+    {
+        return;
+    }
+    std::thread::spawn(|| {
+        std::thread::sleep(Duration::from_millis(100));
+        std::process::exit(87);
+    });
 }
 
 fn join_writer(thread: std::thread::JoinHandle<io::Result<()>>) -> io::Result<()> {
@@ -1605,6 +1662,13 @@ impl Client {
             ready,
             max_inflight,
         })
+    }
+
+    pub fn try_wait(&self) -> io::Result<Option<std::process::ExitStatus>> {
+        self.child
+            .lock()
+            .map_err(|_| io::Error::other("worker child lock is poisoned"))?
+            .try_wait()
     }
 
     pub fn compute_threads(&self) -> usize {
