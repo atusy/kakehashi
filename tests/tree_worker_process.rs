@@ -2,7 +2,9 @@ use std::path::PathBuf;
 use std::sync::{Arc, Barrier};
 
 #[cfg(feature = "e2e")]
-use kakehashi::tree_worker::{ApplyDocumentEdits, ByteEdit, DeriveDocumentSnapshot, SyncDocument};
+use kakehashi::tree_worker::{
+    ApplyDocumentEdits, ByteEdit, CloseDocument, DeriveDocumentSnapshot, SyncDocument,
+};
 use kakehashi::tree_worker::{Client, DeriveSnapshot, RequestContext, Response};
 
 #[test]
@@ -208,5 +210,23 @@ fn real_worker_keeps_document_text_and_tree_across_incremental_edits() {
         panic!("derive must read worker-owned state: {response:?}");
     };
     assert_eq!(snapshot.root_end_byte, "fn main() { value + 2 }".len());
+
+    let mut closed = snapshot.context;
+    closed.request_id = 33;
+    let response = worker
+        .close_document(CloseDocument {
+            context: closed.clone(),
+        })
+        .unwrap();
+    assert!(matches!(response, Response::DocumentClosed(_)));
+
+    closed.request_id = 34;
+    let response = worker
+        .derive_document_snapshot(DeriveDocumentSnapshot { context: closed })
+        .unwrap();
+    let Response::Error(error) = response else {
+        panic!("closed document must not retain its tree: {response:?}");
+    };
+    assert!(error.message.contains("missing"));
     worker.shutdown().unwrap();
 }
