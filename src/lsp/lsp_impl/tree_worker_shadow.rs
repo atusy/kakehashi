@@ -2,18 +2,19 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, mpsc};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crate::language::coordinator::WorkerGrammarDescriptor;
 use crate::lsp::text_sync::SequentialByteEdit;
 use crate::tree_worker::{
     ApplyDocumentEditsAndDerive, ByteEdit, Client, CloseDocument, DeriveDocumentSnapshot,
-    RequestContext, Response, SyncDocument,
+    RequestContext, Response, SyncDocument, named_node_count,
 };
 
 const SHADOW_ENV: &str = "KAKEHASHI_TREE_WORKER_SHADOW";
 const SHADOW_THREADS_ENV: &str = "KAKEHASHI_TREE_WORKER_THREADS";
 const SHADOW_QUEUE_CAPACITY: usize = 256;
+const SHADOW_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 static NEXT_WORKER_GENERATION: AtomicU64 = AtomicU64::new(1);
 
 enum ShadowCommand {
@@ -23,7 +24,7 @@ enum ShadowCommand {
         fallback: SyncDocument,
     },
     Close(CloseDocument),
-    Shutdown,
+    Shutdown(mpsc::SyncSender<()>),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -49,6 +50,7 @@ impl ReplicaIdentity {
 
 pub(super) struct TreeWorkerShadow {
     sender: Option<mpsc::SyncSender<ShadowCommand>>,
+    accepting: Arc<AtomicBool>,
     disabled: Arc<AtomicBool>,
     next_request_id: AtomicU64,
     worker_generation: u64,
@@ -92,11 +94,13 @@ struct ComparisonStore {
 impl TreeWorkerShadow {
     pub(super) fn from_environment() -> Self {
         let disabled = Arc::new(AtomicBool::new(false));
+        let accepting = Arc::new(AtomicBool::new(false));
         let comparisons = Arc::new(ComparisonStore::default());
         let worker_generation = NEXT_WORKER_GENERATION.fetch_add(1, Ordering::Relaxed);
         if !shadow_enabled() {
             return Self {
                 sender: None,
+                accepting,
                 disabled,
                 next_request_id: AtomicU64::new(1),
                 worker_generation,
@@ -110,6 +114,7 @@ impl TreeWorkerShadow {
                 disabled.store(true, Ordering::Release);
                 return Self {
                     sender: None,
+                    accepting,
                     disabled,
                     next_request_id: AtomicU64::new(1),
                     worker_generation,
@@ -121,7 +126,7 @@ impl TreeWorkerShadow {
         let (sender, receiver) = mpsc::sync_channel(SHADOW_QUEUE_CAPACITY);
         let actor_disabled = Arc::clone(&disabled);
         let actor_comparisons = Arc::clone(&comparisons);
-        std::thread::Builder::new()
+        let spawn = std::thread::Builder::new()
             .name("kakehashi-tree-worker-shadow".into())
             .spawn(move || {
                 run_actor(
@@ -132,14 +137,30 @@ impl TreeWorkerShadow {
                     actor_disabled,
                     actor_comparisons,
                 );
-            })
-            .expect("tree worker shadow actor thread must spawn");
+            });
+        if let Err(error) = spawn {
+            disabled.store(true, Ordering::Release);
+            log::error!(
+                target: "kakehashi::tree_worker_shadow",
+                "disabled shadow worker because actor thread could not spawn: {error}"
+            );
+            return Self {
+                sender: None,
+                accepting,
+                disabled,
+                next_request_id: AtomicU64::new(1),
+                worker_generation,
+                comparisons,
+            };
+        }
+        accepting.store(true, Ordering::Release);
         log::info!(
             target: "kakehashi::tree_worker_shadow",
             "enabled one shadow worker with {compute_threads} compute threads"
         );
         Self {
             sender: Some(sender),
+            accepting,
             disabled,
             next_request_id: AtomicU64::new(1),
             worker_generation,
@@ -162,7 +183,9 @@ impl TreeWorkerShadow {
     }
 
     pub(super) fn is_enabled(&self) -> bool {
-        self.sender.is_some() && !self.disabled.load(Ordering::Acquire)
+        self.sender.is_some()
+            && self.accepting.load(Ordering::Acquire)
+            && !self.disabled.load(Ordering::Acquire)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -212,18 +235,7 @@ impl TreeWorkerShadow {
     }
 
     pub(super) fn shutdown(&self) {
-        log::info!(
-            target: "kakehashi::tree_worker_shadow_metrics",
-            "shadow comparisons matched={} mismatched={} superseded={} pending={}",
-            self.comparisons.matched.load(Ordering::Relaxed),
-            self.comparisons.mismatched.load(Ordering::Relaxed),
-            self.comparisons.superseded.load(Ordering::Relaxed),
-            self.comparisons.pending_count(),
-        );
-        self.disabled.store(true, Ordering::Release);
-        if let Some(sender) = &self.sender {
-            let _ = sender.try_send(ShadowCommand::Shutdown);
-        }
+        self.shutdown_with_timeout(SHADOW_SHUTDOWN_TIMEOUT);
     }
 
     pub(super) fn record_authoritative(
@@ -291,7 +303,7 @@ impl TreeWorkerShadow {
     }
 
     fn submit(&self, command: ShadowCommand) {
-        if self.disabled.load(Ordering::Acquire) {
+        if !self.accepting.load(Ordering::Acquire) || self.disabled.load(Ordering::Acquire) {
             return;
         }
         let Some(sender) = &self.sender else {
@@ -305,6 +317,51 @@ impl TreeWorkerShadow {
             );
         }
     }
+
+    fn shutdown_with_timeout(&self, timeout: Duration) {
+        if !self.accepting.swap(false, Ordering::AcqRel) {
+            return;
+        }
+        let deadline = Instant::now() + timeout;
+        let (ack_sender, ack_receiver) = mpsc::sync_channel(0);
+        let Some(sender) = &self.sender else {
+            return;
+        };
+        let mut command = ShadowCommand::Shutdown(ack_sender);
+        loop {
+            match sender.try_send(command) {
+                Ok(()) => break,
+                Err(mpsc::TrySendError::Full(returned)) if Instant::now() < deadline => {
+                    command = returned;
+                    std::thread::yield_now();
+                }
+                Err(error) => {
+                    log_incomplete_shutdown(&format!("could not enqueue drain request: {error}"));
+                    return;
+                }
+            }
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if ack_receiver.recv_timeout(remaining).is_err() {
+            log_incomplete_shutdown("timed out waiting for actor drain");
+            return;
+        }
+        log::info!(
+            target: "kakehashi::tree_worker_shadow_metrics",
+            "shadow comparisons matched={} mismatched={} superseded={} pending={}",
+            self.comparisons.matched.load(Ordering::Relaxed),
+            self.comparisons.mismatched.load(Ordering::Relaxed),
+            self.comparisons.superseded.load(Ordering::Relaxed),
+            self.comparisons.pending_count(),
+        );
+    }
+}
+
+fn log_incomplete_shutdown(reason: &str) {
+    log::error!(
+        target: "kakehashi::tree_worker_shadow_metrics",
+        "shadow validation incomplete: {reason}"
+    );
 }
 
 fn shadow_enabled() -> bool {
@@ -342,8 +399,13 @@ fn run_actor(
         }
     };
     let mut replicas = HashMap::<String, ReplicaIdentity>::new();
+    let mut shutdown_ack = None;
     while let Ok(command) = receiver.recv() {
-        if disabled.load(Ordering::Acquire) || matches!(command, ShadowCommand::Shutdown) {
+        if disabled.load(Ordering::Acquire) {
+            break;
+        }
+        if let ShadowCommand::Shutdown(ack) = command {
+            shutdown_ack = Some(ack);
             break;
         }
         let started = Instant::now();
@@ -376,7 +438,7 @@ fn run_actor(
                 comparisons.mark_closed(&request.context.uri, request.context.incarnation);
                 (client.close_document(request), None)
             }
-            ShadowCommand::Shutdown => unreachable!(),
+            ShadowCommand::Shutdown(_) => unreachable!(),
         };
         match response {
             Ok(Response::Snapshot(snapshot)) => {
@@ -423,6 +485,9 @@ fn run_actor(
     }
     if let Err(error) = client.shutdown() {
         log::warn!(target: "kakehashi::tree_worker_shadow", "worker shutdown failed: {error}");
+    }
+    if let Some(ack) = shutdown_ack {
+        let _ = ack.send(());
     }
 }
 
@@ -574,29 +639,6 @@ impl TreeSummary {
     }
 }
 
-fn named_node_count(root: tree_sitter::Node<'_>) -> usize {
-    let mut count = 0;
-    let mut cursor = root.walk();
-    let mut ascending = false;
-    loop {
-        if !ascending {
-            count += usize::from(cursor.node().is_named());
-            if cursor.goto_first_child() {
-                continue;
-            }
-        }
-        if cursor.goto_next_sibling() {
-            ascending = false;
-            continue;
-        }
-        if !cursor.goto_parent() {
-            break;
-        }
-        ascending = true;
-    }
-    count
-}
-
 fn sync_and_derive(client: &Client, request: SyncDocument) -> std::io::Result<Response> {
     let context = request.context.clone();
     match client.sync_document(request)? {
@@ -614,6 +656,7 @@ mod tests {
     fn shadow(sender: mpsc::SyncSender<ShadowCommand>) -> TreeWorkerShadow {
         TreeWorkerShadow {
             sender: Some(sender),
+            accepting: Arc::new(AtomicBool::new(true)),
             disabled: Arc::new(AtomicBool::new(false)),
             next_request_id: AtomicU64::new(1),
             worker_generation: 7,
@@ -683,8 +726,10 @@ mod tests {
     fn bounded_queue_failure_disables_the_shadow_session() {
         let (sender, _receiver) = mpsc::sync_channel(1);
         let shadow = shadow(sender);
-        shadow.submit(ShadowCommand::Shutdown);
-        shadow.submit(ShadowCommand::Shutdown);
+        let (ack, _receiver) = mpsc::sync_channel(0);
+        shadow.submit(ShadowCommand::Shutdown(ack));
+        let (ack, _receiver) = mpsc::sync_channel(0);
+        shadow.submit(ShadowCommand::Shutdown(ack));
 
         assert!(!shadow.is_enabled());
     }
@@ -693,9 +738,10 @@ mod tests {
     fn shutdown_disables_the_actor_even_when_its_queue_is_full() {
         let (sender, _receiver) = mpsc::sync_channel(1);
         let shadow = shadow(sender);
-        shadow.submit(ShadowCommand::Shutdown);
+        let (ack, _receiver) = mpsc::sync_channel(0);
+        shadow.submit(ShadowCommand::Shutdown(ack));
 
-        shadow.shutdown();
+        shadow.shutdown_with_timeout(Duration::from_millis(1));
 
         assert!(!shadow.is_enabled());
     }

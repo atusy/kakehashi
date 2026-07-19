@@ -450,7 +450,7 @@ pub fn decode_frame<R: Read, T: DeserializeOwned>(reader: &mut R) -> io::Result<
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
 }
 
-fn named_node_count(root: tree_sitter::Node<'_>) -> usize {
+pub(crate) fn named_node_count(root: tree_sitter::Node<'_>) -> usize {
     let mut count = 0;
     let mut cursor = root.walk();
     let mut ascending = false;

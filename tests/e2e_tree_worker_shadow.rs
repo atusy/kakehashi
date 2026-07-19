@@ -92,6 +92,21 @@ fn shadow_worker_matches_authoritative_incremental_lifecycle() {
         stderr.contains("shadow comparisons matched="),
         "missing shadow summary: {stderr}"
     );
+    let summary = stderr
+        .lines()
+        .find(|line| line.contains("shadow comparisons matched="))
+        .expect("shadow summary was checked above");
+    let metric = |name: &str| {
+        summary
+            .split_whitespace()
+            .find_map(|field| field.strip_prefix(&format!("{name}=")))
+            .and_then(|value| value.trim_end_matches(',').parse::<u64>().ok())
+            .unwrap_or_else(|| panic!("missing {name} in shadow summary: {summary}"))
+    };
+    assert!(metric("matched") > 0, "{summary}");
+    assert_eq!(metric("mismatched"), 0, "{summary}");
+    assert_eq!(metric("pending"), 0, "{summary}");
+    assert!(!stderr.contains("shadow validation incomplete"), "{stderr}");
     assert!(!stderr.contains("tree mismatch"), "{stderr}");
     assert!(!stderr.contains("worker transport failed"), "{stderr}");
 }
