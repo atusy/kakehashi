@@ -138,3 +138,7 @@ rstest = "0.26"
 [[bench]]
 name = "semantic_tokens"
 harness = false
+
+[[bench]]
+name = "tree_worker_stage1"
+harness = false

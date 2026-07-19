@@ -194,6 +194,28 @@ struct WorkerThreadState {
     parsers: HashMap<GrammarKey, tree_sitter::Parser>,
 }
 
+pub struct LocalDeriver {
+    state: WorkerThreadState,
+}
+
+impl Default for LocalDeriver {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl LocalDeriver {
+    pub fn new() -> Self {
+        Self {
+            state: WorkerThreadState::new(),
+        }
+    }
+
+    pub fn derive(&mut self, request: DeriveSnapshot) -> Response {
+        self.state.derive(request, Duration::ZERO)
+    }
+}
+
 impl WorkerThreadState {
     fn new() -> Self {
         Self {
