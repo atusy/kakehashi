@@ -3,47 +3,47 @@
   "requests": 1000,
   "threads": 4,
   "source_lines": 200,
-  "source_bytes": 7611,
-  "apply_frame_bytes": 270,
+  "source_bytes": 7651,
+  "apply_frame_bytes": 274,
   "derive_frame_bytes": 191,
-  "fused_apply_and_derive_frame_bytes": 281,
-  "spawn_us": 1003071.541,
+  "fused_apply_and_derive_frame_bytes": 285,
+  "spawn_us": 1141259.625,
   "sync": {
-    "direct_us": 1950.875,
-    "worker_parent_observed_us": 2552.041
+    "direct_us": 1832.4170000000001,
+    "worker_parent_observed_us": 2869.834
   },
   "alternating_incremental_edit_and_derive": {
     "direct": {
-      "p50_us": 252.208,
-      "p95_us": 259.709,
-      "p99_us": 271.416,
-      "mean_us": 252.913473
+      "p50_us": 265.959,
+      "p95_us": 317.334,
+      "p99_us": 325.959,
+      "mean_us": 282.582046
     },
     "worker_parent_observed": {
-      "p50_us": 293.292,
-      "p95_us": 304.709,
-      "p99_us": 316.959,
-      "mean_us": 294.454409
+      "p50_us": 309.0,
+      "p95_us": 368.375,
+      "p99_us": 379.625,
+      "mean_us": 328.465548
     },
-    "direct_requests_per_second": 3953.9214267165594,
-    "worker_requests_per_second": 3396.1114842739544
+    "direct_requests_per_second": 3538.795242497466,
+    "worker_requests_per_second": 3044.4593233260493
   },
   "concurrent_documents": {
     "documents": 4,
     "measurement_order": "worker_then_direct",
     "direct": {
-      "p50_us": 315.334,
-      "p95_us": 392.25,
-      "p99_us": 431.75,
-      "mean_us": 320.88503499999996
+      "p50_us": 357.917,
+      "p95_us": 422.75,
+      "p99_us": 444.583,
+      "mean_us": 361.407684
     },
     "worker_parent_observed": {
-      "p50_us": 367.833,
-      "p95_us": 462.959,
-      "p99_us": 495.917,
-      "mean_us": 379.68826299999995
+      "p50_us": 450.458,
+      "p95_us": 522.209,
+      "p99_us": 547.75,
+      "mean_us": 450.57151400000004
     },
-    "direct_requests_per_second": 12382.840221599841,
-    "worker_requests_per_second": 10454.505333005216
+    "direct_requests_per_second": 10746.74187265287,
+    "worker_requests_per_second": 8797.837758933121
   }
 }
