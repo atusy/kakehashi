@@ -103,7 +103,7 @@ pub(crate) struct LanguageCoordinator {
     /// Content identities for immutable parser artifacts. The generation in
     /// the key keeps didChange from re-reading a shared library while ensuring
     /// a configuration reload revalidates even a same-path replacement.
-    worker_artifacts: dashmap::DashMap<(PathBuf, u64), CachedWorkerArtifact>,
+    worker_artifacts: dashmap::DashMap<(PathBuf, u64, u64), CachedWorkerArtifact>,
     worker_artifact_dir: Option<tempfile::TempDir>,
     worker_settings: RwLock<Arc<WorkspaceSettings>>,
     worker_settings_epoch: std::sync::atomic::AtomicU64,
@@ -453,7 +453,6 @@ impl LanguageCoordinator {
         }
         self.failed_loads.clear();
         self.configured_load_failures.clear();
-        self.worker_artifacts.clear();
 
         // Build base map from language configs
         self.build_base_map(&settings.languages);
@@ -1837,7 +1836,7 @@ impl LanguageCoordinator {
         let configuration_generation = self
             .load_generation
             .load(std::sync::atomic::Ordering::Acquire);
-        let cache_key = (parser_path.clone(), configuration_generation);
+        let cache_key = (parser_path.clone(), configuration_generation, epoch);
         let artifact = if let Some(artifact) = self.worker_artifacts.get(&cache_key) {
             artifact.clone()
         } else {
@@ -1856,9 +1855,26 @@ impl LanguageCoordinator {
                         "cannot import parser artifact {}: {error}",
                         parser_path.display(),
                     );
-                    return None;
+                    self.worker_artifacts
+                        .iter()
+                        .filter(|entry| {
+                            entry.key().0 == parser_path && entry.key().1 < configuration_generation
+                        })
+                        .max_by_key(|entry| (entry.key().1, entry.key().2))
+                        .map(|entry| entry.value().clone())?
                 }
             };
+            if self
+                .worker_settings_epoch
+                .load(std::sync::atomic::Ordering::Acquire)
+                != epoch
+                || self
+                    .load_generation
+                    .load(std::sync::atomic::Ordering::Acquire)
+                    != configuration_generation
+            {
+                return None;
+            }
             self.worker_artifacts.insert(cache_key, artifact.clone());
             artifact
         };
@@ -1888,34 +1904,82 @@ fn import_worker_artifact(
     source: &Path,
     directory: &Path,
 ) -> std::io::Result<CachedWorkerArtifact> {
-    let mut source_file = std::fs::File::open(source)?;
-    let mut candidate = tempfile::NamedTempFile::new_in(directory)?;
+    const MAX_IMPORT_ATTEMPTS: usize = 3;
+    for _ in 0..MAX_IMPORT_ATTEMPTS {
+        let mut first = std::fs::File::open(source)?;
+        let first_before = source_stamp(&first)?;
+        let (first_digest, first_len) = hash_reader(&mut first, None)?;
+        let first_after = source_stamp(&first)?;
+
+        let mut second = std::fs::File::open(source)?;
+        let second_before = source_stamp(&second)?;
+        let mut candidate = tempfile::NamedTempFile::new_in(directory)?;
+        let (second_digest, second_len) = hash_reader(&mut second, Some(&mut candidate))?;
+        let second_after = source_stamp(&second)?;
+        if first_before != first_after
+            || second_before != second_after
+            || first_before != second_before
+            || first_digest != second_digest
+            || first_len != second_len
+        {
+            continue;
+        }
+        candidate.as_file_mut().sync_all()?;
+        let digest = format!("sha256:{first_digest}");
+        let extension = source
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .unwrap_or(std::env::consts::DLL_EXTENSION);
+        let destination = directory.join(format!("{}.{}", &digest[7..], extension));
+        match candidate.persist_noclobber(&destination) {
+            Ok(_) => {}
+            Err(error) if error.error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(error.error),
+        }
+        return Ok(CachedWorkerArtifact {
+            path: destination,
+            digest,
+        });
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        "parser artifact changed during all import attempts",
+    ))
+}
+
+#[derive(Eq, PartialEq)]
+struct SourceStamp {
+    len: u64,
+    modified: Option<std::time::SystemTime>,
+}
+
+fn source_stamp(file: &std::fs::File) -> std::io::Result<SourceStamp> {
+    let metadata = file.metadata()?;
+    Ok(SourceStamp {
+        len: metadata.len(),
+        modified: metadata.modified().ok(),
+    })
+}
+
+fn hash_reader(
+    source: &mut std::fs::File,
+    mut destination: Option<&mut tempfile::NamedTempFile>,
+) -> std::io::Result<(String, u64)> {
     let mut digest = Sha256::new();
+    let mut total = 0_u64;
     let mut buffer = [0_u8; 64 * 1024];
     loop {
-        let read = source_file.read(&mut buffer)?;
+        let read = source.read(&mut buffer)?;
         if read == 0 {
             break;
         }
         digest.update(&buffer[..read]);
-        candidate.write_all(&buffer[..read])?;
+        total = total.saturating_add(read as u64);
+        if let Some(destination) = destination.as_mut() {
+            destination.write_all(&buffer[..read])?;
+        }
     }
-    candidate.as_file_mut().sync_all()?;
-    let digest = format!("sha256:{:x}", digest.finalize());
-    let extension = source
-        .extension()
-        .and_then(|extension| extension.to_str())
-        .unwrap_or(std::env::consts::DLL_EXTENSION);
-    let destination = directory.join(format!("{}.{}", &digest[7..], extension));
-    match candidate.persist_noclobber(&destination) {
-        Ok(_) => {}
-        Err(error) if error.error.kind() == std::io::ErrorKind::AlreadyExists => {}
-        Err(error) => return Err(error.error),
-    }
-    Ok(CachedWorkerArtifact {
-        path: destination,
-        digest,
-    })
+    Ok((format!("{:x}", digest.finalize()), total))
 }
 
 /// Truncate a pattern string for display in log messages.

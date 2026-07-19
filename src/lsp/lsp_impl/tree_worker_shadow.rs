@@ -39,6 +39,7 @@ enum ShadowCommand {
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct ReplicaIdentity {
     incarnation: u64,
+    content_version: u64,
     language: String,
     grammar_symbol: String,
     source_path: PathBuf,
@@ -51,6 +52,7 @@ impl ReplicaIdentity {
     fn from_sync(request: &SyncDocument) -> Self {
         Self {
             incarnation: request.context.incarnation,
+            content_version: request.context.content_version,
             language: request.language.clone(),
             grammar_symbol: request.grammar_symbol.clone(),
             source_path: request.source_path.clone(),
@@ -195,6 +197,7 @@ struct ActorShared {
     comparisons: Arc<ComparisonStore>,
     pending_configuration_generation: Arc<AtomicU64>,
     open_documents: Arc<Mutex<OpenDocuments>>,
+    registry_epoch: Arc<AtomicU64>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -324,6 +327,7 @@ pub(super) struct TreeWorkerShadow {
     comparisons: Arc<ComparisonStore>,
     pending_configuration_generation: Arc<AtomicU64>,
     open_documents: Arc<Mutex<OpenDocuments>>,
+    registry_epoch: Arc<AtomicU64>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -335,6 +339,15 @@ pub(super) struct TreeSummary {
     root_end_byte: usize,
     has_error: bool,
     named_node_count: usize,
+}
+
+pub(super) struct MirrorDocument {
+    pub(super) uri: url::Url,
+    pub(super) incarnation: u64,
+    pub(super) content_version: u64,
+    pub(super) language: String,
+    pub(super) grammar: Option<WorkerGrammarDescriptor>,
+    pub(super) text: String,
 }
 
 #[derive(Default)]
@@ -368,6 +381,7 @@ impl TreeWorkerShadow {
         let comparisons = Arc::new(ComparisonStore::default());
         let pending_configuration_generation = Arc::new(AtomicU64::new(0));
         let open_documents = Arc::new(Mutex::new(OpenDocuments::default()));
+        let registry_epoch = Arc::new(AtomicU64::new(0));
         let worker_generation = NEXT_WORKER_GENERATION.fetch_add(1, Ordering::Relaxed);
         if !shadow_enabled() {
             return Self {
@@ -379,6 +393,7 @@ impl TreeWorkerShadow {
                 comparisons,
                 pending_configuration_generation,
                 open_documents,
+                registry_epoch,
             };
         }
         let executable = match std::env::current_exe() {
@@ -395,6 +410,7 @@ impl TreeWorkerShadow {
                     comparisons,
                     pending_configuration_generation,
                     open_documents,
+                    registry_epoch,
                 };
             }
         };
@@ -405,6 +421,7 @@ impl TreeWorkerShadow {
             comparisons: Arc::clone(&comparisons),
             pending_configuration_generation: Arc::clone(&pending_configuration_generation),
             open_documents: Arc::clone(&open_documents),
+            registry_epoch: Arc::clone(&registry_epoch),
         };
         let spawn = std::thread::Builder::new()
             .name("kakehashi-tree-worker-shadow".into())
@@ -432,6 +449,7 @@ impl TreeWorkerShadow {
                 comparisons,
                 pending_configuration_generation,
                 open_documents,
+                registry_epoch,
             };
         }
         accepting.store(true, Ordering::Release);
@@ -448,6 +466,7 @@ impl TreeWorkerShadow {
             comparisons,
             pending_configuration_generation,
             open_documents,
+            registry_epoch,
         }
     }
 
@@ -466,6 +485,10 @@ impl TreeWorkerShadow {
     }
 
     pub(super) fn is_enabled(&self) -> bool {
+        self.is_configured() && !self.disabled.load(Ordering::Acquire)
+    }
+
+    pub(super) fn is_configured(&self) -> bool {
         self.sender.is_some() && self.accepting.load(Ordering::Acquire)
     }
 
@@ -518,6 +541,58 @@ impl TreeWorkerShadow {
     pub(super) fn configuration_changed(&self, generation: u64) {
         self.pending_configuration_generation
             .fetch_max(generation, Ordering::AcqRel);
+    }
+
+    pub(super) fn mirror_configuration(&self, generation: u64, documents: Vec<MirrorDocument>) {
+        let mut commands = Vec::with_capacity(documents.len());
+        for document in documents {
+            let command = if let Some(grammar) = document.grammar {
+                ShadowCommand::Sync(self.sync_request(
+                    &document.uri,
+                    document.incarnation,
+                    document.content_version,
+                    document.language,
+                    grammar,
+                    document.text,
+                ))
+            } else {
+                ShadowCommand::Close(CloseDocument {
+                    context: self.context(
+                        &document.uri,
+                        document.incarnation,
+                        document.content_version,
+                        generation,
+                    ),
+                })
+            };
+            commands.push(command);
+        }
+        {
+            let mut registry = self
+                .open_documents
+                .lock()
+                .recover_poison("TreeWorkerShadow::mirror_configuration");
+            commands.retain(|command| registry.observe(command) != Observation::Stale);
+        }
+        if !commands.is_empty() {
+            self.registry_epoch.fetch_add(1, Ordering::AcqRel);
+        }
+        for command in &commands {
+            if let Some((uri, incarnation)) = command_document(command) {
+                if matches!(command, ShadowCommand::Close(_)) {
+                    self.comparisons.mark_closed(uri, incarnation);
+                } else {
+                    self.comparisons.open(uri, incarnation);
+                }
+            }
+        }
+        self.configuration_changed(generation);
+        if self.disabled.load(Ordering::Acquire) {
+            return;
+        }
+        for command in commands {
+            self.submit(command);
+        }
     }
 
     pub(super) async fn shutdown(&self) {
@@ -623,6 +698,10 @@ impl TreeWorkerShadow {
         if observation == Observation::Stale {
             return;
         }
+        self.registry_epoch.fetch_add(1, Ordering::AcqRel);
+        if self.disabled.load(Ordering::Acquire) {
+            return;
+        }
         self.submit(command);
     }
 
@@ -724,6 +803,7 @@ fn run_actor(
         comparisons,
         pending_configuration_generation,
         open_documents,
+        registry_epoch,
     } = shared;
     let initial_client = match Client::spawn(&executable, compute_threads, worker_generation) {
         Ok(client) => Some(client),
@@ -766,6 +846,7 @@ fn run_actor(
             let generation = pending_configuration_generation.load(Ordering::Acquire);
             let probe_allowed = breaker_probe_allowed(state.breaker, generation, Instant::now());
             if probe_allowed {
+                let recovery_epoch = registry_epoch.load(Ordering::Acquire);
                 state.breaker = BreakerState::HalfOpen {
                     probe_generation: generation,
                 };
@@ -777,7 +858,8 @@ fn run_actor(
                     None,
                     &comparisons,
                     RecoveryMode::HalfOpen,
-                ) {
+                ) && registry_epoch.load(Ordering::Acquire) == recovery_epoch
+                {
                     disabled.store(false, Ordering::Release);
                     log::info!(
                         target: "kakehashi::tree_worker_shadow",
@@ -877,6 +959,11 @@ fn run_actor(
                 target: "kakehashi::tree_worker_shadow",
                 "performing planned worker restart for parser artifact replacement",
             );
+            let recovery_mode = if matches!(state.breaker, BreakerState::HalfOpen { .. }) {
+                RecoveryMode::HalfOpen
+            } else {
+                RecoveryMode::Planned
+            };
             if !recover_worker(
                 &mut state,
                 &executable,
@@ -884,7 +971,7 @@ fn run_actor(
                 FailureClass::Systemic,
                 None,
                 &comparisons,
-                RecoveryMode::Planned,
+                recovery_mode,
             ) {
                 mark_tree_tier_unavailable(
                     &mut state,
@@ -893,6 +980,9 @@ fn run_actor(
                 );
                 continue;
             }
+            continue;
+        }
+        if replica_satisfies_command(&state.replicas, &command) {
             continue;
         }
         retag_command(&mut command, state.worker_generation);
@@ -1174,15 +1264,10 @@ fn recover_worker(
             }
         };
         state.replicas.clear();
-        let open_documents = state
-            .open_documents
-            .lock()
-            .recover_poison("recover_worker(open documents)")
-            .clone();
         match resync_open_documents(
             &replacement,
             generation,
-            &open_documents,
+            &state.open_documents,
             &state.quarantined,
             &mut state.replicas,
             comparisons,
@@ -1252,20 +1337,30 @@ fn quarantine_grammar(
 fn resync_open_documents(
     client: &Client,
     generation: u64,
-    open_documents: &OpenDocuments,
+    open_documents: &Mutex<OpenDocuments>,
     quarantined: &HashSet<GrammarIdentity>,
     replicas: &mut HashMap<String, ReplicaIdentity>,
     comparisons: &ComparisonStore,
 ) -> Result<ResyncStats, ResyncFailure> {
-    let mut uris = open_documents.current.keys().collect::<Vec<_>>();
+    let mut uris = open_documents
+        .lock()
+        .recover_poison("resync_open_documents(uris)")
+        .current
+        .keys()
+        .cloned()
+        .collect::<Vec<_>>();
     uris.sort_unstable();
     let mut resynced = ResyncStats::default();
     for uri in uris {
-        let mut request = open_documents
+        let Some(mut request) = open_documents
+            .lock()
+            .recover_poison("resync_open_documents(request)")
             .current
-            .get(uri)
-            .expect("resync URI came from the open-document registry")
-            .clone();
+            .get(&uri)
+            .cloned()
+        else {
+            continue;
+        };
         let grammar = GrammarIdentity::from_sync(&request);
         if quarantined.contains(&grammar) {
             continue;
@@ -1390,6 +1485,24 @@ fn command_grammar(command: &ShadowCommand) -> Option<GrammarIdentity> {
         ShadowCommand::Apply { fallback, .. } => Some(GrammarIdentity::from_sync(fallback)),
         ShadowCommand::Close(_) | ShadowCommand::Shutdown(_) => None,
     }
+}
+
+fn command_sync(command: &ShadowCommand) -> Option<&SyncDocument> {
+    match command {
+        ShadowCommand::Sync(request) => Some(request),
+        ShadowCommand::Apply { fallback, .. } => Some(fallback),
+        ShadowCommand::Close(_) | ShadowCommand::Shutdown(_) => None,
+    }
+}
+
+fn replica_satisfies_command(
+    replicas: &HashMap<String, ReplicaIdentity>,
+    command: &ShadowCommand,
+) -> bool {
+    command_uri(command).is_some_and(|uri| {
+        command_sync(command)
+            .is_some_and(|request| replicas.get(uri) == Some(&ReplicaIdentity::from_sync(request)))
+    })
 }
 
 fn replica_requires_sync(
@@ -1583,6 +1696,7 @@ mod tests {
             comparisons: Arc::new(ComparisonStore::default()),
             pending_configuration_generation: Arc::new(AtomicU64::new(0)),
             open_documents: Arc::new(Mutex::new(OpenDocuments::default())),
+            registry_epoch: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -1736,6 +1850,76 @@ mod tests {
         };
         assert_eq!(request.context.worker_generation, 11);
         assert_eq!(fallback.context.worker_generation, 11);
+    }
+
+    #[test]
+    fn exact_command_is_already_satisfied_after_full_resync() {
+        let command = ShadowCommand::Sync(sync("file:///a.rs", 1, 2, 7));
+        let mut replicas = HashMap::new();
+        replicas.insert(
+            "file:///a.rs".into(),
+            ReplicaIdentity::from_sync(command_sync(&command).unwrap()),
+        );
+        assert!(replica_satisfies_command(&replicas, &command));
+
+        let newer = ShadowCommand::Sync(sync("file:///a.rs", 1, 3, 7));
+        assert!(!replica_satisfies_command(&replicas, &newer));
+    }
+
+    #[test]
+    fn configuration_mirroring_publishes_a_complete_registry_before_enqueue() {
+        let (sender, receiver) = mpsc::sync_channel(4);
+        let shadow = shadow(sender);
+        let uri_a = url::Url::parse("file:///a.rs").unwrap();
+        let uri_b = url::Url::parse("file:///b.rs").unwrap();
+        let mut grammar_a = grammar();
+        grammar_a.parser_path = "/private/new.so".into();
+        grammar_a.artifact_digest = "sha256:new".into();
+        grammar_a.configuration_generation = 9;
+        let mut grammar_b = grammar_a.clone();
+        grammar_b.grammar_symbol = "rust_derived".into();
+
+        shadow.mirror_configuration(
+            9,
+            vec![
+                MirrorDocument {
+                    uri: uri_a,
+                    incarnation: 1,
+                    content_version: 2,
+                    language: "rust".into(),
+                    grammar: Some(grammar_a),
+                    text: "fn a() {}".into(),
+                },
+                MirrorDocument {
+                    uri: uri_b,
+                    incarnation: 2,
+                    content_version: 3,
+                    language: "rust_derived".into(),
+                    grammar: Some(grammar_b),
+                    text: "fn b() {}".into(),
+                },
+            ],
+        );
+
+        let registry = shadow
+            .open_documents
+            .lock()
+            .recover_poison("configuration mirror test");
+        assert_eq!(registry.current.len(), 2);
+        assert_eq!(registry.current["file:///a.rs"].grammar_symbol, "rust");
+        assert_eq!(
+            registry.current["file:///b.rs"].grammar_symbol,
+            "rust_derived"
+        );
+        assert_eq!(
+            shadow
+                .pending_configuration_generation
+                .load(Ordering::Acquire),
+            9
+        );
+        drop(registry);
+        assert!(matches!(receiver.try_recv(), Ok(ShadowCommand::Sync(_))));
+        assert!(matches!(receiver.try_recv(), Ok(ShadowCommand::Sync(_))));
     }
 
     #[test]

@@ -76,7 +76,7 @@ impl Kakehashi {
         self.bridge.open_host_incarnation(&uri, incarnation).await;
         drop(edit_guard);
 
-        if self.tree_worker_shadow.is_enabled()
+        if self.tree_worker_shadow.is_configured()
             && let Some(language_name) = language_name.clone()
             && let Some(grammar) = self.language.worker_grammar_descriptor(&language_name)
         {

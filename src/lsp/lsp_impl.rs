@@ -572,48 +572,40 @@ impl Kakehashi {
         )
         .await;
         self.refresh_tree_worker_documents(&self.documents.open_uris());
-        self.tree_worker_shadow
-            .configuration_changed(self.language.configuration_generation());
         reparse_uris
             .into_iter()
             .for_each(|uri| self.schedule_reparse(uri, None));
     }
 
     fn refresh_tree_worker_documents(&self, uris: &[Url]) {
-        if !self.tree_worker_shadow.is_enabled() {
+        if !self.tree_worker_shadow.is_configured() {
             return;
         }
-        for uri in uris {
-            let Some((incarnation, content_version, language, text)) =
-                self.documents.get(uri).and_then(|document| {
-                    Some((
-                        document.incarnation(),
-                        document.content_version(),
-                        document.language_id()?.to_owned(),
-                        document.text().to_owned(),
-                    ))
-                })
-            else {
-                continue;
-            };
-            let Some(grammar) = self.language.worker_grammar_descriptor(&language) else {
-                self.tree_worker_shadow.mirror_close(
-                    uri,
+        let documents = uris
+            .iter()
+            .filter_map(|uri| {
+                let (incarnation, content_version, language, text) =
+                    self.documents.get(uri).and_then(|document| {
+                        Some((
+                            document.incarnation(),
+                            document.content_version(),
+                            document.language_id()?.to_owned(),
+                            document.text().to_owned(),
+                        ))
+                    })?;
+                let grammar = self.language.worker_grammar_descriptor(&language);
+                Some(tree_worker_shadow::MirrorDocument {
+                    uri: uri.clone(),
                     incarnation,
                     content_version,
-                    self.language.configuration_generation(),
-                );
-                continue;
-            };
-            self.tree_worker_shadow.mirror_full(
-                uri,
-                incarnation,
-                content_version,
-                language,
-                grammar,
-                text,
-            );
-        }
+                    language,
+                    grammar,
+                    text,
+                })
+            })
+            .collect();
+        self.tree_worker_shadow
+            .mirror_configuration(self.language.configuration_generation(), documents);
     }
 
     async fn apply_initial_settings(

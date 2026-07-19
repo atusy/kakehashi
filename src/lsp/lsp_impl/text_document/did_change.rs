@@ -68,7 +68,10 @@ impl Kakehashi {
         let text = changes.text;
         let edits = changes.input_edits;
         let sequential_byte_edits = changes.sequential_byte_edits;
-        let shadow_text = self.tree_worker_shadow.is_enabled().then(|| text.clone());
+        let shadow_text = self
+            .tree_worker_shadow
+            .is_configured()
+            .then(|| text.clone());
 
         // lazy-node-identity-tracking: Apply START-priority invalidation to node tracker.
         // Use InputEdits directly for precise invalidation when available,
