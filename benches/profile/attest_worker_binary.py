@@ -142,7 +142,7 @@ def require_clean(checkout):
 def require_uncredentialed_repository_url(repository):
     parsed = urllib.parse.urlsplit(repository)
     ssh_schemes = ("ssh", "git+ssh")
-    if parsed.password is not None or (
+    if parsed.query or parsed.fragment or parsed.password is not None or (
         parsed.username is not None and parsed.scheme not in ssh_schemes
     ):
         raise ValueError("source repository URL must not contain credentials")

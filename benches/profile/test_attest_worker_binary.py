@@ -123,6 +123,8 @@ class BinaryAttestationTest(unittest.TestCase):
             "ftp://user:token@example.invalid/kakehashi.git",
             "ftps://token@example.invalid/kakehashi.git",
             "ssh://git:token@github.com/atusy/kakehashi.git",
+            "https://github.com/atusy/kakehashi.git?access_token=secret",
+            "https://github.com/atusy/kakehashi.git#access_token=secret",
         ):
             with self.subTest(repository=repository):
                 with self.assertRaisesRegex(ValueError, "credentials"):
