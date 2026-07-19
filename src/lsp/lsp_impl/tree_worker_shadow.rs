@@ -1237,7 +1237,7 @@ fn finish_half_open_recovery(
     state.breaker = BreakerState::HalfOpen {
         probe_generation,
         synchronized_epoch,
-        reconcile_after: now + WORKER_LIVENESS_POLL,
+        reconcile_after: Instant::now() + WORKER_LIVENESS_POLL,
     };
     ReconcileOutcome::Pending
 }
