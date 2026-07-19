@@ -630,6 +630,7 @@ impl From<&RequestContext> for DocumentKey {
 
 type DocumentStore = Arc<dashmap::DashMap<DocumentKey, Arc<Mutex<DocumentReplica>>>>;
 type ClosedDocuments = Arc<dashmap::DashMap<DocumentKey, u64>>;
+type DocumentCapacity = Arc<Mutex<usize>>;
 type LaneJob = Box<dyn FnOnce() + Send + 'static>;
 
 struct DocumentLane {
@@ -731,11 +732,14 @@ fn handle_work(
     request: Request,
     documents: &DocumentStore,
     closed_documents: &ClosedDocuments,
+    document_capacity: &DocumentCapacity,
     queue_wait: Duration,
 ) -> Response {
     match request {
         Request::DeriveSnapshot(request) => derive_snapshot(request, queue_wait),
-        Request::SyncDocument(request) => sync_document(request, documents, closed_documents),
+        Request::SyncDocument(request) => {
+            sync_document(request, documents, closed_documents, document_capacity)
+        }
         Request::ApplyDocumentEdits(request) => apply_document_edits(request, documents),
         Request::ApplyDocumentEditsAndDerive(request) => {
             apply_document_edits_and_derive(request, documents)
@@ -776,6 +780,7 @@ fn sync_document(
     request: SyncDocument,
     documents: &DocumentStore,
     closed_documents: &ClosedDocuments,
+    document_capacity: &DocumentCapacity,
 ) -> Response {
     let context = request.context.clone();
     let document_key = DocumentKey::from(&context);
@@ -811,16 +816,22 @@ fn sync_document(
                 message: "full sync targets a closed document incarnation".into(),
             });
         }
-        if documents.len() + closed_documents.len() >= MAX_DOCUMENT_REPLICAS
-            && !closed_documents.contains_key(&document_key)
-        {
+    }
+    let reserves_slot =
+        !documents.contains_key(&document_key) && !closed_documents.contains_key(&document_key);
+    if reserves_slot {
+        let mut known_documents = document_capacity
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if *known_documents >= MAX_DOCUMENT_REPLICAS {
             return Response::Error(WorkerError {
                 context: Some(context),
                 message: format!("document replica limit {MAX_DOCUMENT_REPLICAS} reached"),
             });
         }
+        *known_documents += 1;
     }
-    WORKER_THREAD_STATE.with(|state| {
+    let response = WORKER_THREAD_STATE.with(|state| {
         state
             .borrow_mut()
             .with_parser(
@@ -838,7 +849,14 @@ fn sync_document(
                     }),
                 },
             )
-    })
+    });
+    if reserves_slot && !matches!(&response, Response::DocumentAck(_)) {
+        let mut known_documents = document_capacity
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *known_documents = known_documents.saturating_sub(1);
+    }
+    response
 }
 
 fn apply_document_edits(request: ApplyDocumentEdits, documents: &DocumentStore) -> Response {
@@ -1098,6 +1116,7 @@ where
 
     let documents = Arc::new(dashmap::DashMap::new());
     let closed_documents = Arc::new(dashmap::DashMap::new());
+    let document_capacity = Arc::new(Mutex::new(0));
     let document_lanes: DocumentLanes = Arc::new(dashmap::DashMap::new());
     while let Some(request) = decode_frame::<_, Request>(&mut reader)? {
         let Some(context) = request_context(&request) else {
@@ -1126,10 +1145,17 @@ where
         let permit = AdmissionPermit(permits.clone());
         let documents = Arc::clone(&documents);
         let closed_documents = Arc::clone(&closed_documents);
+        let document_capacity = Arc::clone(&document_capacity);
         let lane_key = document_key(&request);
         let job: LaneJob = Box::new(move || {
             let _ = responses.send((
-                handle_work(request, &documents, &closed_documents, enqueued.elapsed()),
+                handle_work(
+                    request,
+                    &documents,
+                    &closed_documents,
+                    &document_capacity,
+                    enqueued.elapsed(),
+                ),
                 Some(permit),
             ));
         });
