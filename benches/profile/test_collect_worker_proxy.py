@@ -214,10 +214,9 @@ class CollectionHelpersTest(unittest.TestCase):
                         {},
                         timeout_seconds=5,
                         termination_grace_seconds=0.2,
-                    )
+                )
                 child_pid = int(pid_file.read_text())
-                with self.assertRaises(ProcessLookupError):
-                    os.kill(child_pid, 0)
+                wait_for_process_stopped(child_pid)
             finally:
                 if child_pid is None and pid_file.exists():
                     child_pid = int(pid_file.read_text())
@@ -255,8 +254,7 @@ class CollectionHelpersTest(unittest.TestCase):
                     )
                 self.assertEqual(exit_context.exception.code, 128 + signal.SIGTERM)
                 child_pid = int(pid_file.read_text())
-                with self.assertRaises(ProcessLookupError):
-                    os.kill(child_pid, 0)
+                wait_for_process_stopped(child_pid)
             finally:
                 if child_pid is None and pid_file.exists():
                     child_pid = int(pid_file.read_text())
