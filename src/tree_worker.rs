@@ -20,7 +20,7 @@ use std::{
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use sha2::{Digest, Sha256};
 
-pub const PROTOCOL_VERSION: u32 = 2;
+pub const PROTOCOL_VERSION: u32 = 3;
 pub const MAX_FRAME_BYTES: usize = 64 * 1024 * 1024;
 pub const MAX_DOCUMENT_REPLICAS: usize = 4_096;
 pub const MAX_DOCUMENT_BYTES: usize = 32 * 1024 * 1024;
@@ -50,6 +50,7 @@ pub struct DeriveSnapshot {
     pub language: String,
     pub grammar_symbol: String,
     pub parser_path: PathBuf,
+    pub artifact_digest: String,
     pub text: String,
 }
 
@@ -59,6 +60,7 @@ pub struct SyncDocument {
     pub language: String,
     pub grammar_symbol: String,
     pub parser_path: PathBuf,
+    pub artifact_digest: String,
     pub text: String,
 }
 
@@ -186,13 +188,7 @@ impl DocumentReplica {
             context: request.context.clone(),
             incremental: false,
         };
-        let grammar_key = GrammarKey {
-            parser_path: request
-                .parser_path
-                .canonicalize()
-                .unwrap_or_else(|_| request.parser_path.clone()),
-            grammar_symbol: request.grammar_symbol.clone(),
-        };
+        let grammar_key = GrammarKey::from_sync(&request);
         Ok((
             Self {
                 context: request.context,
@@ -519,10 +515,50 @@ fn derive_snapshot_with_parser(
     })
 }
 
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Debug)]
 struct GrammarKey {
     parser_path: PathBuf,
     grammar_symbol: String,
+    artifact_digest: String,
+}
+
+impl GrammarKey {
+    fn from_sync(request: &SyncDocument) -> Self {
+        Self {
+            parser_path: request
+                .parser_path
+                .canonicalize()
+                .unwrap_or_else(|_| request.parser_path.clone()),
+            grammar_symbol: request.grammar_symbol.clone(),
+            artifact_digest: request.artifact_digest.clone(),
+        }
+    }
+
+    fn from_derive(request: &DeriveSnapshot) -> Self {
+        Self {
+            parser_path: request
+                .parser_path
+                .canonicalize()
+                .unwrap_or_else(|_| request.parser_path.clone()),
+            grammar_symbol: request.grammar_symbol.clone(),
+            artifact_digest: request.artifact_digest.clone(),
+        }
+    }
+}
+
+impl PartialEq for GrammarKey {
+    fn eq(&self, other: &Self) -> bool {
+        self.grammar_symbol == other.grammar_symbol && self.artifact_digest == other.artifact_digest
+    }
+}
+
+impl Eq for GrammarKey {}
+
+impl std::hash::Hash for GrammarKey {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.grammar_symbol.hash(state);
+        self.artifact_digest.hash(state);
+    }
 }
 
 struct WorkerThreadState {
@@ -574,13 +610,7 @@ impl LocalDocumentReplica {
 
     pub fn sync_document(&mut self, request: SyncDocument) -> Response {
         let context = request.context.clone();
-        let grammar_key = GrammarKey {
-            parser_path: request
-                .parser_path
-                .canonicalize()
-                .unwrap_or_else(|_| request.parser_path.clone()),
-            grammar_symbol: request.grammar_symbol.clone(),
-        };
+        let grammar_key = GrammarKey::from_sync(&request);
         let Self { state, replica } = self;
         if let Some(existing) = replica.as_ref()
             && let Err(message) =
@@ -664,13 +694,7 @@ impl WorkerThreadState {
 
     fn derive(&mut self, request: DeriveSnapshot, queue_wait: Duration) -> Response {
         let request_context = request.context.clone();
-        let key = GrammarKey {
-            parser_path: request
-                .parser_path
-                .canonicalize()
-                .unwrap_or_else(|_| request.parser_path.clone()),
-            grammar_symbol: request.grammar_symbol.clone(),
-        };
+        let key = GrammarKey::from_derive(&request);
         self.with_parser(key, request_context, |parser, parser_cache_hit| {
             derive_snapshot_with_parser(request, parser, parser_cache_hit, queue_wait)
         })
@@ -968,13 +992,7 @@ fn sync_document(
         });
     }
     let document_key = DocumentKey::from(&context);
-    let grammar_key = GrammarKey {
-        parser_path: request
-            .parser_path
-            .canonicalize()
-            .unwrap_or_else(|_| request.parser_path.clone()),
-        grammar_symbol: request.grammar_symbol.clone(),
-    };
+    let grammar_key = GrammarKey::from_sync(&request);
     let replaced_bytes = if let Some(existing) = documents
         .get(&document_key)
         .map(|entry| Arc::clone(entry.value()))
@@ -2223,6 +2241,7 @@ mod tests {
             language: "rust".into(),
             grammar_symbol: "rust".into(),
             parser_path: "/unused/in/unit-test".into(),
+            artifact_digest: "sha256:rust-v1".into(),
             text: "fn main() {}".into(),
         })
     }
@@ -2600,6 +2619,7 @@ mod tests {
                 language: "rust".into(),
                 grammar_symbol: "rust".into(),
                 parser_path: "/unused/static-language".into(),
+                artifact_digest: "sha256:rust-v1".into(),
                 text: "fn main() { 1 }".into(),
             },
             &mut parser,
@@ -2655,6 +2675,7 @@ mod tests {
                 language: "rust".into(),
                 grammar_symbol: "rust".into(),
                 parser_path: "/unused/static-language".into(),
+                artifact_digest: "sha256:rust-v1".into(),
                 text: "fn main() {}".into(),
             },
             &mut parser,
@@ -2699,6 +2720,7 @@ mod tests {
                 language: "rust".into(),
                 grammar_symbol: "rust".into(),
                 parser_path: "/unused/static-language".into(),
+                artifact_digest: "sha256:rust-v1".into(),
                 text: "fn current() {}".into(),
             },
             &mut parser,
@@ -2736,6 +2758,7 @@ mod tests {
                 language: "rust".into(),
                 grammar_symbol: "rust".into(),
                 parser_path: "/unused/rust".into(),
+                artifact_digest: "sha256:rust-v1".into(),
                 text: "fn current() {}".into(),
             },
             &mut parser,
@@ -2751,9 +2774,19 @@ mod tests {
                 .unwrap_err()
                 .contains("language change")
         );
-        let different_grammar = GrammarKey {
+        let alias_grammar = GrammarKey {
             parser_path: "/unused/other-rust".into(),
             grammar_symbol: "rust".into(),
+            artifact_digest: "sha256:rust-v1".into(),
+        };
+        replica
+            .validate_replacement(&replacement, "rust", &alias_grammar)
+            .unwrap();
+
+        let different_grammar = GrammarKey {
+            parser_path: "/unused/rust".into(),
+            grammar_symbol: "rust".into(),
+            artifact_digest: "sha256:rust-v2".into(),
         };
         assert!(
             replica
@@ -2781,6 +2814,7 @@ mod tests {
                 language: "rust".into(),
                 grammar_symbol: "rust".into(),
                 parser_path: "/unused/rust".into(),
+                artifact_digest: "sha256:rust-v1".into(),
                 text: "fn main() {}".into(),
             },
             &documents,
@@ -2813,6 +2847,7 @@ mod tests {
                 language: "rust".into(),
                 grammar_symbol: "rust".into(),
                 parser_path: "/unused/rust".into(),
+                artifact_digest: "sha256:rust-v1".into(),
                 text: text.into(),
             },
             &mut parser,
@@ -2840,6 +2875,7 @@ mod tests {
                 language: "rust".into(),
                 grammar_symbol: "rust".into(),
                 parser_path: "/unused/rust".into(),
+                artifact_digest: "sha256:rust-v1".into(),
                 text: "fn replacement() {}".into(),
             },
             &documents,
@@ -2951,6 +2987,7 @@ mod tests {
                 language: "rust".into(),
                 grammar_symbol: "rust".into(),
                 parser_path: "/unused/static-language".into(),
+                artifact_digest: "sha256:rust-v1".into(),
                 text: original.into(),
             },
             &mut parser,
@@ -3010,6 +3047,7 @@ mod tests {
                 language: "rust".into(),
                 grammar_symbol: "rust".into(),
                 parser_path: "/unused/static-language".into(),
+                artifact_digest: "sha256:rust-v1".into(),
                 text: "fn main() { 1 }".into(),
             },
             &mut parser,

@@ -43,6 +43,7 @@ fn sync_request(document: usize, parser: &Path, text: &str) -> SyncDocument {
         language: "rust".into(),
         grammar_symbol: "rust".into(),
         parser_path: parser.to_path_buf(),
+        artifact_digest: "sha256:benchmark-rust".into(),
         text: text.into(),
     }
 }

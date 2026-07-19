@@ -39,6 +39,7 @@ struct ReplicaIdentity {
     language: String,
     grammar_symbol: String,
     parser_path: PathBuf,
+    artifact_digest: String,
     configuration_generation: u64,
 }
 
@@ -49,6 +50,7 @@ impl ReplicaIdentity {
             language: request.language.clone(),
             grammar_symbol: request.grammar_symbol.clone(),
             parser_path: request.parser_path.clone(),
+            artifact_digest: request.artifact_digest.clone(),
             configuration_generation: request.context.configuration_generation,
         }
     }
@@ -57,16 +59,14 @@ impl ReplicaIdentity {
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 struct GrammarIdentity {
     grammar_symbol: String,
-    parser_path: PathBuf,
-    configuration_generation: u64,
+    artifact_digest: String,
 }
 
 impl GrammarIdentity {
     fn from_sync(request: &SyncDocument) -> Self {
         Self {
             grammar_symbol: request.grammar_symbol.clone(),
-            parser_path: request.parser_path.clone(),
-            configuration_generation: request.context.configuration_generation,
+            artifact_digest: request.artifact_digest.clone(),
         }
     }
 }
@@ -452,6 +452,7 @@ impl TreeWorkerShadow {
             language,
             grammar_symbol: grammar.grammar_symbol,
             parser_path: grammar.parser_path,
+            artifact_digest: grammar.artifact_digest,
             text,
         }
     }
@@ -909,11 +910,10 @@ fn quarantine_grammar(
     }
     log::error!(
         target: "kakehashi::tree_worker_shadow",
-        "quarantined grammar conservatively for this session after {:?} worker loss: symbol={} path={} configuration_generation={}",
+        "quarantined grammar conservatively for this session after {:?} worker loss: symbol={} artifact_digest={}",
         class,
         grammar.grammar_symbol,
-        grammar.parser_path.display(),
-        grammar.configuration_generation,
+        grammar.artifact_digest,
     );
 }
 
@@ -1286,6 +1286,7 @@ mod tests {
             language: "rust".into(),
             grammar_symbol: "rust".into(),
             parser_path: "/parser/rust.so".into(),
+            artifact_digest: "sha256:rust-v1".into(),
             text: format!("version {version}"),
         }
     }

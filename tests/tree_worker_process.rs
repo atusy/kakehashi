@@ -26,6 +26,7 @@ fn real_worker_handshakes_and_contains_request_errors() {
             language: "rust".into(),
             grammar_symbol: "rust".into(),
             parser_path: PathBuf::from("/missing/tree-sitter-rust"),
+            artifact_digest: "sha256:missing-rust".into(),
             text: "fn main() {}".into(),
         })
         .unwrap();
@@ -65,6 +66,7 @@ fn concurrent_requests_are_routed_by_request_id() {
                         language: "rust".into(),
                         grammar_symbol: "rust".into(),
                         parser_path: PathBuf::from(format!("/missing/{request_id}")),
+                        artifact_digest: format!("sha256:missing-{request_id}"),
                         text: "fn main() {}".into(),
                     })
                     .unwrap()
@@ -114,6 +116,7 @@ fn real_worker_derives_a_snapshot_from_an_installed_grammar() {
             language: "rust".into(),
             grammar_symbol: "rust".into(),
             parser_path: parser.clone(),
+            artifact_digest: "sha256:test-rust".into(),
             text: "fn main() {}".into(),
         })
         .unwrap();
@@ -138,6 +141,7 @@ fn real_worker_derives_a_snapshot_from_an_installed_grammar() {
             language: "rust".into(),
             grammar_symbol: "rust".into(),
             parser_path: parser.clone(),
+            artifact_digest: "sha256:test-rust".into(),
             text: "fn main() { let x = 1; }".into(),
         })
         .unwrap();
@@ -175,6 +179,7 @@ fn real_worker_keeps_document_text_and_tree_across_incremental_edits() {
             language: "rust".into(),
             grammar_symbol: "rust".into(),
             parser_path: parser.clone(),
+            artifact_digest: "sha256:test-rust".into(),
             text: "fn main() { 1 }".into(),
         })
         .unwrap();
@@ -231,6 +236,7 @@ fn real_worker_keeps_document_text_and_tree_across_incremental_edits() {
             language: "rust".into(),
             grammar_symbol: "rust".into(),
             parser_path: parser,
+            artifact_digest: "sha256:test-rust".into(),
             text: "fn stale() {}".into(),
         })
         .unwrap();
