@@ -104,6 +104,7 @@ pub(crate) struct LanguageCoordinator {
     /// the key keeps didChange from re-reading a shared library while ensuring
     /// a configuration reload revalidates even a same-path replacement.
     worker_artifacts: dashmap::DashMap<(PathBuf, u64, u64), CachedWorkerArtifact>,
+    worker_grammar_fallbacks: dashmap::DashMap<String, CachedWorkerArtifact>,
     worker_artifact_dir: Option<tempfile::TempDir>,
     worker_settings: RwLock<Arc<WorkspaceSettings>>,
     worker_settings_epoch: std::sync::atomic::AtomicU64,
@@ -132,6 +133,7 @@ pub(crate) struct WorkerGrammarDescriptor {
 
 #[derive(Clone)]
 struct CachedWorkerArtifact {
+    source_path: PathBuf,
     path: PathBuf,
     digest: String,
 }
@@ -159,6 +161,7 @@ impl LanguageCoordinator {
             settings_reload_lock: Mutex::new(()),
             load_generation: std::sync::atomic::AtomicU64::new(0),
             worker_artifacts: dashmap::DashMap::new(),
+            worker_grammar_fallbacks: dashmap::DashMap::new(),
             worker_artifact_dir: tempfile::Builder::new()
                 .prefix("kakehashi-worker-artifacts-")
                 .tempdir()
@@ -1855,12 +1858,8 @@ impl LanguageCoordinator {
                         "cannot import parser artifact {}: {error}",
                         parser_path.display(),
                     );
-                    self.worker_artifacts
-                        .iter()
-                        .filter(|entry| {
-                            entry.key().0 == parser_path && entry.key().1 < configuration_generation
-                        })
-                        .max_by_key(|entry| (entry.key().1, entry.key().2))
+                    self.worker_grammar_fallbacks
+                        .get(&grammar_symbol)
                         .map(|entry| entry.value().clone())?
                 }
             };
@@ -1885,8 +1884,10 @@ impl LanguageCoordinator {
         {
             return None;
         }
+        self.worker_grammar_fallbacks
+            .insert(grammar_symbol.clone(), artifact.clone());
         Some(WorkerGrammarDescriptor {
-            source_path: parser_path,
+            source_path: artifact.source_path,
             parser_path: artifact.path,
             grammar_symbol,
             artifact_digest: artifact.digest,
@@ -1937,6 +1938,7 @@ fn import_worker_artifact(
             Err(error) => return Err(error.error),
         }
         return Ok(CachedWorkerArtifact {
+            source_path: source.to_path_buf(),
             path: destination,
             digest,
         });

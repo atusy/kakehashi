@@ -178,6 +178,7 @@ enum RecoveryMode {
 #[derive(Clone, Default)]
 struct OpenDocuments {
     current: HashMap<String, SyncDocument>,
+    closed_incarnations: HashMap<String, u64>,
 }
 
 struct SupervisorState {
@@ -254,6 +255,13 @@ impl OpenDocuments {
             ShadowCommand::Close(_) | ShadowCommand::Shutdown(_) => None,
         };
         if incoming.is_some_and(|incoming| {
+            self.closed_incarnations
+                .get(&incoming.context.uri)
+                .is_some_and(|closed| *closed >= incoming.context.incarnation)
+        }) {
+            return Observation::Stale;
+        }
+        if incoming.is_some_and(|incoming| {
             self.current.values().any(|current| {
                 (current.source_path == incoming.source_path
                     && current.context.configuration_generation
@@ -292,15 +300,21 @@ impl OpenDocuments {
         }
         match command {
             ShadowCommand::Sync(request) => {
+                self.closed_incarnations.remove(&request.context.uri);
                 self.current
                     .insert(request.context.uri.clone(), request.clone());
             }
             ShadowCommand::Apply { fallback, .. } => {
+                self.closed_incarnations.remove(&fallback.context.uri);
                 self.current
                     .insert(fallback.context.uri.clone(), fallback.clone());
             }
             ShadowCommand::Close(request) => {
                 self.current.remove(&request.context.uri);
+                self.closed_incarnations
+                    .entry(request.context.uri.clone())
+                    .and_modify(|closed| *closed = (*closed).max(request.context.incarnation))
+                    .or_insert(request.context.incarnation);
             }
             ShadowCommand::Shutdown(_) => {}
         }
@@ -573,9 +587,9 @@ impl TreeWorkerShadow {
                 .lock()
                 .recover_poison("TreeWorkerShadow::mirror_configuration");
             commands.retain(|command| registry.observe(command) != Observation::Stale);
-        }
-        if !commands.is_empty() {
-            self.registry_epoch.fetch_add(1, Ordering::AcqRel);
+            if !commands.is_empty() {
+                self.registry_epoch.fetch_add(1, Ordering::AcqRel);
+            }
         }
         for command in &commands {
             if let Some((uri, incarnation)) = command_document(command) {
@@ -690,15 +704,20 @@ impl TreeWorkerShadow {
     }
 
     fn observe_and_submit(&self, command: ShadowCommand) {
-        let observation = self
-            .open_documents
-            .lock()
-            .recover_poison("TreeWorkerShadow::observe_and_submit")
-            .observe(&command);
+        let observation = {
+            let mut registry = self
+                .open_documents
+                .lock()
+                .recover_poison("TreeWorkerShadow::observe_and_submit");
+            let observation = registry.observe(&command);
+            if observation != Observation::Stale {
+                self.registry_epoch.fetch_add(1, Ordering::AcqRel);
+            }
+            observation
+        };
         if observation == Observation::Stale {
             return;
         }
-        self.registry_epoch.fetch_add(1, Ordering::AcqRel);
         if self.disabled.load(Ordering::Acquire) {
             return;
         }
@@ -858,9 +877,21 @@ fn run_actor(
                     None,
                     &comparisons,
                     RecoveryMode::HalfOpen,
-                ) && registry_epoch.load(Ordering::Acquire) == recovery_epoch
-                {
-                    disabled.store(false, Ordering::Release);
+                ) {
+                    if !finish_half_open_recovery(
+                        &mut state,
+                        &registry_epoch,
+                        recovery_epoch,
+                        &comparisons,
+                        &disabled,
+                    ) {
+                        mark_tree_tier_unavailable(
+                            &mut state,
+                            &disabled,
+                            &pending_configuration_generation,
+                        );
+                        continue;
+                    }
                     log::info!(
                         target: "kakehashi::tree_worker_shadow",
                         "entered shadow worker half-open probation for configuration generation {generation}",
@@ -959,11 +990,14 @@ fn run_actor(
                 target: "kakehashi::tree_worker_shadow",
                 "performing planned worker restart for parser artifact replacement",
             );
-            let recovery_mode = if matches!(state.breaker, BreakerState::HalfOpen { .. }) {
-                RecoveryMode::HalfOpen
-            } else {
-                RecoveryMode::Planned
-            };
+            if matches!(state.breaker, BreakerState::HalfOpen { .. }) {
+                mark_tree_tier_unavailable(
+                    &mut state,
+                    &disabled,
+                    &pending_configuration_generation,
+                );
+                continue;
+            }
             if !recover_worker(
                 &mut state,
                 &executable,
@@ -971,7 +1005,7 @@ fn run_actor(
                 FailureClass::Systemic,
                 None,
                 &comparisons,
-                recovery_mode,
+                RecoveryMode::Planned,
             ) {
                 mark_tree_tier_unavailable(
                     &mut state,
@@ -1108,6 +1142,59 @@ fn run_actor(
     if let Some(ack) = shutdown_ack {
         let _ = ack.send(());
     }
+}
+
+fn finish_half_open_recovery(
+    state: &mut SupervisorState,
+    registry_epoch: &AtomicU64,
+    mut synchronized_epoch: u64,
+    comparisons: &ComparisonStore,
+    disabled: &AtomicBool,
+) -> bool {
+    const MAX_RECONCILIATION_PASSES: usize = 3;
+    for pass in 0..=MAX_RECONCILIATION_PASSES {
+        let registry = state
+            .open_documents
+            .lock()
+            .recover_poison("finish_half_open_recovery");
+        let current_epoch = registry_epoch.load(Ordering::Acquire);
+        if current_epoch == synchronized_epoch {
+            disabled.store(false, Ordering::Release);
+            return true;
+        }
+        drop(registry);
+        if pass == MAX_RECONCILIATION_PASSES {
+            break;
+        }
+        synchronized_epoch = current_epoch;
+        let result = resync_open_documents(
+            state
+                .client
+                .as_ref()
+                .expect("successful half-open recovery retains its worker"),
+            state.worker_generation,
+            &state.open_documents,
+            &state.quarantined,
+            &mut state.replicas,
+            comparisons,
+        );
+        if let Err(failure) = result {
+            if let Some(grammar) = failure.implicated_grammar {
+                quarantine_grammar(state, grammar, failure.class, comparisons);
+            }
+            log::error!(
+                target: "kakehashi::tree_worker_shadow",
+                "half-open registry reconciliation failed: {}",
+                failure.error,
+            );
+            return false;
+        }
+    }
+    log::warn!(
+        target: "kakehashi::tree_worker_shadow",
+        "half-open registry reconciliation did not quiesce after {MAX_RECONCILIATION_PASSES} passes",
+    );
+    false
 }
 
 fn breaker_probe_allowed(state: BreakerState, generation: u64, now: Instant) -> bool {
@@ -1349,6 +1436,48 @@ fn resync_open_documents(
         .keys()
         .cloned()
         .collect::<Vec<_>>();
+    let current_uris = uris.iter().cloned().collect::<HashSet<_>>();
+    let stale_replicas = replicas
+        .iter()
+        .filter(|(uri, _)| !current_uris.contains(*uri))
+        .map(|(uri, identity)| (uri.clone(), identity.clone()))
+        .collect::<Vec<_>>();
+    for (uri, identity) in stale_replicas {
+        let response = client.close_document(CloseDocument {
+            context: RequestContext {
+                request_id: 0,
+                worker_generation: generation,
+                uri: uri.clone(),
+                incarnation: identity.incarnation,
+                content_version: identity.content_version,
+                configuration_generation: identity.configuration_generation,
+            },
+        });
+        match response {
+            Ok(Response::DocumentClosed(_)) | Ok(Response::Error(_)) => {
+                replicas.remove(&uri);
+            }
+            Ok(response) => {
+                return Err(ResyncFailure {
+                    error: std::io::Error::other(format!(
+                        "unexpected reconciliation close response: {response:?}"
+                    )),
+                    class: FailureClass::Systemic,
+                    implicated_grammar: None,
+                });
+            }
+            Err(error) => {
+                return Err(ResyncFailure {
+                    error,
+                    class: FailureClass::Systemic,
+                    implicated_grammar: Some(GrammarIdentity {
+                        grammar_symbol: identity.grammar_symbol,
+                        artifact_digest: identity.artifact_digest,
+                    }),
+                });
+            }
+        }
+    }
     uris.sort_unstable();
     let mut resynced = ResyncStats::default();
     for uri in uris {
@@ -1369,6 +1498,9 @@ fn resync_open_documents(
         let request_uri = request.context.uri.clone();
         request.context.worker_generation = generation;
         let identity = ReplicaIdentity::from_sync(&request);
+        if replicas.get(&request.context.uri) == Some(&identity) {
+            continue;
+        }
         comparisons.open(&request.context.uri, request.context.incarnation);
         match sync_and_derive(client, request) {
             Ok(Response::Snapshot(snapshot)) => {
@@ -1831,6 +1963,35 @@ mod tests {
             documents.current["file:///a.rs"].artifact_digest,
             "sha256:new"
         );
+    }
+
+    #[test]
+    fn closed_incarnation_tombstone_rejects_a_delayed_configuration_snapshot() {
+        let mut documents = OpenDocuments::default();
+        let current = sync("file:///a.rs", 4, 2, 7);
+        assert!(matches!(
+            documents.observe(&ShadowCommand::Sync(current.clone())),
+            Observation::Accepted { .. }
+        ));
+        assert!(matches!(
+            documents.observe(&ShadowCommand::Close(CloseDocument {
+                context: current.context.clone(),
+            })),
+            Observation::Accepted { .. }
+        ));
+
+        assert_eq!(
+            documents.observe(&ShadowCommand::Sync(current)),
+            Observation::Stale
+        );
+        assert!(documents.current.is_empty());
+
+        let reopened = sync("file:///a.rs", 5, 1, 7);
+        assert!(matches!(
+            documents.observe(&ShadowCommand::Sync(reopened)),
+            Observation::Accepted { .. }
+        ));
+        assert_eq!(documents.current["file:///a.rs"].context.incarnation, 5);
     }
 
     #[test]
