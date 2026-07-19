@@ -22,22 +22,24 @@ struct Args {
     threads: usize,
     #[arg(long, default_value_t = 200)]
     lines: usize,
+    #[arg(long)]
+    worker_first: bool,
 }
 
-fn context(request_id: u64, version: u64) -> RequestContext {
+fn context(document: usize, request_id: u64, version: u64) -> RequestContext {
     RequestContext {
         request_id,
         worker_generation: 1,
-        uri: "file:///stage2-benchmark.rs".into(),
+        uri: format!("file:///stage2-benchmark-{document}.rs"),
         incarnation: 1,
         content_version: version,
         configuration_generation: 0,
     }
 }
 
-fn sync_request(parser: &Path, text: &str) -> SyncDocument {
+fn sync_request(document: usize, parser: &Path, text: &str) -> SyncDocument {
     SyncDocument {
-        context: context(1, 1),
+        context: context(document, document as u64 + 1, 1),
         language: "rust".into(),
         grammar_symbol: "rust".into(),
         parser_path: parser.to_path_buf(),
@@ -45,9 +47,14 @@ fn sync_request(parser: &Path, text: &str) -> SyncDocument {
     }
 }
 
-fn edit_request(request_id: u64, version: u64, marker: usize) -> ApplyDocumentEdits {
+fn edit_request(
+    document: usize,
+    request_id: u64,
+    version: u64,
+    marker: usize,
+) -> ApplyDocumentEdits {
     ApplyDocumentEdits {
-        context: context(request_id, version),
+        context: context(document, request_id, version),
         base_version: version - 1,
         edits: vec![ByteEdit {
             start_byte: marker,
@@ -57,8 +64,13 @@ fn edit_request(request_id: u64, version: u64, marker: usize) -> ApplyDocumentEd
     }
 }
 
-fn fused_request(request_id: u64, version: u64, marker: usize) -> ApplyDocumentEditsAndDerive {
-    let request = edit_request(request_id, version, marker);
+fn fused_request(
+    document: usize,
+    request_id: u64,
+    version: u64,
+    marker: usize,
+) -> ApplyDocumentEditsAndDerive {
+    let request = edit_request(document, request_id, version, marker);
     ApplyDocumentEditsAndDerive {
         context: request.context,
         base_version: request.base_version,
@@ -73,26 +85,44 @@ fn expect_ack(response: Response) {
     }
 }
 
+fn expect_sync_ack(response: Response) {
+    if !matches!(response, Response::DocumentAck(_)) {
+        panic!("document sync failed: {response:?}");
+    }
+}
+
 fn expect_snapshot(response: Response) {
     if !matches!(response, Response::Snapshot(_)) {
         panic!("document derive failed: {response:?}");
     }
 }
 
-fn direct_round(direct: &mut LocalDocumentReplica, version: u64, marker: usize) -> u64 {
+fn direct_round(
+    direct: &mut LocalDocumentReplica,
+    document: usize,
+    request_id: u64,
+    version: u64,
+    marker: usize,
+) -> u64 {
     let started = Instant::now();
-    expect_ack(direct.apply_document_edits(edit_request(version * 2, version, marker)));
+    expect_ack(direct.apply_document_edits(edit_request(document, request_id, version, marker)));
     expect_snapshot(direct.derive_document_snapshot(DeriveDocumentSnapshot {
-        context: context(version * 2 + 1, version),
+        context: context(document, request_id + 1, version),
     }));
     started.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64
 }
 
-fn worker_round(worker: &Client, version: u64, marker: usize) -> u64 {
+fn worker_round(
+    worker: &Client,
+    document: usize,
+    request_id: u64,
+    version: u64,
+    marker: usize,
+) -> u64 {
     let started = Instant::now();
     expect_snapshot(
         worker
-            .apply_document_edits_and_derive(fused_request(version * 2, version, marker))
+            .apply_document_edits_and_derive(fused_request(document, request_id, version, marker))
             .unwrap(),
     );
     started.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64
@@ -113,10 +143,80 @@ fn summary(samples: &[u64]) -> serde_json::Value {
     })
 }
 
+fn direct_concurrent(
+    mut replicas: Vec<LocalDocumentReplica>,
+    requests: usize,
+    marker: usize,
+) -> (Vec<u64>, f64) {
+    let documents = replicas.len();
+    let per_document = requests / documents;
+    let started = Instant::now();
+    let samples = std::thread::scope(|scope| {
+        let handles = replicas
+            .drain(..)
+            .enumerate()
+            .map(|(document, mut replica)| {
+                scope.spawn(move || {
+                    (0..per_document)
+                        .map(|index| {
+                            let version = index as u64 + 2;
+                            let request_id =
+                                1_000_000 + (document * per_document + index) as u64 * 2;
+                            direct_round(&mut replica, document + 1, request_id, version, marker)
+                        })
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect::<Vec<_>>();
+        handles
+            .into_iter()
+            .flat_map(|handle| handle.join().unwrap())
+            .collect::<Vec<_>>()
+    });
+    let throughput = requests as f64 / started.elapsed().as_secs_f64();
+    (samples, throughput)
+}
+
+fn worker_concurrent(
+    worker: &Client,
+    documents: usize,
+    requests: usize,
+    marker: usize,
+) -> (Vec<u64>, f64) {
+    let per_document = requests / documents;
+    let started = Instant::now();
+    let samples = std::thread::scope(|scope| {
+        let handles = (0..documents)
+            .map(|document| {
+                scope.spawn(move || {
+                    (0..per_document)
+                        .map(|index| {
+                            let version = index as u64 + 2;
+                            let request_id = 2_000_000 + (document * per_document + index) as u64;
+                            worker_round(worker, document + 1, request_id, version, marker)
+                        })
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect::<Vec<_>>();
+        handles
+            .into_iter()
+            .flat_map(|handle| handle.join().unwrap())
+            .collect::<Vec<_>>()
+    });
+    let throughput = requests as f64 / started.elapsed().as_secs_f64();
+    (samples, throughput)
+}
+
 fn main() {
     let args = Args::parse();
     assert!(args.requests > 0, "--requests must be positive");
     assert!(args.threads > 0, "--threads must be positive");
+    assert_eq!(
+        args.requests % args.threads,
+        0,
+        "--requests must be divisible by --threads"
+    );
     let mut text = "const COUNTER: usize = 100001;\n".to_string();
     let marker = text.find("100001").unwrap();
     text.extend(
@@ -125,7 +225,7 @@ fn main() {
 
     let mut direct = LocalDocumentReplica::new();
     let direct_sync_started = Instant::now();
-    let response = direct.sync_document(sync_request(&args.parser, &text));
+    let response = direct.sync_document(sync_request(0, &args.parser, &text));
     let direct_sync_us = direct_sync_started.elapsed().as_secs_f64() * 1_000_000.0;
     assert!(matches!(response, Response::DocumentAck(_)));
 
@@ -134,7 +234,7 @@ fn main() {
     let spawn_us = worker_started.elapsed().as_secs_f64() * 1_000_000.0;
     let worker_sync_started = Instant::now();
     let response = worker
-        .sync_document(sync_request(&args.parser, &text))
+        .sync_document(sync_request(0, &args.parser, &text))
         .unwrap();
     let worker_sync_us = worker_sync_started.elapsed().as_secs_f64() * 1_000_000.0;
     assert!(matches!(response, Response::DocumentAck(_)));
@@ -143,33 +243,59 @@ fn main() {
     let mut worker_samples = Vec::with_capacity(args.requests);
     for index in 0..args.requests {
         let version = index as u64 + 2;
+        let request_id = version * 2;
         if index % 2 == 0 {
-            direct_samples.push(direct_round(&mut direct, version, marker));
-            worker_samples.push(worker_round(&worker, version, marker));
+            direct_samples.push(direct_round(&mut direct, 0, request_id, version, marker));
+            worker_samples.push(worker_round(&worker, 0, request_id + 1, version, marker));
         } else {
-            worker_samples.push(worker_round(&worker, version, marker));
-            direct_samples.push(direct_round(&mut direct, version, marker));
+            worker_samples.push(worker_round(&worker, 0, request_id + 1, version, marker));
+            direct_samples.push(direct_round(&mut direct, 0, request_id, version, marker));
         }
+    }
+
+    let mut concurrent_direct = Vec::with_capacity(args.threads);
+    for document in 1..=args.threads {
+        let mut replica = LocalDocumentReplica::new();
+        expect_sync_ack(replica.sync_document(sync_request(document, &args.parser, &text)));
+        concurrent_direct.push(replica);
+        expect_sync_ack(
+            worker
+                .sync_document(sync_request(document, &args.parser, &text))
+                .unwrap(),
+        );
+    }
+    let (concurrent_direct_samples, concurrent_direct_throughput);
+    let (concurrent_worker_samples, concurrent_worker_throughput);
+    if args.worker_first {
+        (concurrent_worker_samples, concurrent_worker_throughput) =
+            worker_concurrent(&worker, args.threads, args.requests, marker);
+        (concurrent_direct_samples, concurrent_direct_throughput) =
+            direct_concurrent(concurrent_direct, args.requests, marker);
+    } else {
+        (concurrent_direct_samples, concurrent_direct_throughput) =
+            direct_concurrent(concurrent_direct, args.requests, marker);
+        (concurrent_worker_samples, concurrent_worker_throughput) =
+            worker_concurrent(&worker, args.threads, args.requests, marker);
     }
 
     let mut apply_frame = Vec::new();
     encode_frame(
         &mut apply_frame,
-        &Request::ApplyDocumentEdits(edit_request(2, 2, marker)),
+        &Request::ApplyDocumentEdits(edit_request(0, 2, 2, marker)),
     )
     .unwrap();
     let mut derive_frame = Vec::new();
     encode_frame(
         &mut derive_frame,
         &Request::DeriveDocumentSnapshot(DeriveDocumentSnapshot {
-            context: context(3, 2),
+            context: context(0, 3, 2),
         }),
     )
     .unwrap();
     let mut fused_frame = Vec::new();
     encode_frame(
         &mut fused_frame,
-        &Request::ApplyDocumentEditsAndDerive(fused_request(2, 2, marker)),
+        &Request::ApplyDocumentEditsAndDerive(fused_request(0, 2, 2, marker)),
     )
     .unwrap();
     worker.shutdown().unwrap();
@@ -197,6 +323,14 @@ fn main() {
                     / (direct_samples.iter().sum::<u64>() as f64 / 1_000_000_000.0),
                 "worker_requests_per_second": args.requests as f64
                     / (worker_samples.iter().sum::<u64>() as f64 / 1_000_000_000.0),
+            },
+            "concurrent_documents": {
+                "documents": args.threads,
+                "measurement_order": if args.worker_first { "worker_then_direct" } else { "direct_then_worker" },
+                "direct": summary(&concurrent_direct_samples),
+                "worker_parent_observed": summary(&concurrent_worker_samples),
+                "direct_requests_per_second": concurrent_direct_throughput,
+                "worker_requests_per_second": concurrent_worker_throughput,
             }
         }))
         .unwrap()
