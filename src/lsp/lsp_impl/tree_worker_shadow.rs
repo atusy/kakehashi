@@ -735,6 +735,98 @@ impl TreeWorkerShadow {
         result.value
     }
 
+    pub(super) async fn node_navigation(
+        &self,
+        uri: &url::Url,
+        authoritative_input_id: &str,
+        operation: NodeNavigation,
+    ) -> Option<NodeResult> {
+        let key = (uri.as_str().to_string(), authoritative_input_id.to_string());
+        let node_id = self.worker_nodes.get(&key).map(|entry| entry.clone())?;
+        let sync = self
+            .open_documents
+            .lock()
+            .recover_poison("TreeWorkerShadow::node_navigation(context)")
+            .current
+            .get(uri.as_str())
+            .cloned()?;
+        let client = self.read_client.load_full()?;
+        if !self.is_enabled() || node_id.worker_generation != client.worker_generation() {
+            self.worker_nodes.remove(&key);
+            return None;
+        }
+        let context = self.read_context(
+            &client,
+            uri,
+            sync.context.incarnation,
+            sync.context.content_version,
+            sync.context.configuration_generation,
+        );
+        let expected = context.clone();
+        let response = tokio::task::spawn_blocking(move || {
+            client.navigate_node(NavigateNode {
+                context,
+                node_id,
+                operation,
+            })
+        })
+        .await
+        .ok()?
+        .ok()?;
+        let result = self.admit_node_response(response, &expected)?;
+        let current = self
+            .open_documents
+            .lock()
+            .recover_poison("TreeWorkerShadow::node_navigation(admission)")
+            .current
+            .get(uri.as_str())
+            .map(|current| current.context.clone());
+        if current.as_ref().is_none_or(|current| {
+            current.incarnation != expected.incarnation
+                || current.content_version != expected.content_version
+                || current.configuration_generation != expected.configuration_generation
+        }) {
+            return None;
+        }
+        Some(result)
+    }
+
+    pub(super) fn compare_node_result(
+        &self,
+        uri: &url::Url,
+        operation: &NodeNavigation,
+        authoritative: &Value,
+        worker: &NodeResult,
+    ) {
+        let authoritative_nodes = match authoritative {
+            Value::Null => Vec::new(),
+            Value::Object(_) => vec![authoritative],
+            Value::Array(nodes) => nodes.iter().collect(),
+            _ => return,
+        };
+        let authoritative_kinds = authoritative_nodes
+            .iter()
+            .filter_map(|node| node.get("kind").and_then(Value::as_str))
+            .collect::<Vec<_>>();
+        let worker_kinds = worker
+            .nodes
+            .iter()
+            .map(|node| node.kind.as_str())
+            .collect::<Vec<_>>();
+        if authoritative_kinds != worker_kinds {
+            log::debug!(
+                target: "kakehashi::tree_worker_shadow",
+                "node navigation mismatch operation={operation:?} uri={uri} authoritative={authoritative_kinds:?} worker={worker_kinds:?}",
+            );
+            return;
+        }
+        for (authoritative_node, worker_node) in
+            authoritative_nodes.into_iter().zip(worker.nodes.iter())
+        {
+            self.record_node_mapping(uri, authoritative_node, worker_node);
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(super) fn mirror_change(
         &self,

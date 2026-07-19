@@ -306,6 +306,30 @@ impl Kakehashi {
         }
     }
 
+    pub(super) async fn navigate_to_node_shadowed(
+        &self,
+        lsp_uri: &Uri,
+        id: &str,
+        operation: crate::tree_worker::NodeNavigation,
+        f: impl FnMut(tree_sitter::Node<'_>) -> Option<NodeTriple> + Send + 'static,
+    ) -> Value {
+        let uri = uri_to_url(lsp_uri).ok();
+        let worker = match uri.as_ref() {
+            Some(uri) => {
+                self.tree_worker_shadow
+                    .node_navigation(uri, id, operation.clone())
+                    .await
+            }
+            None => None,
+        };
+        let authoritative = self.navigate_to_node(lsp_uri, id, f).await;
+        if let (Some(uri), Some(worker)) = (uri.as_ref(), worker.as_ref()) {
+            self.tree_worker_shadow
+                .compare_node_result(uri, &operation, &authoritative, worker);
+        }
+        authoritative
+    }
+
     /// Like [`navigate_to_node`](Self::navigate_to_node), but `f` also receives
     /// the host text and the minting layer's included ranges. Used by the
     /// coordinate-input accessors so they can reject byte/point arguments
@@ -327,6 +351,32 @@ impl Kakehashi {
             Some(triple) => self.mint_node_info(&uri, layer, incarnation, triple),
             None => Value::Null,
         }
+    }
+
+    pub(super) async fn navigate_to_node_in_ranges_shadowed(
+        &self,
+        lsp_uri: &Uri,
+        id: &str,
+        operation: crate::tree_worker::NodeNavigation,
+        f: impl FnMut(tree_sitter::Node<'_>, &str, &[tree_sitter::Range]) -> Option<NodeTriple>
+        + Send
+        + 'static,
+    ) -> Value {
+        let uri = uri_to_url(lsp_uri).ok();
+        let worker = match uri.as_ref() {
+            Some(uri) => {
+                self.tree_worker_shadow
+                    .node_navigation(uri, id, operation.clone())
+                    .await
+            }
+            None => None,
+        };
+        let authoritative = self.navigate_to_node_in_ranges(lsp_uri, id, f).await;
+        if let (Some(uri), Some(worker)) = (uri.as_ref(), worker.as_ref()) {
+            self.tree_worker_shadow
+                .compare_node_result(uri, &operation, &authoritative, worker);
+        }
+        authoritative
     }
 
     /// Resolve `id` **and** `descendant_id` in the layer that minted them, run
@@ -458,5 +508,29 @@ impl Kakehashi {
             })
             .collect();
         infos.map_or(Value::Null, Value::Array)
+    }
+
+    pub(super) async fn navigate_to_nodes_shadowed(
+        &self,
+        lsp_uri: &Uri,
+        id: &str,
+        operation: crate::tree_worker::NodeNavigation,
+        f: impl FnMut(tree_sitter::Node<'_>) -> Vec<NodeTriple> + Send + 'static,
+    ) -> Value {
+        let uri = uri_to_url(lsp_uri).ok();
+        let worker = match uri.as_ref() {
+            Some(uri) => {
+                self.tree_worker_shadow
+                    .node_navigation(uri, id, operation.clone())
+                    .await
+            }
+            None => None,
+        };
+        let authoritative = self.navigate_to_nodes(lsp_uri, id, f).await;
+        if let (Some(uri), Some(worker)) = (uri.as_ref(), worker.as_ref()) {
+            self.tree_worker_shadow
+                .compare_node_result(uri, &operation, &authoritative, worker);
+        }
+        authoritative
     }
 }

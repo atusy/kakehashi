@@ -14,8 +14,8 @@
 use serde_json::{Value, json};
 use tower_lsp_server::jsonrpc::Result;
 
-use crate::lsp::lsp_impl::Kakehashi;
 use crate::lsp::lsp_impl::kakehashi::node::common::{NodeFieldNameParams, NodeIndexParams};
+use crate::lsp::lsp_impl::{Kakehashi, uri_to_url};
 
 impl Kakehashi {
     /// `kakehashi/node/childByFieldName` — the child labelled `name`, per
@@ -26,11 +26,17 @@ impl Kakehashi {
         params: NodeFieldNameParams,
     ) -> Result<Value> {
         let name = params.name;
+        let worker_name = name.clone();
         Ok(self
-            .navigate_to_node(&params.text_document.uri, &params.id, move |n| {
-                n.child_by_field_name(&name)
-                    .map(|c| (c.start_byte(), c.end_byte(), c.kind()))
-            })
+            .navigate_to_node_shadowed(
+                &params.text_document.uri,
+                &params.id,
+                crate::tree_worker::NodeNavigation::ChildByFieldName { name: worker_name },
+                move |n| {
+                    n.child_by_field_name(&name)
+                        .map(|c| (c.start_byte(), c.end_byte(), c.kind()))
+                },
+            )
             .await)
     }
 
@@ -42,13 +48,19 @@ impl Kakehashi {
         params: NodeFieldNameParams,
     ) -> Result<Value> {
         let name = params.name;
+        let worker_name = name.clone();
         Ok(self
-            .navigate_to_nodes(&params.text_document.uri, &params.id, move |n| {
-                let mut cursor = n.walk();
-                n.children_by_field_name(&name, &mut cursor)
-                    .map(|c| (c.start_byte(), c.end_byte(), c.kind()))
-                    .collect()
-            })
+            .navigate_to_nodes_shadowed(
+                &params.text_document.uri,
+                &params.id,
+                crate::tree_worker::NodeNavigation::ChildrenByFieldName { name: worker_name },
+                move |n| {
+                    let mut cursor = n.walk();
+                    n.children_by_field_name(&name, &mut cursor)
+                        .map(|c| (c.start_byte(), c.end_byte(), c.kind()))
+                        .collect()
+                },
+            )
             .await)
     }
 
@@ -63,6 +75,21 @@ impl Kakehashi {
         params: NodeIndexParams,
     ) -> Result<Value> {
         let index = u32::try_from(params.index).ok();
+        let shadow = match (index, uri_to_url(&params.text_document.uri).ok()) {
+            (Some(index), Some(uri)) => {
+                self.tree_worker_shadow
+                    .node_scalar(
+                        &uri,
+                        &params.id,
+                        crate::tree_worker::NodeScalarOperation::FieldNameForChild {
+                            index,
+                            named: false,
+                        },
+                    )
+                    .await
+            }
+            _ => None,
+        };
         let value = self
             .with_node_by_id(&params.text_document.uri, &params.id, move |n| {
                 index.and_then(|i| n.field_name_for_child(i))
@@ -70,6 +97,7 @@ impl Kakehashi {
             .await
             .map(|(_uri, _layer, _incarnation, field)| json!({ "fieldName": field }))
             .unwrap_or(Value::Null);
+        compare_field_name(shadow, &value, false);
         Ok(value)
     }
 
@@ -81,6 +109,21 @@ impl Kakehashi {
         params: NodeIndexParams,
     ) -> Result<Value> {
         let index = u32::try_from(params.index).ok();
+        let shadow = match (index, uri_to_url(&params.text_document.uri).ok()) {
+            (Some(index), Some(uri)) => {
+                self.tree_worker_shadow
+                    .node_scalar(
+                        &uri,
+                        &params.id,
+                        crate::tree_worker::NodeScalarOperation::FieldNameForChild {
+                            index,
+                            named: true,
+                        },
+                    )
+                    .await
+            }
+            _ => None,
+        };
         let value = self
             .with_node_by_id(&params.text_document.uri, &params.id, move |n| {
                 index.and_then(|i| n.field_name_for_named_child(i))
@@ -88,6 +131,24 @@ impl Kakehashi {
             .await
             .map(|(_uri, _layer, _incarnation, field)| json!({ "fieldName": field }))
             .unwrap_or(Value::Null);
+        compare_field_name(shadow, &value, true);
         Ok(value)
+    }
+}
+
+fn compare_field_name(
+    shadow: Option<crate::tree_worker::NodeScalarValue>,
+    authoritative: &Value,
+    named: bool,
+) {
+    let Some(crate::tree_worker::NodeScalarValue::NullableString(field)) = shadow else {
+        return;
+    };
+    let worker = json!({ "fieldName": field });
+    if &worker != authoritative {
+        log::debug!(
+            target: "kakehashi::tree_worker_shadow",
+            "node field-name mismatch named={named} authoritative={authoritative} worker={worker}",
+        );
     }
 }

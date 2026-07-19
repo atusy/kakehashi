@@ -35,10 +35,16 @@ impl Kakehashi {
         // tree-sitter child indices are u32; anything outside that range can
         // never match and is treated as "no such child".
         let index = u32::try_from(params.index).ok();
+        let Some(index) = index else {
+            return Ok(Value::Null);
+        };
         Ok(self
-            .navigate_to_node(&params.text_document.uri, &params.id, move |n| {
-                index.and_then(|i| n.child(i)).map(triple)
-            })
+            .navigate_to_node_shadowed(
+                &params.text_document.uri,
+                &params.id,
+                crate::tree_worker::NodeNavigation::Child { index },
+                move |n| n.child(index).map(triple),
+            )
             .await)
     }
 
@@ -46,10 +52,16 @@ impl Kakehashi {
     /// `Node::named_child`. Out-of-range / negative indices resolve to `null`.
     pub async fn kakehashi_node_named_child(&self, params: NodeIndexParams) -> Result<Value> {
         let index = u32::try_from(params.index).ok();
+        let Some(index) = index else {
+            return Ok(Value::Null);
+        };
         Ok(self
-            .navigate_to_node(&params.text_document.uri, &params.id, move |n| {
-                index.and_then(|i| n.named_child(i)).map(triple)
-            })
+            .navigate_to_node_shadowed(
+                &params.text_document.uri,
+                &params.id,
+                crate::tree_worker::NodeNavigation::NamedChild { index },
+                move |n| n.named_child(index).map(triple),
+            )
             .await)
     }
 
@@ -58,10 +70,15 @@ impl Kakehashi {
     /// (named + anonymous) and mints IDs only for named nodes.
     pub async fn kakehashi_node_named_children(&self, params: NodeIdParams) -> Result<Value> {
         Ok(self
-            .navigate_to_nodes(&params.text_document.uri, &params.id, move |n| {
-                let mut cursor = n.walk();
-                n.named_children(&mut cursor).map(triple).collect()
-            })
+            .navigate_to_nodes_shadowed(
+                &params.text_document.uri,
+                &params.id,
+                crate::tree_worker::NodeNavigation::NamedChildren,
+                move |n| {
+                    let mut cursor = n.walk();
+                    n.named_children(&mut cursor).map(triple).collect()
+                },
+            )
             .await)
     }
 
@@ -105,9 +122,12 @@ impl Kakehashi {
     /// `Node::next_sibling`. `null` for the last child or an unresolvable id.
     pub async fn kakehashi_node_next_sibling(&self, params: NodeIdParams) -> Result<Value> {
         Ok(self
-            .navigate_to_node(&params.text_document.uri, &params.id, move |n| {
-                n.next_sibling().map(triple)
-            })
+            .navigate_to_node_shadowed(
+                &params.text_document.uri,
+                &params.id,
+                crate::tree_worker::NodeNavigation::NextSibling,
+                move |n| n.next_sibling().map(triple),
+            )
             .await)
     }
 
@@ -115,9 +135,12 @@ impl Kakehashi {
     /// per `Node::prev_sibling`. `null` for the first child or an unresolvable id.
     pub async fn kakehashi_node_prev_sibling(&self, params: NodeIdParams) -> Result<Value> {
         Ok(self
-            .navigate_to_node(&params.text_document.uri, &params.id, move |n| {
-                n.prev_sibling().map(triple)
-            })
+            .navigate_to_node_shadowed(
+                &params.text_document.uri,
+                &params.id,
+                crate::tree_worker::NodeNavigation::PreviousSibling,
+                move |n| n.prev_sibling().map(triple),
+            )
             .await)
     }
 
@@ -125,9 +148,12 @@ impl Kakehashi {
     /// `Node::next_named_sibling`.
     pub async fn kakehashi_node_next_named_sibling(&self, params: NodeIdParams) -> Result<Value> {
         Ok(self
-            .navigate_to_node(&params.text_document.uri, &params.id, move |n| {
-                n.next_named_sibling().map(triple)
-            })
+            .navigate_to_node_shadowed(
+                &params.text_document.uri,
+                &params.id,
+                crate::tree_worker::NodeNavigation::NextNamedSibling,
+                move |n| n.next_named_sibling().map(triple),
+            )
             .await)
     }
 
@@ -135,9 +161,12 @@ impl Kakehashi {
     /// `Node::prev_named_sibling`.
     pub async fn kakehashi_node_prev_named_sibling(&self, params: NodeIdParams) -> Result<Value> {
         Ok(self
-            .navigate_to_node(&params.text_document.uri, &params.id, move |n| {
-                n.prev_named_sibling().map(triple)
-            })
+            .navigate_to_node_shadowed(
+                &params.text_document.uri,
+                &params.id,
+                crate::tree_worker::NodeNavigation::PreviousNamedSibling,
+                move |n| n.prev_named_sibling().map(triple),
+            )
             .await)
     }
 
@@ -152,16 +181,21 @@ impl Kakehashi {
         params: NodeByteParams,
     ) -> Result<Value> {
         let byte = usize::try_from(params.byte).ok();
+        let Some(byte) = byte else {
+            return Ok(Value::Null);
+        };
         Ok(self
-            .navigate_to_node_in_ranges(
+            .navigate_to_node_in_ranges_shadowed(
                 &params.text_document.uri,
                 &params.id,
+                crate::tree_worker::NodeNavigation::FirstChildForByte { byte },
                 move |n, text, ranges| {
                     // Keep the byte inside the node's own span before handing it to
                     // tree-sitter, whose behaviour for offsets outside the queried
                     // node is version-dependent (mirrors lookup::find_node_at). These
                     // are node-scoped accessors, so an out-of-node argument is null.
-                    byte.filter(|&b| n.start_byte() <= b && b <= n.end_byte())
+                    Some(byte)
+                        .filter(|&b| n.start_byte() <= b && b <= n.end_byte())
                         .filter(|&b| ranges_contain_byte(ranges, b, text.len()))
                         .and_then(|b| n.first_child_for_byte(b))
                         .map(triple)
@@ -181,12 +215,20 @@ impl Kakehashi {
         params: NodeByteRangeParams,
     ) -> Result<Value> {
         let range = byte_range(&params);
+        let Some((start_byte, end_byte)) = range else {
+            return Ok(Value::Null);
+        };
         Ok(self
-            .navigate_to_node_in_ranges(
+            .navigate_to_node_in_ranges_shadowed(
                 &params.text_document.uri,
                 &params.id,
+                crate::tree_worker::NodeNavigation::DescendantForByteRange {
+                    start_byte,
+                    end_byte,
+                    named: false,
+                },
                 move |n, text, ranges| {
-                    range
+                    Some((start_byte, end_byte))
                         .filter(|&(s, e)| n.start_byte() <= s && e <= n.end_byte())
                         .filter(|&(s, e)| range_bounds_in_ranges(ranges, s, e, text.len()))
                         .and_then(|(s, e)| n.descendant_for_byte_range(s, e))
@@ -207,12 +249,20 @@ impl Kakehashi {
         params: NodeByteRangeParams,
     ) -> Result<Value> {
         let range = byte_range(&params);
+        let Some((start_byte, end_byte)) = range else {
+            return Ok(Value::Null);
+        };
         Ok(self
-            .navigate_to_node_in_ranges(
+            .navigate_to_node_in_ranges_shadowed(
                 &params.text_document.uri,
                 &params.id,
+                crate::tree_worker::NodeNavigation::DescendantForByteRange {
+                    start_byte,
+                    end_byte,
+                    named: true,
+                },
                 move |n, text, ranges| {
-                    range
+                    Some((start_byte, end_byte))
                         .filter(|&(s, e)| n.start_byte() <= s && e <= n.end_byte())
                         .filter(|&(s, e)| range_bounds_in_ranges(ranges, s, e, text.len()))
                         .and_then(|(s, e)| n.named_descendant_for_byte_range(s, e))

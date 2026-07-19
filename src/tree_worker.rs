@@ -136,6 +136,7 @@ pub enum NodeScalarOperation {
     DescendantCount,
     SExpression,
     Text,
+    FieldNameForChild { index: u32, named: bool },
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -145,14 +146,39 @@ pub enum NodeScalarValue {
     Bool(bool),
     U64(u64),
     ByteRange { start_byte: u64, end_byte: u64 },
+    NullableString(Option<String>),
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum NodeNavigation {
     Parent,
     Children,
     NamedChildren,
+    Child {
+        index: u32,
+    },
+    NamedChild {
+        index: u32,
+    },
+    NextSibling,
+    PreviousSibling,
+    NextNamedSibling,
+    PreviousNamedSibling,
+    FirstChildForByte {
+        byte: usize,
+    },
+    DescendantForByteRange {
+        start_byte: usize,
+        end_byte: usize,
+        named: bool,
+    },
+    ChildByFieldName {
+        name: String,
+    },
+    ChildrenByFieldName {
+        name: String,
+    },
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
@@ -442,6 +468,48 @@ impl DocumentReplica {
             NodeNavigation::NamedChildren => (0..node.named_child_count() as u32)
                 .filter_map(|index| node.named_child(index))
                 .collect(),
+            NodeNavigation::Child { index } => node.child(index).into_iter().collect(),
+            NodeNavigation::NamedChild { index } => node.named_child(index).into_iter().collect(),
+            NodeNavigation::NextSibling => node.next_sibling().into_iter().collect(),
+            NodeNavigation::PreviousSibling => node.prev_sibling().into_iter().collect(),
+            NodeNavigation::NextNamedSibling => node.next_named_sibling().into_iter().collect(),
+            NodeNavigation::PreviousNamedSibling => node.prev_named_sibling().into_iter().collect(),
+            NodeNavigation::FirstChildForByte { byte } => {
+                if node.start_byte() <= byte && byte <= node.end_byte() && byte <= self.text.len() {
+                    node.first_child_for_byte(byte).into_iter().collect()
+                } else {
+                    Vec::new()
+                }
+            }
+            NodeNavigation::DescendantForByteRange {
+                start_byte,
+                end_byte,
+                named,
+            } => {
+                if node.start_byte() <= start_byte
+                    && start_byte <= end_byte
+                    && end_byte <= node.end_byte()
+                {
+                    if named {
+                        node.named_descendant_for_byte_range(start_byte, end_byte)
+                            .into_iter()
+                            .collect()
+                    } else {
+                        node.descendant_for_byte_range(start_byte, end_byte)
+                            .into_iter()
+                            .collect()
+                    }
+                } else {
+                    Vec::new()
+                }
+            }
+            NodeNavigation::ChildByFieldName { name } => {
+                node.child_by_field_name(&name).into_iter().collect()
+            }
+            NodeNavigation::ChildrenByFieldName { name } => {
+                let mut cursor = node.walk();
+                node.children_by_field_name(&name, &mut cursor).collect()
+            }
         };
         let nodes = selected
             .into_iter()
@@ -495,6 +563,14 @@ impl DocumentReplica {
                     .ok_or_else(|| "node text is not a valid UTF-8 slice".to_string())?
                     .to_string(),
             ),
+            NodeScalarOperation::FieldNameForChild { index, named } => {
+                let field = if named {
+                    node.field_name_for_named_child(index)
+                } else {
+                    node.field_name_for_child(index)
+                };
+                NodeScalarValue::NullableString(field.map(str::to_string))
+            }
         };
         Ok(NodeScalarResult {
             context: request.context,
@@ -3142,6 +3218,33 @@ mod tests {
             .unwrap();
         assert_eq!(parent.nodes.len(), 1);
         assert_eq!(parent.nodes[0].kind, "function_item");
+
+        let named = replica
+            .navigate_node(NavigateNode {
+                context: context.clone(),
+                node_id: parent.nodes[0].id.clone(),
+                operation: NodeNavigation::ChildByFieldName {
+                    name: "name".into(),
+                },
+            })
+            .unwrap();
+        assert_eq!(named.nodes.len(), 1);
+        assert_eq!(named.nodes[0].kind, "identifier");
+        assert_eq!(named.nodes[0].start_byte, 3);
+
+        let descendant = replica
+            .navigate_node(NavigateNode {
+                context: context.clone(),
+                node_id: parent.nodes[0].id.clone(),
+                operation: NodeNavigation::DescendantForByteRange {
+                    start_byte: 3,
+                    end_byte: 7,
+                    named: true,
+                },
+            })
+            .unwrap();
+        assert_eq!(descendant.nodes.len(), 1);
+        assert_eq!(descendant.nodes[0].kind, "identifier");
 
         let mut edited = context.clone();
         edited.request_id = 2;
