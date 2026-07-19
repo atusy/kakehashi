@@ -244,6 +244,11 @@ fn authoritative_worker_serves_injected_node_accessors() {
         json!({ "textDocument": { "uri": uri }, "id": id }),
     );
     assert_eq!(kind["result"]["kind"], "identifier");
+    let semantic = client.send_request(
+        "textDocument/semanticTokens/full",
+        json!({ "textDocument": { "uri": uri } }),
+    );
+    assert!(semantic["result"]["data"].is_array(), "{semantic:?}");
 
     let stderr = shutdown_and_stderr(client);
     assert!(stderr.contains("Authoritative tree worker"), "{stderr}");

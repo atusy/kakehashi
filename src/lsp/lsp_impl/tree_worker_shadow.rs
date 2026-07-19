@@ -3448,7 +3448,7 @@ mod tests {
     }
 
     #[test]
-    fn closing_document_discards_legacy_to_worker_node_mappings() {
+    fn closing_document_discards_all_public_to_worker_node_mappings() {
         let (sender, receiver) = mpsc::sync_channel(1);
         let shadow = shadow(sender);
         let uri = url::Url::parse("file:///mapped.rs").unwrap();
@@ -3468,7 +3468,7 @@ mod tests {
                 layer: 0,
             },
         );
-        assert_eq!(shadow.worker_nodes.len(), 1);
+        assert_eq!(shadow.worker_nodes.len(), 2);
 
         shadow.mirror_close(&uri, 1, 1, 0);
 

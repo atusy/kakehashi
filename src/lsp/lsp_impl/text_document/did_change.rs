@@ -159,19 +159,28 @@ impl Kakehashi {
             .close_invalidated_virtual_docs(&uri, &invalidated_ulids)
             .await;
 
-        // Schedule the OFF-INGRESS reparse: this replaces the inline parse_document,
-        // the post-parse process_injections (didChange forwarding + injected-language
-        // processing + eager bridge spawn), the geometry re-merge republish, AND the
-        // debounced diagnostic — all of which need the fresh tree and so run in the
-        // spawned, coalescing parse loop instead of holding the writer ticket.
+        // Legacy/shadow ownership schedules the OFF-INGRESS parent reparse, which
+        // runs the tree-dependent post-parse workflows. Authoritative ownership
+        // already submitted this exact edit to the worker replica above; it must
+        // not parse the same text again in the parent. Advance the same-incarnation
+        // ingress watermark immediately instead: worker readers fence on the
+        // replica acknowledgment and do not consume the parent's parse watermark.
         //
-        // The debounced diagnostic in particular MUST run post-parse, not here: this
+        // In legacy/shadow mode, the debounced diagnostic in particular MUST run
+        // post-parse, not here: this
         // handler just cleared the tree, and `prepare_diagnostic_snapshot` returns
         // `None` without one (`Document::snapshot()` requires a tree). A `None`
         // snapshot makes the debounce a no-op, skipping the on-edit host re-sync
         // (#431) that keeps a push-only `_self` host server's diagnostics following
         // edits. The handler returns without waiting on the parse.
-        self.schedule_reparse(uri, ticket);
+        if self.tree_worker_shadow.is_authoritative() {
+            if let Some(ticket) = ticket {
+                self.documents
+                    .advance_watermark_for_incarnation(&uri, ticket, incarnation);
+            }
+        } else {
+            self.schedule_reparse(uri, ticket);
+        }
 
         // NOTE: We intentionally do NOT call semantic_tokens_refresh() here.
         // LSP clients already request new tokens after didChange (via semanticTokens/full/delta).

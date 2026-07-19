@@ -999,6 +999,7 @@ name = "kakehashi"
 version = "0.8.0"
 dependencies = [
  "arc-swap",
+ "bincode",
  "clap",
  "dashmap",
  "dirs",

@@ -105,6 +105,47 @@ impl CurrentTokens {
 }
 
 impl Kakehashi {
+    async fn semantic_input_for_tokens(
+        &self,
+        uri: &Url,
+        cancel_rx: Option<&mut crate::lsp::request_id::CancelReceiver>,
+        supersede: &crate::cancel::CancelToken,
+    ) -> TokenSnapshot {
+        if !self.tree_worker_shadow.is_authoritative() {
+            return self
+                .current_snapshot_for_tokens(uri, cancel_rx, supersede)
+                .await;
+        }
+        let Some((text, incarnation, content_version, language_id)) =
+            self.documents.get(uri).map(|document| {
+                (
+                    document.text_arc(),
+                    document.incarnation(),
+                    document.content_version(),
+                    document.language_id().map(str::to_owned),
+                )
+            })
+        else {
+            return TokenSnapshot::Absent;
+        };
+        let language =
+            self.language
+                .detect_language(uri.path(), &text, None, language_id.as_deref());
+        TokenSnapshot::Current(std::sync::Arc::new(
+            crate::document::snapshot::ParseSnapshot {
+                text,
+                tree: None,
+                language,
+                parsed_version: content_version,
+                incarnation,
+                injection_regions: None,
+                bridge_regions: None,
+                resolved_regions: None,
+                layer_trees: std::sync::OnceLock::new(),
+            },
+        ))
+    }
+
     fn semantic_snapshot_is_current(
         &self,
         uri: &Url,
@@ -277,7 +318,7 @@ impl Kakehashi {
         // the snapshot's own detected language — never a live re-detection
         // that could diverge from the tree's grammar.
         let snapshot = match self
-            .current_snapshot_for_tokens(&uri, cancel_rx.as_mut(), &cancel_token)
+            .semantic_input_for_tokens(&uri, cancel_rx.as_mut(), &cancel_token)
             .await
         {
             TokenSnapshot::Current(snapshot) => snapshot,
@@ -321,8 +362,7 @@ impl Kakehashi {
                 return Ok(None);
             }
         };
-        let (Some(language_name), Some(tree)) = (snapshot.language.clone(), snapshot.tree.clone())
-        else {
+        let Some(language_name) = snapshot.language.clone() else {
             // No detectable language, or resolved-but-tree-less (no parser
             // installed / crashed grammar): nothing to tokenize. The empty set
             // IS this snapshot's served state — record it so the parse loop
@@ -335,6 +375,16 @@ impl Kakehashi {
                 data: vec![],
             })));
         };
+        let tree = snapshot.tree.clone();
+        if !self.tree_worker_shadow.is_authoritative() && tree.is_none() {
+            self.cache
+                .record_served_semantic_version(&uri, snapshot.parsed_version);
+            self.cache.finish_request(&uri, request_id);
+            return Ok(Some(SemanticTokensResult::Tokens(SemanticTokens {
+                result_id: None,
+                data: vec![],
+            })));
+        }
         let text = std::sync::Arc::clone(&snapshot.text);
 
         // Ensure language is loaded before trying to get queries.
@@ -488,8 +538,10 @@ impl Kakehashi {
                 tracker: self.bridge.node_tracker_arc(),
                 cache: self.cache.injection_token_cache_arc(),
                 generation: token_generation,
-                documents: std::sync::Arc::clone(&self.documents),
-                parsed_version: snapshot.parsed_version,
+                currency: crate::analysis::semantic::InjectionCacheCurrency::Document {
+                    documents: std::sync::Arc::clone(&self.documents),
+                    parsed_version: snapshot.parsed_version,
+                },
                 incarnation: snapshot.incarnation,
                 // The snapshot's own discovery (ADR §3, don't-discover-twice):
                 // rebuilt into contexts instead of re-running the injection
@@ -498,18 +550,22 @@ impl Kakehashi {
             });
 
             // Compute tokens, racing against cancel notification if provided
-            let compute_future = handle_semantic_tokens_full(
-                &self.compute_pool,
-                text.clone(),
-                tree.clone(),
-                query,
-                Some(language_name.clone()),
-                Some(capture_mappings),
-                coordinator,
-                supports_multiline,
-                injection_cache,
-                Some(cancel_token.clone()),
-            );
+            let compute_future = async {
+                handle_semantic_tokens_full(
+                    &self.compute_pool,
+                    text.clone(),
+                    tree.clone()
+                        .expect("legacy semantic token computation requires a parse tree"),
+                    query,
+                    Some(language_name.clone()),
+                    Some(capture_mappings),
+                    coordinator,
+                    supports_multiline,
+                    injection_cache,
+                    Some(cancel_token.clone()),
+                )
+                .await
+            };
             let worker_future = self.tree_worker_shadow.semantic_tokens(
                 &uri,
                 snapshot.incarnation,
@@ -707,7 +763,7 @@ impl Kakehashi {
         // steady-state typing path where a stale answer corrupts the editor's
         // existing highlights AND poisons the client's delta baseline).
         let snapshot = match self
-            .current_snapshot_for_tokens(&uri, cancel_rx.as_mut(), &cancel_token)
+            .semantic_input_for_tokens(&uri, cancel_rx.as_mut(), &cancel_token)
             .await
         {
             TokenSnapshot::Current(snapshot) => snapshot,
@@ -753,8 +809,7 @@ impl Kakehashi {
                 return Ok(None);
             }
         };
-        let (Some(language_name), Some(tree)) = (snapshot.language.clone(), snapshot.tree.clone())
-        else {
+        let Some(language_name) = snapshot.language.clone() else {
             self.cache
                 .record_served_semantic_version(&uri, snapshot.parsed_version);
             self.cache.finish_request(&uri, request_id);
@@ -765,6 +820,18 @@ impl Kakehashi {
                 },
             )));
         };
+        let tree = snapshot.tree.clone();
+        if !self.tree_worker_shadow.is_authoritative() && tree.is_none() {
+            self.cache
+                .record_served_semantic_version(&uri, snapshot.parsed_version);
+            self.cache.finish_request(&uri, request_id);
+            return Ok(Some(SemanticTokensFullDeltaResult::Tokens(
+                SemanticTokens {
+                    result_id: None,
+                    data: vec![],
+                },
+            )));
+        }
         let text = std::sync::Arc::clone(&snapshot.text);
 
         // Ensure language is loaded before trying to get queries.
@@ -929,26 +996,32 @@ impl Kakehashi {
                     tracker: self.bridge.node_tracker_arc(),
                     cache: self.cache.injection_token_cache_arc(),
                     generation: token_generation,
-                    documents: std::sync::Arc::clone(&self.documents),
-                    parsed_version: snapshot.parsed_version,
+                    currency: crate::analysis::semantic::InjectionCacheCurrency::Document {
+                        documents: std::sync::Arc::clone(&self.documents),
+                        parsed_version: snapshot.parsed_version,
+                    },
                     incarnation: snapshot.incarnation,
                     // The snapshot's own discovery (ADR §3, don't-discover-twice).
                     discovery: snapshot.injection_regions.clone(),
                 });
 
                 // Compute tokens, racing against cancel notification if provided
-                let compute_future = handle_semantic_tokens_full(
-                    &self.compute_pool,
-                    text.clone(),
-                    tree.clone(),
-                    query,
-                    Some(language_name.clone()),
-                    Some(capture_mappings),
-                    coordinator,
-                    supports_multiline,
-                    injection_cache,
-                    Some(cancel_token.clone()),
-                );
+                let compute_future = async {
+                    handle_semantic_tokens_full(
+                        &self.compute_pool,
+                        text.clone(),
+                        tree.clone()
+                            .expect("legacy semantic token computation requires a parse tree"),
+                        query,
+                        Some(language_name.clone()),
+                        Some(capture_mappings),
+                        coordinator,
+                        supports_multiline,
+                        injection_cache,
+                        Some(cancel_token.clone()),
+                    )
+                    .await
+                };
                 let worker_future = self.tree_worker_shadow.semantic_tokens(
                     &uri,
                     snapshot.incarnation,

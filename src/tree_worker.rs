@@ -22,7 +22,7 @@ use sha2::{Digest, Sha256};
 
 use crate::language::node_tracker::{EditInfo, NodeTracker};
 
-pub const PROTOCOL_VERSION: u32 = 12;
+pub const PROTOCOL_VERSION: u32 = 13;
 pub const MAX_FRAME_BYTES: usize = 64 * 1024 * 1024;
 pub const MAX_DOCUMENT_REPLICAS: usize = 4_096;
 pub const MAX_DOCUMENT_BYTES: usize = 32 * 1024 * 1024;
@@ -214,7 +214,6 @@ pub enum NodeScalarOperation {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(tag = "type", content = "value", rename_all = "snake_case")]
 pub enum NodeScalarValue {
     String(String),
     Bool(bool),
@@ -417,7 +416,6 @@ pub struct WorkerRestartRequired {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
 pub enum Request {
     Handshake(Handshake),
     DeriveSnapshot(DeriveSnapshot),
@@ -466,7 +464,6 @@ pub struct WorkerError {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
 pub enum Response {
     HandshakeReady(HandshakeReady),
     DocumentAck(DocumentAck),
@@ -491,11 +488,14 @@ struct DocumentReplica {
     text: String,
     tree: tree_sitter::Tree,
     uri: url::Url,
-    node_tracker: NodeTracker,
+    node_tracker: Arc<NodeTracker>,
     analysis: Arc<crate::language::LanguageCoordinator>,
     grammar_language: tree_sitter::Language,
     queries: WorkerQuerySources,
     captures_match_cache: crate::lsp::lsp_impl::kakehashi::captures_match_cache::CapturesMatchCache,
+    injection_token_cache: Arc<crate::analysis::InjectionTokenCache>,
+    injection_cache_edits: u8,
+    semantic_discovery: Option<Arc<crate::document::DiscoveredInjections>>,
     injection_layers: Vec<CachedInjectionLayer>,
 }
 
@@ -533,7 +533,7 @@ impl DocumentReplica {
         let grammar_key = GrammarKey::from_sync(&request);
         let uri = url::Url::parse(&request.context.uri)
             .map_err(|error| format!("document URI is invalid: {error}"))?;
-        let node_tracker = NodeTracker::new();
+        let node_tracker = Arc::new(NodeTracker::new());
         node_tracker.open_incarnation(&uri, request.context.incarnation);
         let grammar_language = parser
             .language()
@@ -563,6 +563,9 @@ impl DocumentReplica {
                 grammar_language,
                 queries: request.queries,
                 captures_match_cache: Default::default(),
+                injection_token_cache: Arc::new(crate::analysis::InjectionTokenCache::new()),
+                injection_cache_edits: 0,
+                semantic_discovery: None,
                 injection_layers: Vec::new(),
             },
             ack,
@@ -628,6 +631,11 @@ impl DocumentReplica {
         self.text = text;
         self.tree = tree;
         self.injection_layers.clear();
+        self.semantic_discovery = None;
+        self.injection_cache_edits = self.injection_cache_edits.wrapping_add(1);
+        if self.injection_cache_edits == 0 {
+            self.injection_token_cache.clear_document(&self.uri);
+        }
         self.node_tracker
             .apply_input_edits(&self.uri, &tracker_edits);
         self.context = request.context;
@@ -1042,7 +1050,7 @@ impl DocumentReplica {
     }
 
     fn derive_semantic_tokens(
-        &self,
+        &mut self,
         request: DeriveSemanticTokens,
     ) -> Result<DerivedSemanticTokens, String> {
         self.validate_read_identity(&request.context)?;
@@ -1057,6 +1065,7 @@ impl DocumentReplica {
             .analysis
             .highlight_query(&self.language)
             .ok_or_else(|| "worker highlight query is unavailable".to_string())?;
+        let discovery = self.semantic_discovery(request.context.configuration_generation);
         let result = crate::analysis::compute_semantic_tokens_full(
             rayon::current_num_threads(),
             Arc::from(self.text.as_str()),
@@ -1066,7 +1075,15 @@ impl DocumentReplica {
             Some(self.analysis.capture_mappings()),
             Arc::clone(&self.analysis),
             request.supports_multiline,
-            None,
+            Some(crate::analysis::semantic::InjectionCacheParams {
+                uri: self.uri.clone(),
+                tracker: Arc::clone(&self.node_tracker),
+                cache: Arc::clone(&self.injection_token_cache),
+                generation: request.context.configuration_generation,
+                currency: crate::analysis::semantic::InjectionCacheCurrency::Current,
+                incarnation: request.context.incarnation,
+                discovery,
+            }),
             None,
         )
         .ok_or_else(|| "worker semantic token derivation was cancelled".to_string())?;
@@ -1087,6 +1104,56 @@ impl DocumentReplica {
             context: request.context,
             tokens,
         })
+    }
+
+    fn semantic_discovery(
+        &mut self,
+        generation: u64,
+    ) -> Option<Arc<crate::document::DiscoveredInjections>> {
+        if self
+            .semantic_discovery
+            .as_ref()
+            .is_some_and(|discovery| discovery.generation == generation)
+        {
+            return self.semantic_discovery.clone();
+        }
+        let injection_query = self.analysis.injection_query(&self.language)?;
+        let regions = crate::language::injection::collect_all_injections(
+            &self.tree.root_node(),
+            &self.text,
+            Some(injection_query.as_ref()),
+        )?;
+        let cacheable = regions
+            .iter()
+            .map(|region| {
+                let id = crate::language::InjectionResolver::calculate_region_id(
+                    &self.node_tracker,
+                    &self.uri,
+                    region,
+                    self.context.incarnation,
+                )?;
+                Some(
+                    crate::language::injection::CacheableInjectionRegion::from_region_info(
+                        region,
+                        &id.to_string(),
+                        &self.text,
+                    ),
+                )
+            })
+            .collect::<Option<Vec<_>>>()?;
+        self.semantic_discovery = crate::analysis::semantic::build_document_discovery(
+            &regions,
+            &cacheable,
+            injection_query.as_ref(),
+            &self.text,
+            &self.analysis,
+            &self.uri,
+            &self.node_tracker,
+            generation,
+            self.context.incarnation,
+        )
+        .map(Arc::new);
+        self.semantic_discovery.clone()
     }
 
     fn run_captures(&self, request: RunCaptures) -> Result<CapturesResult, String> {
@@ -1645,7 +1712,7 @@ fn ranges_cover_query(
 }
 
 pub fn encode_frame<W: Write, T: Serialize>(writer: &mut W, value: &T) -> io::Result<()> {
-    let payload = serde_json::to_vec(value)
+    let payload = bincode::serialize(value)
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
     if payload.len() > MAX_FRAME_BYTES {
         return Err(io::Error::new(
@@ -1676,7 +1743,7 @@ pub fn decode_frame<R: Read, T: DeserializeOwned>(reader: &mut R) -> io::Result<
     }
     let mut payload = vec![0_u8; length];
     reader.read_exact(&mut payload)?;
-    serde_json::from_slice(&payload)
+    bincode::deserialize(&payload)
         .map(Some)
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
 }
@@ -2397,7 +2464,7 @@ fn derive_semantic_tokens(request: DeriveSemanticTokens, documents: &DocumentSto
         });
     };
     match replica.lock() {
-        Ok(replica) => match replica.derive_semantic_tokens(request) {
+        Ok(mut replica) => match replica.derive_semantic_tokens(request) {
             Ok(result) => Response::SemanticTokens(result),
             Err(message) => Response::Error(WorkerError {
                 context: Some(context),
@@ -4697,7 +4764,7 @@ mod tests {
             content_version: 1,
             configuration_generation: 2,
         };
-        let (replica, _) = DocumentReplica::sync(
+        let (mut replica, _) = DocumentReplica::sync(
             SyncDocument {
                 context: context.clone(),
                 language: "rust".into(),
@@ -4800,7 +4867,7 @@ mod tests {
             content_version: 1,
             configuration_generation: 2,
         };
-        let (replica, _) = DocumentReplica::sync(
+        let (mut replica, _) = DocumentReplica::sync(
             SyncDocument {
                 context: context.clone(),
                 language: "rust".into(),
