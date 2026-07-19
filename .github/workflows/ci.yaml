@@ -32,6 +32,7 @@ jobs:
       - run: rustup component add rust-analyzer
       - run: make deps/tree-sitter
       - run: cargo test
+      - run: cargo build --release --locked --bin kakehashi
       - name: Smoke-test tree worker benchmark CLI
         run: >-
           cargo bench --locked --bench tree_worker_stage1 --
