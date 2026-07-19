@@ -72,7 +72,7 @@ impl Kakehashi {
         self.ensure_document_parsed(&uri).await;
 
         // Get document snapshot (minimizes lock duration)
-        let snapshot = match self.documents.get(&uri) {
+        let (snapshot, content_version) = match self.documents.get(&uri) {
             None => {
                 log::debug!("documentSymbol: No document found for {}", uri);
                 return Ok(None);
@@ -82,7 +82,7 @@ impl Kakehashi {
                     log::debug!("documentSymbol: Document not fully initialized for {}", uri);
                     return Ok(None);
                 }
-                Some(snapshot) => snapshot,
+                Some(snapshot) => (snapshot, doc.content_version()),
             },
             // doc automatically dropped here, lock released
         };
@@ -114,6 +114,14 @@ impl Kakehashi {
                 snapshot.incarnation(),
             )),
         };
+
+        self.shadow_compare_current_injection_regions(
+            &uri,
+            snapshot.incarnation(),
+            content_version,
+            &all_regions,
+        )
+        .await;
 
         if all_regions.is_empty() {
             return Ok(None);

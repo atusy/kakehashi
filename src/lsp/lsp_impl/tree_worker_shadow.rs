@@ -18,6 +18,8 @@ use crate::tree_worker::{
     WirePosition, WorkerLanguageAsset, named_node_count,
 };
 
+use super::Kakehashi;
+
 const SHADOW_ENV: &str = "KAKEHASHI_TREE_WORKER_SHADOW";
 const SHADOW_THREADS_ENV: &str = "KAKEHASHI_TREE_WORKER_THREADS";
 const SHADOW_QUEUE_CAPACITY: usize = 256;
@@ -1342,6 +1344,46 @@ impl TreeWorkerShadow {
             self.sender.as_ref(),
             &self.comparisons,
             timeout,
+        );
+    }
+}
+
+impl Kakehashi {
+    pub(super) async fn shadow_compare_current_injection_regions(
+        &self,
+        uri: &url::Url,
+        incarnation: u64,
+        parsed_version: u64,
+        authoritative: &[crate::language::injection::ResolvedInjection],
+    ) {
+        let Some(view) = self.documents.latest_snapshot(uri) else {
+            return;
+        };
+        if view.slot.current_incarnation != incarnation
+            || view.content_version != parsed_version
+            || view.slot.snapshot.as_ref().is_none_or(|current| {
+                current.incarnation != incarnation || current.parsed_version != parsed_version
+            })
+        {
+            return;
+        }
+        let Some(worker_regions) = self
+            .tree_worker_shadow
+            .injection_regions(
+                uri,
+                incarnation,
+                parsed_version,
+                self.cache.semantic_token_generation(),
+            )
+            .await
+        else {
+            return;
+        };
+        self.tree_worker_shadow.compare_injection_regions(
+            uri,
+            parsed_version,
+            authoritative,
+            &worker_regions,
         );
     }
 }

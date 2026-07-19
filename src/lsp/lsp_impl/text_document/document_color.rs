@@ -40,7 +40,7 @@ impl Kakehashi {
         self.ensure_document_parsed(&uri).await;
 
         // Get document snapshot (minimizes lock duration)
-        let snapshot = match self.documents.get(&uri) {
+        let (snapshot, content_version) = match self.documents.get(&uri) {
             None => {
                 log::debug!("documentColor: No document found for {}", uri);
                 return Ok(Vec::new());
@@ -50,7 +50,7 @@ impl Kakehashi {
                     log::debug!("documentColor: Document not fully initialized for {}", uri);
                     return Ok(Vec::new());
                 }
-                Some(snapshot) => snapshot,
+                Some(snapshot) => (snapshot, doc.content_version()),
             },
             // doc automatically dropped here, lock released
         };
@@ -96,29 +96,13 @@ impl Kakehashi {
         // consumes every injection. Issuing this RPC from the parse hot path
         // can overtake queued edits on the document lane and makes the shadow
         // observation causally stale under a typing burst.
-        if let Some(view) = self.documents.latest_snapshot(&uri)
-            && view.slot.current_incarnation == snapshot.incarnation()
-            && view.slot.snapshot.as_ref().is_some_and(|current| {
-                current.incarnation == snapshot.incarnation()
-                    && current.parsed_version == view.content_version
-            })
-            && let Some(worker_regions) = self
-                .tree_worker_shadow
-                .injection_regions(
-                    &uri,
-                    snapshot.incarnation(),
-                    view.content_version,
-                    self.cache.semantic_token_generation(),
-                )
-                .await
-        {
-            self.tree_worker_shadow.compare_injection_regions(
-                &uri,
-                view.content_version,
-                &all_regions,
-                &worker_regions,
-            );
-        }
+        self.shadow_compare_current_injection_regions(
+            &uri,
+            snapshot.incarnation(),
+            content_version,
+            &all_regions,
+        )
+        .await;
 
         if all_regions.is_empty() {
             return Ok(Vec::new());
