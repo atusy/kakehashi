@@ -12,8 +12,8 @@ use crate::language::coordinator::WorkerGrammarDescriptor;
 use crate::lsp::text_sync::SequentialByteEdit;
 use crate::tree_worker::{
     ApplyDocumentEditsAndDerive, ByteEdit, Client, CloseDocument, DeriveDocumentSnapshot,
-    NavigateNode, NodeNavigation, NodeResult, OpaqueNodeId, RequestContext, ResolveNode, Response,
-    SyncDocument, named_node_count,
+    NavigateNode, NodeNavigation, NodeResult, NodeScalarOperation, NodeScalarValue, OpaqueNodeId,
+    RequestContext, ResolveNode, Response, RunNodeScalar, SyncDocument, named_node_count,
 };
 
 const SHADOW_ENV: &str = "KAKEHASHI_TREE_WORKER_SHADOW";
@@ -667,6 +667,72 @@ impl TreeWorkerShadow {
         {
             self.record_node_mapping(uri, authoritative_node, worker_node);
         }
+    }
+
+    pub(super) async fn node_scalar(
+        &self,
+        uri: &url::Url,
+        authoritative_input_id: &str,
+        operation: NodeScalarOperation,
+    ) -> Option<NodeScalarValue> {
+        let key = (uri.as_str().to_string(), authoritative_input_id.to_string());
+        let node_id = self.worker_nodes.get(&key).map(|entry| entry.clone())?;
+        let sync = self
+            .open_documents
+            .lock()
+            .recover_poison("TreeWorkerShadow::node_scalar(context)")
+            .current
+            .get(uri.as_str())
+            .cloned()?;
+        let client = self.read_client.load_full()?;
+        if !self.is_enabled() || node_id.worker_generation != client.worker_generation() {
+            self.worker_nodes.remove(&key);
+            return None;
+        }
+        let context = self.read_context(
+            &client,
+            uri,
+            sync.context.incarnation,
+            sync.context.content_version,
+            sync.context.configuration_generation,
+        );
+        let expected = context.clone();
+        let response = tokio::task::spawn_blocking(move || {
+            client.run_node_scalar(RunNodeScalar {
+                context,
+                node_id,
+                operation,
+            })
+        })
+        .await
+        .ok()?
+        .ok()?;
+        let Response::NodeScalar(result) = response else {
+            return None;
+        };
+        if result.context != expected {
+            return None;
+        }
+        let current = self
+            .open_documents
+            .lock()
+            .recover_poison("TreeWorkerShadow::node_scalar(admission)")
+            .current
+            .get(uri.as_str())
+            .map(|current| current.context.clone());
+        if current.as_ref().is_none_or(|current| {
+            current.incarnation != expected.incarnation
+                || current.content_version != expected.content_version
+                || current.configuration_generation != expected.configuration_generation
+        }) || self
+            .read_client
+            .load()
+            .as_ref()
+            .is_none_or(|client| client.worker_generation() != expected.worker_generation)
+        {
+            return None;
+        }
+        result.value
     }
 
     #[allow(clippy::too_many_arguments)]

@@ -38,6 +38,14 @@ impl Kakehashi {
             log::warn!(target: "kakehashi::node::text", "invalid URI: {}", lsp_uri.as_str());
             return Ok(Value::Null);
         };
+        let shadow = self
+            .tree_worker_shadow
+            .node_scalar(
+                &uri,
+                &params.id,
+                crate::tree_worker::NodeScalarOperation::Text,
+            )
+            .await;
 
         // Malformed ULID: node-reference-protocol says any unresolvable reference collapses to null,
         // so we treat a parse failure the same as a never-issued ULID rather than
@@ -87,6 +95,18 @@ impl Kakehashi {
             slice.to_string()
         };
 
-        Ok(json!({ "text": slice }))
+        let authoritative = json!({ "text": slice });
+        if let Some(crate::tree_worker::NodeScalarValue::String(text)) = shadow {
+            let worker = json!({ "text": text });
+            if worker != authoritative {
+                log::debug!(
+                    target: "kakehashi::tree_worker_shadow",
+                    "node text mismatch authoritative={} worker={}",
+                    authoritative,
+                    worker,
+                );
+            }
+        }
+        Ok(authoritative)
     }
 }

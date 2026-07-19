@@ -111,6 +111,42 @@ pub struct NavigateNode {
     pub operation: NodeNavigation,
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct RunNodeScalar {
+    pub context: RequestContext,
+    pub node_id: OpaqueNodeId,
+    pub operation: NodeScalarOperation,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NodeScalarOperation {
+    Kind,
+    GrammarName,
+    IsNamed,
+    IsExtra,
+    HasError,
+    IsError,
+    IsMissing,
+    StartByte,
+    EndByte,
+    ByteRange,
+    ChildCount,
+    NamedChildCount,
+    DescendantCount,
+    SExpression,
+    Text,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "type", content = "value", rename_all = "snake_case")]
+pub enum NodeScalarValue {
+    String(String),
+    Bool(bool),
+    U64(u64),
+    ByteRange { start_byte: u64, end_byte: u64 },
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum NodeNavigation {
@@ -139,6 +175,12 @@ pub struct OwnedNode {
 pub struct NodeResult {
     pub context: RequestContext,
     pub nodes: Vec<OwnedNode>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct NodeScalarResult {
+    pub context: RequestContext,
+    pub value: Option<NodeScalarValue>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -174,6 +216,7 @@ pub enum Request {
     DeriveDocumentSnapshot(DeriveDocumentSnapshot),
     ResolveNode(ResolveNode),
     NavigateNode(NavigateNode),
+    RunNodeScalar(RunNodeScalar),
     CloseDocument(CloseDocument),
 }
 
@@ -214,6 +257,7 @@ pub enum Response {
     WorkerRestartRequired(WorkerRestartRequired),
     Snapshot(DerivedSnapshot),
     Nodes(NodeResult),
+    NodeScalar(NodeScalarResult),
     Error(WorkerError),
 }
 
@@ -384,33 +428,7 @@ impl DocumentReplica {
 
     fn navigate_node(&mut self, request: NavigateNode) -> Result<NodeResult, String> {
         self.validate_read_identity(&request.context)?;
-        if request.node_id.worker_generation != request.context.worker_generation {
-            return Ok(NodeResult {
-                context: request.context,
-                nodes: Vec::new(),
-            });
-        }
-        let Ok(ulid) = request.node_id.local_id.parse::<ulid::Ulid>() else {
-            return Ok(NodeResult {
-                context: request.context,
-                nodes: Vec::new(),
-            });
-        };
-        let Some((start_byte, end_byte, kind, layer, incarnation)) =
-            self.node_tracker.lookup_node(&self.uri, &ulid)
-        else {
-            return Ok(NodeResult {
-                context: request.context,
-                nodes: Vec::new(),
-            });
-        };
-        if layer != 0 || incarnation != request.context.incarnation {
-            return Ok(NodeResult {
-                context: request.context,
-                nodes: Vec::new(),
-            });
-        }
-        let Some(node) = find_exact_node(self.tree.root_node(), start_byte, end_byte, kind) else {
+        let Some(node) = self.tracked_node(&request.node_id, &request.context) else {
             return Ok(NodeResult {
                 context: request.context,
                 nodes: Vec::new(),
@@ -433,6 +451,72 @@ impl DocumentReplica {
             context: request.context,
             nodes,
         })
+    }
+
+    fn run_node_scalar(&self, request: RunNodeScalar) -> Result<NodeScalarResult, String> {
+        self.validate_read_identity(&request.context)?;
+        let Some(node) = self.tracked_node(&request.node_id, &request.context) else {
+            return Ok(NodeScalarResult {
+                context: request.context,
+                value: None,
+            });
+        };
+        let value = match request.operation {
+            NodeScalarOperation::Kind => NodeScalarValue::String(node.kind().into()),
+            NodeScalarOperation::GrammarName => NodeScalarValue::String(node.grammar_name().into()),
+            NodeScalarOperation::IsNamed => NodeScalarValue::Bool(node.is_named()),
+            NodeScalarOperation::IsExtra => NodeScalarValue::Bool(node.is_extra()),
+            NodeScalarOperation::HasError => NodeScalarValue::Bool(node.has_error()),
+            NodeScalarOperation::IsError => NodeScalarValue::Bool(node.is_error()),
+            NodeScalarOperation::IsMissing => NodeScalarValue::Bool(node.is_missing()),
+            NodeScalarOperation::StartByte => {
+                NodeScalarValue::U64(node.start_byte().try_into().unwrap_or(u64::MAX))
+            }
+            NodeScalarOperation::EndByte => {
+                NodeScalarValue::U64(node.end_byte().try_into().unwrap_or(u64::MAX))
+            }
+            NodeScalarOperation::ByteRange => NodeScalarValue::ByteRange {
+                start_byte: node.start_byte().try_into().unwrap_or(u64::MAX),
+                end_byte: node.end_byte().try_into().unwrap_or(u64::MAX),
+            },
+            NodeScalarOperation::ChildCount => {
+                NodeScalarValue::U64(node.child_count().try_into().unwrap_or(u64::MAX))
+            }
+            NodeScalarOperation::NamedChildCount => {
+                NodeScalarValue::U64(node.named_child_count().try_into().unwrap_or(u64::MAX))
+            }
+            NodeScalarOperation::DescendantCount => {
+                NodeScalarValue::U64(node.descendant_count().try_into().unwrap_or(u64::MAX))
+            }
+            NodeScalarOperation::SExpression => NodeScalarValue::String(node.to_sexp()),
+            NodeScalarOperation::Text => NodeScalarValue::String(
+                self.text
+                    .get(node.start_byte()..node.end_byte())
+                    .ok_or_else(|| "node text is not a valid UTF-8 slice".to_string())?
+                    .to_string(),
+            ),
+        };
+        Ok(NodeScalarResult {
+            context: request.context,
+            value: Some(value),
+        })
+    }
+
+    fn tracked_node<'tree>(
+        &'tree self,
+        node_id: &OpaqueNodeId,
+        context: &RequestContext,
+    ) -> Option<tree_sitter::Node<'tree>> {
+        if node_id.worker_generation != context.worker_generation {
+            return None;
+        }
+        let ulid = node_id.local_id.parse::<ulid::Ulid>().ok()?;
+        let (start_byte, end_byte, kind, layer, incarnation) =
+            self.node_tracker.lookup_node(&self.uri, &ulid)?;
+        if layer != 0 || incarnation != context.incarnation {
+            return None;
+        }
+        find_exact_node(self.tree.root_node(), start_byte, end_byte, kind)
     }
 
     fn register_node(
@@ -1149,6 +1233,7 @@ fn handle_work(
         }
         Request::ResolveNode(request) => resolve_node(request, documents),
         Request::NavigateNode(request) => navigate_node(request, documents),
+        Request::RunNodeScalar(request) => run_node_scalar(request, documents),
         Request::CloseDocument(request) => close_document(
             request,
             documents,
@@ -1172,6 +1257,7 @@ fn request_context(request: &Request) -> Option<&RequestContext> {
         Request::DeriveDocumentSnapshot(request) => Some(&request.context),
         Request::ResolveNode(request) => Some(&request.context),
         Request::NavigateNode(request) => Some(&request.context),
+        Request::RunNodeScalar(request) => Some(&request.context),
         Request::CloseDocument(request) => Some(&request.context),
     }
 }
@@ -1184,6 +1270,7 @@ fn document_key(request: &Request) -> Option<DocumentKey> {
         Request::DeriveDocumentSnapshot(request) => Some(DocumentKey::from(&request.context)),
         Request::ResolveNode(request) => Some(DocumentKey::from(&request.context)),
         Request::NavigateNode(request) => Some(DocumentKey::from(&request.context)),
+        Request::RunNodeScalar(request) => Some(DocumentKey::from(&request.context)),
         Request::CloseDocument(request) => Some(DocumentKey::from(&request.context)),
         Request::Handshake(_) | Request::DeriveSnapshot(_) => None,
     }
@@ -1226,6 +1313,29 @@ fn navigate_node(request: NavigateNode, documents: &DocumentStore) -> Response {
     match replica.lock() {
         Ok(mut replica) => match replica.navigate_node(request) {
             Ok(result) => Response::Nodes(result),
+            Err(message) => Response::Error(WorkerError {
+                context: Some(context),
+                message,
+            }),
+        },
+        Err(_) => poisoned_document_restart(context),
+    }
+}
+
+fn run_node_scalar(request: RunNodeScalar, documents: &DocumentStore) -> Response {
+    let context = request.context.clone();
+    let Some(replica) = documents
+        .get(&DocumentKey::from(&context))
+        .map(|entry| Arc::clone(entry.value()))
+    else {
+        return Response::Error(WorkerError {
+            context: Some(context),
+            message: "document replica is missing; full sync required".into(),
+        });
+    };
+    match replica.lock() {
+        Ok(replica) => match replica.run_node_scalar(request) {
+            Ok(result) => Response::NodeScalar(result),
             Err(message) => Response::Error(WorkerError {
                 context: Some(context),
                 message,
@@ -2085,6 +2195,15 @@ impl Client {
         )
     }
 
+    pub fn run_node_scalar(&self, request: RunNodeScalar) -> io::Result<Response> {
+        let context = request.context.clone();
+        self.request_with_timeout(
+            Request::RunNodeScalar(request),
+            context,
+            Duration::from_secs(60),
+        )
+    }
+
     pub fn close_document(&self, request: CloseDocument) -> io::Result<Response> {
         let context = request.context.clone();
         self.request_with_timeout(
@@ -2250,6 +2369,7 @@ fn response_request_id(response: &Response) -> Option<u64> {
         Response::WorkerRestartRequired(required) => Some(required.context.request_id),
         Response::Snapshot(snapshot) => Some(snapshot.context.request_id),
         Response::Nodes(result) => Some(result.context.request_id),
+        Response::NodeScalar(result) => Some(result.context.request_id),
         Response::Error(error) => error.context.as_ref().map(|context| context.request_id),
         Response::HandshakeReady(_) => None,
     }
@@ -2262,6 +2382,7 @@ fn response_context(response: &Response) -> Option<&RequestContext> {
         Response::WorkerRestartRequired(required) => Some(&required.context),
         Response::Snapshot(snapshot) => Some(&snapshot.context),
         Response::Nodes(result) => Some(&result.context),
+        Response::NodeScalar(result) => Some(&result.context),
         Response::Error(error) => error.context.as_ref(),
         Response::HandshakeReady(_) => None,
     }
@@ -2375,11 +2496,12 @@ mod tests {
         ApplyDocumentEdits, BUILD_ID, ByteEdit, CloseDocument, DeriveSnapshot, DocumentKey,
         DocumentLane, DocumentReplica, GrammarKey, Handshake, HandshakeReady, LaneAction,
         LaneRegistry, MAX_DOCUMENT_BYTES, MAX_DOCUMENT_REPLICAS, MAX_RETAINED_DOCUMENT_BYTES,
-        NavigateNode, NodeNavigation, OpaqueNodeId, PROTOCOL_VERSION, Request, RequestContext,
-        ResolveNode, Response, Route, SyncDocument, WorkerError, close_document, decode_frame,
-        derive_snapshot_with_language, encode_frame, named_node_count, replace_retained_bytes,
-        reserve_retained_growth, route_response, run, submit_document_job, sync_document,
-        terminate_by_transport, validate_document_size,
+        NavigateNode, NodeNavigation, NodeScalarOperation, NodeScalarValue, OpaqueNodeId,
+        PROTOCOL_VERSION, Request, RequestContext, ResolveNode, Response, Route, RunNodeScalar,
+        SyncDocument, WorkerError, close_document, decode_frame, derive_snapshot_with_language,
+        encode_frame, named_node_count, replace_retained_bytes, reserve_retained_growth,
+        route_response, run, submit_document_job, sync_document, terminate_by_transport,
+        validate_document_size,
     };
 
     #[derive(Clone, Default)]
@@ -3001,6 +3123,15 @@ mod tests {
         assert_eq!(resolved.nodes[0].kind, "identifier");
         assert_eq!(resolved.nodes[0].id.worker_generation, 3);
         let node_id = resolved.nodes[0].id.clone();
+
+        let scalar = replica
+            .run_node_scalar(RunNodeScalar {
+                context: context.clone(),
+                node_id: node_id.clone(),
+                operation: NodeScalarOperation::Text,
+            })
+            .unwrap();
+        assert_eq!(scalar.value, Some(NodeScalarValue::String("main".into())));
 
         let parent = replica
             .navigate_node(NavigateNode {

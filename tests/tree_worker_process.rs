@@ -4,7 +4,8 @@ use std::sync::{Arc, Barrier};
 #[cfg(feature = "e2e")]
 use kakehashi::tree_worker::{
     ApplyDocumentEdits, ByteEdit, CloseDocument, DeriveDocumentSnapshot, NavigateNode,
-    NodeNavigation, OpaqueNodeId, ResolveNode, SyncDocument,
+    NodeNavigation, NodeScalarOperation, NodeScalarValue, OpaqueNodeId, ResolveNode, RunNodeScalar,
+    SyncDocument,
 };
 use kakehashi::tree_worker::{Client, DeriveSnapshot, RequestContext, Response};
 
@@ -264,6 +265,19 @@ fn real_worker_keeps_document_text_and_tree_across_incremental_edits() {
 
     node_context.request_id = 34;
     let response = worker
+        .run_node_scalar(RunNodeScalar {
+            context: node_context.clone(),
+            node_id: nodes.nodes[0].id.clone(),
+            operation: NodeScalarOperation::Text,
+        })
+        .unwrap();
+    let Response::NodeScalar(scalar) = response else {
+        panic!("node scalar must return typed owned data: {response:?}");
+    };
+    assert_eq!(scalar.value, Some(NodeScalarValue::String("value".into())));
+
+    node_context.request_id = 35;
+    let response = worker
         .navigate_node(NavigateNode {
             context: node_context,
             node_id: OpaqueNodeId {
@@ -279,7 +293,7 @@ fn real_worker_keeps_document_text_and_tree_across_incremental_edits() {
     assert!(nodes.nodes.is_empty());
 
     let mut closed = snapshot.context;
-    closed.request_id = 35;
+    closed.request_id = 36;
     closed.content_version = 3;
     closed.configuration_generation = 1;
     let response = worker
@@ -289,7 +303,7 @@ fn real_worker_keeps_document_text_and_tree_across_incremental_edits() {
         .unwrap();
     assert!(matches!(response, Response::DocumentClosed(_)));
 
-    closed.request_id = 36;
+    closed.request_id = 37;
     let response = worker
         .sync_document(SyncDocument {
             context: closed.clone(),
@@ -306,7 +320,7 @@ fn real_worker_keeps_document_text_and_tree_across_incremental_edits() {
     };
     assert!(error.message.contains("closed document incarnation"));
 
-    closed.request_id = 37;
+    closed.request_id = 38;
     let response = worker
         .derive_document_snapshot(DeriveDocumentSnapshot { context: closed })
         .unwrap();
