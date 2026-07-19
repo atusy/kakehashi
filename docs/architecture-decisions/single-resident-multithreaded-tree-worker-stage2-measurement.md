@@ -41,8 +41,12 @@ source commit `40a8fc5a7e65b8b96b49a461bec4e77de9cb67d0` and the executable,
 benchmark, and parser SHA-256 identities. The release build ran on an Apple M4
 with macOS 26.5.1 and Rust 1.95.0. The Rust grammar source revision is recorded
 in the aggregate. Commit `a3455ffef` subsequently changed only poisoned-lock
-handling, a restart-only branch that none of these benchmark operations enter;
-the measured hot path is unchanged.
+handling, a restart-only branch that none of these benchmark operations enter.
+Commit `65bcbae8f` subsequently shortens the `DashMap` lane-registry guard
+before job submission. That change touches concurrent admission and can only
+remove registry-shard contention; these retained numbers therefore describe
+the exact measured binary, not the final Stage 2 head, and are conservative for
+the later head.
 
 For each size, two consecutive page-cache-warm batches first ran 5,000
 sequential rounds. To avoid the fixed-order reversal seen in Stage 1, even
