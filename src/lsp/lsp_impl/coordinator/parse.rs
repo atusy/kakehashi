@@ -210,7 +210,7 @@ impl ParseCoordinator {
                 let mut language_name_owned = language_name_owned;
                 for attempt in 0..2 {
                     let reload_wait_deadline = std::time::Instant::now() + RELOAD_WAIT_BACKSTOP;
-                    let (parser, parser_generation) = loop {
+                    let (parser, parser_generation, configuration_generation) = loop {
                         match parser_pool
                             .lock()
                             .recover_poison("ParseCoordinator::parse_with_pool(acquire)")
@@ -219,7 +219,8 @@ impl ParseCoordinator {
                             crate::language::parser_pool::ParserCheckout::Acquired(
                                 parser,
                                 generation,
-                            ) => break (parser, generation),
+                                configuration_generation,
+                            ) => break (parser, generation, configuration_generation),
                             crate::language::parser_pool::ParserCheckout::Reloading => {
                                 // A reload is synchronous and normally brief. Keep this
                                 // transient state inside the bounded work unit instead
@@ -251,7 +252,7 @@ impl ParseCoordinator {
                         .release_versioned(language_name_owned, parser, parser_generation)
                     {
                         Ok(()) => {
-                            return value.map(|value| (value, parser_generation));
+                            return value.map(|value| (value, configuration_generation));
                         }
                         Err(stale_language_name) => {
                             language_name_owned = stale_language_name;

@@ -32,11 +32,12 @@ pub struct DocumentParserPool {
     /// Factory for creating new parsers
     factory: ParserFactory,
     generation: u64,
+    configuration_generation: u64,
     reload_depth: usize,
 }
 
 pub(crate) enum ParserCheckout {
-    Acquired(Parser, u64),
+    Acquired(Parser, u64, u64),
     Reloading,
     Unavailable,
 }
@@ -48,6 +49,7 @@ impl DocumentParserPool {
             available: HashMap::new(),
             factory,
             generation: 0,
+            configuration_generation: 0,
             reload_depth: 0,
         }
     }
@@ -58,8 +60,9 @@ impl DocumentParserPool {
         self.reload_depth = self.reload_depth.saturating_add(1);
     }
 
-    pub(crate) fn finish_reload(&mut self) {
+    pub(crate) fn finish_reload_at(&mut self, configuration_generation: u64) {
         self.generation = self.generation.wrapping_add(1);
+        self.configuration_generation = configuration_generation;
         self.available.clear();
         self.reload_depth = self.reload_depth.saturating_sub(1);
     }
@@ -70,7 +73,9 @@ impl DocumentParserPool {
         }
         let generation = self.generation;
         match self.acquire(language_id) {
-            Some(parser) => ParserCheckout::Acquired(parser, generation),
+            Some(parser) => {
+                ParserCheckout::Acquired(parser, generation, self.configuration_generation)
+            }
             None => ParserCheckout::Unavailable,
         }
     }
@@ -168,5 +173,22 @@ mod tests {
         let parser2 = pool.acquire("rust");
         assert!(parser2.is_some());
         assert_eq!(pool.pool_size("rust"), 0);
+    }
+
+    #[test]
+    fn versioned_checkout_carries_the_reload_configuration_generation() {
+        let language_registry = create_test_language_registry();
+        let factory = ParserFactory::new(language_registry);
+        let mut pool = DocumentParserPool::new(factory);
+        pool.begin_reload();
+        pool.finish_reload_at(42);
+
+        let ParserCheckout::Acquired(_, _, configuration_generation) =
+            pool.acquire_versioned("rust")
+        else {
+            panic!("parser must be available after reload");
+        };
+
+        assert_eq!(configuration_generation, 42);
     }
 }

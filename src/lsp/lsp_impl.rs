@@ -124,15 +124,22 @@ pub(super) async fn lock_settings_reload() -> tokio::sync::MutexGuard<'static, (
 
 struct ParserReloadGuard<'a> {
     parser_pool: &'a std::sync::Mutex<DocumentParserPool>,
+    language: &'a LanguageCoordinator,
 }
 
 impl<'a> ParserReloadGuard<'a> {
-    fn begin(parser_pool: &'a std::sync::Mutex<DocumentParserPool>) -> Self {
+    fn begin(
+        parser_pool: &'a std::sync::Mutex<DocumentParserPool>,
+        language: &'a LanguageCoordinator,
+    ) -> Self {
         parser_pool
             .lock()
             .recover_poison("ParserReloadGuard::begin")
             .begin_reload();
-        Self { parser_pool }
+        Self {
+            parser_pool,
+            language,
+        }
     }
 }
 
@@ -141,7 +148,7 @@ impl Drop for ParserReloadGuard<'_> {
         self.parser_pool
             .lock()
             .recover_poison("ParserReloadGuard::drop")
-            .finish_reload();
+            .finish_reload_at(self.language.configuration_generation());
     }
 }
 
@@ -194,7 +201,8 @@ pub(super) async fn apply_shared_settings_locked(
     // built MID-swap against a half-updated query set.
     cache.bump_semantic_token_generation();
     crate::analysis::semantic::invalidate_thread_local_parser_caches();
-    let parser_reload = ParserReloadGuard::begin(language_state.parser_pool);
+    let parser_reload =
+        ParserReloadGuard::begin(language_state.parser_pool, language_state.language);
     let mut summary = language_state.language.load_settings(&settings);
     let reparse_uris = if language_state.invalidate_documents {
         language_state.documents.invalidate_all_parses()
@@ -1063,7 +1071,7 @@ mod tests {
             let mut pool = service.inner().parser_pool.lock().unwrap();
             pool.release("stale".to_string(), tree_sitter::Parser::new());
             match pool.acquire_versioned("stale") {
-                crate::language::parser_pool::ParserCheckout::Acquired(parser, generation) => {
+                crate::language::parser_pool::ParserCheckout::Acquired(parser, generation, _) => {
                     (parser, generation)
                 }
                 _ => panic!("precondition: stale parser is available"),
@@ -1130,7 +1138,7 @@ mod tests {
                     if call == 0 {
                         let mut pool = parser_pool.lock().unwrap();
                         pool.begin_reload();
-                        pool.finish_reload();
+                        pool.finish_reload_at(1);
                         pool.release("test".to_string(), tree_sitter::Parser::new());
                     }
                     (parser, Some(call + 1))
@@ -1157,7 +1165,7 @@ mod tests {
             ),
             "no parser checkout may start inside the reload window"
         );
-        pool.finish_reload();
+        pool.finish_reload_at(1);
         assert!(
             matches!(
                 pool.acquire_versioned("test"),
@@ -1165,11 +1173,11 @@ mod tests {
             ),
             "one reload finishing must not close an overlapping reload window"
         );
-        pool.finish_reload();
+        pool.finish_reload_at(1);
         pool.release("test".to_string(), tree_sitter::Parser::new());
         assert!(matches!(
             pool.acquire_versioned("test"),
-            crate::language::parser_pool::ParserCheckout::Acquired(_, _)
+            crate::language::parser_pool::ParserCheckout::Acquired(_, _, _)
         ));
     }
 
@@ -1177,10 +1185,10 @@ mod tests {
     fn parser_reload_guard_finishes_reload_during_unwind() {
         let (service, _socket) = tower_lsp_server::LspService::new(Kakehashi::new);
         let parser_pool = &service.inner().parser_pool;
-        let unwind = std::panic::catch_unwind(|| {
-            let _reload = ParserReloadGuard::begin(parser_pool);
+        let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _reload = ParserReloadGuard::begin(parser_pool, &service.inner().language);
             panic!("simulate reload failure");
-        });
+        }));
 
         assert!(unwind.is_err());
         assert!(!matches!(
@@ -1205,7 +1213,12 @@ mod tests {
             )
             .await;
 
-        service.inner().parser_pool.lock().unwrap().finish_reload();
+        service
+            .inner()
+            .parser_pool
+            .lock()
+            .unwrap()
+            .finish_reload_at(1);
         assert_eq!(parsed, None);
     }
 

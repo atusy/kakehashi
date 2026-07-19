@@ -523,12 +523,19 @@ impl ComparisonStore {
         } else {
             self.slots.entry(uri.to_string()).or_default()
         };
-        slot.pending = None;
         if slot
             .closed_incarnation
             .is_some_and(|closed| closed >= incarnation)
         {
             return;
+        }
+        if slot
+            .pending
+            .as_ref()
+            .is_some_and(|pending| pending.incarnation <= incarnation)
+        {
+            self.superseded.fetch_add(1, Ordering::Relaxed);
+            slot.pending = None;
         }
         slot.closed_incarnation = Some(incarnation);
         drop(slot);
@@ -559,12 +566,6 @@ impl ComparisonStore {
             .is_some_and(|pending| pending.incarnation < incarnation)
         {
             slot.pending = None;
-        }
-        if slot
-            .closed_incarnation
-            .is_some_and(|closed| closed < incarnation)
-        {
-            slot.closed_incarnation = None;
         }
     }
 
@@ -867,6 +868,27 @@ mod tests {
         );
         let slot = store.slots.get(uri).unwrap();
         assert_eq!(slot.closed_incarnation, Some(1));
+    }
+
+    #[test]
+    fn delayed_old_close_preserves_reopened_incarnation_comparison() {
+        let store = ComparisonStore::default();
+        let uri = "file:///a.rs";
+        store.record(
+            uri,
+            2,
+            0,
+            ComparisonSide::Authoritative(summary("source_file")),
+        );
+
+        store.mark_closed(uri, 1);
+        store.record(uri, 1, 9, ComparisonSide::Shadow(summary("stale")));
+        store.record(uri, 2, 0, ComparisonSide::Shadow(summary("source_file")));
+
+        assert_eq!(store.matched.load(Ordering::Relaxed), 1);
+        assert_eq!(store.mismatched.load(Ordering::Relaxed), 0);
+        assert_eq!(store.superseded.load(Ordering::Relaxed), 1);
+        assert_eq!(store.pending_count(), 0);
     }
 
     #[test]
