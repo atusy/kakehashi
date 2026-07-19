@@ -428,7 +428,7 @@ impl Kakehashi {
         // landing after the resolution supersedes this request via the client's
         // next didChange-driven request; the CancelToken then reclaims the
         // compute mid-flight.
-        let result = {
+        let (result, worker_tokens) = {
             // Snapshot-identical repeat request: tokens already cached for this
             // exact text are still correct, so skip re-tokenizing. Returns the
             // cached tokens with their original `result_id`, keeping a client's
@@ -498,6 +498,14 @@ impl Kakehashi {
                 injection_cache,
                 Some(cancel_token.clone()),
             );
+            let worker_future = self.tree_worker_shadow.semantic_tokens(
+                &uri,
+                snapshot.incarnation,
+                snapshot.parsed_version,
+                token_generation,
+                supports_multiline,
+            );
+            let combined = async { tokio::join!(compute_future, worker_future) };
 
             if let Some(cancel_rx) = cancel_rx {
                 // Race between computation and cancel notification
@@ -520,13 +528,26 @@ impl Kakehashi {
                     }
 
                     // Computation completed
-                    result = compute_future => result,
+                    result = combined => result,
                 }
             } else {
                 // No cancel support - just await the computation
-                compute_future.await
+                combined.await
             }
         };
+
+        if let (Some(authoritative), Some(worker)) = (result.as_ref(), worker_tokens.as_ref()) {
+            let authoritative = match authoritative {
+                SemanticTokensResult::Tokens(tokens) => tokens.data.as_slice(),
+                SemanticTokensResult::Partial(partial) => partial.data.as_slice(),
+            };
+            self.tree_worker_shadow.compare_semantic_tokens(
+                &uri,
+                snapshot.parsed_version,
+                authoritative,
+                worker,
+            );
+        }
 
         // A supersede/close between compute start and here flips the token; the
         // compute then bailed at a checkpoint and returned `None` (a partial

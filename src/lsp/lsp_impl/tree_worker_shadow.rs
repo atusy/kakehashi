@@ -12,10 +12,11 @@ use crate::language::coordinator::WorkerGrammarDescriptor;
 use crate::lsp::text_sync::SequentialByteEdit;
 use crate::tree_worker::{
     ApplyDocumentEditsAndDerive, ByteEdit, Client, CloseDocument, ConfigureLanguages,
-    DeriveDocumentSnapshot, DeriveInjectionRegions, DeriveSelectionRanges, InjectionRegionsResult,
-    NavigateNode, NodeNavigation, NodeResult, NodeScalarOperation, NodeScalarValue, OpaqueNodeId,
-    RequestContext, ResolveNode, Response, RunNodeScalar, SelectionRangesResult, SyncDocument,
-    WirePosition, WorkerLanguageAsset, named_node_count,
+    DeriveDocumentSnapshot, DeriveInjectionRegions, DeriveSelectionRanges, DeriveSemanticTokens,
+    DerivedSemanticTokens, InjectionRegionsResult, NavigateNode, NodeNavigation, NodeResult,
+    NodeScalarOperation, NodeScalarValue, OpaqueNodeId, RequestContext, ResolveNode, Response,
+    RunNodeScalar, SelectionRangesResult, SyncDocument, WirePosition, WorkerLanguageAsset,
+    named_node_count,
 };
 
 use super::Kakehashi;
@@ -191,6 +192,7 @@ enum RecoveryMode {
 struct OpenDocuments {
     current: HashMap<String, SyncDocument>,
     closed_incarnations: HashMap<String, u64>,
+    acknowledged: HashMap<String, RequestContext>,
     catalog: Option<(u64, Vec<WorkerLanguageAsset>)>,
     catalog_preload: Option<(u64, u64)>,
 }
@@ -232,6 +234,17 @@ struct ResyncFailure {
 }
 
 impl OpenDocuments {
+    fn acknowledges(&self, context: &RequestContext) -> bool {
+        self.acknowledged
+            .get(&context.uri)
+            .is_some_and(|acknowledged| {
+                acknowledged.worker_generation == context.worker_generation
+                    && acknowledged.incarnation == context.incarnation
+                    && acknowledged.content_version == context.content_version
+                    && acknowledged.configuration_generation == context.configuration_generation
+            })
+    }
+
     fn supersedes(&self, command: &ShadowCommand) -> bool {
         match command {
             ShadowCommand::Sync(incoming)
@@ -337,6 +350,7 @@ impl OpenDocuments {
             }
             ShadowCommand::Close(request) => {
                 self.current.remove(&request.context.uri);
+                self.acknowledged.remove(&request.context.uri);
                 self.closed_incarnations
                     .entry(request.context.uri.clone())
                     .and_modify(|closed| *closed = (*closed).max(request.context.incarnation))
@@ -344,6 +358,7 @@ impl OpenDocuments {
             }
             ShadowCommand::Forget(context) => {
                 self.current.remove(&context.uri);
+                self.acknowledged.remove(&context.uri);
             }
             ShadowCommand::Shutdown(_) => {}
         }
@@ -574,13 +589,13 @@ impl TreeWorkerShadow {
         if !self.is_enabled() {
             return None;
         }
-        let context = self.read_context(
+        let context = self.synchronized_read_context(
             &client,
             uri,
             incarnation,
             content_version,
             configuration_generation,
-        );
+        )?;
         let expected = context.clone();
         let response = tokio::task::spawn_blocking(move || {
             client.resolve_node(ResolveNode {
@@ -608,13 +623,13 @@ impl TreeWorkerShadow {
         if !self.is_enabled() {
             return None;
         }
-        let context = self.read_context(
+        let context = self.synchronized_read_context(
             &client,
             uri,
             incarnation,
             content_version,
             configuration_generation,
-        );
+        )?;
         let expected = context.clone();
         let response = tokio::task::spawn_blocking(move || {
             client.derive_selection_ranges(DeriveSelectionRanges { context, positions })
@@ -661,13 +676,13 @@ impl TreeWorkerShadow {
         if !self.is_enabled() {
             return None;
         }
-        let context = self.read_context(
+        let context = self.synchronized_read_context(
             &client,
             uri,
             incarnation,
             content_version,
             configuration_generation,
-        );
+        )?;
         let expected = context.clone();
         let response = tokio::task::spawn_blocking(move || {
             client.derive_injection_regions(DeriveInjectionRegions { context })
@@ -701,6 +716,92 @@ impl TreeWorkerShadow {
             return None;
         }
         Some(result)
+    }
+
+    pub(super) async fn semantic_tokens(
+        &self,
+        uri: &url::Url,
+        incarnation: u64,
+        content_version: u64,
+        configuration_generation: u64,
+        supports_multiline: bool,
+    ) -> Option<DerivedSemanticTokens> {
+        self.preload_catalog_async();
+        let client = self.read_client.load_full()?;
+        if !self.is_enabled() {
+            return None;
+        }
+        let context = self.synchronized_read_context(
+            &client,
+            uri,
+            incarnation,
+            content_version,
+            configuration_generation,
+        )?;
+        let expected = context.clone();
+        let response = tokio::task::spawn_blocking(move || {
+            client.derive_semantic_tokens(DeriveSemanticTokens {
+                context,
+                supports_multiline,
+            })
+        })
+        .await
+        .ok()?
+        .ok()?;
+        let Response::SemanticTokens(result) = response else {
+            return None;
+        };
+        if result.context != expected {
+            return None;
+        }
+        let current = self
+            .open_documents
+            .lock()
+            .recover_poison("TreeWorkerShadow::semantic_tokens(admission)")
+            .current
+            .get(uri.as_str())
+            .map(|current| current.context.clone());
+        if current.as_ref().is_none_or(|current| {
+            current.incarnation != expected.incarnation
+                || current.content_version != expected.content_version
+                || current.configuration_generation != expected.configuration_generation
+        }) || self
+            .read_client
+            .load()
+            .as_ref()
+            .is_none_or(|client| client.worker_generation() != expected.worker_generation)
+        {
+            return None;
+        }
+        Some(result)
+    }
+
+    pub(super) fn compare_semantic_tokens(
+        &self,
+        uri: &url::Url,
+        content_version: u64,
+        authoritative: &[tower_lsp_server::ls_types::SemanticToken],
+        worker: &DerivedSemanticTokens,
+    ) {
+        let worker = worker
+            .tokens
+            .iter()
+            .map(|token| tower_lsp_server::ls_types::SemanticToken {
+                delta_line: token.delta_line,
+                delta_start: token.delta_start,
+                length: token.length,
+                token_type: token.token_type,
+                token_modifiers_bitset: token.token_modifiers_bitset,
+            })
+            .collect::<Vec<_>>();
+        if authoritative != worker {
+            log::debug!(
+                target: "kakehashi::tree_worker_shadow",
+                "semantic token mismatch uri={uri} version={content_version} authoritative={} worker={}",
+                authoritative.len(),
+                worker.len(),
+            );
+        }
     }
 
     pub(super) fn compare_injection_regions(
@@ -1280,6 +1381,28 @@ impl TreeWorkerShadow {
         }
     }
 
+    fn synchronized_read_context(
+        &self,
+        client: &Client,
+        uri: &url::Url,
+        incarnation: u64,
+        content_version: u64,
+        configuration_generation: u64,
+    ) -> Option<RequestContext> {
+        let context = self.read_context(
+            client,
+            uri,
+            incarnation,
+            content_version,
+            configuration_generation,
+        );
+        self.open_documents
+            .lock()
+            .recover_poison("TreeWorkerShadow::synchronized_read_context")
+            .acknowledges(&context)
+            .then_some(context)
+    }
+
     fn admit_node_response(
         &self,
         response: Response,
@@ -1756,6 +1879,12 @@ fn run_actor(
                         .replicas
                         .insert(snapshot.context.uri.clone(), identity);
                 }
+                state
+                    .open_documents
+                    .lock()
+                    .recover_poison("run_actor(acknowledge snapshot)")
+                    .acknowledged
+                    .insert(snapshot.context.uri.clone(), snapshot.context.clone());
                 log::debug!(
                     target: "kakehashi::tree_worker_shadow_metrics",
                     "uri={} version={} parent_us={} queue_us={} compute_us={}",
@@ -2090,6 +2219,12 @@ fn recover_worker(
             }
         };
         state.replicas.clear();
+        state
+            .open_documents
+            .lock()
+            .recover_poison("recover_worker(clear acknowledgements)")
+            .acknowledged
+            .clear();
         match resync_open_documents(
             &replacement,
             generation,
@@ -2255,6 +2390,11 @@ fn resync_open_documents(
         match sync_and_derive(client, request) {
             Ok(Response::Snapshot(snapshot)) => {
                 replicas.insert(snapshot.context.uri.clone(), identity);
+                open_documents
+                    .lock()
+                    .recover_poison("resync_open_documents(acknowledge snapshot)")
+                    .acknowledged
+                    .insert(snapshot.context.uri.clone(), snapshot.context.clone());
                 comparisons.record(
                     &snapshot.context.uri,
                     snapshot.context.incarnation,
@@ -2690,6 +2830,27 @@ mod tests {
             context: latest.context.clone(),
         }));
         assert!(documents.current.is_empty());
+    }
+
+    #[test]
+    fn read_requires_the_actor_to_acknowledge_the_exact_version() {
+        let mut documents = OpenDocuments::default();
+        let version_one = sync("file:///a.rs", 1, 1, 7).context;
+        documents
+            .acknowledged
+            .insert(version_one.uri.clone(), version_one.clone());
+        assert!(documents.acknowledges(&version_one));
+
+        let version_two = sync("file:///a.rs", 1, 2, 7).context;
+        assert!(!documents.acknowledges(&version_two));
+
+        documents
+            .acknowledged
+            .insert(version_two.uri.clone(), version_two.clone());
+        assert!(documents.acknowledges(&version_two));
+
+        let restarted = sync("file:///a.rs", 1, 2, 8).context;
+        assert!(!documents.acknowledges(&restarted));
     }
 
     #[test]

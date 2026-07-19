@@ -22,7 +22,7 @@ use sha2::{Digest, Sha256};
 
 use crate::language::node_tracker::{EditInfo, NodeTracker};
 
-pub const PROTOCOL_VERSION: u32 = 8;
+pub const PROTOCOL_VERSION: u32 = 9;
 pub const MAX_FRAME_BYTES: usize = 64 * 1024 * 1024;
 pub const MAX_DOCUMENT_REPLICAS: usize = 4_096;
 pub const MAX_DOCUMENT_BYTES: usize = 32 * 1024 * 1024;
@@ -151,6 +151,12 @@ pub struct DeriveSelectionRanges {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct DeriveInjectionRegions {
     pub context: RequestContext,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct DeriveSemanticTokens {
+    pub context: RequestContext,
+    pub supports_multiline: bool,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -309,6 +315,21 @@ pub struct InjectionRegionsResult {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct DerivedSemanticTokens {
+    pub context: RequestContext,
+    pub tokens: Vec<WireSemanticToken>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct WireSemanticToken {
+    pub delta_line: u32,
+    pub delta_start: u32,
+    pub length: u32,
+    pub token_type: u32,
+    pub token_modifiers_bitset: u32,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct LanguageCatalogAck {
     pub context: RequestContext,
     pub languages: usize,
@@ -350,6 +371,7 @@ pub enum Request {
     RunNodeScalar(RunNodeScalar),
     DeriveSelectionRanges(DeriveSelectionRanges),
     DeriveInjectionRegions(DeriveInjectionRegions),
+    DeriveSemanticTokens(DeriveSemanticTokens),
     ConfigureLanguages(ConfigureLanguages),
     CloseDocument(CloseDocument),
 }
@@ -394,6 +416,7 @@ pub enum Response {
     NodeScalar(NodeScalarResult),
     SelectionRanges(SelectionRangesResult),
     InjectionRegions(InjectionRegionsResult),
+    SemanticTokens(DerivedSemanticTokens),
     LanguageCatalogAck(LanguageCatalogAck),
     Error(WorkerError),
 }
@@ -407,6 +430,8 @@ struct DocumentReplica {
     uri: url::Url,
     node_tracker: NodeTracker,
     analysis: Arc<crate::language::LanguageCoordinator>,
+    grammar_language: tree_sitter::Language,
+    queries: WorkerQuerySources,
 }
 
 impl DocumentReplica {
@@ -450,9 +475,9 @@ impl DocumentReplica {
         worker_analysis(
             &analysis,
             &request.language,
-            grammar_language,
-            request.queries,
-            false,
+            grammar_language.clone(),
+            request.queries.clone(),
+            WorkerQuerySet::Injections,
         )?;
         Ok((
             Self {
@@ -464,6 +489,8 @@ impl DocumentReplica {
                 uri,
                 node_tracker,
                 analysis,
+                grammar_language,
+                queries: request.queries,
             },
             ack,
         ))
@@ -848,6 +875,54 @@ impl DocumentReplica {
         })
     }
 
+    fn derive_semantic_tokens(
+        &self,
+        request: DeriveSemanticTokens,
+    ) -> Result<DerivedSemanticTokens, String> {
+        self.validate_read_identity(&request.context)?;
+        worker_analysis(
+            &self.analysis,
+            &self.language,
+            self.grammar_language.clone(),
+            self.queries.clone(),
+            WorkerQuerySet::Semantic,
+        )?;
+        let query = self
+            .analysis
+            .highlight_query(&self.language)
+            .ok_or_else(|| "worker highlight query is unavailable".to_string())?;
+        let result = crate::analysis::compute_semantic_tokens_full(
+            rayon::current_num_threads(),
+            Arc::from(self.text.as_str()),
+            self.tree.clone(),
+            query,
+            Some(self.language.clone()),
+            Some(self.analysis.capture_mappings()),
+            Arc::clone(&self.analysis),
+            request.supports_multiline,
+            None,
+            None,
+        )
+        .ok_or_else(|| "worker semantic token derivation was cancelled".to_string())?;
+        let tokens = match result {
+            tower_lsp_server::ls_types::SemanticTokensResult::Tokens(tokens) => tokens.data,
+            tower_lsp_server::ls_types::SemanticTokensResult::Partial(partial) => partial.data,
+        }
+        .into_iter()
+        .map(|token| WireSemanticToken {
+            delta_line: token.delta_line,
+            delta_start: token.delta_start,
+            length: token.length,
+            token_type: token.token_type,
+            token_modifiers_bitset: token.token_modifiers_bitset,
+        })
+        .collect();
+        Ok(DerivedSemanticTokens {
+            context: request.context,
+            tokens,
+        })
+    }
+
     fn tracked_node<'tree>(
         &'tree self,
         node_id: &OpaqueNodeId,
@@ -973,12 +1048,19 @@ fn selection_range_to_wire(
     }
 }
 
+#[derive(Clone, Copy)]
+enum WorkerQuerySet {
+    Injections,
+    Semantic,
+    All,
+}
+
 fn worker_analysis(
     analysis: &crate::language::LanguageCoordinator,
     language_name: &str,
     language: tree_sitter::Language,
     queries: WorkerQuerySources,
-    compile_all_queries: bool,
+    query_set: WorkerQuerySet,
 ) -> Result<(), String> {
     analysis
         .language_registry_for_parallel()
@@ -997,7 +1079,16 @@ fn worker_analysis(
             queries.injections,
         ),
     ] {
-        if !compile_all_queries && kind != crate::config::settings::QueryKind::Injections {
+        let selected = match query_set {
+            WorkerQuerySet::Injections => kind == crate::config::settings::QueryKind::Injections,
+            WorkerQuerySet::Semantic => matches!(
+                kind,
+                crate::config::settings::QueryKind::Highlights
+                    | crate::config::settings::QueryKind::Injections
+            ),
+            WorkerQuerySet::All => true,
+        };
+        if !selected {
             continue;
         }
         let Some(source) = source else {
@@ -1665,6 +1756,7 @@ fn handle_work(
         Request::RunNodeScalar(request) => run_node_scalar(request, documents),
         Request::DeriveSelectionRanges(request) => derive_selection_ranges(request, documents),
         Request::DeriveInjectionRegions(request) => derive_injection_regions(request, documents),
+        Request::DeriveSemanticTokens(request) => derive_semantic_tokens(request, documents),
         Request::ConfigureLanguages(request) => configure_languages(request, analysis),
         Request::CloseDocument(request) => close_document(
             request,
@@ -1692,6 +1784,7 @@ fn request_context(request: &Request) -> Option<&RequestContext> {
         Request::RunNodeScalar(request) => Some(&request.context),
         Request::DeriveSelectionRanges(request) => Some(&request.context),
         Request::DeriveInjectionRegions(request) => Some(&request.context),
+        Request::DeriveSemanticTokens(request) => Some(&request.context),
         Request::ConfigureLanguages(request) => Some(&request.context),
         Request::CloseDocument(request) => Some(&request.context),
     }
@@ -1708,6 +1801,7 @@ fn document_key(request: &Request) -> Option<DocumentKey> {
         Request::RunNodeScalar(request) => Some(DocumentKey::from(&request.context)),
         Request::DeriveSelectionRanges(request) => Some(DocumentKey::from(&request.context)),
         Request::DeriveInjectionRegions(request) => Some(DocumentKey::from(&request.context)),
+        Request::DeriveSemanticTokens(request) => Some(DocumentKey::from(&request.context)),
         Request::CloseDocument(request) => Some(DocumentKey::from(&request.context)),
         Request::Handshake(_) | Request::DeriveSnapshot(_) | Request::ConfigureLanguages(_) => None,
     }
@@ -1831,6 +1925,29 @@ fn derive_injection_regions(
     }
 }
 
+fn derive_semantic_tokens(request: DeriveSemanticTokens, documents: &DocumentStore) -> Response {
+    let context = request.context.clone();
+    let Some(replica) = documents
+        .get(&DocumentKey::from(&context))
+        .map(|entry| Arc::clone(entry.value()))
+    else {
+        return Response::Error(WorkerError {
+            context: Some(context),
+            message: "document replica is missing; full sync required".into(),
+        });
+    };
+    match replica.lock() {
+        Ok(replica) => match replica.derive_semantic_tokens(request) {
+            Ok(result) => Response::SemanticTokens(result),
+            Err(message) => Response::Error(WorkerError {
+                context: Some(context),
+                message,
+            }),
+        },
+        Err(_) => poisoned_document_restart(context),
+    }
+}
+
 fn configure_languages(
     request: ConfigureLanguages,
     analysis: &Arc<crate::language::LanguageCoordinator>,
@@ -1852,7 +1969,13 @@ fn configure_languages(
                             message: "parser has no configured language".into(),
                         });
                     };
-                    match worker_analysis(analysis, &language_name, language, queries, true) {
+                    match worker_analysis(
+                        analysis,
+                        &language_name,
+                        language,
+                        queries,
+                        WorkerQuerySet::All,
+                    ) {
                         Ok(()) => Response::LanguageCatalogAck(LanguageCatalogAck {
                             context: context.clone(),
                             languages: configured + 1,
@@ -2778,6 +2901,15 @@ impl Client {
         )
     }
 
+    pub fn derive_semantic_tokens(&self, request: DeriveSemanticTokens) -> io::Result<Response> {
+        let context = request.context.clone();
+        self.request_with_timeout(
+            Request::DeriveSemanticTokens(request),
+            context,
+            Duration::from_secs(60),
+        )
+    }
+
     pub fn configure_languages(&self, request: ConfigureLanguages) -> io::Result<Response> {
         let context = request.context.clone();
         self.request_with_timeout(
@@ -2955,6 +3087,7 @@ fn response_request_id(response: &Response) -> Option<u64> {
         Response::NodeScalar(result) => Some(result.context.request_id),
         Response::SelectionRanges(result) => Some(result.context.request_id),
         Response::InjectionRegions(result) => Some(result.context.request_id),
+        Response::SemanticTokens(result) => Some(result.context.request_id),
         Response::LanguageCatalogAck(ack) => Some(ack.context.request_id),
         Response::Error(error) => error.context.as_ref().map(|context| context.request_id),
         Response::HandshakeReady(_) => None,
@@ -2971,6 +3104,7 @@ fn response_context(response: &Response) -> Option<&RequestContext> {
         Response::NodeScalar(result) => Some(&result.context),
         Response::SelectionRanges(result) => Some(&result.context),
         Response::InjectionRegions(result) => Some(&result.context),
+        Response::SemanticTokens(result) => Some(&result.context),
         Response::LanguageCatalogAck(ack) => Some(&ack.context),
         Response::Error(error) => error.context.as_ref(),
         Response::HandshakeReady(_) => None,
@@ -3083,12 +3217,12 @@ mod tests {
 
     use super::{
         ApplyDocumentEdits, BUILD_ID, ByteEdit, CloseDocument, DeriveInjectionRegions,
-        DeriveSelectionRanges, DeriveSnapshot, DocumentKey, DocumentLane, DocumentReplica,
-        GrammarKey, Handshake, HandshakeReady, LaneAction, LaneRegistry, MAX_DOCUMENT_BYTES,
-        MAX_DOCUMENT_REPLICAS, MAX_RETAINED_DOCUMENT_BYTES, NavigateNode, NodeNavigation,
-        NodeScalarOperation, NodeScalarValue, OpaqueNodeId, PROTOCOL_VERSION, Request,
-        RequestContext, ResolveNode, Response, Route, RunNodeScalar, SyncDocument, WirePosition,
-        WireRange, WorkerError, WorkerQuerySources, close_document, decode_frame,
+        DeriveSelectionRanges, DeriveSemanticTokens, DeriveSnapshot, DocumentKey, DocumentLane,
+        DocumentReplica, GrammarKey, Handshake, HandshakeReady, LaneAction, LaneRegistry,
+        MAX_DOCUMENT_BYTES, MAX_DOCUMENT_REPLICAS, MAX_RETAINED_DOCUMENT_BYTES, NavigateNode,
+        NodeNavigation, NodeScalarOperation, NodeScalarValue, OpaqueNodeId, PROTOCOL_VERSION,
+        Request, RequestContext, ResolveNode, Response, Route, RunNodeScalar, SyncDocument,
+        WirePosition, WireRange, WorkerError, WorkerQuerySources, close_document, decode_frame,
         derive_snapshot_with_language, encode_frame, named_node_count, replace_retained_bytes,
         reserve_retained_growth, route_response, run, submit_document_job, sync_document,
         terminate_by_transport, validate_document_size,
@@ -3981,6 +4115,70 @@ mod tests {
         assert_eq!(regions.regions.len(), 1);
         assert_eq!(regions.regions[0].language, "rust");
         assert_eq!(regions.regions[0].virtual_content, "fn inner() {}");
+
+        let tokens = replica
+            .derive_semantic_tokens(DeriveSemanticTokens {
+                context: RequestContext {
+                    request_id: 3,
+                    worker_generation: 3,
+                    uri: "file:///injected.rs".into(),
+                    incarnation: 4,
+                    content_version: 1,
+                    configuration_generation: 2,
+                },
+                supports_multiline: false,
+            })
+            .unwrap();
+        assert!(
+            tokens
+                .tokens
+                .iter()
+                .any(|token| token.delta_start == 6 && token.length == 5)
+        );
+    }
+
+    #[test]
+    fn semantic_tokens_are_derived_from_worker_owned_queries() {
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_rust::LANGUAGE.into())
+            .unwrap();
+        let context = RequestContext {
+            request_id: 1,
+            worker_generation: 3,
+            uri: "file:///semantic.rs".into(),
+            incarnation: 4,
+            content_version: 1,
+            configuration_generation: 2,
+        };
+        let (replica, _) = DocumentReplica::sync(
+            SyncDocument {
+                context: context.clone(),
+                language: "rust".into(),
+                grammar_symbol: "rust".into(),
+                source_path: "/unused/static-language".into(),
+                parser_path: "/unused/static-language".into(),
+                artifact_digest: "sha256:rust-v1".into(),
+                queries: WorkerQuerySources {
+                    highlights: Some("(identifier) @variable".into()),
+                    ..WorkerQuerySources::default()
+                },
+                text: "fn main() {}".into(),
+            },
+            &mut parser,
+        )
+        .unwrap();
+
+        let result = replica
+            .derive_semantic_tokens(DeriveSemanticTokens {
+                context,
+                supports_multiline: false,
+            })
+            .unwrap();
+
+        assert_eq!(result.tokens.len(), 1);
+        assert_eq!(result.tokens[0].delta_start, 3);
+        assert_eq!(result.tokens[0].length, 4);
     }
 
     #[test]
