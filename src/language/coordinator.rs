@@ -104,6 +104,7 @@ pub(crate) struct LanguageCoordinator {
     /// the key keeps didChange from re-reading a shared library while ensuring
     /// a configuration reload revalidates even a same-path replacement.
     worker_artifacts: dashmap::DashMap<(PathBuf, u64, u64), CachedWorkerArtifact>,
+    worker_artifact_import_lock: Mutex<()>,
     worker_grammar_fallbacks: dashmap::DashMap<String, ValidatedWorkerArtifact>,
     worker_artifact_dir: Option<tempfile::TempDir>,
     worker_settings: RwLock<Arc<WorkspaceSettings>>,
@@ -168,6 +169,7 @@ impl LanguageCoordinator {
             settings_reload_lock: Mutex::new(()),
             load_generation: std::sync::atomic::AtomicU64::new(0),
             worker_artifacts: dashmap::DashMap::new(),
+            worker_artifact_import_lock: Mutex::new(()),
             worker_grammar_fallbacks: dashmap::DashMap::new(),
             worker_artifact_dir: tempfile::Builder::new()
                 .prefix("kakehashi-worker-artifacts-")
@@ -1850,39 +1852,47 @@ impl LanguageCoordinator {
         let artifact = if let Some(artifact) = self.worker_artifacts.get(&cache_key) {
             artifact.clone()
         } else {
-            let Some(artifact_dir) = &self.worker_artifact_dir else {
-                log::warn!(
-                    target: "kakehashi::tree_worker_shadow",
-                    "cannot create private parser artifact directory",
-                );
-                return None;
-            };
-            let artifact = match import_worker_artifact(&parser_path, artifact_dir.path()) {
-                Ok(artifact) => artifact,
-                Err(error) => {
+            let _import = self
+                .worker_artifact_import_lock
+                .lock()
+                .recover_poison("LanguageCoordinator::worker_grammar_descriptor(import)");
+            if let Some(artifact) = self.worker_artifacts.get(&cache_key) {
+                artifact.clone()
+            } else {
+                let Some(artifact_dir) = &self.worker_artifact_dir else {
                     log::warn!(
                         target: "kakehashi::tree_worker_shadow",
-                        "cannot import parser artifact {}: {error}",
-                        parser_path.display(),
+                        "cannot create private parser artifact directory",
                     );
-                    self.worker_grammar_fallbacks
-                        .get(&grammar_symbol)
-                        .map(|entry| entry.artifact.clone())?
-                }
-            };
-            if self
-                .worker_settings_epoch
-                .load(std::sync::atomic::Ordering::Acquire)
-                != epoch
-                || self
-                    .load_generation
+                    return None;
+                };
+                let artifact = match import_worker_artifact(&parser_path, artifact_dir.path()) {
+                    Ok(artifact) => artifact,
+                    Err(error) => {
+                        log::warn!(
+                            target: "kakehashi::tree_worker_shadow",
+                            "cannot import parser artifact {}: {error}",
+                            parser_path.display(),
+                        );
+                        self.worker_grammar_fallbacks
+                            .get(&grammar_symbol)
+                            .map(|entry| entry.artifact.clone())?
+                    }
+                };
+                if self
+                    .worker_settings_epoch
                     .load(std::sync::atomic::Ordering::Acquire)
-                    != configuration_generation
-            {
-                return None;
+                    != epoch
+                    || self
+                        .load_generation
+                        .load(std::sync::atomic::Ordering::Acquire)
+                        != configuration_generation
+                {
+                    return None;
+                }
+                self.worker_artifacts.insert(cache_key, artifact.clone());
+                artifact
             }
-            self.worker_artifacts.insert(cache_key, artifact.clone());
-            artifact
         };
         if self
             .worker_settings_epoch

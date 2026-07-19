@@ -167,6 +167,7 @@ enum BreakerState {
     HalfOpen {
         probe_generation: u64,
         synchronized_epoch: u64,
+        reconcile_after: Instant,
     },
 }
 
@@ -880,6 +881,7 @@ fn run_actor(
                 state.breaker = BreakerState::HalfOpen {
                     probe_generation: generation,
                     synchronized_epoch: recovery_epoch,
+                    reconcile_after: Instant::now(),
                 };
                 if recover_worker(
                     &mut state,
@@ -1184,63 +1186,59 @@ fn finish_half_open_recovery(
     comparisons: &ComparisonStore,
     disabled: &AtomicBool,
 ) -> ReconcileOutcome {
-    const MAX_RECONCILIATION_PASSES: usize = 3;
     let BreakerState::HalfOpen {
         probe_generation,
         mut synchronized_epoch,
+        reconcile_after,
     } = state.breaker
     else {
         return ReconcileOutcome::Failed;
     };
-    for pass in 0..=MAX_RECONCILIATION_PASSES {
-        let registry = state
-            .open_documents
-            .lock()
-            .recover_poison("finish_half_open_recovery");
-        let current_epoch = registry_epoch.load(Ordering::Acquire);
-        if current_epoch == synchronized_epoch {
-            let healthy_since = Instant::now();
-            state.healthy_since = Some(healthy_since);
-            state.long_healthy_since = Some(healthy_since);
-            disabled.store(false, Ordering::Release);
-            return ReconcileOutcome::Current;
+    let registry = state
+        .open_documents
+        .lock()
+        .recover_poison("finish_half_open_recovery");
+    let current_epoch = registry_epoch.load(Ordering::Acquire);
+    if current_epoch == synchronized_epoch {
+        let healthy_since = Instant::now();
+        state.healthy_since = Some(healthy_since);
+        state.long_healthy_since = Some(healthy_since);
+        disabled.store(false, Ordering::Release);
+        return ReconcileOutcome::Current;
+    }
+    drop(registry);
+    let now = Instant::now();
+    if now < reconcile_after {
+        return ReconcileOutcome::Pending;
+    }
+    synchronized_epoch = current_epoch;
+    let result = resync_open_documents(
+        state
+            .client
+            .as_ref()
+            .expect("successful half-open recovery retains its worker"),
+        state.worker_generation,
+        &state.open_documents,
+        &state.quarantined,
+        &mut state.replicas,
+        comparisons,
+    );
+    if let Err(failure) = result {
+        if let Some(grammar) = failure.implicated_grammar {
+            quarantine_grammar(state, grammar, failure.class, comparisons);
         }
-        drop(registry);
-        if pass == MAX_RECONCILIATION_PASSES {
-            break;
-        }
-        synchronized_epoch = current_epoch;
-        let result = resync_open_documents(
-            state
-                .client
-                .as_ref()
-                .expect("successful half-open recovery retains its worker"),
-            state.worker_generation,
-            &state.open_documents,
-            &state.quarantined,
-            &mut state.replicas,
-            comparisons,
+        log::error!(
+            target: "kakehashi::tree_worker_shadow",
+            "half-open registry reconciliation failed: {}",
+            failure.error,
         );
-        if let Err(failure) = result {
-            if let Some(grammar) = failure.implicated_grammar {
-                quarantine_grammar(state, grammar, failure.class, comparisons);
-            }
-            log::error!(
-                target: "kakehashi::tree_worker_shadow",
-                "half-open registry reconciliation failed: {}",
-                failure.error,
-            );
-            return ReconcileOutcome::Failed;
-        }
+        return ReconcileOutcome::Failed;
     }
     state.breaker = BreakerState::HalfOpen {
         probe_generation,
         synchronized_epoch,
+        reconcile_after: now + WORKER_LIVENESS_POLL,
     };
-    log::warn!(
-        target: "kakehashi::tree_worker_shadow",
-        "half-open registry reconciliation did not quiesce after {MAX_RECONCILIATION_PASSES} passes",
-    );
     ReconcileOutcome::Pending
 }
 
@@ -1490,7 +1488,16 @@ fn resync_open_documents(
     let current_uris = uris.iter().cloned().collect::<HashSet<_>>();
     let stale_replicas = replicas
         .iter()
-        .filter(|(uri, _)| !current_uris.contains(*uri))
+        .filter(|(uri, identity)| {
+            !current_uris.contains(*uri)
+                && replica_was_closed(
+                    &open_documents
+                        .lock()
+                        .recover_poison("resync_open_documents(closed incarnation)"),
+                    uri,
+                    identity,
+                )
+        })
         .map(|(uri, identity)| (uri.clone(), identity.clone()))
         .collect::<Vec<_>>();
     for (uri, identity) in stale_replicas {
@@ -1600,6 +1607,17 @@ fn resync_open_documents(
         }
     }
     Ok(resynced)
+}
+
+fn replica_was_closed(
+    open_documents: &OpenDocuments,
+    uri: &str,
+    identity: &ReplicaIdentity,
+) -> bool {
+    open_documents
+        .closed_incarnations
+        .get(uri)
+        .is_some_and(|closed| *closed >= identity.incarnation)
 }
 
 fn retag_command(command: &mut ShadowCommand, generation: u64) {
@@ -2052,6 +2070,7 @@ mod tests {
     fn unavailable_grammar_forget_allows_same_incarnation_to_recover() {
         let mut documents = OpenDocuments::default();
         let mut unavailable = sync("file:///a.rs", 4, 2, 7);
+        let replica = ReplicaIdentity::from_sync(&unavailable);
         unavailable.context.configuration_generation = 8;
         assert!(matches!(
             documents.observe(&ShadowCommand::Sync(unavailable.clone())),
@@ -2063,6 +2082,7 @@ mod tests {
         ));
         assert!(documents.current.is_empty());
         assert!(documents.closed_incarnations.is_empty());
+        assert!(!replica_was_closed(&documents, "file:///a.rs", &replica));
 
         unavailable.context.configuration_generation = 9;
         assert!(matches!(
@@ -2192,6 +2212,7 @@ mod tests {
             breaker: BreakerState::HalfOpen {
                 probe_generation: 7,
                 synchronized_epoch: 0,
+                reconcile_after: started,
             },
             healthy_since: Some(started),
             long_healthy_since: Some(started),
