@@ -29,13 +29,51 @@ use crate::lsp::bridge::{BridgeCoordinator, RegionOffset, region_host_end};
 /// whose tracked geometry/layer no longer exists in the live parse, or a
 /// missing document/snapshot/language/query. The third tuple field reports
 /// whether the virtual content maps to one contiguous host span.
-pub(super) fn resolve_region_offset(
+pub(super) async fn resolve_region_offset(
     documents: &DocumentStore,
     language: &Arc<LanguageCoordinator>,
     bridge: &BridgeCoordinator,
+    tree_worker_shadow: Option<&Arc<crate::lsp::lsp_impl::tree_worker_shadow::TreeWorkerShadow>>,
     host_url: &Url,
     region_id: &str,
 ) -> Option<(RegionOffset, Position, bool)> {
+    if let Some(tree_worker_shadow) = tree_worker_shadow
+        && tree_worker_shadow.is_authoritative()
+    {
+        let (text, language_id, incarnation, content_version) =
+            documents.get(host_url).map(|document| {
+                (
+                    document.text_arc(),
+                    document.language_id().map(str::to_owned),
+                    document.incarnation(),
+                    document.content_version(),
+                )
+            })?;
+        let language_name =
+            language.detect_language(host_url.path(), &text, None, language_id.as_deref())?;
+        if !language
+            .ensure_language_loaded_async(&language_name)
+            .await
+            .success
+        {
+            return None;
+        }
+        let regions = tree_worker_shadow
+            .worker_injection_regions(
+                host_url,
+                incarnation,
+                content_version,
+                language.configuration_generation(),
+            )
+            .await?;
+        let current = documents.get(host_url)?;
+        if current.incarnation() != incarnation || current.content_version() != content_version {
+            return None;
+        }
+        drop(current);
+        return resolved_region_by_id(&regions, region_id).map(resolved_region_geometry);
+    }
+
     // Snapshot is owned, so the document handle (a store lock) is released
     // before `detect_document_language` reaches back into the store.
     let snapshot = documents.get(host_url)?.snapshot()?;
@@ -55,6 +93,16 @@ pub(super) fn resolve_region_offset(
     // an edit race: if this snapshot no longer contains the tracked layer, no
     // candidate has the ID and callers fall back safely.
     Some(resolved_region_geometry(resolved))
+}
+
+fn resolved_region_by_id(
+    regions: &[ResolvedInjection],
+    region_id: &str,
+) -> Option<ResolvedInjection> {
+    regions
+        .iter()
+        .find(|resolved| resolved.region.region_id == region_id)
+        .cloned()
 }
 
 /// Consume a resolved region into the geometry shared by freshness and edit
@@ -92,5 +140,29 @@ mod tests {
         let (_, region_end, _) = resolved_region_geometry(resolved);
 
         assert_eq!(region_end, Position::new(2, 4));
+    }
+
+    #[test]
+    fn worker_region_lookup_requires_the_exact_region_id() {
+        let make = |region_id: &str, line: u32| ResolvedInjection {
+            region: CacheableInjectionRegion {
+                language: "rust".to_string(),
+                byte_range: 10..20,
+                line_range: line..line + 1,
+                start_column: 0,
+                region_id: region_id.to_string(),
+                content_hash: 0,
+            },
+            injection_language: "rust".to_string(),
+            virtual_content: "x".to_string(),
+            line_column_offsets: vec![0],
+            contiguous: true,
+        };
+        let regions = vec![make("older", 2), make("current", 7)];
+
+        let selected = resolved_region_by_id(&regions, "current").expect("exact region");
+
+        assert_eq!(selected.region.line_range.start, 7);
+        assert!(resolved_region_by_id(&regions, "missing").is_none());
     }
 }

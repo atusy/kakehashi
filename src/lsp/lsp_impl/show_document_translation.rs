@@ -48,6 +48,7 @@ pub(super) struct ShowDocumentTranslator {
     documents: Arc<DocumentStore>,
     language: Arc<LanguageCoordinator>,
     bridge: Arc<BridgeCoordinator>,
+    tree_worker_shadow: Option<Arc<crate::lsp::lsp_impl::tree_worker_shadow::TreeWorkerShadow>>,
 }
 
 impl ShowDocumentTranslator {
@@ -55,11 +56,13 @@ impl ShowDocumentTranslator {
         documents: Arc<DocumentStore>,
         language: Arc<LanguageCoordinator>,
         bridge: Arc<BridgeCoordinator>,
+        tree_worker_shadow: Option<Arc<crate::lsp::lsp_impl::tree_worker_shadow::TreeWorkerShadow>>,
     ) -> Self {
         Self {
             documents,
             language,
             bridge,
+            tree_worker_shadow,
         }
     }
 
@@ -87,7 +90,7 @@ impl ShowDocumentTranslator {
         // Only a selection needs the (live-parse) region offset, so skip
         // resolving it when there's nothing to translate.
         if params.selection.is_some() {
-            match self.region_offset(&host_url, &region_id) {
+            match self.region_offset(&host_url, &region_id).await {
                 Some(offset) => return Self::apply_host_translation(params, host_uri, &offset),
                 // Offset unavailable (region invalidated by edits, or otherwise
                 // unresolvable): drop the selection we can't translate — a
@@ -120,14 +123,16 @@ impl ShowDocumentTranslator {
     /// document without a selection rather than risk a wrong one. showDocument
     /// only needs the offset (it translates a single selection position, not an
     /// edit), so the region-end bound and contiguity marker are discarded.
-    fn region_offset(&self, host_url: &Url, region_id: &str) -> Option<RegionOffset> {
+    async fn region_offset(&self, host_url: &Url, region_id: &str) -> Option<RegionOffset> {
         resolve_region_offset(
             &self.documents,
             &self.language,
             &self.bridge,
+            self.tree_worker_shadow.as_ref(),
             host_url,
             region_id,
         )
+        .await
         .map(|(offset, _region_end, _contiguous)| offset)
     }
 }
@@ -144,6 +149,7 @@ mod tests {
             Arc::new(DocumentStore::new()),
             Arc::new(LanguageCoordinator::new()),
             Arc::new(BridgeCoordinator::new()),
+            None,
         )
     }
 

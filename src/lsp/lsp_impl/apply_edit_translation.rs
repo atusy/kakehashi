@@ -97,6 +97,7 @@ pub(super) struct ApplyEditTranslator {
     documents: Arc<DocumentStore>,
     language: Arc<LanguageCoordinator>,
     bridge: Arc<BridgeCoordinator>,
+    tree_worker_shadow: Option<Arc<crate::lsp::lsp_impl::tree_worker_shadow::TreeWorkerShadow>>,
 }
 
 impl ApplyEditTranslator {
@@ -104,11 +105,13 @@ impl ApplyEditTranslator {
         documents: Arc<DocumentStore>,
         language: Arc<LanguageCoordinator>,
         bridge: Arc<BridgeCoordinator>,
+        tree_worker_shadow: Option<Arc<crate::lsp::lsp_impl::tree_worker_shadow::TreeWorkerShadow>>,
     ) -> Self {
         Self {
             documents,
             language,
             bridge,
+            tree_worker_shadow,
         }
     }
 
@@ -175,9 +178,12 @@ impl ApplyEditTranslator {
             &self.documents,
             &self.language,
             &self.bridge,
+            self.tree_worker_shadow.as_ref(),
             &host_url,
             &region_id,
-        ) else {
+        )
+        .await
+        else {
             // The region moved or was removed since the downstream produced
             // the edit; translating against a stale offset would edit the
             // wrong host text.
@@ -509,6 +515,7 @@ mod tests {
             Arc::new(DocumentStore::new()),
             Arc::new(LanguageCoordinator::new()),
             bridge,
+            None,
         )
     }
 

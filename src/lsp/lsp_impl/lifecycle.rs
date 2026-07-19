@@ -499,11 +499,13 @@ impl Kakehashi {
                     Arc::clone(&self.documents),
                     Arc::clone(&self.language),
                     Arc::clone(&self.bridge),
+                    Some(Arc::clone(&self.tree_worker_shadow)),
                 ),
                 apply_edit: ApplyEditTranslator::new(
                     Arc::clone(&self.documents),
                     Arc::clone(&self.language),
                     Arc::clone(&self.bridge),
+                    Some(Arc::clone(&self.tree_worker_shadow)),
                 ),
             }));
             let inbound_request_registry = self.bridge.pool().inbound_request_registry();
@@ -3250,11 +3252,13 @@ mod tests {
                 Arc::new(crate::document::DocumentStore::new()),
                 Arc::new(crate::language::LanguageCoordinator::new()),
                 Arc::new(BridgeCoordinator::new()),
+                None,
             ),
             apply_edit: ApplyEditTranslator::new(
                 Arc::new(crate::document::DocumentStore::new()),
                 Arc::new(crate::language::LanguageCoordinator::new()),
                 Arc::new(BridgeCoordinator::new()),
+                None,
             ),
         }));
         let loop_handle = tokio::spawn(upstream_forwarding_loop(
@@ -3376,11 +3380,13 @@ mod tests {
                 Arc::new(crate::document::DocumentStore::new()),
                 Arc::new(crate::language::LanguageCoordinator::new()),
                 Arc::new(BridgeCoordinator::new()),
+                None,
             ),
             apply_edit: ApplyEditTranslator::new(
                 Arc::new(crate::document::DocumentStore::new()),
                 Arc::new(crate::language::LanguageCoordinator::new()),
                 Arc::new(BridgeCoordinator::new()),
+                None,
             ),
         }));
         let loop_handle = tokio::spawn(upstream_forwarding_loop(

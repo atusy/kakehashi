@@ -28,7 +28,7 @@ impl Kakehashi {
         // combined document into one with masked host gaps. Fail closed for
         // legacy/stale envelopes before the downstream can add new edits.
         if let Some(envelope) = extract_envelope(&params)
-            && !self.completion_envelope_is_fresh(&envelope)
+            && !self.completion_envelope_is_fresh(&envelope).await
         {
             return Ok(params);
         }
@@ -41,7 +41,7 @@ impl Kakehashi {
         Ok(item)
     }
 
-    fn completion_envelope_is_fresh(&self, envelope: &KakehashiEnvelope) -> bool {
+    async fn completion_envelope_is_fresh(&self, envelope: &KakehashiEnvelope) -> bool {
         let Ok(host_url) = Url::parse(&envelope.host_uri) else {
             return false;
         };
@@ -49,9 +49,12 @@ impl Kakehashi {
             &self.documents,
             &self.language,
             &self.bridge,
+            Some(&self.tree_worker_shadow),
             &host_url,
             &envelope.region_id,
-        ) else {
+        )
+        .await
+        else {
             return false;
         };
         completion_geometry_matches(envelope, &offset, region_end, contiguous)
