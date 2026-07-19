@@ -4,9 +4,9 @@ use std::sync::{Arc, Barrier};
 #[cfg(feature = "e2e")]
 use kakehashi::tree_worker::{
     ApplyDocumentEdits, ByteEdit, CloseDocument, ConfigureLanguages, DeriveDocumentSnapshot,
-    DeriveSemanticTokens, NavigateNode, NodeNavigation, NodeScalarOperation, NodeScalarValue,
-    OpaqueNodeId, ResolveNode, RunCaptures, RunNodeScalar, SyncDocument, WorkerLanguageAsset,
-    WorkerLanguageCatalog, WorkerQuerySources,
+    DeriveNativeBindings, DeriveSemanticTokens, NavigateNode, NodeNavigation, NodeScalarOperation,
+    NodeScalarValue, OpaqueNodeId, ResolveNode, RunCaptures, RunNodeScalar, SyncDocument,
+    WireByteRange, WirePosition, WorkerLanguageAsset, WorkerLanguageCatalog, WorkerQuerySources,
 };
 use kakehashi::tree_worker::{Client, DeriveSnapshot, RequestContext, Response};
 
@@ -366,6 +366,56 @@ fn real_worker_keeps_document_text_and_tree_across_incremental_edits() {
         panic!("stale node navigation must be contained: {response:?}");
     };
     assert!(nodes.nodes.is_empty());
+
+    let bindings_context = RequestContext {
+        request_id: 351,
+        worker_generation: 44,
+        uri: "file:///bindings-process.rs".into(),
+        incarnation: 1,
+        content_version: 1,
+        configuration_generation: 0,
+    };
+    let response = worker
+        .sync_document(SyncDocument {
+            context: bindings_context.clone(),
+            language: "rust".into(),
+            grammar_symbol: "rust".into(),
+            source_path: parser.clone(),
+            parser_path: parser.clone(),
+            artifact_digest: digest(&parser),
+            queries: WorkerQuerySources {
+                bindings: Some(
+                    r#"
+                    (block) @scope
+                    (let_declaration pattern: (identifier) @definition)
+                    (identifier) @reference
+                    "#
+                    .into(),
+                ),
+                ..Default::default()
+            },
+            text: "fn main() { let target = 1; target; }".into(),
+        })
+        .unwrap();
+    assert!(matches!(response, Response::DocumentAck(_)));
+    let response = worker
+        .derive_native_bindings(DeriveNativeBindings {
+            context: RequestContext {
+                request_id: 352,
+                ..bindings_context
+            },
+            position: WirePosition {
+                line: 0,
+                character: 28,
+            },
+        })
+        .unwrap();
+    let Response::NativeBindings(bindings) = response else {
+        panic!("native bindings must be worker-owned: {response:?}");
+    };
+    let facts = bindings.facts.expect("reference must resolve");
+    assert_eq!(facts.definition, Some(WireByteRange { start: 16, end: 22 }));
+    assert_eq!(facts.references, vec![WireByteRange { start: 28, end: 34 }]);
 
     let mut closed = snapshot.context;
     closed.request_id = 36;

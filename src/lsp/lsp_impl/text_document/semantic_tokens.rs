@@ -428,6 +428,18 @@ impl Kakehashi {
         // landing after the resolution supersedes this request via the client's
         // next didChange-driven request; the CancelToken then reclaims the
         // compute mid-flight.
+        let worker_configuration_generation = self.language.configuration_generation();
+        if let Some(grammar) = self.language.worker_grammar_descriptor(&language_name)
+            && self.tree_worker_shadow.needs_document_sync(
+                &uri,
+                snapshot.incarnation,
+                snapshot.parsed_version,
+                worker_configuration_generation,
+                &grammar.queries,
+            )
+        {
+            self.refresh_tree_worker_documents(std::slice::from_ref(&uri));
+        }
         let (result, worker_tokens) = {
             // Snapshot-identical repeat request: tokens already cached for this
             // exact text are still correct, so skip re-tokenizing. Returns the
@@ -502,7 +514,7 @@ impl Kakehashi {
                 &uri,
                 snapshot.incarnation,
                 snapshot.parsed_version,
-                token_generation,
+                worker_configuration_generation,
                 supports_multiline,
             );
             let combined = async { tokio::join!(compute_future, worker_future) };

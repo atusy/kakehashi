@@ -97,6 +97,18 @@ impl Kakehashi {
         let expected_version = snapshot.parsed_version;
         let expected_incarnation = snapshot.incarnation;
         let expected_settings_generation = self.cache.semantic_token_generation();
+        let worker_configuration_generation = self.language.configuration_generation();
+        if let Some(grammar) = self.language.worker_grammar_descriptor(&language_name)
+            && self.tree_worker_shadow.needs_document_sync(
+                &uri,
+                expected_incarnation,
+                expected_version,
+                worker_configuration_generation,
+                &grammar.queries,
+            )
+        {
+            self.refresh_tree_worker_documents(std::slice::from_ref(&uri));
+        }
 
         let worker_positions = positions
             .iter()
@@ -109,7 +121,7 @@ impl Kakehashi {
             &uri,
             expected_incarnation,
             expected_version,
-            expected_settings_generation,
+            worker_configuration_generation,
             worker_positions,
         );
 

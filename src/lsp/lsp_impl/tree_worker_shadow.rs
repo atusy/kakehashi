@@ -12,11 +12,12 @@ use crate::language::coordinator::WorkerGrammarDescriptor;
 use crate::lsp::text_sync::SequentialByteEdit;
 use crate::tree_worker::{
     ApplyDocumentEditsAndDerive, ByteEdit, CapturesResult, Client, CloseDocument,
-    ConfigureLanguages, DeriveDocumentSnapshot, DeriveInjectionRegions, DeriveSelectionRanges,
-    DeriveSemanticTokens, DerivedSemanticTokens, InjectionRegionsResult, NavigateNode,
-    NodeNavigation, NodeResult, NodeScalarOperation, NodeScalarValue, OpaqueNodeId, RequestContext,
-    ResolveNode, Response, RunCaptures, RunNodeScalar, SelectionRangesResult, SyncDocument,
-    WirePosition, WireRange, WorkerLanguageCatalog, named_node_count,
+    ConfigureLanguages, DeriveDocumentSnapshot, DeriveInjectionRegions, DeriveNativeBindings,
+    DeriveSelectionRanges, DeriveSemanticTokens, DerivedSemanticTokens, InjectionRegionsResult,
+    NativeBindingsFacts, NativeBindingsResult, NavigateNode, NodeNavigation, NodeResult,
+    NodeScalarOperation, NodeScalarValue, OpaqueNodeId, RequestContext, ResolveNode, Response,
+    RunCaptures, RunNodeScalar, SelectionRangesResult, SyncDocument, WirePosition, WireRange,
+    WorkerLanguageCatalog, named_node_count,
 };
 
 use super::Kakehashi;
@@ -56,6 +57,7 @@ struct ReplicaIdentity {
     source_path: PathBuf,
     parser_path: PathBuf,
     artifact_digest: String,
+    queries: crate::tree_worker::WorkerQuerySources,
     configuration_generation: u64,
 }
 
@@ -69,6 +71,7 @@ impl ReplicaIdentity {
             source_path: request.source_path.clone(),
             parser_path: request.parser_path.clone(),
             artifact_digest: request.artifact_digest.clone(),
+            queries: request.queries.clone(),
             configuration_generation: request.context.configuration_generation,
         }
     }
@@ -193,8 +196,10 @@ struct OpenDocuments {
     current: HashMap<String, SyncDocument>,
     closed_incarnations: HashMap<String, u64>,
     acknowledged: HashMap<String, RequestContext>,
+    replica_changed: Arc<tokio::sync::Notify>,
     catalog: Option<(u64, WorkerLanguageCatalog)>,
     catalog_preload: Option<(u64, u64)>,
+    catalog_acknowledged: Option<(u64, u64)>,
 }
 
 struct SupervisorState {
@@ -234,6 +239,11 @@ struct ResyncFailure {
 }
 
 impl OpenDocuments {
+    fn acknowledge(&mut self, context: RequestContext) {
+        self.acknowledged.insert(context.uri.clone(), context);
+        self.replica_changed.notify_waiters();
+    }
+
     fn acknowledges(&self, context: &RequestContext) -> bool {
         self.acknowledged
             .get(&context.uri)
@@ -243,6 +253,14 @@ impl OpenDocuments {
                     && acknowledged.content_version == context.content_version
                     && acknowledged.configuration_generation == context.configuration_generation
             })
+    }
+
+    fn expects(&self, context: &RequestContext) -> bool {
+        self.current.get(&context.uri).is_some_and(|current| {
+            current.context.incarnation == context.incarnation
+                && current.context.content_version == context.content_version
+                && current.context.configuration_generation == context.configuration_generation
+        })
     }
 
     fn supersedes(&self, command: &ShadowCommand) -> bool {
@@ -362,6 +380,7 @@ impl OpenDocuments {
             }
             ShadowCommand::Shutdown(_) => {}
         }
+        self.replica_changed.notify_waiters();
         Observation::Accepted { artifact_replaced }
     }
 
@@ -604,6 +623,36 @@ impl TreeWorkerShadow {
         self.sender.is_some() && self.accepting.load(Ordering::Acquire)
     }
 
+    pub(super) fn needs_document_sync(
+        &self,
+        uri: &url::Url,
+        incarnation: u64,
+        content_version: u64,
+        configuration_generation: u64,
+        expected_queries: &crate::tree_worker::WorkerQuerySources,
+    ) -> bool {
+        if !self.is_enabled() {
+            return false;
+        }
+        let documents = self
+            .open_documents
+            .lock()
+            .recover_poison("TreeWorkerShadow::needs_document_sync");
+        let document_stale = documents.current.get(uri.as_str()).is_none_or(|document| {
+            document.context.incarnation != incarnation
+                || document.context.content_version != content_version
+                || document.context.configuration_generation != configuration_generation
+                || &document.queries != expected_queries
+        });
+        let catalog_stale = documents
+            .catalog
+            .as_ref()
+            .is_none_or(|(generation, catalog)| {
+                *generation != configuration_generation || catalog.assets.is_empty()
+            });
+        document_stale || catalog_stale
+    }
+
     pub(super) async fn resolve_node(
         &self,
         uri: &url::Url,
@@ -646,18 +695,9 @@ impl TreeWorkerShadow {
         configuration_generation: u64,
         positions: Vec<WirePosition>,
     ) -> Option<SelectionRangesResult> {
-        self.preload_catalog_async();
-        let client = self.read_client.load_full()?;
-        if !self.is_enabled() {
-            return None;
-        }
-        let context = self.synchronized_read_context(
-            &client,
-            uri,
-            incarnation,
-            content_version,
-            configuration_generation,
-        )?;
+        let (client, context) = self
+            .synchronized_query_read(uri, incarnation, content_version, configuration_generation)
+            .await?;
         let expected = context.clone();
         let response = tokio::task::spawn_blocking(move || {
             client.derive_selection_ranges(DeriveSelectionRanges { context, positions })
@@ -754,18 +794,9 @@ impl TreeWorkerShadow {
         configuration_generation: u64,
         supports_multiline: bool,
     ) -> Option<DerivedSemanticTokens> {
-        self.preload_catalog_async();
-        let client = self.read_client.load_full()?;
-        if !self.is_enabled() {
-            return None;
-        }
-        let context = self.synchronized_read_context(
-            &client,
-            uri,
-            incarnation,
-            content_version,
-            configuration_generation,
-        )?;
+        let (client, context) = self
+            .synchronized_query_read(uri, incarnation, content_version, configuration_generation)
+            .await?;
         let expected = context.clone();
         let response = tokio::task::spawn_blocking(move || {
             client.derive_semantic_tokens(DeriveSemanticTokens {
@@ -843,18 +874,9 @@ impl TreeWorkerShadow {
         range: Option<WireRange>,
         injection: bool,
     ) -> Option<CapturesResult> {
-        self.preload_catalog_async();
-        let client = self.read_client.load_full()?;
-        if !self.is_enabled() {
-            return None;
-        }
-        let context = self.synchronized_read_context(
-            &client,
-            uri,
-            incarnation,
-            content_version,
-            configuration_generation,
-        )?;
+        let (client, context) = self
+            .synchronized_query_read(uri, incarnation, content_version, configuration_generation)
+            .await?;
         let expected = context.clone();
         let response = tokio::task::spawn_blocking(move || {
             client.run_captures(RunCaptures {
@@ -949,6 +971,82 @@ impl TreeWorkerShadow {
                 .insert((uri.as_str().to_string(), authoritative_id), opaque.clone());
             self.worker_nodes
                 .insert((uri.as_str().to_string(), worker_id), opaque);
+        }
+    }
+
+    pub(super) async fn native_bindings(
+        &self,
+        uri: &url::Url,
+        incarnation: u64,
+        content_version: u64,
+        configuration_generation: u64,
+        position: WirePosition,
+    ) -> Option<NativeBindingsResult> {
+        let Some((client, context)) = self
+            .synchronized_query_read(uri, incarnation, content_version, configuration_generation)
+            .await
+        else {
+            log::debug!(target: "kakehashi::tree_worker_shadow", "native bindings skipped before worker inputs synchronized uri={uri} version={content_version}");
+            return None;
+        };
+        let expected = context.clone();
+        let response = tokio::task::spawn_blocking(move || {
+            client.derive_native_bindings(DeriveNativeBindings { context, position })
+        })
+        .await;
+        let Ok(Ok(response)) = response else {
+            log::debug!(target: "kakehashi::tree_worker_shadow", "native bindings worker request failed uri={uri}");
+            return None;
+        };
+        let Response::NativeBindings(result) = response else {
+            log::debug!(target: "kakehashi::tree_worker_shadow", "native bindings worker returned a non-bindings response uri={uri}: {response:?}");
+            return None;
+        };
+        if result.context != expected {
+            log::debug!(target: "kakehashi::tree_worker_shadow", "native bindings response context mismatch uri={uri}");
+            return None;
+        }
+        let current = self
+            .open_documents
+            .lock()
+            .recover_poison("TreeWorkerShadow::native_bindings(admission)")
+            .current
+            .get(uri.as_str())
+            .map(|current| current.context.clone());
+        if current.as_ref().is_none_or(|current| {
+            current.incarnation != expected.incarnation
+                || current.content_version != expected.content_version
+                || current.configuration_generation != expected.configuration_generation
+        }) || self
+            .read_client
+            .load()
+            .as_ref()
+            .is_none_or(|client| client.worker_generation() != expected.worker_generation)
+        {
+            log::debug!(target: "kakehashi::tree_worker_shadow", "native bindings response became stale uri={uri} version={content_version}");
+            return None;
+        }
+        Some(result)
+    }
+
+    pub(super) fn compare_native_bindings(
+        &self,
+        uri: &url::Url,
+        content_version: u64,
+        authoritative: Option<&NativeBindingsFacts>,
+        worker: &NativeBindingsResult,
+    ) {
+        if authoritative != worker.facts.as_ref() {
+            log::debug!(
+                target: "kakehashi::tree_worker_shadow",
+                "native bindings mismatch uri={uri} version={content_version} authoritative={authoritative:?} worker={:?}",
+                worker.facts,
+            );
+        } else {
+            log::debug!(
+                target: "kakehashi::tree_worker_shadow",
+                "native bindings matched uri={uri} version={content_version}",
+            );
         }
     }
 
@@ -1404,6 +1502,7 @@ impl TreeWorkerShadow {
             .recover_poison("TreeWorkerShadow::remember_catalog");
         documents.catalog = Some((generation, catalog));
         documents.catalog_preload = None;
+        documents.catalog_acknowledged = None;
     }
 
     fn preload_catalog_async(&self) {
@@ -1555,6 +1654,148 @@ impl TreeWorkerShadow {
             .then_some(context)
     }
 
+    async fn synchronized_query_read(
+        &self,
+        uri: &url::Url,
+        incarnation: u64,
+        content_version: u64,
+        configuration_generation: u64,
+    ) -> Option<(Arc<Client>, RequestContext)> {
+        let client = self.read_client_wait().await?;
+        if !self.is_enabled() {
+            return None;
+        }
+        self.preload_catalog_async();
+        if !self
+            .catalog_ready_wait(&client, configuration_generation)
+            .await
+        {
+            return None;
+        }
+        let context = self
+            .synchronized_read_context_wait(
+                &client,
+                uri,
+                incarnation,
+                content_version,
+                configuration_generation,
+            )
+            .await?;
+        Some((client, context))
+    }
+
+    async fn read_client_wait(&self) -> Option<Arc<Client>> {
+        let changed = self
+            .open_documents
+            .lock()
+            .recover_poison("TreeWorkerShadow::read_client_wait(notify)")
+            .replica_changed
+            .clone();
+        loop {
+            let notified = changed.notified();
+            if let Some(client) = self.read_client.load_full() {
+                return Some(client);
+            }
+            if self.disabled.load(Ordering::Acquire)
+                || self.sender.is_none()
+                || tokio::time::timeout(Duration::from_secs(2), notified)
+                    .await
+                    .is_err()
+            {
+                return None;
+            }
+        }
+    }
+
+    async fn catalog_ready_wait(&self, client: &Client, configuration_generation: u64) -> bool {
+        let expected = (client.worker_generation(), configuration_generation);
+        let changed = self
+            .open_documents
+            .lock()
+            .recover_poison("TreeWorkerShadow::catalog_ready_wait(notify)")
+            .replica_changed
+            .clone();
+        loop {
+            let notified = changed.notified();
+            {
+                let documents = self
+                    .open_documents
+                    .lock()
+                    .recover_poison("TreeWorkerShadow::catalog_ready_wait(check)");
+                if documents.catalog_acknowledged == Some(expected) {
+                    return true;
+                }
+                if documents
+                    .catalog
+                    .as_ref()
+                    .is_none_or(|(generation, _)| *generation != configuration_generation)
+                {
+                    return false;
+                }
+            }
+            if !self.is_enabled()
+                || tokio::time::timeout(Duration::from_secs(2), notified)
+                    .await
+                    .is_err()
+            {
+                return false;
+            }
+        }
+    }
+
+    async fn synchronized_read_context_wait(
+        &self,
+        client: &Client,
+        uri: &url::Url,
+        incarnation: u64,
+        content_version: u64,
+        configuration_generation: u64,
+    ) -> Option<RequestContext> {
+        let context = self.read_context(
+            client,
+            uri,
+            incarnation,
+            content_version,
+            configuration_generation,
+        );
+        let changed = self
+            .open_documents
+            .lock()
+            .recover_poison("TreeWorkerShadow::synchronized_read_context_wait(notify)")
+            .replica_changed
+            .clone();
+        loop {
+            let notified = changed.notified();
+            {
+                let documents = self
+                    .open_documents
+                    .lock()
+                    .recover_poison("TreeWorkerShadow::synchronized_read_context_wait(check)");
+                if documents.acknowledges(&context) {
+                    return Some(context);
+                }
+                if !documents.expects(&context) {
+                    log::debug!(
+                        target: "kakehashi::tree_worker_shadow",
+                        "read context is not current expected={context:?} current={:?}",
+                        documents
+                            .current
+                            .get(&context.uri)
+                            .map(|document| &document.context),
+                    );
+                    return None;
+                }
+            }
+            if !self.is_enabled()
+                || tokio::time::timeout(Duration::from_secs(2), notified)
+                    .await
+                    .is_err()
+            {
+                return None;
+            }
+        }
+    }
+
     fn admit_node_response(
         &self,
         response: Response,
@@ -1648,7 +1889,7 @@ impl Kakehashi {
                 uri,
                 incarnation,
                 parsed_version,
-                self.cache.semantic_token_generation(),
+                self.language.configuration_generation(),
             )
             .await
         else {
@@ -1732,14 +1973,19 @@ fn spawn_catalog_preload(
         .name("kakehashi-worker-catalog".into())
         .spawn(move || {
             let outcome = client.configure_languages(ConfigureLanguages { context, catalog });
-            if !matches!(outcome, Ok(Response::LanguageCatalogAck(_))) {
-                let mut documents = open_documents
-                    .lock()
-                    .recover_poison("spawn_catalog_preload(error)");
+            let mut documents = open_documents
+                .lock()
+                .recover_poison("spawn_catalog_preload(completion)");
+            if matches!(outcome, Ok(Response::LanguageCatalogAck(_))) {
+                documents.catalog_acknowledged =
+                    Some((worker_generation, configuration_generation));
+                documents.replica_changed.notify_waiters();
+            } else {
                 if documents.catalog_preload == Some((worker_generation, configuration_generation))
                 {
                     documents.catalog_preload = None;
                 }
+                documents.replica_changed.notify_waiters();
                 log::debug!(
                     target: "kakehashi::tree_worker_shadow",
                     "worker catalog preload did not complete: {outcome:?}",
@@ -1798,6 +2044,11 @@ fn run_actor(
     };
     let initial_healthy_since = initial_client.as_ref().map(|_| Instant::now());
     read_client.store(initial_client.clone());
+    open_documents
+        .lock()
+        .recover_poison("run_actor(notify initial client)")
+        .replica_changed
+        .notify_waiters();
     let mut state = SupervisorState {
         client: initial_client,
         read_client,
@@ -2035,8 +2286,7 @@ fn run_actor(
                     .open_documents
                     .lock()
                     .recover_poison("run_actor(acknowledge snapshot)")
-                    .acknowledged
-                    .insert(snapshot.context.uri.clone(), snapshot.context.clone());
+                    .acknowledge(snapshot.context.clone());
                 log::debug!(
                     target: "kakehashi::tree_worker_shadow_metrics",
                     "uri={} version={} parent_us={} queue_us={} compute_us={}",
@@ -2371,12 +2621,14 @@ fn recover_worker(
             }
         };
         state.replicas.clear();
-        state
-            .open_documents
-            .lock()
-            .recover_poison("recover_worker(clear acknowledgements)")
-            .acknowledged
-            .clear();
+        {
+            let mut documents = state
+                .open_documents
+                .lock()
+                .recover_poison("recover_worker(clear acknowledgements)");
+            documents.acknowledged.clear();
+            documents.replica_changed.notify_waiters();
+        }
         match resync_open_documents(
             &replacement,
             generation,
@@ -2389,6 +2641,12 @@ fn recover_worker(
                 state.worker_generation = generation;
                 let replacement = Arc::new(replacement);
                 state.read_client.store(Some(Arc::clone(&replacement)));
+                state
+                    .open_documents
+                    .lock()
+                    .recover_poison("recover_worker(notify replacement client)")
+                    .replica_changed
+                    .notify_waiters();
                 state.client = Some(replacement);
                 let healthy_since = Instant::now();
                 state.healthy_since = Some(healthy_since);
@@ -2545,8 +2803,7 @@ fn resync_open_documents(
                 open_documents
                     .lock()
                     .recover_poison("resync_open_documents(acknowledge snapshot)")
-                    .acknowledged
-                    .insert(snapshot.context.uri.clone(), snapshot.context.clone());
+                    .acknowledge(snapshot.context.clone());
                 comparisons.record(
                     &snapshot.context.uri,
                     snapshot.context.incarnation,
@@ -3413,6 +3670,10 @@ mod tests {
 
         changed = identity.clone();
         changed.configuration_generation += 1;
+        assert!(replica_requires_sync(&replicas, uri.as_str(), &changed));
+
+        changed = identity.clone();
+        changed.queries.bindings = Some("(identifier) @reference".into());
         assert!(replica_requires_sync(&replicas, uri.as_str(), &changed));
 
         replicas.remove(uri.as_str());

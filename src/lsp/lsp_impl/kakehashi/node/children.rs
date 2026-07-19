@@ -160,7 +160,7 @@ impl Kakehashi {
                 &uri,
                 incarnation,
                 snapshot.parsed_version,
-                self.cache.semantic_token_generation(),
+                self.language.configuration_generation(),
                 &params.id,
                 crate::tree_worker::NodeNavigation::Children,
                 &authoritative,

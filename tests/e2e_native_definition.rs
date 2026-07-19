@@ -11,6 +11,8 @@
 
 mod helpers;
 
+use std::time::Duration;
+
 use helpers::lsp_client::LspClient;
 use serde_json::json;
 
@@ -105,6 +107,81 @@ fn native_definition_resolves_without_a_bridge_server() {
     let start = &range.expect("range")["start"];
     assert_eq!(start["line"], 0, "definition is the `local greeting` line");
     assert_eq!(start["character"], 6);
+}
+
+#[test]
+fn shadow_worker_matches_native_definition_facts() {
+    let mut client = LspClient::builder()
+        .env("KAKEHASHI_EXPERIMENTAL", "true")
+        .env("KAKEHASHI_TREE_WORKER_SHADOW", "true")
+        .env("KAKEHASHI_TREE_WORKER_THREADS", "4")
+        .env("RUST_LOG", "kakehashi::tree_worker_shadow=debug")
+        .build();
+    client.send_request(
+        "initialize",
+        json!({
+            "processId": std::process::id(),
+            "rootUri": null,
+            "capabilities": {},
+            "initializationOptions": init_options()
+        }),
+    );
+    client.send_notification("initialized", json!({}));
+    client.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": URI,
+                "languageId": "lua",
+                "version": 1,
+                "text": LUA_SOURCE
+            }
+        }),
+    );
+    std::thread::sleep(Duration::from_millis(500));
+    let response = client.send_request(
+        "textDocument/definition",
+        json!({
+            "textDocument": { "uri": URI },
+            "position": use_position()
+        }),
+    );
+    assert!(!response["result"].is_null(), "{response:?}");
+
+    let markdown_uri = "file:///native_bindings_shadow.md";
+    client.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": markdown_uri,
+                "languageId": "markdown",
+                "version": 1,
+                "text": "# t\n\n```lua\nlocal v = 1\nprint(v)\n```\n"
+            }
+        }),
+    );
+    std::thread::sleep(Duration::from_millis(500));
+    let response = client.send_request(
+        "textDocument/definition",
+        json!({
+            "textDocument": { "uri": markdown_uri },
+            "position": { "line": 4, "character": 6 }
+        }),
+    );
+    assert!(!response["result"].is_null(), "{response:?}");
+
+    let _ = client.send_request("shutdown", json!(null));
+    client.send_notification("exit", json!(null));
+    let status = client
+        .wait_for_exit(Duration::from_secs(5))
+        .expect("server must exit");
+    assert!(status.success());
+    let stderr = client.drain_stderr();
+    assert!(
+        stderr.matches("native bindings matched").count() >= 2,
+        "worker comparison did not complete: {stderr}"
+    );
+    assert!(!stderr.contains("native bindings mismatch"), "{stderr}");
 }
 
 #[test]

@@ -11,8 +11,6 @@
 //! tree is parsed with included ranges; results map back through the
 //! region's content offset). `#offset!`-shifted regions stay bridge-only.
 
-use std::ops::Range;
-
 use tower_lsp_server::jsonrpc::Result;
 use tower_lsp_server::ls_types::{
     DocumentHighlight, DocumentHighlightKind, Location, LocationLink, Position,
@@ -24,26 +22,22 @@ use crate::analysis::bindings::collect::collect_cancellable;
 use crate::analysis::bindings::model::BindingsModel;
 use crate::text::PositionMapper;
 
-/// Everything a native answer is computed from: the resolved model, the
-/// cursor's byte offset **within the layer**, the host-text mapper, and the
-/// layer's byte offset into the host text (0 for the host layer).
+/// Everything a native answer is computed from: worker-wire-compatible facts
+/// in host byte coordinates plus the host-text position mapper.
 pub(crate) struct NativeBindingsContext<'a> {
-    pub(crate) model: &'a BindingsModel,
-    pub(crate) byte: usize,
+    pub(crate) facts: &'a crate::tree_worker::NativeBindingsFacts,
     pub(crate) mapper: &'a PositionMapper<'a>,
-    pub(crate) layer_offset: usize,
 }
 
 impl NativeBindingsContext<'_> {
-    /// A layer-relative byte range as a host-document LSP range.
-    fn to_host_range(&self, range: &Range<usize>) -> Option<tower_lsp_server::ls_types::Range> {
+    /// A host-document byte range as an LSP range.
+    fn to_host_range(
+        &self,
+        range: crate::tree_worker::WireByteRange,
+    ) -> Option<tower_lsp_server::ls_types::Range> {
         Some(tower_lsp_server::ls_types::Range {
-            start: self
-                .mapper
-                .byte_to_position(range.start + self.layer_offset)?,
-            end: self
-                .mapper
-                .byte_to_position(range.end + self.layer_offset)?,
+            start: self.mapper.byte_to_position(range.start)?,
+            end: self.mapper.byte_to_position(range.end)?,
         })
     }
 }
@@ -98,6 +92,7 @@ impl Kakehashi {
         // (every edit and reopen installs a fresh allocation).
         self.ensure_document_parsed(&uri).await;
         let settings_generation = self.cache.semantic_token_generation();
+        let worker_configuration_generation = self.language.configuration_generation();
         let Some((text, tree, content_version, incarnation)) = ({
             let doc = self.documents.get(&uri);
             doc.and_then(|doc| {
@@ -112,6 +107,17 @@ impl Kakehashi {
         }) else {
             return Ok(None);
         };
+        if let Some(grammar) = self.language.worker_grammar_descriptor(&language)
+            && self.tree_worker_shadow.needs_document_sync(
+                &uri,
+                incarnation,
+                content_version,
+                worker_configuration_generation,
+                &grammar.queries,
+            )
+        {
+            self.refresh_tree_worker_documents(std::slice::from_ref(&uri));
+        }
 
         // Strict conversion: a client-supplied `character` past its line
         // end must silence, not spill onto a later line's identifier.
@@ -120,33 +126,80 @@ impl Kakehashi {
             return Ok(None);
         };
 
+        let local = self.local_native_bindings_facts(&uri, &text, &tree, &language, byte);
+        let worker = self.tree_worker_shadow.native_bindings(
+            &uri,
+            incarnation,
+            content_version,
+            worker_configuration_generation,
+            crate::tree_worker::WirePosition {
+                line: position.line,
+                character: position.character,
+            },
+        );
+        let (facts, worker) = tokio::join!(local, worker);
+        if let Some(worker) = worker.as_ref() {
+            self.tree_worker_shadow.compare_native_bindings(
+                &uri,
+                content_version,
+                facts.as_ref(),
+                worker,
+            );
+        }
+        let Some(facts) = facts else {
+            return Ok(None);
+        };
+        let answer = f(NativeBindingsContext {
+            facts: &facts,
+            mapper: &mapper,
+        });
+
+        // A didChange between the snapshot and here makes every computed
+        // range stale — worst case a rename WorkspaceEdit applied to newer
+        // text. Publish only while the snapshot's text is still current.
+        let unchanged = self.documents.get(&uri).is_some_and(|doc| {
+            doc.content_version() == content_version
+                && doc.incarnation() == incarnation
+                && std::sync::Arc::ptr_eq(&doc.text_arc(), &text)
+        });
+        if !unchanged || self.cache.semantic_token_generation() != settings_generation {
+            return Ok(None);
+        }
+        Ok(answer)
+    }
+
+    async fn local_native_bindings_facts(
+        &self,
+        uri: &url::Url,
+        text: &std::sync::Arc<str>,
+        tree: &tree_sitter::Tree,
+        language: &str,
+        byte: usize,
+    ) -> Option<crate::tree_worker::NativeBindingsFacts> {
         // Scope trees are per layer and resolution never crosses layer
         // boundaries: a cursor inside an injected region resolves in that
         // region's layer alone.
         let (query, layer_text, layer_tree, layer_offset) = match self
-            .injected_bindings_layer(&uri, &text, &tree, &language, byte)
+            .injected_bindings_layer(uri, text, tree, language, byte)
             .await
         {
             Some(Some(layer)) => layer,
             // Inside a region the resolver cannot serve: silence, never
             // a host-layer answer for an injected-code cursor.
-            Some(None) => return Ok(None),
-            None => {
-                let Some(query) = self.language.bindings_query(&language) else {
-                    return Ok(None);
-                };
-                (query, std::sync::Arc::clone(&text), tree.clone(), 0)
-            }
+            Some(None) => return None,
+            None => (
+                self.language.bindings_query(language)?,
+                std::sync::Arc::clone(text),
+                tree.clone(),
+                0,
+            ),
         };
 
         // The query walk and model build are CPU work proportional to the
         // layer, not the request: keep them off the async worker like every
         // other tree-CPU site. Dropping a spawn_blocking JoinHandle does NOT
-        // stop the task, so when the cross-layer race drops this future (a
-        // higher-priority bridge answer won) the guard flips the cooperative
-        // flag and the collection walk exits at its next match instead of
-        // burning a blocking thread on an answer nobody can use. A failed or
-        // cancelled task degrades to silence.
+        // stop the task, so a dropped cross-layer race cooperatively cancels
+        // the collection walk at its next match.
         let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         struct CancelOnDrop {
             flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
@@ -169,36 +222,21 @@ impl Kakehashi {
         })
         .await;
         guard.armed = false;
-        let model = match task {
-            Ok(Some(model)) => model,
-            Ok(None) => return Ok(None),
+        match task {
+            Ok(Some(model)) => Some(native_bindings_facts(
+                &model,
+                byte - layer_offset,
+                layer_offset,
+            )),
+            Ok(None) => None,
             Err(join_error) => {
                 log::warn!(
                     target: "kakehashi::bindings",
                     "bindings model task failed for {uri}: {join_error}"
                 );
-                return Ok(None);
+                None
             }
-        };
-        let answer = f(NativeBindingsContext {
-            model: &model,
-            byte: byte - layer_offset,
-            mapper: &mapper,
-            layer_offset,
-        });
-
-        // A didChange between the snapshot and here makes every computed
-        // range stale — worst case a rename WorkspaceEdit applied to newer
-        // text. Publish only while the snapshot's text is still current.
-        let unchanged = self.documents.get(&uri).is_some_and(|doc| {
-            doc.content_version() == content_version
-                && doc.incarnation() == incarnation
-                && std::sync::Arc::ptr_eq(&doc.text_arc(), &text)
-        });
-        if !unchanged || self.cache.semantic_token_generation() != settings_generation {
-            return Ok(None);
         }
-        Ok(answer)
     }
 
     /// The injected layer under the cursor, prepared for resolution.
@@ -305,13 +343,12 @@ pub(crate) fn native_definition(
     ctx: NativeBindingsContext<'_>,
     lsp_uri: &Uri,
 ) -> Option<Vec<LocationLink>> {
-    let target = ctx.model.definition_range_at(ctx.byte)?;
-    let range = ctx.to_host_range(&target)?;
+    let range = ctx.to_host_range(ctx.facts.definition?)?;
     Some(vec![LocationLink {
         origin_selection_range: ctx
-            .model
-            .resolvable_identifier_at(ctx.byte)
-            .and_then(|r| ctx.to_host_range(&r)),
+            .facts
+            .identifier
+            .and_then(|identifier| ctx.to_host_range(identifier)),
         target_uri: lsp_uri.clone(),
         target_range: range,
         target_selection_range: range,
@@ -328,7 +365,7 @@ pub(crate) fn native_references(
     let ranges = binding_ranges(&ctx, include_declaration)?;
     let locations: Vec<Location> = ranges
         .iter()
-        .filter_map(|r| ctx.to_host_range(r))
+        .filter_map(|range| ctx.to_host_range(*range))
         .map(|range| Location {
             uri: lsp_uri.clone(),
             range,
@@ -346,7 +383,7 @@ pub(crate) fn native_document_highlight(
     let ranges = binding_ranges(&ctx, true)?;
     let highlights: Vec<DocumentHighlight> = ranges
         .iter()
-        .filter_map(|r| ctx.to_host_range(r))
+        .filter_map(|range| ctx.to_host_range(*range))
         .map(|range| DocumentHighlight {
             range,
             kind: Some(DocumentHighlightKind::TEXT),
@@ -374,7 +411,7 @@ pub(crate) fn native_rename(
     let ranges = binding_ranges(&ctx, true)?;
     let edits: Vec<TextEdit> = ranges
         .iter()
-        .filter_map(|r| ctx.to_host_range(r))
+        .filter_map(|range| ctx.to_host_range(*range))
         .map(|range| TextEdit {
             range,
             new_text: new_name.to_string(),
@@ -404,8 +441,8 @@ fn is_conservative_identifier(name: &str) -> bool {
 pub(crate) fn native_prepare_rename(
     ctx: NativeBindingsContext<'_>,
 ) -> Option<PrepareRenameResponse> {
-    let range = ctx.model.resolvable_identifier_at(ctx.byte)?;
-    ctx.to_host_range(&range).map(PrepareRenameResponse::Range)
+    ctx.to_host_range(ctx.facts.identifier?)
+        .map(PrepareRenameResponse::Range)
 }
 
 /// The byte ranges of the cursor binding's references (and, when included,
@@ -413,20 +450,55 @@ pub(crate) fn native_prepare_rename(
 fn binding_ranges(
     ctx: &NativeBindingsContext<'_>,
     include_definitions: bool,
-) -> Option<Vec<Range<usize>>> {
-    let binding = ctx.model.binding_at(ctx.byte)?;
-    let mut ranges = ctx.model.references_resolving_to(binding);
+) -> Option<Vec<crate::tree_worker::WireByteRange>> {
+    let mut ranges = ctx.facts.references.clone();
     if include_definitions {
-        ranges.extend(
-            ctx.model
-                .sites(binding)
-                .iter()
-                .map(|s| s.byte_range.clone()),
-        );
+        ranges.extend(ctx.facts.definitions.iter().copied());
     }
     ranges.sort_by_key(|r| (r.start, r.end));
     ranges.dedup();
-    Some(ranges)
+    (!ctx.facts.definitions.is_empty()).then_some(ranges)
+}
+
+fn native_bindings_facts(
+    model: &BindingsModel,
+    byte: usize,
+    layer_offset: usize,
+) -> crate::tree_worker::NativeBindingsFacts {
+    let to_wire = |range: std::ops::Range<usize>| crate::tree_worker::WireByteRange {
+        start: range.start + layer_offset,
+        end: range.end + layer_offset,
+    };
+    let identifier = model.resolvable_identifier_at(byte).map(&to_wire);
+    let definition = model.definition_range_at(byte).map(&to_wire);
+    let Some(binding) = model.binding_at(byte) else {
+        return crate::tree_worker::NativeBindingsFacts {
+            identifier,
+            definition,
+            references: Vec::new(),
+            definitions: Vec::new(),
+        };
+    };
+    let mut references = model
+        .references_resolving_to(binding)
+        .into_iter()
+        .map(&to_wire)
+        .collect::<Vec<_>>();
+    let mut definitions = model
+        .sites(binding)
+        .iter()
+        .map(|site| to_wire(site.byte_range.clone()))
+        .collect::<Vec<_>>();
+    references.sort_by_key(|range| (range.start, range.end));
+    references.dedup();
+    definitions.sort_by_key(|range| (range.start, range.end));
+    definitions.dedup();
+    crate::tree_worker::NativeBindingsFacts {
+        identifier,
+        definition,
+        references,
+        definitions,
+    }
 }
 
 #[cfg(test)]

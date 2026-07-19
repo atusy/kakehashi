@@ -42,6 +42,13 @@ impl LanguageRegistry {
     pub(crate) fn contains(&self, language_id: &str) -> bool {
         self.languages.contains_key(language_id)
     }
+
+    pub(crate) fn language_ids(&self) -> Vec<String> {
+        self.languages
+            .iter()
+            .map(|entry| entry.key().clone())
+            .collect()
+    }
 }
 
 #[cfg(test)]

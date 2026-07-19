@@ -1981,7 +1981,9 @@ impl LanguageCoordinator {
             .keys()
             .cloned()
             .collect::<Vec<_>>();
+        language_ids.extend(self.language_registry.language_ids());
         language_ids.sort();
+        language_ids.dedup();
         let assets = language_ids
             .into_iter()
             .filter_map(|language| {

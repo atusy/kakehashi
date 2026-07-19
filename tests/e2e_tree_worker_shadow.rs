@@ -372,7 +372,10 @@ fn idle_worker_exit_is_detected_and_restarted_before_the_next_document() {
         )
         .build();
     initialize(&mut client);
-    std::thread::sleep(Duration::from_secs(2));
+    // The debug E2E binary is hashed during the replacement handshake. Leave
+    // enough room for idle detection, backoff, hashing, and the zero-document
+    // resync before introducing the document whose service we verify below.
+    std::thread::sleep(Duration::from_secs(5));
 
     let uri = "file:///after-idle-restart.rs";
     client.send_notification(

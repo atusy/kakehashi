@@ -22,7 +22,7 @@ use sha2::{Digest, Sha256};
 
 use crate::language::node_tracker::{EditInfo, NodeTracker};
 
-pub const PROTOCOL_VERSION: u32 = 10;
+pub const PROTOCOL_VERSION: u32 = 11;
 pub const MAX_FRAME_BYTES: usize = 64 * 1024 * 1024;
 pub const MAX_DOCUMENT_REPLICAS: usize = 4_096;
 pub const MAX_DOCUMENT_BYTES: usize = 32 * 1024 * 1024;
@@ -174,6 +174,12 @@ pub struct RunCaptures {
     pub injection: bool,
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct DeriveNativeBindings {
+    pub context: RequestContext,
+    pub position: WirePosition,
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum NodeScalarOperation {
@@ -268,6 +274,12 @@ pub struct WireRange {
     pub end: WirePosition,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct WireByteRange {
+    pub start: usize,
+    pub end: usize,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct WireSelectionRange {
     pub range: WireRange,
@@ -353,6 +365,20 @@ pub struct CapturesResult {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct NativeBindingsFacts {
+    pub identifier: Option<WireByteRange>,
+    pub definition: Option<WireByteRange>,
+    pub references: Vec<WireByteRange>,
+    pub definitions: Vec<WireByteRange>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct NativeBindingsResult {
+    pub context: RequestContext,
+    pub facts: Option<NativeBindingsFacts>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct LanguageCatalogAck {
     pub context: RequestContext,
     pub languages: usize,
@@ -396,6 +422,7 @@ pub enum Request {
     DeriveInjectionRegions(DeriveInjectionRegions),
     DeriveSemanticTokens(DeriveSemanticTokens),
     RunCaptures(RunCaptures),
+    DeriveNativeBindings(DeriveNativeBindings),
     ConfigureLanguages(ConfigureLanguages),
     CloseDocument(CloseDocument),
 }
@@ -442,6 +469,7 @@ pub enum Response {
     InjectionRegions(InjectionRegionsResult),
     SemanticTokens(DerivedSemanticTokens),
     Captures(CapturesResult),
+    NativeBindings(NativeBindingsResult),
     LanguageCatalogAck(LanguageCatalogAck),
     Error(WorkerError),
 }
@@ -989,6 +1017,105 @@ impl DocumentReplica {
         })
     }
 
+    fn derive_native_bindings(
+        &self,
+        request: DeriveNativeBindings,
+    ) -> Result<NativeBindingsResult, String> {
+        self.validate_read_identity(&request.context)?;
+        worker_analysis(
+            &self.analysis,
+            &self.language,
+            self.grammar_language.clone(),
+            self.queries.clone(),
+            WorkerQuerySet::Bindings,
+        )?;
+        let position = tower_lsp_server::ls_types::Position::new(
+            request.position.line,
+            request.position.character,
+        );
+        let Some(byte) =
+            crate::text::PositionMapper::new(&self.text).position_to_byte_strict(position)
+        else {
+            return Ok(NativeBindingsResult {
+                context: request.context,
+                facts: None,
+            });
+        };
+        let Some((query, layer_text, layer_tree, layer_offset)) = self.native_bindings_inputs(byte)
+        else {
+            return Ok(NativeBindingsResult {
+                context: request.context,
+                facts: None,
+            });
+        };
+        let cancel = AtomicBool::new(false);
+        let facts = crate::analysis::bindings::collect::collect_cancellable(
+            &layer_text,
+            layer_tree.root_node(),
+            &query,
+            &cancel,
+        )
+        .map(crate::analysis::bindings::model::BindingsModel::build)
+        .map(|model| native_bindings_facts(&model, byte - layer_offset, layer_offset));
+        Ok(NativeBindingsResult {
+            context: request.context,
+            facts,
+        })
+    }
+
+    fn native_bindings_inputs(
+        &self,
+        byte: usize,
+    ) -> Option<(Arc<tree_sitter::Query>, Arc<str>, tree_sitter::Tree, usize)> {
+        use crate::language::injection::{
+            collect_all_injections, compute_included_ranges, parse_with_ranges,
+        };
+
+        if let Some(injection_query) = self.analysis.injection_query(&self.language)
+            && let Some(regions) =
+                collect_all_injections(&self.tree.root_node(), &self.text, Some(&injection_query))
+            && let Some(region) = regions
+                .iter()
+                .filter(|region| {
+                    region.content_node.start_byte() <= byte
+                        && byte < region.content_node.end_byte()
+                })
+                .min_by_key(|region| {
+                    region.content_node.end_byte() - region.content_node.start_byte()
+                })
+        {
+            if region.offset.is_some() {
+                return None;
+            }
+            let content_range = region.content_node.byte_range();
+            let content_text = self.text.get(content_range.clone()).map(Arc::<str>::from)?;
+            let (layer_language, load) = self
+                .analysis
+                .resolve_injection_language(&region.language, &content_text)?;
+            if !load.success {
+                return None;
+            }
+            let included_ranges =
+                compute_included_ranges(&region.content_node, region.include_children);
+            let mut parser_pool = self.analysis.create_document_parser_pool();
+            let mut parser = parser_pool.acquire(&layer_language)?;
+            let layer_tree = parse_with_ranges(
+                &mut parser,
+                &content_text,
+                included_ranges.as_deref(),
+                "kakehashi::tree_worker",
+                &layer_language,
+            );
+            parser_pool.release(layer_language.clone(), parser);
+            let layer_tree = layer_tree?;
+            let query = self.analysis.bindings_query(&layer_language)?;
+            return Some((query, content_text, layer_tree, content_range.start));
+        }
+
+        let query = self.analysis.bindings_query(&self.language)?;
+        Some((query, Arc::from(self.text.as_str()), self.tree.clone(), 0))
+    }
+
     fn tracked_node<'tree>(
         &'tree self,
         node_id: &OpaqueNodeId,
@@ -1066,6 +1193,7 @@ impl DocumentReplica {
         context: &RequestContext,
         language: &str,
         grammar_key: &GrammarKey,
+        queries: &WorkerQuerySources,
     ) -> Result<(), String> {
         if context.worker_generation != self.context.worker_generation
             || context.uri != self.context.uri
@@ -1092,6 +1220,7 @@ impl DocumentReplica {
             }
             if context.configuration_generation == self.context.configuration_generation
                 && context.content_version == self.context.content_version
+                && queries == &self.queries
             {
                 return Err("full sync must advance the content version".into());
             }
@@ -1118,6 +1247,7 @@ fn selection_range_to_wire(
 enum WorkerQuerySet {
     Injections,
     Semantic,
+    Bindings,
     All,
 }
 
@@ -1152,6 +1282,11 @@ fn worker_analysis(
                 crate::config::settings::QueryKind::Highlights
                     | crate::config::settings::QueryKind::Injections
             ),
+            WorkerQuerySet::Bindings => matches!(
+                kind,
+                crate::config::settings::QueryKind::Bindings
+                    | crate::config::settings::QueryKind::Injections
+            ),
             WorkerQuerySet::All => true,
         };
         if !selected {
@@ -1177,6 +1312,47 @@ fn worker_analysis(
         );
     }
     Ok(())
+}
+
+fn native_bindings_facts(
+    model: &crate::analysis::bindings::model::BindingsModel,
+    byte: usize,
+    layer_offset: usize,
+) -> NativeBindingsFacts {
+    let to_wire = |range: std::ops::Range<usize>| WireByteRange {
+        start: range.start + layer_offset,
+        end: range.end + layer_offset,
+    };
+    let identifier = model.resolvable_identifier_at(byte).map(&to_wire);
+    let definition = model.definition_range_at(byte).map(&to_wire);
+    let Some(binding) = model.binding_at(byte) else {
+        return NativeBindingsFacts {
+            identifier,
+            definition,
+            references: Vec::new(),
+            definitions: Vec::new(),
+        };
+    };
+    let mut references = model
+        .references_resolving_to(binding)
+        .into_iter()
+        .map(&to_wire)
+        .collect::<Vec<_>>();
+    let mut definitions = model
+        .sites(binding)
+        .iter()
+        .map(|site| to_wire(site.byte_range.clone()))
+        .collect::<Vec<_>>();
+    references.sort_by_key(|range| (range.start, range.end));
+    references.dedup();
+    definitions.sort_by_key(|range| (range.start, range.end));
+    definitions.dedup();
+    NativeBindingsFacts {
+        identifier,
+        definition,
+        references,
+        definitions,
+    }
 }
 
 fn validate_document_size(bytes: usize) -> Result<(), String> {
@@ -1475,8 +1651,12 @@ impl LocalDocumentReplica {
         let grammar_key = GrammarKey::from_sync(&request);
         let Self { state, replica } = self;
         if let Some(existing) = replica.as_ref()
-            && let Err(message) =
-                existing.validate_replacement(&context, &request.language, &grammar_key)
+            && let Err(message) = existing.validate_replacement(
+                &context,
+                &request.language,
+                &grammar_key,
+                &request.queries,
+            )
         {
             return Response::Error(WorkerError {
                 context: Some(context),
@@ -1824,6 +2004,7 @@ fn handle_work(
         Request::DeriveInjectionRegions(request) => derive_injection_regions(request, documents),
         Request::DeriveSemanticTokens(request) => derive_semantic_tokens(request, documents),
         Request::RunCaptures(request) => run_captures(request, documents),
+        Request::DeriveNativeBindings(request) => derive_native_bindings(request, documents),
         Request::ConfigureLanguages(request) => configure_languages(request, analysis),
         Request::CloseDocument(request) => close_document(
             request,
@@ -1853,6 +2034,7 @@ fn request_context(request: &Request) -> Option<&RequestContext> {
         Request::DeriveInjectionRegions(request) => Some(&request.context),
         Request::DeriveSemanticTokens(request) => Some(&request.context),
         Request::RunCaptures(request) => Some(&request.context),
+        Request::DeriveNativeBindings(request) => Some(&request.context),
         Request::ConfigureLanguages(request) => Some(&request.context),
         Request::CloseDocument(request) => Some(&request.context),
     }
@@ -1871,6 +2053,7 @@ fn document_key(request: &Request) -> Option<DocumentKey> {
         Request::DeriveInjectionRegions(request) => Some(DocumentKey::from(&request.context)),
         Request::DeriveSemanticTokens(request) => Some(DocumentKey::from(&request.context)),
         Request::RunCaptures(request) => Some(DocumentKey::from(&request.context)),
+        Request::DeriveNativeBindings(request) => Some(DocumentKey::from(&request.context)),
         Request::CloseDocument(request) => Some(DocumentKey::from(&request.context)),
         Request::Handshake(_) | Request::DeriveSnapshot(_) | Request::ConfigureLanguages(_) => None,
     }
@@ -2040,6 +2223,29 @@ fn run_captures(request: RunCaptures, documents: &DocumentStore) -> Response {
     }
 }
 
+fn derive_native_bindings(request: DeriveNativeBindings, documents: &DocumentStore) -> Response {
+    let context = request.context.clone();
+    let Some(replica) = documents
+        .get(&DocumentKey::from(&context))
+        .map(|entry| Arc::clone(entry.value()))
+    else {
+        return Response::Error(WorkerError {
+            context: Some(context),
+            message: "document replica is missing; full sync required".into(),
+        });
+    };
+    match replica.lock() {
+        Ok(replica) => match replica.derive_native_bindings(request) {
+            Ok(result) => Response::NativeBindings(result),
+            Err(message) => Response::Error(WorkerError {
+                context: Some(context),
+                message,
+            }),
+        },
+        Err(_) => poisoned_document_restart(context),
+    }
+}
+
 fn configure_languages(
     request: ConfigureLanguages,
     analysis: &Arc<crate::language::LanguageCoordinator>,
@@ -2146,7 +2352,12 @@ fn sync_document_with_analysis(
     {
         match existing.lock() {
             Ok(replica) => {
-                match replica.validate_replacement(&context, &request.language, &grammar_key) {
+                match replica.validate_replacement(
+                    &context,
+                    &request.language,
+                    &grammar_key,
+                    &request.queries,
+                ) {
                     Ok(()) => replica.text.len(),
                     Err(message) => {
                         return Response::Error(WorkerError {
@@ -3015,6 +3226,15 @@ impl Client {
         )
     }
 
+    pub fn derive_native_bindings(&self, request: DeriveNativeBindings) -> io::Result<Response> {
+        let context = request.context.clone();
+        self.request_with_timeout(
+            Request::DeriveNativeBindings(request),
+            context,
+            Duration::from_secs(60),
+        )
+    }
+
     pub fn configure_languages(&self, request: ConfigureLanguages) -> io::Result<Response> {
         let context = request.context.clone();
         self.request_with_timeout(
@@ -3194,6 +3414,7 @@ fn response_request_id(response: &Response) -> Option<u64> {
         Response::InjectionRegions(result) => Some(result.context.request_id),
         Response::SemanticTokens(result) => Some(result.context.request_id),
         Response::Captures(result) => Some(result.context.request_id),
+        Response::NativeBindings(result) => Some(result.context.request_id),
         Response::LanguageCatalogAck(ack) => Some(ack.context.request_id),
         Response::Error(error) => error.context.as_ref().map(|context| context.request_id),
         Response::HandshakeReady(_) => None,
@@ -3212,6 +3433,7 @@ fn response_context(response: &Response) -> Option<&RequestContext> {
         Response::InjectionRegions(result) => Some(&result.context),
         Response::SemanticTokens(result) => Some(&result.context),
         Response::Captures(result) => Some(&result.context),
+        Response::NativeBindings(result) => Some(&result.context),
         Response::LanguageCatalogAck(ack) => Some(&ack.context),
         Response::Error(error) => error.context.as_ref(),
         Response::HandshakeReady(_) => None,
@@ -3324,15 +3546,16 @@ mod tests {
 
     use super::{
         ApplyDocumentEdits, BUILD_ID, ByteEdit, CloseDocument, DeriveInjectionRegions,
-        DeriveSelectionRanges, DeriveSemanticTokens, DeriveSnapshot, DocumentKey, DocumentLane,
-        DocumentReplica, GrammarKey, Handshake, HandshakeReady, LaneAction, LaneRegistry,
-        MAX_DOCUMENT_BYTES, MAX_DOCUMENT_REPLICAS, MAX_RETAINED_DOCUMENT_BYTES, NavigateNode,
-        NodeNavigation, NodeScalarOperation, NodeScalarValue, OpaqueNodeId, PROTOCOL_VERSION,
-        Request, RequestContext, ResolveNode, Response, Route, RunCaptures, RunNodeScalar,
-        SyncDocument, WirePosition, WireRange, WorkerError, WorkerQuerySources, close_document,
-        decode_frame, derive_snapshot_with_language, encode_frame, named_node_count,
-        replace_retained_bytes, reserve_retained_growth, route_response, run, submit_document_job,
-        sync_document, terminate_by_transport, validate_document_size,
+        DeriveNativeBindings, DeriveSelectionRanges, DeriveSemanticTokens, DeriveSnapshot,
+        DocumentKey, DocumentLane, DocumentReplica, GrammarKey, Handshake, HandshakeReady,
+        LaneAction, LaneRegistry, MAX_DOCUMENT_BYTES, MAX_DOCUMENT_REPLICAS,
+        MAX_RETAINED_DOCUMENT_BYTES, NavigateNode, NodeNavigation, NodeScalarOperation,
+        NodeScalarValue, OpaqueNodeId, PROTOCOL_VERSION, Request, RequestContext, ResolveNode,
+        Response, Route, RunCaptures, RunNodeScalar, SyncDocument, WireByteRange, WirePosition,
+        WireRange, WorkerError, WorkerQuerySources, close_document, decode_frame,
+        derive_snapshot_with_language, encode_frame, named_node_count, replace_retained_bytes,
+        reserve_retained_growth, route_response, run, submit_document_job, sync_document,
+        terminate_by_transport, validate_document_size,
     };
 
     #[derive(Clone, Default)]
@@ -4289,6 +4512,135 @@ mod tests {
     }
 
     #[test]
+    fn native_bindings_are_resolved_from_the_worker_owned_tree() {
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_rust::LANGUAGE.into())
+            .unwrap();
+        let context = RequestContext {
+            request_id: 1,
+            worker_generation: 3,
+            uri: "file:///bindings.rs".into(),
+            incarnation: 4,
+            content_version: 1,
+            configuration_generation: 2,
+        };
+        let (replica, _) = DocumentReplica::sync(
+            SyncDocument {
+                context: context.clone(),
+                language: "rust".into(),
+                grammar_symbol: "rust".into(),
+                source_path: "/unused/static-language".into(),
+                parser_path: "/unused/static-language".into(),
+                artifact_digest: "sha256:rust-v1".into(),
+                queries: WorkerQuerySources {
+                    bindings: Some(
+                        r#"
+                        (block) @scope
+                        (let_declaration pattern: (identifier) @definition)
+                        (identifier) @reference
+                        "#
+                        .into(),
+                    ),
+                    ..WorkerQuerySources::default()
+                },
+                text: "fn main() { let target = 1; target; }".into(),
+            },
+            &mut parser,
+        )
+        .unwrap();
+
+        let result = replica
+            .derive_native_bindings(DeriveNativeBindings {
+                context,
+                position: WirePosition {
+                    line: 0,
+                    character: 28,
+                },
+            })
+            .unwrap();
+        let facts = result.facts.expect("reference must resolve");
+
+        assert_eq!(facts.definition, Some(WireByteRange { start: 16, end: 22 }));
+        assert_eq!(facts.references, vec![WireByteRange { start: 28, end: 34 }]);
+        assert_eq!(
+            facts.definitions,
+            vec![WireByteRange { start: 16, end: 22 }]
+        );
+    }
+
+    #[test]
+    fn native_bindings_are_resolved_in_the_innermost_injected_layer() {
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_md::LANGUAGE.into())
+            .unwrap();
+        let context = RequestContext {
+            request_id: 1,
+            worker_generation: 3,
+            uri: "file:///bindings.md".into(),
+            incarnation: 4,
+            content_version: 1,
+            configuration_generation: 2,
+        };
+        let analysis = Arc::new(crate::language::LanguageCoordinator::new());
+        super::worker_analysis(
+            &analysis,
+            "lua",
+            tree_sitter_lua::LANGUAGE.into(),
+            WorkerQuerySources {
+                bindings: Some(include_str!("../assets/queries/lua/bindings.scm").into()),
+                ..WorkerQuerySources::default()
+            },
+            super::WorkerQuerySet::Bindings,
+        )
+        .unwrap();
+        let (replica, _) = DocumentReplica::sync_with_analysis(
+            SyncDocument {
+                context: context.clone(),
+                language: "markdown".into(),
+                grammar_symbol: "markdown".into(),
+                source_path: "/unused/static-language".into(),
+                parser_path: "/unused/static-language".into(),
+                artifact_digest: "sha256:markdown-v1".into(),
+                queries: WorkerQuerySources {
+                    injections: Some(
+                        r#"
+                        (fenced_code_block
+                          (info_string (language) @injection.language)
+                          (code_fence_content) @injection.content)
+                        "#
+                        .into(),
+                    ),
+                    ..WorkerQuerySources::default()
+                },
+                text: "# t\n\n```lua\nlocal v = 1\nprint(v)\n```\n".into(),
+            },
+            &mut parser,
+            analysis,
+        )
+        .unwrap();
+
+        let result = replica
+            .derive_native_bindings(DeriveNativeBindings {
+                context,
+                position: WirePosition {
+                    line: 4,
+                    character: 6,
+                },
+            })
+            .unwrap();
+        let facts = result.facts.expect("injected reference must resolve");
+
+        assert_eq!(facts.definition, Some(WireByteRange { start: 18, end: 19 }));
+        assert_eq!(facts.references, vec![WireByteRange { start: 30, end: 31 }]);
+        assert_eq!(
+            facts.definitions,
+            vec![WireByteRange { start: 18, end: 19 }]
+        );
+    }
+
+    #[test]
     fn captures_are_derived_from_worker_owned_tree_and_query_paths() {
         let directory = tempfile::tempdir().unwrap();
         let query_dir = directory.path().join("queries/rust");
@@ -4421,9 +4773,68 @@ mod tests {
 
         assert!(
             replica
-                .validate_replacement(&stale, &replica.language, &replica.grammar_key)
+                .validate_replacement(
+                    &stale,
+                    &replica.language,
+                    &replica.grammar_key,
+                    &replica.queries,
+                )
                 .unwrap_err()
                 .contains("stale content version")
+        );
+    }
+
+    #[test]
+    fn document_replica_allows_same_version_query_asset_refresh() {
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_rust::LANGUAGE.into())
+            .unwrap();
+        let context = RequestContext {
+            request_id: 1,
+            worker_generation: 3,
+            uri: "file:///query-refresh.rs".into(),
+            incarnation: 4,
+            content_version: 3,
+            configuration_generation: 2,
+        };
+        let (replica, _) = DocumentReplica::sync(
+            SyncDocument {
+                context: context.clone(),
+                language: "rust".into(),
+                grammar_symbol: "rust".into(),
+                source_path: "/unused/static-language".into(),
+                parser_path: "/unused/static-language".into(),
+                artifact_digest: "sha256:rust-v1".into(),
+                queries: WorkerQuerySources::default(),
+                text: "fn current() {}".into(),
+            },
+            &mut parser,
+        )
+        .unwrap();
+        let refreshed = WorkerQuerySources {
+            bindings: Some("(identifier) @reference".into()),
+            ..WorkerQuerySources::default()
+        };
+
+        replica
+            .validate_replacement(
+                &context,
+                &replica.language,
+                &replica.grammar_key,
+                &refreshed,
+            )
+            .expect("query-only refresh must be accepted at the same content version");
+        assert!(
+            replica
+                .validate_replacement(
+                    &context,
+                    &replica.language,
+                    &replica.grammar_key,
+                    &replica.queries,
+                )
+                .unwrap_err()
+                .contains("must advance")
         );
     }
 
@@ -4461,7 +4872,12 @@ mod tests {
 
         assert!(
             replica
-                .validate_replacement(&replacement, "python", &replica.grammar_key)
+                .validate_replacement(
+                    &replacement,
+                    "python",
+                    &replica.grammar_key,
+                    &replica.queries,
+                )
                 .unwrap_err()
                 .contains("language change")
         );
@@ -4471,7 +4887,7 @@ mod tests {
             artifact_digest: "sha256:rust-v1".into(),
         };
         replica
-            .validate_replacement(&replacement, "rust", &alias_grammar)
+            .validate_replacement(&replacement, "rust", &alias_grammar, &replica.queries)
             .unwrap();
 
         let different_grammar = GrammarKey {
@@ -4481,7 +4897,7 @@ mod tests {
         };
         assert!(
             replica
-                .validate_replacement(&replacement, "rust", &different_grammar)
+                .validate_replacement(&replacement, "rust", &different_grammar, &replica.queries,)
                 .unwrap_err()
                 .contains("grammar change")
         );

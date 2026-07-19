@@ -968,6 +968,18 @@ impl Kakehashi {
         // Settings generation for the kind-query compile cache — the same
         // reload discipline the token caches use.
         let generation = self.cache.semantic_token_generation();
+        let worker_configuration_generation = self.language.configuration_generation();
+        if let Some(grammar) = self.language.worker_grammar_descriptor(&language_id)
+            && self.tree_worker_shadow.needs_document_sync(
+                &uri,
+                incarnation,
+                snapshot.parsed_version,
+                worker_configuration_generation,
+                &grammar.queries,
+            )
+        {
+            self.refresh_tree_worker_documents(std::slice::from_ref(&uri));
+        }
 
         // Walk-result memo (full mode only — range results depend on the
         // viewport): a typing client sends captures/full AND full/delta per
@@ -1310,7 +1322,7 @@ impl Kakehashi {
                 &uri,
                 incarnation,
                 snapshot.parsed_version,
-                generation,
+                worker_configuration_generation,
                 worker_kind,
                 worker_range,
                 injection,
