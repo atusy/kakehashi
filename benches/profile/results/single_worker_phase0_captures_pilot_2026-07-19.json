@@ -6,7 +6,7 @@
     "python": "3.12.13",
     "binary": "/Users/atusy/ghq/github.com/atusy/kakehashi___worker_measure/target/release/kakehashi",
     "binary_execution": "private staged copy",
-    "binary_sha256": "56cd092bbbb8bb6729d478be43500bd41f696f6ba75bea4c46c628b7287658ba",
+    "binary_sha256": "4035e3a99f2862a569112a024280e593c452df1f2bedd7164a9fb453fac32d00",
     "data_dir": "/private/var/folders/t3/_nc24_w90zq79l3xyz3xzc7c0000gn/T/kakehashi-phase0-final.6tiXV5/data",
     "data_dir_execution": "private staged copy",
     "parser_query_file_count": 35,
@@ -27,7 +27,7 @@
   "binary_attestation": {
     "schema": 1,
     "source_repository": "https://github.com/atusy/kakehashi",
-    "source_commit": "d5f1264bf38b7261b7edc02cb53f7b9f7edadf0a",
+    "source_commit": "897480ff8d9d91ea13e6ad24f5a77a9bb88697c6",
     "source_remote_refs_containing_commit": [
       "refs/remotes/origin/perf/single-tree-worker-measurement"
     ],
@@ -54,19 +54,19 @@
       "TMPDIR": "/var/folders/t3/_nc24_w90zq79l3xyz3xzc7c0000gn/T/",
       "LANG": "C.UTF-8",
       "LC_ALL": "C.UTF-8",
-      "CARGO_TARGET_DIR": "/var/folders/t3/_nc24_w90zq79l3xyz3xzc7c0000gn/T/kakehashi-attested-build-iw22z_tv/target",
-      "CARGO_HOME": "/var/folders/t3/_nc24_w90zq79l3xyz3xzc7c0000gn/T/kakehashi-attested-build-iw22z_tv/target/cargo-home"
+      "CARGO_TARGET_DIR": "/var/folders/t3/_nc24_w90zq79l3xyz3xzc7c0000gn/T/kakehashi-attested-build-nzon46i4/target",
+      "CARGO_HOME": "/var/folders/t3/_nc24_w90zq79l3xyz3xzc7c0000gn/T/kakehashi-attested-build-nzon46i4/target/cargo-home"
     },
     "built_in_fresh_target": true,
     "source_isolated_archive": true,
     "cargo_config_ancestry_clean": true,
     "binary_relative": "target/release/kakehashi",
-    "binary_sha256": "56cd092bbbb8bb6729d478be43500bd41f696f6ba75bea4c46c628b7287658ba"
+    "binary_sha256": "4035e3a99f2862a569112a024280e593c452df1f2bedd7164a9fb453fac32d00"
   },
   "harness": {
     "execution": "private staged driver and relay helpers",
     "source_files_sha256": {
-      "collect_worker_proxy.py": "0a4e3360ce2182ea4f76ba4cb2e1f0a81a0c78c030b5df67bad9c0f70431c8c0",
+      "collect_worker_proxy.py": "0003ad065f90bccb208f0c46e2dfe403a23e866d0fec9dd59b5f4c43850d1905",
       "collect_worker_cold_start.py": "7bdfd26d28e874a02bd79b22669bbff028ea1b1d03bbb672f2a2be69617a49ca",
       "collect_worker_capture_pilot.py": "8b9f8d8873f367a8dd4fddbc431e7571df9cef51322f4dbe9f329592ef4469c2",
       "drive.py": "8722d78a1eddc87d2f62818967c0624b0a7ece5b48f3bdac1d27d0c82a776e0d",
@@ -88,10 +88,10 @@
   "independent_pairs": 1,
   "order": "direct then relay; smoke result only",
   "direct": {
-    "semantic_p50": 4.8,
-    "semantic_p95": 5.6,
-    "captures_p50": 32.8,
-    "captures_p95": 38.8,
+    "semantic_p50": 5.8,
+    "semantic_p95": 11.7,
+    "captures_p50": 38.0,
+    "captures_p95": 51.9,
     "semantic_outcomes": {
       "count": 100,
       "ok": 100,
@@ -112,10 +112,10 @@
     "capture_full_fallbacks": 0
   },
   "relay": {
-    "semantic_p50": 5.7,
-    "semantic_p95": 6.8,
-    "captures_p50": 36.8,
-    "captures_p95": 42.9,
+    "semantic_p50": 5.8,
+    "semantic_p95": 6.7,
+    "captures_p50": 37.6,
+    "captures_p95": 42.5,
     "semantic_outcomes": {
       "count": 100,
       "ok": 100,
