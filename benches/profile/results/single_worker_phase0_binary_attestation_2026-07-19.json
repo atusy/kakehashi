@@ -1,7 +1,7 @@
 {
   "schema": 1,
   "source_repository": "https://github.com/atusy/kakehashi",
-  "source_commit": "90562849485a0ed5397795995b3da44ff9bc0c15",
+  "source_commit": "11a55faa56ffee5cb7d7144456f14afea1da03eb",
   "source_remote_refs_containing_commit": [
     "refs/remotes/origin/perf/single-tree-worker-measurement"
   ],
@@ -35,5 +35,5 @@
   "source_isolated_archive": true,
   "cargo_config_ancestry_clean": true,
   "binary_relative": "target/release/kakehashi",
-  "binary_sha256": "0238be0e9f8bcfa87f25170ee17102b7ff584e8af5dbecf03fc43d3d453adc6a"
+  "binary_sha256": "1c4fbea2083c27eb76bf78b4d0eb74fb7753d03b8b4936a6b4c19e2b120a7c8a"
 }
