@@ -648,24 +648,26 @@ impl Client {
                 },
             );
         }
-        let outbound = self
-            .outbound
-            .lock()
-            .map_err(|_| io::Error::other("worker outbound lock is poisoned"))?;
-        let outbound = outbound
-            .as_ref()
-            .ok_or_else(|| io::Error::new(io::ErrorKind::BrokenPipe, "worker is shut down"))?;
-        if let Err(error) = outbound.try_send(Request::DeriveSnapshot(request)) {
-            self.remove_route(request_id);
-            return Err(match error {
-                mpsc::TrySendError::Full(_) => io::Error::new(
-                    io::ErrorKind::WouldBlock,
-                    "tree worker outbound queue is full",
-                ),
-                mpsc::TrySendError::Disconnected(_) => {
-                    io::Error::new(io::ErrorKind::BrokenPipe, "tree worker writer stopped")
-                }
-            });
+        {
+            let outbound = self
+                .outbound
+                .lock()
+                .map_err(|_| io::Error::other("worker outbound lock is poisoned"))?;
+            let outbound = outbound
+                .as_ref()
+                .ok_or_else(|| io::Error::new(io::ErrorKind::BrokenPipe, "worker is shut down"))?;
+            if let Err(error) = outbound.try_send(Request::DeriveSnapshot(request)) {
+                self.remove_route(request_id);
+                return Err(match error {
+                    mpsc::TrySendError::Full(_) => io::Error::new(
+                        io::ErrorKind::WouldBlock,
+                        "tree worker outbound queue is full",
+                    ),
+                    mpsc::TrySendError::Disconnected(_) => {
+                        io::Error::new(io::ErrorKind::BrokenPipe, "tree worker writer stopped")
+                    }
+                });
+            }
         }
         let remaining = timeout.saturating_sub(started.elapsed());
         let response = match response_rx.recv_timeout(remaining) {
