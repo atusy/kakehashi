@@ -149,3 +149,7 @@ harness = false
 [[bench]]
 name = "tree_worker_stage1"
 harness = false
+
+[[bench]]
+name = "tree_worker_stage2"
+harness = false

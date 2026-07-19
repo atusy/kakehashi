@@ -372,6 +372,11 @@ pub struct LocalDeriver {
     state: WorkerThreadState,
 }
 
+pub struct LocalDocumentReplica {
+    state: WorkerThreadState,
+    replica: Option<DocumentReplica>,
+}
+
 impl Default for LocalDeriver {
     fn default() -> Self {
         Self::new()
@@ -387,6 +392,89 @@ impl LocalDeriver {
 
     pub fn derive(&mut self, request: DeriveSnapshot) -> Response {
         self.state.derive(request, Duration::ZERO)
+    }
+}
+
+impl Default for LocalDocumentReplica {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl LocalDocumentReplica {
+    pub fn new() -> Self {
+        Self {
+            state: WorkerThreadState::new(),
+            replica: None,
+        }
+    }
+
+    pub fn sync_document(&mut self, request: SyncDocument) -> Response {
+        let context = request.context.clone();
+        let grammar_key = GrammarKey {
+            parser_path: request.parser_path.clone(),
+            grammar_symbol: request.grammar_symbol.clone(),
+        };
+        let Self { state, replica } = self;
+        state.with_parser(
+            grammar_key,
+            context.clone(),
+            |parser, _| match DocumentReplica::sync(request, parser) {
+                Ok((document, ack)) => {
+                    *replica = Some(document);
+                    Response::DocumentAck(ack)
+                }
+                Err(message) => Response::Error(WorkerError {
+                    context: Some(context),
+                    message,
+                }),
+            },
+        )
+    }
+
+    pub fn apply_document_edits(&mut self, request: ApplyDocumentEdits) -> Response {
+        let context = request.context.clone();
+        let Some(grammar_key) = self
+            .replica
+            .as_ref()
+            .map(|replica| replica.grammar_key.clone())
+        else {
+            return Response::Error(WorkerError {
+                context: Some(context),
+                message: "document replica is missing; full sync required".into(),
+            });
+        };
+        let Self { state, replica } = self;
+        state.with_parser(grammar_key, context.clone(), |parser, _| {
+            match replica
+                .as_mut()
+                .expect("replica presence checked before parser checkout")
+                .apply(request, parser)
+            {
+                Ok(ack) => Response::DocumentAck(ack),
+                Err(message) => Response::Error(WorkerError {
+                    context: Some(context),
+                    message,
+                }),
+            }
+        })
+    }
+
+    pub fn derive_document_snapshot(&self, request: DeriveDocumentSnapshot) -> Response {
+        let context = request.context;
+        let Some(replica) = &self.replica else {
+            return Response::Error(WorkerError {
+                context: Some(context),
+                message: "document replica is missing; full sync required".into(),
+            });
+        };
+        match replica.derive(context.clone()) {
+            Ok(snapshot) => Response::Snapshot(snapshot),
+            Err(message) => Response::Error(WorkerError {
+                context: Some(context),
+                message,
+            }),
+        }
     }
 }
 
