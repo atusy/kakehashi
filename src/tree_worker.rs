@@ -931,6 +931,13 @@ fn document_key(request: &Request) -> Option<DocumentKey> {
     }
 }
 
+fn poisoned_document_restart(context: RequestContext) -> Response {
+    Response::WorkerRestartRequired(WorkerRestartRequired {
+        context,
+        reason: "document replica lock is poisoned; restart and resync".into(),
+    })
+}
+
 fn sync_document(
     request: SyncDocument,
     documents: &DocumentStore,
@@ -958,21 +965,20 @@ fn sync_document(
         .get(&document_key)
         .map(|entry| Arc::clone(entry.value()))
     {
-        let validation = existing
-            .lock()
-            .map_err(|_| "document replica lock is poisoned".to_string())
-            .and_then(|replica| {
-                replica
-                    .validate_replacement(&context, &request.language, &grammar_key)
-                    .map(|()| replica.text.len())
-            });
-        match validation {
-            Ok(bytes) => bytes,
-            Err(message) => {
-                return Response::Error(WorkerError {
-                    context: Some(context),
-                    message,
-                });
+        match existing.lock() {
+            Ok(replica) => {
+                match replica.validate_replacement(&context, &request.language, &grammar_key) {
+                    Ok(()) => replica.text.len(),
+                    Err(message) => {
+                        return Response::Error(WorkerError {
+                            context: Some(context),
+                            message,
+                        });
+                    }
+                }
+            }
+            Err(_) => {
+                return poisoned_document_restart(context);
             }
         }
     } else {
@@ -1072,10 +1078,7 @@ fn apply_document_edits(
     let grammar_key = match replica.lock() {
         Ok(replica) => replica.grammar_key.clone(),
         Err(_) => {
-            return Response::Error(WorkerError {
-                context: Some(context),
-                message: "document replica lock is poisoned".into(),
-            });
+            return poisoned_document_restart(context);
         }
     };
     WORKER_THREAD_STATE.with(|state| {
@@ -1083,10 +1086,7 @@ fn apply_document_edits(
             .borrow_mut()
             .with_parser(grammar_key, context.clone(), |parser, _| {
                 let Ok(mut replica) = replica.lock() else {
-                    return Response::Error(WorkerError {
-                        context: Some(context),
-                        message: "document replica lock is poisoned".into(),
-                    });
+                    return poisoned_document_restart(context);
                 };
                 match replica.apply(request, parser, Some(retained_document_bytes)) {
                     Ok(ack) => Response::DocumentAck(ack),
@@ -1120,10 +1120,7 @@ fn apply_document_edits_and_derive(
     let grammar_key = match replica.lock() {
         Ok(replica) => replica.grammar_key.clone(),
         Err(_) => {
-            return Response::Error(WorkerError {
-                context: Some(context),
-                message: "document replica lock is poisoned".into(),
-            });
+            return poisoned_document_restart(context);
         }
     };
     WORKER_THREAD_STATE.with(|state| {
@@ -1131,10 +1128,7 @@ fn apply_document_edits_and_derive(
             .borrow_mut()
             .with_parser(grammar_key, context.clone(), |parser, parser_cache_hit| {
                 let Ok(mut replica) = replica.lock() else {
-                    return Response::Error(WorkerError {
-                        context: Some(context),
-                        message: "document replica lock is poisoned".into(),
-                    });
+                    return poisoned_document_restart(context);
                 };
                 let edits = ApplyDocumentEdits {
                     context: request.context,
@@ -1190,10 +1184,7 @@ fn derive_document_snapshot(
                 }),
             }
         }
-        Err(_) => Response::Error(WorkerError {
-            context: Some(context),
-            message: "document replica lock is poisoned".into(),
-        }),
+        Err(_) => poisoned_document_restart(context),
     }
 }
 
@@ -1214,25 +1205,19 @@ fn close_document(
             message: "document replica is missing".into(),
         });
     };
-    let validation = replica
-        .lock()
-        .map_err(|_| "document replica lock is poisoned".to_string())
-        .and_then(|replica| {
-            replica.validate_lifetime(&context)?;
-            Ok(())
-        });
-    if let Err(message) = validation {
-        return Response::Error(WorkerError {
-            context: Some(context),
-            message,
-        });
-    }
-    let removed_bytes = documents.remove(&document_key).map_or(0, |(_, replica)| {
-        replica
-            .lock()
-            .map(|replica| replica.text.len())
-            .unwrap_or(0)
-    });
+    let removed_bytes = match replica.lock() {
+        Ok(replica) => {
+            if let Err(message) = replica.validate_lifetime(&context) {
+                return Response::Error(WorkerError {
+                    context: Some(context),
+                    message,
+                });
+            }
+            replica.text.len()
+        }
+        Err(_) => return poisoned_document_restart(context),
+    };
+    documents.remove(&document_key);
     replace_retained_bytes(retained_document_bytes, removed_bytes, 0)
         .expect("removing a document cannot exceed the retained-byte budget");
     closed_documents.insert(document_key, context.incarnation);
@@ -1949,13 +1934,13 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        ApplyDocumentEdits, BUILD_ID, ByteEdit, DeriveSnapshot, DocumentKey, DocumentLane,
-        DocumentReplica, GrammarKey, Handshake, HandshakeReady, LaneAction, LaneRegistry,
-        MAX_DOCUMENT_BYTES, MAX_DOCUMENT_REPLICAS, MAX_RETAINED_DOCUMENT_BYTES, PROTOCOL_VERSION,
-        Request, RequestContext, Response, Route, SyncDocument, WorkerError, decode_frame,
-        derive_snapshot_with_language, encode_frame, replace_retained_bytes,
-        reserve_retained_growth, route_response, run, submit_document_job, sync_document,
-        validate_document_size,
+        ApplyDocumentEdits, BUILD_ID, ByteEdit, CloseDocument, DeriveSnapshot, DocumentKey,
+        DocumentLane, DocumentReplica, GrammarKey, Handshake, HandshakeReady, LaneAction,
+        LaneRegistry, MAX_DOCUMENT_BYTES, MAX_DOCUMENT_REPLICAS, MAX_RETAINED_DOCUMENT_BYTES,
+        PROTOCOL_VERSION, Request, RequestContext, Response, Route, SyncDocument, WorkerError,
+        close_document, decode_frame, derive_snapshot_with_language, encode_frame,
+        replace_retained_bytes, reserve_retained_growth, route_response, run, submit_document_job,
+        sync_document, validate_document_size,
     };
 
     #[derive(Clone, Default)]
@@ -2644,6 +2629,79 @@ mod tests {
         );
 
         assert!(matches!(response, Response::WorkerRestartRequired(_)));
+    }
+
+    #[test]
+    fn poisoned_document_replica_requires_restart_instead_of_reusing_uncertain_state() {
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_rust::LANGUAGE.into())
+            .unwrap();
+        let context = RequestContext {
+            request_id: 1,
+            worker_generation: 3,
+            uri: "file:///poisoned.rs".into(),
+            incarnation: 1,
+            content_version: 1,
+            configuration_generation: 0,
+        };
+        let text = "fn main() {}";
+        let (replica, _) = DocumentReplica::sync(
+            SyncDocument {
+                context: context.clone(),
+                language: "rust".into(),
+                grammar_symbol: "rust".into(),
+                parser_path: "/unused/rust".into(),
+                text: text.into(),
+            },
+            &mut parser,
+        )
+        .unwrap();
+        let documents = Arc::new(dashmap::DashMap::new());
+        let key = DocumentKey::from(&context);
+        let replica = Arc::new(Mutex::new(replica));
+        documents.insert(key.clone(), Arc::clone(&replica));
+        let poison_target = Arc::clone(&replica);
+        let _ = std::thread::spawn(move || {
+            let _guard = poison_target.lock().unwrap();
+            panic!("poison replica for restart test");
+        })
+        .join();
+        let closed_documents = Arc::new(dashmap::DashMap::new());
+        let retained = Arc::new(AtomicUsize::new(text.len()));
+
+        let mut replacement_context = context.clone();
+        replacement_context.request_id = 2;
+        replacement_context.content_version = 2;
+        let sync_response = sync_document(
+            SyncDocument {
+                context: replacement_context,
+                language: "rust".into(),
+                grammar_symbol: "rust".into(),
+                parser_path: "/unused/rust".into(),
+                text: "fn replacement() {}".into(),
+            },
+            &documents,
+            &closed_documents,
+            &Arc::new(Mutex::new(1)),
+            &retained,
+        );
+        assert!(matches!(sync_response, Response::WorkerRestartRequired(_)));
+
+        let mut close_context = context;
+        close_context.request_id = 3;
+        close_context.content_version = 2;
+        let close_response = close_document(
+            CloseDocument {
+                context: close_context,
+            },
+            &documents,
+            &closed_documents,
+            &retained,
+        );
+        assert!(matches!(close_response, Response::WorkerRestartRequired(_)));
+        assert!(documents.contains_key(&key));
+        assert_eq!(retained.load(Ordering::Relaxed), text.len());
     }
 
     #[test]
