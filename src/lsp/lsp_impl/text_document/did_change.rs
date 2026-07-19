@@ -4,7 +4,7 @@ use tower_lsp_server::ls_types::DidChangeTextDocumentParams;
 
 use super::super::{Kakehashi, uri_to_url};
 use crate::language::node_tracker::EditInfo;
-use crate::lsp::text_sync::apply_content_changes_with_edits;
+use crate::lsp::text_sync::apply_content_changes_detailed;
 
 impl Kakehashi {
     pub(crate) async fn did_change_impl(&self, params: DidChangeTextDocumentParams) {
@@ -59,7 +59,9 @@ impl Kakehashi {
         };
 
         // Apply content changes and build tree-sitter edits
-        let (text, edits) = apply_content_changes_with_edits(&old_text, params.content_changes);
+        let changes = apply_content_changes_detailed(&old_text, params.content_changes);
+        let text = changes.text;
+        let edits = changes.input_edits;
 
         // lazy-node-identity-tracking: Apply START-priority invalidation to node tracker.
         // Use InputEdits directly for precise invalidation when available,

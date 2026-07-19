@@ -17,6 +17,21 @@ use tree_sitter::{InputEdit, Point};
 
 use crate::text::PositionMapper;
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct SequentialByteEdit {
+    pub(crate) start_byte: usize,
+    pub(crate) old_end_byte: usize,
+    pub(crate) new_text: String,
+}
+
+pub(crate) struct AppliedContentChanges {
+    pub(crate) text: String,
+    pub(crate) input_edits: Vec<InputEdit>,
+    /// `Some` preserves the ordered ranged-edit stream. `None` means at least
+    /// one full replacement occurred, so an incremental consumer must resync.
+    pub(crate) sequential_byte_edits: Option<Vec<SequentialByteEdit>>,
+}
+
 /// Apply LSP content changes to `old_text`, returning the updated text and the
 /// matching tree-sitter `InputEdit`s. Changes with `range` build an `InputEdit`;
 /// rangeless full-sync changes replace the whole text and emit no edit.
@@ -31,12 +46,13 @@ use crate::text::PositionMapper;
 /// text, not `old_text`, so they can neither diff against `old_text` nor seed a
 /// tree parsed from `old_text` (the #348 incremental-contract hazard). The whole
 /// batch is therefore a full sync.
-pub(crate) fn apply_content_changes_with_edits(
+pub(crate) fn apply_content_changes_detailed(
     old_text: &str,
     content_changes: Vec<TextDocumentContentChangeEvent>,
-) -> (String, Vec<InputEdit>) {
+) -> AppliedContentChanges {
     let mut text = old_text.to_string();
     let mut edits = Vec::new();
+    let mut sequential_byte_edits = Vec::new();
     // Once a full replacement lands, no `InputEdit` in this batch can describe
     // `old_text → final` incrementally, so the batch is a full sync regardless of
     // any ranged changes that follow.
@@ -59,6 +75,12 @@ pub(crate) fn apply_content_changes_with_edits(
             let mapper = PositionMapper::new(&text);
             let start_offset = mapper.position_to_byte_clamped(range.start);
             let end_offset = mapper.position_to_byte_clamped(range.end).max(start_offset);
+
+            sequential_byte_edits.push(SequentialByteEdit {
+                start_byte: start_offset,
+                old_end_byte: end_offset,
+                new_text: change.text.clone(),
+            });
 
             // Once a full replacement has landed in this batch the edits will be
             // discarded at the end (the batch is a full sync), so skip building the
@@ -128,7 +150,20 @@ pub(crate) fn apply_content_changes_with_edits(
         edits.clear();
     }
 
-    (text, edits)
+    AppliedContentChanges {
+        text,
+        input_edits: edits,
+        sequential_byte_edits: (!saw_full_replacement).then_some(sequential_byte_edits),
+    }
+}
+
+#[cfg(test)]
+fn apply_content_changes_with_edits(
+    old_text: &str,
+    content_changes: Vec<TextDocumentContentChangeEvent>,
+) -> (String, Vec<InputEdit>) {
+    let result = apply_content_changes_detailed(old_text, content_changes);
+    (result.text, result.input_edits)
 }
 
 #[cfg(test)]
@@ -176,6 +211,63 @@ mod tests {
         assert_eq!(edits[0].start_byte, 6);
         assert_eq!(edits[0].old_end_byte, 11);
         assert_eq!(edits[0].new_end_byte, 10); // "rust" is 4 bytes
+    }
+
+    #[test]
+    fn detailed_changes_preserve_sequential_intermediate_coordinates() {
+        let changes = vec![
+            TextDocumentContentChangeEvent {
+                range: Some(Range::new(Position::new(0, 1), Position::new(0, 1))),
+                range_length: Some(0),
+                text: "XX".to_string(),
+            },
+            TextDocumentContentChangeEvent {
+                range: Some(Range::new(Position::new(0, 4), Position::new(0, 5))),
+                range_length: Some(1),
+                text: "Y".to_string(),
+            },
+        ];
+
+        let result = apply_content_changes_detailed("abcde", changes);
+
+        assert_eq!(result.text, "aXXbYde");
+        assert_eq!(
+            result.sequential_byte_edits,
+            Some(vec![
+                SequentialByteEdit {
+                    start_byte: 1,
+                    old_end_byte: 1,
+                    new_text: "XX".to_string(),
+                },
+                SequentialByteEdit {
+                    start_byte: 4,
+                    old_end_byte: 5,
+                    new_text: "Y".to_string(),
+                },
+            ])
+        );
+    }
+
+    #[test]
+    fn detailed_changes_require_resync_after_any_full_replacement() {
+        let changes = vec![
+            TextDocumentContentChangeEvent {
+                range: Some(Range::new(Position::new(0, 0), Position::new(0, 1))),
+                range_length: Some(1),
+                text: "A".to_string(),
+            },
+            TextDocumentContentChangeEvent {
+                range: None,
+                range_length: None,
+                text: "replacement".to_string(),
+            },
+        ];
+
+        let result = apply_content_changes_detailed("abc", changes);
+
+        assert_eq!(result.text, "replacement");
+        assert!(result.input_edits.is_empty());
+        assert_eq!(result.sequential_byte_edits, None);
     }
 
     #[test]
