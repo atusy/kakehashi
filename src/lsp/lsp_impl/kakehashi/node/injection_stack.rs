@@ -30,15 +30,15 @@ use crate::lsp::lsp_impl::kakehashi::node::lookup::find_node_at;
 /// and so the host layer can carry the document tree without cloning lifetime
 /// dependencies. Byte coordinates inside `tree` are in original-document
 /// space (the same space the host text uses).
-pub(super) struct InjectionLayer {
+pub(crate) struct InjectionLayer {
     /// Tree-sitter syntax tree for this layer.
-    pub(super) tree: tree_sitter::Tree,
+    pub(crate) tree: tree_sitter::Tree,
     /// Absolute ranges in host coordinates that this layer's tree was parsed
     /// against. The host layer spans the whole document; each deeper layer's
     /// ranges are the intersection of its own effective ranges with its
     /// parent's, so container exclusions (e.g. blockquote `> ` prefixes) are
     /// inherited down the nesting chain.
-    pub(super) ranges: Vec<tree_sitter::Range>,
+    pub(crate) ranges: Vec<tree_sitter::Range>,
 }
 
 /// Whether `pattern_index` carries an `#offset!` directive. Used to decide if
@@ -74,7 +74,7 @@ fn whole_document_range(host_text: &str) -> tree_sitter::Range {
 /// The returned `Vec` always contains at least the host layer (layer 0); the
 /// function never fails — a parse/registry miss at any depth simply stops the
 /// walk and returns the layers gathered so far.
-pub(super) fn injection_stack_at(
+pub(crate) fn injection_stack_at(
     coordinator: &LanguageCoordinator,
     host_language: &str,
     host_text: &str,
@@ -622,9 +622,9 @@ fn absolutize_range(
 /// end-of-document exception (`byte == host_len` includes nodes whose
 /// `end_byte == host_len`).
 ///
-/// `pub(super)` so the coordinate accessors can apply the same rule the entry
-/// point uses to their byte / start-position arguments (#341).
-pub(super) fn ranges_contain_byte(
+/// `pub(crate)` so both the coordinate accessors and the worker-owned node
+/// implementation apply the same gap rule as the entry point (#341).
+pub(crate) fn ranges_contain_byte(
     ranges: &[tree_sitter::Range],
     byte: usize,
     host_len: usize,

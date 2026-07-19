@@ -77,6 +77,7 @@ where
 /// handler keep the `true` saturation case and the strict-index case
 /// visibly distinct — they share the result for `-1` but differ in
 /// the bounds-check semantics node-reference-protocol spells out.
+#[derive(Clone, Copy)]
 enum InjectionSelector {
     /// Host layer (stack[0]). Triggered by absent, `false`, or `0`.
     Host,
@@ -87,6 +88,17 @@ enum InjectionSelector {
     Index(i64),
     /// Unsupported JSON shape (non-bool / non-integer). Treated as null.
     Invalid,
+}
+
+impl InjectionSelector {
+    fn worker_layer(self) -> crate::tree_worker::NodeLayerSelector {
+        match self {
+            Self::Host => crate::tree_worker::NodeLayerSelector::Host,
+            Self::Saturating => crate::tree_worker::NodeLayerSelector::Deepest,
+            Self::Index(index) => crate::tree_worker::NodeLayerSelector::Index(index),
+            Self::Invalid => unreachable!("invalid selectors return before worker dispatch"),
+        }
+    }
 }
 
 /// Parse the `injection` parameter into an [`InjectionSelector`].
@@ -212,6 +224,19 @@ impl Kakehashi {
         // keeps the no-injection request shape (the dominant case for plain
         // documents) at PR-1 cost.
         if matches!(selector, InjectionSelector::Host) {
+            let worker_configuration_generation = self.language.configuration_generation();
+            if let Some(language) = snapshot.language.as_deref()
+                && let Some(grammar) = self.language.worker_grammar_descriptor(language)
+                && self.tree_worker_shadow.needs_document_sync(
+                    &uri,
+                    incarnation,
+                    snapshot.parsed_version,
+                    worker_configuration_generation,
+                    &grammar.queries,
+                )
+            {
+                self.refresh_tree_worker_documents(std::slice::from_ref(&uri));
+            }
             let authoritative =
                 self.resolve_host_layer_node(&uri, tree, byte, doc_len, incarnation);
             if let Some(shadow) = self
@@ -220,9 +245,9 @@ impl Kakehashi {
                     &uri,
                     incarnation,
                     snapshot.parsed_version,
-                    self.language.configuration_generation(),
-                    byte.min(doc_len.saturating_sub(1)),
-                    false,
+                    worker_configuration_generation,
+                    byte,
+                    crate::tree_worker::NodeLayerSelector::Host,
                 )
                 .await
                 && let Some(node) = shadow.nodes.first()
@@ -239,6 +264,7 @@ impl Kakehashi {
                             && end == node.end_byte
                             && kind == node.kind
                             && layer == 0
+                            && node.layer == 0
                             && tracked_incarnation == incarnation
                     },
                 );
@@ -331,61 +357,128 @@ impl Kakehashi {
         // together with the layer selection and the mint over its result.
         let language = std::sync::Arc::clone(&self.language);
         let tracker = self.bridge.node_tracker_arc();
-        let result = self
-            .compute_pool
-            .run(None, move || {
-                let stack = injection_stack_at(&language, &host_language, &text, &tree, byte);
+        let worker_configuration_generation = self.language.configuration_generation();
+        if let Some(grammar) = self.language.worker_grammar_descriptor(&host_language)
+            && self.tree_worker_shadow.needs_document_sync(
+                &uri,
+                incarnation,
+                snapshot.parsed_version,
+                worker_configuration_generation,
+                &grammar.queries,
+            )
+        {
+            self.refresh_tree_worker_documents(std::slice::from_ref(&uri));
+        }
+        let worker = self.tree_worker_shadow.resolve_node(
+            &uri,
+            incarnation,
+            snapshot.parsed_version,
+            worker_configuration_generation,
+            byte,
+            selector.worker_layer(),
+        );
+        let compute_uri = uri.clone();
+        let authoritative = self.compute_pool.run(None, move || {
+            let stack = injection_stack_at(&language, &host_language, &text, &tree, byte);
 
-                let layer_index = match selector {
-                    InjectionSelector::Host => unreachable!("handled above"),
-                    InjectionSelector::Invalid => unreachable!("handled above"),
-                    InjectionSelector::Saturating => {
-                        // `true` saturates to the deepest layer. The stack always
-                        // contains at least the host (layer 0), so this never
-                        // under-indexes.
-                        stack.len() - 1
-                    }
-                    InjectionSelector::Index(n) => {
-                        let Some(idx) = resolve_index(n, stack.len()) else {
-                            return Value::Null;
-                        };
-                        idx
-                    }
-                };
+            let layer_index = match selector {
+                InjectionSelector::Host => unreachable!("handled above"),
+                InjectionSelector::Invalid => unreachable!("handled above"),
+                InjectionSelector::Saturating => {
+                    // `true` saturates to the deepest layer. The stack always
+                    // contains at least the host (layer 0), so this never
+                    // under-indexes.
+                    stack.len() - 1
+                }
+                InjectionSelector::Index(n) => {
+                    let Some(idx) = resolve_index(n, stack.len()) else {
+                        return Value::Null;
+                    };
+                    idx
+                }
+            };
 
-                let Some(layer) = stack.get(layer_index) else {
-                    return Value::Null;
-                };
+            let Some(layer) = stack.get(layer_index) else {
+                return Value::Null;
+            };
 
-                let Some(node) = smallest_containing_node(&layer.tree, byte, doc_len) else {
-                    return Value::Null;
-                };
+            let Some(node) = smallest_containing_node(&layer.tree, byte, doc_len) else {
+                return Value::Null;
+            };
 
-                // Mint with the resolved layer index so a host and injected node
-                // sharing (start, end, kind) get distinct ULIDs and stay navigable
-                // in their own tree (lazy-node-identity-tracking §"Node Uniqueness
-                // Key", issue #313).
-                let ulid = tracker.get_or_create_in_layer_for_incarnation(
-                    &uri,
-                    node.start_byte(),
-                    node.end_byte(),
-                    node.kind(),
-                    layer_index,
-                    incarnation,
-                );
-                let Some(ulid) = ulid else {
-                    return Value::Null;
-                };
+            // Mint with the resolved layer index so a host and injected node
+            // sharing (start, end, kind) get distinct ULIDs and stay navigable
+            // in their own tree (lazy-node-identity-tracking §"Node Uniqueness
+            // Key", issue #313).
+            let ulid = tracker.get_or_create_in_layer_for_incarnation(
+                &compute_uri,
+                node.start_byte(),
+                node.end_byte(),
+                node.kind(),
+                layer_index,
+                incarnation,
+            );
+            let Some(ulid) = ulid else {
+                return Value::Null;
+            };
 
-                json!({
-                    "id": ulid.to_string(),
-                    "kind": node.kind(),
-                })
+            json!({
+                "id": ulid.to_string(),
+                "kind": node.kind(),
             })
-            .await;
+        });
+        let (worker, result) = tokio::join!(worker, authoritative);
 
         // None = the work-unit panicked (logged by the pool) → protocol null.
-        Ok(result.unwrap_or(Value::Null))
+        let authoritative = result.unwrap_or(Value::Null);
+        if let Some(worker) = worker {
+            let worker_node = worker.nodes.first();
+            let authoritative_identity = authoritative
+                .get("id")
+                .and_then(Value::as_str)
+                .and_then(|id| id.parse::<ulid::Ulid>().ok())
+                .and_then(|id| self.bridge.node_tracker().lookup_node(&uri, &id));
+            let matches = match (authoritative_identity, worker_node) {
+                (None, None) => true,
+                (Some((start, end, kind, layer, tracked_incarnation)), Some(node)) => {
+                    start == node.start_byte
+                        && end == node.end_byte
+                        && kind == node.kind
+                        && layer == node.layer
+                        && tracked_incarnation == incarnation
+                        && match selector {
+                            InjectionSelector::Host => layer == 0,
+                            InjectionSelector::Saturating | InjectionSelector::Index(_) => true,
+                            InjectionSelector::Invalid => unreachable!(),
+                        }
+                }
+                _ => false,
+            };
+            if matches {
+                log::debug!(
+                    target: "kakehashi::tree_worker_shadow",
+                    "injection node matched uri={} version={} byte={}",
+                    uri,
+                    snapshot.parsed_version,
+                    byte,
+                );
+                if let Some(node) = worker_node {
+                    self.tree_worker_shadow
+                        .record_node_mapping(&uri, &authoritative, node);
+                }
+            } else {
+                log::debug!(
+                    target: "kakehashi::tree_worker_shadow",
+                    "injection node mismatch uri={} version={} byte={} authoritative={:?} worker={:?}",
+                    uri,
+                    snapshot.parsed_version,
+                    byte,
+                    authoritative_identity,
+                    worker_node,
+                );
+            }
+        }
+        Ok(authoritative)
     }
 
     /// Host-layer lookup, factored out so the no-injection request keeps

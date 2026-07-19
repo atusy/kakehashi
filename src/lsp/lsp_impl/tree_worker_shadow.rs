@@ -660,25 +660,39 @@ impl TreeWorkerShadow {
         content_version: u64,
         configuration_generation: u64,
         byte_offset: usize,
-        named: bool,
+        layer: crate::tree_worker::NodeLayerSelector,
     ) -> Option<NodeResult> {
-        let client = self.read_client.load_full()?;
-        if !self.is_enabled() {
-            return None;
-        }
-        let context = self.synchronized_read_context(
-            &client,
-            uri,
-            incarnation,
-            content_version,
-            configuration_generation,
-        )?;
+        let (client, context) = if layer == crate::tree_worker::NodeLayerSelector::Host {
+            let client = self.read_client_wait().await?;
+            if !self.is_enabled() {
+                return None;
+            }
+            let context = self
+                .synchronized_read_context_wait(
+                    &client,
+                    uri,
+                    incarnation,
+                    content_version,
+                    configuration_generation,
+                )
+                .await?;
+            (client, context)
+        } else {
+            self.synchronized_query_read(
+                uri,
+                incarnation,
+                content_version,
+                configuration_generation,
+            )
+            .await?
+        };
         let expected = context.clone();
         let response = tokio::task::spawn_blocking(move || {
             client.resolve_node(ResolveNode {
                 context,
                 byte_offset,
-                named,
+                named: false,
+                layer,
             })
         })
         .await
@@ -1183,6 +1197,12 @@ impl TreeWorkerShadow {
         {
             self.record_node_mapping(uri, authoritative_node, worker_node);
         }
+        log::debug!(
+            target: "kakehashi::tree_worker_shadow",
+            "node navigation matched uri={} version={}",
+            uri,
+            content_version,
+        );
     }
 
     pub(super) async fn node_scalar(
@@ -1372,6 +1392,10 @@ impl TreeWorkerShadow {
         {
             self.record_node_mapping(uri, authoritative_node, worker_node);
         }
+        log::debug!(
+            target: "kakehashi::tree_worker_shadow",
+            "node navigation matched operation={operation} uri={uri}",
+        );
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -3165,6 +3189,7 @@ mod tests {
                 end_byte: 1,
                 named: true,
                 has_error: false,
+                layer: 0,
             },
         );
         assert_eq!(shadow.worker_nodes.len(), 1);

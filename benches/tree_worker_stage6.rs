@@ -93,6 +93,7 @@ fn worker_resolve(worker: &Client, document: usize, request_id: u64, byte: usize
             context: context(document, request_id),
             byte_offset: byte,
             named: false,
+            layer: kakehashi::tree_worker::NodeLayerSelector::Host,
         })
         .unwrap();
     let Response::Nodes(result) = response else {

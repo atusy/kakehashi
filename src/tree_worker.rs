@@ -22,7 +22,7 @@ use sha2::{Digest, Sha256};
 
 use crate::language::node_tracker::{EditInfo, NodeTracker};
 
-pub const PROTOCOL_VERSION: u32 = 11;
+pub const PROTOCOL_VERSION: u32 = 12;
 pub const MAX_FRAME_BYTES: usize = 64 * 1024 * 1024;
 pub const MAX_DOCUMENT_REPLICAS: usize = 4_096;
 pub const MAX_DOCUMENT_BYTES: usize = 32 * 1024 * 1024;
@@ -133,6 +133,15 @@ pub struct ResolveNode {
     pub context: RequestContext,
     pub byte_offset: usize,
     pub named: bool,
+    pub layer: NodeLayerSelector,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NodeLayerSelector {
+    Host,
+    Deepest,
+    Index(i64),
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -300,6 +309,7 @@ pub struct OwnedNode {
     pub end_byte: usize,
     pub named: bool,
     pub has_error: bool,
+    pub layer: usize,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -486,6 +496,13 @@ struct DocumentReplica {
     grammar_language: tree_sitter::Language,
     queries: WorkerQuerySources,
     captures_match_cache: crate::lsp::lsp_impl::kakehashi::captures_match_cache::CapturesMatchCache,
+    injection_layers: Vec<CachedInjectionLayer>,
+}
+
+struct CachedInjectionLayer {
+    depth: usize,
+    tree: tree_sitter::Tree,
+    ranges: Vec<tree_sitter::Range>,
 }
 
 impl DocumentReplica {
@@ -546,6 +563,7 @@ impl DocumentReplica {
                 grammar_language,
                 queries: request.queries,
                 captures_match_cache: Default::default(),
+                injection_layers: Vec::new(),
             },
             ack,
         ))
@@ -609,6 +627,7 @@ impl DocumentReplica {
         }
         self.text = text;
         self.tree = tree;
+        self.injection_layers.clear();
         self.node_tracker
             .apply_input_edits(&self.uri, &tracker_edits);
         self.context = request.context;
@@ -656,9 +675,75 @@ impl DocumentReplica {
         if request.byte_offset > self.text.len() {
             return Err("node byte offset exceeds document length".into());
         }
-        let root = self.tree.root_node();
-        let mut node = root
-            .descendant_for_byte_range(request.byte_offset, request.byte_offset)
+        if self.text.is_empty() {
+            return Ok(NodeResult {
+                context: request.context,
+                nodes: Vec::new(),
+            });
+        }
+        let layer = match request.layer {
+            NodeLayerSelector::Host => 0,
+            NodeLayerSelector::Deepest | NodeLayerSelector::Index(_) => {
+                self.cache_injection_stack(request.byte_offset);
+                let depth = self
+                    .injection_layers
+                    .iter()
+                    .filter(|layer| {
+                        crate::lsp::lsp_impl::kakehashi::node::injection_stack::ranges_contain_byte(
+                            &layer.ranges,
+                            request.byte_offset,
+                            self.text.len(),
+                        )
+                    })
+                    .map(|layer| layer.depth)
+                    .max()
+                    .unwrap_or(0);
+                match request.layer {
+                    NodeLayerSelector::Deepest => depth,
+                    NodeLayerSelector::Index(index) => {
+                        let stack_len = depth.saturating_add(1);
+                        let selected = if index >= 0 {
+                            usize::try_from(index)
+                                .ok()
+                                .filter(|index| *index < stack_len)
+                        } else {
+                            i64::try_from(stack_len)
+                                .ok()
+                                .and_then(|len| len.checked_add(index))
+                                .filter(|index| *index >= 0)
+                                .and_then(|index| usize::try_from(index).ok())
+                        };
+                        let Some(selected) = selected else {
+                            return Ok(NodeResult {
+                                context: request.context,
+                                nodes: Vec::new(),
+                            });
+                        };
+                        selected
+                    }
+                    NodeLayerSelector::Host => unreachable!(),
+                }
+            }
+        };
+        let tree = if layer == 0 {
+            &self.tree
+        } else {
+            let Some(layer) = self.injection_layers.iter().find(|candidate| {
+                candidate.depth == layer
+                    && crate::lsp::lsp_impl::kakehashi::node::injection_stack::ranges_contain_byte(
+                        &candidate.ranges,
+                        request.byte_offset,
+                        self.text.len(),
+                    )
+            }) else {
+                return Ok(NodeResult {
+                    context: request.context,
+                    nodes: Vec::new(),
+                });
+            };
+            &layer.tree
+        };
+        let mut node = smallest_containing_worker_node(tree, request.byte_offset, self.text.len())
             .ok_or_else(|| "no node exists at byte offset".to_string())?;
         if request.named {
             while !node.is_named() {
@@ -667,7 +752,7 @@ impl DocumentReplica {
                     .ok_or_else(|| "no named node exists at byte offset".to_string())?;
             }
         }
-        let owned = self.register_node(node, &request.context)?;
+        let owned = self.register_node_in_layer(node, layer, &request.context)?;
         Ok(NodeResult {
             context: request.context,
             nodes: vec![owned],
@@ -676,7 +761,13 @@ impl DocumentReplica {
 
     fn navigate_node(&mut self, request: NavigateNode) -> Result<NodeResult, String> {
         self.validate_read_identity(&request.context)?;
-        let Some(node) = self.tracked_node(&request.node_id, &request.context) else {
+        self.ensure_tracked_layer(&request.node_id, &request.context);
+        if let NodeNavigation::ChildWithDescendant { descendant_id } = &request.operation {
+            self.ensure_tracked_layer(descendant_id, &request.context);
+        }
+        let Some((node, layer, included_ranges)) =
+            self.tracked_node(&request.node_id, &request.context)
+        else {
             return Ok(NodeResult {
                 context: request.context,
                 nodes: Vec::new(),
@@ -697,7 +788,17 @@ impl DocumentReplica {
             NodeNavigation::NextNamedSibling => node.next_named_sibling().into_iter().collect(),
             NodeNavigation::PreviousNamedSibling => node.prev_named_sibling().into_iter().collect(),
             NodeNavigation::FirstChildForByte { byte } => {
-                if node.start_byte() <= byte && byte <= node.end_byte() && byte <= self.text.len() {
+                if node.start_byte() <= byte
+                    && byte <= node.end_byte()
+                    && byte <= self.text.len()
+                    && included_ranges.is_none_or(|ranges| {
+                        crate::lsp::lsp_impl::kakehashi::node::injection_stack::ranges_contain_byte(
+                            ranges,
+                            byte,
+                            self.text.len(),
+                        )
+                    })
+                {
                     node.first_child_for_byte(byte).into_iter().collect()
                 } else {
                     Vec::new()
@@ -711,6 +812,9 @@ impl DocumentReplica {
                 if node.start_byte() <= start_byte
                     && start_byte <= end_byte
                     && end_byte <= node.end_byte()
+                    && included_ranges.is_none_or(|ranges| {
+                        ranges_cover_query(ranges, start_byte, end_byte, self.text.len())
+                    })
                 {
                     if named {
                         node.named_descendant_for_byte_range(start_byte, end_byte)
@@ -740,7 +844,12 @@ impl DocumentReplica {
                     .position_to_byte_strict(start)
                     .zip(mapper.position_to_byte_strict(end))
                     .filter(|(start, end)| {
-                        node.start_byte() <= *start && start <= end && *end <= node.end_byte()
+                        node.start_byte() <= *start
+                            && start <= end
+                            && *end <= node.end_byte()
+                            && included_ranges.is_none_or(|ranges| {
+                                ranges_cover_query(ranges, *start, *end, self.text.len())
+                            })
                     });
                 match range {
                     Some((start, end)) if named => node
@@ -756,7 +865,8 @@ impl DocumentReplica {
             }
             NodeNavigation::ChildWithDescendant { descendant_id } => self
                 .tracked_node(&descendant_id, &request.context)
-                .and_then(|descendant| {
+                .filter(|(_, descendant_layer, _)| *descendant_layer == layer)
+                .and_then(|(descendant, _, _)| {
                     let answer = node.child_with_descendant(descendant)?;
                     let mut current = answer;
                     while current.id() != descendant.id() {
@@ -769,7 +879,7 @@ impl DocumentReplica {
         };
         let nodes = selected
             .into_iter()
-            .map(|node| self.register_node(node, &request.context))
+            .map(|node| self.register_node_in_layer(node, layer, &request.context))
             .collect::<Result<_, _>>()?;
         Ok(NodeResult {
             context: request.context,
@@ -777,9 +887,10 @@ impl DocumentReplica {
         })
     }
 
-    fn run_node_scalar(&self, request: RunNodeScalar) -> Result<NodeScalarResult, String> {
+    fn run_node_scalar(&mut self, request: RunNodeScalar) -> Result<NodeScalarResult, String> {
         self.validate_read_identity(&request.context)?;
-        let Some(node) = self.tracked_node(&request.node_id, &request.context) else {
+        self.ensure_tracked_layer(&request.node_id, &request.context);
+        let Some((node, _, _)) = self.tracked_node(&request.node_id, &request.context) else {
             return Ok(NodeScalarResult {
                 context: request.context,
                 value: None,
@@ -1116,35 +1227,92 @@ impl DocumentReplica {
         Some((query, Arc::from(self.text.as_str()), self.tree.clone(), 0))
     }
 
+    fn cache_injection_stack(&mut self, byte: usize) {
+        let stack = crate::lsp::lsp_impl::kakehashi::node::injection_stack::injection_stack_at(
+            &self.analysis,
+            &self.language,
+            &self.text,
+            &self.tree,
+            byte,
+        );
+        for (depth, layer) in stack.into_iter().enumerate().skip(1) {
+            if self
+                .injection_layers
+                .iter()
+                .any(|cached| cached.depth == depth && cached.ranges == layer.ranges)
+            {
+                continue;
+            }
+            self.injection_layers.push(CachedInjectionLayer {
+                depth,
+                tree: layer.tree,
+                ranges: layer.ranges,
+            });
+        }
+    }
+
+    fn ensure_tracked_layer(&mut self, node_id: &OpaqueNodeId, context: &RequestContext) {
+        if node_id.worker_generation != context.worker_generation {
+            return;
+        }
+        let Some((start_byte, _, _, layer, incarnation)) = node_id
+            .local_id
+            .parse::<ulid::Ulid>()
+            .ok()
+            .and_then(|id| self.node_tracker.lookup_node(&self.uri, &id))
+        else {
+            return;
+        };
+        if layer > 0 && incarnation == context.incarnation {
+            self.cache_injection_stack(start_byte);
+        }
+    }
+
     fn tracked_node<'tree>(
         &'tree self,
         node_id: &OpaqueNodeId,
         context: &RequestContext,
-    ) -> Option<tree_sitter::Node<'tree>> {
+    ) -> Option<(
+        tree_sitter::Node<'tree>,
+        usize,
+        Option<&'tree [tree_sitter::Range]>,
+    )> {
         if node_id.worker_generation != context.worker_generation {
             return None;
         }
         let ulid = node_id.local_id.parse::<ulid::Ulid>().ok()?;
         let (start_byte, end_byte, kind, layer, incarnation) =
             self.node_tracker.lookup_node(&self.uri, &ulid)?;
-        if layer != 0 || incarnation != context.incarnation {
+        if incarnation != context.incarnation {
             return None;
         }
-        find_exact_node(self.tree.root_node(), start_byte, end_byte, kind)
+        if layer == 0 {
+            return find_exact_node(self.tree.root_node(), start_byte, end_byte, kind)
+                .map(|node| (node, 0, None));
+        }
+        self.injection_layers
+            .iter()
+            .filter(|candidate| candidate.depth == layer)
+            .find_map(|candidate| {
+                find_exact_node(candidate.tree.root_node(), start_byte, end_byte, kind)
+                    .map(|node| (node, layer, Some(candidate.ranges.as_slice())))
+            })
     }
 
-    fn register_node(
+    fn register_node_in_layer(
         &self,
         node: tree_sitter::Node<'_>,
+        layer: usize,
         context: &RequestContext,
     ) -> Result<OwnedNode, String> {
         let local_id = self
             .node_tracker
-            .get_or_create_for_incarnation(
+            .get_or_create_in_layer_for_incarnation(
                 &self.uri,
                 node.start_byte(),
                 node.end_byte(),
                 node.kind(),
+                layer,
                 context.incarnation,
             )
             .ok_or_else(|| "document incarnation cannot mint a node ID".to_string())?
@@ -1159,6 +1327,7 @@ impl DocumentReplica {
             end_byte: node.end_byte(),
             named: node.is_named(),
             has_error: node.has_error(),
+            layer,
         })
     }
 
@@ -1434,6 +1603,45 @@ fn find_exact_node<'tree>(
         }
         node = node.parent()?;
     }
+}
+
+fn smallest_containing_worker_node(
+    tree: &tree_sitter::Tree,
+    byte: usize,
+    document_len: usize,
+) -> Option<tree_sitter::Node<'_>> {
+    if byte == document_len {
+        let mut cursor = tree.root_node().walk();
+        let mut current = tree.root_node();
+        while cursor.goto_first_child() {
+            while cursor.goto_next_sibling() {}
+            let child = cursor.node();
+            if child.end_byte() != document_len {
+                break;
+            }
+            current = child;
+        }
+        return (current.end_byte() == document_len).then_some(current);
+    }
+    let mut current = tree.root_node().descendant_for_byte_range(byte, byte);
+    while let Some(node) = current {
+        if node.start_byte() <= byte && byte < node.end_byte() {
+            return Some(node);
+        }
+        current = node.parent();
+    }
+    None
+}
+
+fn ranges_cover_query(
+    ranges: &[tree_sitter::Range],
+    start: usize,
+    end: usize,
+    document_len: usize,
+) -> bool {
+    let contains = crate::lsp::lsp_impl::kakehashi::node::injection_stack::ranges_contain_byte;
+    contains(ranges, start, document_len)
+        && (end == start || contains(ranges, end - 1, document_len))
 }
 
 pub fn encode_frame<W: Write, T: Serialize>(writer: &mut W, value: &T) -> io::Result<()> {
@@ -2117,7 +2325,7 @@ fn run_node_scalar(request: RunNodeScalar, documents: &DocumentStore) -> Respons
         });
     };
     match replica.lock() {
-        Ok(replica) => match replica.run_node_scalar(request) {
+        Ok(mut replica) => match replica.run_node_scalar(request) {
             Ok(result) => Response::NodeScalar(result),
             Err(message) => Response::Error(WorkerError {
                 context: Some(context),
@@ -3549,13 +3757,13 @@ mod tests {
         DeriveNativeBindings, DeriveSelectionRanges, DeriveSemanticTokens, DeriveSnapshot,
         DocumentKey, DocumentLane, DocumentReplica, GrammarKey, Handshake, HandshakeReady,
         LaneAction, LaneRegistry, MAX_DOCUMENT_BYTES, MAX_DOCUMENT_REPLICAS,
-        MAX_RETAINED_DOCUMENT_BYTES, NavigateNode, NodeNavigation, NodeScalarOperation,
-        NodeScalarValue, OpaqueNodeId, PROTOCOL_VERSION, Request, RequestContext, ResolveNode,
-        Response, Route, RunCaptures, RunNodeScalar, SyncDocument, WireByteRange, WirePosition,
-        WireRange, WorkerError, WorkerQuerySources, close_document, decode_frame,
-        derive_snapshot_with_language, encode_frame, named_node_count, replace_retained_bytes,
-        reserve_retained_growth, route_response, run, submit_document_job, sync_document,
-        terminate_by_transport, validate_document_size,
+        MAX_RETAINED_DOCUMENT_BYTES, NavigateNode, NodeLayerSelector, NodeNavigation,
+        NodeScalarOperation, NodeScalarValue, OpaqueNodeId, PROTOCOL_VERSION, Request,
+        RequestContext, ResolveNode, Response, Route, RunCaptures, RunNodeScalar, SyncDocument,
+        WireByteRange, WirePosition, WireRange, WorkerError, WorkerQuerySources, close_document,
+        decode_frame, derive_snapshot_with_language, encode_frame, named_node_count,
+        replace_retained_bytes, reserve_retained_growth, route_response, run, submit_document_job,
+        sync_document, terminate_by_transport, validate_document_size,
     };
 
     #[derive(Clone, Default)]
@@ -4177,6 +4385,7 @@ mod tests {
                 context: context.clone(),
                 byte_offset: 3,
                 named: true,
+                layer: NodeLayerSelector::Host,
             })
             .unwrap();
         assert_eq!(resolved.nodes.len(), 1);
@@ -4362,6 +4571,116 @@ mod tests {
             })
             .unwrap();
         assert!(stale.nodes.is_empty());
+    }
+
+    #[test]
+    fn node_operations_stay_inside_worker_owned_injection_layer() {
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_md::LANGUAGE.into())
+            .unwrap();
+        let context = RequestContext {
+            request_id: 1,
+            worker_generation: 3,
+            uri: "file:///node.md".into(),
+            incarnation: 4,
+            content_version: 1,
+            configuration_generation: 2,
+        };
+        let analysis = Arc::new(crate::language::LanguageCoordinator::new());
+        super::worker_analysis(
+            &analysis,
+            "lua",
+            tree_sitter_lua::LANGUAGE.into(),
+            WorkerQuerySources::default(),
+            super::WorkerQuerySet::Injections,
+        )
+        .unwrap();
+        let text = "# t\n\n```lua\nlocal v = 1\nprint(v)\n```\n";
+        let (mut replica, _) = DocumentReplica::sync_with_analysis(
+            SyncDocument {
+                context: context.clone(),
+                language: "markdown".into(),
+                grammar_symbol: "markdown".into(),
+                source_path: "/unused/static-language".into(),
+                parser_path: "/unused/static-language".into(),
+                artifact_digest: "sha256:markdown-v1".into(),
+                queries: WorkerQuerySources {
+                    injections: Some(
+                        r#"
+                        (fenced_code_block
+                          (info_string (language) @injection.language)
+                          (code_fence_content) @injection.content)
+                        "#
+                        .into(),
+                    ),
+                    ..WorkerQuerySources::default()
+                },
+                text: text.into(),
+            },
+            &mut parser,
+            analysis,
+        )
+        .unwrap();
+
+        let byte_offset = text.find("v)").unwrap();
+        let resolved = replica
+            .resolve_node(ResolveNode {
+                context: context.clone(),
+                byte_offset,
+                named: true,
+                layer: NodeLayerSelector::Deepest,
+            })
+            .unwrap();
+        assert_eq!(resolved.nodes.len(), 1);
+        assert_eq!(resolved.nodes[0].kind, "identifier");
+        assert_eq!(resolved.nodes[0].start_byte, byte_offset);
+        assert_eq!(resolved.nodes[0].layer, 1);
+
+        let scalar = replica
+            .run_node_scalar(RunNodeScalar {
+                context: context.clone(),
+                node_id: resolved.nodes[0].id.clone(),
+                operation: NodeScalarOperation::Text,
+            })
+            .unwrap();
+        assert_eq!(scalar.value, Some(NodeScalarValue::String("v".into())));
+
+        let parent = replica
+            .navigate_node(NavigateNode {
+                context: context.clone(),
+                node_id: resolved.nodes[0].id.clone(),
+                operation: NodeNavigation::Parent,
+            })
+            .unwrap();
+        assert_eq!(parent.nodes.len(), 1);
+        assert_eq!(parent.nodes[0].kind, "arguments");
+
+        for (selector, expected_kind) in [
+            (NodeLayerSelector::Index(0), "code_fence_content"),
+            (NodeLayerSelector::Index(1), "identifier"),
+            (NodeLayerSelector::Index(-1), "identifier"),
+            (NodeLayerSelector::Index(-2), "code_fence_content"),
+        ] {
+            let result = replica
+                .resolve_node(ResolveNode {
+                    context: context.clone(),
+                    byte_offset,
+                    named: false,
+                    layer: selector,
+                })
+                .unwrap();
+            assert_eq!(result.nodes[0].kind, expected_kind);
+        }
+        let out_of_bounds = replica
+            .resolve_node(ResolveNode {
+                context,
+                byte_offset,
+                named: false,
+                layer: NodeLayerSelector::Index(2),
+            })
+            .unwrap();
+        assert!(out_of_bounds.nodes.is_empty());
     }
 
     #[test]

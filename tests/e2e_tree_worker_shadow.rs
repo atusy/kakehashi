@@ -154,6 +154,50 @@ fn shadow_worker_matches_authoritative_incremental_lifecycle() {
 }
 
 #[test]
+fn shadow_worker_matches_injected_node_and_navigation() {
+    let mut client = LspClient::builder()
+        .env("KAKEHASHI_TREE_WORKER_SHADOW", "true")
+        .env("KAKEHASHI_TREE_WORKER_THREADS", "4")
+        .env("RUST_LOG", "kakehashi::tree_worker_shadow=debug")
+        .build();
+    initialize(&mut client);
+    let uri = "file:///tree-worker-injected-node.md";
+    client.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri,
+                "languageId": "markdown",
+                "version": 1,
+                "text": "# Heading\n\n```python\ny = 1 + 2\n```\n"
+            }
+        }),
+    );
+    let node = client.send_request(
+        "kakehashi/node",
+        json!({
+            "textDocument": { "uri": uri },
+            "position": { "line": 3, "character": 4 },
+            "injection": true
+        }),
+    );
+    let id = node["result"]["id"]
+        .as_str()
+        .expect("injected node must have an id");
+    let parent = client.send_request(
+        "kakehashi/node/parent",
+        json!({ "textDocument": { "uri": uri }, "id": id }),
+    );
+    assert!(parent["result"].is_object(), "{parent:?}");
+
+    let stderr = shutdown_and_stderr(client);
+    assert!(stderr.contains("injection node matched"), "{stderr}");
+    assert!(stderr.contains("node navigation matched"), "{stderr}");
+    assert!(!stderr.contains("node mismatch"), "{stderr}");
+    assert!(!stderr.contains("node navigation mismatch"), "{stderr}");
+}
+
+#[test]
 fn systemic_worker_restart_full_resyncs_the_open_document() {
     let directory = tempfile::tempdir().unwrap();
     let marker = directory.path().join("restart-once");

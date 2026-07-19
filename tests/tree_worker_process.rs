@@ -330,6 +330,7 @@ fn real_worker_keeps_document_text_and_tree_across_incremental_edits() {
             context: node_context.clone(),
             byte_offset: 12,
             named: true,
+            layer: kakehashi::tree_worker::NodeLayerSelector::Host,
         })
         .unwrap();
     let Response::Nodes(nodes) = response else {
