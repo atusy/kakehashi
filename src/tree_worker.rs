@@ -856,12 +856,13 @@ fn submit_document_job(
     pool: &Arc<rayon::ThreadPool>,
     job: LaneJob,
 ) {
-    let entry = lanes
-        .entry(key.clone())
-        .or_insert_with(|| Arc::new(DocumentLane::new(key, Arc::downgrade(lanes))));
-    let lane = Arc::clone(entry.value());
+    let lane = {
+        let entry = lanes
+            .entry(key.clone())
+            .or_insert_with(|| Arc::new(DocumentLane::new(key, Arc::downgrade(lanes))));
+        Arc::clone(entry.value())
+    };
     lane.submit(pool, job);
-    drop(entry);
 }
 
 fn handle_work(
