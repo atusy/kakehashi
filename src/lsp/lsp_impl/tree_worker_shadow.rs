@@ -30,7 +30,6 @@ enum ShadowCommand {
         fallback: SyncDocument,
     },
     Close(CloseDocument),
-    ConfigurationChanged(u64),
     Shutdown(mpsc::SyncSender<()>),
 }
 
@@ -218,9 +217,7 @@ impl OpenDocuments {
         let incoming = match command {
             ShadowCommand::Sync(request) => Some(request),
             ShadowCommand::Apply { fallback, .. } => Some(fallback),
-            ShadowCommand::Close(_)
-            | ShadowCommand::ConfigurationChanged(_)
-            | ShadowCommand::Shutdown(_) => None,
+            ShadowCommand::Close(_) | ShadowCommand::Shutdown(_) => None,
         };
         let artifact_replaced = incoming.is_some_and(|incoming| {
             self.current.values().any(|current| {
@@ -252,7 +249,6 @@ impl OpenDocuments {
             ShadowCommand::Close(request) => {
                 self.current.remove(&request.context.uri);
             }
-            ShadowCommand::ConfigurationChanged(_) => {}
             ShadowCommand::Shutdown(_) => {}
         }
         artifact_replaced
@@ -270,6 +266,7 @@ pub(super) struct TreeWorkerShadow {
     next_request_id: AtomicU64,
     worker_generation: u64,
     comparisons: Arc<ComparisonStore>,
+    pending_configuration_generation: Arc<AtomicU64>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -312,6 +309,7 @@ impl TreeWorkerShadow {
         let disabled = Arc::new(AtomicBool::new(false));
         let accepting = Arc::new(AtomicBool::new(false));
         let comparisons = Arc::new(ComparisonStore::default());
+        let pending_configuration_generation = Arc::new(AtomicU64::new(0));
         let worker_generation = NEXT_WORKER_GENERATION.fetch_add(1, Ordering::Relaxed);
         if !shadow_enabled() {
             return Self {
@@ -321,6 +319,7 @@ impl TreeWorkerShadow {
                 next_request_id: AtomicU64::new(1),
                 worker_generation,
                 comparisons,
+                pending_configuration_generation,
             };
         }
         let executable = match std::env::current_exe() {
@@ -335,6 +334,7 @@ impl TreeWorkerShadow {
                     next_request_id: AtomicU64::new(1),
                     worker_generation,
                     comparisons,
+                    pending_configuration_generation,
                 };
             }
         };
@@ -342,6 +342,7 @@ impl TreeWorkerShadow {
         let (sender, receiver) = mpsc::sync_channel(SHADOW_QUEUE_CAPACITY);
         let actor_disabled = Arc::clone(&disabled);
         let actor_comparisons = Arc::clone(&comparisons);
+        let actor_configuration_generation = Arc::clone(&pending_configuration_generation);
         let spawn = std::thread::Builder::new()
             .name("kakehashi-tree-worker-shadow".into())
             .spawn(move || {
@@ -352,6 +353,7 @@ impl TreeWorkerShadow {
                     worker_generation,
                     actor_disabled,
                     actor_comparisons,
+                    actor_configuration_generation,
                 );
             });
         if let Err(error) = spawn {
@@ -367,6 +369,7 @@ impl TreeWorkerShadow {
                 next_request_id: AtomicU64::new(1),
                 worker_generation,
                 comparisons,
+                pending_configuration_generation,
             };
         }
         accepting.store(true, Ordering::Release);
@@ -381,6 +384,7 @@ impl TreeWorkerShadow {
             next_request_id: AtomicU64::new(1),
             worker_generation,
             comparisons,
+            pending_configuration_generation,
         }
     }
 
@@ -451,18 +455,8 @@ impl TreeWorkerShadow {
     }
 
     pub(super) fn configuration_changed(&self, generation: u64) {
-        if !self.accepting.load(Ordering::Acquire) {
-            return;
-        }
-        let Some(sender) = &self.sender else {
-            return;
-        };
-        if let Err(error) = sender.try_send(ShadowCommand::ConfigurationChanged(generation)) {
-            log::error!(
-                target: "kakehashi::tree_worker_shadow",
-                "could not notify shadow worker about configuration generation {generation}: {error}",
-            );
-        }
+        self.pending_configuration_generation
+            .fetch_max(generation, Ordering::AcqRel);
     }
 
     pub(super) async fn shutdown(&self) {
@@ -651,6 +645,7 @@ fn run_actor(
     worker_generation: u64,
     disabled: Arc<AtomicBool>,
     comparisons: Arc<ComparisonStore>,
+    pending_configuration_generation: Arc<AtomicU64>,
 ) {
     let initial_client = match Client::spawn(&executable, compute_threads, worker_generation) {
         Ok(client) => Some(client),
@@ -683,6 +678,31 @@ fn run_actor(
     }
     let mut shutdown_ack = None;
     loop {
+        if disabled.load(Ordering::Acquire) {
+            let generation = pending_configuration_generation.load(Ordering::Acquire);
+            if generation > state.last_half_open_generation
+                && state.restart_budget.prepare_half_open_at(Instant::now())
+            {
+                state.last_half_open_generation = generation;
+                if recover_worker(
+                    &mut state,
+                    &executable,
+                    compute_threads,
+                    FailureClass::Systemic,
+                    None,
+                    &comparisons,
+                    true,
+                ) {
+                    disabled.store(false, Ordering::Release);
+                    log::info!(
+                        target: "kakehashi::tree_worker_shadow",
+                        "closed shadow worker breaker after configuration generation {generation} half-open probe",
+                    );
+                } else {
+                    mark_tree_tier_unavailable(&mut state, &disabled);
+                }
+            }
+        }
         let mut command = match receiver.recv_timeout(WORKER_LIVENESS_POLL) {
             Ok(command) => command,
             Err(mpsc::RecvTimeoutError::Timeout) => {
@@ -725,32 +745,6 @@ fn run_actor(
         if let ShadowCommand::Shutdown(ack) = command {
             shutdown_ack = Some(ack);
             break;
-        }
-        if let ShadowCommand::ConfigurationChanged(generation) = command {
-            if disabled.load(Ordering::Acquire)
-                && generation > state.last_half_open_generation
-                && state.restart_budget.prepare_half_open_at(Instant::now())
-            {
-                state.last_half_open_generation = generation;
-                if recover_worker(
-                    &mut state,
-                    &executable,
-                    compute_threads,
-                    FailureClass::Systemic,
-                    None,
-                    &comparisons,
-                    true,
-                ) {
-                    disabled.store(false, Ordering::Release);
-                    log::info!(
-                        target: "kakehashi::tree_worker_shadow",
-                        "closed shadow worker breaker after configuration generation {generation} half-open probe",
-                    );
-                } else {
-                    mark_tree_tier_unavailable(&mut state, &disabled);
-                }
-            }
-            continue;
         }
         if disabled.load(Ordering::Acquire) {
             continue;
@@ -936,7 +930,7 @@ fn execute_command(
             comparisons.mark_closed(&request.context.uri, request.context.incarnation);
             (client.close_document(request), None)
         }
-        ShadowCommand::ConfigurationChanged(_) | ShadowCommand::Shutdown(_) => unreachable!(),
+        ShadowCommand::Shutdown(_) => unreachable!(),
     }
 }
 
@@ -1130,7 +1124,6 @@ fn retag_command(command: &mut ShadowCommand, generation: u64) {
             fallback.context.worker_generation = generation;
         }
         ShadowCommand::Close(request) => request.context.worker_generation = generation,
-        ShadowCommand::ConfigurationChanged(_) => {}
         ShadowCommand::Shutdown(_) => {}
     }
 }
@@ -1168,7 +1161,7 @@ fn command_uri(command: &ShadowCommand) -> Option<&str> {
         ShadowCommand::Sync(request) => Some(&request.context.uri),
         ShadowCommand::Apply { fallback, .. } => Some(&fallback.context.uri),
         ShadowCommand::Close(request) => Some(&request.context.uri),
-        ShadowCommand::ConfigurationChanged(_) | ShadowCommand::Shutdown(_) => None,
+        ShadowCommand::Shutdown(_) => None,
     }
 }
 
@@ -1179,7 +1172,7 @@ fn command_document(command: &ShadowCommand) -> Option<(&str, u64)> {
             Some((&fallback.context.uri, fallback.context.incarnation))
         }
         ShadowCommand::Close(request) => Some((&request.context.uri, request.context.incarnation)),
-        ShadowCommand::ConfigurationChanged(_) | ShadowCommand::Shutdown(_) => None,
+        ShadowCommand::Shutdown(_) => None,
     }
 }
 
@@ -1187,9 +1180,7 @@ fn command_grammar(command: &ShadowCommand) -> Option<GrammarIdentity> {
     match command {
         ShadowCommand::Sync(request) => Some(GrammarIdentity::from_sync(request)),
         ShadowCommand::Apply { fallback, .. } => Some(GrammarIdentity::from_sync(fallback)),
-        ShadowCommand::Close(_)
-        | ShadowCommand::ConfigurationChanged(_)
-        | ShadowCommand::Shutdown(_) => None,
+        ShadowCommand::Close(_) | ShadowCommand::Shutdown(_) => None,
     }
 }
 
@@ -1382,6 +1373,7 @@ mod tests {
             next_request_id: AtomicU64::new(1),
             worker_generation: 7,
             comparisons: Arc::new(ComparisonStore::default()),
+            pending_configuration_generation: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -1558,9 +1550,15 @@ mod tests {
 
         shadow.configuration_changed(9);
 
+        assert_eq!(
+            shadow
+                .pending_configuration_generation
+                .load(Ordering::Acquire),
+            9
+        );
         assert!(matches!(
-            receiver.recv().unwrap(),
-            ShadowCommand::ConfigurationChanged(9)
+            receiver.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
         ));
     }
 
