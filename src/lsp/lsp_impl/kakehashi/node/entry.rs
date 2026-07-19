@@ -228,17 +228,42 @@ impl Kakehashi {
                 && let Some(node) = shadow.nodes.first()
             {
                 let authoritative_kind = authoritative.get("kind").and_then(Value::as_str);
-                if authoritative_kind != Some(node.kind.as_str()) {
-                    log::warn!(
+                let authoritative_identity = authoritative
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .and_then(|id| id.parse::<ulid::Ulid>().ok())
+                    .and_then(|id| self.bridge.node_tracker().lookup_node(&uri, &id));
+                let identities_match = authoritative_identity.is_some_and(
+                    |(start, end, kind, layer, tracked_incarnation)| {
+                        start == node.start_byte
+                            && end == node.end_byte
+                            && kind == node.kind
+                            && layer == 0
+                            && tracked_incarnation == incarnation
+                    },
+                );
+                if authoritative_kind != Some(node.kind.as_str()) || !identities_match {
+                    log::debug!(
                         target: "kakehashi::tree_worker_shadow",
-                        "host node mismatch uri={} version={} byte={} authoritative_kind={:?} worker_kind={}",
+                        "host node mismatch uri={} version={} byte={} authoritative={:?} worker=({}, {}, {})",
                         uri,
                         snapshot.parsed_version,
                         byte,
-                        authoritative_kind,
+                        authoritative_identity,
+                        node.start_byte,
+                        node.end_byte,
                         node.kind,
                     );
+                } else {
+                    self.tree_worker_shadow
+                        .record_node_mapping(&uri, &authoritative, node);
                 }
+            }
+            if !self.documents.latest_snapshot(&uri).is_some_and(|view| {
+                view.content_version == snapshot.parsed_version
+                    && view.slot.current_incarnation == incarnation
+            }) {
+                return Ok(Value::Null);
             }
             return Ok(authoritative);
         }

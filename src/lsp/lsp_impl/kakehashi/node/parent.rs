@@ -142,9 +142,27 @@ impl Kakehashi {
             return Ok(Value::Null);
         };
 
-        Ok(json!({
+        let authoritative = json!({
             "id": parent_ulid.to_string(),
             "kind": p_kind,
-        }))
+        });
+        self.tree_worker_shadow
+            .compare_node_navigation(
+                &uri,
+                incarnation,
+                snapshot.parsed_version,
+                self.cache.semantic_token_generation(),
+                &params.id,
+                crate::tree_worker::NodeNavigation::Parent,
+                &authoritative,
+            )
+            .await;
+        if !self.documents.latest_snapshot(&uri).is_some_and(|view| {
+            view.content_version == snapshot.parsed_version
+                && view.slot.current_incarnation == incarnation
+        }) {
+            return Ok(Value::Null);
+        }
+        Ok(authoritative)
     }
 }

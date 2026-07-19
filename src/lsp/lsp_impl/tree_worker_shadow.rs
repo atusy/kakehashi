@@ -5,13 +5,15 @@ use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant};
 
 use arc_swap::ArcSwapOption;
+use serde_json::Value;
 
 use crate::error::LockResultExt;
 use crate::language::coordinator::WorkerGrammarDescriptor;
 use crate::lsp::text_sync::SequentialByteEdit;
 use crate::tree_worker::{
     ApplyDocumentEditsAndDerive, ByteEdit, Client, CloseDocument, DeriveDocumentSnapshot,
-    NodeResult, RequestContext, ResolveNode, Response, SyncDocument, named_node_count,
+    NavigateNode, NodeNavigation, NodeResult, OpaqueNodeId, RequestContext, ResolveNode, Response,
+    SyncDocument, named_node_count,
 };
 
 const SHADOW_ENV: &str = "KAKEHASHI_TREE_WORKER_SHADOW";
@@ -189,6 +191,7 @@ struct OpenDocuments {
 struct SupervisorState {
     client: Option<Arc<Client>>,
     read_client: Arc<ArcSwapOption<Client>>,
+    worker_nodes: Arc<dashmap::DashMap<(String, String), OpaqueNodeId>>,
     worker_generation: u64,
     replicas: HashMap<String, ReplicaIdentity>,
     open_documents: Arc<Mutex<OpenDocuments>>,
@@ -206,6 +209,7 @@ struct ActorShared {
     open_documents: Arc<Mutex<OpenDocuments>>,
     registry_epoch: Arc<AtomicU64>,
     read_client: Arc<ArcSwapOption<Client>>,
+    worker_nodes: Arc<dashmap::DashMap<(String, String), OpaqueNodeId>>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -361,6 +365,7 @@ pub(super) struct TreeWorkerShadow {
     open_documents: Arc<Mutex<OpenDocuments>>,
     registry_epoch: Arc<AtomicU64>,
     read_client: Arc<ArcSwapOption<Client>>,
+    worker_nodes: Arc<dashmap::DashMap<(String, String), OpaqueNodeId>>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -416,6 +421,7 @@ impl TreeWorkerShadow {
         let open_documents = Arc::new(Mutex::new(OpenDocuments::default()));
         let registry_epoch = Arc::new(AtomicU64::new(0));
         let read_client = Arc::new(ArcSwapOption::empty());
+        let worker_nodes = Arc::new(dashmap::DashMap::new());
         let worker_generation = NEXT_WORKER_GENERATION.fetch_add(1, Ordering::Relaxed);
         if !shadow_enabled() {
             return Self {
@@ -429,6 +435,7 @@ impl TreeWorkerShadow {
                 open_documents,
                 registry_epoch,
                 read_client,
+                worker_nodes,
             };
         }
         let executable = match std::env::current_exe() {
@@ -447,6 +454,7 @@ impl TreeWorkerShadow {
                     open_documents,
                     registry_epoch,
                     read_client,
+                    worker_nodes,
                 };
             }
         };
@@ -459,6 +467,7 @@ impl TreeWorkerShadow {
             open_documents: Arc::clone(&open_documents),
             registry_epoch: Arc::clone(&registry_epoch),
             read_client: Arc::clone(&read_client),
+            worker_nodes: Arc::clone(&worker_nodes),
         };
         let spawn = std::thread::Builder::new()
             .name("kakehashi-tree-worker-shadow".into())
@@ -488,6 +497,7 @@ impl TreeWorkerShadow {
                 open_documents,
                 registry_epoch,
                 read_client,
+                worker_nodes,
             };
         }
         accepting.store(true, Ordering::Release);
@@ -506,6 +516,7 @@ impl TreeWorkerShadow {
             open_documents,
             registry_epoch,
             read_client,
+            worker_nodes,
         }
     }
 
@@ -565,6 +576,99 @@ impl TreeWorkerShadow {
         self.admit_node_response(response, &expected)
     }
 
+    pub(super) fn record_node_mapping(
+        &self,
+        uri: &url::Url,
+        authoritative: &Value,
+        worker: &crate::tree_worker::OwnedNode,
+    ) {
+        let Some(id) = authoritative.get("id").and_then(Value::as_str) else {
+            return;
+        };
+        self.worker_nodes.insert(
+            (uri.as_str().to_string(), id.to_string()),
+            worker.id.clone(),
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) async fn compare_node_navigation(
+        &self,
+        uri: &url::Url,
+        incarnation: u64,
+        content_version: u64,
+        configuration_generation: u64,
+        authoritative_input_id: &str,
+        operation: NodeNavigation,
+        authoritative: &Value,
+    ) {
+        let key = (uri.as_str().to_string(), authoritative_input_id.to_string());
+        let Some(node_id) = self.worker_nodes.get(&key).map(|entry| entry.clone()) else {
+            return;
+        };
+        let Some(client) = self.read_client.load_full() else {
+            return;
+        };
+        if !self.is_enabled() || node_id.worker_generation != client.worker_generation() {
+            self.worker_nodes.remove(&key);
+            return;
+        }
+        let context = self.read_context(
+            &client,
+            uri,
+            incarnation,
+            content_version,
+            configuration_generation,
+        );
+        let expected = context.clone();
+        let response = tokio::task::spawn_blocking(move || {
+            client.navigate_node(NavigateNode {
+                context,
+                node_id,
+                operation,
+            })
+        })
+        .await
+        .ok()
+        .and_then(Result::ok);
+        let Some(result) =
+            response.and_then(|response| self.admit_node_response(response, &expected))
+        else {
+            return;
+        };
+        let authoritative_nodes = match authoritative {
+            Value::Null => Vec::new(),
+            Value::Object(_) => vec![authoritative],
+            Value::Array(nodes) => nodes.iter().collect(),
+            _ => return,
+        };
+        let authoritative_kinds = authoritative_nodes
+            .iter()
+            .filter_map(|node| node.get("kind").and_then(Value::as_str))
+            .collect::<Vec<_>>();
+        let worker_kinds = result
+            .nodes
+            .iter()
+            .map(|node| node.kind.as_str())
+            .collect::<Vec<_>>();
+        if authoritative_kinds != worker_kinds {
+            log::debug!(
+                target: "kakehashi::tree_worker_shadow",
+                "node navigation mismatch uri={} version={} authoritative={:?} worker={:?}",
+                uri,
+                content_version,
+                authoritative_kinds,
+                worker_kinds,
+            );
+            return;
+        }
+        for (authoritative_node, worker_node) in
+            authoritative_nodes.into_iter().zip(result.nodes.iter())
+        {
+            self.record_node_mapping(uri, authoritative_node, worker_node);
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(super) fn mirror_change(
         &self,
@@ -606,6 +710,8 @@ impl TreeWorkerShadow {
         configuration_generation: u64,
     ) {
         self.comparisons.mark_closed(uri.as_str(), incarnation);
+        self.worker_nodes
+            .retain(|(mapped_uri, _), _| mapped_uri != uri.as_str());
         self.observe_and_submit(ShadowCommand::Close(CloseDocument {
             context: self.context(uri, incarnation, content_version, configuration_generation),
         }));
@@ -919,6 +1025,7 @@ fn run_actor(
         open_documents,
         registry_epoch,
         read_client,
+        worker_nodes,
     } = shared;
     let initial_client = match Client::spawn(&executable, compute_threads, worker_generation) {
         Ok(client) => Some(Arc::new(client)),
@@ -932,6 +1039,7 @@ fn run_actor(
     let mut state = SupervisorState {
         client: initial_client,
         read_client,
+        worker_nodes,
         worker_generation,
         replicas: HashMap::new(),
         open_documents,
@@ -1340,6 +1448,7 @@ fn breaker_probe_allowed(state: BreakerState, generation: u64, now: Instant) -> 
 
 fn retire_client(state: &mut SupervisorState) -> std::io::Result<()> {
     state.read_client.store(None);
+    state.worker_nodes.clear();
     let Some(client) = state.client.take() else {
         return Ok(());
     };
@@ -1998,7 +2107,36 @@ mod tests {
             open_documents: Arc::new(Mutex::new(OpenDocuments::default())),
             registry_epoch: Arc::new(AtomicU64::new(0)),
             read_client: Arc::new(ArcSwapOption::empty()),
+            worker_nodes: Arc::new(dashmap::DashMap::new()),
         }
+    }
+
+    #[test]
+    fn closing_document_discards_legacy_to_worker_node_mappings() {
+        let (sender, receiver) = mpsc::sync_channel(1);
+        let shadow = shadow(sender);
+        let uri = url::Url::parse("file:///mapped.rs").unwrap();
+        shadow.record_node_mapping(
+            &uri,
+            &serde_json::json!({"id": "legacy", "kind": "identifier"}),
+            &crate::tree_worker::OwnedNode {
+                id: OpaqueNodeId {
+                    worker_generation: 7,
+                    local_id: "worker".into(),
+                },
+                kind: "identifier".into(),
+                start_byte: 0,
+                end_byte: 1,
+                named: true,
+                has_error: false,
+            },
+        );
+        assert_eq!(shadow.worker_nodes.len(), 1);
+
+        shadow.mirror_close(&uri, 1, 1, 0);
+
+        assert!(shadow.worker_nodes.is_empty());
+        assert!(matches!(receiver.recv().unwrap(), ShadowCommand::Close(_)));
     }
 
     fn grammar() -> WorkerGrammarDescriptor {
@@ -2302,6 +2440,7 @@ mod tests {
         let mut state = SupervisorState {
             client: None,
             read_client: Arc::new(ArcSwapOption::empty()),
+            worker_nodes: Arc::new(dashmap::DashMap::new()),
             worker_generation: 1,
             replicas: HashMap::new(),
             open_documents: Arc::new(Mutex::new(OpenDocuments::default())),

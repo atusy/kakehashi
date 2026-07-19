@@ -154,6 +154,24 @@ impl Kakehashi {
             return Ok(Value::Null);
         };
 
-        Ok(Value::Array(infos))
+        let authoritative = Value::Array(infos);
+        self.tree_worker_shadow
+            .compare_node_navigation(
+                &uri,
+                incarnation,
+                snapshot.parsed_version,
+                self.cache.semantic_token_generation(),
+                &params.id,
+                crate::tree_worker::NodeNavigation::Children,
+                &authoritative,
+            )
+            .await;
+        if !self.documents.latest_snapshot(&uri).is_some_and(|view| {
+            view.content_version == snapshot.parsed_version
+                && view.slot.current_incarnation == incarnation
+        }) {
+            return Ok(Value::Null);
+        }
+        Ok(authoritative)
     }
 }
