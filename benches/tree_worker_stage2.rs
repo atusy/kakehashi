@@ -43,6 +43,7 @@ fn sync_request(document: usize, parser: &Path, text: &str) -> SyncDocument {
         context: context(document, document as u64 + 1, 1),
         language: "rust".into(),
         grammar_symbol: "rust".into(),
+        source_path: parser.to_path_buf(),
         parser_path: parser.to_path_buf(),
         artifact_digest: DIGEST
             .get_or_init(|| kakehashi::tree_worker::artifact_digest(parser).unwrap())

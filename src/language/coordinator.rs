@@ -123,6 +123,7 @@ pub(crate) struct LanguageCoordinator {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct WorkerGrammarDescriptor {
+    pub(crate) source_path: PathBuf,
     pub(crate) parser_path: PathBuf,
     pub(crate) grammar_symbol: String,
     pub(crate) artifact_digest: String,
@@ -1869,6 +1870,7 @@ impl LanguageCoordinator {
             return None;
         }
         Some(WorkerGrammarDescriptor {
+            source_path: parser_path,
             parser_path: artifact.path,
             grammar_symbol,
             artifact_digest: artifact.digest,

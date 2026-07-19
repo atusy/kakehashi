@@ -68,6 +68,43 @@ pub(crate) struct InstallCoordinator {
 }
 
 impl InstallCoordinator {
+    fn refresh_tree_worker_documents(&self, uris: &[Url]) {
+        if !self.tree_worker_shadow.is_enabled() {
+            return;
+        }
+        for uri in uris {
+            let Some((incarnation, content_version, language, text)) =
+                self.documents.get(uri).and_then(|document| {
+                    Some((
+                        document.incarnation(),
+                        document.content_version(),
+                        document.language_id()?.to_owned(),
+                        document.text().to_owned(),
+                    ))
+                })
+            else {
+                continue;
+            };
+            let Some(grammar) = self.language.worker_grammar_descriptor(&language) else {
+                self.tree_worker_shadow.mirror_close(
+                    uri,
+                    incarnation,
+                    content_version,
+                    self.language.configuration_generation(),
+                );
+                continue;
+            };
+            self.tree_worker_shadow.mirror_full(
+                uri,
+                incarnation,
+                content_version,
+                language,
+                grammar,
+                text,
+            );
+        }
+    }
+
     pub(crate) fn new(server: &Kakehashi) -> Self {
         Self::from_parts(InstallCoordinatorDeps {
             client: server.client.clone(),
@@ -363,6 +400,7 @@ impl InstallCoordinator {
             },
         )
         .await;
+        self.refresh_tree_worker_documents(&self.documents.open_uris());
         self.tree_worker_shadow
             .configuration_changed(self.language.configuration_generation());
     }

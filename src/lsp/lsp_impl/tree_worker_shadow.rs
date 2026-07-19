@@ -1,9 +1,10 @@
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, mpsc};
+use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant};
 
+use crate::error::LockResultExt;
 use crate::language::coordinator::WorkerGrammarDescriptor;
 use crate::lsp::text_sync::SequentialByteEdit;
 use crate::tree_worker::{
@@ -21,6 +22,8 @@ const MAX_SESSION_RESTARTS: u8 = 16;
 const INITIAL_RESTART_BACKOFF: Duration = Duration::from_millis(250);
 const MAX_RESTART_BACKOFF: Duration = Duration::from_secs(300);
 const WORKER_LIVENESS_POLL: Duration = Duration::from_millis(250);
+const FAST_HEALTHY_INTERVAL: Duration = Duration::from_secs(60);
+const LONG_HEALTHY_INTERVAL: Duration = Duration::from_secs(10 * 60);
 static NEXT_WORKER_GENERATION: AtomicU64 = AtomicU64::new(1);
 
 enum ShadowCommand {
@@ -38,6 +41,7 @@ struct ReplicaIdentity {
     incarnation: u64,
     language: String,
     grammar_symbol: String,
+    source_path: PathBuf,
     parser_path: PathBuf,
     artifact_digest: String,
     configuration_generation: u64,
@@ -49,6 +53,7 @@ impl ReplicaIdentity {
             incarnation: request.context.incarnation,
             language: request.language.clone(),
             grammar_symbol: request.grammar_symbol.clone(),
+            source_path: request.source_path.clone(),
             parser_path: request.parser_path.clone(),
             artifact_digest: request.artifact_digest.clone(),
             configuration_generation: request.context.configuration_generation,
@@ -82,8 +87,6 @@ struct RestartBudget {
     native: u8,
     tokens: u8,
     backoff_count: u8,
-    last_restart: Option<Instant>,
-    last_long_restore: Option<Instant>,
 }
 
 impl Default for RestartBudget {
@@ -93,18 +96,12 @@ impl Default for RestartBudget {
             native: 0,
             tokens: MAX_SESSION_RESTARTS,
             backoff_count: 0,
-            last_restart: None,
-            last_long_restore: None,
         }
     }
 }
 
 impl RestartBudget {
     fn consume(&mut self, class: FailureClass) -> bool {
-        self.consume_at(class, Instant::now())
-    }
-
-    fn consume_at(&mut self, class: FailureClass, now: Instant) -> bool {
         let class_available = match class {
             FailureClass::Systemic => self.systemic < MAX_SYSTEMIC_RESTARTS,
             FailureClass::NativeEvidenced => self.native < MAX_NATIVE_RESTARTS,
@@ -118,63 +115,34 @@ impl RestartBudget {
         }
         self.tokens -= 1;
         self.backoff_count = self.backoff_count.saturating_add(1);
-        self.last_restart = Some(now);
-        self.last_long_restore = Some(now);
         true
     }
 
-    fn observe_healthy(&mut self, now: Instant) {
-        const FAST_RESET: Duration = Duration::from_secs(60);
-        const LONG_RESET: Duration = Duration::from_secs(10 * 60);
+    fn consume_half_open(&mut self, class: FailureClass) {
+        if self.tokens == 0 {
+            self.tokens = 1;
+        }
+        self.tokens -= 1;
+        self.backoff_count = self.backoff_count.saturating_add(1);
+        match class {
+            FailureClass::Systemic => self.systemic = self.systemic.saturating_add(1),
+            FailureClass::NativeEvidenced => self.native = self.native.saturating_add(1),
+        }
+    }
 
-        if self
-            .last_restart
-            .is_some_and(|last_restart| now.saturating_duration_since(last_restart) >= FAST_RESET)
-        {
-            self.systemic = 0;
-            self.native = 0;
-        }
-        let Some(last_restore) = self.last_long_restore else {
-            return;
-        };
-        let elapsed = now.saturating_duration_since(last_restore);
-        let intervals = elapsed.as_secs() / LONG_RESET.as_secs();
-        if intervals == 0 {
-            return;
-        }
+    fn reset_fast(&mut self) {
+        self.systemic = 0;
+        self.native = 0;
+    }
+
+    fn restore_long(&mut self, intervals: u64) {
         let restored = intervals.min(u64::from(MAX_SESSION_RESTARTS - self.tokens)) as u8;
         self.tokens = self.tokens.saturating_add(restored);
         self.backoff_count = 0;
-        self.last_long_restore = Some(last_restore + LONG_RESET.saturating_mul(intervals as u32));
     }
 
     fn tokens_remaining(&self) -> u8 {
         self.tokens
-    }
-
-    fn prepare_half_open_at(&mut self, now: Instant) -> bool {
-        let Some(last_restart) = self.last_restart else {
-            return false;
-        };
-        let exhausted_long_bucket = self.tokens == 0;
-        let exhausted_fast_budget =
-            self.systemic >= MAX_SYSTEMIC_RESTARTS || self.native >= MAX_NATIVE_RESTARTS;
-        let cooldown = if exhausted_long_bucket {
-            Duration::from_secs(10 * 60)
-        } else if exhausted_fast_budget {
-            Duration::from_secs(60)
-        } else {
-            return false;
-        };
-        if now.saturating_duration_since(last_restart) < cooldown {
-            return false;
-        }
-        self.systemic = 0;
-        self.native = 0;
-        if exhausted_long_bucket {
-            self.tokens = 1;
-        }
-        true
     }
 
     fn backoff(&self) -> Duration {
@@ -185,7 +153,27 @@ impl RestartBudget {
     }
 }
 
-#[derive(Default)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BreakerState {
+    Closed,
+    Open {
+        opened_at: Instant,
+        baseline_generation: u64,
+        cooldown: Duration,
+    },
+    HalfOpen {
+        probe_generation: u64,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RecoveryMode {
+    Normal,
+    Planned,
+    HalfOpen,
+}
+
+#[derive(Clone, Default)]
 struct OpenDocuments {
     current: HashMap<String, SyncDocument>,
 }
@@ -194,10 +182,19 @@ struct SupervisorState {
     client: Option<Client>,
     worker_generation: u64,
     replicas: HashMap<String, ReplicaIdentity>,
-    open_documents: OpenDocuments,
+    open_documents: Arc<Mutex<OpenDocuments>>,
     quarantined: HashSet<GrammarIdentity>,
     restart_budget: RestartBudget,
-    last_half_open_generation: u64,
+    breaker: BreakerState,
+    healthy_since: Option<Instant>,
+    long_healthy_since: Option<Instant>,
+}
+
+struct ActorShared {
+    disabled: Arc<AtomicBool>,
+    comparisons: Arc<ComparisonStore>,
+    pending_configuration_generation: Arc<AtomicU64>,
+    open_documents: Arc<Mutex<OpenDocuments>>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -213,22 +210,75 @@ struct ResyncFailure {
 }
 
 impl OpenDocuments {
-    fn observe(&mut self, command: &ShadowCommand) -> bool {
+    fn supersedes(&self, command: &ShadowCommand) -> bool {
+        match command {
+            ShadowCommand::Sync(incoming)
+            | ShadowCommand::Apply {
+                fallback: incoming, ..
+            } => self
+                .current
+                .get(&incoming.context.uri)
+                .is_some_and(|current| {
+                    current.context.incarnation > incoming.context.incarnation
+                        || (current.context.incarnation == incoming.context.incarnation
+                            && (current.context.configuration_generation
+                                > incoming.context.configuration_generation
+                                || (current.context.configuration_generation
+                                    == incoming.context.configuration_generation
+                                    && current.context.content_version
+                                        > incoming.context.content_version)))
+                }),
+            ShadowCommand::Close(request) => self
+                .current
+                .get(&request.context.uri)
+                .is_some_and(|current| current.context.incarnation > request.context.incarnation),
+            ShadowCommand::Shutdown(_) => false,
+        }
+    }
+
+    fn observe(&mut self, command: &ShadowCommand) -> Observation {
+        if let ShadowCommand::Close(request) = command
+            && self
+                .current
+                .get(&request.context.uri)
+                .is_some_and(|current| current.context.incarnation > request.context.incarnation)
+        {
+            return Observation::Stale;
+        }
         let incoming = match command {
             ShadowCommand::Sync(request) => Some(request),
             ShadowCommand::Apply { fallback, .. } => Some(fallback),
             ShadowCommand::Close(_) | ShadowCommand::Shutdown(_) => None,
         };
+        if incoming.is_some_and(|incoming| {
+            self.current.values().any(|current| {
+                (current.source_path == incoming.source_path
+                    && current.context.configuration_generation
+                        > incoming.context.configuration_generation)
+                    || (current.context.uri == incoming.context.uri
+                        && (current.context.incarnation > incoming.context.incarnation
+                            || (current.context.incarnation == incoming.context.incarnation
+                                && (current.context.configuration_generation
+                                    > incoming.context.configuration_generation
+                                    || (current.context.configuration_generation
+                                        == incoming.context.configuration_generation
+                                        && current.context.content_version
+                                            > incoming.context.content_version)))))
+            })
+        }) {
+            return Observation::Stale;
+        }
         let artifact_replaced = incoming.is_some_and(|incoming| {
             self.current.values().any(|current| {
-                current.parser_path == incoming.parser_path
+                current.source_path == incoming.source_path
                     && current.artifact_digest != incoming.artifact_digest
             })
         });
         if artifact_replaced {
             let incoming = incoming.expect("replacement requires an incoming document");
             for current in self.current.values_mut() {
-                if current.parser_path == incoming.parser_path {
+                if current.source_path == incoming.source_path {
+                    current.parser_path.clone_from(&incoming.parser_path);
                     current
                         .artifact_digest
                         .clone_from(&incoming.artifact_digest);
@@ -251,12 +301,18 @@ impl OpenDocuments {
             }
             ShadowCommand::Shutdown(_) => {}
         }
-        artifact_replaced
+        Observation::Accepted { artifact_replaced }
     }
 
     fn grammar_for(&self, uri: &str) -> Option<GrammarIdentity> {
         self.current.get(uri).map(GrammarIdentity::from_sync)
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Observation {
+    Accepted { artifact_replaced: bool },
+    Stale,
 }
 
 pub(super) struct TreeWorkerShadow {
@@ -267,6 +323,7 @@ pub(super) struct TreeWorkerShadow {
     worker_generation: u64,
     comparisons: Arc<ComparisonStore>,
     pending_configuration_generation: Arc<AtomicU64>,
+    open_documents: Arc<Mutex<OpenDocuments>>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -310,6 +367,7 @@ impl TreeWorkerShadow {
         let accepting = Arc::new(AtomicBool::new(false));
         let comparisons = Arc::new(ComparisonStore::default());
         let pending_configuration_generation = Arc::new(AtomicU64::new(0));
+        let open_documents = Arc::new(Mutex::new(OpenDocuments::default()));
         let worker_generation = NEXT_WORKER_GENERATION.fetch_add(1, Ordering::Relaxed);
         if !shadow_enabled() {
             return Self {
@@ -320,6 +378,7 @@ impl TreeWorkerShadow {
                 worker_generation,
                 comparisons,
                 pending_configuration_generation,
+                open_documents,
             };
         }
         let executable = match std::env::current_exe() {
@@ -335,14 +394,18 @@ impl TreeWorkerShadow {
                     worker_generation,
                     comparisons,
                     pending_configuration_generation,
+                    open_documents,
                 };
             }
         };
         let compute_threads = configured_compute_threads();
         let (sender, receiver) = mpsc::sync_channel(SHADOW_QUEUE_CAPACITY);
-        let actor_disabled = Arc::clone(&disabled);
-        let actor_comparisons = Arc::clone(&comparisons);
-        let actor_configuration_generation = Arc::clone(&pending_configuration_generation);
+        let actor_shared = ActorShared {
+            disabled: Arc::clone(&disabled),
+            comparisons: Arc::clone(&comparisons),
+            pending_configuration_generation: Arc::clone(&pending_configuration_generation),
+            open_documents: Arc::clone(&open_documents),
+        };
         let spawn = std::thread::Builder::new()
             .name("kakehashi-tree-worker-shadow".into())
             .spawn(move || {
@@ -351,9 +414,7 @@ impl TreeWorkerShadow {
                     executable,
                     compute_threads,
                     worker_generation,
-                    actor_disabled,
-                    actor_comparisons,
-                    actor_configuration_generation,
+                    actor_shared,
                 );
             });
         if let Err(error) = spawn {
@@ -370,6 +431,7 @@ impl TreeWorkerShadow {
                 worker_generation,
                 comparisons,
                 pending_configuration_generation,
+                open_documents,
             };
         }
         accepting.store(true, Ordering::Release);
@@ -385,6 +447,7 @@ impl TreeWorkerShadow {
             worker_generation,
             comparisons,
             pending_configuration_generation,
+            open_documents,
         }
     }
 
@@ -399,13 +462,11 @@ impl TreeWorkerShadow {
     ) {
         let request = self.sync_request(uri, incarnation, content_version, language, grammar, text);
         self.comparisons.open(uri.as_str(), incarnation);
-        self.submit(ShadowCommand::Sync(request));
+        self.observe_and_submit(ShadowCommand::Sync(request));
     }
 
     pub(super) fn is_enabled(&self) -> bool {
-        self.sender.is_some()
-            && self.accepting.load(Ordering::Acquire)
-            && !self.disabled.load(Ordering::Acquire)
+        self.sender.is_some() && self.accepting.load(Ordering::Acquire)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -423,7 +484,7 @@ impl TreeWorkerShadow {
         let fallback =
             self.sync_request(uri, incarnation, content_version, language, grammar, text);
         let Some(edits) = edits else {
-            self.submit(ShadowCommand::Sync(fallback));
+            self.observe_and_submit(ShadowCommand::Sync(fallback));
             return;
         };
         let request = ApplyDocumentEditsAndDerive {
@@ -438,7 +499,7 @@ impl TreeWorkerShadow {
                 })
                 .collect(),
         };
-        self.submit(ShadowCommand::Apply { request, fallback });
+        self.observe_and_submit(ShadowCommand::Apply { request, fallback });
     }
 
     pub(super) fn mirror_close(
@@ -449,7 +510,7 @@ impl TreeWorkerShadow {
         configuration_generation: u64,
     ) {
         self.comparisons.mark_closed(uri.as_str(), incarnation);
-        self.submit(ShadowCommand::Close(CloseDocument {
+        self.observe_and_submit(ShadowCommand::Close(CloseDocument {
             context: self.context(uri, incarnation, content_version, configuration_generation),
         }));
     }
@@ -513,6 +574,7 @@ impl TreeWorkerShadow {
             ),
             language,
             grammar_symbol: grammar.grammar_symbol,
+            source_path: grammar.source_path,
             parser_path: grammar.parser_path,
             artifact_digest: grammar.artifact_digest,
             text,
@@ -537,7 +599,7 @@ impl TreeWorkerShadow {
     }
 
     fn submit(&self, command: ShadowCommand) {
-        if !self.accepting.load(Ordering::Acquire) || self.disabled.load(Ordering::Acquire) {
+        if !self.accepting.load(Ordering::Acquire) {
             return;
         }
         let Some(sender) = &self.sender else {
@@ -550,6 +612,18 @@ impl TreeWorkerShadow {
                 "disabled shadow worker after bounded queue failure: {error}"
             );
         }
+    }
+
+    fn observe_and_submit(&self, command: ShadowCommand) {
+        let observation = self
+            .open_documents
+            .lock()
+            .recover_poison("TreeWorkerShadow::observe_and_submit")
+            .observe(&command);
+        if observation == Observation::Stale {
+            return;
+        }
+        self.submit(command);
     }
 
     #[cfg(test)]
@@ -643,10 +717,14 @@ fn run_actor(
     executable: PathBuf,
     compute_threads: usize,
     worker_generation: u64,
-    disabled: Arc<AtomicBool>,
-    comparisons: Arc<ComparisonStore>,
-    pending_configuration_generation: Arc<AtomicU64>,
+    shared: ActorShared,
 ) {
+    let ActorShared {
+        disabled,
+        comparisons,
+        pending_configuration_generation,
+        open_documents,
+    } = shared;
     let initial_client = match Client::spawn(&executable, compute_threads, worker_generation) {
         Ok(client) => Some(client),
         Err(error) => {
@@ -654,14 +732,17 @@ fn run_actor(
             None
         }
     };
+    let initial_healthy_since = initial_client.as_ref().map(|_| Instant::now());
     let mut state = SupervisorState {
         client: initial_client,
         worker_generation,
         replicas: HashMap::new(),
-        open_documents: OpenDocuments::default(),
+        open_documents,
         quarantined: HashSet::new(),
         restart_budget: RestartBudget::default(),
-        last_half_open_generation: 0,
+        breaker: BreakerState::Closed,
+        healthy_since: initial_healthy_since,
+        long_healthy_since: initial_healthy_since,
     };
     if state.client.is_none()
         && !recover_worker(
@@ -671,19 +752,23 @@ fn run_actor(
             FailureClass::Systemic,
             None,
             &comparisons,
-            true,
+            RecoveryMode::Normal,
         )
     {
-        mark_tree_tier_unavailable(&mut state, &disabled);
+        mark_tree_tier_unavailable(&mut state, &disabled, &pending_configuration_generation);
     }
     let mut shutdown_ack = None;
     loop {
+        if disabled.load(Ordering::Acquire) && !matches!(state.breaker, BreakerState::Open { .. }) {
+            mark_tree_tier_unavailable(&mut state, &disabled, &pending_configuration_generation);
+        }
         if disabled.load(Ordering::Acquire) {
             let generation = pending_configuration_generation.load(Ordering::Acquire);
-            if generation > state.last_half_open_generation
-                && state.restart_budget.prepare_half_open_at(Instant::now())
-            {
-                state.last_half_open_generation = generation;
+            let probe_allowed = breaker_probe_allowed(state.breaker, generation, Instant::now());
+            if probe_allowed {
+                state.breaker = BreakerState::HalfOpen {
+                    probe_generation: generation,
+                };
                 if recover_worker(
                     &mut state,
                     &executable,
@@ -691,15 +776,19 @@ fn run_actor(
                     FailureClass::Systemic,
                     None,
                     &comparisons,
-                    true,
+                    RecoveryMode::HalfOpen,
                 ) {
                     disabled.store(false, Ordering::Release);
                     log::info!(
                         target: "kakehashi::tree_worker_shadow",
-                        "closed shadow worker breaker after configuration generation {generation} half-open probe",
+                        "entered shadow worker half-open probation for configuration generation {generation}",
                     );
                 } else {
-                    mark_tree_tier_unavailable(&mut state, &disabled);
+                    mark_tree_tier_unavailable(
+                        &mut state,
+                        &disabled,
+                        &pending_configuration_generation,
+                    );
                 }
             }
         }
@@ -712,7 +801,7 @@ fn run_actor(
                 let status = client.try_wait();
                 match status {
                     Ok(None) => {
-                        state.restart_budget.observe_healthy(Instant::now());
+                        observe_healthy_service(&mut state, Instant::now());
                         continue;
                     }
                     Ok(Some(status)) => log::error!(
@@ -726,16 +815,22 @@ fn run_actor(
                         state.worker_generation,
                     ),
                 }
-                if !recover_worker(
-                    &mut state,
-                    &executable,
-                    compute_threads,
-                    FailureClass::Systemic,
-                    None,
-                    &comparisons,
-                    true,
-                ) {
-                    mark_tree_tier_unavailable(&mut state, &disabled);
+                if matches!(state.breaker, BreakerState::HalfOpen { .. })
+                    || !recover_worker(
+                        &mut state,
+                        &executable,
+                        compute_threads,
+                        FailureClass::Systemic,
+                        None,
+                        &comparisons,
+                        RecoveryMode::Normal,
+                    )
+                {
+                    mark_tree_tier_unavailable(
+                        &mut state,
+                        &disabled,
+                        &pending_configuration_generation,
+                    );
                     continue;
                 }
                 continue;
@@ -749,13 +844,34 @@ fn run_actor(
         if disabled.load(Ordering::Acquire) {
             continue;
         }
-        state.restart_budget.observe_healthy(Instant::now());
+        if state
+            .open_documents
+            .lock()
+            .recover_poison("run_actor(stale command)")
+            .supersedes(&command)
+        {
+            continue;
+        }
+        observe_healthy_service(&mut state, Instant::now());
         let implicated_grammar = command_grammar(&command).or_else(|| {
-            command_uri(&command).and_then(|uri| state.open_documents.grammar_for(uri))
+            command_uri(&command).and_then(|uri| {
+                state
+                    .open_documents
+                    .lock()
+                    .recover_poison("run_actor(command grammar)")
+                    .grammar_for(uri)
+            })
         });
         let command_document =
             command_document(&command).map(|(uri, incarnation)| (uri.to_string(), incarnation));
-        let artifact_replaced = state.open_documents.observe(&command);
+        let artifact_replaced = command_uri(&command).is_some_and(|uri| {
+            command_grammar(&command).is_some_and(|incoming| {
+                state.replicas.get(uri).is_some_and(|current| {
+                    current.grammar_symbol == incoming.grammar_symbol
+                        && current.artifact_digest != incoming.artifact_digest
+                })
+            })
+        });
         if artifact_replaced {
             log::info!(
                 target: "kakehashi::tree_worker_shadow",
@@ -768,9 +884,13 @@ fn run_actor(
                 FailureClass::Systemic,
                 None,
                 &comparisons,
-                false,
+                RecoveryMode::Planned,
             ) {
-                mark_tree_tier_unavailable(&mut state, &disabled);
+                mark_tree_tier_unavailable(
+                    &mut state,
+                    &disabled,
+                    &pending_configuration_generation,
+                );
                 continue;
             }
             continue;
@@ -825,16 +945,22 @@ fn run_actor(
                     state.worker_generation,
                     required.reason
                 );
-                if !recover_worker(
-                    &mut state,
-                    &executable,
-                    compute_threads,
-                    FailureClass::Systemic,
-                    None,
-                    &comparisons,
-                    true,
-                ) {
-                    mark_tree_tier_unavailable(&mut state, &disabled);
+                if matches!(state.breaker, BreakerState::HalfOpen { .. })
+                    || !recover_worker(
+                        &mut state,
+                        &executable,
+                        compute_threads,
+                        FailureClass::Systemic,
+                        None,
+                        &comparisons,
+                        RecoveryMode::Normal,
+                    )
+                {
+                    mark_tree_tier_unavailable(
+                        &mut state,
+                        &disabled,
+                        &pending_configuration_generation,
+                    );
                     continue;
                 }
             }
@@ -863,16 +989,22 @@ fn run_actor(
                     "worker generation {} transport failed: {error}",
                     state.worker_generation,
                 );
-                if !recover_worker(
-                    &mut state,
-                    &executable,
-                    compute_threads,
-                    class,
-                    implicated_grammar,
-                    &comparisons,
-                    true,
-                ) {
-                    mark_tree_tier_unavailable(&mut state, &disabled);
+                if matches!(state.breaker, BreakerState::HalfOpen { .. })
+                    || !recover_worker(
+                        &mut state,
+                        &executable,
+                        compute_threads,
+                        class,
+                        implicated_grammar,
+                        &comparisons,
+                        RecoveryMode::Normal,
+                    )
+                {
+                    mark_tree_tier_unavailable(
+                        &mut state,
+                        &disabled,
+                        &pending_configuration_generation,
+                    );
                     continue;
                 }
             }
@@ -888,13 +1020,67 @@ fn run_actor(
     }
 }
 
-fn mark_tree_tier_unavailable(state: &mut SupervisorState, disabled: &AtomicBool) {
+fn breaker_probe_allowed(state: BreakerState, generation: u64, now: Instant) -> bool {
+    matches!(
+        state,
+        BreakerState::Open {
+            opened_at,
+            baseline_generation,
+            cooldown,
+        } if generation > baseline_generation
+            && now.saturating_duration_since(opened_at) >= cooldown
+    )
+}
+
+fn mark_tree_tier_unavailable(
+    state: &mut SupervisorState,
+    disabled: &AtomicBool,
+    pending_configuration_generation: &AtomicU64,
+) {
     if let Some(client) = state.client.take()
         && let Err(error) = client.shutdown()
     {
         log::warn!(target: "kakehashi::tree_worker_shadow", "failed worker cleanup while opening breaker: {error}");
     }
+    state.healthy_since = None;
+    state.long_healthy_since = None;
+    state.breaker = BreakerState::Open {
+        opened_at: Instant::now(),
+        baseline_generation: pending_configuration_generation.load(Ordering::Acquire),
+        cooldown: if state.restart_budget.tokens_remaining() == 0 {
+            LONG_HEALTHY_INTERVAL
+        } else {
+            FAST_HEALTHY_INTERVAL
+        },
+    };
     disabled.store(true, Ordering::Release);
+}
+
+fn observe_healthy_service(state: &mut SupervisorState, now: Instant) {
+    let Some(healthy_since) = state.healthy_since else {
+        return;
+    };
+    if now.saturating_duration_since(healthy_since) >= FAST_HEALTHY_INTERVAL {
+        state.restart_budget.reset_fast();
+        if let BreakerState::HalfOpen { probe_generation } = state.breaker {
+            state.breaker = BreakerState::Closed;
+            log::info!(
+                target: "kakehashi::tree_worker_shadow",
+                "closed shadow worker breaker after configuration generation {probe_generation} completed 60 seconds of healthy service",
+            );
+        }
+    }
+    let Some(last_restore) = state.long_healthy_since else {
+        return;
+    };
+    let elapsed = now.saturating_duration_since(last_restore);
+    let intervals = elapsed.as_secs() / LONG_HEALTHY_INTERVAL.as_secs();
+    if intervals == 0 {
+        return;
+    }
+    state.restart_budget.restore_long(intervals);
+    state.long_healthy_since =
+        Some(last_restore + LONG_HEALTHY_INTERVAL.saturating_mul(intervals as u32));
 }
 
 fn execute_command(
@@ -941,15 +1127,19 @@ fn recover_worker(
     mut class: FailureClass,
     implicated_grammar: Option<GrammarIdentity>,
     comparisons: &ComparisonStore,
-    mut charge_next_attempt: bool,
+    mode: RecoveryMode,
 ) -> bool {
     let recovery_started = Instant::now();
     if let Some(grammar) = implicated_grammar {
         quarantine_grammar(state, grammar, class, comparisons);
     }
 
+    let mut first_attempt = true;
     loop {
-        if charge_next_attempt && !state.restart_budget.consume(class) {
+        let charged = mode != RecoveryMode::Planned || !first_attempt;
+        if mode == RecoveryMode::HalfOpen {
+            state.restart_budget.consume_half_open(class);
+        } else if charged && !state.restart_budget.consume(class) {
             log::error!(
                 target: "kakehashi::tree_worker_shadow",
                 "disabled shadow tree tier after restart budget exhaustion: systemic={} native={} tokens_remaining={}",
@@ -964,7 +1154,7 @@ fn recover_worker(
         {
             log::warn!(target: "kakehashi::tree_worker_shadow", "failed worker cleanup: {error}");
         }
-        if charge_next_attempt {
+        if charged {
             std::thread::sleep(state.restart_budget.backoff());
         }
         let generation = NEXT_WORKER_GENERATION.fetch_add(1, Ordering::Relaxed);
@@ -976,15 +1166,23 @@ fn recover_worker(
                     "worker generation {generation} restart failed: {error}"
                 );
                 class = FailureClass::Systemic;
-                charge_next_attempt = true;
+                if mode == RecoveryMode::HalfOpen {
+                    return false;
+                }
+                first_attempt = false;
                 continue;
             }
         };
         state.replicas.clear();
+        let open_documents = state
+            .open_documents
+            .lock()
+            .recover_poison("recover_worker(open documents)")
+            .clone();
         match resync_open_documents(
             &replacement,
             generation,
-            &state.open_documents,
+            &open_documents,
             &state.quarantined,
             &mut state.replicas,
             comparisons,
@@ -992,6 +1190,9 @@ fn recover_worker(
             Ok(resynced) => {
                 state.worker_generation = generation;
                 state.client = Some(replacement);
+                let healthy_since = Instant::now();
+                state.healthy_since = Some(healthy_since);
+                state.long_healthy_since = Some(healthy_since);
                 log::info!(
                     target: "kakehashi::tree_worker_shadow",
                     "restarted worker generation {generation} and full-resynced {} open documents (bytes={} recovery_ms={})",
@@ -1012,7 +1213,10 @@ fn recover_worker(
                     failure.error,
                 );
                 class = failure.class;
-                charge_next_attempt = true;
+                if mode == RecoveryMode::HalfOpen {
+                    return false;
+                }
+                first_attempt = false;
             }
         }
     }
@@ -1027,7 +1231,11 @@ fn quarantine_grammar(
     if !state.quarantined.insert(grammar.clone()) {
         return;
     }
-    for request in state.open_documents.current.values() {
+    let open_documents = state
+        .open_documents
+        .lock()
+        .recover_poison("quarantine_grammar(open documents)");
+    for request in open_documents.current.values() {
         if GrammarIdentity::from_sync(request) == grammar {
             comparisons.mark_closed(&request.context.uri, request.context.incarnation);
         }
@@ -1374,11 +1582,13 @@ mod tests {
             worker_generation: 7,
             comparisons: Arc::new(ComparisonStore::default()),
             pending_configuration_generation: Arc::new(AtomicU64::new(0)),
+            open_documents: Arc::new(Mutex::new(OpenDocuments::default())),
         }
     }
 
     fn grammar() -> WorkerGrammarDescriptor {
         WorkerGrammarDescriptor {
+            source_path: "/parser/rust.so".into(),
             parser_path: "/parser/rust.so".into(),
             grammar_symbol: "rust".into(),
             artifact_digest: "sha256:rust-v1".into(),
@@ -1410,6 +1620,7 @@ mod tests {
             },
             language: "rust".into(),
             grammar_symbol: "rust".into(),
+            source_path: "/parser/rust.so".into(),
             parser_path: "/parser/rust.so".into(),
             artifact_digest: "sha256:rust-v1".into(),
             text: format!("version {version}"),
@@ -1442,23 +1653,70 @@ mod tests {
     #[test]
     fn artifact_replacement_updates_all_same_path_documents_and_requests_restart() {
         let mut documents = OpenDocuments::default();
-        assert!(!documents.observe(&ShadowCommand::Sync(sync("file:///a.rs", 1, 1, 7))));
-        assert!(!documents.observe(&ShadowCommand::Sync(sync("file:///b.rs", 1, 1, 7))));
+        assert_eq!(
+            documents.observe(&ShadowCommand::Sync(sync("file:///a.rs", 1, 1, 7))),
+            Observation::Accepted {
+                artifact_replaced: false
+            }
+        );
+        assert_eq!(
+            documents.observe(&ShadowCommand::Sync(sync("file:///b.rs", 1, 1, 7))),
+            Observation::Accepted {
+                artifact_replaced: false
+            }
+        );
 
         let mut replacement = sync("file:///b.rs", 1, 2, 7);
+        replacement.parser_path = "/private/sha256-rust-v2.so".into();
+        let replacement_path = replacement.parser_path.clone();
         replacement.artifact_digest = "sha256:rust-v2".into();
         replacement.context.configuration_generation = 4;
-        assert!(documents.observe(&ShadowCommand::Sync(replacement)));
+        assert_eq!(
+            documents.observe(&ShadowCommand::Sync(replacement)),
+            Observation::Accepted {
+                artifact_replaced: true
+            }
+        );
 
         for document in documents.current.values() {
             assert_eq!(document.artifact_digest, "sha256:rust-v2");
+            assert_eq!(document.parser_path, replacement_path);
             assert_eq!(document.context.configuration_generation, 4);
         }
 
         let mut alias = sync("file:///c.rs", 1, 1, 7);
         alias.artifact_digest = "sha256:rust-v2".into();
         alias.context.configuration_generation = 4;
-        assert!(!documents.observe(&ShadowCommand::Sync(alias)));
+        assert_eq!(
+            documents.observe(&ShadowCommand::Sync(alias)),
+            Observation::Accepted {
+                artifact_replaced: false
+            }
+        );
+    }
+
+    #[test]
+    fn stale_configuration_cannot_roll_back_a_newer_artifact_selection() {
+        let mut documents = OpenDocuments::default();
+        let mut current = sync("file:///a.rs", 1, 2, 7);
+        current.context.configuration_generation = 5;
+        current.parser_path = "/private/new.so".into();
+        current.artifact_digest = "sha256:new".into();
+        assert!(matches!(
+            documents.observe(&ShadowCommand::Sync(current)),
+            Observation::Accepted { .. }
+        ));
+
+        let stale = sync("file:///b.rs", 1, 3, 7);
+        assert_eq!(
+            documents.observe(&ShadowCommand::Sync(stale)),
+            Observation::Stale
+        );
+        assert_eq!(documents.current.len(), 1);
+        assert_eq!(
+            documents.current["file:///a.rs"].artifact_digest,
+            "sha256:new"
+        );
     }
 
     #[test]
@@ -1482,19 +1740,18 @@ mod tests {
 
     #[test]
     fn restart_budgets_are_independent_and_session_bounded() {
-        let started = Instant::now();
         let mut systemic = RestartBudget::default();
-        assert!(systemic.consume_at(FailureClass::Systemic, started));
-        assert!(systemic.consume_at(FailureClass::Systemic, started));
-        assert!(systemic.consume_at(FailureClass::Systemic, started));
-        assert!(!systemic.consume_at(FailureClass::Systemic, started));
+        assert!(systemic.consume(FailureClass::Systemic));
+        assert!(systemic.consume(FailureClass::Systemic));
+        assert!(systemic.consume(FailureClass::Systemic));
+        assert!(!systemic.consume(FailureClass::Systemic));
         assert_eq!(systemic.tokens_remaining(), MAX_SESSION_RESTARTS - 3);
 
         let mut native = RestartBudget::default();
         for _ in 0..MAX_NATIVE_RESTARTS {
-            assert!(native.consume_at(FailureClass::NativeEvidenced, started));
+            assert!(native.consume(FailureClass::NativeEvidenced));
         }
-        assert!(!native.consume_at(FailureClass::NativeEvidenced, started));
+        assert!(!native.consume(FailureClass::NativeEvidenced));
 
         assert_eq!(systemic.backoff(), Duration::from_secs(1));
     }
@@ -1502,44 +1759,70 @@ mod tests {
     #[test]
     fn healthy_intervals_reset_fast_budgets_but_restore_long_tokens_slowly() {
         let started = Instant::now();
-        let mut budget = RestartBudget::default();
+        let mut state = SupervisorState {
+            client: None,
+            worker_generation: 1,
+            replicas: HashMap::new(),
+            open_documents: Arc::new(Mutex::new(OpenDocuments::default())),
+            quarantined: HashSet::new(),
+            restart_budget: RestartBudget::default(),
+            breaker: BreakerState::HalfOpen {
+                probe_generation: 7,
+            },
+            healthy_since: Some(started),
+            long_healthy_since: Some(started),
+        };
         for _ in 0..MAX_SYSTEMIC_RESTARTS {
-            assert!(budget.consume_at(FailureClass::Systemic, started));
+            assert!(state.restart_budget.consume(FailureClass::Systemic));
         }
-        assert_eq!(budget.tokens_remaining(), MAX_SESSION_RESTARTS - 3);
+        assert_eq!(
+            state.restart_budget.tokens_remaining(),
+            MAX_SESSION_RESTARTS - 3
+        );
 
-        budget.observe_healthy(started + Duration::from_secs(60));
-        assert!(budget.consume_at(FailureClass::Systemic, started + Duration::from_secs(60)));
-        assert_eq!(budget.tokens_remaining(), MAX_SESSION_RESTARTS - 4);
-        assert_eq!(budget.backoff(), Duration::from_secs(2));
+        observe_healthy_service(&mut state, started + FAST_HEALTHY_INTERVAL);
+        assert_eq!(state.breaker, BreakerState::Closed);
+        assert!(state.restart_budget.consume(FailureClass::Systemic));
+        assert_eq!(
+            state.restart_budget.tokens_remaining(),
+            MAX_SESSION_RESTARTS - 4
+        );
+        assert_eq!(state.restart_budget.backoff(), Duration::from_secs(2));
 
-        budget.observe_healthy(started + Duration::from_secs(660));
-        assert_eq!(budget.tokens_remaining(), MAX_SESSION_RESTARTS - 3);
-        assert_eq!(budget.backoff(), INITIAL_RESTART_BACKOFF);
+        observe_healthy_service(
+            &mut state,
+            started + FAST_HEALTHY_INTERVAL + LONG_HEALTHY_INTERVAL,
+        );
+        assert_eq!(
+            state.restart_budget.tokens_remaining(),
+            MAX_SESSION_RESTARTS - 3
+        );
+        assert_eq!(state.restart_budget.backoff(), INITIAL_RESTART_BACKOFF);
     }
 
     #[test]
     fn breaker_half_open_requires_the_matching_cooldown() {
         let started = Instant::now();
-        let mut fast = RestartBudget::default();
-        for _ in 0..MAX_SYSTEMIC_RESTARTS {
-            assert!(fast.consume_at(FailureClass::Systemic, started));
-        }
-        assert!(!fast.prepare_half_open_at(started + Duration::from_secs(59)));
-        assert!(fast.prepare_half_open_at(started + Duration::from_secs(60)));
-        assert!(fast.consume_at(FailureClass::Systemic, started + Duration::from_secs(60)));
-
-        let mut long = RestartBudget {
-            tokens: 0,
-            last_restart: Some(started),
-            last_long_restore: Some(started),
-            ..RestartBudget::default()
+        let fast = BreakerState::Open {
+            opened_at: started,
+            baseline_generation: 3,
+            cooldown: FAST_HEALTHY_INTERVAL,
         };
-        assert!(!long.prepare_half_open_at(started + Duration::from_secs(599)));
-        assert!(long.prepare_half_open_at(started + Duration::from_secs(600)));
-        assert_eq!(long.tokens_remaining(), 1);
-        assert!(long.consume_at(FailureClass::Systemic, started + Duration::from_secs(600)));
-        assert_eq!(long.tokens_remaining(), 0);
+        assert!(!breaker_probe_allowed(
+            fast,
+            4,
+            started + Duration::from_secs(59)
+        ));
+        assert!(breaker_probe_allowed(
+            fast,
+            4,
+            started + FAST_HEALTHY_INTERVAL
+        ));
+        assert!(!breaker_probe_allowed(
+            fast,
+            3,
+            started + FAST_HEALTHY_INTERVAL
+        ));
     }
 
     #[test]
