@@ -649,7 +649,6 @@ type LaneJob = Box<dyn FnOnce() -> LaneAction + Send + 'static>;
 
 #[derive(Clone, Copy)]
 enum LaneAction {
-    Unchanged,
     Keep,
     Retire,
 }
@@ -670,7 +669,10 @@ struct DocumentLaneState {
 impl DocumentLane {
     fn new(key: DocumentKey, registry: Weak<LaneRegistry>) -> Self {
         Self {
-            state: Mutex::new(DocumentLaneState::default()),
+            state: Mutex::new(DocumentLaneState {
+                retire_when_idle: true,
+                ..DocumentLaneState::default()
+            }),
             key: Some(key),
             registry,
         }
@@ -731,7 +733,6 @@ impl DocumentLane {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             match action {
-                LaneAction::Unchanged => {}
                 LaneAction::Keep => state.retire_when_idle = false,
                 LaneAction::Retire => state.retire_when_idle = true,
             }
@@ -1197,7 +1198,7 @@ where
         let closed_documents = Arc::clone(&closed_documents);
         let document_capacity = Arc::clone(&document_capacity);
         let lane_key = document_key(&request);
-        let is_sync = matches!(&request, Request::SyncDocument(_));
+        let action_key = lane_key.clone();
         let job: LaneJob = Box::new(move || {
             let response = handle_work(
                 request,
@@ -1206,12 +1207,13 @@ where
                 &document_capacity,
                 enqueued.elapsed(),
             );
-            let action = if matches!(&response, Response::DocumentClosed(_)) {
-                LaneAction::Retire
-            } else if is_sync && matches!(&response, Response::DocumentAck(_)) {
+            let action = if action_key
+                .as_ref()
+                .is_some_and(|key| documents.contains_key(key))
+            {
                 LaneAction::Keep
             } else {
-                LaneAction::Unchanged
+                LaneAction::Retire
             };
             let _ = responses.send((response, Some(permit)));
             action
@@ -2186,7 +2188,7 @@ mod tests {
                 let released = released.lock().unwrap();
                 drop(changed.wait_while(released, |released| !*released).unwrap());
                 first_order.lock().unwrap().push(1);
-                LaneAction::Unchanged
+                LaneAction::Retire
             }),
         );
         let second_order = Arc::clone(&order);
@@ -2195,7 +2197,7 @@ mod tests {
             Box::new(move || {
                 second_order.lock().unwrap().push(2);
                 completed.send(()).unwrap();
-                LaneAction::Unchanged
+                LaneAction::Retire
             }),
         );
 
