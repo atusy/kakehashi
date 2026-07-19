@@ -1993,6 +1993,25 @@ impl Client {
         self.ready.compute_threads
     }
 
+    pub fn worker_generation(&self) -> u64 {
+        self.ready.worker_generation
+    }
+
+    /// Stops this generation without requiring unique ownership of the client.
+    ///
+    /// Supervisors use this after atomically removing a generation from the
+    /// read router. In-flight requests then observe transport failure while a
+    /// replacement generation can be published independently.
+    pub fn terminate_shared(&self, timeout: Duration) {
+        self.outbound
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Ok(mut child) = self.child.lock() {
+            terminate_by_transport(&mut child, &self.terminated_by_transport, timeout);
+        }
+    }
+
     pub fn derive(&self, request: DeriveSnapshot) -> io::Result<Response> {
         self.derive_with_timeout(request, Duration::from_secs(60))
     }

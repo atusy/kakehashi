@@ -212,7 +212,35 @@ impl Kakehashi {
         // keeps the no-injection request shape (the dominant case for plain
         // documents) at PR-1 cost.
         if matches!(selector, InjectionSelector::Host) {
-            return Ok(self.resolve_host_layer_node(&uri, tree, byte, doc_len, incarnation));
+            let authoritative =
+                self.resolve_host_layer_node(&uri, tree, byte, doc_len, incarnation);
+            if let Some(shadow) = self
+                .tree_worker_shadow
+                .resolve_node(
+                    &uri,
+                    incarnation,
+                    snapshot.parsed_version,
+                    self.cache.semantic_token_generation(),
+                    byte.min(doc_len.saturating_sub(1)),
+                    false,
+                )
+                .await
+                && let Some(node) = shadow.nodes.first()
+            {
+                let authoritative_kind = authoritative.get("kind").and_then(Value::as_str);
+                if authoritative_kind != Some(node.kind.as_str()) {
+                    log::warn!(
+                        target: "kakehashi::tree_worker_shadow",
+                        "host node mismatch uri={} version={} byte={} authoritative_kind={:?} worker_kind={}",
+                        uri,
+                        snapshot.parsed_version,
+                        byte,
+                        authoritative_kind,
+                        node.kind,
+                    );
+                }
+            }
+            return Ok(authoritative);
         }
 
         // We need the host language to seed `injection_stack_at` with the

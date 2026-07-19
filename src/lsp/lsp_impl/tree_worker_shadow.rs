@@ -4,12 +4,14 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant};
 
+use arc_swap::ArcSwapOption;
+
 use crate::error::LockResultExt;
 use crate::language::coordinator::WorkerGrammarDescriptor;
 use crate::lsp::text_sync::SequentialByteEdit;
 use crate::tree_worker::{
     ApplyDocumentEditsAndDerive, ByteEdit, Client, CloseDocument, DeriveDocumentSnapshot,
-    RequestContext, Response, SyncDocument, named_node_count,
+    NodeResult, RequestContext, ResolveNode, Response, SyncDocument, named_node_count,
 };
 
 const SHADOW_ENV: &str = "KAKEHASHI_TREE_WORKER_SHADOW";
@@ -185,7 +187,8 @@ struct OpenDocuments {
 }
 
 struct SupervisorState {
-    client: Option<Client>,
+    client: Option<Arc<Client>>,
+    read_client: Arc<ArcSwapOption<Client>>,
     worker_generation: u64,
     replicas: HashMap<String, ReplicaIdentity>,
     open_documents: Arc<Mutex<OpenDocuments>>,
@@ -202,6 +205,7 @@ struct ActorShared {
     pending_configuration_generation: Arc<AtomicU64>,
     open_documents: Arc<Mutex<OpenDocuments>>,
     registry_epoch: Arc<AtomicU64>,
+    read_client: Arc<ArcSwapOption<Client>>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -356,6 +360,7 @@ pub(super) struct TreeWorkerShadow {
     pending_configuration_generation: Arc<AtomicU64>,
     open_documents: Arc<Mutex<OpenDocuments>>,
     registry_epoch: Arc<AtomicU64>,
+    read_client: Arc<ArcSwapOption<Client>>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -410,6 +415,7 @@ impl TreeWorkerShadow {
         let pending_configuration_generation = Arc::new(AtomicU64::new(0));
         let open_documents = Arc::new(Mutex::new(OpenDocuments::default()));
         let registry_epoch = Arc::new(AtomicU64::new(0));
+        let read_client = Arc::new(ArcSwapOption::empty());
         let worker_generation = NEXT_WORKER_GENERATION.fetch_add(1, Ordering::Relaxed);
         if !shadow_enabled() {
             return Self {
@@ -422,6 +428,7 @@ impl TreeWorkerShadow {
                 pending_configuration_generation,
                 open_documents,
                 registry_epoch,
+                read_client,
             };
         }
         let executable = match std::env::current_exe() {
@@ -439,6 +446,7 @@ impl TreeWorkerShadow {
                     pending_configuration_generation,
                     open_documents,
                     registry_epoch,
+                    read_client,
                 };
             }
         };
@@ -450,6 +458,7 @@ impl TreeWorkerShadow {
             pending_configuration_generation: Arc::clone(&pending_configuration_generation),
             open_documents: Arc::clone(&open_documents),
             registry_epoch: Arc::clone(&registry_epoch),
+            read_client: Arc::clone(&read_client),
         };
         let spawn = std::thread::Builder::new()
             .name("kakehashi-tree-worker-shadow".into())
@@ -478,6 +487,7 @@ impl TreeWorkerShadow {
                 pending_configuration_generation,
                 open_documents,
                 registry_epoch,
+                read_client,
             };
         }
         accepting.store(true, Ordering::Release);
@@ -495,6 +505,7 @@ impl TreeWorkerShadow {
             pending_configuration_generation,
             open_documents,
             registry_epoch,
+            read_client,
         }
     }
 
@@ -518,6 +529,40 @@ impl TreeWorkerShadow {
 
     pub(super) fn is_configured(&self) -> bool {
         self.sender.is_some() && self.accepting.load(Ordering::Acquire)
+    }
+
+    pub(super) async fn resolve_node(
+        &self,
+        uri: &url::Url,
+        incarnation: u64,
+        content_version: u64,
+        configuration_generation: u64,
+        byte_offset: usize,
+        named: bool,
+    ) -> Option<NodeResult> {
+        let client = self.read_client.load_full()?;
+        if !self.is_enabled() {
+            return None;
+        }
+        let context = self.read_context(
+            &client,
+            uri,
+            incarnation,
+            content_version,
+            configuration_generation,
+        );
+        let expected = context.clone();
+        let response = tokio::task::spawn_blocking(move || {
+            client.resolve_node(ResolveNode {
+                context,
+                byte_offset,
+                named,
+            })
+        })
+        .await
+        .ok()?
+        .ok()?;
+        self.admit_node_response(response, &expected)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -699,6 +744,44 @@ impl TreeWorkerShadow {
         }
     }
 
+    fn read_context(
+        &self,
+        client: &Client,
+        uri: &url::Url,
+        incarnation: u64,
+        content_version: u64,
+        configuration_generation: u64,
+    ) -> RequestContext {
+        RequestContext {
+            request_id: self.next_request_id.fetch_add(1, Ordering::Relaxed),
+            worker_generation: client.worker_generation(),
+            uri: uri.as_str().to_string(),
+            incarnation,
+            content_version,
+            configuration_generation,
+        }
+    }
+
+    fn admit_node_response(
+        &self,
+        response: Response,
+        expected: &RequestContext,
+    ) -> Option<NodeResult> {
+        let Response::Nodes(result) = response else {
+            return None;
+        };
+        if &result.context != expected
+            || self
+                .read_client
+                .load()
+                .as_ref()
+                .is_none_or(|client| client.worker_generation() != expected.worker_generation)
+        {
+            return None;
+        }
+        Some(result)
+    }
+
     fn submit(&self, command: ShadowCommand) {
         if !self.accepting.load(Ordering::Acquire) {
             return;
@@ -835,17 +918,20 @@ fn run_actor(
         pending_configuration_generation,
         open_documents,
         registry_epoch,
+        read_client,
     } = shared;
     let initial_client = match Client::spawn(&executable, compute_threads, worker_generation) {
-        Ok(client) => Some(client),
+        Ok(client) => Some(Arc::new(client)),
         Err(error) => {
             log::error!(target: "kakehashi::tree_worker_shadow", "worker spawn failed: {error}");
             None
         }
     };
     let initial_healthy_since = initial_client.as_ref().map(|_| Instant::now());
+    read_client.store(initial_client.clone());
     let mut state = SupervisorState {
         client: initial_client,
+        read_client,
         worker_generation,
         replicas: HashMap::new(),
         open_documents,
@@ -1163,9 +1249,7 @@ fn run_actor(
             }
         }
     }
-    if let Some(client) = state.client
-        && let Err(error) = client.shutdown()
-    {
+    if let Err(error) = retire_client(&mut state) {
         log::warn!(target: "kakehashi::tree_worker_shadow", "worker shutdown failed: {error}");
     }
     if let Some(ack) = shutdown_ack {
@@ -1254,14 +1338,26 @@ fn breaker_probe_allowed(state: BreakerState, generation: u64, now: Instant) -> 
     )
 }
 
+fn retire_client(state: &mut SupervisorState) -> std::io::Result<()> {
+    state.read_client.store(None);
+    let Some(client) = state.client.take() else {
+        return Ok(());
+    };
+    match Arc::try_unwrap(client) {
+        Ok(client) => client.shutdown(),
+        Err(client) => {
+            client.terminate_shared(SHADOW_SHUTDOWN_TIMEOUT);
+            Ok(())
+        }
+    }
+}
+
 fn mark_tree_tier_unavailable(
     state: &mut SupervisorState,
     disabled: &AtomicBool,
     pending_configuration_generation: &AtomicU64,
 ) {
-    if let Some(client) = state.client.take()
-        && let Err(error) = client.shutdown()
-    {
+    if let Err(error) = retire_client(state) {
         log::warn!(target: "kakehashi::tree_worker_shadow", "failed worker cleanup while opening breaker: {error}");
     }
     state.healthy_since = None;
@@ -1375,9 +1471,7 @@ fn recover_worker(
             );
             return false;
         }
-        if let Some(old_client) = state.client.take()
-            && let Err(error) = old_client.shutdown()
-        {
+        if let Err(error) = retire_client(state) {
             log::warn!(target: "kakehashi::tree_worker_shadow", "failed worker cleanup: {error}");
         }
         if charged {
@@ -1410,6 +1504,8 @@ fn recover_worker(
         ) {
             Ok(resynced) => {
                 state.worker_generation = generation;
+                let replacement = Arc::new(replacement);
+                state.read_client.store(Some(Arc::clone(&replacement)));
                 state.client = Some(replacement);
                 let healthy_since = Instant::now();
                 state.healthy_since = Some(healthy_since);
@@ -1424,7 +1520,7 @@ fn recover_worker(
                 return true;
             }
             Err(failure) => {
-                state.client = Some(replacement);
+                state.client = Some(Arc::new(replacement));
                 if let Some(grammar) = failure.implicated_grammar {
                     quarantine_grammar(state, grammar, failure.class, comparisons);
                 }
@@ -1901,6 +1997,7 @@ mod tests {
             pending_configuration_generation: Arc::new(AtomicU64::new(0)),
             open_documents: Arc::new(Mutex::new(OpenDocuments::default())),
             registry_epoch: Arc::new(AtomicU64::new(0)),
+            read_client: Arc::new(ArcSwapOption::empty()),
         }
     }
 
@@ -2204,6 +2301,7 @@ mod tests {
         let started = Instant::now();
         let mut state = SupervisorState {
             client: None,
+            read_client: Arc::new(ArcSwapOption::empty()),
             worker_generation: 1,
             replicas: HashMap::new(),
             open_documents: Arc::new(Mutex::new(OpenDocuments::default())),
