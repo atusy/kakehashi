@@ -863,7 +863,8 @@ fn terminate(child: &mut Child, timeout: Duration) {
 mod tests {
     use std::collections::HashMap;
     use std::io::{Cursor, Write};
-    use std::sync::{Arc, Mutex};
+    use std::sync::{Arc, Condvar, Mutex};
+    use std::time::Duration;
 
     use super::{
         BUILD_ID, DeriveSnapshot, Handshake, HandshakeReady, PROTOCOL_VERSION, Request,
@@ -881,6 +882,56 @@ mod tests {
 
         fn flush(&mut self) -> std::io::Result<()> {
             Ok(())
+        }
+    }
+
+    #[derive(Clone, Default)]
+    struct GatedWriter(Arc<(Mutex<GateState>, Condvar)>);
+
+    #[derive(Default)]
+    struct GateState {
+        bytes: Vec<u8>,
+        flushes: usize,
+        blocked: bool,
+        released: bool,
+    }
+
+    impl Write for GatedWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            let (state, _) = &*self.0;
+            state.lock().unwrap().bytes.write(bytes)
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            let (state, changed) = &*self.0;
+            let mut state = state.lock().unwrap();
+            state.flushes += 1;
+            if state.flushes >= 2 && !state.released {
+                state.blocked = true;
+                changed.notify_all();
+                state = changed.wait_while(state, |state| !state.released).unwrap();
+            }
+            state.bytes.flush()
+        }
+    }
+
+    impl GatedWriter {
+        fn wait_until_blocked(&self) {
+            let (state, changed) = &*self.0;
+            let state = state.lock().unwrap();
+            let (state, timeout) = changed
+                .wait_timeout_while(state, Duration::from_secs(5), |state| !state.blocked)
+                .unwrap();
+            assert!(
+                !timeout.timed_out() && state.blocked,
+                "writer never blocked"
+            );
+        }
+
+        fn release(&self) {
+            let (state, changed) = &*self.0;
+            state.lock().unwrap().released = true;
+            changed.notify_all();
         }
     }
 
@@ -1073,5 +1124,37 @@ mod tests {
             error.context.as_ref().map(|context| context.request_id),
             Some(7)
         );
+    }
+
+    #[test]
+    fn worker_backpressures_until_the_response_writer_resumes() {
+        let writer = GatedWriter::default();
+        let gate = writer.clone();
+        let mut requests = vec![handshake(PROTOCOL_VERSION)];
+        for request_id in 1..=12 {
+            let Request::DeriveSnapshot(mut request) = request() else {
+                unreachable!()
+            };
+            request.context.request_id = request_id;
+            requests.push(Request::DeriveSnapshot(request));
+        }
+        let (completed, completed_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = completed.send(run(Cursor::new(framed(&requests)), writer, 1));
+        });
+
+        gate.wait_until_blocked();
+        assert!(
+            completed_rx
+                .recv_timeout(Duration::from_millis(50))
+                .is_err(),
+            "worker must not consume an unbounded request stream while stdout is stalled"
+        );
+
+        gate.release();
+        completed_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("worker did not resume after stdout was released")
+            .unwrap();
     }
 }

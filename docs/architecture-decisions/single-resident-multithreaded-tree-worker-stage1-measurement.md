@@ -105,8 +105,11 @@ The measured artifacts were prepared and collected with:
 cargo build --release --locked --bin kakehashi
 target/release/kakehashi language install rust \
   --data-dir deps/test/kakehashi --force
-shasum -a 256 target/release/kakehashi \
-  target/release/deps/tree_worker_stage1-8d08bf9882b4bf01 \
+stage1_bench_bin="$(cargo bench --locked --bench tree_worker_stage1 \
+  --no-run --message-format=json \
+  | jq -sr 'map(select(.reason == "compiler-artifact" and \
+      .target.name == "tree_worker_stage1")) | last | .executable')"
+shasum -a 256 target/release/kakehashi "$stage1_bench_bin" \
   deps/test/kakehashi/parser/rust.dylib
 
 cargo bench --locked --bench tree_worker_stage1 -- \
