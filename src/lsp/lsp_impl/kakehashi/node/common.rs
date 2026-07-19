@@ -484,6 +484,38 @@ impl Kakehashi {
         }
     }
 
+    pub(super) async fn navigate_with_descendant_shadowed(
+        &self,
+        lsp_uri: &Uri,
+        id: &str,
+        descendant_id: &str,
+        f: impl FnMut(tree_sitter::Node<'_>, tree_sitter::Node<'_>) -> Option<NodeTriple>
+        + Send
+        + 'static,
+    ) -> Value {
+        let uri = uri_to_url(lsp_uri).ok();
+        let worker = match uri.as_ref() {
+            Some(uri) => {
+                self.tree_worker_shadow
+                    .node_navigation_with_descendant(uri, id, descendant_id)
+                    .await
+            }
+            None => None,
+        };
+        let authoritative = self
+            .navigate_with_descendant(lsp_uri, id, descendant_id, f)
+            .await;
+        if let (Some(uri), Some(worker)) = (uri.as_ref(), worker.as_ref()) {
+            self.tree_worker_shadow.compare_node_result_label(
+                uri,
+                "ChildWithDescendant",
+                &authoritative,
+                worker,
+            );
+        }
+        authoritative
+    }
+
     /// Resolve `id`, run `f` to collect a list of related nodes (children,
     /// named children, field children, …), and return them as a `NodeInfo[]`.
     ///

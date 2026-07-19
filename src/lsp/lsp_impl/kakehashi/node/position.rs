@@ -27,9 +27,9 @@
 use serde_json::{Value, json};
 use tower_lsp_server::jsonrpc::Result;
 
-use crate::lsp::lsp_impl::Kakehashi;
 use crate::lsp::lsp_impl::kakehashi::node::common::{NodeIdParams, NodePointRangeParams};
 use crate::lsp::lsp_impl::kakehashi::node::navigation::range_bounds_in_ranges;
+use crate::lsp::lsp_impl::{Kakehashi, uri_to_url};
 use crate::text::PositionMapper;
 
 impl Kakehashi {
@@ -37,6 +37,13 @@ impl Kakehashi {
     /// per `Node::range`. Returns `{ "start": Position, "end": Position }` or
     /// `null`.
     pub async fn kakehashi_node_range(&self, params: NodeIdParams) -> Result<Value> {
+        let shadow = self
+            .shadow_position_scalar(
+                &params.text_document.uri,
+                &params.id,
+                crate::tree_worker::NodeScalarOperation::Range,
+            )
+            .await;
         let value = self
             .with_node_text(&params.text_document.uri, &params.id, move |n, text| {
                 let mapper = PositionMapper::new(text);
@@ -49,6 +56,7 @@ impl Kakehashi {
             .and_then(|(_uri, _layer, _incarnation, span)| span)
             .map(|(start, end)| json!({ "start": start, "end": end }))
             .unwrap_or(Value::Null);
+        compare_position_scalar(shadow, &value, "range");
         Ok(value)
     }
 
@@ -56,6 +64,13 @@ impl Kakehashi {
     /// per `Node::start_position`. Returns `{ "startPosition": Position }` or
     /// `null`.
     pub async fn kakehashi_node_start_position(&self, params: NodeIdParams) -> Result<Value> {
+        let shadow = self
+            .shadow_position_scalar(
+                &params.text_document.uri,
+                &params.id,
+                crate::tree_worker::NodeScalarOperation::StartPosition,
+            )
+            .await;
         let value = self
             .with_node_text(&params.text_document.uri, &params.id, move |n, text| {
                 PositionMapper::new(text).byte_to_position(n.start_byte())
@@ -64,12 +79,20 @@ impl Kakehashi {
             .and_then(|(_uri, _layer, _incarnation, pos)| pos)
             .map(|pos| json!({ "startPosition": pos }))
             .unwrap_or(Value::Null);
+        compare_position_scalar(shadow, &value, "startPosition");
         Ok(value)
     }
 
     /// `kakehashi/node/endPosition` — the node's end as an LSP `Position`, per
     /// `Node::end_position`. Returns `{ "endPosition": Position }` or `null`.
     pub async fn kakehashi_node_end_position(&self, params: NodeIdParams) -> Result<Value> {
+        let shadow = self
+            .shadow_position_scalar(
+                &params.text_document.uri,
+                &params.id,
+                crate::tree_worker::NodeScalarOperation::EndPosition,
+            )
+            .await;
         let value = self
             .with_node_text(&params.text_document.uri, &params.id, move |n, text| {
                 PositionMapper::new(text).byte_to_position(n.end_byte())
@@ -78,6 +101,7 @@ impl Kakehashi {
             .and_then(|(_uri, _layer, _incarnation, pos)| pos)
             .map(|pos| json!({ "endPosition": pos }))
             .unwrap_or(Value::Null);
+        compare_position_scalar(shadow, &value, "endPosition");
         Ok(value)
     }
 
@@ -115,10 +139,21 @@ impl Kakehashi {
     ) -> Result<Value> {
         let start = params.start;
         let end = params.end;
-        let resolved = self
-            .with_node_text_ranges(
+        let value = self
+            .navigate_to_node_in_ranges_shadowed(
                 &params.text_document.uri,
                 &params.id,
+                crate::tree_worker::NodeNavigation::DescendantForPointRange {
+                    start: crate::tree_worker::WirePosition {
+                        line: start.line,
+                        character: start.character,
+                    },
+                    end: crate::tree_worker::WirePosition {
+                        line: end.line,
+                        character: end.character,
+                    },
+                    named,
+                },
                 move |n, text, ranges| {
                     let mapper = PositionMapper::new(text);
                     // Strict conversion: a `character` past a line's end must mean
@@ -150,13 +185,46 @@ impl Kakehashi {
                 },
             )
             .await;
-
-        let value = match resolved {
-            Some((uri, layer, incarnation, Some(triple))) => {
-                self.mint_node_info(&uri, layer, incarnation, triple)
-            }
-            _ => Value::Null,
-        };
         Ok(value)
+    }
+
+    async fn shadow_position_scalar(
+        &self,
+        lsp_uri: &tower_lsp_server::ls_types::Uri,
+        id: &str,
+        operation: crate::tree_worker::NodeScalarOperation,
+    ) -> Option<crate::tree_worker::NodeScalarValue> {
+        let uri = uri_to_url(lsp_uri).ok()?;
+        self.tree_worker_shadow
+            .node_scalar(&uri, id, operation)
+            .await
+    }
+}
+
+fn wire_position_json(position: crate::tree_worker::WirePosition) -> Value {
+    json!({ "line": position.line, "character": position.character })
+}
+
+fn compare_position_scalar(
+    shadow: Option<crate::tree_worker::NodeScalarValue>,
+    authoritative: &Value,
+    field: &str,
+) {
+    let worker = match shadow {
+        Some(crate::tree_worker::NodeScalarValue::Position(position)) => {
+            let mut object = serde_json::Map::new();
+            object.insert(field.into(), wire_position_json(position));
+            Value::Object(object)
+        }
+        Some(crate::tree_worker::NodeScalarValue::Range { start, end }) => {
+            json!({ "start": wire_position_json(start), "end": wire_position_json(end) })
+        }
+        _ => return,
+    };
+    if &worker != authoritative {
+        log::debug!(
+            target: "kakehashi::tree_worker_shadow",
+            "node position mismatch field={field} authoritative={authoritative} worker={worker}",
+        );
     }
 }

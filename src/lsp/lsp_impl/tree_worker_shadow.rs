@@ -791,10 +791,41 @@ impl TreeWorkerShadow {
         Some(result)
     }
 
+    pub(super) async fn node_navigation_with_descendant(
+        &self,
+        uri: &url::Url,
+        authoritative_input_id: &str,
+        authoritative_descendant_id: &str,
+    ) -> Option<NodeResult> {
+        let descendant_id = self
+            .worker_nodes
+            .get(&(
+                uri.as_str().to_string(),
+                authoritative_descendant_id.to_string(),
+            ))
+            .map(|entry| entry.clone())?;
+        self.node_navigation(
+            uri,
+            authoritative_input_id,
+            NodeNavigation::ChildWithDescendant { descendant_id },
+        )
+        .await
+    }
+
     pub(super) fn compare_node_result(
         &self,
         uri: &url::Url,
         operation: &NodeNavigation,
+        authoritative: &Value,
+        worker: &NodeResult,
+    ) {
+        self.compare_node_result_label(uri, &format!("{operation:?}"), authoritative, worker);
+    }
+
+    pub(super) fn compare_node_result_label(
+        &self,
+        uri: &url::Url,
+        operation: &str,
         authoritative: &Value,
         worker: &NodeResult,
     ) {
@@ -816,7 +847,7 @@ impl TreeWorkerShadow {
         if authoritative_kinds != worker_kinds {
             log::debug!(
                 target: "kakehashi::tree_worker_shadow",
-                "node navigation mismatch operation={operation:?} uri={uri} authoritative={authoritative_kinds:?} worker={worker_kinds:?}",
+                "node navigation mismatch operation={operation} uri={uri} authoritative={authoritative_kinds:?} worker={worker_kinds:?}",
             );
             return;
         }

@@ -137,6 +137,9 @@ pub enum NodeScalarOperation {
     SExpression,
     Text,
     FieldNameForChild { index: u32, named: bool },
+    StartPosition,
+    EndPosition,
+    Range,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -145,8 +148,16 @@ pub enum NodeScalarValue {
     String(String),
     Bool(bool),
     U64(u64),
-    ByteRange { start_byte: u64, end_byte: u64 },
+    ByteRange {
+        start_byte: u64,
+        end_byte: u64,
+    },
     NullableString(Option<String>),
+    Position(WirePosition),
+    Range {
+        start: WirePosition,
+        end: WirePosition,
+    },
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -179,6 +190,20 @@ pub enum NodeNavigation {
     ChildrenByFieldName {
         name: String,
     },
+    DescendantForPointRange {
+        start: WirePosition,
+        end: WirePosition,
+        named: bool,
+    },
+    ChildWithDescendant {
+        descendant_id: OpaqueNodeId,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct WirePosition {
+    pub line: u32,
+    pub character: u32,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
@@ -510,6 +535,40 @@ impl DocumentReplica {
                 let mut cursor = node.walk();
                 node.children_by_field_name(&name, &mut cursor).collect()
             }
+            NodeNavigation::DescendantForPointRange { start, end, named } => {
+                let mapper = crate::text::PositionMapper::new(&self.text);
+                let start = tower_lsp_server::ls_types::Position::new(start.line, start.character);
+                let end = tower_lsp_server::ls_types::Position::new(end.line, end.character);
+                let range = mapper
+                    .position_to_byte_strict(start)
+                    .zip(mapper.position_to_byte_strict(end))
+                    .filter(|(start, end)| {
+                        node.start_byte() <= *start && start <= end && *end <= node.end_byte()
+                    });
+                match range {
+                    Some((start, end)) if named => node
+                        .named_descendant_for_byte_range(start, end)
+                        .into_iter()
+                        .collect(),
+                    Some((start, end)) => node
+                        .descendant_for_byte_range(start, end)
+                        .into_iter()
+                        .collect(),
+                    None => Vec::new(),
+                }
+            }
+            NodeNavigation::ChildWithDescendant { descendant_id } => self
+                .tracked_node(&descendant_id, &request.context)
+                .and_then(|descendant| {
+                    let answer = node.child_with_descendant(descendant)?;
+                    let mut current = answer;
+                    while current.id() != descendant.id() {
+                        current = current.child_with_descendant(descendant)?;
+                    }
+                    Some(answer)
+                })
+                .into_iter()
+                .collect(),
         };
         let nodes = selected
             .into_iter()
@@ -570,6 +629,31 @@ impl DocumentReplica {
                     node.field_name_for_child(index)
                 };
                 NodeScalarValue::NullableString(field.map(str::to_string))
+            }
+            NodeScalarOperation::StartPosition => NodeScalarValue::Position(wire_position(
+                crate::text::PositionMapper::new(&self.text)
+                    .byte_to_position(node.start_byte())
+                    .ok_or_else(|| "node start byte has no LSP position".to_string())?,
+            )),
+            NodeScalarOperation::EndPosition => NodeScalarValue::Position(wire_position(
+                crate::text::PositionMapper::new(&self.text)
+                    .byte_to_position(node.end_byte())
+                    .ok_or_else(|| "node end byte has no LSP position".to_string())?,
+            )),
+            NodeScalarOperation::Range => {
+                let mapper = crate::text::PositionMapper::new(&self.text);
+                NodeScalarValue::Range {
+                    start: wire_position(
+                        mapper
+                            .byte_to_position(node.start_byte())
+                            .ok_or_else(|| "node start byte has no LSP position".to_string())?,
+                    ),
+                    end: wire_position(
+                        mapper
+                            .byte_to_position(node.end_byte())
+                            .ok_or_else(|| "node end byte has no LSP position".to_string())?,
+                    ),
+                }
             }
         };
         Ok(NodeScalarResult {
@@ -746,6 +830,13 @@ fn point_at_byte(text: &str, byte: usize) -> tree_sitter::Point {
         .rposition(|&value| value == b'\n')
         .map_or(prefix.len(), |index| prefix.len() - index - 1);
     tree_sitter::Point::new(row, column)
+}
+
+fn wire_position(position: tower_lsp_server::ls_types::Position) -> WirePosition {
+    WirePosition {
+        line: position.line,
+        character: position.character,
+    }
 }
 
 fn find_exact_node<'tree>(
@@ -2574,10 +2665,10 @@ mod tests {
         LaneRegistry, MAX_DOCUMENT_BYTES, MAX_DOCUMENT_REPLICAS, MAX_RETAINED_DOCUMENT_BYTES,
         NavigateNode, NodeNavigation, NodeScalarOperation, NodeScalarValue, OpaqueNodeId,
         PROTOCOL_VERSION, Request, RequestContext, ResolveNode, Response, Route, RunNodeScalar,
-        SyncDocument, WorkerError, close_document, decode_frame, derive_snapshot_with_language,
-        encode_frame, named_node_count, replace_retained_bytes, reserve_retained_growth,
-        route_response, run, submit_document_job, sync_document, terminate_by_transport,
-        validate_document_size,
+        SyncDocument, WirePosition, WorkerError, close_document, decode_frame,
+        derive_snapshot_with_language, encode_frame, named_node_count, replace_retained_bytes,
+        reserve_retained_growth, route_response, run, submit_document_job, sync_document,
+        terminate_by_transport, validate_document_size,
     };
 
     #[derive(Clone, Default)]
@@ -3209,6 +3300,27 @@ mod tests {
             .unwrap();
         assert_eq!(scalar.value, Some(NodeScalarValue::String("main".into())));
 
+        let range = replica
+            .run_node_scalar(RunNodeScalar {
+                context: context.clone(),
+                node_id: node_id.clone(),
+                operation: NodeScalarOperation::Range,
+            })
+            .unwrap();
+        assert_eq!(
+            range.value,
+            Some(NodeScalarValue::Range {
+                start: WirePosition {
+                    line: 0,
+                    character: 3,
+                },
+                end: WirePosition {
+                    line: 0,
+                    character: 7,
+                },
+            })
+        );
+
         let parent = replica
             .navigate_node(NavigateNode {
                 context: context.clone(),
@@ -3245,6 +3357,38 @@ mod tests {
             .unwrap();
         assert_eq!(descendant.nodes.len(), 1);
         assert_eq!(descendant.nodes[0].kind, "identifier");
+
+        let point_descendant = replica
+            .navigate_node(NavigateNode {
+                context: context.clone(),
+                node_id: parent.nodes[0].id.clone(),
+                operation: NodeNavigation::DescendantForPointRange {
+                    start: WirePosition {
+                        line: 0,
+                        character: 3,
+                    },
+                    end: WirePosition {
+                        line: 0,
+                        character: 7,
+                    },
+                    named: true,
+                },
+            })
+            .unwrap();
+        assert_eq!(point_descendant.nodes.len(), 1);
+        assert_eq!(point_descendant.nodes[0].kind, "identifier");
+
+        let child_with_descendant = replica
+            .navigate_node(NavigateNode {
+                context: context.clone(),
+                node_id: parent.nodes[0].id.clone(),
+                operation: NodeNavigation::ChildWithDescendant {
+                    descendant_id: node_id.clone(),
+                },
+            })
+            .unwrap();
+        assert_eq!(child_with_descendant.nodes.len(), 1);
+        assert_eq!(child_with_descendant.nodes[0].kind, "identifier");
 
         let mut edited = context.clone();
         edited.request_id = 2;

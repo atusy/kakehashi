@@ -94,7 +94,7 @@ impl Kakehashi {
         params: NodeDescendantParams,
     ) -> Result<Value> {
         Ok(self
-            .navigate_with_descendant(
+            .navigate_with_descendant_shadowed(
                 &params.text_document.uri,
                 &params.id,
                 &params.descendant_id,

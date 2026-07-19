@@ -33,6 +33,7 @@ fn scalar_json(field: &str, value: NodeScalarValue) -> Option<Value> {
         NodeScalarValue::U64(value) => Value::Number(value.into()),
         NodeScalarValue::ByteRange { .. } => return None,
         NodeScalarValue::NullableString(value) => value.map_or(Value::Null, Value::String),
+        NodeScalarValue::Position(_) | NodeScalarValue::Range { .. } => return None,
     };
     let mut object = serde_json::Map::new();
     object.insert(field.into(), value);
