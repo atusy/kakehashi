@@ -864,10 +864,15 @@ fn resync_open_documents(
     replicas: &mut HashMap<String, ReplicaIdentity>,
     comparisons: &ComparisonStore,
 ) -> Result<ResyncStats, ResyncFailure> {
-    let mut requests = open_documents.current.values().cloned().collect::<Vec<_>>();
-    requests.sort_unstable_by(|left, right| left.context.uri.cmp(&right.context.uri));
+    let mut uris = open_documents.current.keys().collect::<Vec<_>>();
+    uris.sort_unstable();
     let mut resynced = ResyncStats::default();
-    for mut request in requests {
+    for uri in uris {
+        let mut request = open_documents
+            .current
+            .get(uri)
+            .expect("resync URI came from the open-document registry")
+            .clone();
         let grammar = GrammarIdentity::from_sync(&request);
         if quarantined.contains(&grammar) {
             continue;
