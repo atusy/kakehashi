@@ -38,12 +38,17 @@ impl Kakehashi {
         // Retrieve the stored document's current text (the base for the diff). The
         // language is re-detected by the off-ingress reparse from the stored
         // `language_id`, so it is not needed here.
-        let old_text = {
+        let (old_text, base_version, incarnation, language_id) = {
             let doc = self.documents.get(&uri);
             match doc {
                 // `text_arc()` is a refcount bump, not a full copy of the pre-edit
                 // text — cheap on every keystroke (#498).
-                Some(d) => d.text_arc(),
+                Some(d) => (
+                    d.text_arc(),
+                    d.content_version(),
+                    d.incarnation(),
+                    d.language_id().map(str::to_string),
+                ),
                 None => {
                     self.notifier()
                         .log_warning("Document not found for change event")
@@ -62,6 +67,8 @@ impl Kakehashi {
         let changes = apply_content_changes_detailed(&old_text, params.content_changes);
         let text = changes.text;
         let edits = changes.input_edits;
+        let sequential_byte_edits = changes.sequential_byte_edits;
+        let shadow_text = self.tree_worker_shadow.is_enabled().then(|| text.clone());
 
         // lazy-node-identity-tracking: Apply START-priority invalidation to node tracker.
         // Use InputEdits directly for precise invalidation when available,
@@ -100,6 +107,32 @@ impl Kakehashi {
         // keeps no seed and parses from scratch (#348).
         let ticket = crate::lsp::current_writer_ticket();
         self.documents.apply_edit_clearing_tree(&uri, text, &edits);
+
+        if let Some(shadow_text) = shadow_text {
+            let language_name = self.language.detect_language(
+                uri.path(),
+                &shadow_text,
+                None,
+                language_id.as_deref(),
+            );
+            if let Some(language_name) = language_name
+                && let Some(grammar) = self.language.worker_grammar_descriptor(
+                    &language_name,
+                    &self.settings_manager.load_settings(),
+                )
+            {
+                self.tree_worker_shadow.mirror_change(
+                    &uri,
+                    incarnation,
+                    base_version,
+                    base_version.wrapping_add(1),
+                    language_name,
+                    grammar,
+                    shadow_text,
+                    sequential_byte_edits,
+                );
+            }
+        }
 
         // NOTE: We intentionally do NOT invalidate the semantic token cache here.
         // The cached tokens (with their result_id) are needed for delta calculations.

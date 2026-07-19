@@ -76,6 +76,22 @@ impl Kakehashi {
         self.bridge.open_host_incarnation(&uri, incarnation).await;
         drop(edit_guard);
 
+        if self.tree_worker_shadow.is_enabled()
+            && let Some(language_name) = language_name.clone()
+            && let Some(grammar) = self
+                .language
+                .worker_grammar_descriptor(&language_name, &self.settings_manager.load_settings())
+        {
+            self.tree_worker_shadow.mirror_full(
+                &uri,
+                incarnation,
+                0,
+                language_name,
+                grammar,
+                text.clone(),
+            );
+        }
+
         // Host-tier hoist (parse-decoupled-document-lifecycle ADR): attach the real
         // host document to any `_self` host-bridge server *before* the parser load,
         // the parse, and auto-install — none of which the host tier depends on.

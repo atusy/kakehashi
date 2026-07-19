@@ -10,6 +10,7 @@ mod region_offset;
 mod show_document_translation;
 mod snapshot_read;
 pub(crate) mod text_document;
+mod tree_worker_shadow;
 mod whole_document;
 mod workspace;
 
@@ -404,6 +405,9 @@ pub struct Kakehashi {
     /// the ingress writer ticket, coalescing bursts to one reparse over the latest
     /// text. Shared (`Arc`) with the spawned parse loops.
     parse_scheduler: std::sync::Arc<parse_scheduler::ParseScheduler>,
+    /// Non-authoritative, opt-in mirror of document parser state in one
+    /// process-isolated worker. Queue failure disables only this shadow path.
+    tree_worker_shadow: tree_worker_shadow::TreeWorkerShadow,
 }
 
 impl std::fmt::Debug for Kakehashi {
@@ -482,6 +486,7 @@ impl Kakehashi {
             cli_mode: std::sync::atomic::AtomicBool::new(false),
             experimental: std::sync::atomic::AtomicBool::new(crate::experimental::enabled()),
             parse_scheduler: std::sync::Arc::new(parse_scheduler::ParseScheduler::default()),
+            tree_worker_shadow: tree_worker_shadow::TreeWorkerShadow::from_environment(),
         }
     }
 

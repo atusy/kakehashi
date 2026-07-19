@@ -647,6 +647,8 @@ impl Kakehashi {
         // Without this, the task only exits when all senders are dropped.
         self.shutdown_token.cancel();
 
+        self.tree_worker_shadow.shutdown();
+
         // Graceful shutdown of all downstream language server connections (ls-bridge-graceful-shutdown)
         // - Transitions to Closing state, sends LSP shutdown/exit handshake
         // - Escalates to SIGTERM/SIGKILL for unresponsive servers (Unix)

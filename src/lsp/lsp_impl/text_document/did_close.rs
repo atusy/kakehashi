@@ -19,7 +19,19 @@ impl Kakehashi {
     }
 
     async fn clear_document_state_on_close_locked(&self, uri: &url::Url) -> Option<u64> {
-        let closing_incarnation = self.documents.get(uri).map(|doc| doc.incarnation());
+        let closing_document = self
+            .documents
+            .get(uri)
+            .map(|doc| (doc.incarnation(), doc.content_version()));
+        let closing_incarnation = closing_document.map(|(incarnation, _)| incarnation);
+        if let Some((incarnation, content_version)) = closing_document {
+            self.tree_worker_shadow.mirror_close(
+                uri,
+                incarnation,
+                content_version.wrapping_add(1),
+                self.language.configuration_generation(),
+            );
+        }
         if let Some(incarnation) = closing_incarnation {
             self.bridge.close_host_incarnation(uri, incarnation).await;
         }

@@ -112,6 +112,13 @@ pub(crate) struct LanguageCoordinator {
     load_inflight: dashmap::DashMap<String, Arc<tokio::sync::Notify>>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct WorkerGrammarDescriptor {
+    pub(crate) parser_path: PathBuf,
+    pub(crate) grammar_symbol: String,
+    pub(crate) configuration_generation: u64,
+}
+
 impl Default for LanguageCoordinator {
     fn default() -> Self {
         Self::new()
@@ -1741,6 +1748,42 @@ impl LanguageCoordinator {
     pub(crate) fn search_paths(&self) -> Vec<std::path::PathBuf> {
         self.config_store.search_paths()
     }
+
+    /// Resolve the dynamic grammar identity the isolated tree worker must load.
+    /// Derived languages that share a base parser use the base export symbol;
+    /// standalone derived parsers retain their own symbol.
+    pub(crate) fn worker_grammar_descriptor(
+        &self,
+        language_id: &str,
+        settings: &WorkspaceSettings,
+    ) -> Option<WorkerGrammarDescriptor> {
+        let grammar_symbol = self
+            .resolve_base(language_id)
+            .unwrap_or_else(|| language_id.to_string());
+        let parser_config = settings
+            .languages
+            .get(&grammar_symbol)
+            .and_then(|language| language.parser.as_deref());
+        let parser_path = QueryLoader::resolve_library_path(
+            parser_config,
+            &grammar_symbol,
+            &self.config_store.search_paths(),
+        )?;
+        Some(WorkerGrammarDescriptor {
+            parser_path: parser_path
+                .canonicalize()
+                .unwrap_or_else(|_| parser_path.clone()),
+            grammar_symbol,
+            configuration_generation: self
+                .load_generation
+                .load(std::sync::atomic::Ordering::Acquire),
+        })
+    }
+
+    pub(crate) fn configuration_generation(&self) -> u64 {
+        self.load_generation
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
 }
 
 /// Truncate a pattern string for display in log messages.
@@ -1773,6 +1816,39 @@ mod tests {
     use crate::config::settings::RawWorkspaceSettings;
     use std::fs;
     use tempfile::tempdir;
+
+    #[test]
+    fn worker_grammar_descriptor_uses_shared_base_parser_identity() {
+        let coordinator = LanguageCoordinator::new();
+        let parser_path = "/nonexistent/tree-sitter-markdown.so";
+        let settings = WorkspaceSettings {
+            languages: HashMap::from([
+                (
+                    "markdown".to_string(),
+                    LanguageSettings {
+                        parser: Some(parser_path.to_string()),
+                        ..Default::default()
+                    },
+                ),
+                (
+                    "rmd".to_string(),
+                    LanguageSettings {
+                        base: Some("markdown".to_string()),
+                        ..Default::default()
+                    },
+                ),
+            ]),
+            ..Default::default()
+        };
+        coordinator.build_base_map(&settings.languages);
+
+        let descriptor = coordinator
+            .worker_grammar_descriptor("rmd", &settings)
+            .unwrap();
+
+        assert_eq!(descriptor.grammar_symbol, "markdown");
+        assert_eq!(descriptor.parser_path, PathBuf::from(parser_path));
+    }
 
     /// Pins the #575 single-flight fix: a caller that arrives while another
     /// caller already claimed the in-flight marker for a language must PARK
