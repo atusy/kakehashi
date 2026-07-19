@@ -1316,7 +1316,7 @@ impl Kakehashi {
         if walk_cancel.is_cancelled() {
             return Ok(None);
         }
-        if let Some(worker) = self
+        let worker = self
             .tree_worker_shadow
             .captures(
                 &uri,
@@ -1327,8 +1327,8 @@ impl Kakehashi {
                 worker_range,
                 injection,
             )
-            .await
-        {
+            .await;
+        if let Some(worker) = worker.as_ref() {
             self.tree_worker_shadow.compare_captures(
                 &uri,
                 snapshot.parsed_version,
@@ -1340,8 +1340,18 @@ impl Kakehashi {
         // arrays by refcount instead of deep-cloning ~20k `Value`s. A `None`
         // walk (no kind file) is memoized too — the negative entry, see
         // `CachedCapturesWalk::result`.
-        let result = walked
-            .map(|(matches, skipped)| (std::sync::Arc::new(matches), std::sync::Arc::new(skipped)));
+        let result = if self.tree_worker_shadow.is_authoritative() {
+            worker.filter(|worker| worker.available).map(|worker| {
+                (
+                    std::sync::Arc::new(worker.matches),
+                    std::sync::Arc::new(worker.skipped),
+                )
+            })
+        } else {
+            walked.map(|(matches, skipped)| {
+                (std::sync::Arc::new(matches), std::sync::Arc::new(skipped))
+            })
+        };
         if let Some(key) = walk_key {
             // Serialize the final currency check and memo installation with
             // didChange/didClose. This prevents a close from clearing the memo

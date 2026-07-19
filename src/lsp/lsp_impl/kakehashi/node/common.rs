@@ -327,7 +327,11 @@ impl Kakehashi {
             self.tree_worker_shadow
                 .compare_node_result(uri, &operation, &authoritative, worker);
         }
-        authoritative
+        if self.tree_worker_shadow.is_authoritative() {
+            self.tree_worker_shadow.public_node_result(worker, false)
+        } else {
+            authoritative
+        }
     }
 
     /// Like [`navigate_to_node`](Self::navigate_to_node), but `f` also receives
@@ -376,7 +380,11 @@ impl Kakehashi {
             self.tree_worker_shadow
                 .compare_node_result(uri, &operation, &authoritative, worker);
         }
-        authoritative
+        if self.tree_worker_shadow.is_authoritative() {
+            self.tree_worker_shadow.public_node_result(worker, false)
+        } else {
+            authoritative
+        }
     }
 
     /// Resolve `id` **and** `descendant_id` in the layer that minted them, run
@@ -513,7 +521,11 @@ impl Kakehashi {
                 worker,
             );
         }
-        authoritative
+        if self.tree_worker_shadow.is_authoritative() {
+            self.tree_worker_shadow.public_node_result(worker, false)
+        } else {
+            authoritative
+        }
     }
 
     /// Resolve `id`, run `f` to collect a list of related nodes (children,
@@ -563,6 +575,10 @@ impl Kakehashi {
             self.tree_worker_shadow
                 .compare_node_result(uri, &operation, &authoritative, worker);
         }
-        authoritative
+        if self.tree_worker_shadow.is_authoritative() {
+            self.tree_worker_shadow.public_node_result(worker, true)
+        } else {
+            authoritative
+        }
     }
 }

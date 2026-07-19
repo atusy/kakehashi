@@ -56,8 +56,12 @@ impl Kakehashi {
             .and_then(|(_uri, _layer, _incarnation, span)| span)
             .map(|(start, end)| json!({ "start": start, "end": end }))
             .unwrap_or(Value::Null);
-        compare_position_scalar(shadow, &value, "range");
-        Ok(value)
+        let worker = compare_position_scalar(shadow, &value, "range");
+        if self.tree_worker_shadow.is_authoritative() {
+            Ok(worker.unwrap_or(Value::Null))
+        } else {
+            Ok(value)
+        }
     }
 
     /// `kakehashi/node/startPosition` — the node's start as an LSP `Position`,
@@ -79,8 +83,12 @@ impl Kakehashi {
             .and_then(|(_uri, _layer, _incarnation, pos)| pos)
             .map(|pos| json!({ "startPosition": pos }))
             .unwrap_or(Value::Null);
-        compare_position_scalar(shadow, &value, "startPosition");
-        Ok(value)
+        let worker = compare_position_scalar(shadow, &value, "startPosition");
+        if self.tree_worker_shadow.is_authoritative() {
+            Ok(worker.unwrap_or(Value::Null))
+        } else {
+            Ok(value)
+        }
     }
 
     /// `kakehashi/node/endPosition` — the node's end as an LSP `Position`, per
@@ -101,8 +109,12 @@ impl Kakehashi {
             .and_then(|(_uri, _layer, _incarnation, pos)| pos)
             .map(|pos| json!({ "endPosition": pos }))
             .unwrap_or(Value::Null);
-        compare_position_scalar(shadow, &value, "endPosition");
-        Ok(value)
+        let worker = compare_position_scalar(shadow, &value, "endPosition");
+        if self.tree_worker_shadow.is_authoritative() {
+            Ok(worker.unwrap_or(Value::Null))
+        } else {
+            Ok(value)
+        }
     }
 
     /// `kakehashi/node/descendantForPointRange` — the smallest descendant
@@ -209,7 +221,7 @@ fn compare_position_scalar(
     shadow: Option<crate::tree_worker::NodeScalarValue>,
     authoritative: &Value,
     field: &str,
-) {
+) -> Option<Value> {
     let worker = match shadow {
         Some(crate::tree_worker::NodeScalarValue::Position(position)) => {
             let mut object = serde_json::Map::new();
@@ -219,7 +231,7 @@ fn compare_position_scalar(
         Some(crate::tree_worker::NodeScalarValue::Range { start, end }) => {
             json!({ "start": wire_position_json(start), "end": wire_position_json(end) })
         }
-        _ => return,
+        _ => return None,
     };
     if &worker != authoritative {
         log::debug!(
@@ -227,4 +239,5 @@ fn compare_position_scalar(
             "node position mismatch field={field} authoritative={authoritative} worker={worker}",
         );
     }
+    Some(worker)
 }

@@ -23,6 +23,7 @@ use crate::tree_worker::{
 use super::Kakehashi;
 
 const SHADOW_ENV: &str = "KAKEHASHI_TREE_WORKER_SHADOW";
+const MODE_ENV: &str = "KAKEHASHI_TREE_WORKER_MODE";
 const SHADOW_THREADS_ENV: &str = "KAKEHASHI_TREE_WORKER_THREADS";
 const SHADOW_QUEUE_CAPACITY: usize = 256;
 const SHADOW_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
@@ -36,6 +37,13 @@ const FAST_HEALTHY_INTERVAL: Duration = Duration::from_secs(60);
 const LONG_HEALTHY_INTERVAL: Duration = Duration::from_secs(10 * 60);
 static NEXT_WORKER_GENERATION: AtomicU64 = AtomicU64::new(1);
 static NEXT_CATALOG_REQUEST_ID: AtomicU64 = AtomicU64::new(1_u64 << 63);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TreeWorkerMode {
+    Legacy,
+    Shadow,
+    Authoritative,
+}
 
 enum ShadowCommand {
     Sync(SyncDocument),
@@ -407,6 +415,7 @@ enum Observation {
 }
 
 pub(super) struct TreeWorkerShadow {
+    mode: TreeWorkerMode,
     sender: Option<mpsc::SyncSender<ShadowCommand>>,
     accepting: Arc<AtomicBool>,
     disabled: Arc<AtomicBool>,
@@ -460,6 +469,13 @@ fn worker_region_to_resolved(
         line_column_offsets: region.line_column_offsets.clone(),
         contiguous: region.contiguous,
     }
+}
+
+fn worker_node_info(node: crate::tree_worker::OwnedNode) -> Value {
+    serde_json::json!({
+        "id": node.id.local_id,
+        "kind": node.kind,
+    })
 }
 
 fn remove_capture_ids(value: &mut Value) {
@@ -525,6 +541,7 @@ struct ComparisonStore {
 
 impl TreeWorkerShadow {
     pub(super) fn from_environment() -> Self {
+        let mode = configured_mode();
         let disabled = Arc::new(AtomicBool::new(false));
         let accepting = Arc::new(AtomicBool::new(false));
         let comparisons = Arc::new(ComparisonStore::default());
@@ -534,8 +551,9 @@ impl TreeWorkerShadow {
         let read_client = Arc::new(ArcSwapOption::empty());
         let worker_nodes = Arc::new(dashmap::DashMap::new());
         let worker_generation = NEXT_WORKER_GENERATION.fetch_add(1, Ordering::Relaxed);
-        if !shadow_enabled() {
+        if mode == TreeWorkerMode::Legacy {
             return Self {
+                mode,
                 sender: None,
                 accepting,
                 disabled,
@@ -555,6 +573,7 @@ impl TreeWorkerShadow {
                 log::error!(target: "kakehashi::tree_worker_shadow", "cannot resolve worker executable: {error}");
                 disabled.store(true, Ordering::Release);
                 return Self {
+                    mode,
                     sender: None,
                     accepting,
                     disabled,
@@ -598,6 +617,7 @@ impl TreeWorkerShadow {
                 "disabled shadow worker because actor thread could not spawn: {error}"
             );
             return Self {
+                mode,
                 sender: None,
                 accepting,
                 disabled,
@@ -614,9 +634,10 @@ impl TreeWorkerShadow {
         accepting.store(true, Ordering::Release);
         log::info!(
             target: "kakehashi::tree_worker_shadow",
-            "enabled one shadow worker with {compute_threads} compute threads"
+            "enabled one {mode:?} tree worker with {compute_threads} compute threads"
         );
         Self {
+            mode,
             sender: Some(sender),
             accepting,
             disabled,
@@ -647,6 +668,25 @@ impl TreeWorkerShadow {
 
     pub(super) fn is_enabled(&self) -> bool {
         self.is_configured() && !self.disabled.load(Ordering::Acquire)
+    }
+
+    pub(super) fn is_authoritative(&self) -> bool {
+        self.mode == TreeWorkerMode::Authoritative && self.is_enabled()
+    }
+
+    pub(super) fn public_node_result(&self, result: Option<NodeResult>, list: bool) -> Value {
+        if !self.is_authoritative() {
+            return Value::Null;
+        }
+        let Some(result) = result else {
+            return Value::Null;
+        };
+        let mut nodes = result.nodes.into_iter().map(worker_node_info);
+        if list {
+            Value::Array(nodes.collect())
+        } else {
+            nodes.next().unwrap_or(Value::Null)
+        }
     }
 
     pub(super) fn is_configured(&self) -> bool {
@@ -873,6 +913,26 @@ impl TreeWorkerShadow {
             && snapshot.context.content_version == content_version
             && snapshot.context.configuration_generation == configuration_generation)
             .then(|| Arc::clone(&snapshot.regions))
+    }
+
+    pub(super) async fn worker_injection_regions(
+        &self,
+        uri: &url::Url,
+        incarnation: u64,
+        content_version: u64,
+        configuration_generation: u64,
+    ) -> Option<Arc<Vec<crate::language::injection::ResolvedInjection>>> {
+        if let Some(regions) = self.cached_injection_regions(
+            uri,
+            incarnation,
+            content_version,
+            configuration_generation,
+        ) {
+            return Some(regions);
+        }
+        self.injection_regions(uri, incarnation, content_version, configuration_generation)
+            .await?;
+        self.cached_injection_regions(uri, incarnation, content_version, configuration_generation)
     }
 
     pub(super) async fn semantic_tokens(
@@ -1218,6 +1278,10 @@ impl TreeWorkerShadow {
             (uri.as_str().to_string(), id.to_string()),
             worker.id.clone(),
         );
+        self.worker_nodes.insert(
+            (uri.as_str().to_string(), worker.id.local_id.clone()),
+            worker.id.clone(),
+        );
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1230,17 +1294,17 @@ impl TreeWorkerShadow {
         authoritative_input_id: &str,
         operation: NodeNavigation,
         authoritative: &Value,
-    ) {
+    ) -> Option<NodeResult> {
         let key = (uri.as_str().to_string(), authoritative_input_id.to_string());
         let Some(node_id) = self.worker_nodes.get(&key).map(|entry| entry.clone()) else {
-            return;
+            return None;
         };
         let Some(client) = self.read_client.load_full() else {
-            return;
+            return None;
         };
         if !self.is_enabled() || node_id.worker_generation != client.worker_generation() {
             self.worker_nodes.remove(&key);
-            return;
+            return None;
         }
         let context = self.read_context(
             &client,
@@ -1263,13 +1327,13 @@ impl TreeWorkerShadow {
         let Some(result) =
             response.and_then(|response| self.admit_node_response(response, &expected))
         else {
-            return;
+            return None;
         };
         let authoritative_nodes = match authoritative {
             Value::Null => Vec::new(),
             Value::Object(_) => vec![authoritative],
             Value::Array(nodes) => nodes.iter().collect(),
-            _ => return,
+            _ => return None,
         };
         let authoritative_kinds = authoritative_nodes
             .iter()
@@ -1289,7 +1353,7 @@ impl TreeWorkerShadow {
                 authoritative_kinds,
                 worker_kinds,
             );
-            return;
+            return Some(result);
         }
         for (authoritative_node, worker_node) in
             authoritative_nodes.into_iter().zip(result.nodes.iter())
@@ -1302,6 +1366,7 @@ impl TreeWorkerShadow {
             uri,
             content_version,
         );
+        Some(result)
     }
 
     pub(super) async fn node_scalar(
@@ -1966,6 +2031,75 @@ impl TreeWorkerShadow {
 }
 
 impl Kakehashi {
+    pub(super) async fn worker_injection_region_at_snapshot(
+        &self,
+        uri: &url::Url,
+        incarnation: u64,
+        parsed_version: u64,
+        language: &str,
+        byte_offset: usize,
+    ) -> Option<crate::language::injection::ResolvedInjection> {
+        let configuration_generation = self.language.configuration_generation();
+        if let Some(grammar) = self.language.worker_grammar_descriptor(language)
+            && self.tree_worker_shadow.needs_document_sync(
+                uri,
+                incarnation,
+                parsed_version,
+                configuration_generation,
+                &grammar.queries,
+            )
+        {
+            self.refresh_tree_worker_documents(std::slice::from_ref(uri));
+        }
+        let node = self
+            .tree_worker_shadow
+            .resolve_node(
+                uri,
+                incarnation,
+                parsed_version,
+                configuration_generation,
+                byte_offset,
+                crate::tree_worker::NodeLayerSelector::Deepest,
+            )
+            .await?
+            .nodes
+            .into_iter()
+            .next()?;
+        if node.layer == 0 {
+            return None;
+        }
+        self.tree_worker_shadow
+            .worker_injection_regions(uri, incarnation, parsed_version, configuration_generation)
+            .await?
+            .iter()
+            .find(|resolved| resolved.region.byte_range.contains(&byte_offset))
+            .cloned()
+    }
+
+    pub(super) async fn worker_injection_regions_for_snapshot(
+        &self,
+        uri: &url::Url,
+        incarnation: u64,
+        parsed_version: u64,
+        language: &str,
+    ) -> Option<Arc<Vec<crate::language::injection::ResolvedInjection>>> {
+        let configuration_generation = self.language.configuration_generation();
+        if let Some(grammar) = self.language.worker_grammar_descriptor(language)
+            && self.tree_worker_shadow.needs_document_sync(
+                uri,
+                incarnation,
+                parsed_version,
+                configuration_generation,
+                &grammar.queries,
+            )
+        {
+            self.refresh_tree_worker_documents(std::slice::from_ref(uri));
+        }
+        self.tree_worker_shadow
+            .worker_injection_regions(uri, incarnation, parsed_version, configuration_generation)
+            .await
+    }
+
     pub(super) async fn shadow_compare_current_injection_regions(
         &self,
         uri: &url::Url,
@@ -2127,10 +2261,30 @@ fn log_incomplete_shutdown(reason: &str) {
     );
 }
 
-fn shadow_enabled() -> bool {
-    std::env::var(SHADOW_ENV)
-        .ok()
-        .is_some_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE"))
+fn configured_mode() -> TreeWorkerMode {
+    parse_mode(
+        std::env::var(MODE_ENV).ok().as_deref(),
+        std::env::var(SHADOW_ENV).ok().as_deref(),
+    )
+}
+
+fn parse_mode(mode: Option<&str>, legacy_shadow: Option<&str>) -> TreeWorkerMode {
+    match mode {
+        Some("authoritative") => TreeWorkerMode::Authoritative,
+        Some("shadow") => TreeWorkerMode::Shadow,
+        Some("legacy") => TreeWorkerMode::Legacy,
+        Some(value) => {
+            log::warn!(
+                target: "kakehashi::tree_worker_shadow",
+                "unsupported {MODE_ENV}={value:?}; using legacy tree ownership",
+            );
+            TreeWorkerMode::Legacy
+        }
+        None if legacy_shadow.is_some_and(|value| matches!(value, "1" | "true" | "TRUE")) => {
+            TreeWorkerMode::Shadow
+        }
+        None => TreeWorkerMode::Legacy,
+    }
 }
 
 fn configured_compute_threads() -> usize {
@@ -3259,6 +3413,7 @@ mod tests {
 
     fn shadow(sender: mpsc::SyncSender<ShadowCommand>) -> TreeWorkerShadow {
         TreeWorkerShadow {
+            mode: TreeWorkerMode::Shadow,
             sender: Some(sender),
             accepting: Arc::new(AtomicBool::new(true)),
             disabled: Arc::new(AtomicBool::new(false)),
@@ -3271,6 +3426,25 @@ mod tests {
             read_client: Arc::new(ArcSwapOption::empty()),
             worker_nodes: Arc::new(dashmap::DashMap::new()),
         }
+    }
+
+    #[test]
+    fn worker_mode_is_explicit_and_legacy_shadow_env_remains_compatible() {
+        assert_eq!(
+            parse_mode(Some("authoritative"), None),
+            TreeWorkerMode::Authoritative
+        );
+        assert_eq!(parse_mode(Some("shadow"), None), TreeWorkerMode::Shadow);
+        assert_eq!(
+            parse_mode(Some("legacy"), Some("true")),
+            TreeWorkerMode::Legacy
+        );
+        assert_eq!(parse_mode(None, Some("true")), TreeWorkerMode::Shadow);
+        assert_eq!(parse_mode(None, None), TreeWorkerMode::Legacy);
+        assert_eq!(
+            parse_mode(Some("invalid"), Some("true")),
+            TreeWorkerMode::Legacy
+        );
     }
 
     #[test]

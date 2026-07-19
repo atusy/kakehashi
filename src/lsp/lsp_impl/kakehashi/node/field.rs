@@ -97,8 +97,13 @@ impl Kakehashi {
             .await
             .map(|(_uri, _layer, _incarnation, field)| json!({ "fieldName": field }))
             .unwrap_or(Value::Null);
-        compare_field_name(shadow, &value, false);
-        Ok(value)
+        let worker = field_name_json(shadow);
+        compare_field_name(worker.as_ref(), &value, false);
+        if self.tree_worker_shadow.is_authoritative() {
+            Ok(worker.unwrap_or(Value::Null))
+        } else {
+            Ok(value)
+        }
     }
 
     /// `kakehashi/node/fieldNameForNamedChild` — the field name of the *named*
@@ -131,21 +136,28 @@ impl Kakehashi {
             .await
             .map(|(_uri, _layer, _incarnation, field)| json!({ "fieldName": field }))
             .unwrap_or(Value::Null);
-        compare_field_name(shadow, &value, true);
-        Ok(value)
+        let worker = field_name_json(shadow);
+        compare_field_name(worker.as_ref(), &value, true);
+        if self.tree_worker_shadow.is_authoritative() {
+            Ok(worker.unwrap_or(Value::Null))
+        } else {
+            Ok(value)
+        }
     }
 }
 
-fn compare_field_name(
-    shadow: Option<crate::tree_worker::NodeScalarValue>,
-    authoritative: &Value,
-    named: bool,
-) {
-    let Some(crate::tree_worker::NodeScalarValue::NullableString(field)) = shadow else {
+fn field_name_json(shadow: Option<crate::tree_worker::NodeScalarValue>) -> Option<Value> {
+    let crate::tree_worker::NodeScalarValue::NullableString(field) = shadow? else {
+        return None;
+    };
+    Some(json!({ "fieldName": field }))
+}
+
+fn compare_field_name(shadow: Option<&Value>, authoritative: &Value, named: bool) {
+    let Some(worker) = shadow else {
         return;
     };
-    let worker = json!({ "fieldName": field });
-    if &worker != authoritative {
+    if worker != authoritative {
         log::debug!(
             target: "kakehashi::tree_worker_shadow",
             "node field-name mismatch named={named} authoritative={authoritative} worker={worker}",

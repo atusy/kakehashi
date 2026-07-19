@@ -239,7 +239,7 @@ impl Kakehashi {
             }
             let authoritative =
                 self.resolve_host_layer_node(&uri, tree, byte, doc_len, incarnation);
-            if let Some(shadow) = self
+            let worker = self
                 .tree_worker_shadow
                 .resolve_node(
                     &uri,
@@ -249,7 +249,8 @@ impl Kakehashi {
                     byte,
                     crate::tree_worker::NodeLayerSelector::Host,
                 )
-                .await
+                .await;
+            if let Some(shadow) = worker.as_ref()
                 && let Some(node) = shadow.nodes.first()
             {
                 let authoritative_kind = authoritative.get("kind").and_then(Value::as_str);
@@ -291,7 +292,11 @@ impl Kakehashi {
             }) {
                 return Ok(Value::Null);
             }
-            return Ok(authoritative);
+            return if self.tree_worker_shadow.is_authoritative() {
+                Ok(self.tree_worker_shadow.public_node_result(worker, false))
+            } else {
+                Ok(authoritative)
+            };
         }
 
         // We need the host language to seed `injection_stack_at` with the
@@ -431,7 +436,7 @@ impl Kakehashi {
 
         // None = the work-unit panicked (logged by the pool) → protocol null.
         let authoritative = result.unwrap_or(Value::Null);
-        if let Some(worker) = worker {
+        if let Some(worker) = worker.as_ref() {
             let worker_node = worker.nodes.first();
             let authoritative_identity = authoritative
                 .get("id")
@@ -478,7 +483,11 @@ impl Kakehashi {
                 );
             }
         }
-        Ok(authoritative)
+        if self.tree_worker_shadow.is_authoritative() {
+            Ok(self.tree_worker_shadow.public_node_result(worker, false))
+        } else {
+            Ok(authoritative)
+        }
     }
 
     /// Host-layer lookup, factored out so the no-injection request keeps

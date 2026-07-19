@@ -51,6 +51,17 @@ impl Kakehashi {
             log::warn!(target: "kakehashi::node::children", "invalid URI: {}", lsp_uri.as_str());
             return Ok(Value::Null);
         };
+        if self.tree_worker_shadow.is_authoritative() {
+            let worker = self
+                .tree_worker_shadow
+                .node_navigation(
+                    &uri,
+                    &params.id,
+                    crate::tree_worker::NodeNavigation::Children,
+                )
+                .await;
+            return Ok(self.tree_worker_shadow.public_node_result(worker, true));
+        }
 
         // Malformed ULID collapses to null per node-reference-protocol §"Invalidate vs Not-Found".
         let Ok(ulid) = params.id.parse::<Ulid>() else {
@@ -155,7 +166,8 @@ impl Kakehashi {
         };
 
         let authoritative = Value::Array(infos);
-        self.tree_worker_shadow
+        let worker = self
+            .tree_worker_shadow
             .compare_node_navigation(
                 &uri,
                 incarnation,
@@ -172,6 +184,10 @@ impl Kakehashi {
         }) {
             return Ok(Value::Null);
         }
-        Ok(authoritative)
+        if self.tree_worker_shadow.is_authoritative() {
+            Ok(self.tree_worker_shadow.public_node_result(worker, true))
+        } else {
+            Ok(authoritative)
+        }
     }
 }

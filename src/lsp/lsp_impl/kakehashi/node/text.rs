@@ -46,6 +46,13 @@ impl Kakehashi {
                 crate::tree_worker::NodeScalarOperation::Text,
             )
             .await;
+        if self.tree_worker_shadow.is_authoritative() {
+            let worker = match shadow.as_ref() {
+                Some(crate::tree_worker::NodeScalarValue::String(text)) => json!({ "text": text }),
+                _ => Value::Null,
+            };
+            return Ok(worker);
+        }
 
         // Malformed ULID: node-reference-protocol says any unresolvable reference collapses to null,
         // so we treat a parse failure the same as a never-issued ULID rather than
@@ -96,9 +103,14 @@ impl Kakehashi {
         };
 
         let authoritative = json!({ "text": slice });
-        if let Some(crate::tree_worker::NodeScalarValue::String(text)) = shadow {
-            let worker = json!({ "text": text });
-            if worker != authoritative {
+        let worker = match shadow {
+            Some(crate::tree_worker::NodeScalarValue::String(text)) => {
+                Some(json!({ "text": text }))
+            }
+            _ => None,
+        };
+        if let Some(worker) = worker.as_ref() {
+            if worker != &authoritative {
                 log::debug!(
                     target: "kakehashi::tree_worker_shadow",
                     "node text mismatch authoritative={} worker={}",
@@ -107,6 +119,10 @@ impl Kakehashi {
                 );
             }
         }
-        Ok(authoritative)
+        if self.tree_worker_shadow.is_authoritative() {
+            Ok(worker.unwrap_or(Value::Null))
+        } else {
+            Ok(authoritative)
+        }
     }
 }

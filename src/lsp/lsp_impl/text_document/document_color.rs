@@ -103,6 +103,18 @@ impl Kakehashi {
             &all_regions,
         )
         .await;
+        let all_regions = if self.tree_worker_shadow.is_authoritative() {
+            self.worker_injection_regions_for_snapshot(
+                &uri,
+                snapshot.incarnation(),
+                content_version,
+                &language_name,
+            )
+            .await
+            .unwrap_or_default()
+        } else {
+            all_regions
+        };
 
         if all_regions.is_empty() {
             return Ok(Vec::new());

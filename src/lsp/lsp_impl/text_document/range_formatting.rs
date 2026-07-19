@@ -78,7 +78,7 @@ impl Kakehashi {
 
             log::debug!("rangeFormatting called for {} range {:?}", uri, host_range);
 
-            let snapshot = match self.documents.get(&uri) {
+            let (snapshot, content_version) = match self.documents.get(&uri) {
                 None => {
                     log::debug!("rangeFormatting: No document found for {}", uri);
                     return Ok(None);
@@ -91,7 +91,7 @@ impl Kakehashi {
                         );
                         return Ok(None);
                     }
-                    Some(snapshot) => snapshot,
+                    Some(snapshot) => (snapshot, doc.content_version()),
                 },
             };
 
@@ -130,6 +130,18 @@ impl Kakehashi {
                     injection_query.as_ref(),
                     snapshot.incarnation(),
                 )),
+            };
+            let all_regions = if self.tree_worker_shadow.is_authoritative() {
+                self.worker_injection_regions_for_snapshot(
+                    &uri,
+                    snapshot.incarnation(),
+                    content_version,
+                    &language_name,
+                )
+                .await
+                .unwrap_or_default()
+            } else {
+                all_regions
             };
 
             if all_regions.is_empty() {

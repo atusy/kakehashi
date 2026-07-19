@@ -146,6 +146,11 @@ impl Kakehashi {
                 worker,
             );
         }
+        let facts = if self.tree_worker_shadow.is_authoritative() {
+            worker.and_then(|worker| worker.facts)
+        } else {
+            facts
+        };
         let Some(facts) = facts else {
             return Ok(None);
         };

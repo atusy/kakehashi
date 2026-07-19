@@ -108,7 +108,7 @@ impl Kakehashi {
             return Err(crate::error::content_modified_error());
         }
 
-        let snapshot = match self.documents.get(&uri) {
+        let (snapshot, content_version) = match self.documents.get(&uri) {
             None => {
                 log::debug!("formatting: No document found for {}", uri);
                 return Ok(None);
@@ -118,7 +118,7 @@ impl Kakehashi {
                     log::debug!("formatting: Document not fully initialized for {}", uri);
                     return Ok(None);
                 }
-                Some(snapshot) => snapshot,
+                Some(snapshot) => (snapshot, doc.content_version()),
             },
         };
 
@@ -154,6 +154,7 @@ impl Kakehashi {
                 let virt = self.virt_format_edits(
                     &uri,
                     &snapshot,
+                    content_version,
                     &language_name,
                     &options,
                     &upstream_request_id,
@@ -197,6 +198,7 @@ impl Kakehashi {
                             self.virt_format_edits(
                                 &uri,
                                 &snapshot,
+                                content_version,
                                 &language_name,
                                 &options,
                                 &upstream_request_id,
@@ -247,6 +249,7 @@ impl Kakehashi {
         &self,
         uri: &url::Url,
         snapshot: &crate::document::model::DocumentSnapshot,
+        content_version: u64,
         language_name: &str,
         options: &tower_lsp_server::ls_types::FormattingOptions,
         upstream_request_id: &Option<UpstreamId>,
@@ -271,6 +274,18 @@ impl Kakehashi {
                 injection_query.as_ref(),
                 snapshot.incarnation(),
             )),
+        };
+        let all_regions = if self.tree_worker_shadow.is_authoritative() {
+            self.worker_injection_regions_for_snapshot(
+                uri,
+                snapshot.incarnation(),
+                content_version,
+                language_name,
+            )
+            .await
+            .unwrap_or_default()
+        } else {
+            all_regions
         };
 
         if all_regions.is_empty() {

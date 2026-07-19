@@ -161,13 +161,15 @@ impl Kakehashi {
             return Err(crate::error::content_modified_error());
         }
 
-        if let (Some(worker), Some(authoritative)) = (worker, result.as_ref()) {
-            let worker = worker
+        let worker = worker.map(|worker| {
+            worker
                 .ranges
                 .into_iter()
                 .map(selection_range_from_wire)
-                .collect::<Vec<_>>();
-            if &worker != authoritative {
+                .collect::<Vec<_>>()
+        });
+        if let (Some(worker), Some(authoritative)) = (worker.as_ref(), result.as_ref()) {
+            if worker != authoritative {
                 log::debug!(
                     target: "kakehashi::tree_worker_shadow",
                     "selectionRange mismatch uri={} version={} authoritative={:?} worker={:?}",
@@ -181,7 +183,11 @@ impl Kakehashi {
 
         // None = the work-unit panicked (logged by the pool); serve the
         // no-result fallback rather than an error.
-        Ok(result)
+        if self.tree_worker_shadow.is_authoritative() {
+            Ok(worker)
+        } else {
+            Ok(result)
+        }
     }
 }
 

@@ -688,7 +688,7 @@ impl Kakehashi {
     ///
     /// Returns `None` for any early-exit condition (invalid URI, no document,
     /// no language, no injection at position).
-    fn resolve_bridge_preamble(
+    async fn resolve_bridge_preamble(
         &self,
         lsp_uri: &Uri,
         position: Position,
@@ -709,7 +709,7 @@ impl Kakehashi {
         );
 
         // Get document snapshot (minimizes lock duration)
-        let snapshot = match self.documents.get(&uri) {
+        let (snapshot, content_version) = match self.documents.get(&uri) {
             None => {
                 log::debug!("{}: No document found for {}", method_name, uri);
                 return None;
@@ -723,7 +723,7 @@ impl Kakehashi {
                     );
                     return None;
                 }
-                Some(snapshot) => snapshot,
+                Some(snapshot) => (snapshot, doc.content_version()),
             },
             // doc automatically dropped here, lock released
         };
@@ -741,7 +741,7 @@ impl Kakehashi {
         let mapper = PositionMapper::new(snapshot.text());
         let byte_offset = mapper.position_to_byte(position)?;
 
-        let Some(resolved) = crate::language::InjectionResolver::resolve_at_byte_offset(
+        let legacy_resolved = crate::language::InjectionResolver::resolve_at_byte_offset(
             &self.language,
             self.bridge.node_tracker(),
             &uri,
@@ -750,7 +750,20 @@ impl Kakehashi {
             injection_query.as_ref(),
             byte_offset,
             snapshot.incarnation(),
-        ) else {
+        );
+        let resolved = if self.tree_worker_shadow.is_authoritative() {
+            self.worker_injection_region_at_snapshot(
+                &uri,
+                snapshot.incarnation(),
+                content_version,
+                &language_name,
+                byte_offset,
+            )
+            .await
+        } else {
+            legacy_resolved
+        };
+        let Some(resolved) = resolved else {
             // Not in an injection region - return None
             return None;
         };
@@ -1285,7 +1298,9 @@ impl Kakehashi {
         // request (hover / definition / completion / …) issued in the reparse window
         // would find `snapshot()` empty and return null after every edit.
         self.ensure_fresh_tree_for_bridge(lsp_uri).await;
-        let preamble = self.resolve_bridge_preamble(lsp_uri, position, method_name)?;
+        let preamble = self
+            .resolve_bridge_preamble(lsp_uri, position, method_name)
+            .await?;
         let document = self
             .preamble_to_document_context(preamble, method_name)
             .await?;
@@ -1312,7 +1327,9 @@ impl Kakehashi {
         method_name: &str,
     ) -> Option<RangeRequestContext> {
         self.ensure_fresh_tree_for_bridge(lsp_uri).await;
-        let preamble = self.resolve_bridge_preamble(lsp_uri, range.start, method_name)?;
+        let preamble = self
+            .resolve_bridge_preamble(lsp_uri, range.start, method_name)
+            .await?;
         let document = self
             .preamble_to_document_context(preamble, method_name)
             .await?;
@@ -1355,7 +1372,11 @@ impl Kakehashi {
         let Ok(uri) = uri_to_url(lsp_uri) else {
             return Vec::new();
         };
-        let Some(snapshot) = self.documents.get(&uri).and_then(|d| d.snapshot()) else {
+        let Some((snapshot, content_version)) = self
+            .documents
+            .get(&uri)
+            .and_then(|d| d.snapshot().map(|snapshot| (snapshot, d.content_version())))
+        else {
             return Vec::new();
         };
         let Some(language_name) = self.document_language(&uri) else {
@@ -1365,7 +1386,7 @@ impl Kakehashi {
             return Vec::new();
         };
 
-        let regions = crate::language::InjectionResolver::resolve_all(
+        let legacy_regions = crate::language::InjectionResolver::resolve_all(
             &self.language,
             self.bridge.node_tracker(),
             &uri,
@@ -1374,6 +1395,19 @@ impl Kakehashi {
             injection_query.as_ref(),
             snapshot.incarnation(),
         );
+        let regions = if self.tree_worker_shadow.is_authoritative() {
+            self.worker_injection_regions_for_snapshot(
+                &uri,
+                snapshot.incarnation(),
+                content_version,
+                &language_name,
+            )
+            .await
+            .map(|regions| regions.as_ref().clone())
+            .unwrap_or_default()
+        } else {
+            legacy_regions
+        };
 
         // One upstream request ID for the whole scan: every overlapping
         // region's context shares it — with the OTHER layers too, so nothing

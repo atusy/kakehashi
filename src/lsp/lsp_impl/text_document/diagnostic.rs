@@ -170,7 +170,10 @@ impl Kakehashi {
         // (parse pending/failed) yields `None` — host still pulls, virt skips.
         let snapshot = if virt_enabled {
             self.ensure_document_parsed(&uri).await;
-            self.documents.get(&uri).and_then(|doc| doc.snapshot())
+            self.documents.get(&uri).and_then(|doc| {
+                doc.snapshot()
+                    .map(|snapshot| (snapshot, doc.content_version()))
+            })
         } else {
             None
         };
@@ -187,7 +190,7 @@ impl Kakehashi {
         // Resolve injection regions once: the live virt pull below and the
         // pushFallback fold (#425) after the join share them.
         let virt_regions = match (virt_enabled, snapshot.as_ref()) {
-            (true, Some(snapshot)) => self
+            (true, Some((snapshot, _))) => self
                 .language
                 .injection_query(&language_name)
                 .map(|injection_query| {
@@ -212,6 +215,20 @@ impl Kakehashi {
             // wait+on-demand above already tried, so a missing tree here is the
             // rare parse-failure case, self-healing on the next pull.
             _ => std::sync::Arc::new(Vec::new()),
+        };
+        let virt_regions = if self.tree_worker_shadow.is_authoritative()
+            && let Some((snapshot, content_version)) = snapshot.as_ref()
+        {
+            self.worker_injection_regions_for_snapshot(
+                &uri,
+                snapshot.incarnation(),
+                *content_version,
+                &language_name,
+            )
+            .await
+            .unwrap_or_default()
+        } else {
+            virt_regions
         };
         // Lightweight per-region metadata `(region_id, injection_language,
         // current offset)` for the pushFallback fold; the live pull below moves

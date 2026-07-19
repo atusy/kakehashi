@@ -58,8 +58,9 @@ macro_rules! scalar_accessor {
             .await
             .map(|(_uri, _layer, _incarnation, v)| json!({ $field: v }))
             .unwrap_or(Value::Null);
-        if let Some(shadow) = shadow.and_then(|shadow| scalar_json($field, shadow))
-            && shadow != value
+        let worker = shadow.and_then(|shadow| scalar_json($field, shadow));
+        if let Some(shadow) = worker.as_ref()
+            && shadow != &value
         {
             log::debug!(
                 target: "kakehashi::tree_worker_shadow",
@@ -69,7 +70,11 @@ macro_rules! scalar_accessor {
                 shadow,
             );
         }
-        Ok(value)
+        if $self.tree_worker_shadow.is_authoritative() {
+            Ok(worker.unwrap_or(Value::Null))
+        } else {
+            Ok(value)
+        }
     }};
 }
 
@@ -176,7 +181,7 @@ impl Kakehashi {
             .await
             .map(|(_uri, _layer, _incarnation, v)| v)
             .unwrap_or(Value::Null);
-        if let Some(NodeScalarValue::ByteRange {
+        let worker = if let Some(NodeScalarValue::ByteRange {
             start_byte,
             end_byte,
         }) = shadow
@@ -191,8 +196,15 @@ impl Kakehashi {
                     shadow,
                 );
             }
+            Some(shadow)
+        } else {
+            None
+        };
+        if self.tree_worker_shadow.is_authoritative() {
+            Ok(worker.unwrap_or(Value::Null))
+        } else {
+            Ok(value)
         }
-        Ok(value)
     }
 
     /// `kakehashi/node/childCount` — number of children (named + anonymous),

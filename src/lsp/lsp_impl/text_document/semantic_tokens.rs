@@ -423,11 +423,6 @@ impl Kakehashi {
         // snapshot's own text hash means a compute racing a fresh edit stores
         // under its own text's hash, which a post-edit request never looks up.
         let cache_key = self.cache.cache_key_for(&text, token_generation);
-
-        // Compute tokens against the (current-at-resolution) snapshot. An edit
-        // landing after the resolution supersedes this request via the client's
-        // next didChange-driven request; the CancelToken then reclaims the
-        // compute mid-flight.
         let worker_configuration_generation = self.language.configuration_generation();
         if let Some(grammar) = self.language.worker_grammar_descriptor(&language_name)
             && self.tree_worker_shadow.needs_document_sync(
@@ -440,6 +435,11 @@ impl Kakehashi {
         {
             self.refresh_tree_worker_documents(std::slice::from_ref(&uri));
         }
+
+        // Compute tokens against the (current-at-resolution) snapshot. An edit
+        // landing after the resolution supersedes this request via the client's
+        // next didChange-driven request; the CancelToken then reclaims the
+        // compute mid-flight.
         let (result, worker_tokens) = {
             // Snapshot-identical repeat request: tokens already cached for this
             // exact text are still correct, so skip re-tokenizing. Returns the
@@ -517,7 +517,14 @@ impl Kakehashi {
                 worker_configuration_generation,
                 supports_multiline,
             );
-            let combined = async { tokio::join!(compute_future, worker_future) };
+            let authoritative_worker = self.tree_worker_shadow.is_authoritative();
+            let combined = async {
+                if authoritative_worker {
+                    (None, worker_future.await)
+                } else {
+                    tokio::join!(compute_future, worker_future)
+                }
+            };
 
             if let Some(cancel_rx) = cancel_rx {
                 // Race between computation and cancel notification
@@ -560,6 +567,11 @@ impl Kakehashi {
                 worker,
             );
         }
+        let result = if self.tree_worker_shadow.is_authoritative() {
+            worker_tokens.map(worker_semantic_tokens_result)
+        } else {
+            result
+        };
 
         // A supersede/close between compute start and here flips the token; the
         // compute then bailed at a checkpoint and returned `None` (a partial
@@ -846,6 +858,18 @@ impl Kakehashi {
         // the top (see semanticTokens/full for why snapshot-text keying makes
         // a compute racing a fresh edit cache-safe).
         let cache_key = self.cache.cache_key_for(&text, token_generation);
+        let worker_configuration_generation = self.language.configuration_generation();
+        if let Some(grammar) = self.language.worker_grammar_descriptor(&language_name)
+            && self.tree_worker_shadow.needs_document_sync(
+                &uri,
+                snapshot.incarnation,
+                snapshot.parsed_version,
+                worker_configuration_generation,
+                &grammar.queries,
+            )
+        {
+            self.refresh_tree_worker_documents(std::slice::from_ref(&uri));
+        }
 
         // Compute tokens against the (current-at-resolution) snapshot; same as
         // semanticTokens/full.
@@ -925,6 +949,21 @@ impl Kakehashi {
                     injection_cache,
                     Some(cancel_token.clone()),
                 );
+                let worker_future = self.tree_worker_shadow.semantic_tokens(
+                    &uri,
+                    snapshot.incarnation,
+                    snapshot.parsed_version,
+                    worker_configuration_generation,
+                    supports_multiline,
+                );
+                let authoritative_worker = self.tree_worker_shadow.is_authoritative();
+                let combined = async {
+                    if authoritative_worker {
+                        (None, worker_future.await)
+                    } else {
+                        tokio::join!(compute_future, worker_future)
+                    }
+                };
 
                 let computed = if let Some(cancel_rx) = cancel_rx {
                     // Race between computation and cancel notification
@@ -948,13 +987,34 @@ impl Kakehashi {
                         }
 
                         // Computation completed
-                        result = compute_future => result,
+                        result = combined => result,
                     }
                 } else {
                     // No cancel support - just await the computation
-                    compute_future.await
+                    combined.await
                 };
-                computed.map(CurrentTokens::from_result)
+                if let (Some(authoritative), Some(worker)) =
+                    (computed.0.as_ref(), computed.1.as_ref())
+                {
+                    let authoritative = match authoritative {
+                        SemanticTokensResult::Tokens(tokens) => tokens.data.as_slice(),
+                        SemanticTokensResult::Partial(partial) => partial.data.as_slice(),
+                    };
+                    self.tree_worker_shadow.compare_semantic_tokens(
+                        &uri,
+                        snapshot.parsed_version,
+                        authoritative,
+                        worker,
+                    );
+                }
+                if self.tree_worker_shadow.is_authoritative() {
+                    computed
+                        .1
+                        .map(worker_semantic_tokens)
+                        .map(CurrentTokens::Owned)
+                } else {
+                    computed.0.map(CurrentTokens::from_result)
+                }
             }
         };
 
@@ -1255,8 +1315,20 @@ impl Kakehashi {
         // Use Rayon-based parallel injection processing
         let supports_multiline = self.settings_manager.supports_multiline_tokens();
         let coordinator = std::sync::Arc::clone(&self.language);
+        let worker_configuration_generation = self.language.configuration_generation();
+        if let Some(grammar) = self.language.worker_grammar_descriptor(&language_name)
+            && self.tree_worker_shadow.needs_document_sync(
+                &uri,
+                snapshot.incarnation,
+                snapshot.parsed_version,
+                worker_configuration_generation,
+                &grammar.queries,
+            )
+        {
+            self.refresh_tree_worker_documents(std::slice::from_ref(&uri));
+        }
 
-        let result = handle_semantic_tokens_full(
+        let local = handle_semantic_tokens_full(
             &self.compute_pool,
             text,
             tree,
@@ -1267,8 +1339,36 @@ impl Kakehashi {
             supports_multiline,
             None,
             None,
-        )
-        .await;
+        );
+        let worker = self.tree_worker_shadow.semantic_tokens(
+            &uri,
+            snapshot.incarnation,
+            snapshot.parsed_version,
+            worker_configuration_generation,
+            supports_multiline,
+        );
+        let (result, worker) = if self.tree_worker_shadow.is_authoritative() {
+            (None, worker.await)
+        } else {
+            tokio::join!(local, worker)
+        };
+        if let (Some(authoritative), Some(worker)) = (result.as_ref(), worker.as_ref()) {
+            let authoritative = match authoritative {
+                SemanticTokensResult::Tokens(tokens) => tokens.data.as_slice(),
+                SemanticTokensResult::Partial(partial) => partial.data.as_slice(),
+            };
+            self.tree_worker_shadow.compare_semantic_tokens(
+                &uri,
+                snapshot.parsed_version,
+                authoritative,
+                worker,
+            );
+        }
+        let result = if self.tree_worker_shadow.is_authoritative() {
+            worker.map(worker_semantic_tokens_result)
+        } else {
+            result
+        };
 
         // Shape immutable payloads before taking the edit lock. Only the final
         // live-snapshot validation and cache commits need to exclude edits.
@@ -1332,6 +1432,31 @@ impl Kakehashi {
         }
 
         Ok(Some(domain_range_result))
+    }
+}
+
+fn worker_semantic_tokens_result(
+    worker: crate::tree_worker::DerivedSemanticTokens,
+) -> tower_lsp_server::ls_types::SemanticTokensResult {
+    tower_lsp_server::ls_types::SemanticTokensResult::Tokens(worker_semantic_tokens(worker))
+}
+
+fn worker_semantic_tokens(
+    worker: crate::tree_worker::DerivedSemanticTokens,
+) -> tower_lsp_server::ls_types::SemanticTokens {
+    tower_lsp_server::ls_types::SemanticTokens {
+        result_id: None,
+        data: worker
+            .tokens
+            .into_iter()
+            .map(|token| tower_lsp_server::ls_types::SemanticToken {
+                delta_line: token.delta_line,
+                delta_start: token.delta_start,
+                length: token.length,
+                token_type: token.token_type,
+                token_modifiers_bitset: token.token_modifiers_bitset,
+            })
+            .collect(),
     }
 }
 
