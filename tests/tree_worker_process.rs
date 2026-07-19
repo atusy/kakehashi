@@ -123,7 +123,7 @@ fn real_worker_derives_a_snapshot_from_an_installed_grammar() {
     };
     assert_eq!(snapshot.root_kind, "source_file");
     assert_eq!(snapshot.context.worker_generation, 42);
-    assert!(!snapshot.parser_cache_hit);
+    assert_eq!(snapshot.parser_cache_hit, Some(false));
 
     let response = worker
         .derive(DeriveSnapshot {
@@ -144,7 +144,7 @@ fn real_worker_derives_a_snapshot_from_an_installed_grammar() {
     let Response::Snapshot(snapshot) = response else {
         panic!("second derive must produce a snapshot: {response:?}");
     };
-    assert!(snapshot.parser_cache_hit);
+    assert_eq!(snapshot.parser_cache_hit, Some(true));
     assert!(snapshot.compute_ns > 0);
     worker.shutdown().unwrap();
 }
@@ -210,6 +210,8 @@ fn real_worker_keeps_document_text_and_tree_across_incremental_edits() {
         panic!("derive must read worker-owned state: {response:?}");
     };
     assert_eq!(snapshot.root_end_byte, "fn main() { value + 2 }".len());
+    assert_eq!(snapshot.parser_cache_hit, None);
+    assert!(snapshot.compute_ns > 0);
 
     let mut closed = snapshot.context;
     closed.request_id = 33;

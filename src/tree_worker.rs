@@ -143,7 +143,7 @@ pub struct DerivedSnapshot {
     pub root_end_byte: usize,
     pub has_error: bool,
     pub named_node_count: usize,
-    pub parser_cache_hit: bool,
+    pub parser_cache_hit: Option<bool>,
     pub queue_wait_ns: u64,
     pub compute_ns: u64,
 }
@@ -265,6 +265,16 @@ impl DocumentReplica {
     }
 
     fn derive(&self, context: RequestContext) -> Result<DerivedSnapshot, String> {
+        self.derive_with_telemetry(context, None, Duration::ZERO, Instant::now())
+    }
+
+    fn derive_with_telemetry(
+        &self,
+        context: RequestContext,
+        parser_cache_hit: Option<bool>,
+        queue_wait: Duration,
+        started: Instant,
+    ) -> Result<DerivedSnapshot, String> {
         self.validate_identity(&context)?;
         if context.content_version != self.context.content_version {
             return Err(format!(
@@ -281,9 +291,9 @@ impl DocumentReplica {
             root_end_byte: root.end_byte(),
             has_error: root.has_error(),
             named_node_count: named_node_count(root),
-            parser_cache_hit: true,
-            queue_wait_ns: 0,
-            compute_ns: 0,
+            parser_cache_hit,
+            queue_wait_ns: duration_ns(queue_wait),
+            compute_ns: duration_ns(started.elapsed()),
         })
     }
 
@@ -490,7 +500,7 @@ fn derive_snapshot_with_parser(
         root_end_byte: root.end_byte(),
         has_error: root.has_error(),
         named_node_count: named_node_count(root),
-        parser_cache_hit,
+        parser_cache_hit: Some(parser_cache_hit),
         queue_wait_ns: duration_ns(queue_wait),
         compute_ns: duration_ns(started.elapsed()),
     })
@@ -862,6 +872,7 @@ fn handle_work(
     retained_document_bytes: &RetainedDocumentBytes,
     queue_wait: Duration,
 ) -> Response {
+    let started = Instant::now();
     match request {
         Request::DeriveSnapshot(request) => derive_snapshot(request, queue_wait),
         Request::SyncDocument(request) => sync_document(
@@ -874,10 +885,16 @@ fn handle_work(
         Request::ApplyDocumentEdits(request) => {
             apply_document_edits(request, documents, retained_document_bytes)
         }
-        Request::ApplyDocumentEditsAndDerive(request) => {
-            apply_document_edits_and_derive(request, documents, retained_document_bytes)
+        Request::ApplyDocumentEditsAndDerive(request) => apply_document_edits_and_derive(
+            request,
+            documents,
+            retained_document_bytes,
+            queue_wait,
+            started,
+        ),
+        Request::DeriveDocumentSnapshot(request) => {
+            derive_document_snapshot(request, documents, queue_wait, started)
         }
-        Request::DeriveDocumentSnapshot(request) => derive_document_snapshot(request, documents),
         Request::CloseDocument(request) => close_document(
             request,
             documents,
@@ -1086,6 +1103,8 @@ fn apply_document_edits_and_derive(
     request: ApplyDocumentEditsAndDerive,
     documents: &DocumentStore,
     retained_document_bytes: &RetainedDocumentBytes,
+    queue_wait: Duration,
+    started: Instant,
 ) -> Response {
     let context = request.context.clone();
     let document_key = DocumentKey::from(&context);
@@ -1110,7 +1129,7 @@ fn apply_document_edits_and_derive(
     WORKER_THREAD_STATE.with(|state| {
         state
             .borrow_mut()
-            .with_parser(grammar_key, context.clone(), |parser, _| {
+            .with_parser(grammar_key, context.clone(), |parser, parser_cache_hit| {
                 let Ok(mut replica) = replica.lock() else {
                     return Response::Error(WorkerError {
                         context: Some(context),
@@ -1128,7 +1147,12 @@ fn apply_document_edits_and_derive(
                         message,
                     });
                 }
-                match replica.derive(context.clone()) {
+                match replica.derive_with_telemetry(
+                    context.clone(),
+                    Some(parser_cache_hit),
+                    queue_wait,
+                    started,
+                ) {
                     Ok(snapshot) => Response::Snapshot(snapshot),
                     Err(message) => Response::Error(WorkerError {
                         context: Some(context),
@@ -1142,6 +1166,8 @@ fn apply_document_edits_and_derive(
 fn derive_document_snapshot(
     request: DeriveDocumentSnapshot,
     documents: &DocumentStore,
+    queue_wait: Duration,
+    started: Instant,
 ) -> Response {
     let context = request.context;
     let document_key = DocumentKey::from(&context);
@@ -1155,13 +1181,15 @@ fn derive_document_snapshot(
         });
     };
     match replica.lock() {
-        Ok(replica) => match replica.derive(context.clone()) {
-            Ok(snapshot) => Response::Snapshot(snapshot),
-            Err(message) => Response::Error(WorkerError {
-                context: Some(context),
-                message,
-            }),
-        },
+        Ok(replica) => {
+            match replica.derive_with_telemetry(context.clone(), None, queue_wait, started) {
+                Ok(snapshot) => Response::Snapshot(snapshot),
+                Err(message) => Response::Error(WorkerError {
+                    context: Some(context),
+                    message,
+                }),
+            }
+        }
         Err(_) => Response::Error(WorkerError {
             context: Some(context),
             message: "document replica lock is poisoned".into(),
@@ -2457,6 +2485,8 @@ mod tests {
         let snapshot = replica.derive(edited_context).unwrap();
         assert_eq!(snapshot.root_kind, "source_file");
         assert_eq!(snapshot.root_end_byte, "fn main() { value + 2 }".len());
+        assert_eq!(snapshot.parser_cache_hit, None);
+        assert!(snapshot.compute_ns > 0);
     }
 
     #[test]
