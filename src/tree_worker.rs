@@ -708,21 +708,41 @@ impl WorkerThreadState {
     ) -> Response {
         let language = match self.languages.get(&key).cloned() {
             Some(language) => language,
-            None => match self
-                .loader
-                .load_language(&key.parser_path, &key.grammar_symbol)
-            {
-                Ok(language) => {
-                    self.languages.insert(key.clone(), language.clone());
-                    language
-                }
-                Err(error) => {
+            None => {
+                let actual_digest = match artifact_digest(&key.parser_path) {
+                    Ok(digest) => digest,
+                    Err(error) => {
+                        return Response::Error(WorkerError {
+                            context: Some(request_context),
+                            message: format!("cannot verify parser artifact: {error}"),
+                        });
+                    }
+                };
+                if actual_digest != key.artifact_digest {
                     return Response::Error(WorkerError {
                         context: Some(request_context),
-                        message: error.to_string(),
+                        message: format!(
+                            "parser artifact digest mismatch: expected {} got {actual_digest}",
+                            key.artifact_digest
+                        ),
                     });
                 }
-            },
+                match self
+                    .loader
+                    .load_language(&key.parser_path, &key.grammar_symbol)
+                {
+                    Ok(language) => {
+                        self.languages.insert(key.clone(), language.clone());
+                        language
+                    }
+                    Err(error) => {
+                        return Response::Error(WorkerError {
+                            context: Some(request_context),
+                            message: error.to_string(),
+                        });
+                    }
+                }
+            }
         };
         let parser_cache_hit = self.parsers.contains_key(&key);
         let mut parser = if let Some(parser) = self.parsers.remove(&key) {
@@ -1506,7 +1526,7 @@ impl Drop for AdmissionPermit {
 }
 
 pub fn run_stdio(compute_threads: usize) -> io::Result<()> {
-    let build_id = executable_digest(&std::env::current_exe()?)?;
+    let build_id = artifact_digest(&std::env::current_exe()?)?;
     run_with_build_id(
         std::io::stdin(),
         std::io::stdout(),
@@ -1515,7 +1535,7 @@ pub fn run_stdio(compute_threads: usize) -> io::Result<()> {
     )
 }
 
-fn executable_digest(path: &std::path::Path) -> io::Result<String> {
+pub fn artifact_digest(path: &std::path::Path) -> io::Result<String> {
     let mut file = std::fs::File::open(path)?;
     let mut digest = Sha256::new();
     let mut buffer = [0_u8; 64 * 1024];
@@ -1557,7 +1577,7 @@ impl Client {
                 "worker compute thread count must be positive",
             ));
         }
-        let build_id = executable_digest(executable)?;
+        let build_id = artifact_digest(executable)?;
         let mut child = Command::new(executable)
             .args(["__tree-worker", "--threads", &compute_threads.to_string()])
             .stdin(Stdio::piped())

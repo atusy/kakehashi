@@ -116,10 +116,7 @@ impl Kakehashi {
                 language_id.as_deref(),
             );
             if let Some(language_name) = language_name
-                && let Some(grammar) = self.language.worker_grammar_descriptor(
-                    &language_name,
-                    &self.settings_manager.load_settings(),
-                )
+                && let Some(grammar) = self.language.worker_grammar_descriptor(&language_name)
             {
                 self.tree_worker_shadow.mirror_change(
                     &uri,

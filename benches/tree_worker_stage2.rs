@@ -38,12 +38,15 @@ fn context(document: usize, request_id: u64, version: u64) -> RequestContext {
 }
 
 fn sync_request(document: usize, parser: &Path, text: &str) -> SyncDocument {
+    static DIGEST: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     SyncDocument {
         context: context(document, document as u64 + 1, 1),
         language: "rust".into(),
         grammar_symbol: "rust".into(),
         parser_path: parser.to_path_buf(),
-        artifact_digest: "sha256:benchmark-rust".into(),
+        artifact_digest: DIGEST
+            .get_or_init(|| kakehashi::tree_worker::artifact_digest(parser).unwrap())
+            .clone(),
         text: text.into(),
     }
 }

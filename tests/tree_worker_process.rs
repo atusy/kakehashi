@@ -7,6 +7,11 @@ use kakehashi::tree_worker::{
 };
 use kakehashi::tree_worker::{Client, DeriveSnapshot, RequestContext, Response};
 
+#[cfg(feature = "e2e")]
+fn digest(path: &std::path::Path) -> String {
+    kakehashi::tree_worker::artifact_digest(path).unwrap()
+}
+
 #[test]
 fn real_worker_handshakes_and_contains_request_errors() {
     let executable = PathBuf::from(env!("CARGO_BIN_EXE_kakehashi"));
@@ -103,6 +108,28 @@ fn real_worker_derives_a_snapshot_from_an_installed_grammar() {
     let executable = PathBuf::from(env!("CARGO_BIN_EXE_kakehashi"));
     let worker = Client::spawn(&executable, 1, 42).unwrap();
 
+    let rejected = worker
+        .derive(DeriveSnapshot {
+            context: RequestContext {
+                request_id: 9,
+                worker_generation: 42,
+                uri: "file:///example.rs".into(),
+                incarnation: 1,
+                content_version: 0,
+                configuration_generation: 0,
+            },
+            language: "rust".into(),
+            grammar_symbol: "rust".into(),
+            parser_path: parser.clone(),
+            artifact_digest: "sha256:not-the-parser".into(),
+            text: "fn main() {}".into(),
+        })
+        .unwrap();
+    let Response::Error(error) = rejected else {
+        panic!("digest mismatch must be rejected: {rejected:?}");
+    };
+    assert!(error.message.contains("digest mismatch"));
+
     let response = worker
         .derive(DeriveSnapshot {
             context: RequestContext {
@@ -116,7 +143,7 @@ fn real_worker_derives_a_snapshot_from_an_installed_grammar() {
             language: "rust".into(),
             grammar_symbol: "rust".into(),
             parser_path: parser.clone(),
-            artifact_digest: "sha256:test-rust".into(),
+            artifact_digest: digest(&parser),
             text: "fn main() {}".into(),
         })
         .unwrap();
@@ -141,7 +168,7 @@ fn real_worker_derives_a_snapshot_from_an_installed_grammar() {
             language: "rust".into(),
             grammar_symbol: "rust".into(),
             parser_path: parser.clone(),
-            artifact_digest: "sha256:test-rust".into(),
+            artifact_digest: digest(&parser),
             text: "fn main() { let x = 1; }".into(),
         })
         .unwrap();
@@ -179,7 +206,7 @@ fn real_worker_keeps_document_text_and_tree_across_incremental_edits() {
             language: "rust".into(),
             grammar_symbol: "rust".into(),
             parser_path: parser.clone(),
-            artifact_digest: "sha256:test-rust".into(),
+            artifact_digest: digest(&parser),
             text: "fn main() { 1 }".into(),
         })
         .unwrap();
@@ -235,8 +262,8 @@ fn real_worker_keeps_document_text_and_tree_across_incremental_edits() {
             context: closed.clone(),
             language: "rust".into(),
             grammar_symbol: "rust".into(),
-            parser_path: parser,
-            artifact_digest: "sha256:test-rust".into(),
+            parser_path: parser.clone(),
+            artifact_digest: digest(&parser),
             text: "fn stale() {}".into(),
         })
         .unwrap();

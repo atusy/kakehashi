@@ -78,9 +78,7 @@ impl Kakehashi {
 
         if self.tree_worker_shadow.is_enabled()
             && let Some(language_name) = language_name.clone()
-            && let Some(grammar) = self
-                .language
-                .worker_grammar_descriptor(&language_name, &self.settings_manager.load_settings())
+            && let Some(grammar) = self.language.worker_grammar_descriptor(&language_name)
         {
             self.tree_worker_shadow.mirror_full(
                 &uri,

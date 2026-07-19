@@ -32,6 +32,7 @@ struct Args {
 }
 
 fn request(id: u64, generation: u64, parser: &std::path::Path, text: &str) -> DeriveSnapshot {
+    static DIGEST: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     DeriveSnapshot {
         context: RequestContext {
             request_id: id,
@@ -44,7 +45,9 @@ fn request(id: u64, generation: u64, parser: &std::path::Path, text: &str) -> De
         language: "rust".into(),
         grammar_symbol: "rust".into(),
         parser_path: parser.to_path_buf(),
-        artifact_digest: "sha256:benchmark-rust".into(),
+        artifact_digest: DIGEST
+            .get_or_init(|| kakehashi::tree_worker::artifact_digest(parser).unwrap())
+            .clone(),
         text: text.into(),
     }
 }
