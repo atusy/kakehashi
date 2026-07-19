@@ -385,6 +385,7 @@ def load_binary_attestation(path, binary):
     attestation = json.loads(path.read_text())
     required = (
         "schema", "source_repository", "source_commit",
+        "source_remote_refs_containing_commit",
         "source_checkout_clean", "build_command", "rustc", "cargo",
         "native_toolchain", "build_environment", "built_in_fresh_target", "binary_relative",
         "source_isolated_archive", "cargo_config_ancestry_clean",
@@ -398,6 +399,15 @@ def load_binary_attestation(path, binary):
         and bool(attestation["source_repository"])
         and isinstance(attestation["source_commit"], str)
         and re.fullmatch(r"[0-9a-f]{40}", attestation["source_commit"])
+        and isinstance(
+            attestation["source_remote_refs_containing_commit"], list
+        )
+        and bool(attestation["source_remote_refs_containing_commit"])
+        and all(
+            isinstance(ref, str)
+            and re.fullmatch(r"refs/remotes/origin/[^\s]+", ref)
+            for ref in attestation["source_remote_refs_containing_commit"]
+        )
         and attestation["source_checkout_clean"] is True
         and attestation["build_command"] == ATTESTED_BUILD_COMMAND
         and isinstance(attestation["rustc"], str)

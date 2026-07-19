@@ -569,6 +569,9 @@ class CollectionHelpersTest(unittest.TestCase):
                 "schema": 1,
                 "source_repository": "https://github.com/atusy/kakehashi",
                 "source_commit": "a" * 40,
+                "source_remote_refs_containing_commit": [
+                    "refs/remotes/origin/main"
+                ],
                 "source_checkout_clean": True,
                 "build_command": [
                     "cargo", "build", "--locked", "--release", "--bin", "kakehashi"
@@ -597,6 +600,12 @@ class CollectionHelpersTest(unittest.TestCase):
             loaded = load_binary_attestation(attestation, binary)
 
             self.assertEqual(loaded["source_commit"], "a" * 40)
+            without_remote_proof = json.loads(attestation.read_text())
+            del without_remote_proof["source_remote_refs_containing_commit"]
+            attestation.write_text(json.dumps(without_remote_proof))
+            with self.assertRaisesRegex(ValueError, "missing required fields"):
+                load_binary_attestation(attestation, binary)
+            attestation.write_text(json.dumps(loaded))
             without_ancestry_proof = json.loads(attestation.read_text())
             del without_ancestry_proof["cargo_config_ancestry_clean"]
             attestation.write_text(json.dumps(without_ancestry_proof))
