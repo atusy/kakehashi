@@ -4,16 +4,16 @@
   "environment": {
     "platform": "macOS-26.5.1-arm64-arm-64bit",
     "python": "3.12.13",
-    "binary": "/Users/atusy/ghq/github.com/atusy/kakehashi___worker_measure/target/release/kakehashi",
+    "binary": "<provided-binary>",
     "binary_execution": "private staged copy",
-    "binary_sha256": "547e3ac31aebaae8fcfa3e2b32ad98041d243d07a979e91398d0e60f3c57d345",
-    "data_dir": "/private/var/folders/t3/_nc24_w90zq79l3xyz3xzc7c0000gn/T/kakehashi-phase0-final.6tiXV5/data",
+    "binary_sha256": "0238be0e9f8bcfa87f25170ee17102b7ff584e8af5dbecf03fc43d3d453adc6a",
+    "data_dir": "<provided-data-dir>",
     "data_dir_execution": "private staged copy",
     "parser_query_file_count": 35,
     "parser_query_tree_sha256": "b00cba49b01be8da6e1d9b9c5b5139701821de79125e89276366ee315d06ee3e",
     "retained_environment": {
-      "PATH": "/Users/atusy/.local/bin:/Users/atusy/.bun/install/global/node_modules/@openai/codex-darwin-arm64/vendor/aarch64-apple-darwin/codex-path:/Users/atusy/.codex/tmp/arg0/codex-arg0wMKckG:/opt/homebrew/bin:/opt/homebrew/sbin:/nix/var/nix/profiles/default/bin:/Users/atusy/.nix-profile/bin:/run/current-system/sw/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/Users/atusy/.local/lastresort/bin",
-      "TMPDIR": "/var/folders/t3/_nc24_w90zq79l3xyz3xzc7c0000gn/T/",
+      "PATH": "<redacted-search-path>",
+      "TMPDIR": "<redacted-path>",
       "LANG": "C.UTF-8",
       "LC_ALL": "C.UTF-8"
     }
@@ -27,7 +27,7 @@
   "binary_attestation": {
     "schema": 1,
     "source_repository": "https://github.com/atusy/kakehashi",
-    "source_commit": "ef3a90c767636b1fb7f1dda68f9c42a7700b34fc",
+    "source_commit": "90562849485a0ed5397795995b3da44ff9bc0c15",
     "source_remote_refs_containing_commit": [
       "refs/remotes/origin/perf/single-tree-worker-measurement"
     ],
@@ -50,26 +50,26 @@
       "sdk_version": "26.5"
     },
     "build_environment": {
-      "PATH": "/Users/atusy/.local/bin:/Users/atusy/.bun/install/global/node_modules/@openai/codex-darwin-arm64/vendor/aarch64-apple-darwin/codex-path:/Users/atusy/.codex/tmp/arg0/codex-arg0wMKckG:/opt/homebrew/bin:/opt/homebrew/sbin:/nix/var/nix/profiles/default/bin:/Users/atusy/.nix-profile/bin:/run/current-system/sw/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/Users/atusy/.local/lastresort/bin",
-      "TMPDIR": "/var/folders/t3/_nc24_w90zq79l3xyz3xzc7c0000gn/T/",
+      "PATH": "<redacted-search-path>",
+      "TMPDIR": "<redacted-path>",
       "LANG": "C.UTF-8",
       "LC_ALL": "C.UTF-8",
-      "CARGO_TARGET_DIR": "/var/folders/t3/_nc24_w90zq79l3xyz3xzc7c0000gn/T/kakehashi-attested-build-_q40yuq1/target",
-      "CARGO_HOME": "/var/folders/t3/_nc24_w90zq79l3xyz3xzc7c0000gn/T/kakehashi-attested-build-_q40yuq1/target/cargo-home"
+      "CARGO_TARGET_DIR": "${ATTESTED_BUILD_ROOT}/target",
+      "CARGO_HOME": "${ATTESTED_BUILD_ROOT}/target/cargo-home"
     },
     "built_in_fresh_target": true,
     "source_isolated_archive": true,
     "cargo_config_ancestry_clean": true,
     "binary_relative": "target/release/kakehashi",
-    "binary_sha256": "547e3ac31aebaae8fcfa3e2b32ad98041d243d07a979e91398d0e60f3c57d345"
+    "binary_sha256": "0238be0e9f8bcfa87f25170ee17102b7ff584e8af5dbecf03fc43d3d453adc6a"
   },
   "harness": {
     "execution": "private staged driver and relay helpers",
     "source_files_sha256": {
-      "collect_worker_proxy.py": "0003ad065f90bccb208f0c46e2dfe403a23e866d0fec9dd59b5f4c43850d1905",
-      "collect_worker_cold_start.py": "7bdfd26d28e874a02bd79b22669bbff028ea1b1d03bbb672f2a2be69617a49ca",
-      "collect_worker_capture_pilot.py": "8b9f8d8873f367a8dd4fddbc431e7571df9cef51322f4dbe9f329592ef4469c2",
-      "drive.py": "23ef9f86a6b00212a22acff9e7da15be4a696a9607dd083121e04c80ea761fb7",
+      "collect_worker_proxy.py": "279488c781df43d650f4fe7a6ca86999551436d18fafc5ae3f4d6e10fc2ce489",
+      "collect_worker_cold_start.py": "7648e2b0eba60b20b7f11a641c07c6ccdd5a1d3b75bc91492f32acfa90750109",
+      "collect_worker_capture_pilot.py": "3a709d50253dc23060ca99f885978e71a8b58f07a71af6c492d2fa73916a75f5",
+      "drive.py": "03125dc45da371f7933cf6ce1fb1af422c6ed0b6dcb847d6a2c70fe1ddb646bd",
       "worker_proxy.py": "24cc8fc29f4c90195f22a22c63a7ec3f9c0286a03b4f53eb6c49681b57b9db66",
       "gen_session.py": "6f4f6b8388c607db1c70fe29579ce14fe00d57668cab17601432ff123cfb15a3"
     }
@@ -92,12 +92,12 @@
       "run": 1,
       "order": "direct-relay",
       "direct": {
-        "elapsed_seconds": 0.1283685410162434,
+        "elapsed_seconds": 0.16682100004982203,
         "validated_responses": 1,
         "tokens_per_request": 1342
       },
       "relay": {
-        "elapsed_seconds": 0.16337708302307874,
+        "elapsed_seconds": 0.21261437505017966,
         "validated_responses": 1,
         "tokens_per_request": 1342
       }
@@ -106,12 +106,12 @@
       "run": 2,
       "order": "relay-direct",
       "relay": {
-        "elapsed_seconds": 0.16202104196418077,
+        "elapsed_seconds": 0.2149303749902174,
         "validated_responses": 1,
         "tokens_per_request": 1342
       },
       "direct": {
-        "elapsed_seconds": 0.12719612498767674,
+        "elapsed_seconds": 0.16968087491113693,
         "validated_responses": 1,
         "tokens_per_request": 1342
       }
@@ -120,12 +120,12 @@
       "run": 3,
       "order": "direct-relay",
       "direct": {
-        "elapsed_seconds": 0.13217208394780755,
+        "elapsed_seconds": 0.16813937504775822,
         "validated_responses": 1,
         "tokens_per_request": 1342
       },
       "relay": {
-        "elapsed_seconds": 0.17191833292599767,
+        "elapsed_seconds": 0.2094579580007121,
         "validated_responses": 1,
         "tokens_per_request": 1342
       }
@@ -134,12 +134,12 @@
       "run": 4,
       "order": "relay-direct",
       "relay": {
-        "elapsed_seconds": 0.17150699999183416,
+        "elapsed_seconds": 0.2042018340434879,
         "validated_responses": 1,
         "tokens_per_request": 1342
       },
       "direct": {
-        "elapsed_seconds": 0.13681149994954467,
+        "elapsed_seconds": 0.1456928749103099,
         "validated_responses": 1,
         "tokens_per_request": 1342
       }
@@ -148,12 +148,12 @@
       "run": 5,
       "order": "direct-relay",
       "direct": {
-        "elapsed_seconds": 0.13888783298898488,
+        "elapsed_seconds": 0.14340379205532372,
         "validated_responses": 1,
         "tokens_per_request": 1342
       },
       "relay": {
-        "elapsed_seconds": 0.1811554169980809,
+        "elapsed_seconds": 0.18242712505161762,
         "validated_responses": 1,
         "tokens_per_request": 1342
       }
@@ -162,12 +162,12 @@
       "run": 6,
       "order": "relay-direct",
       "relay": {
-        "elapsed_seconds": 0.1825086249737069,
+        "elapsed_seconds": 0.18175845791120082,
         "validated_responses": 1,
         "tokens_per_request": 1342
       },
       "direct": {
-        "elapsed_seconds": 0.13781991694122553,
+        "elapsed_seconds": 0.1421035419916734,
         "validated_responses": 1,
         "tokens_per_request": 1342
       }
@@ -176,12 +176,12 @@
       "run": 7,
       "order": "direct-relay",
       "direct": {
-        "elapsed_seconds": 0.1376292499480769,
+        "elapsed_seconds": 0.14344479201827198,
         "validated_responses": 1,
         "tokens_per_request": 1342
       },
       "relay": {
-        "elapsed_seconds": 0.17939333303365856,
+        "elapsed_seconds": 0.18471820803824812,
         "validated_responses": 1,
         "tokens_per_request": 1342
       }
@@ -190,12 +190,12 @@
       "run": 8,
       "order": "relay-direct",
       "relay": {
-        "elapsed_seconds": 0.17352470895275474,
+        "elapsed_seconds": 0.1732027499238029,
         "validated_responses": 1,
         "tokens_per_request": 1342
       },
       "direct": {
-        "elapsed_seconds": 0.13730583305004984,
+        "elapsed_seconds": 0.1348518329905346,
         "validated_responses": 1,
         "tokens_per_request": 1342
       }
@@ -204,12 +204,12 @@
       "run": 9,
       "order": "direct-relay",
       "direct": {
-        "elapsed_seconds": 0.13968745793681592,
+        "elapsed_seconds": 0.13676808297168463,
         "validated_responses": 1,
         "tokens_per_request": 1342
       },
       "relay": {
-        "elapsed_seconds": 0.17423675011377782,
+        "elapsed_seconds": 0.17489641695283353,
         "validated_responses": 1,
         "tokens_per_request": 1342
       }
@@ -218,12 +218,12 @@
       "run": 10,
       "order": "relay-direct",
       "relay": {
-        "elapsed_seconds": 0.17473420803435147,
+        "elapsed_seconds": 0.1731244169641286,
         "validated_responses": 1,
         "tokens_per_request": 1342
       },
       "direct": {
-        "elapsed_seconds": 0.13559566694311798,
+        "elapsed_seconds": 0.1437530000694096,
         "validated_responses": 1,
         "tokens_per_request": 1342
       }
@@ -232,12 +232,12 @@
       "run": 11,
       "order": "direct-relay",
       "direct": {
-        "elapsed_seconds": 0.13862958294339478,
+        "elapsed_seconds": 0.13889162510167807,
         "validated_responses": 1,
         "tokens_per_request": 1342
       },
       "relay": {
-        "elapsed_seconds": 0.1736102079739794,
+        "elapsed_seconds": 0.18409933301154524,
         "validated_responses": 1,
         "tokens_per_request": 1342
       }
@@ -246,12 +246,12 @@
       "run": 12,
       "order": "relay-direct",
       "relay": {
-        "elapsed_seconds": 0.17685291706584394,
+        "elapsed_seconds": 0.20139933296013623,
         "validated_responses": 1,
         "tokens_per_request": 1342
       },
       "direct": {
-        "elapsed_seconds": 0.13563016708940268,
+        "elapsed_seconds": 0.1663047500187531,
         "validated_responses": 1,
         "tokens_per_request": 1342
       }
@@ -260,12 +260,12 @@
       "run": 13,
       "order": "direct-relay",
       "direct": {
-        "elapsed_seconds": 0.13925062504131347,
+        "elapsed_seconds": 0.1649086669785902,
         "validated_responses": 1,
         "tokens_per_request": 1342
       },
       "relay": {
-        "elapsed_seconds": 0.1792214580345899,
+        "elapsed_seconds": 0.2098573329858482,
         "validated_responses": 1,
         "tokens_per_request": 1342
       }
@@ -274,12 +274,12 @@
       "run": 14,
       "order": "relay-direct",
       "relay": {
-        "elapsed_seconds": 0.17858833400532603,
+        "elapsed_seconds": 0.20920200005639344,
         "validated_responses": 1,
         "tokens_per_request": 1342
       },
       "direct": {
-        "elapsed_seconds": 0.1366892500082031,
+        "elapsed_seconds": 0.16712733393069357,
         "validated_responses": 1,
         "tokens_per_request": 1342
       }
@@ -288,12 +288,12 @@
       "run": 15,
       "order": "direct-relay",
       "direct": {
-        "elapsed_seconds": 0.14264824998099357,
+        "elapsed_seconds": 0.16428933397401124,
         "validated_responses": 1,
         "tokens_per_request": 1342
       },
       "relay": {
-        "elapsed_seconds": 0.18185587495099753,
+        "elapsed_seconds": 0.20694591593928635,
         "validated_responses": 1,
         "tokens_per_request": 1342
       }
@@ -302,12 +302,12 @@
       "run": 16,
       "order": "relay-direct",
       "relay": {
-        "elapsed_seconds": 0.1831322500947863,
+        "elapsed_seconds": 0.2154196249321103,
         "validated_responses": 1,
         "tokens_per_request": 1342
       },
       "direct": {
-        "elapsed_seconds": 0.14307191595435143,
+        "elapsed_seconds": 0.18658270791638643,
         "validated_responses": 1,
         "tokens_per_request": 1342
       }
@@ -316,12 +316,12 @@
       "run": 17,
       "order": "direct-relay",
       "direct": {
-        "elapsed_seconds": 0.14223570900503546,
+        "elapsed_seconds": 0.1658697499660775,
         "validated_responses": 1,
         "tokens_per_request": 1342
       },
       "relay": {
-        "elapsed_seconds": 0.17608708410989493,
+        "elapsed_seconds": 0.2107360839145258,
         "validated_responses": 1,
         "tokens_per_request": 1342
       }
@@ -330,12 +330,12 @@
       "run": 18,
       "order": "relay-direct",
       "relay": {
-        "elapsed_seconds": 0.17271750001236796,
+        "elapsed_seconds": 0.21385320799890906,
         "validated_responses": 1,
         "tokens_per_request": 1342
       },
       "direct": {
-        "elapsed_seconds": 0.13622979097999632,
+        "elapsed_seconds": 0.1583883340936154,
         "validated_responses": 1,
         "tokens_per_request": 1342
       }
@@ -344,12 +344,12 @@
       "run": 19,
       "order": "direct-relay",
       "direct": {
-        "elapsed_seconds": 0.13878987496718764,
+        "elapsed_seconds": 0.14473362499848008,
         "validated_responses": 1,
         "tokens_per_request": 1342
       },
       "relay": {
-        "elapsed_seconds": 0.17468974995426834,
+        "elapsed_seconds": 0.1822153340326622,
         "validated_responses": 1,
         "tokens_per_request": 1342
       }
@@ -358,12 +358,12 @@
       "run": 20,
       "order": "relay-direct",
       "relay": {
-        "elapsed_seconds": 0.17544320807792246,
+        "elapsed_seconds": 0.18201729201246053,
         "validated_responses": 1,
         "tokens_per_request": 1342
       },
       "direct": {
-        "elapsed_seconds": 0.1363020419375971,
+        "elapsed_seconds": 0.14308329194318503,
         "validated_responses": 1,
         "tokens_per_request": 1342
       }

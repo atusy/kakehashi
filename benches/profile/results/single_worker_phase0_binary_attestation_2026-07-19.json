@@ -1,7 +1,7 @@
 {
   "schema": 1,
   "source_repository": "https://github.com/atusy/kakehashi",
-  "source_commit": "ef3a90c767636b1fb7f1dda68f9c42a7700b34fc",
+  "source_commit": "90562849485a0ed5397795995b3da44ff9bc0c15",
   "source_remote_refs_containing_commit": [
     "refs/remotes/origin/perf/single-tree-worker-measurement"
   ],
@@ -24,16 +24,16 @@
     "sdk_version": "26.5"
   },
   "build_environment": {
-    "PATH": "/Users/atusy/.local/bin:/Users/atusy/.bun/install/global/node_modules/@openai/codex-darwin-arm64/vendor/aarch64-apple-darwin/codex-path:/Users/atusy/.codex/tmp/arg0/codex-arg0wMKckG:/opt/homebrew/bin:/opt/homebrew/sbin:/nix/var/nix/profiles/default/bin:/Users/atusy/.nix-profile/bin:/run/current-system/sw/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/Users/atusy/.local/lastresort/bin",
-    "TMPDIR": "/var/folders/t3/_nc24_w90zq79l3xyz3xzc7c0000gn/T/",
+    "PATH": "<redacted-search-path>",
+    "TMPDIR": "<redacted-path>",
     "LANG": "C.UTF-8",
     "LC_ALL": "C.UTF-8",
-    "CARGO_TARGET_DIR": "/var/folders/t3/_nc24_w90zq79l3xyz3xzc7c0000gn/T/kakehashi-attested-build-_q40yuq1/target",
-    "CARGO_HOME": "/var/folders/t3/_nc24_w90zq79l3xyz3xzc7c0000gn/T/kakehashi-attested-build-_q40yuq1/target/cargo-home"
+    "CARGO_TARGET_DIR": "${ATTESTED_BUILD_ROOT}/target",
+    "CARGO_HOME": "${ATTESTED_BUILD_ROOT}/target/cargo-home"
   },
   "built_in_fresh_target": true,
   "source_isolated_archive": true,
   "cargo_config_ancestry_clean": true,
   "binary_relative": "target/release/kakehashi",
-  "binary_sha256": "547e3ac31aebaae8fcfa3e2b32ad98041d243d07a979e91398d0e60f3c57d345"
+  "binary_sha256": "0238be0e9f8bcfa87f25170ee17102b7ff584e8af5dbecf03fc43d3d453adc6a"
 }
