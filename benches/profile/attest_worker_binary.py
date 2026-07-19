@@ -35,6 +35,26 @@ def controlled_build_environment(source, target_dir):
     return environment
 
 
+def portable_build_environment(environment):
+    path_keys = {
+        "PATH", "TMPDIR", "TMP", "TEMP", "SDKROOT",
+        "CARGO_TARGET_DIR", "CARGO_HOME",
+    }
+    portable = {}
+    for key, value in environment.items():
+        if key == "PATH":
+            portable[key] = "<redacted-search-path>"
+        elif key == "CARGO_TARGET_DIR":
+            portable[key] = "${ATTESTED_BUILD_ROOT}/target"
+        elif key == "CARGO_HOME":
+            portable[key] = "${ATTESTED_BUILD_ROOT}/target/cargo-home"
+        elif key in path_keys:
+            portable[key] = "<redacted-path>"
+        else:
+            portable[key] = value
+    return portable
+
+
 def environment_tool_version(command, environment):
     return subprocess.run(
         command, check=True, text=True, stdout=subprocess.PIPE,
@@ -273,7 +293,7 @@ def main():
         "rustc": rustc,
         "cargo": cargo,
         "native_toolchain": native_toolchain,
-        "build_environment": build_environment,
+        "build_environment": portable_build_environment(build_environment),
         "built_in_fresh_target": True,
         "source_isolated_archive": True,
         "cargo_config_ancestry_clean": True,

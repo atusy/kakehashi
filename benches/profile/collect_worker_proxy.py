@@ -75,6 +75,22 @@ def controlled_environment(source):
     }
 
 
+def portable_environment(source):
+    environment = controlled_environment(source)
+    path_keys = {
+        "PATH", "TMPDIR", "TMP", "TEMP",
+        "LD_LIBRARY_PATH", "DYLD_LIBRARY_PATH",
+    }
+    return {
+        key: (
+            "<redacted-search-path>" if key == "PATH"
+            else "<redacted-path>" if key in path_keys
+            else value
+        )
+        for key, value in environment.items()
+    }
+
+
 def official_revision_blobs(
     revision, relative_paths, official_url=OFFICIAL_NVIM_TREESITTER_URL
 ):
@@ -856,14 +872,14 @@ def collect_staged(
                 "os.cpu_count approximation of available_parallelism - 2 policy; "
                 "not the binary's reported effective pool size"
             ),
-            "binary": str(args.bin.resolve()),
+            "binary": "<provided-binary>",
             "binary_execution": "private staged copy",
             "binary_sha256": initial_binary_sha256,
-            "data_dir": str(args.data_dir.resolve()),
+            "data_dir": "<provided-data-dir>",
             "data_dir_execution": "private staged copy",
             "parser_query_file_count": initial_artifact_identity[0],
             "parser_query_tree_sha256": initial_artifact_identity[1],
-            "retained_environment": controlled_environment(os.environ),
+            "retained_environment": portable_environment(os.environ),
         },
         "artifacts": artifact_provenance(
             data_dir, args.nvim_treesitter_checkout

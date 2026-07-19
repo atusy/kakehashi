@@ -32,6 +32,7 @@ from collect_worker_proxy import (
     official_revision_blobs,
     load_binary_attestation,
     parser_library_suffix,
+    portable_environment,
     require_posix as require_collector_posix,
     require_benchmark_artifacts,
     run_order,
@@ -46,6 +47,19 @@ from collect_worker_proxy import (
 
 
 class CollectionHelpersTest(unittest.TestCase):
+    def test_recorded_environment_redacts_local_paths(self):
+        self.assertEqual(portable_environment({
+            "PATH": "/home/developer/bin:/usr/bin",
+            "TMPDIR": "/private/tmp/developer/",
+            "LANG": "C.UTF-8",
+            "LD_LIBRARY_PATH": "/home/developer/lib",
+        }), {
+            "PATH": "<redacted-search-path>",
+            "TMPDIR": "<redacted-path>",
+            "LANG": "C.UTF-8",
+            "LD_LIBRARY_PATH": "<redacted-path>",
+        })
+
     def test_read_timeout_uses_subprocess_timeout_contract(self):
         with self.assertRaises(subprocess.TimeoutExpired):
             read_with_timeout(None, lambda _stream: time.sleep(1), 0.01)

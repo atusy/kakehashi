@@ -17,6 +17,7 @@ from attest_worker_binary import (
     git,
     isolated_local_git_environment,
     native_toolchain_metadata,
+    portable_build_environment,
     require_isolated_source,
     require_uncredentialed_repository_url,
     remote_verification_environment,
@@ -25,6 +26,23 @@ from attest_worker_binary import (
 
 
 class BinaryAttestationTest(unittest.TestCase):
+    def test_recorded_build_environment_redacts_local_paths(self):
+        recorded = portable_build_environment({
+            "PATH": "/home/developer/bin:/usr/bin",
+            "TMPDIR": "/private/tmp/developer/",
+            "LANG": "C.UTF-8",
+            "CARGO_TARGET_DIR": "/private/tmp/build/target",
+            "CARGO_HOME": "/private/tmp/build/target/cargo-home",
+        })
+
+        self.assertEqual(recorded, {
+            "PATH": "<redacted-search-path>",
+            "TMPDIR": "<redacted-path>",
+            "LANG": "C.UTF-8",
+            "CARGO_TARGET_DIR": "${ATTESTED_BUILD_ROOT}/target",
+            "CARGO_HOME": "${ATTESTED_BUILD_ROOT}/target/cargo-home",
+        })
+
     def test_local_git_ignores_ambient_repository_selection(self):
         with tempfile.TemporaryDirectory() as directory:
             root = pathlib.Path(directory)
