@@ -404,7 +404,7 @@ impl ParseCoordinator {
             .is_enabled()
             .then_some(configuration_generation);
         let shadow_uri = uri.clone();
-        let populated = self
+        let mut populated = self
             .compute_pool
             .run(None, move || {
                 let shadow_summary = shadow_generation.map(|generation| {
@@ -450,7 +450,7 @@ impl ParseCoordinator {
             })
             .await
             .unwrap_or_default();
-        if let Some(summary) = populated.shadow_summary.clone() {
+        if let Some(summary) = populated.shadow_summary.take() {
             self.tree_worker_shadow.record_authoritative_summary(
                 &shadow_uri,
                 incarnation,
