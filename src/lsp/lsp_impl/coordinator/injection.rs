@@ -35,6 +35,7 @@ pub(crate) struct InjectionCoordinator {
     auto_install: AutoInstallManager,
     bridge: std::sync::Arc<BridgeCoordinator>,
     diagnostics: std::sync::Arc<DiagnosticAggregator>,
+    tree_worker_shadow: std::sync::Arc<crate::lsp::lsp_impl::tree_worker_shadow::TreeWorkerShadow>,
 }
 
 impl InjectionCoordinator {
@@ -50,6 +51,7 @@ impl InjectionCoordinator {
             auto_install: server.auto_install.clone(),
             bridge: std::sync::Arc::clone(&server.bridge),
             diagnostics: std::sync::Arc::clone(&server.diagnostics),
+            tree_worker_shadow: std::sync::Arc::clone(&server.tree_worker_shadow),
         }
     }
 
@@ -459,6 +461,7 @@ impl InjectionCoordinator {
             settings_manager: std::sync::Arc::clone(&self.settings_manager),
             auto_install: self.auto_install.clone(),
             bridge: std::sync::Arc::clone(&self.bridge),
+            tree_worker_shadow: std::sync::Arc::clone(&self.tree_worker_shadow),
         })
     }
 }

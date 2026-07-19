@@ -92,6 +92,8 @@ pub(super) struct ParseCoordinatorDeps {
     pub(super) settings_manager: std::sync::Arc<SettingsManager>,
     pub(super) auto_install: AutoInstallManager,
     pub(super) bridge: std::sync::Arc<BridgeCoordinator>,
+    pub(super) tree_worker_shadow:
+        std::sync::Arc<crate::lsp::lsp_impl::tree_worker_shadow::TreeWorkerShadow>,
 }
 
 pub(crate) struct ParseCoordinator {
@@ -104,6 +106,7 @@ pub(crate) struct ParseCoordinator {
     settings_manager: std::sync::Arc<SettingsManager>,
     auto_install: AutoInstallManager,
     bridge: std::sync::Arc<BridgeCoordinator>,
+    tree_worker_shadow: std::sync::Arc<crate::lsp::lsp_impl::tree_worker_shadow::TreeWorkerShadow>,
 }
 
 impl ParseCoordinator {
@@ -118,6 +121,7 @@ impl ParseCoordinator {
             settings_manager: std::sync::Arc::clone(&server.settings_manager),
             auto_install: server.auto_install.clone(),
             bridge: std::sync::Arc::clone(&server.bridge),
+            tree_worker_shadow: std::sync::Arc::clone(&server.tree_worker_shadow),
         })
     }
 
@@ -132,6 +136,7 @@ impl ParseCoordinator {
             settings_manager: deps.settings_manager,
             auto_install: deps.auto_install,
             bridge: deps.bridge,
+            tree_worker_shadow: deps.tree_worker_shadow,
         }
     }
 
@@ -609,6 +614,13 @@ impl ParseCoordinator {
                 // populate — the snapshot then publishes without discovery and
                 // readers discover inline for that (already-superseded) snapshot.
                 let regions = if stored {
+                    self.tree_worker_shadow.record_authoritative(
+                        &uri,
+                        incarnation,
+                        content_version,
+                        &language_name,
+                        &tree,
+                    );
                     self.populate_injections_on_pool(
                         uri.clone(),
                         text.clone(),
@@ -886,6 +898,13 @@ impl ParseCoordinator {
             // out-of-order version at publish. A rejected CAS skips populate —
             // the snapshot still publishes as stale-but-consistent.
             let regions = if stored {
+                self.tree_worker_shadow.record_authoritative(
+                    &uri,
+                    expected_incarnation,
+                    content_version,
+                    &language_name,
+                    &tree,
+                );
                 self.populate_injections_on_pool(
                     uri.clone(),
                     text.clone(),
@@ -1098,6 +1117,13 @@ impl ParseCoordinator {
             // publishes as stale-but-consistent (its readers discover inline;
             // the scheduler's dirty loop is already reparsing the newer text).
             let regions = if stored {
+                self.tree_worker_shadow.record_authoritative(
+                    uri,
+                    incarnation,
+                    content_version,
+                    &language_name,
+                    &tree,
+                );
                 self.populate_injections_on_pool(
                     uri.clone(),
                     text.clone(),

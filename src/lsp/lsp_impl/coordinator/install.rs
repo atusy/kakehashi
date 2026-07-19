@@ -50,6 +50,8 @@ pub(super) struct InstallCoordinatorDeps {
     pub(super) settings_manager: std::sync::Arc<SettingsManager>,
     pub(super) auto_install: AutoInstallManager,
     pub(super) bridge: std::sync::Arc<BridgeCoordinator>,
+    pub(super) tree_worker_shadow:
+        std::sync::Arc<crate::lsp::lsp_impl::tree_worker_shadow::TreeWorkerShadow>,
 }
 
 pub(crate) struct InstallCoordinator {
@@ -62,6 +64,7 @@ pub(crate) struct InstallCoordinator {
     settings_manager: std::sync::Arc<SettingsManager>,
     auto_install: AutoInstallManager,
     bridge: std::sync::Arc<BridgeCoordinator>,
+    tree_worker_shadow: std::sync::Arc<crate::lsp::lsp_impl::tree_worker_shadow::TreeWorkerShadow>,
 }
 
 impl InstallCoordinator {
@@ -76,6 +79,7 @@ impl InstallCoordinator {
             settings_manager: std::sync::Arc::clone(&server.settings_manager),
             auto_install: server.auto_install.clone(),
             bridge: std::sync::Arc::clone(&server.bridge),
+            tree_worker_shadow: std::sync::Arc::clone(&server.tree_worker_shadow),
         })
     }
 
@@ -90,6 +94,7 @@ impl InstallCoordinator {
             settings_manager: deps.settings_manager,
             auto_install: deps.auto_install,
             bridge: deps.bridge,
+            tree_worker_shadow: deps.tree_worker_shadow,
         }
     }
 
@@ -395,6 +400,7 @@ impl InstallCoordinator {
             settings_manager: std::sync::Arc::clone(&self.settings_manager),
             auto_install: self.auto_install.clone(),
             bridge: std::sync::Arc::clone(&self.bridge),
+            tree_worker_shadow: std::sync::Arc::clone(&self.tree_worker_shadow),
         })
     }
 }

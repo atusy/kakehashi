@@ -407,7 +407,7 @@ pub struct Kakehashi {
     parse_scheduler: std::sync::Arc<parse_scheduler::ParseScheduler>,
     /// Non-authoritative, opt-in mirror of document parser state in one
     /// process-isolated worker. Queue failure disables only this shadow path.
-    tree_worker_shadow: tree_worker_shadow::TreeWorkerShadow,
+    tree_worker_shadow: std::sync::Arc<tree_worker_shadow::TreeWorkerShadow>,
 }
 
 impl std::fmt::Debug for Kakehashi {
@@ -486,7 +486,9 @@ impl Kakehashi {
             cli_mode: std::sync::atomic::AtomicBool::new(false),
             experimental: std::sync::atomic::AtomicBool::new(crate::experimental::enabled()),
             parse_scheduler: std::sync::Arc::new(parse_scheduler::ParseScheduler::default()),
-            tree_worker_shadow: tree_worker_shadow::TreeWorkerShadow::from_environment(),
+            tree_worker_shadow: std::sync::Arc::new(
+                tree_worker_shadow::TreeWorkerShadow::from_environment(),
+            ),
         }
     }
 
