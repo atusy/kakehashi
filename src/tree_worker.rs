@@ -281,7 +281,7 @@ fn derive_snapshot(request: DeriveSnapshot, queue_wait: Duration) -> Response {
 
 pub fn run<R, W>(reader: R, writer: W, compute_threads: usize) -> io::Result<()>
 where
-    R: Read + Send,
+    R: Read,
     W: Write + Send + 'static,
 {
     run_with_build_id(reader, writer, compute_threads, BUILD_ID)
@@ -294,7 +294,7 @@ fn run_with_build_id<R, W>(
     build_id: &str,
 ) -> io::Result<()>
 where
-    R: Read + Send,
+    R: Read,
     W: Write + Send + 'static,
 {
     if compute_threads == 0 {
@@ -374,51 +374,47 @@ where
         ))
         .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "worker writer stopped"))?;
 
-    let service_responses = responses.clone();
-    let service_permits = permits.clone();
-    let service_result = pool.scope(move |scope| -> io::Result<()> {
-        while let Some(request) = decode_frame::<_, Request>(&mut reader)? {
-            let Request::DeriveSnapshot(request) = request else {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "handshake may only be sent once",
-                ));
-            };
-            if request.context.worker_generation != worker_generation {
-                service_responses
-                    .send((
-                        Response::Error(WorkerError {
-                            context: Some(request.context),
-                            message: "stale worker generation".into(),
-                        }),
-                        false,
-                    ))
-                    .map_err(|_| {
-                        io::Error::new(io::ErrorKind::BrokenPipe, "worker writer stopped")
-                    })?;
-                continue;
-            }
-            let enqueued = Instant::now();
-            permit_rx
-                .recv()
-                .map_err(|_| io::Error::other("worker admission queue stopped"))?;
-            let responses = service_responses.clone();
-            let permits = service_permits.clone();
-            scope.spawn(move |_| {
-                if responses
-                    .send((derive_snapshot(request, enqueued.elapsed()), true))
-                    .is_err()
-                {
-                    let _ = permits.send(());
-                }
-            });
+    while let Some(request) = decode_frame::<_, Request>(&mut reader)? {
+        let Request::DeriveSnapshot(request) = request else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "handshake may only be sent once",
+            ));
+        };
+        if request.context.worker_generation != worker_generation {
+            responses
+                .send((
+                    Response::Error(WorkerError {
+                        context: Some(request.context),
+                        message: "stale worker generation".into(),
+                    }),
+                    false,
+                ))
+                .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "worker writer stopped"))?;
+            continue;
         }
-        Ok(())
-    });
+        let enqueued = Instant::now();
+        permit_rx
+            .recv()
+            .map_err(|_| io::Error::other("worker admission queue stopped"))?;
+        let responses = responses.clone();
+        let permits = permits.clone();
+        pool.spawn(move || {
+            if responses
+                .send((derive_snapshot(request, enqueued.elapsed()), true))
+                .is_err()
+            {
+                let _ = permits.send(());
+            }
+        });
+    }
+    for _ in 0..max_inflight {
+        permit_rx
+            .recv()
+            .map_err(|_| io::Error::other("worker admission queue stopped"))?;
+    }
     drop(responses);
-    let writer_result = join_writer(writer_thread);
-    service_result?;
-    writer_result
+    join_writer(writer_thread)
 }
 
 fn join_writer(thread: std::thread::JoinHandle<io::Result<()>>) -> io::Result<()> {
