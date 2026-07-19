@@ -7,43 +7,43 @@
   "apply_frame_bytes": 276,
   "derive_frame_bytes": 191,
   "fused_apply_and_derive_frame_bytes": 287,
-  "spawn_us": 355163.083,
+  "spawn_us": 244572.875,
   "sync": {
-    "direct_us": 12953.582999999999,
-    "worker_parent_observed_us": 12760.708
+    "direct_us": 8648.416000000001,
+    "worker_parent_observed_us": 9069.292
   },
   "alternating_incremental_edit_and_derive": {
     "direct": {
-      "p50_us": 3157.75,
-      "p95_us": 3405.75,
-      "p99_us": 4278.75,
-      "mean_us": 3067.4421239999997
+      "p50_us": 2687.5,
+      "p95_us": 3372.167,
+      "p99_us": 4242.125,
+      "mean_us": 2917.6310412
     },
     "worker_parent_observed": {
-      "p50_us": 3206.208,
-      "p95_us": 3484.708,
-      "p99_us": 4433.459,
-      "mean_us": 3116.2796982
+      "p50_us": 2749.834,
+      "p95_us": 3633.25,
+      "p99_us": 4520.916,
+      "mean_us": 3003.309162
     },
-    "direct_requests_per_second": 326.0045208924698,
-    "worker_requests_per_second": 320.89545767589857
+    "direct_requests_per_second": 342.7438171170223,
+    "worker_requests_per_second": 332.9660537958296
   },
   "concurrent_documents": {
     "documents": 4,
     "measurement_order": "direct_then_worker",
     "direct": {
-      "p50_us": 3763.292,
-      "p95_us": 4469.417,
-      "p99_us": 5173.417,
-      "mean_us": 3852.0304146
+      "p50_us": 3842.667,
+      "p95_us": 4537.417,
+      "p99_us": 5085.459,
+      "mean_us": 3907.1822521999998
     },
     "worker_parent_observed": {
-      "p50_us": 4091.125,
-      "p95_us": 4735.791,
-      "p99_us": 5107.583,
-      "mean_us": 4138.2528908
+      "p50_us": 3968.208,
+      "p95_us": 5030.042,
+      "p99_us": 10045.875,
+      "mean_us": 4195.8995668
     },
-    "direct_requests_per_second": 1029.0480718777728,
-    "worker_requests_per_second": 963.93235826149
+    "direct_requests_per_second": 1016.4734945630968,
+    "worker_requests_per_second": 943.5595912962194
   }
 }

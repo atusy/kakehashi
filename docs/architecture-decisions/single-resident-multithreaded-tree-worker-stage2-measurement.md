@@ -37,7 +37,7 @@ cover injections, queries, semantic tokens, or automatic worker restart.
 The committed aggregate is
 `benches/profile/results/single_worker_stage2_2026-07-19.json`; four raw
 collector outputs, two per size, are retained beside it. The aggregate records
-source commit `8adde114cfafe6f8cb1894e72c90410a37e04a49` and the executable,
+source commit `40a8fc5a7e65b8b96b49a461bec4e77de9cb67d0` and the executable,
 benchmark, and parser SHA-256 identities. The release build ran on an Apple M4
 with macOS 26.5.1 and Rust 1.95.0. The Rust grammar source revision is recorded
 in the aggregate.
@@ -61,31 +61,31 @@ large workload. The 285-byte small fused request is 96.5% smaller than Stage
 
 | Batch | Direct p50 / p95 / p99 | Worker p50 / p95 / p99 | Worker p50 delta |
 |---|---:|---:|---:|
-| A | 310.4 / 365.0 / 396.8 us | 376.1 / 450.1 / 501.4 us | +21.2% |
-| B | 261.8 / 317.0 / 356.6 us | 303.3 / 417.0 / 463.8 us | +15.9% |
+| A | 309.4 / 357.4 / 390.9 us | 372.6 / 441.3 / 489.0 us | +20.4% |
+| B | 304.9 / 318.5 / 362.3 us | 352.5 / 417.7 / 482.9 us | +15.6% |
 
 | Batch | Direct | Worker | Worker throughput delta |
 |---|---:|---:|---:|
-| A | 3238.0 req/s | 2661.1 req/s | -17.8% |
-| B | 3587.6 req/s | 3040.5 req/s | -15.2% |
+| A | 3325.9 req/s | 2741.3 req/s | -17.6% |
+| B | 3448.8 req/s | 2904.4 req/s | -15.8% |
 
-For a single sequential small document, the worker remains 42--66 us slower at
-p50 and 15--18% lower in throughput than the same incremental work in process.
+For a single sequential small document, the worker remains 48--63 us slower at
+p50 and 16--18% lower in throughput than the same incremental work in process.
 That residual includes JSON serialization, two pipe crossings, scheduling,
 response routing, parent wakeup, and one atomic retained-byte reservation.
 
 | Batch and order | Direct p50 / p95 / p99 | Worker p50 / p95 / p99 |
 |---|---:|---:|
-| A, direct first | 350.4 / 416.3 / 464.6 us | 385.6 / 487.1 / 552.1 us |
-| B, worker first | 339.8 / 398.7 / 460.7 us | 434.7 / 522.2 / 574.5 us |
+| A, direct first | 351.7 / 388.8 / 424.2 us | 398.2 / 514.9 / 623.8 us |
+| B, worker first | 346.9 / 378.0 / 409.5 us | 432.5 / 498.8 / 582.8 us |
 
 | Batch | Direct | Worker | Worker throughput delta |
 |---|---:|---:|---:|
-| A | 10964.8 req/s | 9880.6 req/s | -9.9% |
-| B | 11380.4 req/s | 9008.0 req/s | -20.8% |
+| A | 11298.5 req/s | 9517.4 req/s | -15.8% |
+| B | 11428.7 req/s | 9124.0 req/s | -20.2% |
 
-The fixed worker scales from 2.66--3.04k sequential requests/s to 9.01--9.88k
-requests/s, or 3.0--3.7x, while retaining FIFO order within each document. One
+The fixed worker scales from 2.74--2.90k sequential requests/s to 9.12--9.52k
+requests/s, or 3.1--3.5x, while retaining FIFO order within each document. One
 worker therefore uses its internal threads materially; it is not a
 single-threaded bottleneck. The process-local baseline remains faster for this
 small operation.
@@ -94,36 +94,36 @@ small operation.
 
 | Batch | Direct p50 / p95 / p99 | Worker p50 / p95 / p99 | Worker p50 delta |
 |---|---:|---:|---:|
-| A | 3157.8 / 3405.8 / 4278.8 us | 3206.2 / 3484.7 / 4433.5 us | +1.5% |
-| B | 2927.9 / 3262.0 / 3880.3 us | 2968.3 / 3369.9 / 4215.0 us | +1.4% |
+| A | 2687.5 / 3372.2 / 4242.1 us | 2749.8 / 3633.3 / 4520.9 us | +2.3% |
+| B | 2669.0 / 3231.7 / 3580.8 us | 2738.8 / 3320.9 / 3833.9 us | +2.6% |
 
 | Batch | Direct | Worker | Worker throughput delta |
 |---|---:|---:|---:|
-| A | 326.0 req/s | 320.9 req/s | -1.6% |
-| B | 340.6 req/s | 330.5 req/s | -3.0% |
+| A | 342.7 req/s | 333.0 req/s | -2.9% |
+| B | 356.2 req/s | 347.1 req/s | -2.6% |
 
 | Batch and order | Direct p50 / p95 / p99 | Worker p50 / p95 / p99 |
 |---|---:|---:|
-| A, direct first | 3763.3 / 4469.4 / 5173.4 us | 4091.1 / 4735.8 / 5107.6 us |
-| B, worker first | 3998.0 / 4737.4 / 5867.6 us | 3987.2 / 5143.5 / 7213.1 us |
+| A, direct first | 3842.7 / 4537.4 / 5085.5 us | 3968.2 / 5030.0 / 10045.9 us |
+| B, worker first | 3994.5 / 4785.8 / 6206.3 us | 3976.4 / 4747.2 / 6533.5 us |
 
 | Batch | Direct | Worker | Worker throughput delta |
 |---|---:|---:|---:|
-| A | 1029.0 req/s | 963.9 req/s | -6.3% |
-| B | 967.2 req/s | 955.8 req/s | -1.2% |
+| A | 1016.5 req/s | 943.6 req/s | -7.2% |
+| B | 971.2 req/s | 965.7 req/s | -0.6% |
 
-For the large near-EOF edit, the sequential gap narrows to about 1.6--3.0%.
-The worker is 6.3% slower in concurrent batch A and 1.2% slower in batch B;
-batch B worker p50 is 0.3% faster but its tail and total throughput are worse.
+For the large near-EOF edit, the sequential gap narrows to about 2.6--2.9%.
+The worker is 7.2% slower in concurrent batch A and 0.6% slower in batch B;
+batch B worker p50 and p95 are slightly faster but its p99 and total throughput are worse.
 This is not evidence of a worker win. It shows that fixed IPC overhead becomes small relative to the
 O(n) text clone and point calculation shared by both implementations. The
-worker scales 2.9--3.0x from sequential to four document lanes.
+worker scales 2.8x from sequential to four document lanes.
 
-Initial full synchronization was 3.84 ms directly versus 2.59 ms through the
-worker in small batch A and 2.36 versus 2.68 ms in small batch B. For the large
-document it was 12.95 versus 12.76 ms and 12.01 versus 13.22 ms. These cold,
+Initial full synchronization was 1.18 ms directly versus 1.38 ms through the
+worker in small batch A and 2.18 versus 2.60 ms in small batch B. For the large
+document it was 8.65 versus 9.07 ms and 12.55 versus 12.84 ms. These cold,
 single-sample, order-sensitive values are provenance rather than acceptance
-evidence. Spawn plus executable-digest handshake took 0.35--0.99 s; as in Stage
+evidence. Spawn plus executable-digest handshake took 0.22--0.35 s; as in Stage
 1, the current implementation hashes the full executable on both sides and is
 not representative of a retained immutable session image.
 
@@ -131,7 +131,7 @@ Stage 1 and Stage 2 measure different work: full parsing versus one incremental
 edit. Their absolute numbers are therefore not a speedup ratio for equivalent
 operations. They do show that retaining text and Tree state removes the
 dominant steady-state payload and full-parse cost: small-worker p50 falls from
-roughly 1.15 ms to roughly 0.30 ms while the request frame falls from 8,069 to
+roughly 1.15 ms to roughly 0.35 ms while the request frame falls from 8,069 to
 285 bytes.
 
 An earlier exploratory two-request version performed edit and derive
