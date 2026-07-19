@@ -250,6 +250,46 @@ fn authoritative_worker_serves_injected_node_accessors() {
     );
     assert!(semantic["result"]["data"].is_array(), "{semantic:?}");
 
+    client.send_notification(
+        "textDocument/didChange",
+        json!({
+            "textDocument": { "uri": uri, "version": 2 },
+            "contentChanges": [{
+                "range": {
+                    "start": { "line": 0, "character": 0 },
+                    "end": { "line": 0, "character": 0 }
+                },
+                "text": "\n"
+            }]
+        }),
+    );
+    let edited_node = client.send_request(
+        "kakehashi/node",
+        json!({
+            "textDocument": { "uri": uri },
+            "position": { "line": 4, "character": 0 },
+            "injection": true
+        }),
+    );
+    assert_eq!(
+        edited_node["result"]["kind"], "identifier",
+        "{edited_node:?}"
+    );
+    let edited_id = edited_node["result"]["id"].as_str().unwrap();
+    let edited_range = client.send_request(
+        "kakehashi/node/range",
+        json!({ "textDocument": { "uri": uri }, "id": edited_id }),
+    );
+    assert_eq!(edited_range["result"]["start"]["line"], 4);
+    let selection = client.send_request(
+        "textDocument/selectionRange",
+        json!({
+            "textDocument": { "uri": uri },
+            "positions": [{ "line": 4, "character": 0 }]
+        }),
+    );
+    assert!(selection["result"].is_array(), "{selection:?}");
+
     let stderr = shutdown_and_stderr(client);
     assert!(stderr.contains("Authoritative tree worker"), "{stderr}");
     assert!(!stderr.contains("node mismatch"), "{stderr}");

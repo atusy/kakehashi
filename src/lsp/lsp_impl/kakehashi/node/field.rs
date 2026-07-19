@@ -90,6 +90,10 @@ impl Kakehashi {
             }
             _ => None,
         };
+        let worker = field_name_json(shadow);
+        if self.tree_worker_shadow.is_authoritative() {
+            return Ok(worker.unwrap_or(Value::Null));
+        }
         let value = self
             .with_node_by_id(&params.text_document.uri, &params.id, move |n| {
                 index.and_then(|i| n.field_name_for_child(i))
@@ -97,7 +101,6 @@ impl Kakehashi {
             .await
             .map(|(_uri, _layer, _incarnation, field)| json!({ "fieldName": field }))
             .unwrap_or(Value::Null);
-        let worker = field_name_json(shadow);
         compare_field_name(worker.as_ref(), &value, false);
         if self.tree_worker_shadow.is_authoritative() {
             Ok(worker.unwrap_or(Value::Null))
@@ -129,6 +132,10 @@ impl Kakehashi {
             }
             _ => None,
         };
+        let worker = field_name_json(shadow);
+        if self.tree_worker_shadow.is_authoritative() {
+            return Ok(worker.unwrap_or(Value::Null));
+        }
         let value = self
             .with_node_by_id(&params.text_document.uri, &params.id, move |n| {
                 index.and_then(|i| n.field_name_for_named_child(i))
@@ -136,7 +143,6 @@ impl Kakehashi {
             .await
             .map(|(_uri, _layer, _incarnation, field)| json!({ "fieldName": field }))
             .unwrap_or(Value::Null);
-        let worker = field_name_json(shadow);
         compare_field_name(worker.as_ref(), &value, true);
         if self.tree_worker_shadow.is_authoritative() {
             Ok(worker.unwrap_or(Value::Null))

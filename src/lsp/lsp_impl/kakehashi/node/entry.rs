@@ -187,6 +187,81 @@ impl Kakehashi {
             return Ok(Value::Null);
         };
 
+        if self.tree_worker_shadow.is_authoritative() {
+            let Some((text, incarnation, content_version, language_name)) =
+                self.documents.get(&uri).and_then(|document| {
+                    let text = document.text_arc();
+                    let language = self.language.detect_language(
+                        uri.path(),
+                        &text,
+                        None,
+                        document.language_id(),
+                    )?;
+                    Some((
+                        text,
+                        document.incarnation(),
+                        document.content_version(),
+                        language,
+                    ))
+                })
+            else {
+                return Ok(Value::Null);
+            };
+            if text.is_empty() {
+                return Ok(Value::Null);
+            }
+            let Some(byte) = PositionMapper::new(&text).position_to_byte(position) else {
+                return Ok(Value::Null);
+            };
+            let load = self
+                .language
+                .ensure_language_loaded_async(&language_name)
+                .await;
+            if !load.success {
+                return Ok(Value::Null);
+            }
+            let Some(current) = self.documents.get(&uri) else {
+                return Ok(Value::Null);
+            };
+            if current.incarnation() != incarnation || current.content_version() != content_version
+            {
+                return Ok(Value::Null);
+            }
+            drop(current);
+            let Some(grammar) = self.language.worker_grammar_descriptor(&language_name) else {
+                return Ok(Value::Null);
+            };
+            let generation = self.language.configuration_generation();
+            if self.tree_worker_shadow.needs_document_sync(
+                &uri,
+                incarnation,
+                content_version,
+                generation,
+                &grammar.queries,
+            ) {
+                self.refresh_tree_worker_documents(std::slice::from_ref(&uri));
+            }
+            let worker = self
+                .tree_worker_shadow
+                .resolve_node(
+                    &uri,
+                    incarnation,
+                    content_version,
+                    generation,
+                    byte,
+                    selector.worker_layer(),
+                )
+                .await;
+            if let Some(result) = worker.as_ref() {
+                for node in &result.nodes {
+                    let public = serde_json::json!({ "id": node.id.local_id, "kind": node.kind });
+                    self.tree_worker_shadow
+                        .record_node_mapping(&uri, &public, node);
+                }
+            }
+            return Ok(self.tree_worker_shadow.public_node_result(worker, false));
+        }
+
         // Resolve a CURRENT parse snapshot (parse-snapshot ADR §3): the
         // request's position is authored against the live text, so a trailing
         // snapshot rejects immediately with the universal null; only the

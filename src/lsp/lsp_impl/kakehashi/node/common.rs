@@ -322,16 +322,15 @@ impl Kakehashi {
             }
             None => None,
         };
+        if self.tree_worker_shadow.is_authoritative() {
+            return self.tree_worker_shadow.public_node_result(worker, false);
+        }
         let authoritative = self.navigate_to_node(lsp_uri, id, f).await;
         if let (Some(uri), Some(worker)) = (uri.as_ref(), worker.as_ref()) {
             self.tree_worker_shadow
                 .compare_node_result(uri, &operation, &authoritative, worker);
         }
-        if self.tree_worker_shadow.is_authoritative() {
-            self.tree_worker_shadow.public_node_result(worker, false)
-        } else {
-            authoritative
-        }
+        authoritative
     }
 
     /// Like [`navigate_to_node`](Self::navigate_to_node), but `f` also receives
@@ -375,16 +374,15 @@ impl Kakehashi {
             }
             None => None,
         };
+        if self.tree_worker_shadow.is_authoritative() {
+            return self.tree_worker_shadow.public_node_result(worker, false);
+        }
         let authoritative = self.navigate_to_node_in_ranges(lsp_uri, id, f).await;
         if let (Some(uri), Some(worker)) = (uri.as_ref(), worker.as_ref()) {
             self.tree_worker_shadow
                 .compare_node_result(uri, &operation, &authoritative, worker);
         }
-        if self.tree_worker_shadow.is_authoritative() {
-            self.tree_worker_shadow.public_node_result(worker, false)
-        } else {
-            authoritative
-        }
+        authoritative
     }
 
     /// Resolve `id` **and** `descendant_id` in the layer that minted them, run
@@ -510,6 +508,9 @@ impl Kakehashi {
             }
             None => None,
         };
+        if self.tree_worker_shadow.is_authoritative() {
+            return self.tree_worker_shadow.public_node_result(worker, false);
+        }
         let authoritative = self
             .navigate_with_descendant(lsp_uri, id, descendant_id, f)
             .await;
@@ -521,11 +522,7 @@ impl Kakehashi {
                 worker,
             );
         }
-        if self.tree_worker_shadow.is_authoritative() {
-            self.tree_worker_shadow.public_node_result(worker, false)
-        } else {
-            authoritative
-        }
+        authoritative
     }
 
     /// Resolve `id`, run `f` to collect a list of related nodes (children,
@@ -570,15 +567,14 @@ impl Kakehashi {
             }
             None => None,
         };
+        if self.tree_worker_shadow.is_authoritative() {
+            return self.tree_worker_shadow.public_node_result(worker, true);
+        }
         let authoritative = self.navigate_to_nodes(lsp_uri, id, f).await;
         if let (Some(uri), Some(worker)) = (uri.as_ref(), worker.as_ref()) {
             self.tree_worker_shadow
                 .compare_node_result(uri, &operation, &authoritative, worker);
         }
-        if self.tree_worker_shadow.is_authoritative() {
-            self.tree_worker_shadow.public_node_result(worker, true)
-        } else {
-            authoritative
-        }
+        authoritative
     }
 }

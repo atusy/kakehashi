@@ -42,6 +42,58 @@ impl Kakehashi {
             return Ok(None);
         }
 
+        if self.tree_worker_shadow.is_authoritative() {
+            let Some((incarnation, content_version)) = self
+                .documents
+                .get(&uri)
+                .map(|document| (document.incarnation(), document.content_version()))
+            else {
+                return Ok(None);
+            };
+            let generation = self.language.configuration_generation();
+            let Some(grammar) = self.language.worker_grammar_descriptor(&language_name) else {
+                return Ok(None);
+            };
+            if self.tree_worker_shadow.needs_document_sync(
+                &uri,
+                incarnation,
+                content_version,
+                generation,
+                &grammar.queries,
+            ) {
+                self.refresh_tree_worker_documents(std::slice::from_ref(&uri));
+            }
+            let worker = self
+                .tree_worker_shadow
+                .selection_ranges(
+                    &uri,
+                    incarnation,
+                    content_version,
+                    generation,
+                    positions
+                        .into_iter()
+                        .map(|position| crate::tree_worker::WirePosition {
+                            line: position.line,
+                            character: position.character,
+                        })
+                        .collect(),
+                )
+                .await;
+            if !self.documents.get(&uri).is_some_and(|document| {
+                document.incarnation() == incarnation
+                    && document.content_version() == content_version
+            }) {
+                return Err(crate::error::content_modified_error());
+            }
+            return Ok(worker.map(|worker| {
+                worker
+                    .ranges
+                    .into_iter()
+                    .map(selection_range_from_wire)
+                    .collect()
+            }));
+        }
+
         // Resolve the latest parse snapshot, waiting briefly (bounded) for a
         // *current* one — this reader's coordinates are authored against the
         // live text, so a trailing snapshot cannot answer it (ADR §3

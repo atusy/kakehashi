@@ -86,6 +86,60 @@ impl Kakehashi {
             return Ok(None);
         }
 
+        if self.tree_worker_shadow.is_authoritative() {
+            let Some((text, content_version, incarnation)) = self
+                .documents
+                .get(&uri)
+                .map(|doc| (doc.text_arc(), doc.content_version(), doc.incarnation()))
+            else {
+                return Ok(None);
+            };
+            let mapper = PositionMapper::new(&text);
+            if mapper.position_to_byte_strict(position).is_none() {
+                return Ok(None);
+            }
+            let generation = self.language.configuration_generation();
+            let Some(grammar) = self.language.worker_grammar_descriptor(&language) else {
+                return Ok(None);
+            };
+            if self.tree_worker_shadow.needs_document_sync(
+                &uri,
+                incarnation,
+                content_version,
+                generation,
+                &grammar.queries,
+            ) {
+                self.refresh_tree_worker_documents(std::slice::from_ref(&uri));
+            }
+            let facts = self
+                .tree_worker_shadow
+                .native_bindings(
+                    &uri,
+                    incarnation,
+                    content_version,
+                    generation,
+                    crate::tree_worker::WirePosition {
+                        line: position.line,
+                        character: position.character,
+                    },
+                )
+                .await
+                .and_then(|worker| worker.facts);
+            if !self.documents.get(&uri).is_some_and(|doc| {
+                doc.content_version() == content_version
+                    && doc.incarnation() == incarnation
+                    && std::sync::Arc::ptr_eq(&doc.text_arc(), &text)
+            }) {
+                return Ok(None);
+            }
+            return Ok(facts.and_then(|facts| {
+                f(NativeBindingsContext {
+                    facts: &facts,
+                    mapper: &mapper,
+                })
+            }));
+        }
+
         // Wait for / trigger the off-ingress parse, then snapshot text and
         // tree without holding the store Ref across compute. The text Arc
         // doubles as the staleness witness for the publish-time check below

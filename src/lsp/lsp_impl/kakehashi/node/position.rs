@@ -44,6 +44,9 @@ impl Kakehashi {
                 crate::tree_worker::NodeScalarOperation::Range,
             )
             .await;
+        if self.tree_worker_shadow.is_authoritative() {
+            return Ok(position_scalar_json(shadow, "range").unwrap_or(Value::Null));
+        }
         let value = self
             .with_node_text(&params.text_document.uri, &params.id, move |n, text| {
                 let mapper = PositionMapper::new(text);
@@ -75,6 +78,9 @@ impl Kakehashi {
                 crate::tree_worker::NodeScalarOperation::StartPosition,
             )
             .await;
+        if self.tree_worker_shadow.is_authoritative() {
+            return Ok(position_scalar_json(shadow, "startPosition").unwrap_or(Value::Null));
+        }
         let value = self
             .with_node_text(&params.text_document.uri, &params.id, move |n, text| {
                 PositionMapper::new(text).byte_to_position(n.start_byte())
@@ -101,6 +107,9 @@ impl Kakehashi {
                 crate::tree_worker::NodeScalarOperation::EndPosition,
             )
             .await;
+        if self.tree_worker_shadow.is_authoritative() {
+            return Ok(position_scalar_json(shadow, "endPosition").unwrap_or(Value::Null));
+        }
         let value = self
             .with_node_text(&params.text_document.uri, &params.id, move |n, text| {
                 PositionMapper::new(text).byte_to_position(n.end_byte())
@@ -222,7 +231,21 @@ fn compare_position_scalar(
     authoritative: &Value,
     field: &str,
 ) -> Option<Value> {
-    let worker = match shadow {
+    let worker = position_scalar_json(shadow, field)?;
+    if &worker != authoritative {
+        log::debug!(
+            target: "kakehashi::tree_worker_shadow",
+            "node position mismatch field={field} authoritative={authoritative} worker={worker}",
+        );
+    }
+    Some(worker)
+}
+
+fn position_scalar_json(
+    shadow: Option<crate::tree_worker::NodeScalarValue>,
+    field: &str,
+) -> Option<Value> {
+    Some(match shadow {
         Some(crate::tree_worker::NodeScalarValue::Position(position)) => {
             let mut object = serde_json::Map::new();
             object.insert(field.into(), wire_position_json(position));
@@ -232,12 +255,5 @@ fn compare_position_scalar(
             json!({ "start": wire_position_json(start), "end": wire_position_json(end) })
         }
         _ => return None,
-    };
-    if &worker != authoritative {
-        log::debug!(
-            target: "kakehashi::tree_worker_shadow",
-            "node position mismatch field={field} authoritative={authoritative} worker={worker}",
-        );
-    }
-    Some(worker)
+    })
 }

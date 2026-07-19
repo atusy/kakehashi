@@ -53,12 +53,15 @@ macro_rules! scalar_accessor {
             }
             Err(_) => None,
         };
+        let worker = shadow.and_then(|shadow| scalar_json($field, shadow));
+        if $self.tree_worker_shadow.is_authoritative() {
+            return Ok(worker.unwrap_or(Value::Null));
+        }
         let value = $self
             .with_node_by_id(&$params.text_document.uri, &$params.id, $f)
             .await
             .map(|(_uri, _layer, _incarnation, v)| json!({ $field: v }))
             .unwrap_or(Value::Null);
-        let worker = shadow.and_then(|shadow| scalar_json($field, shadow));
         if let Some(shadow) = worker.as_ref()
             && shadow != &value
         {
@@ -172,6 +175,15 @@ impl Kakehashi {
             }
             Err(_) => None,
         };
+        if self.tree_worker_shadow.is_authoritative() {
+            return Ok(match shadow {
+                Some(NodeScalarValue::ByteRange {
+                    start_byte,
+                    end_byte,
+                }) => json!({ "startByte": start_byte, "endByte": end_byte }),
+                _ => Value::Null,
+            });
+        }
         let value = self
             .with_node_by_id(
                 &params.text_document.uri,

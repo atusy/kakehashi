@@ -862,6 +862,86 @@ impl Kakehashi {
         let (mut cancel_rx, _cancel_guard) = self.subscribe_cancel(upstream_id.as_ref());
         let cancel_token = crate::cancel::CancelToken::default();
 
+        if self.tree_worker_shadow.is_authoritative() {
+            let Some(language_id) = self.document_language(&uri) else {
+                return Ok(None);
+            };
+            if !self
+                .language
+                .ensure_language_loaded_async(&language_id)
+                .await
+                .success
+            {
+                return Ok(None);
+            }
+            let Some((incarnation, content_version)) = self
+                .documents
+                .get(&uri)
+                .map(|document| (document.incarnation(), document.content_version()))
+            else {
+                return Ok(None);
+            };
+            let generation = self.cache.semantic_token_generation();
+            let worker_generation = self.language.configuration_generation();
+            let Some(grammar) = self.language.worker_grammar_descriptor(&language_id) else {
+                return Ok(None);
+            };
+            if self.tree_worker_shadow.needs_document_sync(
+                &uri,
+                incarnation,
+                content_version,
+                worker_generation,
+                &grammar.queries,
+            ) {
+                self.refresh_tree_worker_documents(std::slice::from_ref(&uri));
+            }
+            let worker = self.tree_worker_shadow.captures(
+                &uri,
+                incarnation,
+                content_version,
+                worker_generation,
+                kind.to_string(),
+                lsp_range.map(|range| crate::tree_worker::WireRange {
+                    start: crate::tree_worker::WirePosition {
+                        line: range.start.line,
+                        character: range.start.character,
+                    },
+                    end: crate::tree_worker::WirePosition {
+                        line: range.end.line,
+                        character: range.end.character,
+                    },
+                }),
+                injection,
+            );
+            let worker = match cancel_rx.as_mut() {
+                Some(rx) => {
+                    tokio::select! {
+                        biased;
+                        _ = rx => return Err(JsonRpcError::request_cancelled()),
+                        worker = worker => worker,
+                    }
+                }
+                None => worker.await,
+            };
+            if !self.documents.get(&uri).is_some_and(|document| {
+                document.incarnation() == incarnation
+                    && document.content_version() == content_version
+            }) || self.cache.semantic_token_generation() != generation
+            {
+                return Ok(None);
+            }
+            return Ok(worker
+                .filter(|worker| worker.available)
+                .map(|worker| ComputedCaptures {
+                    uri,
+                    incarnation,
+                    generation,
+                    entry_content_version: content_version,
+                    matches: Arc::new(worker.matches),
+                    skipped: Arc::new(worker.skipped),
+                }));
+        }
+
         // Serve-current (parse-snapshot ADR §3, revised like semanticTokens):
         // park — racing the client's cancel — until the latest snapshot
         // matches the live text, then walk THAT. The previous serve-stale
