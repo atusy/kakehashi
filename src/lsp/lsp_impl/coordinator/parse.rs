@@ -619,6 +619,7 @@ impl ParseCoordinator {
                         incarnation,
                         content_version,
                         &language_name,
+                        self.language.configuration_generation(),
                         &tree,
                     );
                     self.populate_injections_on_pool(
@@ -903,6 +904,7 @@ impl ParseCoordinator {
                     expected_incarnation,
                     content_version,
                     &language_name,
+                    self.language.configuration_generation(),
                     &tree,
                 );
                 self.populate_injections_on_pool(
@@ -1122,6 +1124,7 @@ impl ParseCoordinator {
                     incarnation,
                     content_version,
                     &language_name,
+                    self.language.configuration_generation(),
                     &tree,
                 );
                 self.populate_injections_on_pool(

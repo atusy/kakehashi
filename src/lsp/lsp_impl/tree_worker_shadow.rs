@@ -58,6 +58,7 @@ pub(super) struct TreeWorkerShadow {
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct TreeSummary {
     language: String,
+    configuration_generation: u64,
     root_kind: String,
     root_start_byte: usize,
     root_end_byte: usize,
@@ -69,6 +70,7 @@ struct TreeSummary {
 struct PendingComparison {
     incarnation: u64,
     content_version: u64,
+    configuration_generation: u64,
     authoritative: Option<TreeSummary>,
     shadow: Option<TreeSummary>,
 }
@@ -223,6 +225,7 @@ impl TreeWorkerShadow {
         incarnation: u64,
         content_version: u64,
         language: &str,
+        configuration_generation: u64,
         tree: &tree_sitter::Tree,
     ) {
         if !self.is_enabled() {
@@ -232,7 +235,11 @@ impl TreeWorkerShadow {
             uri.as_str(),
             incarnation,
             content_version,
-            ComparisonSide::Authoritative(TreeSummary::from_tree(language, tree)),
+            ComparisonSide::Authoritative(TreeSummary::from_tree(
+                language,
+                configuration_generation,
+                tree,
+            )),
         );
     }
 
@@ -358,6 +365,7 @@ fn run_actor(
             }
             ShadowCommand::Close(request) => {
                 replicas.remove(&request.context.uri);
+                comparisons.pending.remove(&request.context.uri);
                 (client.close_document(request), None)
             }
             ShadowCommand::Shutdown => unreachable!(),
@@ -425,13 +433,22 @@ enum ComparisonSide {
 
 impl ComparisonStore {
     fn record(&self, uri: &str, incarnation: u64, content_version: u64, side: ComparisonSide) {
-        let incoming = (incarnation, content_version);
+        let incoming_generation = match &side {
+            ComparisonSide::Authoritative(summary) | ComparisonSide::Shadow(summary) => {
+                summary.configuration_generation
+            }
+        };
+        let incoming = (incarnation, content_version, incoming_generation);
         let mut pending = if let Some(pending) = self.pending.get_mut(uri) {
             pending
         } else {
             self.pending.entry(uri.to_string()).or_default()
         };
-        let current = (pending.incarnation, pending.content_version);
+        let current = (
+            pending.incarnation,
+            pending.content_version,
+            pending.configuration_generation,
+        );
         if incoming < current {
             self.superseded.fetch_add(1, Ordering::Relaxed);
             return;
@@ -443,6 +460,7 @@ impl ComparisonStore {
             *pending = PendingComparison {
                 incarnation,
                 content_version,
+                configuration_generation: incoming_generation,
                 ..Default::default()
             };
         }
@@ -450,21 +468,27 @@ impl ComparisonStore {
             ComparisonSide::Authoritative(summary) => pending.authoritative = Some(summary),
             ComparisonSide::Shadow(summary) => pending.shadow = Some(summary),
         }
-        let completed = pending
-            .authoritative
-            .as_ref()
-            .zip(pending.shadow.as_ref())
-            .map(|(authoritative, shadow)| (authoritative.clone(), shadow.clone()));
+        let completed = pending.authoritative.is_some() && pending.shadow.is_some();
         drop(pending);
-        let Some((authoritative, shadow)) = completed else {
+        if !completed {
             return;
-        };
-        self.pending.remove_if(uri, |_, pending| {
+        }
+        let Some((_, completed)) = self.pending.remove_if(uri, |_, pending| {
             pending.incarnation == incarnation
                 && pending.content_version == content_version
+                && pending.configuration_generation == incoming_generation
                 && pending.authoritative.is_some()
                 && pending.shadow.is_some()
-        });
+        }) else {
+            self.superseded.fetch_add(1, Ordering::Relaxed);
+            return;
+        };
+        let authoritative = completed
+            .authoritative
+            .expect("completed comparison has an authoritative summary");
+        let shadow = completed
+            .shadow
+            .expect("completed comparison has a shadow summary");
         if authoritative == shadow {
             self.matched.fetch_add(1, Ordering::Relaxed);
         } else {
@@ -482,10 +506,11 @@ impl ComparisonStore {
 }
 
 impl TreeSummary {
-    fn from_tree(language: &str, tree: &tree_sitter::Tree) -> Self {
+    fn from_tree(language: &str, configuration_generation: u64, tree: &tree_sitter::Tree) -> Self {
         let root = tree.root_node();
         Self {
             language: language.to_string(),
+            configuration_generation,
             root_kind: root.kind().to_string(),
             root_start_byte: root.start_byte(),
             root_end_byte: root.end_byte(),
@@ -497,6 +522,7 @@ impl TreeSummary {
     fn from_snapshot(snapshot: &crate::tree_worker::DerivedSnapshot) -> Self {
         Self {
             language: snapshot.language.clone(),
+            configuration_generation: snapshot.context.configuration_generation,
             root_kind: snapshot.root_kind.clone(),
             root_start_byte: snapshot.root_start_byte,
             root_end_byte: snapshot.root_end_byte,
@@ -564,6 +590,7 @@ mod tests {
     fn summary(root_kind: &str) -> TreeSummary {
         TreeSummary {
             language: "rust".into(),
+            configuration_generation: 3,
             root_kind: root_kind.into(),
             root_start_byte: 0,
             root_end_byte: 10,
@@ -703,6 +730,28 @@ mod tests {
         assert_eq!(store.matched.load(Ordering::Relaxed), 0);
         assert_eq!(store.mismatched.load(Ordering::Relaxed), 1);
         assert_eq!(store.superseded.load(Ordering::Relaxed), 2);
+        assert!(store.pending.is_empty());
+    }
+
+    #[test]
+    fn comparisons_do_not_pair_across_configuration_generations() {
+        let store = ComparisonStore::default();
+        let authoritative = summary("source_file");
+        let mut stale_shadow = authoritative.clone();
+        stale_shadow.configuration_generation -= 1;
+
+        store.record(
+            "file:///a.rs",
+            1,
+            2,
+            ComparisonSide::Authoritative(authoritative.clone()),
+        );
+        store.record("file:///a.rs", 1, 2, ComparisonSide::Shadow(stale_shadow));
+        store.record("file:///a.rs", 1, 2, ComparisonSide::Shadow(authoritative));
+
+        assert_eq!(store.matched.load(Ordering::Relaxed), 1);
+        assert_eq!(store.mismatched.load(Ordering::Relaxed), 0);
+        assert_eq!(store.superseded.load(Ordering::Relaxed), 1);
         assert!(store.pending.is_empty());
     }
 }
