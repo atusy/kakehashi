@@ -1,49 +1,49 @@
 {
   "schema": 1,
-  "requests": 1000,
+  "requests": 5000,
   "threads": 4,
   "source_lines": 200,
   "source_bytes": 7651,
   "apply_frame_bytes": 274,
   "derive_frame_bytes": 191,
   "fused_apply_and_derive_frame_bytes": 285,
-  "spawn_us": 1141259.625,
+  "spawn_us": 372558.08400000003,
   "sync": {
-    "direct_us": 1832.4170000000001,
-    "worker_parent_observed_us": 2869.834
+    "direct_us": 2114.791,
+    "worker_parent_observed_us": 2750.041
   },
   "alternating_incremental_edit_and_derive": {
     "direct": {
-      "p50_us": 265.959,
-      "p95_us": 317.334,
-      "p99_us": 325.959,
-      "mean_us": 282.582046
+      "p50_us": 307.042,
+      "p95_us": 357.875,
+      "p99_us": 427.708,
+      "mean_us": 302.8719274
     },
     "worker_parent_observed": {
-      "p50_us": 309.0,
-      "p95_us": 368.375,
-      "p99_us": 379.625,
-      "mean_us": 328.465548
+      "p50_us": 391.584,
+      "p95_us": 467.125,
+      "p99_us": 554.5,
+      "mean_us": 383.3173218
     },
-    "direct_requests_per_second": 3538.795242497466,
-    "worker_requests_per_second": 3044.4593233260493
+    "direct_requests_per_second": 3301.7256124873857,
+    "worker_requests_per_second": 2608.804619901213
   },
   "concurrent_documents": {
     "documents": 4,
     "measurement_order": "worker_then_direct",
     "direct": {
-      "p50_us": 357.917,
-      "p95_us": 422.75,
-      "p99_us": 444.583,
-      "mean_us": 361.407684
+      "p50_us": 352.292,
+      "p95_us": 434.875,
+      "p99_us": 531.208,
+      "mean_us": 362.8487428
     },
     "worker_parent_observed": {
-      "p50_us": 450.458,
-      "p95_us": 522.209,
-      "p99_us": 547.75,
-      "mean_us": 450.57151400000004
+      "p50_us": 433.916,
+      "p95_us": 495.25,
+      "p99_us": 520.458,
+      "mean_us": 433.3873162
     },
-    "direct_requests_per_second": 10746.74187265287,
-    "worker_requests_per_second": 8797.837758933121
+    "direct_requests_per_second": 10919.630345703397,
+    "worker_requests_per_second": 9208.399190116135
   }
 }

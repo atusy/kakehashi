@@ -37,15 +37,15 @@ cover injections, queries, semantic tokens, or automatic worker restart.
 The committed aggregate is
 `benches/profile/results/single_worker_stage2_2026-07-19.json`; four raw
 collector outputs, two per size, are retained beside it. The aggregate records
-source commit `ea2bf541fdada37bfaea76fa69511b20b9a0471f` and the executable,
+source commit `d0ae7b56cf901ce19aad87407425471013ee2396` and the executable,
 benchmark, and parser SHA-256 identities. The release build ran on an Apple M4
 with macOS 26.5.1 and Rust 1.95.0. The Rust grammar source revision is recorded
 in the aggregate.
 
-For each size, two consecutive page-cache-warm batches first ran 1,000
+For each size, two consecutive page-cache-warm batches first ran 5,000
 sequential rounds. To avoid the fixed-order reversal seen in Stage 1, even
 rounds measured direct then worker and odd rounds measured worker then direct.
-Each batch then ran 1,000 edits divided evenly across four documents and four
+Each batch then ran 5,000 edits divided evenly across four documents and four
 caller threads. Batch A measured the concurrent direct path first; batch B
 measured the concurrent worker path first. The worker had four compute threads
 and a FIFO lane per URI.
@@ -61,31 +61,31 @@ large workload. The 285-byte small fused request is 96.5% smaller than Stage
 
 | Batch | Direct p50 / p95 / p99 | Worker p50 / p95 / p99 | Worker p50 delta |
 |---|---:|---:|---:|
-| A | 260.7 / 269.3 / 278.8 us | 303.3 / 316.7 / 331.3 us | +16.3% |
-| B | 266.0 / 317.3 / 326.0 us | 309.0 / 368.4 / 379.6 us | +16.2% |
+| A | 308.5 / 361.7 / 396.5 us | 362.4 / 456.9 / 495.4 us | +17.5% |
+| B | 307.0 / 357.9 / 427.7 us | 391.6 / 467.1 / 554.5 us | +27.5% |
 
 | Batch | Direct | Worker | Worker throughput delta |
 |---|---:|---:|---:|
-| A | 3825.5 req/s | 3282.1 req/s | -14.2% |
-| B | 3538.8 req/s | 3044.5 req/s | -14.0% |
+| A | 3344.8 req/s | 2782.0 req/s | -16.8% |
+| B | 3301.7 req/s | 2608.8 req/s | -21.0% |
 
-For a single sequential small document, the worker remains about 43 us slower
-at p50 and about 14% lower in throughput than the same incremental work in
-process. That residual includes JSON serialization, two pipe crossings,
-scheduling, response routing, and parent wakeup.
+For a single sequential small document, the worker remains 54--85 us slower at
+p50 and 17--21% lower in throughput than the same incremental work in process.
+That residual includes JSON serialization, two pipe crossings, scheduling,
+response routing, parent wakeup, and one atomic retained-byte reservation.
 
 | Batch and order | Direct p50 / p95 / p99 | Worker p50 / p95 / p99 |
 |---|---:|---:|
-| A, direct first | 326.7 / 421.3 / 456.2 us | 456.6 / 515.9 / 540.2 us |
-| B, worker first | 357.9 / 422.8 / 444.6 us | 450.5 / 522.2 / 547.8 us |
+| A, direct first | 329.3 / 390.5 / 461.1 us | 387.0 / 535.3 / 858.2 us |
+| B, worker first | 352.3 / 434.9 / 531.2 us | 433.9 / 495.3 / 520.5 us |
 
 | Batch | Direct | Worker | Worker throughput delta |
 |---|---:|---:|---:|
-| A | 11503.8 req/s | 8671.9 req/s | -24.6% |
-| B | 10746.7 req/s | 8797.8 req/s | -18.1% |
+| A | 11722.1 req/s | 9395.2 req/s | -19.9% |
+| B | 10919.6 req/s | 9208.4 req/s | -15.7% |
 
-The fixed worker scales from 3.04--3.28k sequential requests/s to 8.67--8.80k
-requests/s, or 2.6--2.9x, while retaining FIFO order within each document. One
+The fixed worker scales from 2.61--2.78k sequential requests/s to 9.21--9.40k
+requests/s, or 3.4--3.5x, while retaining FIFO order within each document. One
 worker therefore uses its internal threads materially; it is not a
 single-threaded bottleneck. The process-local baseline remains faster for this
 small operation.
@@ -94,36 +94,36 @@ small operation.
 
 | Batch | Direct p50 / p95 / p99 | Worker p50 / p95 / p99 | Worker p50 delta |
 |---|---:|---:|---:|
-| A | 3141.1 / 4010.0 / 4647.1 us | 3181.5 / 4217.2 / 4808.0 us | +1.3% |
-| B | 3160.4 / 3614.5 / 4329.5 us | 3207.6 / 3827.6 / 4534.0 us | +1.5% |
+| A | 2675.0 / 3268.2 / 4098.6 us | 2734.7 / 3334.2 / 4192.4 us | +2.2% |
+| B | 2676.4 / 3252.3 / 3613.7 us | 2734.3 / 3329.4 / 3806.8 us | +2.2% |
 
 | Batch | Direct | Worker | Worker throughput delta |
 |---|---:|---:|---:|
-| A | 323.9 req/s | 318.1 req/s | -1.8% |
-| B | 328.4 req/s | 322.1 req/s | -1.9% |
+| A | 352.0 req/s | 344.8 req/s | -2.0% |
+| B | 357.2 req/s | 349.7 req/s | -2.1% |
 
 | Batch and order | Direct p50 / p95 / p99 | Worker p50 / p95 / p99 |
 |---|---:|---:|
-| A, direct first | 3861.5 / 4696.0 / 5456.7 us | 3977.6 / 4879.7 / 5964.5 us |
-| B, worker first | 3883.1 / 4575.6 / 4892.1 us | 3841.4 / 4311.4 / 4606.1 us |
+| A, direct first | 3805.1 / 4431.3 / 4754.4 us | 3954.9 / 4555.4 / 4828.9 us |
+| B, worker first | 3927.7 / 4593.9 / 4884.6 us | 3860.3 / 4443.9 / 5238.6 us |
 
 | Batch | Direct | Worker | Worker throughput delta |
 |---|---:|---:|---:|
-| A | 998.2 req/s | 973.5 req/s | -2.5% |
-| B | 1006.3 req/s | 1038.7 req/s | +3.2% |
+| A | 1031.7 req/s | 996.8 req/s | -3.4% |
+| B | 995.7 req/s | 1019.4 req/s | +2.4% |
 
-For the large near-EOF edit, the sequential gap narrows to about 1.8--1.9%.
-The concurrent direction reverses with measurement order: the worker is 2.5%
-slower in batch A and 3.2% faster in batch B. This is not evidence of a stable
+For the large near-EOF edit, the sequential gap narrows to about 2.0--2.1%.
+The concurrent direction reverses with measurement order: the worker is 3.4%
+slower in batch A and 2.4% faster in batch B. This is not evidence of a stable
 worker win. It shows that the fixed IPC overhead becomes small relative to the
 O(n) text clone and point calculation shared by both implementations. The
-worker scales 3.1--3.2x from sequential to four document lanes.
+worker scales about 2.9x from sequential to four document lanes.
 
-Initial full synchronization was 5.11 ms directly versus 2.80 ms through the
-worker in small batch A and 1.83 versus 2.87 ms in small batch B. For the large
-document it was 12.57 versus 11.07 ms and 12.18 versus 11.74 ms. These cold,
+Initial full synchronization was 1.10 ms directly versus 1.44 ms through the
+worker in small batch A and 2.11 versus 2.75 ms in small batch B. For the large
+document it was 13.68 versus 13.19 ms and 12.08 versus 12.99 ms. These cold,
 single-sample, order-sensitive values are provenance rather than acceptance
-evidence. Spawn plus executable-digest handshake took 1.06--1.17 s; as in Stage
+evidence. Spawn plus executable-digest handshake took 0.20--0.37 s; as in Stage
 1, the current implementation hashes the full executable on both sides and is
 not representative of a retained immutable session image.
 
@@ -154,7 +154,7 @@ shasum -a 256 target/release/kakehashi "$stage2_bench_bin" \
 cargo bench --locked --bench tree_worker_stage2 -- \
   --bin target/release/kakehashi \
   --parser deps/test/kakehashi/parser/rust.dylib \
-  --requests 1000 --threads 4 --lines 200 \
+  --requests 5000 --threads 4 --lines 200 \
   > benches/profile/results/single_worker_stage2_2026-07-19_batch_a.json
 
 # Repeat with --worker-first and batch_b.json as the output.
@@ -182,7 +182,8 @@ future isolation boundary that an in-process baseline cannot. The protocol now
 has persistent live per-URI FIFO lanes, transactional edit-and-parse, explicit
 close/removal, incarnation and generation fences, bounded closed-document
 tombstones, and a typed restart-required response when its identity budget is
-exhausted.
+exhausted. Retained text is also capped at 32 MiB per document and 512 MiB per
+worker through an atomic reservation, avoiding a global lane mutex.
 
 The next stage should integrate this data plane in shadow mode: retain the
 current in-process result as authoritative, mirror document lifecycle into the

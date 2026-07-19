@@ -1,49 +1,49 @@
 {
   "schema": 1,
-  "requests": 1000,
+  "requests": 5000,
   "threads": 4,
   "source_lines": 200,
   "source_bytes": 7651,
   "apply_frame_bytes": 274,
   "derive_frame_bytes": 191,
   "fused_apply_and_derive_frame_bytes": 285,
-  "spawn_us": 1169070.417,
+  "spawn_us": 201496.583,
   "sync": {
-    "direct_us": 5108.334,
-    "worker_parent_observed_us": 2798.709
+    "direct_us": 1099.625,
+    "worker_parent_observed_us": 1439.666
   },
   "alternating_incremental_edit_and_derive": {
     "direct": {
-      "p50_us": 260.708,
-      "p95_us": 269.333,
-      "p99_us": 278.833,
-      "mean_us": 261.401292
+      "p50_us": 308.5,
+      "p95_us": 361.667,
+      "p99_us": 396.542,
+      "mean_us": 298.9691756
     },
     "worker_parent_observed": {
-      "p50_us": 303.334,
-      "p95_us": 316.667,
-      "p99_us": 331.334,
-      "mean_us": 304.680008
+      "p50_us": 362.417,
+      "p95_us": 456.875,
+      "p99_us": 495.375,
+      "mean_us": 359.4564506
     },
-    "direct_requests_per_second": 3825.535797275248,
-    "worker_requests_per_second": 3282.131986815492
+    "direct_requests_per_second": 3344.826428989223,
+    "worker_requests_per_second": 2781.9781737977246
   },
   "concurrent_documents": {
     "documents": 4,
     "measurement_order": "direct_then_worker",
     "direct": {
-      "p50_us": 326.667,
-      "p95_us": 421.334,
-      "p99_us": 456.209,
-      "mean_us": 332.558997
+      "p50_us": 329.291,
+      "p95_us": 390.541,
+      "p99_us": 461.083,
+      "mean_us": 339.4742632
     },
     "worker_parent_observed": {
-      "p50_us": 456.583,
-      "p95_us": 515.917,
-      "p99_us": 540.208,
-      "mean_us": 456.202861
+      "p50_us": 386.959,
+      "p95_us": 535.333,
+      "p99_us": 858.167,
+      "mean_us": 423.9664366
     },
-    "direct_requests_per_second": 11503.789779745564,
-    "worker_requests_per_second": 8671.936313299715
+    "direct_requests_per_second": 11722.10980393306,
+    "worker_requests_per_second": 9395.210707160937
   }
 }
