@@ -116,6 +116,7 @@ pub(crate) struct DiagnosticPublisher {
     bridge: Arc<BridgeCoordinator>,
     settings_manager: Arc<SettingsManager>,
     cache: Arc<crate::lsp::cache::CacheCoordinator>,
+    tree_worker_shadow: Arc<crate::lsp::lsp_impl::tree_worker_shadow::TreeWorkerShadow>,
     snapshot_preparer: DiagnosticSnapshotPreparer,
     aggregator: Arc<DiagnosticAggregator>,
     shutdown: tokio_util::sync::CancellationToken,
@@ -130,6 +131,7 @@ impl DiagnosticPublisher {
             bridge: Arc::clone(&server.bridge),
             settings_manager: Arc::clone(&server.settings_manager),
             cache: Arc::clone(&server.cache),
+            tree_worker_shadow: Arc::clone(&server.tree_worker_shadow),
             snapshot_preparer: DiagnosticSnapshotPreparer::new(server),
             aggregator: Arc::clone(&server.diagnostics),
             shutdown: server.shutdown_token.clone(),
@@ -888,7 +890,7 @@ impl DiagnosticPublisher {
         // exactly that check.
         let needs_geometry = crate::lsp::diagnostic_cache::has_live_region_slots(&snapshot);
         let region_offsets = if needs_geometry {
-            match self.current_region_offsets(host) {
+            match self.current_region_offsets(host).await {
                 Some(offsets) => offsets,
                 // The document is open but has no parse snapshot: `did_change`
                 // cleared the tree and the off-ingress reparse hasn't landed yet,
@@ -1349,12 +1351,53 @@ impl DiagnosticPublisher {
     /// regions as gone. `Some(empty)` means there legitimately are no regions to
     /// anchor: the document is closed, or its language resolves to no injection
     /// query — stale region slots drop from the merge.
-    fn current_region_offsets(&self, host: &Url) -> Option<HashMap<String, RegionOffset>> {
+    async fn current_region_offsets(&self, host: &Url) -> Option<HashMap<String, RegionOffset>> {
         let mut offsets = HashMap::new();
 
         let Some(doc) = self.documents.get(host) else {
             return Some(offsets); // closed host: nothing to anchor against
         };
+        if self.tree_worker_shadow.is_authoritative() {
+            let text = doc.text_arc();
+            let language_id = doc.language_id().map(str::to_owned);
+            let incarnation = doc.incarnation();
+            let content_version = doc.content_version();
+            let Some(language_name) = self.language.detect_language_trace(
+                host.path(),
+                &text,
+                None,
+                language_id.as_deref(),
+            ) else {
+                return Some(offsets);
+            };
+            drop(doc);
+            if self.language.injection_query(&language_name).is_none() {
+                return Some(offsets);
+            }
+            if !self
+                .language
+                .ensure_language_loaded_async(&language_name)
+                .await
+                .success
+            {
+                return None;
+            }
+            let regions = self
+                .tree_worker_shadow
+                .worker_injection_regions(
+                    host,
+                    incarnation,
+                    content_version,
+                    self.language.configuration_generation(),
+                )
+                .await?;
+            let current = self.documents.get(host)?;
+            if current.incarnation() != incarnation || current.content_version() != content_version
+            {
+                return None;
+            }
+            return Some(region_offsets_from_resolved(&regions));
+        }
         let Some(snapshot) = doc.snapshot() else {
             return None; // open but tree pending: geometry unknown, defer
         };
@@ -1402,6 +1445,23 @@ impl DiagnosticPublisher {
     }
 }
 
+fn region_offsets_from_resolved(
+    regions: &[crate::language::injection::ResolvedInjection],
+) -> HashMap<String, RegionOffset> {
+    regions
+        .iter()
+        .map(|resolved| {
+            (
+                resolved.region.region_id.clone(),
+                RegionOffset::with_per_line_offsets(
+                    resolved.region.line_range.start,
+                    resolved.line_column_offsets.clone(),
+                ),
+            )
+        })
+        .collect()
+}
+
 /// Remove `Region`/`Host` push slots whose server is in `pull_driven` when a
 /// `PullLayer` blob is present in `snapshot`, dropping any source left empty.
 /// The pure core of [`DiagnosticPublisher::filter_pull_driven_push_slots`],
@@ -1442,6 +1502,27 @@ mod tests {
             range: Range::new(Position::new(0, 0), Position::new(0, 1)),
             message: message.to_string(),
             ..Default::default()
+        }
+    }
+
+    fn resolved_region(
+        region_id: &str,
+        line: u32,
+        line_column_offsets: Vec<u32>,
+    ) -> crate::language::injection::ResolvedInjection {
+        crate::language::injection::ResolvedInjection {
+            region: crate::language::injection::CacheableInjectionRegion {
+                language: "rust".to_string(),
+                byte_range: 0..1,
+                line_range: line..line + 1,
+                start_column: 0,
+                region_id: region_id.to_string(),
+                content_hash: 0,
+            },
+            injection_language: "rust".to_string(),
+            virtual_content: "x".to_string(),
+            line_column_offsets,
+            contiguous: true,
         }
     }
 
@@ -2397,7 +2478,7 @@ mod tests {
             None,
         );
         assert!(
-            publisher.current_region_offsets(&pending).is_none(),
+            publisher.current_region_offsets(&pending).await.is_none(),
             "an open document with no parse snapshot has unknown geometry"
         );
 
@@ -2407,8 +2488,28 @@ mod tests {
         assert!(
             publisher
                 .current_region_offsets(&closed)
+                .await
                 .is_some_and(|offsets| offsets.is_empty()),
             "a closed document has no regions to anchor, not unknown geometry"
+        );
+    }
+
+    #[test]
+    fn region_offsets_preserve_every_worker_region_identity() {
+        let regions = vec![
+            resolved_region("first", 2, vec![1]),
+            resolved_region("second", 8, vec![3, 4]),
+        ];
+
+        let offsets = region_offsets_from_resolved(&regions);
+
+        assert_eq!(
+            offsets["first"],
+            RegionOffset::with_per_line_offsets(2, vec![1])
+        );
+        assert_eq!(
+            offsets["second"],
+            RegionOffset::with_per_line_offsets(8, vec![3, 4])
         );
     }
 
