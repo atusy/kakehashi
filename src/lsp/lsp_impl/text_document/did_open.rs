@@ -151,6 +151,7 @@ impl Kakehashi {
                     let documents = std::sync::Arc::clone(&self.documents);
                     let lang = lang.clone();
                     let install_uri = uri.clone();
+                    let authoritative = self.tree_worker_shadow.is_authoritative();
                     // Mirror the handler's `!is_cli_mode()` gate on the synthetic
                     // diagnostic (#489): in one-shot CLI mode no editor consumes the
                     // proactive publishDiagnostics, so re-firing it from the install
@@ -169,46 +170,56 @@ impl Kakehashi {
                         if !same_lifetime {
                             return;
                         }
-                        // The skipped inline parse meant the handler's
-                        // process_injections (below) ran with no tree. Now that the
-                        // off-ingress reparse may have produced one, run the normal
-                        // post-parse injection workflow — injected-language install
-                        // and eager bridge spawn — which also keeps that injected
-                        // install off the ingress ticket. forward=false: open path.
-                        //
-                        // Gate on the document actually having a tree: install can
-                        // fail or be deduped (AlreadyInstalling) with no reparse, and
-                        // process_injections would otherwise cancel the eager-open
-                        // for a still-tree-less document.
-                        let has_tree = documents.get(&install_uri).is_some_and(|doc| {
+                        // Resume the open downstream from the owner selected by the
+                        // atomic mode. Authoritative recovery mirrors the newly
+                        // installed grammar into the worker and intentionally leaves
+                        // the parent document tree-less; legacy recovery reparses and
+                        // retains its existing tree gate.
+                        let recovered = if authoritative {
+                            let Some(content_version) =
+                                documents.get(&install_uri).and_then(|doc| {
+                                    (doc.incarnation() == incarnation)
+                                        .then(|| doc.content_version())
+                                })
+                            else {
+                                return;
+                            };
+                            injection
+                                .process_worker_injections_for_incarnation(
+                                    &install_uri,
+                                    false,
+                                    incarnation,
+                                    content_version,
+                                )
+                                .await
+                        } else if documents.get(&install_uri).is_some_and(|doc| {
                             doc.incarnation() == incarnation && doc.tree().is_some()
-                        });
-                        if has_tree {
-                            let same_lifetime = injection
+                        }) {
+                            injection
                                 .process_injections_for_incarnation(
                                     &install_uri,
                                     false,
                                     incarnation,
                                 )
-                                .await;
-                            if !same_lifetime {
-                                return;
-                            }
-                            // Re-fire the proactive synthetic diagnostic now that a
-                            // tree exists: the handler's spawn (below) ran in the
-                            // skip-parse path with no tree, so its snapshot was None
-                            // and the pull-layer diagnostics were skipped on this
-                            // first open of a just-installed parser. Skipped in CLI
-                            // mode (#489), matching the handler's own gate.
+                                .await
+                        } else {
+                            false
+                        };
+                        if recovered {
                             if !is_cli_mode {
-                                spawn_synthetic_diagnostic_for_incarnation(
-                                    &documents,
-                                    &diagnostic_scheduler,
-                                    install_uri,
-                                    incarnation,
-                                    std::future::ready(()),
-                                )
-                                .await;
+                                if authoritative {
+                                    diagnostic_scheduler
+                                        .spawn_synthetic_diagnostic_task(install_uri);
+                                } else {
+                                    spawn_synthetic_diagnostic_for_incarnation(
+                                        &documents,
+                                        &diagnostic_scheduler,
+                                        install_uri,
+                                        incarnation,
+                                        std::future::ready(()),
+                                    )
+                                    .await;
+                                }
                             }
                         }
                     });

@@ -40,6 +40,10 @@ fn updated_settings_after_install(
     (updated_raw_settings, updated_settings)
 }
 
+fn should_reparse_installed_document_in_parent(authoritative: bool, is_injection: bool) -> bool {
+    !authoritative && !is_injection
+}
+
 pub(super) struct InstallCoordinatorDeps {
     pub(super) client: Client,
     pub(super) language: std::sync::Arc<LanguageCoordinator>,
@@ -206,11 +210,8 @@ impl InstallCoordinator {
         }
 
         if self.language.has_parser_available(language) {
-            if !is_injection && self.same_document_incarnation(&uri, expected_incarnation) {
-                self.parse_coordinator()
-                    .reparse_installed_document(uri.clone(), language, expected_incarnation)
-                    .await;
-            }
+            self.recover_installed_document(&uri, language, is_injection, expected_incarnation)
+                .await;
             if !self.same_document_incarnation(&uri, expected_incarnation) {
                 return false;
             }
@@ -273,11 +274,8 @@ impl InstallCoordinator {
             if terminal.data_dir().is_some()
                 && self.same_document_incarnation(&uri, expected_incarnation)
             {
-                if !is_injection {
-                    self.parse_coordinator()
-                        .reparse_installed_document(uri.clone(), language, expected_incarnation)
-                        .await;
-                }
+                self.recover_installed_document(&uri, language, is_injection, expected_incarnation)
+                    .await;
                 if self.install_reparse_recovered(
                     language,
                     &uri,
@@ -360,14 +358,35 @@ impl InstallCoordinator {
             .log_language_events(&load_result.events)
             .await;
 
-        if global_loaded && !is_injection {
-            // Resurrection-safe, off-ingress reparse: re-detects the language from
-            // the current document lifetime and persists through a non-inserting
-            // CAS, so a didClose/reopen during the install can't receive a tree for
-            // the old language. A host waiter whose install claim was won by an
-            // injection reaches this same per-URI path after the claim completes.
+        if global_loaded {
+            // Resurrection-safe recovery: legacy reparses through its guarded CAS;
+            // authoritative re-mirrors current text into the worker. A host waiter
+            // whose install claim was won by an injection reaches this same per-URI
+            // path after the claim completes.
+            self.recover_installed_document(&uri, language, is_injection, expected_incarnation)
+                .await;
+        }
+    }
+
+    async fn recover_installed_document(
+        &self,
+        uri: &Url,
+        language: &str,
+        is_injection: bool,
+        expected_incarnation: Option<u64>,
+    ) {
+        if !self.same_document_incarnation(uri, expected_incarnation) {
+            return;
+        }
+        let authoritative = self.tree_worker_shadow.is_authoritative();
+        if authoritative {
+            // Settings reload already configured the worker catalog. Re-mirror the
+            // current document so the newly installed grammar owns the first tree;
+            // do not recreate a parent parser/Tree as a recovery side effect.
+            self.refresh_tree_worker_documents(std::slice::from_ref(uri));
+        } else if should_reparse_installed_document_in_parent(authoritative, is_injection) {
             self.parse_coordinator()
-                .reparse_installed_document(uri, language, expected_incarnation)
+                .reparse_installed_document(uri.clone(), language, expected_incarnation)
                 .await;
         }
     }
@@ -418,6 +437,8 @@ impl InstallCoordinator {
         self.same_document_incarnation(uri, expected_incarnation)
             && self.language.has_parser_available(language)
             && (is_injection
+                || (self.tree_worker_shadow.is_authoritative()
+                    && self.language.worker_grammar_descriptor(language).is_some())
                 || self
                     .documents
                     .get(uri)
@@ -450,6 +471,14 @@ mod tests {
     use std::path::Path;
     use std::task::Poll;
     use tower_lsp_server::LspService;
+
+    #[test]
+    fn authoritative_install_recovery_never_reparses_in_parent() {
+        assert!(!should_reparse_installed_document_in_parent(true, false));
+        assert!(!should_reparse_installed_document_in_parent(true, true));
+        assert!(should_reparse_installed_document_in_parent(false, false));
+        assert!(!should_reparse_installed_document_in_parent(false, true));
+    }
 
     #[test]
     fn reload_after_install_preserves_explicit_matching_override_in_raw_settings() {
