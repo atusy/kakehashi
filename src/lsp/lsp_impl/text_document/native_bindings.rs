@@ -260,7 +260,7 @@ impl Kakehashi {
         let content_text_for_parse = std::sync::Arc::clone(&content_text);
         let parsed = self
             .parse_coordinator()
-            .parse_with_pool(
+            .parse_with_pool_versioned(
                 &layer_language,
                 uri,
                 content_text.len(),
@@ -280,11 +280,16 @@ impl Kakehashi {
             .await;
 
         match parsed {
-            Some(layer_tree) => {
-                // Resolve after parse_with_pool: a reload can invalidate the
+            Some((layer_tree, configuration_generation)) => {
+                // Resolve after parse_with_pool_versioned: a reload can invalidate the
                 // first parser generation and make it retry with the new
                 // grammar, whose bindings query must accompany that tree.
-                let Some(query) = self.language.bindings_query(&layer_language) else {
+                let (query_generation, query) =
+                    self.language.bindings_query_versioned(&layer_language);
+                if query_generation != configuration_generation {
+                    return Some(None);
+                }
+                let Some(query) = query else {
                     return Some(None);
                 };
                 Some(Some((query, content_text, layer_tree, content_range.start)))

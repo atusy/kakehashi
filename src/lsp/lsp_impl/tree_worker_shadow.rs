@@ -1,7 +1,7 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, mpsc};
+use std::sync::{Arc, mpsc};
 use std::time::Instant;
 
 use crate::language::coordinator::WorkerGrammarDescriptor;
@@ -14,7 +14,6 @@ use crate::tree_worker::{
 const SHADOW_ENV: &str = "KAKEHASHI_TREE_WORKER_SHADOW";
 const SHADOW_THREADS_ENV: &str = "KAKEHASHI_TREE_WORKER_THREADS";
 const SHADOW_QUEUE_CAPACITY: usize = 256;
-const CLOSED_COMPARISON_TOMBSTONES: usize = 4_096;
 static NEXT_WORKER_GENERATION: AtomicU64 = AtomicU64::new(1);
 
 enum ShadowCommand {
@@ -78,14 +77,13 @@ struct PendingComparison {
 
 #[derive(Default)]
 struct ComparisonSlot {
-    closed_incarnation: Option<u64>,
+    open_incarnation: u64,
     pending: Option<PendingComparison>,
 }
 
 #[derive(Default)]
 struct ComparisonStore {
     slots: dashmap::DashMap<String, ComparisonSlot>,
-    closed_order: Mutex<VecDeque<(String, u64)>>,
     matched: AtomicU64,
     mismatched: AtomicU64,
     superseded: AtomicU64,
@@ -159,7 +157,7 @@ impl TreeWorkerShadow {
         text: String,
     ) {
         let request = self.sync_request(uri, incarnation, content_version, language, grammar, text);
-        self.comparisons.reopen(uri.as_str(), incarnation);
+        self.comparisons.open(uri.as_str(), incarnation);
         self.submit(ShadowCommand::Sync(request));
     }
 
@@ -352,7 +350,7 @@ fn run_actor(
         let (response, synced_identity) = match command {
             ShadowCommand::Sync(request) => {
                 let identity = ReplicaIdentity::from_sync(&request);
-                comparisons.reopen(&request.context.uri, request.context.incarnation);
+                comparisons.open(&request.context.uri, request.context.incarnation);
                 (sync_and_derive(&client, request), Some(identity))
             }
             ShadowCommand::Apply { request, fallback } => {
@@ -449,15 +447,11 @@ impl ComparisonStore {
             }
         };
         let incoming = (incarnation, content_version, incoming_generation);
-        let mut slot = if let Some(slot) = self.slots.get_mut(uri) {
-            slot
-        } else {
-            self.slots.entry(uri.to_string()).or_default()
+        let Some(mut slot) = self.slots.get_mut(uri) else {
+            self.superseded.fetch_add(1, Ordering::Relaxed);
+            return;
         };
-        if slot
-            .closed_incarnation
-            .is_some_and(|closed| closed >= incarnation)
-        {
+        if slot.open_incarnation != incarnation {
             self.superseded.fetch_add(1, Ordering::Relaxed);
             return;
         }
@@ -518,54 +512,30 @@ impl ComparisonStore {
     }
 
     fn mark_closed(&self, uri: &str, incarnation: u64) {
-        let mut slot = if let Some(slot) = self.slots.get_mut(uri) {
-            slot
-        } else {
-            self.slots.entry(uri.to_string()).or_default()
+        let Some(slot) = self.slots.get_mut(uri) else {
+            return;
         };
-        if slot
-            .closed_incarnation
-            .is_some_and(|closed| closed >= incarnation)
-        {
+        if slot.open_incarnation > incarnation {
             return;
         }
-        if slot
-            .pending
-            .as_ref()
-            .is_some_and(|pending| pending.incarnation <= incarnation)
-        {
+        if slot.pending.is_some() {
             self.superseded.fetch_add(1, Ordering::Relaxed);
-            slot.pending = None;
         }
-        slot.closed_incarnation = Some(incarnation);
         drop(slot);
-
-        use crate::error::LockResultExt;
-        let mut order = self
-            .closed_order
-            .lock()
-            .recover_poison("TreeWorkerShadow::mark_closed");
-        order.push_back((uri.to_string(), incarnation));
-        while order.len() > CLOSED_COMPARISON_TOMBSTONES {
-            let Some((expired_uri, expired_incarnation)) = order.pop_front() else {
-                break;
-            };
-            self.slots.remove_if(&expired_uri, |_, slot| {
-                slot.closed_incarnation == Some(expired_incarnation) && slot.pending.is_none()
-            });
-        }
+        self.slots
+            .remove_if(uri, |_, slot| slot.open_incarnation <= incarnation);
     }
 
-    fn reopen(&self, uri: &str, incarnation: u64) {
-        let Some(mut slot) = self.slots.get_mut(uri) else {
-            return;
-        };
-        if slot
-            .pending
-            .as_ref()
-            .is_some_and(|pending| pending.incarnation < incarnation)
-        {
-            slot.pending = None;
+    fn open(&self, uri: &str, incarnation: u64) {
+        let mut slot = self.slots.entry(uri.to_string()).or_default();
+        if slot.open_incarnation < incarnation {
+            if slot.pending.is_some() {
+                self.superseded.fetch_add(1, Ordering::Relaxed);
+            }
+            *slot = ComparisonSlot {
+                open_incarnation: incarnation,
+                pending: None,
+            };
         }
     }
 
@@ -762,6 +732,7 @@ mod tests {
     fn comparisons_match_regardless_of_arrival_order() {
         for authoritative_first in [true, false] {
             let store = ComparisonStore::default();
+            store.open("file:///a.rs", 1);
             let authoritative = ComparisonSide::Authoritative(summary("source_file"));
             let shadow = ComparisonSide::Shadow(summary("source_file"));
             if authoritative_first {
@@ -779,6 +750,7 @@ mod tests {
     #[test]
     fn comparisons_keep_only_the_latest_document_version() {
         let store = ComparisonStore::default();
+        store.open("file:///a.rs", 1);
         store.record(
             "file:///a.rs",
             1,
@@ -808,6 +780,7 @@ mod tests {
     #[test]
     fn comparisons_do_not_pair_across_configuration_generations() {
         let store = ComparisonStore::default();
+        store.open("file:///a.rs", 1);
         let authoritative = summary("source_file");
         let mut stale_shadow = authoritative.clone();
         stale_shadow.configuration_generation -= 1;
@@ -831,13 +804,14 @@ mod tests {
     fn closed_incarnation_rejects_late_results_until_reopen() {
         let store = ComparisonStore::default();
         let uri = "file:///a.rs";
+        store.open(uri, 1);
         store.mark_closed(uri, 1);
 
         store.record(uri, 1, 2, ComparisonSide::Authoritative(summary("late")));
         assert_eq!(store.pending_count(), 0);
         assert_eq!(store.superseded.load(Ordering::Relaxed), 1);
 
-        store.reopen(uri, 2);
+        store.open(uri, 2);
         store.record(
             uri,
             2,
@@ -850,30 +824,21 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_close_keeps_one_live_tombstone() {
-        use crate::error::LockResultExt;
-
+    fn duplicate_close_keeps_the_uri_closed() {
         let store = ComparisonStore::default();
         let uri = "file:///a.rs";
+        store.open(uri, 1);
         store.mark_closed(uri, 1);
         store.mark_closed(uri, 1);
 
-        assert_eq!(
-            store
-                .closed_order
-                .lock()
-                .recover_poison("duplicate close test")
-                .len(),
-            1
-        );
-        let slot = store.slots.get(uri).unwrap();
-        assert_eq!(slot.closed_incarnation, Some(1));
+        assert!(!store.slots.contains_key(uri));
     }
 
     #[test]
     fn delayed_old_close_preserves_reopened_incarnation_comparison() {
         let store = ComparisonStore::default();
         let uri = "file:///a.rs";
+        store.open(uri, 2);
         store.record(
             uri,
             2,
@@ -892,17 +857,14 @@ mod tests {
     }
 
     #[test]
-    fn closed_comparison_tombstones_stay_bounded() {
+    fn closed_comparison_slots_are_removed() {
         let store = ComparisonStore::default();
-        for index in 0..=CLOSED_COMPARISON_TOMBSTONES {
-            store.mark_closed(&format!("file:///{index}.rs"), 1);
+        for index in 0..=4_096 {
+            let uri = format!("file:///{index}.rs");
+            store.open(&uri, 1);
+            store.mark_closed(&uri, 1);
         }
 
-        let retained = store
-            .slots
-            .iter()
-            .filter(|slot| slot.closed_incarnation.is_some())
-            .count();
-        assert!(retained <= CLOSED_COMPARISON_TOMBSTONES);
+        assert!(store.slots.is_empty());
     }
 }

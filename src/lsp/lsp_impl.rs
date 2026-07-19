@@ -1128,7 +1128,7 @@ mod tests {
         let parsed = service
             .inner()
             .parse_coordinator()
-            .parse_with_pool(
+            .parse_with_pool_versioned(
                 "test",
                 &url::Url::parse("file:///reload-race.test").unwrap(),
                 0,
@@ -1146,7 +1146,11 @@ mod tests {
             )
             .await;
 
-        assert_eq!(parsed, Some(2), "only the current-generation parse lands");
+        assert_eq!(
+            parsed,
+            Some((2, 1)),
+            "only the current-generation parse lands"
+        );
         assert_eq!(calls.load(Ordering::SeqCst), 2);
     }
 
@@ -1205,7 +1209,7 @@ mod tests {
         let parsed = service
             .inner()
             .parse_coordinator()
-            .parse_with_pool(
+            .parse_with_pool_versioned(
                 "test",
                 &url::Url::parse("file:///stuck-reload.test").unwrap(),
                 0,

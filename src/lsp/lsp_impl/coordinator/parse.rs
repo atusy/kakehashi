@@ -48,7 +48,7 @@ const RELOAD_WAIT_BACKSTOP: std::time::Duration = PARSE_TIMEOUT;
 /// [`parse_with_deadline`](crate::language::injection::parse_with_deadline)
 /// primitive under the name the parse-loop call sites use.
 ///
-/// `parse_with_pool`'s `tokio::time::timeout` only abandons the *awaiter*;
+/// `parse_with_pool_versioned`'s `tokio::time::timeout` only abandons the *awaiter*;
 /// the in-parse abort is what actually reclaims the bounded-pool thread from
 /// a pathological parse (see the primitive's doc).
 fn parse_text_with_deadline(
@@ -168,25 +168,7 @@ impl ParseCoordinator {
     /// - Settings changed during both the initial parse and its one retry, so
     ///   neither result belongs to the current parser generation
     /// - The closure returned `None`
-    pub(crate) async fn parse_with_pool<T, F>(
-        &self,
-        language_name: &str,
-        uri: &Url,
-        text_len: usize,
-        parse_fn: F,
-    ) -> Option<T>
-    where
-        F: FnMut(tree_sitter::Parser, std::time::Instant, bool) -> (tree_sitter::Parser, Option<T>)
-            + Send
-            + 'static,
-        T: Send + 'static,
-    {
-        self.parse_with_pool_versioned(language_name, uri, text_len, parse_fn)
-            .await
-            .map(|(value, _generation)| value)
-    }
-
-    async fn parse_with_pool_versioned<T, F>(
+    pub(crate) async fn parse_with_pool_versioned<T, F>(
         &self,
         language_name: &str,
         uri: &Url,
@@ -213,7 +195,7 @@ impl ParseCoordinator {
                     let (parser, parser_generation, configuration_generation) = loop {
                         match parser_pool
                             .lock()
-                            .recover_poison("ParseCoordinator::parse_with_pool(acquire)")
+                            .recover_poison("ParseCoordinator::parse_with_pool_versioned(acquire)")
                             .acquire_versioned(&language_name_owned)
                         {
                             crate::language::parser_pool::ParserCheckout::Acquired(
@@ -248,7 +230,7 @@ impl ParseCoordinator {
                     let (parser, value) = parse_fn(parser, deadline, attempt != 0);
                     match parser_pool
                         .lock()
-                        .recover_poison("ParseCoordinator::parse_with_pool(release)")
+                        .recover_poison("ParseCoordinator::parse_with_pool_versioned(release)")
                         .release_versioned(language_name_owned, parser, parser_generation)
                     {
                         Ok(()) => {

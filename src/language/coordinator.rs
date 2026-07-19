@@ -1533,6 +1533,23 @@ impl LanguageCoordinator {
         self.query_store().bindings_query(lang_name)
     }
 
+    pub(crate) fn bindings_query_versioned(
+        &self,
+        lang_name: &str,
+    ) -> (u64, Option<Arc<tree_sitter::Query>>) {
+        use crate::error::LockResultExt;
+
+        let _reload = self
+            .settings_reload_lock
+            .lock()
+            .recover_poison("LanguageCoordinator::bindings_query_versioned");
+        (
+            self.load_generation
+                .load(std::sync::atomic::Ordering::Acquire),
+            self.query_store().bindings_query(lang_name),
+        )
+    }
+
     /// Get capture mappings.
     ///
     /// Visibility: pub(crate) - called by LSP layer (semantic_tokens) and analysis
