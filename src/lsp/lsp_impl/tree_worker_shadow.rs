@@ -12,8 +12,9 @@ use crate::language::coordinator::WorkerGrammarDescriptor;
 use crate::lsp::text_sync::SequentialByteEdit;
 use crate::tree_worker::{
     ApplyDocumentEditsAndDerive, ByteEdit, Client, CloseDocument, DeriveDocumentSnapshot,
-    NavigateNode, NodeNavigation, NodeResult, NodeScalarOperation, NodeScalarValue, OpaqueNodeId,
-    RequestContext, ResolveNode, Response, RunNodeScalar, SyncDocument, named_node_count,
+    DeriveSelectionRanges, NavigateNode, NodeNavigation, NodeResult, NodeScalarOperation,
+    NodeScalarValue, OpaqueNodeId, RequestContext, ResolveNode, Response, RunNodeScalar,
+    SelectionRangesResult, SyncDocument, WirePosition, named_node_count,
 };
 
 const SHADOW_ENV: &str = "KAKEHASHI_TREE_WORKER_SHADOW";
@@ -574,6 +575,60 @@ impl TreeWorkerShadow {
         .ok()?
         .ok()?;
         self.admit_node_response(response, &expected)
+    }
+
+    pub(super) async fn selection_ranges(
+        &self,
+        uri: &url::Url,
+        incarnation: u64,
+        content_version: u64,
+        configuration_generation: u64,
+        positions: Vec<WirePosition>,
+    ) -> Option<SelectionRangesResult> {
+        let client = self.read_client.load_full()?;
+        if !self.is_enabled() {
+            return None;
+        }
+        let context = self.read_context(
+            &client,
+            uri,
+            incarnation,
+            content_version,
+            configuration_generation,
+        );
+        let expected = context.clone();
+        let response = tokio::task::spawn_blocking(move || {
+            client.derive_selection_ranges(DeriveSelectionRanges { context, positions })
+        })
+        .await
+        .ok()?
+        .ok()?;
+        let Response::SelectionRanges(result) = response else {
+            return None;
+        };
+        if result.context != expected {
+            return None;
+        }
+        let current = self
+            .open_documents
+            .lock()
+            .recover_poison("TreeWorkerShadow::selection_ranges(admission)")
+            .current
+            .get(uri.as_str())
+            .map(|current| current.context.clone());
+        if current.as_ref().is_none_or(|current| {
+            current.incarnation != expected.incarnation
+                || current.content_version != expected.content_version
+                || current.configuration_generation != expected.configuration_generation
+        }) || self
+            .read_client
+            .load()
+            .as_ref()
+            .is_none_or(|client| client.worker_generation() != expected.worker_generation)
+        {
+            return None;
+        }
+        Some(result)
     }
 
     pub(super) fn record_node_mapping(

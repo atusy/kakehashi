@@ -98,6 +98,21 @@ impl Kakehashi {
         let expected_incarnation = snapshot.incarnation;
         let expected_settings_generation = self.cache.semantic_token_generation();
 
+        let worker_positions = positions
+            .iter()
+            .map(|position| crate::tree_worker::WirePosition {
+                line: position.line,
+                character: position.character,
+            })
+            .collect();
+        let worker = self.tree_worker_shadow.selection_ranges(
+            &uri,
+            expected_incarnation,
+            expected_version,
+            expected_settings_generation,
+            worker_positions,
+        );
+
         // Run the synchronous injection-aware walk as one work-unit on the
         // compute pool against the snapshot's consistent (text, tree). The
         // walk uses a TRANSIENT parser pool: holding the shared parser-pool
@@ -108,20 +123,18 @@ impl Kakehashi {
         // a user-triggered, infrequent read, so per-request parsers beat
         // cross-request reuse here.
         let language = std::sync::Arc::clone(&self.language);
-        let result = self
-            .compute_pool
-            .run(None, move || {
-                let mut pool = language.create_document_parser_pool();
-                handle_selection_range(
-                    &snapshot.text,
-                    snapshot.tree.as_ref(),
-                    snapshot.language.as_deref(),
-                    &positions,
-                    &language,
-                    &mut pool,
-                )
-            })
-            .await;
+        let authoritative = self.compute_pool.run(None, move || {
+            let mut pool = language.create_document_parser_pool();
+            handle_selection_range(
+                &snapshot.text,
+                snapshot.tree.as_ref(),
+                snapshot.language.as_deref(),
+                &positions,
+                &language,
+                &mut pool,
+            )
+        });
+        let (worker, result) = tokio::join!(worker, authoritative);
 
         let still_current = self.documents.latest_snapshot(&uri).is_some_and(|view| {
             view.content_version == expected_version
@@ -136,8 +149,44 @@ impl Kakehashi {
             return Err(crate::error::content_modified_error());
         }
 
+        if let (Some(worker), Some(authoritative)) = (worker, result.as_ref()) {
+            let worker = worker
+                .ranges
+                .into_iter()
+                .map(selection_range_from_wire)
+                .collect::<Vec<_>>();
+            if &worker != authoritative {
+                log::debug!(
+                    target: "kakehashi::tree_worker_shadow",
+                    "host-only selectionRange mismatch uri={} version={} authoritative={:?} worker={:?}",
+                    uri,
+                    expected_version,
+                    authoritative,
+                    worker,
+                );
+            }
+        }
+
         // None = the work-unit panicked (logged by the pool); serve the
         // no-result fallback rather than an error.
         Ok(result)
     }
+}
+
+fn selection_range_from_wire(range: crate::tree_worker::WireSelectionRange) -> SelectionRange {
+    SelectionRange {
+        range: tower_lsp_server::ls_types::Range::new(
+            position_from_wire(range.range.start),
+            position_from_wire(range.range.end),
+        ),
+        parent: range
+            .parent
+            .map(|parent| Box::new(selection_range_from_wire(*parent))),
+    }
+}
+
+fn position_from_wire(
+    position: crate::tree_worker::WirePosition,
+) -> tower_lsp_server::ls_types::Position {
+    tower_lsp_server::ls_types::Position::new(position.line, position.character)
 }

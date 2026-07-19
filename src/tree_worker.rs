@@ -22,7 +22,7 @@ use sha2::{Digest, Sha256};
 
 use crate::language::node_tracker::{EditInfo, NodeTracker};
 
-pub const PROTOCOL_VERSION: u32 = 4;
+pub const PROTOCOL_VERSION: u32 = 5;
 pub const MAX_FRAME_BYTES: usize = 64 * 1024 * 1024;
 pub const MAX_DOCUMENT_REPLICAS: usize = 4_096;
 pub const MAX_DOCUMENT_BYTES: usize = 32 * 1024 * 1024;
@@ -118,6 +118,12 @@ pub struct RunNodeScalar {
     pub operation: NodeScalarOperation,
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct DeriveSelectionRanges {
+    pub context: RequestContext,
+    pub positions: Vec<WirePosition>,
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum NodeScalarOperation {
@@ -206,6 +212,18 @@ pub struct WirePosition {
     pub character: u32,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct WireRange {
+    pub start: WirePosition,
+    pub end: WirePosition,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct WireSelectionRange {
+    pub range: WireRange,
+    pub parent: Option<Box<WireSelectionRange>>,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
 pub struct OpaqueNodeId {
     pub worker_generation: u64,
@@ -232,6 +250,12 @@ pub struct NodeResult {
 pub struct NodeScalarResult {
     pub context: RequestContext,
     pub value: Option<NodeScalarValue>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct SelectionRangesResult {
+    pub context: RequestContext,
+    pub ranges: Vec<WireSelectionRange>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -268,6 +292,7 @@ pub enum Request {
     ResolveNode(ResolveNode),
     NavigateNode(NavigateNode),
     RunNodeScalar(RunNodeScalar),
+    DeriveSelectionRanges(DeriveSelectionRanges),
     CloseDocument(CloseDocument),
 }
 
@@ -309,6 +334,7 @@ pub enum Response {
     Snapshot(DerivedSnapshot),
     Nodes(NodeResult),
     NodeScalar(NodeScalarResult),
+    SelectionRanges(SelectionRangesResult),
     Error(WorkerError),
 }
 
@@ -662,6 +688,38 @@ impl DocumentReplica {
         })
     }
 
+    fn derive_selection_ranges(
+        &self,
+        request: DeriveSelectionRanges,
+    ) -> Result<SelectionRangesResult, String> {
+        self.validate_read_identity(&request.context)?;
+        let mapper = crate::text::PositionMapper::new(&self.text);
+        let root = self.tree.root_node();
+        let ranges = request
+            .positions
+            .into_iter()
+            .map(|position| {
+                let lsp_position =
+                    tower_lsp_server::ls_types::Position::new(position.line, position.character);
+                mapper
+                    .position_to_byte(lsp_position)
+                    .and_then(|byte| root.descendant_for_byte_range(byte, byte))
+                    .map(|node| build_wire_selection_range(node, &mapper))
+                    .unwrap_or(WireSelectionRange {
+                        range: WireRange {
+                            start: position,
+                            end: position,
+                        },
+                        parent: None,
+                    })
+            })
+            .collect();
+        Ok(SelectionRangesResult {
+            context: request.context,
+            ranges,
+        })
+    }
+
     fn tracked_node<'tree>(
         &'tree self,
         node_id: &OpaqueNodeId,
@@ -770,6 +828,36 @@ impl DocumentReplica {
             }
         }
         Ok(())
+    }
+}
+
+fn build_wire_selection_range(
+    node: tree_sitter::Node<'_>,
+    mapper: &crate::text::PositionMapper<'_>,
+) -> WireSelectionRange {
+    let current_range = node.byte_range();
+    let mut parent = node.parent();
+    while parent.is_some_and(|parent| parent.byte_range() == current_range) {
+        parent = parent.and_then(|parent| parent.parent());
+    }
+    WireSelectionRange {
+        range: WireRange {
+            start: mapper
+                .byte_to_position(node.start_byte())
+                .map(wire_position)
+                .unwrap_or(WirePosition {
+                    line: node.start_position().row as u32,
+                    character: 0,
+                }),
+            end: mapper
+                .byte_to_position(node.end_byte())
+                .map(wire_position)
+                .unwrap_or(WirePosition {
+                    line: node.end_position().row as u32,
+                    character: 0,
+                }),
+        },
+        parent: parent.map(|parent| Box::new(build_wire_selection_range(parent, mapper))),
     }
 }
 
@@ -1401,6 +1489,7 @@ fn handle_work(
         Request::ResolveNode(request) => resolve_node(request, documents),
         Request::NavigateNode(request) => navigate_node(request, documents),
         Request::RunNodeScalar(request) => run_node_scalar(request, documents),
+        Request::DeriveSelectionRanges(request) => derive_selection_ranges(request, documents),
         Request::CloseDocument(request) => close_document(
             request,
             documents,
@@ -1425,6 +1514,7 @@ fn request_context(request: &Request) -> Option<&RequestContext> {
         Request::ResolveNode(request) => Some(&request.context),
         Request::NavigateNode(request) => Some(&request.context),
         Request::RunNodeScalar(request) => Some(&request.context),
+        Request::DeriveSelectionRanges(request) => Some(&request.context),
         Request::CloseDocument(request) => Some(&request.context),
     }
 }
@@ -1438,6 +1528,7 @@ fn document_key(request: &Request) -> Option<DocumentKey> {
         Request::ResolveNode(request) => Some(DocumentKey::from(&request.context)),
         Request::NavigateNode(request) => Some(DocumentKey::from(&request.context)),
         Request::RunNodeScalar(request) => Some(DocumentKey::from(&request.context)),
+        Request::DeriveSelectionRanges(request) => Some(DocumentKey::from(&request.context)),
         Request::CloseDocument(request) => Some(DocumentKey::from(&request.context)),
         Request::Handshake(_) | Request::DeriveSnapshot(_) => None,
     }
@@ -1503,6 +1594,29 @@ fn run_node_scalar(request: RunNodeScalar, documents: &DocumentStore) -> Respons
     match replica.lock() {
         Ok(replica) => match replica.run_node_scalar(request) {
             Ok(result) => Response::NodeScalar(result),
+            Err(message) => Response::Error(WorkerError {
+                context: Some(context),
+                message,
+            }),
+        },
+        Err(_) => poisoned_document_restart(context),
+    }
+}
+
+fn derive_selection_ranges(request: DeriveSelectionRanges, documents: &DocumentStore) -> Response {
+    let context = request.context.clone();
+    let Some(replica) = documents
+        .get(&DocumentKey::from(&context))
+        .map(|entry| Arc::clone(entry.value()))
+    else {
+        return Response::Error(WorkerError {
+            context: Some(context),
+            message: "document replica is missing; full sync required".into(),
+        });
+    };
+    match replica.lock() {
+        Ok(replica) => match replica.derive_selection_ranges(request) {
+            Ok(result) => Response::SelectionRanges(result),
             Err(message) => Response::Error(WorkerError {
                 context: Some(context),
                 message,
@@ -2371,6 +2485,15 @@ impl Client {
         )
     }
 
+    pub fn derive_selection_ranges(&self, request: DeriveSelectionRanges) -> io::Result<Response> {
+        let context = request.context.clone();
+        self.request_with_timeout(
+            Request::DeriveSelectionRanges(request),
+            context,
+            Duration::from_secs(60),
+        )
+    }
+
     pub fn close_document(&self, request: CloseDocument) -> io::Result<Response> {
         let context = request.context.clone();
         self.request_with_timeout(
@@ -2537,6 +2660,7 @@ fn response_request_id(response: &Response) -> Option<u64> {
         Response::Snapshot(snapshot) => Some(snapshot.context.request_id),
         Response::Nodes(result) => Some(result.context.request_id),
         Response::NodeScalar(result) => Some(result.context.request_id),
+        Response::SelectionRanges(result) => Some(result.context.request_id),
         Response::Error(error) => error.context.as_ref().map(|context| context.request_id),
         Response::HandshakeReady(_) => None,
     }
@@ -2550,6 +2674,7 @@ fn response_context(response: &Response) -> Option<&RequestContext> {
         Response::Snapshot(snapshot) => Some(&snapshot.context),
         Response::Nodes(result) => Some(&result.context),
         Response::NodeScalar(result) => Some(&result.context),
+        Response::SelectionRanges(result) => Some(&result.context),
         Response::Error(error) => error.context.as_ref(),
         Response::HandshakeReady(_) => None,
     }
@@ -2660,15 +2785,15 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        ApplyDocumentEdits, BUILD_ID, ByteEdit, CloseDocument, DeriveSnapshot, DocumentKey,
-        DocumentLane, DocumentReplica, GrammarKey, Handshake, HandshakeReady, LaneAction,
-        LaneRegistry, MAX_DOCUMENT_BYTES, MAX_DOCUMENT_REPLICAS, MAX_RETAINED_DOCUMENT_BYTES,
-        NavigateNode, NodeNavigation, NodeScalarOperation, NodeScalarValue, OpaqueNodeId,
-        PROTOCOL_VERSION, Request, RequestContext, ResolveNode, Response, Route, RunNodeScalar,
-        SyncDocument, WirePosition, WorkerError, close_document, decode_frame,
-        derive_snapshot_with_language, encode_frame, named_node_count, replace_retained_bytes,
-        reserve_retained_growth, route_response, run, submit_document_job, sync_document,
-        terminate_by_transport, validate_document_size,
+        ApplyDocumentEdits, BUILD_ID, ByteEdit, CloseDocument, DeriveSelectionRanges,
+        DeriveSnapshot, DocumentKey, DocumentLane, DocumentReplica, GrammarKey, Handshake,
+        HandshakeReady, LaneAction, LaneRegistry, MAX_DOCUMENT_BYTES, MAX_DOCUMENT_REPLICAS,
+        MAX_RETAINED_DOCUMENT_BYTES, NavigateNode, NodeNavigation, NodeScalarOperation,
+        NodeScalarValue, OpaqueNodeId, PROTOCOL_VERSION, Request, RequestContext, ResolveNode,
+        Response, Route, RunNodeScalar, SyncDocument, WirePosition, WorkerError, close_document,
+        decode_frame, derive_snapshot_with_language, encode_frame, named_node_count,
+        replace_retained_bytes, reserve_retained_growth, route_response, run, submit_document_job,
+        sync_document, terminate_by_transport, validate_document_size,
     };
 
     #[derive(Clone, Default)]
@@ -3389,6 +3514,46 @@ mod tests {
             .unwrap();
         assert_eq!(child_with_descendant.nodes.len(), 1);
         assert_eq!(child_with_descendant.nodes[0].kind, "identifier");
+
+        let selections = replica
+            .derive_selection_ranges(DeriveSelectionRanges {
+                context: context.clone(),
+                positions: vec![
+                    WirePosition {
+                        line: 0,
+                        character: 3,
+                    },
+                    WirePosition {
+                        line: 99,
+                        character: 0,
+                    },
+                ],
+            })
+            .unwrap();
+        assert_eq!(selections.ranges.len(), 2);
+        assert_eq!(
+            selections.ranges[0].range.start,
+            WirePosition {
+                line: 0,
+                character: 3,
+            }
+        );
+        assert_eq!(
+            selections.ranges[0].range.end,
+            WirePosition {
+                line: 0,
+                character: 7,
+            }
+        );
+        assert!(selections.ranges[0].parent.is_some());
+        assert_eq!(
+            selections.ranges[1].range.start,
+            WirePosition {
+                line: 99,
+                character: 0,
+            }
+        );
+        assert!(selections.ranges[1].parent.is_none());
 
         let mut edited = context.clone();
         edited.request_id = 2;
