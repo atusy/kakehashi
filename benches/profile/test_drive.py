@@ -115,6 +115,21 @@ class RequestSummaryTest(unittest.TestCase):
 
         server.wait.assert_called_once_with(timeout=3)
 
+    def test_server_kill_tolerates_exit_race_and_still_reaps(self):
+        server = mock.Mock()
+        server.poll.return_value = None
+        server.wait.side_effect = [
+            subprocess.TimeoutExpired("server", 0.25),
+            0,
+        ]
+        server.kill.side_effect = ProcessLookupError("already exited")
+
+        terminate_server(server, timeout_seconds=0.25)
+
+        self.assertEqual(server.wait.call_args_list, [
+            mock.call(timeout=0.25), mock.call(),
+        ])
+
     @unittest.skipUnless(
         os.name == "posix" and hasattr(signal, "SIGTERM"),
         "requires POSIX SIGTERM",

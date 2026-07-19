@@ -3,6 +3,7 @@ import os
 import pathlib
 import threading
 import time
+import subprocess
 
 
 def read_with_timeout(stream, operation, timeout_seconds=5):
@@ -18,7 +19,9 @@ def read_with_timeout(stream, operation, timeout_seconds=5):
     try:
         succeeded, value = result.get(timeout=timeout_seconds)
     except queue.Empty as error:
-        raise TimeoutError("timed out waiting for subprocess output") from error
+        raise subprocess.TimeoutExpired(
+            "subprocess output", timeout_seconds,
+        ) from error
     if not succeeded:
         raise value
     return value
@@ -40,8 +43,10 @@ def process_is_running(pid):
     stat = pathlib.Path(f"/proc/{pid}/stat")
     if stat.is_file():
         try:
-            return stat.read_text().split()[2] != "Z"
-        except (IndexError, OSError):
+            text = stat.read_text()
+            fields = text[text.rindex(")") + 1:].split()
+            return fields[0] != "Z"
+        except (ValueError, IndexError, OSError):
             pass
     return True
 

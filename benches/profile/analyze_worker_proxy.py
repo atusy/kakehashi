@@ -69,6 +69,8 @@ def analyze_data(
     drop_first_pairs=0,
     last_pairs=None,
 ):
+    if not isinstance(data, dict):
+        raise ValueError("input data must be a JSON object")
     if data.get("experiment") == "single-tree-worker-phase0-cold-start":
         return {
             "cold_start": summarize_pairs(

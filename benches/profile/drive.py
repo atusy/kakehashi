@@ -233,7 +233,10 @@ def terminate_server(server, timeout_seconds=3):
     try:
         server.wait(timeout=timeout_seconds)
     except subprocess.TimeoutExpired:
-        server.kill()
+        try:
+            server.kill()
+        except ProcessLookupError:
+            pass
         server.wait()
 
 

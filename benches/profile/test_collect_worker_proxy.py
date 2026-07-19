@@ -13,7 +13,11 @@ from unittest import mock
 sys.path.insert(0, str(pathlib.Path(__file__).parent))
 
 import collect_worker_proxy as collector
-from process_test_utils import wait_for_process_stopped
+from process_test_utils import (
+    process_is_running,
+    read_with_timeout,
+    wait_for_process_stopped,
+)
 from collect_worker_proxy import (
     CLEANUP_SIGNALS,
     build_driver_command,
@@ -42,6 +46,20 @@ from collect_worker_proxy import (
 
 
 class CollectionHelpersTest(unittest.TestCase):
+    def test_read_timeout_uses_subprocess_timeout_contract(self):
+        with self.assertRaises(subprocess.TimeoutExpired):
+            read_with_timeout(None, lambda _stream: time.sleep(1), 0.01)
+
+    def test_linux_zombie_parser_handles_spaces_and_parentheses_in_comm(self):
+        stat = mock.Mock()
+        stat.is_file.return_value = True
+        stat.read_text.return_value = "123 (worker ) with spaces) Z 1 2 3"
+        with (
+            mock.patch("process_test_utils.os.kill"),
+            mock.patch("process_test_utils.pathlib.Path", return_value=stat),
+        ):
+            self.assertFalse(process_is_running(123))
+
     def test_driver_summary_accepts_scientific_wall_time(self):
         output = (
             "tokens/req=42 wall=1.25e-05ms\n"
@@ -612,6 +630,17 @@ class CollectionHelpersTest(unittest.TestCase):
             attestation.write_text(json.dumps(loaded))
             binary.write_bytes(b"other")
             with self.assertRaisesRegex(ValueError, "attested binary digest"):
+                load_binary_attestation(attestation, binary)
+
+    def test_rejects_non_object_binary_attestation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            binary = root / "kakehashi"
+            binary.write_bytes(b"release")
+            attestation = root / "attestation.json"
+            attestation.write_text("[]")
+
+            with self.assertRaisesRegex(ValueError, "JSON object"):
                 load_binary_attestation(attestation, binary)
 
     def test_rejects_attestation_without_clean_release_build(self):

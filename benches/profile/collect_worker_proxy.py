@@ -383,6 +383,8 @@ def verify_file_sha256(path, expected):
 
 def load_binary_attestation(path, binary):
     attestation = json.loads(path.read_text())
+    if not isinstance(attestation, dict):
+        raise ValueError("binary attestation must be a JSON object")
     required = (
         "schema", "source_repository", "source_commit",
         "source_remote_refs_containing_commit",

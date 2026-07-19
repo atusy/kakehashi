@@ -10,6 +10,10 @@ from analyze_worker_proxy import analyze_data, summarize_cold_start, summarize_p
 
 
 class PairedSummaryTest(unittest.TestCase):
+    def test_rejects_non_object_input(self):
+        with self.assertRaisesRegex(ValueError, "JSON object"):
+            analyze_data([])
+
     def test_rejects_non_positive_resample_count(self):
         pairs = [{"direct": {"p50": 1.0}, "relay": {"p50": 1.1}}]
 
