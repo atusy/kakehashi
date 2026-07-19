@@ -9,6 +9,11 @@ use kakehashi::tree_worker::{
 use rayon::prelude::*;
 use serde_json::json;
 
+thread_local! {
+    static PARALLEL_LOCAL_DERIVER: std::cell::RefCell<LocalDeriver> =
+        std::cell::RefCell::new(LocalDeriver::new());
+}
+
 #[derive(Parser)]
 struct Args {
     #[arg(long)]
@@ -123,19 +128,26 @@ fn main() {
     let direct_parallel = pool.install(|| {
         (0..args.requests)
             .into_par_iter()
-            .map_init(LocalDeriver::new, |local, index| {
+            .map(|index| {
                 let started = Instant::now();
-                snapshot(local.derive(request(
-                    30_000 + index as u64,
-                    generation,
-                    &args.parser,
-                    &text,
-                )));
-                started.elapsed().as_nanos() as u64
+                let snapshot = PARALLEL_LOCAL_DERIVER.with(|local| {
+                    snapshot(local.borrow_mut().derive(request(
+                        30_000 + index as u64,
+                        generation,
+                        &args.parser,
+                        &text,
+                    )))
+                });
+                (
+                    started.elapsed().as_nanos() as u64,
+                    snapshot.parser_cache_hit,
+                )
             })
             .collect::<Vec<_>>()
     });
     let direct_parallel_wall_ms = direct_parallel_started.elapsed().as_secs_f64() * 1_000.0;
+    let (direct_parallel, direct_cache_hits): (Vec<_>, Vec<_>) =
+        direct_parallel.into_iter().unzip();
 
     let worker = Arc::new(worker);
     let worker_parallel_started = Instant::now();
@@ -144,7 +156,7 @@ fn main() {
             .into_par_iter()
             .map(|index| {
                 let started = Instant::now();
-                snapshot(
+                let snapshot = snapshot(
                     worker
                         .derive(request(
                             40_000 + index as u64,
@@ -154,11 +166,16 @@ fn main() {
                         ))
                         .unwrap(),
                 );
-                started.elapsed().as_nanos() as u64
+                (
+                    started.elapsed().as_nanos() as u64,
+                    snapshot.parser_cache_hit,
+                )
             })
             .collect::<Vec<_>>()
     });
     let worker_parallel_wall_ms = worker_parallel_started.elapsed().as_secs_f64() * 1_000.0;
+    let (worker_parallel, worker_cache_hits): (Vec<_>, Vec<_>) =
+        worker_parallel.into_iter().unzip();
     Arc::try_unwrap(worker)
         .ok()
         .expect("parallel benchmark released worker")
@@ -192,6 +209,8 @@ fn main() {
                 "worker_request_latency": summary(&worker_parallel),
                 "direct_wall_ms": direct_parallel_wall_ms,
                 "worker_wall_ms": worker_parallel_wall_ms,
+                "direct_parser_cache_hits": direct_cache_hits.into_iter().filter(|hit| *hit).count(),
+                "worker_parser_cache_hits": worker_cache_hits.into_iter().filter(|hit| *hit).count(),
                 "direct_requests_per_second": args.requests as f64 / (direct_parallel_wall_ms / 1_000.0),
                 "worker_requests_per_second": args.requests as f64 / (worker_parallel_wall_ms / 1_000.0),
             },
