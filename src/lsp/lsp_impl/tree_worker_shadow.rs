@@ -124,6 +124,12 @@ struct ResyncStats {
     bytes: usize,
 }
 
+struct ResyncFailure {
+    error: std::io::Error,
+    class: FailureClass,
+    implicated_grammar: Option<GrammarIdentity>,
+}
+
 impl OpenDocuments {
     fn observe(&mut self, command: &ShadowCommand) {
         match command {
@@ -180,6 +186,7 @@ struct PendingComparison {
 struct ComparisonSlot {
     open_incarnation: u64,
     pending: Option<PendingComparison>,
+    completed: Option<(u64, u64, u64)>,
 }
 
 #[derive(Default)]
@@ -469,6 +476,13 @@ fn shutdown_with_timeout(
         log_incomplete_shutdown("timed out waiting for actor drain");
         return;
     }
+    let pending_uris = comparisons.pending_uris();
+    if !pending_uris.is_empty() {
+        log::warn!(
+            target: "kakehashi::tree_worker_shadow_metrics",
+            "shadow comparisons still pending for URIs: {pending_uris:?}",
+        );
+    }
     log::info!(
         target: "kakehashi::tree_worker_shadow_metrics",
         "shadow comparisons matched={} mismatched={} superseded={} pending={}",
@@ -588,14 +602,16 @@ fn run_actor(
         let implicated_grammar = command_grammar(&command).or_else(|| {
             command_uri(&command).and_then(|uri| state.open_documents.grammar_for(uri))
         });
+        let command_document =
+            command_document(&command).map(|(uri, incarnation)| (uri.to_string(), incarnation));
         state.open_documents.observe(&command);
         retag_command(&mut command, state.worker_generation);
         if implicated_grammar
             .as_ref()
             .is_some_and(|grammar| state.quarantined.contains(grammar))
         {
-            if let Some((uri, incarnation)) = command_document(&command) {
-                comparisons.mark_closed(uri, incarnation);
+            if let Some((uri, incarnation)) = command_document.as_ref() {
+                comparisons.mark_closed(uri, *incarnation);
             }
             continue;
         }
@@ -651,11 +667,16 @@ fn run_actor(
                     break;
                 }
             }
-            Ok(Response::Error(error)) => log::warn!(
-                target: "kakehashi::tree_worker_shadow",
-                "shadow request rejected: {}",
-                error.message
-            ),
+            Ok(Response::Error(error)) => {
+                if let Some((uri, incarnation)) = command_document {
+                    comparisons.mark_closed(&uri, incarnation);
+                }
+                log::warn!(
+                    target: "kakehashi::tree_worker_shadow",
+                    "shadow request rejected: {}",
+                    error.message
+                );
+            }
             Ok(_) => {}
             Err(error) => {
                 let class = classify_transport_failure(
@@ -741,22 +762,8 @@ fn recover_worker(
     comparisons: &ComparisonStore,
 ) -> bool {
     let recovery_started = Instant::now();
-    if let Some(grammar) = implicated_grammar
-        && state.quarantined.insert(grammar.clone())
-    {
-        for request in state.open_documents.current.values() {
-            if GrammarIdentity::from_sync(request) == grammar {
-                comparisons.mark_closed(&request.context.uri, request.context.incarnation);
-            }
-        }
-        log::error!(
-            target: "kakehashi::tree_worker_shadow",
-            "quarantined grammar conservatively for this session after {:?} worker loss: symbol={} path={} configuration_generation={}",
-            class,
-            grammar.grammar_symbol,
-            grammar.parser_path.display(),
-            grammar.configuration_generation,
-        );
+    if let Some(grammar) = implicated_grammar {
+        quarantine_grammar(state, grammar, class, comparisons);
     }
 
     loop {
@@ -809,16 +816,44 @@ fn recover_worker(
                 );
                 return true;
             }
-            Err(error) => {
+            Err(failure) => {
                 state.client = Some(replacement);
+                if let Some(grammar) = failure.implicated_grammar {
+                    quarantine_grammar(state, grammar, failure.class, comparisons);
+                }
                 log::error!(
                     target: "kakehashi::tree_worker_shadow",
-                    "worker generation {generation} full resync failed: {error}"
+                    "worker generation {generation} full resync failed: {}",
+                    failure.error,
                 );
-                class = FailureClass::Systemic;
+                class = failure.class;
             }
         }
     }
+}
+
+fn quarantine_grammar(
+    state: &mut SupervisorState,
+    grammar: GrammarIdentity,
+    class: FailureClass,
+    comparisons: &ComparisonStore,
+) {
+    if !state.quarantined.insert(grammar.clone()) {
+        return;
+    }
+    for request in state.open_documents.current.values() {
+        if GrammarIdentity::from_sync(request) == grammar {
+            comparisons.mark_closed(&request.context.uri, request.context.incarnation);
+        }
+    }
+    log::error!(
+        target: "kakehashi::tree_worker_shadow",
+        "quarantined grammar conservatively for this session after {:?} worker loss: symbol={} path={} configuration_generation={}",
+        class,
+        grammar.grammar_symbol,
+        grammar.parser_path.display(),
+        grammar.configuration_generation,
+    );
 }
 
 fn resync_open_documents(
@@ -828,20 +863,22 @@ fn resync_open_documents(
     quarantined: &HashSet<GrammarIdentity>,
     replicas: &mut HashMap<String, ReplicaIdentity>,
     comparisons: &ComparisonStore,
-) -> std::io::Result<ResyncStats> {
+) -> Result<ResyncStats, ResyncFailure> {
     let mut requests = open_documents.current.values().cloned().collect::<Vec<_>>();
     requests.sort_unstable_by(|left, right| left.context.uri.cmp(&right.context.uri));
     let mut resynced = ResyncStats::default();
     for mut request in requests {
-        if quarantined.contains(&GrammarIdentity::from_sync(&request)) {
+        let grammar = GrammarIdentity::from_sync(&request);
+        if quarantined.contains(&grammar) {
             continue;
         }
-        resynced.bytes = resynced.bytes.saturating_add(request.text.len());
+        let request_bytes = request.text.len();
+        let request_uri = request.context.uri.clone();
         request.context.worker_generation = generation;
         let identity = ReplicaIdentity::from_sync(&request);
         comparisons.open(&request.context.uri, request.context.incarnation);
-        match sync_and_derive(client, request)? {
-            Response::Snapshot(snapshot) => {
+        match sync_and_derive(client, request) {
+            Ok(Response::Snapshot(snapshot)) => {
                 replicas.insert(snapshot.context.uri.clone(), identity);
                 comparisons.record(
                     &snapshot.context.uri,
@@ -850,15 +887,39 @@ fn resync_open_documents(
                     ComparisonSide::Shadow(TreeSummary::from_snapshot(&snapshot)),
                 );
                 resynced.documents += 1;
+                resynced.bytes = resynced.bytes.saturating_add(request_bytes);
             }
-            Response::WorkerRestartRequired(required) => {
-                return Err(std::io::Error::other(required.reason));
+            Ok(Response::WorkerRestartRequired(required)) => {
+                return Err(ResyncFailure {
+                    error: std::io::Error::other(required.reason),
+                    class: FailureClass::Systemic,
+                    implicated_grammar: None,
+                });
             }
-            Response::Error(error) => return Err(std::io::Error::other(error.message)),
-            response => {
-                return Err(std::io::Error::other(format!(
-                    "unexpected resync response: {response:?}"
-                )));
+            Ok(Response::Error(error)) => {
+                comparisons.mark_closed(&request_uri, identity.incarnation);
+                log::warn!(
+                    target: "kakehashi::tree_worker_shadow",
+                    "skipped shadow resync for {request_uri}: {}",
+                    error.message,
+                );
+            }
+            Ok(response) => {
+                return Err(ResyncFailure {
+                    error: std::io::Error::other(format!(
+                        "unexpected resync response: {response:?}"
+                    )),
+                    class: FailureClass::Systemic,
+                    implicated_grammar: None,
+                });
+            }
+            Err(error) => {
+                let class = classify_transport_failure(client, &error, Some(&grammar));
+                return Err(ResyncFailure {
+                    error,
+                    class,
+                    implicated_grammar: Some(grammar),
+                });
             }
         }
     }
@@ -962,6 +1023,14 @@ impl ComparisonStore {
             self.superseded.fetch_add(1, Ordering::Relaxed);
             return;
         }
+        if let Some(completed) = slot.completed
+            && incoming <= completed
+        {
+            if incoming < completed {
+                self.superseded.fetch_add(1, Ordering::Relaxed);
+            }
+            return;
+        }
 
         let pending = slot.pending.get_or_insert_with(|| PendingComparison {
             incarnation,
@@ -1006,6 +1075,7 @@ impl ComparisonStore {
         let shadow = completed
             .shadow
             .expect("completed comparison has a shadow summary");
+        slot.completed = Some(incoming);
         drop(slot);
         if authoritative == shadow {
             self.matched.fetch_add(1, Ordering::Relaxed);
@@ -1039,6 +1109,7 @@ impl ComparisonStore {
             *slot = ComparisonSlot {
                 open_incarnation: incarnation,
                 pending: None,
+                completed: None,
             };
         }
     }
@@ -1048,6 +1119,14 @@ impl ComparisonStore {
             .iter()
             .filter(|slot| slot.pending.is_some())
             .count()
+    }
+
+    fn pending_uris(&self) -> Vec<String> {
+        self.slots
+            .iter()
+            .filter(|slot| slot.pending.is_some())
+            .map(|slot| slot.key().clone())
+            .collect()
     }
 }
 
@@ -1310,6 +1389,26 @@ mod tests {
             assert_eq!(store.matched.load(Ordering::Relaxed), 1);
             assert_eq!(store.pending_count(), 0);
         }
+    }
+
+    #[test]
+    fn replayed_shadow_for_an_already_completed_version_is_ignored() {
+        let store = ComparisonStore::default();
+        let uri = "file:///a.rs";
+        store.open(uri, 1);
+        store.record(
+            uri,
+            1,
+            2,
+            ComparisonSide::Authoritative(summary("source_file")),
+        );
+        store.record(uri, 1, 2, ComparisonSide::Shadow(summary("source_file")));
+
+        store.record(uri, 1, 2, ComparisonSide::Shadow(summary("source_file")));
+
+        assert_eq!(store.matched.load(Ordering::Relaxed), 1);
+        assert_eq!(store.superseded.load(Ordering::Relaxed), 0);
+        assert_eq!(store.pending_count(), 0);
     }
 
     #[test]

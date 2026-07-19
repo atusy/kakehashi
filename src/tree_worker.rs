@@ -1442,6 +1442,15 @@ fn inject_worker_failure_once(request: &Request) -> Option<Response> {
             reason: "injected systemic restart".into(),
         }));
     }
+    if std::env::var("KAKEHASHI_TREE_WORKER_ERROR_URI_SUFFIX")
+        .ok()
+        .is_some_and(|suffix| sync.context.uri.ends_with(&suffix))
+    {
+        return Some(Response::Error(WorkerError {
+            context: Some(sync.context.clone()),
+            message: "injected document rejection".into(),
+        }));
+    }
     None
 }
 

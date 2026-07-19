@@ -276,6 +276,77 @@ fn systemic_worker_restart_measures_many_document_full_resync() {
 }
 
 #[test]
+fn rejected_document_does_not_block_other_documents_during_full_resync() {
+    let directory = tempfile::tempdir().unwrap();
+    let marker = directory.path().join("restart-after-rejection");
+    let mut client = LspClient::builder()
+        .env("KAKEHASHI_TREE_WORKER_SHADOW", "true")
+        .env("KAKEHASHI_TREE_WORKER_THREADS", "4")
+        .env(
+            "KAKEHASHI_TREE_WORKER_RESTART_ONCE_FILE",
+            marker.to_string_lossy().into_owned(),
+        )
+        .env("KAKEHASHI_TREE_WORKER_RESTART_URI_SUFFIX", "/trigger.rs")
+        .env("KAKEHASHI_TREE_WORKER_ERROR_URI_SUFFIX", "/rejected.rs")
+        .env(
+            "RUST_LOG",
+            "kakehashi::tree_worker_shadow=info,kakehashi::tree_worker_shadow_metrics=info",
+        )
+        .build();
+    initialize(&mut client);
+    for (uri, language, text) in [
+        ("file:///rejected.rs", "rust", "fn rejected() {}\n"),
+        ("file:///healthy.lua", "lua", "local healthy = true\n"),
+    ] {
+        client.send_notification(
+            "textDocument/didOpen",
+            json!({
+                "textDocument": {
+                    "uri": uri,
+                    "languageId": language,
+                    "version": 1,
+                    "text": text
+                }
+            }),
+        );
+    }
+    std::thread::sleep(Duration::from_secs(1));
+
+    let trigger_uri = "file:///trigger.rs";
+    client.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": trigger_uri,
+                "languageId": "rust",
+                "version": 1,
+                "text": "fn trigger_recovery() {}\n"
+            }
+        }),
+    );
+    let response = client.send_request(
+        "textDocument/semanticTokens/full",
+        json!({ "textDocument": { "uri": trigger_uri } }),
+    );
+    assert!(response.get("result").is_some());
+    std::thread::sleep(Duration::from_secs(2));
+
+    let stderr = shutdown_and_stderr(client);
+    assert!(
+        stderr.contains("skipped shadow resync for file:///rejected.rs"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("full-resynced 2 open documents"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("shadow comparisons matched=2"), "{stderr}");
+    assert!(stderr.contains("pending=0"), "{stderr}");
+    assert!(!stderr.contains("quarantined grammar"), "{stderr}");
+    assert!(!stderr.contains("disabled shadow tree tier"), "{stderr}");
+}
+
+#[test]
 fn idle_worker_exit_is_detected_and_restarted_before_the_next_document() {
     let directory = tempfile::tempdir().unwrap();
     let marker = directory.path().join("idle-crash-once");
