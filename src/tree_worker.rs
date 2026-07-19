@@ -11,7 +11,10 @@ use std::time::{Duration, Instant};
 use std::{
     cell::RefCell,
     collections::{HashMap, VecDeque},
-    sync::{Arc, Mutex, Weak},
+    sync::{
+        Arc, Mutex, Weak,
+        atomic::{AtomicUsize, Ordering},
+    },
 };
 
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -20,6 +23,8 @@ use sha2::{Digest, Sha256};
 pub const PROTOCOL_VERSION: u32 = 2;
 pub const MAX_FRAME_BYTES: usize = 64 * 1024 * 1024;
 pub const MAX_DOCUMENT_REPLICAS: usize = 4_096;
+pub const MAX_DOCUMENT_BYTES: usize = 32 * 1024 * 1024;
+pub const MAX_RETAINED_DOCUMENT_BYTES: usize = 512 * 1024 * 1024;
 pub const BUILD_ID: &str = concat!(env!("CARGO_PKG_NAME"), "-", env!("CARGO_PKG_VERSION"));
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -169,6 +174,7 @@ impl DocumentReplica {
         request: SyncDocument,
         parser: &mut tree_sitter::Parser,
     ) -> Result<(Self, DocumentAck), String> {
+        validate_document_size(request.text.len())?;
         let tree = parser
             .parse(request.text.as_bytes(), None)
             .ok_or_else(|| "parser returned no tree during document sync".to_string())?;
@@ -199,6 +205,7 @@ impl DocumentReplica {
         &mut self,
         request: ApplyDocumentEdits,
         parser: &mut tree_sitter::Parser,
+        retained_bytes: Option<&AtomicUsize>,
     ) -> Result<DocumentAck, String> {
         self.validate_identity(&request.context)?;
         if request.base_version != self.context.content_version {
@@ -227,6 +234,7 @@ impl DocumentReplica {
                 .checked_add(edit.new_text.len())
                 .ok_or_else(|| "edit length overflows byte offsets".to_string())?;
             text.replace_range(edit.start_byte..edit.old_end_byte, &edit.new_text);
+            validate_document_size(text.len())?;
             let new_end_position = point_at_byte(&text, new_end_byte);
             edited_tree.edit(&tree_sitter::InputEdit {
                 start_byte: edit.start_byte,
@@ -240,6 +248,9 @@ impl DocumentReplica {
         let tree = parser
             .parse(text.as_bytes(), Some(&edited_tree))
             .ok_or_else(|| "parser returned no tree during incremental parse".to_string())?;
+        if let Some(retained_bytes) = retained_bytes {
+            replace_retained_bytes(retained_bytes, self.text.len(), text.len())?;
+        }
         self.text = text;
         self.tree = tree;
         self.context = request.context;
@@ -326,6 +337,43 @@ impl DocumentReplica {
             }
         }
         Ok(())
+    }
+}
+
+fn validate_document_size(bytes: usize) -> Result<(), String> {
+    if bytes > MAX_DOCUMENT_BYTES {
+        return Err(format!(
+            "document exceeds retained size limit {MAX_DOCUMENT_BYTES} bytes"
+        ));
+    }
+    Ok(())
+}
+
+fn replace_retained_bytes(
+    retained_bytes: &AtomicUsize,
+    old_bytes: usize,
+    new_bytes: usize,
+) -> Result<(), String> {
+    let mut retained = retained_bytes.load(Ordering::Relaxed);
+    loop {
+        let next = retained
+            .checked_sub(old_bytes)
+            .and_then(|bytes| bytes.checked_add(new_bytes))
+            .ok_or_else(|| "retained document byte accounting overflowed".to_string())?;
+        if next > MAX_RETAINED_DOCUMENT_BYTES {
+            return Err(format!(
+                "worker retained document budget {MAX_RETAINED_DOCUMENT_BYTES} bytes exceeded"
+            ));
+        }
+        match retained_bytes.compare_exchange_weak(
+            retained,
+            next,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => return Ok(()),
+            Err(current) => retained = current,
+        }
     }
 }
 
@@ -488,10 +536,22 @@ impl LocalDocumentReplica {
     pub fn sync_document(&mut self, request: SyncDocument) -> Response {
         let context = request.context.clone();
         let grammar_key = GrammarKey {
-            parser_path: request.parser_path.clone(),
+            parser_path: request
+                .parser_path
+                .canonicalize()
+                .unwrap_or_else(|_| request.parser_path.clone()),
             grammar_symbol: request.grammar_symbol.clone(),
         };
         let Self { state, replica } = self;
+        if let Some(existing) = replica.as_ref()
+            && let Err(message) =
+                existing.validate_replacement(&context, &request.language, &grammar_key)
+        {
+            return Response::Error(WorkerError {
+                context: Some(context),
+                message,
+            });
+        }
         state.with_parser(
             grammar_key,
             context.clone(),
@@ -525,7 +585,7 @@ impl LocalDocumentReplica {
             match replica
                 .as_mut()
                 .expect("replica presence checked before parser checkout")
-                .apply(request, parser)
+                .apply(request, parser, None)
             {
                 Ok(ack) => Response::DocumentAck(ack),
                 Err(message) => Response::Error(WorkerError {
@@ -645,6 +705,7 @@ impl From<&RequestContext> for DocumentKey {
 type DocumentStore = Arc<dashmap::DashMap<DocumentKey, Arc<Mutex<DocumentReplica>>>>;
 type ClosedDocuments = Arc<dashmap::DashMap<DocumentKey, u64>>;
 type DocumentCapacity = Arc<Mutex<usize>>;
+type RetainedDocumentBytes = Arc<AtomicUsize>;
 type LaneJob = Box<dyn FnOnce() -> LaneAction + Send + 'static>;
 
 #[derive(Clone, Copy)]
@@ -782,19 +843,31 @@ fn handle_work(
     documents: &DocumentStore,
     closed_documents: &ClosedDocuments,
     document_capacity: &DocumentCapacity,
+    retained_document_bytes: &RetainedDocumentBytes,
     queue_wait: Duration,
 ) -> Response {
     match request {
         Request::DeriveSnapshot(request) => derive_snapshot(request, queue_wait),
-        Request::SyncDocument(request) => {
-            sync_document(request, documents, closed_documents, document_capacity)
+        Request::SyncDocument(request) => sync_document(
+            request,
+            documents,
+            closed_documents,
+            document_capacity,
+            retained_document_bytes,
+        ),
+        Request::ApplyDocumentEdits(request) => {
+            apply_document_edits(request, documents, retained_document_bytes)
         }
-        Request::ApplyDocumentEdits(request) => apply_document_edits(request, documents),
         Request::ApplyDocumentEditsAndDerive(request) => {
-            apply_document_edits_and_derive(request, documents)
+            apply_document_edits_and_derive(request, documents, retained_document_bytes)
         }
         Request::DeriveDocumentSnapshot(request) => derive_document_snapshot(request, documents),
-        Request::CloseDocument(request) => close_document(request, documents, closed_documents),
+        Request::CloseDocument(request) => close_document(
+            request,
+            documents,
+            closed_documents,
+            retained_document_bytes,
+        ),
         Request::Handshake(_) => Response::Error(WorkerError {
             context: None,
             message: "handshake may only be sent once".into(),
@@ -830,8 +903,16 @@ fn sync_document(
     documents: &DocumentStore,
     closed_documents: &ClosedDocuments,
     document_capacity: &DocumentCapacity,
+    retained_document_bytes: &RetainedDocumentBytes,
 ) -> Response {
     let context = request.context.clone();
+    let request_text_len = request.text.len();
+    if let Err(message) = validate_document_size(request_text_len) {
+        return Response::Error(WorkerError {
+            context: Some(context),
+            message,
+        });
+    }
     let document_key = DocumentKey::from(&context);
     let grammar_key = GrammarKey {
         parser_path: request
@@ -840,7 +921,7 @@ fn sync_document(
             .unwrap_or_else(|_| request.parser_path.clone()),
         grammar_symbol: request.grammar_symbol.clone(),
     };
-    if let Some(existing) = documents
+    let replaced_bytes = if let Some(existing) = documents
         .get(&document_key)
         .map(|entry| Arc::clone(entry.value()))
     {
@@ -848,13 +929,18 @@ fn sync_document(
             .lock()
             .map_err(|_| "document replica lock is poisoned".to_string())
             .and_then(|replica| {
-                replica.validate_replacement(&context, &request.language, &grammar_key)
+                replica
+                    .validate_replacement(&context, &request.language, &grammar_key)
+                    .map(|()| replica.text.len())
             });
-        if let Err(message) = validation {
-            return Response::Error(WorkerError {
-                context: Some(context),
-                message,
-            });
+        match validation {
+            Ok(bytes) => bytes,
+            Err(message) => {
+                return Response::Error(WorkerError {
+                    context: Some(context),
+                    message,
+                });
+            }
         }
     } else {
         if let Some(closed_incarnation) = closed_documents.get(&document_key)
@@ -865,7 +951,8 @@ fn sync_document(
                 message: "full sync targets a closed document incarnation".into(),
             });
         }
-    }
+        0
+    };
     let reserves_slot =
         !documents.contains_key(&document_key) && !closed_documents.contains_key(&document_key);
     if reserves_slot {
@@ -881,6 +968,20 @@ fn sync_document(
             });
         }
         *known_documents += 1;
+    }
+    if let Err(message) =
+        replace_retained_bytes(retained_document_bytes, replaced_bytes, request_text_len)
+    {
+        if reserves_slot {
+            let mut known_documents = document_capacity
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            *known_documents = known_documents.saturating_sub(1);
+        }
+        return Response::Error(WorkerError {
+            context: Some(context),
+            message,
+        });
     }
     let response = WORKER_THREAD_STATE.with(|state| {
         state
@@ -907,10 +1008,18 @@ fn sync_document(
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         *known_documents = known_documents.saturating_sub(1);
     }
+    if !matches!(&response, Response::DocumentAck(_)) {
+        replace_retained_bytes(retained_document_bytes, request_text_len, replaced_bytes)
+            .expect("rolling back a retained-byte reservation must fit");
+    }
     response
 }
 
-fn apply_document_edits(request: ApplyDocumentEdits, documents: &DocumentStore) -> Response {
+fn apply_document_edits(
+    request: ApplyDocumentEdits,
+    documents: &DocumentStore,
+    retained_document_bytes: &RetainedDocumentBytes,
+) -> Response {
     let context = request.context.clone();
     let document_key = DocumentKey::from(&context);
     let Some(replica) = documents
@@ -941,7 +1050,7 @@ fn apply_document_edits(request: ApplyDocumentEdits, documents: &DocumentStore) 
                         message: "document replica lock is poisoned".into(),
                     });
                 };
-                match replica.apply(request, parser) {
+                match replica.apply(request, parser, Some(retained_document_bytes)) {
                     Ok(ack) => Response::DocumentAck(ack),
                     Err(message) => Response::Error(WorkerError {
                         context: Some(context),
@@ -955,6 +1064,7 @@ fn apply_document_edits(request: ApplyDocumentEdits, documents: &DocumentStore) 
 fn apply_document_edits_and_derive(
     request: ApplyDocumentEditsAndDerive,
     documents: &DocumentStore,
+    retained_document_bytes: &RetainedDocumentBytes,
 ) -> Response {
     let context = request.context.clone();
     let document_key = DocumentKey::from(&context);
@@ -991,7 +1101,7 @@ fn apply_document_edits_and_derive(
                     base_version: request.base_version,
                     edits: request.edits,
                 };
-                if let Err(message) = replica.apply(edits, parser) {
+                if let Err(message) = replica.apply(edits, parser, Some(retained_document_bytes)) {
                     return Response::Error(WorkerError {
                         context: Some(context),
                         message,
@@ -1042,6 +1152,7 @@ fn close_document(
     request: CloseDocument,
     documents: &DocumentStore,
     closed_documents: &ClosedDocuments,
+    retained_document_bytes: &RetainedDocumentBytes,
 ) -> Response {
     let context = request.context;
     let document_key = DocumentKey::from(&context);
@@ -1067,7 +1178,14 @@ fn close_document(
             message,
         });
     }
-    documents.remove(&document_key);
+    let removed_bytes = documents.remove(&document_key).map_or(0, |(_, replica)| {
+        replica
+            .lock()
+            .map(|replica| replica.text.len())
+            .unwrap_or(0)
+    });
+    replace_retained_bytes(retained_document_bytes, removed_bytes, 0)
+        .expect("removing a document cannot exceed the retained-byte budget");
     closed_documents.insert(document_key, context.incarnation);
     Response::DocumentClosed(DocumentClosed { context })
 }
@@ -1168,6 +1286,7 @@ where
     let documents = Arc::new(dashmap::DashMap::new());
     let closed_documents = Arc::new(dashmap::DashMap::new());
     let document_capacity = Arc::new(Mutex::new(0));
+    let retained_document_bytes = Arc::new(AtomicUsize::new(0));
     let document_lanes: DocumentLanes = Arc::new(dashmap::DashMap::new());
     while let Some(request) = decode_frame::<_, Request>(&mut reader)? {
         let Some(context) = request_context(&request) else {
@@ -1197,6 +1316,7 @@ where
         let documents = Arc::clone(&documents);
         let closed_documents = Arc::clone(&closed_documents);
         let document_capacity = Arc::clone(&document_capacity);
+        let retained_document_bytes = Arc::clone(&retained_document_bytes);
         let lane_key = document_key(&request);
         let action_key = lane_key.clone();
         let job: LaneJob = Box::new(move || {
@@ -1205,6 +1325,7 @@ where
                 &documents,
                 &closed_documents,
                 &document_capacity,
+                &retained_document_bytes,
                 enqueued.elapsed(),
             );
             let action = if action_key
@@ -1781,9 +1902,10 @@ mod tests {
     use super::{
         ApplyDocumentEdits, BUILD_ID, ByteEdit, DeriveSnapshot, DocumentKey, DocumentLane,
         DocumentReplica, GrammarKey, Handshake, HandshakeReady, LaneAction, LaneRegistry,
-        MAX_DOCUMENT_REPLICAS, PROTOCOL_VERSION, Request, RequestContext, Response, Route,
-        SyncDocument, WorkerError, decode_frame, derive_snapshot_with_language, encode_frame,
-        route_response, run, submit_document_job, sync_document,
+        MAX_DOCUMENT_BYTES, MAX_DOCUMENT_REPLICAS, MAX_RETAINED_DOCUMENT_BYTES, PROTOCOL_VERSION,
+        Request, RequestContext, Response, Route, SyncDocument, WorkerError, decode_frame,
+        derive_snapshot_with_language, encode_frame, replace_retained_bytes, route_response, run,
+        submit_document_job, sync_document, validate_document_size,
     };
 
     #[derive(Clone, Default)]
@@ -2304,6 +2426,7 @@ mod tests {
                     }],
                 },
                 &mut parser,
+                None,
             )
             .unwrap();
 
@@ -2351,6 +2474,7 @@ mod tests {
                     edits: Vec::new(),
                 },
                 &mut parser,
+                None,
             )
             .unwrap_err();
 
@@ -2464,9 +2588,41 @@ mod tests {
             &documents,
             &closed_documents,
             &capacity,
+            &Arc::new(AtomicUsize::new(0)),
         );
 
         assert!(matches!(response, Response::WorkerRestartRequired(_)));
+    }
+
+    #[test]
+    fn document_size_limit_rejects_unbounded_replica_growth() {
+        assert!(validate_document_size(MAX_DOCUMENT_BYTES).is_ok());
+        assert!(
+            validate_document_size(MAX_DOCUMENT_BYTES + 1)
+                .unwrap_err()
+                .contains("retained size limit")
+        );
+    }
+
+    #[test]
+    fn retained_document_budget_is_transactional() {
+        let retained = AtomicUsize::new(MAX_RETAINED_DOCUMENT_BYTES - 8);
+
+        assert!(
+            replace_retained_bytes(&retained, 4, 13)
+                .unwrap_err()
+                .contains("retained document budget")
+        );
+        assert_eq!(
+            retained.load(Ordering::Relaxed),
+            MAX_RETAINED_DOCUMENT_BYTES - 8
+        );
+
+        replace_retained_bytes(&retained, 4, 12).unwrap();
+        assert_eq!(
+            retained.load(Ordering::Relaxed),
+            MAX_RETAINED_DOCUMENT_BYTES
+        );
     }
 
     #[test]
@@ -2518,6 +2674,7 @@ mod tests {
                     ],
                 },
                 &mut parser,
+                None,
             )
             .unwrap_err();
 
