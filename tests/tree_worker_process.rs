@@ -1,6 +1,8 @@
 use std::path::PathBuf;
 use std::sync::{Arc, Barrier};
 
+#[cfg(feature = "e2e")]
+use kakehashi::tree_worker::{ApplyDocumentEdits, ByteEdit, DeriveDocumentSnapshot, SyncDocument};
 use kakehashi::tree_worker::{Client, DeriveSnapshot, RequestContext, Response};
 
 #[test]
@@ -142,5 +144,69 @@ fn real_worker_derives_a_snapshot_from_an_installed_grammar() {
     };
     assert!(snapshot.parser_cache_hit);
     assert!(snapshot.compute_ns > 0);
+    worker.shutdown().unwrap();
+}
+
+#[cfg(feature = "e2e")]
+#[test]
+fn real_worker_keeps_document_text_and_tree_across_incremental_edits() {
+    let data_dir = kakehashi::install::test_support::test_data_dir_path();
+    std::fs::create_dir_all(&data_dir).unwrap();
+    kakehashi::install::test_support::ensure_test_languages_installed(&data_dir).unwrap();
+    let parser = data_dir
+        .join("parser")
+        .join(format!("rust.{}", std::env::consts::DLL_EXTENSION));
+    let executable = PathBuf::from(env!("CARGO_BIN_EXE_kakehashi"));
+    let worker = Client::spawn(&executable, 2, 44).unwrap();
+    let context = RequestContext {
+        request_id: 30,
+        worker_generation: 44,
+        uri: "file:///incremental.rs".into(),
+        incarnation: 1,
+        content_version: 1,
+        configuration_generation: 0,
+    };
+
+    let response = worker
+        .sync_document(SyncDocument {
+            context: context.clone(),
+            language: "rust".into(),
+            grammar_symbol: "rust".into(),
+            parser_path: parser,
+            text: "fn main() { 1 }".into(),
+        })
+        .unwrap();
+    let Response::DocumentAck(ack) = response else {
+        panic!("full sync must be acknowledged: {response:?}");
+    };
+    assert!(!ack.incremental);
+
+    let mut edited = context;
+    edited.request_id = 31;
+    edited.content_version = 2;
+    let response = worker
+        .apply_document_edits(ApplyDocumentEdits {
+            context: edited.clone(),
+            base_version: 1,
+            edits: vec![ByteEdit {
+                start_byte: 12,
+                old_end_byte: 13,
+                new_text: "value + 2".into(),
+            }],
+        })
+        .unwrap();
+    let Response::DocumentAck(ack) = response else {
+        panic!("incremental edit must be acknowledged: {response:?}");
+    };
+    assert!(ack.incremental);
+
+    edited.request_id = 32;
+    let response = worker
+        .derive_document_snapshot(DeriveDocumentSnapshot { context: edited })
+        .unwrap();
+    let Response::Snapshot(snapshot) = response else {
+        panic!("derive must read worker-owned state: {response:?}");
+    };
+    assert_eq!(snapshot.root_end_byte, "fn main() { value + 2 }".len());
     worker.shutdown().unwrap();
 }

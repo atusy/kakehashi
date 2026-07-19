@@ -48,10 +48,47 @@ pub struct DeriveSnapshot {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct SyncDocument {
+    pub context: RequestContext,
+    pub language: String,
+    pub grammar_symbol: String,
+    pub parser_path: PathBuf,
+    pub text: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ByteEdit {
+    pub start_byte: usize,
+    pub old_end_byte: usize,
+    pub new_text: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ApplyDocumentEdits {
+    pub context: RequestContext,
+    pub base_version: u64,
+    pub edits: Vec<ByteEdit>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct DeriveDocumentSnapshot {
+    pub context: RequestContext,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct DocumentAck {
+    pub context: RequestContext,
+    pub incremental: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Request {
     Handshake(Handshake),
     DeriveSnapshot(DeriveSnapshot),
+    SyncDocument(SyncDocument),
+    ApplyDocumentEdits(ApplyDocumentEdits),
+    DeriveDocumentSnapshot(DeriveDocumentSnapshot),
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -86,8 +123,144 @@ pub struct WorkerError {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Response {
     HandshakeReady(HandshakeReady),
+    DocumentAck(DocumentAck),
     Snapshot(DerivedSnapshot),
     Error(WorkerError),
+}
+
+struct DocumentReplica {
+    context: RequestContext,
+    language: String,
+    grammar_key: GrammarKey,
+    text: String,
+    tree: tree_sitter::Tree,
+}
+
+impl DocumentReplica {
+    fn sync(
+        request: SyncDocument,
+        parser: &mut tree_sitter::Parser,
+    ) -> Result<(Self, DocumentAck), String> {
+        let tree = parser
+            .parse(request.text.as_bytes(), None)
+            .ok_or_else(|| "parser returned no tree during document sync".to_string())?;
+        let ack = DocumentAck {
+            context: request.context.clone(),
+            incremental: false,
+        };
+        let grammar_key = GrammarKey {
+            parser_path: request.parser_path.clone(),
+            grammar_symbol: request.grammar_symbol.clone(),
+        };
+        Ok((
+            Self {
+                context: request.context,
+                language: request.language,
+                grammar_key,
+                text: request.text,
+                tree,
+            },
+            ack,
+        ))
+    }
+
+    fn apply(
+        &mut self,
+        request: ApplyDocumentEdits,
+        parser: &mut tree_sitter::Parser,
+    ) -> Result<DocumentAck, String> {
+        self.validate_identity(&request.context)?;
+        if request.base_version != self.context.content_version {
+            return Err(format!(
+                "base version {} does not match {}",
+                request.base_version, self.context.content_version
+            ));
+        }
+        if request.context.content_version <= request.base_version {
+            return Err("target content version must advance".into());
+        }
+        let mut text = self.text.clone();
+        let mut edited_tree = self.tree.clone();
+        for edit in request.edits {
+            if edit.start_byte > edit.old_end_byte
+                || edit.old_end_byte > text.len()
+                || !text.is_char_boundary(edit.start_byte)
+                || !text.is_char_boundary(edit.old_end_byte)
+            {
+                return Err("edit range is not a valid UTF-8 byte range".into());
+            }
+            let start_position = point_at_byte(&text, edit.start_byte);
+            let old_end_position = point_at_byte(&text, edit.old_end_byte);
+            let new_end_byte = edit
+                .start_byte
+                .checked_add(edit.new_text.len())
+                .ok_or_else(|| "edit length overflows byte offsets".to_string())?;
+            text.replace_range(edit.start_byte..edit.old_end_byte, &edit.new_text);
+            let new_end_position = point_at_byte(&text, new_end_byte);
+            edited_tree.edit(&tree_sitter::InputEdit {
+                start_byte: edit.start_byte,
+                old_end_byte: edit.old_end_byte,
+                new_end_byte,
+                start_position,
+                old_end_position,
+                new_end_position,
+            });
+        }
+        let tree = parser
+            .parse(text.as_bytes(), Some(&edited_tree))
+            .ok_or_else(|| "parser returned no tree during incremental parse".to_string())?;
+        self.text = text;
+        self.tree = tree;
+        self.context = request.context;
+        Ok(DocumentAck {
+            context: self.context.clone(),
+            incremental: true,
+        })
+    }
+
+    fn derive(&self, context: RequestContext) -> Result<DerivedSnapshot, String> {
+        self.validate_identity(&context)?;
+        if context.content_version != self.context.content_version {
+            return Err(format!(
+                "content version {} does not match {}",
+                context.content_version, self.context.content_version
+            ));
+        }
+        let root = self.tree.root_node();
+        Ok(DerivedSnapshot {
+            context,
+            language: self.language.clone(),
+            root_kind: root.kind().into(),
+            root_start_byte: root.start_byte(),
+            root_end_byte: root.end_byte(),
+            has_error: root.has_error(),
+            named_node_count: named_node_count(root),
+            parser_cache_hit: true,
+            queue_wait_ns: 0,
+            compute_ns: 0,
+        })
+    }
+
+    fn validate_identity(&self, context: &RequestContext) -> Result<(), String> {
+        if context.worker_generation != self.context.worker_generation
+            || context.uri != self.context.uri
+            || context.incarnation != self.context.incarnation
+            || context.configuration_generation != self.context.configuration_generation
+        {
+            return Err("document identity does not match worker replica".into());
+        }
+        Ok(())
+    }
+}
+
+fn point_at_byte(text: &str, byte: usize) -> tree_sitter::Point {
+    let prefix = &text.as_bytes()[..byte];
+    let row = prefix.iter().filter(|&&value| value == b'\n').count();
+    let column = prefix
+        .iter()
+        .rposition(|&value| value == b'\n')
+        .map_or(prefix.len(), |index| prefix.len() - index - 1);
+    tree_sitter::Point::new(row, column)
 }
 
 pub fn encode_frame<W: Write, T: Serialize>(writer: &mut W, value: &T) -> io::Result<()> {
@@ -235,11 +408,22 @@ impl WorkerThreadState {
                 .unwrap_or_else(|_| request.parser_path.clone()),
             grammar_symbol: request.grammar_symbol.clone(),
         };
+        self.with_parser(key, request_context, |parser, parser_cache_hit| {
+            derive_snapshot_with_parser(request, parser, parser_cache_hit, queue_wait)
+        })
+    }
+
+    fn with_parser(
+        &mut self,
+        key: GrammarKey,
+        request_context: RequestContext,
+        operation: impl FnOnce(&mut tree_sitter::Parser, bool) -> Response,
+    ) -> Response {
         let language = match self.languages.get(&key).cloned() {
             Some(language) => language,
             None => match self
                 .loader
-                .load_language(&request.parser_path, &request.grammar_symbol)
+                .load_language(&key.parser_path, &key.grammar_symbol)
             {
                 Ok(language) => {
                     self.languages.insert(key.clone(), language.clone());
@@ -266,8 +450,7 @@ impl WorkerThreadState {
             }
             parser
         };
-        let response =
-            derive_snapshot_with_parser(request, &mut parser, parser_cache_hit, queue_wait);
+        let response = operation(&mut parser, parser_cache_hit);
         self.parsers.insert(key, parser);
         response
     }
@@ -280,6 +463,145 @@ thread_local! {
 
 fn derive_snapshot(request: DeriveSnapshot, queue_wait: Duration) -> Response {
     WORKER_THREAD_STATE.with(|state| state.borrow_mut().derive(request, queue_wait))
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct DocumentKey {
+    uri: String,
+    incarnation: u64,
+}
+
+impl From<&RequestContext> for DocumentKey {
+    fn from(context: &RequestContext) -> Self {
+        Self {
+            uri: context.uri.clone(),
+            incarnation: context.incarnation,
+        }
+    }
+}
+
+type DocumentStore = Arc<dashmap::DashMap<DocumentKey, Arc<Mutex<DocumentReplica>>>>;
+
+fn handle_work(request: Request, documents: &DocumentStore, queue_wait: Duration) -> Response {
+    match request {
+        Request::DeriveSnapshot(request) => derive_snapshot(request, queue_wait),
+        Request::SyncDocument(request) => sync_document(request, documents),
+        Request::ApplyDocumentEdits(request) => apply_document_edits(request, documents),
+        Request::DeriveDocumentSnapshot(request) => derive_document_snapshot(request, documents),
+        Request::Handshake(_) => Response::Error(WorkerError {
+            context: None,
+            message: "handshake may only be sent once".into(),
+        }),
+    }
+}
+
+fn request_context(request: &Request) -> Option<&RequestContext> {
+    match request {
+        Request::Handshake(_) => None,
+        Request::DeriveSnapshot(request) => Some(&request.context),
+        Request::SyncDocument(request) => Some(&request.context),
+        Request::ApplyDocumentEdits(request) => Some(&request.context),
+        Request::DeriveDocumentSnapshot(request) => Some(&request.context),
+    }
+}
+
+fn sync_document(request: SyncDocument, documents: &DocumentStore) -> Response {
+    let context = request.context.clone();
+    let document_key = DocumentKey::from(&context);
+    let grammar_key = GrammarKey {
+        parser_path: request.parser_path.clone(),
+        grammar_symbol: request.grammar_symbol.clone(),
+    };
+    WORKER_THREAD_STATE.with(|state| {
+        state
+            .borrow_mut()
+            .with_parser(
+                grammar_key,
+                context.clone(),
+                |parser, _| match DocumentReplica::sync(request, parser) {
+                    Ok((replica, ack)) => {
+                        documents.insert(document_key, Arc::new(Mutex::new(replica)));
+                        Response::DocumentAck(ack)
+                    }
+                    Err(message) => Response::Error(WorkerError {
+                        context: Some(context),
+                        message,
+                    }),
+                },
+            )
+    })
+}
+
+fn apply_document_edits(request: ApplyDocumentEdits, documents: &DocumentStore) -> Response {
+    let context = request.context.clone();
+    let document_key = DocumentKey::from(&context);
+    let Some(replica) = documents
+        .get(&document_key)
+        .map(|entry| Arc::clone(entry.value()))
+    else {
+        return Response::Error(WorkerError {
+            context: Some(context),
+            message: "document replica is missing; full sync required".into(),
+        });
+    };
+    let grammar_key = match replica.lock() {
+        Ok(replica) => replica.grammar_key.clone(),
+        Err(_) => {
+            return Response::Error(WorkerError {
+                context: Some(context),
+                message: "document replica lock is poisoned".into(),
+            });
+        }
+    };
+    WORKER_THREAD_STATE.with(|state| {
+        state
+            .borrow_mut()
+            .with_parser(grammar_key, context.clone(), |parser, _| {
+                let Ok(mut replica) = replica.lock() else {
+                    return Response::Error(WorkerError {
+                        context: Some(context),
+                        message: "document replica lock is poisoned".into(),
+                    });
+                };
+                match replica.apply(request, parser) {
+                    Ok(ack) => Response::DocumentAck(ack),
+                    Err(message) => Response::Error(WorkerError {
+                        context: Some(context),
+                        message,
+                    }),
+                }
+            })
+    })
+}
+
+fn derive_document_snapshot(
+    request: DeriveDocumentSnapshot,
+    documents: &DocumentStore,
+) -> Response {
+    let context = request.context;
+    let document_key = DocumentKey::from(&context);
+    let Some(replica) = documents
+        .get(&document_key)
+        .map(|entry| Arc::clone(entry.value()))
+    else {
+        return Response::Error(WorkerError {
+            context: Some(context),
+            message: "document replica is missing; full sync required".into(),
+        });
+    };
+    match replica.lock() {
+        Ok(replica) => match replica.derive(context.clone()) {
+            Ok(snapshot) => Response::Snapshot(snapshot),
+            Err(message) => Response::Error(WorkerError {
+                context: Some(context),
+                message,
+            }),
+        },
+        Err(_) => Response::Error(WorkerError {
+            context: Some(context),
+            message: "document replica lock is poisoned".into(),
+        }),
+    }
 }
 
 pub fn run<R, W>(reader: R, writer: W, compute_threads: usize) -> io::Result<()>
@@ -334,7 +656,7 @@ where
             drop(responses);
             return join_writer(writer_thread);
         }
-        Some(Request::DeriveSnapshot(_)) => {
+        Some(_) => {
             drop(responses);
             join_writer(writer_thread)?;
             return Err(io::Error::new(
@@ -373,18 +695,19 @@ where
         ))
         .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "worker writer stopped"))?;
 
+    let documents = Arc::new(dashmap::DashMap::new());
     while let Some(request) = decode_frame::<_, Request>(&mut reader)? {
-        let Request::DeriveSnapshot(request) = request else {
+        let Some(context) = request_context(&request) else {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "handshake may only be sent once",
             ));
         };
-        if request.context.worker_generation != worker_generation {
+        if context.worker_generation != worker_generation {
             responses
                 .send((
                     Response::Error(WorkerError {
-                        context: Some(request.context),
+                        context: Some(context.clone()),
                         message: "stale worker generation".into(),
                     }),
                     None,
@@ -398,8 +721,12 @@ where
             .map_err(|_| io::Error::other("worker admission queue stopped"))?;
         let responses = responses.clone();
         let permit = AdmissionPermit(permits.clone());
+        let documents = Arc::clone(&documents);
         pool.spawn(move || {
-            let _ = responses.send((derive_snapshot(request, enqueued.elapsed()), Some(permit)));
+            let _ = responses.send((
+                handle_work(request, &documents, enqueued.elapsed()),
+                Some(permit),
+            ));
         });
     }
     for _ in 0..max_inflight {
@@ -632,15 +959,54 @@ impl Client {
         request: DeriveSnapshot,
         timeout: Duration,
     ) -> io::Result<Response> {
+        let context = request.context.clone();
+        self.request_with_timeout(Request::DeriveSnapshot(request), context, timeout)
+    }
+
+    pub fn sync_document(&self, request: SyncDocument) -> io::Result<Response> {
+        let context = request.context.clone();
+        self.request_with_timeout(
+            Request::SyncDocument(request),
+            context,
+            Duration::from_secs(60),
+        )
+    }
+
+    pub fn apply_document_edits(&self, request: ApplyDocumentEdits) -> io::Result<Response> {
+        let context = request.context.clone();
+        self.request_with_timeout(
+            Request::ApplyDocumentEdits(request),
+            context,
+            Duration::from_secs(60),
+        )
+    }
+
+    pub fn derive_document_snapshot(
+        &self,
+        request: DeriveDocumentSnapshot,
+    ) -> io::Result<Response> {
+        let context = request.context.clone();
+        self.request_with_timeout(
+            Request::DeriveDocumentSnapshot(request),
+            context,
+            Duration::from_secs(60),
+        )
+    }
+
+    fn request_with_timeout(
+        &self,
+        request: Request,
+        expected: RequestContext,
+        timeout: Duration,
+    ) -> io::Result<Response> {
         let started = Instant::now();
-        if request.context.worker_generation != self.ready.worker_generation {
+        if expected.worker_generation != self.ready.worker_generation {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "request targets a stale worker generation",
             ));
         }
-        let request_id = request.context.request_id;
-        let expected = request.context.clone();
+        let request_id = expected.request_id;
         let (response_tx, response_rx) = mpsc::channel();
         {
             let mut routes = self
@@ -675,7 +1041,7 @@ impl Client {
             let outbound = outbound
                 .as_ref()
                 .ok_or_else(|| io::Error::new(io::ErrorKind::BrokenPipe, "worker is shut down"))?;
-            if let Err(error) = outbound.try_send(Request::DeriveSnapshot(request)) {
+            if let Err(error) = outbound.try_send(request) {
                 self.remove_route(request_id);
                 return Err(match error {
                     mpsc::TrySendError::Full(_) => io::Error::new(
@@ -778,6 +1144,7 @@ impl Drop for Client {
 
 fn response_request_id(response: &Response) -> Option<u64> {
     match response {
+        Response::DocumentAck(ack) => Some(ack.context.request_id),
         Response::Snapshot(snapshot) => Some(snapshot.context.request_id),
         Response::Error(error) => error.context.as_ref().map(|context| context.request_id),
         Response::HandshakeReady(_) => None,
@@ -786,6 +1153,7 @@ fn response_request_id(response: &Response) -> Option<u64> {
 
 fn response_context(response: &Response) -> Option<&RequestContext> {
     match response {
+        Response::DocumentAck(ack) => Some(&ack.context),
         Response::Snapshot(snapshot) => Some(&snapshot.context),
         Response::Error(error) => error.context.as_ref(),
         Response::HandshakeReady(_) => None,
@@ -889,9 +1257,10 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        BUILD_ID, DeriveSnapshot, Handshake, HandshakeReady, PROTOCOL_VERSION, Request,
-        RequestContext, Response, Route, WorkerError, decode_frame, derive_snapshot_with_language,
-        encode_frame, route_response, run,
+        ApplyDocumentEdits, BUILD_ID, ByteEdit, DeriveSnapshot, DocumentReplica, Handshake,
+        HandshakeReady, PROTOCOL_VERSION, Request, RequestContext, Response, Route, SyncDocument,
+        WorkerError, decode_frame, derive_snapshot_with_language, encode_frame, route_response,
+        run,
     };
 
     #[derive(Clone, Default)]
@@ -1272,5 +1641,159 @@ mod tests {
             .expect("worker deadlocked after response writer failure")
             .unwrap_err();
         assert_eq!(error.kind(), std::io::ErrorKind::BrokenPipe);
+    }
+
+    #[test]
+    fn document_replica_applies_an_incremental_edit_at_the_expected_base_version() {
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_rust::LANGUAGE.into())
+            .unwrap();
+        let context = RequestContext {
+            request_id: 1,
+            worker_generation: 3,
+            uri: "file:///example.rs".into(),
+            incarnation: 4,
+            content_version: 1,
+            configuration_generation: 2,
+        };
+        let (mut replica, sync_ack) = DocumentReplica::sync(
+            SyncDocument {
+                context: context.clone(),
+                language: "rust".into(),
+                grammar_symbol: "rust".into(),
+                parser_path: "/unused/static-language".into(),
+                text: "fn main() { 1 }".into(),
+            },
+            &mut parser,
+        )
+        .unwrap();
+        assert!(!sync_ack.incremental);
+
+        let mut edited_context = context;
+        edited_context.request_id = 2;
+        edited_context.content_version = 2;
+        let ack = replica
+            .apply(
+                ApplyDocumentEdits {
+                    context: edited_context.clone(),
+                    base_version: 1,
+                    edits: vec![ByteEdit {
+                        start_byte: 12,
+                        old_end_byte: 13,
+                        new_text: "value + 2".into(),
+                    }],
+                },
+                &mut parser,
+            )
+            .unwrap();
+
+        assert!(ack.incremental);
+        assert_eq!(ack.context.content_version, 2);
+        let snapshot = replica.derive(edited_context).unwrap();
+        assert_eq!(snapshot.root_kind, "source_file");
+        assert_eq!(snapshot.root_end_byte, "fn main() { value + 2 }".len());
+    }
+
+    #[test]
+    fn document_replica_rejects_an_edit_with_a_stale_base_version() {
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_rust::LANGUAGE.into())
+            .unwrap();
+        let context = RequestContext {
+            request_id: 1,
+            worker_generation: 3,
+            uri: "file:///example.rs".into(),
+            incarnation: 4,
+            content_version: 3,
+            configuration_generation: 2,
+        };
+        let (mut replica, _) = DocumentReplica::sync(
+            SyncDocument {
+                context: context.clone(),
+                language: "rust".into(),
+                grammar_symbol: "rust".into(),
+                parser_path: "/unused/static-language".into(),
+                text: "fn main() {}".into(),
+            },
+            &mut parser,
+        )
+        .unwrap();
+        let mut target = context;
+        target.request_id = 2;
+        target.content_version = 4;
+
+        let error = replica
+            .apply(
+                ApplyDocumentEdits {
+                    context: target,
+                    base_version: 2,
+                    edits: Vec::new(),
+                },
+                &mut parser,
+            )
+            .unwrap_err();
+
+        assert!(error.contains("base version 2 does not match 3"));
+    }
+
+    #[test]
+    fn document_replica_keeps_the_previous_version_when_an_edit_batch_is_invalid() {
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_rust::LANGUAGE.into())
+            .unwrap();
+        let context = RequestContext {
+            request_id: 1,
+            worker_generation: 3,
+            uri: "file:///transaction.rs".into(),
+            incarnation: 1,
+            content_version: 1,
+            configuration_generation: 0,
+        };
+        let original = "fn main() { 1 }";
+        let (mut replica, _) = DocumentReplica::sync(
+            SyncDocument {
+                context: context.clone(),
+                language: "rust".into(),
+                grammar_symbol: "rust".into(),
+                parser_path: "/unused/static-language".into(),
+                text: original.into(),
+            },
+            &mut parser,
+        )
+        .unwrap();
+        let mut target = context.clone();
+        target.request_id = 2;
+        target.content_version = 2;
+
+        replica
+            .apply(
+                ApplyDocumentEdits {
+                    context: target,
+                    base_version: 1,
+                    edits: vec![
+                        ByteEdit {
+                            start_byte: 12,
+                            old_end_byte: 13,
+                            new_text: "2".into(),
+                        },
+                        ByteEdit {
+                            start_byte: 999,
+                            old_end_byte: 999,
+                            new_text: "invalid".into(),
+                        },
+                    ],
+                },
+                &mut parser,
+            )
+            .unwrap_err();
+
+        let mut derive_context = context;
+        derive_context.request_id = 3;
+        let snapshot = replica.derive(derive_context).unwrap();
+        assert_eq!(snapshot.root_end_byte, original.len());
+        assert_eq!(replica.text, original);
     }
 }
