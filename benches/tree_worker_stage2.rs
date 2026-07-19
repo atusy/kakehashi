@@ -48,6 +48,7 @@ fn sync_request(document: usize, parser: &Path, text: &str) -> SyncDocument {
         artifact_digest: DIGEST
             .get_or_init(|| kakehashi::tree_worker::artifact_digest(parser).unwrap())
             .clone(),
+        queries: Default::default(),
         text: text.into(),
     }
 }

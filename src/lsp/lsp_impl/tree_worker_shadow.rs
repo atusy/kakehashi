@@ -1073,6 +1073,7 @@ impl TreeWorkerShadow {
             source_path: grammar.source_path,
             parser_path: grammar.parser_path,
             artifact_digest: grammar.artifact_digest,
+            queries: grammar.queries,
             text,
         }
     }
@@ -2389,6 +2390,7 @@ mod tests {
             parser_path: "/parser/rust.so".into(),
             grammar_symbol: "rust".into(),
             artifact_digest: "sha256:rust-v1".into(),
+            queries: Default::default(),
             configuration_generation: 3,
         }
     }
@@ -2420,6 +2422,7 @@ mod tests {
             source_path: "/parser/rust.so".into(),
             parser_path: "/parser/rust.so".into(),
             artifact_digest: "sha256:rust-v1".into(),
+            queries: Default::default(),
             text: format!("version {version}"),
         }
     }

@@ -210,6 +210,7 @@ fn real_worker_keeps_document_text_and_tree_across_incremental_edits() {
             source_path: parser.clone(),
             parser_path: parser.clone(),
             artifact_digest: digest(&parser),
+            queries: Default::default(),
             text: "fn main() { 1 }".into(),
         })
         .unwrap();
@@ -312,6 +313,7 @@ fn real_worker_keeps_document_text_and_tree_across_incremental_edits() {
             source_path: parser.clone(),
             parser_path: parser.clone(),
             artifact_digest: digest(&parser),
+            queries: Default::default(),
             text: "fn stale() {}".into(),
         })
         .unwrap();

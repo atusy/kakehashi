@@ -22,7 +22,7 @@ use sha2::{Digest, Sha256};
 
 use crate::language::node_tracker::{EditInfo, NodeTracker};
 
-pub const PROTOCOL_VERSION: u32 = 5;
+pub const PROTOCOL_VERSION: u32 = 6;
 pub const MAX_FRAME_BYTES: usize = 64 * 1024 * 1024;
 pub const MAX_DOCUMENT_REPLICAS: usize = 4_096;
 pub const MAX_DOCUMENT_BYTES: usize = 32 * 1024 * 1024;
@@ -56,6 +56,13 @@ pub struct DeriveSnapshot {
     pub text: String,
 }
 
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct WorkerQuerySources {
+    pub highlights: Option<String>,
+    pub bindings: Option<String>,
+    pub injections: Option<String>,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct SyncDocument {
     pub context: RequestContext,
@@ -64,6 +71,7 @@ pub struct SyncDocument {
     pub source_path: PathBuf,
     pub parser_path: PathBuf,
     pub artifact_digest: String,
+    pub queries: WorkerQuerySources,
     pub text: String,
 }
 
@@ -346,12 +354,25 @@ struct DocumentReplica {
     tree: tree_sitter::Tree,
     uri: url::Url,
     node_tracker: NodeTracker,
+    analysis: Arc<crate::language::LanguageCoordinator>,
 }
 
 impl DocumentReplica {
     fn sync(
         request: SyncDocument,
         parser: &mut tree_sitter::Parser,
+    ) -> Result<(Self, DocumentAck), String> {
+        Self::sync_with_analysis(
+            request,
+            parser,
+            Arc::new(crate::language::LanguageCoordinator::new()),
+        )
+    }
+
+    fn sync_with_analysis(
+        request: SyncDocument,
+        parser: &mut tree_sitter::Parser,
+        analysis: Arc<crate::language::LanguageCoordinator>,
     ) -> Result<(Self, DocumentAck), String> {
         validate_document_size(request.text.len())?;
         let tree = parser
@@ -366,6 +387,16 @@ impl DocumentReplica {
             .map_err(|error| format!("document URI is invalid: {error}"))?;
         let node_tracker = NodeTracker::new();
         node_tracker.open_incarnation(&uri, request.context.incarnation);
+        let grammar_language = parser
+            .language()
+            .map(|language| (*language).clone())
+            .ok_or_else(|| "parser has no configured language".to_string())?;
+        worker_analysis(
+            &analysis,
+            &request.language,
+            grammar_language,
+            request.queries,
+        )?;
         Ok((
             Self {
                 context: request.context,
@@ -375,6 +406,7 @@ impl DocumentReplica {
                 tree,
                 uri,
                 node_tracker,
+                analysis,
             },
             ack,
         ))
@@ -693,27 +725,25 @@ impl DocumentReplica {
         request: DeriveSelectionRanges,
     ) -> Result<SelectionRangesResult, String> {
         self.validate_read_identity(&request.context)?;
-        let mapper = crate::text::PositionMapper::new(&self.text);
-        let root = self.tree.root_node();
-        let ranges = request
+        let positions = request
             .positions
             .into_iter()
             .map(|position| {
-                let lsp_position =
-                    tower_lsp_server::ls_types::Position::new(position.line, position.character);
-                mapper
-                    .position_to_byte(lsp_position)
-                    .and_then(|byte| root.descendant_for_byte_range(byte, byte))
-                    .map(|node| build_wire_selection_range(node, &mapper))
-                    .unwrap_or(WireSelectionRange {
-                        range: WireRange {
-                            start: position,
-                            end: position,
-                        },
-                        parent: None,
-                    })
+                tower_lsp_server::ls_types::Position::new(position.line, position.character)
             })
-            .collect();
+            .collect::<Vec<_>>();
+        let mut parser_pool = self.analysis.create_document_parser_pool();
+        let ranges = crate::analysis::handle_selection_range(
+            &self.text,
+            Some(&self.tree),
+            Some(&self.language),
+            &positions,
+            &self.analysis,
+            &mut parser_pool,
+        )
+        .into_iter()
+        .map(selection_range_to_wire)
+        .collect();
         Ok(SelectionRangesResult {
             context: request.context,
             ranges,
@@ -831,34 +861,56 @@ impl DocumentReplica {
     }
 }
 
-fn build_wire_selection_range(
-    node: tree_sitter::Node<'_>,
-    mapper: &crate::text::PositionMapper<'_>,
+fn selection_range_to_wire(
+    selection: tower_lsp_server::ls_types::SelectionRange,
 ) -> WireSelectionRange {
-    let current_range = node.byte_range();
-    let mut parent = node.parent();
-    while parent.is_some_and(|parent| parent.byte_range() == current_range) {
-        parent = parent.and_then(|parent| parent.parent());
-    }
     WireSelectionRange {
         range: WireRange {
-            start: mapper
-                .byte_to_position(node.start_byte())
-                .map(wire_position)
-                .unwrap_or(WirePosition {
-                    line: node.start_position().row as u32,
-                    character: 0,
-                }),
-            end: mapper
-                .byte_to_position(node.end_byte())
-                .map(wire_position)
-                .unwrap_or(WirePosition {
-                    line: node.end_position().row as u32,
-                    character: 0,
-                }),
+            start: wire_position(selection.range.start),
+            end: wire_position(selection.range.end),
         },
-        parent: parent.map(|parent| Box::new(build_wire_selection_range(parent, mapper))),
+        parent: selection
+            .parent
+            .map(|parent| Box::new(selection_range_to_wire(*parent))),
     }
+}
+
+fn worker_analysis(
+    analysis: &crate::language::LanguageCoordinator,
+    language_name: &str,
+    language: tree_sitter::Language,
+    queries: WorkerQuerySources,
+) -> Result<(), String> {
+    analysis
+        .language_registry_for_parallel()
+        .register(language_name.to_string(), language.clone());
+    for (kind, source) in [
+        (
+            crate::config::settings::QueryKind::Highlights,
+            queries.highlights,
+        ),
+        (
+            crate::config::settings::QueryKind::Bindings,
+            queries.bindings,
+        ),
+        (
+            crate::config::settings::QueryKind::Injections,
+            queries.injections,
+        ),
+    ] {
+        let Some(source) = source else {
+            continue;
+        };
+        let query = tree_sitter::Query::new(&language, &source)
+            .map_err(|error| format!("worker query reconstruction failed: {error}"))?;
+        analysis.query_store().insert_query_with_source(
+            kind,
+            language_name.to_string(),
+            Arc::new(query),
+            source,
+        );
+    }
+    Ok(())
 }
 
 fn validate_document_size(bytes: usize) -> Result<(), String> {
@@ -1457,6 +1509,7 @@ fn submit_document_job(
 
 fn handle_work(
     request: Request,
+    analysis: &Arc<crate::language::LanguageCoordinator>,
     documents: &DocumentStore,
     closed_documents: &ClosedDocuments,
     document_capacity: &DocumentCapacity,
@@ -1466,8 +1519,9 @@ fn handle_work(
     let started = Instant::now();
     match request {
         Request::DeriveSnapshot(request) => derive_snapshot(request, queue_wait),
-        Request::SyncDocument(request) => sync_document(
+        Request::SyncDocument(request) => sync_document_with_analysis(
             request,
+            analysis,
             documents,
             closed_documents,
             document_capacity,
@@ -1633,8 +1687,27 @@ fn poisoned_document_restart(context: RequestContext) -> Response {
     })
 }
 
+#[cfg(test)]
 fn sync_document(
     request: SyncDocument,
+    documents: &DocumentStore,
+    closed_documents: &ClosedDocuments,
+    document_capacity: &DocumentCapacity,
+    retained_document_bytes: &RetainedDocumentBytes,
+) -> Response {
+    sync_document_with_analysis(
+        request,
+        &Arc::new(crate::language::LanguageCoordinator::new()),
+        documents,
+        closed_documents,
+        document_capacity,
+        retained_document_bytes,
+    )
+}
+
+fn sync_document_with_analysis(
+    request: SyncDocument,
+    analysis: &Arc<crate::language::LanguageCoordinator>,
     documents: &DocumentStore,
     closed_documents: &ClosedDocuments,
     document_capacity: &DocumentCapacity,
@@ -1716,10 +1789,8 @@ fn sync_document(
     let response = WORKER_THREAD_STATE.with(|state| {
         state
             .borrow_mut()
-            .with_parser(
-                grammar_key,
-                context.clone(),
-                |parser, _| match DocumentReplica::sync(request, parser) {
+            .with_parser(grammar_key, context.clone(), |parser, _| {
+                match DocumentReplica::sync_with_analysis(request, parser, Arc::clone(analysis)) {
                     Ok((replica, ack)) => {
                         documents.insert(document_key, Arc::new(Mutex::new(replica)));
                         closed_documents.remove(&DocumentKey::from(&ack.context));
@@ -1729,8 +1800,8 @@ fn sync_document(
                         context: Some(context),
                         message,
                     }),
-                },
-            )
+                }
+            })
     });
     if reserves_slot && !matches!(&response, Response::DocumentAck(_)) {
         let mut known_documents = document_capacity
@@ -2009,6 +2080,7 @@ where
     inject_idle_worker_crash_once();
 
     let documents = Arc::new(dashmap::DashMap::new());
+    let analysis = Arc::new(crate::language::LanguageCoordinator::new());
     let closed_documents = Arc::new(dashmap::DashMap::new());
     let document_capacity = Arc::new(Mutex::new(0));
     let retained_document_bytes = Arc::new(AtomicUsize::new(0));
@@ -2046,6 +2118,7 @@ where
         let responses = responses.clone();
         let permit = AdmissionPermit(permits.clone());
         let documents = Arc::clone(&documents);
+        let analysis = Arc::clone(&analysis);
         let closed_documents = Arc::clone(&closed_documents);
         let document_capacity = Arc::clone(&document_capacity);
         let retained_document_bytes = Arc::clone(&retained_document_bytes);
@@ -2054,6 +2127,7 @@ where
         let job: LaneJob = Box::new(move || {
             let response = handle_work(
                 request,
+                &analysis,
                 &documents,
                 &closed_documents,
                 &document_capacity,
@@ -2790,10 +2864,11 @@ mod tests {
         HandshakeReady, LaneAction, LaneRegistry, MAX_DOCUMENT_BYTES, MAX_DOCUMENT_REPLICAS,
         MAX_RETAINED_DOCUMENT_BYTES, NavigateNode, NodeNavigation, NodeScalarOperation,
         NodeScalarValue, OpaqueNodeId, PROTOCOL_VERSION, Request, RequestContext, ResolveNode,
-        Response, Route, RunNodeScalar, SyncDocument, WirePosition, WorkerError, close_document,
-        decode_frame, derive_snapshot_with_language, encode_frame, named_node_count,
-        replace_retained_bytes, reserve_retained_growth, route_response, run, submit_document_job,
-        sync_document, terminate_by_transport, validate_document_size,
+        Response, Route, RunNodeScalar, SyncDocument, WirePosition, WorkerError,
+        WorkerQuerySources, close_document, decode_frame, derive_snapshot_with_language,
+        encode_frame, named_node_count, replace_retained_bytes, reserve_retained_growth,
+        route_response, run, submit_document_job, sync_document, terminate_by_transport,
+        validate_document_size,
     };
 
     #[derive(Clone, Default)]
@@ -3341,6 +3416,7 @@ mod tests {
                 source_path: "/unused/static-language".into(),
                 parser_path: "/unused/static-language".into(),
                 artifact_digest: "sha256:rust-v1".into(),
+                queries: WorkerQuerySources::default(),
                 text: "fn main() { 1 }".into(),
             },
             &mut parser,
@@ -3398,11 +3474,16 @@ mod tests {
                 source_path: "/unused/static-language".into(),
                 parser_path: "/unused/static-language".into(),
                 artifact_digest: "sha256:rust-v1".into(),
+                queries: WorkerQuerySources {
+                    injections: Some("(identifier) @injection.content".into()),
+                    ..WorkerQuerySources::default()
+                },
                 text: "fn main() {}".into(),
             },
             &mut parser,
         )
         .unwrap();
+        assert!(replica.analysis.injection_query("rust").is_some());
 
         let resolved = replica
             .resolve_node(ResolveNode {
@@ -3618,6 +3699,7 @@ mod tests {
                 source_path: "/unused/static-language".into(),
                 parser_path: "/unused/static-language".into(),
                 artifact_digest: "sha256:rust-v1".into(),
+                queries: WorkerQuerySources::default(),
                 text: "fn main() {}".into(),
             },
             &mut parser,
@@ -3664,6 +3746,7 @@ mod tests {
                 source_path: "/unused/static-language".into(),
                 parser_path: "/unused/static-language".into(),
                 artifact_digest: "sha256:rust-v1".into(),
+                queries: WorkerQuerySources::default(),
                 text: "fn current() {}".into(),
             },
             &mut parser,
@@ -3703,6 +3786,7 @@ mod tests {
                 source_path: "/unused/rust".into(),
                 parser_path: "/unused/rust".into(),
                 artifact_digest: "sha256:rust-v1".into(),
+                queries: WorkerQuerySources::default(),
                 text: "fn current() {}".into(),
             },
             &mut parser,
@@ -3760,6 +3844,7 @@ mod tests {
                 source_path: "/unused/rust".into(),
                 parser_path: "/unused/rust".into(),
                 artifact_digest: "sha256:rust-v1".into(),
+                queries: WorkerQuerySources::default(),
                 text: "fn main() {}".into(),
             },
             &documents,
@@ -3794,6 +3879,7 @@ mod tests {
                 source_path: "/unused/rust".into(),
                 parser_path: "/unused/rust".into(),
                 artifact_digest: "sha256:rust-v1".into(),
+                queries: WorkerQuerySources::default(),
                 text: text.into(),
             },
             &mut parser,
@@ -3823,6 +3909,7 @@ mod tests {
                 source_path: "/unused/rust".into(),
                 parser_path: "/unused/rust".into(),
                 artifact_digest: "sha256:rust-v1".into(),
+                queries: WorkerQuerySources::default(),
                 text: "fn replacement() {}".into(),
             },
             &documents,
@@ -3936,6 +4023,7 @@ mod tests {
                 source_path: "/unused/static-language".into(),
                 parser_path: "/unused/static-language".into(),
                 artifact_digest: "sha256:rust-v1".into(),
+                queries: WorkerQuerySources::default(),
                 text: original.into(),
             },
             &mut parser,
@@ -3997,6 +4085,7 @@ mod tests {
                 source_path: "/unused/static-language".into(),
                 parser_path: "/unused/static-language".into(),
                 artifact_digest: "sha256:rust-v1".into(),
+                queries: WorkerQuerySources::default(),
                 text: "fn main() { 1 }".into(),
             },
             &mut parser,

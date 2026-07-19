@@ -44,6 +44,7 @@ fn sync_request(document: usize, parser: &Path, digest: &str, text: &str) -> Syn
         source_path: parser.to_path_buf(),
         parser_path: parser.to_path_buf(),
         artifact_digest: digest.into(),
+        queries: Default::default(),
         text: text.into(),
     }
 }

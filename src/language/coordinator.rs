@@ -129,6 +129,7 @@ pub(crate) struct WorkerGrammarDescriptor {
     pub(crate) parser_path: PathBuf,
     pub(crate) grammar_symbol: String,
     pub(crate) artifact_digest: String,
+    pub(crate) queries: crate::tree_worker::WorkerQuerySources,
     pub(crate) configuration_generation: u64,
 }
 
@@ -1940,6 +1941,20 @@ impl LanguageCoordinator {
             parser_path: artifact.path,
             grammar_symbol,
             artifact_digest: artifact.digest,
+            queries: crate::tree_worker::WorkerQuerySources {
+                highlights: self
+                    .query_store
+                    .query_source(QueryKind::Highlights, language_id)
+                    .map(|source| source.to_string()),
+                bindings: self
+                    .query_store
+                    .query_source(QueryKind::Bindings, language_id)
+                    .map(|source| source.to_string()),
+                injections: self
+                    .query_store
+                    .query_source(QueryKind::Injections, language_id)
+                    .map(|source| source.to_string()),
+            },
             configuration_generation,
         })
     }
