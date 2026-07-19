@@ -1,0 +1,59 @@
+{
+  "schema_version": 1,
+  "source_commit": "7f0d8039c29209a9c67fc98f84fe0d9e96c62c2a",
+  "binary_sha256": "9469eb77490b348c579595dc08b009699556d4f1a0571176313a1207cd4b138b",
+  "environment": {
+    "cpu": "Apple M4",
+    "os": "macOS 26.5.1 (25F80)",
+    "rustc": "rustc 1.95.0 (59807616e 2026-04-14)"
+  },
+  "workload": {
+    "driver": "benches/profile/drive.py",
+    "language": "rust",
+    "generated_lines": 200,
+    "cycles": 200,
+    "edits_per_cycle": 1,
+    "request": "textDocument/semanticTokens/full",
+    "warm_semantic_cache": true,
+    "settle_seconds": 0.5,
+    "shadow_compute_threads": 4
+  },
+  "batches": [
+    {
+      "name": "A",
+      "order": ["disabled", "shadow"],
+      "disabled": {
+        "wall_ms": 14726.119,
+        "ms_per_cycle": 73.63,
+        "semantic_ms": {"p50": 52.9, "p90": 60.3, "p95": 63.3, "p99": 68.9, "max": 156.7},
+        "responses_ok": 200
+      },
+      "shadow": {
+        "wall_ms": 15825.299,
+        "ms_per_cycle": 79.13,
+        "semantic_ms": {"p50": 59.6, "p90": 65.7, "p95": 67.3, "p99": 73.5, "max": 178.9},
+        "responses_ok": 200,
+        "comparisons": {"matched": 201, "mismatched": 0, "superseded": 0, "pending": 0}
+      },
+      "shadow_delta_percent": {"wall": 7.46, "p50": 12.67, "p90": 8.96, "p95": 6.32, "p99": 6.68}
+    },
+    {
+      "name": "B",
+      "order": ["shadow", "disabled"],
+      "disabled": {
+        "wall_ms": 16676.5592090087,
+        "ms_per_cycle": 83.38,
+        "semantic_ms": {"p50": 62.0, "p90": 70.8, "p95": 75.0, "p99": 79.0, "max": 81.0},
+        "responses_ok": 200
+      },
+      "shadow": {
+        "wall_ms": 18132.641332922503,
+        "ms_per_cycle": 90.66,
+        "semantic_ms": {"p50": 70.6, "p90": 77.3, "p95": 79.5, "p99": 85.1, "max": 87.8},
+        "responses_ok": 200,
+        "comparisons": {"matched": 201, "mismatched": 0, "superseded": 0, "pending": 0}
+      },
+      "shadow_delta_percent": {"wall": 8.73, "p50": 13.87, "p90": 9.18, "p95": 6.0, "p99": 7.72}
+    }
+  ]
+}

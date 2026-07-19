@@ -1117,6 +1117,11 @@ records a preliminary raw-relay estimate for an additional resident
 child-process transport hop. It is not a worker prototype result or a bound on
 the future protocol, and it does not change this decision's `proposed` status.
 
+The [Stage 3 shadow measurement](single-resident-multithreaded-tree-worker-stage3-measurement.md)
+records real LSP lifecycle comparison and the foreground cost of running both
+the authoritative and worker parse for every edit. It validates the comparison
+path, not the performance of a worker-authoritative cutover.
+
 The implementation should proceed in measured stages:
 
 1. Prototype the framed transport, supervision, and one high-level
