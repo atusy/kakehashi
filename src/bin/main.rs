@@ -81,6 +81,13 @@ enum Commands {
         /// Output path for the compiled shared library
         output_path: PathBuf,
     },
+    /// Internal: run the development tree-worker protocol on stdin/stdout.
+    #[command(name = "__tree-worker", hide = true)]
+    TreeWorker {
+        /// Fixed compute budget selected by the parent process.
+        #[arg(long)]
+        threads: usize,
+    },
     /// Report diagnostics for files via the configured downstream language servers
     ///
     /// Only pull diagnostics (textDocument/diagnostic) are collected. Push
@@ -338,6 +345,11 @@ fn main() -> ExitCode {
             grammar_dir,
             output_path,
         }) => run_compile_parser(&grammar_dir, &output_path),
+        Some(Commands::TreeWorker { threads }) => kakehashi::tree_worker::run_stdio(threads)
+            .map_err(|error| {
+                eprintln!("tree worker failed: {error}");
+                ExitCode::FAILURE
+            }),
         None => {
             // Start LSP server (backward compatible default behavior)
             // Only LSP mode needs a tokio runtime; CLI subcommands are synchronous

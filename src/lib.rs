@@ -10,3 +10,4 @@ pub mod install;
 pub(crate) mod language;
 pub mod lsp;
 pub(crate) mod text;
+pub mod tree_worker;
