@@ -16,6 +16,9 @@ thread_local! {
 
 #[derive(Parser)]
 struct Args {
+    // Cargo appends this flag when launching a harness-free benchmark.
+    #[arg(long = "bench", hide = true)]
+    _bench: bool,
     #[arg(long)]
     bin: PathBuf,
     #[arg(long)]
