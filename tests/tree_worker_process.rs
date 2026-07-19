@@ -29,7 +29,10 @@ fn real_worker_handshakes_and_contains_request_errors() {
     let Response::Error(error) = response else {
         panic!("missing grammar must be a contained request error");
     };
-    assert_eq!(error.request_id, Some(9));
+    assert_eq!(
+        error.context.as_ref().map(|context| context.request_id),
+        Some(9)
+    );
     worker.shutdown().unwrap();
 }
 
@@ -69,7 +72,7 @@ fn concurrent_requests_are_routed_by_request_id() {
     let mut ids = handles
         .into_iter()
         .map(|handle| match handle.join().unwrap() {
-            Response::Error(error) => error.request_id.unwrap(),
+            Response::Error(error) => error.context.unwrap().request_id,
             response => panic!("missing grammars must fail independently: {response:?}"),
         })
         .collect::<Vec<_>>();

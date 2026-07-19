@@ -10,11 +10,12 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant};
 use std::{
     cell::RefCell,
-    collections::{HashMap, hash_map::Entry},
+    collections::HashMap,
     sync::{Arc, Mutex},
 };
 
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use sha2::{Digest, Sha256};
 
 pub const PROTOCOL_VERSION: u32 = 1;
 pub const MAX_FRAME_BYTES: usize = 64 * 1024 * 1024;
@@ -77,7 +78,7 @@ pub struct DerivedSnapshot {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct WorkerError {
-    pub request_id: Option<u64>,
+    pub context: Option<RequestContext>,
     pub message: String,
 }
 
@@ -143,7 +144,7 @@ pub fn derive_snapshot_with_language(
     let mut parser = tree_sitter::Parser::new();
     if let Err(error) = parser.set_language(&language) {
         return Response::Error(WorkerError {
-            request_id: Some(request.context.request_id),
+            context: Some(request.context),
             message: format!("incompatible grammar: {error}"),
         });
     }
@@ -163,7 +164,7 @@ fn derive_snapshot_with_parser(
     let started = Instant::now();
     let Some(tree) = parser.parse(request.text.as_bytes(), None) else {
         return Response::Error(WorkerError {
-            request_id: Some(request.context.request_id),
+            context: Some(request.context),
             message: "parser returned no tree".into(),
         });
     };
@@ -226,7 +227,7 @@ impl WorkerThreadState {
     }
 
     fn derive(&mut self, request: DeriveSnapshot, queue_wait: Duration) -> Response {
-        let request_id = request.context.request_id;
+        let request_context = request.context.clone();
         let key = GrammarKey {
             parser_path: request.parser_path.clone(),
             grammar_symbol: request.grammar_symbol.clone(),
@@ -243,7 +244,7 @@ impl WorkerThreadState {
                 }
                 Err(error) => {
                     return Response::Error(WorkerError {
-                        request_id: Some(request_id),
+                        context: Some(request_context),
                         message: error.to_string(),
                     });
                 }
@@ -256,7 +257,7 @@ impl WorkerThreadState {
             let mut parser = tree_sitter::Parser::new();
             if let Err(error) = parser.set_language(&language) {
                 return Response::Error(WorkerError {
-                    request_id: Some(request_id),
+                    context: Some(request_context),
                     message: format!("incompatible grammar: {error}"),
                 });
             }
@@ -278,7 +279,20 @@ fn derive_snapshot(request: DeriveSnapshot, queue_wait: Duration) -> Response {
     WORKER_THREAD_STATE.with(|state| state.borrow_mut().derive(request, queue_wait))
 }
 
-pub fn run<R, W>(mut reader: R, writer: W, compute_threads: usize) -> io::Result<()>
+pub fn run<R, W>(reader: R, writer: W, compute_threads: usize) -> io::Result<()>
+where
+    R: Read,
+    W: Write + Send + 'static,
+{
+    run_with_build_id(reader, writer, compute_threads, BUILD_ID)
+}
+
+fn run_with_build_id<R, W>(
+    mut reader: R,
+    writer: W,
+    compute_threads: usize,
+    build_id: &str,
+) -> io::Result<()>
 where
     R: Read,
     W: Write + Send + 'static,
@@ -303,14 +317,25 @@ where
         Ok(())
     });
 
-    let Some(Request::Handshake(handshake)) = decode_frame::<_, Request>(&mut reader)? else {
-        drop(responses);
-        return join_writer(writer_thread);
+    let handshake = match decode_frame::<_, Request>(&mut reader)? {
+        Some(Request::Handshake(handshake)) => handshake,
+        None => {
+            drop(responses);
+            return join_writer(writer_thread);
+        }
+        Some(Request::DeriveSnapshot(_)) => {
+            drop(responses);
+            join_writer(writer_thread)?;
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "tree worker requires handshake as its first message",
+            ));
+        }
     };
-    if handshake.protocol_version != PROTOCOL_VERSION || handshake.build_id != BUILD_ID {
+    if handshake.protocol_version != PROTOCOL_VERSION || handshake.build_id != build_id {
         responses
             .send(Response::Error(WorkerError {
-                request_id: None,
+                context: None,
                 message: "worker protocol/build identity mismatch".into(),
             }))
             .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "worker writer stopped"))?;
@@ -325,13 +350,20 @@ where
     responses
         .send(Response::HandshakeReady(HandshakeReady {
             protocol_version: PROTOCOL_VERSION,
-            build_id: BUILD_ID.into(),
+            build_id: build_id.into(),
             worker_generation,
             compute_threads,
         }))
         .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "worker writer stopped"))?;
 
     let (completed, completed_rx) = mpsc::channel();
+    let max_inflight = compute_threads.saturating_mul(2).max(1);
+    let (permits, permit_rx) = mpsc::sync_channel(max_inflight);
+    for _ in 0..max_inflight {
+        permits
+            .send(())
+            .map_err(|_| io::Error::other("worker admission queue stopped"))?;
+    }
     let mut pending = 0_usize;
     while let Some(request) = decode_frame::<_, Request>(&mut reader)? {
         let Request::DeriveSnapshot(request) = request else {
@@ -343,19 +375,24 @@ where
         if request.context.worker_generation != worker_generation {
             responses
                 .send(Response::Error(WorkerError {
-                    request_id: Some(request.context.request_id),
+                    context: Some(request.context),
                     message: "stale worker generation".into(),
                 }))
                 .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "worker writer stopped"))?;
             continue;
         }
+        permit_rx
+            .recv()
+            .map_err(|_| io::Error::other("worker admission queue stopped"))?;
         pending += 1;
         let responses = responses.clone();
         let completed = completed.clone();
+        let permits = permits.clone();
         let enqueued = Instant::now();
         pool.spawn(move || {
             let _ = responses.send(derive_snapshot(request, enqueued.elapsed()));
             let _ = completed.send(());
+            let _ = permits.send(());
         });
     }
     drop(completed);
@@ -375,15 +412,42 @@ fn join_writer(thread: std::thread::JoinHandle<io::Result<()>>) -> io::Result<()
 }
 
 pub fn run_stdio(compute_threads: usize) -> io::Result<()> {
-    run(std::io::stdin(), std::io::stdout(), compute_threads)
+    let build_id = executable_digest(&std::env::current_exe()?)?;
+    run_with_build_id(
+        std::io::stdin(),
+        std::io::stdout(),
+        compute_threads,
+        &build_id,
+    )
+}
+
+fn executable_digest(path: &std::path::Path) -> io::Result<String> {
+    let mut file = std::fs::File::open(path)?;
+    let mut digest = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        digest.update(&buffer[..read]);
+    }
+    Ok(format!("sha256:{:x}", digest.finalize()))
 }
 
 pub struct Client {
-    child: Mutex<Child>,
-    stdin: Mutex<Option<ChildStdin>>,
-    routes: Arc<Mutex<HashMap<u64, mpsc::Sender<io::Result<Response>>>>>,
+    child: Arc<Mutex<Child>>,
+    outbound: Mutex<Option<mpsc::SyncSender<Request>>>,
+    routes: Arc<Mutex<HashMap<u64, Route>>>,
     reader: Option<std::thread::JoinHandle<()>>,
+    writer: Option<std::thread::JoinHandle<()>>,
     ready: HandshakeReady,
+    max_inflight: usize,
+}
+
+struct Route {
+    expected: RequestContext,
+    sender: mpsc::Sender<io::Result<Response>>,
 }
 
 impl Client {
@@ -398,6 +462,7 @@ impl Client {
                 "worker compute thread count must be positive",
             ));
         }
+        let build_id = executable_digest(executable)?;
         let mut child = Command::new(executable)
             .args(["__tree-worker", "--threads", &compute_threads.to_string()])
             .stdin(Stdio::piped())
@@ -412,10 +477,10 @@ impl Client {
             .stdout
             .take()
             .ok_or_else(|| io::Error::other("worker stdout was not piped"))?;
-        let routes = Arc::new(Mutex::new(
-            HashMap::<u64, mpsc::Sender<io::Result<Response>>>::new(),
-        ));
+        let child = Arc::new(Mutex::new(child));
+        let routes = Arc::new(Mutex::new(HashMap::<u64, Route>::new()));
         let reader_routes = Arc::clone(&routes);
+        let reader_child = Arc::clone(&child);
         let (handshake_tx, handshake_rx) = mpsc::channel();
         let reader = std::thread::spawn(move || {
             let mut handshake_tx = Some(handshake_tx);
@@ -426,7 +491,12 @@ impl Client {
                             let _ = handshake.send(Ok(response));
                             continue;
                         }
-                        route_response(&reader_routes, response);
+                        if let Err(error) = route_response(&reader_routes, response) {
+                            let kind = error.kind();
+                            let message = error.to_string();
+                            fail_routes(None, &reader_routes, kind, &message);
+                            break;
+                        }
                     }
                     Ok(None) => {
                         fail_routes(
@@ -445,56 +515,88 @@ impl Client {
                     }
                 }
             }
+            if let Ok(mut child) = reader_child.lock() {
+                terminate(&mut child, Duration::from_secs(1));
+            }
         });
-        encode_frame(
+        if let Err(error) = encode_frame(
             &mut stdin,
             &Request::Handshake(Handshake {
                 protocol_version: PROTOCOL_VERSION,
-                build_id: BUILD_ID.into(),
+                build_id: build_id.clone(),
                 worker_generation,
             }),
-        )?;
+        ) {
+            return failed_spawn(child, stdin, reader, error);
+        }
         let ready = match handshake_rx.recv_timeout(Duration::from_secs(5)) {
             Ok(Ok(Response::HandshakeReady(ready)))
                 if ready.protocol_version == PROTOCOL_VERSION
-                    && ready.build_id == BUILD_ID
+                    && ready.build_id == build_id
                     && ready.worker_generation == worker_generation
                     && ready.compute_threads == compute_threads =>
             {
                 ready
             }
             Ok(Ok(response)) => {
-                terminate(&mut child, Duration::from_secs(1));
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("invalid worker handshake response: {response:?}"),
-                ));
+                return failed_spawn(
+                    child,
+                    stdin,
+                    reader,
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("invalid worker handshake response: {response:?}"),
+                    ),
+                );
             }
             Ok(Err(error)) => {
-                terminate(&mut child, Duration::from_secs(1));
-                return Err(error);
+                return failed_spawn(child, stdin, reader, error);
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {
-                terminate(&mut child, Duration::from_secs(1));
-                return Err(io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    "tree worker handshake timed out",
-                ));
+                return failed_spawn(
+                    child,
+                    stdin,
+                    reader,
+                    io::Error::new(io::ErrorKind::TimedOut, "tree worker handshake timed out"),
+                );
             }
             Err(mpsc::RecvTimeoutError::Disconnected) => {
-                terminate(&mut child, Duration::from_secs(1));
-                return Err(io::Error::new(
-                    io::ErrorKind::BrokenPipe,
-                    "tree worker handshake channel closed",
-                ));
+                return failed_spawn(
+                    child,
+                    stdin,
+                    reader,
+                    io::Error::new(
+                        io::ErrorKind::BrokenPipe,
+                        "tree worker handshake channel closed",
+                    ),
+                );
             }
         };
+        let max_inflight = compute_threads.saturating_mul(4).max(1);
+        let (outbound, outbound_rx) = mpsc::sync_channel::<Request>(max_inflight);
+        let writer_routes = Arc::clone(&routes);
+        let writer_child = Arc::clone(&child);
+        let writer = std::thread::spawn(move || {
+            for request in outbound_rx {
+                if let Err(error) = encode_frame(&mut stdin, &request) {
+                    let kind = error.kind();
+                    let message = error.to_string();
+                    fail_routes(None, &writer_routes, kind, &message);
+                    if let Ok(mut child) = writer_child.lock() {
+                        terminate(&mut child, Duration::from_secs(1));
+                    }
+                    break;
+                }
+            }
+        });
         Ok(Self {
-            child: Mutex::new(child),
-            stdin: Mutex::new(Some(stdin)),
+            child,
+            outbound: Mutex::new(Some(outbound)),
             routes,
             reader: Some(reader),
+            writer: Some(writer),
             ready,
+            max_inflight,
         })
     }
 
@@ -511,6 +613,7 @@ impl Client {
         request: DeriveSnapshot,
         timeout: Duration,
     ) -> io::Result<Response> {
+        let started = Instant::now();
         if request.context.worker_generation != self.ready.worker_generation {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -518,38 +621,54 @@ impl Client {
             ));
         }
         let request_id = request.context.request_id;
+        let expected = request.context.clone();
         let (response_tx, response_rx) = mpsc::channel();
         {
             let mut routes = self
                 .routes
                 .lock()
                 .map_err(|_| io::Error::other("worker response router is poisoned"))?;
-            match routes.entry(request_id) {
-                Entry::Vacant(route) => {
-                    route.insert(response_tx);
-                }
-                Entry::Occupied(_) => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::AlreadyExists,
-                        format!("tree worker request {request_id} is already active"),
-                    ));
-                }
+            if routes.contains_key(&request_id) {
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    format!("tree worker request {request_id} is already active"),
+                ));
             }
-        }
-        {
-            let mut stdin = self
-                .stdin
-                .lock()
-                .map_err(|_| io::Error::other("worker stdin lock is poisoned"))?;
-            let stdin = stdin
-                .as_mut()
-                .ok_or_else(|| io::Error::new(io::ErrorKind::BrokenPipe, "worker is shut down"))?;
-            if let Err(error) = encode_frame(stdin, &Request::DeriveSnapshot(request)) {
-                self.remove_route(request_id);
-                return Err(error);
+            if routes.len() >= self.max_inflight {
+                return Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "tree worker in-flight limit reached",
+                ));
             }
+            routes.insert(
+                request_id,
+                Route {
+                    expected,
+                    sender: response_tx,
+                },
+            );
         }
-        let response = match response_rx.recv_timeout(timeout) {
+        let outbound = self
+            .outbound
+            .lock()
+            .map_err(|_| io::Error::other("worker outbound lock is poisoned"))?;
+        let outbound = outbound
+            .as_ref()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::BrokenPipe, "worker is shut down"))?;
+        if let Err(error) = outbound.try_send(Request::DeriveSnapshot(request)) {
+            self.remove_route(request_id);
+            return Err(match error {
+                mpsc::TrySendError::Full(_) => io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "tree worker outbound queue is full",
+                ),
+                mpsc::TrySendError::Disconnected(_) => {
+                    io::Error::new(io::ErrorKind::BrokenPipe, "tree worker writer stopped")
+                }
+            });
+        }
+        let remaining = timeout.saturating_sub(started.elapsed());
+        let response = match response_rx.recv_timeout(remaining) {
             Ok(response) => response?,
             Err(mpsc::RecvTimeoutError::Timeout) => {
                 self.remove_route(request_id);
@@ -568,17 +687,6 @@ impl Client {
                 ));
             }
         };
-        let response_id = match &response {
-            Response::Snapshot(snapshot) => Some(snapshot.context.request_id),
-            Response::Error(error) => error.request_id,
-            Response::HandshakeReady(_) => None,
-        };
-        if response_id != Some(request_id) {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("unexpected response for request {response_id:?}"),
-            ));
-        }
         Ok(response)
     }
 
@@ -589,16 +697,20 @@ impl Client {
     }
 
     pub fn shutdown(mut self) -> io::Result<()> {
-        self.stdin
+        self.outbound
             .get_mut()
-            .map_err(|_| io::Error::other("worker stdin lock is poisoned"))?
+            .map_err(|_| io::Error::other("worker outbound lock is poisoned"))?
             .take();
-        let status = wait_until(
-            self.child
-                .get_mut()
-                .map_err(|_| io::Error::other("worker child lock is poisoned"))?,
-            Duration::from_secs(2),
-        )?;
+        let status = {
+            let mut child = self
+                .child
+                .lock()
+                .map_err(|_| io::Error::other("worker child lock is poisoned"))?;
+            wait_until(&mut child, Duration::from_secs(2))?
+        };
+        if let Some(writer) = self.writer.take() {
+            let _ = writer.join();
+        }
         if let Some(reader) = self.reader.take() {
             let _ = reader.join();
         }
@@ -612,13 +724,30 @@ impl Client {
     }
 }
 
+fn failed_spawn(
+    child: Arc<Mutex<Child>>,
+    stdin: ChildStdin,
+    reader: std::thread::JoinHandle<()>,
+    error: io::Error,
+) -> io::Result<Client> {
+    drop(stdin);
+    if let Ok(mut child) = child.lock() {
+        terminate(&mut child, Duration::from_secs(1));
+    }
+    let _ = reader.join();
+    Err(error)
+}
+
 impl Drop for Client {
     fn drop(&mut self) {
-        if let Ok(stdin) = self.stdin.get_mut() {
-            stdin.take();
+        if let Ok(outbound) = self.outbound.get_mut() {
+            outbound.take();
         }
-        if let Ok(child) = self.child.get_mut() {
-            terminate(child, Duration::from_secs(1));
+        if let Ok(mut child) = self.child.lock() {
+            terminate(&mut child, Duration::from_secs(1));
+        }
+        if let Some(writer) = self.writer.take() {
+            let _ = writer.join();
         }
         if let Some(reader) = self.reader.take() {
             let _ = reader.join();
@@ -629,36 +758,53 @@ impl Drop for Client {
 fn response_request_id(response: &Response) -> Option<u64> {
     match response {
         Response::Snapshot(snapshot) => Some(snapshot.context.request_id),
-        Response::Error(error) => error.request_id,
+        Response::Error(error) => error.context.as_ref().map(|context| context.request_id),
         Response::HandshakeReady(_) => None,
     }
 }
 
-fn route_response(
-    routes: &Mutex<HashMap<u64, mpsc::Sender<io::Result<Response>>>>,
-    response: Response,
-) {
+fn response_context(response: &Response) -> Option<&RequestContext> {
+    match response {
+        Response::Snapshot(snapshot) => Some(&snapshot.context),
+        Response::Error(error) => error.context.as_ref(),
+        Response::HandshakeReady(_) => None,
+    }
+}
+
+fn route_response(routes: &Mutex<HashMap<u64, Route>>, response: Response) -> io::Result<()> {
     let Some(request_id) = response_request_id(&response) else {
-        fail_routes(
-            None,
-            routes,
+        return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "unexpected response without request id",
-        );
-        return;
+        ));
     };
     let route = routes
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .remove(&request_id);
-    if let Some(route) = route {
-        let _ = route.send(Ok(response));
+        .remove(&request_id)
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("response has unknown request id {request_id}"),
+            )
+        })?;
+    if response_context(&response) != Some(&route.expected) {
+        let error = io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("response context mismatch for request {request_id}"),
+        );
+        let _ = route
+            .sender
+            .send(Err(io::Error::new(error.kind(), error.to_string())));
+        return Err(error);
     }
+    let _ = route.sender.send(Ok(response));
+    Ok(())
 }
 
 fn fail_routes(
     handshake: Option<mpsc::Sender<io::Result<Response>>>,
-    routes: &Mutex<HashMap<u64, mpsc::Sender<io::Result<Response>>>>,
+    routes: &Mutex<HashMap<u64, Route>>,
     kind: io::ErrorKind,
     message: &str,
 ) {
@@ -671,7 +817,9 @@ fn fail_routes(
             .unwrap_or_else(std::sync::PoisonError::into_inner),
     );
     for route in routes.into_values() {
-        let _ = route.send(Err(io::Error::new(kind, message.to_string())));
+        let _ = route
+            .sender
+            .send(Err(io::Error::new(kind, message.to_string())));
     }
 }
 
@@ -699,12 +847,14 @@ fn terminate(child: &mut Child, timeout: Duration) {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
     use std::io::{Cursor, Write};
     use std::sync::{Arc, Mutex};
 
     use super::{
         BUILD_ID, DeriveSnapshot, Handshake, HandshakeReady, PROTOCOL_VERSION, Request,
-        RequestContext, Response, decode_frame, derive_snapshot_with_language, encode_frame, run,
+        RequestContext, Response, Route, WorkerError, decode_frame, derive_snapshot_with_language,
+        encode_frame, route_response, run,
     };
 
     #[derive(Clone, Default)]
@@ -814,6 +964,71 @@ mod tests {
     }
 
     #[test]
+    fn worker_rejects_work_before_handshake() {
+        let output = SharedWriter::default();
+
+        let error = run(Cursor::new(framed(&[request()])), output, 2).unwrap_err();
+
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("handshake"));
+    }
+
+    #[test]
+    fn response_router_rejects_unknown_request_id() {
+        let routes = Mutex::new(HashMap::new());
+        let response = Response::Error(WorkerError {
+            context: Some(RequestContext {
+                request_id: 99,
+                worker_generation: 3,
+                uri: "file:///unknown.rs".into(),
+                incarnation: 1,
+                content_version: 1,
+                configuration_generation: 1,
+            }),
+            message: "unexpected".into(),
+        });
+
+        let error = route_response(&routes, response).unwrap_err();
+
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("unknown request id 99"));
+    }
+
+    #[test]
+    fn response_router_rejects_stale_context() {
+        let expected = RequestContext {
+            request_id: 7,
+            worker_generation: 3,
+            uri: "file:///example.rs".into(),
+            incarnation: 11,
+            content_version: 5,
+            configuration_generation: 2,
+        };
+        let (sender, _receiver) = std::sync::mpsc::channel();
+        let routes = Mutex::new(HashMap::from([(
+            7,
+            Route {
+                expected: expected.clone(),
+                sender,
+            },
+        )]));
+        let mut stale = expected;
+        stale.content_version += 1;
+
+        let error = route_response(
+            &routes,
+            Response::Error(WorkerError {
+                context: Some(stale),
+                message: "stale".into(),
+            }),
+        )
+        .unwrap_err();
+
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("context mismatch"));
+    }
+
+    #[test]
     fn worker_reports_budget_and_routes_guarded_request_errors() {
         let output = SharedWriter::default();
         let captured = output.clone();
@@ -840,6 +1055,9 @@ mod tests {
         let Response::Error(error) = response else {
             panic!("missing parser path must return a routed request error");
         };
-        assert_eq!(error.request_id, Some(7));
+        assert_eq!(
+            error.context.as_ref().map(|context| context.request_id),
+            Some(7)
+        );
     }
 }
