@@ -20,7 +20,7 @@ use std::{
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use sha2::{Digest, Sha256};
 
-pub const PROTOCOL_VERSION: u32 = 3;
+pub const PROTOCOL_VERSION: u32 = 4;
 pub const MAX_FRAME_BYTES: usize = 64 * 1024 * 1024;
 pub const MAX_DOCUMENT_REPLICAS: usize = 4_096;
 pub const MAX_DOCUMENT_BYTES: usize = 32 * 1024 * 1024;
@@ -96,6 +96,50 @@ pub struct DeriveDocumentSnapshot {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ResolveNode {
+    pub context: RequestContext,
+    pub byte_offset: usize,
+    pub named: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct NavigateNode {
+    pub context: RequestContext,
+    pub node_id: OpaqueNodeId,
+    pub operation: NodeNavigation,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NodeNavigation {
+    Parent,
+    Children,
+    NamedChildren,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
+pub struct OpaqueNodeId {
+    pub worker_generation: u64,
+    pub local_id: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct OwnedNode {
+    pub id: OpaqueNodeId,
+    pub kind: String,
+    pub start_byte: usize,
+    pub end_byte: usize,
+    pub named: bool,
+    pub has_error: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct NodeResult {
+    pub context: RequestContext,
+    pub nodes: Vec<OwnedNode>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct CloseDocument {
     pub context: RequestContext,
 }
@@ -126,6 +170,8 @@ pub enum Request {
     ApplyDocumentEdits(ApplyDocumentEdits),
     ApplyDocumentEditsAndDerive(ApplyDocumentEditsAndDerive),
     DeriveDocumentSnapshot(DeriveDocumentSnapshot),
+    ResolveNode(ResolveNode),
+    NavigateNode(NavigateNode),
     CloseDocument(CloseDocument),
 }
 
@@ -165,6 +211,7 @@ pub enum Response {
     DocumentClosed(DocumentClosed),
     WorkerRestartRequired(WorkerRestartRequired),
     Snapshot(DerivedSnapshot),
+    Nodes(NodeResult),
     Error(WorkerError),
 }
 
@@ -174,6 +221,9 @@ struct DocumentReplica {
     grammar_key: GrammarKey,
     text: String,
     tree: tree_sitter::Tree,
+    node_paths: HashMap<u64, Vec<u32>>,
+    path_ids: HashMap<Vec<u32>, u64>,
+    next_node_id: u64,
 }
 
 impl DocumentReplica {
@@ -197,6 +247,9 @@ impl DocumentReplica {
                 grammar_key,
                 text: request.text,
                 tree,
+                node_paths: HashMap::new(),
+                path_ids: HashMap::new(),
+                next_node_id: 1,
             },
             ack,
         ))
@@ -254,6 +307,8 @@ impl DocumentReplica {
         }
         self.text = text;
         self.tree = tree;
+        self.node_paths.clear();
+        self.path_ids.clear();
         self.context = request.context;
         Ok(DocumentAck {
             context: self.context.clone(),
@@ -292,6 +347,102 @@ impl DocumentReplica {
             queue_wait_ns: duration_ns(queue_wait),
             compute_ns: duration_ns(started.elapsed()),
         })
+    }
+
+    fn resolve_node(&mut self, request: ResolveNode) -> Result<NodeResult, String> {
+        self.validate_identity(&request.context)?;
+        if request.byte_offset > self.text.len() {
+            return Err("node byte offset exceeds document length".into());
+        }
+        let root = self.tree.root_node();
+        let mut node = root
+            .descendant_for_byte_range(request.byte_offset, request.byte_offset)
+            .ok_or_else(|| "no node exists at byte offset".to_string())?;
+        if request.named {
+            while !node.is_named() {
+                node = node
+                    .parent()
+                    .ok_or_else(|| "no named node exists at byte offset".to_string())?;
+            }
+        }
+        let descriptor = describe_node(node)?;
+        let owned = self.register_node(descriptor, &request.context);
+        Ok(NodeResult {
+            context: request.context,
+            nodes: vec![owned],
+        })
+    }
+
+    fn navigate_node(&mut self, request: NavigateNode) -> Result<NodeResult, String> {
+        self.validate_identity(&request.context)?;
+        if request.node_id.worker_generation != request.context.worker_generation {
+            return Ok(NodeResult {
+                context: request.context,
+                nodes: Vec::new(),
+            });
+        }
+        let Some(path) = self.node_paths.get(&request.node_id.local_id).cloned() else {
+            return Ok(NodeResult {
+                context: request.context,
+                nodes: Vec::new(),
+            });
+        };
+        let Some(node) = node_at_path(self.tree.root_node(), &path) else {
+            return Ok(NodeResult {
+                context: request.context,
+                nodes: Vec::new(),
+            });
+        };
+        let selected = match request.operation {
+            NodeNavigation::Parent => node.parent().into_iter().collect::<Vec<_>>(),
+            NodeNavigation::Children => (0..node.child_count() as u32)
+                .filter_map(|index| node.child(index))
+                .collect(),
+            NodeNavigation::NamedChildren => (0..node.named_child_count() as u32)
+                .filter_map(|index| node.named_child(index))
+                .collect(),
+        };
+        let selected: Vec<NodeDescriptor> = selected
+            .into_iter()
+            .map(describe_node)
+            .collect::<Result<_, _>>()?;
+        let nodes = selected
+            .into_iter()
+            .map(|descriptor| self.register_node(descriptor, &request.context))
+            .collect();
+        Ok(NodeResult {
+            context: request.context,
+            nodes,
+        })
+    }
+
+    fn register_node(&mut self, descriptor: NodeDescriptor, context: &RequestContext) -> OwnedNode {
+        let NodeDescriptor {
+            path,
+            kind,
+            start_byte,
+            end_byte,
+            named,
+            has_error,
+        } = descriptor;
+        let local_id = self.path_ids.get(&path).copied().unwrap_or_else(|| {
+            let id = self.next_node_id;
+            self.next_node_id = self.next_node_id.saturating_add(1);
+            self.node_paths.insert(id, path.clone());
+            self.path_ids.insert(path, id);
+            id
+        });
+        OwnedNode {
+            id: OpaqueNodeId {
+                worker_generation: context.worker_generation,
+                local_id,
+            },
+            kind,
+            start_byte,
+            end_byte,
+            named,
+            has_error,
+        }
     }
 
     fn validate_identity(&self, context: &RequestContext) -> Result<(), String> {
@@ -408,6 +559,53 @@ fn point_at_byte(text: &str, byte: usize) -> tree_sitter::Point {
         .rposition(|&value| value == b'\n')
         .map_or(prefix.len(), |index| prefix.len() - index - 1);
     tree_sitter::Point::new(row, column)
+}
+
+struct NodeDescriptor {
+    path: Vec<u32>,
+    kind: String,
+    start_byte: usize,
+    end_byte: usize,
+    named: bool,
+    has_error: bool,
+}
+
+fn describe_node(node: tree_sitter::Node<'_>) -> Result<NodeDescriptor, String> {
+    Ok(NodeDescriptor {
+        path: path_to_node(node)?,
+        kind: node.kind().into(),
+        start_byte: node.start_byte(),
+        end_byte: node.end_byte(),
+        named: node.is_named(),
+        has_error: node.has_error(),
+    })
+}
+
+fn path_to_node(mut node: tree_sitter::Node<'_>) -> Result<Vec<u32>, String> {
+    let mut reversed = Vec::new();
+    while let Some(parent) = node.parent() {
+        let index = (0..parent.child_count() as u32)
+            .find(|index| {
+                parent
+                    .child(*index)
+                    .is_some_and(|child| child.id() == node.id())
+            })
+            .ok_or_else(|| "node is not reachable from its parent".to_string())?;
+        reversed.push(index);
+        node = parent;
+    }
+    reversed.reverse();
+    Ok(reversed)
+}
+
+fn node_at_path<'tree>(
+    mut node: tree_sitter::Node<'tree>,
+    path: &[u32],
+) -> Option<tree_sitter::Node<'tree>> {
+    for index in path {
+        node = node.child(*index)?;
+    }
+    Some(node)
 }
 
 pub fn encode_frame<W: Write, T: Serialize>(writer: &mut W, value: &T) -> io::Result<()> {
@@ -954,6 +1152,8 @@ fn handle_work(
         Request::DeriveDocumentSnapshot(request) => {
             derive_document_snapshot(request, documents, queue_wait, started)
         }
+        Request::ResolveNode(request) => resolve_node(request, documents),
+        Request::NavigateNode(request) => navigate_node(request, documents),
         Request::CloseDocument(request) => close_document(
             request,
             documents,
@@ -975,6 +1175,8 @@ fn request_context(request: &Request) -> Option<&RequestContext> {
         Request::ApplyDocumentEdits(request) => Some(&request.context),
         Request::ApplyDocumentEditsAndDerive(request) => Some(&request.context),
         Request::DeriveDocumentSnapshot(request) => Some(&request.context),
+        Request::ResolveNode(request) => Some(&request.context),
+        Request::NavigateNode(request) => Some(&request.context),
         Request::CloseDocument(request) => Some(&request.context),
     }
 }
@@ -985,8 +1187,56 @@ fn document_key(request: &Request) -> Option<DocumentKey> {
         Request::ApplyDocumentEdits(request) => Some(DocumentKey::from(&request.context)),
         Request::ApplyDocumentEditsAndDerive(request) => Some(DocumentKey::from(&request.context)),
         Request::DeriveDocumentSnapshot(request) => Some(DocumentKey::from(&request.context)),
+        Request::ResolveNode(request) => Some(DocumentKey::from(&request.context)),
+        Request::NavigateNode(request) => Some(DocumentKey::from(&request.context)),
         Request::CloseDocument(request) => Some(DocumentKey::from(&request.context)),
         Request::Handshake(_) | Request::DeriveSnapshot(_) => None,
+    }
+}
+
+fn resolve_node(request: ResolveNode, documents: &DocumentStore) -> Response {
+    let context = request.context.clone();
+    let Some(replica) = documents
+        .get(&DocumentKey::from(&context))
+        .map(|entry| Arc::clone(entry.value()))
+    else {
+        return Response::Error(WorkerError {
+            context: Some(context),
+            message: "document replica is missing; full sync required".into(),
+        });
+    };
+    match replica.lock() {
+        Ok(mut replica) => match replica.resolve_node(request) {
+            Ok(result) => Response::Nodes(result),
+            Err(message) => Response::Error(WorkerError {
+                context: Some(context),
+                message,
+            }),
+        },
+        Err(_) => poisoned_document_restart(context),
+    }
+}
+
+fn navigate_node(request: NavigateNode, documents: &DocumentStore) -> Response {
+    let context = request.context.clone();
+    let Some(replica) = documents
+        .get(&DocumentKey::from(&context))
+        .map(|entry| Arc::clone(entry.value()))
+    else {
+        return Response::Error(WorkerError {
+            context: Some(context),
+            message: "document replica is missing; full sync required".into(),
+        });
+    };
+    match replica.lock() {
+        Ok(mut replica) => match replica.navigate_node(request) {
+            Ok(result) => Response::Nodes(result),
+            Err(message) => Response::Error(WorkerError {
+                context: Some(context),
+                message,
+            }),
+        },
+        Err(_) => poisoned_document_restart(context),
     }
 }
 
@@ -1803,6 +2053,24 @@ impl Client {
         )
     }
 
+    pub fn resolve_node(&self, request: ResolveNode) -> io::Result<Response> {
+        let context = request.context.clone();
+        self.request_with_timeout(
+            Request::ResolveNode(request),
+            context,
+            Duration::from_secs(60),
+        )
+    }
+
+    pub fn navigate_node(&self, request: NavigateNode) -> io::Result<Response> {
+        let context = request.context.clone();
+        self.request_with_timeout(
+            Request::NavigateNode(request),
+            context,
+            Duration::from_secs(60),
+        )
+    }
+
     pub fn close_document(&self, request: CloseDocument) -> io::Result<Response> {
         let context = request.context.clone();
         self.request_with_timeout(
@@ -1967,6 +2235,7 @@ fn response_request_id(response: &Response) -> Option<u64> {
         Response::DocumentClosed(closed) => Some(closed.context.request_id),
         Response::WorkerRestartRequired(required) => Some(required.context.request_id),
         Response::Snapshot(snapshot) => Some(snapshot.context.request_id),
+        Response::Nodes(result) => Some(result.context.request_id),
         Response::Error(error) => error.context.as_ref().map(|context| context.request_id),
         Response::HandshakeReady(_) => None,
     }
@@ -1978,6 +2247,7 @@ fn response_context(response: &Response) -> Option<&RequestContext> {
         Response::DocumentClosed(closed) => Some(&closed.context),
         Response::WorkerRestartRequired(required) => Some(&required.context),
         Response::Snapshot(snapshot) => Some(&snapshot.context),
+        Response::Nodes(result) => Some(&result.context),
         Response::Error(error) => error.context.as_ref(),
         Response::HandshakeReady(_) => None,
     }
@@ -2091,10 +2361,11 @@ mod tests {
         ApplyDocumentEdits, BUILD_ID, ByteEdit, CloseDocument, DeriveSnapshot, DocumentKey,
         DocumentLane, DocumentReplica, GrammarKey, Handshake, HandshakeReady, LaneAction,
         LaneRegistry, MAX_DOCUMENT_BYTES, MAX_DOCUMENT_REPLICAS, MAX_RETAINED_DOCUMENT_BYTES,
-        PROTOCOL_VERSION, Request, RequestContext, Response, Route, SyncDocument, WorkerError,
-        close_document, decode_frame, derive_snapshot_with_language, encode_frame,
-        named_node_count, replace_retained_bytes, reserve_retained_growth, route_response, run,
-        submit_document_job, sync_document, terminate_by_transport, validate_document_size,
+        NavigateNode, NodeNavigation, OpaqueNodeId, PROTOCOL_VERSION, Request, RequestContext,
+        ResolveNode, Response, Route, SyncDocument, WorkerError, close_document, decode_frame,
+        derive_snapshot_with_language, encode_frame, named_node_count, replace_retained_bytes,
+        reserve_retained_growth, route_response, run, submit_document_job, sync_document,
+        terminate_by_transport, validate_document_size,
     };
 
     #[derive(Clone, Default)]
@@ -2675,6 +2946,68 @@ mod tests {
         assert_eq!(snapshot.root_end_byte, "fn main() { value + 2 }".len());
         assert_eq!(snapshot.parser_cache_hit, None);
         assert!(snapshot.compute_ns > 0);
+    }
+
+    #[test]
+    fn node_operations_return_generation_fenced_owned_data() {
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_rust::LANGUAGE.into())
+            .unwrap();
+        let context = RequestContext {
+            request_id: 1,
+            worker_generation: 3,
+            uri: "file:///example.rs".into(),
+            incarnation: 4,
+            content_version: 1,
+            configuration_generation: 2,
+        };
+        let (mut replica, _) = DocumentReplica::sync(
+            SyncDocument {
+                context: context.clone(),
+                language: "rust".into(),
+                grammar_symbol: "rust".into(),
+                source_path: "/unused/static-language".into(),
+                parser_path: "/unused/static-language".into(),
+                artifact_digest: "sha256:rust-v1".into(),
+                text: "fn main() {}".into(),
+            },
+            &mut parser,
+        )
+        .unwrap();
+
+        let resolved = replica
+            .resolve_node(ResolveNode {
+                context: context.clone(),
+                byte_offset: 3,
+                named: true,
+            })
+            .unwrap();
+        assert_eq!(resolved.nodes.len(), 1);
+        assert_eq!(resolved.nodes[0].kind, "identifier");
+        assert_eq!(resolved.nodes[0].id.worker_generation, 3);
+
+        let parent = replica
+            .navigate_node(NavigateNode {
+                context: context.clone(),
+                node_id: resolved.nodes[0].id,
+                operation: NodeNavigation::Parent,
+            })
+            .unwrap();
+        assert_eq!(parent.nodes.len(), 1);
+        assert_eq!(parent.nodes[0].kind, "function_item");
+
+        let stale = replica
+            .navigate_node(NavigateNode {
+                context,
+                node_id: OpaqueNodeId {
+                    worker_generation: 2,
+                    local_id: resolved.nodes[0].id.local_id,
+                },
+                operation: NodeNavigation::Parent,
+            })
+            .unwrap();
+        assert!(stale.nodes.is_empty());
     }
 
     #[test]

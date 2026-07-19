@@ -3,7 +3,8 @@ use std::sync::{Arc, Barrier};
 
 #[cfg(feature = "e2e")]
 use kakehashi::tree_worker::{
-    ApplyDocumentEdits, ByteEdit, CloseDocument, DeriveDocumentSnapshot, SyncDocument,
+    ApplyDocumentEdits, ByteEdit, CloseDocument, DeriveDocumentSnapshot, NavigateNode,
+    NodeNavigation, OpaqueNodeId, ResolveNode, SyncDocument,
 };
 use kakehashi::tree_worker::{Client, DeriveSnapshot, RequestContext, Response};
 
@@ -246,8 +247,39 @@ fn real_worker_keeps_document_text_and_tree_across_incremental_edits() {
     assert_eq!(snapshot.parser_cache_hit, None);
     assert!(snapshot.compute_ns > 0);
 
+    let mut node_context = snapshot.context.clone();
+    node_context.request_id = 33;
+    let response = worker
+        .resolve_node(ResolveNode {
+            context: node_context.clone(),
+            byte_offset: 12,
+            named: true,
+        })
+        .unwrap();
+    let Response::Nodes(nodes) = response else {
+        panic!("node resolve must return owned data: {response:?}");
+    };
+    assert_eq!(nodes.nodes[0].kind, "identifier");
+    assert_eq!(nodes.nodes[0].id.worker_generation, 44);
+
+    node_context.request_id = 34;
+    let response = worker
+        .navigate_node(NavigateNode {
+            context: node_context,
+            node_id: OpaqueNodeId {
+                worker_generation: 43,
+                local_id: nodes.nodes[0].id.local_id,
+            },
+            operation: NodeNavigation::Parent,
+        })
+        .unwrap();
+    let Response::Nodes(nodes) = response else {
+        panic!("stale node navigation must be contained: {response:?}");
+    };
+    assert!(nodes.nodes.is_empty());
+
     let mut closed = snapshot.context;
-    closed.request_id = 33;
+    closed.request_id = 35;
     closed.content_version = 3;
     closed.configuration_generation = 1;
     let response = worker
@@ -257,7 +289,7 @@ fn real_worker_keeps_document_text_and_tree_across_incremental_edits() {
         .unwrap();
     assert!(matches!(response, Response::DocumentClosed(_)));
 
-    closed.request_id = 34;
+    closed.request_id = 36;
     let response = worker
         .sync_document(SyncDocument {
             context: closed.clone(),
@@ -274,7 +306,7 @@ fn real_worker_keeps_document_text_and_tree_across_incremental_edits() {
     };
     assert!(error.message.contains("closed document incarnation"));
 
-    closed.request_id = 35;
+    closed.request_id = 37;
     let response = worker
         .derive_document_snapshot(DeriveDocumentSnapshot { context: closed })
         .unwrap();
