@@ -1,59 +1,199 @@
 {
-  "schema_version": 1,
-  "source_commit": "946de588c3928136138afb112200d6cf34af0da3",
-  "binary_sha256": "8584e64bfb38d8548221d5f5fc3c4d3a086530697a153b4a8b193fb51a885ac1",
+  "schema": 1,
+  "experiment": "single-tree-worker-stage3-shadow",
   "environment": {
-    "cpu": "Apple M4",
-    "os": "macOS 26.5.1 (25F80)",
-    "rustc": "rustc 1.95.0 (59807616e 2026-04-14)"
+    "platform": "macOS-26.5.1-arm64-arm-64bit",
+    "python": "3.12.13",
+    "rustc": "rustc 1.95.0 (59807616e 2026-04-14) (built from a source tarball)",
+    "cpu_model": "Apple M4",
+    "binary_sha256": "a6ee0ac80a97c814259a4c8855dc195332b4cab1a5faf34077d025818c577657",
+    "retained_environment": {
+      "PATH": "<redacted-search-path>",
+      "TMPDIR": "<redacted-path>",
+      "LANG": "C.UTF-8",
+      "LC_ALL": "C.UTF-8"
+    }
   },
-  "workload": {
-    "driver": "benches/profile/drive.py",
-    "language": "rust",
-    "generated_lines": 200,
-    "cycles": 200,
-    "edits_per_cycle": 1,
-    "request": "textDocument/semanticTokens/full",
-    "warm_semantic_cache": true,
-    "settle_seconds": 0.5,
+  "artifacts": {
+    "nvim_treesitter_repository": "https://github.com/nvim-treesitter/nvim-treesitter",
+    "nvim_treesitter_revision": "4916d6592ede8c07973490d9322f187e07dfefac",
+    "nvim_treesitter_fetched_main": "24977147550d53589e53b874ec75e14e4fbc304e",
+    "verification": "parser metadata and every installed query byte-matched"
+  },
+  "binary_attestation": {
+    "schema": 1,
+    "source_repository": "https://github.com/atusy/kakehashi",
+    "source_commit": "9f6d7a50e44f30b445c7232604904dc68a7d2868",
+    "source_remote_refs_containing_commit": [
+      "refs/remotes/origin/feat/tree-worker-stage3-shadow"
+    ],
+    "source_checkout_clean": true,
+    "build_command": [
+      "cargo",
+      "build",
+      "--locked",
+      "--release",
+      "--bin",
+      "kakehashi"
+    ],
+    "rustc": "rustc 1.95.0 (59807616e 2026-04-14) (built from a source tarball)",
+    "cargo": "cargo 1.95.0 (f2d3ce0bd 2026-03-21)",
+    "native_toolchain": {
+      "rustc_verbose": "rustc 1.95.0 (59807616e 2026-04-14) (built from a source tarball)\nbinary: rustc\ncommit-hash: 59807616e1fa2540724bfbac14d7976d7e4a3860\ncommit-date: 2026-04-14\nhost: aarch64-apple-darwin\nrelease: 1.95.0\nLLVM version: 21.1.8",
+      "cc": "Apple clang version 21.0.0 (clang-2100.1.1.101)\nTarget: arm64-apple-darwin25.5.0\nThread model: posix\nInstalledDir: /Library/Developer/CommandLineTools/usr/bin",
+      "linker": "@(#)PROGRAM:ld PROJECT:ld-1267\nBUILD 18:30:29 Apr 22 2026\nconfigured to support archs: armv6 armv7 armv7s arm64 arm64e arm64_32 i386 x86_64 x86_64h armv6m armv7k armv7m armv7em armv8m.main armv8.1m.main\nwill use ld-classic for: armv6 armv7 armv7s i386 armv6m armv7k armv7m armv7em\nLTO support using: LLVM version 21.0.0 (static support for 30, runtime is 30)\nTAPI support using: Apple TAPI version 21.0.0 (tapi-2100.0.2.6)\nLibrary search paths:\n\t/usr/local/lib\n\t/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/lib\n\t/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/lib/swift\nFramework search paths:\n\t/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/System/Library/Frameworks",
+      "sdk_path": "/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk",
+      "sdk_version": "26.5"
+    },
+    "build_environment": {
+      "PATH": "<redacted-search-path>",
+      "TMPDIR": "<redacted-path>",
+      "LANG": "C.UTF-8",
+      "LC_ALL": "C.UTF-8",
+      "CARGO_TARGET_DIR": "${ATTESTED_BUILD_ROOT}/target",
+      "CARGO_HOME": "${ATTESTED_BUILD_ROOT}/target/cargo-home"
+    },
+    "built_in_fresh_target": true,
+    "source_isolated_archive": true,
+    "cargo_config_ancestry_clean": true,
+    "binary_relative": "target/release/kakehashi",
+    "binary_sha256": "a6ee0ac80a97c814259a4c8855dc195332b4cab1a5faf34077d025818c577657"
+  },
+  "harness": {
+    "execution": "private staged driver and collector helpers",
+    "source_files_sha256": {
+      "collect_worker_proxy.py": "00867d5ebd4f23b0d02ad94b7f49cb41c8d868da8c49620f809f4cb300ba7f56",
+      "collect_worker_shadow.py": "cac7e119837531da2821ed1ca4776d1319a9cd8e91547da7f6d805fdd3701a28",
+      "collect_worker_cold_start.py": "7648e2b0eba60b20b7f11a641c07c6ccdd5a1d3b75bc91492f32acfa90750109",
+      "collect_worker_capture_pilot.py": "3a709d50253dc23060ca99f885978e71a8b58f07a71af6c492d2fa73916a75f5",
+      "drive.py": "3e9e2d8d84b6a2c4704c41f2e4efbd3a54499b1a6882d4f648c0c6ef2e178c12",
+      "worker_proxy.py": "e3fe07d73168835e71fb976109e034b121b1112d6c7a746be1575ac07a6fd542",
+      "gen_session.py": "6f4f6b8388c607db1c70fe29579ce14fe00d57668cab17601432ff123cfb15a3"
+    }
+  },
+  "collector": {
+    "batches": 2,
+    "order": "disabled-shadow on odd batches; shadow-disabled on even batches",
+    "fresh_xdg_per_variant": true,
     "shadow_compute_threads": 4
   },
-  "batches": [
-    {
-      "name": "A",
-      "order": ["disabled", "shadow"],
-      "disabled": {
-        "wall_ms": 14208.375375019386,
-        "ms_per_cycle": 71.04,
-        "semantic_ms": {"p50": 52.0, "p90": 56.6, "p95": 57.6, "p99": 61.2, "max": 62.4},
-        "responses_ok": 200
-      },
-      "shadow": {
-        "wall_ms": 15401.541374973021,
-        "ms_per_cycle": 77.01,
-        "semantic_ms": {"p50": 59.1, "p90": 64.5, "p95": 67.0, "p99": 68.6, "max": 72.2},
-        "responses_ok": 200,
-        "comparisons": {"matched": 201, "mismatched": 0, "superseded": 0, "pending": 0}
-      },
-      "shadow_delta_percent": {"wall": 8.4, "p50": 13.65, "p90": 13.96, "p95": 16.32, "p99": 12.09}
-    },
-    {
-      "name": "B",
-      "order": ["shadow", "disabled"],
-      "disabled": {
-        "wall_ms": 13559.062582906336,
-        "ms_per_cycle": 67.80,
-        "semantic_ms": {"p50": 50.3, "p90": 53.0, "p95": 54.2, "p99": 57.0, "max": 59.3},
-        "responses_ok": 200
-      },
-      "shadow": {
-        "wall_ms": 15332.948083989322,
-        "ms_per_cycle": 76.66,
-        "semantic_ms": {"p50": 57.7, "p90": 65.4, "p95": 67.5, "p99": 73.6, "max": 76.7},
-        "responses_ok": 200,
-        "comparisons": {"matched": 201, "mismatched": 0, "superseded": 0, "pending": 0}
-      },
-      "shadow_delta_percent": {"wall": 13.08, "p50": 14.71, "p90": 23.4, "p95": 24.54, "p99": 29.12}
+  "steady_state": {
+    "rust_edit_semantic_tokens": {
+      "arguments": [
+        "--lang",
+        "rust",
+        "--size",
+        "200",
+        "--requests",
+        "200",
+        "--edits",
+        "1",
+        "--warm-semantic-cache",
+        "--settle",
+        "0.5"
+      ],
+      "batches": [
+        {
+          "batch": 1,
+          "order": [
+            "disabled",
+            "shadow"
+          ],
+          "disabled": {
+            "count": 200,
+            "ok": 200,
+            "canceled": 0,
+            "null": 0,
+            "errors": 0,
+            "tokens_per_request": 17807,
+            "p50": 57.5,
+            "p90": 62.0,
+            "p95": 63.5,
+            "p99": 67.8,
+            "max": 76.7,
+            "wall": 15282.706290949136,
+            "wire_kib": 37800.9
+          },
+          "shadow": {
+            "count": 200,
+            "ok": 200,
+            "canceled": 0,
+            "null": 0,
+            "errors": 0,
+            "tokens_per_request": 17807,
+            "p50": 62.9,
+            "p90": 68.3,
+            "p95": 71.3,
+            "p99": 74.6,
+            "max": 150.5,
+            "wall": 16335.963875055313,
+            "wire_kib": 37800.9,
+            "comparisons": {
+              "matched": 201,
+              "mismatched": 0,
+              "superseded": 0,
+              "pending": 0
+            }
+          },
+          "shadow_delta_percent": {
+            "wall": 6.89,
+            "p50": 9.39,
+            "p90": 10.16,
+            "p95": 12.28,
+            "p99": 10.03
+          }
+        },
+        {
+          "batch": 2,
+          "order": [
+            "shadow",
+            "disabled"
+          ],
+          "shadow": {
+            "count": 200,
+            "ok": 200,
+            "canceled": 0,
+            "null": 0,
+            "errors": 0,
+            "tokens_per_request": 17807,
+            "p50": 55.6,
+            "p90": 60.7,
+            "p95": 63.4,
+            "p99": 66.5,
+            "max": 67.8,
+            "wall": 14803.383833030239,
+            "wire_kib": 37800.9,
+            "comparisons": {
+              "matched": 201,
+              "mismatched": 0,
+              "superseded": 0,
+              "pending": 0
+            }
+          },
+          "disabled": {
+            "count": 200,
+            "ok": 200,
+            "canceled": 0,
+            "null": 0,
+            "errors": 0,
+            "tokens_per_request": 17807,
+            "p50": 49.2,
+            "p90": 51.8,
+            "p95": 54.0,
+            "p99": 57.7,
+            "max": 61.2,
+            "wall": 13742.651749984361,
+            "wire_kib": 37800.9
+          },
+          "shadow_delta_percent": {
+            "wall": 7.72,
+            "p50": 13.01,
+            "p90": 17.18,
+            "p95": 17.41,
+            "p99": 15.25
+          }
+        }
+      ]
     }
-  ]
+  }
 }

@@ -25,8 +25,8 @@ captures, semantic tokens, or node identities.
 The committed result is
 `benches/profile/results/single_worker_stage3_shadow_2026-07-19.json`. The
 release binary was built from commit
-`946de588c3928136138afb112200d6cf34af0da3` and has SHA-256
-`8584e64bfb38d8548221d5f5fc3c4d3a086530697a153b4a8b193fb51a885ac1`.
+`9f6d7a50e44f30b445c7232604904dc68a7d2868` and has SHA-256
+`a6ee0ac80a97c814259a4c8855dc195332b4cab1a5faf34077d025818c577657`.
 The run used an Apple M4, macOS 26.5.1, Rust 1.95.0, and four worker compute
 threads.
 
@@ -52,23 +52,24 @@ comparisons at shutdown.
 
 | Batch and order | Disabled ms/cycle | Shadow ms/cycle | Shadow wall delta |
 |---|---:|---:|---:|
-| A, disabled first | 71.04 | 77.01 | +8.40% |
-| B, shadow first | 67.80 | 76.66 | +13.08% |
+| A, disabled first | 76.41 | 81.68 | +6.89% |
+| B, shadow first | 68.71 | 74.02 | +7.72% |
 
 | Batch | Disabled p50 / p90 / p95 / p99 | Shadow p50 / p90 / p95 / p99 | Shadow p50 delta |
 |---|---:|---:|---:|
-| A | 52.0 / 56.6 / 57.6 / 61.2 ms | 59.1 / 64.5 / 67.0 / 68.6 ms | +13.65% |
-| B | 50.3 / 53.0 / 54.2 / 57.0 ms | 57.7 / 65.4 / 67.5 / 73.6 ms | +14.71% |
+| A | 57.5 / 62.0 / 63.5 / 67.8 ms | 62.9 / 68.3 / 71.3 / 74.6 ms | +9.39% |
+| B | 49.2 / 51.8 / 54.0 / 57.7 ms | 55.6 / 60.7 / 63.4 / 66.5 ms | +13.01% |
 
 Reversing execution order did not reverse the result. Continuous shadow parsing
-cost 8.4--13.1% wall time and 13.7--14.7% at p50 in this single-document
-edit-and-token workload. The p90--p99 deltas ranged from 12.1% to 29.1%.
+cost 6.9--7.7% wall time and 9.4--13.0% at p50 in this single-document
+edit-and-token workload. The p90--p99 deltas ranged from 10.0% to 17.4%.
 Batch B's disabled baseline was faster than batch A's, so the range includes
 temporal/system variation rather than isolating one fixed shadow cost.
 
 This final run includes review-driven allocation removal, exact parser/query
-generation fencing, per-URI open-incarnation admission, and atomic comparison
-lifecycle state. Those correctness checks are part of the measured hot path.
+generation fencing, per-URI open-incarnation admission, atomic comparison
+lifecycle state, and bounded actor drain before the final summary. Those
+correctness checks are part of the measured hot path.
 Earlier exploratory runs had lower overhead after allocation removal, but they
 predated the final lifecycle fences and are not retained as acceptance evidence.
 
@@ -83,22 +84,26 @@ the authoritative result.
 ## Reproduction
 
 ```sh
-cargo build --release --locked --bin kakehashi
-shasum -a 256 target/release/kakehashi
+python3 benches/profile/attest_worker_binary.py \
+  --checkout . \
+  --output benches/profile/results/single_worker_stage3_binary_attestation_2026-07-19.json
 
-KAKEHASHI_TREE_WORKER_SHADOW=true \
-KAKEHASHI_TREE_WORKER_THREADS=4 \
-RUST_LOG=kakehashi::tree_worker_shadow=info,kakehashi::tree_worker_shadow_metrics=info \
-python3 benches/profile/drive.py \
+# Prepare DATA_DIR from one fixed nvim-treesitter checkout as in the Phase 0
+# procedure, including byte-identical parsers.lua and runtime/queries files.
+python3 benches/profile/collect_worker_shadow.py \
   --bin ./target/release/kakehashi \
-  --lang rust --size 200 --requests 200 --edits 1 \
-  --warm-semantic-cache --settle 0.5 \
-  --data-dir deps/test/kakehashi
-
-# Repeat without KAKEHASHI_TREE_WORKER_SHADOW, then repeat the pair in the
-# opposite order. Use isolated but identical XDG_CONFIG_HOME and XDG_STATE_HOME
-# directories for every run.
+  --binary-attestation benches/profile/results/single_worker_stage3_binary_attestation_2026-07-19.json \
+  --data-dir "$DATA_DIR" \
+  --nvim-treesitter-checkout "$NVIM_TREESITTER_CHECKOUT" \
+  --batches 2 --worker-threads 4 \
+  --output benches/profile/results/single_worker_stage3_shadow_2026-07-19.json
 ```
+
+The collector alternates order, explicitly sets shadow to `false` for control,
+creates a fresh empty `XDG_CONFIG_HOME` and `XDG_STATE_HOME` for every variant,
+requires a complete drained comparison summary, and writes the batches,
+deltas, binary attestation, runtime provenance, and harness hashes directly to
+the committed JSON.
 
 ## Consequence for Stage 3
 
