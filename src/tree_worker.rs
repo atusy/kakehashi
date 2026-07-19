@@ -73,6 +73,8 @@ pub struct ByteEdit {
 pub struct ApplyDocumentEdits {
     pub context: RequestContext,
     pub base_version: u64,
+    /// Ordered edits whose byte ranges address the text produced by all prior
+    /// entries, matching the sequential semantics of LSP content changes.
     pub edits: Vec<ByteEdit>,
 }
 
@@ -80,6 +82,8 @@ pub struct ApplyDocumentEdits {
 pub struct ApplyDocumentEditsAndDerive {
     pub context: RequestContext,
     pub base_version: u64,
+    /// Ordered edits whose byte ranges address the text produced by all prior
+    /// entries, matching the sequential semantics of LSP content changes.
     pub edits: Vec<ByteEdit>,
 }
 
@@ -2735,5 +2739,60 @@ mod tests {
         let snapshot = replica.derive(derive_context).unwrap();
         assert_eq!(snapshot.root_end_byte, original.len());
         assert_eq!(replica.text, original);
+    }
+
+    #[test]
+    fn document_replica_applies_edit_ranges_to_each_intermediate_text() {
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_rust::LANGUAGE.into())
+            .unwrap();
+        let context = RequestContext {
+            request_id: 1,
+            worker_generation: 3,
+            uri: "file:///sequential-edits.rs".into(),
+            incarnation: 1,
+            content_version: 1,
+            configuration_generation: 0,
+        };
+        let (mut replica, _) = DocumentReplica::sync(
+            SyncDocument {
+                context: context.clone(),
+                language: "rust".into(),
+                grammar_symbol: "rust".into(),
+                parser_path: "/unused/static-language".into(),
+                text: "fn main() { 1 }".into(),
+            },
+            &mut parser,
+        )
+        .unwrap();
+        let mut target = context;
+        target.request_id = 2;
+        target.content_version = 2;
+
+        replica
+            .apply(
+                ApplyDocumentEdits {
+                    context: target,
+                    base_version: 1,
+                    edits: vec![
+                        ByteEdit {
+                            start_byte: 12,
+                            old_end_byte: 12,
+                            new_text: "value + ".into(),
+                        },
+                        ByteEdit {
+                            start_byte: 20,
+                            old_end_byte: 21,
+                            new_text: "2".into(),
+                        },
+                    ],
+                },
+                &mut parser,
+                None,
+            )
+            .unwrap();
+
+        assert_eq!(replica.text, "fn main() { value + 2 }");
     }
 }
