@@ -5,7 +5,9 @@
 
 use std::io::{self, Read, Write};
 use std::path::PathBuf;
+use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::mpsc;
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
@@ -264,6 +266,218 @@ fn join_writer(thread: std::thread::JoinHandle<io::Result<()>>) -> io::Result<()
 
 pub fn run_stdio(compute_threads: usize) -> io::Result<()> {
     run(std::io::stdin(), std::io::stdout(), compute_threads)
+}
+
+pub struct Client {
+    child: Child,
+    stdin: Option<ChildStdin>,
+    responses: mpsc::Receiver<io::Result<Response>>,
+    reader: Option<std::thread::JoinHandle<()>>,
+    ready: HandshakeReady,
+}
+
+impl Client {
+    pub fn spawn(
+        executable: &std::path::Path,
+        compute_threads: usize,
+        worker_generation: u64,
+    ) -> io::Result<Self> {
+        if compute_threads == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "worker compute thread count must be positive",
+            ));
+        }
+        let mut child = Command::new(executable)
+            .args(["__tree-worker", "--threads", &compute_threads.to_string()])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .spawn()?;
+        let mut stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| io::Error::other("worker stdin was not piped"))?;
+        let mut stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| io::Error::other("worker stdout was not piped"))?;
+        let (responses_tx, responses) = mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            loop {
+                match decode_frame::<_, Response>(&mut stdout) {
+                    Ok(Some(response)) => {
+                        if responses_tx.send(Ok(response)).is_err() {
+                            break;
+                        }
+                    }
+                    Ok(None) => {
+                        let _ = responses_tx.send(Err(io::Error::new(
+                            io::ErrorKind::UnexpectedEof,
+                            "tree worker closed its response stream",
+                        )));
+                        break;
+                    }
+                    Err(error) => {
+                        let _ = responses_tx.send(Err(error));
+                        break;
+                    }
+                }
+            }
+        });
+        encode_frame(
+            &mut stdin,
+            &Request::Handshake(Handshake {
+                protocol_version: PROTOCOL_VERSION,
+                build_id: BUILD_ID.into(),
+                worker_generation,
+            }),
+        )?;
+        let ready = match responses.recv_timeout(Duration::from_secs(5)) {
+            Ok(Ok(Response::HandshakeReady(ready)))
+                if ready.protocol_version == PROTOCOL_VERSION
+                    && ready.build_id == BUILD_ID
+                    && ready.worker_generation == worker_generation
+                    && ready.compute_threads == compute_threads =>
+            {
+                ready
+            }
+            Ok(Ok(response)) => {
+                terminate(&mut child, Duration::from_secs(1));
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("invalid worker handshake response: {response:?}"),
+                ));
+            }
+            Ok(Err(error)) => {
+                terminate(&mut child, Duration::from_secs(1));
+                return Err(error);
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                terminate(&mut child, Duration::from_secs(1));
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "tree worker handshake timed out",
+                ));
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                terminate(&mut child, Duration::from_secs(1));
+                return Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "tree worker handshake channel closed",
+                ));
+            }
+        };
+        Ok(Self {
+            child,
+            stdin: Some(stdin),
+            responses,
+            reader: Some(reader),
+            ready,
+        })
+    }
+
+    pub fn compute_threads(&self) -> usize {
+        self.ready.compute_threads
+    }
+
+    pub fn derive(&mut self, request: DeriveSnapshot) -> io::Result<Response> {
+        self.derive_with_timeout(request, Duration::from_secs(60))
+    }
+
+    pub fn derive_with_timeout(
+        &mut self,
+        request: DeriveSnapshot,
+        timeout: Duration,
+    ) -> io::Result<Response> {
+        if request.context.worker_generation != self.ready.worker_generation {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "request targets a stale worker generation",
+            ));
+        }
+        let request_id = request.context.request_id;
+        let stdin = self
+            .stdin
+            .as_mut()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::BrokenPipe, "worker is shut down"))?;
+        encode_frame(stdin, &Request::DeriveSnapshot(request))?;
+        let response = match self.responses.recv_timeout(timeout) {
+            Ok(response) => response?,
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                terminate(&mut self.child, Duration::from_secs(1));
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    format!("tree worker request {request_id} timed out"),
+                ));
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "tree worker response channel closed",
+                ));
+            }
+        };
+        let response_id = match &response {
+            Response::Snapshot(snapshot) => Some(snapshot.context.request_id),
+            Response::Error(error) => error.request_id,
+            Response::HandshakeReady(_) => None,
+        };
+        if response_id != Some(request_id) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("unexpected response for request {response_id:?}"),
+            ));
+        }
+        Ok(response)
+    }
+
+    pub fn shutdown(mut self) -> io::Result<()> {
+        self.stdin.take();
+        let status = wait_until(&mut self.child, Duration::from_secs(2))?;
+        if let Some(reader) = self.reader.take() {
+            let _ = reader.join();
+        }
+        if status.success() {
+            Ok(())
+        } else {
+            Err(io::Error::other(format!(
+                "tree worker exited with {status}"
+            )))
+        }
+    }
+}
+
+impl Drop for Client {
+    fn drop(&mut self) {
+        self.stdin.take();
+        terminate(&mut self.child, Duration::from_secs(1));
+        if let Some(reader) = self.reader.take() {
+            let _ = reader.join();
+        }
+    }
+}
+
+fn wait_until(child: &mut Child, timeout: Duration) -> io::Result<std::process::ExitStatus> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Some(status) = child.try_wait()? {
+            return Ok(status);
+        }
+        if Instant::now() >= deadline {
+            child.kill()?;
+            return child.wait();
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+fn terminate(child: &mut Child, timeout: Duration) {
+    if child.try_wait().ok().flatten().is_some() {
+        return;
+    }
+    let _ = child.kill();
+    let _ = wait_until(child, timeout);
 }
 
 #[cfg(test)]
