@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, mpsc};
@@ -23,6 +24,27 @@ enum ShadowCommand {
     },
     Close(CloseDocument),
     Shutdown,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ReplicaIdentity {
+    incarnation: u64,
+    language: String,
+    grammar_symbol: String,
+    parser_path: PathBuf,
+    configuration_generation: u64,
+}
+
+impl ReplicaIdentity {
+    fn from_sync(request: &SyncDocument) -> Self {
+        Self {
+            incarnation: request.context.incarnation,
+            language: request.language.clone(),
+            grammar_symbol: request.grammar_symbol.clone(),
+            parser_path: request.parser_path.clone(),
+            configuration_generation: request.context.configuration_generation,
+        }
+    }
 }
 
 pub(super) struct TreeWorkerShadow {
@@ -189,6 +211,7 @@ impl TreeWorkerShadow {
             self.comparisons.superseded.load(Ordering::Relaxed),
             self.comparisons.pending.len(),
         );
+        self.disabled.store(true, Ordering::Release);
         if let Some(sender) = &self.sender {
             let _ = sender.try_send(ShadowCommand::Shutdown);
         }
@@ -304,28 +327,46 @@ fn run_actor(
             return;
         }
     };
+    let mut replicas = HashMap::<String, ReplicaIdentity>::new();
     while let Ok(command) = receiver.recv() {
         if disabled.load(Ordering::Acquire) || matches!(command, ShadowCommand::Shutdown) {
             break;
         }
         let started = Instant::now();
-        let response = match command {
-            ShadowCommand::Sync(request) => sync_and_derive(&client, request),
+        let (response, synced_identity) = match command {
+            ShadowCommand::Sync(request) => {
+                let identity = ReplicaIdentity::from_sync(&request);
+                (sync_and_derive(&client, request), Some(identity))
+            }
             ShadowCommand::Apply { request, fallback } => {
-                match client.apply_document_edits_and_derive(request) {
-                    Ok(Response::Snapshot(snapshot)) => Ok(Response::Snapshot(snapshot)),
-                    Ok(Response::WorkerRestartRequired(required)) => {
-                        Ok(Response::WorkerRestartRequired(required))
+                let uri = fallback.context.uri.clone();
+                let identity = ReplicaIdentity::from_sync(&fallback);
+                if replica_requires_sync(&replicas, &uri, &identity) {
+                    (sync_and_derive(&client, fallback), Some(identity))
+                } else {
+                    match client.apply_document_edits_and_derive(request) {
+                        Ok(Response::Snapshot(snapshot)) => {
+                            (Ok(Response::Snapshot(snapshot)), None)
+                        }
+                        Ok(Response::WorkerRestartRequired(required)) => {
+                            (Ok(Response::WorkerRestartRequired(required)), None)
+                        }
+                        Ok(_) => (sync_and_derive(&client, fallback), Some(identity)),
+                        Err(error) => (Err(error), None),
                     }
-                    Ok(_) => sync_and_derive(&client, fallback),
-                    Err(error) => Err(error),
                 }
             }
-            ShadowCommand::Close(request) => client.close_document(request),
+            ShadowCommand::Close(request) => {
+                replicas.remove(&request.context.uri);
+                (client.close_document(request), None)
+            }
             ShadowCommand::Shutdown => unreachable!(),
         };
         match response {
             Ok(Response::Snapshot(snapshot)) => {
+                if let Some(identity) = synced_identity {
+                    replicas.insert(snapshot.context.uri.clone(), identity);
+                }
                 log::debug!(
                     target: "kakehashi::tree_worker_shadow_metrics",
                     "uri={} version={} parent_us={} queue_us={} compute_us={}",
@@ -367,6 +408,14 @@ fn run_actor(
     if let Err(error) = client.shutdown() {
         log::warn!(target: "kakehashi::tree_worker_shadow", "worker shutdown failed: {error}");
     }
+}
+
+fn replica_requires_sync(
+    replicas: &HashMap<String, ReplicaIdentity>,
+    uri: &str,
+    desired: &ReplicaIdentity,
+) -> bool {
+    replicas.get(uri) != Some(desired)
 }
 
 enum ComparisonSide {
@@ -569,6 +618,45 @@ mod tests {
         shadow.submit(ShadowCommand::Shutdown);
 
         assert!(!shadow.is_enabled());
+    }
+
+    #[test]
+    fn shutdown_disables_the_actor_even_when_its_queue_is_full() {
+        let (sender, _receiver) = mpsc::sync_channel(1);
+        let shadow = shadow(sender);
+        shadow.submit(ShadowCommand::Shutdown);
+
+        shadow.shutdown();
+
+        assert!(!shadow.is_enabled());
+    }
+
+    #[test]
+    fn replica_identity_change_requires_a_full_sync() {
+        let (sender, _receiver) = mpsc::sync_channel(1);
+        let shadow = shadow(sender);
+        let uri = url::Url::parse("file:///example").unwrap();
+        let request =
+            shadow.sync_request(&uri, 2, 4, "rust".into(), grammar(), "fn main() {}".into());
+        let identity = ReplicaIdentity::from_sync(&request);
+        let mut replicas = HashMap::from([(uri.as_str().to_string(), identity.clone())]);
+
+        assert!(!replica_requires_sync(&replicas, uri.as_str(), &identity));
+
+        let mut changed = identity.clone();
+        changed.language = "bash".into();
+        assert!(replica_requires_sync(&replicas, uri.as_str(), &changed));
+
+        changed = identity.clone();
+        changed.grammar_symbol = "rust_with_changes".into();
+        assert!(replica_requires_sync(&replicas, uri.as_str(), &changed));
+
+        changed = identity.clone();
+        changed.configuration_generation += 1;
+        assert!(replica_requires_sync(&replicas, uri.as_str(), &changed));
+
+        replicas.remove(uri.as_str());
+        assert!(replica_requires_sync(&replicas, uri.as_str(), &identity));
     }
 
     #[test]
