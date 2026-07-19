@@ -281,7 +281,7 @@ fn derive_snapshot(request: DeriveSnapshot, queue_wait: Duration) -> Response {
 
 pub fn run<R, W>(reader: R, writer: W, compute_threads: usize) -> io::Result<()>
 where
-    R: Read,
+    R: Read + Send,
     W: Write + Send + 'static,
 {
     run_with_build_id(reader, writer, compute_threads, BUILD_ID)
@@ -294,7 +294,7 @@ fn run_with_build_id<R, W>(
     build_id: &str,
 ) -> io::Result<()>
 where
-    R: Read,
+    R: Read + Send,
     W: Write + Send + 'static,
 {
     if compute_threads == 0 {
@@ -308,11 +308,23 @@ where
         .thread_name(|index| format!("kakehashi-tree-worker-{index}"))
         .build()
         .map_err(io::Error::other)?;
-    let (responses, response_rx) = mpsc::channel::<Response>();
+    let max_inflight = compute_threads.saturating_mul(2).max(1);
+    let (permits, permit_rx) = mpsc::sync_channel(max_inflight);
+    for _ in 0..max_inflight {
+        permits
+            .send(())
+            .map_err(|_| io::Error::other("worker admission queue stopped"))?;
+    }
+    let (responses, response_rx) = mpsc::sync_channel::<(Response, bool)>(max_inflight);
+    let writer_permits = permits.clone();
     let writer_thread = std::thread::spawn(move || -> io::Result<()> {
         let mut writer = writer;
-        for response in response_rx {
-            encode_frame(&mut writer, &response)?;
+        for (response, releases_permit) in response_rx {
+            let result = encode_frame(&mut writer, &response);
+            if releases_permit {
+                let _ = writer_permits.send(());
+            }
+            result?;
         }
         Ok(())
     });
@@ -334,10 +346,13 @@ where
     };
     if handshake.protocol_version != PROTOCOL_VERSION || handshake.build_id != build_id {
         responses
-            .send(Response::Error(WorkerError {
-                context: None,
-                message: "worker protocol/build identity mismatch".into(),
-            }))
+            .send((
+                Response::Error(WorkerError {
+                    context: None,
+                    message: "worker protocol/build identity mismatch".into(),
+                }),
+                false,
+            ))
             .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "worker writer stopped"))?;
         drop(responses);
         join_writer(writer_thread)?;
@@ -348,61 +363,62 @@ where
     }
     let worker_generation = handshake.worker_generation;
     responses
-        .send(Response::HandshakeReady(HandshakeReady {
-            protocol_version: PROTOCOL_VERSION,
-            build_id: build_id.into(),
-            worker_generation,
-            compute_threads,
-        }))
+        .send((
+            Response::HandshakeReady(HandshakeReady {
+                protocol_version: PROTOCOL_VERSION,
+                build_id: build_id.into(),
+                worker_generation,
+                compute_threads,
+            }),
+            false,
+        ))
         .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "worker writer stopped"))?;
 
-    let (completed, completed_rx) = mpsc::channel();
-    let max_inflight = compute_threads.saturating_mul(2).max(1);
-    let (permits, permit_rx) = mpsc::sync_channel(max_inflight);
-    for _ in 0..max_inflight {
-        permits
-            .send(())
-            .map_err(|_| io::Error::other("worker admission queue stopped"))?;
-    }
-    let mut pending = 0_usize;
-    while let Some(request) = decode_frame::<_, Request>(&mut reader)? {
-        let Request::DeriveSnapshot(request) = request else {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "handshake may only be sent once",
-            ));
-        };
-        if request.context.worker_generation != worker_generation {
-            responses
-                .send(Response::Error(WorkerError {
-                    context: Some(request.context),
-                    message: "stale worker generation".into(),
-                }))
-                .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "worker writer stopped"))?;
-            continue;
+    let service_responses = responses.clone();
+    let service_permits = permits.clone();
+    let service_result = pool.scope(move |scope| -> io::Result<()> {
+        while let Some(request) = decode_frame::<_, Request>(&mut reader)? {
+            let Request::DeriveSnapshot(request) = request else {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "handshake may only be sent once",
+                ));
+            };
+            if request.context.worker_generation != worker_generation {
+                service_responses
+                    .send((
+                        Response::Error(WorkerError {
+                            context: Some(request.context),
+                            message: "stale worker generation".into(),
+                        }),
+                        false,
+                    ))
+                    .map_err(|_| {
+                        io::Error::new(io::ErrorKind::BrokenPipe, "worker writer stopped")
+                    })?;
+                continue;
+            }
+            let enqueued = Instant::now();
+            permit_rx
+                .recv()
+                .map_err(|_| io::Error::other("worker admission queue stopped"))?;
+            let responses = service_responses.clone();
+            let permits = service_permits.clone();
+            scope.spawn(move |_| {
+                if responses
+                    .send((derive_snapshot(request, enqueued.elapsed()), true))
+                    .is_err()
+                {
+                    let _ = permits.send(());
+                }
+            });
         }
-        permit_rx
-            .recv()
-            .map_err(|_| io::Error::other("worker admission queue stopped"))?;
-        pending += 1;
-        let responses = responses.clone();
-        let completed = completed.clone();
-        let permits = permits.clone();
-        let enqueued = Instant::now();
-        pool.spawn(move || {
-            let _ = responses.send(derive_snapshot(request, enqueued.elapsed()));
-            let _ = completed.send(());
-            let _ = permits.send(());
-        });
-    }
-    drop(completed);
-    for _ in 0..pending {
-        completed_rx.recv().map_err(|_| {
-            io::Error::new(io::ErrorKind::BrokenPipe, "worker compute task stopped")
-        })?;
-    }
+        Ok(())
+    });
     drop(responses);
-    join_writer(writer_thread)
+    let writer_result = join_writer(writer_thread);
+    service_result?;
+    writer_result
 }
 
 fn join_writer(thread: std::thread::JoinHandle<io::Result<()>>) -> io::Result<()> {
