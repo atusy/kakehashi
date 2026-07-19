@@ -1,7 +1,7 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, mpsc};
+use std::sync::{Arc, Mutex, mpsc};
 use std::time::Instant;
 
 use crate::language::coordinator::WorkerGrammarDescriptor;
@@ -14,6 +14,7 @@ use crate::tree_worker::{
 const SHADOW_ENV: &str = "KAKEHASHI_TREE_WORKER_SHADOW";
 const SHADOW_THREADS_ENV: &str = "KAKEHASHI_TREE_WORKER_THREADS";
 const SHADOW_QUEUE_CAPACITY: usize = 256;
+const CLOSED_COMPARISON_TOMBSTONES: usize = 4_096;
 static NEXT_WORKER_GENERATION: AtomicU64 = AtomicU64::new(1);
 
 enum ShadowCommand {
@@ -78,6 +79,8 @@ struct PendingComparison {
 #[derive(Default)]
 struct ComparisonStore {
     pending: dashmap::DashMap<String, PendingComparison>,
+    closed: dashmap::DashMap<String, u64>,
+    closed_order: Mutex<VecDeque<(String, u64)>>,
     matched: AtomicU64,
     mismatched: AtomicU64,
     superseded: AtomicU64,
@@ -151,6 +154,7 @@ impl TreeWorkerShadow {
         text: String,
     ) {
         let request = self.sync_request(uri, incarnation, content_version, language, grammar, text);
+        self.comparisons.reopen(uri.as_str(), incarnation);
         self.submit(ShadowCommand::Sync(request));
     }
 
@@ -198,7 +202,7 @@ impl TreeWorkerShadow {
         content_version: u64,
         configuration_generation: u64,
     ) {
-        self.comparisons.clear_uri(uri);
+        self.comparisons.mark_closed(uri.as_str(), incarnation);
         self.submit(ShadowCommand::Close(CloseDocument {
             context: self.context(uri, incarnation, content_version, configuration_generation),
         }));
@@ -343,6 +347,7 @@ fn run_actor(
         let (response, synced_identity) = match command {
             ShadowCommand::Sync(request) => {
                 let identity = ReplicaIdentity::from_sync(&request);
+                comparisons.reopen(&request.context.uri, request.context.incarnation);
                 (sync_and_derive(&client, request), Some(identity))
             }
             ShadowCommand::Apply { request, fallback } => {
@@ -365,7 +370,7 @@ fn run_actor(
             }
             ShadowCommand::Close(request) => {
                 replicas.remove(&request.context.uri);
-                comparisons.pending.remove(&request.context.uri);
+                comparisons.mark_closed(&request.context.uri, request.context.incarnation);
                 (client.close_document(request), None)
             }
             ShadowCommand::Shutdown => unreachable!(),
@@ -433,6 +438,14 @@ enum ComparisonSide {
 
 impl ComparisonStore {
     fn record(&self, uri: &str, incarnation: u64, content_version: u64, side: ComparisonSide) {
+        if self
+            .closed
+            .get(uri)
+            .is_some_and(|closed| *closed >= incarnation)
+        {
+            self.superseded.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
         let incoming_generation = match &side {
             ComparisonSide::Authoritative(summary) | ComparisonSide::Shadow(summary) => {
                 summary.configuration_generation
@@ -500,8 +513,35 @@ impl ComparisonStore {
         }
     }
 
-    fn clear_uri(&self, uri: &url::Url) {
-        self.pending.remove(uri.as_str());
+    fn mark_closed(&self, uri: &str, incarnation: u64) {
+        self.pending.remove(uri);
+        if self
+            .closed
+            .get(uri)
+            .is_some_and(|closed| *closed > incarnation)
+        {
+            return;
+        }
+        self.closed.insert(uri.to_string(), incarnation);
+
+        use crate::error::LockResultExt;
+        let mut order = self
+            .closed_order
+            .lock()
+            .recover_poison("TreeWorkerShadow::mark_closed");
+        order.push_back((uri.to_string(), incarnation));
+        while order.len() > CLOSED_COMPARISON_TOMBSTONES {
+            let Some((expired_uri, expired_incarnation)) = order.pop_front() else {
+                break;
+            };
+            self.closed
+                .remove_if(&expired_uri, |_, closed| *closed == expired_incarnation);
+        }
+    }
+
+    fn reopen(&self, uri: &str, incarnation: u64) {
+        self.closed
+            .remove_if(uri, |_, closed| *closed < incarnation);
     }
 }
 
@@ -753,5 +793,37 @@ mod tests {
         assert_eq!(store.mismatched.load(Ordering::Relaxed), 0);
         assert_eq!(store.superseded.load(Ordering::Relaxed), 1);
         assert!(store.pending.is_empty());
+    }
+
+    #[test]
+    fn closed_incarnation_rejects_late_results_until_reopen() {
+        let store = ComparisonStore::default();
+        let uri = "file:///a.rs";
+        store.mark_closed(uri, 1);
+
+        store.record(uri, 1, 2, ComparisonSide::Authoritative(summary("late")));
+        assert!(store.pending.is_empty());
+        assert_eq!(store.superseded.load(Ordering::Relaxed), 1);
+
+        store.reopen(uri, 2);
+        store.record(
+            uri,
+            2,
+            0,
+            ComparisonSide::Authoritative(summary("source_file")),
+        );
+        store.record(uri, 2, 0, ComparisonSide::Shadow(summary("source_file")));
+        assert_eq!(store.matched.load(Ordering::Relaxed), 1);
+        assert!(store.pending.is_empty());
+    }
+
+    #[test]
+    fn closed_comparison_tombstones_stay_bounded() {
+        let store = ComparisonStore::default();
+        for index in 0..=CLOSED_COMPARISON_TOMBSTONES {
+            store.mark_closed(&format!("file:///{index}.rs"), 1);
+        }
+
+        assert!(store.closed.len() <= CLOSED_COMPARISON_TOMBSTONES);
     }
 }

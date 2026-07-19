@@ -181,6 +181,24 @@ impl ParseCoordinator {
             + 'static,
         T: Send + 'static,
     {
+        self.parse_with_pool_versioned(language_name, uri, text_len, parse_fn)
+            .await
+            .map(|(value, _generation)| value)
+    }
+
+    async fn parse_with_pool_versioned<T, F>(
+        &self,
+        language_name: &str,
+        uri: &Url,
+        text_len: usize,
+        parse_fn: F,
+    ) -> Option<(T, u64)>
+    where
+        F: FnMut(tree_sitter::Parser, std::time::Instant, bool) -> (tree_sitter::Parser, Option<T>)
+            + Send
+            + 'static,
+        T: Send + 'static,
+    {
         use crate::error::LockResultExt;
 
         let parser_pool = std::sync::Arc::clone(&self.parser_pool);
@@ -232,7 +250,9 @@ impl ParseCoordinator {
                         .recover_poison("ParseCoordinator::parse_with_pool(release)")
                         .release_versioned(language_name_owned, parser, parser_generation)
                     {
-                        Ok(()) => return value,
+                        Ok(()) => {
+                            return value.map(|value| (value, parser_generation));
+                        }
                         Err(stale_language_name) => {
                             language_name_owned = stale_language_name;
                         }
@@ -565,7 +585,7 @@ impl ParseCoordinator {
             let language_name_clone = language_name.clone();
 
             let parsed_tree = if load_result.success {
-                self.parse_with_pool(
+                self.parse_with_pool_versioned(
                     &language_name,
                     &uri,
                     text.len(),
@@ -582,7 +602,7 @@ impl ParseCoordinator {
                 None
             };
 
-            if let Some(tree) = parsed_tree {
+            if let Some((tree, configuration_generation)) = parsed_tree {
                 // Legacy tree CAS BEFORE the snapshot publish: a legacy-store
                 // reader woken by the publish (the explicit-action waiters
                 // read `doc.snapshot()` after `wait_for_current_snapshot`)
@@ -619,7 +639,7 @@ impl ParseCoordinator {
                         incarnation,
                         content_version,
                         &language_name,
-                        self.language.configuration_generation(),
+                        configuration_generation,
                         &tree,
                     );
                     self.populate_injections_on_pool(
@@ -859,7 +879,7 @@ impl ParseCoordinator {
             // document text is never copied.
             let text_for_parse = text.clone();
             let parsed = self
-                .parse_with_pool(
+                .parse_with_pool_versioned(
                     &language_name,
                     &uri,
                     text_len,
@@ -873,7 +893,9 @@ impl ParseCoordinator {
                 )
                 .await;
 
-            let Some(tree) = parsed else { break };
+            let Some((tree, configuration_generation)) = parsed else {
+                break;
+            };
 
             // Persist FIRST through the non-inserting, tree-absent CAS —
             // before the snapshot publish, so a legacy-store reader the
@@ -904,7 +926,7 @@ impl ParseCoordinator {
                     expected_incarnation,
                     content_version,
                     &language_name,
-                    self.language.configuration_generation(),
+                    configuration_generation,
                     &tree,
                 );
                 self.populate_injections_on_pool(
@@ -1070,7 +1092,7 @@ impl ParseCoordinator {
         // (`didChange` → `apply_edit_and_seed`), satisfying tree-sitter's contract.
         let text_for_parse = text.clone();
         let parsed = self
-            .parse_with_pool(
+            .parse_with_pool_versioned(
                 &language_name,
                 uri,
                 text_len,
@@ -1093,7 +1115,7 @@ impl ParseCoordinator {
             .await;
 
         let mut events = load_result.events;
-        if let Some(tree) = parsed {
+        if let Some((tree, configuration_generation)) = parsed {
             // Legacy tree CAS BEFORE the snapshot publish (see the
             // parse_document ordering note): a legacy-store reader woken by
             // the publish must find the tree already attached. Text +
@@ -1124,7 +1146,7 @@ impl ParseCoordinator {
                     incarnation,
                     content_version,
                     &language_name,
-                    self.language.configuration_generation(),
+                    configuration_generation,
                     &tree,
                 );
                 self.populate_injections_on_pool(
