@@ -33,6 +33,7 @@ enum ShadowCommand {
         fallback: SyncDocument,
     },
     Close(CloseDocument),
+    Forget(RequestContext),
     Shutdown(mpsc::SyncSender<()>),
 }
 
@@ -165,6 +166,7 @@ enum BreakerState {
     },
     HalfOpen {
         probe_generation: u64,
+        synchronized_epoch: u64,
     },
 }
 
@@ -236,23 +238,31 @@ impl OpenDocuments {
                 .current
                 .get(&request.context.uri)
                 .is_some_and(|current| current.context.incarnation > request.context.incarnation),
+            ShadowCommand::Forget(context) => {
+                self.current.get(&context.uri).is_some_and(|current| {
+                    current.context.incarnation > context.incarnation
+                        || (current.context.incarnation == context.incarnation
+                            && (current.context.configuration_generation
+                                > context.configuration_generation
+                                || (current.context.configuration_generation
+                                    == context.configuration_generation
+                                    && current.context.content_version > context.content_version)))
+                })
+            }
             ShadowCommand::Shutdown(_) => false,
         }
     }
 
     fn observe(&mut self, command: &ShadowCommand) -> Observation {
-        if let ShadowCommand::Close(request) = command
-            && self
-                .current
-                .get(&request.context.uri)
-                .is_some_and(|current| current.context.incarnation > request.context.incarnation)
+        if self.supersedes(command)
+            && matches!(command, ShadowCommand::Close(_) | ShadowCommand::Forget(_))
         {
             return Observation::Stale;
         }
         let incoming = match command {
             ShadowCommand::Sync(request) => Some(request),
             ShadowCommand::Apply { fallback, .. } => Some(fallback),
-            ShadowCommand::Close(_) | ShadowCommand::Shutdown(_) => None,
+            ShadowCommand::Close(_) | ShadowCommand::Forget(_) | ShadowCommand::Shutdown(_) => None,
         };
         if incoming.is_some_and(|incoming| {
             self.closed_incarnations
@@ -315,6 +325,9 @@ impl OpenDocuments {
                     .entry(request.context.uri.clone())
                     .and_modify(|closed| *closed = (*closed).max(request.context.incarnation))
                     .or_insert(request.context.incarnation);
+            }
+            ShadowCommand::Forget(context) => {
+                self.current.remove(&context.uri);
             }
             ShadowCommand::Shutdown(_) => {}
         }
@@ -570,14 +583,12 @@ impl TreeWorkerShadow {
                     document.text,
                 ))
             } else {
-                ShadowCommand::Close(CloseDocument {
-                    context: self.context(
-                        &document.uri,
-                        document.incarnation,
-                        document.content_version,
-                        generation,
-                    ),
-                })
+                ShadowCommand::Forget(self.context(
+                    &document.uri,
+                    document.incarnation,
+                    document.content_version,
+                    generation,
+                ))
             };
             commands.push(command);
         }
@@ -593,7 +604,7 @@ impl TreeWorkerShadow {
         }
         for command in &commands {
             if let Some((uri, incarnation)) = command_document(command) {
-                if matches!(command, ShadowCommand::Close(_)) {
+                if matches!(command, ShadowCommand::Close(_) | ShadowCommand::Forget(_)) {
                     self.comparisons.mark_closed(uri, incarnation);
                 } else {
                     self.comparisons.open(uri, incarnation);
@@ -858,7 +869,7 @@ fn run_actor(
     }
     let mut shutdown_ack = None;
     loop {
-        if disabled.load(Ordering::Acquire) && !matches!(state.breaker, BreakerState::Open { .. }) {
+        if disabled.load(Ordering::Acquire) && matches!(state.breaker, BreakerState::Closed) {
             mark_tree_tier_unavailable(&mut state, &disabled, &pending_configuration_generation);
         }
         if disabled.load(Ordering::Acquire) {
@@ -868,6 +879,7 @@ fn run_actor(
                 let recovery_epoch = registry_epoch.load(Ordering::Acquire);
                 state.breaker = BreakerState::HalfOpen {
                     probe_generation: generation,
+                    synchronized_epoch: recovery_epoch,
                 };
                 if recover_worker(
                     &mut state,
@@ -878,13 +890,13 @@ fn run_actor(
                     &comparisons,
                     RecoveryMode::HalfOpen,
                 ) {
-                    if !finish_half_open_recovery(
+                    if finish_half_open_recovery(
                         &mut state,
                         &registry_epoch,
-                        recovery_epoch,
                         &comparisons,
                         &disabled,
-                    ) {
+                    ) == ReconcileOutcome::Failed
+                    {
                         mark_tree_tier_unavailable(
                             &mut state,
                             &disabled,
@@ -892,10 +904,12 @@ fn run_actor(
                         );
                         continue;
                     }
-                    log::info!(
-                        target: "kakehashi::tree_worker_shadow",
-                        "entered shadow worker half-open probation for configuration generation {generation}",
-                    );
+                    if !disabled.load(Ordering::Acquire) {
+                        log::info!(
+                            target: "kakehashi::tree_worker_shadow",
+                            "entered shadow worker half-open probation for configuration generation {generation}",
+                        );
+                    }
                 } else {
                     mark_tree_tier_unavailable(
                         &mut state,
@@ -904,6 +918,13 @@ fn run_actor(
                     );
                 }
             }
+        }
+        if disabled.load(Ordering::Acquire)
+            && matches!(state.breaker, BreakerState::HalfOpen { .. })
+            && finish_half_open_recovery(&mut state, &registry_epoch, &comparisons, &disabled)
+                == ReconcileOutcome::Failed
+        {
+            mark_tree_tier_unavailable(&mut state, &disabled, &pending_configuration_generation);
         }
         let mut command = match receiver.recv_timeout(WORKER_LIVENESS_POLL) {
             Ok(command) => command,
@@ -914,7 +935,9 @@ fn run_actor(
                 let status = client.try_wait();
                 match status {
                     Ok(None) => {
-                        observe_healthy_service(&mut state, Instant::now());
+                        if !disabled.load(Ordering::Acquire) {
+                            observe_healthy_service(&mut state, Instant::now());
+                        }
                         continue;
                     }
                     Ok(Some(status)) => log::error!(
@@ -985,7 +1008,8 @@ fn run_actor(
                 })
             })
         });
-        if artifact_replaced {
+        let replica_forgotten = matches!(&command, ShadowCommand::Forget(context) if state.replicas.contains_key(&context.uri));
+        if artifact_replaced || replica_forgotten {
             log::info!(
                 target: "kakehashi::tree_worker_shadow",
                 "performing planned worker restart for parser artifact replacement",
@@ -1014,6 +1038,9 @@ fn run_actor(
                 );
                 continue;
             }
+            continue;
+        }
+        if matches!(command, ShadowCommand::Forget(_)) {
             continue;
         }
         if replica_satisfies_command(&state.replicas, &command) {
@@ -1144,14 +1171,27 @@ fn run_actor(
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ReconcileOutcome {
+    Current,
+    Pending,
+    Failed,
+}
+
 fn finish_half_open_recovery(
     state: &mut SupervisorState,
     registry_epoch: &AtomicU64,
-    mut synchronized_epoch: u64,
     comparisons: &ComparisonStore,
     disabled: &AtomicBool,
-) -> bool {
+) -> ReconcileOutcome {
     const MAX_RECONCILIATION_PASSES: usize = 3;
+    let BreakerState::HalfOpen {
+        probe_generation,
+        mut synchronized_epoch,
+    } = state.breaker
+    else {
+        return ReconcileOutcome::Failed;
+    };
     for pass in 0..=MAX_RECONCILIATION_PASSES {
         let registry = state
             .open_documents
@@ -1159,8 +1199,11 @@ fn finish_half_open_recovery(
             .recover_poison("finish_half_open_recovery");
         let current_epoch = registry_epoch.load(Ordering::Acquire);
         if current_epoch == synchronized_epoch {
+            let healthy_since = Instant::now();
+            state.healthy_since = Some(healthy_since);
+            state.long_healthy_since = Some(healthy_since);
             disabled.store(false, Ordering::Release);
-            return true;
+            return ReconcileOutcome::Current;
         }
         drop(registry);
         if pass == MAX_RECONCILIATION_PASSES {
@@ -1187,14 +1230,18 @@ fn finish_half_open_recovery(
                 "half-open registry reconciliation failed: {}",
                 failure.error,
             );
-            return false;
+            return ReconcileOutcome::Failed;
         }
     }
+    state.breaker = BreakerState::HalfOpen {
+        probe_generation,
+        synchronized_epoch,
+    };
     log::warn!(
         target: "kakehashi::tree_worker_shadow",
         "half-open registry reconciliation did not quiesce after {MAX_RECONCILIATION_PASSES} passes",
     );
-    false
+    ReconcileOutcome::Pending
 }
 
 fn breaker_probe_allowed(state: BreakerState, generation: u64, now: Instant) -> bool {
@@ -1239,7 +1286,10 @@ fn observe_healthy_service(state: &mut SupervisorState, now: Instant) {
     };
     if now.saturating_duration_since(healthy_since) >= FAST_HEALTHY_INTERVAL {
         state.restart_budget.reset_fast();
-        if let BreakerState::HalfOpen { probe_generation } = state.breaker {
+        if let BreakerState::HalfOpen {
+            probe_generation, ..
+        } = state.breaker
+        {
             state.breaker = BreakerState::Closed;
             log::info!(
                 target: "kakehashi::tree_worker_shadow",
@@ -1293,6 +1343,7 @@ fn execute_command(
             comparisons.mark_closed(&request.context.uri, request.context.incarnation);
             (client.close_document(request), None)
         }
+        ShadowCommand::Forget(_) => unreachable!("forget commands restart before execution"),
         ShadowCommand::Shutdown(_) => unreachable!(),
     }
 }
@@ -1559,6 +1610,7 @@ fn retag_command(command: &mut ShadowCommand, generation: u64) {
             fallback.context.worker_generation = generation;
         }
         ShadowCommand::Close(request) => request.context.worker_generation = generation,
+        ShadowCommand::Forget(context) => context.worker_generation = generation,
         ShadowCommand::Shutdown(_) => {}
     }
 }
@@ -1596,6 +1648,7 @@ fn command_uri(command: &ShadowCommand) -> Option<&str> {
         ShadowCommand::Sync(request) => Some(&request.context.uri),
         ShadowCommand::Apply { fallback, .. } => Some(&fallback.context.uri),
         ShadowCommand::Close(request) => Some(&request.context.uri),
+        ShadowCommand::Forget(context) => Some(&context.uri),
         ShadowCommand::Shutdown(_) => None,
     }
 }
@@ -1607,6 +1660,7 @@ fn command_document(command: &ShadowCommand) -> Option<(&str, u64)> {
             Some((&fallback.context.uri, fallback.context.incarnation))
         }
         ShadowCommand::Close(request) => Some((&request.context.uri, request.context.incarnation)),
+        ShadowCommand::Forget(context) => Some((&context.uri, context.incarnation)),
         ShadowCommand::Shutdown(_) => None,
     }
 }
@@ -1615,7 +1669,7 @@ fn command_grammar(command: &ShadowCommand) -> Option<GrammarIdentity> {
     match command {
         ShadowCommand::Sync(request) => Some(GrammarIdentity::from_sync(request)),
         ShadowCommand::Apply { fallback, .. } => Some(GrammarIdentity::from_sync(fallback)),
-        ShadowCommand::Close(_) | ShadowCommand::Shutdown(_) => None,
+        ShadowCommand::Close(_) | ShadowCommand::Forget(_) | ShadowCommand::Shutdown(_) => None,
     }
 }
 
@@ -1623,7 +1677,7 @@ fn command_sync(command: &ShadowCommand) -> Option<&SyncDocument> {
     match command {
         ShadowCommand::Sync(request) => Some(request),
         ShadowCommand::Apply { fallback, .. } => Some(fallback),
-        ShadowCommand::Close(_) | ShadowCommand::Shutdown(_) => None,
+        ShadowCommand::Close(_) | ShadowCommand::Forget(_) | ShadowCommand::Shutdown(_) => None,
     }
 }
 
@@ -1995,6 +2049,30 @@ mod tests {
     }
 
     #[test]
+    fn unavailable_grammar_forget_allows_same_incarnation_to_recover() {
+        let mut documents = OpenDocuments::default();
+        let mut unavailable = sync("file:///a.rs", 4, 2, 7);
+        unavailable.context.configuration_generation = 8;
+        assert!(matches!(
+            documents.observe(&ShadowCommand::Sync(unavailable.clone())),
+            Observation::Accepted { .. }
+        ));
+        assert!(matches!(
+            documents.observe(&ShadowCommand::Forget(unavailable.context.clone())),
+            Observation::Accepted { .. }
+        ));
+        assert!(documents.current.is_empty());
+        assert!(documents.closed_incarnations.is_empty());
+
+        unavailable.context.configuration_generation = 9;
+        assert!(matches!(
+            documents.observe(&ShadowCommand::Sync(unavailable)),
+            Observation::Accepted { .. }
+        ));
+        assert!(documents.current.contains_key("file:///a.rs"));
+    }
+
+    #[test]
     fn command_retagging_fences_queued_work_to_replacement_generation() {
         let mut command = ShadowCommand::Apply {
             request: ApplyDocumentEditsAndDerive {
@@ -2113,6 +2191,7 @@ mod tests {
             restart_budget: RestartBudget::default(),
             breaker: BreakerState::HalfOpen {
                 probe_generation: 7,
+                synchronized_epoch: 0,
             },
             healthy_since: Some(started),
             long_healthy_since: Some(started),

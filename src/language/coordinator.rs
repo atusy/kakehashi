@@ -104,7 +104,7 @@ pub(crate) struct LanguageCoordinator {
     /// the key keeps didChange from re-reading a shared library while ensuring
     /// a configuration reload revalidates even a same-path replacement.
     worker_artifacts: dashmap::DashMap<(PathBuf, u64, u64), CachedWorkerArtifact>,
-    worker_grammar_fallbacks: dashmap::DashMap<String, CachedWorkerArtifact>,
+    worker_grammar_fallbacks: dashmap::DashMap<String, ValidatedWorkerArtifact>,
     worker_artifact_dir: Option<tempfile::TempDir>,
     worker_settings: RwLock<Arc<WorkspaceSettings>>,
     worker_settings_epoch: std::sync::atomic::AtomicU64,
@@ -136,6 +136,13 @@ struct CachedWorkerArtifact {
     source_path: PathBuf,
     path: PathBuf,
     digest: String,
+}
+
+#[derive(Clone)]
+struct ValidatedWorkerArtifact {
+    artifact: CachedWorkerArtifact,
+    generation: u64,
+    epoch: u64,
 }
 
 impl Default for LanguageCoordinator {
@@ -1860,7 +1867,7 @@ impl LanguageCoordinator {
                     );
                     self.worker_grammar_fallbacks
                         .get(&grammar_symbol)
-                        .map(|entry| entry.value().clone())?
+                        .map(|entry| entry.artifact.clone())?
                 }
             };
             if self
@@ -1885,7 +1892,21 @@ impl LanguageCoordinator {
             return None;
         }
         self.worker_grammar_fallbacks
-            .insert(grammar_symbol.clone(), artifact.clone());
+            .entry(grammar_symbol.clone())
+            .and_modify(|validated| {
+                if (configuration_generation, epoch) > (validated.generation, validated.epoch) {
+                    *validated = ValidatedWorkerArtifact {
+                        artifact: artifact.clone(),
+                        generation: configuration_generation,
+                        epoch,
+                    };
+                }
+            })
+            .or_insert_with(|| ValidatedWorkerArtifact {
+                artifact: artifact.clone(),
+                generation: configuration_generation,
+                epoch,
+            });
         Some(WorkerGrammarDescriptor {
             source_path: artifact.source_path,
             parser_path: artifact.path,
