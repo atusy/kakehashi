@@ -19,6 +19,12 @@ incarnation, content version, and configuration generation. No `Tree`, `Node`,
 The worker accepts concurrent requests and routes out-of-order responses by
 request ID.
 
+The prototype authenticates the exact bytes at the caller-supplied spawn path
+against the image observed by the child. It does not yet bind that path to the
+parent's running image or retain the immutable session-private executable
+snapshot required by the final ADR. That parent-image binding remains a
+cutover prerequisite, not a security property claimed by Stage 1.
+
 This prototype does not yet maintain a worker-side document replica or
 incremental `Tree`. Every `DeriveSnapshot` request carries the complete source
 text and performs a full parse. It does not run injection discovery, queries,
@@ -43,7 +49,7 @@ Both paths retained one parser cache per compute thread; the final runs recorded
 996 direct and 997 worker cache hits in each batch, avoiding the earlier unfair benchmark
 variant that recreated direct parsers at Rayon split boundaries.
 
-The request frame was 8,133 bytes, dominated by repeated full text. The worker
+The request frame was 8,069 bytes, dominated by repeated full text. The worker
 reported queue wait and parse/summary compute separately; parent-observed time
 also includes JSON encoding/decoding, pipe I/O, wakeup, and response routing.
 
@@ -53,10 +59,10 @@ also includes JSON encoding/decoding, pipe I/O, wakeup, and response routing.
 
 | Batch | Direct p50 / p95 / p99 | Worker p50 / p95 / p99 | Worker queue p50 |
 |---|---:|---:|---:|
-| A | 960.9 / 1100.7 / 1183.8 µs | 1129.7 / 1172.0 / 1217.8 µs | 4.5 µs |
-| B | 1093.7 / 1108.0 / 1123.5 µs | 1000.2 / 1161.5 / 1177.1 µs | 4.3 µs |
+| A | 957.3 / 1084.5 / 1092.5 µs | 1147.5 / 1170.3 / 1189.5 µs | 4.7 µs |
+| B | 1274.5 / 1304.0 / 1328.0 µs | 1175.4 / 1396.2 / 1419.6 µs | 5.2 µs |
 
-The parent-observed worker p50 was 18% slower in batch A and 9% faster in batch
+The parent-observed worker p50 was 20% slower in batch A and 8% faster in batch
 B. This reversal under a fixed direct-then-worker order is evidence that the
 sequential difference is smaller than run-order noise, not evidence of a worker
 win. Queue wait remained small. The remainder cannot be labeled pure transport
@@ -66,14 +72,15 @@ overhead without an alternating paired collector.
 
 | Batch | Direct | Worker | Worker delta |
 |---|---:|---:|---:|
-| A | 3120.1 req/s | 2236.7 req/s | -28.3% |
-| B | 2686.2 req/s | 2230.2 req/s | -17.0% |
+| A | 2440.2 req/s | 2381.1 req/s | -2.4% |
+| B | 2133.8 req/s | 2527.4 req/s | +18.4% |
 
-The worker did use multiple compute threads and preserved almost identical
-parser-cache hit rates, but did not improve throughput in this full-text
-protocol shape. Exact executable SHA-256 authentication added after review made
-spawn plus handshake 1.10--1.11 s in these runs, dominated by hashing the 34 MiB
-parent and child images with the current implementation. The final retained
+The worker did use all four compute threads and preserved the expected cache
+hit rates. The two batches disagree on the throughput direction, so this
+fixed-order collector cannot establish either a win or a regression. Exact
+executable SHA-256 authentication added after review made spawn plus handshake
+1.09--1.14 s in these runs, dominated by hashing the 34 MiB parent and child
+images with the current implementation. The final retained
 executable snapshot should hash once and reuse its identity across worker
 generations; cold-start acceptance needs a dedicated alternating collector.
 
@@ -82,6 +89,13 @@ across response wait: throughput fell to 693--818 req/s and p99 reached
 117--140 ms. Releasing the guard immediately after bounded queue admission
 restored 2230--2237 req/s. Those defective runs are not part of the committed
 results.
+
+A second intermediate implementation used `Rayon::scope` to remove lifetime
+completion messages. The control scope consumed one compute slot, shifted the
+worker cache-hit count from 997 to 998, and reduced throughput to 1597--1815
+req/s. Waiting for all bounded admission permits at EOF instead preserved four
+compute threads without retaining per-request completion history. Those runs
+are also excluded.
 
 ## Reproduction
 
@@ -92,6 +106,7 @@ cargo build --release --locked --bin kakehashi
 target/release/kakehashi language install rust \
   --data-dir deps/test/kakehashi --force
 shasum -a 256 target/release/kakehashi \
+  target/release/deps/tree_worker_stage1-8d08bf9882b4bf01 \
   deps/test/kakehashi/parser/rust.dylib
 
 cargo bench --locked --bench tree_worker_stage1 -- \
@@ -107,6 +122,17 @@ Before comparing results, the parser revision and all three recorded SHA-256
 values must match the aggregate JSON. The raw files are the collector output;
 the aggregate embeds them unchanged under `batches` plus environment and
 artifact provenance.
+
+The embedding can be checked without trusting the prose:
+
+```sh
+jq -e --slurpfile a \
+  benches/profile/results/single_worker_stage1_2026-07-19_batch_a.json \
+  --slurpfile b \
+  benches/profile/results/single_worker_stage1_2026-07-19_batch_b.json \
+  '.batches == [$a[0], $b[0]]' \
+  benches/profile/results/single_worker_stage1_2026-07-19.json
+```
 
 ## Decision and next stage
 
