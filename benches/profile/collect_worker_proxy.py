@@ -412,7 +412,8 @@ def load_binary_attestation(path, binary):
     if any(key not in attestation for key in required):
         raise ValueError("binary attestation is missing required fields")
     valid_schema = (
-        attestation["schema"] == 1
+        type(attestation["schema"]) is int
+        and attestation["schema"] == 1
         and isinstance(attestation["source_repository"], str)
         and bool(attestation["source_repository"])
         and isinstance(attestation["source_commit"], str)

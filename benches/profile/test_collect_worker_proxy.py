@@ -630,6 +630,11 @@ class CollectionHelpersTest(unittest.TestCase):
             loaded = load_binary_attestation(attestation, binary)
 
             self.assertEqual(loaded["source_commit"], "a" * 40)
+            boolean_schema = dict(loaded, schema=True)
+            attestation.write_text(json.dumps(boolean_schema))
+            with self.assertRaisesRegex(ValueError, "attestation schema"):
+                load_binary_attestation(attestation, binary)
+            attestation.write_text(json.dumps(loaded))
             without_remote_proof = json.loads(attestation.read_text())
             del without_remote_proof["source_remote_refs_containing_commit"]
             attestation.write_text(json.dumps(without_remote_proof))
