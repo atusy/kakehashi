@@ -3,9 +3,9 @@ use std::sync::{Arc, Barrier};
 
 #[cfg(feature = "e2e")]
 use kakehashi::tree_worker::{
-    ApplyDocumentEdits, ByteEdit, CloseDocument, DeriveDocumentSnapshot, NavigateNode,
-    NodeNavigation, NodeScalarOperation, NodeScalarValue, OpaqueNodeId, ResolveNode, RunNodeScalar,
-    SyncDocument,
+    ApplyDocumentEdits, ByteEdit, CloseDocument, ConfigureLanguages, DeriveDocumentSnapshot,
+    NavigateNode, NodeNavigation, NodeScalarOperation, NodeScalarValue, OpaqueNodeId, ResolveNode,
+    RunNodeScalar, SyncDocument, WorkerLanguageAsset, WorkerQuerySources,
 };
 use kakehashi::tree_worker::{Client, DeriveSnapshot, RequestContext, Response};
 
@@ -201,6 +201,34 @@ fn real_worker_keeps_document_text_and_tree_across_incremental_edits() {
         content_version: 1,
         configuration_generation: 0,
     };
+
+    let response = worker
+        .configure_languages(ConfigureLanguages {
+            context: RequestContext {
+                request_id: 29,
+                worker_generation: 44,
+                uri: "kakehashi://language-catalog".into(),
+                incarnation: 0,
+                content_version: 0,
+                configuration_generation: 0,
+            },
+            assets: vec![WorkerLanguageAsset {
+                language: "rust".into(),
+                grammar_symbol: "rust".into(),
+                source_path: parser.clone(),
+                parser_path: parser.clone(),
+                artifact_digest: digest(&parser),
+                queries: WorkerQuerySources {
+                    injections: Some("(identifier) @injection.content".into()),
+                    ..Default::default()
+                },
+            }],
+        })
+        .unwrap();
+    let Response::LanguageCatalogAck(ack) = response else {
+        panic!("language catalog must be acknowledged: {response:?}");
+    };
+    assert_eq!(ack.languages, 1);
 
     let response = worker
         .sync_document(SyncDocument {

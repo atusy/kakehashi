@@ -22,7 +22,7 @@ use sha2::{Digest, Sha256};
 
 use crate::language::node_tracker::{EditInfo, NodeTracker};
 
-pub const PROTOCOL_VERSION: u32 = 6;
+pub const PROTOCOL_VERSION: u32 = 7;
 pub const MAX_FRAME_BYTES: usize = 64 * 1024 * 1024;
 pub const MAX_DOCUMENT_REPLICAS: usize = 4_096;
 pub const MAX_DOCUMENT_BYTES: usize = 32 * 1024 * 1024;
@@ -61,6 +61,22 @@ pub struct WorkerQuerySources {
     pub highlights: Option<String>,
     pub bindings: Option<String>,
     pub injections: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct WorkerLanguageAsset {
+    pub language: String,
+    pub grammar_symbol: String,
+    pub source_path: PathBuf,
+    pub parser_path: PathBuf,
+    pub artifact_digest: String,
+    pub queries: WorkerQuerySources,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ConfigureLanguages {
+    pub context: RequestContext,
+    pub assets: Vec<WorkerLanguageAsset>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -267,6 +283,12 @@ pub struct SelectionRangesResult {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct LanguageCatalogAck {
+    pub context: RequestContext,
+    pub languages: usize,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct CloseDocument {
     pub context: RequestContext,
 }
@@ -301,6 +323,7 @@ pub enum Request {
     NavigateNode(NavigateNode),
     RunNodeScalar(RunNodeScalar),
     DeriveSelectionRanges(DeriveSelectionRanges),
+    ConfigureLanguages(ConfigureLanguages),
     CloseDocument(CloseDocument),
 }
 
@@ -343,6 +366,7 @@ pub enum Response {
     Nodes(NodeResult),
     NodeScalar(NodeScalarResult),
     SelectionRanges(SelectionRangesResult),
+    LanguageCatalogAck(LanguageCatalogAck),
     Error(WorkerError),
 }
 
@@ -1129,6 +1153,17 @@ impl GrammarKey {
             artifact_digest: request.artifact_digest.clone(),
         }
     }
+
+    fn from_asset(asset: &WorkerLanguageAsset) -> Self {
+        Self {
+            parser_path: asset
+                .parser_path
+                .canonicalize()
+                .unwrap_or_else(|_| asset.parser_path.clone()),
+            grammar_symbol: asset.grammar_symbol.clone(),
+            artifact_digest: asset.artifact_digest.clone(),
+        }
+    }
 }
 
 impl PartialEq for GrammarKey {
@@ -1544,6 +1579,7 @@ fn handle_work(
         Request::NavigateNode(request) => navigate_node(request, documents),
         Request::RunNodeScalar(request) => run_node_scalar(request, documents),
         Request::DeriveSelectionRanges(request) => derive_selection_ranges(request, documents),
+        Request::ConfigureLanguages(request) => configure_languages(request, analysis),
         Request::CloseDocument(request) => close_document(
             request,
             documents,
@@ -1569,6 +1605,7 @@ fn request_context(request: &Request) -> Option<&RequestContext> {
         Request::NavigateNode(request) => Some(&request.context),
         Request::RunNodeScalar(request) => Some(&request.context),
         Request::DeriveSelectionRanges(request) => Some(&request.context),
+        Request::ConfigureLanguages(request) => Some(&request.context),
         Request::CloseDocument(request) => Some(&request.context),
     }
 }
@@ -1584,7 +1621,7 @@ fn document_key(request: &Request) -> Option<DocumentKey> {
         Request::RunNodeScalar(request) => Some(DocumentKey::from(&request.context)),
         Request::DeriveSelectionRanges(request) => Some(DocumentKey::from(&request.context)),
         Request::CloseDocument(request) => Some(DocumentKey::from(&request.context)),
-        Request::Handshake(_) | Request::DeriveSnapshot(_) => None,
+        Request::Handshake(_) | Request::DeriveSnapshot(_) | Request::ConfigureLanguages(_) => None,
     }
 }
 
@@ -1678,6 +1715,53 @@ fn derive_selection_ranges(request: DeriveSelectionRanges, documents: &DocumentS
         },
         Err(_) => poisoned_document_restart(context),
     }
+}
+
+fn configure_languages(
+    request: ConfigureLanguages,
+    analysis: &Arc<crate::language::LanguageCoordinator>,
+) -> Response {
+    let context = request.context;
+    let mut configured = 0;
+    for asset in request.assets {
+        let key = GrammarKey::from_asset(&asset);
+        let language_name = asset.language;
+        let queries = asset.queries;
+        let response = WORKER_THREAD_STATE.with(|state| {
+            state
+                .borrow_mut()
+                .with_parser(key, context.clone(), |parser, _| {
+                    let Some(language) = parser.language().map(|language| (*language).clone())
+                    else {
+                        return Response::Error(WorkerError {
+                            context: Some(context.clone()),
+                            message: "parser has no configured language".into(),
+                        });
+                    };
+                    match worker_analysis(analysis, &language_name, language, queries) {
+                        Ok(()) => Response::LanguageCatalogAck(LanguageCatalogAck {
+                            context: context.clone(),
+                            languages: configured + 1,
+                        }),
+                        Err(message) => Response::Error(WorkerError {
+                            context: Some(context.clone()),
+                            message,
+                        }),
+                    }
+                })
+        });
+        if matches!(
+            response,
+            Response::Error(_) | Response::WorkerRestartRequired(_)
+        ) {
+            return response;
+        }
+        configured += 1;
+    }
+    Response::LanguageCatalogAck(LanguageCatalogAck {
+        context,
+        languages: configured,
+    })
 }
 
 fn poisoned_document_restart(context: RequestContext) -> Response {
@@ -2568,6 +2652,15 @@ impl Client {
         )
     }
 
+    pub fn configure_languages(&self, request: ConfigureLanguages) -> io::Result<Response> {
+        let context = request.context.clone();
+        self.request_with_timeout(
+            Request::ConfigureLanguages(request),
+            context,
+            Duration::from_secs(60),
+        )
+    }
+
     pub fn close_document(&self, request: CloseDocument) -> io::Result<Response> {
         let context = request.context.clone();
         self.request_with_timeout(
@@ -2735,6 +2828,7 @@ fn response_request_id(response: &Response) -> Option<u64> {
         Response::Nodes(result) => Some(result.context.request_id),
         Response::NodeScalar(result) => Some(result.context.request_id),
         Response::SelectionRanges(result) => Some(result.context.request_id),
+        Response::LanguageCatalogAck(ack) => Some(ack.context.request_id),
         Response::Error(error) => error.context.as_ref().map(|context| context.request_id),
         Response::HandshakeReady(_) => None,
     }
@@ -2749,6 +2843,7 @@ fn response_context(response: &Response) -> Option<&RequestContext> {
         Response::Nodes(result) => Some(&result.context),
         Response::NodeScalar(result) => Some(&result.context),
         Response::SelectionRanges(result) => Some(&result.context),
+        Response::LanguageCatalogAck(ack) => Some(&ack.context),
         Response::Error(error) => error.context.as_ref(),
         Response::HandshakeReady(_) => None,
     }

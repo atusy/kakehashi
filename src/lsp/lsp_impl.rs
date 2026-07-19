@@ -604,8 +604,11 @@ impl Kakehashi {
                 })
             })
             .collect();
-        self.tree_worker_shadow
-            .mirror_configuration(self.language.configuration_generation(), documents);
+        self.tree_worker_shadow.mirror_configuration_with_catalog(
+            self.language.configuration_generation(),
+            self.language.worker_language_catalog(),
+            documents,
+        );
     }
 
     async fn apply_initial_settings(

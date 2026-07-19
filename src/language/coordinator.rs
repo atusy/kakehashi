@@ -1959,6 +1959,36 @@ impl LanguageCoordinator {
         })
     }
 
+    /// Snapshot every configured language into immutable worker-owned assets.
+    /// The catalog is built after settings loading, so query sources are the
+    /// exact tolerant-compilation output and parser paths point at private,
+    /// content-addressed imports.
+    pub(crate) fn worker_language_catalog(&self) -> Vec<crate::tree_worker::WorkerLanguageAsset> {
+        let mut language_ids = self
+            .worker_settings
+            .read()
+            .recover_poison("LanguageCoordinator::worker_language_catalog(settings)")
+            .languages
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+        language_ids.sort();
+        language_ids
+            .into_iter()
+            .filter_map(|language| {
+                let descriptor = self.worker_grammar_descriptor(&language)?;
+                Some(crate::tree_worker::WorkerLanguageAsset {
+                    language,
+                    grammar_symbol: descriptor.grammar_symbol,
+                    source_path: descriptor.source_path,
+                    parser_path: descriptor.parser_path,
+                    artifact_digest: descriptor.artifact_digest,
+                    queries: descriptor.queries,
+                })
+            })
+            .collect()
+    }
+
     pub(crate) fn configuration_generation(&self) -> u64 {
         self.load_generation
             .load(std::sync::atomic::Ordering::Acquire)

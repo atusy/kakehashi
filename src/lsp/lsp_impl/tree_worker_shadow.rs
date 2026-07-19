@@ -11,10 +11,11 @@ use crate::error::LockResultExt;
 use crate::language::coordinator::WorkerGrammarDescriptor;
 use crate::lsp::text_sync::SequentialByteEdit;
 use crate::tree_worker::{
-    ApplyDocumentEditsAndDerive, ByteEdit, Client, CloseDocument, DeriveDocumentSnapshot,
-    DeriveSelectionRanges, NavigateNode, NodeNavigation, NodeResult, NodeScalarOperation,
-    NodeScalarValue, OpaqueNodeId, RequestContext, ResolveNode, Response, RunNodeScalar,
-    SelectionRangesResult, SyncDocument, WirePosition, named_node_count,
+    ApplyDocumentEditsAndDerive, ByteEdit, Client, CloseDocument, ConfigureLanguages,
+    DeriveDocumentSnapshot, DeriveSelectionRanges, NavigateNode, NodeNavigation, NodeResult,
+    NodeScalarOperation, NodeScalarValue, OpaqueNodeId, RequestContext, ResolveNode, Response,
+    RunNodeScalar, SelectionRangesResult, SyncDocument, WirePosition, WorkerLanguageAsset,
+    named_node_count,
 };
 
 const SHADOW_ENV: &str = "KAKEHASHI_TREE_WORKER_SHADOW";
@@ -32,6 +33,7 @@ const LONG_HEALTHY_INTERVAL: Duration = Duration::from_secs(10 * 60);
 static NEXT_WORKER_GENERATION: AtomicU64 = AtomicU64::new(1);
 
 enum ShadowCommand {
+    Configure(ConfigureLanguages),
     Sync(SyncDocument),
     Apply {
         request: ApplyDocumentEditsAndDerive,
@@ -259,7 +261,7 @@ impl OpenDocuments {
                                     && current.context.content_version > context.content_version)))
                 })
             }
-            ShadowCommand::Shutdown(_) => false,
+            ShadowCommand::Configure(_) | ShadowCommand::Shutdown(_) => false,
         }
     }
 
@@ -272,7 +274,10 @@ impl OpenDocuments {
         let incoming = match command {
             ShadowCommand::Sync(request) => Some(request),
             ShadowCommand::Apply { fallback, .. } => Some(fallback),
-            ShadowCommand::Close(_) | ShadowCommand::Forget(_) | ShadowCommand::Shutdown(_) => None,
+            ShadowCommand::Close(_)
+            | ShadowCommand::Forget(_)
+            | ShadowCommand::Configure(_)
+            | ShadowCommand::Shutdown(_) => None,
         };
         if incoming.is_some_and(|incoming| {
             self.closed_incarnations
@@ -339,7 +344,7 @@ impl OpenDocuments {
             ShadowCommand::Forget(context) => {
                 self.current.remove(&context.uri);
             }
-            ShadowCommand::Shutdown(_) => {}
+            ShadowCommand::Configure(_) | ShadowCommand::Shutdown(_) => {}
         }
         Observation::Accepted { artifact_replaced }
     }
@@ -966,8 +971,31 @@ impl TreeWorkerShadow {
             .fetch_max(generation, Ordering::AcqRel);
     }
 
+    #[cfg(test)]
     pub(super) fn mirror_configuration(&self, generation: u64, documents: Vec<MirrorDocument>) {
-        let mut commands = Vec::with_capacity(documents.len());
+        self.mirror_configuration_with_catalog(generation, Vec::new(), documents);
+    }
+
+    pub(super) fn mirror_configuration_with_catalog(
+        &self,
+        generation: u64,
+        assets: Vec<WorkerLanguageAsset>,
+        documents: Vec<MirrorDocument>,
+    ) {
+        let mut commands = Vec::with_capacity(documents.len() + usize::from(!assets.is_empty()));
+        if !assets.is_empty() {
+            commands.push(ShadowCommand::Configure(ConfigureLanguages {
+                context: RequestContext {
+                    request_id: self.next_request_id.fetch_add(1, Ordering::Relaxed),
+                    worker_generation: self.worker_generation,
+                    uri: "kakehashi://language-catalog".into(),
+                    incarnation: 0,
+                    content_version: 0,
+                    configuration_generation: generation,
+                },
+                assets,
+            }));
+        }
         for document in documents {
             let command = if let Some(grammar) = document.grammar {
                 ShadowCommand::Sync(self.sync_request(
@@ -1765,6 +1793,7 @@ fn execute_command(
     comparisons: &ComparisonStore,
 ) -> (std::io::Result<Response>, Option<ReplicaIdentity>) {
     match command {
+        ShadowCommand::Configure(request) => (client.configure_languages(request), None),
         ShadowCommand::Sync(request) => {
             let identity = ReplicaIdentity::from_sync(&request);
             comparisons.open(&request.context.uri, request.context.incarnation);
@@ -2072,6 +2101,7 @@ fn replica_was_closed(
 
 fn retag_command(command: &mut ShadowCommand, generation: u64) {
     match command {
+        ShadowCommand::Configure(request) => request.context.worker_generation = generation,
         ShadowCommand::Sync(request) => request.context.worker_generation = generation,
         ShadowCommand::Apply { request, fallback } => {
             request.context.worker_generation = generation;
@@ -2113,6 +2143,7 @@ fn classify_transport_failure(
 
 fn command_uri(command: &ShadowCommand) -> Option<&str> {
     match command {
+        ShadowCommand::Configure(_) => None,
         ShadowCommand::Sync(request) => Some(&request.context.uri),
         ShadowCommand::Apply { fallback, .. } => Some(&fallback.context.uri),
         ShadowCommand::Close(request) => Some(&request.context.uri),
@@ -2123,6 +2154,7 @@ fn command_uri(command: &ShadowCommand) -> Option<&str> {
 
 fn command_document(command: &ShadowCommand) -> Option<(&str, u64)> {
     match command {
+        ShadowCommand::Configure(_) => None,
         ShadowCommand::Sync(request) => Some((&request.context.uri, request.context.incarnation)),
         ShadowCommand::Apply { fallback, .. } => {
             Some((&fallback.context.uri, fallback.context.incarnation))
@@ -2137,7 +2169,10 @@ fn command_grammar(command: &ShadowCommand) -> Option<GrammarIdentity> {
     match command {
         ShadowCommand::Sync(request) => Some(GrammarIdentity::from_sync(request)),
         ShadowCommand::Apply { fallback, .. } => Some(GrammarIdentity::from_sync(fallback)),
-        ShadowCommand::Close(_) | ShadowCommand::Forget(_) | ShadowCommand::Shutdown(_) => None,
+        ShadowCommand::Configure(_)
+        | ShadowCommand::Close(_)
+        | ShadowCommand::Forget(_)
+        | ShadowCommand::Shutdown(_) => None,
     }
 }
 
@@ -2145,7 +2180,10 @@ fn command_sync(command: &ShadowCommand) -> Option<&SyncDocument> {
     match command {
         ShadowCommand::Sync(request) => Some(request),
         ShadowCommand::Apply { fallback, .. } => Some(fallback),
-        ShadowCommand::Close(_) | ShadowCommand::Forget(_) | ShadowCommand::Shutdown(_) => None,
+        ShadowCommand::Configure(_)
+        | ShadowCommand::Close(_)
+        | ShadowCommand::Forget(_)
+        | ShadowCommand::Shutdown(_) => None,
     }
 }
 
