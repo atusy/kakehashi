@@ -229,7 +229,10 @@ impl WorkerThreadState {
     fn derive(&mut self, request: DeriveSnapshot, queue_wait: Duration) -> Response {
         let request_context = request.context.clone();
         let key = GrammarKey {
-            parser_path: request.parser_path.clone(),
+            parser_path: request
+                .parser_path
+                .canonicalize()
+                .unwrap_or_else(|_| request.parser_path.clone()),
             grammar_symbol: request.grammar_symbol.clone(),
         };
         let language = match self.languages.get(&key).cloned() {
@@ -315,16 +318,12 @@ where
             .send(())
             .map_err(|_| io::Error::other("worker admission queue stopped"))?;
     }
-    let (responses, response_rx) = mpsc::sync_channel::<(Response, bool)>(max_inflight);
-    let writer_permits = permits.clone();
+    let (responses, response_rx) =
+        mpsc::sync_channel::<(Response, Option<AdmissionPermit>)>(max_inflight);
     let writer_thread = std::thread::spawn(move || -> io::Result<()> {
         let mut writer = writer;
-        for (response, releases_permit) in response_rx {
-            let result = encode_frame(&mut writer, &response);
-            if releases_permit {
-                let _ = writer_permits.send(());
-            }
-            result?;
+        for (response, _permit) in response_rx {
+            encode_frame(&mut writer, &response)?;
         }
         Ok(())
     });
@@ -351,7 +350,7 @@ where
                     context: None,
                     message: "worker protocol/build identity mismatch".into(),
                 }),
-                false,
+                None,
             ))
             .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "worker writer stopped"))?;
         drop(responses);
@@ -370,7 +369,7 @@ where
                 worker_generation,
                 compute_threads,
             }),
-            false,
+            None,
         ))
         .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "worker writer stopped"))?;
 
@@ -388,7 +387,7 @@ where
                         context: Some(request.context),
                         message: "stale worker generation".into(),
                     }),
-                    false,
+                    None,
                 ))
                 .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "worker writer stopped"))?;
             continue;
@@ -398,14 +397,9 @@ where
             .recv()
             .map_err(|_| io::Error::other("worker admission queue stopped"))?;
         let responses = responses.clone();
-        let permits = permits.clone();
+        let permit = AdmissionPermit(permits.clone());
         pool.spawn(move || {
-            if responses
-                .send((derive_snapshot(request, enqueued.elapsed()), true))
-                .is_err()
-            {
-                let _ = permits.send(());
-            }
+            let _ = responses.send((derive_snapshot(request, enqueued.elapsed()), Some(permit)));
         });
     }
     for _ in 0..max_inflight {
@@ -421,6 +415,14 @@ fn join_writer(thread: std::thread::JoinHandle<io::Result<()>>) -> io::Result<()
     thread
         .join()
         .map_err(|_| io::Error::other("worker writer panicked"))?
+}
+
+struct AdmissionPermit(mpsc::SyncSender<()>);
+
+impl Drop for AdmissionPermit {
+    fn drop(&mut self) {
+        let _ = self.0.send(());
+    }
 }
 
 pub fn run_stdio(compute_threads: usize) -> io::Result<()> {
@@ -620,6 +622,11 @@ impl Client {
         self.derive_with_timeout(request, Duration::from_secs(60))
     }
 
+    /// Sends one request with a process-level recovery deadline.
+    ///
+    /// A timeout terminates the shared worker because native parser code may be
+    /// non-cooperative. All concurrent requests consequently fail, and this
+    /// client cannot be reused; the supervisor must create a new generation.
     pub fn derive_with_timeout(
         &self,
         request: DeriveSnapshot,
@@ -844,8 +851,22 @@ fn wait_until(child: &mut Child, timeout: Duration) -> io::Result<std::process::
             return Ok(status);
         }
         if Instant::now() >= deadline {
-            child.kill()?;
-            return child.wait();
+            let kill_error = child.kill().err();
+            let reap_deadline = Instant::now() + timeout;
+            loop {
+                if let Some(status) = child.try_wait()? {
+                    return Ok(status);
+                }
+                if Instant::now() >= reap_deadline {
+                    return Err(kill_error.unwrap_or_else(|| {
+                        io::Error::new(
+                            io::ErrorKind::TimedOut,
+                            "tree worker did not exit after kill",
+                        )
+                    }));
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
         }
         std::thread::sleep(Duration::from_millis(5));
     }
@@ -938,14 +959,53 @@ mod tests {
 
     struct CountingReader {
         cursor: Cursor<Vec<u8>>,
-        bytes_read: Arc<AtomicUsize>,
+        progress: Arc<(AtomicUsize, Condvar, Mutex<()>)>,
     }
 
     impl Read for CountingReader {
         fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
             let read = self.cursor.read(buffer)?;
-            self.bytes_read.fetch_add(read, Ordering::Relaxed);
+            self.progress.0.fetch_add(read, Ordering::Relaxed);
+            self.progress.1.notify_all();
             Ok(read)
+        }
+    }
+
+    fn wait_for_read_progress(progress: &Arc<(AtomicUsize, Condvar, Mutex<()>)>, minimum: usize) {
+        let guard = progress.2.lock().unwrap();
+        let (_guard, timeout) = progress
+            .1
+            .wait_timeout_while(guard, Duration::from_secs(5), |_| {
+                progress.0.load(Ordering::Relaxed) < minimum
+            })
+            .unwrap();
+        assert!(
+            !timeout.timed_out(),
+            "reader did not reach bounded lookahead"
+        );
+    }
+
+    #[derive(Default)]
+    struct FailAfterFirstFlush {
+        bytes: Vec<u8>,
+        flushes: usize,
+    }
+
+    impl Write for FailAfterFirstFlush {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.bytes.write(bytes)
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            self.flushes += 1;
+            if self.flushes > 1 {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "injected writer failure",
+                ))
+            } else {
+                Ok(())
+            }
         }
     }
 
@@ -1154,10 +1214,10 @@ mod tests {
         }
         let admitted_prefix_bytes = framed(&requests[..4]).len();
         let framed_requests = framed(&requests);
-        let bytes_read = Arc::new(AtomicUsize::new(0));
+        let progress = Arc::new((AtomicUsize::new(0), Condvar::new(), Mutex::new(())));
         let reader = CountingReader {
             cursor: Cursor::new(framed_requests.clone()),
-            bytes_read: Arc::clone(&bytes_read),
+            progress: Arc::clone(&progress),
         };
         let (completed, completed_rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
@@ -1165,13 +1225,13 @@ mod tests {
         });
 
         gate.wait_until_blocked();
-        std::thread::sleep(Duration::from_millis(50));
+        wait_for_read_progress(&progress, admitted_prefix_bytes);
         assert!(
-            bytes_read.load(Ordering::Relaxed) <= admitted_prefix_bytes,
+            progress.0.load(Ordering::Relaxed) <= admitted_prefix_bytes,
             "worker read past two admitted requests plus one bounded lookahead"
         );
         assert!(
-            bytes_read.load(Ordering::Relaxed) < framed_requests.len(),
+            progress.0.load(Ordering::Relaxed) < framed_requests.len(),
             "worker consumed the complete request stream while stdout was stalled"
         );
         assert!(
@@ -1186,5 +1246,31 @@ mod tests {
             .recv_timeout(Duration::from_secs(5))
             .expect("worker did not resume after stdout was released")
             .unwrap();
+    }
+
+    #[test]
+    fn writer_failure_releases_all_admission_permits() {
+        let mut requests = vec![handshake(PROTOCOL_VERSION)];
+        for request_id in 1..=8 {
+            let Request::DeriveSnapshot(mut request) = request() else {
+                unreachable!()
+            };
+            request.context.request_id = request_id;
+            requests.push(Request::DeriveSnapshot(request));
+        }
+        let (completed, completed_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = completed.send(run(
+                Cursor::new(framed(&requests)),
+                FailAfterFirstFlush::default(),
+                1,
+            ));
+        });
+
+        let error = completed_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("worker deadlocked after response writer failure")
+            .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::BrokenPipe);
     }
 }

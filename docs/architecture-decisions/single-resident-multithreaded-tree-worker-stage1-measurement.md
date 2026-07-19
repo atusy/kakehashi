@@ -107,7 +107,7 @@ target/release/kakehashi language install rust \
   --data-dir deps/test/kakehashi --force
 stage1_bench_bin="$(cargo bench --locked --bench tree_worker_stage1 \
   --no-run --message-format=json \
-  | jq -sr 'map(select(.reason == "compiler-artifact" and \
+  | jq -sr 'map(select(.reason == "compiler-artifact" and
       .target.name == "tree_worker_stage1")) | last | .executable')"
 shasum -a 256 target/release/kakehashi "$stage1_bench_bin" \
   deps/test/kakehashi/parser/rust.dylib
