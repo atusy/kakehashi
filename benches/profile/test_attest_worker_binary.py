@@ -13,6 +13,8 @@ from attest_worker_binary import (
     archive_source,
     controlled_build_environment,
     environment_tool_version,
+    git,
+    isolated_local_git_environment,
     native_toolchain_metadata,
     require_isolated_source,
     require_uncredentialed_repository_url,
@@ -22,6 +24,41 @@ from attest_worker_binary import (
 
 
 class BinaryAttestationTest(unittest.TestCase):
+    def test_local_git_ignores_ambient_repository_selection(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            checkout = root / "checkout"
+            other = root / "other"
+            subprocess.run(["git", "init", "-q", checkout], check=True)
+            subprocess.run(["git", "init", "-q", other], check=True)
+
+            with mock.patch.dict(
+                os.environ,
+                {
+                    "GIT_DIR": str(other / ".git"),
+                    "GIT_WORK_TREE": str(other),
+                    "GIT_INDEX_FILE": str(other / "index"),
+                },
+            ):
+                selected = git(checkout, "rev-parse", "--show-toplevel")
+
+            self.assertEqual(pathlib.Path(selected).resolve(), checkout.resolve())
+
+    def test_local_git_environment_drops_repository_overrides(self):
+        environment = isolated_local_git_environment({
+            "PATH": "/bin",
+            "GIT_DIR": "/other/.git",
+            "GIT_WORK_TREE": "/other",
+            "GIT_INDEX_FILE": "/other/index",
+            "GIT_OBJECT_DIRECTORY": "/other/objects",
+            "GIT_ALTERNATE_OBJECT_DIRECTORIES": "/other/alternate",
+        })
+
+        self.assertEqual(environment["PATH"], "/bin")
+        self.assertFalse(any(key.startswith("GIT_") for key in environment if key not in {
+            "GIT_CONFIG_NOSYSTEM", "GIT_CONFIG_GLOBAL", "GIT_NO_REPLACE_OBJECTS"
+        }))
+
     def test_remote_verification_preserves_ssh_agent_without_git_config(self):
         environment = remote_verification_environment({
             "PATH": "/bin",

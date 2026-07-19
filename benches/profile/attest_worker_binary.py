@@ -91,19 +91,14 @@ def extract_source_archive(source, destination):
 def archive_source(checkout, revision, destination):
     destination.parent.mkdir(parents=True, exist_ok=True)
     archive = destination.parent / "source.tar"
-    git_environment = dict(os.environ)
-    git_environment.update({
-        "GIT_CONFIG_NOSYSTEM": "1",
-        "GIT_CONFIG_GLOBAL": os.devnull,
-        "GIT_NO_REPLACE_OBJECTS": "1",
-    })
+    environment = isolated_local_git_environment(os.environ)
     subprocess.run(
         [
             "git", "-C", str(checkout), "archive", "--format=tar",
             "--output", str(archive), revision,
         ],
         check=True,
-        env=git_environment,
+        env=environment,
     )
     destination.mkdir()
     try:
@@ -128,7 +123,14 @@ def require_isolated_source(source, checkout):
 
 
 def git(checkout, *arguments):
-    return tool_version(["git", "-C", str(checkout), *arguments])
+    return subprocess.run(
+        ["git", "-C", str(checkout), *arguments],
+        check=True,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        env=isolated_local_git_environment(os.environ),
+    ).stdout.strip()
 
 
 def require_clean(checkout):
@@ -147,16 +149,21 @@ def require_uncredentialed_repository_url(repository):
     return repository
 
 
-def remote_verification_environment(source):
+def isolated_local_git_environment(source):
     environment = controlled_environment(source)
-    for key in ("HOME", "SSH_AUTH_SOCK"):
-        if key in source:
-            environment[key] = source[key]
     environment.update({
         "GIT_CONFIG_NOSYSTEM": "1",
         "GIT_CONFIG_GLOBAL": os.devnull,
         "GIT_NO_REPLACE_OBJECTS": "1",
     })
+    return environment
+
+
+def remote_verification_environment(source):
+    environment = isolated_local_git_environment(source)
+    for key in ("HOME", "SSH_AUTH_SOCK"):
+        if key in source:
+            environment[key] = source[key]
     return environment
 
 
