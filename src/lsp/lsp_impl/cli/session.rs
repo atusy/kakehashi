@@ -124,20 +124,34 @@ impl Kakehashi {
         let mut configs = Vec::new();
 
         // Virt layer: servers configured for the document's injection regions.
-        if let Some(language_name) = self.document_language(uri)
-            && let Some(injection_query) = self.language.injection_query(&language_name)
-            && let Some(snapshot) = self.documents.get(uri).and_then(|doc| doc.snapshot())
-        {
-            let regions = InjectionResolver::resolve_all(
-                &self.language,
-                self.bridge.node_tracker(),
-                uri,
-                snapshot.tree(),
-                snapshot.text(),
-                injection_query.as_ref(),
-                snapshot.incarnation(),
-            );
-            for resolved in regions {
+        let worker_view = if self.tree_worker_shadow.is_authoritative() {
+            self.current_worker_injection_view(uri).await
+        } else {
+            None
+        };
+        let language_name = worker_view
+            .as_ref()
+            .map(|view| view.language.clone())
+            .or_else(|| self.document_language(uri));
+        if let Some(language_name) = language_name {
+            let regions = if let Some(view) = worker_view {
+                view.regions
+            } else if let Some(injection_query) = self.language.injection_query(&language_name)
+                && let Some(snapshot) = self.documents.get(uri).and_then(|doc| doc.snapshot())
+            {
+                std::sync::Arc::new(InjectionResolver::resolve_all(
+                    &self.language,
+                    self.bridge.node_tracker(),
+                    uri,
+                    snapshot.tree(),
+                    snapshot.text(),
+                    injection_query.as_ref(),
+                    snapshot.incarnation(),
+                ))
+            } else {
+                std::sync::Arc::new(Vec::new())
+            };
+            for resolved in regions.iter() {
                 configs.extend(self.bridge_configs_for_injection_language(
                     &language_name,
                     &resolved.injection_language,
