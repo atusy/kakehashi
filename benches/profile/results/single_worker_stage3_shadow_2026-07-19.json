@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
-  "source_commit": "900077461aa0d740baef65bca28560c4a1a18b8b",
-  "binary_sha256": "9469eb77490b348c579595dc08b009699556d4f1a0571176313a1207cd4b138b",
+  "source_commit": "fadac25333af6238903de043022f2a376c2c490d",
+  "binary_sha256": "29e0509e40c90337a157753bda6c8a165cfaeea1419b70bceffffb033e43dced",
   "environment": {
     "cpu": "Apple M4",
     "os": "macOS 26.5.1 (25F80)",
@@ -23,37 +23,37 @@
       "name": "A",
       "order": ["disabled", "shadow"],
       "disabled": {
-        "wall_ms": 14726.119,
-        "ms_per_cycle": 73.63,
-        "semantic_ms": {"p50": 52.9, "p90": 60.3, "p95": 63.3, "p99": 68.9, "max": 156.7},
+        "wall_ms": 14032.410750049166,
+        "ms_per_cycle": 70.16,
+        "semantic_ms": {"p50": 51.6, "p90": 55.7, "p95": 57.2, "p99": 61.2, "max": 63.2},
         "responses_ok": 200
       },
       "shadow": {
-        "wall_ms": 15825.299,
-        "ms_per_cycle": 79.13,
-        "semantic_ms": {"p50": 59.6, "p90": 65.7, "p95": 67.3, "p99": 73.5, "max": 178.9},
+        "wall_ms": 15124.330458929762,
+        "ms_per_cycle": 75.62,
+        "semantic_ms": {"p50": 57.1, "p90": 64.7, "p95": 67.7, "p99": 73.2, "max": 74.3},
         "responses_ok": 200,
         "comparisons": {"matched": 201, "mismatched": 0, "superseded": 0, "pending": 0}
       },
-      "shadow_delta_percent": {"wall": 7.46, "p50": 12.67, "p90": 8.96, "p95": 6.32, "p99": 6.68}
+      "shadow_delta_percent": {"wall": 7.78, "p50": 10.66, "p90": 16.16, "p95": 18.36, "p99": 19.61}
     },
     {
       "name": "B",
       "order": ["shadow", "disabled"],
       "disabled": {
-        "wall_ms": 16676.5592090087,
-        "ms_per_cycle": 83.38,
-        "semantic_ms": {"p50": 62.0, "p90": 70.8, "p95": 75.0, "p99": 79.0, "max": 81.0},
+        "wall_ms": 14165.658124955371,
+        "ms_per_cycle": 70.83,
+        "semantic_ms": {"p50": 52.6, "p90": 57.8, "p95": 59.5, "p99": 62.7, "max": 80.2},
         "responses_ok": 200
       },
       "shadow": {
-        "wall_ms": 18132.641332922503,
-        "ms_per_cycle": 90.66,
-        "semantic_ms": {"p50": 70.6, "p90": 77.3, "p95": 79.5, "p99": 85.1, "max": 87.8},
+        "wall_ms": 15217.304041958414,
+        "ms_per_cycle": 76.09,
+        "semantic_ms": {"p50": 57.2, "p90": 65.5, "p95": 68.0, "p99": 73.5, "max": 74.7},
         "responses_ok": 200,
         "comparisons": {"matched": 201, "mismatched": 0, "superseded": 0, "pending": 0}
       },
-      "shadow_delta_percent": {"wall": 8.73, "p50": 13.87, "p90": 9.18, "p95": 6.0, "p99": 7.72}
+      "shadow_delta_percent": {"wall": 7.42, "p50": 8.75, "p90": 13.32, "p95": 14.29, "p99": 17.22}
     }
   ]
 }
