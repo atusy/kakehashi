@@ -1,0 +1,299 @@
+{
+  "schema": 1,
+  "experiment": "single-tree-worker-stage3-shadow",
+  "environment": {
+    "platform": "macOS-26.5.1-arm64-arm-64bit",
+    "python": "3.12.13",
+    "rustc": "rustc 1.95.0 (59807616e 2026-04-14) (built from a source tarball)",
+    "cpu_model": "Apple M4",
+    "binary_sha256": "dc504feebbf2ad6e7116a07708aaddfddbd44d70b1282ffd355871977b067041",
+    "retained_environment": {
+      "PATH": "<redacted-search-path>",
+      "TMPDIR": "<redacted-path>",
+      "LANG": "C.UTF-8",
+      "LC_ALL": "C.UTF-8"
+    }
+  },
+  "artifacts": {
+    "nvim_treesitter_repository": "https://github.com/nvim-treesitter/nvim-treesitter",
+    "nvim_treesitter_revision": "4916d6592ede8c07973490d9322f187e07dfefac",
+    "nvim_treesitter_fetched_main": "24977147550d53589e53b874ec75e14e4fbc304e",
+    "verification": "parser metadata and every installed query byte-matched"
+  },
+  "binary_attestation": {
+    "schema": 1,
+    "source_repository": "https://github.com/atusy/kakehashi",
+    "source_commit": "691c877f2017e9f1885b8dff005b02be3e603317",
+    "source_remote_refs_containing_commit": [
+      "refs/remotes/origin/feat/tree-worker-stage5-identity-budget"
+    ],
+    "source_checkout_clean": true,
+    "build_command": [
+      "cargo",
+      "build",
+      "--locked",
+      "--release",
+      "--bin",
+      "kakehashi"
+    ],
+    "rustc": "rustc 1.95.0 (59807616e 2026-04-14) (built from a source tarball)",
+    "cargo": "cargo 1.95.0 (f2d3ce0bd 2026-03-21)",
+    "native_toolchain": {
+      "rustc_verbose": "rustc 1.95.0 (59807616e 2026-04-14) (built from a source tarball)\nbinary: rustc\ncommit-hash: 59807616e1fa2540724bfbac14d7976d7e4a3860\ncommit-date: 2026-04-14\nhost: aarch64-apple-darwin\nrelease: 1.95.0\nLLVM version: 21.1.8",
+      "cc": "Apple clang version 21.0.0 (clang-2100.1.1.101)\nTarget: arm64-apple-darwin25.5.0\nThread model: posix\nInstalledDir: /Library/Developer/CommandLineTools/usr/bin",
+      "linker": "@(#)PROGRAM:ld PROJECT:ld-1267\nBUILD 18:30:29 Apr 22 2026\nconfigured to support archs: armv6 armv7 armv7s arm64 arm64e arm64_32 i386 x86_64 x86_64h armv6m armv7k armv7m armv7em armv8m.main armv8.1m.main\nwill use ld-classic for: armv6 armv7 armv7s i386 armv6m armv7k armv7m armv7em\nLTO support using: LLVM version 21.0.0 (static support for 30, runtime is 30)\nTAPI support using: Apple TAPI version 21.0.0 (tapi-2100.0.2.6)\nLibrary search paths:\n\t/usr/local/lib\n\t/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/lib\n\t/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/lib/swift\nFramework search paths:\n\t/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/System/Library/Frameworks",
+      "sdk_path": "/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk",
+      "sdk_version": "26.5"
+    },
+    "build_environment": {
+      "PATH": "<redacted-search-path>",
+      "TMPDIR": "<redacted-path>",
+      "LANG": "C.UTF-8",
+      "LC_ALL": "C.UTF-8",
+      "CARGO_TARGET_DIR": "${ATTESTED_BUILD_ROOT}/target",
+      "CARGO_HOME": "${ATTESTED_BUILD_ROOT}/target/cargo-home"
+    },
+    "built_in_fresh_target": true,
+    "source_isolated_archive": true,
+    "cargo_config_ancestry_clean": true,
+    "binary_relative": "target/release/kakehashi",
+    "binary_sha256": "dc504feebbf2ad6e7116a07708aaddfddbd44d70b1282ffd355871977b067041"
+  },
+  "harness": {
+    "execution": "private staged driver and collector helpers",
+    "source_files_sha256": {
+      "collect_worker_proxy.py": "00867d5ebd4f23b0d02ad94b7f49cb41c8d868da8c49620f809f4cb300ba7f56",
+      "collect_worker_shadow.py": "c4696420ae0b47920dfaea45ec636c68f07373bcbdc260fc733e091ae17a7e9e",
+      "collect_worker_cold_start.py": "7648e2b0eba60b20b7f11a641c07c6ccdd5a1d3b75bc91492f32acfa90750109",
+      "collect_worker_capture_pilot.py": "3a709d50253dc23060ca99f885978e71a8b58f07a71af6c492d2fa73916a75f5",
+      "drive.py": "3e9e2d8d84b6a2c4704c41f2e4efbd3a54499b1a6882d4f648c0c6ef2e178c12",
+      "worker_proxy.py": "e3fe07d73168835e71fb976109e034b121b1112d6c7a746be1575ac07a6fd542",
+      "gen_session.py": "6f4f6b8388c607db1c70fe29579ce14fe00d57668cab17601432ff123cfb15a3"
+    }
+  },
+  "collector": {
+    "batches": 4,
+    "order": "disabled-shadow on odd batches; shadow-disabled on even batches",
+    "fresh_xdg_per_variant": true,
+    "shadow_compute_threads": 4
+  },
+  "steady_state": {
+    "rust_edit_semantic_tokens": {
+      "arguments": [
+        "--lang",
+        "rust",
+        "--size",
+        "200",
+        "--requests",
+        "200",
+        "--edits",
+        "1",
+        "--warm-semantic-cache",
+        "--settle",
+        "0.5"
+      ],
+      "batches": [
+        {
+          "batch": 1,
+          "order": [
+            "disabled",
+            "shadow"
+          ],
+          "disabled": {
+            "count": 200,
+            "ok": 200,
+            "canceled": 0,
+            "null": 0,
+            "errors": 0,
+            "tokens_per_request": 17807,
+            "p50": 38.3,
+            "p90": 39.7,
+            "p95": 40.2,
+            "p99": 44.3,
+            "max": 48.4,
+            "wall": 11145.606499980204,
+            "wire_kib": 37800.9
+          },
+          "shadow": {
+            "count": 200,
+            "ok": 200,
+            "canceled": 0,
+            "null": 0,
+            "errors": 0,
+            "tokens_per_request": 17807,
+            "p50": 41.8,
+            "p90": 48.0,
+            "p95": 49.7,
+            "p99": 53.4,
+            "max": 54.7,
+            "wall": 12159.15591607336,
+            "wire_kib": 37800.9,
+            "comparisons": {
+              "matched": 201,
+              "mismatched": 0,
+              "superseded": 0,
+              "pending": 0
+            }
+          },
+          "shadow_delta_percent": {
+            "wall": 9.09,
+            "p50": 9.14,
+            "p90": 20.91,
+            "p95": 23.63,
+            "p99": 20.54
+          }
+        },
+        {
+          "batch": 2,
+          "order": [
+            "shadow",
+            "disabled"
+          ],
+          "shadow": {
+            "count": 200,
+            "ok": 200,
+            "canceled": 0,
+            "null": 0,
+            "errors": 0,
+            "tokens_per_request": 17807,
+            "p50": 40.6,
+            "p90": 44.4,
+            "p95": 45.8,
+            "p99": 49.8,
+            "max": 52.1,
+            "wall": 11896.748583996668,
+            "wire_kib": 37800.9,
+            "comparisons": {
+              "matched": 201,
+              "mismatched": 0,
+              "superseded": 0,
+              "pending": 0
+            }
+          },
+          "disabled": {
+            "count": 200,
+            "ok": 200,
+            "canceled": 0,
+            "null": 0,
+            "errors": 0,
+            "tokens_per_request": 17807,
+            "p50": 35.9,
+            "p90": 38.7,
+            "p95": 39.5,
+            "p99": 39.9,
+            "max": 40.4,
+            "wall": 10641.36749994941,
+            "wire_kib": 37800.9
+          },
+          "shadow_delta_percent": {
+            "wall": 11.8,
+            "p50": 13.09,
+            "p90": 14.73,
+            "p95": 15.95,
+            "p99": 24.81
+          }
+        },
+        {
+          "batch": 3,
+          "order": [
+            "disabled",
+            "shadow"
+          ],
+          "disabled": {
+            "count": 200,
+            "ok": 200,
+            "canceled": 0,
+            "null": 0,
+            "errors": 0,
+            "tokens_per_request": 17807,
+            "p50": 35.9,
+            "p90": 38.0,
+            "p95": 39.0,
+            "p99": 40.2,
+            "max": 43.4,
+            "wall": 10619.826957932673,
+            "wire_kib": 37800.9
+          },
+          "shadow": {
+            "count": 200,
+            "ok": 200,
+            "canceled": 0,
+            "null": 0,
+            "errors": 0,
+            "tokens_per_request": 17807,
+            "p50": 40.0,
+            "p90": 43.8,
+            "p95": 44.1,
+            "p99": 44.9,
+            "max": 46.4,
+            "wall": 11725.638624979183,
+            "wire_kib": 37800.9,
+            "comparisons": {
+              "matched": 201,
+              "mismatched": 0,
+              "superseded": 0,
+              "pending": 0
+            }
+          },
+          "shadow_delta_percent": {
+            "wall": 10.41,
+            "p50": 11.42,
+            "p90": 15.26,
+            "p95": 13.08,
+            "p99": 11.69
+          }
+        },
+        {
+          "batch": 4,
+          "order": [
+            "shadow",
+            "disabled"
+          ],
+          "shadow": {
+            "count": 200,
+            "ok": 200,
+            "canceled": 0,
+            "null": 0,
+            "errors": 0,
+            "tokens_per_request": 17807,
+            "p50": 40.1,
+            "p90": 44.1,
+            "p95": 44.3,
+            "p99": 45.7,
+            "max": 46.2,
+            "wall": 11751.324750017375,
+            "wire_kib": 37800.9,
+            "comparisons": {
+              "matched": 201,
+              "mismatched": 0,
+              "superseded": 0,
+              "pending": 0
+            }
+          },
+          "disabled": {
+            "count": 200,
+            "ok": 200,
+            "canceled": 0,
+            "null": 0,
+            "errors": 0,
+            "tokens_per_request": 17807,
+            "p50": 35.9,
+            "p90": 39.0,
+            "p95": 40.5,
+            "p99": 42.2,
+            "max": 42.9,
+            "wall": 10623.865584027953,
+            "wire_kib": 37800.9
+          },
+          "shadow_delta_percent": {
+            "wall": 10.61,
+            "p50": 11.7,
+            "p90": 13.08,
+            "p95": 9.38,
+            "p99": 8.29
+          }
+        }
+      ]
+    }
+  }
+}
