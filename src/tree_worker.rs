@@ -377,6 +377,18 @@ fn replace_retained_bytes(
     }
 }
 
+fn reserve_retained_growth(
+    retained_bytes: &AtomicUsize,
+    old_bytes: usize,
+    new_bytes: usize,
+) -> Result<bool, String> {
+    if new_bytes <= old_bytes {
+        return Ok(false);
+    }
+    replace_retained_bytes(retained_bytes, old_bytes, new_bytes)?;
+    Ok(true)
+}
+
 fn point_at_byte(text: &str, byte: usize) -> tree_sitter::Point {
     let prefix = &text.as_bytes()[..byte];
     let row = prefix.iter().filter(|&&value| value == b'\n').count();
@@ -969,20 +981,22 @@ fn sync_document(
         }
         *known_documents += 1;
     }
-    if let Err(message) =
-        replace_retained_bytes(retained_document_bytes, replaced_bytes, request_text_len)
-    {
-        if reserves_slot {
-            let mut known_documents = document_capacity
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            *known_documents = known_documents.saturating_sub(1);
-        }
-        return Response::Error(WorkerError {
-            context: Some(context),
-            message,
-        });
-    }
+    let reserved_growth =
+        match reserve_retained_growth(retained_document_bytes, replaced_bytes, request_text_len) {
+            Ok(reserved) => reserved,
+            Err(message) => {
+                if reserves_slot {
+                    let mut known_documents = document_capacity
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    *known_documents = known_documents.saturating_sub(1);
+                }
+                return Response::Error(WorkerError {
+                    context: Some(context),
+                    message,
+                });
+            }
+        };
     let response = WORKER_THREAD_STATE.with(|state| {
         state
             .borrow_mut()
@@ -1008,9 +1022,12 @@ fn sync_document(
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         *known_documents = known_documents.saturating_sub(1);
     }
-    if !matches!(&response, Response::DocumentAck(_)) {
+    if matches!(&response, Response::DocumentAck(_)) && request_text_len < replaced_bytes {
+        replace_retained_bytes(retained_document_bytes, replaced_bytes, request_text_len)
+            .expect("committing a document shrink cannot exceed the retained-byte budget");
+    } else if !matches!(&response, Response::DocumentAck(_)) && reserved_growth {
         replace_retained_bytes(retained_document_bytes, request_text_len, replaced_bytes)
-            .expect("rolling back a retained-byte reservation must fit");
+            .expect("rolling back retained growth cannot exceed the retained-byte budget");
     }
     response
 }
@@ -1904,8 +1921,9 @@ mod tests {
         DocumentReplica, GrammarKey, Handshake, HandshakeReady, LaneAction, LaneRegistry,
         MAX_DOCUMENT_BYTES, MAX_DOCUMENT_REPLICAS, MAX_RETAINED_DOCUMENT_BYTES, PROTOCOL_VERSION,
         Request, RequestContext, Response, Route, SyncDocument, WorkerError, decode_frame,
-        derive_snapshot_with_language, encode_frame, replace_retained_bytes, route_response, run,
-        submit_document_job, sync_document, validate_document_size,
+        derive_snapshot_with_language, encode_frame, replace_retained_bytes,
+        reserve_retained_growth, route_response, run, submit_document_job, sync_document,
+        validate_document_size,
     };
 
     #[derive(Clone, Default)]
@@ -2622,6 +2640,40 @@ mod tests {
         assert_eq!(
             retained.load(Ordering::Relaxed),
             MAX_RETAINED_DOCUMENT_BYTES
+        );
+    }
+
+    #[test]
+    fn retained_document_shrink_does_not_release_budget_before_commit() {
+        let retained = AtomicUsize::new(MAX_RETAINED_DOCUMENT_BYTES);
+
+        assert!(!reserve_retained_growth(&retained, 12, 4).unwrap());
+        assert_eq!(
+            retained.load(Ordering::Relaxed),
+            MAX_RETAINED_DOCUMENT_BYTES
+        );
+
+        replace_retained_bytes(&retained, 12, 4).unwrap();
+        assert_eq!(
+            retained.load(Ordering::Relaxed),
+            MAX_RETAINED_DOCUMENT_BYTES - 8
+        );
+    }
+
+    #[test]
+    fn retained_document_growth_reservation_can_always_roll_back() {
+        let retained = AtomicUsize::new(MAX_RETAINED_DOCUMENT_BYTES - 8);
+
+        assert!(reserve_retained_growth(&retained, 4, 12).unwrap());
+        assert_eq!(
+            retained.load(Ordering::Relaxed),
+            MAX_RETAINED_DOCUMENT_BYTES
+        );
+
+        replace_retained_bytes(&retained, 12, 4).unwrap();
+        assert_eq!(
+            retained.load(Ordering::Relaxed),
+            MAX_RETAINED_DOCUMENT_BYTES - 8
         );
     }
 
