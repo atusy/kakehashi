@@ -25,6 +25,23 @@ impl ConfigStore {
         self.set_search_paths(settings.search_paths.clone());
     }
 
+    pub(crate) fn configure_worker(
+        &self,
+        search_paths: Vec<PathBuf>,
+        capture_mappings: CaptureMappings,
+    ) {
+        *self
+            .capture_mappings
+            .write()
+            .recover_poison("ConfigStore::configure_worker(capture mappings)") =
+            Arc::new(capture_mappings);
+        *self
+            .search_paths
+            .write()
+            .recover_poison("ConfigStore::configure_worker(search paths)") =
+            search_paths.into_iter().map(|path| path.clean()).collect();
+    }
+
     fn set_capture_mappings(&self, mappings: CaptureMappings) {
         *self
             .capture_mappings

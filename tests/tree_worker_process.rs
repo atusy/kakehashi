@@ -4,8 +4,9 @@ use std::sync::{Arc, Barrier};
 #[cfg(feature = "e2e")]
 use kakehashi::tree_worker::{
     ApplyDocumentEdits, ByteEdit, CloseDocument, ConfigureLanguages, DeriveDocumentSnapshot,
-    NavigateNode, NodeNavigation, NodeScalarOperation, NodeScalarValue, OpaqueNodeId, ResolveNode,
-    RunNodeScalar, SyncDocument, WorkerLanguageAsset, WorkerQuerySources,
+    DeriveSemanticTokens, NavigateNode, NodeNavigation, NodeScalarOperation, NodeScalarValue,
+    OpaqueNodeId, ResolveNode, RunNodeScalar, SyncDocument, WorkerLanguageAsset,
+    WorkerLanguageCatalog, WorkerQuerySources,
 };
 use kakehashi::tree_worker::{Client, DeriveSnapshot, RequestContext, Response};
 
@@ -212,17 +213,24 @@ fn real_worker_keeps_document_text_and_tree_across_incremental_edits() {
                 content_version: 0,
                 configuration_generation: 0,
             },
-            assets: vec![WorkerLanguageAsset {
-                language: "rust".into(),
-                grammar_symbol: "rust".into(),
-                source_path: parser.clone(),
-                parser_path: parser.clone(),
-                artifact_digest: digest(&parser),
-                queries: WorkerQuerySources {
-                    injections: Some("(identifier) @injection.content".into()),
-                    ..Default::default()
-                },
-            }],
+            catalog: WorkerLanguageCatalog {
+                assets: vec![WorkerLanguageAsset {
+                    language: "rust".into(),
+                    grammar_symbol: "rust".into(),
+                    source_path: parser.clone(),
+                    parser_path: parser.clone(),
+                    artifact_digest: digest(&parser),
+                    queries: WorkerQuerySources {
+                        injections: Some("(identifier) @injection.content".into()),
+                        ..Default::default()
+                    },
+                }],
+                capture_mappings: serde_json::from_value(serde_json::json!({
+                    "rust": { "highlights": { "variable": "keyword" } }
+                }))
+                .unwrap(),
+                ..Default::default()
+            },
         })
         .unwrap();
     let Response::LanguageCatalogAck(ack) = response else {
@@ -238,7 +246,10 @@ fn real_worker_keeps_document_text_and_tree_across_incremental_edits() {
             source_path: parser.clone(),
             parser_path: parser.clone(),
             artifact_digest: digest(&parser),
-            queries: Default::default(),
+            queries: WorkerQuerySources {
+                highlights: Some("(identifier) @variable".into()),
+                ..Default::default()
+            },
             text: "fn main() { 1 }".into(),
         })
         .unwrap();
@@ -276,6 +287,20 @@ fn real_worker_keeps_document_text_and_tree_across_incremental_edits() {
     assert_eq!(snapshot.root_end_byte, "fn main() { value + 2 }".len());
     assert_eq!(snapshot.parser_cache_hit, None);
     assert!(snapshot.compute_ns > 0);
+
+    let mut semantic_context = snapshot.context.clone();
+    semantic_context.request_id = 321;
+    let response = worker
+        .derive_semantic_tokens(DeriveSemanticTokens {
+            context: semantic_context,
+            supports_multiline: false,
+        })
+        .unwrap();
+    let Response::SemanticTokens(tokens) = response else {
+        panic!("semantic tokens must be worker-owned: {response:?}");
+    };
+    assert!(!tokens.tokens.is_empty());
+    assert!(tokens.tokens.iter().all(|token| token.token_type == 1));
 
     let mut node_context = snapshot.context.clone();
     node_context.request_id = 33;

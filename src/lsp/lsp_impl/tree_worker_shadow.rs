@@ -15,7 +15,7 @@ use crate::tree_worker::{
     DeriveDocumentSnapshot, DeriveInjectionRegions, DeriveSelectionRanges, DeriveSemanticTokens,
     DerivedSemanticTokens, InjectionRegionsResult, NavigateNode, NodeNavigation, NodeResult,
     NodeScalarOperation, NodeScalarValue, OpaqueNodeId, RequestContext, ResolveNode, Response,
-    RunNodeScalar, SelectionRangesResult, SyncDocument, WirePosition, WorkerLanguageAsset,
+    RunNodeScalar, SelectionRangesResult, SyncDocument, WirePosition, WorkerLanguageCatalog,
     named_node_count,
 };
 
@@ -193,7 +193,7 @@ struct OpenDocuments {
     current: HashMap<String, SyncDocument>,
     closed_incarnations: HashMap<String, u64>,
     acknowledged: HashMap<String, RequestContext>,
-    catalog: Option<(u64, Vec<WorkerLanguageAsset>)>,
+    catalog: Option<(u64, WorkerLanguageCatalog)>,
     catalog_preload: Option<(u64, u64)>,
 }
 
@@ -1183,16 +1183,20 @@ impl TreeWorkerShadow {
 
     #[cfg(test)]
     pub(super) fn mirror_configuration(&self, generation: u64, documents: Vec<MirrorDocument>) {
-        self.mirror_configuration_with_catalog(generation, Vec::new(), documents);
+        self.mirror_configuration_with_catalog(
+            generation,
+            WorkerLanguageCatalog::default(),
+            documents,
+        );
     }
 
     pub(super) fn mirror_configuration_with_catalog(
         &self,
         generation: u64,
-        assets: Vec<WorkerLanguageAsset>,
+        catalog: WorkerLanguageCatalog,
         documents: Vec<MirrorDocument>,
     ) {
-        self.remember_catalog(generation, assets);
+        self.remember_catalog(generation, catalog);
         let mut commands = Vec::with_capacity(documents.len());
         for document in documents {
             let command = if let Some(grammar) = document.grammar {
@@ -1242,15 +1246,15 @@ impl TreeWorkerShadow {
         }
     }
 
-    fn remember_catalog(&self, generation: u64, assets: Vec<WorkerLanguageAsset>) {
-        if assets.is_empty() {
+    fn remember_catalog(&self, generation: u64, catalog: WorkerLanguageCatalog) {
+        if catalog.assets.is_empty() {
             return;
         }
         let mut documents = self
             .open_documents
             .lock()
             .recover_poison("TreeWorkerShadow::remember_catalog");
-        documents.catalog = Some((generation, assets));
+        documents.catalog = Some((generation, catalog));
         documents.catalog_preload = None;
     }
 
@@ -1262,24 +1266,24 @@ impl TreeWorkerShadow {
             return;
         };
         let worker_generation = client.worker_generation();
-        let (configuration_generation, assets) = {
+        let (configuration_generation, catalog) = {
             let mut documents = self
                 .open_documents
                 .lock()
                 .recover_poison("TreeWorkerShadow::preload_catalog_async");
-            let Some((configuration_generation, assets)) = documents.catalog.clone() else {
+            let Some((configuration_generation, catalog)) = documents.catalog.clone() else {
                 return;
             };
             if documents.catalog_preload == Some((worker_generation, configuration_generation)) {
                 return;
             }
             documents.catalog_preload = Some((worker_generation, configuration_generation));
-            (configuration_generation, assets)
+            (configuration_generation, catalog)
         };
         spawn_catalog_preload(
             client,
             configuration_generation,
-            assets,
+            catalog,
             Arc::clone(&self.open_documents),
         );
     }
@@ -1564,7 +1568,7 @@ fn shutdown_with_timeout(
 fn spawn_catalog_preload(
     client: Arc<Client>,
     configuration_generation: u64,
-    assets: Vec<WorkerLanguageAsset>,
+    catalog: WorkerLanguageCatalog,
     open_documents: Arc<Mutex<OpenDocuments>>,
 ) {
     let worker_generation = client.worker_generation();
@@ -1579,7 +1583,7 @@ fn spawn_catalog_preload(
     let _ = std::thread::Builder::new()
         .name("kakehashi-worker-catalog".into())
         .spawn(move || {
-            let outcome = client.configure_languages(ConfigureLanguages { context, assets });
+            let outcome = client.configure_languages(ConfigureLanguages { context, catalog });
             if !matches!(outcome, Ok(Response::LanguageCatalogAck(_))) {
                 let mut documents = open_documents
                     .lock()

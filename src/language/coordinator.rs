@@ -1830,6 +1830,15 @@ impl LanguageCoordinator {
         self.config_store.search_paths()
     }
 
+    pub(crate) fn configure_worker_runtime(
+        &self,
+        search_paths: Vec<std::path::PathBuf>,
+        capture_mappings: CaptureMappings,
+    ) {
+        self.config_store
+            .configure_worker(search_paths, capture_mappings);
+    }
+
     /// Resolve the dynamic grammar identity the isolated tree worker must load.
     /// Derived languages that share a base parser use the base export symbol;
     /// standalone derived parsers retain their own symbol.
@@ -1963,7 +1972,7 @@ impl LanguageCoordinator {
     /// The catalog is built after settings loading, so query sources are the
     /// exact tolerant-compilation output and parser paths point at private,
     /// content-addressed imports.
-    pub(crate) fn worker_language_catalog(&self) -> Vec<crate::tree_worker::WorkerLanguageAsset> {
+    pub(crate) fn worker_language_catalog(&self) -> crate::tree_worker::WorkerLanguageCatalog {
         let mut language_ids = self
             .worker_settings
             .read()
@@ -1973,7 +1982,7 @@ impl LanguageCoordinator {
             .cloned()
             .collect::<Vec<_>>();
         language_ids.sort();
-        language_ids
+        let assets = language_ids
             .into_iter()
             .filter_map(|language| {
                 let descriptor = self.worker_grammar_descriptor(&language)?;
@@ -1986,7 +1995,12 @@ impl LanguageCoordinator {
                     queries: descriptor.queries,
                 })
             })
-            .collect()
+            .collect();
+        crate::tree_worker::WorkerLanguageCatalog {
+            assets,
+            search_paths: self.search_paths(),
+            capture_mappings: (*self.capture_mappings()).clone(),
+        }
     }
 
     pub(crate) fn configuration_generation(&self) -> u64 {

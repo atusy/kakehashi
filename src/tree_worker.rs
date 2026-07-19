@@ -73,10 +73,17 @@ pub struct WorkerLanguageAsset {
     pub queries: WorkerQuerySources,
 }
 
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct WorkerLanguageCatalog {
+    pub assets: Vec<WorkerLanguageAsset>,
+    pub search_paths: Vec<PathBuf>,
+    pub capture_mappings: crate::config::settings::CaptureMappings,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ConfigureLanguages {
     pub context: RequestContext,
-    pub assets: Vec<WorkerLanguageAsset>,
+    pub catalog: WorkerLanguageCatalog,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -1953,8 +1960,12 @@ fn configure_languages(
     analysis: &Arc<crate::language::LanguageCoordinator>,
 ) -> Response {
     let context = request.context;
+    analysis.configure_worker_runtime(
+        request.catalog.search_paths,
+        request.catalog.capture_mappings,
+    );
     let mut configured = 0;
-    for asset in request.assets {
+    for asset in request.catalog.assets {
         let key = GrammarKey::from_asset(&asset);
         let language_name = asset.language;
         let queries = asset.queries;
