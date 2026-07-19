@@ -158,7 +158,7 @@ impl Kakehashi {
             if &worker != authoritative {
                 log::debug!(
                     target: "kakehashi::tree_worker_shadow",
-                    "host-only selectionRange mismatch uri={} version={} authoritative={:?} worker={:?}",
+                    "selectionRange mismatch uri={} version={} authoritative={:?} worker={:?}",
                     uri,
                     expected_version,
                     authoritative,

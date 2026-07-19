@@ -2959,7 +2959,7 @@ mod tests {
         HandshakeReady, LaneAction, LaneRegistry, MAX_DOCUMENT_BYTES, MAX_DOCUMENT_REPLICAS,
         MAX_RETAINED_DOCUMENT_BYTES, NavigateNode, NodeNavigation, NodeScalarOperation,
         NodeScalarValue, OpaqueNodeId, PROTOCOL_VERSION, Request, RequestContext, ResolveNode,
-        Response, Route, RunNodeScalar, SyncDocument, WirePosition, WorkerError,
+        Response, Route, RunNodeScalar, SyncDocument, WirePosition, WireRange, WorkerError,
         WorkerQuerySources, close_document, decode_frame, derive_snapshot_with_language,
         encode_frame, named_node_count, replace_retained_bytes, reserve_retained_growth,
         route_response, run, submit_document_job, sync_document, terminate_by_transport,
@@ -3770,6 +3770,70 @@ mod tests {
             })
             .unwrap();
         assert!(stale.nodes.is_empty());
+    }
+
+    #[test]
+    fn selection_ranges_descend_into_worker_owned_injections() {
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_rust::LANGUAGE.into())
+            .unwrap();
+        let context = RequestContext {
+            request_id: 1,
+            worker_generation: 3,
+            uri: "file:///injected.rs".into(),
+            incarnation: 4,
+            content_version: 1,
+            configuration_generation: 2,
+        };
+        let (replica, _) = DocumentReplica::sync(
+            SyncDocument {
+                context: context.clone(),
+                language: "rust".into(),
+                grammar_symbol: "rust".into(),
+                source_path: "/unused/static-language".into(),
+                parser_path: "/unused/static-language".into(),
+                artifact_digest: "sha256:rust-v1".into(),
+                queries: WorkerQuerySources {
+                    injections: Some(
+                        r#"((line_comment) @injection.content
+                            (#set! injection.language "rust")
+                            (#offset! @injection.content 0 3 0 0))"#
+                            .into(),
+                    ),
+                    ..WorkerQuerySources::default()
+                },
+                text: "// fn inner() {}\n".into(),
+            },
+            &mut parser,
+        )
+        .unwrap();
+
+        let result = replica
+            .derive_selection_ranges(DeriveSelectionRanges {
+                context,
+                positions: vec![WirePosition {
+                    line: 0,
+                    character: 6,
+                }],
+            })
+            .unwrap();
+
+        assert_eq!(result.ranges.len(), 1);
+        assert_eq!(
+            result.ranges[0].range,
+            WireRange {
+                start: WirePosition {
+                    line: 0,
+                    character: 6,
+                },
+                end: WirePosition {
+                    line: 0,
+                    character: 11,
+                },
+            }
+        );
+        assert!(result.ranges[0].parent.is_some());
     }
 
     #[test]
