@@ -1,3 +1,4 @@
+import os
 import pathlib
 import subprocess
 import sys
@@ -15,11 +16,26 @@ from attest_worker_binary import (
     native_toolchain_metadata,
     require_isolated_source,
     require_uncredentialed_repository_url,
+    remote_verification_environment,
     verify_remote_commit,
 )
 
 
 class BinaryAttestationTest(unittest.TestCase):
+    def test_remote_verification_preserves_ssh_agent_without_git_config(self):
+        environment = remote_verification_environment({
+            "PATH": "/bin",
+            "HOME": "/home/developer",
+            "SSH_AUTH_SOCK": "/tmp/agent.sock",
+            "GIT_CONFIG_GLOBAL": "/ambient/gitconfig",
+            "GIT_SSH_COMMAND": "unsafe override",
+        })
+
+        self.assertEqual(environment["HOME"], "/home/developer")
+        self.assertEqual(environment["SSH_AUTH_SOCK"], "/tmp/agent.sock")
+        self.assertEqual(environment["GIT_CONFIG_GLOBAL"], os.devnull)
+        self.assertNotIn("GIT_SSH_COMMAND", environment)
+
     def test_source_commit_must_be_reachable_from_recorded_remote(self):
         with tempfile.TemporaryDirectory() as directory:
             root = pathlib.Path(directory)

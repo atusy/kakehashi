@@ -144,13 +144,21 @@ def require_uncredentialed_repository_url(repository):
     return repository
 
 
-def verify_remote_commit(repository, revision):
-    environment = controlled_environment(os.environ)
+def remote_verification_environment(source):
+    environment = controlled_environment(source)
+    for key in ("HOME", "SSH_AUTH_SOCK"):
+        if key in source:
+            environment[key] = source[key]
     environment.update({
         "GIT_CONFIG_NOSYSTEM": "1",
         "GIT_CONFIG_GLOBAL": os.devnull,
         "GIT_NO_REPLACE_OBJECTS": "1",
     })
+    return environment
+
+
+def verify_remote_commit(repository, revision):
+    environment = remote_verification_environment(os.environ)
     with tempfile.TemporaryDirectory(
         prefix="kakehashi-attested-origin-"
     ) as directory:
