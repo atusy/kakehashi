@@ -188,7 +188,30 @@ struct ResyncFailure {
 }
 
 impl OpenDocuments {
-    fn observe(&mut self, command: &ShadowCommand) {
+    fn observe(&mut self, command: &ShadowCommand) -> bool {
+        let incoming = match command {
+            ShadowCommand::Sync(request) => Some(request),
+            ShadowCommand::Apply { fallback, .. } => Some(fallback),
+            ShadowCommand::Close(_) | ShadowCommand::Shutdown(_) => None,
+        };
+        let artifact_replaced = incoming.is_some_and(|incoming| {
+            self.current.values().any(|current| {
+                current.parser_path == incoming.parser_path
+                    && current.artifact_digest != incoming.artifact_digest
+            })
+        });
+        if artifact_replaced {
+            let incoming = incoming.expect("replacement requires an incoming document");
+            for current in self.current.values_mut() {
+                if current.parser_path == incoming.parser_path {
+                    current
+                        .artifact_digest
+                        .clone_from(&incoming.artifact_digest);
+                    current.context.configuration_generation =
+                        incoming.context.configuration_generation;
+                }
+            }
+        }
         match command {
             ShadowCommand::Sync(request) => {
                 self.current
@@ -203,6 +226,7 @@ impl OpenDocuments {
             }
             ShadowCommand::Shutdown(_) => {}
         }
+        artifact_replaced
     }
 
     fn grammar_for(&self, uri: &str) -> Option<GrammarIdentity> {
@@ -607,6 +631,7 @@ fn run_actor(
             FailureClass::Systemic,
             None,
             &comparisons,
+            true,
         )
     {
         disabled.store(true, Ordering::Release);
@@ -645,6 +670,7 @@ fn run_actor(
                     FailureClass::Systemic,
                     None,
                     &comparisons,
+                    true,
                 ) {
                     disabled.store(true, Ordering::Release);
                     break;
@@ -666,7 +692,26 @@ fn run_actor(
         });
         let command_document =
             command_document(&command).map(|(uri, incarnation)| (uri.to_string(), incarnation));
-        state.open_documents.observe(&command);
+        let artifact_replaced = state.open_documents.observe(&command);
+        if artifact_replaced {
+            log::info!(
+                target: "kakehashi::tree_worker_shadow",
+                "performing planned worker restart for parser artifact replacement",
+            );
+            if !recover_worker(
+                &mut state,
+                &executable,
+                compute_threads,
+                FailureClass::Systemic,
+                None,
+                &comparisons,
+                false,
+            ) {
+                disabled.store(true, Ordering::Release);
+                break;
+            }
+            continue;
+        }
         retag_command(&mut command, state.worker_generation);
         if implicated_grammar
             .as_ref()
@@ -724,6 +769,7 @@ fn run_actor(
                     FailureClass::Systemic,
                     None,
                     &comparisons,
+                    true,
                 ) {
                     disabled.store(true, Ordering::Release);
                     break;
@@ -761,6 +807,7 @@ fn run_actor(
                     class,
                     implicated_grammar,
                     &comparisons,
+                    true,
                 ) {
                     disabled.store(true, Ordering::Release);
                     break;
@@ -822,6 +869,7 @@ fn recover_worker(
     mut class: FailureClass,
     implicated_grammar: Option<GrammarIdentity>,
     comparisons: &ComparisonStore,
+    mut charge_next_attempt: bool,
 ) -> bool {
     let recovery_started = Instant::now();
     if let Some(grammar) = implicated_grammar {
@@ -829,7 +877,7 @@ fn recover_worker(
     }
 
     loop {
-        if !state.restart_budget.consume(class) {
+        if charge_next_attempt && !state.restart_budget.consume(class) {
             log::error!(
                 target: "kakehashi::tree_worker_shadow",
                 "disabled shadow tree tier after restart budget exhaustion: systemic={} native={} tokens_remaining={}",
@@ -844,7 +892,9 @@ fn recover_worker(
         {
             log::warn!(target: "kakehashi::tree_worker_shadow", "failed worker cleanup: {error}");
         }
-        std::thread::sleep(state.restart_budget.backoff());
+        if charge_next_attempt {
+            std::thread::sleep(state.restart_budget.backoff());
+        }
         let generation = NEXT_WORKER_GENERATION.fetch_add(1, Ordering::Relaxed);
         let replacement = match Client::spawn(executable, compute_threads, generation) {
             Ok(client) => client,
@@ -854,6 +904,7 @@ fn recover_worker(
                     "worker generation {generation} restart failed: {error}"
                 );
                 class = FailureClass::Systemic;
+                charge_next_attempt = true;
                 continue;
             }
         };
@@ -889,6 +940,7 @@ fn recover_worker(
                     failure.error,
                 );
                 class = failure.class;
+                charge_next_attempt = true;
             }
         }
     }
@@ -1312,6 +1364,28 @@ mod tests {
             context: latest.context.clone(),
         }));
         assert!(documents.current.is_empty());
+    }
+
+    #[test]
+    fn artifact_replacement_updates_all_same_path_documents_and_requests_restart() {
+        let mut documents = OpenDocuments::default();
+        assert!(!documents.observe(&ShadowCommand::Sync(sync("file:///a.rs", 1, 1, 7))));
+        assert!(!documents.observe(&ShadowCommand::Sync(sync("file:///b.rs", 1, 1, 7))));
+
+        let mut replacement = sync("file:///b.rs", 1, 2, 7);
+        replacement.artifact_digest = "sha256:rust-v2".into();
+        replacement.context.configuration_generation = 4;
+        assert!(documents.observe(&ShadowCommand::Sync(replacement)));
+
+        for document in documents.current.values() {
+            assert_eq!(document.artifact_digest, "sha256:rust-v2");
+            assert_eq!(document.context.configuration_generation, 4);
+        }
+
+        let mut alias = sync("file:///c.rs", 1, 1, 7);
+        alias.artifact_digest = "sha256:rust-v2".into();
+        alias.context.configuration_generation = 4;
+        assert!(!documents.observe(&ShadowCommand::Sync(alias)));
     }
 
     #[test]
