@@ -113,7 +113,7 @@ class RequestSummaryTest(unittest.TestCase):
 
         terminate_server(server)
 
-        server.wait.assert_not_called()
+        server.wait.assert_called_once_with(timeout=3)
 
     @unittest.skipUnless(
         os.name == "posix" and hasattr(signal, "SIGTERM"),
