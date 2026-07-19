@@ -862,7 +862,8 @@ fn terminate(child: &mut Child, timeout: Duration) {
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
-    use std::io::{Cursor, Write};
+    use std::io::{Cursor, Read, Write};
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Condvar, Mutex};
     use std::time::Duration;
 
@@ -932,6 +933,19 @@ mod tests {
             let (state, changed) = &*self.0;
             state.lock().unwrap().released = true;
             changed.notify_all();
+        }
+    }
+
+    struct CountingReader {
+        cursor: Cursor<Vec<u8>>,
+        bytes_read: Arc<AtomicUsize>,
+    }
+
+    impl Read for CountingReader {
+        fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+            let read = self.cursor.read(buffer)?;
+            self.bytes_read.fetch_add(read, Ordering::Relaxed);
+            Ok(read)
         }
     }
 
@@ -1138,17 +1152,33 @@ mod tests {
             request.context.request_id = request_id;
             requests.push(Request::DeriveSnapshot(request));
         }
+        let admitted_prefix_bytes = framed(&requests[..4]).len();
+        let framed_requests = framed(&requests);
+        let bytes_read = Arc::new(AtomicUsize::new(0));
+        let reader = CountingReader {
+            cursor: Cursor::new(framed_requests.clone()),
+            bytes_read: Arc::clone(&bytes_read),
+        };
         let (completed, completed_rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
-            let _ = completed.send(run(Cursor::new(framed(&requests)), writer, 1));
+            let _ = completed.send(run(reader, writer, 1));
         });
 
         gate.wait_until_blocked();
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(
+            bytes_read.load(Ordering::Relaxed) <= admitted_prefix_bytes,
+            "worker read past two admitted requests plus one bounded lookahead"
+        );
+        assert!(
+            bytes_read.load(Ordering::Relaxed) < framed_requests.len(),
+            "worker consumed the complete request stream while stdout was stalled"
+        );
         assert!(
             completed_rx
                 .recv_timeout(Duration::from_millis(50))
                 .is_err(),
-            "worker must not consume an unbounded request stream while stdout is stalled"
+            "worker unexpectedly completed while stdout was stalled"
         );
 
         gate.release();
