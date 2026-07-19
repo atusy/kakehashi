@@ -4,28 +4,46 @@
   "threads": 4,
   "source_lines": 200,
   "source_bytes": 7611,
-  "apply_frame_bytes": 268,
-  "derive_frame_bytes": 189,
-  "fused_apply_and_derive_frame_bytes": 279,
-  "spawn_us": 988678.5,
+  "apply_frame_bytes": 270,
+  "derive_frame_bytes": 191,
+  "fused_apply_and_derive_frame_bytes": 281,
+  "spawn_us": 1003071.541,
   "sync": {
-    "direct_us": 1582.5,
-    "worker_parent_observed_us": 2539.541
+    "direct_us": 1950.875,
+    "worker_parent_observed_us": 2552.041
   },
   "alternating_incremental_edit_and_derive": {
     "direct": {
-      "p50_us": 256.166,
-      "p95_us": 305.875,
-      "p99_us": 316.708,
-      "mean_us": 272.806754
+      "p50_us": 252.208,
+      "p95_us": 259.709,
+      "p99_us": 271.416,
+      "mean_us": 252.913473
     },
     "worker_parent_observed": {
-      "p50_us": 299.416,
-      "p95_us": 357.375,
-      "p99_us": 373.5,
-      "mean_us": 318.461248
+      "p50_us": 293.292,
+      "p95_us": 304.709,
+      "p99_us": 316.959,
+      "mean_us": 294.454409
     },
-    "direct_requests_per_second": 3665.598396438528,
-    "worker_requests_per_second": 3140.0994823709293
+    "direct_requests_per_second": 3953.9214267165594,
+    "worker_requests_per_second": 3396.1114842739544
+  },
+  "concurrent_documents": {
+    "documents": 4,
+    "measurement_order": "worker_then_direct",
+    "direct": {
+      "p50_us": 315.334,
+      "p95_us": 392.25,
+      "p99_us": 431.75,
+      "mean_us": 320.88503499999996
+    },
+    "worker_parent_observed": {
+      "p50_us": 367.833,
+      "p95_us": 462.959,
+      "p99_us": 495.917,
+      "mean_us": 379.68826299999995
+    },
+    "direct_requests_per_second": 12382.840221599841,
+    "worker_requests_per_second": 10454.505333005216
   }
 }
