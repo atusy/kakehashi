@@ -1,9 +1,9 @@
 {
   "schema": 3,
   "experiment": "single-tree-worker-stage2-incremental-replica",
-  "source_commit": "d0ae7b56cf901ce19aad87407425471013ee2396",
-  "binary_sha256": "b0ad74ce8885ff7060554e5953f9a50c8209af1a74b4f404300094bb43eb9962",
-  "benchmark_sha256": "17e56ce07fce6f7c1a3bbc1f15bf22372f2b012c9d9673159d3ecc9ad47fe8bf",
+  "source_commit": "8adde114cfafe6f8cb1894e72c90410a37e04a49",
+  "binary_sha256": "75f5a0ffc01901766b34009628726df8a960fb3e587c1a57e069e1f216527c9e",
+  "benchmark_sha256": "d6f3d80ad05fa8530afdc9086b15f610b6b9311f26efb7b9b568fa487388b644",
   "parser_sha256": "aad08b1e5f0f922cd6800841d034ba6a38516a2f62abd1147217b440f35ca192",
   "parser_source": {
     "url": "https://github.com/tree-sitter/tree-sitter-rust",
@@ -55,44 +55,44 @@
         "apply_frame_bytes": 274,
         "derive_frame_bytes": 191,
         "fused_apply_and_derive_frame_bytes": 285,
-        "spawn_us": 201496.583,
+        "spawn_us": 994131.667,
         "sync": {
-          "direct_us": 1099.625,
-          "worker_parent_observed_us": 1439.666
+          "direct_us": 3835.5,
+          "worker_parent_observed_us": 2586.0840000000003
         },
         "alternating_incremental_edit_and_derive": {
           "direct": {
-            "p50_us": 308.5,
-            "p95_us": 361.667,
-            "p99_us": 396.542,
-            "mean_us": 298.9691756
+            "p50_us": 310.375,
+            "p95_us": 364.958,
+            "p99_us": 396.834,
+            "mean_us": 308.8361432
           },
           "worker_parent_observed": {
-            "p50_us": 362.417,
-            "p95_us": 456.875,
-            "p99_us": 495.375,
-            "mean_us": 359.4564506
+            "p50_us": 376.084,
+            "p95_us": 450.125,
+            "p99_us": 501.416,
+            "mean_us": 375.7849926
           },
-          "direct_requests_per_second": 3344.826428989223,
-          "worker_requests_per_second": 2781.9781737977246
+          "direct_requests_per_second": 3237.9629846381267,
+          "worker_requests_per_second": 2661.096157888451
         },
         "concurrent_documents": {
           "documents": 4,
           "measurement_order": "direct_then_worker",
           "direct": {
-            "p50_us": 329.291,
-            "p95_us": 390.541,
-            "p99_us": 461.083,
-            "mean_us": 339.4742632
+            "p50_us": 350.417,
+            "p95_us": 416.333,
+            "p99_us": 464.583,
+            "mean_us": 358.8503856
           },
           "worker_parent_observed": {
-            "p50_us": 386.959,
-            "p95_us": 535.333,
-            "p99_us": 858.167,
-            "mean_us": 423.9664366
+            "p50_us": 385.625,
+            "p95_us": 487.083,
+            "p99_us": 552.125,
+            "mean_us": 402.5613906
           },
-          "direct_requests_per_second": 11722.10980393306,
-          "worker_requests_per_second": 9395.210707160937
+          "direct_requests_per_second": 10964.771998947715,
+          "worker_requests_per_second": 9880.589772482565
         }
       },
       {
@@ -104,44 +104,44 @@
         "apply_frame_bytes": 274,
         "derive_frame_bytes": 191,
         "fused_apply_and_derive_frame_bytes": 285,
-        "spawn_us": 372558.08400000003,
+        "spawn_us": 361234.792,
         "sync": {
-          "direct_us": 2114.791,
-          "worker_parent_observed_us": 2750.041
+          "direct_us": 2356.042,
+          "worker_parent_observed_us": 2675.417
         },
         "alternating_incremental_edit_and_derive": {
           "direct": {
-            "p50_us": 307.042,
-            "p95_us": 357.875,
-            "p99_us": 427.708,
-            "mean_us": 302.8719274
+            "p50_us": 261.791,
+            "p95_us": 317.042,
+            "p99_us": 356.583,
+            "mean_us": 278.73589000000004
           },
           "worker_parent_observed": {
-            "p50_us": 391.584,
-            "p95_us": 467.125,
-            "p99_us": 554.5,
-            "mean_us": 383.3173218
+            "p50_us": 303.334,
+            "p95_us": 416.959,
+            "p99_us": 463.75,
+            "mean_us": 328.89179859999996
           },
-          "direct_requests_per_second": 3301.7256124873857,
-          "worker_requests_per_second": 2608.804619901213
+          "direct_requests_per_second": 3587.625547610679,
+          "worker_requests_per_second": 3040.513640828744
         },
         "concurrent_documents": {
           "documents": 4,
           "measurement_order": "worker_then_direct",
           "direct": {
-            "p50_us": 352.292,
-            "p95_us": 434.875,
-            "p99_us": 531.208,
-            "mean_us": 362.8487428
+            "p50_us": 339.792,
+            "p95_us": 398.667,
+            "p99_us": 460.708,
+            "mean_us": 350.440462
           },
           "worker_parent_observed": {
-            "p50_us": 433.916,
-            "p95_us": 495.25,
-            "p99_us": 520.458,
-            "mean_us": 433.3873162
+            "p50_us": 434.666,
+            "p95_us": 522.208,
+            "p99_us": 574.542,
+            "mean_us": 442.4977294
           },
-          "direct_requests_per_second": 10919.630345703397,
-          "worker_requests_per_second": 9208.399190116135
+          "direct_requests_per_second": 11380.36635570673,
+          "worker_requests_per_second": 9008.020285456343
         }
       }
     ],
@@ -155,44 +155,44 @@
         "apply_frame_bytes": 276,
         "derive_frame_bytes": 191,
         "fused_apply_and_derive_frame_bytes": 287,
-        "spawn_us": 358085.75,
+        "spawn_us": 355163.083,
         "sync": {
-          "direct_us": 13681.875,
-          "worker_parent_observed_us": 13185.208999999999
+          "direct_us": 12953.582999999999,
+          "worker_parent_observed_us": 12760.708
         },
         "alternating_incremental_edit_and_derive": {
           "direct": {
-            "p50_us": 2674.958,
-            "p95_us": 3268.209,
-            "p99_us": 4098.583,
-            "mean_us": 2840.8480898000003
+            "p50_us": 3157.75,
+            "p95_us": 3405.75,
+            "p99_us": 4278.75,
+            "mean_us": 3067.4421239999997
           },
           "worker_parent_observed": {
-            "p50_us": 2734.667,
-            "p95_us": 3334.209,
-            "p99_us": 4192.416,
-            "mean_us": 2900.2027712
+            "p50_us": 3206.208,
+            "p95_us": 3484.708,
+            "p99_us": 4433.459,
+            "mean_us": 3116.2796982
           },
-          "direct_requests_per_second": 352.00755844371866,
-          "worker_requests_per_second": 344.80347716730023
+          "direct_requests_per_second": 326.0045208924698,
+          "worker_requests_per_second": 320.89545767589857
         },
         "concurrent_documents": {
           "documents": 4,
           "measurement_order": "direct_then_worker",
           "direct": {
-            "p50_us": 3805.125,
-            "p95_us": 4431.334,
-            "p99_us": 4754.416,
-            "mean_us": 3844.1941343999997
+            "p50_us": 3763.292,
+            "p95_us": 4469.417,
+            "p99_us": 5173.417,
+            "mean_us": 3852.0304146
           },
           "worker_parent_observed": {
-            "p50_us": 3954.875,
-            "p95_us": 4555.375,
-            "p99_us": 4828.875,
-            "mean_us": 3984.415478
+            "p50_us": 4091.125,
+            "p95_us": 4735.791,
+            "p99_us": 5107.583,
+            "mean_us": 4138.2528908
           },
-          "direct_requests_per_second": 1031.7300138591634,
-          "worker_requests_per_second": 996.8079551785175
+          "direct_requests_per_second": 1029.0480718777728,
+          "worker_requests_per_second": 963.93235826149
         }
       },
       {
@@ -204,44 +204,44 @@
         "apply_frame_bytes": 276,
         "derive_frame_bytes": 191,
         "fused_apply_and_derive_frame_bytes": 287,
-        "spawn_us": 345994.666,
+        "spawn_us": 345922.25,
         "sync": {
-          "direct_us": 12081.583,
-          "worker_parent_observed_us": 12985.25
+          "direct_us": 12013.042,
+          "worker_parent_observed_us": 13216.5
         },
         "alternating_incremental_edit_and_derive": {
           "direct": {
-            "p50_us": 2676.417,
-            "p95_us": 3252.291,
-            "p99_us": 3613.708,
-            "mean_us": 2799.3548346000002
+            "p50_us": 2927.875,
+            "p95_us": 3262.0,
+            "p99_us": 3880.25,
+            "mean_us": 2935.8551174
           },
           "worker_parent_observed": {
-            "p50_us": 2734.333,
-            "p95_us": 3329.417,
-            "p99_us": 3806.833,
-            "mean_us": 2859.3204394
+            "p50_us": 2968.333,
+            "p95_us": 3369.875,
+            "p99_us": 4215.0,
+            "mean_us": 3025.6247954
           },
-          "direct_requests_per_second": 357.22516761362624,
-          "worker_requests_per_second": 349.7334493261063
+          "direct_requests_per_second": 340.61626340934777,
+          "worker_requests_per_second": 330.5102475099844
         },
         "concurrent_documents": {
           "documents": 4,
           "measurement_order": "worker_then_direct",
           "direct": {
-            "p50_us": 3927.708,
-            "p95_us": 4593.917,
-            "p99_us": 4884.625,
-            "mean_us": 3962.737241
+            "p50_us": 3998.0,
+            "p95_us": 4737.416,
+            "p99_us": 5867.583,
+            "mean_us": 4077.7393192
           },
           "worker_parent_observed": {
-            "p50_us": 3860.333,
-            "p95_us": 4443.875,
-            "p99_us": 5238.583,
-            "mean_us": 3904.0072162
+            "p50_us": 3987.208,
+            "p95_us": 5143.459,
+            "p99_us": 7213.084,
+            "mean_us": 4150.0583666
           },
-          "direct_requests_per_second": 995.7054146123102,
-          "worker_requests_per_second": 1019.4351488241517
+          "direct_requests_per_second": 967.2211727466265,
+          "worker_requests_per_second": 955.8427873752092
         }
       }
     ]
