@@ -103,7 +103,7 @@ class RequestSummaryTest(unittest.TestCase):
         terminate_server(server, timeout_seconds=0.25)
 
         self.assertEqual(server.actions, [
-            "terminate", ("wait", 0.25), "kill", ("wait", None),
+            "terminate", ("wait", 0.25), "kill", ("wait", 0.25),
         ])
 
     def test_server_termination_tolerates_exit_after_poll(self):
@@ -127,7 +127,20 @@ class RequestSummaryTest(unittest.TestCase):
         terminate_server(server, timeout_seconds=0.25)
 
         self.assertEqual(server.wait.call_args_list, [
-            mock.call(timeout=0.25), mock.call(),
+            mock.call(timeout=0.25), mock.call(timeout=0.25),
+        ])
+
+    def test_server_termination_does_not_block_after_kill(self):
+        server = mock.Mock()
+        server.poll.return_value = None
+        server.wait.side_effect = subprocess.TimeoutExpired("server", 0.25)
+
+        terminate_server(server, timeout_seconds=0.25)
+
+        server.terminate.assert_called_once_with()
+        server.kill.assert_called_once_with()
+        self.assertEqual(server.wait.call_args_list, [
+            mock.call(timeout=0.25), mock.call(timeout=0.25),
         ])
 
     @unittest.skipUnless(

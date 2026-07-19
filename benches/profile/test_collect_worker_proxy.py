@@ -172,6 +172,25 @@ class CollectionHelpersTest(unittest.TestCase):
         send_signal.assert_called_once_with(process, signal.SIGTERM)
         process.communicate.assert_called_once_with(timeout=3)
 
+    def test_process_group_termination_does_not_block_after_kill(self):
+        first_timeout = subprocess.TimeoutExpired("process", 3)
+        final_timeout = subprocess.TimeoutExpired(
+            "process", 3, output="partial stdout", stderr="partial stderr"
+        )
+        process = mock.Mock(pid=12345, stdout=None, stderr=None)
+        process.communicate.side_effect = [first_timeout, final_timeout]
+        process.wait.side_effect = subprocess.TimeoutExpired("process", 3)
+
+        with mock.patch.object(collector, "signal_process_group") as send_signal:
+            output = collector.terminate_process_group(process, 3)
+
+        self.assertEqual(output, ("partial stdout", "partial stderr"))
+        self.assertEqual(
+            send_signal.call_args_list,
+            [mock.call(process, signal.SIGTERM), mock.call(process, signal.SIGKILL)],
+        )
+        process.wait.assert_called_once_with(timeout=3)
+
     def test_attested_build_requires_committed_lockfile(self):
         self.assertIn("--locked", collector.ATTESTED_BUILD_COMMAND)
 

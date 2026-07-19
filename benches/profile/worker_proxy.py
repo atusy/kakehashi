@@ -49,7 +49,10 @@ def terminate_child(child):
             child.wait(timeout=1)
         except subprocess.TimeoutExpired:
             child.kill()
-            child.wait()
+            try:
+                child.wait(timeout=1)
+            except subprocess.TimeoutExpired:
+                pass
     except ProcessLookupError:
         # The child may exit between poll and signal delivery.
         pass

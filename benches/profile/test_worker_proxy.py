@@ -114,6 +114,20 @@ class CopyStreamTest(unittest.TestCase):
         with self.assertRaises(PermissionError):
             terminate_child(child)
 
+    def test_cleanup_does_not_block_after_kill(self):
+        child = mock.Mock()
+        child.poll.return_value = None
+        child.wait.side_effect = subprocess.TimeoutExpired("child", 1)
+
+        terminate_child(child)
+
+        child.terminate.assert_called_once_with()
+        child.kill.assert_called_once_with()
+        self.assertEqual(
+            child.wait.call_args_list,
+            [mock.call(timeout=1), mock.call(timeout=1)],
+        )
+
     def test_child_may_exit_while_proxy_stdin_remains_open(self):
         proxy = pathlib.Path(__file__).with_name("worker_proxy.py")
         env = dict(os.environ, KAKEHASHI_WORKER_PROXY_BIN=sys.executable)

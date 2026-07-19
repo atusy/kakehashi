@@ -636,7 +636,10 @@ def terminate_process_group(process, grace_seconds):
                     stream.close()
                 except OSError:
                     pass
-        process.wait(timeout=grace_seconds)
+        try:
+            process.wait(timeout=grace_seconds)
+        except subprocess.TimeoutExpired:
+            pass
     return final_stdout, final_stderr
 
 
