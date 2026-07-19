@@ -214,6 +214,7 @@ fn real_worker_keeps_document_text_and_tree_across_incremental_edits() {
     let mut closed = snapshot.context;
     closed.request_id = 33;
     closed.content_version = 3;
+    closed.configuration_generation = 1;
     let response = worker
         .close_document(CloseDocument {
             context: closed.clone(),

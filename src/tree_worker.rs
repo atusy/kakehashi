@@ -100,6 +100,12 @@ pub struct DocumentClosed {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct WorkerRestartRequired {
+    pub context: RequestContext,
+    pub reason: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Request {
     Handshake(Handshake),
@@ -145,6 +151,7 @@ pub enum Response {
     HandshakeReady(HandshakeReady),
     DocumentAck(DocumentAck),
     DocumentClosed(DocumentClosed),
+    WorkerRestartRequired(WorkerRestartRequired),
     Snapshot(DerivedSnapshot),
     Error(WorkerError),
 }
@@ -266,12 +273,19 @@ impl DocumentReplica {
     }
 
     fn validate_identity(&self, context: &RequestContext) -> Result<(), String> {
+        self.validate_lifetime(context)?;
+        if context.configuration_generation != self.context.configuration_generation {
+            return Err("document identity does not match worker replica".into());
+        }
+        Ok(())
+    }
+
+    fn validate_lifetime(&self, context: &RequestContext) -> Result<(), String> {
         if context.worker_generation != self.context.worker_generation
             || context.uri != self.context.uri
             || context.incarnation != self.context.incarnation
-            || context.configuration_generation != self.context.configuration_generation
         {
-            return Err("document identity does not match worker replica".into());
+            return Err("document lifetime does not match worker replica".into());
         }
         Ok(())
     }
@@ -631,7 +645,14 @@ impl From<&RequestContext> for DocumentKey {
 type DocumentStore = Arc<dashmap::DashMap<DocumentKey, Arc<Mutex<DocumentReplica>>>>;
 type ClosedDocuments = Arc<dashmap::DashMap<DocumentKey, u64>>;
 type DocumentCapacity = Arc<Mutex<usize>>;
-type LaneJob = Box<dyn FnOnce() + Send + 'static>;
+type LaneJob = Box<dyn FnOnce() -> LaneAction + Send + 'static>;
+
+#[derive(Clone, Copy)]
+enum LaneAction {
+    Unchanged,
+    Keep,
+    Retire,
+}
 
 struct DocumentLane {
     state: Mutex<DocumentLaneState>,
@@ -642,6 +663,7 @@ struct DocumentLane {
 #[derive(Default)]
 struct DocumentLaneState {
     running: bool,
+    retire_when_idle: bool,
     pending: VecDeque<LaneJob>,
 }
 
@@ -694,38 +716,64 @@ impl DocumentLane {
                     Some(job) => job,
                     None => {
                         state.running = false;
+                        let retire = state.retire_when_idle;
+                        drop(state);
+                        if retire {
+                            self.remove_if_retired();
+                        }
                         return;
                     }
                 }
             };
-            job();
+            let action = job();
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            match action {
+                LaneAction::Unchanged => {}
+                LaneAction::Keep => state.retire_when_idle = false,
+                LaneAction::Retire => state.retire_when_idle = true,
+            }
         }
     }
-}
 
-impl Drop for DocumentLane {
-    fn drop(&mut self) {
+    fn remove_if_retired(&self) {
         let (Some(key), Some(registry)) = (&self.key, self.registry.upgrade()) else {
             return;
         };
-        if let dashmap::mapref::entry::Entry::Occupied(entry) = registry.entry(key.clone())
-            && std::ptr::eq(entry.get().as_ptr(), self)
-        {
-            entry.remove();
+        if let dashmap::mapref::entry::Entry::Occupied(entry) = registry.entry(key.clone()) {
+            let state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if !state.running
+                && state.pending.is_empty()
+                && state.retire_when_idle
+                && std::ptr::eq(Arc::as_ptr(entry.get()), self)
+            {
+                drop(state);
+                entry.remove();
+            }
         }
     }
 }
 
-type LaneRegistry = dashmap::DashMap<DocumentKey, Weak<DocumentLane>>;
+type LaneRegistry = dashmap::DashMap<DocumentKey, Arc<DocumentLane>>;
 type DocumentLanes = Arc<LaneRegistry>;
 
-fn document_lane(lanes: &DocumentLanes, key: DocumentKey) -> Arc<DocumentLane> {
-    if let Some(lane) = lanes.get(&key).and_then(|entry| entry.value().upgrade()) {
-        return lane;
-    }
-    let lane = Arc::new(DocumentLane::new(key.clone(), Arc::downgrade(lanes)));
-    lanes.insert(key, Arc::downgrade(&lane));
-    lane
+fn submit_document_job(
+    lanes: &DocumentLanes,
+    key: DocumentKey,
+    pool: &Arc<rayon::ThreadPool>,
+    job: LaneJob,
+) {
+    let entry = lanes
+        .entry(key.clone())
+        .or_insert_with(|| Arc::new(DocumentLane::new(key, Arc::downgrade(lanes))));
+    let lane = Arc::clone(entry.value());
+    lane.submit(pool, job);
+    drop(entry);
 }
 
 fn handle_work(
@@ -824,9 +872,11 @@ fn sync_document(
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if *known_documents >= MAX_DOCUMENT_REPLICAS {
-            return Response::Error(WorkerError {
-                context: Some(context),
-                message: format!("document replica limit {MAX_DOCUMENT_REPLICAS} reached"),
+            return Response::WorkerRestartRequired(WorkerRestartRequired {
+                context,
+                reason: format!(
+                    "document identity limit {MAX_DOCUMENT_REPLICAS} reached; restart and resync"
+                ),
             });
         }
         *known_documents += 1;
@@ -1007,7 +1057,7 @@ fn close_document(
         .lock()
         .map_err(|_| "document replica lock is poisoned".to_string())
         .and_then(|replica| {
-            replica.validate_identity(&context)?;
+            replica.validate_lifetime(&context)?;
             Ok(())
         });
     if let Err(message) = validation {
@@ -1147,23 +1197,31 @@ where
         let closed_documents = Arc::clone(&closed_documents);
         let document_capacity = Arc::clone(&document_capacity);
         let lane_key = document_key(&request);
+        let is_sync = matches!(&request, Request::SyncDocument(_));
         let job: LaneJob = Box::new(move || {
-            let _ = responses.send((
-                handle_work(
-                    request,
-                    &documents,
-                    &closed_documents,
-                    &document_capacity,
-                    enqueued.elapsed(),
-                ),
-                Some(permit),
-            ));
+            let response = handle_work(
+                request,
+                &documents,
+                &closed_documents,
+                &document_capacity,
+                enqueued.elapsed(),
+            );
+            let action = if matches!(&response, Response::DocumentClosed(_)) {
+                LaneAction::Retire
+            } else if is_sync && matches!(&response, Response::DocumentAck(_)) {
+                LaneAction::Keep
+            } else {
+                LaneAction::Unchanged
+            };
+            let _ = responses.send((response, Some(permit)));
+            action
         });
         if let Some(lane_key) = lane_key {
-            let lane = document_lane(&document_lanes, lane_key);
-            lane.submit(&pool, job);
+            submit_document_job(&document_lanes, lane_key, &pool, job);
         } else {
-            pool.spawn(job);
+            pool.spawn(move || {
+                let _ = job();
+            });
         }
     }
     for _ in 0..max_inflight {
@@ -1604,6 +1662,7 @@ fn response_request_id(response: &Response) -> Option<u64> {
     match response {
         Response::DocumentAck(ack) => Some(ack.context.request_id),
         Response::DocumentClosed(closed) => Some(closed.context.request_id),
+        Response::WorkerRestartRequired(required) => Some(required.context.request_id),
         Response::Snapshot(snapshot) => Some(snapshot.context.request_id),
         Response::Error(error) => error.context.as_ref().map(|context| context.request_id),
         Response::HandshakeReady(_) => None,
@@ -1614,6 +1673,7 @@ fn response_context(response: &Response) -> Option<&RequestContext> {
     match response {
         Response::DocumentAck(ack) => Some(&ack.context),
         Response::DocumentClosed(closed) => Some(&closed.context),
+        Response::WorkerRestartRequired(required) => Some(&required.context),
         Response::Snapshot(snapshot) => Some(&snapshot.context),
         Response::Error(error) => error.context.as_ref(),
         Response::HandshakeReady(_) => None,
@@ -1718,9 +1778,10 @@ mod tests {
 
     use super::{
         ApplyDocumentEdits, BUILD_ID, ByteEdit, DeriveSnapshot, DocumentKey, DocumentLane,
-        DocumentReplica, GrammarKey, Handshake, HandshakeReady, LaneRegistry, PROTOCOL_VERSION,
-        Request, RequestContext, Response, Route, SyncDocument, WorkerError, decode_frame,
-        derive_snapshot_with_language, document_lane, encode_frame, route_response, run,
+        DocumentReplica, GrammarKey, Handshake, HandshakeReady, LaneAction, LaneRegistry,
+        MAX_DOCUMENT_REPLICAS, PROTOCOL_VERSION, Request, RequestContext, Response, Route,
+        SyncDocument, WorkerError, decode_frame, derive_snapshot_with_language, encode_frame,
+        route_response, run, submit_document_job, sync_document,
     };
 
     #[derive(Clone, Default)]
@@ -2125,6 +2186,7 @@ mod tests {
                 let released = released.lock().unwrap();
                 drop(changed.wait_while(released, |released| !*released).unwrap());
                 first_order.lock().unwrap().push(1);
+                LaneAction::Unchanged
             }),
         );
         let second_order = Arc::clone(&order);
@@ -2133,6 +2195,7 @@ mod tests {
             Box::new(move || {
                 second_order.lock().unwrap().push(2);
                 completed.send(()).unwrap();
+                LaneAction::Unchanged
             }),
         );
 
@@ -2150,21 +2213,51 @@ mod tests {
         let key = DocumentKey {
             uri: "file:///closed.rs".into(),
         };
-        let lane = document_lane(&registry, key);
         let (completed, completed_rx) = std::sync::mpsc::channel();
-        lane.submit(
+        submit_document_job(
+            &registry,
+            key,
             &pool,
             Box::new(move || {
                 completed.send(()).unwrap();
+                LaneAction::Retire
             }),
         );
-        drop(lane);
         completed_rx.recv_timeout(Duration::from_secs(5)).unwrap();
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
         while !registry.is_empty() && std::time::Instant::now() < deadline {
             std::thread::yield_now();
         }
         assert!(registry.is_empty(), "idle lane retained its URI key");
+    }
+
+    #[test]
+    fn live_document_lane_stays_registered_between_requests() {
+        let pool = Arc::new(rayon::ThreadPoolBuilder::new().build().unwrap());
+        let registry = Arc::new(LaneRegistry::new());
+        let key = DocumentKey {
+            uri: "file:///live.rs".into(),
+        };
+        let (completed, completed_rx) = std::sync::mpsc::channel();
+        submit_document_job(
+            &registry,
+            key,
+            &pool,
+            Box::new(move || {
+                completed.send(()).unwrap();
+                LaneAction::Keep
+            }),
+        );
+        completed_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while registry
+            .iter()
+            .any(|entry| entry.value().state.lock().unwrap().running)
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::yield_now();
+        }
+        assert_eq!(registry.len(), 1, "live lane was recreated after idle");
     }
 
     #[test]
@@ -2344,6 +2437,34 @@ mod tests {
                 .unwrap_err()
                 .contains("grammar change")
         );
+    }
+
+    #[test]
+    fn document_identity_limit_requests_a_worker_restart() {
+        let documents = Arc::new(dashmap::DashMap::new());
+        let closed_documents = Arc::new(dashmap::DashMap::new());
+        let capacity = Arc::new(Mutex::new(MAX_DOCUMENT_REPLICAS));
+        let response = sync_document(
+            SyncDocument {
+                context: RequestContext {
+                    request_id: 1,
+                    worker_generation: 3,
+                    uri: "file:///over-limit.rs".into(),
+                    incarnation: 5_000,
+                    content_version: 1,
+                    configuration_generation: 0,
+                },
+                language: "rust".into(),
+                grammar_symbol: "rust".into(),
+                parser_path: "/unused/rust".into(),
+                text: "fn main() {}".into(),
+            },
+            &documents,
+            &closed_documents,
+            &capacity,
+        );
+
+        assert!(matches!(response, Response::WorkerRestartRequired(_)));
     }
 
     #[test]
