@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 use std::{
     cell::RefCell,
     collections::{HashMap, VecDeque},
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, Weak},
 };
 
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -19,6 +19,7 @@ use sha2::{Digest, Sha256};
 
 pub const PROTOCOL_VERSION: u32 = 2;
 pub const MAX_FRAME_BYTES: usize = 64 * 1024 * 1024;
+pub const MAX_DOCUMENT_REPLICAS: usize = 4_096;
 pub const BUILD_ID: &str = concat!(env!("CARGO_PKG_NAME"), "-", env!("CARGO_PKG_VERSION"));
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -275,7 +276,12 @@ impl DocumentReplica {
         Ok(())
     }
 
-    fn validate_replacement(&self, context: &RequestContext) -> Result<(), String> {
+    fn validate_replacement(
+        &self,
+        context: &RequestContext,
+        language: &str,
+        grammar_key: &GrammarKey,
+    ) -> Result<(), String> {
         if context.worker_generation != self.context.worker_generation
             || context.uri != self.context.uri
         {
@@ -285,6 +291,14 @@ impl DocumentReplica {
             return Err("full sync targets a stale document incarnation".into());
         }
         if context.incarnation == self.context.incarnation {
+            if language != self.language {
+                return Err("language change requires a new document incarnation".into());
+            }
+            if grammar_key != &self.grammar_key
+                && context.configuration_generation <= self.context.configuration_generation
+            {
+                return Err("grammar change requires a newer configuration generation".into());
+            }
             if context.configuration_generation < self.context.configuration_generation {
                 return Err("full sync targets a stale configuration generation".into());
             }
@@ -615,11 +629,13 @@ impl From<&RequestContext> for DocumentKey {
 }
 
 type DocumentStore = Arc<dashmap::DashMap<DocumentKey, Arc<Mutex<DocumentReplica>>>>;
+type ClosedDocuments = Arc<dashmap::DashMap<DocumentKey, u64>>;
 type LaneJob = Box<dyn FnOnce() + Send + 'static>;
 
-#[derive(Default)]
 struct DocumentLane {
     state: Mutex<DocumentLaneState>,
+    key: Option<DocumentKey>,
+    registry: Weak<LaneRegistry>,
 }
 
 #[derive(Default)]
@@ -629,6 +645,23 @@ struct DocumentLaneState {
 }
 
 impl DocumentLane {
+    fn new(key: DocumentKey, registry: Weak<LaneRegistry>) -> Self {
+        Self {
+            state: Mutex::new(DocumentLaneState::default()),
+            key: Some(key),
+            registry,
+        }
+    }
+
+    #[cfg(test)]
+    fn detached() -> Self {
+        Self {
+            state: Mutex::new(DocumentLaneState::default()),
+            key: None,
+            registry: Weak::new(),
+        }
+    }
+
     fn submit(self: &Arc<Self>, pool: &Arc<rayon::ThreadPool>, job: LaneJob) {
         let should_start = {
             let mut state = self
@@ -669,18 +702,46 @@ impl DocumentLane {
     }
 }
 
-type DocumentLanes = Arc<dashmap::DashMap<DocumentKey, Arc<DocumentLane>>>;
+impl Drop for DocumentLane {
+    fn drop(&mut self) {
+        let (Some(key), Some(registry)) = (&self.key, self.registry.upgrade()) else {
+            return;
+        };
+        if let dashmap::mapref::entry::Entry::Occupied(entry) = registry.entry(key.clone())
+            && std::ptr::eq(entry.get().as_ptr(), self)
+        {
+            entry.remove();
+        }
+    }
+}
 
-fn handle_work(request: Request, documents: &DocumentStore, queue_wait: Duration) -> Response {
+type LaneRegistry = dashmap::DashMap<DocumentKey, Weak<DocumentLane>>;
+type DocumentLanes = Arc<LaneRegistry>;
+
+fn document_lane(lanes: &DocumentLanes, key: DocumentKey) -> Arc<DocumentLane> {
+    if let Some(lane) = lanes.get(&key).and_then(|entry| entry.value().upgrade()) {
+        return lane;
+    }
+    let lane = Arc::new(DocumentLane::new(key.clone(), Arc::downgrade(lanes)));
+    lanes.insert(key, Arc::downgrade(&lane));
+    lane
+}
+
+fn handle_work(
+    request: Request,
+    documents: &DocumentStore,
+    closed_documents: &ClosedDocuments,
+    queue_wait: Duration,
+) -> Response {
     match request {
         Request::DeriveSnapshot(request) => derive_snapshot(request, queue_wait),
-        Request::SyncDocument(request) => sync_document(request, documents),
+        Request::SyncDocument(request) => sync_document(request, documents, closed_documents),
         Request::ApplyDocumentEdits(request) => apply_document_edits(request, documents),
         Request::ApplyDocumentEditsAndDerive(request) => {
             apply_document_edits_and_derive(request, documents)
         }
         Request::DeriveDocumentSnapshot(request) => derive_document_snapshot(request, documents),
-        Request::CloseDocument(request) => close_document(request, documents),
+        Request::CloseDocument(request) => close_document(request, documents, closed_documents),
         Request::Handshake(_) => Response::Error(WorkerError {
             context: None,
             message: "handshake may only be sent once".into(),
@@ -711,24 +772,13 @@ fn document_key(request: &Request) -> Option<DocumentKey> {
     }
 }
 
-fn sync_document(request: SyncDocument, documents: &DocumentStore) -> Response {
+fn sync_document(
+    request: SyncDocument,
+    documents: &DocumentStore,
+    closed_documents: &ClosedDocuments,
+) -> Response {
     let context = request.context.clone();
     let document_key = DocumentKey::from(&context);
-    if let Some(existing) = documents
-        .get(&document_key)
-        .map(|entry| Arc::clone(entry.value()))
-    {
-        let validation = existing
-            .lock()
-            .map_err(|_| "document replica lock is poisoned".to_string())
-            .and_then(|replica| replica.validate_replacement(&context));
-        if let Err(message) = validation {
-            return Response::Error(WorkerError {
-                context: Some(context),
-                message,
-            });
-        }
-    }
     let grammar_key = GrammarKey {
         parser_path: request
             .parser_path
@@ -736,6 +786,40 @@ fn sync_document(request: SyncDocument, documents: &DocumentStore) -> Response {
             .unwrap_or_else(|_| request.parser_path.clone()),
         grammar_symbol: request.grammar_symbol.clone(),
     };
+    if let Some(existing) = documents
+        .get(&document_key)
+        .map(|entry| Arc::clone(entry.value()))
+    {
+        let validation = existing
+            .lock()
+            .map_err(|_| "document replica lock is poisoned".to_string())
+            .and_then(|replica| {
+                replica.validate_replacement(&context, &request.language, &grammar_key)
+            });
+        if let Err(message) = validation {
+            return Response::Error(WorkerError {
+                context: Some(context),
+                message,
+            });
+        }
+    } else {
+        if let Some(closed_incarnation) = closed_documents.get(&document_key)
+            && context.incarnation <= *closed_incarnation
+        {
+            return Response::Error(WorkerError {
+                context: Some(context),
+                message: "full sync targets a closed document incarnation".into(),
+            });
+        }
+        if documents.len() + closed_documents.len() >= MAX_DOCUMENT_REPLICAS
+            && !closed_documents.contains_key(&document_key)
+        {
+            return Response::Error(WorkerError {
+                context: Some(context),
+                message: format!("document replica limit {MAX_DOCUMENT_REPLICAS} reached"),
+            });
+        }
+    }
     WORKER_THREAD_STATE.with(|state| {
         state
             .borrow_mut()
@@ -745,6 +829,7 @@ fn sync_document(request: SyncDocument, documents: &DocumentStore) -> Response {
                 |parser, _| match DocumentReplica::sync(request, parser) {
                     Ok((replica, ack)) => {
                         documents.insert(document_key, Arc::new(Mutex::new(replica)));
+                        closed_documents.remove(&DocumentKey::from(&ack.context));
                         Response::DocumentAck(ack)
                     }
                     Err(message) => Response::Error(WorkerError {
@@ -884,7 +969,11 @@ fn derive_document_snapshot(
     }
 }
 
-fn close_document(request: CloseDocument, documents: &DocumentStore) -> Response {
+fn close_document(
+    request: CloseDocument,
+    documents: &DocumentStore,
+    closed_documents: &ClosedDocuments,
+) -> Response {
     let context = request.context;
     let document_key = DocumentKey::from(&context);
     let Some(replica) = documents
@@ -901,9 +990,6 @@ fn close_document(request: CloseDocument, documents: &DocumentStore) -> Response
         .map_err(|_| "document replica lock is poisoned".to_string())
         .and_then(|replica| {
             replica.validate_identity(&context)?;
-            if replica.context.content_version != context.content_version {
-                return Err("close targets a stale content version".into());
-            }
             Ok(())
         });
     if let Err(message) = validation {
@@ -913,6 +999,7 @@ fn close_document(request: CloseDocument, documents: &DocumentStore) -> Response
         });
     }
     documents.remove(&document_key);
+    closed_documents.insert(document_key, context.incarnation);
     Response::DocumentClosed(DocumentClosed { context })
 }
 
@@ -1010,6 +1097,7 @@ where
         .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "worker writer stopped"))?;
 
     let documents = Arc::new(dashmap::DashMap::new());
+    let closed_documents = Arc::new(dashmap::DashMap::new());
     let document_lanes: DocumentLanes = Arc::new(dashmap::DashMap::new());
     while let Some(request) = decode_frame::<_, Request>(&mut reader)? {
         let Some(context) = request_context(&request) else {
@@ -1037,20 +1125,16 @@ where
         let responses = responses.clone();
         let permit = AdmissionPermit(permits.clone());
         let documents = Arc::clone(&documents);
+        let closed_documents = Arc::clone(&closed_documents);
         let lane_key = document_key(&request);
         let job: LaneJob = Box::new(move || {
             let _ = responses.send((
-                handle_work(request, &documents, enqueued.elapsed()),
+                handle_work(request, &documents, &closed_documents, enqueued.elapsed()),
                 Some(permit),
             ));
         });
         if let Some(lane_key) = lane_key {
-            let lane = Arc::clone(
-                document_lanes
-                    .entry(lane_key)
-                    .or_insert_with(|| Arc::new(DocumentLane::default()))
-                    .value(),
-            );
+            let lane = document_lane(&document_lanes, lane_key);
             lane.submit(&pool, job);
         } else {
             pool.spawn(job);
@@ -1607,10 +1691,10 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        ApplyDocumentEdits, BUILD_ID, ByteEdit, DeriveSnapshot, DocumentLane, DocumentReplica,
-        Handshake, HandshakeReady, PROTOCOL_VERSION, Request, RequestContext, Response, Route,
-        SyncDocument, WorkerError, decode_frame, derive_snapshot_with_language, encode_frame,
-        route_response, run,
+        ApplyDocumentEdits, BUILD_ID, ByteEdit, DeriveSnapshot, DocumentKey, DocumentLane,
+        DocumentReplica, GrammarKey, Handshake, HandshakeReady, LaneRegistry, PROTOCOL_VERSION,
+        Request, RequestContext, Response, Route, SyncDocument, WorkerError, decode_frame,
+        derive_snapshot_with_language, document_lane, encode_frame, route_response, run,
     };
 
     #[derive(Clone, Default)]
@@ -2001,7 +2085,7 @@ mod tests {
                 .build()
                 .unwrap(),
         );
-        let lane = Arc::new(DocumentLane::default());
+        let lane = Arc::new(DocumentLane::detached());
         let gate = Arc::new((Mutex::new(false), Condvar::new()));
         let order = Arc::new(Mutex::new(Vec::new()));
         let (completed, completed_rx) = std::sync::mpsc::channel();
@@ -2031,6 +2115,30 @@ mod tests {
         gate.1.notify_all();
         completed_rx.recv_timeout(Duration::from_secs(5)).unwrap();
         assert_eq!(*order.lock().unwrap(), [1, 2]);
+    }
+
+    #[test]
+    fn idle_document_lane_removes_its_registry_key() {
+        let pool = Arc::new(rayon::ThreadPoolBuilder::new().build().unwrap());
+        let registry = Arc::new(LaneRegistry::new());
+        let key = DocumentKey {
+            uri: "file:///closed.rs".into(),
+        };
+        let lane = document_lane(&registry, key);
+        let (completed, completed_rx) = std::sync::mpsc::channel();
+        lane.submit(
+            &pool,
+            Box::new(move || {
+                completed.send(()).unwrap();
+            }),
+        );
+        drop(lane);
+        completed_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !registry.is_empty() && std::time::Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        assert!(registry.is_empty(), "idle lane retained its URI key");
     }
 
     #[test]
@@ -2159,9 +2267,56 @@ mod tests {
 
         assert!(
             replica
-                .validate_replacement(&stale)
+                .validate_replacement(&stale, &replica.language, &replica.grammar_key)
                 .unwrap_err()
                 .contains("stale content version")
+        );
+    }
+
+    #[test]
+    fn document_replica_fences_language_and_grammar_replacement() {
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_rust::LANGUAGE.into())
+            .unwrap();
+        let context = RequestContext {
+            request_id: 1,
+            worker_generation: 3,
+            uri: "file:///replacement.rs".into(),
+            incarnation: 4,
+            content_version: 3,
+            configuration_generation: 2,
+        };
+        let (replica, _) = DocumentReplica::sync(
+            SyncDocument {
+                context: context.clone(),
+                language: "rust".into(),
+                grammar_symbol: "rust".into(),
+                parser_path: "/unused/rust".into(),
+                text: "fn current() {}".into(),
+            },
+            &mut parser,
+        )
+        .unwrap();
+        let mut replacement = context;
+        replacement.request_id = 2;
+        replacement.content_version = 4;
+
+        assert!(
+            replica
+                .validate_replacement(&replacement, "python", &replica.grammar_key)
+                .unwrap_err()
+                .contains("language change")
+        );
+        let different_grammar = GrammarKey {
+            parser_path: "/unused/other-rust".into(),
+            grammar_symbol: "rust".into(),
+        };
+        assert!(
+            replica
+                .validate_replacement(&replacement, "rust", &different_grammar)
+                .unwrap_err()
+                .contains("grammar change")
         );
     }
 

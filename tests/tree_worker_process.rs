@@ -137,7 +137,7 @@ fn real_worker_derives_a_snapshot_from_an_installed_grammar() {
             },
             language: "rust".into(),
             grammar_symbol: "rust".into(),
-            parser_path: parser,
+            parser_path: parser.clone(),
             text: "fn main() { let x = 1; }".into(),
         })
         .unwrap();
@@ -174,7 +174,7 @@ fn real_worker_keeps_document_text_and_tree_across_incremental_edits() {
             context: context.clone(),
             language: "rust".into(),
             grammar_symbol: "rust".into(),
-            parser_path: parser,
+            parser_path: parser.clone(),
             text: "fn main() { 1 }".into(),
         })
         .unwrap();
@@ -213,6 +213,7 @@ fn real_worker_keeps_document_text_and_tree_across_incremental_edits() {
 
     let mut closed = snapshot.context;
     closed.request_id = 33;
+    closed.content_version = 3;
     let response = worker
         .close_document(CloseDocument {
             context: closed.clone(),
@@ -221,6 +222,21 @@ fn real_worker_keeps_document_text_and_tree_across_incremental_edits() {
     assert!(matches!(response, Response::DocumentClosed(_)));
 
     closed.request_id = 34;
+    let response = worker
+        .sync_document(SyncDocument {
+            context: closed.clone(),
+            language: "rust".into(),
+            grammar_symbol: "rust".into(),
+            parser_path: parser,
+            text: "fn stale() {}".into(),
+        })
+        .unwrap();
+    let Response::Error(error) = response else {
+        panic!("stale full sync must not resurrect a closed document: {response:?}");
+    };
+    assert!(error.message.contains("closed document incarnation"));
+
+    closed.request_id = 35;
     let response = worker
         .derive_document_snapshot(DeriveDocumentSnapshot { context: closed })
         .unwrap();
