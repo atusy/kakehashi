@@ -7,8 +7,8 @@
     "rustc": "rustc 1.95.0 (59807616e 2026-04-14)",
     "profile": "release",
     "features": ["e2e"],
-    "source_commit": "de6343766e4d9669c71066081f519d6111fdd8a0",
-    "binary_sha256": "30ad55b1d67f6a34edf31cb32e791f3e9869607b32ca32519d9c4f777b031401"
+    "source_commit": "0d6763b36f1aa6bb32576f9b5882514678e30805",
+    "binary_sha256": "d75ff167c973a17e3d1f842284c376eee794f0672f9f9aeac8e8cca4012aaad6"
   },
   "method": {
     "trials_per_scenario": 5,
@@ -22,39 +22,39 @@
     "systemic_one_document": {
       "open_documents": 1,
       "resynced_bytes": 34,
-      "recovery_ms": [529, 551, 547, 494, 615],
-      "median_ms": 547,
-      "mean_ms": 547.2,
-      "min_ms": 494,
-      "max_ms": 615
+      "recovery_ms": [557, 625, 515, 508, 512],
+      "median_ms": 515,
+      "mean_ms": 543.4,
+      "min_ms": 508,
+      "max_ms": 625
     },
     "systemic_many_documents": {
       "open_documents": 17,
       "resynced_bytes": 248037,
-      "recovery_ms": [509, 538, 512, 529, 527],
-      "median_ms": 527,
-      "mean_ms": 523.0,
-      "min_ms": 509,
-      "max_ms": 538
+      "recovery_ms": [517, 522, 522, 527, 543],
+      "median_ms": 522,
+      "mean_ms": 526.2,
+      "min_ms": 517,
+      "max_ms": 543
     },
     "request_crash_with_grammar_quarantine": {
       "open_documents": 1,
       "resynced_documents": 0,
       "resynced_bytes": 0,
-      "recovery_ms": [501, 601, 477, 553, 490],
-      "median_ms": 501,
-      "mean_ms": 524.4,
-      "min_ms": 477,
-      "max_ms": 601
+      "recovery_ms": [600, 486, 550, 500, 504],
+      "median_ms": 504,
+      "mean_ms": 528.0,
+      "min_ms": 486,
+      "max_ms": 600
     },
     "idle_process_exit": {
       "open_documents": 0,
       "resynced_bytes": 0,
-      "recovery_ms": [476, 499, 481, 486, 497],
-      "median_ms": 486,
-      "mean_ms": 487.8,
-      "min_ms": 476,
-      "max_ms": 499
+      "recovery_ms": [493, 503, 476, 550, 470],
+      "median_ms": 493,
+      "mean_ms": 498.4,
+      "min_ms": 470,
+      "max_ms": 550
     }
   }
 }

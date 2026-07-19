@@ -17,8 +17,8 @@ persisted and therefore does not create a next-start blacklist.
 The committed raw result is
 `benches/profile/results/single_worker_stage4_recovery_2026-07-19.json`. The
 release binary was built with the `e2e` feature from commit
-`de6343766e4d9669c71066081f519d6111fdd8a0` and has SHA-256
-`30ad55b1d67f6a34edf31cb32e791f3e9869607b32ca32519d9c4f777b031401`.
+`0d6763b36f1aa6bb32576f9b5882514678e30805` and has SHA-256
+`d75ff167c973a17e3d1f842284c376eee794f0672f9f9aeac8e8cca4012aaad6`.
 The run used an Apple M4, macOS 26.5.1, Rust 1.95.0, and four worker compute
 threads.
 
@@ -33,13 +33,13 @@ polls at 250 ms, so up to another 250 ms precedes the logged recovery interval.
 
 | Scenario | Replayed documents / bytes | Recovery median | Mean | Range |
 |---|---:|---:|---:|---:|
-| Explicit systemic restart | 1 / 34 B | 547 ms | 547.2 ms | 494--615 ms |
-| Explicit systemic restart, larger session | 17 / 248,037 B | 527 ms | 523.0 ms | 509--538 ms |
-| Request-time process crash, implicated grammar quarantined | 0 / 0 B | 501 ms | 524.4 ms | 477--601 ms |
-| Idle process exit | 0 / 0 B | 486 ms | 487.8 ms | 476--499 ms |
+| Explicit systemic restart | 1 / 34 B | 515 ms | 543.4 ms | 508--625 ms |
+| Explicit systemic restart, larger session | 17 / 248,037 B | 522 ms | 526.2 ms | 517--543 ms |
+| Request-time process crash, implicated grammar quarantined | 0 / 0 B | 504 ms | 528.0 ms | 486--600 ms |
+| Idle process exit | 0 / 0 B | 493 ms | 498.4 ms | 470--550 ms |
 
 The 17-document replay did not measure slower than the one-document replay;
-their ranges overlap and the larger replay's median was 20 ms lower. At this
+their ranges overlap and the larger replay's median was only 7 ms higher. At this
 scale, replaying roughly 248 KB is below run-to-run worker cleanup and spawn
 jitter. The fixed 250 ms backoff plus cleanup, process creation, binary digest,
 handshake, and parser loading dominates the observed roughly 0.5 second
