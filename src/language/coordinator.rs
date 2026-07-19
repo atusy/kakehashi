@@ -652,8 +652,17 @@ impl LanguageCoordinator {
         } else {
             for kind in QueryKind::ALL {
                 if let Some(query) = self.query_store.get_query(kind, base_name) {
-                    self.query_store
-                        .insert_query(kind, derived_name.to_string(), query);
+                    if let Some(source) = self.query_store.query_source(kind, base_name) {
+                        self.query_store.insert_query_with_source(
+                            kind,
+                            derived_name.to_string(),
+                            query,
+                            source.to_string(),
+                        );
+                    } else {
+                        self.query_store
+                            .insert_query(kind, derived_name.to_string(), query);
+                    }
                 }
             }
         }
@@ -1027,7 +1036,9 @@ impl LanguageCoordinator {
                 },
                 context,
                 events,
-                |store, query| store.insert_query(query_kind, lang_name.to_string(), query),
+                |store, query, source| {
+                    store.insert_query_with_source(query_kind, lang_name.to_string(), query, source)
+                },
             );
         }
     }
@@ -1040,7 +1051,7 @@ impl LanguageCoordinator {
         ctx: QueryLoadContext<'_>,
         context: &str,
         events: &mut Vec<LanguageEvent>,
-        insert_fn: impl FnOnce(&QueryStore, Arc<tree_sitter::Query>),
+        insert_fn: impl FnOnce(&QueryStore, Arc<tree_sitter::Query>, String),
     ) {
         let filename = ctx.query_kind.filename();
         let result = match QueryLoader::load_query_with_inheritance(
@@ -1076,7 +1087,7 @@ impl LanguageCoordinator {
         paths: &[P],
         ctx: QueryLoadContext<'_>,
         events: &mut Vec<LanguageEvent>,
-        insert_fn: impl FnOnce(&QueryStore, Arc<tree_sitter::Query>),
+        insert_fn: impl FnOnce(&QueryStore, Arc<tree_sitter::Query>, String),
     ) {
         let result = match QueryLoader::load_query_from_paths(language, paths) {
             Ok(r) => r,
@@ -1109,7 +1120,7 @@ impl LanguageCoordinator {
         query_label: &str,
         success_prefix: &str,
         events: &mut Vec<LanguageEvent>,
-        insert_fn: impl FnOnce(&QueryStore, Arc<tree_sitter::Query>),
+        insert_fn: impl FnOnce(&QueryStore, Arc<tree_sitter::Query>, String),
     ) {
         // Log warnings for skipped patterns
         for skipped in &result.skipped {
@@ -1130,9 +1141,9 @@ impl LanguageCoordinator {
             ));
         }
 
-        match result.query {
-            Some(query) => {
-                insert_fn(&self.query_store, Arc::new(query));
+        match (result.query, result.compiled_source) {
+            (Some(query), Some(source)) => {
+                insert_fn(&self.query_store, Arc::new(query), source);
                 let skipped_count = result.skipped.len();
                 let msg = if skipped_count > 0 {
                     format!("{success_prefix} ({skipped_count} pattern(s) skipped)")
@@ -1141,7 +1152,7 @@ impl LanguageCoordinator {
                 };
                 events.push(LanguageEvent::log(LanguageLogLevel::Info, msg));
             }
-            None => {
+            _ => {
                 if let Some(reason) = &result.failure_reason {
                     let msg = match reason {
                         ParseFailure::PatternSplitFailed(err) => {
@@ -1787,7 +1798,14 @@ impl LanguageCoordinator {
                         query_kind,
                     },
                     &mut events,
-                    |store, q| store.insert_query(query_kind, lang_name.to_string(), q),
+                    |store, query, source| {
+                        store.insert_query_with_source(
+                            query_kind,
+                            lang_name.to_string(),
+                            query,
+                            source,
+                        )
+                    },
                 );
             }
         }

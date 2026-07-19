@@ -56,6 +56,10 @@ pub(crate) enum ParseFailure {
 pub(crate) struct ParseResult {
     /// The successfully compiled query (None if all patterns failed)
     pub query: Option<Query>,
+    /// Exact source used to compile `query` after tolerant invalid-pattern
+    /// removal. This is retained so an isolated worker can reconstruct the
+    /// same query rather than re-reading mutable files.
+    pub compiled_source: Option<String>,
     /// Patterns that were skipped due to errors
     pub skipped: Vec<SkippedPattern>,
     /// If `query` is `None`, this indicates why parsing failed.
@@ -262,6 +266,7 @@ impl QueryLoader {
         if let Ok(query) = Query::new(language, query_str) {
             return ParseResult {
                 query: Some(query),
+                compiled_source: Some(query_str.to_string()),
                 skipped: Vec::new(),
                 failure_reason: None,
                 used_inheritance,
@@ -277,6 +282,7 @@ impl QueryLoader {
                 warn!("Failed to split query patterns: {}", reason);
                 return ParseResult {
                     query: None,
+                    compiled_source: None,
                     skipped: Vec::new(),
                     failure_reason: Some(ParseFailure::PatternSplitFailed(reason)),
                     used_inheritance,
@@ -307,6 +313,7 @@ impl QueryLoader {
         if valid_patterns.is_empty() {
             return ParseResult {
                 query: None,
+                compiled_source: None,
                 skipped,
                 failure_reason: Some(ParseFailure::AllPatternsInvalid),
                 used_inheritance,
@@ -317,6 +324,7 @@ impl QueryLoader {
         match Query::new(language, &combined) {
             Ok(q) => ParseResult {
                 query: Some(q),
+                compiled_source: Some(combined),
                 skipped,
                 failure_reason: None,
                 used_inheritance,
@@ -331,6 +339,7 @@ impl QueryLoader {
                 );
                 ParseResult {
                     query: None,
+                    compiled_source: None,
                     skipped,
                     failure_reason: Some(ParseFailure::CombinationFailed(e.message)),
                     used_inheritance,

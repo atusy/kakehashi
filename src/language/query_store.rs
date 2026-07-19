@@ -9,6 +9,7 @@ pub(crate) struct QueryStore {
     highlight_queries: RwLock<HashMap<String, Arc<Query>>>,
     bindings_queries: RwLock<HashMap<String, Arc<Query>>>,
     injection_queries: RwLock<HashMap<String, Arc<Query>>>,
+    query_sources: RwLock<HashMap<(String, QueryKind), Arc<str>>>,
 }
 
 impl QueryStore {
@@ -17,6 +18,7 @@ impl QueryStore {
             highlight_queries: RwLock::new(HashMap::new()),
             bindings_queries: RwLock::new(HashMap::new()),
             injection_queries: RwLock::new(HashMap::new()),
+            query_sources: RwLock::new(HashMap::new()),
         }
     }
 
@@ -35,6 +37,10 @@ impl QueryStore {
             .write()
             .recover_poison(format_args!("QueryStore::remove_queries({})", lang_name))
             .remove(lang_name);
+        self.query_sources
+            .write()
+            .recover_poison(format_args!("QueryStore::remove_queries({})", lang_name))
+            .retain(|(language, _), _| language != lang_name);
         self.bindings_queries
             .write()
             .recover_poison(format_args!("QueryStore::remove_queries({})", lang_name))
@@ -106,6 +112,30 @@ impl QueryStore {
             QueryKind::Bindings => self.insert_bindings_query(lang_name, query),
             QueryKind::Injections => self.insert_injection_query(lang_name, query),
         }
+    }
+
+    pub(crate) fn insert_query_with_source(
+        &self,
+        kind: QueryKind,
+        lang_name: String,
+        query: Arc<Query>,
+        source: String,
+    ) {
+        self.insert_query(kind, lang_name.clone(), query);
+        self.query_sources
+            .write()
+            .recover_poison(format_args!(
+                "QueryStore::insert_query_with_source({lang_name})"
+            ))
+            .insert((lang_name, kind), Arc::from(source));
+    }
+
+    pub(crate) fn query_source(&self, kind: QueryKind, lang_name: &str) -> Option<Arc<str>> {
+        self.query_sources
+            .read()
+            .recover_poison(format_args!("QueryStore::query_source({lang_name})"))
+            .get(&(lang_name.to_string(), kind))
+            .cloned()
     }
 
     /// Get a query by kind, dispatching to the appropriate store.
