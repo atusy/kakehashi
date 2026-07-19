@@ -5,6 +5,7 @@ import sys
 import time
 import unittest
 import subprocess
+from unittest import mock
 
 sys.path.insert(0, str(pathlib.Path(__file__).parent))
 
@@ -104,6 +105,15 @@ class RequestSummaryTest(unittest.TestCase):
         self.assertEqual(server.actions, [
             "terminate", ("wait", 0.25), "kill", ("wait", None),
         ])
+
+    def test_server_termination_tolerates_exit_after_poll(self):
+        server = mock.Mock()
+        server.poll.return_value = None
+        server.terminate.side_effect = ProcessLookupError("already exited")
+
+        terminate_server(server)
+
+        server.wait.assert_not_called()
 
     @unittest.skipUnless(
         os.name == "posix" and hasattr(signal, "SIGTERM"),

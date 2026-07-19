@@ -226,7 +226,10 @@ def terminate_server(server, timeout_seconds=3):
     """Give a server (and relay cleanup handler) a bounded graceful exit."""
     if server.poll() is not None:
         return
-    server.terminate()
+    try:
+        server.terminate()
+    except ProcessLookupError:
+        return
     try:
         server.wait(timeout=timeout_seconds)
     except subprocess.TimeoutExpired:
