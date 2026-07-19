@@ -13,6 +13,7 @@ from attest_worker_binary import (
     archive_source,
     controlled_build_environment,
     environment_tool_version,
+    fetch_verified_remote_commit,
     git,
     isolated_local_git_environment,
     native_toolchain_metadata,
@@ -172,6 +173,47 @@ class BinaryAttestationTest(unittest.TestCase):
             self.assertEqual(
                 (destination / "source.txt").read_text(), "attested"
             )
+
+    def test_remote_source_archive_ignores_local_info_attributes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            remote = root / "remote.git"
+            checkout = root / "checkout"
+            fetched = root / "fetched.git"
+            destination = root / "isolated/source"
+            subprocess.run(["git", "init", "--bare", "-q", remote], check=True)
+            subprocess.run(["git", "init", "-q", checkout], check=True)
+            source = checkout / "source.txt"
+            source.write_text("attested")
+            subprocess.run(["git", "-C", checkout, "add", "."], check=True)
+            subprocess.run(
+                [
+                    "git", "-C", checkout,
+                    "-c", "user.name=benchmark-test",
+                    "-c", "user.email=benchmark@example.invalid",
+                    "commit", "-qm", "attested",
+                ],
+                check=True,
+            )
+            revision = subprocess.run(
+                ["git", "-C", checkout, "rev-parse", "HEAD"],
+                check=True, text=True, stdout=subprocess.PIPE,
+            ).stdout.strip()
+            subprocess.run(
+                [
+                    "git", "-C", checkout, "push", "-q", str(remote),
+                    "HEAD:refs/heads/main",
+                ],
+                check=True,
+            )
+            info_attributes = checkout / ".git/info/attributes"
+            info_attributes.parent.mkdir(exist_ok=True)
+            info_attributes.write_text("source.txt export-ignore\n")
+
+            fetch_verified_remote_commit(str(remote), revision, fetched)
+            archive_source(fetched, revision, destination)
+
+            self.assertEqual((destination / "source.txt").read_text(), "attested")
 
     def test_source_archive_extraction_supports_python_without_data_filter(self):
         source = mock.Mock()

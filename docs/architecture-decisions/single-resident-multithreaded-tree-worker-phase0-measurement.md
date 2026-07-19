@@ -126,7 +126,9 @@ end-to-end cycle times are nevertheless disclosed below.
 | Markdown injections | 2022.1 ms | 2041.1 ms | +19.0 ms (+190 µs/cycle) | [-73.9, 108.5] ms |
 
 Batch B measured Rust at -8.3 ms [-20.8, 4.6] and Markdown at +16.8 ms
-[-32.3, 63.3]. Neither edit-cycle effect repeats across batches.
+[-32.3, 63.3]. Markdown's positive point estimate repeats, but both intervals
+cross zero; Rust changes direction. Neither scenario establishes a stable
+edit-cycle effect across batches.
 This experiment cannot attribute either difference to pipe transport: every cycle includes the fixed edit-settle delay,
 parse scheduling, derivation, response relay, and parent/child scheduling. The
 real worker benchmark must separate enqueue, queue, compute, serialization, and
