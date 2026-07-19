@@ -3,8 +3,8 @@ use std::time::Instant;
 
 use clap::Parser;
 use kakehashi::tree_worker::{
-    ApplyDocumentEdits, ByteEdit, Client, DeriveDocumentSnapshot, LocalDocumentReplica, Request,
-    RequestContext, Response, SyncDocument, encode_frame,
+    ApplyDocumentEdits, ApplyDocumentEditsAndDerive, ByteEdit, Client, DeriveDocumentSnapshot,
+    LocalDocumentReplica, Request, RequestContext, Response, SyncDocument, encode_frame,
 };
 use serde_json::json;
 
@@ -57,6 +57,15 @@ fn edit_request(request_id: u64, version: u64, marker: usize) -> ApplyDocumentEd
     }
 }
 
+fn fused_request(request_id: u64, version: u64, marker: usize) -> ApplyDocumentEditsAndDerive {
+    let request = edit_request(request_id, version, marker);
+    ApplyDocumentEditsAndDerive {
+        context: request.context,
+        base_version: request.base_version,
+        edits: request.edits,
+    }
+}
+
 fn expect_ack(response: Response) {
     match response {
         Response::DocumentAck(ack) if ack.incremental => {}
@@ -81,16 +90,9 @@ fn direct_round(direct: &mut LocalDocumentReplica, version: u64, marker: usize) 
 
 fn worker_round(worker: &Client, version: u64, marker: usize) -> u64 {
     let started = Instant::now();
-    expect_ack(
-        worker
-            .apply_document_edits(edit_request(version * 2, version, marker))
-            .unwrap(),
-    );
     expect_snapshot(
         worker
-            .derive_document_snapshot(DeriveDocumentSnapshot {
-                context: context(version * 2 + 1, version),
-            })
+            .apply_document_edits_and_derive(fused_request(version * 2, version, marker))
             .unwrap(),
     );
     started.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64
@@ -164,6 +166,12 @@ fn main() {
         }),
     )
     .unwrap();
+    let mut fused_frame = Vec::new();
+    encode_frame(
+        &mut fused_frame,
+        &Request::ApplyDocumentEditsAndDerive(fused_request(2, 2, marker)),
+    )
+    .unwrap();
     worker.shutdown().unwrap();
 
     println!(
@@ -176,6 +184,7 @@ fn main() {
             "source_bytes": text.len(),
             "apply_frame_bytes": apply_frame.len(),
             "derive_frame_bytes": derive_frame.len(),
+            "fused_apply_and_derive_frame_bytes": fused_frame.len(),
             "spawn_us": spawn_us,
             "sync": {
                 "direct_us": direct_sync_us,

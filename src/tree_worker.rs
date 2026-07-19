@@ -71,6 +71,13 @@ pub struct ApplyDocumentEdits {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ApplyDocumentEditsAndDerive {
+    pub context: RequestContext,
+    pub base_version: u64,
+    pub edits: Vec<ByteEdit>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct DeriveDocumentSnapshot {
     pub context: RequestContext,
 }
@@ -88,6 +95,7 @@ pub enum Request {
     DeriveSnapshot(DeriveSnapshot),
     SyncDocument(SyncDocument),
     ApplyDocumentEdits(ApplyDocumentEdits),
+    ApplyDocumentEditsAndDerive(ApplyDocumentEditsAndDerive),
     DeriveDocumentSnapshot(DeriveDocumentSnapshot),
 }
 
@@ -575,6 +583,9 @@ fn handle_work(request: Request, documents: &DocumentStore, queue_wait: Duration
         Request::DeriveSnapshot(request) => derive_snapshot(request, queue_wait),
         Request::SyncDocument(request) => sync_document(request, documents),
         Request::ApplyDocumentEdits(request) => apply_document_edits(request, documents),
+        Request::ApplyDocumentEditsAndDerive(request) => {
+            apply_document_edits_and_derive(request, documents)
+        }
         Request::DeriveDocumentSnapshot(request) => derive_document_snapshot(request, documents),
         Request::Handshake(_) => Response::Error(WorkerError {
             context: None,
@@ -589,6 +600,7 @@ fn request_context(request: &Request) -> Option<&RequestContext> {
         Request::DeriveSnapshot(request) => Some(&request.context),
         Request::SyncDocument(request) => Some(&request.context),
         Request::ApplyDocumentEdits(request) => Some(&request.context),
+        Request::ApplyDocumentEditsAndDerive(request) => Some(&request.context),
         Request::DeriveDocumentSnapshot(request) => Some(&request.context),
     }
 }
@@ -653,6 +665,62 @@ fn apply_document_edits(request: ApplyDocumentEdits, documents: &DocumentStore) 
                 };
                 match replica.apply(request, parser) {
                     Ok(ack) => Response::DocumentAck(ack),
+                    Err(message) => Response::Error(WorkerError {
+                        context: Some(context),
+                        message,
+                    }),
+                }
+            })
+    })
+}
+
+fn apply_document_edits_and_derive(
+    request: ApplyDocumentEditsAndDerive,
+    documents: &DocumentStore,
+) -> Response {
+    let context = request.context.clone();
+    let document_key = DocumentKey::from(&context);
+    let Some(replica) = documents
+        .get(&document_key)
+        .map(|entry| Arc::clone(entry.value()))
+    else {
+        return Response::Error(WorkerError {
+            context: Some(context),
+            message: "document replica is missing; full sync required".into(),
+        });
+    };
+    let grammar_key = match replica.lock() {
+        Ok(replica) => replica.grammar_key.clone(),
+        Err(_) => {
+            return Response::Error(WorkerError {
+                context: Some(context),
+                message: "document replica lock is poisoned".into(),
+            });
+        }
+    };
+    WORKER_THREAD_STATE.with(|state| {
+        state
+            .borrow_mut()
+            .with_parser(grammar_key, context.clone(), |parser, _| {
+                let Ok(mut replica) = replica.lock() else {
+                    return Response::Error(WorkerError {
+                        context: Some(context),
+                        message: "document replica lock is poisoned".into(),
+                    });
+                };
+                let edits = ApplyDocumentEdits {
+                    context: request.context,
+                    base_version: request.base_version,
+                    edits: request.edits,
+                };
+                if let Err(message) = replica.apply(edits, parser) {
+                    return Response::Error(WorkerError {
+                        context: Some(context),
+                        message,
+                    });
+                }
+                match replica.derive(context.clone()) {
+                    Ok(snapshot) => Response::Snapshot(snapshot),
                     Err(message) => Response::Error(WorkerError {
                         context: Some(context),
                         message,
@@ -1064,6 +1132,18 @@ impl Client {
         let context = request.context.clone();
         self.request_with_timeout(
             Request::ApplyDocumentEdits(request),
+            context,
+            Duration::from_secs(60),
+        )
+    }
+
+    pub fn apply_document_edits_and_derive(
+        &self,
+        request: ApplyDocumentEditsAndDerive,
+    ) -> io::Result<Response> {
+        let context = request.context.clone();
+        self.request_with_timeout(
+            Request::ApplyDocumentEditsAndDerive(request),
             context,
             Duration::from_secs(60),
         )
