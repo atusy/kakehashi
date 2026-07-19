@@ -33,12 +33,9 @@ impl Kakehashi {
             .forward_did_save_to_virtual_docs(&uri)
             .await;
 
-        // Ensure a fresh tree before the synthetic task snapshots it: a save
-        // batched right after an edit (autosave / format-on-save) races the
-        // off-ingress reparse, and `prepare_diagnostic_snapshot` returns `None`
-        // without a tree — making the synthetic diagnostic a no-op for the virt
-        // layer.
-        self.ensure_document_parsed(&uri).await;
+        if !self.tree_worker_shadow.is_authoritative() {
+            self.ensure_document_parsed(&uri).await;
+        }
 
         // Spawn background task for synthetic diagnostic collection
         self.diagnostic_scheduler()

@@ -496,6 +496,7 @@ struct DocumentReplica {
     injection_token_cache: Arc<crate::analysis::InjectionTokenCache>,
     injection_cache_edits: u8,
     semantic_discovery: Option<Arc<crate::document::DiscoveredInjections>>,
+    resolved_injections: Option<(u64, Arc<Vec<crate::language::injection::ResolvedInjection>>)>,
     injection_layers: Vec<CachedInjectionLayer>,
 }
 
@@ -566,6 +567,7 @@ impl DocumentReplica {
                 injection_token_cache: Arc::new(crate::analysis::InjectionTokenCache::new()),
                 injection_cache_edits: 0,
                 semantic_discovery: None,
+                resolved_injections: None,
                 injection_layers: Vec::new(),
             },
             ack,
@@ -632,6 +634,7 @@ impl DocumentReplica {
         self.tree = tree;
         self.injection_layers.clear();
         self.semantic_discovery = None;
+        self.resolved_injections = None;
         self.injection_cache_edits = self.injection_cache_edits.wrapping_add(1);
         if self.injection_cache_edits == 0 {
             self.injection_token_cache.clear_document(&self.uri);
@@ -1009,37 +1012,28 @@ impl DocumentReplica {
     }
 
     fn derive_injection_regions(
-        &self,
+        &mut self,
         request: DeriveInjectionRegions,
     ) -> Result<InjectionRegionsResult, String> {
         self.validate_read_identity(&request.context)?;
+        self.ensure_injection_facts(request.context.configuration_generation, true);
         let regions = self
-            .analysis
-            .injection_query(&self.language)
-            .map(|query| {
-                crate::language::InjectionResolver::resolve_all(
-                    &self.analysis,
-                    &self.node_tracker,
-                    &self.uri,
-                    &self.tree,
-                    &self.text,
-                    query.as_ref(),
-                    request.context.incarnation,
-                )
-            })
-            .unwrap_or_default()
+            .resolved_injections
+            .as_ref()
+            .map(|(_, regions)| regions.iter())
             .into_iter()
+            .flatten()
             .map(|resolved| WireInjectionRegion {
-                language: resolved.injection_language,
+                language: resolved.injection_language.clone(),
                 byte_start: resolved.region.byte_range.start,
                 byte_end: resolved.region.byte_range.end,
                 line_start: resolved.region.line_range.start,
                 line_end: resolved.region.line_range.end,
                 start_column: resolved.region.start_column,
-                region_id: resolved.region.region_id,
+                region_id: resolved.region.region_id.clone(),
                 content_hash: resolved.region.content_hash,
-                virtual_content: resolved.virtual_content,
-                line_column_offsets: resolved.line_column_offsets,
+                virtual_content: resolved.virtual_content.clone(),
+                line_column_offsets: resolved.line_column_offsets.clone(),
                 contiguous: resolved.contiguous,
             })
             .collect();
@@ -1117,13 +1111,38 @@ impl DocumentReplica {
         {
             return self.semantic_discovery.clone();
         }
-        let injection_query = self.analysis.injection_query(&self.language)?;
+        self.ensure_injection_facts(generation, false);
+        self.semantic_discovery.clone()
+    }
+
+    fn ensure_injection_facts(&mut self, generation: u64, needs_resolved: bool) {
+        if self
+            .resolved_injections
+            .as_ref()
+            .is_some_and(|(cached_generation, _)| *cached_generation == generation)
+        {
+            return;
+        }
+        if !needs_resolved
+            && self
+                .semantic_discovery
+                .as_ref()
+                .is_some_and(|discovery| discovery.generation == generation)
+        {
+            return;
+        }
+        self.semantic_discovery = None;
+        let Some(injection_query) = self.analysis.injection_query(&self.language) else {
+            self.resolved_injections = Some((generation, Arc::new(Vec::new())));
+            return;
+        };
         let regions = crate::language::injection::collect_all_injections(
             &self.tree.root_node(),
             &self.text,
             Some(injection_query.as_ref()),
-        )?;
-        let cacheable = regions
+        )
+        .unwrap_or_default();
+        let Some(cacheable) = regions
             .iter()
             .map(|region| {
                 let id = crate::language::InjectionResolver::calculate_region_id(
@@ -1140,7 +1159,19 @@ impl DocumentReplica {
                     ),
                 )
             })
-            .collect::<Option<Vec<_>>>()?;
+            .collect::<Option<Vec<_>>>()
+        else {
+            self.resolved_injections = Some((generation, Arc::new(Vec::new())));
+            return;
+        };
+        let resolved = needs_resolved.then(|| {
+            crate::language::InjectionResolver::resolve_from_prebuilt(
+                &self.analysis,
+                &regions,
+                &cacheable,
+                &self.text,
+            )
+        });
         self.semantic_discovery = crate::analysis::semantic::build_document_discovery(
             &regions,
             &cacheable,
@@ -1153,7 +1184,9 @@ impl DocumentReplica {
             self.context.incarnation,
         )
         .map(Arc::new);
-        self.semantic_discovery.clone()
+        if let Some(resolved) = resolved {
+            self.resolved_injections = Some((generation, Arc::new(resolved)));
+        }
     }
 
     fn run_captures(&self, request: RunCaptures) -> Result<CapturesResult, String> {
@@ -2441,7 +2474,7 @@ fn derive_injection_regions(
         });
     };
     match replica.lock() {
-        Ok(replica) => match replica.derive_injection_regions(request) {
+        Ok(mut replica) => match replica.derive_injection_regions(request) {
             Ok(result) => Response::InjectionRegions(result),
             Err(message) => Response::Error(WorkerError {
                 context: Some(context),

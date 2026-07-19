@@ -58,7 +58,8 @@ impl Kakehashi {
         // region) is the jarring outcome §3 forbids. Hoisted above the layer
         // closures so it applies under every layer-order configuration.
         // Never-parsed/gone falls through to the layers' empty fallbacks.
-        if let Ok(wait_uri) = uri_to_url(&lsp_uri)
+        if !self.tree_worker_shadow.is_authoritative()
+            && let Ok(wait_uri) = uri_to_url(&lsp_uri)
             && let crate::lsp::lsp_impl::snapshot_read::SnapshotWait::Stale = self
                 .wait_for_current_snapshot(&wait_uri, std::time::Duration::from_millis(500))
                 .await
@@ -78,26 +79,51 @@ impl Kakehashi {
 
             log::debug!("rangeFormatting called for {} range {:?}", uri, host_range);
 
-            let (snapshot, content_version) = match self.documents.get(&uri) {
-                None => {
-                    log::debug!("rangeFormatting: No document found for {}", uri);
+            let (text, language_name, all_regions) = if self.tree_worker_shadow.is_authoritative() {
+                let Some(view) = self.current_worker_injection_view(&uri).await else {
                     return Ok(None);
-                }
-                Some(doc) => match doc.snapshot() {
+                };
+                (view.text, view.language, view.regions)
+            } else {
+                let snapshot = match self.documents.get(&uri) {
                     None => {
-                        log::debug!(
-                            "rangeFormatting: Document not fully initialized for {}",
-                            uri
-                        );
+                        log::debug!("rangeFormatting: No document found for {}", uri);
                         return Ok(None);
                     }
-                    Some(snapshot) => (snapshot, doc.content_version()),
-                },
-            };
-
-            let Some(language_name) = self.document_language(&uri) else {
-                log::debug!(target: "kakehashi::rangeFormatting", "No language detected");
-                return Ok(None);
+                    Some(doc) => match doc.snapshot() {
+                        None => {
+                            log::debug!(
+                                "rangeFormatting: Document not fully initialized for {}",
+                                uri
+                            );
+                            return Ok(None);
+                        }
+                        Some(snapshot) => snapshot,
+                    },
+                };
+                let Some(language_name) = self.document_language(&uri) else {
+                    log::debug!(target: "kakehashi::rangeFormatting", "No language detected");
+                    return Ok(None);
+                };
+                let Some(injection_query) = self.language.injection_query(&language_name) else {
+                    return Ok(None);
+                };
+                let all_regions = match self
+                    .documents
+                    .current_resolved_regions(&uri, self.cache.semantic_token_generation())
+                {
+                    Some(regions) => regions,
+                    None => std::sync::Arc::new(InjectionResolver::resolve_all(
+                        &self.language,
+                        self.bridge.node_tracker(),
+                        &uri,
+                        snapshot.tree(),
+                        snapshot.text(),
+                        injection_query.as_ref(),
+                        snapshot.incarnation(),
+                    )),
+                };
+                (snapshot.text_arc(), language_name, all_regions)
             };
 
             // Layer gating keys off "textDocument/formatting", matching the
@@ -111,38 +137,6 @@ impl Kakehashi {
                 );
                 return Ok(None);
             }
-
-            let Some(injection_query) = self.language.injection_query(&language_name) else {
-                return Ok(None);
-            };
-
-            let all_regions = match self
-                .documents
-                .current_resolved_regions(&uri, self.cache.semantic_token_generation())
-            {
-                Some(regions) => regions,
-                None => std::sync::Arc::new(InjectionResolver::resolve_all(
-                    &self.language,
-                    self.bridge.node_tracker(),
-                    &uri,
-                    snapshot.tree(),
-                    snapshot.text(),
-                    injection_query.as_ref(),
-                    snapshot.incarnation(),
-                )),
-            };
-            let all_regions = if self.tree_worker_shadow.is_authoritative() {
-                self.worker_injection_regions_for_snapshot(
-                    &uri,
-                    snapshot.incarnation(),
-                    content_version,
-                    &language_name,
-                )
-                .await
-                .unwrap_or_default()
-            } else {
-                all_regions
-            };
 
             if all_regions.is_empty() {
                 return Ok(None);
@@ -170,7 +164,7 @@ impl Kakehashi {
             //
             // Multi-line code-fence injections (`start_column == 0`) are
             // unchanged because their line and byte bounds are equivalent.
-            let mapper = PositionMapper::new(snapshot.text());
+            let mapper = PositionMapper::new(&text);
             let request_bytes = clamp_request_to_document(&mapper, host_range);
 
             let mut outer_join_set: JoinSet<Option<Vec<TextEdit>>> = JoinSet::new();

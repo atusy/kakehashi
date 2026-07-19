@@ -168,7 +168,14 @@ impl Kakehashi {
         // the reparse window after each edit. The HOST layer needs no tree, so a
         // host-only document must not pay the freshness wait. A still-missing tree
         // (parse pending/failed) yields `None` — host still pulls, virt skips.
-        let snapshot = if virt_enabled {
+        let worker_regions = if virt_enabled && self.tree_worker_shadow.is_authoritative() {
+            self.current_worker_injection_view(&uri)
+                .await
+                .map(|view| view.regions)
+        } else {
+            None
+        };
+        let snapshot = if virt_enabled && !self.tree_worker_shadow.is_authoritative() {
             self.ensure_document_parsed(&uri).await;
             self.documents.get(&uri).and_then(|doc| {
                 doc.snapshot()
@@ -189,46 +196,36 @@ impl Kakehashi {
 
         // Resolve injection regions once: the live virt pull below and the
         // pushFallback fold (#425) after the join share them.
-        let virt_regions = match (virt_enabled, snapshot.as_ref()) {
-            (true, Some((snapshot, _))) => self
-                .language
-                .injection_query(&language_name)
-                .map(|injection_query| {
-                    match self
-                        .documents
-                        .current_resolved_regions(&uri, self.cache.semantic_token_generation())
-                    {
-                        Some(regions) => regions,
-                        None => std::sync::Arc::new(InjectionResolver::resolve_all(
-                            &self.language,
-                            self.bridge.node_tracker(),
-                            &uri,
-                            snapshot.tree(),
-                            snapshot.text(),
-                            injection_query.as_ref(),
-                            snapshot.incarnation(),
-                        )),
-                    }
-                })
-                .unwrap_or_default(),
-            // Virt gated off, or no tree yet (the host layer still pulls). The
-            // wait+on-demand above already tried, so a missing tree here is the
-            // rare parse-failure case, self-healing on the next pull.
-            _ => std::sync::Arc::new(Vec::new()),
-        };
-        let virt_regions = if self.tree_worker_shadow.is_authoritative()
-            && let Some((snapshot, content_version)) = snapshot.as_ref()
-        {
-            self.worker_injection_regions_for_snapshot(
-                &uri,
-                snapshot.incarnation(),
-                *content_version,
-                &language_name,
-            )
-            .await
-            .unwrap_or_default()
+        let virt_regions = if self.tree_worker_shadow.is_authoritative() {
+            worker_regions.unwrap_or_default()
         } else {
-            virt_regions
+            match (virt_enabled, snapshot.as_ref()) {
+                (true, Some((snapshot, _))) => self
+                    .language
+                    .injection_query(&language_name)
+                    .map(|injection_query| {
+                        match self
+                            .documents
+                            .current_resolved_regions(&uri, self.cache.semantic_token_generation())
+                        {
+                            Some(regions) => regions,
+                            None => std::sync::Arc::new(InjectionResolver::resolve_all(
+                                &self.language,
+                                self.bridge.node_tracker(),
+                                &uri,
+                                snapshot.tree(),
+                                snapshot.text(),
+                                injection_query.as_ref(),
+                                snapshot.incarnation(),
+                            )),
+                        }
+                    })
+                    .unwrap_or_default(),
+                // Virt gated off, or no tree yet (the host layer still pulls). The
+                // wait+on-demand above already tried, so a missing tree here is the
+                // rare parse-failure case, self-healing on the next pull.
+                _ => std::sync::Arc::new(Vec::new()),
+            }
         };
         // Lightweight per-region metadata `(region_id, injection_language,
         // current offset)` for the pushFallback fold; the live pull below moves

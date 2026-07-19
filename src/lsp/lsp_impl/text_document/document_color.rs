@@ -34,31 +34,57 @@ impl Kakehashi {
 
         log::debug!("documentColor called for {}", uri);
 
-        // Ensure a fresh tree before snapshotting: `didChange` clears the tree and
-        // reparses off-ingress, so without this documentColor (virt-only) returns
-        // empty for the whole reparse window after every edit.
-        self.ensure_document_parsed(&uri).await;
-
-        // Get document snapshot (minimizes lock duration)
-        let (snapshot, content_version) = match self.documents.get(&uri) {
-            None => {
-                log::debug!("documentColor: No document found for {}", uri);
+        let (language_name, all_regions) = if self.tree_worker_shadow.is_authoritative() {
+            let Some(view) = self.current_worker_injection_view(&uri).await else {
                 return Ok(Vec::new());
-            }
-            Some(doc) => match doc.snapshot() {
+            };
+            (view.language, view.regions)
+        } else {
+            // Legacy/shadow readers retain the bounded parent-owned parse path.
+            self.ensure_document_parsed(&uri).await;
+            let (snapshot, content_version) = match self.documents.get(&uri) {
                 None => {
-                    log::debug!("documentColor: Document not fully initialized for {}", uri);
+                    log::debug!("documentColor: No document found for {}", uri);
                     return Ok(Vec::new());
                 }
-                Some(snapshot) => (snapshot, doc.content_version()),
-            },
-            // doc automatically dropped here, lock released
-        };
-
-        // Get the language for this document
-        let Some(language_name) = self.document_language(&uri) else {
-            log::debug!(target: "kakehashi::document_color", "No language detected");
-            return Ok(Vec::new());
+                Some(doc) => match doc.snapshot() {
+                    None => {
+                        log::debug!("documentColor: Document not fully initialized for {}", uri);
+                        return Ok(Vec::new());
+                    }
+                    Some(snapshot) => (snapshot, doc.content_version()),
+                },
+            };
+            let Some(language_name) = self.document_language(&uri) else {
+                log::debug!(target: "kakehashi::document_color", "No language detected");
+                return Ok(Vec::new());
+            };
+            let Some(injection_query) = self.language.injection_query(&language_name) else {
+                return Ok(Vec::new());
+            };
+            let all_regions = match self
+                .documents
+                .current_resolved_regions(&uri, self.cache.semantic_token_generation())
+            {
+                Some(regions) => regions,
+                None => std::sync::Arc::new(InjectionResolver::resolve_all(
+                    &self.language,
+                    self.bridge.node_tracker(),
+                    &uri,
+                    snapshot.tree(),
+                    snapshot.text(),
+                    injection_query.as_ref(),
+                    snapshot.incarnation(),
+                )),
+            };
+            self.shadow_compare_current_injection_regions(
+                &uri,
+                snapshot.incarnation(),
+                content_version,
+                &all_regions,
+            )
+            .await;
+            (language_name, all_regions)
         };
 
         if !self.virt_layer_enabled(&language_name, "textDocument/documentColor") {
@@ -69,52 +95,6 @@ impl Kakehashi {
             );
             return Ok(Vec::new());
         }
-
-        // Get injection query to detect injection regions
-        let Some(injection_query) = self.language.injection_query(&language_name) else {
-            return Ok(Vec::new());
-        };
-
-        // Collect all injection regions
-        let all_regions = match self
-            .documents
-            .current_resolved_regions(&uri, self.cache.semantic_token_generation())
-        {
-            Some(regions) => regions,
-            None => std::sync::Arc::new(InjectionResolver::resolve_all(
-                &self.language,
-                self.bridge.node_tracker(),
-                &uri,
-                snapshot.tree(),
-                snapshot.text(),
-                injection_query.as_ref(),
-                snapshot.incarnation(),
-            )),
-        };
-
-        // Compare the fused worker derivation only for a reader that already
-        // consumes every injection. Issuing this RPC from the parse hot path
-        // can overtake queued edits on the document lane and makes the shadow
-        // observation causally stale under a typing burst.
-        self.shadow_compare_current_injection_regions(
-            &uri,
-            snapshot.incarnation(),
-            content_version,
-            &all_regions,
-        )
-        .await;
-        let all_regions = if self.tree_worker_shadow.is_authoritative() {
-            self.worker_injection_regions_for_snapshot(
-                &uri,
-                snapshot.incarnation(),
-                content_version,
-                &language_name,
-            )
-            .await
-            .unwrap_or_default()
-        } else {
-            all_regions
-        };
 
         if all_regions.is_empty() {
             return Ok(Vec::new());

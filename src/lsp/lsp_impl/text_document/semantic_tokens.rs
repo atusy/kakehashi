@@ -20,13 +20,12 @@ use tower_lsp_server::jsonrpc::{Error, Result};
 use tower_lsp_server::ls_types::{
     SemanticTokens, SemanticTokensDeltaParams, SemanticTokensFullDeltaResult, SemanticTokensParams,
     SemanticTokensRangeParams, SemanticTokensRangeResult, SemanticTokensResult,
+    TextDocumentIdentifier,
 };
 use url::Url;
 
 #[cfg(test)]
-use tower_lsp_server::ls_types::{
-    PartialResultParams, Position, Range, TextDocumentIdentifier, WorkDoneProgressParams,
-};
+use tower_lsp_server::ls_types::{PartialResultParams, Position, Range, WorkDoneProgressParams};
 
 use crate::analysis::{
     SemanticSnapshotIdentity, calculate_delta_or_full, filter_semantic_tokens_by_range,
@@ -1243,6 +1242,30 @@ impl Kakehashi {
         // key on the old generation — invisible to post-reload requests (which
         // compute the new-generation key) — so a stale entry can never be served.
         let generation = self.cache.semantic_token_generation();
+
+        // The authoritative worker already owns full-document token discovery
+        // and its cache. Reuse that current live-text path, then perform the
+        // cheap viewport filter in the parent; never wait for a parent Tree.
+        if self.tree_worker_shadow.is_authoritative() {
+            let full = self
+                .semantic_tokens_full_impl(SemanticTokensParams {
+                    text_document: TextDocumentIdentifier {
+                        uri: lsp_uri.clone(),
+                    },
+                    work_done_progress_params: Default::default(),
+                    partial_result_params: Default::default(),
+                })
+                .await?;
+            return Ok(full.map(|result| match result {
+                SemanticTokensResult::Tokens(tokens) => {
+                    let tokens = filter_semantic_tokens_by_range(&tokens, &domain_range);
+                    SemanticTokensRangeResult::Tokens(tokens)
+                }
+                SemanticTokensResult::Partial(partial) => {
+                    SemanticTokensRangeResult::Partial(partial)
+                }
+            }));
+        }
 
         // First-parse bound (parse-snapshot ADR §3): resolve through the same
         // bounded first-parse wait as full/delta. Without it, a range request

@@ -66,73 +66,56 @@ impl Kakehashi {
 
         log::debug!("documentSymbol called for {}", uri);
 
-        // Ensure a fresh tree before snapshotting: `didChange` clears the tree and
-        // reparses off-ingress, so without this the (tree-driven) virt layer drops
-        // injection-region symbols for the whole reparse window after every edit.
-        self.ensure_document_parsed(&uri).await;
-
-        // Get document snapshot (minimizes lock duration)
-        let (snapshot, content_version) = match self.documents.get(&uri) {
-            None => {
-                log::debug!("documentSymbol: No document found for {}", uri);
+        let (language_name, all_regions) = if self.tree_worker_shadow.is_authoritative() {
+            let Some(view) = self.current_worker_injection_view(&uri).await else {
                 return Ok(None);
-            }
-            Some(doc) => match doc.snapshot() {
+            };
+            (view.language, view.regions)
+        } else {
+            self.ensure_document_parsed(&uri).await;
+            let (snapshot, content_version) = match self.documents.get(&uri) {
                 None => {
-                    log::debug!("documentSymbol: Document not fully initialized for {}", uri);
+                    log::debug!("documentSymbol: No document found for {}", uri);
                     return Ok(None);
                 }
-                Some(snapshot) => (snapshot, doc.content_version()),
-            },
-            // doc automatically dropped here, lock released
-        };
-
-        // Get the language for this document
-        let Some(language_name) = self.document_language(&uri) else {
-            log::debug!(target: "kakehashi::document_symbol", "No language detected");
-            return Ok(None);
-        };
-
-        // Get injection query to detect injection regions
-        let Some(injection_query) = self.language.injection_query(&language_name) else {
-            return Ok(None);
-        };
-
-        // Collect all injection regions
-        let all_regions = match self
-            .documents
-            .current_resolved_regions(&uri, self.cache.semantic_token_generation())
-        {
-            Some(regions) => regions,
-            None => std::sync::Arc::new(InjectionResolver::resolve_all(
-                &self.language,
-                self.bridge.node_tracker(),
-                &uri,
-                snapshot.tree(),
-                snapshot.text(),
-                injection_query.as_ref(),
-                snapshot.incarnation(),
-            )),
-        };
-
-        self.shadow_compare_current_injection_regions(
-            &uri,
-            snapshot.incarnation(),
-            content_version,
-            &all_regions,
-        )
-        .await;
-        let all_regions = if self.tree_worker_shadow.is_authoritative() {
-            self.worker_injection_regions_for_snapshot(
+                Some(doc) => match doc.snapshot() {
+                    None => {
+                        log::debug!("documentSymbol: Document not fully initialized for {}", uri);
+                        return Ok(None);
+                    }
+                    Some(snapshot) => (snapshot, doc.content_version()),
+                },
+            };
+            let Some(language_name) = self.document_language(&uri) else {
+                log::debug!(target: "kakehashi::document_symbol", "No language detected");
+                return Ok(None);
+            };
+            let Some(injection_query) = self.language.injection_query(&language_name) else {
+                return Ok(None);
+            };
+            let all_regions = match self
+                .documents
+                .current_resolved_regions(&uri, self.cache.semantic_token_generation())
+            {
+                Some(regions) => regions,
+                None => std::sync::Arc::new(InjectionResolver::resolve_all(
+                    &self.language,
+                    self.bridge.node_tracker(),
+                    &uri,
+                    snapshot.tree(),
+                    snapshot.text(),
+                    injection_query.as_ref(),
+                    snapshot.incarnation(),
+                )),
+            };
+            self.shadow_compare_current_injection_regions(
                 &uri,
                 snapshot.incarnation(),
                 content_version,
-                &language_name,
+                &all_regions,
             )
-            .await
-            .unwrap_or_default()
-        } else {
-            all_regions
+            .await;
+            (language_name, all_regions)
         };
 
         if all_regions.is_empty() {

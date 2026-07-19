@@ -45,6 +45,12 @@ enum TreeWorkerMode {
     Authoritative,
 }
 
+pub(super) struct WorkerInjectionView {
+    pub(super) text: Arc<str>,
+    pub(super) language: String,
+    pub(super) regions: Arc<Vec<crate::language::injection::ResolvedInjection>>,
+}
+
 enum ShadowCommand {
     Sync(SyncDocument),
     Apply {
@@ -2031,6 +2037,53 @@ impl TreeWorkerShadow {
 }
 
 impl Kakehashi {
+    /// Resolve injection facts from the worker against one current live-text
+    /// identity. Authoritative readers use this instead of waiting for (or
+    /// accidentally reviving) a parent-owned parse snapshot after an edit.
+    pub(super) async fn current_worker_injection_view(
+        &self,
+        uri: &url::Url,
+    ) -> Option<WorkerInjectionView> {
+        let (text, incarnation, content_version, language_id) =
+            self.documents.get(uri).map(|document| {
+                (
+                    document.text_arc(),
+                    document.incarnation(),
+                    document.content_version(),
+                    document.language_id().map(str::to_owned),
+                )
+            })?;
+        let language =
+            self.language
+                .detect_language(uri.path(), &text, None, language_id.as_deref())?;
+        if !self
+            .language
+            .ensure_language_loaded_async(&language)
+            .await
+            .success
+        {
+            return None;
+        }
+        let current = self.documents.get(uri)?;
+        if current.incarnation() != incarnation || current.content_version() != content_version {
+            return None;
+        }
+        drop(current);
+        let regions = self
+            .worker_injection_regions_for_snapshot(uri, incarnation, content_version, &language)
+            .await?;
+        let current = self.documents.get(uri)?;
+        if current.incarnation() != incarnation || current.content_version() != content_version {
+            return None;
+        }
+        drop(current);
+        Some(WorkerInjectionView {
+            text,
+            language,
+            regions,
+        })
+    }
+
     pub(super) async fn worker_injection_region_at_snapshot(
         &self,
         uri: &url::Url,

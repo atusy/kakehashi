@@ -289,6 +289,20 @@ fn authoritative_worker_serves_injected_node_accessors() {
         }),
     );
     assert!(selection["result"].is_array(), "{selection:?}");
+    let semantic_range = client.send_request(
+        "textDocument/semanticTokens/range",
+        json!({
+            "textDocument": { "uri": uri },
+            "range": {
+                "start": { "line": 3, "character": 0 },
+                "end": { "line": 5, "character": 0 }
+            }
+        }),
+    );
+    assert!(
+        semantic_range["result"]["data"].is_array(),
+        "{semantic_range:?}"
+    );
 
     let stderr = shutdown_and_stderr(client);
     assert!(stderr.contains("Authoritative tree worker"), "{stderr}");

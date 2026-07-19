@@ -95,36 +95,54 @@ impl Kakehashi {
 
         log::debug!("formatting called for {}", uri);
 
-        // Explicit-action bounded wait (parse-snapshot ADR §3): formatting is
-        // user-triggered and infrequent, so it may briefly wait for the
-        // in-flight parse; a still-stale snapshot after the wait rejects with
-        // ContentModified rather than silently no-opping an action the user
-        // consciously triggered. Never-parsed/gone falls through to the
-        // existing empty fallbacks below.
-        if let crate::lsp::lsp_impl::snapshot_read::SnapshotWait::Stale = self
-            .wait_for_current_snapshot(&uri, std::time::Duration::from_millis(500))
-            .await
-        {
-            return Err(crate::error::content_modified_error());
-        }
-
-        let (snapshot, content_version) = match self.documents.get(&uri) {
-            None => {
-                log::debug!("formatting: No document found for {}", uri);
+        let (original, language_name, all_regions) = if self.tree_worker_shadow.is_authoritative() {
+            let Some(view) = self.current_worker_injection_view(&uri).await else {
                 return Ok(None);
+            };
+            (view.text, view.language, view.regions)
+        } else {
+            if let crate::lsp::lsp_impl::snapshot_read::SnapshotWait::Stale = self
+                .wait_for_current_snapshot(&uri, std::time::Duration::from_millis(500))
+                .await
+            {
+                return Err(crate::error::content_modified_error());
             }
-            Some(doc) => match doc.snapshot() {
+            let snapshot = match self.documents.get(&uri) {
                 None => {
-                    log::debug!("formatting: Document not fully initialized for {}", uri);
+                    log::debug!("formatting: No document found for {}", uri);
                     return Ok(None);
                 }
-                Some(snapshot) => (snapshot, doc.content_version()),
-            },
-        };
-
-        let Some(language_name) = self.document_language(&uri) else {
-            log::debug!(target: "kakehashi::formatting", "No language detected");
-            return Ok(None);
+                Some(doc) => match doc.snapshot() {
+                    None => {
+                        log::debug!("formatting: Document not fully initialized for {}", uri);
+                        return Ok(None);
+                    }
+                    Some(snapshot) => snapshot,
+                },
+            };
+            let Some(language_name) = self.document_language(&uri) else {
+                log::debug!(target: "kakehashi::formatting", "No language detected");
+                return Ok(None);
+            };
+            let Some(injection_query) = self.language.injection_query(&language_name) else {
+                return Ok(None);
+            };
+            let all_regions = match self
+                .documents
+                .current_resolved_regions(&uri, self.cache.semantic_token_generation())
+            {
+                Some(regions) => regions,
+                None => std::sync::Arc::new(InjectionResolver::resolve_all(
+                    &self.language,
+                    self.bridge.node_tracker(),
+                    &uri,
+                    snapshot.tree(),
+                    snapshot.text(),
+                    injection_query.as_ref(),
+                    snapshot.incarnation(),
+                )),
+            };
+            (snapshot.text_arc(), language_name, all_regions)
         };
 
         // Formatting consumes the full layer config (order AND strategy):
@@ -144,8 +162,6 @@ impl Kakehashi {
         );
         let mut cancel_state = self.setup_formatting_cancel_token(upstream_request_id.as_ref());
         cancel_state.request_error_sink = request_error_sink;
-        let original = snapshot.text_arc();
-
         let result = match layer_cfg.strategy {
             AggregationStrategy::Preferred => {
                 // Concurrent fan-out with priority decision
@@ -153,8 +169,8 @@ impl Kakehashi {
                 // flight at once; the highest-priority non-empty result wins.
                 let virt = self.virt_format_edits(
                     &uri,
-                    &snapshot,
-                    content_version,
+                    &original,
+                    Arc::clone(&all_regions),
                     &language_name,
                     &options,
                     &upstream_request_id,
@@ -197,8 +213,8 @@ impl Kakehashi {
                             }
                             self.virt_format_edits(
                                 &uri,
-                                &snapshot,
-                                content_version,
+                                &original,
+                                Arc::clone(&all_regions),
                                 &language_name,
                                 &options,
                                 &upstream_request_id,
@@ -248,46 +264,14 @@ impl Kakehashi {
     async fn virt_format_edits(
         &self,
         uri: &url::Url,
-        snapshot: &crate::document::model::DocumentSnapshot,
-        content_version: u64,
+        original: &Arc<str>,
+        all_regions: Arc<Vec<crate::language::injection::ResolvedInjection>>,
         language_name: &str,
         options: &tower_lsp_server::ls_types::FormattingOptions,
         upstream_request_id: &Option<UpstreamId>,
         cancel_state: &FormattingCancelState<'_>,
         client_progress_token: Option<NumberOrString>,
     ) -> Result<Option<Vec<TextEdit>>> {
-        let Some(injection_query) = self.language.injection_query(language_name) else {
-            return Ok(None);
-        };
-
-        let all_regions = match self
-            .documents
-            .current_resolved_regions(uri, self.cache.semantic_token_generation())
-        {
-            Some(regions) => regions,
-            None => std::sync::Arc::new(InjectionResolver::resolve_all(
-                &self.language,
-                self.bridge.node_tracker(),
-                uri,
-                snapshot.tree(),
-                snapshot.text(),
-                injection_query.as_ref(),
-                snapshot.incarnation(),
-            )),
-        };
-        let all_regions = if self.tree_worker_shadow.is_authoritative() {
-            self.worker_injection_regions_for_snapshot(
-                uri,
-                snapshot.incarnation(),
-                content_version,
-                language_name,
-            )
-            .await
-            .unwrap_or_default()
-        } else {
-            all_regions
-        };
-
         if all_regions.is_empty() {
             return Ok(None);
         }
@@ -420,10 +404,10 @@ impl Kakehashi {
                     let virtual_line_count =
                         region_ctx.resolved.virtual_content.matches('\n').count() + 1;
                     let mapper = host_mapper
-                        .get_or_insert_with(|| crate::text::PositionMapper::new(snapshot.text()));
+                        .get_or_insert_with(|| crate::text::PositionMapper::new(original));
                     let host_line_prefixes = extract_host_line_prefixes(
                         mapper,
-                        snapshot.text(),
+                        original,
                         region_ctx.resolved.region.line_range.start,
                         &region_ctx.resolved.line_column_offsets,
                         virtual_line_count,

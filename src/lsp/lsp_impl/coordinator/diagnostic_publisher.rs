@@ -301,7 +301,11 @@ impl DiagnosticPublisher {
     async fn prefetch_open_pull_fallback_diagnostics(&self) -> bool {
         let mut tasks = tokio::task::JoinSet::new();
         for uri in self.documents.open_uris() {
-            let Some(snapshot) = self.snapshot_preparer.prepare_diagnostic_snapshot(&uri) else {
+            let Some(snapshot) = self
+                .snapshot_preparer
+                .prepare_diagnostic_snapshot_async(&uri)
+                .await
+            else {
                 continue;
             };
             let lineage = snapshot.lineage;

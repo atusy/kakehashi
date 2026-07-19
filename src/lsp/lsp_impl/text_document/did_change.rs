@@ -178,6 +178,24 @@ impl Kakehashi {
                 self.documents
                     .advance_watermark_for_incarnation(&uri, ticket, incarnation);
             }
+            // Continue the post-parse bridge lifecycle from worker-owned facts.
+            // Keep it off ingress just like the legacy reparse actor: the worker
+            // document lane orders this derivation after the mirrored edit.
+            let coordinator = self.injection_coordinator();
+            let diagnostic_scheduler = self.diagnostic_scheduler();
+            let worker_uri = uri.clone();
+            let worker_version = base_version.wrapping_add(1);
+            tokio::spawn(async move {
+                coordinator
+                    .process_worker_injections_for_incarnation(
+                        &worker_uri,
+                        true,
+                        incarnation,
+                        worker_version,
+                    )
+                    .await;
+                diagnostic_scheduler.schedule_debounced_diagnostic(worker_uri);
+            });
         } else {
             self.schedule_reparse(uri, ticket);
         }

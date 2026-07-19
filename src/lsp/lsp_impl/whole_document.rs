@@ -67,72 +67,53 @@ impl Kakehashi {
 
             log::debug!("{} called for {}", method_name, uri);
 
-            // Resolve a CURRENT parse snapshot with a bounded wait (parse-snapshot
-            // ADR §3). This family is nominally serve-stale, but the region
-            // resolution below MINTS tracker ULIDs — a live-position index — so a
-            // stale snapshot must not feed it (a stale read never mints); until the
-            // snapshot-owned region ordinals land, staleness degrades to `Ok(None)`
-            // (the native/empty fallback), self-correcting on the client's next
-            // request. The former parse-on-demand fallback is gone: readers never
-            // parse inline.
-            let snapshot = match self
-                .wait_for_current_snapshot(&uri, std::time::Duration::from_millis(200))
-                .await
-            {
-                crate::lsp::lsp_impl::snapshot_read::SnapshotWait::Current(snapshot) => snapshot,
-                _ => {
-                    log::debug!("{}: no current parse snapshot for {}", method_name, uri);
+            let (language_name, all_regions) = if self.tree_worker_shadow.is_authoritative() {
+                let Some(view) = self.current_worker_injection_view(&uri).await else {
                     return Ok(None);
-                }
-            };
-            let Some(language_name) = snapshot.language.clone() else {
-                log::debug!("{}: No language detected", method_name);
-                return Ok(None);
-            };
-            let Some(snapshot_tree) = snapshot.tree.as_ref() else {
-                log::debug!("{}: no tree (parser unavailable) for {}", method_name, uri);
-                return Ok(None);
-            };
-
-            // Get injection query to detect injection regions
-            let Some(injection_query) = self.language.injection_query(&language_name) else {
-                return Ok(None);
-            };
-
-            // Collect all injection regions — from THIS snapshot's own
-            // resolved_regions (generation-gated), never a store re-read: a
-            // parse publishing between the wait above and a store lookup
-            // could pair this snapshot's tree/text with a NEWER snapshot's
-            // regions. Snapshot immutability makes tree, text, and regions
-            // one value; absent/reload-stale falls back inline over the same
-            // tree.
-            let all_regions = match snapshot
-                .resolved_regions
-                .as_ref()
-                .filter(|(stamped, _)| *stamped == self.cache.semantic_token_generation())
-            {
-                Some((_, regions)) => std::sync::Arc::clone(regions),
-                None => std::sync::Arc::new(InjectionResolver::resolve_all(
-                    &self.language,
-                    self.bridge.node_tracker(),
-                    &uri,
-                    snapshot_tree,
-                    &snapshot.text,
-                    injection_query.as_ref(),
-                    snapshot.incarnation,
-                )),
-            };
-            let all_regions = if self.tree_worker_shadow.is_authoritative() {
-                self.worker_injection_regions_for_snapshot(
-                    &uri,
-                    snapshot.incarnation,
-                    snapshot.parsed_version,
-                    &language_name,
-                )
-                .await
-                .unwrap_or_default()
+                };
+                (view.language, view.regions)
             } else {
-                all_regions
+                // Legacy/shadow readers retain the immutable parent snapshot path.
+                let snapshot = match self
+                    .wait_for_current_snapshot(&uri, std::time::Duration::from_millis(200))
+                    .await
+                {
+                    crate::lsp::lsp_impl::snapshot_read::SnapshotWait::Current(snapshot) => {
+                        snapshot
+                    }
+                    _ => {
+                        log::debug!("{}: no current parse snapshot for {}", method_name, uri);
+                        return Ok(None);
+                    }
+                };
+                let Some(language_name) = snapshot.language.clone() else {
+                    log::debug!("{}: No language detected", method_name);
+                    return Ok(None);
+                };
+                let Some(snapshot_tree) = snapshot.tree.as_ref() else {
+                    log::debug!("{}: no tree (parser unavailable) for {}", method_name, uri);
+                    return Ok(None);
+                };
+                let Some(injection_query) = self.language.injection_query(&language_name) else {
+                    return Ok(None);
+                };
+                let all_regions = match snapshot
+                    .resolved_regions
+                    .as_ref()
+                    .filter(|(stamped, _)| *stamped == self.cache.semantic_token_generation())
+                {
+                    Some((_, regions)) => std::sync::Arc::clone(regions),
+                    None => std::sync::Arc::new(InjectionResolver::resolve_all(
+                        &self.language,
+                        self.bridge.node_tracker(),
+                        &uri,
+                        snapshot_tree,
+                        &snapshot.text,
+                        injection_query.as_ref(),
+                        snapshot.incarnation,
+                    )),
+                };
+                (language_name, all_regions)
             };
 
             if all_regions.is_empty() {

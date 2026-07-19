@@ -50,6 +50,7 @@ pub(crate) struct DiagnosticSnapshotPreparer {
     bridge: std::sync::Arc<BridgeCoordinator>,
     settings_manager: std::sync::Arc<SettingsManager>,
     cache: std::sync::Arc<crate::lsp::cache::CacheCoordinator>,
+    tree_worker_shadow: std::sync::Arc<crate::lsp::lsp_impl::tree_worker_shadow::TreeWorkerShadow>,
 }
 
 impl DiagnosticSnapshotPreparer {
@@ -60,10 +61,12 @@ impl DiagnosticSnapshotPreparer {
             bridge: std::sync::Arc::clone(&server.bridge),
             settings_manager: std::sync::Arc::clone(&server.settings_manager),
             cache: std::sync::Arc::clone(&server.cache),
+            tree_worker_shadow: std::sync::Arc::clone(&server.tree_worker_shadow),
         }
     }
 }
 
+#[derive(Clone)]
 pub(crate) struct DiagnosticScheduler {
     documents: std::sync::Arc<DocumentStore>,
     bridge: std::sync::Arc<BridgeCoordinator>,
@@ -93,30 +96,29 @@ impl DiagnosticScheduler {
 
     /// Schedule a debounced diagnostic for a document (pull-first-diagnostic-forwarding Phase 3).
     ///
-    /// A later change cancels and replaces the pending timer. The snapshot is
-    /// captured now, at schedule time, so diagnostics stay consistent with the
-    /// document state that triggered the change.
+    /// A later change cancels and replaces the pending timer. Snapshot preparation
+    /// runs off ingress and preserves its exact document lineage, including when
+    /// authoritative region facts must be awaited from the worker first.
     pub(crate) fn schedule_debounced_diagnostic(&self, uri: Url) {
-        let snapshot_data = self.prepare_diagnostic_snapshot(&uri);
-
-        // Apply the current `diagnostics_debounce_ms` setting (#533). The snapshot
-        // is a cheap arc-swap clone, so reading it per schedule keeps the debounce
-        // in sync with config reloads without a dedicated apply hook.
-        self.debounced_diagnostics.set_debounce_millis(
-            self.settings_manager
-                .load_settings()
-                .diagnostics_debounce_ms,
-        );
-
-        self.debounced_diagnostics.schedule(
-            uri,
-            snapshot_data,
-            self.bridge.pool_arc(),
-            std::sync::Arc::clone(&self.bridge),
-            std::sync::Arc::clone(&self.synthetic_diagnostics),
-            std::sync::Arc::clone(&self.publisher),
-            std::sync::Arc::clone(&self.documents),
-        );
+        let scheduler = self.clone();
+        tokio::spawn(async move {
+            let snapshot_data = scheduler.prepare_diagnostic_snapshot_async(&uri).await;
+            scheduler.debounced_diagnostics.set_debounce_millis(
+                scheduler
+                    .settings_manager
+                    .load_settings()
+                    .diagnostics_debounce_ms,
+            );
+            scheduler.debounced_diagnostics.schedule(
+                uri,
+                snapshot_data,
+                scheduler.bridge.pool_arc(),
+                std::sync::Arc::clone(&scheduler.bridge),
+                std::sync::Arc::clone(&scheduler.synthetic_diagnostics),
+                std::sync::Arc::clone(&scheduler.publisher),
+                std::sync::Arc::clone(&scheduler.documents),
+            );
+        });
     }
 
     /// Spawn a background task to collect and publish diagnostics.
@@ -126,12 +128,15 @@ impl DiagnosticScheduler {
     /// fans out to downstream servers and publishes via
     /// `textDocument/publishDiagnostics`.
     pub(crate) fn spawn_synthetic_diagnostic_task(&self, uri: Url) {
-        let snapshot_data = self.prepare_diagnostic_snapshot(&uri);
+        let snapshot_preparer = self.snapshot_preparer.clone();
         let bridge_pool = self.bridge.pool_arc();
         let publisher = std::sync::Arc::clone(&self.publisher);
         let uri_clone = uri.clone();
 
         let task = tokio::spawn(async move {
+            let snapshot_data = snapshot_preparer
+                .prepare_diagnostic_snapshot_async(&uri_clone)
+                .await;
             let diagnostics =
                 collect_push_diagnostics(snapshot_data, &bridge_pool, &uri_clone, LOG_TARGET).await;
 
@@ -167,8 +172,18 @@ impl DiagnosticScheduler {
     /// collection returns `Clear`, evicting any stale `PullLayer`; a
     /// configured-but-pull-gated host still lands here so its re-sync runs), and
     /// `Some(snapshot)` with virt regions and/or a pullable host context.
+    #[cfg(test)]
     pub(crate) fn prepare_diagnostic_snapshot(&self, uri: &Url) -> Option<DiagnosticSnapshot> {
         self.snapshot_preparer.prepare_diagnostic_snapshot(uri)
+    }
+
+    pub(crate) async fn prepare_diagnostic_snapshot_async(
+        &self,
+        uri: &Url,
+    ) -> Option<DiagnosticSnapshot> {
+        self.snapshot_preparer
+            .prepare_diagnostic_snapshot_async(uri)
+            .await
     }
 }
 
@@ -186,7 +201,101 @@ impl DiagnosticSnapshotPreparer {
             let content_version = doc.content_version();
             (snapshot, language_name, content_version)
         };
+        let incarnation = snapshot.incarnation();
+        let text = snapshot.text_arc();
+        let resolved_regions =
+            self.language.injection_query(&language_name).map(|query| {
+                match self
+                    .documents
+                    .current_resolved_regions(uri, self.cache.semantic_token_generation())
+                {
+                    Some(regions) => regions,
+                    None => std::sync::Arc::new(InjectionResolver::resolve_all(
+                        &self.language,
+                        self.bridge.node_tracker(),
+                        uri,
+                        snapshot.tree(),
+                        snapshot.text(),
+                        query.as_ref(),
+                        incarnation,
+                    )),
+                }
+            });
+        self.prepare_diagnostic_snapshot_from(
+            uri,
+            text,
+            language_name,
+            incarnation,
+            content_version,
+            resolved_regions,
+        )
+    }
 
+    pub(crate) async fn prepare_diagnostic_snapshot_async(
+        &self,
+        uri: &Url,
+    ) -> Option<DiagnosticSnapshot> {
+        if !self.tree_worker_shadow.is_authoritative() {
+            return self.prepare_diagnostic_snapshot(uri);
+        }
+        let (text, language_id, incarnation, content_version) =
+            self.documents.get(uri).map(|document| {
+                (
+                    document.text_arc(),
+                    document.language_id().map(str::to_owned),
+                    document.incarnation(),
+                    document.content_version(),
+                )
+            })?;
+        let language_name =
+            self.language
+                .detect_language(uri.path(), &text, None, language_id.as_deref())?;
+        if !self
+            .language
+            .ensure_language_loaded_async(&language_name)
+            .await
+            .success
+        {
+            return None;
+        }
+        let resolved_regions = if self.language.injection_query(&language_name).is_some() {
+            self.tree_worker_shadow
+                .worker_injection_regions(
+                    uri,
+                    incarnation,
+                    content_version,
+                    self.language.configuration_generation(),
+                )
+                .await
+        } else {
+            None
+        };
+        let current = self.documents.get(uri)?;
+        if current.incarnation() != incarnation || current.content_version() != content_version {
+            return None;
+        }
+        drop(current);
+        self.prepare_diagnostic_snapshot_from(
+            uri,
+            text,
+            language_name,
+            incarnation,
+            content_version,
+            resolved_regions,
+        )
+    }
+
+    fn prepare_diagnostic_snapshot_from(
+        &self,
+        uri: &Url,
+        text: std::sync::Arc<str>,
+        language_name: String,
+        incarnation: u64,
+        content_version: u64,
+        resolved_regions: Option<
+            std::sync::Arc<Vec<crate::language::injection::ResolvedInjection>>,
+        >,
+    ) -> Option<DiagnosticSnapshot> {
         // Cross-layer gating, keyed by the same method name as the
         // aggregation configs below. A layer gated off still yields a
         // snapshot (with that layer absent) so that publishing an empty list
@@ -201,117 +310,96 @@ impl DiagnosticSnapshotPreparer {
         // Virt layer: `None` = the document can never have virt diagnostics
         // (no injection query), distinct from `Some(vec![])` = gated off or
         // currently no regions (publish-empty-to-clear).
-        let virt_contexts: Option<Vec<DocumentRequestContext>> =
-            if !layer_cfg.allows(crate::config::settings::LayerSource::Virt) {
-                log::debug!(
-                    target: LOG_TARGET,
-                    "virt layer disabled for {} via layers.aggregation priorities",
-                    language_name
-                );
-                Some(Vec::new())
-            } else {
-                self.language
-                    .injection_query(&language_name)
-                    .map(|injection_query| {
-                        // Prefer the populate pass's regions riding the current
-                        // parse snapshot (never discover twice, ADR §3); fall
-                        // back to the inline resolution when absent/stale.
-                        let all_regions = match self
-                            .documents
-                            .current_resolved_regions(uri, self.cache.semantic_token_generation())
-                        {
-                            Some(regions) => regions,
-                            None => std::sync::Arc::new(InjectionResolver::resolve_all(
-                                &self.language,
-                                self.bridge.node_tracker(),
-                                uri,
-                                snapshot.tree(),
-                                snapshot.text(),
-                                injection_query.as_ref(),
-                                snapshot.incarnation(),
-                            )),
-                        };
-
-                        let mut contexts = Vec::new();
-                        // Configs + aggregation are keyed by injection language, so
-                        // resolve them once per distinct language (a document can
-                        // hold many regions of one language). `None` caches a skipped
-                        // language: no configured server, OR the pull would dispatch
-                        // to none. The key is cloned only on the resolving miss, not
-                        // on every region.
-                        type ResolvedLang =
-                            Option<(Vec<ResolvedServerConfig>, ResolvedAggregationConfig)>;
-                        let mut resolved_by_lang: std::collections::HashMap<String, ResolvedLang> =
-                            std::collections::HashMap::new();
-                        for resolved in all_regions.iter() {
-                            // `get` on the common (cache-hit) path is a single lookup;
-                            // only the resolving miss touches the map again, cloning
-                            // the language key just for that insert.
-                            let entry = match resolved_by_lang.get(&resolved.injection_language) {
-                                Some(entry) => entry,
-                                None => {
-                                    let lang = &resolved.injection_language;
-                                    let computed: ResolvedLang = {
-                                        let configs = self.bridge.get_all_configs_for_language(
-                                            &settings,
-                                            &language_name,
-                                            lang,
-                                        );
-                                        if configs.is_empty() {
-                                            None
-                                        } else {
-                                            let agg = resolve_aggregation_config_from_settings(
-                                                &settings,
-                                                &language_name,
-                                                lang,
-                                                "textDocument/publishDiagnostics",
-                                            );
-                                            // Only keep a language the pull will actually
-                                            // dispatch (#425): drop it when `pullFallback =
-                                            // false` OR its effective server selection is
-                                            // empty (`priorities = []`, `maxFanOut = 0`, or
-                                            // names only unconfigured servers). This keeps
-                                            // the invariant "PullLayer present ⟺ a pull
-                                            // dispatched to ≥1 server", so an absent/Clear
-                                            // pull layer never falsely suppresses a
-                                            // server's spontaneous push. The push path is
-                                            // untouched — only kakehashi's pulling stops.
-                                            if !agg.pull_fallback
-                                                || !dispatches_to_any_server(
-                                                    &agg.priorities,
-                                                    &configs,
-                                                    agg.max_fan_out,
-                                                )
-                                            {
-                                                None
-                                            } else {
-                                                Some((configs, agg))
-                                            }
-                                        }
-                                    };
-                                    resolved_by_lang
-                                        .entry(resolved.injection_language.clone())
-                                        .or_insert(computed)
+        let virt_contexts: Option<Vec<DocumentRequestContext>> = if !layer_cfg
+            .allows(crate::config::settings::LayerSource::Virt)
+        {
+            log::debug!(
+                target: LOG_TARGET,
+                "virt layer disabled for {} via layers.aggregation priorities",
+                language_name
+            );
+            Some(Vec::new())
+        } else {
+            resolved_regions.map(|all_regions| {
+                let mut contexts = Vec::new();
+                // Configs + aggregation are keyed by injection language, so
+                // resolve them once per distinct language (a document can
+                // hold many regions of one language). `None` caches a skipped
+                // language: no configured server, OR the pull would dispatch
+                // to none. The key is cloned only on the resolving miss, not
+                // on every region.
+                type ResolvedLang = Option<(Vec<ResolvedServerConfig>, ResolvedAggregationConfig)>;
+                let mut resolved_by_lang: std::collections::HashMap<String, ResolvedLang> =
+                    std::collections::HashMap::new();
+                for resolved in all_regions.iter() {
+                    // `get` on the common (cache-hit) path is a single lookup;
+                    // only the resolving miss touches the map again, cloning
+                    // the language key just for that insert.
+                    let entry = match resolved_by_lang.get(&resolved.injection_language) {
+                        Some(entry) => entry,
+                        None => {
+                            let lang = &resolved.injection_language;
+                            let computed: ResolvedLang = {
+                                let configs = self.bridge.get_all_configs_for_language(
+                                    &settings,
+                                    &language_name,
+                                    lang,
+                                );
+                                if configs.is_empty() {
+                                    None
+                                } else {
+                                    let agg = resolve_aggregation_config_from_settings(
+                                        &settings,
+                                        &language_name,
+                                        lang,
+                                        "textDocument/publishDiagnostics",
+                                    );
+                                    // Only keep a language the pull will actually
+                                    // dispatch (#425): drop it when `pullFallback =
+                                    // false` OR its effective server selection is
+                                    // empty (`priorities = []`, `maxFanOut = 0`, or
+                                    // names only unconfigured servers). This keeps
+                                    // the invariant "PullLayer present ⟺ a pull
+                                    // dispatched to ≥1 server", so an absent/Clear
+                                    // pull layer never falsely suppresses a
+                                    // server's spontaneous push. The push path is
+                                    // untouched — only kakehashi's pulling stops.
+                                    if !agg.pull_fallback
+                                        || !dispatches_to_any_server(
+                                            &agg.priorities,
+                                            &configs,
+                                            agg.max_fan_out,
+                                        )
+                                    {
+                                        None
+                                    } else {
+                                        Some((configs, agg))
+                                    }
                                 }
                             };
-                            let Some((configs, agg)) = entry else {
-                                continue;
-                            };
-
-                            contexts.push(DocumentRequestContext {
-                                uri: uri.clone(),
-                                resolved: resolved.clone(),
-                                configs: configs.clone(),
-                                upstream_request_id: None,
-                                priorities: agg.priorities.clone(),
-                                strategy: agg.strategy,
-                                max_fan_out: agg.max_fan_out,
-                                client_progress_token: None,
-                            });
+                            resolved_by_lang
+                                .entry(resolved.injection_language.clone())
+                                .or_insert(computed)
                         }
-                        contexts
-                    })
-            };
+                    };
+                    let Some((configs, agg)) = entry else {
+                        continue;
+                    };
+
+                    contexts.push(DocumentRequestContext {
+                        uri: uri.clone(),
+                        resolved: resolved.clone(),
+                        configs: configs.clone(),
+                        upstream_request_id: None,
+                        priorities: agg.priorities.clone(),
+                        strategy: agg.strategy,
+                        max_fan_out: agg.max_fan_out,
+                        client_progress_token: None,
+                    });
+                }
+                contexts
+            })
+        };
 
         // Host layer (host-document-bridge): participates when listed in the
         // layer priorities AND opted in via bridge._self.enabled with a
@@ -349,7 +437,7 @@ impl DiagnosticSnapshotPreparer {
             Some(HostRequestContext {
                 uri: uri.clone(),
                 language_id: language_name.clone(),
-                text: snapshot.text_arc(),
+                text: std::sync::Arc::clone(&text),
                 configs,
                 priorities: agg.priorities,
                 strategy: agg.strategy,
@@ -369,7 +457,7 @@ impl DiagnosticSnapshotPreparer {
 
         Some(DiagnosticSnapshot {
             lineage: DiagnosticSnapshotLineage {
-                incarnation: snapshot.incarnation(),
+                incarnation,
                 content_version,
             },
             virt_contexts,

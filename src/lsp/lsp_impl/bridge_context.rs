@@ -708,6 +708,59 @@ impl Kakehashi {
             position.character
         );
 
+        if self.tree_worker_shadow.is_authoritative() {
+            let (text, incarnation, content_version, language_id) =
+                self.documents.get(&uri).map(|document| {
+                    (
+                        document.text_arc(),
+                        document.incarnation(),
+                        document.content_version(),
+                        document.language_id().map(str::to_owned),
+                    )
+                })?;
+            let language_name =
+                self.language
+                    .detect_language(uri.path(), &text, None, language_id.as_deref())?;
+            if !self
+                .language
+                .ensure_language_loaded_async(&language_name)
+                .await
+                .success
+            {
+                return None;
+            }
+            let byte_offset = PositionMapper::new(&text).position_to_byte(position)?;
+            let current = self.documents.get(&uri)?;
+            if current.incarnation() != incarnation || current.content_version() != content_version
+            {
+                return None;
+            }
+            drop(current);
+            let resolved = self
+                .worker_injection_region_at_snapshot(
+                    &uri,
+                    incarnation,
+                    content_version,
+                    &language_name,
+                    byte_offset,
+                )
+                .await?;
+            let current = self.documents.get(&uri)?;
+            if current.incarnation() != incarnation || current.content_version() != content_version
+            {
+                return None;
+            }
+            if !resolved.contiguous && method_requires_contiguous_injection(method_name) {
+                return None;
+            }
+            return Some(PreambleResult {
+                uri,
+                resolved,
+                language_name,
+                upstream_request_id: current_upstream_id(),
+            });
+        }
+
         // Get document snapshot (minimizes lock duration)
         let (snapshot, content_version) = match self.documents.get(&uri) {
             None => {
@@ -1311,6 +1364,9 @@ impl Kakehashi {
     /// Wait for / on-demand the document's tree before a sync bridge-preamble
     /// snapshot (shared by the position and range resolvers).
     async fn ensure_fresh_tree_for_bridge(&self, lsp_uri: &Uri) {
+        if self.tree_worker_shadow.is_authoritative() {
+            return;
+        }
         if let Ok(uri) = uri_to_url(lsp_uri) {
             self.ensure_document_parsed(&uri).await;
         }
@@ -1372,11 +1428,22 @@ impl Kakehashi {
         let Ok(uri) = uri_to_url(lsp_uri) else {
             return Vec::new();
         };
-        let Some((snapshot, content_version)) = self
-            .documents
-            .get(&uri)
-            .and_then(|d| d.snapshot().map(|snapshot| (snapshot, d.content_version())))
-        else {
+        if self.tree_worker_shadow.is_authoritative() {
+            let Some(view) = self.current_worker_injection_view(&uri).await else {
+                return Vec::new();
+            };
+            return self
+                .bridge_contexts_for_overlapping_regions(
+                    uri,
+                    &view.text,
+                    view.language,
+                    view.regions.as_ref().clone(),
+                    range,
+                    method_name,
+                )
+                .await;
+        }
+        let Some(snapshot) = self.documents.get(&uri).and_then(|d| d.snapshot()) else {
             return Vec::new();
         };
         let Some(language_name) = self.document_language(&uri) else {
@@ -1395,20 +1462,26 @@ impl Kakehashi {
             injection_query.as_ref(),
             snapshot.incarnation(),
         );
-        let regions = if self.tree_worker_shadow.is_authoritative() {
-            self.worker_injection_regions_for_snapshot(
-                &uri,
-                snapshot.incarnation(),
-                content_version,
-                &language_name,
-            )
-            .await
-            .map(|regions| regions.as_ref().clone())
-            .unwrap_or_default()
-        } else {
-            legacy_regions
-        };
+        self.bridge_contexts_for_overlapping_regions(
+            uri,
+            snapshot.text(),
+            language_name,
+            legacy_regions,
+            range,
+            method_name,
+        )
+        .await
+    }
 
+    async fn bridge_contexts_for_overlapping_regions(
+        &self,
+        uri: url::Url,
+        text: &str,
+        language_name: String,
+        regions: Vec<crate::language::injection::ResolvedInjection>,
+        range: Range,
+        method_name: &str,
+    ) -> Vec<RangeRequestContext> {
         // One upstream request ID for the whole scan: every overlapping
         // region's context shares it — with the OTHER layers too, so nothing
         // in the virt walk may wipe the registry for it; `run_layer_race`'s
@@ -1417,7 +1490,7 @@ impl Kakehashi {
         // can't drift if this scan is reused under a different request-id scope.
         let upstream_request_id = current_upstream_id();
 
-        let mapper = PositionMapper::new(snapshot.text());
+        let mapper = PositionMapper::new(text);
         let mut contexts = Vec::new();
         for resolved in regions {
             if !resolved.contiguous && method_requires_contiguous_injection(method_name) {

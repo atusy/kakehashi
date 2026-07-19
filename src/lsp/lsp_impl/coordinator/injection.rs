@@ -179,6 +179,7 @@ impl InjectionCoordinator {
                 uri,
                 forward_did_change,
                 None,
+                None,
                 std::future::ready(()),
             )
             .await;
@@ -194,6 +195,40 @@ impl InjectionCoordinator {
             uri,
             forward_did_change,
             Some(incarnation),
+            None,
+            std::future::ready(()),
+        )
+        .await
+    }
+
+    pub(crate) async fn process_worker_injections_for_incarnation(
+        &self,
+        uri: &Url,
+        forward_did_change: bool,
+        incarnation: u64,
+        content_version: u64,
+    ) -> bool {
+        let generation = self.language.configuration_generation();
+        let Some(regions) = self
+            .tree_worker_shadow
+            .worker_injection_regions(uri, incarnation, content_version, generation)
+            .await
+        else {
+            return false;
+        };
+        let injections = regions
+            .iter()
+            .map(|region| BridgeInjection {
+                language: region.injection_language.clone(),
+                region_id: region.region.region_id.clone(),
+                content: region.virtual_content.clone(),
+            })
+            .collect();
+        self.process_injections_after_lifecycle_lock(
+            uri,
+            forward_did_change,
+            Some(incarnation),
+            Some(injections),
             std::future::ready(()),
         )
         .await
@@ -204,6 +239,7 @@ impl InjectionCoordinator {
         uri: &Url,
         forward_did_change: bool,
         required_incarnation: Option<u64>,
+        worker_injections: Option<Vec<BridgeInjection>>,
         after_lifecycle_lock: F,
     ) -> bool
     where
@@ -230,7 +266,8 @@ impl InjectionCoordinator {
             self.bridge.cancel_eager_open(uri);
             return false;
         };
-        let injections = self.resolve_injection_data(uri, &host_language);
+        let injections =
+            worker_injections.unwrap_or_else(|| self.resolve_injection_data(uri, &host_language));
         if injections.is_empty() {
             self.bridge.cancel_eager_open(uri);
             return true;
@@ -506,10 +543,16 @@ mod tests {
         let process_release = Arc::clone(&release);
         let process = tokio::spawn(async move {
             injection
-                .process_injections_after_lifecycle_lock(&process_uri, false, None, async move {
-                    process_entered.notify_one();
-                    process_release.notified().await;
-                })
+                .process_injections_after_lifecycle_lock(
+                    &process_uri,
+                    false,
+                    None,
+                    None,
+                    async move {
+                        process_entered.notify_one();
+                        process_release.notified().await;
+                    },
+                )
                 .await;
         });
         entered.notified().await;
@@ -586,16 +629,22 @@ mod tests {
 
         let processed = server
             .injection_coordinator()
-            .process_injections_after_lifecycle_lock(&uri, false, Some(old_incarnation), async {
-                server.documents.remove_preserving_edit_lock(&uri);
-                let new_incarnation =
-                    server
-                        .documents
-                        .insert(uri.clone(), "new".to_string(), None, None);
-                assert_ne!(new_incarnation, old_incarnation);
-                let token = server.bridge.begin_test_eager_open_batch(&uri);
-                let _ = token_tx.send(token);
-            })
+            .process_injections_after_lifecycle_lock(
+                &uri,
+                false,
+                Some(old_incarnation),
+                None,
+                async {
+                    server.documents.remove_preserving_edit_lock(&uri);
+                    let new_incarnation =
+                        server
+                            .documents
+                            .insert(uri.clone(), "new".to_string(), None, None);
+                    assert_ne!(new_incarnation, old_incarnation);
+                    let token = server.bridge.begin_test_eager_open_batch(&uri);
+                    let _ = token_tx.send(token);
+                },
+            )
             .await;
         let token = token_rx.await.unwrap();
 
