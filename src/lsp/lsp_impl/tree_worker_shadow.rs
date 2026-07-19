@@ -892,11 +892,12 @@ fn classify_transport_failure(
     {
         use std::os::unix::process::ExitStatusExt;
 
-        if client
-            .try_wait()
-            .ok()
-            .flatten()
-            .is_some_and(|status| status.signal().is_some())
+        if !client.was_terminated_by_transport()
+            && client
+                .try_wait()
+                .ok()
+                .flatten()
+                .is_some_and(|status| status.signal().is_some())
         {
             return FailureClass::NativeEvidenced;
         }

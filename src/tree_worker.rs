@@ -13,7 +13,7 @@ use std::{
     collections::{HashMap, VecDeque},
     sync::{
         Arc, Mutex, Weak,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
 };
 
@@ -1504,6 +1504,7 @@ fn executable_digest(path: &std::path::Path) -> io::Result<String> {
 
 pub struct Client {
     child: Arc<Mutex<Child>>,
+    terminated_by_transport: Arc<AtomicBool>,
     outbound: Mutex<Option<mpsc::SyncSender<Request>>>,
     routes: Arc<Mutex<HashMap<u64, Route>>>,
     reader: Option<std::thread::JoinHandle<()>>,
@@ -1545,9 +1546,11 @@ impl Client {
             .take()
             .ok_or_else(|| io::Error::other("worker stdout was not piped"))?;
         let child = Arc::new(Mutex::new(child));
+        let terminated_by_transport = Arc::new(AtomicBool::new(false));
         let routes = Arc::new(Mutex::new(HashMap::<u64, Route>::new()));
         let reader_routes = Arc::clone(&routes);
         let reader_child = Arc::clone(&child);
+        let reader_terminated_by_transport = Arc::clone(&terminated_by_transport);
         let (handshake_tx, handshake_rx) = mpsc::channel();
         let reader = std::thread::spawn(move || {
             let mut handshake_tx = Some(handshake_tx);
@@ -1583,7 +1586,11 @@ impl Client {
                 }
             }
             if let Ok(mut child) = reader_child.lock() {
-                terminate(&mut child, Duration::from_secs(1));
+                terminate_by_transport(
+                    &mut child,
+                    &reader_terminated_by_transport,
+                    Duration::from_secs(1),
+                );
             }
         });
         if let Err(error) = encode_frame(
@@ -1643,6 +1650,7 @@ impl Client {
         let (outbound, outbound_rx) = mpsc::sync_channel::<Request>(max_inflight);
         let writer_routes = Arc::clone(&routes);
         let writer_child = Arc::clone(&child);
+        let writer_terminated_by_transport = Arc::clone(&terminated_by_transport);
         let writer = std::thread::spawn(move || {
             for request in outbound_rx {
                 if let Err(error) = encode_frame(&mut stdin, &request) {
@@ -1650,7 +1658,11 @@ impl Client {
                     let message = error.to_string();
                     fail_routes(None, &writer_routes, kind, &message);
                     if let Ok(mut child) = writer_child.lock() {
-                        terminate(&mut child, Duration::from_secs(1));
+                        terminate_by_transport(
+                            &mut child,
+                            &writer_terminated_by_transport,
+                            Duration::from_secs(1),
+                        );
                     }
                     break;
                 }
@@ -1658,6 +1670,7 @@ impl Client {
         });
         Ok(Self {
             child,
+            terminated_by_transport,
             outbound: Mutex::new(Some(outbound)),
             routes,
             reader: Some(reader),
@@ -1672,6 +1685,10 @@ impl Client {
             .lock()
             .map_err(|_| io::Error::other("worker child lock is poisoned"))?
             .try_wait()
+    }
+
+    pub fn was_terminated_by_transport(&self) -> bool {
+        self.terminated_by_transport.load(Ordering::Acquire)
     }
 
     pub fn compute_threads(&self) -> usize {
@@ -2006,11 +2023,19 @@ fn terminate(child: &mut Child, timeout: Duration) {
     let _ = wait_until(child, timeout);
 }
 
+fn terminate_by_transport(child: &mut Child, marker: &AtomicBool, timeout: Duration) {
+    if child.try_wait().ok().flatten().is_some() {
+        return;
+    }
+    marker.store(true, Ordering::Release);
+    terminate(child, timeout);
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
     use std::io::{Cursor, Read, Write};
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Condvar, Mutex};
     use std::time::Duration;
 
@@ -2021,7 +2046,7 @@ mod tests {
         PROTOCOL_VERSION, Request, RequestContext, Response, Route, SyncDocument, WorkerError,
         close_document, decode_frame, derive_snapshot_with_language, encode_frame,
         named_node_count, replace_retained_bytes, reserve_retained_growth, route_response, run,
-        submit_document_job, sync_document, validate_document_size,
+        submit_document_job, sync_document, terminate_by_transport, validate_document_size,
     };
 
     #[derive(Clone, Default)]
@@ -2035,6 +2060,27 @@ mod tests {
         fn flush(&mut self) -> std::io::Result<()> {
             Ok(())
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn transport_termination_marker_excludes_already_exited_workers() {
+        let marker = AtomicBool::new(false);
+        let mut running = std::process::Command::new("sh")
+            .args(["-c", "sleep 10"])
+            .spawn()
+            .unwrap();
+        terminate_by_transport(&mut running, &marker, Duration::from_secs(1));
+        assert!(marker.load(Ordering::Acquire));
+
+        let marker = AtomicBool::new(false);
+        let mut exited = std::process::Command::new("sh")
+            .args(["-c", "exit 0"])
+            .spawn()
+            .unwrap();
+        exited.wait().unwrap();
+        terminate_by_transport(&mut exited, &marker, Duration::from_secs(1));
+        assert!(!marker.load(Ordering::Acquire));
     }
 
     #[derive(Clone, Default)]
