@@ -229,6 +229,61 @@ impl Kakehashi {
         // has resolved.
         let ticket = crate::lsp::current_writer_ticket();
 
+        // The authoritative cutover owns the open parse in the worker as well as
+        // subsequent edits. Re-submit after language loading so the replica sees
+        // the final query sources, then continue the former post-parse workflows
+        // from worker-owned injection facts. The parent document deliberately
+        // remains tree-less: spawning ParseCoordinator here would recreate the
+        // duplicate parser/Tree/cache ownership this mode exists to remove.
+        if self.tree_worker_shadow.is_authoritative() && !skip_parse {
+            if let Some(language_name) = language_name.clone()
+                && let Some(grammar) = self.language.worker_grammar_descriptor(&language_name)
+            {
+                self.tree_worker_shadow.mirror_full(
+                    &uri,
+                    incarnation,
+                    0,
+                    language_name,
+                    grammar,
+                    text.clone(),
+                );
+            }
+            if let Some(ticket) = ticket {
+                self.documents
+                    .advance_watermark_for_incarnation(&uri, ticket, incarnation);
+            }
+            if !deferred_events.is_empty() {
+                self.notifier().log_language_events(&deferred_events).await;
+            }
+
+            let injection = self.injection_coordinator();
+            if self.is_cli_mode() {
+                injection
+                    .process_worker_injections_for_incarnation(&uri, false, incarnation, 0)
+                    .await;
+            } else {
+                let diagnostic_scheduler = self.diagnostic_scheduler();
+                let worker_uri = uri.clone();
+                tokio::spawn(async move {
+                    injection
+                        .process_worker_injections_for_incarnation(
+                            &worker_uri,
+                            false,
+                            incarnation,
+                            0,
+                        )
+                        .await;
+                    diagnostic_scheduler.spawn_synthetic_diagnostic_task(worker_uri);
+                });
+            }
+            log::info!(
+                target: "kakehashi::tree_worker_shadow",
+                "authoritative worker owns didOpen parsing for {uri}"
+            );
+            self.notifier().log_info("file opened!").await;
+            return;
+        }
+
         // Parse the document and run its tree-dependent downstream. Three shapes:
         //
         // - **auto-install (`skip_parse`)**: the install task spawned above reparses

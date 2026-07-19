@@ -306,6 +306,10 @@ fn authoritative_worker_serves_injected_node_accessors() {
 
     let stderr = shutdown_and_stderr(client);
     assert!(stderr.contains("Authoritative tree worker"), "{stderr}");
+    assert!(
+        stderr.contains("authoritative worker owns didOpen parsing"),
+        "authoritative didOpen must not create a parent-owned tree: {stderr}"
+    );
     assert!(!stderr.contains("node mismatch"), "{stderr}");
 }
 
