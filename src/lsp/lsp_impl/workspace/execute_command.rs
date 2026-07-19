@@ -84,11 +84,9 @@ impl Kakehashi {
         let Ok(host_url) = url::Url::parse(route.host_uri) else {
             return;
         };
-        // didChange clears the tree and reparses off-ingress: an executeCommand
-        // landing right after an edit would otherwise find no injections and
-        // silently skip the heal (the request paths await the fresh tree the
-        // same way).
-        self.ensure_document_parsed(&host_url).await;
+        if !self.tree_worker_shadow.is_authoritative() {
+            self.ensure_document_parsed(&host_url).await;
+        }
         let Some(host_incarnation) = self
             .documents
             .get(&host_url)
@@ -96,8 +94,10 @@ impl Kakehashi {
         else {
             return;
         };
-        let Some((host_language, injections)) =
-            self.injection_coordinator().bridge_injections(&host_url)
+        let Some((host_language, injections)) = self
+            .injection_coordinator()
+            .bridge_injections(&host_url)
+            .await
         else {
             return;
         };

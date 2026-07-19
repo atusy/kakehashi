@@ -216,14 +216,7 @@ impl InjectionCoordinator {
         else {
             return false;
         };
-        let injections = regions
-            .iter()
-            .map(|region| BridgeInjection {
-                language: region.injection_language.clone(),
-                region_id: region.region.region_id.clone(),
-                content: region.virtual_content.clone(),
-            })
-            .collect();
+        let injections = bridge_injections_from_resolved(&regions);
         self.process_injections_after_lifecycle_lock(
             uri,
             forward_did_change,
@@ -481,8 +474,35 @@ impl InjectionCoordinator {
     /// when the document has no detectable language. Lets a caller re-derive the
     /// injected regions on demand (executeCommand doc-sync), mirroring the
     /// didOpen/didChange discovery.
-    pub(crate) fn bridge_injections(&self, uri: &Url) -> Option<(String, Vec<BridgeInjection>)> {
+    pub(crate) async fn bridge_injections(
+        &self,
+        uri: &Url,
+    ) -> Option<(String, Vec<BridgeInjection>)> {
         let host_language = self.get_language_for_document(uri)?;
+        if self.tree_worker_shadow.is_authoritative() {
+            let (incarnation, content_version) = self
+                .documents
+                .get(uri)
+                .map(|document| (document.incarnation(), document.content_version()))?;
+            if self.language.injection_query(&host_language).is_none() {
+                return Some((host_language, Vec::new()));
+            }
+            let regions = self
+                .tree_worker_shadow
+                .worker_injection_regions(
+                    uri,
+                    incarnation,
+                    content_version,
+                    self.language.configuration_generation(),
+                )
+                .await?;
+            let current = self.documents.get(uri)?;
+            if current.incarnation() != incarnation || current.content_version() != content_version
+            {
+                return None;
+            }
+            return Some((host_language, bridge_injections_from_resolved(&regions)));
+        }
         let injections = self.resolve_injection_data(uri, &host_language);
         Some((host_language, injections))
     }
@@ -503,6 +523,19 @@ impl InjectionCoordinator {
     }
 }
 
+fn bridge_injections_from_resolved(
+    regions: &[crate::language::injection::ResolvedInjection],
+) -> Vec<BridgeInjection> {
+    regions
+        .iter()
+        .map(|region| BridgeInjection {
+            language: region.injection_language.clone(),
+            region_id: region.region.region_id.clone(),
+            content: region.virtual_content.clone(),
+        })
+        .collect()
+}
+
 fn parser_enabled_injection_language(language: &str) -> bool {
     // Explicit, unconfigured plaintext is deliberately featureless. An eligible
     // configured plaintext base is canonicalized before reaching this loop.
@@ -511,7 +544,31 @@ fn parser_enabled_injection_language(language: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::parser_enabled_injection_language;
+    use super::{bridge_injections_from_resolved, parser_enabled_injection_language};
+
+    #[test]
+    fn worker_bridge_injection_preserves_identity_language_and_content() {
+        let resolved = crate::language::injection::ResolvedInjection {
+            region: crate::language::injection::CacheableInjectionRegion {
+                language: "python".to_string(),
+                byte_range: 10..15,
+                line_range: 2..3,
+                start_column: 0,
+                region_id: "stable-id".to_string(),
+                content_hash: 0,
+            },
+            injection_language: "python".to_string(),
+            virtual_content: "x = 1".to_string(),
+            line_column_offsets: vec![0],
+            contiguous: true,
+        };
+
+        let injections = bridge_injections_from_resolved(std::slice::from_ref(&resolved));
+
+        assert_eq!(injections[0].region_id, "stable-id");
+        assert_eq!(injections[0].language, "python");
+        assert_eq!(injections[0].content, "x = 1");
+    }
 
     #[test]
     fn explicit_plaintext_does_not_request_a_parser() {
