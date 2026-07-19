@@ -377,7 +377,11 @@ enum ComparisonSide {
 impl ComparisonStore {
     fn record(&self, uri: &str, incarnation: u64, content_version: u64, side: ComparisonSide) {
         let incoming = (incarnation, content_version);
-        let mut pending = self.pending.entry(uri.to_string()).or_default();
+        let mut pending = if let Some(pending) = self.pending.get_mut(uri) {
+            pending
+        } else {
+            self.pending.entry(uri.to_string()).or_default()
+        };
         let current = (pending.incarnation, pending.content_version);
         if incoming < current {
             self.superseded.fetch_add(1, Ordering::Relaxed);
@@ -455,13 +459,23 @@ impl TreeSummary {
 
 fn named_node_count(root: tree_sitter::Node<'_>) -> usize {
     let mut count = 0;
-    let mut pending = vec![root];
-    while let Some(node) = pending.pop() {
-        if node.is_named() {
-            count += 1;
+    let mut cursor = root.walk();
+    let mut ascending = false;
+    loop {
+        if !ascending {
+            count += usize::from(cursor.node().is_named());
+            if cursor.goto_first_child() {
+                continue;
+            }
         }
-        let mut cursor = node.walk();
-        pending.extend(node.children(&mut cursor));
+        if cursor.goto_next_sibling() {
+            ascending = false;
+            continue;
+        }
+        if !cursor.goto_parent() {
+            break;
+        }
+        ascending = true;
     }
     count
 }

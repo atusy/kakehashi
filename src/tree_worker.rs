@@ -452,10 +452,23 @@ pub fn decode_frame<R: Read, T: DeserializeOwned>(reader: &mut R) -> io::Result<
 
 fn named_node_count(root: tree_sitter::Node<'_>) -> usize {
     let mut count = 0;
-    let mut pending = vec![root];
-    while let Some(node) = pending.pop() {
-        count += usize::from(node.is_named());
-        pending.extend((0..node.child_count() as u32).filter_map(|index| node.child(index)));
+    let mut cursor = root.walk();
+    let mut ascending = false;
+    loop {
+        if !ascending {
+            count += usize::from(cursor.node().is_named());
+            if cursor.goto_first_child() {
+                continue;
+            }
+        }
+        if cursor.goto_next_sibling() {
+            ascending = false;
+            continue;
+        }
+        if !cursor.goto_parent() {
+            break;
+        }
+        ascending = true;
     }
     count
 }
@@ -1940,8 +1953,8 @@ mod tests {
         LaneRegistry, MAX_DOCUMENT_BYTES, MAX_DOCUMENT_REPLICAS, MAX_RETAINED_DOCUMENT_BYTES,
         PROTOCOL_VERSION, Request, RequestContext, Response, Route, SyncDocument, WorkerError,
         close_document, decode_frame, derive_snapshot_with_language, encode_frame,
-        replace_retained_bytes, reserve_retained_growth, route_response, run, submit_document_job,
-        sync_document, validate_document_size,
+        named_node_count, replace_retained_bytes, reserve_retained_growth, route_response, run,
+        submit_document_job, sync_document, validate_document_size,
     };
 
     #[derive(Clone, Default)]
@@ -2130,6 +2143,31 @@ mod tests {
         assert_eq!(snapshot.root_kind, "source_file");
         assert!(!snapshot.has_error);
         assert!(snapshot.named_node_count >= 2);
+    }
+
+    #[test]
+    fn cursor_named_node_count_visits_each_node_once() {
+        fn recursive_count(node: tree_sitter::Node<'_>) -> usize {
+            usize::from(node.is_named())
+                + (0..node.child_count() as u32)
+                    .filter_map(|index| node.child(index))
+                    .map(recursive_count)
+                    .sum::<usize>()
+        }
+
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_rust::LANGUAGE.into())
+            .unwrap();
+        let tree = parser
+            .parse(
+                "fn main() { let answer = if true { 42 } else { 0 }; }",
+                None,
+            )
+            .unwrap();
+        let root = tree.root_node();
+
+        assert_eq!(named_node_count(root), recursive_count(root));
     }
 
     #[test]
