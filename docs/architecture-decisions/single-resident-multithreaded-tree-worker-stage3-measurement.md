@@ -25,8 +25,8 @@ captures, semantic tokens, or node identities.
 The committed result is
 `benches/profile/results/single_worker_stage3_shadow_2026-07-19.json`. The
 release binary was built from commit
-`fadac25333af6238903de043022f2a376c2c490d` and has SHA-256
-`29e0509e40c90337a157753bda6c8a165cfaeea1419b70bceffffb033e43dced`.
+`946de588c3928136138afb112200d6cf34af0da3` and has SHA-256
+`8584e64bfb38d8548221d5f5fc3c4d3a086530697a153b4a8b193fb51a885ac1`.
 The run used an Apple M4, macOS 26.5.1, Rust 1.95.0, and four worker compute
 threads.
 
@@ -52,21 +52,25 @@ comparisons at shutdown.
 
 | Batch and order | Disabled ms/cycle | Shadow ms/cycle | Shadow wall delta |
 |---|---:|---:|---:|
-| A, disabled first | 70.16 | 75.62 | +7.78% |
-| B, shadow first | 70.83 | 76.09 | +7.42% |
+| A, disabled first | 71.04 | 77.01 | +8.40% |
+| B, shadow first | 67.80 | 76.66 | +13.08% |
 
 | Batch | Disabled p50 / p90 / p95 / p99 | Shadow p50 / p90 / p95 / p99 | Shadow p50 delta |
 |---|---:|---:|---:|
-| A | 51.6 / 55.7 / 57.2 / 61.2 ms | 57.1 / 64.7 / 67.7 / 73.2 ms | +10.66% |
-| B | 52.6 / 57.8 / 59.5 / 62.7 ms | 57.2 / 65.5 / 68.0 / 73.5 ms | +8.75% |
+| A | 52.0 / 56.6 / 57.6 / 61.2 ms | 59.1 / 64.5 / 67.0 / 68.6 ms | +13.65% |
+| B | 50.3 / 53.0 / 54.2 / 57.0 ms | 57.7 / 65.4 / 67.5 / 73.6 ms | +14.71% |
 
 Reversing execution order did not reverse the result. Continuous shadow parsing
-cost about 7.4--7.8% wall time and 8.8--10.7% at p50 in this single-document
-edit-and-token workload. The p90--p99 deltas were 13.3--19.6% in both batches.
-This final run includes the review-driven replacement of per-node traversal
-allocation with one `TreeCursor` on both paths, plus borrowed-key lookup for
-existing comparison entries. Those changes reduced p50 overhead from the
-earlier exploratory 12.7--13.9%, but did not remove duplicate-parse contention.
+cost 8.4--13.1% wall time and 13.7--14.7% at p50 in this single-document
+edit-and-token workload. The p90--p99 deltas ranged from 12.1% to 29.1%.
+Batch B's disabled baseline was faster than batch A's, so the range includes
+temporal/system variation rather than isolating one fixed shadow cost.
+
+This final run includes review-driven allocation removal, exact parser/query
+generation fencing, per-URI open-incarnation admission, and atomic comparison
+lifecycle state. Those correctness checks are part of the measured hot path.
+Earlier exploratory runs had lower overhead after allocation removal, but they
+predated the final lifecycle fences and are not retained as acceptance evidence.
 
 This does not imply that the eventual worker-authoritative design is slower by
 the same amount. Shadow mode deliberately performs both the legacy parse and
