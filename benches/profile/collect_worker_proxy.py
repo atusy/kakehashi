@@ -54,6 +54,7 @@ ATTESTED_BUILD_COMMAND = [
 ]
 HARNESS_SCRIPT_NAMES = (
     "collect_worker_proxy.py",
+    "collect_worker_shadow.py",
     "collect_worker_cold_start.py",
     "collect_worker_capture_pilot.py",
     "drive.py",
