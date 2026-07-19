@@ -1,0 +1,54 @@
+{
+  "schema": 1,
+  "requests": 1000,
+  "threads": 4,
+  "source_lines": 200,
+  "request_frame_bytes": 8069,
+  "cold_start_us": 1095208.542,
+  "sequential": {
+    "direct": {
+      "p50_us": 1093.667,
+      "p95_us": 1108.0,
+      "p99_us": 1123.459,
+      "mean_us": 1058.767824
+    },
+    "worker_parent_observed": {
+      "p50_us": 1000.167,
+      "p95_us": 1161.5,
+      "p99_us": 1177.083,
+      "mean_us": 1042.1313129999999
+    },
+    "worker_compute": {
+      "p50_us": 879.791,
+      "p95_us": 1022.5,
+      "p99_us": 1038.25,
+      "mean_us": 922.289995
+    },
+    "worker_queue": {
+      "p50_us": 4.334,
+      "p95_us": 7.042,
+      "p99_us": 9.292,
+      "mean_us": 4.690554
+    }
+  },
+  "parallel": {
+    "direct_request_latency": {
+      "p50_us": 1384.917,
+      "p95_us": 2153.375,
+      "p99_us": 2320.75,
+      "mean_us": 1471.164802
+    },
+    "worker_request_latency": {
+      "p50_us": 1749.0,
+      "p95_us": 2211.334,
+      "p99_us": 2346.833,
+      "mean_us": 1791.140396
+    },
+    "direct_wall_ms": 372.279584,
+    "worker_wall_ms": 448.392792,
+    "direct_parser_cache_hits": 996,
+    "worker_parser_cache_hits": 997,
+    "direct_requests_per_second": 2686.153211130697,
+    "worker_requests_per_second": 2230.187500427081
+  }
+}

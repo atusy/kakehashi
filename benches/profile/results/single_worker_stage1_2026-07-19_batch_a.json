@@ -1,0 +1,54 @@
+{
+  "schema": 1,
+  "requests": 1000,
+  "threads": 4,
+  "source_lines": 200,
+  "request_frame_bytes": 8069,
+  "cold_start_us": 1108750.75,
+  "sequential": {
+    "direct": {
+      "p50_us": 960.917,
+      "p95_us": 1100.708,
+      "p99_us": 1183.75,
+      "mean_us": 1006.508422
+    },
+    "worker_parent_observed": {
+      "p50_us": 1129.709,
+      "p95_us": 1172.0,
+      "p99_us": 1217.791,
+      "mean_us": 1084.497511
+    },
+    "worker_compute": {
+      "p50_us": 1008.5,
+      "p95_us": 1033.583,
+      "p99_us": 1072.791,
+      "mean_us": 961.191374
+    },
+    "worker_queue": {
+      "p50_us": 4.542,
+      "p95_us": 7.75,
+      "p99_us": 10.792,
+      "mean_us": 4.97864
+    }
+  },
+  "parallel": {
+    "direct_request_latency": {
+      "p50_us": 1277.875,
+      "p95_us": 1557.334,
+      "p99_us": 1618.792,
+      "mean_us": 1276.203831
+    },
+    "worker_request_latency": {
+      "p50_us": 1730.041,
+      "p95_us": 2162.667,
+      "p99_us": 2306.416,
+      "mean_us": 1786.093039
+    },
+    "direct_wall_ms": 320.506417,
+    "worker_wall_ms": 447.09700000000004,
+    "direct_parser_cache_hits": 996,
+    "worker_parser_cache_hits": 997,
+    "direct_requests_per_second": 3120.0623356006004,
+    "worker_requests_per_second": 2236.6511070304655
+  }
+}

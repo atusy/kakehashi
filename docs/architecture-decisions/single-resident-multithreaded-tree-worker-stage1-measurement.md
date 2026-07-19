@@ -29,14 +29,18 @@ non-regression gate.
 
 The committed result is
 `benches/profile/results/single_worker_stage1_2026-07-19.json`.
-It records source, binary, benchmark, and parser SHA-256 digests. The measured
-release build ran on an Apple M4 with macOS 26.5.1 and Rust 1.95.0.
+It records source, binary, benchmark, and parser SHA-256 digests, and retains
+the two raw collector outputs beside the aggregate. The measured release build
+ran on an Apple M4 with macOS 26.5.1 and Rust 1.95.0. The Rust grammar came
+from `tree-sitter/tree-sitter-rust` revision
+`77a3747266f4d621d0757825e6b11edcbf991ca5`; its recorded digest is the final
+identity check.
 
 Each of two consecutive page-cache-warm batches parsed a generated 200-line
 Rust document 1,000 times. The sequential path measured one request at a time.
 The parallel path used four caller threads and a four-thread worker budget.
 Both paths retained one parser cache per compute thread; the final runs recorded
-996 direct and 997 worker cache hits, avoiding the earlier unfair benchmark
+996 direct and 997 worker cache hits in each batch, avoiding the earlier unfair benchmark
 variant that recreated direct parsers at Rayon split boundaries.
 
 The request frame was 8,133 bytes, dominated by repeated full text. The worker
@@ -49,27 +53,60 @@ also includes JSON encoding/decoding, pipe I/O, wakeup, and response routing.
 
 | Batch | Direct p50 / p95 / p99 | Worker p50 / p95 / p99 | Worker queue p50 |
 |---|---:|---:|---:|
-| A | 808.8 / 823.4 / 830.5 µs | 1138.9 / 1372.1 / 1392.0 µs | 5.0 µs |
-| B | 730.4 / 825.7 / 838.1 µs | 978.9 / 1163.4 / 1188.4 µs | 4.0 µs |
+| A | 960.9 / 1100.7 / 1183.8 µs | 1129.7 / 1172.0 / 1217.8 µs | 4.5 µs |
+| B | 1093.7 / 1108.0 / 1123.5 µs | 1000.2 / 1161.5 / 1177.1 µs | 4.3 µs |
 
-The parent-observed worker p50 was 41% slower in batch A and 34% slower in
-batch B. Queue wait was small. Worker-reported compute was also slower than the
-earlier direct interval, so the remainder cannot be labeled pure transport
+The parent-observed worker p50 was 18% slower in batch A and 9% faster in batch
+B. This reversal under a fixed direct-then-worker order is evidence that the
+sequential difference is smaller than run-order noise, not evidence of a worker
+win. Queue wait remained small. The remainder cannot be labeled pure transport
 overhead without an alternating paired collector.
 
 ### Four-thread throughput
 
 | Batch | Direct | Worker | Worker delta |
 |---|---:|---:|---:|
-| A | 2399.8 req/s | 2027.2 req/s | -15.5% |
-| B | 2830.0 req/s | 2234.2 req/s | -21.1% |
+| A | 3120.1 req/s | 2236.7 req/s | -28.3% |
+| B | 2686.2 req/s | 2230.2 req/s | -17.0% |
 
 The worker did use multiple compute threads and preserved almost identical
 parser-cache hit rates, but did not improve throughput in this full-text
-protocol shape. Warm worker spawn plus handshake was 3.4--3.7 ms. A first run
-after relinking observed a 698-ms cold value and is intentionally excluded from
-the two warm batches; cold-start acceptance needs a dedicated alternating
-collector rather than this microbenchmark.
+protocol shape. Exact executable SHA-256 authentication added after review made
+spawn plus handshake 1.10--1.11 s in these runs, dominated by hashing the 34 MiB
+parent and child images with the current implementation. The final retained
+executable snapshot should hash once and reuse its identity across worker
+generations; cold-start acceptance needs a dedicated alternating collector.
+
+An intermediate measurement exposed a sender-mutex guard accidentally retained
+across response wait: throughput fell to 693--818 req/s and p99 reached
+117--140 ms. Releasing the guard immediately after bounded queue admission
+restored 2230--2237 req/s. Those defective runs are not part of the committed
+results.
+
+## Reproduction
+
+The measured artifacts were prepared and collected with:
+
+```sh
+cargo build --release --locked --bin kakehashi
+target/release/kakehashi language install rust \
+  --data-dir deps/test/kakehashi --force
+shasum -a 256 target/release/kakehashi \
+  deps/test/kakehashi/parser/rust.dylib
+
+cargo bench --locked --bench tree_worker_stage1 -- \
+  --bin target/release/kakehashi \
+  --parser deps/test/kakehashi/parser/rust.dylib \
+  --requests 1000 --threads 4 --lines 200 \
+  > benches/profile/results/single_worker_stage1_2026-07-19_batch_a.json
+
+# Repeat the preceding cargo bench command with batch_b.json as the output.
+```
+
+Before comparing results, the parser revision and all three recorded SHA-256
+values must match the aggregate JSON. The raw files are the collector output;
+the aggregate embeds them unchanged under `batches` plus environment and
+artifact provenance.
 
 ## Decision and next stage
 
