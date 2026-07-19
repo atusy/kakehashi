@@ -369,8 +369,94 @@ pub struct WireSemanticToken {
 pub struct CapturesResult {
     pub context: RequestContext,
     pub available: bool,
+    #[serde(with = "wire_json_values")]
     pub matches: Vec<serde_json::Value>,
+    #[serde(with = "wire_json_values")]
     pub skipped: Vec<serde_json::Value>,
+}
+
+/// Encode schemaless capture payloads without asking the binary codec to
+/// implement serde's self-describing `deserialize_any` entry point.
+mod wire_json_values {
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    #[derive(Deserialize, Serialize)]
+    enum WireJsonValue {
+        Null,
+        Bool(bool),
+        Number(String),
+        String(String),
+        Array(Vec<WireJsonValue>),
+        Object(Vec<(String, WireJsonValue)>),
+    }
+
+    impl From<&serde_json::Value> for WireJsonValue {
+        fn from(value: &serde_json::Value) -> Self {
+            match value {
+                serde_json::Value::Null => Self::Null,
+                serde_json::Value::Bool(value) => Self::Bool(*value),
+                serde_json::Value::Number(value) => Self::Number(value.to_string()),
+                serde_json::Value::String(value) => Self::String(value.clone()),
+                serde_json::Value::Array(values) => {
+                    Self::Array(values.iter().map(Self::from).collect())
+                }
+                serde_json::Value::Object(values) => Self::Object(
+                    values
+                        .iter()
+                        .map(|(key, value)| (key.clone(), Self::from(value)))
+                        .collect(),
+                ),
+            }
+        }
+    }
+
+    impl WireJsonValue {
+        fn into_json(self) -> Result<serde_json::Value, String> {
+            Ok(match self {
+                Self::Null => serde_json::Value::Null,
+                Self::Bool(value) => serde_json::Value::Bool(value),
+                Self::Number(value) => serde_json::Value::Number(
+                    value
+                        .parse()
+                        .map_err(|error| format!("invalid JSON number in worker frame: {error}"))?,
+                ),
+                Self::String(value) => serde_json::Value::String(value),
+                Self::Array(values) => serde_json::Value::Array(
+                    values
+                        .into_iter()
+                        .map(Self::into_json)
+                        .collect::<Result<_, _>>()?,
+                ),
+                Self::Object(values) => serde_json::Value::Object(
+                    values
+                        .into_iter()
+                        .map(|(key, value)| Ok((key, value.into_json()?)))
+                        .collect::<Result<_, String>>()?,
+                ),
+            })
+        }
+    }
+
+    pub fn serialize<S>(values: &[serde_json::Value], serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        values
+            .iter()
+            .map(WireJsonValue::from)
+            .collect::<Vec<_>>()
+            .serialize(serializer)
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<Vec<serde_json::Value>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Vec::<WireJsonValue>::deserialize(deserializer)?
+            .into_iter()
+            .map(|value| value.into_json().map_err(serde::de::Error::custom))
+            .collect()
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -3853,10 +3939,10 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        ApplyDocumentEdits, BUILD_ID, ByteEdit, CloseDocument, DeriveInjectionRegions,
-        DeriveNativeBindings, DeriveSelectionRanges, DeriveSemanticTokens, DeriveSnapshot,
-        DocumentKey, DocumentLane, DocumentReplica, GrammarKey, Handshake, HandshakeReady,
-        LaneAction, LaneRegistry, MAX_DOCUMENT_BYTES, MAX_DOCUMENT_REPLICAS,
+        ApplyDocumentEdits, BUILD_ID, ByteEdit, CapturesResult, CloseDocument,
+        DeriveInjectionRegions, DeriveNativeBindings, DeriveSelectionRanges, DeriveSemanticTokens,
+        DeriveSnapshot, DocumentKey, DocumentLane, DocumentReplica, GrammarKey, Handshake,
+        HandshakeReady, LaneAction, LaneRegistry, MAX_DOCUMENT_BYTES, MAX_DOCUMENT_REPLICAS,
         MAX_RETAINED_DOCUMENT_BYTES, NavigateNode, NodeLayerSelector, NodeNavigation,
         NodeScalarOperation, NodeScalarValue, OpaqueNodeId, PROTOCOL_VERSION, Request,
         RequestContext, ResolveNode, Response, Route, RunCaptures, RunNodeScalar, SyncDocument,
@@ -4045,6 +4131,29 @@ mod tests {
         assert_eq!(
             decode_frame(&mut Cursor::new(bytes)).unwrap(),
             Some(request)
+        );
+    }
+
+    #[test]
+    fn frame_round_trip_preserves_capture_json_without_self_describing_codec() {
+        let Request::DeriveSnapshot(snapshot_request) = request() else {
+            unreachable!()
+        };
+        let response = Response::Captures(CapturesResult {
+            context: snapshot_request.context,
+            available: true,
+            matches: vec![serde_json::json!({
+                "node": {"id": "opaque", "named": true},
+                "captures": [1, null, "text"]
+            })],
+            skipped: vec![serde_json::json!({"reason": "missing query"})],
+        });
+        let mut bytes = Vec::new();
+        encode_frame(&mut bytes, &response).unwrap();
+
+        assert_eq!(
+            decode_frame(&mut Cursor::new(bytes)).unwrap(),
+            Some(response)
         );
     }
 
