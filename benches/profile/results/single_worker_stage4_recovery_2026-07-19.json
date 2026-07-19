@@ -1,0 +1,60 @@
+{
+  "schema": 1,
+  "experiment": "single-tree-worker-stage4-recovery",
+  "environment": {
+    "platform": "macOS 26.5.1 (25F80)",
+    "cpu_model": "Apple M4",
+    "rustc": "rustc 1.95.0 (59807616e 2026-04-14)",
+    "profile": "release",
+    "features": ["e2e"],
+    "source_commit": "de6343766e4d9669c71066081f519d6111fdd8a0",
+    "binary_sha256": "30ad55b1d67f6a34edf31cb32e791f3e9869607b32ca32519d9c4f777b031401"
+  },
+  "method": {
+    "trials_per_scenario": 5,
+    "worker_compute_threads": 4,
+    "initial_backoff_ms": 250,
+    "recovery_ms_definition": "failure handling start through cleanup, backoff, spawn, handshake, and full resync completion",
+    "idle_detection_poll_ms": 250,
+    "idle_detection_delay_included": false
+  },
+  "scenarios": {
+    "systemic_one_document": {
+      "open_documents": 1,
+      "resynced_bytes": 34,
+      "recovery_ms": [529, 551, 547, 494, 615],
+      "median_ms": 547,
+      "mean_ms": 547.2,
+      "min_ms": 494,
+      "max_ms": 615
+    },
+    "systemic_many_documents": {
+      "open_documents": 17,
+      "resynced_bytes": 248037,
+      "recovery_ms": [509, 538, 512, 529, 527],
+      "median_ms": 527,
+      "mean_ms": 523.0,
+      "min_ms": 509,
+      "max_ms": 538
+    },
+    "request_crash_with_grammar_quarantine": {
+      "open_documents": 1,
+      "resynced_documents": 0,
+      "resynced_bytes": 0,
+      "recovery_ms": [501, 601, 477, 553, 490],
+      "median_ms": 501,
+      "mean_ms": 524.4,
+      "min_ms": 477,
+      "max_ms": 601
+    },
+    "idle_process_exit": {
+      "open_documents": 0,
+      "resynced_bytes": 0,
+      "recovery_ms": [476, 499, 481, 486, 497],
+      "median_ms": 486,
+      "mean_ms": 487.8,
+      "min_ms": 476,
+      "max_ms": 499
+    }
+  }
+}
