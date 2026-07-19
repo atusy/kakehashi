@@ -1130,6 +1130,13 @@ must therefore be fused into one high-level worker operation; the cutover must
 not expose remote Tree-sitter primitives or translate a local parent/child walk
 into N+1 internal RPCs.
 
+The [Stage 7 authoritative-reader measurement](single-resident-multithreaded-tree-worker-stage7-measurement.md)
+records the first guarded worker-authoritative LSP workloads. Exact-version
+cache hits can be substantially faster, but edit and large cache-miss paths do
+not yet pass a performance non-regression gate. It identifies lazy shared facts,
+single-flight derivation, and large-result transfer as the next optimization
+targets; it does not change this ADR's `proposed` status.
+
 The implementation should proceed in measured stages:
 
 1. Prototype the framed transport, supervision, and one high-level
