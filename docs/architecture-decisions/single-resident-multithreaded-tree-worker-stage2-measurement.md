@@ -40,7 +40,9 @@ collector outputs, two per size, are retained beside it. The aggregate records
 source commit `40a8fc5a7e65b8b96b49a461bec4e77de9cb67d0` and the executable,
 benchmark, and parser SHA-256 identities. The release build ran on an Apple M4
 with macOS 26.5.1 and Rust 1.95.0. The Rust grammar source revision is recorded
-in the aggregate.
+in the aggregate. Commit `a3455ffef` subsequently changed only poisoned-lock
+handling, a restart-only branch that none of these benchmark operations enter;
+the measured hot path is unchanged.
 
 For each size, two consecutive page-cache-warm batches first ran 5,000
 sequential rounds. To avoid the fixed-order reversal seen in Stage 1, even
