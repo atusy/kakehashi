@@ -327,7 +327,7 @@ impl TreeWorkerShadow {
                 Ok(()) => break,
                 Err(mpsc::TrySendError::Full(returned)) if Instant::now() < deadline => {
                     command = returned;
-                    std::thread::yield_now();
+                    std::thread::sleep(Duration::from_millis(1));
                 }
                 Err(error) => {
                     log_incomplete_shutdown(&format!("could not enqueue drain request: {error}"));
