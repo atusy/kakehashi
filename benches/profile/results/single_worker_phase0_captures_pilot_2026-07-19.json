@@ -6,7 +6,7 @@
     "python": "3.12.13",
     "binary": "/Users/atusy/ghq/github.com/atusy/kakehashi___worker_measure/target/release/kakehashi",
     "binary_execution": "private staged copy",
-    "binary_sha256": "9a56d93536eb41b915c274f4138238956a06a1267d748f3613b76920886f2ada",
+    "binary_sha256": "34ae593996181161a9b64e8db83d845a113232fb552507db2194be8849f85863",
     "data_dir": "/private/var/folders/t3/_nc24_w90zq79l3xyz3xzc7c0000gn/T/kakehashi-phase0-final.6tiXV5/data",
     "data_dir_execution": "private staged copy",
     "parser_query_file_count": 35,
@@ -27,7 +27,7 @@
   "binary_attestation": {
     "schema": 1,
     "source_repository": "https://github.com/atusy/kakehashi",
-    "source_commit": "118d7d82a0c643db3eae2883f8903f9931e9799d",
+    "source_commit": "487f61202e70a960db7a96d9cb5cee94eacfc5dc",
     "source_remote_refs_containing_commit": [
       "refs/remotes/origin/perf/single-tree-worker-measurement"
     ],
@@ -54,14 +54,14 @@
       "TMPDIR": "/var/folders/t3/_nc24_w90zq79l3xyz3xzc7c0000gn/T/",
       "LANG": "C.UTF-8",
       "LC_ALL": "C.UTF-8",
-      "CARGO_TARGET_DIR": "/var/folders/t3/_nc24_w90zq79l3xyz3xzc7c0000gn/T/kakehashi-attested-build-u4f19zmr/target",
-      "CARGO_HOME": "/var/folders/t3/_nc24_w90zq79l3xyz3xzc7c0000gn/T/kakehashi-attested-build-u4f19zmr/target/cargo-home"
+      "CARGO_TARGET_DIR": "/var/folders/t3/_nc24_w90zq79l3xyz3xzc7c0000gn/T/kakehashi-attested-build-qmxgte1p/target",
+      "CARGO_HOME": "/var/folders/t3/_nc24_w90zq79l3xyz3xzc7c0000gn/T/kakehashi-attested-build-qmxgte1p/target/cargo-home"
     },
     "built_in_fresh_target": true,
     "source_isolated_archive": true,
     "cargo_config_ancestry_clean": true,
     "binary_relative": "target/release/kakehashi",
-    "binary_sha256": "9a56d93536eb41b915c274f4138238956a06a1267d748f3613b76920886f2ada"
+    "binary_sha256": "34ae593996181161a9b64e8db83d845a113232fb552507db2194be8849f85863"
   },
   "harness": {
     "execution": "private staged driver and relay helpers",
@@ -88,10 +88,10 @@
   "independent_pairs": 1,
   "order": "direct then relay; smoke result only",
   "direct": {
-    "semantic_p50": 4.8,
-    "semantic_p95": 5.6,
-    "captures_p50": 31.6,
-    "captures_p95": 36.8,
+    "semantic_p50": 4.9,
+    "semantic_p95": 5.3,
+    "captures_p50": 33.1,
+    "captures_p95": 37.6,
     "semantic_outcomes": {
       "count": 100,
       "ok": 100,
@@ -112,10 +112,10 @@
     "capture_full_fallbacks": 0
   },
   "relay": {
-    "semantic_p50": 5.7,
-    "semantic_p95": 5.9,
-    "captures_p50": 37.5,
-    "captures_p95": 41.1,
+    "semantic_p50": 4.9,
+    "semantic_p95": 5.7,
+    "captures_p50": 33.2,
+    "captures_p95": 40.5,
     "semantic_outcomes": {
       "count": 100,
       "ok": 100,
