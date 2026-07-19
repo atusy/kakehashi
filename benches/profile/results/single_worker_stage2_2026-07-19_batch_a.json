@@ -1,0 +1,31 @@
+{
+  "schema": 1,
+  "requests": 1000,
+  "threads": 4,
+  "source_lines": 200,
+  "source_bytes": 7611,
+  "apply_frame_bytes": 268,
+  "derive_frame_bytes": 189,
+  "fused_apply_and_derive_frame_bytes": 279,
+  "spawn_us": 1171436.584,
+  "sync": {
+    "direct_us": 1846.166,
+    "worker_parent_observed_us": 2725.416
+  },
+  "alternating_incremental_edit_and_derive": {
+    "direct": {
+      "p50_us": 254.167,
+      "p95_us": 301.167,
+      "p99_us": 304.375,
+      "mean_us": 267.38780699999995
+    },
+    "worker_parent_observed": {
+      "p50_us": 293.959,
+      "p95_us": 351.083,
+      "p99_us": 365.292,
+      "mean_us": 311.249928
+    },
+    "direct_requests_per_second": 3739.8863142626396,
+    "worker_requests_per_second": 3212.852148836481
+  }
+}
