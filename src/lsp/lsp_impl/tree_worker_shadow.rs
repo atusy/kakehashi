@@ -58,7 +58,7 @@ pub(super) struct TreeWorkerShadow {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-struct TreeSummary {
+pub(super) struct TreeSummary {
     language: String,
     configuration_generation: u64,
     root_kind: String,
@@ -238,14 +238,12 @@ impl TreeWorkerShadow {
         self.shutdown_with_timeout(SHADOW_SHUTDOWN_TIMEOUT);
     }
 
-    pub(super) fn record_authoritative(
+    pub(super) fn record_authoritative_summary(
         &self,
         uri: &url::Url,
         incarnation: u64,
         content_version: u64,
-        language: &str,
-        configuration_generation: u64,
-        tree: &tree_sitter::Tree,
+        summary: TreeSummary,
     ) {
         if !self.is_enabled() {
             return;
@@ -254,11 +252,7 @@ impl TreeWorkerShadow {
             uri.as_str(),
             incarnation,
             content_version,
-            ComparisonSide::Authoritative(TreeSummary::from_tree(
-                language,
-                configuration_generation,
-                tree,
-            )),
+            ComparisonSide::Authoritative(summary),
         );
     }
 
@@ -401,11 +395,11 @@ fn run_actor(
     let mut replicas = HashMap::<String, ReplicaIdentity>::new();
     let mut shutdown_ack = None;
     while let Ok(command) = receiver.recv() {
-        if disabled.load(Ordering::Acquire) {
-            break;
-        }
         if let ShadowCommand::Shutdown(ack) = command {
             shutdown_ack = Some(ack);
+            break;
+        }
+        if disabled.load(Ordering::Acquire) {
             break;
         }
         let started = Instant::now();
@@ -613,7 +607,11 @@ impl ComparisonStore {
 }
 
 impl TreeSummary {
-    fn from_tree(language: &str, configuration_generation: u64, tree: &tree_sitter::Tree) -> Self {
+    pub(super) fn from_tree(
+        language: &str,
+        configuration_generation: u64,
+        tree: &tree_sitter::Tree,
+    ) -> Self {
         let root = tree.root_node();
         Self {
             language: language.to_string(),

@@ -25,6 +25,14 @@ struct PopulatedSnapshotRegions {
         u64,
         std::sync::Arc<Vec<crate::language::injection::ResolvedInjection>>,
     )>,
+    shadow_summary: Option<super::super::tree_worker_shadow::TreeSummary>,
+}
+
+#[derive(Clone, Copy)]
+struct ShadowParseContext {
+    incarnation: u64,
+    content_version: u64,
+    configuration_generation: u64,
 }
 
 /// Timeout for compute-pool parse operations to prevent hangs on pathological inputs.
@@ -325,9 +333,13 @@ impl ParseCoordinator {
         text: std::sync::Arc<str>,
         tree: tree_sitter::Tree,
         language_name: String,
-        incarnation: u64,
-        content_version: u64,
+        shadow_context: ShadowParseContext,
     ) -> PopulatedSnapshotRegions {
+        let ShadowParseContext {
+            incarnation,
+            content_version,
+            configuration_generation,
+        } = shadow_context;
         let cache = std::sync::Arc::clone(&self.cache);
         let language = std::sync::Arc::clone(&self.language);
         let tracker = self.bridge.node_tracker_arc();
@@ -387,8 +399,21 @@ impl ParseCoordinator {
             .settings_manager
             .load_settings()
             .any_bridge_server_runnable();
-        self.compute_pool
+        let shadow_generation = self
+            .tree_worker_shadow
+            .is_enabled()
+            .then_some(configuration_generation);
+        let shadow_uri = uri.clone();
+        let populated = self
+            .compute_pool
             .run(None, move || {
+                let shadow_summary = shadow_generation.map(|generation| {
+                    super::super::tree_worker_shadow::TreeSummary::from_tree(
+                        &language_name,
+                        generation,
+                        &tree,
+                    )
+                });
                 // A refused pass (`None`) maps to all-`None` region fields —
                 // the snapshot then rides WITHOUT regions and readers fall
                 // back to inline resolution. Mapping it to the ran-and-empty
@@ -407,7 +432,10 @@ impl ParseCoordinator {
                     build_bridge_regions,
                     build_bridge_regions,
                 ) else {
-                    return PopulatedSnapshotRegions::default();
+                    return PopulatedSnapshotRegions {
+                        shadow_summary,
+                        ..Default::default()
+                    };
                 };
                 PopulatedSnapshotRegions {
                     discovery: populated.discovery.map(std::sync::Arc::new),
@@ -417,10 +445,20 @@ impl ParseCoordinator {
                     resolved_regions: populated
                         .resolved_regions
                         .map(|regions| (populated.generation, std::sync::Arc::new(regions))),
+                    shadow_summary,
                 }
             })
             .await
-            .unwrap_or_default()
+            .unwrap_or_default();
+        if let Some(summary) = populated.shadow_summary.clone() {
+            self.tree_worker_shadow.record_authoritative_summary(
+                &shadow_uri,
+                incarnation,
+                content_version,
+                summary,
+            );
+        }
+        populated
     }
 
     /// Parse the (already-registered) document at `uri` and publish the result.
@@ -617,21 +655,16 @@ impl ParseCoordinator {
                 // populate — the snapshot then publishes without discovery and
                 // readers discover inline for that (already-superseded) snapshot.
                 let regions = if stored {
-                    self.tree_worker_shadow.record_authoritative(
-                        &uri,
-                        incarnation,
-                        content_version,
-                        &language_name,
-                        configuration_generation,
-                        &tree,
-                    );
                     self.populate_injections_on_pool(
                         uri.clone(),
                         text.clone(),
                         tree.clone(),
                         language_name.clone(),
-                        incarnation,
-                        content_version,
+                        ShadowParseContext {
+                            incarnation,
+                            content_version,
+                            configuration_generation,
+                        },
                     )
                     .await
                 } else {
@@ -904,21 +937,16 @@ impl ParseCoordinator {
             // out-of-order version at publish. A rejected CAS skips populate —
             // the snapshot still publishes as stale-but-consistent.
             let regions = if stored {
-                self.tree_worker_shadow.record_authoritative(
-                    &uri,
-                    expected_incarnation,
-                    content_version,
-                    &language_name,
-                    configuration_generation,
-                    &tree,
-                );
                 self.populate_injections_on_pool(
                     uri.clone(),
                     text.clone(),
                     tree.clone(),
                     language_name.clone(),
-                    expected_incarnation,
-                    content_version,
+                    ShadowParseContext {
+                        incarnation: expected_incarnation,
+                        content_version,
+                        configuration_generation,
+                    },
                 )
                 .await
             } else {
@@ -1124,21 +1152,16 @@ impl ParseCoordinator {
             // publishes as stale-but-consistent (its readers discover inline;
             // the scheduler's dirty loop is already reparsing the newer text).
             let regions = if stored {
-                self.tree_worker_shadow.record_authoritative(
-                    uri,
-                    incarnation,
-                    content_version,
-                    &language_name,
-                    configuration_generation,
-                    &tree,
-                );
                 self.populate_injections_on_pool(
                     uri.clone(),
                     text.clone(),
                     tree.clone(),
                     language_name.clone(),
-                    incarnation,
-                    content_version,
+                    ShadowParseContext {
+                        incarnation,
+                        content_version,
+                        configuration_generation,
+                    },
                 )
                 .await
             } else {
