@@ -1122,6 +1122,14 @@ records real LSP lifecycle comparison and the foreground cost of running both
 the authoritative and worker parse for every edit. It validates the comparison
 path, not the performance of a worker-authoritative cutover.
 
+The [Stage 6 node-operation measurement](single-resident-multithreaded-tree-worker-stage6-measurement.md)
+measures the first worker-owned reader path. A resident worker sustains
+concurrent reads across documents, but each fine-grained process round trip
+costs about 54 microseconds at the median on the measured host. Public handlers
+must therefore be fused into one high-level worker operation; the cutover must
+not expose remote Tree-sitter primitives or translate a local parent/child walk
+into N+1 internal RPCs.
+
 The implementation should proceed in measured stages:
 
 1. Prototype the framed transport, supervision, and one high-level

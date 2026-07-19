@@ -1,0 +1,48 @@
+{
+  "schema": 1,
+  "date": "2026-07-20",
+  "source_commit": "4b0884ef941a3b29e8c9692b3c2b0a89e7a4e131",
+  "binary_sha256": "02c0d7717dcac03e7f168a2b11758da33169a6bec918fb778aa2d56be7ebdb61",
+  "parser_sha256": "74a21f5ff92f409170d6fc605b44773911842c54757744af71a95fd4aeccd28a",
+  "requests_per_batch": 5000,
+  "threads": 4,
+  "source_lines": 200,
+  "source_bytes": 8270,
+  "batches": [
+    {
+      "direct_p50_us": 0.833,
+      "worker_resolve_p50_us": 53.041,
+      "worker_resolve_parent_p50_us": 107.292,
+      "concurrent_worker_p50_us": 77.167,
+      "concurrent_worker_requests_per_second": 49739.2420236908
+    },
+    {
+      "direct_p50_us": 0.667,
+      "worker_resolve_p50_us": 42.791,
+      "worker_resolve_parent_p50_us": 87.167,
+      "concurrent_worker_p50_us": 72.083,
+      "concurrent_worker_requests_per_second": 53224.0936487721
+    },
+    {
+      "direct_p50_us": 0.875,
+      "worker_resolve_p50_us": 54.792,
+      "worker_resolve_parent_p50_us": 110.375,
+      "concurrent_worker_p50_us": 87.167,
+      "concurrent_worker_requests_per_second": 43983.20721148665
+    },
+    {
+      "direct_p50_us": 0.917,
+      "worker_resolve_p50_us": 57.417,
+      "worker_resolve_parent_p50_us": 115.916,
+      "concurrent_worker_p50_us": 86.708,
+      "concurrent_worker_requests_per_second": 44124.44416989235
+    }
+  ],
+  "median_of_batches": {
+    "direct_p50_us": 0.854,
+    "worker_resolve_p50_us": 53.9165,
+    "worker_resolve_parent_p50_us": 108.8335,
+    "concurrent_worker_p50_us": 81.9375,
+    "concurrent_worker_requests_per_second": 46931.8430967915
+  }
+}
