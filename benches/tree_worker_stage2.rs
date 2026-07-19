@@ -218,10 +218,11 @@ fn main() {
         "--requests must be divisible by --threads"
     );
     let mut text = "const COUNTER: usize = 100001;\n".to_string();
-    let marker = text.find("100001").unwrap();
     text.extend(
         (0..args.lines).map(|index| format!("fn function_{index}() {{ let value = {index}; }}\n")),
     );
+    text.push_str("const TRAILING_COUNTER: usize = 100001;\n");
+    let marker = text.rfind("100001").unwrap();
 
     let mut direct = LocalDocumentReplica::new();
     let direct_sync_started = Instant::now();
