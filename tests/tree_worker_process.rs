@@ -268,7 +268,7 @@ fn real_worker_keeps_document_text_and_tree_across_incremental_edits() {
             context: node_context,
             node_id: OpaqueNodeId {
                 worker_generation: 43,
-                local_id: nodes.nodes[0].id.local_id,
+                local_id: nodes.nodes[0].id.local_id.clone(),
             },
             operation: NodeNavigation::Parent,
         })

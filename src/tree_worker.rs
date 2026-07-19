@@ -20,6 +20,8 @@ use std::{
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use sha2::{Digest, Sha256};
 
+use crate::language::node_tracker::{EditInfo, NodeTracker};
+
 pub const PROTOCOL_VERSION: u32 = 4;
 pub const MAX_FRAME_BYTES: usize = 64 * 1024 * 1024;
 pub const MAX_DOCUMENT_REPLICAS: usize = 4_096;
@@ -117,10 +119,10 @@ pub enum NodeNavigation {
     NamedChildren,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
 pub struct OpaqueNodeId {
     pub worker_generation: u64,
-    pub local_id: u64,
+    pub local_id: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -221,9 +223,8 @@ struct DocumentReplica {
     grammar_key: GrammarKey,
     text: String,
     tree: tree_sitter::Tree,
-    node_paths: HashMap<u64, Vec<u32>>,
-    path_ids: HashMap<Vec<u32>, u64>,
-    next_node_id: u64,
+    uri: url::Url,
+    node_tracker: NodeTracker,
 }
 
 impl DocumentReplica {
@@ -240,6 +241,10 @@ impl DocumentReplica {
             incremental: false,
         };
         let grammar_key = GrammarKey::from_sync(&request);
+        let uri = url::Url::parse(&request.context.uri)
+            .map_err(|error| format!("document URI is invalid: {error}"))?;
+        let node_tracker = NodeTracker::new();
+        node_tracker.open_incarnation(&uri, request.context.incarnation);
         Ok((
             Self {
                 context: request.context,
@@ -247,9 +252,8 @@ impl DocumentReplica {
                 grammar_key,
                 text: request.text,
                 tree,
-                node_paths: HashMap::new(),
-                path_ids: HashMap::new(),
-                next_node_id: 1,
+                uri,
+                node_tracker,
             },
             ack,
         ))
@@ -273,6 +277,7 @@ impl DocumentReplica {
         }
         let mut text = self.text.clone();
         let mut edited_tree = self.tree.clone();
+        let mut tracker_edits = Vec::with_capacity(request.edits.len());
         for edit in request.edits {
             if edit.start_byte > edit.old_end_byte
                 || edit.old_end_byte > text.len()
@@ -287,6 +292,11 @@ impl DocumentReplica {
                 .start_byte
                 .checked_add(edit.new_text.len())
                 .ok_or_else(|| "edit length overflows byte offsets".to_string())?;
+            tracker_edits.push(EditInfo::new(
+                edit.start_byte,
+                edit.old_end_byte,
+                new_end_byte,
+            ));
             text.replace_range(edit.start_byte..edit.old_end_byte, &edit.new_text);
             validate_document_size(text.len())?;
             let new_end_position = point_at_byte(&text, new_end_byte);
@@ -307,8 +317,8 @@ impl DocumentReplica {
         }
         self.text = text;
         self.tree = tree;
-        self.node_paths.clear();
-        self.path_ids.clear();
+        self.node_tracker
+            .apply_input_edits(&self.uri, &tracker_edits);
         self.context = request.context;
         Ok(DocumentAck {
             context: self.context.clone(),
@@ -350,7 +360,7 @@ impl DocumentReplica {
     }
 
     fn resolve_node(&mut self, request: ResolveNode) -> Result<NodeResult, String> {
-        self.validate_identity(&request.context)?;
+        self.validate_read_identity(&request.context)?;
         if request.byte_offset > self.text.len() {
             return Err("node byte offset exceeds document length".into());
         }
@@ -365,8 +375,7 @@ impl DocumentReplica {
                     .ok_or_else(|| "no named node exists at byte offset".to_string())?;
             }
         }
-        let descriptor = describe_node(node)?;
-        let owned = self.register_node(descriptor, &request.context);
+        let owned = self.register_node(node, &request.context)?;
         Ok(NodeResult {
             context: request.context,
             nodes: vec![owned],
@@ -374,20 +383,34 @@ impl DocumentReplica {
     }
 
     fn navigate_node(&mut self, request: NavigateNode) -> Result<NodeResult, String> {
-        self.validate_identity(&request.context)?;
+        self.validate_read_identity(&request.context)?;
         if request.node_id.worker_generation != request.context.worker_generation {
             return Ok(NodeResult {
                 context: request.context,
                 nodes: Vec::new(),
             });
         }
-        let Some(path) = self.node_paths.get(&request.node_id.local_id).cloned() else {
+        let Ok(ulid) = request.node_id.local_id.parse::<ulid::Ulid>() else {
             return Ok(NodeResult {
                 context: request.context,
                 nodes: Vec::new(),
             });
         };
-        let Some(node) = node_at_path(self.tree.root_node(), &path) else {
+        let Some((start_byte, end_byte, kind, layer, incarnation)) =
+            self.node_tracker.lookup_node(&self.uri, &ulid)
+        else {
+            return Ok(NodeResult {
+                context: request.context,
+                nodes: Vec::new(),
+            });
+        };
+        if layer != 0 || incarnation != request.context.incarnation {
+            return Ok(NodeResult {
+                context: request.context,
+                nodes: Vec::new(),
+            });
+        }
+        let Some(node) = find_exact_node(self.tree.root_node(), start_byte, end_byte, kind) else {
             return Ok(NodeResult {
                 context: request.context,
                 nodes: Vec::new(),
@@ -402,53 +425,57 @@ impl DocumentReplica {
                 .filter_map(|index| node.named_child(index))
                 .collect(),
         };
-        let selected: Vec<NodeDescriptor> = selected
-            .into_iter()
-            .map(describe_node)
-            .collect::<Result<_, _>>()?;
         let nodes = selected
             .into_iter()
-            .map(|descriptor| self.register_node(descriptor, &request.context))
-            .collect();
+            .map(|node| self.register_node(node, &request.context))
+            .collect::<Result<_, _>>()?;
         Ok(NodeResult {
             context: request.context,
             nodes,
         })
     }
 
-    fn register_node(&mut self, descriptor: NodeDescriptor, context: &RequestContext) -> OwnedNode {
-        let NodeDescriptor {
-            path,
-            kind,
-            start_byte,
-            end_byte,
-            named,
-            has_error,
-        } = descriptor;
-        let local_id = self.path_ids.get(&path).copied().unwrap_or_else(|| {
-            let id = self.next_node_id;
-            self.next_node_id = self.next_node_id.saturating_add(1);
-            self.node_paths.insert(id, path.clone());
-            self.path_ids.insert(path, id);
-            id
-        });
-        OwnedNode {
+    fn register_node(
+        &self,
+        node: tree_sitter::Node<'_>,
+        context: &RequestContext,
+    ) -> Result<OwnedNode, String> {
+        let local_id = self
+            .node_tracker
+            .get_or_create_for_incarnation(
+                &self.uri,
+                node.start_byte(),
+                node.end_byte(),
+                node.kind(),
+                context.incarnation,
+            )
+            .ok_or_else(|| "document incarnation cannot mint a node ID".to_string())?
+            .to_string();
+        Ok(OwnedNode {
             id: OpaqueNodeId {
                 worker_generation: context.worker_generation,
                 local_id,
             },
-            kind,
-            start_byte,
-            end_byte,
-            named,
-            has_error,
-        }
+            kind: node.kind().into(),
+            start_byte: node.start_byte(),
+            end_byte: node.end_byte(),
+            named: node.is_named(),
+            has_error: node.has_error(),
+        })
     }
 
     fn validate_identity(&self, context: &RequestContext) -> Result<(), String> {
         self.validate_lifetime(context)?;
         if context.configuration_generation != self.context.configuration_generation {
             return Err("document identity does not match worker replica".into());
+        }
+        Ok(())
+    }
+
+    fn validate_read_identity(&self, context: &RequestContext) -> Result<(), String> {
+        self.validate_identity(context)?;
+        if context.content_version != self.context.content_version {
+            return Err("document content version does not match worker replica".into());
         }
         Ok(())
     }
@@ -561,51 +588,19 @@ fn point_at_byte(text: &str, byte: usize) -> tree_sitter::Point {
     tree_sitter::Point::new(row, column)
 }
 
-struct NodeDescriptor {
-    path: Vec<u32>,
-    kind: String,
+fn find_exact_node<'tree>(
+    root: tree_sitter::Node<'tree>,
     start_byte: usize,
     end_byte: usize,
-    named: bool,
-    has_error: bool,
-}
-
-fn describe_node(node: tree_sitter::Node<'_>) -> Result<NodeDescriptor, String> {
-    Ok(NodeDescriptor {
-        path: path_to_node(node)?,
-        kind: node.kind().into(),
-        start_byte: node.start_byte(),
-        end_byte: node.end_byte(),
-        named: node.is_named(),
-        has_error: node.has_error(),
-    })
-}
-
-fn path_to_node(mut node: tree_sitter::Node<'_>) -> Result<Vec<u32>, String> {
-    let mut reversed = Vec::new();
-    while let Some(parent) = node.parent() {
-        let index = (0..parent.child_count() as u32)
-            .find(|index| {
-                parent
-                    .child(*index)
-                    .is_some_and(|child| child.id() == node.id())
-            })
-            .ok_or_else(|| "node is not reachable from its parent".to_string())?;
-        reversed.push(index);
-        node = parent;
-    }
-    reversed.reverse();
-    Ok(reversed)
-}
-
-fn node_at_path<'tree>(
-    mut node: tree_sitter::Node<'tree>,
-    path: &[u32],
+    kind: &str,
 ) -> Option<tree_sitter::Node<'tree>> {
-    for index in path {
-        node = node.child(*index)?;
+    let mut node = root.descendant_for_byte_range(start_byte, end_byte)?;
+    loop {
+        if node.start_byte() == start_byte && node.end_byte() == end_byte && node.kind() == kind {
+            return Some(node);
+        }
+        node = node.parent()?;
     }
-    Some(node)
 }
 
 pub fn encode_frame<W: Write, T: Serialize>(writer: &mut W, value: &T) -> io::Result<()> {
@@ -3005,23 +3000,52 @@ mod tests {
         assert_eq!(resolved.nodes.len(), 1);
         assert_eq!(resolved.nodes[0].kind, "identifier");
         assert_eq!(resolved.nodes[0].id.worker_generation, 3);
+        let node_id = resolved.nodes[0].id.clone();
 
         let parent = replica
             .navigate_node(NavigateNode {
                 context: context.clone(),
-                node_id: resolved.nodes[0].id,
+                node_id: node_id.clone(),
                 operation: NodeNavigation::Parent,
             })
             .unwrap();
         assert_eq!(parent.nodes.len(), 1);
         assert_eq!(parent.nodes[0].kind, "function_item");
 
+        let mut edited = context.clone();
+        edited.request_id = 2;
+        edited.content_version = 2;
+        replica
+            .apply(
+                ApplyDocumentEdits {
+                    context: edited.clone(),
+                    base_version: 1,
+                    edits: vec![ByteEdit {
+                        start_byte: 0,
+                        old_end_byte: 0,
+                        new_text: "pub ".into(),
+                    }],
+                },
+                &mut parser,
+                None,
+            )
+            .unwrap();
+        let shifted = replica
+            .navigate_node(NavigateNode {
+                context: edited.clone(),
+                node_id: node_id.clone(),
+                operation: NodeNavigation::Parent,
+            })
+            .unwrap();
+        assert_eq!(shifted.nodes.len(), 1);
+        assert_eq!(shifted.nodes[0].kind, "function_item");
+
         let stale = replica
             .navigate_node(NavigateNode {
-                context,
+                context: edited,
                 node_id: OpaqueNodeId {
                     worker_generation: 2,
-                    local_id: resolved.nodes[0].id.local_id,
+                    local_id: node_id.local_id,
                 },
                 operation: NodeNavigation::Parent,
             })
