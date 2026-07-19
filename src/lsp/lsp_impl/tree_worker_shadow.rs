@@ -234,8 +234,22 @@ impl TreeWorkerShadow {
         }));
     }
 
-    pub(super) fn shutdown(&self) {
-        self.shutdown_with_timeout(SHADOW_SHUTDOWN_TIMEOUT);
+    pub(super) async fn shutdown(&self) {
+        let accepting = Arc::clone(&self.accepting);
+        let sender = self.sender.clone();
+        let comparisons = Arc::clone(&self.comparisons);
+        if let Err(error) = tokio::task::spawn_blocking(move || {
+            shutdown_with_timeout(
+                &accepting,
+                sender.as_ref(),
+                &comparisons,
+                SHADOW_SHUTDOWN_TIMEOUT,
+            );
+        })
+        .await
+        {
+            log_incomplete_shutdown(&format!("shutdown task failed: {error}"));
+        }
     }
 
     pub(super) fn record_authoritative_summary(
@@ -312,43 +326,58 @@ impl TreeWorkerShadow {
         }
     }
 
+    #[cfg(test)]
     fn shutdown_with_timeout(&self, timeout: Duration) {
-        if !self.accepting.swap(false, Ordering::AcqRel) {
-            return;
-        }
-        let deadline = Instant::now() + timeout;
-        let (ack_sender, ack_receiver) = mpsc::sync_channel(0);
-        let Some(sender) = &self.sender else {
-            return;
-        };
-        let mut command = ShadowCommand::Shutdown(ack_sender);
-        loop {
-            match sender.try_send(command) {
-                Ok(()) => break,
-                Err(mpsc::TrySendError::Full(returned)) if Instant::now() < deadline => {
-                    command = returned;
-                    std::thread::sleep(Duration::from_millis(1));
-                }
-                Err(error) => {
-                    log_incomplete_shutdown(&format!("could not enqueue drain request: {error}"));
-                    return;
-                }
-            }
-        }
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if ack_receiver.recv_timeout(remaining).is_err() {
-            log_incomplete_shutdown("timed out waiting for actor drain");
-            return;
-        }
-        log::info!(
-            target: "kakehashi::tree_worker_shadow_metrics",
-            "shadow comparisons matched={} mismatched={} superseded={} pending={}",
-            self.comparisons.matched.load(Ordering::Relaxed),
-            self.comparisons.mismatched.load(Ordering::Relaxed),
-            self.comparisons.superseded.load(Ordering::Relaxed),
-            self.comparisons.pending_count(),
+        shutdown_with_timeout(
+            &self.accepting,
+            self.sender.as_ref(),
+            &self.comparisons,
+            timeout,
         );
     }
+}
+
+fn shutdown_with_timeout(
+    accepting: &AtomicBool,
+    sender: Option<&mpsc::SyncSender<ShadowCommand>>,
+    comparisons: &ComparisonStore,
+    timeout: Duration,
+) {
+    if !accepting.swap(false, Ordering::AcqRel) {
+        return;
+    }
+    let deadline = Instant::now() + timeout;
+    let (ack_sender, ack_receiver) = mpsc::sync_channel(0);
+    let Some(sender) = sender else {
+        return;
+    };
+    let mut command = ShadowCommand::Shutdown(ack_sender);
+    loop {
+        match sender.try_send(command) {
+            Ok(()) => break,
+            Err(mpsc::TrySendError::Full(returned)) if Instant::now() < deadline => {
+                command = returned;
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            Err(error) => {
+                log_incomplete_shutdown(&format!("could not enqueue drain request: {error}"));
+                return;
+            }
+        }
+    }
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if ack_receiver.recv_timeout(remaining).is_err() {
+        log_incomplete_shutdown("timed out waiting for actor drain");
+        return;
+    }
+    log::info!(
+        target: "kakehashi::tree_worker_shadow_metrics",
+        "shadow comparisons matched={} mismatched={} superseded={} pending={}",
+        comparisons.matched.load(Ordering::Relaxed),
+        comparisons.mismatched.load(Ordering::Relaxed),
+        comparisons.superseded.load(Ordering::Relaxed),
+        comparisons.pending_count(),
+    );
 }
 
 fn log_incomplete_shutdown(reason: &str) {
