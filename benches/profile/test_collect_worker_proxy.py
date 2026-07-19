@@ -13,6 +13,7 @@ from unittest import mock
 sys.path.insert(0, str(pathlib.Path(__file__).parent))
 
 import collect_worker_proxy as collector
+from process_test_utils import wait_for_process_stopped
 from collect_worker_proxy import (
     CLEANUP_SIGNALS,
     build_driver_command,
@@ -184,8 +185,7 @@ class CollectionHelpersTest(unittest.TestCase):
                     termination_grace_seconds=0.2,
                 )
             child_pid = int(pid_file.read_text())
-            with self.assertRaises(ProcessLookupError):
-                os.kill(child_pid, 0)
+            wait_for_process_stopped(child_pid)
 
     @unittest.skipUnless(os.name == "posix", "requires POSIX process groups")
     def test_bounded_run_reaps_group_when_collector_is_interrupted(self):
