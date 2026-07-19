@@ -92,6 +92,34 @@ impl Kakehashi {
             )),
         };
 
+        // Compare the fused worker derivation only for a reader that already
+        // consumes every injection. Issuing this RPC from the parse hot path
+        // can overtake queued edits on the document lane and makes the shadow
+        // observation causally stale under a typing burst.
+        if let Some(view) = self.documents.latest_snapshot(&uri)
+            && view.slot.current_incarnation == snapshot.incarnation()
+            && view.slot.snapshot.as_ref().is_some_and(|current| {
+                current.incarnation == snapshot.incarnation()
+                    && current.parsed_version == view.content_version
+            })
+            && let Some(worker_regions) = self
+                .tree_worker_shadow
+                .injection_regions(
+                    &uri,
+                    snapshot.incarnation(),
+                    view.content_version,
+                    self.cache.semantic_token_generation(),
+                )
+                .await
+        {
+            self.tree_worker_shadow.compare_injection_regions(
+                &uri,
+                view.content_version,
+                &all_regions,
+                &worker_regions,
+            );
+        }
+
         if all_regions.is_empty() {
             return Ok(Vec::new());
         }

@@ -12,10 +12,10 @@ use crate::language::coordinator::WorkerGrammarDescriptor;
 use crate::lsp::text_sync::SequentialByteEdit;
 use crate::tree_worker::{
     ApplyDocumentEditsAndDerive, ByteEdit, Client, CloseDocument, ConfigureLanguages,
-    DeriveDocumentSnapshot, DeriveSelectionRanges, NavigateNode, NodeNavigation, NodeResult,
-    NodeScalarOperation, NodeScalarValue, OpaqueNodeId, RequestContext, ResolveNode, Response,
-    RunNodeScalar, SelectionRangesResult, SyncDocument, WirePosition, WorkerLanguageAsset,
-    named_node_count,
+    DeriveDocumentSnapshot, DeriveInjectionRegions, DeriveSelectionRanges, InjectionRegionsResult,
+    NavigateNode, NodeNavigation, NodeResult, NodeScalarOperation, NodeScalarValue, OpaqueNodeId,
+    RequestContext, ResolveNode, Response, RunNodeScalar, SelectionRangesResult, SyncDocument,
+    WirePosition, WorkerLanguageAsset, named_node_count,
 };
 
 const SHADOW_ENV: &str = "KAKEHASHI_TREE_WORKER_SHADOW";
@@ -31,9 +31,9 @@ const WORKER_LIVENESS_POLL: Duration = Duration::from_millis(250);
 const FAST_HEALTHY_INTERVAL: Duration = Duration::from_secs(60);
 const LONG_HEALTHY_INTERVAL: Duration = Duration::from_secs(10 * 60);
 static NEXT_WORKER_GENERATION: AtomicU64 = AtomicU64::new(1);
+static NEXT_CATALOG_REQUEST_ID: AtomicU64 = AtomicU64::new(1_u64 << 63);
 
 enum ShadowCommand {
-    Configure(ConfigureLanguages),
     Sync(SyncDocument),
     Apply {
         request: ApplyDocumentEditsAndDerive,
@@ -189,6 +189,8 @@ enum RecoveryMode {
 struct OpenDocuments {
     current: HashMap<String, SyncDocument>,
     closed_incarnations: HashMap<String, u64>,
+    catalog: Option<(u64, Vec<WorkerLanguageAsset>)>,
+    catalog_preload: Option<(u64, u64)>,
 }
 
 struct SupervisorState {
@@ -261,7 +263,7 @@ impl OpenDocuments {
                                     && current.context.content_version > context.content_version)))
                 })
             }
-            ShadowCommand::Configure(_) | ShadowCommand::Shutdown(_) => false,
+            ShadowCommand::Shutdown(_) => false,
         }
     }
 
@@ -274,10 +276,7 @@ impl OpenDocuments {
         let incoming = match command {
             ShadowCommand::Sync(request) => Some(request),
             ShadowCommand::Apply { fallback, .. } => Some(fallback),
-            ShadowCommand::Close(_)
-            | ShadowCommand::Forget(_)
-            | ShadowCommand::Configure(_)
-            | ShadowCommand::Shutdown(_) => None,
+            ShadowCommand::Close(_) | ShadowCommand::Forget(_) | ShadowCommand::Shutdown(_) => None,
         };
         if incoming.is_some_and(|incoming| {
             self.closed_incarnations
@@ -344,7 +343,7 @@ impl OpenDocuments {
             ShadowCommand::Forget(context) => {
                 self.current.remove(&context.uri);
             }
-            ShadowCommand::Configure(_) | ShadowCommand::Shutdown(_) => {}
+            ShadowCommand::Shutdown(_) => {}
         }
         Observation::Accepted { artifact_replaced }
     }
@@ -383,6 +382,18 @@ pub(super) struct TreeSummary {
     root_end_byte: usize,
     has_error: bool,
     named_node_count: usize,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct ComparableInjection<'a> {
+    language: &'a str,
+    byte_range: std::ops::Range<usize>,
+    line_range: std::ops::Range<u32>,
+    start_column: u32,
+    content_hash: u64,
+    virtual_content: &'a str,
+    line_column_offsets: &'a [u32],
+    contiguous: bool,
 }
 
 pub(super) struct MirrorDocument {
@@ -590,6 +601,7 @@ impl TreeWorkerShadow {
         configuration_generation: u64,
         positions: Vec<WirePosition>,
     ) -> Option<SelectionRangesResult> {
+        self.preload_catalog_async();
         let client = self.read_client.load_full()?;
         if !self.is_enabled() {
             return None;
@@ -634,6 +646,101 @@ impl TreeWorkerShadow {
             return None;
         }
         Some(result)
+    }
+
+    pub(super) async fn injection_regions(
+        &self,
+        uri: &url::Url,
+        incarnation: u64,
+        content_version: u64,
+        configuration_generation: u64,
+    ) -> Option<InjectionRegionsResult> {
+        let client = self.read_client.load_full()?;
+        if !self.is_enabled() {
+            return None;
+        }
+        let context = self.read_context(
+            &client,
+            uri,
+            incarnation,
+            content_version,
+            configuration_generation,
+        );
+        let expected = context.clone();
+        let response = tokio::task::spawn_blocking(move || {
+            client.derive_injection_regions(DeriveInjectionRegions { context })
+        })
+        .await
+        .ok()?
+        .ok()?;
+        let Response::InjectionRegions(result) = response else {
+            return None;
+        };
+        if result.context != expected {
+            return None;
+        }
+        let current = self
+            .open_documents
+            .lock()
+            .recover_poison("TreeWorkerShadow::injection_regions(admission)")
+            .current
+            .get(uri.as_str())
+            .map(|current| current.context.clone());
+        if current.as_ref().is_none_or(|current| {
+            current.incarnation != expected.incarnation
+                || current.content_version != expected.content_version
+                || current.configuration_generation != expected.configuration_generation
+        }) || self
+            .read_client
+            .load()
+            .as_ref()
+            .is_none_or(|client| client.worker_generation() != expected.worker_generation)
+        {
+            return None;
+        }
+        Some(result)
+    }
+
+    pub(super) fn compare_injection_regions(
+        &self,
+        uri: &url::Url,
+        content_version: u64,
+        authoritative: &[crate::language::injection::ResolvedInjection],
+        worker: &InjectionRegionsResult,
+    ) {
+        let authoritative = authoritative
+            .iter()
+            .map(|region| ComparableInjection {
+                language: &region.injection_language,
+                byte_range: region.region.byte_range.clone(),
+                line_range: region.region.line_range.clone(),
+                start_column: region.region.start_column,
+                content_hash: region.region.content_hash,
+                virtual_content: &region.virtual_content,
+                line_column_offsets: &region.line_column_offsets,
+                contiguous: region.contiguous,
+            })
+            .collect::<Vec<_>>();
+        let worker = worker
+            .regions
+            .iter()
+            .map(|region| ComparableInjection {
+                language: &region.language,
+                byte_range: region.byte_start..region.byte_end,
+                line_range: region.line_start..region.line_end,
+                start_column: region.start_column,
+                content_hash: region.content_hash,
+                virtual_content: &region.virtual_content,
+                line_column_offsets: &region.line_column_offsets,
+                contiguous: region.contiguous,
+            })
+            .collect::<Vec<_>>();
+        if authoritative != worker {
+            log::debug!(
+                target: "kakehashi::tree_worker_shadow",
+                "injection region mismatch uri={uri} version={content_version} authoritative={authoritative:?} worker={worker:?}",
+            );
+        }
     }
 
     pub(super) fn record_node_mapping(
@@ -982,20 +1089,8 @@ impl TreeWorkerShadow {
         assets: Vec<WorkerLanguageAsset>,
         documents: Vec<MirrorDocument>,
     ) {
-        let mut commands = Vec::with_capacity(documents.len() + usize::from(!assets.is_empty()));
-        if !assets.is_empty() {
-            commands.push(ShadowCommand::Configure(ConfigureLanguages {
-                context: RequestContext {
-                    request_id: self.next_request_id.fetch_add(1, Ordering::Relaxed),
-                    worker_generation: self.worker_generation,
-                    uri: "kakehashi://language-catalog".into(),
-                    incarnation: 0,
-                    content_version: 0,
-                    configuration_generation: generation,
-                },
-                assets,
-            }));
-        }
+        self.remember_catalog(generation, assets);
+        let mut commands = Vec::with_capacity(documents.len());
         for document in documents {
             let command = if let Some(grammar) = document.grammar {
                 ShadowCommand::Sync(self.sync_request(
@@ -1042,6 +1137,48 @@ impl TreeWorkerShadow {
         for command in commands {
             self.submit(command);
         }
+    }
+
+    fn remember_catalog(&self, generation: u64, assets: Vec<WorkerLanguageAsset>) {
+        if assets.is_empty() {
+            return;
+        }
+        let mut documents = self
+            .open_documents
+            .lock()
+            .recover_poison("TreeWorkerShadow::remember_catalog");
+        documents.catalog = Some((generation, assets));
+        documents.catalog_preload = None;
+    }
+
+    fn preload_catalog_async(&self) {
+        if !self.is_enabled() {
+            return;
+        }
+        let Some(client) = self.read_client.load_full() else {
+            return;
+        };
+        let worker_generation = client.worker_generation();
+        let (configuration_generation, assets) = {
+            let mut documents = self
+                .open_documents
+                .lock()
+                .recover_poison("TreeWorkerShadow::preload_catalog_async");
+            let Some((configuration_generation, assets)) = documents.catalog.clone() else {
+                return;
+            };
+            if documents.catalog_preload == Some((worker_generation, configuration_generation)) {
+                return;
+            }
+            documents.catalog_preload = Some((worker_generation, configuration_generation));
+            (configuration_generation, assets)
+        };
+        spawn_catalog_preload(
+            client,
+            configuration_generation,
+            assets,
+            Arc::clone(&self.open_documents),
+        );
     }
 
     pub(super) async fn shutdown(&self) {
@@ -1257,6 +1394,41 @@ fn shutdown_with_timeout(
         comparisons.superseded.load(Ordering::Relaxed),
         comparisons.pending_count(),
     );
+}
+
+fn spawn_catalog_preload(
+    client: Arc<Client>,
+    configuration_generation: u64,
+    assets: Vec<WorkerLanguageAsset>,
+    open_documents: Arc<Mutex<OpenDocuments>>,
+) {
+    let worker_generation = client.worker_generation();
+    let context = RequestContext {
+        request_id: NEXT_CATALOG_REQUEST_ID.fetch_add(1, Ordering::Relaxed),
+        worker_generation: client.worker_generation(),
+        uri: "kakehashi://language-catalog".into(),
+        incarnation: 0,
+        content_version: 0,
+        configuration_generation,
+    };
+    let _ = std::thread::Builder::new()
+        .name("kakehashi-worker-catalog".into())
+        .spawn(move || {
+            let outcome = client.configure_languages(ConfigureLanguages { context, assets });
+            if !matches!(outcome, Ok(Response::LanguageCatalogAck(_))) {
+                let mut documents = open_documents
+                    .lock()
+                    .recover_poison("spawn_catalog_preload(error)");
+                if documents.catalog_preload == Some((worker_generation, configuration_generation))
+                {
+                    documents.catalog_preload = None;
+                }
+                log::debug!(
+                    target: "kakehashi::tree_worker_shadow",
+                    "worker catalog preload did not complete: {outcome:?}",
+                );
+            }
+        });
 }
 
 fn log_incomplete_shutdown(reason: &str) {
@@ -1793,7 +1965,6 @@ fn execute_command(
     comparisons: &ComparisonStore,
 ) -> (std::io::Result<Response>, Option<ReplicaIdentity>) {
     match command {
-        ShadowCommand::Configure(request) => (client.configure_languages(request), None),
         ShadowCommand::Sync(request) => {
             let identity = ReplicaIdentity::from_sync(&request);
             comparisons.open(&request.context.uri, request.context.incarnation);
@@ -2101,7 +2272,6 @@ fn replica_was_closed(
 
 fn retag_command(command: &mut ShadowCommand, generation: u64) {
     match command {
-        ShadowCommand::Configure(request) => request.context.worker_generation = generation,
         ShadowCommand::Sync(request) => request.context.worker_generation = generation,
         ShadowCommand::Apply { request, fallback } => {
             request.context.worker_generation = generation;
@@ -2143,7 +2313,6 @@ fn classify_transport_failure(
 
 fn command_uri(command: &ShadowCommand) -> Option<&str> {
     match command {
-        ShadowCommand::Configure(_) => None,
         ShadowCommand::Sync(request) => Some(&request.context.uri),
         ShadowCommand::Apply { fallback, .. } => Some(&fallback.context.uri),
         ShadowCommand::Close(request) => Some(&request.context.uri),
@@ -2154,7 +2323,6 @@ fn command_uri(command: &ShadowCommand) -> Option<&str> {
 
 fn command_document(command: &ShadowCommand) -> Option<(&str, u64)> {
     match command {
-        ShadowCommand::Configure(_) => None,
         ShadowCommand::Sync(request) => Some((&request.context.uri, request.context.incarnation)),
         ShadowCommand::Apply { fallback, .. } => {
             Some((&fallback.context.uri, fallback.context.incarnation))
@@ -2169,10 +2337,7 @@ fn command_grammar(command: &ShadowCommand) -> Option<GrammarIdentity> {
     match command {
         ShadowCommand::Sync(request) => Some(GrammarIdentity::from_sync(request)),
         ShadowCommand::Apply { fallback, .. } => Some(GrammarIdentity::from_sync(fallback)),
-        ShadowCommand::Configure(_)
-        | ShadowCommand::Close(_)
-        | ShadowCommand::Forget(_)
-        | ShadowCommand::Shutdown(_) => None,
+        ShadowCommand::Close(_) | ShadowCommand::Forget(_) | ShadowCommand::Shutdown(_) => None,
     }
 }
 
@@ -2180,10 +2345,7 @@ fn command_sync(command: &ShadowCommand) -> Option<&SyncDocument> {
     match command {
         ShadowCommand::Sync(request) => Some(request),
         ShadowCommand::Apply { fallback, .. } => Some(fallback),
-        ShadowCommand::Configure(_)
-        | ShadowCommand::Close(_)
-        | ShadowCommand::Forget(_)
-        | ShadowCommand::Shutdown(_) => None,
+        ShadowCommand::Close(_) | ShadowCommand::Forget(_) | ShadowCommand::Shutdown(_) => None,
     }
 }
 

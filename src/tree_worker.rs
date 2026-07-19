@@ -22,7 +22,7 @@ use sha2::{Digest, Sha256};
 
 use crate::language::node_tracker::{EditInfo, NodeTracker};
 
-pub const PROTOCOL_VERSION: u32 = 7;
+pub const PROTOCOL_VERSION: u32 = 8;
 pub const MAX_FRAME_BYTES: usize = 64 * 1024 * 1024;
 pub const MAX_DOCUMENT_REPLICAS: usize = 4_096;
 pub const MAX_DOCUMENT_BYTES: usize = 32 * 1024 * 1024;
@@ -146,6 +146,11 @@ pub struct RunNodeScalar {
 pub struct DeriveSelectionRanges {
     pub context: RequestContext,
     pub positions: Vec<WirePosition>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct DeriveInjectionRegions {
+    pub context: RequestContext,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -283,6 +288,27 @@ pub struct SelectionRangesResult {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct WireInjectionRegion {
+    pub language: String,
+    pub byte_start: usize,
+    pub byte_end: usize,
+    pub line_start: u32,
+    pub line_end: u32,
+    pub start_column: u32,
+    pub region_id: String,
+    pub content_hash: u64,
+    pub virtual_content: String,
+    pub line_column_offsets: Vec<u32>,
+    pub contiguous: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct InjectionRegionsResult {
+    pub context: RequestContext,
+    pub regions: Vec<WireInjectionRegion>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct LanguageCatalogAck {
     pub context: RequestContext,
     pub languages: usize,
@@ -323,6 +349,7 @@ pub enum Request {
     NavigateNode(NavigateNode),
     RunNodeScalar(RunNodeScalar),
     DeriveSelectionRanges(DeriveSelectionRanges),
+    DeriveInjectionRegions(DeriveInjectionRegions),
     ConfigureLanguages(ConfigureLanguages),
     CloseDocument(CloseDocument),
 }
@@ -366,6 +393,7 @@ pub enum Response {
     Nodes(NodeResult),
     NodeScalar(NodeScalarResult),
     SelectionRanges(SelectionRangesResult),
+    InjectionRegions(InjectionRegionsResult),
     LanguageCatalogAck(LanguageCatalogAck),
     Error(WorkerError),
 }
@@ -415,11 +443,16 @@ impl DocumentReplica {
             .language()
             .map(|language| (*language).clone())
             .ok_or_else(|| "parser has no configured language".to_string())?;
+        // Parsing and node reads do not consume highlight/binding queries.
+        // Compile only the injection query needed by the current fused
+        // readers; the catalog path prepares the full query set lazily before
+        // readers that need it. This keeps document sync and recovery cheap.
         worker_analysis(
             &analysis,
             &request.language,
             grammar_language,
             request.queries,
+            false,
         )?;
         Ok((
             Self {
@@ -774,6 +807,47 @@ impl DocumentReplica {
         })
     }
 
+    fn derive_injection_regions(
+        &self,
+        request: DeriveInjectionRegions,
+    ) -> Result<InjectionRegionsResult, String> {
+        self.validate_read_identity(&request.context)?;
+        let regions = self
+            .analysis
+            .injection_query(&self.language)
+            .map(|query| {
+                crate::language::InjectionResolver::resolve_all(
+                    &self.analysis,
+                    &self.node_tracker,
+                    &self.uri,
+                    &self.tree,
+                    &self.text,
+                    query.as_ref(),
+                    request.context.incarnation,
+                )
+            })
+            .unwrap_or_default()
+            .into_iter()
+            .map(|resolved| WireInjectionRegion {
+                language: resolved.injection_language,
+                byte_start: resolved.region.byte_range.start,
+                byte_end: resolved.region.byte_range.end,
+                line_start: resolved.region.line_range.start,
+                line_end: resolved.region.line_range.end,
+                start_column: resolved.region.start_column,
+                region_id: resolved.region.region_id,
+                content_hash: resolved.region.content_hash,
+                virtual_content: resolved.virtual_content,
+                line_column_offsets: resolved.line_column_offsets,
+                contiguous: resolved.contiguous,
+            })
+            .collect();
+        Ok(InjectionRegionsResult {
+            context: request.context,
+            regions,
+        })
+    }
+
     fn tracked_node<'tree>(
         &'tree self,
         node_id: &OpaqueNodeId,
@@ -904,6 +978,7 @@ fn worker_analysis(
     language_name: &str,
     language: tree_sitter::Language,
     queries: WorkerQuerySources,
+    compile_all_queries: bool,
 ) -> Result<(), String> {
     analysis
         .language_registry_for_parallel()
@@ -922,9 +997,19 @@ fn worker_analysis(
             queries.injections,
         ),
     ] {
+        if !compile_all_queries && kind != crate::config::settings::QueryKind::Injections {
+            continue;
+        }
         let Some(source) = source else {
             continue;
         };
+        if analysis
+            .query_store()
+            .query_source(kind, language_name)
+            .is_some_and(|current| current.as_ref() == source)
+        {
+            continue;
+        }
         let query = tree_sitter::Query::new(&language, &source)
             .map_err(|error| format!("worker query reconstruction failed: {error}"))?;
         analysis.query_store().insert_query_with_source(
@@ -1579,6 +1664,7 @@ fn handle_work(
         Request::NavigateNode(request) => navigate_node(request, documents),
         Request::RunNodeScalar(request) => run_node_scalar(request, documents),
         Request::DeriveSelectionRanges(request) => derive_selection_ranges(request, documents),
+        Request::DeriveInjectionRegions(request) => derive_injection_regions(request, documents),
         Request::ConfigureLanguages(request) => configure_languages(request, analysis),
         Request::CloseDocument(request) => close_document(
             request,
@@ -1605,6 +1691,7 @@ fn request_context(request: &Request) -> Option<&RequestContext> {
         Request::NavigateNode(request) => Some(&request.context),
         Request::RunNodeScalar(request) => Some(&request.context),
         Request::DeriveSelectionRanges(request) => Some(&request.context),
+        Request::DeriveInjectionRegions(request) => Some(&request.context),
         Request::ConfigureLanguages(request) => Some(&request.context),
         Request::CloseDocument(request) => Some(&request.context),
     }
@@ -1620,6 +1707,7 @@ fn document_key(request: &Request) -> Option<DocumentKey> {
         Request::NavigateNode(request) => Some(DocumentKey::from(&request.context)),
         Request::RunNodeScalar(request) => Some(DocumentKey::from(&request.context)),
         Request::DeriveSelectionRanges(request) => Some(DocumentKey::from(&request.context)),
+        Request::DeriveInjectionRegions(request) => Some(DocumentKey::from(&request.context)),
         Request::CloseDocument(request) => Some(DocumentKey::from(&request.context)),
         Request::Handshake(_) | Request::DeriveSnapshot(_) | Request::ConfigureLanguages(_) => None,
     }
@@ -1717,6 +1805,32 @@ fn derive_selection_ranges(request: DeriveSelectionRanges, documents: &DocumentS
     }
 }
 
+fn derive_injection_regions(
+    request: DeriveInjectionRegions,
+    documents: &DocumentStore,
+) -> Response {
+    let context = request.context.clone();
+    let Some(replica) = documents
+        .get(&DocumentKey::from(&context))
+        .map(|entry| Arc::clone(entry.value()))
+    else {
+        return Response::Error(WorkerError {
+            context: Some(context),
+            message: "document replica is missing; full sync required".into(),
+        });
+    };
+    match replica.lock() {
+        Ok(replica) => match replica.derive_injection_regions(request) {
+            Ok(result) => Response::InjectionRegions(result),
+            Err(message) => Response::Error(WorkerError {
+                context: Some(context),
+                message,
+            }),
+        },
+        Err(_) => poisoned_document_restart(context),
+    }
+}
+
 fn configure_languages(
     request: ConfigureLanguages,
     analysis: &Arc<crate::language::LanguageCoordinator>,
@@ -1738,7 +1852,7 @@ fn configure_languages(
                             message: "parser has no configured language".into(),
                         });
                     };
-                    match worker_analysis(analysis, &language_name, language, queries) {
+                    match worker_analysis(analysis, &language_name, language, queries, true) {
                         Ok(()) => Response::LanguageCatalogAck(LanguageCatalogAck {
                             context: context.clone(),
                             languages: configured + 1,
@@ -2652,6 +2766,18 @@ impl Client {
         )
     }
 
+    pub fn derive_injection_regions(
+        &self,
+        request: DeriveInjectionRegions,
+    ) -> io::Result<Response> {
+        let context = request.context.clone();
+        self.request_with_timeout(
+            Request::DeriveInjectionRegions(request),
+            context,
+            Duration::from_secs(60),
+        )
+    }
+
     pub fn configure_languages(&self, request: ConfigureLanguages) -> io::Result<Response> {
         let context = request.context.clone();
         self.request_with_timeout(
@@ -2828,6 +2954,7 @@ fn response_request_id(response: &Response) -> Option<u64> {
         Response::Nodes(result) => Some(result.context.request_id),
         Response::NodeScalar(result) => Some(result.context.request_id),
         Response::SelectionRanges(result) => Some(result.context.request_id),
+        Response::InjectionRegions(result) => Some(result.context.request_id),
         Response::LanguageCatalogAck(ack) => Some(ack.context.request_id),
         Response::Error(error) => error.context.as_ref().map(|context| context.request_id),
         Response::HandshakeReady(_) => None,
@@ -2843,6 +2970,7 @@ fn response_context(response: &Response) -> Option<&RequestContext> {
         Response::Nodes(result) => Some(&result.context),
         Response::NodeScalar(result) => Some(&result.context),
         Response::SelectionRanges(result) => Some(&result.context),
+        Response::InjectionRegions(result) => Some(&result.context),
         Response::LanguageCatalogAck(ack) => Some(&ack.context),
         Response::Error(error) => error.context.as_ref(),
         Response::HandshakeReady(_) => None,
@@ -2954,16 +3082,16 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        ApplyDocumentEdits, BUILD_ID, ByteEdit, CloseDocument, DeriveSelectionRanges,
-        DeriveSnapshot, DocumentKey, DocumentLane, DocumentReplica, GrammarKey, Handshake,
-        HandshakeReady, LaneAction, LaneRegistry, MAX_DOCUMENT_BYTES, MAX_DOCUMENT_REPLICAS,
-        MAX_RETAINED_DOCUMENT_BYTES, NavigateNode, NodeNavigation, NodeScalarOperation,
-        NodeScalarValue, OpaqueNodeId, PROTOCOL_VERSION, Request, RequestContext, ResolveNode,
-        Response, Route, RunNodeScalar, SyncDocument, WirePosition, WireRange, WorkerError,
-        WorkerQuerySources, close_document, decode_frame, derive_snapshot_with_language,
-        encode_frame, named_node_count, replace_retained_bytes, reserve_retained_growth,
-        route_response, run, submit_document_job, sync_document, terminate_by_transport,
-        validate_document_size,
+        ApplyDocumentEdits, BUILD_ID, ByteEdit, CloseDocument, DeriveInjectionRegions,
+        DeriveSelectionRanges, DeriveSnapshot, DocumentKey, DocumentLane, DocumentReplica,
+        GrammarKey, Handshake, HandshakeReady, LaneAction, LaneRegistry, MAX_DOCUMENT_BYTES,
+        MAX_DOCUMENT_REPLICAS, MAX_RETAINED_DOCUMENT_BYTES, NavigateNode, NodeNavigation,
+        NodeScalarOperation, NodeScalarValue, OpaqueNodeId, PROTOCOL_VERSION, Request,
+        RequestContext, ResolveNode, Response, Route, RunNodeScalar, SyncDocument, WirePosition,
+        WireRange, WorkerError, WorkerQuerySources, close_document, decode_frame,
+        derive_snapshot_with_language, encode_frame, named_node_count, replace_retained_bytes,
+        reserve_retained_growth, route_response, run, submit_document_job, sync_document,
+        terminate_by_transport, validate_document_size,
     };
 
     #[derive(Clone, Default)]
@@ -3795,6 +3923,7 @@ mod tests {
                 parser_path: "/unused/static-language".into(),
                 artifact_digest: "sha256:rust-v1".into(),
                 queries: WorkerQuerySources {
+                    highlights: Some("(identifier) @variable".into()),
                     injections: Some(
                         r#"((line_comment) @injection.content
                             (#set! injection.language "rust")
@@ -3808,6 +3937,8 @@ mod tests {
             &mut parser,
         )
         .unwrap();
+        assert!(replica.analysis.highlight_query("rust").is_none());
+        assert!(replica.analysis.injection_query("rust").is_some());
 
         let result = replica
             .derive_selection_ranges(DeriveSelectionRanges {
@@ -3834,6 +3965,22 @@ mod tests {
             }
         );
         assert!(result.ranges[0].parent.is_some());
+
+        let regions = replica
+            .derive_injection_regions(DeriveInjectionRegions {
+                context: RequestContext {
+                    request_id: 2,
+                    worker_generation: 3,
+                    uri: "file:///injected.rs".into(),
+                    incarnation: 4,
+                    content_version: 1,
+                    configuration_generation: 2,
+                },
+            })
+            .unwrap();
+        assert_eq!(regions.regions.len(), 1);
+        assert_eq!(regions.regions[0].language, "rust");
+        assert_eq!(regions.regions[0].virtual_content, "fn inner() {}");
     }
 
     #[test]
