@@ -25,7 +25,7 @@ captures, semantic tokens, or node identities.
 The committed result is
 `benches/profile/results/single_worker_stage3_shadow_2026-07-19.json`. The
 release binary was built from commit
-`7f0d8039c29209a9c67fc98f84fe0d9e96c62c2a` and has SHA-256
+`900077461aa0d740baef65bca28560c4a1a18b8b` and has SHA-256
 `9469eb77490b348c579595dc08b009699556d4f1a0571176313a1207cd4b138b`.
 The run used an Apple M4, macOS 26.5.1, Rust 1.95.0, and four worker compute
 threads.
