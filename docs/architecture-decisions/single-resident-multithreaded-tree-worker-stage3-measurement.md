@@ -25,8 +25,8 @@ captures, semantic tokens, or node identities.
 The committed result is
 `benches/profile/results/single_worker_stage3_shadow_2026-07-19.json`. The
 release binary was built from commit
-`9f6d7a50e44f30b445c7232604904dc68a7d2868` and has SHA-256
-`a6ee0ac80a97c814259a4c8855dc195332b4cab1a5faf34077d025818c577657`.
+`00d99301c1751d3ca17ece6f7012de999ade5617` and has SHA-256
+`90902453b256fcbab027fa84fbf87f2483aad1e077df3ae37ecdebc4590eb1ca`.
 The run used an Apple M4, macOS 26.5.1, Rust 1.95.0, and four worker compute
 threads.
 
@@ -52,24 +52,28 @@ comparisons at shutdown.
 
 | Batch and order | Disabled ms/cycle | Shadow ms/cycle | Shadow wall delta |
 |---|---:|---:|---:|
-| A, disabled first | 76.41 | 81.68 | +6.89% |
-| B, shadow first | 68.71 | 74.02 | +7.72% |
+| A, disabled first | 68.88 | 74.34 | +7.92% |
+| B, shadow first | 69.37 | 73.71 | +6.27% |
 
 | Batch | Disabled p50 / p90 / p95 / p99 | Shadow p50 / p90 / p95 / p99 | Shadow p50 delta |
 |---|---:|---:|---:|
-| A | 57.5 / 62.0 / 63.5 / 67.8 ms | 62.9 / 68.3 / 71.3 / 74.6 ms | +9.39% |
-| B | 49.2 / 51.8 / 54.0 / 57.7 ms | 55.6 / 60.7 / 63.4 / 66.5 ms | +13.01% |
+| A | 50.8 / 53.1 / 54.3 / 57.2 ms | 56.4 / 60.3 / 62.2 / 66.7 ms | +11.02% |
+| B | 50.1 / 56.6 / 59.3 / 64.8 ms | 55.4 / 59.8 / 62.3 / 65.2 ms | +10.58% |
 
 Reversing execution order did not reverse the result. Continuous shadow parsing
-cost 6.9--7.7% wall time and 9.4--13.0% at p50 in this single-document
-edit-and-token workload. The p90--p99 deltas ranged from 10.0% to 17.4%.
-Batch B's disabled baseline was faster than batch A's, so the range includes
-temporal/system variation rather than isolating one fixed shadow cost.
+cost 6.3--7.9% wall time and 10.6--11.0% at p50 in this single-document
+edit-and-token workload. The p90--p99 deltas ranged from 0.6% to 16.6%.
+The two disabled wall baselines differed by less than 1%, while percentile
+variation still shows why the reversed order is retained rather than treating
+one batch as a fixed shadow cost.
 
 This final run includes review-driven allocation removal, exact parser/query
 generation fencing, per-URI open-incarnation admission, atomic comparison
 lifecycle state, and bounded actor drain before the final summary. Those
 correctness checks are part of the measured hot path.
+The authoritative summary traversal also runs inside the existing compute-pool
+injection work-unit rather than blocking a Tokio worker or adding another pool
+submission.
 Earlier exploratory runs had lower overhead after allocation removal, but they
 predated the final lifecycle fences and are not retained as acceptance evidence.
 

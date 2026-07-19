@@ -6,7 +6,7 @@
     "python": "3.12.13",
     "rustc": "rustc 1.95.0 (59807616e 2026-04-14) (built from a source tarball)",
     "cpu_model": "Apple M4",
-    "binary_sha256": "a6ee0ac80a97c814259a4c8855dc195332b4cab1a5faf34077d025818c577657",
+    "binary_sha256": "90902453b256fcbab027fa84fbf87f2483aad1e077df3ae37ecdebc4590eb1ca",
     "retained_environment": {
       "PATH": "<redacted-search-path>",
       "TMPDIR": "<redacted-path>",
@@ -23,7 +23,7 @@
   "binary_attestation": {
     "schema": 1,
     "source_repository": "https://github.com/atusy/kakehashi",
-    "source_commit": "9f6d7a50e44f30b445c7232604904dc68a7d2868",
+    "source_commit": "00d99301c1751d3ca17ece6f7012de999ade5617",
     "source_remote_refs_containing_commit": [
       "refs/remotes/origin/feat/tree-worker-stage3-shadow"
     ],
@@ -57,13 +57,13 @@
     "source_isolated_archive": true,
     "cargo_config_ancestry_clean": true,
     "binary_relative": "target/release/kakehashi",
-    "binary_sha256": "a6ee0ac80a97c814259a4c8855dc195332b4cab1a5faf34077d025818c577657"
+    "binary_sha256": "90902453b256fcbab027fa84fbf87f2483aad1e077df3ae37ecdebc4590eb1ca"
   },
   "harness": {
     "execution": "private staged driver and collector helpers",
     "source_files_sha256": {
       "collect_worker_proxy.py": "00867d5ebd4f23b0d02ad94b7f49cb41c8d868da8c49620f809f4cb300ba7f56",
-      "collect_worker_shadow.py": "cac7e119837531da2821ed1ca4776d1319a9cd8e91547da7f6d805fdd3701a28",
+      "collect_worker_shadow.py": "c4696420ae0b47920dfaea45ec636c68f07373bcbdc260fc733e091ae17a7e9e",
       "collect_worker_cold_start.py": "7648e2b0eba60b20b7f11a641c07c6ccdd5a1d3b75bc91492f32acfa90750109",
       "collect_worker_capture_pilot.py": "3a709d50253dc23060ca99f885978e71a8b58f07a71af6c492d2fa73916a75f5",
       "drive.py": "3e9e2d8d84b6a2c4704c41f2e4efbd3a54499b1a6882d4f648c0c6ef2e178c12",
@@ -106,12 +106,12 @@
             "null": 0,
             "errors": 0,
             "tokens_per_request": 17807,
-            "p50": 57.5,
-            "p90": 62.0,
-            "p95": 63.5,
-            "p99": 67.8,
-            "max": 76.7,
-            "wall": 15282.706290949136,
+            "p50": 50.8,
+            "p90": 53.1,
+            "p95": 54.3,
+            "p99": 57.2,
+            "max": 58.9,
+            "wall": 13776.48274996318,
             "wire_kib": 37800.9
           },
           "shadow": {
@@ -121,12 +121,12 @@
             "null": 0,
             "errors": 0,
             "tokens_per_request": 17807,
-            "p50": 62.9,
-            "p90": 68.3,
-            "p95": 71.3,
-            "p99": 74.6,
-            "max": 150.5,
-            "wall": 16335.963875055313,
+            "p50": 56.4,
+            "p90": 60.3,
+            "p95": 62.2,
+            "p99": 66.7,
+            "max": 67.8,
+            "wall": 14868.049292010255,
             "wire_kib": 37800.9,
             "comparisons": {
               "matched": 201,
@@ -136,11 +136,11 @@
             }
           },
           "shadow_delta_percent": {
-            "wall": 6.89,
-            "p50": 9.39,
-            "p90": 10.16,
-            "p95": 12.28,
-            "p99": 10.03
+            "wall": 7.92,
+            "p50": 11.02,
+            "p90": 13.56,
+            "p95": 14.55,
+            "p99": 16.61
           }
         },
         {
@@ -156,12 +156,12 @@
             "null": 0,
             "errors": 0,
             "tokens_per_request": 17807,
-            "p50": 55.6,
-            "p90": 60.7,
-            "p95": 63.4,
-            "p99": 66.5,
-            "max": 67.8,
-            "wall": 14803.383833030239,
+            "p50": 55.4,
+            "p90": 59.8,
+            "p95": 62.3,
+            "p99": 65.2,
+            "max": 74.6,
+            "wall": 14742.709832964465,
             "wire_kib": 37800.9,
             "comparisons": {
               "matched": 201,
@@ -177,20 +177,20 @@
             "null": 0,
             "errors": 0,
             "tokens_per_request": 17807,
-            "p50": 49.2,
-            "p90": 51.8,
-            "p95": 54.0,
-            "p99": 57.7,
-            "max": 61.2,
-            "wall": 13742.651749984361,
+            "p50": 50.1,
+            "p90": 56.6,
+            "p95": 59.3,
+            "p99": 64.8,
+            "max": 68.0,
+            "wall": 13873.362708021887,
             "wire_kib": 37800.9
           },
           "shadow_delta_percent": {
-            "wall": 7.72,
-            "p50": 13.01,
-            "p90": 17.18,
-            "p95": 17.41,
-            "p99": 15.25
+            "wall": 6.27,
+            "p50": 10.58,
+            "p90": 5.65,
+            "p95": 5.06,
+            "p99": 0.62
           }
         }
       ]

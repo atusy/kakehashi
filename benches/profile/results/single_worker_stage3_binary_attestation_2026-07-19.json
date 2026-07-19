@@ -1,7 +1,7 @@
 {
   "schema": 1,
   "source_repository": "https://github.com/atusy/kakehashi",
-  "source_commit": "9f6d7a50e44f30b445c7232604904dc68a7d2868",
+  "source_commit": "00d99301c1751d3ca17ece6f7012de999ade5617",
   "source_remote_refs_containing_commit": [
     "refs/remotes/origin/feat/tree-worker-stage3-shadow"
   ],
@@ -35,5 +35,5 @@
   "source_isolated_archive": true,
   "cargo_config_ancestry_clean": true,
   "binary_relative": "target/release/kakehashi",
-  "binary_sha256": "a6ee0ac80a97c814259a4c8855dc195332b4cab1a5faf34077d025818c577657"
+  "binary_sha256": "90902453b256fcbab027fa84fbf87f2483aad1e077df3ae37ecdebc4590eb1ca"
 }
