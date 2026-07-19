@@ -8,9 +8,12 @@ import pathlib
 import platform
 import shutil
 import subprocess
+import sys
 import tarfile
 import tempfile
 import urllib.parse
+
+sys.dont_write_bytecode = True
 
 from collect_worker_proxy import (
     ATTESTED_BUILD_COMMAND,

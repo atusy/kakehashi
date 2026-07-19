@@ -47,6 +47,17 @@ from collect_worker_proxy import (
 
 
 class CollectionHelpersTest(unittest.TestCase):
+    def test_runtime_artifacts_exclude_internal_replace_locks(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            query = root / "queries/rust/highlights.scm"
+            query.parent.mkdir(parents=True)
+            query.write_text("(identifier) @variable\n")
+            (root / "queries/.rust.replace.lock").write_text("")
+            (query.parent / ".kakehashi-install-complete").write_text("")
+
+            self.assertEqual(collector.runtime_artifact_files(root), [query])
+
     def test_recorded_environment_redacts_local_paths(self):
         self.assertEqual(portable_environment({
             "PATH": "/home/developer/bin:/usr/bin",

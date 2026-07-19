@@ -92,6 +92,7 @@ def collect(args):
         args.bin, args.data_dir, source_script_dir
     )
     try:
+        provenance = artifact_provenance(data_dir, args.nvim_treesitter_checkout)
         batches = []
         for index in range(args.batches):
             batch = {"batch": index + 1, "order": list(order(index))}
@@ -121,7 +122,7 @@ def collect(args):
                 "binary_sha256": binary_sha256,
                 "retained_environment": portable_environment(os.environ),
             },
-            "artifacts": artifact_provenance(data_dir, args.nvim_treesitter_checkout),
+            "artifacts": provenance,
             "binary_attestation": attestation,
             "harness": {
                 "execution": "private staged driver and collector helpers",

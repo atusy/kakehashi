@@ -484,7 +484,10 @@ def runtime_artifact_files(root):
             continue
         files.extend(
             item for item in artifact_root.rglob("*")
-            if item.is_file() and not item.is_symlink()
+            if item.is_file()
+            and not item.is_symlink()
+            and not item.name.endswith(".replace.lock")
+            and item.name != ".kakehashi-install-complete"
         )
     return sorted(
         files, key=lambda item: item.relative_to(root).as_posix()
