@@ -43,13 +43,20 @@ def order(batch_index):
     return ("disabled", "shadow") if batch_index % 2 == 0 else ("shadow", "disabled")
 
 
-def parse_comparisons(output):
+def parse_comparisons(output, expected=201):
     matches = COMPARISON_RE.findall(output)
     if len(matches) != 1:
         raise ValueError(f"expected one complete shadow summary, got {len(matches)}")
     values = map(int, matches[0])
-    result = dict(zip(("matched", "mismatched", "superseded", "pending"), values))
-    if result["matched"] <= 0 or result["mismatched"] or result["pending"]:
+    result = dict(
+        zip(("matched", "mismatched", "superseded", "pending"), values, strict=True)
+    )
+    if (
+        result["matched"] != expected
+        or result["mismatched"]
+        or result["superseded"]
+        or result["pending"]
+    ):
         raise ValueError(f"shadow validation did not converge: {result}")
     return result
 

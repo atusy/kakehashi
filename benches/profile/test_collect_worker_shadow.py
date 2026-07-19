@@ -19,6 +19,10 @@ class ShadowCollectorTest(unittest.TestCase):
         self.assertEqual(parse_comparisons(output)["matched"], 201)
         with self.assertRaises(ValueError):
             parse_comparisons(output.replace("pending=0", "pending=1"))
+        with self.assertRaises(ValueError):
+            parse_comparisons(output.replace("superseded=0", "superseded=1"))
+        with self.assertRaises(ValueError):
+            parse_comparisons(output.replace("matched=201", "matched=200"))
 
     def test_delta_percent_uses_control_as_baseline(self):
         self.assertEqual(delta_percent({"wall": 100}, {"wall": 112.5}, "wall"), 12.5)
