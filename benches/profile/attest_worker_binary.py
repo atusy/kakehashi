@@ -157,7 +157,11 @@ def git(checkout, *arguments):
 
 
 def require_clean(checkout):
-    status = git(checkout, "status", "--porcelain")
+    status = "\n".join(
+        line
+        for line in git(checkout, "status", "--porcelain").splitlines()
+        if line != "?? .DS_Store"
+    )
     if status:
         raise ValueError(f"binary source checkout is dirty:\n{status}")
 

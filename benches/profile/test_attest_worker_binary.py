@@ -18,6 +18,7 @@ from attest_worker_binary import (
     isolated_local_git_environment,
     native_toolchain_metadata,
     portable_build_environment,
+    require_clean,
     require_isolated_source,
     require_uncredentialed_repository_url,
     remote_verification_environment,
@@ -26,6 +27,15 @@ from attest_worker_binary import (
 
 
 class BinaryAttestationTest(unittest.TestCase):
+    @mock.patch("attest_worker_binary.git")
+    def test_clean_check_ignores_only_root_finder_metadata(self, git_status):
+        git_status.return_value = "?? .DS_Store"
+        require_clean(pathlib.Path("/checkout"))
+
+        git_status.return_value = "?? .DS_Store\n M src/main.rs"
+        with self.assertRaisesRegex(ValueError, "src/main.rs"):
+            require_clean(pathlib.Path("/checkout"))
+
     def test_recorded_build_environment_redacts_local_paths(self):
         recorded = portable_build_environment({
             "PATH": "/home/developer/bin:/usr/bin",
