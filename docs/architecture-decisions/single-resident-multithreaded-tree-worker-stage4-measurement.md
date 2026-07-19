@@ -22,8 +22,8 @@ release binary was built with the `e2e` feature from commit
 The run used an Apple M4, macOS 26.5.1, Rust 1.95.0, and four worker compute
 threads.
 
-Deterministic one-shot hooks injected four failure shapes. Each scenario ran
-five fresh LSP server sessions. `recovery_ms` starts when the actor begins
+Deterministic one-shot hooks injected three failure shapes across four replay
+scenarios. Each scenario ran five fresh LSP server sessions. `recovery_ms` starts when the actor begins
 handling the failure and ends after worker cleanup, the configured 250 ms
 backoff, replacement spawn and handshake, and full-text resynchronization.
 For idle exit, the separate detection delay is not included; the supervisor

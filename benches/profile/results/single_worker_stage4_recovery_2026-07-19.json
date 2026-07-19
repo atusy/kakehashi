@@ -21,6 +21,7 @@
   "scenarios": {
     "systemic_one_document": {
       "open_documents": 1,
+      "resynced_documents": 1,
       "resynced_bytes": 34,
       "recovery_ms": [557, 625, 515, 508, 512],
       "median_ms": 515,
@@ -30,6 +31,7 @@
     },
     "systemic_many_documents": {
       "open_documents": 17,
+      "resynced_documents": 17,
       "resynced_bytes": 248037,
       "recovery_ms": [517, 522, 522, 527, 543],
       "median_ms": 522,
@@ -49,6 +51,7 @@
     },
     "idle_process_exit": {
       "open_documents": 0,
+      "resynced_documents": 0,
       "resynced_bytes": 0,
       "recovery_ms": [493, 503, 476, 550, 470],
       "median_ms": 493,

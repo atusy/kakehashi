@@ -41,6 +41,25 @@ fn shutdown_and_stderr(mut client: LspClient) -> String {
     client.drain_stderr()
 }
 
+fn log_metric(line: &str, name: &str) -> u64 {
+    line.split_whitespace()
+        .find_map(|field| {
+            field
+                .trim_start_matches('(')
+                .strip_prefix(&format!("{name}="))
+        })
+        .and_then(|value| value.trim_end_matches([',', ')']).parse::<u64>().ok())
+        .unwrap_or_else(|| panic!("missing {name} in log line: {line}"))
+}
+
+fn shadow_metric(stderr: &str, name: &str) -> u64 {
+    let summary = stderr
+        .lines()
+        .find(|line| line.contains("shadow comparisons matched="))
+        .unwrap_or_else(|| panic!("missing shadow comparison summary: {stderr}"));
+    log_metric(summary, name)
+}
+
 #[test]
 fn shadow_worker_matches_authoritative_incremental_lifecycle() {
     let mut client = LspClient::builder()
@@ -126,20 +145,9 @@ fn shadow_worker_matches_authoritative_incremental_lifecycle() {
         stderr.contains("shadow comparisons matched="),
         "missing shadow summary: {stderr}"
     );
-    let summary = stderr
-        .lines()
-        .find(|line| line.contains("shadow comparisons matched="))
-        .expect("shadow summary was checked above");
-    let metric = |name: &str| {
-        summary
-            .split_whitespace()
-            .find_map(|field| field.strip_prefix(&format!("{name}=")))
-            .and_then(|value| value.trim_end_matches(',').parse::<u64>().ok())
-            .unwrap_or_else(|| panic!("missing {name} in shadow summary: {summary}"))
-    };
-    assert!(metric("matched") > 0, "{summary}");
-    assert_eq!(metric("mismatched"), 0, "{summary}");
-    assert_eq!(metric("pending"), 0, "{summary}");
+    assert!(shadow_metric(&stderr, "matched") > 0, "{stderr}");
+    assert_eq!(shadow_metric(&stderr, "mismatched"), 0, "{stderr}");
+    assert_eq!(shadow_metric(&stderr, "pending"), 0, "{stderr}");
     assert!(!stderr.contains("shadow validation incomplete"), "{stderr}");
     assert!(!stderr.contains("tree mismatch"), "{stderr}");
     assert!(!stderr.contains("worker transport failed"), "{stderr}");
@@ -188,7 +196,7 @@ fn systemic_worker_restart_full_resyncs_the_open_document() {
         stderr.contains("full-resynced 1 open documents"),
         "{stderr}"
     );
-    assert!(stderr.contains("shadow comparisons matched=1"), "{stderr}");
+    assert_eq!(shadow_metric(&stderr, "matched"), 1, "{stderr}");
     assert!(stderr.contains("pending=0"), "{stderr}");
     assert!(!stderr.contains("quarantined grammar"), "{stderr}");
     eprintln!(
@@ -267,8 +275,9 @@ fn systemic_worker_restart_measures_many_document_full_resync() {
         recovery.contains("full-resynced 17 open documents"),
         "{stderr}"
     );
-    assert!(
-        recovery.contains(&format!("bytes={expected_bytes}")),
+    assert_eq!(
+        log_metric(recovery, "bytes"),
+        expected_bytes as u64,
         "{stderr}"
     );
     assert!(!stderr.contains("quarantined grammar"), "{stderr}");
@@ -340,7 +349,7 @@ fn rejected_document_does_not_block_other_documents_during_full_resync() {
         stderr.contains("full-resynced 2 open documents"),
         "{stderr}"
     );
-    assert!(stderr.contains("shadow comparisons matched=2"), "{stderr}");
+    assert_eq!(shadow_metric(&stderr, "matched"), 2, "{stderr}");
     assert!(stderr.contains("pending=0"), "{stderr}");
     assert!(!stderr.contains("quarantined grammar"), "{stderr}");
     assert!(!stderr.contains("disabled shadow tree tier"), "{stderr}");
@@ -391,7 +400,7 @@ fn idle_worker_exit_is_detected_and_restarted_before_the_next_document() {
         stderr.contains("full-resynced 0 open documents"),
         "{stderr}"
     );
-    assert!(stderr.contains("shadow comparisons matched=1"), "{stderr}");
+    assert_eq!(shadow_metric(&stderr, "matched"), 1, "{stderr}");
     assert!(!stderr.contains("quarantined grammar"), "{stderr}");
     eprintln!(
         "idle recovery measurement: {}",
@@ -459,7 +468,7 @@ fn crashed_grammar_is_quarantined_only_in_session_and_other_grammar_recovers() {
     );
     assert!(stderr.contains("symbol=rust"), "{stderr}");
     assert!(stderr.contains("restarted worker generation"), "{stderr}");
-    assert!(stderr.contains("shadow comparisons matched=1"), "{stderr}");
+    assert_eq!(shadow_metric(&stderr, "matched"), 1, "{stderr}");
     assert!(stderr.contains("pending=0"), "{stderr}");
     assert!(!stderr.contains("disabled shadow tree tier"), "{stderr}");
     eprintln!(
