@@ -9,7 +9,9 @@ use crate::config::settings::{LanguageSettings, QueryKind, infer_query_kind};
 use crate::config::{CaptureMappings, WorkspaceSettings};
 use crate::error::LockResultExt;
 use log::debug;
+use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
 use tree_sitter::Language;
@@ -98,6 +100,10 @@ pub(crate) struct LanguageCoordinator {
     /// failed load succeed) before the hygiene clear. Read-validated against
     /// `failed_loads` entries; see there.
     load_generation: std::sync::atomic::AtomicU64,
+    /// Content identities for immutable parser artifacts. The generation in
+    /// the key keeps didChange from re-reading a shared library while ensuring
+    /// a configuration reload revalidates even a same-path replacement.
+    worker_artifact_digests: dashmap::DashMap<(PathBuf, u64), String>,
     /// Single-flight marker for [`ensure_language_loaded_async`](Self::ensure_language_loaded_async):
     /// a language with an in-flight first load has an entry here, so a
     /// concurrent request for the same language parks on the winner's
@@ -116,6 +122,7 @@ pub(crate) struct LanguageCoordinator {
 pub(crate) struct WorkerGrammarDescriptor {
     pub(crate) parser_path: PathBuf,
     pub(crate) grammar_symbol: String,
+    pub(crate) artifact_digest: String,
     pub(crate) configuration_generation: u64,
 }
 
@@ -141,6 +148,7 @@ impl LanguageCoordinator {
             registration_lock: Mutex::new(()),
             settings_reload_lock: Mutex::new(()),
             load_generation: std::sync::atomic::AtomicU64::new(0),
+            worker_artifact_digests: dashmap::DashMap::new(),
             config_warnings: RwLock::new(Vec::new()),
             load_inflight: dashmap::DashMap::new(),
         }
@@ -422,6 +430,7 @@ impl LanguageCoordinator {
         }
         self.failed_loads.clear();
         self.configured_load_failures.clear();
+        self.worker_artifact_digests.clear();
 
         // Build base map from language configs
         self.build_base_map(&settings.languages);
@@ -1786,14 +1795,36 @@ impl LanguageCoordinator {
             &grammar_symbol,
             &self.config_store.search_paths(),
         )?;
+        let parser_path = parser_path
+            .canonicalize()
+            .unwrap_or_else(|_| parser_path.clone());
+        let configuration_generation = self
+            .load_generation
+            .load(std::sync::atomic::Ordering::Acquire);
+        let cache_key = (parser_path.clone(), configuration_generation);
+        let artifact_digest = if let Some(digest) = self.worker_artifact_digests.get(&cache_key) {
+            digest.clone()
+        } else {
+            let digest = match sha256_file(&parser_path) {
+                Ok(digest) => digest,
+                Err(error) => {
+                    log::warn!(
+                        target: "kakehashi::tree_worker_shadow",
+                        "cannot identify parser artifact {}: {error}",
+                        parser_path.display(),
+                    );
+                    return None;
+                }
+            };
+            self.worker_artifact_digests
+                .insert(cache_key, digest.clone());
+            digest
+        };
         Some(WorkerGrammarDescriptor {
-            parser_path: parser_path
-                .canonicalize()
-                .unwrap_or_else(|_| parser_path.clone()),
+            parser_path,
             grammar_symbol,
-            configuration_generation: self
-                .load_generation
-                .load(std::sync::atomic::Ordering::Acquire),
+            artifact_digest,
+            configuration_generation,
         })
     }
 
@@ -1801,6 +1832,20 @@ impl LanguageCoordinator {
         self.load_generation
             .load(std::sync::atomic::Ordering::Acquire)
     }
+}
+
+fn sha256_file(path: &Path) -> std::io::Result<String> {
+    let mut file = std::fs::File::open(path)?;
+    let mut digest = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        digest.update(&buffer[..read]);
+    }
+    Ok(format!("sha256:{:x}", digest.finalize()))
 }
 
 /// Truncate a pattern string for display in log messages.
@@ -1837,13 +1882,15 @@ mod tests {
     #[test]
     fn worker_grammar_descriptor_uses_shared_base_parser_identity() {
         let coordinator = LanguageCoordinator::new();
-        let parser_path = "/nonexistent/tree-sitter-markdown.so";
+        let directory = tempdir().unwrap();
+        let parser_path = directory.path().join("tree-sitter-markdown.so");
+        fs::write(&parser_path, b"parser-v1").unwrap();
         let settings = WorkspaceSettings {
             languages: HashMap::from([
                 (
                     "markdown".to_string(),
                     LanguageSettings {
-                        parser: Some(parser_path.to_string()),
+                        parser: Some(parser_path.to_string_lossy().into_owned()),
                         ..Default::default()
                     },
                 ),
@@ -1864,7 +1911,26 @@ mod tests {
             .unwrap();
 
         assert_eq!(descriptor.grammar_symbol, "markdown");
-        assert_eq!(descriptor.parser_path, PathBuf::from(parser_path));
+        assert_eq!(descriptor.parser_path, parser_path.canonicalize().unwrap());
+
+        let alias = coordinator
+            .worker_grammar_descriptor("markdown", &settings)
+            .unwrap();
+        assert_eq!(alias.artifact_digest, descriptor.artifact_digest);
+
+        fs::write(&parser_path, b"parser-v2").unwrap();
+        let cached = coordinator
+            .worker_grammar_descriptor("rmd", &settings)
+            .unwrap();
+        assert_eq!(cached.artifact_digest, descriptor.artifact_digest);
+
+        coordinator
+            .load_generation
+            .fetch_add(1, std::sync::atomic::Ordering::Release);
+        let replaced = coordinator
+            .worker_grammar_descriptor("rmd", &settings)
+            .unwrap();
+        assert_ne!(replaced.artifact_digest, descriptor.artifact_digest);
     }
 
     /// Pins the #575 single-flight fix: a caller that arrives while another

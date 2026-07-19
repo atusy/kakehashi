@@ -1256,6 +1256,7 @@ mod tests {
         WorkerGrammarDescriptor {
             parser_path: "/parser/rust.so".into(),
             grammar_symbol: "rust".into(),
+            artifact_digest: "sha256:rust-v1".into(),
             configuration_generation: 3,
         }
     }
