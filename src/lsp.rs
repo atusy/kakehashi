@@ -12,7 +12,7 @@ mod text_sync;
 
 mod aggregation;
 mod ingress_order;
-mod lsp_impl;
+pub(crate) mod lsp_impl;
 mod progress;
 mod request_id;
 mod semantic_request_tracker;

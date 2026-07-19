@@ -203,7 +203,7 @@ struct DocMatchCache {
 /// See the module docs. One instance lives on the server, shared with the
 /// compute-pool walks by `Arc`.
 #[derive(Default)]
-pub(in crate::lsp::lsp_impl) struct CapturesMatchCache {
+pub(crate) struct CapturesMatchCache {
     cache: dashmap::DashMap<Url, DocMatchCache>,
 }
 

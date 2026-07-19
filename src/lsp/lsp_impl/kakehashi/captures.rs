@@ -1136,6 +1136,17 @@ impl Kakehashi {
         let mut flight_guard = flight_guard;
 
         let uri_for_walk = uri.clone();
+        let worker_kind = kind.to_string();
+        let worker_range = lsp_range.map(|range| crate::tree_worker::WireRange {
+            start: crate::tree_worker::WirePosition {
+                line: range.start.line,
+                character: range.start.character,
+            },
+            end: crate::tree_worker::WirePosition {
+                line: range.end.line,
+                character: range.end.character,
+            },
+        });
         let kind = kind.to_string();
         let language = std::sync::Arc::clone(&self.language);
         let tracker = self.bridge.node_tracker_arc();
@@ -1238,7 +1249,7 @@ impl Kakehashi {
                     layers,
                     &language,
                     &tracker,
-                    &documents,
+                    &|| documents.latest_snapshot(&uri_for_walk).is_some(),
                     entry_mint_epoch,
                     incarnation,
                     mint_into_tracker,
@@ -1292,6 +1303,26 @@ impl Kakehashi {
         // internal checkpoint. Never cache or serve that obsolete result.
         if walk_cancel.is_cancelled() {
             return Ok(None);
+        }
+        if let Some(worker) = self
+            .tree_worker_shadow
+            .captures(
+                &uri,
+                incarnation,
+                snapshot.parsed_version,
+                generation,
+                worker_kind,
+                worker_range,
+                injection,
+            )
+            .await
+        {
+            self.tree_worker_shadow.compare_captures(
+                &uri,
+                snapshot.parsed_version,
+                walked.as_ref(),
+                &worker,
+            );
         }
         // Arc once; the memo and the returned ComputedCaptures share the
         // arrays by refcount instead of deep-cloning ~20k `Value`s. A `None`
@@ -1347,7 +1378,7 @@ impl Kakehashi {
 /// Returns `None` when no visited language compiled a kind file (→ `null` on
 /// the wire), `Some((matches, skipped))` otherwise.
 #[allow(clippy::too_many_arguments)]
-fn execute_captures_walk(
+pub(crate) fn execute_captures_walk(
     uri: &Url,
     kind: &str,
     lsp_range: Option<Range>,
@@ -1358,7 +1389,7 @@ fn execute_captures_walk(
     layer_trees: Option<&[crate::document::SnapshotLayerTree]>,
     language: &crate::language::LanguageCoordinator,
     tracker: &crate::language::NodeTracker,
-    documents: &crate::document::DocumentStore,
+    document_is_open: &dyn Fn() -> bool,
     entry_mint_epoch: (u64, u64),
     incarnation: u64,
     mint_into_tracker: bool,
@@ -1490,7 +1521,6 @@ fn execute_captures_walk(
                 // per-document slot (first store after open, or a walk racing
                 // its own didClose) — see the resurrection-leak note on
                 // `store_host`.
-                let doc_open = || documents.latest_snapshot(uri).is_some();
                 if depth == 0 {
                     match_cache.store_host(
                         uri,
@@ -1498,7 +1528,7 @@ fn execute_captures_walk(
                         hash,
                         generation,
                         std::sync::Arc::clone(&arc),
-                        doc_open,
+                        document_is_open,
                     );
                 } else {
                     match_cache.store_layer(
@@ -1507,7 +1537,7 @@ fn execute_captures_walk(
                         hash,
                         generation,
                         std::sync::Arc::clone(&arc),
-                        doc_open,
+                        document_is_open,
                     );
                     touched_layer_hashes.insert(hash);
                 }
@@ -2787,7 +2817,7 @@ mod tests {
             None,
             &coordinator,
             &tracker,
-            &store,
+            &|| store.latest_snapshot(&uri).is_some(),
             tracker.mint_epoch(&uri),
             0,
             true,
@@ -2818,7 +2848,7 @@ mod tests {
             None,
             &coordinator,
             &tracker,
-            &store,
+            &|| store.latest_snapshot(&uri).is_some(),
             tracker.mint_epoch(&uri),
             0,
             false,
@@ -2851,7 +2881,7 @@ mod tests {
             None,
             &coordinator,
             &stale_tracker,
-            &store,
+            &|| store.latest_snapshot(&uri).is_some(),
             stale_tracker.mint_epoch(&uri),
             0,
             false,
@@ -3006,7 +3036,7 @@ mod tests {
                 injection.then_some(layers),
                 &self.coordinator,
                 &self.tracker,
-                &self.store,
+                &|| self.store.latest_snapshot(&self.uri).is_some(),
                 entry_mint_epoch,
                 incarnation,
                 mint_into_tracker,

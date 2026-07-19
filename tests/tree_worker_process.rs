@@ -5,7 +5,7 @@ use std::sync::{Arc, Barrier};
 use kakehashi::tree_worker::{
     ApplyDocumentEdits, ByteEdit, CloseDocument, ConfigureLanguages, DeriveDocumentSnapshot,
     DeriveSemanticTokens, NavigateNode, NodeNavigation, NodeScalarOperation, NodeScalarValue,
-    OpaqueNodeId, ResolveNode, RunNodeScalar, SyncDocument, WorkerLanguageAsset,
+    OpaqueNodeId, ResolveNode, RunCaptures, RunNodeScalar, SyncDocument, WorkerLanguageAsset,
     WorkerLanguageCatalog, WorkerQuerySources,
 };
 use kakehashi::tree_worker::{Client, DeriveSnapshot, RequestContext, Response};
@@ -194,6 +194,10 @@ fn real_worker_keeps_document_text_and_tree_across_incremental_edits() {
         .join(format!("rust.{}", std::env::consts::DLL_EXTENSION));
     let executable = PathBuf::from(env!("CARGO_BIN_EXE_kakehashi"));
     let worker = Client::spawn(&executable, 2, 44).unwrap();
+    let capture_queries = tempfile::tempdir().unwrap();
+    let capture_query_dir = capture_queries.path().join("queries/rust");
+    std::fs::create_dir_all(&capture_query_dir).unwrap();
+    std::fs::write(capture_query_dir.join("context.scm"), "(identifier) @name").unwrap();
     let context = RequestContext {
         request_id: 30,
         worker_generation: 44,
@@ -229,6 +233,7 @@ fn real_worker_keeps_document_text_and_tree_across_incremental_edits() {
                     "rust": { "highlights": { "variable": "keyword" } }
                 }))
                 .unwrap(),
+                search_paths: vec![capture_queries.path().into()],
                 ..Default::default()
             },
         })
@@ -301,6 +306,22 @@ fn real_worker_keeps_document_text_and_tree_across_incremental_edits() {
     };
     assert!(!tokens.tokens.is_empty());
     assert!(tokens.tokens.iter().all(|token| token.token_type == 1));
+
+    let mut captures_context = snapshot.context.clone();
+    captures_context.request_id = 322;
+    let response = worker
+        .run_captures(RunCaptures {
+            context: captures_context,
+            kind: "context".into(),
+            range: None,
+            injection: false,
+        })
+        .unwrap();
+    let Response::Captures(captures) = response else {
+        panic!("captures must be worker-owned: {response:?}");
+    };
+    assert!(captures.available);
+    assert_eq!(captures.matches.len(), 2);
 
     let mut node_context = snapshot.context.clone();
     node_context.request_id = 33;

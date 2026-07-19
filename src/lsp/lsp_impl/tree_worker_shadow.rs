@@ -11,12 +11,12 @@ use crate::error::LockResultExt;
 use crate::language::coordinator::WorkerGrammarDescriptor;
 use crate::lsp::text_sync::SequentialByteEdit;
 use crate::tree_worker::{
-    ApplyDocumentEditsAndDerive, ByteEdit, Client, CloseDocument, ConfigureLanguages,
-    DeriveDocumentSnapshot, DeriveInjectionRegions, DeriveSelectionRanges, DeriveSemanticTokens,
-    DerivedSemanticTokens, InjectionRegionsResult, NavigateNode, NodeNavigation, NodeResult,
-    NodeScalarOperation, NodeScalarValue, OpaqueNodeId, RequestContext, ResolveNode, Response,
-    RunNodeScalar, SelectionRangesResult, SyncDocument, WirePosition, WorkerLanguageCatalog,
-    named_node_count,
+    ApplyDocumentEditsAndDerive, ByteEdit, CapturesResult, Client, CloseDocument,
+    ConfigureLanguages, DeriveDocumentSnapshot, DeriveInjectionRegions, DeriveSelectionRanges,
+    DeriveSemanticTokens, DerivedSemanticTokens, InjectionRegionsResult, NavigateNode,
+    NodeNavigation, NodeResult, NodeScalarOperation, NodeScalarValue, OpaqueNodeId, RequestContext,
+    ResolveNode, Response, RunCaptures, RunNodeScalar, SelectionRangesResult, SyncDocument,
+    WirePosition, WireRange, WorkerLanguageCatalog, named_node_count,
 };
 
 use super::Kakehashi;
@@ -413,6 +413,34 @@ struct ComparableInjection<'a> {
     contiguous: bool,
 }
 
+fn remove_capture_ids(value: &mut Value) {
+    match value {
+        Value::Array(values) => values.iter_mut().for_each(remove_capture_ids),
+        Value::Object(map) => {
+            if let Some(Value::Object(node)) = map.get_mut("node") {
+                node.remove("id");
+            }
+            map.values_mut().for_each(remove_capture_ids);
+        }
+        _ => {}
+    }
+}
+
+fn capture_node_ids(value: &Value, ids: &mut Vec<String>) {
+    match value {
+        Value::Array(values) => values.iter().for_each(|value| capture_node_ids(value, ids)),
+        Value::Object(map) => {
+            if let Some(Value::Object(node)) = map.get("node")
+                && let Some(Value::String(id)) = node.get("id")
+            {
+                ids.push(id.clone());
+            }
+            map.values().for_each(|value| capture_node_ids(value, ids));
+        }
+        _ => {}
+    }
+}
+
 pub(super) struct MirrorDocument {
     pub(super) uri: url::Url,
     pub(super) incarnation: u64,
@@ -801,6 +829,126 @@ impl TreeWorkerShadow {
                 authoritative.len(),
                 worker.len(),
             );
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) async fn captures(
+        &self,
+        uri: &url::Url,
+        incarnation: u64,
+        content_version: u64,
+        configuration_generation: u64,
+        kind: String,
+        range: Option<WireRange>,
+        injection: bool,
+    ) -> Option<CapturesResult> {
+        self.preload_catalog_async();
+        let client = self.read_client.load_full()?;
+        if !self.is_enabled() {
+            return None;
+        }
+        let context = self.synchronized_read_context(
+            &client,
+            uri,
+            incarnation,
+            content_version,
+            configuration_generation,
+        )?;
+        let expected = context.clone();
+        let response = tokio::task::spawn_blocking(move || {
+            client.run_captures(RunCaptures {
+                context,
+                kind,
+                range,
+                injection,
+            })
+        })
+        .await
+        .ok()?
+        .ok()?;
+        let Response::Captures(result) = response else {
+            return None;
+        };
+        if result.context != expected {
+            return None;
+        }
+        let current = self
+            .open_documents
+            .lock()
+            .recover_poison("TreeWorkerShadow::captures(admission)")
+            .current
+            .get(uri.as_str())
+            .map(|current| current.context.clone());
+        if current.as_ref().is_none_or(|current| {
+            current.incarnation != expected.incarnation
+                || current.content_version != expected.content_version
+                || current.configuration_generation != expected.configuration_generation
+        }) || self
+            .read_client
+            .load()
+            .as_ref()
+            .is_none_or(|client| client.worker_generation() != expected.worker_generation)
+        {
+            return None;
+        }
+        Some(result)
+    }
+
+    pub(super) fn compare_captures(
+        &self,
+        uri: &url::Url,
+        content_version: u64,
+        authoritative: Option<&(Vec<Value>, Vec<Value>)>,
+        worker: &CapturesResult,
+    ) {
+        let normalize = |values: &[Value]| {
+            let mut values = values.to_vec();
+            for value in &mut values {
+                remove_capture_ids(value);
+            }
+            values
+        };
+        let authoritative_available = authoritative.is_some();
+        let authoritative_matches = authoritative
+            .map(|(matches, _)| normalize(matches))
+            .unwrap_or_default();
+        let worker_matches = normalize(&worker.matches);
+        let authoritative_skipped = authoritative
+            .map(|(_, skipped)| skipped.as_slice())
+            .unwrap_or_default();
+        let matches = authoritative_available == worker.available
+            && authoritative_matches == worker_matches
+            && authoritative_skipped == worker.skipped;
+        if !matches {
+            log::debug!(
+                target: "kakehashi::tree_worker_shadow",
+                "captures mismatch uri={uri} version={content_version} authoritative={} worker={}",
+                authoritative_matches.len(),
+                worker_matches.len(),
+            );
+            return;
+        }
+        let mut authoritative_ids = Vec::new();
+        if let Some((matches, _)) = authoritative {
+            matches
+                .iter()
+                .for_each(|value| capture_node_ids(value, &mut authoritative_ids));
+        }
+        let mut worker_ids = Vec::new();
+        worker
+            .matches
+            .iter()
+            .for_each(|value| capture_node_ids(value, &mut worker_ids));
+        for (authoritative_id, worker_id) in authoritative_ids.into_iter().zip(worker_ids) {
+            let opaque = OpaqueNodeId {
+                worker_generation: worker.context.worker_generation,
+                local_id: worker_id.clone(),
+            };
+            self.worker_nodes
+                .insert((uri.as_str().to_string(), authoritative_id), opaque.clone());
+            self.worker_nodes
+                .insert((uri.as_str().to_string(), worker_id), opaque);
         }
     }
 
