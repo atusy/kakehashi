@@ -30,6 +30,7 @@ enum ShadowCommand {
         fallback: SyncDocument,
     },
     Close(CloseDocument),
+    ConfigurationChanged(u64),
     Shutdown(mpsc::SyncSender<()>),
 }
 
@@ -105,7 +106,6 @@ impl RestartBudget {
     }
 
     fn consume_at(&mut self, class: FailureClass, now: Instant) -> bool {
-        self.observe_healthy(now);
         let class_available = match class {
             FailureClass::Systemic => self.systemic < MAX_SYSTEMIC_RESTARTS,
             FailureClass::NativeEvidenced => self.native < MAX_NATIVE_RESTARTS,
@@ -153,6 +153,31 @@ impl RestartBudget {
         self.tokens
     }
 
+    fn prepare_half_open_at(&mut self, now: Instant) -> bool {
+        let Some(last_restart) = self.last_restart else {
+            return false;
+        };
+        let exhausted_long_bucket = self.tokens == 0;
+        let exhausted_fast_budget =
+            self.systemic >= MAX_SYSTEMIC_RESTARTS || self.native >= MAX_NATIVE_RESTARTS;
+        let cooldown = if exhausted_long_bucket {
+            Duration::from_secs(10 * 60)
+        } else if exhausted_fast_budget {
+            Duration::from_secs(60)
+        } else {
+            return false;
+        };
+        if now.saturating_duration_since(last_restart) < cooldown {
+            return false;
+        }
+        self.systemic = 0;
+        self.native = 0;
+        if exhausted_long_bucket {
+            self.tokens = 1;
+        }
+        true
+    }
+
     fn backoff(&self) -> Duration {
         let exponent = self.backoff_count.saturating_sub(1).min(10) as u32;
         INITIAL_RESTART_BACKOFF
@@ -173,6 +198,7 @@ struct SupervisorState {
     open_documents: OpenDocuments,
     quarantined: HashSet<GrammarIdentity>,
     restart_budget: RestartBudget,
+    last_half_open_generation: u64,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -192,7 +218,9 @@ impl OpenDocuments {
         let incoming = match command {
             ShadowCommand::Sync(request) => Some(request),
             ShadowCommand::Apply { fallback, .. } => Some(fallback),
-            ShadowCommand::Close(_) | ShadowCommand::Shutdown(_) => None,
+            ShadowCommand::Close(_)
+            | ShadowCommand::ConfigurationChanged(_)
+            | ShadowCommand::Shutdown(_) => None,
         };
         let artifact_replaced = incoming.is_some_and(|incoming| {
             self.current.values().any(|current| {
@@ -224,6 +252,7 @@ impl OpenDocuments {
             ShadowCommand::Close(request) => {
                 self.current.remove(&request.context.uri);
             }
+            ShadowCommand::ConfigurationChanged(_) => {}
             ShadowCommand::Shutdown(_) => {}
         }
         artifact_replaced
@@ -419,6 +448,21 @@ impl TreeWorkerShadow {
         self.submit(ShadowCommand::Close(CloseDocument {
             context: self.context(uri, incarnation, content_version, configuration_generation),
         }));
+    }
+
+    pub(super) fn configuration_changed(&self, generation: u64) {
+        if !self.accepting.load(Ordering::Acquire) {
+            return;
+        }
+        let Some(sender) = &self.sender else {
+            return;
+        };
+        if let Err(error) = sender.try_send(ShadowCommand::ConfigurationChanged(generation)) {
+            log::error!(
+                target: "kakehashi::tree_worker_shadow",
+                "could not notify shadow worker about configuration generation {generation}: {error}",
+            );
+        }
     }
 
     pub(super) async fn shutdown(&self) {
@@ -622,6 +666,7 @@ fn run_actor(
         open_documents: OpenDocuments::default(),
         quarantined: HashSet::new(),
         restart_budget: RestartBudget::default(),
+        last_half_open_generation: 0,
     };
     if state.client.is_none()
         && !recover_worker(
@@ -634,19 +679,17 @@ fn run_actor(
             true,
         )
     {
-        disabled.store(true, Ordering::Release);
-        return;
+        mark_tree_tier_unavailable(&mut state, &disabled);
     }
     let mut shutdown_ack = None;
     loop {
         let mut command = match receiver.recv_timeout(WORKER_LIVENESS_POLL) {
             Ok(command) => command,
             Err(mpsc::RecvTimeoutError::Timeout) => {
-                let status = state
-                    .client
-                    .as_ref()
-                    .expect("an enabled shadow actor has a worker client")
-                    .try_wait();
+                let Some(client) = state.client.as_ref() else {
+                    continue;
+                };
+                let status = client.try_wait();
                 match status {
                     Ok(None) => {
                         state.restart_budget.observe_healthy(Instant::now());
@@ -672,8 +715,8 @@ fn run_actor(
                     &comparisons,
                     true,
                 ) {
-                    disabled.store(true, Ordering::Release);
-                    break;
+                    mark_tree_tier_unavailable(&mut state, &disabled);
+                    continue;
                 }
                 continue;
             }
@@ -683,8 +726,34 @@ fn run_actor(
             shutdown_ack = Some(ack);
             break;
         }
+        if let ShadowCommand::ConfigurationChanged(generation) = command {
+            if disabled.load(Ordering::Acquire)
+                && generation > state.last_half_open_generation
+                && state.restart_budget.prepare_half_open_at(Instant::now())
+            {
+                state.last_half_open_generation = generation;
+                if recover_worker(
+                    &mut state,
+                    &executable,
+                    compute_threads,
+                    FailureClass::Systemic,
+                    None,
+                    &comparisons,
+                    true,
+                ) {
+                    disabled.store(false, Ordering::Release);
+                    log::info!(
+                        target: "kakehashi::tree_worker_shadow",
+                        "closed shadow worker breaker after configuration generation {generation} half-open probe",
+                    );
+                } else {
+                    mark_tree_tier_unavailable(&mut state, &disabled);
+                }
+            }
+            continue;
+        }
         if disabled.load(Ordering::Acquire) {
-            break;
+            continue;
         }
         state.restart_budget.observe_healthy(Instant::now());
         let implicated_grammar = command_grammar(&command).or_else(|| {
@@ -707,8 +776,8 @@ fn run_actor(
                 &comparisons,
                 false,
             ) {
-                disabled.store(true, Ordering::Release);
-                break;
+                mark_tree_tier_unavailable(&mut state, &disabled);
+                continue;
             }
             continue;
         }
@@ -771,8 +840,8 @@ fn run_actor(
                     &comparisons,
                     true,
                 ) {
-                    disabled.store(true, Ordering::Release);
-                    break;
+                    mark_tree_tier_unavailable(&mut state, &disabled);
+                    continue;
                 }
             }
             Ok(Response::Error(error)) => {
@@ -809,8 +878,8 @@ fn run_actor(
                     &comparisons,
                     true,
                 ) {
-                    disabled.store(true, Ordering::Release);
-                    break;
+                    mark_tree_tier_unavailable(&mut state, &disabled);
+                    continue;
                 }
             }
         }
@@ -823,6 +892,15 @@ fn run_actor(
     if let Some(ack) = shutdown_ack {
         let _ = ack.send(());
     }
+}
+
+fn mark_tree_tier_unavailable(state: &mut SupervisorState, disabled: &AtomicBool) {
+    if let Some(client) = state.client.take()
+        && let Err(error) = client.shutdown()
+    {
+        log::warn!(target: "kakehashi::tree_worker_shadow", "failed worker cleanup while opening breaker: {error}");
+    }
+    disabled.store(true, Ordering::Release);
 }
 
 fn execute_command(
@@ -858,7 +936,7 @@ fn execute_command(
             comparisons.mark_closed(&request.context.uri, request.context.incarnation);
             (client.close_document(request), None)
         }
-        ShadowCommand::Shutdown(_) => unreachable!(),
+        ShadowCommand::ConfigurationChanged(_) | ShadowCommand::Shutdown(_) => unreachable!(),
     }
 }
 
@@ -1052,6 +1130,7 @@ fn retag_command(command: &mut ShadowCommand, generation: u64) {
             fallback.context.worker_generation = generation;
         }
         ShadowCommand::Close(request) => request.context.worker_generation = generation,
+        ShadowCommand::ConfigurationChanged(_) => {}
         ShadowCommand::Shutdown(_) => {}
     }
 }
@@ -1089,7 +1168,7 @@ fn command_uri(command: &ShadowCommand) -> Option<&str> {
         ShadowCommand::Sync(request) => Some(&request.context.uri),
         ShadowCommand::Apply { fallback, .. } => Some(&fallback.context.uri),
         ShadowCommand::Close(request) => Some(&request.context.uri),
-        ShadowCommand::Shutdown(_) => None,
+        ShadowCommand::ConfigurationChanged(_) | ShadowCommand::Shutdown(_) => None,
     }
 }
 
@@ -1100,7 +1179,7 @@ fn command_document(command: &ShadowCommand) -> Option<(&str, u64)> {
             Some((&fallback.context.uri, fallback.context.incarnation))
         }
         ShadowCommand::Close(request) => Some((&request.context.uri, request.context.incarnation)),
-        ShadowCommand::Shutdown(_) => None,
+        ShadowCommand::ConfigurationChanged(_) | ShadowCommand::Shutdown(_) => None,
     }
 }
 
@@ -1108,7 +1187,9 @@ fn command_grammar(command: &ShadowCommand) -> Option<GrammarIdentity> {
     match command {
         ShadowCommand::Sync(request) => Some(GrammarIdentity::from_sync(request)),
         ShadowCommand::Apply { fallback, .. } => Some(GrammarIdentity::from_sync(fallback)),
-        ShadowCommand::Close(_) | ShadowCommand::Shutdown(_) => None,
+        ShadowCommand::Close(_)
+        | ShadowCommand::ConfigurationChanged(_)
+        | ShadowCommand::Shutdown(_) => None,
     }
 }
 
@@ -1443,6 +1524,44 @@ mod tests {
         budget.observe_healthy(started + Duration::from_secs(660));
         assert_eq!(budget.tokens_remaining(), MAX_SESSION_RESTARTS - 3);
         assert_eq!(budget.backoff(), INITIAL_RESTART_BACKOFF);
+    }
+
+    #[test]
+    fn breaker_half_open_requires_the_matching_cooldown() {
+        let started = Instant::now();
+        let mut fast = RestartBudget::default();
+        for _ in 0..MAX_SYSTEMIC_RESTARTS {
+            assert!(fast.consume_at(FailureClass::Systemic, started));
+        }
+        assert!(!fast.prepare_half_open_at(started + Duration::from_secs(59)));
+        assert!(fast.prepare_half_open_at(started + Duration::from_secs(60)));
+        assert!(fast.consume_at(FailureClass::Systemic, started + Duration::from_secs(60)));
+
+        let mut long = RestartBudget {
+            tokens: 0,
+            last_restart: Some(started),
+            last_long_restore: Some(started),
+            ..RestartBudget::default()
+        };
+        assert!(!long.prepare_half_open_at(started + Duration::from_secs(599)));
+        assert!(long.prepare_half_open_at(started + Duration::from_secs(600)));
+        assert_eq!(long.tokens_remaining(), 1);
+        assert!(long.consume_at(FailureClass::Systemic, started + Duration::from_secs(600)));
+        assert_eq!(long.tokens_remaining(), 0);
+    }
+
+    #[test]
+    fn configuration_change_reaches_an_open_breaker() {
+        let (sender, receiver) = mpsc::sync_channel(1);
+        let shadow = shadow(sender);
+        shadow.disabled.store(true, Ordering::Release);
+
+        shadow.configuration_changed(9);
+
+        assert!(matches!(
+            receiver.recv().unwrap(),
+            ShadowCommand::ConfigurationChanged(9)
+        ));
     }
 
     #[test]

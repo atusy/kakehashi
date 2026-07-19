@@ -552,7 +552,7 @@ impl Kakehashi {
         raw_settings: RawWorkspaceSettings,
         settings: WorkspaceSettings,
     ) {
-        apply_shared_settings_locked(
+        let reparse_uris = apply_shared_settings_locked(
             reload,
             &self.client,
             ReloadLanguageState {
@@ -570,9 +570,12 @@ impl Kakehashi {
                 settings,
             },
         )
-        .await
-        .into_iter()
-        .for_each(|uri| self.schedule_reparse(uri, None));
+        .await;
+        self.tree_worker_shadow
+            .configuration_changed(self.language.configuration_generation());
+        reparse_uris
+            .into_iter()
+            .for_each(|uri| self.schedule_reparse(uri, None));
     }
 
     async fn apply_initial_settings(

@@ -363,6 +363,8 @@ impl InstallCoordinator {
             },
         )
         .await;
+        self.tree_worker_shadow
+            .configuration_changed(self.language.configuration_generation());
     }
 
     fn notifier(&self) -> ClientNotifier<'_> {
