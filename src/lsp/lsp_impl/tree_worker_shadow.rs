@@ -200,6 +200,13 @@ struct OpenDocuments {
     catalog: Option<(u64, WorkerLanguageCatalog)>,
     catalog_preload: Option<(u64, u64)>,
     catalog_acknowledged: Option<(u64, u64)>,
+    worker_regions: HashMap<String, WorkerRegionSnapshot>,
+}
+
+#[derive(Clone)]
+struct WorkerRegionSnapshot {
+    context: RequestContext,
+    regions: Arc<Vec<crate::language::injection::ResolvedInjection>>,
 }
 
 struct SupervisorState {
@@ -358,17 +365,20 @@ impl OpenDocuments {
         match command {
             ShadowCommand::Sync(request) => {
                 self.closed_incarnations.remove(&request.context.uri);
+                self.worker_regions.remove(&request.context.uri);
                 self.current
                     .insert(request.context.uri.clone(), request.clone());
             }
             ShadowCommand::Apply { fallback, .. } => {
                 self.closed_incarnations.remove(&fallback.context.uri);
+                self.worker_regions.remove(&fallback.context.uri);
                 self.current
                     .insert(fallback.context.uri.clone(), fallback.clone());
             }
             ShadowCommand::Close(request) => {
                 self.current.remove(&request.context.uri);
                 self.acknowledged.remove(&request.context.uri);
+                self.worker_regions.remove(&request.context.uri);
                 self.closed_incarnations
                     .entry(request.context.uri.clone())
                     .and_modify(|closed| *closed = (*closed).max(request.context.incarnation))
@@ -377,6 +387,7 @@ impl OpenDocuments {
             ShadowCommand::Forget(context) => {
                 self.current.remove(&context.uri);
                 self.acknowledged.remove(&context.uri);
+                self.worker_regions.remove(&context.uri);
             }
             ShadowCommand::Shutdown(_) => {}
         }
@@ -430,6 +441,25 @@ struct ComparableInjection<'a> {
     virtual_content: &'a str,
     line_column_offsets: &'a [u32],
     contiguous: bool,
+}
+
+fn worker_region_to_resolved(
+    region: &crate::tree_worker::WireInjectionRegion,
+) -> crate::language::injection::ResolvedInjection {
+    crate::language::injection::ResolvedInjection {
+        region: crate::language::injection::CacheableInjectionRegion {
+            language: region.language.clone(),
+            byte_range: region.byte_start..region.byte_end,
+            line_range: region.line_start..region.line_end,
+            start_column: region.start_column,
+            region_id: region.region_id.clone(),
+            content_hash: region.content_hash,
+        },
+        injection_language: region.language.clone(),
+        virtual_content: region.virtual_content.clone(),
+        line_column_offsets: region.line_column_offsets.clone(),
+        contiguous: region.contiguous,
+    }
 }
 
 fn remove_capture_ids(value: &mut Value) {
@@ -754,17 +784,9 @@ impl TreeWorkerShadow {
         content_version: u64,
         configuration_generation: u64,
     ) -> Option<InjectionRegionsResult> {
-        let client = self.read_client.load_full()?;
-        if !self.is_enabled() {
-            return None;
-        }
-        let context = self.synchronized_read_context(
-            &client,
-            uri,
-            incarnation,
-            content_version,
-            configuration_generation,
-        )?;
+        let (client, context) = self
+            .synchronized_query_read(uri, incarnation, content_version, configuration_generation)
+            .await?;
         let expected = context.clone();
         let response = tokio::task::spawn_blocking(move || {
             client.derive_injection_regions(DeriveInjectionRegions { context })
@@ -797,7 +819,60 @@ impl TreeWorkerShadow {
         {
             return None;
         }
+        self.cache_worker_regions(uri, &result);
         Some(result)
+    }
+
+    fn cache_worker_regions(&self, uri: &url::Url, result: &InjectionRegionsResult) {
+        let regions = Arc::new(
+            result
+                .regions
+                .iter()
+                .map(worker_region_to_resolved)
+                .collect::<Vec<_>>(),
+        );
+        for region in result.regions.iter() {
+            self.worker_nodes.insert(
+                (uri.as_str().to_string(), region.region_id.clone()),
+                OpaqueNodeId {
+                    worker_generation: result.context.worker_generation,
+                    local_id: region.region_id.clone(),
+                },
+            );
+        }
+        let mut documents = self
+            .open_documents
+            .lock()
+            .recover_poison("TreeWorkerShadow::cache_worker_regions");
+        if documents.acknowledges(&result.context) {
+            documents.worker_regions.insert(
+                uri.as_str().to_string(),
+                WorkerRegionSnapshot {
+                    context: result.context.clone(),
+                    regions,
+                },
+            );
+        }
+    }
+
+    pub(super) fn cached_injection_regions(
+        &self,
+        uri: &url::Url,
+        incarnation: u64,
+        content_version: u64,
+        configuration_generation: u64,
+    ) -> Option<Arc<Vec<crate::language::injection::ResolvedInjection>>> {
+        let client = self.read_client.load_full()?;
+        let documents = self
+            .open_documents
+            .lock()
+            .recover_poison("TreeWorkerShadow::cached_injection_regions");
+        let snapshot = documents.worker_regions.get(uri.as_str())?;
+        (snapshot.context.worker_generation == client.worker_generation()
+            && snapshot.context.incarnation == incarnation
+            && snapshot.context.content_version == content_version
+            && snapshot.context.configuration_generation == configuration_generation)
+            .then(|| Arc::clone(&snapshot.regions))
     }
 
     pub(super) async fn semantic_tokens(
@@ -1069,9 +1144,9 @@ impl TreeWorkerShadow {
         uri: &url::Url,
         content_version: u64,
         authoritative: &[crate::language::injection::ResolvedInjection],
-        worker: &InjectionRegionsResult,
+        worker_result: &InjectionRegionsResult,
     ) {
-        let authoritative = authoritative
+        let comparable_authoritative = authoritative
             .iter()
             .map(|region| ComparableInjection {
                 language: &region.injection_language,
@@ -1084,7 +1159,7 @@ impl TreeWorkerShadow {
                 contiguous: region.contiguous,
             })
             .collect::<Vec<_>>();
-        let worker = worker
+        let comparable_worker = worker_result
             .regions
             .iter()
             .map(|region| ComparableInjection {
@@ -1098,12 +1173,36 @@ impl TreeWorkerShadow {
                 contiguous: region.contiguous,
             })
             .collect::<Vec<_>>();
-        if authoritative != worker {
+        if comparable_authoritative != comparable_worker {
             log::debug!(
                 target: "kakehashi::tree_worker_shadow",
-                "injection region mismatch uri={uri} version={content_version} authoritative={authoritative:?} worker={worker:?}",
+                "injection region mismatch uri={uri} version={content_version} authoritative={comparable_authoritative:?} worker={comparable_worker:?}",
+            );
+            return;
+        }
+        for (authoritative_region, worker_region) in
+            authoritative.iter().zip(worker_result.regions.iter())
+        {
+            let opaque = OpaqueNodeId {
+                worker_generation: worker_result.context.worker_generation,
+                local_id: worker_region.region_id.clone(),
+            };
+            self.worker_nodes.insert(
+                (
+                    uri.as_str().to_string(),
+                    authoritative_region.region.region_id.clone(),
+                ),
+                opaque.clone(),
+            );
+            self.worker_nodes.insert(
+                (uri.as_str().to_string(), worker_region.region_id.clone()),
+                opaque,
             );
         }
+        log::debug!(
+            target: "kakehashi::tree_worker_shadow",
+            "injection regions matched uri={uri} version={content_version}",
+        );
     }
 
     pub(super) fn record_node_mapping(
@@ -1656,28 +1755,6 @@ impl TreeWorkerShadow {
         }
     }
 
-    fn synchronized_read_context(
-        &self,
-        client: &Client,
-        uri: &url::Url,
-        incarnation: u64,
-        content_version: u64,
-        configuration_generation: u64,
-    ) -> Option<RequestContext> {
-        let context = self.read_context(
-            client,
-            uri,
-            incarnation,
-            content_version,
-            configuration_generation,
-        );
-        self.open_documents
-            .lock()
-            .recover_poison("TreeWorkerShadow::synchronized_read_context")
-            .acknowledges(&context)
-            .then_some(context)
-    }
-
     async fn synchronized_query_read(
         &self,
         uri: &url::Url,
@@ -1907,14 +1984,29 @@ impl Kakehashi {
         {
             return;
         }
-        let Some(worker_regions) = self
-            .tree_worker_shadow
-            .injection_regions(
+        let configuration_generation = self.language.configuration_generation();
+        let Some(language) = view
+            .slot
+            .snapshot
+            .as_ref()
+            .and_then(|snapshot| snapshot.language.as_deref())
+        else {
+            return;
+        };
+        if let Some(grammar) = self.language.worker_grammar_descriptor(language)
+            && self.tree_worker_shadow.needs_document_sync(
                 uri,
                 incarnation,
                 parsed_version,
-                self.language.configuration_generation(),
+                configuration_generation,
+                &grammar.queries,
             )
+        {
+            self.refresh_tree_worker_documents(std::slice::from_ref(uri));
+        }
+        let Some(worker_regions) = self
+            .tree_worker_shadow
+            .injection_regions(uri, incarnation, parsed_version, configuration_generation)
             .await
         else {
             return;
@@ -1925,6 +2017,16 @@ impl Kakehashi {
             authoritative,
             &worker_regions,
         );
+        if self
+            .tree_worker_shadow
+            .cached_injection_regions(uri, incarnation, parsed_version, configuration_generation)
+            .is_none()
+        {
+            log::debug!(
+                target: "kakehashi::tree_worker_shadow",
+                "current worker injection snapshot was not cached uri={uri} version={parsed_version}",
+            );
+        }
     }
 }
 
@@ -3200,6 +3302,68 @@ mod tests {
         assert!(matches!(receiver.recv().unwrap(), ShadowCommand::Close(_)));
     }
 
+    #[test]
+    fn accepted_worker_regions_are_cached_and_generation_fenced_as_node_ids() {
+        let (sender, _receiver) = mpsc::sync_channel(1);
+        let shadow = shadow(sender);
+        let uri = url::Url::parse("file:///regions.md").unwrap();
+        let sync = sync(uri.as_str(), 2, 3, 7);
+        {
+            let mut documents = shadow.open_documents.lock().unwrap();
+            documents.current.insert(uri.as_str().into(), sync.clone());
+            documents
+                .acknowledged
+                .insert(uri.as_str().into(), sync.context.clone());
+        }
+        let result = InjectionRegionsResult {
+            context: sync.context,
+            regions: vec![crate::tree_worker::WireInjectionRegion {
+                language: "lua".into(),
+                byte_start: 10,
+                byte_end: 20,
+                line_start: 2,
+                line_end: 3,
+                start_column: 0,
+                region_id: "worker-region".into(),
+                content_hash: 42,
+                virtual_content: "local x = 1".into(),
+                line_column_offsets: vec![0],
+                contiguous: true,
+            }],
+        };
+
+        shadow.cache_worker_regions(&uri, &result);
+        let mut authoritative = worker_region_to_resolved(&result.regions[0]);
+        authoritative.region.region_id = "legacy-region".into();
+        shadow.compare_injection_regions(&uri, 3, &[authoritative], &result);
+
+        let documents = shadow.open_documents.lock().unwrap();
+        let cached = documents.worker_regions.get(uri.as_str()).unwrap();
+        assert_eq!(cached.context, result.context);
+        assert_eq!(cached.regions[0].region.region_id, "worker-region");
+        drop(documents);
+        assert_eq!(
+            shadow
+                .worker_nodes
+                .get(&(uri.as_str().into(), "worker-region".into()))
+                .map(|entry| entry.clone()),
+            Some(OpaqueNodeId {
+                worker_generation: 7,
+                local_id: "worker-region".into(),
+            })
+        );
+        assert_eq!(
+            shadow
+                .worker_nodes
+                .get(&(uri.as_str().into(), "legacy-region".into()))
+                .map(|entry| entry.clone()),
+            Some(OpaqueNodeId {
+                worker_generation: 7,
+                local_id: "worker-region".into(),
+            })
+        );
+    }
+
     fn grammar() -> WorkerGrammarDescriptor {
         WorkerGrammarDescriptor {
             source_path: "/parser/rust.so".into(),
@@ -3264,6 +3428,61 @@ mod tests {
             context: latest.context.clone(),
         }));
         assert!(documents.current.is_empty());
+    }
+
+    #[test]
+    fn document_change_invalidates_cached_worker_regions() {
+        let uri = "file:///a.rs";
+        let mut documents = OpenDocuments::default();
+        let first = sync(uri, 1, 1, 7);
+        documents.observe(&ShadowCommand::Sync(first.clone()));
+        documents.worker_regions.insert(
+            uri.into(),
+            WorkerRegionSnapshot {
+                context: first.context,
+                regions: Arc::new(Vec::new()),
+            },
+        );
+
+        documents.observe(&ShadowCommand::Apply {
+            request: ApplyDocumentEditsAndDerive {
+                context: sync(uri, 1, 2, 7).context,
+                base_version: 1,
+                edits: Vec::new(),
+            },
+            fallback: sync(uri, 1, 2, 7),
+        });
+
+        assert!(!documents.worker_regions.contains_key(uri));
+    }
+
+    #[test]
+    fn worker_region_conversion_preserves_bridge_geometry_and_identity() {
+        let wire = crate::tree_worker::WireInjectionRegion {
+            language: "lua".into(),
+            byte_start: 10,
+            byte_end: 20,
+            line_start: 2,
+            line_end: 4,
+            start_column: 3,
+            region_id: "worker-region".into(),
+            content_hash: 42,
+            virtual_content: "x\ny".into(),
+            line_column_offsets: vec![3, 0],
+            contiguous: false,
+        };
+
+        let resolved = worker_region_to_resolved(&wire);
+
+        assert_eq!(resolved.injection_language, "lua");
+        assert_eq!(resolved.region.byte_range, 10..20);
+        assert_eq!(resolved.region.line_range, 2..4);
+        assert_eq!(resolved.region.start_column, 3);
+        assert_eq!(resolved.region.region_id, "worker-region");
+        assert_eq!(resolved.region.content_hash, 42);
+        assert_eq!(resolved.virtual_content, "x\ny");
+        assert_eq!(resolved.line_column_offsets, vec![3, 0]);
+        assert!(!resolved.contiguous);
     }
 
     #[test]
