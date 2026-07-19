@@ -1,0 +1,59 @@
+{
+  "schema": 1,
+  "experiment": "single-tree-worker-stage1-host-parse-prototype",
+  "source_commit": "a5d0524efc989b946ab32b6869f16f8f9009e311",
+  "binary_sha256": "6ff9d15f7d574beaec45c554af60a040134b9255ed301fa836de5ca6623fd6d2",
+  "benchmark_sha256": "d6cf22b0bd58f839d482719ed92de8285c77bc7d33e9eb604f4eab18bf5c2254",
+  "parser_sha256": "e75df6b549c18158dd0e506d9cd78224cea0e2a01e9a3e79a11cdfff9fb4b1fe",
+  "environment": {
+    "machine": "Apple M4",
+    "os": "macOS 26.5.1 (25F80)",
+    "rustc": "rustc 1.95.0 (59807616e 2026-04-14) (built from a source tarball)",
+    "cargo": "cargo 1.95.0 (f2d3ce0bd 2026-03-21)"
+  },
+  "method": {
+    "requests": 1000,
+    "threads": 4,
+    "source_lines": 200,
+    "request_frame_bytes": 8133,
+    "direct_parser_cache_hits": 996,
+    "worker_parser_cache_hits": 997,
+    "note": "Two consecutive page-cache-warm summary batches; no confidence interval."
+  },
+  "batches": [
+    {
+      "cold_start_us": 3730.25,
+      "sequential": {
+        "direct": {"p50_us": 808.834, "p95_us": 823.375, "p99_us": 830.459, "mean_us": 768.519267},
+        "worker_parent_observed": {"p50_us": 1138.875, "p95_us": 1372.084, "p99_us": 1391.958, "mean_us": 1090.447202},
+        "worker_compute": {"p50_us": 1010.666, "p95_us": 1219.375, "p99_us": 1229.542, "mean_us": 966.111412},
+        "worker_queue": {"p50_us": 5.0, "p95_us": 8.333, "p99_us": 18.875, "mean_us": 5.461271}
+      },
+      "parallel": {
+        "direct_request_latency": {"p50_us": 1606.959, "p95_us": 2038.709, "p99_us": 2953.041, "mean_us": 1663.009363},
+        "worker_request_latency": {"p50_us": 1782.083, "p95_us": 2783.416, "p99_us": 3766.125, "mean_us": 1958.225098},
+        "direct_wall_ms": 416.695583,
+        "worker_wall_ms": 493.3005,
+        "direct_requests_per_second": 2399.8334534781957,
+        "worker_requests_per_second": 2027.1619428725494
+      }
+    },
+    {
+      "cold_start_us": 3399.5,
+      "sequential": {
+        "direct": {"p50_us": 730.375, "p95_us": 825.709, "p99_us": 838.083, "mean_us": 735.612035},
+        "worker_parent_observed": {"p50_us": 978.916, "p95_us": 1163.375, "p99_us": 1188.417, "mean_us": 969.662396},
+        "worker_compute": {"p50_us": 871.875, "p95_us": 1032.167, "p99_us": 1045.542, "mean_us": 861.171694},
+        "worker_queue": {"p50_us": 4.042, "p95_us": 7.625, "p99_us": 11.917, "mean_us": 4.58003}
+      },
+      "parallel": {
+        "direct_request_latency": {"p50_us": 1331.792, "p95_us": 2010.167, "p99_us": 2182.958, "mean_us": 1410.930249},
+        "worker_request_latency": {"p50_us": 1708.292, "p95_us": 2172.459, "p99_us": 2336.875, "mean_us": 1771.911374},
+        "direct_wall_ms": 353.357166,
+        "worker_wall_ms": 447.580583,
+        "direct_requests_per_second": 2829.997793224321,
+        "worker_requests_per_second": 2234.234544531169
+      }
+    }
+  ]
+}
