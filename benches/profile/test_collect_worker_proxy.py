@@ -626,6 +626,9 @@ class CollectionHelpersTest(unittest.TestCase):
                 "schema": 1,
                 "source_repository": "https://github.com/atusy/kakehashi",
                 "source_commit": "a" * 40,
+                "source_remote_refs_containing_commit": [
+                    "refs/remotes/origin/main"
+                ],
                 "source_checkout_clean": False,
                 "build_command": ["cargo", "build"],
                 "rustc": "",
