@@ -76,11 +76,13 @@ pub(crate) fn apply_content_changes_detailed(
             let start_offset = mapper.position_to_byte_clamped(range.start);
             let end_offset = mapper.position_to_byte_clamped(range.end).max(start_offset);
 
-            sequential_byte_edits.push(SequentialByteEdit {
-                start_byte: start_offset,
-                old_end_byte: end_offset,
-                new_text: change.text.clone(),
-            });
+            if !saw_full_replacement {
+                sequential_byte_edits.push(SequentialByteEdit {
+                    start_byte: start_offset,
+                    old_end_byte: end_offset,
+                    new_text: change.text.clone(),
+                });
+            }
 
             // Once a full replacement has landed in this batch the edits will be
             // discarded at the end (the batch is a full sync), so skip building the
@@ -135,6 +137,7 @@ pub(crate) fn apply_content_changes_detailed(
             // Full document change - no incremental parsing
             text = change.text;
             edits.clear(); // Clear any previous edits since it's a full replacement
+            sequential_byte_edits.clear();
             saw_full_replacement = true;
         }
     }
@@ -148,6 +151,7 @@ pub(crate) fn apply_content_changes_detailed(
     // seed) into the returned vec.
     if saw_full_replacement {
         edits.clear();
+        sequential_byte_edits.clear();
     }
 
     AppliedContentChanges {
@@ -261,11 +265,16 @@ mod tests {
                 range_length: None,
                 text: "replacement".to_string(),
             },
+            TextDocumentContentChangeEvent {
+                range: Some(Range::new(Position::new(0, 0), Position::new(0, 1))),
+                range_length: Some(1),
+                text: "R".to_string(),
+            },
         ];
 
         let result = apply_content_changes_detailed("abc", changes);
 
-        assert_eq!(result.text, "replacement");
+        assert_eq!(result.text, "Replacement");
         assert!(result.input_edits.is_empty());
         assert_eq!(result.sequential_byte_edits, None);
     }

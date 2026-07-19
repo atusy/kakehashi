@@ -571,18 +571,15 @@ impl ComparisonStore {
     }
 
     fn mark_closed(&self, uri: &str, incarnation: u64) {
-        let Some(slot) = self.slots.get_mut(uri) else {
-            return;
-        };
-        if slot.open_incarnation > incarnation {
-            return;
-        }
-        if slot.pending.is_some() {
-            self.superseded.fetch_add(1, Ordering::Relaxed);
-        }
-        drop(slot);
-        self.slots
-            .remove_if(uri, |_, slot| slot.open_incarnation <= incarnation);
+        self.slots.remove_if(uri, |_, slot| {
+            if slot.open_incarnation > incarnation {
+                return false;
+            }
+            if slot.pending.is_some() {
+                self.superseded.fetch_add(1, Ordering::Relaxed);
+            }
+            true
+        });
     }
 
     fn open(&self, uri: &str, incarnation: u64) {
