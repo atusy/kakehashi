@@ -1428,6 +1428,9 @@ fn inject_worker_failure_once(request: &Request) -> Option<Response> {
         std::process::exit(86);
     }
     if let Ok(marker) = std::env::var("KAKEHASHI_TREE_WORKER_RESTART_ONCE_FILE")
+        && std::env::var("KAKEHASHI_TREE_WORKER_RESTART_URI_SUFFIX")
+            .ok()
+            .is_none_or(|suffix| sync.context.uri.ends_with(&suffix))
         && std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
