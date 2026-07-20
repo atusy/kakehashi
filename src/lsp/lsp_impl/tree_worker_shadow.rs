@@ -123,7 +123,7 @@ impl ReplicaIdentity {
     }
 }
 
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 struct GrammarIdentity {
     grammar_symbol: String,
     artifact_digest: String,
@@ -337,7 +337,30 @@ struct ResyncStats {
 struct ResyncFailure {
     error: std::io::Error,
     class: FailureClass,
-    implicated_grammar: Option<GrammarIdentity>,
+    active_grammars: Vec<GrammarIdentity>,
+    active_lease_count: usize,
+}
+
+struct WorkerLossEvidence {
+    class: FailureClass,
+    active_grammars: Vec<GrammarIdentity>,
+    active_lease_count: usize,
+}
+
+impl WorkerLossEvidence {
+    fn systemic() -> Self {
+        Self {
+            class: FailureClass::Systemic,
+            active_grammars: Vec::new(),
+            active_lease_count: 0,
+        }
+    }
+}
+
+#[derive(Default)]
+struct QuarantineBatch {
+    newly_quarantined: usize,
+    already_quarantined: usize,
 }
 
 impl OpenDocuments {
@@ -2514,8 +2537,7 @@ fn run_actor(
             &mut state,
             &executable,
             compute_threads,
-            FailureClass::Systemic,
-            None,
+            WorkerLossEvidence::systemic(),
             &comparisons,
             RecoveryMode::Normal,
         )
@@ -2541,8 +2563,7 @@ fn run_actor(
                     &mut state,
                     &executable,
                     compute_threads,
-                    FailureClass::Systemic,
-                    None,
+                    WorkerLossEvidence::systemic(),
                     &comparisons,
                     RecoveryMode::HalfOpen,
                 ) {
@@ -2589,31 +2610,40 @@ fn run_actor(
                     continue;
                 };
                 let status = client.try_wait();
-                match status {
+                let loss_error = match status {
                     Ok(None) => {
                         if !disabled.load(Ordering::Acquire) {
                             observe_healthy_service(&mut state, Instant::now());
                         }
                         continue;
                     }
-                    Ok(Some(status)) => log::error!(
-                        target: "kakehashi::tree_worker_shadow",
-                        "worker generation {} exited while idle: {status}",
-                        state.worker_generation,
-                    ),
-                    Err(error) => log::error!(
-                        target: "kakehashi::tree_worker_shadow",
-                        "worker generation {} liveness check failed: {error}",
-                        state.worker_generation,
-                    ),
-                }
+                    Ok(Some(status)) => {
+                        log::error!(
+                            target: "kakehashi::tree_worker_shadow",
+                            "worker generation {} exited while idle: {status}",
+                            state.worker_generation,
+                        );
+                        std::io::Error::new(
+                            std::io::ErrorKind::UnexpectedEof,
+                            format!("tree worker exited while idle: {status}"),
+                        )
+                    }
+                    Err(error) => {
+                        log::error!(
+                            target: "kakehashi::tree_worker_shadow",
+                            "worker generation {} liveness check failed: {error}",
+                            state.worker_generation,
+                        );
+                        error
+                    }
+                };
+                let failure = worker_loss_evidence(client, &loss_error);
                 if matches!(state.breaker, BreakerState::HalfOpen { .. })
                     || !recover_worker(
                         &mut state,
                         &executable,
                         compute_threads,
-                        FailureClass::Systemic,
-                        None,
+                        failure,
                         &comparisons,
                         RecoveryMode::Normal,
                     )
@@ -2682,8 +2712,7 @@ fn run_actor(
                 &mut state,
                 &executable,
                 compute_threads,
-                FailureClass::Systemic,
-                None,
+                WorkerLossEvidence::systemic(),
                 &comparisons,
                 RecoveryMode::Planned,
             ) {
@@ -2772,8 +2801,7 @@ fn run_actor(
                         &mut state,
                         &executable,
                         compute_threads,
-                        FailureClass::Systemic,
-                        None,
+                        WorkerLossEvidence::systemic(),
                         &comparisons,
                         RecoveryMode::Normal,
                     )
@@ -2798,43 +2826,12 @@ fn run_actor(
             }
             Ok(_) => {}
             Err(error) => {
-                let acknowledged_hazards = state
-                    .client
-                    .as_ref()
-                    .expect("failed request retains its worker client")
-                    .active_grammar_hazards();
-                if !acknowledged_hazards.is_empty() {
-                    log::error!(
-                        target: "kakehashi::tree_worker_shadow",
-                        "worker generation {} failed with {} acknowledged active grammar hazard(s): {}",
-                        state.worker_generation,
-                        acknowledged_hazards.len(),
-                        acknowledged_hazards
-                            .iter()
-                            .map(|hazard| format!(
-                                "lease={} request={} symbol={} artifact_digest={}",
-                                hazard.lease_id,
-                                hazard.context.request_id,
-                                hazard.grammar.grammar_symbol,
-                                hazard.grammar.artifact_digest,
-                            ))
-                            .collect::<Vec<_>>()
-                            .join(", "),
-                    );
-                }
-                let acknowledged_grammar =
-                    acknowledged_hazards.first().map(|hazard| GrammarIdentity {
-                        grammar_symbol: hazard.grammar.grammar_symbol.clone(),
-                        artifact_digest: hazard.grammar.artifact_digest.clone(),
-                    });
-                let implicated_grammar = acknowledged_grammar.or(implicated_grammar);
-                let class = classify_transport_failure(
+                let failure = worker_loss_evidence(
                     state
                         .client
                         .as_ref()
                         .expect("failed request retains its worker client"),
                     &error,
-                    implicated_grammar.as_ref(),
                 );
                 log::error!(
                     target: "kakehashi::tree_worker_shadow",
@@ -2846,8 +2843,7 @@ fn run_actor(
                         &mut state,
                         &executable,
                         compute_threads,
-                        class,
-                        implicated_grammar,
+                        failure,
                         &comparisons,
                         RecoveryMode::Normal,
                     )
@@ -2921,9 +2917,13 @@ fn finish_half_open_recovery(
         comparisons,
     );
     if let Err(failure) = result {
-        if let Some(grammar) = failure.implicated_grammar {
-            quarantine_grammar(state, grammar, failure.class, comparisons);
-        }
+        let _ = quarantine_grammars(
+            state,
+            failure.active_grammars,
+            failure.class,
+            comparisons,
+            failure.active_lease_count,
+        );
         log::error!(
             target: "kakehashi::tree_worker_shadow",
             "half-open registry reconciliation failed: {}",
@@ -3091,15 +3091,20 @@ fn recover_worker(
     state: &mut SupervisorState,
     executable: &std::path::Path,
     compute_threads: usize,
-    mut class: FailureClass,
-    implicated_grammar: Option<GrammarIdentity>,
+    mut failure: WorkerLossEvidence,
     comparisons: &ComparisonStore,
     mode: RecoveryMode,
 ) -> bool {
     let recovery_started = Instant::now();
-    if let Some(grammar) = implicated_grammar {
-        quarantine_grammar(state, grammar, class, comparisons);
-    }
+    let initial_quarantine = quarantine_grammars(
+        state,
+        std::mem::take(&mut failure.active_grammars),
+        failure.class,
+        comparisons,
+        failure.active_lease_count,
+    );
+    failure.class = effective_failure_class(failure.class, &initial_quarantine);
+    let mut class = failure.class;
 
     let mut first_attempt = true;
     loop {
@@ -3176,19 +3181,27 @@ fn recover_worker(
                     resynced.bytes,
                     recovery_started.elapsed().as_millis(),
                 );
+                #[cfg(feature = "e2e")]
+                if let Ok(path) = std::env::var("KAKEHASHI_TREE_WORKER_RECOVERY_READY_FILE") {
+                    let _ = std::fs::write(path, b"ready");
+                }
                 return true;
             }
             Err(failure) => {
                 state.client = Some(Arc::new(replacement));
-                if let Some(grammar) = failure.implicated_grammar {
-                    quarantine_grammar(state, grammar, failure.class, comparisons);
-                }
+                let quarantine = quarantine_grammars(
+                    state,
+                    failure.active_grammars,
+                    failure.class,
+                    comparisons,
+                    failure.active_lease_count,
+                );
+                class = effective_failure_class(failure.class, &quarantine);
                 log::error!(
                     target: "kakehashi::tree_worker_shadow",
                     "worker generation {generation} full resync failed: {}",
                     failure.error,
                 );
-                class = failure.class;
                 if mode == RecoveryMode::HalfOpen {
                     return false;
                 }
@@ -3198,31 +3211,65 @@ fn recover_worker(
     }
 }
 
-fn quarantine_grammar(
+fn quarantine_grammars(
     state: &mut SupervisorState,
-    grammar: GrammarIdentity,
+    mut grammars: Vec<GrammarIdentity>,
     class: FailureClass,
     comparisons: &ComparisonStore,
-) {
-    if !state.quarantined.insert(grammar.clone()) {
-        return;
-    }
-    let open_documents = state
-        .open_documents
-        .lock()
-        .recover_poison("quarantine_grammar(open documents)");
-    for request in open_documents.current.values() {
-        if GrammarIdentity::from_sync(request) == grammar {
-            comparisons.mark_closed(&request.context.uri, request.context.incarnation);
+    active_lease_count: usize,
+) -> QuarantineBatch {
+    grammars.sort_unstable();
+    grammars.dedup();
+    let mut batch = QuarantineBatch::default();
+    let mut newly_quarantined = Vec::new();
+    for grammar in grammars {
+        if state.quarantined.insert(grammar.clone()) {
+            newly_quarantined.push(grammar);
+            batch.newly_quarantined += 1;
+        } else {
+            batch.already_quarantined += 1;
         }
+    }
+    if !newly_quarantined.is_empty() {
+        let newly_quarantined_set = newly_quarantined.iter().cloned().collect::<HashSet<_>>();
+        let open_documents = state
+            .open_documents
+            .lock()
+            .recover_poison("quarantine_grammars(open documents)");
+        for request in open_documents.current.values() {
+            if newly_quarantined_set.contains(&GrammarIdentity::from_sync(request)) {
+                comparisons.mark_closed(&request.context.uri, request.context.incarnation);
+            }
+        }
+        drop(open_documents);
+    }
+    for grammar in &newly_quarantined {
+        log::error!(
+            target: "kakehashi::tree_worker_shadow",
+            "quarantined grammar conservatively for this session after {:?} worker loss: symbol={} artifact_digest={}",
+            class,
+            grammar.grammar_symbol,
+            grammar.artifact_digest,
+        );
     }
     log::error!(
         target: "kakehashi::tree_worker_shadow",
-        "quarantined grammar conservatively for this session after {:?} worker loss: symbol={} artifact_digest={}",
+        "worker loss quarantine summary active_leases={} unique_grammars={} newly_quarantined={} already_quarantined={} class={:?}",
+        active_lease_count,
+        batch.newly_quarantined + batch.already_quarantined,
+        batch.newly_quarantined,
+        batch.already_quarantined,
         class,
-        grammar.grammar_symbol,
-        grammar.artifact_digest,
     );
+    batch
+}
+
+fn effective_failure_class(class: FailureClass, quarantine: &QuarantineBatch) -> FailureClass {
+    if quarantine.already_quarantined > 0 {
+        FailureClass::Systemic
+    } else {
+        class
+    }
 }
 
 fn resync_open_documents(
@@ -3276,17 +3323,17 @@ fn resync_open_documents(
                         "unexpected reconciliation close response: {response:?}"
                     )),
                     class: FailureClass::Systemic,
-                    implicated_grammar: None,
+                    active_grammars: Vec::new(),
+                    active_lease_count: 0,
                 });
             }
             Err(error) => {
+                let failure = worker_loss_evidence(client, &error);
                 return Err(ResyncFailure {
                     error,
-                    class: FailureClass::Systemic,
-                    implicated_grammar: Some(GrammarIdentity {
-                        grammar_symbol: identity.grammar_symbol,
-                        artifact_digest: identity.artifact_digest,
-                    }),
+                    class: failure.class,
+                    active_grammars: failure.active_grammars,
+                    active_lease_count: failure.active_lease_count,
                 });
             }
         }
@@ -3335,7 +3382,8 @@ fn resync_open_documents(
                 return Err(ResyncFailure {
                     error: std::io::Error::other(required.reason),
                     class: FailureClass::Systemic,
-                    implicated_grammar: None,
+                    active_grammars: Vec::new(),
+                    active_lease_count: 0,
                 });
             }
             Ok(Response::Error(error)) => {
@@ -3352,15 +3400,17 @@ fn resync_open_documents(
                         "unexpected resync response: {response:?}"
                     )),
                     class: FailureClass::Systemic,
-                    implicated_grammar: None,
+                    active_grammars: Vec::new(),
+                    active_lease_count: 0,
                 });
             }
             Err(error) => {
-                let class = classify_transport_failure(client, &error, Some(&grammar));
+                let failure = worker_loss_evidence(client, &error);
                 return Err(ResyncFailure {
                     error,
-                    class,
-                    implicated_grammar: Some(grammar),
+                    class: failure.class,
+                    active_grammars: failure.active_grammars,
+                    active_lease_count: failure.active_lease_count,
                 });
             }
         }
@@ -3394,12 +3444,86 @@ fn retag_command(command: &mut ShadowCommand, generation: u64) {
     }
 }
 
+fn worker_loss_evidence(client: &Client, error: &std::io::Error) -> WorkerLossEvidence {
+    if let Err(drain_error) = client.wait_for_reader_drain(SHADOW_SHUTDOWN_TIMEOUT) {
+        log::error!(
+            target: "kakehashi::tree_worker_shadow",
+            "could not obtain a complete worker failure snapshot: {drain_error}",
+        );
+        return WorkerLossEvidence {
+            class: FailureClass::Systemic,
+            active_grammars: Vec::new(),
+            active_lease_count: 0,
+        };
+    }
+    let mut active_hazards = client.active_grammar_hazards();
+    active_hazards.sort_unstable_by(|left, right| {
+        (
+            &left.grammar.grammar_symbol,
+            &left.grammar.artifact_digest,
+            left.lease_id,
+            left.context.request_id,
+        )
+            .cmp(&(
+                &right.grammar.grammar_symbol,
+                &right.grammar.artifact_digest,
+                right.lease_id,
+                right.context.request_id,
+            ))
+    });
+    let active_lease_count = active_hazards.len();
+    let active_grammars = unique_active_grammars(&active_hazards);
+    if !active_hazards.is_empty() {
+        let leases = active_hazards
+            .iter()
+            .map(|hazard| {
+                format!(
+                    "{}@{}:lease={}:request={}",
+                    hazard.grammar.grammar_symbol,
+                    hazard.grammar.artifact_digest,
+                    hazard.lease_id,
+                    hazard.context.request_id,
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        log::error!(
+            target: "kakehashi::tree_worker_shadow",
+            "worker loss snapshot committed active grammar hazard(s): active_leases={} unique_grammars={} leases=[{}]",
+            active_lease_count,
+            active_grammars.len(),
+            leases,
+        );
+    }
+    let class = classify_transport_failure(client, error, !active_grammars.is_empty());
+    WorkerLossEvidence {
+        class,
+        active_grammars,
+        active_lease_count,
+    }
+}
+
+fn unique_active_grammars(
+    active_hazards: &[crate::tree_worker::GrammarHazardArmed],
+) -> Vec<GrammarIdentity> {
+    let mut active_grammars = active_hazards
+        .iter()
+        .map(|hazard| GrammarIdentity {
+            grammar_symbol: hazard.grammar.grammar_symbol.clone(),
+            artifact_digest: hazard.grammar.artifact_digest.clone(),
+        })
+        .collect::<Vec<_>>();
+    active_grammars.sort_unstable();
+    active_grammars.dedup();
+    active_grammars
+}
+
 fn classify_transport_failure(
     client: &Client,
     error: &std::io::Error,
-    implicated_grammar: Option<&GrammarIdentity>,
+    has_active_hazards: bool,
 ) -> FailureClass {
-    if implicated_grammar.is_none() {
+    if !has_active_hazards || error.kind() == std::io::ErrorKind::InvalidData {
         return FailureClass::Systemic;
     }
     if error.kind() == std::io::ErrorKind::TimedOut {
@@ -3663,6 +3787,29 @@ fn sync_and_derive(client: &Client, request: SyncDocument) -> std::io::Result<Re
 mod tests {
     use super::*;
 
+    fn active_hazard(
+        lease_id: u64,
+        request_id: u64,
+        grammar_symbol: &str,
+        artifact_digest: &str,
+    ) -> crate::tree_worker::GrammarHazardArmed {
+        crate::tree_worker::GrammarHazardArmed {
+            lease_id,
+            context: RequestContext {
+                request_id,
+                worker_generation: 7,
+                uri: format!("file:///{grammar_symbol}-{request_id}"),
+                incarnation: 1,
+                content_version: 1,
+                configuration_generation: 1,
+            },
+            grammar: crate::tree_worker::WorkerGrammarIdentity {
+                grammar_symbol: grammar_symbol.into(),
+                artifact_digest: artifact_digest.into(),
+            },
+        }
+    }
+
     fn shadow(sender: mpsc::SyncSender<ShadowCommand>) -> TreeWorkerShadow {
         TreeWorkerShadow {
             mode: TreeWorkerMode::Shadow,
@@ -3699,6 +3846,54 @@ mod tests {
         );
         assert!(should_derive_edit_snapshot(TreeWorkerMode::Shadow));
         assert!(!should_derive_edit_snapshot(TreeWorkerMode::Authoritative));
+    }
+
+    #[test]
+    fn active_hazard_snapshot_is_a_sorted_unique_grammar_set() {
+        let hazards = vec![
+            active_hazard(3, 30, "rust", "digest-b"),
+            active_hazard(1, 10, "lua", "digest-a"),
+            active_hazard(2, 20, "rust", "digest-b"),
+        ];
+
+        assert_eq!(
+            unique_active_grammars(&hazards),
+            vec![
+                GrammarIdentity {
+                    grammar_symbol: "lua".into(),
+                    artifact_digest: "digest-a".into(),
+                },
+                GrammarIdentity {
+                    grammar_symbol: "rust".into(),
+                    artifact_digest: "digest-b".into(),
+                },
+            ]
+        );
+        assert!(unique_active_grammars(&[]).is_empty());
+    }
+
+    #[test]
+    fn already_quarantined_hazard_escalates_worker_loss_to_systemic() {
+        assert_eq!(
+            effective_failure_class(
+                FailureClass::NativeEvidenced,
+                &QuarantineBatch {
+                    newly_quarantined: 0,
+                    already_quarantined: 1,
+                },
+            ),
+            FailureClass::Systemic,
+        );
+        assert_eq!(
+            effective_failure_class(
+                FailureClass::NativeEvidenced,
+                &QuarantineBatch {
+                    newly_quarantined: 2,
+                    already_quarantined: 0,
+                },
+            ),
+            FailureClass::NativeEvidenced,
+        );
     }
 
     #[test]

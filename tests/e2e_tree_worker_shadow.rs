@@ -1095,7 +1095,7 @@ fn crashed_grammar_is_quarantined_only_in_session_and_other_grammar_recovers() {
     let stderr = shutdown_and_stderr(client);
     assert!(marker.exists(), "failure injection did not run: {stderr}");
     assert!(
-        stderr.contains("acknowledged active grammar hazard(s)"),
+        stderr.contains("committed active grammar hazard(s)"),
         "{stderr}"
     );
     assert!(
@@ -1116,6 +1116,189 @@ fn crashed_grammar_is_quarantined_only_in_session_and_other_grammar_recovers() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn crash_quarantines_every_unique_committed_grammar_hazard() {
+    let directory = tempfile::tempdir().unwrap();
+    let trigger = directory.path().join("trigger");
+    let rust_committed = directory.path().join("rust-committed");
+    let lua_committed = directory.path().join("lua-committed");
+    let recovery_ready = directory.path().join("recovery-ready");
+    let mut client = LspClient::builder()
+        .env("KAKEHASHI_TREE_WORKER_SHADOW", "true")
+        .env("KAKEHASHI_TREE_WORKER_THREADS", "4")
+        .env(
+            "KAKEHASHI_TREE_WORKER_MULTI_HAZARD_TRIGGER_FILE",
+            trigger.to_string_lossy(),
+        )
+        .env(
+            "KAKEHASHI_TREE_WORKER_HOLD_COMMITTED_HAZARD_URI_SUFFIX",
+            "/active-rust.rs",
+        )
+        .env(
+            "KAKEHASHI_TREE_WORKER_HOLD_COMMITTED_HAZARD_MARKER",
+            rust_committed.to_string_lossy(),
+        )
+        .env(
+            "KAKEHASHI_TREE_WORKER_CRASH_COMMITTED_HAZARD_URI_SUFFIX",
+            "/active-lua.lua",
+        )
+        .env(
+            "KAKEHASHI_TREE_WORKER_CRASH_COMMITTED_HAZARD_MARKER",
+            lua_committed.to_string_lossy(),
+        )
+        .env(
+            "KAKEHASHI_TREE_WORKER_RECOVERY_READY_FILE",
+            recovery_ready.to_string_lossy(),
+        )
+        .env(
+            "RUST_LOG",
+            "kakehashi::tree_worker_shadow=info,kakehashi::tree_worker_shadow_metrics=info",
+        )
+        .build();
+    initialize(&mut client);
+
+    let documents = [
+        ("file:///active-rust.rs", "rust", "fn active_rust() {}\n"),
+        ("file:///active-lua.lua", "lua", "local active_lua = true\n"),
+        ("file:///healthy.yaml", "yaml", "healthy: true\n"),
+    ];
+    for (uri, language_id, text) in documents {
+        client.send_notification(
+            "textDocument/didOpen",
+            json!({
+                "textDocument": {
+                    "uri": uri,
+                    "languageId": language_id,
+                    "version": 1,
+                    "text": text
+                }
+            }),
+        );
+        let response = client.send_request(
+            "textDocument/semanticTokens/full",
+            json!({ "textDocument": { "uri": uri } }),
+        );
+        assert!(response.get("result").is_some(), "{response:?}");
+    }
+
+    std::fs::write(&trigger, b"trigger").unwrap();
+    let rust_request = client.send_request_async(
+        "kakehashi/node",
+        json!({
+            "textDocument": { "uri": "file:///active-rust.rs" },
+            "position": { "line": 0, "character": 4 }
+        }),
+    );
+    wait_for_file(
+        &rust_committed,
+        "Rust hazard was not committed before the second request",
+    );
+    let lua_request = client.send_request_async(
+        "kakehashi/node",
+        json!({
+            "textDocument": { "uri": "file:///active-lua.lua" },
+            "position": { "line": 0, "character": 6 }
+        }),
+    );
+    wait_for_file(&lua_committed, "Lua hazard did not commit before abort");
+
+    let mut completed = std::collections::HashSet::new();
+    for _ in 0..2 {
+        let response = client.receive_next_response_public();
+        completed.insert(response.get("id").and_then(|id| id.as_i64()).unwrap());
+    }
+    assert_eq!(
+        completed,
+        std::collections::HashSet::from([rust_request, lua_request])
+    );
+    wait_for_file(
+        &recovery_ready,
+        "replacement worker did not complete quarantine-aware resync",
+    );
+
+    let healthy = client.send_request(
+        "kakehashi/node",
+        json!({
+            "textDocument": { "uri": "file:///healthy.yaml" },
+            "position": { "line": 0, "character": 1 }
+        }),
+    );
+    assert!(healthy.get("result").is_some(), "{healthy:?}");
+
+    let stderr = shutdown_and_stderr(client);
+    let quarantine = stderr
+        .lines()
+        .filter(|line| line.contains("quarantined grammar conservatively for this session"))
+        .collect::<Vec<_>>();
+    assert_eq!(quarantine.len(), 2, "{stderr}");
+    assert!(
+        quarantine.iter().any(|line| line.contains("symbol=rust")),
+        "{stderr}"
+    );
+    assert!(
+        quarantine.iter().any(|line| line.contains("symbol=lua")),
+        "{stderr}"
+    );
+    assert!(
+        !quarantine.iter().any(|line| line.contains("symbol=yaml")),
+        "{stderr}"
+    );
+    assert_eq!(
+        stderr
+            .lines()
+            .filter(|line| line.contains("restarted worker generation"))
+            .count(),
+        1,
+        "{stderr}",
+    );
+    assert!(
+        stderr.contains("full-resynced 1 open documents"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains(
+            "worker loss quarantine summary active_leases=2 unique_grammars=2 newly_quarantined=2 already_quarantined=0 class=NativeEvidenced"
+        ),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("disabled shadow tree tier"), "{stderr}");
+    eprintln!(
+        "multi-hazard recovery measurement: {}",
+        stderr
+            .lines()
+            .find(|line| line.contains("restarted worker generation"))
+            .expect("restart measurement log must be present")
+    );
+
+    let mut next_session = LspClient::builder()
+        .env("KAKEHASHI_TREE_WORKER_MODE", "authoritative")
+        .build();
+    initialize(&mut next_session);
+    open_rust_and_request_tokens(
+        &mut next_session,
+        "file:///next-session.rs",
+        "fn next_session() {}\n",
+    );
+    next_session.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": "file:///next-session.lua",
+                "languageId": "lua",
+                "version": 1,
+                "text": "local next_session = true\n"
+            }
+        }),
+    );
+    let lua = next_session.send_request(
+        "textDocument/semanticTokens/full",
+        json!({ "textDocument": { "uri": "file:///next-session.lua" } }),
+    );
+    assert!(lua.get("result").is_some(), "{lua:?}");
+    let _stderr = shutdown_and_stderr(next_session);
+}
+
 #[test]
 fn hung_grammar_hits_hard_deadline_and_other_grammar_recovers() {
     let directory = tempfile::tempdir().unwrap();
@@ -1129,10 +1312,13 @@ fn hung_grammar_hits_hard_deadline_and_other_grammar_recovers() {
             "/hung.rs",
         )
         .env(
-            "KAKEHASHI_TREE_WORKER_HANG_ONCE_FILE",
+            "KAKEHASHI_TREE_WORKER_HANG_AFTER_HAZARD_ARMED_FILE",
             marker.to_string_lossy().into_owned(),
         )
-        .env("KAKEHASHI_TREE_WORKER_HANG_URI_SUFFIX", "/hung.rs")
+        .env(
+            "KAKEHASHI_TREE_WORKER_HANG_AFTER_HAZARD_ARMED_URI_SUFFIX",
+            "/hung.rs",
+        )
         .env(
             "RUST_LOG",
             "kakehashi::tree_worker_shadow=info,kakehashi::tree_worker_shadow_metrics=info",

@@ -12,7 +12,7 @@ use std::{
     cell::RefCell,
     collections::{HashMap, VecDeque},
     sync::{
-        Arc, Mutex, Weak,
+        Arc, Condvar, Mutex, Weak,
         atomic::{AtomicBool, AtomicUsize, Ordering},
     },
 };
@@ -4087,6 +4087,55 @@ where
                     Ok(()) => {
                         #[cfg(feature = "e2e")]
                         if let Ok(marker) =
+                            std::env::var("KAKEHASHI_TREE_WORKER_HANG_AFTER_HAZARD_ARMED_FILE")
+                            && std::env::var(
+                                "KAKEHASHI_TREE_WORKER_HANG_AFTER_HAZARD_ARMED_URI_SUFFIX",
+                            )
+                            .ok()
+                            .is_none_or(|suffix| context.uri.ends_with(&suffix))
+                            && std::fs::OpenOptions::new()
+                                .write(true)
+                                .create_new(true)
+                                .open(marker)
+                                .is_ok()
+                        {
+                            loop {
+                                std::thread::park();
+                            }
+                        }
+                        #[cfg(feature = "e2e")]
+                        if std::env::var_os("KAKEHASHI_TREE_WORKER_MULTI_HAZARD_TRIGGER_FILE")
+                            .is_some_and(|path| std::path::Path::new(&path).exists())
+                        {
+                            if std::env::var(
+                                "KAKEHASHI_TREE_WORKER_HOLD_COMMITTED_HAZARD_URI_SUFFIX",
+                            )
+                            .ok()
+                            .is_some_and(|suffix| context.uri.ends_with(&suffix))
+                                && let Ok(marker) = std::env::var(
+                                    "KAKEHASHI_TREE_WORKER_HOLD_COMMITTED_HAZARD_MARKER",
+                                )
+                                && std::fs::write(marker, b"committed").is_ok()
+                            {
+                                loop {
+                                    std::thread::park();
+                                }
+                            }
+                            if std::env::var(
+                                "KAKEHASHI_TREE_WORKER_CRASH_COMMITTED_HAZARD_URI_SUFFIX",
+                            )
+                            .ok()
+                            .is_some_and(|suffix| context.uri.ends_with(&suffix))
+                                && let Ok(marker) = std::env::var(
+                                    "KAKEHASHI_TREE_WORKER_CRASH_COMMITTED_HAZARD_MARKER",
+                                )
+                                && std::fs::write(marker, b"committed").is_ok()
+                            {
+                                std::process::abort();
+                            }
+                        }
+                        #[cfg(feature = "e2e")]
+                        if let Ok(marker) =
                             std::env::var("KAKEHASHI_TREE_WORKER_CRASH_AFTER_HAZARD_ARMED_FILE")
                             && std::fs::OpenOptions::new()
                                 .write(true)
@@ -4921,6 +4970,7 @@ pub struct Client {
     terminated_by_transport: Arc<AtomicBool>,
     outbound: Mutex<Option<mpsc::Sender<Request>>>,
     active_grammar_hazards: Arc<Mutex<HashMap<u64, GrammarHazardArmed>>>,
+    reader_drained: Arc<(Mutex<bool>, Condvar)>,
     routes: Arc<Mutex<HashMap<u64, Route>>>,
     reader: Option<std::thread::JoinHandle<()>>,
     writer: Option<std::thread::JoinHandle<()>>,
@@ -5038,8 +5088,10 @@ impl Client {
         let routes = Arc::new(Mutex::new(HashMap::<u64, Route>::new()));
         let active_grammar_hazards =
             Arc::new(Mutex::new(HashMap::<u64, GrammarHazardArmed>::new()));
+        let reader_drained = Arc::new((Mutex::new(false), Condvar::new()));
         let reader_routes = Arc::clone(&routes);
         let reader_hazards = Arc::clone(&active_grammar_hazards);
+        let reader_drain_signal = Arc::clone(&reader_drained);
         let reader_child = Arc::clone(&child);
         let reader_terminated_by_transport = Arc::clone(&terminated_by_transport);
         let (handshake_tx, handshake_rx) = mpsc::channel();
@@ -5119,6 +5171,11 @@ impl Client {
                     }
                 }
             }
+            let (drained, ready) = &*reader_drain_signal;
+            *drained
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = true;
+            ready.notify_all();
             if let Ok(mut child) = reader_child.lock() {
                 terminate_by_transport(
                     &mut child,
@@ -5210,6 +5267,7 @@ impl Client {
             terminated_by_transport,
             outbound: Mutex::new(Some(outbound)),
             active_grammar_hazards,
+            reader_drained,
             routes,
             reader: Some(reader),
             writer: Some(writer),
@@ -5244,6 +5302,24 @@ impl Client {
             .values()
             .cloned()
             .collect()
+    }
+
+    pub fn wait_for_reader_drain(&self, timeout: Duration) -> io::Result<()> {
+        let (drained, ready) = &*self.reader_drained;
+        let drained = drained
+            .lock()
+            .map_err(|_| io::Error::other("worker reader drain lock is poisoned"))?;
+        let (drained, _) = ready
+            .wait_timeout_while(drained, timeout, |drained| !*drained)
+            .map_err(|_| io::Error::other("worker reader drain lock is poisoned"))?;
+        if *drained {
+            Ok(())
+        } else {
+            Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "worker response reader did not drain after worker loss",
+            ))
+        }
     }
 
     /// Idempotently cancel queued or cooperatively running work in this worker
