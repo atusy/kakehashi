@@ -1672,6 +1672,78 @@ fn deadline_grace_preserves_a_delayed_worker_restart_requirement() {
 }
 
 #[test]
+fn cancellation_waits_for_request_delivery_before_sending_cancel() {
+    let directory = tempfile::tempdir().unwrap();
+    let waiter_started = directory.path().join("waiter-started");
+    let cancel_observed = directory.path().join("cancel-observed");
+    let mut client = LspClient::builder()
+        .env("KAKEHASHI_TREE_WORKER_MODE", "authoritative")
+        .env("KAKEHASHI_TREE_WORKER_THREADS", "2")
+        .env(
+            "KAKEHASHI_TREE_WORKER_ADMISSION_DELAY_URI_SUFFIX",
+            "/cancel-before-wait.rs",
+        )
+        .env("KAKEHASHI_TREE_WORKER_ADMISSION_DELAY_MS", "1000")
+        .env(
+            "KAKEHASHI_TREE_WORKER_RESPONSE_WAITER_DELAY_URI_SUFFIX",
+            "/cancel-before-wait.rs",
+        )
+        .env("KAKEHASHI_TREE_WORKER_RESPONSE_WAITER_DELAY_MS", "500")
+        .env(
+            "KAKEHASHI_TREE_WORKER_RESPONSE_WAITER_DELAY_STARTED_FILE",
+            waiter_started.to_string_lossy(),
+        )
+        .env(
+            "KAKEHASHI_TREE_WORKER_CANCEL_OBSERVED_FILE",
+            cancel_observed.to_string_lossy(),
+        )
+        .env("RUST_LOG", "kakehashi::tree_worker_shadow=info")
+        .build();
+    initialize(&mut client);
+
+    let uri = "file:///cancel-before-wait.rs";
+    open_rust_and_request_tokens(&mut client, uri, "fn cancel_before_wait() {}\n");
+    std::fs::remove_file(&waiter_started).unwrap();
+    client.send_notification(
+        "textDocument/didChange",
+        json!({
+            "textDocument": { "uri": uri, "version": 2 },
+            "contentChanges": [{ "text": "fn cancel_before_wait_v2() {}\n" }]
+        }),
+    );
+    let request_id = client.send_request_async(
+        "textDocument/semanticTokens/full",
+        json!({ "textDocument": { "uri": uri } }),
+    );
+    wait_for_file(
+        &waiter_started,
+        "semantic request was not delivered before the blocking waiter delay",
+    );
+    client.send_notification("$/cancelRequest", json!({ "id": request_id }));
+    let cancelled = client.receive_response_for_id_public(request_id);
+    assert!(cancelled.get("error").is_some(), "{cancelled:?}");
+    wait_for_file(
+        &cancel_observed,
+        "worker did not observe cancellation for the already-delivered request",
+    );
+    assert!(
+        std::fs::read_to_string(&cancel_observed)
+            .unwrap()
+            .parse::<u64>()
+            .is_ok(),
+        "worker did not record the cancelled internal request ID"
+    );
+
+    let healthy = client.send_request(
+        "textDocument/semanticTokens/full",
+        json!({ "textDocument": { "uri": uri } }),
+    );
+    assert!(healthy.get("result").is_some(), "{healthy:?}");
+    let stderr = shutdown_and_stderr(client);
+    assert!(!stderr.contains("restarted worker generation"), "{stderr}");
+}
+
+#[test]
 fn noncooperative_jobs_saturating_all_compute_threads_recover_as_one_generation() {
     let directory = tempfile::tempdir().unwrap();
     let trigger = directory.path().join("trigger");

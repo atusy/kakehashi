@@ -3956,7 +3956,13 @@ where
     let mut pending = injected_hung_compute;
     while let Some(request) = decode_frame::<_, Request>(&mut reader)? {
         if let Request::Cancel(cancel) = request {
-            cancel_active_request(&cancellations, &cancel, worker_generation);
+            let cancelled = cancel_active_request(&cancellations, &cancel, worker_generation);
+            #[cfg(feature = "e2e")]
+            if cancelled
+                && let Ok(path) = std::env::var("KAKEHASHI_TREE_WORKER_CANCEL_OBSERVED_FILE")
+            {
+                let _ = std::fs::write(path, cancel.request_id.to_string());
+            }
             continue;
         }
         let Some(context) = request_context(&request) else {
@@ -5115,6 +5121,13 @@ struct Route {
     sender: mpsc::Sender<io::Result<Response>>,
 }
 
+pub struct PendingResponse {
+    request_id: u64,
+    response_rx: mpsc::Receiver<io::Result<Response>>,
+    started: Instant,
+    timeout: Duration,
+}
+
 impl Client {
     pub fn spawn(
         executable: &std::path::Path,
@@ -5605,9 +5618,17 @@ impl Client {
     }
 
     pub fn derive_semantic_tokens(&self, request: DeriveSemanticTokens) -> io::Result<Response> {
+        let pending = self.begin_derive_semantic_tokens(request)?;
+        self.wait_for_response(pending)
+    }
+
+    pub fn begin_derive_semantic_tokens(
+        &self,
+        request: DeriveSemanticTokens,
+    ) -> io::Result<PendingResponse> {
         let context = request.context.clone();
         let timeout = request_timeout(&context.uri);
-        self.request_with_timeout(Request::DeriveSemanticTokens(request), context, timeout)
+        self.begin_request(Request::DeriveSemanticTokens(request), context, timeout)
     }
 
     pub fn run_captures(&self, request: RunCaptures) -> io::Result<Response> {
@@ -5647,6 +5668,16 @@ impl Client {
         expected: RequestContext,
         timeout: Duration,
     ) -> io::Result<Response> {
+        let pending = self.begin_request(request, expected, timeout)?;
+        self.wait_for_response(pending)
+    }
+
+    fn begin_request(
+        &self,
+        request: Request,
+        expected: RequestContext,
+        timeout: Duration,
+    ) -> io::Result<PendingResponse> {
         let started = Instant::now();
         let uses_supervisor_reserve = request_uses_supervisor_route_reserve(&request);
         if expected.worker_generation != self.ready.worker_generation {
@@ -5708,6 +5739,21 @@ impl Client {
                 ));
             }
         }
+        Ok(PendingResponse {
+            request_id,
+            response_rx,
+            started,
+            timeout,
+        })
+    }
+
+    pub fn wait_for_response(&self, pending: PendingResponse) -> io::Result<Response> {
+        let PendingResponse {
+            request_id,
+            response_rx,
+            started,
+            timeout,
+        } = pending;
         let remaining = timeout.saturating_sub(started.elapsed());
         let response = match response_rx.recv_timeout(remaining) {
             Ok(response) => response?,

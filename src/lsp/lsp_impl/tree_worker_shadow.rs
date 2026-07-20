@@ -1087,14 +1087,33 @@ impl TreeWorkerShadow {
             .await?;
         let expected = context.clone();
         let started = Instant::now();
-        let mut cancellation =
-            WorkerRequestCancellation::new(Arc::clone(&client), context.request_id);
-        let response = tokio::task::spawn_blocking(move || {
-            client.derive_semantic_tokens(DeriveSemanticTokens {
+        let pending = client
+            .begin_derive_semantic_tokens(DeriveSemanticTokens {
                 context,
                 supports_multiline,
             })
-        });
+            .ok()?;
+        let mut cancellation =
+            WorkerRequestCancellation::new(Arc::clone(&client), expected.request_id);
+        #[cfg(feature = "e2e")]
+        if std::env::var("KAKEHASHI_TREE_WORKER_RESPONSE_WAITER_DELAY_URI_SUFFIX")
+            .ok()
+            .is_some_and(|suffix| expected.uri.ends_with(&suffix))
+        {
+            if let Ok(path) =
+                std::env::var("KAKEHASHI_TREE_WORKER_RESPONSE_WAITER_DELAY_STARTED_FILE")
+            {
+                let _ = std::fs::write(path, b"started");
+            }
+            if let Ok(milliseconds) =
+                std::env::var("KAKEHASHI_TREE_WORKER_RESPONSE_WAITER_DELAY_MS")
+                    .unwrap_or_default()
+                    .parse::<u64>()
+            {
+                tokio::time::sleep(Duration::from_millis(milliseconds)).await;
+            }
+        }
+        let response = tokio::task::spawn_blocking(move || client.wait_for_response(pending));
         let response = if let Some(supersede) = supersede {
             tokio::select! {
                 biased;
