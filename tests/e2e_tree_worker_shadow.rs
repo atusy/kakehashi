@@ -1589,6 +1589,72 @@ fn planned_restart_retires_a_noncooperative_published_request() {
 }
 
 #[test]
+fn deadline_grace_preserves_a_delayed_worker_restart_requirement() {
+    let directory = tempfile::tempdir().unwrap();
+    let restart_once = directory.path().join("restart-once");
+    let recovery_ready = directory.path().join("recovery-ready");
+    std::fs::write(&restart_once, b"suppress initial restart").unwrap();
+    let mut client = LspClient::builder()
+        .env("KAKEHASHI_TREE_WORKER_MODE", "authoritative")
+        .env("KAKEHASHI_TREE_WORKER_THREADS", "2")
+        .env("KAKEHASHI_TREE_WORKER_REQUEST_TIMEOUT_MS", "500")
+        .env(
+            "KAKEHASHI_TREE_WORKER_REQUEST_TIMEOUT_URI_SUFFIX",
+            "/grace-restart.rs",
+        )
+        .env(
+            "KAKEHASHI_TREE_WORKER_RESTART_ONCE_FILE",
+            restart_once.to_string_lossy(),
+        )
+        .env(
+            "KAKEHASHI_TREE_WORKER_RESTART_URI_SUFFIX",
+            "/grace-restart.rs",
+        )
+        .env("KAKEHASHI_TREE_WORKER_RESTART_RESPONSE_DELAY_MS", "600")
+        .env(
+            "KAKEHASHI_TREE_WORKER_RECOVERY_READY_FILE",
+            recovery_ready.to_string_lossy(),
+        )
+        .env("RUST_LOG", "kakehashi::tree_worker_shadow=info")
+        .build();
+    initialize(&mut client);
+
+    let uri = "file:///grace-restart.rs";
+    open_rust_and_request_tokens(&mut client, uri, "fn grace_restart() {}\n");
+    std::fs::remove_file(&restart_once).unwrap();
+    client.send_notification(
+        "workspace/didChangeConfiguration",
+        json!({ "settings": { "autoInstall": false } }),
+    );
+    wait_for_file(
+        &recovery_ready,
+        "restart requirement returned during cancellation grace was discarded",
+    );
+
+    let healthy = client.send_request(
+        "kakehashi/node",
+        json!({
+            "textDocument": { "uri": uri },
+            "position": { "line": 0, "character": 4 }
+        }),
+    );
+    assert!(healthy.get("result").is_some(), "{healthy:?}");
+
+    let stderr = shutdown_and_stderr(client);
+    assert!(
+        stderr.contains("requested restart: injected systemic restart"),
+        "{stderr}"
+    );
+    assert_eq!(
+        stderr.matches("restarted worker generation").count(),
+        1,
+        "{stderr}"
+    );
+    assert!(!stderr.contains("timed out"), "{stderr}");
+    assert!(!stderr.contains("quarantined grammar"), "{stderr}");
+}
+
+#[test]
 fn noncooperative_jobs_saturating_all_compute_threads_recover_as_one_generation() {
     let directory = tempfile::tempdir().unwrap();
     let trigger = directory.path().join("trigger");

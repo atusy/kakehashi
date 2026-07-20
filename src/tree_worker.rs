@@ -4420,6 +4420,12 @@ fn inject_worker_failure_once(request: &Request) -> Option<Response> {
             .open(marker)
             .is_ok()
     {
+        if let Ok(milliseconds) = std::env::var("KAKEHASHI_TREE_WORKER_RESTART_RESPONSE_DELAY_MS")
+            .unwrap_or_default()
+            .parse::<u64>()
+        {
+            std::thread::sleep(Duration::from_millis(milliseconds));
+        }
         return Some(Response::WorkerRestartRequired(WorkerRestartRequired {
             context: sync.context.clone(),
             reason: "injected systemic restart".into(),
@@ -5693,11 +5699,17 @@ impl Client {
         let response = match response_rx.recv_timeout(remaining) {
             Ok(response) => response?,
             Err(mpsc::RecvTimeoutError::Timeout) => {
-                let cancellation_completed = self.cancel_request(request_id).is_ok()
-                    && cancellation_grace_completed(
+                let cancellation_response = if self.cancel_request(request_id).is_ok() {
+                    cancellation_grace_response(
                         response_rx.recv_timeout(REQUEST_CANCELLATION_GRACE),
-                    )?;
-                if !cancellation_completed {
+                    )?
+                } else {
+                    None
+                };
+                if let Some(Response::WorkerRestartRequired(required)) = cancellation_response {
+                    return Ok(Response::WorkerRestartRequired(required));
+                }
+                if cancellation_response.is_none() {
                     self.terminate_for_request_deadline(Duration::from_secs(1));
                 }
                 return Err(io::Error::new(
@@ -5751,13 +5763,13 @@ impl Client {
     }
 }
 
-fn cancellation_grace_completed(
+fn cancellation_grace_response(
     result: Result<io::Result<Response>, mpsc::RecvTimeoutError>,
-) -> io::Result<bool> {
+) -> io::Result<Option<Response>> {
     match result {
-        Ok(Ok(_)) => Ok(true),
+        Ok(Ok(response)) => Ok(Some(response)),
         Ok(Err(error)) => Err(error),
-        Err(mpsc::RecvTimeoutError::Timeout | mpsc::RecvTimeoutError::Disconnected) => Ok(false),
+        Err(mpsc::RecvTimeoutError::Timeout | mpsc::RecvTimeoutError::Disconnected) => Ok(None),
     }
 }
 
@@ -5990,14 +6002,14 @@ mod tests {
         ResolveNode, Response, Route, RunCaptures, RunNodeScalar, RunnableDocuments,
         SEMANTIC_CACHE_AUXILIARY_TRIM_THRESHOLD_BYTES, SyncDocument, WireByteRange, WirePosition,
         WireRange, WireSemanticToken, WorkPriority, WorkerError, WorkerGrammarIdentity,
-        WorkerQuerySources, cache_eviction_plan, cancellation_grace_completed,
-        client_generation_is_idle, close_document, decode_frame, derive_snapshot_with_language,
-        encode_frame, enforce_derived_memory_budget, named_node_count, parse_request_timeout,
-        pressure_checkpoint_required, replace_retained_bytes, replace_retained_estimated_bytes,
-        request_may_grow_derived_state, request_priority, reserve_retained_growth,
-        route_is_admissible, route_response, run, submit_document_job, sync_document, terminate,
-        terminate_by_transport, terminate_by_transport_for_request_deadline,
-        validate_document_size,
+        WorkerQuerySources, WorkerRestartRequired, cache_eviction_plan,
+        cancellation_grace_response, client_generation_is_idle, close_document, decode_frame,
+        derive_snapshot_with_language, encode_frame, enforce_derived_memory_budget,
+        named_node_count, parse_request_timeout, pressure_checkpoint_required,
+        replace_retained_bytes, replace_retained_estimated_bytes, request_may_grow_derived_state,
+        request_priority, reserve_retained_growth, route_is_admissible, route_response, run,
+        submit_document_job, sync_document, terminate, terminate_by_transport,
+        terminate_by_transport_for_request_deadline, validate_document_size,
     };
 
     #[derive(Clone, Default)]
@@ -6353,9 +6365,30 @@ mod tests {
                 "worker lost during cancellation grace",
             )));
 
-        let error = cancellation_grace_completed(result).unwrap_err();
+        let error = cancellation_grace_response(result).unwrap_err();
 
         assert_eq!(error.kind(), std::io::ErrorKind::BrokenPipe);
+    }
+
+    #[test]
+    fn cancellation_grace_preserves_worker_restart_requirement() {
+        let required = WorkerRestartRequired {
+            context: RequestContext {
+                request_id: 42,
+                worker_generation: 7,
+                uri: "file:///pressure.rs".into(),
+                incarnation: 3,
+                content_version: 5,
+                configuration_generation: 11,
+            },
+            reason: "post-compute pressure checkpoint failed".into(),
+        };
+
+        let response =
+            cancellation_grace_response(Ok(Ok(Response::WorkerRestartRequired(required.clone()))))
+                .unwrap();
+
+        assert_eq!(response, Some(Response::WorkerRestartRequired(required)));
     }
 
     #[test]
