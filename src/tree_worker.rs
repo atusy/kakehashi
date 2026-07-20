@@ -44,6 +44,39 @@ const TREE_NODE_ADMISSION_BYTES: usize = 64;
 const MAX_RETAINED_DERIVED_BYTES: usize = 128 * 1024 * 1024;
 pub const BUILD_ID: &str = concat!(env!("CARGO_PKG_NAME"), "-", env!("CARGO_PKG_VERSION"));
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct WorkerMemoryBudgets {
+    derived_cache_soft_bytes: usize,
+    non_evictable_estimate_hard_bytes: usize,
+}
+
+impl WorkerMemoryBudgets {
+    fn new(
+        derived_cache_soft_bytes: usize,
+        non_evictable_estimate_hard_bytes: usize,
+    ) -> Result<Self, String> {
+        if derived_cache_soft_bytes == 0 {
+            return Err("worker derived-cache soft budget must be positive".into());
+        }
+        if non_evictable_estimate_hard_bytes == 0 {
+            return Err("worker non-evictable estimate hard budget must be positive".into());
+        }
+        Ok(Self {
+            derived_cache_soft_bytes,
+            non_evictable_estimate_hard_bytes,
+        })
+    }
+}
+
+impl Default for WorkerMemoryBudgets {
+    fn default() -> Self {
+        Self {
+            derived_cache_soft_bytes: MAX_RETAINED_DERIVED_BYTES,
+            non_evictable_estimate_hard_bytes: MAX_RETAINED_ESTIMATED_DOCUMENT_BYTES,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct RequestContext {
     pub request_id: u64,
@@ -7156,6 +7189,12 @@ mod tests {
             retained.load(Ordering::Relaxed),
             MAX_RETAINED_ESTIMATED_DOCUMENT_BYTES
         );
+    }
+
+    #[test]
+    fn worker_memory_budgets_reject_zero_limits() {
+        assert!(super::WorkerMemoryBudgets::new(0, 1).is_err());
+        assert!(super::WorkerMemoryBudgets::new(1, 0).is_err());
     }
 
     #[test]
