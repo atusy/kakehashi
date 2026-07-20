@@ -1230,6 +1230,7 @@ fn build_combined_context<'a>(
 /// A region is *active* only if at least one token was produced from it (depth ≥ 1);
 /// resolved-but-empty injections don't suppress parent tokens.
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 pub(crate) fn collect_injection_tokens_parallel(
     host_text: &str,
     host_lines: &[&str],
@@ -1241,6 +1242,35 @@ pub(crate) fn collect_injection_tokens_parallel(
     supports_multiline: bool,
     cache_ctx: Option<&InjectionCacheCtx>,
     cancel: Option<&crate::cancel::CancelToken>,
+) -> (Vec<RawToken>, Vec<ActiveInjectionBounds>) {
+    collect_injection_tokens_with_parallelism(
+        host_text,
+        host_lines,
+        host_line_starts,
+        host_tree,
+        host_filetype,
+        coordinator,
+        capture_mappings,
+        supports_multiline,
+        cache_ctx,
+        cancel,
+        true,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn collect_injection_tokens_with_parallelism(
+    host_text: &str,
+    host_lines: &[&str],
+    host_line_starts: &[usize],
+    host_tree: &Tree,
+    host_filetype: Option<&str>,
+    coordinator: &LanguageCoordinator,
+    capture_mappings: Option<&CaptureMappings>,
+    supports_multiline: bool,
+    cache_ctx: Option<&InjectionCacheCtx>,
+    cancel: Option<&crate::cancel::CancelToken>,
+    allow_parallelism: bool,
 ) -> (Vec<RawToken>, Vec<ActiveInjectionBounds>) {
     use crate::cancel::is_cancelled;
     use rayon::prelude::*;
@@ -1376,6 +1406,17 @@ pub(crate) fn collect_injection_tokens_parallel(
                 },
             );
         }
+        #[cfg(feature = "e2e")]
+        if let Some(cache_ctx) = cache_ctx
+            && std::env::var("KAKEHASHI_TREE_WORKER_INJECTION_DELAY_URI_SUFFIX")
+                .ok()
+                .is_some_and(|suffix| cache_ctx.uri.as_str().ends_with(&suffix))
+            && let Ok(milliseconds) = std::env::var("KAKEHASHI_TREE_WORKER_INJECTION_DELAY_MS")
+                .unwrap_or_default()
+                .parse::<u64>()
+        {
+            std::thread::sleep(std::time::Duration::from_millis(milliseconds));
+        }
         (
             i,
             process_injection_sync(
@@ -1392,11 +1433,12 @@ pub(crate) fn collect_injection_tokens_parallel(
             ),
         )
     };
-    let processed: Vec<(usize, InjectionTokens)> = if miss_indices.len() >= PARALLEL_THRESHOLD {
-        miss_indices.par_iter().map(|&i| process_one(i)).collect()
-    } else {
-        miss_indices.iter().map(|&i| process_one(i)).collect()
-    };
+    let processed: Vec<(usize, InjectionTokens)> =
+        if allow_parallelism && miss_indices.len() >= PARALLEL_THRESHOLD {
+            miss_indices.par_iter().map(|&i| process_one(i)).collect()
+        } else {
+            miss_indices.iter().map(|&i| process_one(i)).collect()
+        };
 
     // Store region-local tokens for newly computed eligible, fully-loaded regions
     // (#529, write half), single-threaded after fan-in so cache writes never run

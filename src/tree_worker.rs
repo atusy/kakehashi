@@ -1153,7 +1153,13 @@ impl DocumentReplica {
         &mut self,
         request: DeriveSemanticTokens,
     ) -> Result<DerivedSemanticTokens, String> {
-        self.derive_semantic_tokens_with_telemetry(request, Duration::ZERO, Instant::now(), None)
+        self.derive_semantic_tokens_with_telemetry(
+            request,
+            Duration::ZERO,
+            Instant::now(),
+            rayon::current_num_threads(),
+            None,
+        )
     }
 
     fn derive_semantic_tokens_with_telemetry(
@@ -1161,6 +1167,7 @@ impl DocumentReplica {
         request: DeriveSemanticTokens,
         queue_wait: Duration,
         started: Instant,
+        compute_threads: usize,
         cancellation: Option<&crate::cancel::CancelToken>,
     ) -> Result<DerivedSemanticTokens, String> {
         self.validate_read_identity(&request.context)?;
@@ -1189,7 +1196,7 @@ impl DocumentReplica {
             .ok_or_else(|| "worker highlight query is unavailable".to_string())?;
         let discovery = self.semantic_discovery(request.context.configuration_generation);
         let result = crate::analysis::compute_semantic_tokens_full(
-            rayon::current_num_threads(),
+            compute_threads,
             Arc::from(self.text.as_str()),
             self.tree.clone(),
             query,
@@ -2413,6 +2420,47 @@ impl DocumentLane {
 type LaneRegistry = dashmap::DashMap<DocumentKey, Arc<DocumentLane>>;
 type DocumentLanes = Arc<LaneRegistry>;
 
+#[derive(Default)]
+struct RunnableDocuments {
+    counts: dashmap::DashMap<DocumentKey, usize>,
+}
+
+impl RunnableDocuments {
+    fn enter(self: &Arc<Self>, key: DocumentKey) -> RunnableDocumentGuard {
+        self.counts
+            .entry(key.clone())
+            .and_modify(|count| *count += 1)
+            .or_insert(1);
+        RunnableDocumentGuard {
+            runnable: Arc::clone(self),
+            key,
+        }
+    }
+
+    fn has_competitor(&self) -> bool {
+        self.counts.len() > 1
+    }
+}
+
+struct RunnableDocumentGuard {
+    runnable: Arc<RunnableDocuments>,
+    key: DocumentKey,
+}
+
+impl Drop for RunnableDocumentGuard {
+    fn drop(&mut self) {
+        if let dashmap::mapref::entry::Entry::Occupied(mut entry) =
+            self.runnable.counts.entry(self.key.clone())
+        {
+            if *entry.get() == 1 {
+                entry.remove();
+            } else {
+                *entry.get_mut() -= 1;
+            }
+        }
+    }
+}
+
 fn submit_document_job(
     lanes: &DocumentLanes,
     key: DocumentKey,
@@ -2437,6 +2485,7 @@ fn handle_work(
     retained_document_bytes: &RetainedDocumentBytes,
     queue_wait: Duration,
     cancellation: &crate::cancel::CancelToken,
+    allow_nested_parallelism: bool,
 ) -> Response {
     let context = request_context(&request)
         .expect("scheduled worker request must have context")
@@ -2476,9 +2525,14 @@ fn handle_work(
         Request::RunNodeScalar(request) => run_node_scalar(request, documents),
         Request::DeriveSelectionRanges(request) => derive_selection_ranges(request, documents),
         Request::DeriveInjectionRegions(request) => derive_injection_regions(request, documents),
-        Request::DeriveSemanticTokens(request) => {
-            derive_semantic_tokens(request, documents, queue_wait, started, cancellation)
-        }
+        Request::DeriveSemanticTokens(request) => derive_semantic_tokens(
+            request,
+            documents,
+            queue_wait,
+            started,
+            cancellation,
+            allow_nested_parallelism,
+        ),
         Request::RunCaptures(request) => run_captures(request, documents),
         Request::DeriveNativeBindings(request) => derive_native_bindings(request, documents),
         Request::ConfigureLanguages(request) => configure_languages(request, analysis),
@@ -2679,6 +2733,7 @@ fn derive_semantic_tokens(
     queue_wait: Duration,
     started: Instant,
     cancellation: &crate::cancel::CancelToken,
+    allow_nested_parallelism: bool,
 ) -> Response {
     let context = request.context.clone();
     let Some(replica) = documents
@@ -2696,6 +2751,7 @@ fn derive_semantic_tokens(
                 request,
                 queue_wait,
                 started,
+                semantic_compute_threads(rayon::current_num_threads(), allow_nested_parallelism),
                 Some(cancellation),
             ) {
                 Ok(result) => Response::SemanticTokens(result),
@@ -2706,6 +2762,14 @@ fn derive_semantic_tokens(
             }
         }
         Err(_) => poisoned_document_restart(context),
+    }
+}
+
+fn semantic_compute_threads(pool_threads: usize, allow_nested_parallelism: bool) -> usize {
+    if allow_nested_parallelism {
+        pool_threads
+    } else {
+        1
     }
 }
 
@@ -3224,6 +3288,7 @@ where
     let document_capacity = Arc::new(Mutex::new(0));
     let retained_document_bytes = Arc::new(AtomicUsize::new(0));
     let document_lanes: DocumentLanes = Arc::new(dashmap::DashMap::new());
+    let runnable_documents = Arc::new(RunnableDocuments::default());
     let cancellations = Arc::new(dashmap::DashMap::<u64, crate::cancel::CancelToken>::new());
     // The client permits at most four requests per compute thread. Decode one
     // frame beyond this pending window so cancellation stays observable under
@@ -3290,14 +3355,34 @@ where
         let retained_document_bytes = Arc::clone(&retained_document_bytes);
         let job_cancellations = Arc::clone(&cancellations);
         let lane_key = document_key(&request);
+        let runnable_guard = lane_key
+            .as_ref()
+            .map(|key| runnable_documents.enter(key.clone()));
+        let job_runnable_documents = Arc::clone(&runnable_documents);
         let action_key = lane_key.clone();
         let job: LaneJob = Box::new(move || {
+            #[cfg(feature = "e2e")]
+            if action_key.as_ref().is_some_and(|key| {
+                std::env::var("KAKEHASHI_TREE_WORKER_ADMISSION_DELAY_URI_SUFFIX")
+                    .ok()
+                    .is_some_and(|suffix| key.uri.ends_with(&suffix))
+            }) && let Ok(milliseconds) =
+                std::env::var("KAKEHASHI_TREE_WORKER_ADMISSION_DELAY_MS")
+                    .unwrap_or_default()
+                    .parse::<u64>()
+            {
+                std::thread::sleep(Duration::from_millis(milliseconds));
+            }
             permit_rx
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .recv()
                 .expect("worker admission queue stopped before its jobs");
             let permit = AdmissionPermit(permits);
+            let allow_nested_parallelism = !job_runnable_documents.has_competitor();
+            #[cfg(feature = "e2e")]
+            let allow_nested_parallelism = allow_nested_parallelism
+                || std::env::var_os("KAKEHASHI_TREE_WORKER_FORCE_NESTED_PARALLELISM").is_some();
             let response = handle_work(
                 request,
                 &analysis,
@@ -3307,6 +3392,7 @@ where
                 &retained_document_bytes,
                 enqueued.elapsed(),
                 &cancellation,
+                allow_nested_parallelism,
             );
             job_cancellations.remove(&request_id);
             let action = if action_key
@@ -3319,6 +3405,7 @@ where
             };
             let _ = responses.send((response, Some(permit)));
             let _ = completion_tx.send(());
+            drop(runnable_guard);
             action
         });
         if let Some(lane_key) = lane_key {
@@ -3463,6 +3550,7 @@ pub struct Client {
 
 const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 
+#[cfg(any(test, feature = "e2e"))]
 fn parse_request_timeout(value: Option<&str>) -> Duration {
     value
         .and_then(|value| value.parse::<u64>().ok())
@@ -4125,11 +4213,11 @@ mod tests {
         MAX_RETAINED_DOCUMENT_BYTES, NavigateNode, NodeLayerSelector, NodeNavigation,
         NodeScalarOperation, NodeScalarValue, OpaqueNodeId, PROTOCOL_VERSION, Request,
         RequestCancelled, RequestContext, ResolveNode, Response, Route, RunCaptures, RunNodeScalar,
-        SyncDocument, WireByteRange, WirePosition, WireRange, WorkerError, WorkerQuerySources,
-        close_document, decode_frame, derive_snapshot_with_language, encode_frame,
-        named_node_count, parse_request_timeout, replace_retained_bytes, reserve_retained_growth,
-        route_response, run, submit_document_job, sync_document, terminate_by_transport,
-        validate_document_size,
+        RunnableDocuments, SyncDocument, WireByteRange, WirePosition, WireRange, WorkerError,
+        WorkerQuerySources, close_document, decode_frame, derive_snapshot_with_language,
+        encode_frame, named_node_count, parse_request_timeout, replace_retained_bytes,
+        reserve_retained_growth, route_response, run, semantic_compute_threads,
+        submit_document_job, sync_document, terminate_by_transport, validate_document_size,
     };
 
     #[derive(Clone, Default)]
@@ -4681,6 +4769,36 @@ mod tests {
         gate.1.notify_all();
         completed_rx.recv_timeout(Duration::from_secs(5)).unwrap();
         assert_eq!(*order.lock().unwrap(), [1, 2]);
+    }
+
+    #[test]
+    fn runnable_documents_count_distinct_uris_not_backlog_depth() {
+        let runnable = Arc::new(RunnableDocuments::default());
+        let a = DocumentKey {
+            uri: "file:///a.rs".into(),
+        };
+        let b = DocumentKey {
+            uri: "file:///b.rs".into(),
+        };
+
+        let first_a = runnable.enter(a.clone());
+        let second_a = runnable.enter(a);
+        assert!(!runnable.has_competitor());
+
+        let first_b = runnable.enter(b);
+        assert!(runnable.has_competitor());
+        drop(first_b);
+        assert!(!runnable.has_competitor());
+
+        drop(second_a);
+        drop(first_a);
+        assert!(!runnable.has_competitor());
+    }
+
+    #[test]
+    fn competing_document_disables_nested_semantic_parallelism() {
+        assert_eq!(semantic_compute_threads(4, true), 4);
+        assert_eq!(semantic_compute_threads(4, false), 1);
     }
 
     #[test]
@@ -5386,6 +5504,7 @@ mod tests {
             },
             Duration::ZERO,
             Instant::now(),
+            rayon::current_num_threads(),
             Some(&cancellation),
         );
 

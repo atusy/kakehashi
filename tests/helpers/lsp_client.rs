@@ -607,6 +607,26 @@ impl LspClient {
         self.receive_response_for_id(expected_id)
     }
 
+    /// Receive the next client-request response without assuming completion order.
+    pub(crate) fn receive_next_response_public(&mut self) -> Value {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            assert!(!remaining.is_zero(), "timed out waiting for next response");
+            let message = match self.rx.recv_timeout(remaining) {
+                Ok(ReaderEvent::Message(value)) => value,
+                Ok(ReaderEvent::Error(error)) => panic!("{error}"),
+                Err(RecvTimeoutError::Timeout) => panic!("timed out waiting for next response"),
+                Err(RecvTimeoutError::Disconnected) => {
+                    panic!("server closed connection while waiting for next response")
+                }
+            };
+            if message.get("id").is_some() && message.get("method").is_none() {
+                return message;
+            }
+        }
+    }
+
     /// Receive a client-request response while retaining selected notifications
     /// that arrived before it. Useful for initialization tests, where the normal
     /// synchronous response helper intentionally discards notifications.

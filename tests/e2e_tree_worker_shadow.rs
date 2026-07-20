@@ -738,3 +738,92 @@ fn hung_grammar_hits_hard_deadline_and_other_grammar_recovers() {
             .expect("restart measurement log must be present")
     );
 }
+
+#[test]
+fn competing_document_finishes_while_injection_fanout_is_running() {
+    let force_nested = std::env::var_os("KAKEHASHI_E2E_FORCE_NESTED_PARALLELISM").is_some();
+    let mut builder = LspClient::builder()
+        .env("KAKEHASHI_TREE_WORKER_MODE", "authoritative")
+        .env("KAKEHASHI_TREE_WORKER_THREADS", "4")
+        .env(
+            "KAKEHASHI_TREE_WORKER_ADMISSION_DELAY_URI_SUFFIX",
+            "/fair-a.md",
+        )
+        .env("KAKEHASHI_TREE_WORKER_ADMISSION_DELAY_MS", "100")
+        .env(
+            "KAKEHASHI_TREE_WORKER_INJECTION_DELAY_URI_SUFFIX",
+            "/fair-a.md",
+        )
+        .env("KAKEHASHI_TREE_WORKER_INJECTION_DELAY_MS", "20");
+    if force_nested {
+        builder = builder.env("KAKEHASHI_TREE_WORKER_FORCE_NESTED_PARALLELISM", "1");
+    }
+    let mut client = builder.build();
+    initialize(&mut client);
+    let heavy_uri = "file:///fair-a.md";
+    let heavy = (0..60)
+        .map(|index| format!("```rust\nfn injected_{index}() {{}}\n```\n"))
+        .collect::<String>();
+    client.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": heavy_uri,
+                "languageId": "markdown",
+                "version": 1,
+                "text": heavy
+            }
+        }),
+    );
+    let foreground_uri = "file:///fair-b.rs";
+    client.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": foreground_uri,
+                "languageId": "rust",
+                "version": 1,
+                "text": "fn foreground() {}\n"
+            }
+        }),
+    );
+    std::thread::sleep(Duration::from_secs(1));
+
+    let heavy_started = std::time::Instant::now();
+    let heavy_request = client.send_request_async(
+        "textDocument/semanticTokens/full",
+        json!({ "textDocument": { "uri": heavy_uri } }),
+    );
+    let started = std::time::Instant::now();
+    let foreground_request = client.send_request_async(
+        "kakehashi/node",
+        json!({
+            "textDocument": { "uri": foreground_uri },
+            "position": { "line": 0, "character": 4 }
+        }),
+    );
+    let mut foreground_elapsed = None;
+    let mut heavy_elapsed = None;
+    for _ in 0..2 {
+        let response = client.receive_next_response_public();
+        assert!(response.get("result").is_some(), "{response:?}");
+        match response.get("id").and_then(|id| id.as_i64()) {
+            Some(id) if id == foreground_request => foreground_elapsed = Some(started.elapsed()),
+            Some(id) if id == heavy_request => heavy_elapsed = Some(heavy_started.elapsed()),
+            _ => panic!("unexpected response while measuring fairness: {response:?}"),
+        }
+    }
+    let foreground_elapsed = foreground_elapsed.expect("foreground response must arrive");
+    let heavy_elapsed = heavy_elapsed.expect("heavy response must arrive");
+    if !force_nested {
+        assert!(
+            heavy_elapsed > foreground_elapsed,
+            "heavy fanout did not yield completion order to the foreground document: heavy={heavy_elapsed:?} foreground={foreground_elapsed:?}"
+        );
+    }
+
+    let _stderr = shutdown_and_stderr(client);
+    eprintln!(
+        "cross-document force_nested={force_nested} foreground_latency={foreground_elapsed:?} heavy_completion={heavy_elapsed:?}"
+    );
+}

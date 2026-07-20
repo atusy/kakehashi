@@ -20,7 +20,9 @@ pub(crate) use parallel::build_document_discovery;
 pub(crate) use range::filter_semantic_tokens_by_range;
 
 // Re-export for parallel processing
-use parallel::{INJECTION_CACHE_MIN_REGIONS, InjectionCacheCtx, collect_injection_tokens_parallel};
+use parallel::{
+    INJECTION_CACHE_MIN_REGIONS, InjectionCacheCtx, collect_injection_tokens_with_parallelism,
+};
 
 /// Owned handle the LSP layer passes into [`handle_semantic_tokens_full`] to
 /// enable per-region injection-token caching (#529). `None` disables caching
@@ -184,7 +186,7 @@ pub(crate) fn compute_semantic_tokens_full(
     };
     let injection_work = || {
         let started = std::time::Instant::now();
-        let result = collect_injection_tokens_parallel(
+        let result = collect_injection_tokens_with_parallelism(
             &text,
             &lines,
             &line_starts,
@@ -195,6 +197,7 @@ pub(crate) fn compute_semantic_tokens_full(
             supports_multiline,
             cache_ctx.as_ref(),
             cancel.as_ref(),
+            compute_threads > 1,
         );
         (result, started.elapsed())
     };
