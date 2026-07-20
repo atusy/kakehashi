@@ -1137,6 +1137,14 @@ not yet pass a performance non-regression gate. It identifies lazy shared facts,
 single-flight derivation, and large-result transfer as the next optimization
 targets; it does not change this ADR's `proposed` status.
 
+The [Stage 8 ownership measurement](single-resident-multithreaded-tree-worker-stage8-measurement.md)
+records authoritative open/install ownership, true incremental worker edits,
+semantic-path telemetry, and same-version fact reuse. It finds substantially
+faster exact-version cache hits and a material improvement over Stage 7, but
+the paired legacy mode remains faster in every measured end-to-end scenario.
+Queue wait is not the dominant miss cost, so the result supports keeping one
+worker while rejecting an overall performance-win claim.
+
 The implementation should proceed in measured stages:
 
 1. Prototype the framed transport, supervision, and one high-level
