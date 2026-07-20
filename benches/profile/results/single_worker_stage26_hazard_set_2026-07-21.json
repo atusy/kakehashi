@@ -54,7 +54,7 @@
       "build_profile": "test (unoptimized + debuginfo)",
       "measurement": "supervisor recovery_ms from recovery start through replacement spawn and quarantine-aware full resync",
       "runs": 7,
-      "test": "crash_quarantines_every_unique_committed_grammar_hazard",
+      "test": "windows_and_unix_crash_quarantine_every_unique_committed_grammar_hazard",
       "threads": 4,
       "warmup_runs": 1
     },

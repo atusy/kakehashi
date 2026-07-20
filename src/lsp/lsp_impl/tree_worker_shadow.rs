@@ -3661,21 +3661,38 @@ fn classify_transport_failure(
     if error.kind() == std::io::ErrorKind::TimedOut {
         return FailureClass::NativeEvidenced;
     }
-    #[cfg(unix)]
+    if !client.was_terminated_by_transport()
+        && client
+            .try_wait()
+            .ok()
+            .flatten()
+            .is_some_and(|status| process_status_is_native_crash(&status))
     {
-        use std::os::unix::process::ExitStatusExt;
-
-        if !client.was_terminated_by_transport()
-            && client
-                .try_wait()
-                .ok()
-                .flatten()
-                .is_some_and(|status| status.signal().is_some())
-        {
-            return FailureClass::NativeEvidenced;
-        }
+        return FailureClass::NativeEvidenced;
     }
     FailureClass::Systemic
+}
+
+#[cfg(unix)]
+fn process_status_is_native_crash(status: &std::process::ExitStatus) -> bool {
+    use std::os::unix::process::ExitStatusExt;
+
+    status.signal().is_some()
+}
+
+#[cfg(windows)]
+fn process_status_is_native_crash(status: &std::process::ExitStatus) -> bool {
+    status.code().is_some_and(windows_exit_code_is_exception)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn process_status_is_native_crash(_status: &std::process::ExitStatus) -> bool {
+    false
+}
+
+#[cfg(any(test, windows))]
+fn windows_exit_code_is_exception(code: i32) -> bool {
+    code.is_negative()
 }
 
 fn command_uri(command: &ShadowCommand) -> Option<&str> {
@@ -4071,6 +4088,12 @@ mod tests {
                 "retryable",
             )));
         }
+    }
+
+    #[test]
+    fn windows_exception_status_is_native_crash_evidence() {
+        assert!(windows_exit_code_is_exception(0xc000_0409_u32 as i32));
+        assert!(!windows_exit_code_is_exception(86));
     }
 
     #[test]

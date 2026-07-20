@@ -1116,9 +1116,8 @@ fn crashed_grammar_is_quarantined_only_in_session_and_other_grammar_recovers() {
     );
 }
 
-#[cfg(unix)]
 #[test]
-fn crash_quarantines_every_unique_committed_grammar_hazard() {
+fn windows_and_unix_crash_quarantine_every_unique_committed_grammar_hazard() {
     let directory = tempfile::tempdir().unwrap();
     let trigger = directory.path().join("trigger");
     let rust_committed = directory.path().join("rust-committed");
