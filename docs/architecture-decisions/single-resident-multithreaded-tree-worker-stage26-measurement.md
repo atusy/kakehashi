@@ -24,8 +24,9 @@ quarantines.
 
 The GREEN E2E observes both complete arm frames before EOF, quarantines exactly
 Rust and Lua, restarts once, and full-resynchronizes only the healthy YAML
-document. A second server session serves Rust and Lua again, proving the
-quarantine is session-local.
+document. A second server session resolves non-null Rust and Lua nodes through
+`kakehashi/node`, proving both grammars parse again and the quarantine is
+session-local; an empty semantic-token result is not accepted as evidence.
 
 A generic request deadline remains insufficient parser-fault evidence. The
 client sends cancellation at the deadline, waits 250 ms for a terminal
@@ -41,19 +42,37 @@ commits a Rust hazard and then sends an invalid release frame. The reader
 classifies the failure as systemic, preserves and quarantines the complete
 active Rust set, restarts once, and serves the healthy Lua document. A
 transport error received during cancellation grace is propagated instead of
-being overwritten as a generic timeout.
+being overwritten as a generic timeout. A `WorkerRestartRequired` response
+received after the deadline but inside that grace likewise remains authoritative
+and replaces the invalid generation rather than being overwritten as a generic
+timeout.
 
-The focused 65 worker and 40 supervisor tests, the single-crash, protocol-
-failure, multi-hazard, single-timeout, and four-thread saturation E2Es,
+A planned configuration transition first fences request admission and waits five
+seconds for cooperative quiescence. If a healthy or non-cooperative published
+request outlives that window, the old generation is forcibly retired and the
+planned replacement continues. The regression E2E holds native work beyond the
+full five-second window and proves one replacement, no quarantine, and no
+configuration-gated breaker.
+
+The focused 66 worker and 40 supervisor tests, the single-crash, protocol-
+failure, multi-hazard, single-timeout, four-thread saturation, planned-restart,
+and delayed-restart-response E2Es,
 all-target Check, warning-denying Clippy, and formatting checks pass locally.
 
 ## Recovery measurement
 
-The final-HEAD measurement compares immutable Stage 25 (`f6e0c2125`) and Stage
-26 (`67c338ca7`) with the same single-hazard E2E on macOS 26.5.1 (`Darwin
+The performance measurement compares immutable Stage 25 (`f6e0c2125`) and the
+measured Stage 26 candidate (`67c338ca7`) with the same single-hazard E2E on
+macOS 26.5.1 (`Darwin
 25.5.0`, Apple M4). After one warmup per stage, 12 pairs alternate revision
 order. The supervisor's `recovery_ms` covers failure recovery through
 replacement spawn and full resync; it is not end-to-end request latency.
+
+Review convergence subsequently changed only deadline/restart branches and test
+assertions. Those commits add no operation to the measured admitted-request hot
+path, so the table remains evidence for the admission-fence cost; its binary
+hashes and raw samples intentionally continue to identify `67c338ca7` rather
+than being relabeled as a final-HEAD run.
 
 | Metric | Stage 25 | Stage 26 | Difference |
 | --- | ---: | ---: | ---: |

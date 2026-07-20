@@ -558,8 +558,12 @@ installed replacement. The external source itself is never modified.
 For an installer-managed replacement, the parent stages the immutable candidate,
 drains or cancels public tree requests, terminates and reaps the old worker, and
 starts the sole worker in non-serving `Validation` mode with the exact digest
-without changing the manifest. Only after loading, exported-symbol lookup, and
-initial query validation succeed does the parent CAS-commit the expected target
+without changing the manifest. Once admission is fenced, expiry of the bounded
+cooperative drain forcibly retires that old generation and continues this
+planned transition; it does not open a configuration-gated breaker merely
+because healthy work outlived the drain window. Only after loading, exported-
+symbol lookup, and initial query validation succeed does the parent CAS-commit
+the expected target
 manifest revision. It then constructs a promotion snapshot containing that new
 revision plus the unchanged revisions for every other configured grammar and
 applies the post-load fence below. On an exact match it advances configuration,
@@ -753,8 +757,10 @@ therefore retries every installed parser.
 
 An end-to-end request deadline starts at request admission. At expiry, the
 parent requests cooperative cancellation and waits a bounded grace period. A
-terminal response releases the client without a restart. If native work does
-not cooperate, the parent publishes the systemic deadline-termination cause,
+terminal response releases the client without a restart, except that
+`WorkerRestartRequired` remains authoritative and replaces the invalid
+generation even when it arrives during grace. If native work does not cooperate,
+the parent publishes the systemic deadline-termination cause,
 kills and restarts the complete generation, and does not quarantine any active
 grammar. A separate hard native-segment deadline starts with the handoff
 allowance when the parent receives
@@ -1327,14 +1333,18 @@ extends crash attribution from the first observed lease to the complete exact
 set. The parent drains the dead generation's response reader before snapshot,
 deduplicates every committed active grammar identity, installs the full set,
 and then restarts once. The two-grammar E2E consistently quarantined Rust and
-Lua while resyncing only healthy YAML; seven final-HEAD runs recovered in a
-median 960 ms. Against Stage 25 on the same single-hazard fixture, alternating
+Lua while resyncing only healthy YAML; seven measured-candidate runs recovered
+in a median 960 ms, and a fresh server then resolved non-null nodes with both
+grammars. Against Stage 25 on the same single-hazard fixture, alternating
 12-pair medians changed from 1153.5 to 1144.5 ms and the median paired delta was
 +3 ms (+0.26%); the wide -342 to +123 ms paired range does not establish a
 regression. The request-admission fence adds one atomic load under the existing
 route mutex. Paired release measurements moved sequential p50/p95 in the faster
 direction, while parallel p50/p95 and throughput changed by less than 1%, so no
-parallel cost was distinguishable in this fixture.
+parallel cost was distinguishable in this fixture. Review convergence later
+changed only deadline/restart failure branches and stronger E2E assertions; the
+recorded performance binary remains the explicitly identified measured
+candidate rather than being relabeled as final HEAD.
 Keep the failure-path barrier. Runtime
 injection identities, independently bounded control transport, native segment
 deadlines, explicit workload-aware admission, protocol and compatibility
