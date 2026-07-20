@@ -4100,6 +4100,32 @@ where
                             let _ = writeln!(log, "{e2e_grammar_symbol}");
                         }
                         #[cfg(feature = "e2e")]
+                        if let Ok(marker) = std::env::var(
+                            "KAKEHASHI_TREE_WORKER_INVALID_RELEASE_AFTER_HAZARD_ARMED_FILE",
+                        ) && std::env::var(
+                            "KAKEHASHI_TREE_WORKER_INVALID_RELEASE_AFTER_HAZARD_ARMED_URI_SUFFIX",
+                        )
+                        .ok()
+                        .is_none_or(|suffix| context.uri.ends_with(&suffix))
+                            && std::fs::OpenOptions::new()
+                                .write(true)
+                                .create_new(true)
+                                .open(marker)
+                                .is_ok()
+                        {
+                            let _ = responses.send((
+                                Response::GrammarHazardReleased(GrammarHazardReleased {
+                                    lease_id: u64::MAX,
+                                    worker_generation,
+                                }),
+                                None,
+                                None,
+                            ));
+                            loop {
+                                std::thread::park();
+                            }
+                        }
+                        #[cfg(feature = "e2e")]
                         if let Ok(marker) =
                             std::env::var("KAKEHASHI_TREE_WORKER_HANG_AFTER_HAZARD_ARMED_FILE")
                             && std::env::var(
@@ -5017,6 +5043,7 @@ impl std::ops::DerefMut for OwnedChild {
 pub struct Client {
     child: Arc<Mutex<OwnedChild>>,
     terminated_by_transport: Arc<AtomicBool>,
+    terminated_for_request_deadline: AtomicBool,
     outbound: Mutex<Option<mpsc::Sender<Request>>>,
     accepting_requests: AtomicBool,
     active_grammar_hazards: Arc<Mutex<HashMap<u64, GrammarHazardArmed>>>,
@@ -5321,6 +5348,7 @@ impl Client {
         Ok(Self {
             child,
             terminated_by_transport,
+            terminated_for_request_deadline: AtomicBool::new(false),
             outbound: Mutex::new(Some(outbound)),
             accepting_requests: AtomicBool::new(true),
             active_grammar_hazards,
@@ -5342,6 +5370,10 @@ impl Client {
 
     pub fn was_terminated_by_transport(&self) -> bool {
         self.terminated_by_transport.load(Ordering::Acquire)
+    }
+
+    pub fn was_terminated_for_request_deadline(&self) -> bool {
+        self.terminated_for_request_deadline.load(Ordering::Acquire)
     }
 
     pub fn compute_threads(&self) -> usize {
@@ -5441,12 +5473,25 @@ impl Client {
     /// read router. In-flight requests then observe transport failure while a
     /// replacement generation can be published independently.
     pub fn terminate_shared(&self, timeout: Duration) {
+        self.terminate_shared_with_cause(timeout, false);
+    }
+
+    fn terminate_for_request_deadline(&self, timeout: Duration) {
+        self.terminate_shared_with_cause(timeout, true);
+    }
+
+    fn terminate_shared_with_cause(&self, timeout: Duration, request_deadline: bool) {
         self.outbound
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .take();
         if let Ok(mut child) = self.child.lock() {
-            terminate_by_transport(&mut child, &self.terminated_by_transport, timeout);
+            let terminated =
+                terminate_by_transport(&mut child, &self.terminated_by_transport, timeout);
+            if request_deadline && terminated {
+                self.terminated_for_request_deadline
+                    .store(true, Ordering::Release);
+            }
         }
     }
 
@@ -5645,9 +5690,11 @@ impl Client {
             Ok(response) => response?,
             Err(mpsc::RecvTimeoutError::Timeout) => {
                 let cancellation_completed = self.cancel_request(request_id).is_ok()
-                    && response_rx.recv_timeout(REQUEST_CANCELLATION_GRACE).is_ok();
+                    && cancellation_grace_completed(
+                        response_rx.recv_timeout(REQUEST_CANCELLATION_GRACE),
+                    )?;
                 if !cancellation_completed {
-                    self.terminate_shared(Duration::from_secs(1));
+                    self.terminate_for_request_deadline(Duration::from_secs(1));
                 }
                 return Err(io::Error::new(
                     io::ErrorKind::TimedOut,
@@ -5697,6 +5744,16 @@ impl Client {
                 "tree worker exited with {status}"
             )))
         }
+    }
+}
+
+fn cancellation_grace_completed(
+    result: Result<io::Result<Response>, mpsc::RecvTimeoutError>,
+) -> io::Result<bool> {
+    match result {
+        Ok(Ok(_)) => Ok(true),
+        Ok(Err(error)) => Err(error),
+        Err(mpsc::RecvTimeoutError::Timeout | mpsc::RecvTimeoutError::Disconnected) => Ok(false),
     }
 }
 
@@ -5887,11 +5944,13 @@ fn terminate(child: &mut OwnedChild, timeout: Duration) {
     }
 }
 
-fn terminate_by_transport(child: &mut OwnedChild, marker: &AtomicBool, timeout: Duration) {
-    if child.try_wait().ok().flatten().is_none() {
+fn terminate_by_transport(child: &mut OwnedChild, marker: &AtomicBool, timeout: Duration) -> bool {
+    let terminated = child.try_wait().ok().flatten().is_none();
+    if terminated {
         marker.store(true, Ordering::Release);
     }
     terminate(child, timeout);
+    terminated
 }
 
 #[cfg(test)]
@@ -5915,13 +5974,13 @@ mod tests {
         ResolveNode, Response, Route, RunCaptures, RunNodeScalar, RunnableDocuments,
         SEMANTIC_CACHE_AUXILIARY_TRIM_THRESHOLD_BYTES, SyncDocument, WireByteRange, WirePosition,
         WireRange, WireSemanticToken, WorkPriority, WorkerError, WorkerGrammarIdentity,
-        WorkerQuerySources, cache_eviction_plan, client_generation_is_idle, close_document,
-        decode_frame, derive_snapshot_with_language, encode_frame, enforce_derived_memory_budget,
-        named_node_count, parse_request_timeout, pressure_checkpoint_required,
-        replace_retained_bytes, replace_retained_estimated_bytes, request_may_grow_derived_state,
-        request_priority, reserve_retained_growth, route_is_admissible, route_response, run,
-        submit_document_job, sync_document, terminate, terminate_by_transport,
-        validate_document_size,
+        WorkerQuerySources, cache_eviction_plan, cancellation_grace_completed,
+        client_generation_is_idle, close_document, decode_frame, derive_snapshot_with_language,
+        encode_frame, enforce_derived_memory_budget, named_node_count, parse_request_timeout,
+        pressure_checkpoint_required, replace_retained_bytes, replace_retained_estimated_bytes,
+        request_may_grow_derived_state, request_priority, reserve_retained_growth,
+        route_is_admissible, route_response, run, submit_document_job, sync_document, terminate,
+        terminate_by_transport, validate_document_size,
     };
 
     #[derive(Clone, Default)]
@@ -6234,6 +6293,19 @@ mod tests {
             Duration::from_secs(60)
         );
         assert_eq!(parse_request_timeout(None), Duration::from_secs(60));
+    }
+
+    #[test]
+    fn cancellation_grace_preserves_worker_transport_failure() {
+        let result: Result<std::io::Result<Response>, std::sync::mpsc::RecvTimeoutError> =
+            Ok(Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "worker lost during cancellation grace",
+            )));
+
+        let error = cancellation_grace_completed(result).unwrap_err();
+
+        assert_eq!(error.kind(), std::io::ErrorKind::BrokenPipe);
     }
 
     #[test]

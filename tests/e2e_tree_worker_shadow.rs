@@ -1117,6 +1117,81 @@ fn crashed_grammar_is_quarantined_only_in_session_and_other_grammar_recovers() {
 }
 
 #[test]
+fn protocol_failure_preserves_complete_active_hazard_set() {
+    let directory = tempfile::tempdir().unwrap();
+    let marker = directory.path().join("invalid-release-once");
+    let mut client = LspClient::builder()
+        .env("KAKEHASHI_TREE_WORKER_SHADOW", "true")
+        .env("KAKEHASHI_TREE_WORKER_THREADS", "4")
+        .env(
+            "KAKEHASHI_TREE_WORKER_INVALID_RELEASE_AFTER_HAZARD_ARMED_FILE",
+            marker.to_string_lossy(),
+        )
+        .env(
+            "KAKEHASHI_TREE_WORKER_INVALID_RELEASE_AFTER_HAZARD_ARMED_URI_SUFFIX",
+            "/protocol.rs",
+        )
+        .env(
+            "RUST_LOG",
+            "kakehashi::tree_worker_shadow=info,kakehashi::tree_worker_shadow_metrics=info",
+        )
+        .build();
+    initialize(&mut client);
+    client.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": "file:///protocol.rs",
+                "languageId": "rust",
+                "version": 1,
+                "text": "fn corrupt_protocol() {}\n"
+            }
+        }),
+    );
+    wait_for_file(&marker, "invalid release injection did not run");
+
+    let healthy_uri = "file:///protocol-survivor.lua";
+    client.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": healthy_uri,
+                "languageId": "lua",
+                "version": 1,
+                "text": "local protocol_survivor = true\n"
+            }
+        }),
+    );
+    let healthy = client.send_request(
+        "textDocument/semanticTokens/full",
+        json!({ "textDocument": { "uri": healthy_uri } }),
+    );
+    assert!(healthy.get("result").is_some(), "{healthy:?}");
+
+    let stderr = shutdown_and_stderr(client);
+    assert!(
+        stderr.contains("invalid grammar hazard release"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("committed active grammar hazard(s)"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("symbol=rust"), "{stderr}");
+    assert!(stderr.contains("class=Systemic"), "{stderr}");
+    assert_eq!(
+        stderr.matches("restarted worker generation").count(),
+        1,
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("full-resynced 1 open documents"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("disabled shadow tree tier"), "{stderr}");
+}
+
+#[test]
 fn windows_and_unix_crash_quarantine_every_unique_committed_grammar_hazard() {
     let directory = tempfile::tempdir().unwrap();
     let trigger = directory.path().join("trigger");

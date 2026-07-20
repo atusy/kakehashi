@@ -2906,7 +2906,7 @@ fn run_actor(
                 let worker_was_terminated = state
                     .client
                     .as_ref()
-                    .is_some_and(|client| client.was_terminated_by_transport());
+                    .is_some_and(|client| client.was_terminated_for_request_deadline());
                 if is_nonfatal_client_error(&error) && !worker_was_terminated {
                     log::warn!(
                         target: "kakehashi::tree_worker_shadow",
@@ -3589,6 +3589,13 @@ fn retag_command(command: &mut ShadowCommand, generation: u64) {
 }
 
 fn worker_loss_evidence(client: &Client, error: &std::io::Error) -> WorkerLossEvidence {
+    if client.was_terminated_for_request_deadline() {
+        log::error!(
+            target: "kakehashi::tree_worker_shadow",
+            "worker generation was terminated for a request deadline; treating its loss as systemic",
+        );
+        return WorkerLossEvidence::systemic();
+    }
     if let Err(drain_error) = client.wait_for_reader_drain(SHADOW_SHUTDOWN_TIMEOUT) {
         let active_hazards = client.active_grammar_hazards();
         let active_lease_count = active_hazards.len();
@@ -3599,13 +3606,6 @@ fn worker_loss_evidence(client: &Client, error: &std::io::Error) -> WorkerLossEv
             active_grammars.len(),
         );
         return WorkerLossEvidence::incomplete(active_grammars, active_lease_count);
-    }
-    if client.was_terminated_by_transport() {
-        log::error!(
-            target: "kakehashi::tree_worker_shadow",
-            "worker generation was terminated by the supervisor; treating its loss as systemic",
-        );
-        return WorkerLossEvidence::systemic();
     }
     let mut active_hazards = client.active_grammar_hazards();
     active_hazards.sort_unstable_by(|left, right| {
