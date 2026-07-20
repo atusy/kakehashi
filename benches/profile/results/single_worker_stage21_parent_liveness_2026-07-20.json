@@ -1,0 +1,24 @@
+{
+  "schema": 1,
+  "experiment": "single-tree-worker-stage21-parent-liveness",
+  "date": "2026-07-20",
+  "environment": {"source_commit": "8e6549081d7609fc7e7eead0e97f4e3871f5587f", "baseline_stage": 20, "baseline_binary_sha256": "ac0b197a425cb5812270cc89d9e108448d83f09b7ede7973b8b18658882a1761", "candidate_stage": 21, "candidate_binary_sha256": "d1b321f0f1ef452627439110a4413647cd765f43c99014149c178139cdb6b25c", "release_build": "cargo build --locked --release --bin kakehashi", "features": "default", "platform": "macOS"},
+  "cold_start": {
+    "scenario": {"language": "rust", "generated_size": 15, "documents": 1, "measured_requests": 1, "settle_seconds": 0, "worker_threads": 4, "isolation": "fresh XDG config and state directory for every run", "order": "baseline-candidate on odd runs; candidate-baseline on even runs"},
+    "runs": [
+      {"run":1,"baseline":{"elapsed_ms":4348.445,"request_ms":3052.3,"wall_ms_per_cycle":3052.75},"candidate":{"elapsed_ms":3369.553,"request_ms":2041.2,"wall_ms_per_cycle":2041.69}},
+      {"run":2,"baseline":{"elapsed_ms":2366.088,"request_ms":2049.9,"wall_ms_per_cycle":2050.58},"candidate":{"elapsed_ms":2351.452,"request_ms":2042.7,"wall_ms_per_cycle":2043.34}},
+      {"run":3,"baseline":{"elapsed_ms":2358.166,"request_ms":2045.0,"wall_ms_per_cycle":2045.73},"candidate":{"elapsed_ms":2357.514,"request_ms":2032.9,"wall_ms_per_cycle":2033.61}},
+      {"run":4,"baseline":{"elapsed_ms":2340.460,"request_ms":2027.6,"wall_ms_per_cycle":2028.28},"candidate":{"elapsed_ms":2345.815,"request_ms":2033.4,"wall_ms_per_cycle":2034.05}},
+      {"run":5,"baseline":{"elapsed_ms":2349.929,"request_ms":2044.2,"wall_ms_per_cycle":2044.95},"candidate":{"elapsed_ms":2363.907,"request_ms":2042.0,"wall_ms_per_cycle":2042.52}},
+      {"run":6,"baseline":{"elapsed_ms":2364.614,"request_ms":2046.7,"wall_ms_per_cycle":2047.41},"candidate":{"elapsed_ms":2383.874,"request_ms":2063.4,"wall_ms_per_cycle":2064.17}},
+      {"run":7,"baseline":{"elapsed_ms":2353.760,"request_ms":2026.2,"wall_ms_per_cycle":2026.88},"candidate":{"elapsed_ms":2368.766,"request_ms":2048.7,"wall_ms_per_cycle":2049.56}},
+      {"run":8,"baseline":{"elapsed_ms":2354.104,"request_ms":2038.4,"wall_ms_per_cycle":2039.09},"candidate":{"elapsed_ms":2330.564,"request_ms":2023.8,"wall_ms_per_cycle":2024.63}},
+      {"run":9,"baseline":{"elapsed_ms":2327.614,"request_ms":2017.0,"wall_ms_per_cycle":2017.53},"candidate":{"elapsed_ms":2338.702,"request_ms":2032.5,"wall_ms_per_cycle":2032.93}},
+      {"run":10,"baseline":{"elapsed_ms":2352.116,"request_ms":2037.1,"wall_ms_per_cycle":2037.79},"candidate":{"elapsed_ms":2344.015,"request_ms":2027.8,"wall_ms_per_cycle":2028.45}},
+      {"run":11,"baseline":{"elapsed_ms":2336.480,"request_ms":2033.4,"wall_ms_per_cycle":2034.04},"candidate":{"elapsed_ms":2346.296,"request_ms":2040.7,"wall_ms_per_cycle":2041.18}},
+      {"run":12,"baseline":{"elapsed_ms":2340.083,"request_ms":2023.0,"wall_ms_per_cycle":2023.65},"candidate":{"elapsed_ms":2341.833,"request_ms":2027.4,"wall_ms_per_cycle":2028.17}}
+    ]
+  },
+  "parent_death_e2e": {"note": "complete debug E2E including initialization, hung compute admission, parent kill, and worker liveness assertion", "runs": [{"run":1,"elapsed_ms":16976.985,"passed":true},{"run":2,"elapsed_ms":3923.416,"passed":true},{"run":3,"elapsed_ms":3891.979,"passed":true}]}
+}

@@ -1252,6 +1252,14 @@ This does not satisfy abnormal parent-death or Windows Job Object requirements;
 those remain open with native hazard/quarantine, protocol and compatibility
 gates, and legacy-path removal.
 
+The [Stage 21 parent-liveness measurement](single-resident-multithreaded-tree-worker-stage21-measurement.md)
+proves that a close-on-exec Unix liveness pipe terminates the worker after
+abnormal parent death even while a compute thread is permanently hung. The
+dedicated control thread exits without joining compute work. Twelve cold-start
+pairs found noise-scale median paired deltas of +0.15% for driver elapsed and
++0.05% for the first request. Linux parent-death-signal hardening and Windows
+ownership remain open with the later protocol and migration gates.
+
 The implementation should proceed in measured stages:
 
 1. Prototype the framed transport, supervision, and one high-level
