@@ -202,16 +202,25 @@ impl Default for RestartBudget {
 
 impl RestartBudget {
     fn consume(&mut self, class: FailureClass) -> bool {
-        let class_available = match class {
-            FailureClass::Systemic => self.systemic < MAX_SYSTEMIC_RESTARTS,
-            FailureClass::NativeEvidenced => self.native < MAX_NATIVE_RESTARTS,
-        };
-        if self.tokens == 0 || !class_available {
+        if self.tokens == 0 {
             return false;
         }
         match class {
-            FailureClass::Systemic => self.systemic = self.systemic.saturating_add(1),
-            FailureClass::NativeEvidenced => self.native = self.native.saturating_add(1),
+            FailureClass::Systemic => {
+                if self.systemic >= MAX_SYSTEMIC_RESTARTS {
+                    return false;
+                }
+                self.systemic = self.systemic.saturating_add(1);
+                if self.systemic == MAX_SYSTEMIC_RESTARTS {
+                    return false;
+                }
+            }
+            FailureClass::NativeEvidenced => {
+                if self.native >= MAX_NATIVE_RESTARTS {
+                    return false;
+                }
+                self.native = self.native.saturating_add(1);
+            }
         }
         self.tokens -= 1;
         self.backoff_count = self.backoff_count.saturating_add(1);
@@ -4147,9 +4156,8 @@ mod tests {
         let mut systemic = RestartBudget::default();
         assert!(systemic.consume(FailureClass::Systemic));
         assert!(systemic.consume(FailureClass::Systemic));
-        assert!(systemic.consume(FailureClass::Systemic));
         assert!(!systemic.consume(FailureClass::Systemic));
-        assert_eq!(systemic.tokens_remaining(), MAX_SESSION_RESTARTS - 3);
+        assert_eq!(systemic.tokens_remaining(), MAX_SESSION_RESTARTS - 2);
 
         let mut native = RestartBudget::default();
         for _ in 0..MAX_NATIVE_RESTARTS {
@@ -4159,8 +4167,19 @@ mod tests {
 
         assert_eq!(
             systemic.backoff(RestartPolicy::default()),
-            Duration::from_secs(1)
+            Duration::from_millis(500)
         );
+    }
+
+    #[test]
+    fn third_systemic_generation_failure_denies_a_replacement() {
+        let mut budget = RestartBudget::default();
+
+        assert!(budget.consume(FailureClass::Systemic));
+        assert!(budget.consume(FailureClass::Systemic));
+        assert!(!budget.consume(FailureClass::Systemic));
+        assert_eq!(budget.systemic, MAX_SYSTEMIC_RESTARTS);
+        assert_eq!(budget.tokens_remaining(), MAX_SESSION_RESTARTS - 2);
     }
 
     #[test]
@@ -4184,12 +4203,13 @@ mod tests {
             healthy_since: Some(started),
             long_healthy_since: Some(started),
         };
-        for _ in 0..MAX_SYSTEMIC_RESTARTS {
+        for _ in 0..MAX_SYSTEMIC_RESTARTS - 1 {
             assert!(state.restart_budget.consume(FailureClass::Systemic));
         }
+        assert!(!state.restart_budget.consume(FailureClass::Systemic));
         assert_eq!(
             state.restart_budget.tokens_remaining(),
-            MAX_SESSION_RESTARTS - 3
+            MAX_SESSION_RESTARTS - 2
         );
 
         observe_healthy_service(&mut state, started + FAST_HEALTHY_INTERVAL);
@@ -4197,11 +4217,11 @@ mod tests {
         assert!(state.restart_budget.consume(FailureClass::Systemic));
         assert_eq!(
             state.restart_budget.tokens_remaining(),
-            MAX_SESSION_RESTARTS - 4
+            MAX_SESSION_RESTARTS - 3
         );
         assert_eq!(
             state.restart_budget.backoff(state.restart_policy),
-            Duration::from_secs(2)
+            Duration::from_secs(1)
         );
 
         observe_healthy_service(
@@ -4210,7 +4230,7 @@ mod tests {
         );
         assert_eq!(
             state.restart_budget.tokens_remaining(),
-            MAX_SESSION_RESTARTS - 3
+            MAX_SESSION_RESTARTS - 2
         );
         assert_eq!(
             state.restart_budget.backoff(state.restart_policy),

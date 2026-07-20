@@ -457,7 +457,7 @@ fn repeated_systemic_failures_open_the_breaker_once_and_keep_lsp_alive() {
         1,
         "{stderr}"
     );
-    assert_eq!(stderr.matches("full resync failed").count(), 3, "{stderr}");
+    assert_eq!(stderr.matches("full resync failed").count(), 2, "{stderr}");
     assert!(!stderr.contains("quarantined grammar"), "{stderr}");
 }
 
@@ -516,7 +516,7 @@ fn configuration_change_allows_one_failed_half_open_probe() {
         1,
         "{stderr}"
     );
-    assert_eq!(stderr.matches("full resync failed").count(), 4, "{stderr}");
+    assert_eq!(stderr.matches("full resync failed").count(), 3, "{stderr}");
     assert!(!stderr.contains("quarantined grammar"), "{stderr}");
 }
 
@@ -580,7 +580,7 @@ fn successful_half_open_resync_closes_the_breaker() {
     assert!(recovered.get("result").is_some(), "{recovered:?}");
 
     let stderr = shutdown_and_stderr(client);
-    assert_eq!(stderr.matches("full resync failed").count(), 3, "{stderr}");
+    assert_eq!(stderr.matches("full resync failed").count(), 2, "{stderr}");
     assert!(
         stderr.contains("entered shadow worker half-open probation"),
         "{stderr}"
