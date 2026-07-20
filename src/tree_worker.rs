@@ -646,6 +646,26 @@ fn estimated_discovery_bytes(discovery: &crate::document::DiscoveredInjections) 
         }))
 }
 
+fn estimated_resolved_injection_bytes(
+    resolved: &[crate::language::injection::ResolvedInjection],
+    capacity: usize,
+) -> usize {
+    std::mem::size_of::<Vec<crate::language::injection::ResolvedInjection>>()
+        .saturating_add(
+            capacity * std::mem::size_of::<crate::language::injection::ResolvedInjection>(),
+        )
+        .saturating_add(resolved.iter().fold(0, |bytes, injection| {
+            bytes
+                .saturating_add(injection.region.language.capacity())
+                .saturating_add(injection.region.region_id.capacity())
+                .saturating_add(injection.injection_language.capacity())
+                .saturating_add(injection.virtual_content.capacity())
+                .saturating_add(
+                    injection.line_column_offsets.capacity() * std::mem::size_of::<u32>(),
+                )
+        }))
+}
+
 impl DocumentReplica {
     fn estimated_memory(&self) -> EstimatedDocumentMemory {
         EstimatedDocumentMemory {
@@ -659,7 +679,15 @@ impl DocumentReplica {
                 .semantic_discovery
                 .as_deref()
                 .map(estimated_discovery_bytes)
-                .unwrap_or_default(),
+                .unwrap_or_default()
+                .saturating_add(
+                    self.resolved_injections
+                        .as_ref()
+                        .map(|(_, resolved)| {
+                            estimated_resolved_injection_bytes(resolved, resolved.capacity())
+                        })
+                        .unwrap_or_default(),
+                ),
         }
     }
 
@@ -5939,6 +5967,49 @@ mod tests {
         assert_eq!(
             after.auxiliary_cache_bytes,
             before.auxiliary_cache_bytes + discovery_bytes
+        );
+    }
+
+    #[test]
+    fn resolved_injection_capacity_is_reported_as_auxiliary_memory() {
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_rust::LANGUAGE.into())
+            .unwrap();
+        let context = RequestContext {
+            request_id: 1,
+            worker_generation: 3,
+            uri: "file:///resolved-accounting.rs".into(),
+            incarnation: 4,
+            content_version: 1,
+            configuration_generation: 2,
+        };
+        let (mut replica, _) = DocumentReplica::sync(
+            SyncDocument {
+                context,
+                language: "rust".into(),
+                grammar_symbol: "rust".into(),
+                source_path: "/unused/static-language".into(),
+                parser_path: "/unused/static-language".into(),
+                artifact_digest: "sha256:rust-v1".into(),
+                queries: WorkerQuerySources::default(),
+                text: "fn main() {}".into(),
+            },
+            &mut parser,
+        )
+        .unwrap();
+        let before = replica.estimated_memory();
+        let resolved = Vec::with_capacity(16);
+        let resolved_bytes =
+            std::mem::size_of::<Vec<crate::language::injection::ResolvedInjection>>()
+                + resolved.capacity()
+                    * std::mem::size_of::<crate::language::injection::ResolvedInjection>();
+        replica.resolved_injections = Some((2, Arc::new(resolved)));
+
+        let after = replica.estimated_memory();
+        assert_eq!(
+            after.auxiliary_cache_bytes,
+            before.auxiliary_cache_bytes + resolved_bytes
         );
     }
 
