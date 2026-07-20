@@ -1686,6 +1686,13 @@ fn worker_analysis(
         let Some(source) = source else {
             continue;
         };
+        if analysis
+            .query_store()
+            .query_input(kind, language_name)
+            .is_some_and(|current| current.as_ref() == source)
+        {
+            continue;
+        }
         let parsed =
             crate::language::query_loader::QueryLoader::parse_query(&language, &source, false);
         if !parsed.skipped.is_empty() {
@@ -1707,11 +1714,12 @@ fn worker_analysis(
         {
             continue;
         }
-        analysis.query_store().insert_query_with_source(
+        analysis.query_store().insert_query_with_source_input(
             kind,
             language_name.to_string(),
             Arc::new(query),
             compiled_source,
+            source,
         );
     }
     Ok(())
@@ -4967,6 +4975,27 @@ mod tests {
         .unwrap();
 
         assert!(analysis.highlight_query("rust").is_some());
+        let first = analysis.highlight_query("rust").unwrap();
+        super::worker_analysis(
+            &analysis,
+            "rust",
+            tree_sitter_rust::LANGUAGE.into(),
+            WorkerQuerySources {
+                highlights: Some("(identifier) @variable\n(nonexistent_node) @invalid\n".into()),
+                ..WorkerQuerySources::default()
+            },
+            super::WorkerQuerySet::Semantic,
+        )
+        .unwrap();
+        let second = analysis.highlight_query("rust").unwrap();
+        assert!(Arc::ptr_eq(&first, &second));
+        assert_eq!(
+            analysis
+                .query_store()
+                .query_input(crate::config::settings::QueryKind::Highlights, "rust")
+                .as_deref(),
+            Some("(identifier) @variable\n(nonexistent_node) @invalid\n")
+        );
         let compiled = analysis
             .query_store()
             .query_source(crate::config::settings::QueryKind::Highlights, "rust")

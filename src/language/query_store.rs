@@ -10,6 +10,7 @@ pub(crate) struct QueryStore {
     bindings_queries: RwLock<HashMap<String, Arc<Query>>>,
     injection_queries: RwLock<HashMap<String, Arc<Query>>>,
     query_sources: RwLock<HashMap<(String, QueryKind), Arc<str>>>,
+    query_inputs: RwLock<HashMap<(String, QueryKind), Arc<str>>>,
 }
 
 impl QueryStore {
@@ -19,6 +20,7 @@ impl QueryStore {
             bindings_queries: RwLock::new(HashMap::new()),
             injection_queries: RwLock::new(HashMap::new()),
             query_sources: RwLock::new(HashMap::new()),
+            query_inputs: RwLock::new(HashMap::new()),
         }
     }
 
@@ -38,6 +40,10 @@ impl QueryStore {
             .recover_poison(format_args!("QueryStore::remove_queries({})", lang_name))
             .remove(lang_name);
         self.query_sources
+            .write()
+            .recover_poison(format_args!("QueryStore::remove_queries({})", lang_name))
+            .retain(|(language, _), _| language != lang_name);
+        self.query_inputs
             .write()
             .recover_poison(format_args!("QueryStore::remove_queries({})", lang_name))
             .retain(|(language, _), _| language != lang_name);
@@ -121,19 +127,44 @@ impl QueryStore {
         query: Arc<Query>,
         source: String,
     ) {
+        self.insert_query_with_source_input(kind, lang_name, query, source.clone(), source);
+    }
+
+    pub(crate) fn insert_query_with_source_input(
+        &self,
+        kind: QueryKind,
+        lang_name: String,
+        query: Arc<Query>,
+        source: String,
+        input: String,
+    ) {
         self.insert_query(kind, lang_name.clone(), query);
         self.query_sources
             .write()
             .recover_poison(format_args!(
                 "QueryStore::insert_query_with_source({lang_name})"
             ))
-            .insert((lang_name, kind), Arc::from(source));
+            .insert((lang_name.clone(), kind), Arc::from(source));
+        self.query_inputs
+            .write()
+            .recover_poison(format_args!(
+                "QueryStore::insert_query_with_source_input({lang_name})"
+            ))
+            .insert((lang_name, kind), Arc::from(input));
     }
 
     pub(crate) fn query_source(&self, kind: QueryKind, lang_name: &str) -> Option<Arc<str>> {
         self.query_sources
             .read()
             .recover_poison(format_args!("QueryStore::query_source({lang_name})"))
+            .get(&(lang_name.to_string(), kind))
+            .cloned()
+    }
+
+    pub(crate) fn query_input(&self, kind: QueryKind, lang_name: &str) -> Option<Arc<str>> {
+        self.query_inputs
+            .read()
+            .recover_poison(format_args!("QueryStore::query_input({lang_name})"))
             .get(&(lang_name.to_string(), kind))
             .cloned()
     }
