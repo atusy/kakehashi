@@ -1873,6 +1873,158 @@ fn noncooperative_jobs_saturating_all_compute_threads_recover_as_one_generation(
 }
 
 #[test]
+fn reserved_lifecycle_slot_does_not_block_cancellation_under_full_admission() {
+    let directory = tempfile::tempdir().unwrap();
+    let trigger = directory.path().join("trigger");
+    let markers = directory.path().join("hung-jobs");
+    let lifecycle_scheduled = directory.path().join("lifecycle-scheduled");
+    let cancel_observed = directory.path().join("cancel-observed");
+    let recovery_ready = directory.path().join("recovery-ready");
+    std::fs::create_dir(&markers).unwrap();
+    let mut client = LspClient::builder()
+        .env("KAKEHASHI_TREE_WORKER_MODE", "authoritative")
+        .env("KAKEHASHI_TREE_WORKER_THREADS", "4")
+        .env("KAKEHASHI_TREE_WORKER_REQUEST_TIMEOUT_MS", "2000")
+        .env(
+            "KAKEHASHI_TREE_WORKER_REQUEST_TIMEOUT_TRIGGER_FILE",
+            trigger.to_string_lossy(),
+        )
+        .env(
+            "KAKEHASHI_TREE_WORKER_HANG_ALL_COMMITTED_HAZARDS_URI_PREFIX",
+            "file:///reserve-saturated-",
+        )
+        .env(
+            "KAKEHASHI_TREE_WORKER_HANG_ALL_COMMITTED_HAZARDS_TRIGGER_FILE",
+            trigger.to_string_lossy(),
+        )
+        .env(
+            "KAKEHASHI_TREE_WORKER_HANG_ALL_COMMITTED_HAZARDS_MARKER_DIR",
+            markers.to_string_lossy(),
+        )
+        .env(
+            "KAKEHASHI_TREE_WORKER_HANG_ALL_COMMITTED_HAZARDS_COUNT",
+            "4",
+        )
+        .env(
+            "KAKEHASHI_TREE_WORKER_SCHEDULED_URI_SUFFIX",
+            "/reserve-lifecycle.lua",
+        )
+        .env(
+            "KAKEHASHI_TREE_WORKER_SCHEDULED_FILE",
+            lifecycle_scheduled.to_string_lossy(),
+        )
+        .env(
+            "KAKEHASHI_TREE_WORKER_CANCEL_OBSERVED_FILE",
+            cancel_observed.to_string_lossy(),
+        )
+        .env(
+            "KAKEHASHI_TREE_WORKER_RECOVERY_READY_FILE",
+            recovery_ready.to_string_lossy(),
+        )
+        .env("RUST_LOG", "kakehashi::tree_worker_shadow=info")
+        .build();
+    initialize(&mut client);
+
+    let documents = (0..4)
+        .map(|index| {
+            (
+                format!("file:///reserve-saturated-{index}.rs"),
+                format!("fn reserve_saturated_{index}() {{}}\n"),
+            )
+        })
+        .collect::<Vec<_>>();
+    for (uri, text) in &documents {
+        open_rust_and_request_tokens(&mut client, uri, text);
+    }
+    let lifecycle_uri = "file:///reserve-lifecycle.lua";
+    client.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": lifecycle_uri,
+                "languageId": "lua",
+                "version": 1,
+                "text": "local reserve_lifecycle = 1\n"
+            }
+        }),
+    );
+    let lifecycle_ready = client.send_request(
+        "kakehashi/node",
+        json!({
+            "textDocument": { "uri": lifecycle_uri },
+            "position": { "line": 0, "character": 6 }
+        }),
+    );
+    assert!(
+        lifecycle_ready.get("result").is_some(),
+        "{lifecycle_ready:?}"
+    );
+    std::fs::remove_file(&lifecycle_scheduled).unwrap();
+
+    std::fs::write(&trigger, b"trigger").unwrap();
+    let request_ids = (0..16)
+        .map(|index| {
+            let (uri, _) = &documents[index % documents.len()];
+            client.send_request_async(
+                "kakehashi/node",
+                json!({
+                    "textDocument": { "uri": uri },
+                    "position": { "line": 0, "character": 4 }
+                }),
+            )
+        })
+        .collect::<std::collections::HashSet<_>>();
+    let marker_deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while std::fs::read_dir(&markers).unwrap().count() < 4
+        && std::time::Instant::now() < marker_deadline
+    {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(std::fs::read_dir(&markers).unwrap().count(), 4);
+
+    client.send_notification(
+        "textDocument/didChange",
+        json!({
+            "textDocument": { "uri": lifecycle_uri, "version": 2 },
+            "contentChanges": [{ "text": "local reserve_lifecycle = 2\n" }]
+        }),
+    );
+    wait_for_file(
+        &lifecycle_scheduled,
+        "reserved lifecycle request was not scheduled at full ordinary admission",
+    );
+    wait_for_file(
+        &cancel_observed,
+        "cancellation frame was blocked behind the reserved lifecycle request",
+    );
+
+    let mut completed = std::collections::HashSet::new();
+    for _ in 0..16 {
+        let response = client.receive_next_response_public();
+        assert!(response.get("result").is_some(), "{response:?}");
+        completed.insert(response.get("id").and_then(|id| id.as_i64()).unwrap());
+    }
+    assert_eq!(completed, request_ids);
+    wait_for_file(
+        &recovery_ready,
+        "fully saturated worker did not recover after cancellation remained observable",
+    );
+
+    let stderr = shutdown_and_stderr(client);
+    assert_eq!(
+        stderr.matches("restarted worker generation").count(),
+        1,
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("full-resynced 5 open documents"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("quarantined grammar"), "{stderr}");
+    assert!(!stderr.contains("disabled tree tier"), "{stderr}");
+}
+
+#[test]
 fn competing_document_finishes_while_injection_fanout_is_running() {
     let force_nested = std::env::var_os("KAKEHASHI_E2E_FORCE_NESTED_PARALLELISM").is_some();
     let mut builder = LspClient::builder()

@@ -3935,7 +3935,7 @@ where
     // The client permits at most four requests per compute thread. Decode one
     // frame beyond this pending window so cancellation stays observable under
     // saturation, but wait before scheduling any excess ordinary work.
-    let max_pending = compute_threads.saturating_mul(4).max(1);
+    let max_pending = compute_threads.saturating_mul(4).max(1).saturating_add(1);
     let (completion_tx, completion_rx) = mpsc::channel::<()>();
     #[cfg(feature = "e2e")]
     let injected_hung_compute =
