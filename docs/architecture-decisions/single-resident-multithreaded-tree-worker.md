@@ -461,6 +461,9 @@ identity exactly match an active response route. Direct requests bind that
 identity from their payload; document requests inherit it from an acknowledged
 sync or an active same-document sync route. The reader publishes sync and close
 updates to this identity registry atomically with routing their acknowledgments.
+The worker resolves a document request's runtime identity only after that job
+reaches the head of its document lane, so a preceding queued sync cannot leave
+the arm bound to the prior replica.
 An unknown or mismatched route is an incomplete protocol abort, not quarantine
 evidence. Each grammar
 encountered by a fused host/injection operation is leased separately and remains

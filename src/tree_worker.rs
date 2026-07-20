@@ -2309,7 +2309,6 @@ struct GrammarKey {
 }
 
 impl GrammarKey {
-    #[cfg(not(test))]
     fn identity(&self) -> WorkerGrammarIdentity {
         WorkerGrammarIdentity {
             grammar_symbol: self.grammar_symbol.clone(),
@@ -3106,7 +3105,6 @@ fn document_key(request: &Request) -> Option<DocumentKey> {
     }
 }
 
-#[cfg(not(test))]
 fn request_grammar_identity(
     request: &Request,
     documents: &DocumentStore,
@@ -4008,10 +4006,6 @@ where
         }
         pending += 1;
         let enqueued = Instant::now();
-        #[cfg(not(test))]
-        let grammar_hazard = request_grammar_identity(&request, &documents);
-        #[cfg(test)]
-        let grammar_hazard = None;
         let responses = responses.clone();
         let permits = permits.clone();
         let permit_rx = Arc::clone(&permit_rx);
@@ -4066,6 +4060,10 @@ where
                 .recv()
                 .expect("worker admission queue stopped before its jobs");
             let permit = AdmissionPermit(permits);
+            #[cfg(not(test))]
+            let grammar_hazard = request_grammar_identity(&request, &documents);
+            #[cfg(test)]
+            let grammar_hazard = None;
             let mut announced_lease = None;
             let hazard_error = grammar_hazard.and_then(|grammar: WorkerGrammarIdentity| {
                 #[cfg(feature = "e2e")]
@@ -6237,10 +6235,10 @@ mod tests {
         derive_snapshot_with_language, encode_frame, enforce_derived_memory_budget,
         named_node_count, parse_request_timeout, pressure_checkpoint_required,
         record_grammar_hazard_arm, replace_retained_bytes, replace_retained_estimated_bytes,
-        request_may_grow_derived_state, request_priority, reserve_retained_growth,
-        route_is_admissible, route_response, run, submit_document_job, sync_document, terminate,
-        terminate_by_transport, terminate_by_transport_for_request_deadline,
-        validate_document_size,
+        request_grammar_identity, request_may_grow_derived_state, request_priority,
+        reserve_retained_growth, route_is_admissible, route_response, run, submit_document_job,
+        sync_document, terminate, terminate_by_transport,
+        terminate_by_transport_for_request_deadline, validate_document_size,
     };
 
     #[derive(Clone, Default)]
@@ -6884,6 +6882,68 @@ mod tests {
 
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
         assert!(hazards.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn grammar_hazard_identity_uses_the_lane_current_replica() {
+        let documents = Arc::new(dashmap::DashMap::new());
+        let context = RequestContext {
+            request_id: 7,
+            worker_generation: 3,
+            uri: "file:///pipelined.rs".into(),
+            incarnation: 1,
+            content_version: 1,
+            configuration_generation: 2,
+        };
+        let make_replica = |context: RequestContext, digest: &str| {
+            let mut parser = tree_sitter::Parser::new();
+            parser
+                .set_language(&tree_sitter_rust::LANGUAGE.into())
+                .unwrap();
+            DocumentReplica::sync(
+                SyncDocument {
+                    context,
+                    language: "rust".into(),
+                    grammar_symbol: "rust".into(),
+                    source_path: "/unused/rust".into(),
+                    parser_path: "/unused/rust".into(),
+                    artifact_digest: digest.into(),
+                    queries: WorkerQuerySources::default(),
+                    text: "fn pipelined() {}\n".into(),
+                },
+                &mut parser,
+            )
+            .unwrap()
+            .0
+        };
+        documents.insert(
+            DocumentKey::from(&context),
+            Arc::new(Mutex::new(make_replica(context.clone(), "sha256:v1"))),
+        );
+        let request = Request::DeriveSemanticTokens(DeriveSemanticTokens {
+            context: context.clone(),
+            supports_multiline: true,
+        });
+        assert_eq!(
+            request_grammar_identity(&request, &documents)
+                .unwrap()
+                .artifact_digest,
+            "sha256:v1"
+        );
+
+        let mut replacement = context;
+        replacement.content_version = 2;
+        documents.insert(
+            DocumentKey::from(&replacement),
+            Arc::new(Mutex::new(make_replica(replacement, "sha256:v2"))),
+        );
+
+        assert_eq!(
+            request_grammar_identity(&request, &documents)
+                .unwrap()
+                .artifact_digest,
+            "sha256:v2"
+        );
     }
 
     #[test]
