@@ -20,6 +20,7 @@ pub(crate) use parallel::build_document_discovery;
 pub(crate) use range::filter_semantic_tokens_by_range;
 
 // Re-export for parallel processing
+pub(crate) use parallel::NestedWorkPolicy;
 use parallel::{
     INJECTION_CACHE_MIN_REGIONS, InjectionCacheCtx, collect_injection_tokens_with_parallelism,
 };
@@ -118,12 +119,16 @@ pub(crate) fn compute_semantic_tokens_full(
     supports_multiline: bool,
     injection_cache: Option<InjectionCacheParams>,
     cancel: Option<crate::cancel::CancelToken>,
-    nested_parallelism: Option<&(dyn Fn() -> bool + Sync)>,
+    nested_work_policy: Option<&(dyn Fn() -> NestedWorkPolicy + Sync)>,
 ) -> Option<SemanticTokensResult> {
     let is_cancelled = || crate::cancel::is_cancelled(cancel.as_ref());
-    let allow_nested_parallelism = || {
-        compute_threads > 1
-            && nested_parallelism.is_none_or(|allow_parallelism| allow_parallelism())
+    let nested_work_policy = || {
+        let policy = nested_work_policy.map_or(NestedWorkPolicy::Parallel, |policy| policy());
+        if compute_threads == 1 && policy == NestedWorkPolicy::Parallel {
+            NestedWorkPolicy::Sequential
+        } else {
+            policy
+        }
     };
     let compute_started = std::time::Instant::now();
     let mut host_tokens: Vec<RawToken> = Vec::with_capacity(1000);
@@ -155,7 +160,7 @@ pub(crate) fn compute_semantic_tokens_full(
         discovery: p.discovery.as_deref(),
     });
 
-    let should_parallelize = allow_nested_parallelism()
+    let should_parallelize = nested_work_policy() == NestedWorkPolicy::Parallel
         && cache_ctx.as_ref().is_some_and(|ctx| {
             should_parallelize_host_and_injections(
                 compute_threads,
@@ -203,7 +208,7 @@ pub(crate) fn compute_semantic_tokens_full(
             supports_multiline,
             cache_ctx.as_ref(),
             cancel.as_ref(),
-            &allow_nested_parallelism,
+            &nested_work_policy,
         );
         (result, started.elapsed())
     };

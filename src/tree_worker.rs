@@ -1170,7 +1170,9 @@ impl DocumentReplica {
         started: Instant,
         compute_threads: usize,
         cancellation: Option<&crate::cancel::CancelToken>,
-        nested_parallelism: Option<&(dyn Fn() -> bool + Sync)>,
+        nested_work_policy: Option<
+            &(dyn Fn() -> crate::analysis::semantic::NestedWorkPolicy + Sync),
+        >,
     ) -> Result<DerivedSemanticTokens, String> {
         self.validate_read_identity(&request.context)?;
         if let Some((generation, supports_multiline, tokens)) = &self.cached_semantic_tokens
@@ -1216,7 +1218,7 @@ impl DocumentReplica {
                 discovery,
             }),
             cancellation.cloned(),
-            nested_parallelism,
+            nested_work_policy,
         )
         .ok_or_else(|| "worker semantic token derivation was cancelled".to_string())?;
         let tokens: Vec<WireSemanticToken> = match result {
@@ -2307,6 +2309,12 @@ type DocumentCapacity = Arc<Mutex<usize>>;
 type RetainedDocumentBytes = Arc<AtomicUsize>;
 type LaneJob = Box<dyn FnOnce() -> LaneAction + Send + 'static>;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum WorkPriority {
+    Foreground,
+    Background,
+}
+
 #[derive(Clone, Copy)]
 enum LaneAction {
     Keep,
@@ -2425,29 +2433,61 @@ type DocumentLanes = Arc<LaneRegistry>;
 
 #[derive(Default)]
 struct RunnableDocuments {
-    counts: dashmap::DashMap<DocumentKey, usize>,
+    counts: dashmap::DashMap<DocumentKey, RunnableDocumentCounts>,
+}
+
+#[derive(Default)]
+struct RunnableDocumentCounts {
+    total: usize,
+    foreground: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DocumentCompetition {
+    None,
+    Background,
+    Foreground,
 }
 
 impl RunnableDocuments {
-    fn enter(self: &Arc<Self>, key: DocumentKey) -> RunnableDocumentGuard {
+    fn enter(self: &Arc<Self>, key: DocumentKey, priority: WorkPriority) -> RunnableDocumentGuard {
         self.counts
             .entry(key.clone())
-            .and_modify(|count| *count += 1)
-            .or_insert(1);
+            .and_modify(|counts| {
+                counts.total += 1;
+                counts.foreground += usize::from(priority == WorkPriority::Foreground);
+            })
+            .or_insert(RunnableDocumentCounts {
+                total: 1,
+                foreground: usize::from(priority == WorkPriority::Foreground),
+            });
         RunnableDocumentGuard {
             runnable: Arc::clone(self),
             key,
+            priority,
         }
     }
 
-    fn has_competitor(&self) -> bool {
-        self.counts.len() > 1
+    fn competition_for(&self, current: &DocumentKey) -> DocumentCompetition {
+        if self.counts.len() <= 1 {
+            return DocumentCompetition::None;
+        }
+        if self
+            .counts
+            .iter()
+            .any(|entry| entry.key() != current && entry.value().foreground > 0)
+        {
+            DocumentCompetition::Foreground
+        } else {
+            DocumentCompetition::Background
+        }
     }
 }
 
 struct RunnableDocumentGuard {
     runnable: Arc<RunnableDocuments>,
     key: DocumentKey,
+    priority: WorkPriority,
 }
 
 impl Drop for RunnableDocumentGuard {
@@ -2455,12 +2495,36 @@ impl Drop for RunnableDocumentGuard {
         if let dashmap::mapref::entry::Entry::Occupied(mut entry) =
             self.runnable.counts.entry(self.key.clone())
         {
-            if *entry.get() == 1 {
+            if entry.get().total == 1 {
                 entry.remove();
             } else {
-                *entry.get_mut() -= 1;
+                let counts = entry.get_mut();
+                counts.total -= 1;
+                counts.foreground -= usize::from(self.priority == WorkPriority::Foreground);
             }
         }
+    }
+}
+
+fn request_priority(request: &Request) -> WorkPriority {
+    match request {
+        Request::DeriveSnapshot(_)
+        | Request::DeriveDocumentSnapshot(_)
+        | Request::DeriveInjectionRegions(_)
+        | Request::DeriveSemanticTokens(_) => WorkPriority::Background,
+        Request::Handshake(_)
+        | Request::Cancel(_)
+        | Request::SyncDocument(_)
+        | Request::ApplyDocumentEdits(_)
+        | Request::ApplyDocumentEditsAndDerive(_)
+        | Request::ResolveNode(_)
+        | Request::NavigateNode(_)
+        | Request::RunNodeScalar(_)
+        | Request::DeriveSelectionRanges(_)
+        | Request::RunCaptures(_)
+        | Request::DeriveNativeBindings(_)
+        | Request::ConfigureLanguages(_)
+        | Request::CloseDocument(_) => WorkPriority::Foreground,
     }
 }
 
@@ -2488,7 +2552,7 @@ fn handle_work(
     retained_document_bytes: &RetainedDocumentBytes,
     queue_wait: Duration,
     cancellation: &crate::cancel::CancelToken,
-    nested_parallelism: &(dyn Fn() -> bool + Sync),
+    nested_work_policy: &(dyn Fn() -> crate::analysis::semantic::NestedWorkPolicy + Sync),
 ) -> Response {
     let context = request_context(&request)
         .expect("scheduled worker request must have context")
@@ -2534,7 +2598,7 @@ fn handle_work(
             queue_wait,
             started,
             cancellation,
-            nested_parallelism,
+            nested_work_policy,
         ),
         Request::RunCaptures(request) => run_captures(request, documents),
         Request::DeriveNativeBindings(request) => derive_native_bindings(request, documents),
@@ -2736,7 +2800,7 @@ fn derive_semantic_tokens(
     queue_wait: Duration,
     started: Instant,
     cancellation: &crate::cancel::CancelToken,
-    nested_parallelism: &(dyn Fn() -> bool + Sync),
+    nested_work_policy: &(dyn Fn() -> crate::analysis::semantic::NestedWorkPolicy + Sync),
 ) -> Response {
     let context = request.context.clone();
     let Some(replica) = documents
@@ -2756,7 +2820,7 @@ fn derive_semantic_tokens(
                 started,
                 rayon::current_num_threads(),
                 Some(cancellation),
-                Some(nested_parallelism),
+                Some(nested_work_policy),
             ) {
                 Ok(result) => Response::SemanticTokens(result),
                 Err(message) => Response::Error(WorkerError {
@@ -3351,9 +3415,10 @@ where
         let retained_document_bytes = Arc::clone(&retained_document_bytes);
         let job_cancellations = Arc::clone(&cancellations);
         let lane_key = document_key(&request);
+        let priority = request_priority(&request);
         let runnable_guard = lane_key
             .as_ref()
-            .map(|key| runnable_documents.enter(key.clone()));
+            .map(|key| runnable_documents.enter(key.clone(), priority));
         #[cfg(feature = "e2e")]
         if lane_key.as_ref().is_some_and(|key| {
             std::env::var("KAKEHASHI_TREE_WORKER_RUNNABLE_ENTERED_URI_SUFFIX")
@@ -3394,12 +3459,27 @@ where
             let nested_parallelism_was_allowed = AtomicBool::new(false);
             #[cfg(feature = "e2e")]
             let nested_parallelism_yield_was_reported = AtomicBool::new(false);
-            let allow_nested_parallelism = || {
+            let nested_work_policy = || {
+                use crate::analysis::semantic::NestedWorkPolicy;
+
                 #[cfg(feature = "e2e")]
-                if std::env::var_os("KAKEHASHI_TREE_WORKER_FORCE_NESTED_PARALLELISM").is_some() {
-                    return true;
-                }
-                let allowed = !job_runnable_documents.has_competitor();
+                let force_nested =
+                    std::env::var_os("KAKEHASHI_TREE_WORKER_FORCE_NESTED_PARALLELISM").is_some();
+                #[cfg(not(feature = "e2e"))]
+                let force_nested = false;
+                let policy = if force_nested {
+                    NestedWorkPolicy::Parallel
+                } else {
+                    match action_key
+                        .as_ref()
+                        .map(|key| job_runnable_documents.competition_for(key))
+                        .unwrap_or(DocumentCompetition::None)
+                    {
+                        DocumentCompetition::None => NestedWorkPolicy::Parallel,
+                        DocumentCompetition::Background => NestedWorkPolicy::Sequential,
+                        DocumentCompetition::Foreground => NestedWorkPolicy::Yield,
+                    }
+                };
                 #[cfg(feature = "e2e")]
                 let trace_fairness = action_key.as_ref().is_some_and(|key| {
                     std::env::var("KAKEHASHI_TREE_WORKER_FAIRNESS_TRACE_URI_SUFFIX")
@@ -3407,7 +3487,7 @@ where
                         .is_some_and(|suffix| key.uri.ends_with(&suffix))
                 });
                 #[cfg(feature = "e2e")]
-                if allowed {
+                if policy == NestedWorkPolicy::Parallel {
                     if trace_fairness
                         && let Ok(path) =
                             std::env::var("KAKEHASHI_TREE_WORKER_FAIRNESS_ALLOWED_FILE")
@@ -3423,7 +3503,7 @@ where
                         let _ = std::fs::write(path, b"yielded");
                     }
                 }
-                allowed
+                policy
             };
             let response = handle_work(
                 request,
@@ -3434,7 +3514,7 @@ where
                 &retained_document_bytes,
                 enqueued.elapsed(),
                 &cancellation,
-                &allow_nested_parallelism,
+                &nested_work_policy,
             );
             job_cancellations.remove(&request_id);
             let action = if action_key
@@ -3450,12 +3530,35 @@ where
             drop(runnable_guard);
             action
         });
+        #[cfg(feature = "e2e")]
+        let scheduled_key = lane_key.clone();
+        #[cfg(feature = "e2e")]
+        if scheduled_key.as_ref().is_some_and(|key| {
+            std::env::var("KAKEHASHI_TREE_WORKER_SCHEDULE_RELEASE_URI_SUFFIX")
+                .ok()
+                .is_some_and(|suffix| key.uri.ends_with(&suffix))
+        }) && let Ok(path) = std::env::var("KAKEHASHI_TREE_WORKER_SCHEDULE_RELEASE_FILE")
+        {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while !std::path::Path::new(&path).exists() && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
         if let Some(lane_key) = lane_key {
             submit_document_job(&document_lanes, lane_key, &pool, job);
         } else {
             pool.spawn(move || {
                 let _ = job();
             });
+        }
+        #[cfg(feature = "e2e")]
+        if scheduled_key.as_ref().is_some_and(|key| {
+            std::env::var("KAKEHASHI_TREE_WORKER_SCHEDULED_URI_SUFFIX")
+                .ok()
+                .is_some_and(|suffix| key.uri.ends_with(&suffix))
+        }) && let Ok(path) = std::env::var("KAKEHASHI_TREE_WORKER_SCHEDULED_FILE")
+        {
+            let _ = std::fs::write(path, b"scheduled");
         }
     }
     for _ in 0..pending {
@@ -4250,16 +4353,16 @@ mod tests {
     use super::{
         ApplyDocumentEdits, BUILD_ID, ByteEdit, CancelRequest, CapturesResult, CloseDocument,
         DeriveInjectionRegions, DeriveNativeBindings, DeriveSelectionRanges, DeriveSemanticTokens,
-        DeriveSnapshot, DocumentKey, DocumentLane, DocumentReplica, GrammarKey, Handshake,
-        HandshakeReady, LaneAction, LaneRegistry, MAX_DOCUMENT_BYTES, MAX_DOCUMENT_REPLICAS,
-        MAX_RETAINED_DOCUMENT_BYTES, NavigateNode, NodeLayerSelector, NodeNavigation,
-        NodeScalarOperation, NodeScalarValue, OpaqueNodeId, PROTOCOL_VERSION, Request,
-        RequestCancelled, RequestContext, ResolveNode, Response, Route, RunCaptures, RunNodeScalar,
-        RunnableDocuments, SyncDocument, WireByteRange, WirePosition, WireRange, WorkerError,
-        WorkerQuerySources, close_document, decode_frame, derive_snapshot_with_language,
-        encode_frame, named_node_count, parse_request_timeout, replace_retained_bytes,
-        reserve_retained_growth, route_response, run, submit_document_job, sync_document,
-        terminate_by_transport, validate_document_size,
+        DeriveSnapshot, DocumentCompetition, DocumentKey, DocumentLane, DocumentReplica,
+        GrammarKey, Handshake, HandshakeReady, LaneAction, LaneRegistry, MAX_DOCUMENT_BYTES,
+        MAX_DOCUMENT_REPLICAS, MAX_RETAINED_DOCUMENT_BYTES, NavigateNode, NodeLayerSelector,
+        NodeNavigation, NodeScalarOperation, NodeScalarValue, OpaqueNodeId, PROTOCOL_VERSION,
+        Request, RequestCancelled, RequestContext, ResolveNode, Response, Route, RunCaptures,
+        RunNodeScalar, RunnableDocuments, SyncDocument, WireByteRange, WirePosition, WireRange,
+        WorkPriority, WorkerError, WorkerQuerySources, close_document, decode_frame,
+        derive_snapshot_with_language, encode_frame, named_node_count, parse_request_timeout,
+        replace_retained_bytes, request_priority, reserve_retained_growth, route_response, run,
+        submit_document_job, sync_document, terminate_by_transport, validate_document_size,
     };
 
     #[derive(Clone, Default)]
@@ -4823,36 +4926,103 @@ mod tests {
             uri: "file:///b.rs".into(),
         };
 
-        let first_a = runnable.enter(a.clone());
-        let second_a = runnable.enter(a);
-        assert!(!runnable.has_competitor());
+        let first_a = runnable.enter(a.clone(), WorkPriority::Background);
+        let second_a = runnable.enter(a.clone(), WorkPriority::Foreground);
+        assert_eq!(runnable.competition_for(&a), DocumentCompetition::None);
 
-        let first_b = runnable.enter(b);
-        assert!(runnable.has_competitor());
+        let first_b = runnable.enter(b, WorkPriority::Background);
+        assert_eq!(
+            runnable.competition_for(&DocumentKey {
+                uri: "file:///a.rs".into()
+            }),
+            DocumentCompetition::Background
+        );
         drop(first_b);
-        assert!(!runnable.has_competitor());
+        assert_eq!(
+            runnable.competition_for(&DocumentKey {
+                uri: "file:///a.rs".into()
+            }),
+            DocumentCompetition::None
+        );
 
         drop(second_a);
         drop(first_a);
-        assert!(!runnable.has_competitor());
+        assert_eq!(
+            runnable.competition_for(&DocumentKey {
+                uri: "file:///a.rs".into()
+            }),
+            DocumentCompetition::None
+        );
     }
 
     #[test]
-    fn nested_parallelism_gate_tracks_competing_document_lifetime() {
+    fn runnable_documents_track_foreground_competitors_separately() {
         let runnable = Arc::new(RunnableDocuments::default());
-        let first = runnable.enter(DocumentKey {
+        let current = DocumentKey {
             uri: "file:///a.rs".into(),
-        });
-        let allow_nested_parallelism = || !runnable.has_competitor();
-        assert!(allow_nested_parallelism());
+        };
+        let first = runnable.enter(current.clone(), WorkPriority::Background);
+        assert_eq!(
+            runnable.competition_for(&current),
+            DocumentCompetition::None
+        );
 
-        let competitor = runnable.enter(DocumentKey {
-            uri: "file:///b.rs".into(),
-        });
-        assert!(!allow_nested_parallelism());
-        drop(competitor);
-        assert!(allow_nested_parallelism());
+        let background = runnable.enter(
+            DocumentKey {
+                uri: "file:///b.rs".into(),
+            },
+            WorkPriority::Background,
+        );
+        assert_eq!(
+            runnable.competition_for(&current),
+            DocumentCompetition::Background
+        );
+
+        let foreground = runnable.enter(
+            DocumentKey {
+                uri: "file:///c.rs".into(),
+            },
+            WorkPriority::Foreground,
+        );
+        assert_eq!(
+            runnable.competition_for(&current),
+            DocumentCompetition::Foreground
+        );
+        drop(foreground);
+        assert_eq!(
+            runnable.competition_for(&current),
+            DocumentCompetition::Background
+        );
+        drop(background);
         drop(first);
+    }
+
+    #[test]
+    fn request_priority_separates_bulk_derivation_from_interactive_reads() {
+        let context = RequestContext {
+            request_id: 1,
+            worker_generation: 1,
+            uri: "file:///priority.rs".into(),
+            incarnation: 1,
+            content_version: 1,
+            configuration_generation: 1,
+        };
+        assert_eq!(
+            request_priority(&Request::DeriveSemanticTokens(DeriveSemanticTokens {
+                context: context.clone(),
+                supports_multiline: false,
+            })),
+            WorkPriority::Background
+        );
+        assert_eq!(
+            request_priority(&Request::ResolveNode(ResolveNode {
+                context,
+                byte_offset: 0,
+                named: true,
+                layer: NodeLayerSelector::Host,
+            })),
+            WorkPriority::Foreground
+        );
     }
 
     #[test]

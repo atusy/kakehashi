@@ -830,6 +830,15 @@ fn competing_document_finishes_while_injection_fanout_is_running() {
 
 #[test]
 fn late_competing_document_reduces_fanout_at_a_chunk_boundary() {
+    run_late_competitor_scenario(4);
+}
+
+#[test]
+fn one_thread_worker_yields_background_fanout_to_foreground_work() {
+    run_late_competitor_scenario(1);
+}
+
+fn run_late_competitor_scenario(worker_threads: usize) {
     let force_nested = std::env::var_os("KAKEHASHI_E2E_FORCE_NESTED_PARALLELISM").is_some();
     let marker_dir = tempfile::tempdir().expect("create fanout marker directory");
     let fanout_started = marker_dir.path().join("started");
@@ -837,23 +846,20 @@ fn late_competing_document_reduces_fanout_at_a_chunk_boundary() {
     let fanout_allowed = marker_dir.path().join("allowed");
     let fanout_yielded = marker_dir.path().join("yielded");
     let competitor_runnable = marker_dir.path().join("competitor-runnable");
+    let competitor_scheduled = marker_dir.path().join("competitor-scheduled");
     let mut builder = LspClient::builder()
         .env("KAKEHASHI_TREE_WORKER_MODE", "authoritative")
-        .env("KAKEHASHI_TREE_WORKER_THREADS", "4")
+        .env("KAKEHASHI_TREE_WORKER_THREADS", worker_threads.to_string())
         .env(
             "KAKEHASHI_TREE_WORKER_INJECTION_DELAY_URI_SUFFIX",
             "/late-fair-a.md",
         )
-        .env("KAKEHASHI_TREE_WORKER_INJECTION_DELAY_MS", "50")
+        .env("KAKEHASHI_TREE_WORKER_INJECTION_DELAY_MS", "500")
         .env(
             "KAKEHASHI_TREE_WORKER_ADMISSION_DELAY_URI_SUFFIX",
             "/late-fair-b.rs",
         )
         .env("KAKEHASHI_TREE_WORKER_ADMISSION_DELAY_MS", "200")
-        .env(
-            "KAKEHASHI_TREE_WORKER_ADMISSION_RELEASE_FILE",
-            fanout_yielded.to_string_lossy(),
-        )
         .env(
             "KAKEHASHI_TREE_WORKER_RUNNABLE_ENTERED_URI_SUFFIX",
             "/late-fair-b.rs",
@@ -861,6 +867,14 @@ fn late_competing_document_reduces_fanout_at_a_chunk_boundary() {
         .env(
             "KAKEHASHI_TREE_WORKER_RUNNABLE_ENTERED_FILE",
             competitor_runnable.to_string_lossy(),
+        )
+        .env(
+            "KAKEHASHI_TREE_WORKER_SCHEDULED_URI_SUFFIX",
+            "/late-fair-b.rs",
+        )
+        .env(
+            "KAKEHASHI_TREE_WORKER_SCHEDULED_FILE",
+            competitor_scheduled.to_string_lossy(),
         )
         .env(
             "KAKEHASHI_TREE_WORKER_FAIRNESS_TRACE_URI_SUFFIX",
@@ -884,6 +898,16 @@ fn late_competing_document_reduces_fanout_at_a_chunk_boundary() {
         );
     if force_nested {
         builder = builder.env("KAKEHASHI_TREE_WORKER_FORCE_NESTED_PARALLELISM", "1");
+    } else {
+        builder = builder
+            .env(
+                "KAKEHASHI_TREE_WORKER_SCHEDULE_RELEASE_URI_SUFFIX",
+                "/late-fair-b.rs",
+            )
+            .env(
+                "KAKEHASHI_TREE_WORKER_SCHEDULE_RELEASE_FILE",
+                fanout_yielded.to_string_lossy(),
+            );
     }
     let mut client = builder.build();
     initialize(&mut client);
@@ -946,7 +970,25 @@ fn late_competing_document_reduces_fanout_at_a_chunk_boundary() {
         competitor_runnable.exists(),
         "competing worker job was not registered as runnable"
     );
+    if force_nested {
+        while !competitor_scheduled.exists() && std::time::Instant::now() < competitor_deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            competitor_scheduled.exists(),
+            "competing worker job was not scheduled"
+        );
+    }
     std::fs::write(&fanout_release, b"release").expect("release the first fanout chunk");
+    if !force_nested {
+        while !competitor_scheduled.exists() && std::time::Instant::now() < competitor_deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            competitor_scheduled.exists(),
+            "competing worker job was not scheduled after the worker observed its priority"
+        );
+    }
 
     let mut foreground_elapsed = None;
     let mut heavy_elapsed = None;
@@ -972,6 +1014,10 @@ fn late_competing_document_reduces_fanout_at_a_chunk_boundary() {
         assert!(
             fanout_yielded.exists(),
             "late competitor did not change a later chunk's admission"
+        );
+        assert!(
+            foreground_elapsed < heavy_elapsed,
+            "foreground work did not complete before background fanout: foreground={foreground_elapsed:?} heavy={heavy_elapsed:?}"
         );
     }
 }

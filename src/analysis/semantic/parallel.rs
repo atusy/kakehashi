@@ -1254,27 +1254,39 @@ pub(crate) fn collect_injection_tokens_parallel(
         supports_multiline,
         cache_ctx,
         cancel,
-        &|| true,
+        &|| NestedWorkPolicy::Parallel,
     )
 }
 
-fn map_fanout_chunks<T, R, Parallel, Map>(
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum NestedWorkPolicy {
+    Parallel,
+    Sequential,
+    Yield,
+}
+
+fn map_fanout_chunks<T, R, Policy, Map>(
     items: &[T],
     chunk_size: usize,
-    should_parallelize: Parallel,
+    work_policy: Policy,
     map: Map,
 ) -> Vec<R>
 where
     T: Sync,
     R: Send,
-    Parallel: Fn() -> bool,
+    Policy: Fn() -> NestedWorkPolicy,
     Map: Fn(&T) -> R + Sync,
 {
     use rayon::prelude::*;
 
     let mut output = Vec::with_capacity(items.len());
     for chunk in items.chunks(chunk_size.max(1)) {
-        if should_parallelize() {
+        let mut policy = work_policy();
+        if policy == NestedWorkPolicy::Yield {
+            let _ = rayon::yield_now();
+            policy = work_policy();
+        }
+        if policy == NestedWorkPolicy::Parallel {
             output.extend(chunk.par_iter().map(&map).collect::<Vec<_>>());
         } else {
             output.extend(chunk.iter().map(&map));
@@ -1295,7 +1307,7 @@ pub(crate) fn collect_injection_tokens_with_parallelism(
     supports_multiline: bool,
     cache_ctx: Option<&InjectionCacheCtx>,
     cancel: Option<&crate::cancel::CancelToken>,
-    allow_parallelism: &(dyn Fn() -> bool + Sync),
+    work_policy: &(dyn Fn() -> NestedWorkPolicy + Sync),
 ) -> (Vec<RawToken>, Vec<ActiveInjectionBounds>) {
     use crate::cancel::is_cancelled;
 
@@ -1476,7 +1488,7 @@ pub(crate) fn collect_injection_tokens_with_parallelism(
         map_fanout_chunks(
             &miss_indices,
             rayon::current_num_threads(),
-            allow_parallelism,
+            work_policy,
             |&i| process_one(i),
         )
     } else {
@@ -1690,12 +1702,102 @@ mod tests {
         let output = map_fanout_chunks(
             &items,
             4,
-            || checks.fetch_add(1, Ordering::SeqCst) == 0,
+            || {
+                if checks.fetch_add(1, Ordering::SeqCst) == 0 {
+                    NestedWorkPolicy::Parallel
+                } else {
+                    NestedWorkPolicy::Sequential
+                }
+            },
             |item| *item,
         );
 
         assert_eq!(output, items);
         assert_eq!(checks.load(Ordering::SeqCst), 3);
+    }
+
+    #[test]
+    fn fanout_yields_a_single_thread_to_queued_foreground_work() {
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build()
+            .unwrap();
+        let foreground_ran = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        pool.install(|| {
+            let task_ran = Arc::clone(&foreground_ran);
+            rayon::spawn(move || task_ran.store(true, Ordering::SeqCst));
+
+            let output = map_fanout_chunks(
+                &[1],
+                1,
+                || {
+                    if foreground_ran.load(Ordering::SeqCst) {
+                        NestedWorkPolicy::Sequential
+                    } else {
+                        NestedWorkPolicy::Yield
+                    }
+                },
+                |item| *item,
+            );
+            assert_eq!(output, [1]);
+        });
+
+        assert!(foreground_ran.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn fanout_yields_a_single_thread_to_externally_scheduled_foreground_work() {
+        let pool = Arc::new(
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(1)
+                .build()
+                .unwrap(),
+        );
+        let foreground_pending = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let order = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let first_chunk_release = Arc::new(std::sync::Barrier::new(2));
+        let (first_chunk_started, started_rx) = std::sync::mpsc::channel();
+
+        let background_pool = Arc::clone(&pool);
+        let background_pending = Arc::clone(&foreground_pending);
+        let background_order = Arc::clone(&order);
+        let background_release = Arc::clone(&first_chunk_release);
+        let background = std::thread::spawn(move || {
+            background_pool.install(|| {
+                map_fanout_chunks(
+                    &[0, 1, 2],
+                    1,
+                    || {
+                        if background_pending.load(Ordering::SeqCst) {
+                            NestedWorkPolicy::Yield
+                        } else {
+                            NestedWorkPolicy::Sequential
+                        }
+                    },
+                    |item| {
+                        if *item == 0 {
+                            first_chunk_started.send(()).unwrap();
+                            background_release.wait();
+                        }
+                        background_order.lock().unwrap().push(*item);
+                        *item
+                    },
+                )
+            })
+        });
+
+        started_rx.recv().unwrap();
+        foreground_pending.store(true, Ordering::SeqCst);
+        let task_pending = Arc::clone(&foreground_pending);
+        let task_order = Arc::clone(&order);
+        pool.spawn(move || {
+            task_order.lock().unwrap().push(99);
+            task_pending.store(false, Ordering::SeqCst);
+        });
+        first_chunk_release.wait();
+
+        assert_eq!(background.join().unwrap(), [0, 1, 2]);
+        assert_eq!(*order.lock().unwrap(), [0, 99, 1, 2]);
     }
 
     #[test]
