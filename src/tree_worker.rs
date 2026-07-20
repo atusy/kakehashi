@@ -22,7 +22,7 @@ use sha2::{Digest, Sha256};
 
 use crate::language::node_tracker::{EditInfo, NodeTracker};
 
-pub const PROTOCOL_VERSION: u32 = 17;
+pub const PROTOCOL_VERSION: u32 = 18;
 pub const MAX_FRAME_BYTES: usize = 64 * 1024 * 1024;
 pub const MAX_DOCUMENT_REPLICAS: usize = 4_096;
 pub const MAX_DOCUMENT_BYTES: usize = 32 * 1024 * 1024;
@@ -589,12 +589,6 @@ pub struct WorkerGrammarIdentity {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-pub struct GrammarHazardAck {
-    pub lease_id: u64,
-    pub worker_generation: u64,
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct GrammarHazardArmed {
     pub lease_id: u64,
     pub context: RequestContext,
@@ -611,7 +605,6 @@ pub struct GrammarHazardReleased {
 pub enum Request {
     Handshake(Handshake),
     Cancel(CancelRequest),
-    GrammarHazardAck(GrammarHazardAck),
     DeriveSnapshot(DeriveSnapshot),
     SyncDocument(SyncDocument),
     ApplyDocumentEdits(ApplyDocumentEdits),
@@ -2924,7 +2917,6 @@ fn request_priority(request: &Request) -> WorkPriority {
         | Request::DeriveSemanticTokens(_) => WorkPriority::Background,
         Request::Handshake(_)
         | Request::Cancel(_)
-        | Request::GrammarHazardAck(_)
         | Request::SyncDocument(_)
         | Request::ApplyDocumentEdits(_)
         | Request::ApplyDocumentEditsAndDerive(_)
@@ -2984,7 +2976,7 @@ fn handle_work(
         non_evictable_estimate_hard_bytes: memory_budgets.non_evictable_estimate_hard_bytes,
     };
     let response = match request {
-        Request::Handshake(_) | Request::Cancel(_) | Request::GrammarHazardAck(_) => {
+        Request::Handshake(_) | Request::Cancel(_) => {
             unreachable!("control requests are not scheduled")
         }
         Request::DeriveSnapshot(request) => derive_snapshot(request, queue_wait),
@@ -3071,7 +3063,7 @@ fn request_may_grow_derived_state(request: &Request) -> bool {
 
 fn request_context(request: &Request) -> Option<&RequestContext> {
     match request {
-        Request::Handshake(_) | Request::Cancel(_) | Request::GrammarHazardAck(_) => None,
+        Request::Handshake(_) | Request::Cancel(_) => None,
         Request::DeriveSnapshot(request) => Some(&request.context),
         Request::SyncDocument(request) => Some(&request.context),
         Request::ApplyDocumentEdits(request) => Some(&request.context),
@@ -3109,7 +3101,6 @@ fn document_key(request: &Request) -> Option<DocumentKey> {
         Request::CloseDocument(request) => Some(DocumentKey::from(&request.context)),
         Request::Handshake(_)
         | Request::Cancel(_)
-        | Request::GrammarHazardAck(_)
         | Request::DeriveSnapshot(_)
         | Request::ConfigureLanguages(_) => None,
     }
@@ -3150,7 +3141,6 @@ fn request_grammar_identity(
         }),
         Request::Handshake(_)
         | Request::Cancel(_)
-        | Request::GrammarHazardAck(_)
         | Request::ConfigureLanguages(_)
         | Request::InspectDocumentMemory(_)
         | Request::CloseDocument(_) => None,
@@ -3868,11 +3858,16 @@ where
     }
     let permit_rx = Arc::new(Mutex::new(permit_rx));
     let (responses, response_rx) =
-        mpsc::sync_channel::<(Response, Option<AdmissionPermit>)>(max_inflight);
+        mpsc::sync_channel::<(Response, Option<AdmissionPermit>, Option<mpsc::Sender<()>>)>(
+            max_inflight,
+        );
     let writer_thread = std::thread::spawn(move || -> io::Result<()> {
         let mut writer = writer;
-        for (response, _permit) in response_rx {
+        for (response, _permit, committed) in response_rx {
             encode_frame(&mut writer, &response)?;
+            if let Some(committed) = committed {
+                let _ = committed.send(());
+            }
         }
         Ok(())
     });
@@ -3900,6 +3895,7 @@ where
                     message: "worker protocol/build identity mismatch".into(),
                 }),
                 None,
+                None,
             ))
             .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "worker writer stopped"))?;
         drop(responses);
@@ -3919,6 +3915,7 @@ where
                 compute_threads,
             }),
             None,
+            None,
         ))
         .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "worker writer stopped"))?;
     #[cfg(feature = "e2e")]
@@ -3934,7 +3931,6 @@ where
     let document_lanes: DocumentLanes = Arc::new(dashmap::DashMap::new());
     let runnable_documents = Arc::new(RunnableDocuments::default());
     let cancellations = Arc::new(dashmap::DashMap::<u64, crate::cancel::CancelToken>::new());
-    let hazard_waiters = Arc::new(dashmap::DashMap::<u64, mpsc::Sender<()>>::new());
     let next_hazard_lease = Arc::new(std::sync::atomic::AtomicU64::new(1));
     // The client permits at most four requests per compute thread. Decode one
     // frame beyond this pending window so cancellation stays observable under
@@ -3959,22 +3955,6 @@ where
     let injected_hung_compute = 0_usize;
     let mut pending = injected_hung_compute;
     while let Some(request) = decode_frame::<_, Request>(&mut reader)? {
-        if let Request::GrammarHazardAck(ack) = request {
-            if ack.worker_generation != worker_generation {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "stale grammar hazard acknowledgment",
-                ));
-            }
-            let Some((_, waiter)) = hazard_waiters.remove(&ack.lease_id) else {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "unknown grammar hazard acknowledgment",
-                ));
-            };
-            let _ = waiter.send(());
-            continue;
-        }
         if let Request::Cancel(cancel) = request {
             if cancel.worker_generation == worker_generation {
                 cancellations.entry(cancel.request_id).or_default().cancel();
@@ -3995,6 +3975,7 @@ where
                         message: "stale worker generation".into(),
                     }),
                     None,
+                    None,
                 ))
                 .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "worker writer stopped"))?;
             continue;
@@ -4002,7 +3983,7 @@ where
         #[cfg(feature = "e2e")]
         if let Some(response) = inject_worker_failure_once(&request) {
             responses
-                .send((response, None))
+                .send((response, None, None))
                 .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "worker writer stopped"))?;
             continue;
         }
@@ -4038,7 +4019,6 @@ where
         let retained_estimated_document_bytes = Arc::clone(&retained_estimated_document_bytes);
         let derived_pressure_lock = Arc::clone(&derived_pressure_lock);
         let job_cancellations = Arc::clone(&cancellations);
-        let job_hazard_waiters = Arc::clone(&hazard_waiters);
         let job_next_hazard_lease = Arc::clone(&next_hazard_lease);
         let lane_key = document_key(&request);
         let priority = request_priority(&request);
@@ -4084,8 +4064,7 @@ where
             let mut announced_lease = None;
             let hazard_error = grammar_hazard.and_then(|grammar| {
                 let lease_id = job_next_hazard_lease.fetch_add(1, Ordering::Relaxed);
-                let (ack_tx, ack_rx) = mpsc::channel();
-                job_hazard_waiters.insert(lease_id, ack_tx);
+                let (committed_tx, committed_rx) = mpsc::channel();
                 if responses
                     .send((
                         Response::GrammarHazardArmed(GrammarHazardArmed {
@@ -4094,17 +4073,17 @@ where
                             grammar,
                         }),
                         None,
+                        Some(committed_tx),
                     ))
                     .is_err()
                 {
-                    job_hazard_waiters.remove(&lease_id);
                     return Some(Response::WorkerRestartRequired(WorkerRestartRequired {
                         context: context.clone(),
-                        reason: "worker writer stopped before grammar hazard acknowledgment".into(),
+                        reason: "worker writer stopped before committing grammar hazard".into(),
                     }));
                 }
                 announced_lease = Some(lease_id);
-                match ack_rx.recv_timeout(Duration::from_secs(5)) {
+                match committed_rx.recv_timeout(Duration::from_secs(5)) {
                     Ok(()) => {
                         #[cfg(feature = "e2e")]
                         if let Ok(marker) =
@@ -4119,13 +4098,10 @@ where
                         }
                         None
                     }
-                    Err(_) => {
-                        job_hazard_waiters.remove(&lease_id);
-                        Some(Response::WorkerRestartRequired(WorkerRestartRequired {
-                            context: context.clone(),
-                            reason: "grammar hazard acknowledgment timed out".into(),
-                        }))
-                    }
+                    Err(_) => Some(Response::WorkerRestartRequired(WorkerRestartRequired {
+                        context: context.clone(),
+                        reason: "grammar hazard commit timed out".into(),
+                    })),
                 }
             });
             #[cfg(feature = "e2e")]
@@ -4193,17 +4169,17 @@ where
                     &nested_work_policy,
                 )
             });
-            // Once the arm frame was handed to the response writer, the parent
-            // may have recorded it even when its acknowledgment times out in
-            // transit. Release that announced lease before the terminal
-            // response so a non-entered scope cannot survive as false crash
-            // attribution.
+            // Once the arm frame was committed to the OS pipe, the parent will
+            // decode it before the later release or EOF. Release that announced
+            // lease before the terminal response so a commit timeout cannot
+            // survive as false crash attribution if the writer later resumes.
             if let Some(lease_id) = announced_lease {
                 let _ = responses.send((
                     Response::GrammarHazardReleased(GrammarHazardReleased {
                         lease_id,
                         worker_generation,
                     }),
+                    None,
                     None,
                 ));
             }
@@ -4216,7 +4192,7 @@ where
             } else {
                 LaneAction::Retire
             };
-            let _ = responses.send((response, Some(permit)));
+            let _ = responses.send((response, Some(permit), None));
             let _ = completion_tx.send(());
             drop(runnable_guard);
             action
@@ -4943,7 +4919,7 @@ impl std::ops::DerefMut for OwnedChild {
 pub struct Client {
     child: Arc<Mutex<OwnedChild>>,
     terminated_by_transport: Arc<AtomicBool>,
-    outbound: Arc<Mutex<Option<mpsc::Sender<Request>>>>,
+    outbound: Mutex<Option<mpsc::Sender<Request>>>,
     active_grammar_hazards: Arc<Mutex<HashMap<u64, GrammarHazardArmed>>>,
     routes: Arc<Mutex<HashMap<u64, Route>>>,
     reader: Option<std::thread::JoinHandle<()>>,
@@ -5060,11 +5036,9 @@ impl Client {
         let child = Arc::new(Mutex::new(child));
         let terminated_by_transport = Arc::new(AtomicBool::new(false));
         let routes = Arc::new(Mutex::new(HashMap::<u64, Route>::new()));
-        let outbound = Arc::new(Mutex::new(None::<mpsc::Sender<Request>>));
         let active_grammar_hazards =
             Arc::new(Mutex::new(HashMap::<u64, GrammarHazardArmed>::new()));
         let reader_routes = Arc::clone(&routes);
-        let reader_outbound = Arc::clone(&outbound);
         let reader_hazards = Arc::clone(&active_grammar_hazards);
         let reader_child = Arc::clone(&child);
         let reader_terminated_by_transport = Arc::clone(&terminated_by_transport);
@@ -5094,38 +5068,10 @@ impl Client {
                                     );
                                     break;
                                 }
-                                let ack = Request::GrammarHazardAck(GrammarHazardAck {
-                                    lease_id: armed.lease_id,
-                                    worker_generation: armed.context.worker_generation,
-                                });
                                 reader_hazards
                                     .lock()
                                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                                     .insert(armed.lease_id, armed);
-                                let ack_result = reader_outbound
-                                    .lock()
-                                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                                    .as_ref()
-                                    .ok_or_else(|| {
-                                        io::Error::new(
-                                            io::ErrorKind::BrokenPipe,
-                                            "worker control writer is unavailable",
-                                        )
-                                    })
-                                    .and_then(|outbound| {
-                                        outbound.send(ack).map_err(|_| {
-                                            io::Error::new(
-                                                io::ErrorKind::BrokenPipe,
-                                                "worker control writer stopped",
-                                            )
-                                        })
-                                    });
-                                if let Err(error) = ack_result {
-                                    let kind = error.kind();
-                                    let message = error.to_string();
-                                    fail_routes(None, &reader_routes, kind, &message);
-                                    break;
-                                }
                                 continue;
                             }
                             Response::GrammarHazardReleased(released) => {
@@ -5238,10 +5184,7 @@ impl Client {
         // The route table is the bounded admission control. Keep the transport
         // channel unbounded so a cancellation control frame never competes
         // with work for the final queue slot.
-        let (outbound_tx, outbound_rx) = mpsc::channel::<Request>();
-        *outbound
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(outbound_tx);
+        let (outbound, outbound_rx) = mpsc::channel::<Request>();
         let writer_routes = Arc::clone(&routes);
         let writer_child = Arc::clone(&child);
         let writer_terminated_by_transport = Arc::clone(&terminated_by_transport);
@@ -5265,7 +5208,7 @@ impl Client {
         Ok(Self {
             child,
             terminated_by_transport,
-            outbound,
+            outbound: Mutex::new(Some(outbound)),
             active_grammar_hazards,
             routes,
             reader: Some(reader),
@@ -5547,7 +5490,7 @@ impl Client {
 
     pub fn shutdown(mut self) -> io::Result<()> {
         self.outbound
-            .lock()
+            .get_mut()
             .map_err(|_| io::Error::other("worker outbound lock is poisoned"))?
             .take();
         let status = {
@@ -5591,7 +5534,7 @@ fn failed_spawn(
 
 impl Drop for Client {
     fn drop(&mut self) {
-        if let Ok(mut outbound) = self.outbound.lock() {
+        if let Ok(outbound) = self.outbound.get_mut() {
             outbound.take();
         }
         if let Ok(mut child) = self.child.lock() {
@@ -5758,8 +5701,8 @@ mod tests {
         CachedInjectionLayer, CancelRequest, CapturesResult, CloseDocument, DeriveInjectionRegions,
         DeriveNativeBindings, DeriveSelectionRanges, DeriveSemanticTokens, DeriveSnapshot,
         DocumentCompetition, DocumentKey, DocumentLane, DocumentMemoryAdmission, DocumentReplica,
-        GrammarHazardAck, GrammarHazardArmed, GrammarHazardReleased, GrammarKey, Handshake,
-        HandshakeReady, LaneAction, LaneRegistry, MAX_DOCUMENT_BYTES, MAX_DOCUMENT_REPLICAS,
+        GrammarHazardArmed, GrammarHazardReleased, GrammarKey, Handshake, HandshakeReady,
+        LaneAction, LaneRegistry, MAX_DOCUMENT_BYTES, MAX_DOCUMENT_REPLICAS,
         MAX_RETAINED_DOCUMENT_BYTES, MAX_RETAINED_ESTIMATED_DOCUMENT_BYTES, NavigateNode,
         NodeLayerSelector, NodeNavigation, NodeScalarOperation, NodeScalarValue, OpaqueNodeId,
         OwnedChild, PROTOCOL_VERSION, ParentLiveness, Request, RequestCancelled, RequestContext,
@@ -6038,7 +5981,7 @@ mod tests {
     }
 
     #[test]
-    fn frame_round_trip_preserves_acknowledged_grammar_hazard_lifecycle() {
+    fn frame_round_trip_preserves_committed_grammar_hazard_lifecycle() {
         let context = RequestContext {
             request_id: 42,
             worker_generation: 7,
@@ -6070,14 +6013,6 @@ mod tests {
                 Some(response)
             );
         }
-
-        let ack = Request::GrammarHazardAck(GrammarHazardAck {
-            lease_id: 9,
-            worker_generation: 7,
-        });
-        let mut bytes = Vec::new();
-        encode_frame(&mut bytes, &ack).unwrap();
-        assert_eq!(decode_frame(&mut Cursor::new(bytes)).unwrap(), Some(ack));
     }
 
     #[test]

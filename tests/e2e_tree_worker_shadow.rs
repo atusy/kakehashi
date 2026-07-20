@@ -87,6 +87,30 @@ fn open_rust_and_request_tokens(client: &mut LspClient, uri: &str, text: &str) {
     assert!(response.get("result").is_some(), "{response:?}");
 }
 
+#[test]
+fn grammar_work_does_not_require_a_parent_round_trip_acknowledgment() {
+    let mut client = LspClient::builder()
+        .env("KAKEHASHI_TREE_WORKER_MODE", "authoritative")
+        .env("KAKEHASHI_TREE_WORKER_ABORT_ON_HAZARD_ACK", "1")
+        .build();
+    initialize(&mut client);
+
+    let started = std::time::Instant::now();
+    open_rust_and_request_tokens(
+        &mut client,
+        "file:///committed-hazard.rs",
+        "fn committed_hazard() {}\n",
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(10),
+        "grammar request waited for worker restart: {:?}",
+        started.elapsed(),
+    );
+
+    let stderr = shutdown_and_stderr(client);
+    assert!(!stderr.contains("restarted worker generation"), "{stderr}");
+}
+
 fn assert_host_tier_available(client: &mut LspClient, command: &str) {
     let response = client.send_request(
         "workspace/executeCommand",
