@@ -613,7 +613,26 @@ struct CachedInjectionLayer {
     ranges: Vec<tree_sitter::Range>,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct EstimatedDocumentMemory {
+    non_evictable_bytes: usize,
+    evictable_bytes: usize,
+}
+
 impl DocumentReplica {
+    fn estimated_memory(&self) -> EstimatedDocumentMemory {
+        EstimatedDocumentMemory {
+            non_evictable_bytes: self.text.capacity(),
+            evictable_bytes: self
+                .cached_semantic_tokens
+                .as_ref()
+                .map(|(_, _, tokens)| {
+                    tokens.capacity() * std::mem::size_of::<WireSemanticToken>()
+                })
+                .unwrap_or_default(),
+        }
+    }
+
     fn trim_auxiliary_caches_for_pressure(&mut self) -> bool {
         let semantic_bytes = self
             .cached_semantic_tokens
@@ -5798,6 +5817,51 @@ mod tests {
 
         assert!(!replica.trim_auxiliary_caches_for_pressure());
         assert!(replica.semantic_discovery.is_some());
+    }
+
+    #[test]
+    fn semantic_cache_capacity_is_reported_as_evictable_memory() {
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_rust::LANGUAGE.into())
+            .unwrap();
+        let context = RequestContext {
+            request_id: 1,
+            worker_generation: 3,
+            uri: "file:///memory-accounting.rs".into(),
+            incarnation: 4,
+            content_version: 1,
+            configuration_generation: 2,
+        };
+        let (mut replica, _) = DocumentReplica::sync(
+            SyncDocument {
+                context,
+                language: "rust".into(),
+                grammar_symbol: "rust".into(),
+                source_path: "/unused/static-language".into(),
+                parser_path: "/unused/static-language".into(),
+                artifact_digest: "sha256:rust-v1".into(),
+                queries: WorkerQuerySources::default(),
+                text: "fn main() {}".into(),
+            },
+            &mut parser,
+        )
+        .unwrap();
+        let before = replica.estimated_memory();
+        let token = WireSemanticToken {
+            delta_line: 0,
+            delta_start: 0,
+            length: 1,
+            token_type: 0,
+            token_modifiers_bitset: 0,
+        };
+        let tokens = vec![token; 16];
+        let semantic_bytes = tokens.capacity() * std::mem::size_of::<WireSemanticToken>();
+        replica.cached_semantic_tokens = Some((2, false, Arc::new(tokens)));
+
+        let after = replica.estimated_memory();
+        assert_eq!(after.non_evictable_bytes, before.non_evictable_bytes);
+        assert_eq!(after.evictable_bytes, before.evictable_bytes + semantic_bytes);
     }
 
     #[test]
