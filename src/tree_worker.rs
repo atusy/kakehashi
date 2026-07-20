@@ -4196,6 +4196,8 @@ pub fn run_stdio_with_memory_budgets(
     compute_threads: usize,
     memory_budgets: WorkerMemoryBudgets,
 ) -> io::Result<()> {
+    #[cfg(all(unix, feature = "e2e"))]
+    spawn_test_descendant()?;
     let build_id = artifact_digest(&std::env::current_exe()?)?;
     run_with_build_id(
         std::io::stdin(),
@@ -4204,6 +4206,21 @@ pub fn run_stdio_with_memory_budgets(
         &build_id,
         memory_budgets,
     )
+}
+
+#[cfg(all(unix, feature = "e2e"))]
+fn spawn_test_descendant() -> io::Result<()> {
+    let Some(pid_path) = std::env::var_os("KAKEHASHI_TREE_WORKER_DESCENDANT_PID_FILE") else {
+        return Ok(());
+    };
+    let _descendant = Command::new("sh")
+        .args(["-c", "echo $$ > \"$1\"; exec sleep 30", "worker-descendant"])
+        .arg(pid_path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+    Ok(())
 }
 
 pub fn artifact_digest(path: &std::path::Path) -> io::Result<String> {
@@ -4220,8 +4237,59 @@ pub fn artifact_digest(path: &std::path::Path) -> io::Result<String> {
     Ok(format!("sha256:{:x}", digest.finalize()))
 }
 
+struct OwnedChild {
+    child: Child,
+    #[cfg(unix)]
+    process_group: nix::unistd::Pid,
+}
+
+impl OwnedChild {
+    fn spawn(mut command: Command) -> io::Result<Self> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt as _;
+
+            command.process_group(0);
+        }
+        let child = command.spawn()?;
+        #[cfg(unix)]
+        let process_group = nix::unistd::Pid::from_raw(child.id() as i32);
+        Ok(Self {
+            child,
+            #[cfg(unix)]
+            process_group,
+        })
+    }
+
+    fn kill_all(&mut self) {
+        #[cfg(unix)]
+        {
+            use nix::sys::signal::{Signal, killpg};
+
+            if killpg(self.process_group, Signal::SIGKILL).is_ok() {
+                return;
+            }
+        }
+        let _ = self.child.kill();
+    }
+}
+
+impl std::ops::Deref for OwnedChild {
+    type Target = Child;
+
+    fn deref(&self) -> &Self::Target {
+        &self.child
+    }
+}
+
+impl std::ops::DerefMut for OwnedChild {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.child
+    }
+}
+
 pub struct Client {
-    child: Arc<Mutex<Child>>,
+    child: Arc<Mutex<OwnedChild>>,
     terminated_by_transport: Arc<AtomicBool>,
     outbound: Mutex<Option<mpsc::Sender<Request>>>,
     routes: Arc<Mutex<HashMap<u64, Route>>>,
@@ -4313,7 +4381,8 @@ impl Client {
         let derived_cache_soft_bytes = memory_budgets.derived_cache_soft_bytes.to_string();
         let non_evictable_estimate_hard_bytes =
             memory_budgets.non_evictable_estimate_hard_bytes.to_string();
-        let mut child = Command::new(executable)
+        let mut command = Command::new(executable);
+        command
             .args([
                 "__tree-worker",
                 "--threads",
@@ -4325,8 +4394,8 @@ impl Client {
             ])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::inherit())
-            .spawn()?;
+            .stderr(Stdio::inherit());
+        let mut child = OwnedChild::spawn(command)?;
         let mut stdin = child
             .stdin
             .take()
@@ -4744,7 +4813,9 @@ impl Client {
                 .child
                 .lock()
                 .map_err(|_| io::Error::other("worker child lock is poisoned"))?;
-            wait_until(&mut child, Duration::from_secs(2))?
+            let status = wait_until(&mut child, Duration::from_secs(2))?;
+            child.kill_all();
+            status
         };
         if let Some(writer) = self.writer.take() {
             let _ = writer.join();
@@ -4763,7 +4834,7 @@ impl Client {
 }
 
 fn failed_spawn(
-    child: Arc<Mutex<Child>>,
+    child: Arc<Mutex<OwnedChild>>,
     stdin: ChildStdin,
     reader: std::thread::JoinHandle<()>,
     error: io::Error,
@@ -4887,26 +4958,24 @@ fn fail_routes(
     }
 }
 
-fn wait_until(child: &mut Child, timeout: Duration) -> io::Result<std::process::ExitStatus> {
+fn wait_until(child: &mut OwnedChild, timeout: Duration) -> io::Result<std::process::ExitStatus> {
     let deadline = Instant::now() + timeout;
     loop {
         if let Some(status) = child.try_wait()? {
             return Ok(status);
         }
         if Instant::now() >= deadline {
-            let kill_error = child.kill().err();
+            child.kill_all();
             let reap_deadline = Instant::now() + timeout;
             loop {
                 if let Some(status) = child.try_wait()? {
                     return Ok(status);
                 }
                 if Instant::now() >= reap_deadline {
-                    return Err(kill_error.unwrap_or_else(|| {
-                        io::Error::new(
-                            io::ErrorKind::TimedOut,
-                            "tree worker did not exit after kill",
-                        )
-                    }));
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "tree worker did not exit after kill",
+                    ));
                 }
                 std::thread::sleep(Duration::from_millis(5));
             }
@@ -4915,19 +4984,18 @@ fn wait_until(child: &mut Child, timeout: Duration) -> io::Result<std::process::
     }
 }
 
-fn terminate(child: &mut Child, timeout: Duration) {
-    if child.try_wait().ok().flatten().is_some() {
-        return;
+fn terminate(child: &mut OwnedChild, timeout: Duration) {
+    let exited = child.try_wait().ok().flatten().is_some();
+    child.kill_all();
+    if !exited {
+        let _ = wait_until(child, timeout);
     }
-    let _ = child.kill();
-    let _ = wait_until(child, timeout);
 }
 
-fn terminate_by_transport(child: &mut Child, marker: &AtomicBool, timeout: Duration) {
-    if child.try_wait().ok().flatten().is_some() {
-        return;
+fn terminate_by_transport(child: &mut OwnedChild, marker: &AtomicBool, timeout: Duration) {
+    if child.try_wait().ok().flatten().is_none() {
+        marker.store(true, Ordering::Release);
     }
-    marker.store(true, Ordering::Release);
     terminate(child, timeout);
 }
 
@@ -4947,8 +5015,8 @@ mod tests {
         GrammarKey, Handshake, HandshakeReady, LaneAction, LaneRegistry, MAX_DOCUMENT_BYTES,
         MAX_DOCUMENT_REPLICAS, MAX_RETAINED_DOCUMENT_BYTES, MAX_RETAINED_ESTIMATED_DOCUMENT_BYTES,
         NavigateNode, NodeLayerSelector, NodeNavigation, NodeScalarOperation, NodeScalarValue,
-        OpaqueNodeId, PROTOCOL_VERSION, Request, RequestCancelled, RequestContext, ResolveNode,
-        Response, Route, RunCaptures, RunNodeScalar, RunnableDocuments,
+        OpaqueNodeId, OwnedChild, PROTOCOL_VERSION, Request, RequestCancelled, RequestContext,
+        ResolveNode, Response, Route, RunCaptures, RunNodeScalar, RunnableDocuments,
         SEMANTIC_CACHE_AUXILIARY_TRIM_THRESHOLD_BYTES, SyncDocument, WireByteRange, WirePosition,
         WireRange, WireSemanticToken, WorkPriority, WorkerError, WorkerQuerySources,
         cache_eviction_plan, close_document, decode_frame, derive_snapshot_with_language,
@@ -4974,9 +5042,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn termination_reaps_the_owned_process_group() {
-        use std::os::unix::process::CommandExt as _;
-
+    fn termination_kills_the_owned_process_group() {
         use nix::errno::Errno;
         use nix::sys::signal::{Signal, kill};
         use nix::unistd::Pid;
@@ -4985,15 +5051,18 @@ mod tests {
         let pid_path = directory.path().join("descendant.pid");
         let script = format!("sleep 30 & echo $! > '{}'; wait", pid_path.display());
         let mut command = std::process::Command::new("sh");
-        command.args(["-c", &script]).process_group(0);
-        let mut owner = command.spawn().unwrap();
+        command.args(["-c", &script]);
+        let mut owner = OwnedChild::spawn(command).unwrap();
 
         let deadline = Instant::now() + Duration::from_secs(2);
         let descendant = loop {
             if let Ok(pid) = std::fs::read_to_string(&pid_path) {
                 break Pid::from_raw(pid.trim().parse().unwrap());
             }
-            assert!(Instant::now() < deadline, "descendant pid was not published");
+            assert!(
+                Instant::now() < deadline,
+                "descendant pid was not published"
+            );
             std::thread::sleep(Duration::from_millis(5));
         };
 
@@ -5019,18 +5088,16 @@ mod tests {
     #[test]
     fn transport_termination_marker_excludes_already_exited_workers() {
         let marker = AtomicBool::new(false);
-        let mut running = std::process::Command::new("sh")
-            .args(["-c", "sleep 10"])
-            .spawn()
-            .unwrap();
+        let mut running_command = std::process::Command::new("sh");
+        running_command.args(["-c", "sleep 10"]);
+        let mut running = OwnedChild::spawn(running_command).unwrap();
         terminate_by_transport(&mut running, &marker, Duration::from_secs(1));
         assert!(marker.load(Ordering::Acquire));
 
         let marker = AtomicBool::new(false);
-        let mut exited = std::process::Command::new("sh")
-            .args(["-c", "exit 0"])
-            .spawn()
-            .unwrap();
+        let mut exited_command = std::process::Command::new("sh");
+        exited_command.args(["-c", "exit 0"]);
+        let mut exited = OwnedChild::spawn(exited_command).unwrap();
         exited.wait().unwrap();
         terminate_by_transport(&mut exited, &marker, Duration::from_secs(1));
         assert!(!marker.load(Ordering::Acquire));

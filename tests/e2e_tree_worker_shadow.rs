@@ -95,6 +95,50 @@ fn assert_host_tier_available(client: &mut LspClient, command: &str) {
     assert!(response.get("result").is_some(), "{response:?}");
 }
 
+#[cfg(unix)]
+#[test]
+fn normal_shutdown_terminates_worker_descendants() {
+    use nix::errno::Errno;
+    use nix::sys::signal::{Signal, kill};
+    use nix::unistd::Pid;
+
+    let directory = tempfile::tempdir().unwrap();
+    let pid_path = directory.path().join("worker-descendant.pid");
+    let mut client = LspClient::builder()
+        .env("KAKEHASHI_TREE_WORKER_MODE", "authoritative")
+        .env(
+            "KAKEHASHI_TREE_WORKER_DESCENDANT_PID_FILE",
+            pid_path.to_string_lossy(),
+        )
+        .build();
+    initialize(&mut client);
+    wait_for_file(&pid_path, "worker descendant pid was not published");
+    let descendant = Pid::from_raw(
+        std::fs::read_to_string(&pid_path)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap(),
+    );
+
+    let _stderr = shutdown_and_stderr(client);
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    let descendant_survived = loop {
+        match kill(descendant, None) {
+            Err(Errno::ESRCH) => break false,
+            Ok(()) | Err(Errno::EPERM) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            Ok(()) | Err(Errno::EPERM) => break true,
+            Err(error) => panic!("unexpected descendant liveness error: {error}"),
+        }
+    };
+    if descendant_survived {
+        let _ = kill(descendant, Signal::SIGKILL);
+    }
+    assert!(!descendant_survived, "worker descendant survived shutdown");
+}
+
 #[test]
 fn shadow_worker_matches_authoritative_incremental_lifecycle() {
     let mut client = LspClient::builder()
