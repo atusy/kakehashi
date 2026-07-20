@@ -31,6 +31,10 @@ pub const MAX_RETAINED_DOCUMENT_BYTES: usize = 512 * 1024 * 1024;
 // result from retaining a second full set of injection-derived caches. Stage 15
 // measured 74 KiB for the small fixture and 2.35 MiB for the pressure fixture.
 const SEMANTIC_CACHE_AUXILIARY_TRIM_THRESHOLD_BYTES: usize = 2 * 1024 * 1024;
+// tree-sitter does not expose allocation size. Admission therefore assigns a
+// conservative portable weight per retained subtree node; Stage 17 compares
+// the estimate with process footprint rather than treating it as measured RSS.
+const TREE_NODE_ADMISSION_BYTES: usize = 64;
 pub const BUILD_ID: &str = concat!(env!("CARGO_PKG_NAME"), "-", env!("CARGO_PKG_VERSION"));
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -672,6 +676,13 @@ fn estimated_injection_layer_bytes(layers: &[CachedInjectionLayer], capacity: us
         |bytes, layer| {
             bytes
                 .saturating_add(layer.ranges.capacity() * std::mem::size_of::<tree_sitter::Range>())
+                .saturating_add(
+                    layer
+                        .tree
+                        .root_node()
+                        .descendant_count()
+                        .saturating_mul(TREE_NODE_ADMISSION_BYTES),
+                )
         },
     ))
 }
@@ -679,7 +690,12 @@ fn estimated_injection_layer_bytes(layers: &[CachedInjectionLayer], capacity: us
 impl DocumentReplica {
     fn estimated_memory(&self) -> EstimatedDocumentMemory {
         EstimatedDocumentMemory {
-            non_evictable_bytes: self.text.capacity(),
+            non_evictable_bytes: self.text.capacity().saturating_add(
+                self.tree
+                    .root_node()
+                    .descendant_count()
+                    .saturating_mul(TREE_NODE_ADMISSION_BYTES),
+            ),
             result_cache_bytes: self
                 .cached_semantic_tokens
                 .as_ref()
@@ -5946,6 +5962,37 @@ mod tests {
             after.evictable_bytes(),
             before.evictable_bytes() + semantic_bytes
         );
+    }
+
+    #[test]
+    fn parsed_tree_contributes_to_non_evictable_memory() {
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_rust::LANGUAGE.into())
+            .unwrap();
+        let (replica, _) = DocumentReplica::sync(
+            SyncDocument {
+                context: RequestContext {
+                    request_id: 1,
+                    worker_generation: 3,
+                    uri: "file:///tree-accounting.rs".into(),
+                    incarnation: 4,
+                    content_version: 1,
+                    configuration_generation: 2,
+                },
+                language: "rust".into(),
+                grammar_symbol: "rust".into(),
+                source_path: "/unused/static-language".into(),
+                parser_path: "/unused/static-language".into(),
+                artifact_digest: "sha256:rust-v1".into(),
+                queries: WorkerQuerySources::default(),
+                text: "fn main() { let answer = 42; }".into(),
+            },
+            &mut parser,
+        )
+        .unwrap();
+
+        assert!(replica.estimated_memory().non_evictable_bytes > replica.text.capacity());
     }
 
     #[test]
