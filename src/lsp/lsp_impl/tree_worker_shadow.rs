@@ -2922,11 +2922,18 @@ fn run_actor(
             }
             Ok(_) => {}
             Err(error) => {
-                let worker_was_terminated = state
+                let client = state
                     .client
                     .as_ref()
-                    .is_some_and(|client| client.was_terminated_for_request_deadline());
-                if is_nonfatal_client_error(&error) && !worker_was_terminated {
+                    .expect("failed request retains its worker client");
+                let worker_was_terminated = client.was_terminated_for_request_deadline();
+                let worker_transport_is_live =
+                    client.try_wait().is_ok_and(|status| status.is_none());
+                if may_continue_after_client_error(
+                    &error,
+                    worker_was_terminated,
+                    worker_transport_is_live,
+                ) {
                     log::warn!(
                         target: "kakehashi::tree_worker_shadow",
                         "worker request did not complete without transport loss: {error}",
@@ -3695,6 +3702,14 @@ fn is_nonfatal_client_error(error: &std::io::Error) -> bool {
     )
 }
 
+fn may_continue_after_client_error(
+    error: &std::io::Error,
+    terminated_for_request_deadline: bool,
+    worker_transport_is_live: bool,
+) -> bool {
+    is_nonfatal_client_error(error) && !terminated_for_request_deadline && worker_transport_is_live
+}
+
 fn unique_active_grammars(
     active_hazards: &[crate::tree_worker::GrammarHazardArmed],
 ) -> Vec<GrammarIdentity> {
@@ -4158,6 +4173,20 @@ mod tests {
                 "retryable",
             )));
         }
+    }
+
+    #[test]
+    fn nonfatal_timeout_requires_a_confirmed_live_worker() {
+        let timeout = std::io::Error::new(std::io::ErrorKind::TimedOut, "deadline");
+
+        assert!(may_continue_after_client_error(&timeout, false, true));
+        assert!(!may_continue_after_client_error(&timeout, true, true));
+        assert!(!may_continue_after_client_error(&timeout, false, false));
+        assert!(!may_continue_after_client_error(
+            &std::io::Error::new(std::io::ErrorKind::BrokenPipe, "transport"),
+            false,
+            true,
+        ));
     }
 
     #[test]
