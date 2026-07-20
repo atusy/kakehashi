@@ -2848,6 +2848,16 @@ fn run_actor(
             }
             Ok(_) => {}
             Err(error) => {
+                if is_nonfatal_client_error(&error) {
+                    log::warn!(
+                        target: "kakehashi::tree_worker_shadow",
+                        "worker request did not complete without transport loss: {error}",
+                    );
+                    if let Some((uri, incarnation)) = command_document {
+                        comparisons.mark_closed(&uri, incarnation);
+                    }
+                    continue;
+                }
                 if is_local_client_error(&error) {
                     log::error!(
                         target: "kakehashi::tree_worker_shadow",
@@ -3575,9 +3585,14 @@ fn worker_loss_evidence(client: &Client, error: &std::io::Error) -> WorkerLossEv
 fn is_local_client_error(error: &std::io::Error) -> bool {
     matches!(
         error.kind(),
-        std::io::ErrorKind::InvalidInput
-            | std::io::ErrorKind::AlreadyExists
-            | std::io::ErrorKind::WouldBlock
+        std::io::ErrorKind::InvalidInput | std::io::ErrorKind::AlreadyExists
+    )
+}
+
+fn is_nonfatal_client_error(error: &std::io::Error) -> bool {
+    matches!(
+        error.kind(),
+        std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
     )
 }
 
@@ -4004,7 +4019,6 @@ mod tests {
         for kind in [
             std::io::ErrorKind::InvalidInput,
             std::io::ErrorKind::AlreadyExists,
-            std::io::ErrorKind::WouldBlock,
         ] {
             assert!(is_local_client_error(&std::io::Error::new(kind, "local")));
         }
@@ -4012,6 +4026,12 @@ mod tests {
             std::io::ErrorKind::BrokenPipe,
             "transport",
         )));
+        for kind in [std::io::ErrorKind::TimedOut, std::io::ErrorKind::WouldBlock] {
+            assert!(is_nonfatal_client_error(&std::io::Error::new(
+                kind,
+                "retryable",
+            )));
+        }
     }
 
     #[test]

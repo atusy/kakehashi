@@ -1330,7 +1330,7 @@ fn crash_quarantines_every_unique_committed_grammar_hazard() {
 }
 
 #[test]
-fn hung_grammar_hits_hard_deadline_and_other_grammar_recovers() {
+fn request_timeout_without_native_segment_does_not_quarantine_grammar() {
     let directory = tempfile::tempdir().unwrap();
     let marker = directory.path().join("hang-once");
     let mut client = LspClient::builder()
@@ -1396,26 +1396,11 @@ fn hung_grammar_hits_hard_deadline_and_other_grammar_recovers() {
     let stderr = shutdown_and_stderr(client);
     assert!(marker.exists(), "failure injection did not run: {stderr}");
     assert!(stderr.contains("timed out"), "{stderr}");
-    assert!(
-        stderr.contains("quarantined grammar conservatively for this session"),
-        "{stderr}"
-    );
-    assert!(stderr.contains("symbol=rust"), "{stderr}");
-    assert!(stderr.contains("restarted worker generation"), "{stderr}");
-    assert!(
-        stderr.contains("full-resynced 1 open documents"),
-        "{stderr}"
-    );
+    assert!(!stderr.contains("quarantined grammar"), "{stderr}");
+    assert!(!stderr.contains("restarted worker generation"), "{stderr}");
     assert_eq!(shadow_metric(&stderr, "matched"), 1, "{stderr}");
     assert!(stderr.contains("pending=0"), "{stderr}");
     assert!(!stderr.contains("disabled shadow tree tier"), "{stderr}");
-    eprintln!(
-        "hard-deadline recovery measurement: {}",
-        stderr
-            .lines()
-            .find(|line| line.contains("restarted worker generation"))
-            .expect("restart measurement log must be present")
-    );
 }
 
 #[test]

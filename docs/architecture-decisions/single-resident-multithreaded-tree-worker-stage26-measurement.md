@@ -23,12 +23,13 @@ worker-loss path observed no implicated grammar and produced zero quarantines.
 The GREEN E2E observes both complete arm frames before EOF, quarantines exactly
 Rust and Lua, restarts once, and full-resynchronizes only the healthy YAML
 document. A second server session serves Rust and Lua again, proving the
-quarantine is session-local. A separate hard-deadline E2E hangs only after its
-Rust arm frame is committed; it quarantines Rust from the ledger rather than
-inferring it from the timed-out command.
+quarantine is session-local. A separate request-timeout E2E hangs only after a
+Rust arm frame is committed but does not quarantine it: without the ADR's
+future `NativeSegmentEntered` deadline, a generic response deadline is systemic
+rather than sufficient parser-fault evidence.
 
 The focused 61 worker and 34 supervisor tests, the single-crash, multi-hazard,
-and hard-deadline E2Es, all-target Check, and warning-denying Clippy pass
+and request-timeout E2Es, all-target Check, and warning-denying Clippy pass
 locally.
 
 ## Recovery measurement

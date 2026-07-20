@@ -5556,10 +5556,7 @@ impl Client {
         let response = match response_rx.recv_timeout(remaining) {
             Ok(response) => response?,
             Err(mpsc::RecvTimeoutError::Timeout) => {
-                self.remove_route(request_id);
-                if let Ok(mut child) = self.child.lock() {
-                    terminate(&mut child, Duration::from_secs(1));
-                }
+                let _ = self.cancel_request(request_id);
                 return Err(io::Error::new(
                     io::ErrorKind::TimedOut,
                     format!("tree worker request {request_id} timed out"),
