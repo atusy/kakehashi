@@ -1218,6 +1218,17 @@ noise-scale memory deltas and exact-version latency moved by only +0.6% to
 RSS cap; configurable-boundary stress, failure injection, protocol and
 compatibility gates remain open.
 
+The [Stage 18 memory-stress measurement](single-resident-multithreaded-tree-worker-stage18-measurement.md)
+injects immutable worker-process budgets and exposes stateless internal memory
+inspection. Six reduced-budget release runs deterministically observed soft
+eviction, identical recomputation, node-identity preservation, transactional
+full-sync and incremental-edit rejection, and subsequent recovery without a
+worker restart. Default-budget exact-version latency remained noise-scale;
+three-document memory medians were higher but paired ranges crossed zero by a
+wide margin. This validates the admission policy end to end without claiming a
+total-RSS cap or a repeatable default-memory change. Failure injection,
+protocol and compatibility gates, and legacy-path removal remain open.
+
 The implementation should proceed in measured stages:
 
 1. Prototype the framed transport, supervision, and one high-level

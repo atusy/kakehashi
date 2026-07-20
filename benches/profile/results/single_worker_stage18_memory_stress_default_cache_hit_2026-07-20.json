@@ -1,0 +1,38 @@
+{
+  "experiment": "single worker stage 18 memory stress exact-version cache hit",
+  "date": "2026-07-20",
+  "baseline": {
+    "stage": 17,
+    "binary_sha256": "fb44ffe210efa84f088914bc38e81e0b98120789f4c066d709d6cef77eb6c57d"
+  },
+  "candidate": {
+    "stage": 18,
+    "source_commit": "9b46c7360661fdf1294914b27b4e3a3c86df6c29",
+    "binary_sha256": "ce06bbfd7bce95d7b0867142008e5a381a16d3ef26b6d0064c230d288b75dfc4"
+  },
+  "scenario": {
+    "language": "markdown",
+    "generated_size": 5000,
+    "documents": 1,
+    "measured_requests": 20,
+    "warm_semantic_cache": true,
+    "settle_seconds": 0.5,
+    "worker_threads": 4,
+    "memory_sampling": false,
+    "order": "baseline-candidate on odd runs; candidate-baseline on even runs"
+  },
+  "runs": [
+    {"run": 1, "baseline": {"p50_ms": 78.7, "p95_ms": 81.7, "wall_ms_per_cycle": 127.37}, "candidate": {"p50_ms": 75.5, "p95_ms": 81.7, "wall_ms_per_cycle": 118.90}},
+    {"run": 2, "baseline": {"p50_ms": 75.3, "p95_ms": 80.8, "wall_ms_per_cycle": 120.56}, "candidate": {"p50_ms": 77.6, "p95_ms": 81.8, "wall_ms_per_cycle": 121.71}},
+    {"run": 3, "baseline": {"p50_ms": 76.3, "p95_ms": 78.4, "wall_ms_per_cycle": 117.63}, "candidate": {"p50_ms": 76.6, "p95_ms": 80.3, "wall_ms_per_cycle": 118.53}},
+    {"run": 4, "baseline": {"p50_ms": 77.2, "p95_ms": 79.7, "wall_ms_per_cycle": 120.93}, "candidate": {"p50_ms": 76.7, "p95_ms": 80.7, "wall_ms_per_cycle": 121.63}},
+    {"run": 5, "baseline": {"p50_ms": 77.4, "p95_ms": 80.9, "wall_ms_per_cycle": 121.68}, "candidate": {"p50_ms": 76.4, "p95_ms": 81.0, "wall_ms_per_cycle": 120.43}},
+    {"run": 6, "baseline": {"p50_ms": 76.4, "p95_ms": 79.2, "wall_ms_per_cycle": 120.30}, "candidate": {"p50_ms": 77.7, "p95_ms": 79.9, "wall_ms_per_cycle": 121.69}},
+    {"run": 7, "baseline": {"p50_ms": 77.1, "p95_ms": 80.6, "wall_ms_per_cycle": 122.03}, "candidate": {"p50_ms": 76.4, "p95_ms": 78.7, "wall_ms_per_cycle": 118.48}},
+    {"run": 8, "baseline": {"p50_ms": 77.2, "p95_ms": 80.4, "wall_ms_per_cycle": 120.08}, "candidate": {"p50_ms": 75.6, "p95_ms": 79.6, "wall_ms_per_cycle": 119.54}},
+    {"run": 9, "baseline": {"p50_ms": 76.4, "p95_ms": 79.3, "wall_ms_per_cycle": 122.44}, "candidate": {"p50_ms": 75.3, "p95_ms": 77.4, "wall_ms_per_cycle": 118.50}},
+    {"run": 10, "baseline": {"p50_ms": 75.8, "p95_ms": 78.1, "wall_ms_per_cycle": 118.09}, "candidate": {"p50_ms": 76.3, "p95_ms": 79.8, "wall_ms_per_cycle": 118.02}},
+    {"run": 11, "baseline": {"p50_ms": 77.5, "p95_ms": 81.2, "wall_ms_per_cycle": 120.62}, "candidate": {"p50_ms": 75.3, "p95_ms": 77.6, "wall_ms_per_cycle": 117.06}},
+    {"run": 12, "baseline": {"p50_ms": 75.6, "p95_ms": 80.4, "wall_ms_per_cycle": 119.51}, "candidate": {"p50_ms": 78.3, "p95_ms": 83.1, "wall_ms_per_cycle": 125.32}}
+  ]
+}

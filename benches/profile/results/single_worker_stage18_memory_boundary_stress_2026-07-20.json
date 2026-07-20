@@ -1,0 +1,389 @@
+{
+  "schema": 1,
+  "experiment": "single-tree-worker-stage18-memory-boundary-stress",
+  "environment": {
+    "platform": "macOS-26.5.1-arm64-arm-64bit",
+    "python": "3.12.13",
+    "rustc": "rustc 1.95.0 (59807616e 2026-04-14) (built from a source tarball)",
+    "cpu_model": "Apple M4",
+    "source_commit": "9b46c7360661fdf1294914b27b4e3a3c86df6c29",
+    "worker_binary_sha256": "ce06bbfd7bce95d7b0867142008e5a381a16d3ef26b6d0064c230d288b75dfc4",
+    "driver_binary_sha256": "9ac0590725fd23ea16d57394a95d76ea629b1fbc82c5bdc53291501f8c2e91ae",
+    "worker_build_command": "cargo build --locked --release --bin kakehashi",
+    "driver_build_command": "cargo build --locked --release --example tree_worker_memory_stress",
+    "features": "default",
+    "retained_environment": {
+      "PATH": "<redacted-search-path>",
+      "TMPDIR": "<redacted-path>",
+      "LANG": "C.UTF-8",
+      "LC_ALL": "C.UTF-8"
+    }
+  },
+  "artifacts": [
+    19,
+    "f8c2b2cabd37920d217a1d8712f7588dde2a57e530714e02693744e8b324d768"
+  ],
+  "collector": {
+    "batches": 6,
+    "sample_interval_ms": 20.0,
+    "footprint_interval_ms": 250.0,
+    "metric": "sum of RSS/footprint for the stress driver and worker child"
+  },
+  "scenario": {
+    "derived_cache_soft_bytes": 20,
+    "non_evictable_estimate_hard_bytes": 4096,
+    "hold_open_seconds": 2.0,
+    "documents": 2,
+    "language": "rust"
+  },
+  "batches": [
+    {
+      "batch": 1,
+      "report": {
+        "worker_generation": 1,
+        "derived_cache_soft_bytes": 20,
+        "non_evictable_estimate_hard_bytes": 4096,
+        "first_a_us": 4032,
+        "first_b_us": 109,
+        "recompute_a_us": 88,
+        "rejected_full_sync_us": 1368,
+        "rejected_incremental_edit_us": 993,
+        "recovery_edit_us": 125,
+        "token_count": 1,
+        "recomputed_tokens_match": true,
+        "node_identity_survived": true,
+        "full_sync_rejection": "worker estimated non-evictable budget 4096 bytes exceeded",
+        "incremental_edit_rejection": "worker estimated non-evictable budget 4096 bytes exceeded",
+        "a_after_pressure": {
+          "context": {
+            "request_id": 7,
+            "worker_generation": 1,
+            "uri": "file:///memory-stress-a.rs",
+            "incarnation": 1,
+            "content_version": 1,
+            "configuration_generation": 0
+          },
+          "derived_cache_soft_bytes": 20,
+          "non_evictable_estimate_hard_bytes": 4096,
+          "non_evictable_bytes": 652,
+          "result_cache_bytes": 0,
+          "auxiliary_cache_bytes": 0
+        },
+        "b_after_pressure": {
+          "context": {
+            "request_id": 8,
+            "worker_generation": 1,
+            "uri": "file:///memory-stress-b.rs",
+            "incarnation": 1,
+            "content_version": 1,
+            "configuration_generation": 0
+          },
+          "derived_cache_soft_bytes": 20,
+          "non_evictable_estimate_hard_bytes": 4096,
+          "non_evictable_bytes": 652,
+          "result_cache_bytes": 20,
+          "auxiliary_cache_bytes": 0
+        }
+      },
+      "memory": {
+        "sample_count": 23,
+        "peak_total_rss_kib": 20256,
+        "stable_median_total_rss_kib": 20256,
+        "peak_process_count": 2,
+        "footprint_sample_count": 11,
+        "peak_total_footprint_bytes": 6865640,
+        "stable_median_total_footprint_bytes": 6865640
+      }
+    },
+    {
+      "batch": 2,
+      "report": {
+        "worker_generation": 1,
+        "derived_cache_soft_bytes": 20,
+        "non_evictable_estimate_hard_bytes": 4096,
+        "first_a_us": 3337,
+        "first_b_us": 112,
+        "recompute_a_us": 88,
+        "rejected_full_sync_us": 1426,
+        "rejected_incremental_edit_us": 1071,
+        "recovery_edit_us": 116,
+        "token_count": 1,
+        "recomputed_tokens_match": true,
+        "node_identity_survived": true,
+        "full_sync_rejection": "worker estimated non-evictable budget 4096 bytes exceeded",
+        "incremental_edit_rejection": "worker estimated non-evictable budget 4096 bytes exceeded",
+        "a_after_pressure": {
+          "context": {
+            "request_id": 7,
+            "worker_generation": 1,
+            "uri": "file:///memory-stress-a.rs",
+            "incarnation": 1,
+            "content_version": 1,
+            "configuration_generation": 0
+          },
+          "derived_cache_soft_bytes": 20,
+          "non_evictable_estimate_hard_bytes": 4096,
+          "non_evictable_bytes": 652,
+          "result_cache_bytes": 0,
+          "auxiliary_cache_bytes": 0
+        },
+        "b_after_pressure": {
+          "context": {
+            "request_id": 8,
+            "worker_generation": 1,
+            "uri": "file:///memory-stress-b.rs",
+            "incarnation": 1,
+            "content_version": 1,
+            "configuration_generation": 0
+          },
+          "derived_cache_soft_bytes": 20,
+          "non_evictable_estimate_hard_bytes": 4096,
+          "non_evictable_bytes": 652,
+          "result_cache_bytes": 20,
+          "auxiliary_cache_bytes": 0
+        }
+      },
+      "memory": {
+        "sample_count": 15,
+        "peak_total_rss_kib": 20352,
+        "stable_median_total_rss_kib": 20352,
+        "peak_process_count": 2,
+        "footprint_sample_count": 8,
+        "peak_total_footprint_bytes": 6947536,
+        "stable_median_total_footprint_bytes": 6947536
+      }
+    },
+    {
+      "batch": 3,
+      "report": {
+        "worker_generation": 1,
+        "derived_cache_soft_bytes": 20,
+        "non_evictable_estimate_hard_bytes": 4096,
+        "first_a_us": 3002,
+        "first_b_us": 112,
+        "recompute_a_us": 76,
+        "rejected_full_sync_us": 1227,
+        "rejected_incremental_edit_us": 773,
+        "recovery_edit_us": 93,
+        "token_count": 1,
+        "recomputed_tokens_match": true,
+        "node_identity_survived": true,
+        "full_sync_rejection": "worker estimated non-evictable budget 4096 bytes exceeded",
+        "incremental_edit_rejection": "worker estimated non-evictable budget 4096 bytes exceeded",
+        "a_after_pressure": {
+          "context": {
+            "request_id": 7,
+            "worker_generation": 1,
+            "uri": "file:///memory-stress-a.rs",
+            "incarnation": 1,
+            "content_version": 1,
+            "configuration_generation": 0
+          },
+          "derived_cache_soft_bytes": 20,
+          "non_evictable_estimate_hard_bytes": 4096,
+          "non_evictable_bytes": 652,
+          "result_cache_bytes": 0,
+          "auxiliary_cache_bytes": 0
+        },
+        "b_after_pressure": {
+          "context": {
+            "request_id": 8,
+            "worker_generation": 1,
+            "uri": "file:///memory-stress-b.rs",
+            "incarnation": 1,
+            "content_version": 1,
+            "configuration_generation": 0
+          },
+          "derived_cache_soft_bytes": 20,
+          "non_evictable_estimate_hard_bytes": 4096,
+          "non_evictable_bytes": 652,
+          "result_cache_bytes": 20,
+          "auxiliary_cache_bytes": 0
+        }
+      },
+      "memory": {
+        "sample_count": 15,
+        "peak_total_rss_kib": 20304,
+        "stable_median_total_rss_kib": 20304,
+        "peak_process_count": 2,
+        "footprint_sample_count": 8,
+        "peak_total_footprint_bytes": 6898384,
+        "stable_median_total_footprint_bytes": 6898384
+      }
+    },
+    {
+      "batch": 4,
+      "report": {
+        "worker_generation": 1,
+        "derived_cache_soft_bytes": 20,
+        "non_evictable_estimate_hard_bytes": 4096,
+        "first_a_us": 4206,
+        "first_b_us": 123,
+        "recompute_a_us": 79,
+        "rejected_full_sync_us": 1361,
+        "rejected_incremental_edit_us": 1003,
+        "recovery_edit_us": 80,
+        "token_count": 1,
+        "recomputed_tokens_match": true,
+        "node_identity_survived": true,
+        "full_sync_rejection": "worker estimated non-evictable budget 4096 bytes exceeded",
+        "incremental_edit_rejection": "worker estimated non-evictable budget 4096 bytes exceeded",
+        "a_after_pressure": {
+          "context": {
+            "request_id": 7,
+            "worker_generation": 1,
+            "uri": "file:///memory-stress-a.rs",
+            "incarnation": 1,
+            "content_version": 1,
+            "configuration_generation": 0
+          },
+          "derived_cache_soft_bytes": 20,
+          "non_evictable_estimate_hard_bytes": 4096,
+          "non_evictable_bytes": 652,
+          "result_cache_bytes": 0,
+          "auxiliary_cache_bytes": 0
+        },
+        "b_after_pressure": {
+          "context": {
+            "request_id": 8,
+            "worker_generation": 1,
+            "uri": "file:///memory-stress-b.rs",
+            "incarnation": 1,
+            "content_version": 1,
+            "configuration_generation": 0
+          },
+          "derived_cache_soft_bytes": 20,
+          "non_evictable_estimate_hard_bytes": 4096,
+          "non_evictable_bytes": 652,
+          "result_cache_bytes": 20,
+          "auxiliary_cache_bytes": 0
+        }
+      },
+      "memory": {
+        "sample_count": 15,
+        "peak_total_rss_kib": 20224,
+        "stable_median_total_rss_kib": 20224,
+        "peak_process_count": 2,
+        "footprint_sample_count": 7,
+        "peak_total_footprint_bytes": 6832872,
+        "stable_median_total_footprint_bytes": 6832872
+      }
+    },
+    {
+      "batch": 5,
+      "report": {
+        "worker_generation": 1,
+        "derived_cache_soft_bytes": 20,
+        "non_evictable_estimate_hard_bytes": 4096,
+        "first_a_us": 3843,
+        "first_b_us": 83,
+        "recompute_a_us": 75,
+        "rejected_full_sync_us": 1279,
+        "rejected_incremental_edit_us": 922,
+        "recovery_edit_us": 82,
+        "token_count": 1,
+        "recomputed_tokens_match": true,
+        "node_identity_survived": true,
+        "full_sync_rejection": "worker estimated non-evictable budget 4096 bytes exceeded",
+        "incremental_edit_rejection": "worker estimated non-evictable budget 4096 bytes exceeded",
+        "a_after_pressure": {
+          "context": {
+            "request_id": 7,
+            "worker_generation": 1,
+            "uri": "file:///memory-stress-a.rs",
+            "incarnation": 1,
+            "content_version": 1,
+            "configuration_generation": 0
+          },
+          "derived_cache_soft_bytes": 20,
+          "non_evictable_estimate_hard_bytes": 4096,
+          "non_evictable_bytes": 652,
+          "result_cache_bytes": 0,
+          "auxiliary_cache_bytes": 0
+        },
+        "b_after_pressure": {
+          "context": {
+            "request_id": 8,
+            "worker_generation": 1,
+            "uri": "file:///memory-stress-b.rs",
+            "incarnation": 1,
+            "content_version": 1,
+            "configuration_generation": 0
+          },
+          "derived_cache_soft_bytes": 20,
+          "non_evictable_estimate_hard_bytes": 4096,
+          "non_evictable_bytes": 652,
+          "result_cache_bytes": 20,
+          "auxiliary_cache_bytes": 0
+        }
+      },
+      "memory": {
+        "sample_count": 16,
+        "peak_total_rss_kib": 20272,
+        "stable_median_total_rss_kib": 20272,
+        "peak_process_count": 2,
+        "footprint_sample_count": 8,
+        "peak_total_footprint_bytes": 6865616,
+        "stable_median_total_footprint_bytes": 6865616
+      }
+    },
+    {
+      "batch": 6,
+      "report": {
+        "worker_generation": 1,
+        "derived_cache_soft_bytes": 20,
+        "non_evictable_estimate_hard_bytes": 4096,
+        "first_a_us": 3113,
+        "first_b_us": 154,
+        "recompute_a_us": 71,
+        "rejected_full_sync_us": 1215,
+        "rejected_incremental_edit_us": 963,
+        "recovery_edit_us": 100,
+        "token_count": 1,
+        "recomputed_tokens_match": true,
+        "node_identity_survived": true,
+        "full_sync_rejection": "worker estimated non-evictable budget 4096 bytes exceeded",
+        "incremental_edit_rejection": "worker estimated non-evictable budget 4096 bytes exceeded",
+        "a_after_pressure": {
+          "context": {
+            "request_id": 7,
+            "worker_generation": 1,
+            "uri": "file:///memory-stress-a.rs",
+            "incarnation": 1,
+            "content_version": 1,
+            "configuration_generation": 0
+          },
+          "derived_cache_soft_bytes": 20,
+          "non_evictable_estimate_hard_bytes": 4096,
+          "non_evictable_bytes": 652,
+          "result_cache_bytes": 0,
+          "auxiliary_cache_bytes": 0
+        },
+        "b_after_pressure": {
+          "context": {
+            "request_id": 8,
+            "worker_generation": 1,
+            "uri": "file:///memory-stress-b.rs",
+            "incarnation": 1,
+            "content_version": 1,
+            "configuration_generation": 0
+          },
+          "derived_cache_soft_bytes": 20,
+          "non_evictable_estimate_hard_bytes": 4096,
+          "non_evictable_bytes": 652,
+          "result_cache_bytes": 20,
+          "auxiliary_cache_bytes": 0
+        }
+      },
+      "memory": {
+        "sample_count": 14,
+        "peak_total_rss_kib": 20304,
+        "stable_median_total_rss_kib": 20304,
+        "peak_process_count": 2,
+        "footprint_sample_count": 7,
+        "peak_total_footprint_bytes": 6914792,
+        "stable_median_total_footprint_bytes": 6914792
+      }
+    }
+  ]
+}
