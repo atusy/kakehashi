@@ -4,10 +4,10 @@ use std::sync::{Arc, Barrier};
 #[cfg(feature = "e2e")]
 use kakehashi::tree_worker::{
     ApplyDocumentEdits, ByteEdit, CloseDocument, ConfigureLanguages, DeriveDocumentSnapshot,
-    DeriveNativeBindings, DeriveSemanticTokens, NavigateNode, NodeNavigation, NodeScalarOperation,
-    NodeScalarValue, OpaqueNodeId, ResolveNode, RunCaptures, RunNodeScalar, SyncDocument,
-    WireByteRange, WirePosition, WorkerLanguageAsset, WorkerLanguageCatalog, WorkerQuerySources,
-    WorkerTestMemoryBudgets,
+    DeriveNativeBindings, DeriveSemanticTokens, InspectDocumentMemory, NavigateNode,
+    NodeNavigation, NodeScalarOperation, NodeScalarValue, OpaqueNodeId, ResolveNode, RunCaptures,
+    RunNodeScalar, SyncDocument, WireByteRange, WirePosition, WorkerLanguageAsset,
+    WorkerLanguageCatalog, WorkerQuerySources, WorkerTestMemoryBudgets,
 };
 use kakehashi::tree_worker::{Client, DeriveSnapshot, RequestContext, Response};
 
@@ -484,6 +484,160 @@ fn rejected_incremental_edit_preserves_replica_and_admission_capacity() {
         })
         .unwrap();
     assert!(matches!(response, Response::DocumentAck(_)));
+    worker.shutdown().unwrap();
+}
+
+#[cfg(feature = "e2e")]
+#[test]
+fn soft_budget_evicts_non_current_result_without_invalidating_identity() {
+    let data_dir = kakehashi::install::test_support::test_data_dir_path();
+    std::fs::create_dir_all(&data_dir).unwrap();
+    kakehashi::install::test_support::ensure_test_languages_installed(&data_dir).unwrap();
+    let parser = data_dir
+        .join("parser")
+        .join(format!("rust.{}", std::env::consts::DLL_EXTENSION));
+    let executable = PathBuf::from(env!("CARGO_BIN_EXE_kakehashi"));
+    let worker = Client::spawn_with_test_memory_budgets(
+        &executable,
+        1,
+        48,
+        WorkerTestMemoryBudgets::new(20, 4096).unwrap(),
+    )
+    .unwrap();
+    let catalog_context = RequestContext {
+        request_id: 1,
+        worker_generation: 48,
+        uri: "kakehashi://memory-stress-catalog".into(),
+        incarnation: 0,
+        content_version: 0,
+        configuration_generation: 0,
+    };
+    let response = worker
+        .configure_languages(ConfigureLanguages {
+            context: catalog_context,
+            catalog: WorkerLanguageCatalog {
+                assets: vec![WorkerLanguageAsset {
+                    language: "rust".into(),
+                    grammar_symbol: "rust".into(),
+                    source_path: parser.clone(),
+                    parser_path: parser.clone(),
+                    artifact_digest: digest(&parser),
+                    queries: WorkerQuerySources::default(),
+                }],
+                capture_mappings: serde_json::from_value(serde_json::json!({
+                    "rust": { "highlights": { "variable": "keyword" } }
+                }))
+                .unwrap(),
+                search_paths: Vec::new(),
+            },
+        })
+        .unwrap();
+    assert!(matches!(response, Response::LanguageCatalogAck(_)));
+
+    let context = |request_id, uri: &str| RequestContext {
+        request_id,
+        worker_generation: 48,
+        uri: uri.into(),
+        incarnation: 1,
+        content_version: 1,
+        configuration_generation: 0,
+    };
+    let a = context(2, "file:///soft-a.rs");
+    let b = context(3, "file:///soft-b.rs");
+    for document in [&a, &b] {
+        let response = worker
+            .sync_document(SyncDocument {
+                context: document.clone(),
+                language: "rust".into(),
+                grammar_symbol: "rust".into(),
+                source_path: parser.clone(),
+                parser_path: parser.clone(),
+                artifact_digest: digest(&parser),
+                queries: WorkerQuerySources {
+                    highlights: Some("(identifier) @variable".into()),
+                    ..Default::default()
+                },
+                text: "fn main() {}".into(),
+            })
+            .unwrap();
+        assert!(matches!(response, Response::DocumentAck(_)));
+    }
+    let response = worker
+        .resolve_node(ResolveNode {
+            context: RequestContext {
+                request_id: 4,
+                ..a.clone()
+            },
+            byte_offset: 3,
+            named: true,
+            layer: kakehashi::tree_worker::NodeLayerSelector::Host,
+        })
+        .unwrap();
+    let Response::Nodes(nodes) = response else {
+        panic!("document A node identity must be minted: {response:?}");
+    };
+    let a_node = nodes.nodes[0].id.clone();
+
+    let derive = |request_id, context: &RequestContext| {
+        worker
+            .derive_semantic_tokens(DeriveSemanticTokens {
+                context: RequestContext {
+                    request_id,
+                    ..context.clone()
+                },
+                supports_multiline: false,
+            })
+            .unwrap()
+    };
+    let Response::SemanticTokens(a_first) = derive(5, &a) else {
+        panic!("document A semantic derivation must succeed");
+    };
+    assert!(!a_first.cache_hit);
+    let Response::SemanticTokens(b_first) = derive(6, &b) else {
+        panic!("document B semantic derivation must succeed");
+    };
+    assert!(!b_first.cache_hit);
+
+    let inspect = |request_id, context: &RequestContext| {
+        worker
+            .inspect_document_memory(InspectDocumentMemory {
+                context: RequestContext {
+                    request_id,
+                    ..context.clone()
+                },
+            })
+            .unwrap()
+    };
+    let Response::DocumentMemory(a_memory) = inspect(7, &a) else {
+        panic!("document A memory must be inspectable");
+    };
+    let Response::DocumentMemory(b_memory) = inspect(8, &b) else {
+        panic!("document B memory must be inspectable");
+    };
+    assert_eq!(a_memory.result_cache_bytes, 0);
+    assert_eq!(a_memory.auxiliary_cache_bytes, 0);
+    assert_eq!(b_memory.result_cache_bytes, 20);
+    assert_eq!(b_memory.auxiliary_cache_bytes, 0);
+
+    let Response::SemanticTokens(a_recomputed) = derive(9, &a) else {
+        panic!("evicted document A must recompute");
+    };
+    assert!(!a_recomputed.cache_hit);
+    assert_eq!(a_recomputed.tokens, a_first.tokens);
+    let response = worker
+        .run_node_scalar(RunNodeScalar {
+            context: RequestContext {
+                request_id: 10,
+                ..a
+            },
+            node_id: a_node,
+            operation: NodeScalarOperation::Text,
+        })
+        .unwrap();
+    let Response::NodeScalar(node) = response else {
+        panic!("cache eviction must preserve node identity: {response:?}");
+    };
+    assert_eq!(node.value, Some(NodeScalarValue::String("main".into())));
     worker.shutdown().unwrap();
 }
 

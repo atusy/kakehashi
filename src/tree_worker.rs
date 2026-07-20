@@ -22,7 +22,7 @@ use sha2::{Digest, Sha256};
 
 use crate::language::node_tracker::{EditInfo, NodeTracker};
 
-pub const PROTOCOL_VERSION: u32 = 15;
+pub const PROTOCOL_VERSION: u32 = 16;
 pub const MAX_FRAME_BYTES: usize = 64 * 1024 * 1024;
 pub const MAX_DOCUMENT_REPLICAS: usize = 4_096;
 pub const MAX_DOCUMENT_BYTES: usize = 32 * 1024 * 1024;
@@ -540,6 +540,21 @@ pub struct CloseDocument {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct InspectDocumentMemory {
+    pub context: RequestContext,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct DocumentMemoryStats {
+    pub context: RequestContext,
+    pub derived_cache_soft_bytes: usize,
+    pub non_evictable_estimate_hard_bytes: usize,
+    pub non_evictable_bytes: usize,
+    pub result_cache_bytes: usize,
+    pub auxiliary_cache_bytes: usize,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct DocumentAck {
     pub context: RequestContext,
     pub incremental: bool,
@@ -585,6 +600,7 @@ pub enum Request {
     RunCaptures(RunCaptures),
     DeriveNativeBindings(DeriveNativeBindings),
     ConfigureLanguages(ConfigureLanguages),
+    InspectDocumentMemory(InspectDocumentMemory),
     CloseDocument(CloseDocument),
 }
 
@@ -632,6 +648,7 @@ pub enum Response {
     Captures(CapturesResult),
     NativeBindings(NativeBindingsResult),
     LanguageCatalogAck(LanguageCatalogAck),
+    DocumentMemory(DocumentMemoryStats),
     Error(WorkerError),
 }
 
@@ -2867,6 +2884,7 @@ fn request_priority(request: &Request) -> WorkPriority {
         | Request::RunCaptures(_)
         | Request::DeriveNativeBindings(_)
         | Request::ConfigureLanguages(_)
+        | Request::InspectDocumentMemory(_)
         | Request::CloseDocument(_) => WorkPriority::Foreground,
     }
 }
@@ -2959,6 +2977,9 @@ fn handle_work(
         Request::RunCaptures(request) => run_captures(request, documents),
         Request::DeriveNativeBindings(request) => derive_native_bindings(request, documents),
         Request::ConfigureLanguages(request) => configure_languages(request, analysis),
+        Request::InspectDocumentMemory(request) => {
+            inspect_document_memory(request, documents, memory_budgets)
+        }
         Request::CloseDocument(request) => close_document(
             request,
             documents,
@@ -3022,6 +3043,7 @@ fn request_context(request: &Request) -> Option<&RequestContext> {
         Request::RunCaptures(request) => Some(&request.context),
         Request::DeriveNativeBindings(request) => Some(&request.context),
         Request::ConfigureLanguages(request) => Some(&request.context),
+        Request::InspectDocumentMemory(request) => Some(&request.context),
         Request::CloseDocument(request) => Some(&request.context),
     }
 }
@@ -3040,6 +3062,7 @@ fn document_key(request: &Request) -> Option<DocumentKey> {
         Request::DeriveSemanticTokens(request) => Some(DocumentKey::from(&request.context)),
         Request::RunCaptures(request) => Some(DocumentKey::from(&request.context)),
         Request::DeriveNativeBindings(request) => Some(DocumentKey::from(&request.context)),
+        Request::InspectDocumentMemory(request) => Some(DocumentKey::from(&request.context)),
         Request::CloseDocument(request) => Some(DocumentKey::from(&request.context)),
         Request::Handshake(_)
         | Request::Cancel(_)
@@ -3062,6 +3085,43 @@ fn is_cancellable_reader_request(request: &Request) -> bool {
             | Request::RunCaptures(_)
             | Request::DeriveNativeBindings(_)
     )
+}
+
+fn inspect_document_memory(
+    request: InspectDocumentMemory,
+    documents: &DocumentStore,
+    memory_budgets: WorkerMemoryBudgets,
+) -> Response {
+    let context = request.context;
+    let Some(replica) = documents
+        .get(&DocumentKey::from(&context))
+        .map(|entry| Arc::clone(entry.value()))
+    else {
+        return Response::Error(WorkerError {
+            context: Some(context),
+            message: "document replica is missing; full sync required".into(),
+        });
+    };
+    match replica.lock() {
+        Ok(replica) => {
+            if let Err(message) = replica.validate_read_identity(&context) {
+                return Response::Error(WorkerError {
+                    context: Some(context),
+                    message,
+                });
+            }
+            let estimated = replica.estimated_memory();
+            Response::DocumentMemory(DocumentMemoryStats {
+                context,
+                derived_cache_soft_bytes: memory_budgets.derived_cache_soft_bytes,
+                non_evictable_estimate_hard_bytes: memory_budgets.non_evictable_estimate_hard_bytes,
+                non_evictable_bytes: estimated.non_evictable_bytes,
+                result_cache_bytes: estimated.result_cache_bytes,
+                auxiliary_cache_bytes: estimated.auxiliary_cache_bytes,
+            })
+        }
+        Err(_) => poisoned_document_restart(context),
+    }
 }
 
 fn resolve_node(request: ResolveNode, documents: &DocumentStore) -> Response {
@@ -4559,6 +4619,13 @@ impl Client {
         self.request_with_timeout(Request::ConfigureLanguages(request), context, timeout)
     }
 
+    #[doc(hidden)]
+    pub fn inspect_document_memory(&self, request: InspectDocumentMemory) -> io::Result<Response> {
+        let context = request.context.clone();
+        let timeout = request_timeout(&context.uri);
+        self.request_with_timeout(Request::InspectDocumentMemory(request), context, timeout)
+    }
+
     pub fn close_document(&self, request: CloseDocument) -> io::Result<Response> {
         let context = request.context.clone();
         let timeout = request_timeout(&context.uri);
@@ -4724,6 +4791,7 @@ fn response_request_id(response: &Response) -> Option<u64> {
         Response::Captures(result) => Some(result.context.request_id),
         Response::NativeBindings(result) => Some(result.context.request_id),
         Response::LanguageCatalogAck(ack) => Some(ack.context.request_id),
+        Response::DocumentMemory(result) => Some(result.context.request_id),
         Response::Error(error) => error.context.as_ref().map(|context| context.request_id),
         Response::HandshakeReady(_) => None,
     }
@@ -4744,6 +4812,7 @@ fn response_context(response: &Response) -> Option<&RequestContext> {
         Response::Captures(result) => Some(&result.context),
         Response::NativeBindings(result) => Some(&result.context),
         Response::LanguageCatalogAck(ack) => Some(&ack.context),
+        Response::DocumentMemory(result) => Some(&result.context),
         Response::Error(error) => error.context.as_ref(),
         Response::HandshakeReady(_) => None,
     }
