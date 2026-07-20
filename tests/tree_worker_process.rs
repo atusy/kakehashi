@@ -634,6 +634,9 @@ fn soft_budget_evicts_non_current_result_without_invalidating_identity() {
     assert_eq!(a_memory.auxiliary_cache_bytes, 0);
     assert_eq!(b_memory.result_cache_bytes, 20);
     assert_eq!(b_memory.auxiliary_cache_bytes, 0);
+    assert_eq!(b_memory.derived_cache_soft_bytes, 20);
+    assert_eq!(b_memory.non_evictable_estimate_hard_bytes, 4096);
+    assert!(b_memory.non_evictable_bytes > 0);
 
     let Response::SemanticTokens(a_recomputed) = derive(9, &a) else {
         panic!("evicted document A must recompute");

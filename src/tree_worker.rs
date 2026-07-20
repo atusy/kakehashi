@@ -4279,7 +4279,8 @@ impl Client {
         )
     }
 
-    fn spawn_with_memory_budgets(
+    #[doc(hidden)]
+    pub fn spawn_with_memory_budgets(
         executable: &std::path::Path,
         compute_threads: usize,
         worker_generation: u64,
