@@ -5486,11 +5486,15 @@ impl Client {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .take();
         if let Ok(mut child) = self.child.lock() {
-            let terminated =
+            if request_deadline {
+                terminate_by_transport_for_request_deadline(
+                    &mut child,
+                    &self.terminated_by_transport,
+                    &self.terminated_for_request_deadline,
+                    timeout,
+                );
+            } else {
                 terminate_by_transport(&mut child, &self.terminated_by_transport, timeout);
-            if request_deadline && terminated {
-                self.terminated_for_request_deadline
-                    .store(true, Ordering::Release);
             }
         }
     }
@@ -5953,6 +5957,18 @@ fn terminate_by_transport(child: &mut OwnedChild, marker: &AtomicBool, timeout: 
     terminated
 }
 
+fn terminate_by_transport_for_request_deadline(
+    child: &mut OwnedChild,
+    transport_marker: &AtomicBool,
+    request_deadline_marker: &AtomicBool,
+    timeout: Duration,
+) {
+    if child.try_wait().ok().flatten().is_none() {
+        request_deadline_marker.store(true, Ordering::Release);
+    }
+    terminate_by_transport(child, transport_marker, timeout);
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
@@ -5980,7 +5996,8 @@ mod tests {
         pressure_checkpoint_required, replace_retained_bytes, replace_retained_estimated_bytes,
         request_may_grow_derived_state, request_priority, reserve_retained_growth,
         route_is_admissible, route_response, run, submit_document_job, sync_document, terminate,
-        terminate_by_transport, validate_document_size,
+        terminate_by_transport, terminate_by_transport_for_request_deadline,
+        validate_document_size,
     };
 
     #[derive(Clone, Default)]
@@ -6081,6 +6098,39 @@ mod tests {
         exited.wait().unwrap();
         terminate_by_transport(&mut exited, &marker, Duration::from_secs(1));
         assert!(!marker.load(Ordering::Acquire));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn request_deadline_cause_selects_only_a_running_worker() {
+        let transport_marker = AtomicBool::new(false);
+        let deadline_marker = AtomicBool::new(false);
+        let mut running_command = std::process::Command::new("sh");
+        running_command.args(["-c", "sleep 10"]);
+        let mut running = OwnedChild::spawn(running_command).unwrap();
+        terminate_by_transport_for_request_deadline(
+            &mut running,
+            &transport_marker,
+            &deadline_marker,
+            Duration::from_secs(1),
+        );
+        assert!(transport_marker.load(Ordering::Acquire));
+        assert!(deadline_marker.load(Ordering::Acquire));
+
+        let transport_marker = AtomicBool::new(false);
+        let deadline_marker = AtomicBool::new(false);
+        let mut exited_command = std::process::Command::new("sh");
+        exited_command.args(["-c", "exit 0"]);
+        let mut exited = OwnedChild::spawn(exited_command).unwrap();
+        exited.wait().unwrap();
+        terminate_by_transport_for_request_deadline(
+            &mut exited,
+            &transport_marker,
+            &deadline_marker,
+            Duration::from_secs(1),
+        );
+        assert!(!transport_marker.load(Ordering::Acquire));
+        assert!(!deadline_marker.load(Ordering::Acquire));
     }
 
     #[derive(Clone, Default)]

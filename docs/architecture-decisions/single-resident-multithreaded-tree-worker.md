@@ -677,7 +677,10 @@ the versioned quarantine set before enabling document derivation, and full-syncs
 all open documents. Restarts are also governed by a per-session systemic-failure
 circuit breaker. Quarantine and breaker accounting are separate decisions. Any
 active hazard leases at worker loss are conservatively quarantined, but that
-fact alone does not classify the cause as native or exempt the restart.
+fact alone does not classify the cause as native or exempt the restart. The
+exception is a generation that the parent itself selected for generic request-
+deadline termination: that loss is systemic and suppresses parser attribution
+because the deadline is not evidence that an active grammar caused the hang.
 
 Classification precedence is explicit. A supervisor-observed startup,
 handshake, framing/protocol, failed bounded resynchronization, parent-liveness,
@@ -748,9 +751,13 @@ has a new key and may be tried. The parent does not persist a `failed_parsers`
 set or an active-parse marker across server sessions. A fresh kakehashi process
 therefore retries every installed parser.
 
-An end-to-end request deadline starts at request admission and can release the
-client without killing the worker. A separate hard native-segment deadline
-starts with the handoff allowance when the parent receives
+An end-to-end request deadline starts at request admission. At expiry, the
+parent requests cooperative cancellation and waits a bounded grace period. A
+terminal response releases the client without a restart. If native work does
+not cooperate, the parent publishes the systemic deadline-termination cause,
+kills and restarts the complete generation, and does not quarantine any active
+grammar. A separate hard native-segment deadline starts with the handoff
+allowance when the parent receives
 `NativeSegmentEntered`; only after that allowance does it consume the native
 budget, and it ends at `NativeSegmentExited`. It does not run while an arm frame
 is queued or in transit, nor does it run for the lifetime of the surrounding
@@ -1320,10 +1327,14 @@ extends crash attribution from the first observed lease to the complete exact
 set. The parent drains the dead generation's response reader before snapshot,
 deduplicates every committed active grammar identity, installs the full set,
 and then restarts once. The two-grammar E2E consistently quarantined Rust and
-Lua while resyncing only healthy YAML; seven runs recovered in a median 974 ms.
-Against Stage 25 on the same single-hazard fixture, median recovery changed from
-1266 to 1281 ms and the median paired delta was +11 ms (+0.9%). Keep the
-failure-path barrier; no production request hot path was added. Runtime
+Lua while resyncing only healthy YAML; seven final-HEAD runs recovered in a
+median 962 ms. Against Stage 25 on the same single-hazard fixture, alternating
+12-pair medians changed from 1202 to 1182 ms and the median paired delta was
+-47 ms (-3.8%), but the wide -234 to +385 ms paired range does not establish an
+improvement. The request-admission fence adds one atomic load under the existing
+route mutex; paired release measurements put every sequential and four-way
+median delta below 1%, so its cost was not distinguishable in this fixture.
+Keep the failure-path barrier. Runtime
 injection identities, independently bounded control transport, native segment
 deadlines, explicit workload-aware admission, protocol and compatibility
 gates, and legacy-path removal remain open.
