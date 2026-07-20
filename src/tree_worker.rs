@@ -3225,97 +3225,12 @@ where
     let retained_document_bytes = Arc::new(AtomicUsize::new(0));
     let document_lanes: DocumentLanes = Arc::new(dashmap::DashMap::new());
     let cancellations = Arc::new(dashmap::DashMap::<u64, crate::cancel::CancelToken>::new());
-    // The client permits at most four requests per compute thread. Let the
-    // dispatcher own exactly that bounded pending window while leaving one
-    // transport lookahead slot; cancellation frames bypass this work queue.
+    // The client permits at most four requests per compute thread. Decode one
+    // frame beyond this pending window so cancellation stays observable under
+    // saturation, but wait before scheduling any excess ordinary work.
     let max_pending = compute_threads.saturating_mul(4).max(1);
-    let (work_tx, work_rx) =
-        mpsc::sync_channel::<(Request, RequestContext, Instant, crate::cancel::CancelToken)>(1);
     let (completion_tx, completion_rx) = mpsc::channel::<()>();
-    let dispatcher = {
-        let pool = Arc::clone(&pool);
-        let permits = permits.clone();
-        let permit_rx = Arc::clone(&permit_rx);
-        let responses = responses.clone();
-        let documents = Arc::clone(&documents);
-        let analysis = Arc::clone(&analysis);
-        let closed_documents = Arc::clone(&closed_documents);
-        let document_capacity = Arc::clone(&document_capacity);
-        let retained_document_bytes = Arc::clone(&retained_document_bytes);
-        let document_lanes = Arc::clone(&document_lanes);
-        let cancellations = Arc::clone(&cancellations);
-        std::thread::spawn(move || {
-            let mut pending = 0_usize;
-            loop {
-                if pending == max_pending {
-                    completion_rx
-                        .recv()
-                        .expect("worker completion queue stopped before its jobs");
-                    pending -= 1;
-                    continue;
-                }
-                let Ok((request, context, enqueued, cancellation)) = work_rx.recv() else {
-                    break;
-                };
-                pending += 1;
-                let responses = responses.clone();
-                let permits = permits.clone();
-                let permit_rx = Arc::clone(&permit_rx);
-                let completion_tx = completion_tx.clone();
-                let documents = Arc::clone(&documents);
-                let analysis = Arc::clone(&analysis);
-                let closed_documents = Arc::clone(&closed_documents);
-                let document_capacity = Arc::clone(&document_capacity);
-                let retained_document_bytes = Arc::clone(&retained_document_bytes);
-                let request_id = context.request_id;
-                let job_cancellations = Arc::clone(&cancellations);
-                let lane_key = document_key(&request);
-                let action_key = lane_key.clone();
-                let job: LaneJob = Box::new(move || {
-                    permit_rx
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .recv()
-                        .expect("worker admission queue stopped before its jobs");
-                    let permit = AdmissionPermit(permits);
-                    let response = handle_work(
-                        request,
-                        &analysis,
-                        &documents,
-                        &closed_documents,
-                        &document_capacity,
-                        &retained_document_bytes,
-                        enqueued.elapsed(),
-                        &cancellation,
-                    );
-                    job_cancellations.remove(&request_id);
-                    let action = if action_key
-                        .as_ref()
-                        .is_some_and(|key| documents.contains_key(key))
-                    {
-                        LaneAction::Keep
-                    } else {
-                        LaneAction::Retire
-                    };
-                    let _ = responses.send((response, Some(permit)));
-                    let _ = completion_tx.send(());
-                    action
-                });
-                if let Some(lane_key) = lane_key {
-                    submit_document_job(&document_lanes, lane_key, &pool, job);
-                } else {
-                    pool.spawn(move || {
-                        let _ = job();
-                    });
-                }
-            }
-            for _ in 0..pending {
-                completion_rx
-                    .recv()
-                    .expect("worker completion queue stopped before its jobs");
-            }
-        })
-    };
+    let mut pending = 0_usize;
     while let Some(request) = decode_frame::<_, Request>(&mut reader)? {
         if let Request::Cancel(cancel) = request {
             if cancel.worker_generation == worker_generation {
@@ -3356,18 +3271,69 @@ where
             cancellations.remove(&request_id);
             crate::cancel::CancelToken::default()
         };
-        if work_tx
-            .send((request, context, Instant::now(), cancellation))
-            .is_err()
-        {
-            cancellations.remove(&request_id);
-            return Err(io::Error::other("worker dispatcher stopped"));
+        if pending == max_pending {
+            completion_rx
+                .recv()
+                .map_err(|_| io::Error::other("worker completion queue stopped"))?;
+            pending -= 1;
+        }
+        pending += 1;
+        let enqueued = Instant::now();
+        let responses = responses.clone();
+        let permits = permits.clone();
+        let permit_rx = Arc::clone(&permit_rx);
+        let completion_tx = completion_tx.clone();
+        let documents = Arc::clone(&documents);
+        let analysis = Arc::clone(&analysis);
+        let closed_documents = Arc::clone(&closed_documents);
+        let document_capacity = Arc::clone(&document_capacity);
+        let retained_document_bytes = Arc::clone(&retained_document_bytes);
+        let job_cancellations = Arc::clone(&cancellations);
+        let lane_key = document_key(&request);
+        let action_key = lane_key.clone();
+        let job: LaneJob = Box::new(move || {
+            permit_rx
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .recv()
+                .expect("worker admission queue stopped before its jobs");
+            let permit = AdmissionPermit(permits);
+            let response = handle_work(
+                request,
+                &analysis,
+                &documents,
+                &closed_documents,
+                &document_capacity,
+                &retained_document_bytes,
+                enqueued.elapsed(),
+                &cancellation,
+            );
+            job_cancellations.remove(&request_id);
+            let action = if action_key
+                .as_ref()
+                .is_some_and(|key| documents.contains_key(key))
+            {
+                LaneAction::Keep
+            } else {
+                LaneAction::Retire
+            };
+            let _ = responses.send((response, Some(permit)));
+            let _ = completion_tx.send(());
+            action
+        });
+        if let Some(lane_key) = lane_key {
+            submit_document_job(&document_lanes, lane_key, &pool, job);
+        } else {
+            pool.spawn(move || {
+                let _ = job();
+            });
         }
     }
-    drop(work_tx);
-    dispatcher
-        .join()
-        .map_err(|_| io::Error::other("worker dispatcher panicked"))?;
+    for _ in 0..pending {
+        completion_rx
+            .recv()
+            .map_err(|_| io::Error::other("worker completion queue stopped"))?;
+    }
     drop(responses);
     join_writer(writer_thread)
 }
