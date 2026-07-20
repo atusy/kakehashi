@@ -1175,6 +1175,13 @@ user-blocking node latency by 9.3% without partitioning the worker pool. The
 decision is still made only at derivation admission; late-arrival chunking,
 priority classes, and one-thread cooperative fairness remain open gates.
 
+The [Stage 13 dynamic-fairness measurement](single-resident-multithreaded-tree-worker-stage13-measurement.md)
+splits injection fan-out into compute-width chunks and rechecks cross-document
+competition at every boundary. A causal E2E barrier proves a late competitor
+changes the next chunk's policy, while 40-request single-document benchmarks
+show no measurable regression. Per-document max-min admission, explicit
+priority classes, other long tree walks, and one-thread fairness remain open.
+
 The implementation should proceed in measured stages:
 
 1. Prototype the framed transport, supervision, and one high-level
