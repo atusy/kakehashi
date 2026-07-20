@@ -2906,6 +2906,10 @@ fn mark_tree_tier_unavailable(
         },
     };
     disabled.store(true, Ordering::Release);
+    #[cfg(feature = "e2e")]
+    if let Ok(path) = std::env::var("KAKEHASHI_TREE_WORKER_BREAKER_OPEN_FILE") {
+        let _ = std::fs::write(path, b"open");
+    }
 }
 
 fn observe_healthy_service(state: &mut SupervisorState, now: Instant) {

@@ -4083,6 +4083,15 @@ fn inject_worker_failure_once(request: &Request) -> Option<Response> {
     let Request::SyncDocument(sync) = request else {
         return None;
     };
+    if std::env::var("KAKEHASHI_TREE_WORKER_RESTART_ALWAYS_URI_SUFFIX")
+        .ok()
+        .is_some_and(|suffix| sync.context.uri.ends_with(&suffix))
+    {
+        return Some(Response::WorkerRestartRequired(WorkerRestartRequired {
+            context: sync.context.clone(),
+            reason: "injected repeated systemic restart".into(),
+        }));
+    }
     if let Ok(marker) = std::env::var("KAKEHASHI_TREE_WORKER_HANG_ONCE_FILE")
         && std::env::var("KAKEHASHI_TREE_WORKER_HANG_URI_SUFFIX")
             .ok()

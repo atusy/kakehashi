@@ -379,6 +379,84 @@ fn systemic_worker_restart_full_resyncs_the_open_document() {
 }
 
 #[test]
+fn repeated_systemic_failures_open_the_breaker_once_and_keep_lsp_alive() {
+    let directory = tempfile::tempdir().unwrap();
+    let breaker_open = directory.path().join("breaker-open");
+    let mut client = LspClient::builder()
+        .env("KAKEHASHI_TREE_WORKER_SHADOW", "true")
+        .env("KAKEHASHI_TREE_WORKER_THREADS", "4")
+        .env(
+            "KAKEHASHI_TREE_WORKER_RESTART_ALWAYS_URI_SUFFIX",
+            "/breaker.rs",
+        )
+        .env(
+            "KAKEHASHI_TREE_WORKER_BREAKER_OPEN_FILE",
+            breaker_open.to_string_lossy().into_owned(),
+        )
+        .env(
+            "RUST_LOG",
+            "kakehashi::tree_worker_shadow=info,kakehashi::tree_worker_shadow_metrics=info",
+        )
+        .build();
+    initialize(&mut client);
+    let uri = "file:///breaker.rs";
+    client.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri,
+                "languageId": "rust",
+                "version": 1,
+                "text": "fn breaker() { let value = 1; }\n"
+            }
+        }),
+    );
+    let response = client.send_request(
+        "textDocument/semanticTokens/full",
+        json!({ "textDocument": { "uri": uri } }),
+    );
+    assert!(response.get("result").is_some(), "{response:?}");
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while !breaker_open.exists() && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        breaker_open.exists(),
+        "systemic failures did not open breaker"
+    );
+
+    for version in 2..=5 {
+        client.send_notification(
+            "textDocument/didChange",
+            json!({
+                "textDocument": { "uri": uri, "version": version },
+                "contentChanges": [{ "text": format!("fn breaker() {{ let value = {version}; }}\n") }]
+            }),
+        );
+    }
+    let host_response = client.send_request(
+        "workspace/executeCommand",
+        json!({
+            "command": "kakehashi.test.host-tier-after-breaker",
+            "arguments": []
+        }),
+    );
+    assert!(host_response.get("result").is_some(), "{host_response:?}");
+
+    let stderr = shutdown_and_stderr(client);
+    assert_eq!(
+        stderr
+            .matches("disabled shadow tree tier after restart budget exhaustion")
+            .count(),
+        1,
+        "{stderr}"
+    );
+    assert_eq!(stderr.matches("full resync failed").count(), 3, "{stderr}");
+    assert!(!stderr.contains("quarantined grammar"), "{stderr}");
+}
+
+#[test]
 fn systemic_worker_restart_measures_many_document_full_resync() {
     let directory = tempfile::tempdir().unwrap();
     let marker = directory.path().join("restart-many-once");
