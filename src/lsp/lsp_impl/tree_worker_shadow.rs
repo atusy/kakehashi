@@ -339,6 +339,19 @@ struct ResyncFailure {
     class: FailureClass,
     active_grammars: Vec<GrammarIdentity>,
     active_lease_count: usize,
+    snapshot_complete: bool,
+}
+
+impl ResyncFailure {
+    fn from_worker_loss(error: std::io::Error, failure: WorkerLossEvidence) -> Self {
+        Self {
+            error,
+            class: failure.class,
+            active_grammars: failure.active_grammars,
+            active_lease_count: failure.active_lease_count,
+            snapshot_complete: failure.snapshot_complete,
+        }
+    }
 }
 
 struct WorkerLossEvidence {
@@ -3276,18 +3289,22 @@ fn recover_worker(
             }
             Err(failure) => {
                 state.client = Some(Arc::new(replacement));
-                let quarantine = quarantine_grammars(
-                    state,
-                    failure.active_grammars,
-                    failure.class,
-                    comparisons,
-                    failure.active_lease_count,
-                );
-                class = effective_failure_class(failure.class, &quarantine);
+                let error = failure.error;
+                let evidence = WorkerLossEvidence {
+                    class: failure.class,
+                    active_grammars: failure.active_grammars,
+                    active_lease_count: failure.active_lease_count,
+                    snapshot_complete: failure.snapshot_complete,
+                };
+                let Some(next_class) = apply_worker_loss_evidence(state, evidence, comparisons)
+                else {
+                    return false;
+                };
+                class = next_class;
                 log::error!(
                     target: "kakehashi::tree_worker_shadow",
                     "worker generation {generation} full resync failed: {}",
-                    failure.error,
+                    error,
                 );
                 if mode == RecoveryMode::HalfOpen {
                     return false;
@@ -3442,16 +3459,12 @@ fn resync_open_documents(
                     class: FailureClass::Systemic,
                     active_grammars: Vec::new(),
                     active_lease_count: 0,
+                    snapshot_complete: true,
                 });
             }
             Err(error) => {
                 let failure = worker_loss_evidence(client, &error);
-                return Err(ResyncFailure {
-                    error,
-                    class: failure.class,
-                    active_grammars: failure.active_grammars,
-                    active_lease_count: failure.active_lease_count,
-                });
+                return Err(ResyncFailure::from_worker_loss(error, failure));
             }
         }
     }
@@ -3501,6 +3514,7 @@ fn resync_open_documents(
                     class: FailureClass::Systemic,
                     active_grammars: Vec::new(),
                     active_lease_count: 0,
+                    snapshot_complete: true,
                 });
             }
             Ok(Response::Error(error)) => {
@@ -3519,16 +3533,12 @@ fn resync_open_documents(
                     class: FailureClass::Systemic,
                     active_grammars: Vec::new(),
                     active_lease_count: 0,
+                    snapshot_complete: true,
                 });
             }
             Err(error) => {
                 let failure = worker_loss_evidence(client, &error);
-                return Err(ResyncFailure {
-                    error,
-                    class: failure.class,
-                    active_grammars: failure.active_grammars,
-                    active_lease_count: failure.active_lease_count,
-                });
+                return Err(ResyncFailure::from_worker_loss(error, failure));
             }
         }
     }
@@ -4068,6 +4078,16 @@ mod tests {
         assert_eq!(evidence.class, FailureClass::Systemic);
         assert_eq!(evidence.active_grammars.len(), 1);
         assert_eq!(evidence.active_lease_count, 2);
+    }
+
+    #[test]
+    fn resync_failure_preserves_incomplete_worker_snapshot() {
+        let failure = ResyncFailure::from_worker_loss(
+            std::io::Error::new(std::io::ErrorKind::BrokenPipe, "lost"),
+            WorkerLossEvidence::incomplete(Vec::new(), 0),
+        );
+
+        assert!(!failure.snapshot_complete);
     }
 
     #[test]
