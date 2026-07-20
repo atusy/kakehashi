@@ -1028,10 +1028,10 @@ Implementation is accepted only when all of the following hold:
 * Cancellation tests cover queued and running work for client cancellation,
   supersession, handler drop, and `didClose`, including completion races and the
   rule that canceled work publishes and caches nothing.
-* Cancellation tests also cover cancellation before request delivery and at
-  every hazard/segment handshake phase, proving that no later request executes
-  after an overtaking cancel and no lease or timer survives
-  `RequestHazardsReleased`.
+* Cancellation tests also cover enqueue-before-guard ordering and every
+  hazard/segment handshake phase. A delayed response waiter proves cancellation
+  still reaches already-admitted work without an overtaking unknown-ID
+  tombstone, and no lease or timer survives `RequestHazardsReleased`.
 * A saturated worker-to-parent bulk stream proves hazard cleanup may overtake a
   successful response without removing its router, losing the payload, or
   leaving the public request unresolved.
@@ -1343,10 +1343,15 @@ existing route mutex together with supervisor-reserve classification and
 admission arithmetic. Paired release measurements moved sequential p50/p95 in
 the faster direction, while parallel p50/p95 and throughput changed by less
 than 1%, so no cost from those combined changes was distinguishable in this
-fixture. Review convergence later
-changed only deadline/restart failure branches and stronger E2E assertions; the
-recorded performance binary remains the explicitly identified measured
-candidate rather than being relabeled as final HEAD.
+fixture. Review convergence later changed deadline/restart failure branches,
+strengthened E2E assertions, and moved semantic request registration/enqueue
+before the blocking response waiter. The original performance binary remains
+the explicitly identified measured candidate rather than being relabeled as
+final HEAD. A separate eight-pair authoritative semantic edit/delta comparison
+between that candidate and the review-converged scheduling path measured
+39.013 ms versus 39.021 ms median latency, with a +0.146 ms (+0.374%) median
+paired delta. Two late pairs widened the paired range to -0.522–+5.866 ms, so
+central latency was indistinguishable but tail equivalence was not established.
 Keep the failure-path barrier. Runtime
 injection identities, independently bounded control transport, native segment
 deadlines, explicit workload-aware admission, protocol and compatibility

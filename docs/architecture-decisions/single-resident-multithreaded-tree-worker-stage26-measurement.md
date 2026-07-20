@@ -75,12 +75,12 @@ macOS 26.5.1 (`Darwin
 order. The supervisor's `recovery_ms` covers failure recovery through
 replacement spawn and full resync; it is not end-to-end request latency.
 
-Review convergence subsequently changed only deadline/restart branches and test
-assertions. Those commits add no operation to the measured admitted-request hot
-path, so the table remains evidence for the combined Stage 26 admission-path
-cost; its binary
+Review convergence subsequently changed deadline/restart branches, test
+assertions, and semantic request scheduling. The original table remains
+evidence for the combined Stage 26 direct-client admission path; its binary
 hashes and raw samples intentionally continue to identify `67c338ca7` rather
-than being relabeled as a final-HEAD run.
+than being relabeled as a final-HEAD run. The later end-to-end semantic
+scheduling change is measured separately below.
 
 | Metric | Stage 25 | Stage 26 | Difference |
 | --- | ---: | ---: | ---: |
@@ -136,6 +136,25 @@ bound.
 Raw samples, artifact roles and hashes, stable source paths, exact build/run
 commands, metric ordering, and commit identities are in
 `benches/profile/results/single_worker_stage26_hazard_set_2026-07-21.json`.
+
+## Post-review semantic scheduling measurement
+
+Review convergence moved semantic route registration and frame enqueue onto the
+async owner before it arms cancellation and delegates only response waiting to
+`spawn_blocking`. Because the direct-client harness above does not exercise that
+LSP scheduling boundary, the measured candidate (`67c338ca7`) and the
+review-converged binary (`36842edc5`) were compared with the end-to-end
+`rust_large/edit_delta` semantic fixture in authoritative-worker mode.
+
+Eight pairs alternated revision order. Each binary ran 10 warmups and 40
+measured edit/reparse/retokenize/delta cycles per pair with four worker threads.
+The measured-candidate median was 39.013 ms and the review-converged median was
+39.021 ms. The paired median delta was +0.146 ms (+0.374%), so central latency
+was indistinguishable. Paired differences ranged from -0.522 to +5.866 ms; two
+late pairs put the review-converged binary about five milliseconds behind, so
+this run does not establish tail equivalence. The raw pairs, one excluded
+pre-series pilot, commands, source hash, harness hash, and both release binary
+hashes are recorded in the JSON artifact.
 
 ## Decision
 
