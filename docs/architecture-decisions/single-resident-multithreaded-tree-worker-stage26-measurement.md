@@ -65,7 +65,7 @@ planned replacement continues. The regression E2E holds native work beyond the
 full five-second window and proves one replacement, no quarantine, and no
 configuration-gated breaker.
 
-The focused 67 worker and 43 supervisor tests, the single-crash, protocol-
+The focused 68 worker and 43 supervisor tests, the single-crash, protocol-
 failure, multi-hazard, single-timeout, four-thread saturation, planned-restart,
 delayed-restart-response, cancellation-delivery, and reserved-lifecycle
 saturation E2Es,

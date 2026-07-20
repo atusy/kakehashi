@@ -455,7 +455,10 @@ waits for a worker-local completion receipt. The writer issues that receipt only
 after the complete frame has been committed to the OS pipe. The worker must not
 enter the hazard scope without the receipt; if it later dies, the parent reader
 must decode the complete arm before a later release or EOF. The parent records
-the lease in its session-local active set. Each grammar
+the lease in its session-local active set only when the generation and unique
+lease ID are valid and the arm's complete request context exactly matches an
+active response route. An unknown or mismatched route is an incomplete protocol
+abort, not quarantine evidence. Each grammar
 encountered by a fused host/injection operation is leased separately and remains
 active until the complete high-level operation has stopped consuming every
 value backed by that grammar. Only then does `GrammarHazardReleased` remove it
@@ -998,10 +1001,11 @@ Implementation is accepted only when all of the following hold:
   degraded state instead of resyncing forever.
 * A protocol-corruption fixture followed by another hazard-arm frame proves the
   reader marks its ledger incomplete and disables the tree tier rather than
-  restarting from the observed subset. A reported Rust-panic fixture while a
-  grammar lease is active may conservatively quarantine that key but still
-  consumes the systemic budget; a signaled native crash with the same lease
-  follows the native-evidence exemption instead.
+  restarting from the observed subset. Unknown-route and context-mismatched arm
+  fixtures prove forged attribution never enters the ledger. A reported
+  Rust-panic fixture while a grammar lease is active may conservatively
+  quarantine that key but still consumes the systemic budget; a signaled native
+  crash with the same lease follows the native-evidence exemption instead.
 * Install/reload tests cover missing host and injected grammars, concurrent
   install deduplication, cache invalidation, latest-version re-derivation, and
   refusal to load the same quarantined artifact. Same-path parser replacement,

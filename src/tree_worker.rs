@@ -5143,6 +5143,33 @@ struct Route {
     sender: mpsc::Sender<io::Result<Response>>,
 }
 
+fn record_grammar_hazard_arm(
+    routes: &Mutex<HashMap<u64, Route>>,
+    hazards: &Mutex<HashMap<u64, GrammarHazardArmed>>,
+    armed: GrammarHazardArmed,
+    worker_generation: u64,
+) -> io::Result<()> {
+    let has_matching_route = routes
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(&armed.context.request_id)
+        .is_some_and(|route| route.expected == armed.context);
+    let mut hazards = hazards
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if armed.context.worker_generation != worker_generation
+        || !has_matching_route
+        || hazards.contains_key(&armed.lease_id)
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid grammar hazard arm",
+        ));
+    }
+    hazards.insert(armed.lease_id, armed);
+    Ok(())
+}
+
 pub struct PendingResponse {
     request_id: u64,
     response_rx: mpsc::Receiver<io::Result<Response>>,
@@ -5243,12 +5270,14 @@ impl Client {
                         }
                         match response {
                             Response::GrammarHazardArmed(armed) => {
-                                let valid = armed.context.worker_generation == worker_generation
-                                    && !reader_hazards
-                                        .lock()
-                                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                                        .contains_key(&armed.lease_id);
-                                if !valid {
+                                if record_grammar_hazard_arm(
+                                    &reader_routes,
+                                    &reader_hazards,
+                                    armed,
+                                    worker_generation,
+                                )
+                                .is_err()
+                                {
                                     fail_routes(
                                         None,
                                         &reader_routes,
@@ -5257,10 +5286,6 @@ impl Client {
                                     );
                                     break ReaderDrainState::Incomplete;
                                 }
-                                reader_hazards
-                                    .lock()
-                                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                                    .insert(armed.lease_id, armed);
                                 continue;
                             }
                             Response::GrammarHazardReleased(released) => {
@@ -6090,10 +6115,11 @@ mod tests {
         cancellation_grace_response, client_generation_is_idle, close_document, decode_frame,
         derive_snapshot_with_language, encode_frame, enforce_derived_memory_budget,
         named_node_count, parse_request_timeout, pressure_checkpoint_required,
-        replace_retained_bytes, replace_retained_estimated_bytes, request_may_grow_derived_state,
-        request_priority, reserve_retained_growth, route_is_admissible, route_response, run,
-        submit_document_job, sync_document, terminate, terminate_by_transport,
-        terminate_by_transport_for_request_deadline, validate_document_size,
+        record_grammar_hazard_arm, replace_retained_bytes, replace_retained_estimated_bytes,
+        request_may_grow_derived_state, request_priority, reserve_retained_growth,
+        route_is_admissible, route_response, run, submit_document_job, sync_document, terminate,
+        terminate_by_transport, terminate_by_transport_for_request_deadline,
+        validate_document_size,
     };
 
     #[derive(Clone, Default)]
@@ -6649,6 +6675,67 @@ mod tests {
 
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
         assert!(error.to_string().contains("context mismatch"));
+    }
+
+    #[test]
+    fn grammar_hazard_arm_requires_the_exact_request_route() {
+        let expected = RequestContext {
+            request_id: 7,
+            worker_generation: 3,
+            uri: "file:///expected.rs".into(),
+            incarnation: 11,
+            content_version: 5,
+            configuration_generation: 2,
+        };
+        let (sender, _receiver) = std::sync::mpsc::channel();
+        let routes = Mutex::new(HashMap::from([(
+            7,
+            Route {
+                expected: expected.clone(),
+                sender,
+            },
+        )]));
+        let hazards = Mutex::new(HashMap::new());
+        let mut mismatched = expected.clone();
+        mismatched.uri = "file:///forged.rs".into();
+
+        let error = record_grammar_hazard_arm(
+            &routes,
+            &hazards,
+            GrammarHazardArmed {
+                lease_id: 9,
+                context: mismatched,
+                grammar: WorkerGrammarIdentity {
+                    grammar_symbol: "rust".into(),
+                    artifact_digest: "sha256:forged".into(),
+                },
+            },
+            3,
+        )
+        .unwrap_err();
+
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(hazards.lock().unwrap().is_empty());
+
+        let mut unknown = expected;
+        unknown.request_id = 99;
+        let error = record_grammar_hazard_arm(
+            &routes,
+            &hazards,
+            GrammarHazardArmed {
+                lease_id: 10,
+                context: unknown,
+                grammar: WorkerGrammarIdentity {
+                    grammar_symbol: "lua".into(),
+                    artifact_digest: "sha256:unknown".into(),
+                },
+            },
+            3,
+        )
+        .unwrap_err();
+
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(hazards.lock().unwrap().is_empty());
     }
 
     #[test]
