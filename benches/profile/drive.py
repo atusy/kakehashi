@@ -283,6 +283,10 @@ def main() -> None:
         help="seconds to wait after didOpen before the first request "
              "(0 reproduces a client that requests immediately)")
     ap.add_argument(
+        "--hold-open", type=float, default=0,
+        help="seconds to keep the initialized server alive after the workload "
+             "so external steady-state samplers can observe it")
+    ap.add_argument(
         "--edits", type=int, default=0,
         help="simulate typing: before each request, send this many incremental "
              "didChange edits (appending/removing a char at the end of the first "
@@ -303,6 +307,8 @@ def main() -> None:
         ap.error("--burst-edits requires --burst greater than 1")
     if args.burst_delay_ms < 0:
         ap.error("--burst-delay-ms must be non-negative")
+    if args.hold_open < 0:
+        ap.error("--hold-open must be non-negative")
     if args.burst > 1 and (args.captures or args.concurrent_captures):
         ap.error("--burst cannot be combined with captures modes")
     if args.concurrent_captures:
@@ -614,6 +620,9 @@ def main() -> None:
             canceled += cycle_canceled
             superseded += cycle_superseded
         elapsed = benchmark_clock() - t0
+
+        if args.hold_open > 0:
+            time.sleep(args.hold_open)
 
         request("shutdown", None)
         notify("exit", {})

@@ -57,6 +57,7 @@ HARNESS_SCRIPT_NAMES = (
     "collect_worker_shadow.py",
     "collect_worker_cold_start.py",
     "collect_worker_capture_pilot.py",
+    "collect_worker_memory.py",
     "drive.py",
     "worker_proxy.py",
     "gen_session.py",
