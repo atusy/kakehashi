@@ -2439,6 +2439,63 @@ impl From<&RequestContext> for DocumentKey {
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct CacheEvictionCandidate {
+    key: DocumentKey,
+    result_bytes: usize,
+    auxiliary_bytes: usize,
+    current: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum CacheEviction {
+    Auxiliary(DocumentKey),
+    Result(DocumentKey),
+}
+
+fn cache_eviction_plan(
+    mut candidates: Vec<CacheEvictionCandidate>,
+    target_bytes: usize,
+) -> Vec<CacheEviction> {
+    let mut retained = candidates.iter().fold(0_usize, |bytes, candidate| {
+        bytes
+            .saturating_add(candidate.result_bytes)
+            .saturating_add(candidate.auxiliary_bytes)
+    });
+    let mut plan = Vec::new();
+    candidates.sort_by(|left, right| {
+        right
+            .auxiliary_bytes
+            .cmp(&left.auxiliary_bytes)
+            .then_with(|| left.key.uri.cmp(&right.key.uri))
+    });
+    for candidate in &candidates {
+        if retained <= target_bytes {
+            return plan;
+        }
+        if candidate.auxiliary_bytes > 0 {
+            retained = retained.saturating_sub(candidate.auxiliary_bytes);
+            plan.push(CacheEviction::Auxiliary(candidate.key.clone()));
+        }
+    }
+    candidates.sort_by(|left, right| {
+        left.current
+            .cmp(&right.current)
+            .then_with(|| right.result_bytes.cmp(&left.result_bytes))
+            .then_with(|| left.key.uri.cmp(&right.key.uri))
+    });
+    for candidate in candidates {
+        if retained <= target_bytes {
+            break;
+        }
+        if candidate.result_bytes > 0 {
+            retained = retained.saturating_sub(candidate.result_bytes);
+            plan.push(CacheEviction::Result(candidate.key));
+        }
+    }
+    plan
+}
+
 type DocumentStore = Arc<dashmap::DashMap<DocumentKey, Arc<Mutex<DocumentReplica>>>>;
 type ClosedDocuments = Arc<dashmap::DashMap<DocumentKey, u64>>;
 type DocumentCapacity = Arc<Mutex<usize>>;
@@ -4487,20 +4544,20 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use super::{
-        ApplyDocumentEdits, BUILD_ID, ByteEdit, CachedInjectionLayer, CancelRequest,
-        CapturesResult, CloseDocument, DeriveInjectionRegions, DeriveNativeBindings,
-        DeriveSelectionRanges, DeriveSemanticTokens, DeriveSnapshot, DocumentCompetition,
-        DocumentKey, DocumentLane, DocumentReplica, GrammarKey, Handshake, HandshakeReady,
-        LaneAction, LaneRegistry, MAX_DOCUMENT_BYTES, MAX_DOCUMENT_REPLICAS,
+        ApplyDocumentEdits, BUILD_ID, ByteEdit, CacheEviction, CacheEvictionCandidate,
+        CachedInjectionLayer, CancelRequest, CapturesResult, CloseDocument, DeriveInjectionRegions,
+        DeriveNativeBindings, DeriveSelectionRanges, DeriveSemanticTokens, DeriveSnapshot,
+        DocumentCompetition, DocumentKey, DocumentLane, DocumentReplica, GrammarKey, Handshake,
+        HandshakeReady, LaneAction, LaneRegistry, MAX_DOCUMENT_BYTES, MAX_DOCUMENT_REPLICAS,
         MAX_RETAINED_DOCUMENT_BYTES, NavigateNode, NodeLayerSelector, NodeNavigation,
         NodeScalarOperation, NodeScalarValue, OpaqueNodeId, PROTOCOL_VERSION, Request,
         RequestCancelled, RequestContext, ResolveNode, Response, Route, RunCaptures, RunNodeScalar,
         RunnableDocuments, SEMANTIC_CACHE_AUXILIARY_TRIM_THRESHOLD_BYTES, SyncDocument,
         WireByteRange, WirePosition, WireRange, WireSemanticToken, WorkPriority, WorkerError,
-        WorkerQuerySources, close_document, decode_frame, derive_snapshot_with_language,
-        encode_frame, named_node_count, parse_request_timeout, replace_retained_bytes,
-        request_priority, reserve_retained_growth, route_response, run, submit_document_job,
-        sync_document, terminate_by_transport, validate_document_size,
+        WorkerQuerySources, cache_eviction_plan, close_document, decode_frame,
+        derive_snapshot_with_language, encode_frame, named_node_count, parse_request_timeout,
+        replace_retained_bytes, request_priority, reserve_retained_growth, route_response, run,
+        submit_document_job, sync_document, terminate_by_transport, validate_document_size,
     };
 
     #[derive(Clone, Default)]
@@ -5993,6 +6050,43 @@ mod tests {
         .unwrap();
 
         assert!(replica.estimated_memory().non_evictable_bytes > replica.text.capacity());
+    }
+
+    #[test]
+    fn cache_eviction_prefers_largest_auxiliary_then_non_current_results() {
+        let candidates = vec![
+            CacheEvictionCandidate {
+                key: DocumentKey {
+                    uri: "file:///a.rs".into(),
+                },
+                result_bytes: 40,
+                auxiliary_bytes: 20,
+                current: false,
+            },
+            CacheEvictionCandidate {
+                key: DocumentKey {
+                    uri: "file:///b.rs".into(),
+                },
+                result_bytes: 50,
+                auxiliary_bytes: 30,
+                current: true,
+            },
+        ];
+
+        assert_eq!(
+            cache_eviction_plan(candidates, 50),
+            vec![
+                CacheEviction::Auxiliary(DocumentKey {
+                    uri: "file:///b.rs".into(),
+                }),
+                CacheEviction::Auxiliary(DocumentKey {
+                    uri: "file:///a.rs".into(),
+                }),
+                CacheEviction::Result(DocumentKey {
+                    uri: "file:///a.rs".into(),
+                }),
+            ]
+        );
     }
 
     #[test]
