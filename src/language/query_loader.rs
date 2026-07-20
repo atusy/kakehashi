@@ -387,6 +387,32 @@ impl QueryLoader {
         Ok(Self::parse_query(language, &query_str, used_inheritance))
     }
 
+    /// Resolve a search-path query into source without loading a native
+    /// grammar. The isolated worker compiles this source against its own
+    /// `Language`, so the parent can remain free of parser/query ownership.
+    pub(crate) fn load_query_source_with_inheritance<P: AsRef<Path>>(
+        runtime_bases: &[P],
+        lang_name: &str,
+        file_name: &str,
+    ) -> LspResult<String> {
+        let original_content = Self::load_query_file(runtime_bases, lang_name, file_name)?;
+        let mut visited = std::collections::HashSet::new();
+        Self::resolve_query_recursive(
+            runtime_bases,
+            lang_name,
+            file_name,
+            Some(original_content),
+            &mut visited,
+        )
+    }
+
+    /// Combine explicit query files without loading a native grammar.
+    pub(crate) fn load_query_source_from_paths<P: AsRef<Path>>(
+        paths: &[P],
+    ) -> LspResult<String> {
+        Self::load_content_from_paths(paths)
+    }
+
     /// Resolve library path for a language.
     ///
     /// An explicit `library` is normalized and returned as-is; otherwise searches
@@ -468,6 +494,46 @@ mod tests {
         let result = QueryLoader::load_content_from_paths(&paths).unwrap();
         assert!(result.contains("(identifier) @variable"));
         assert!(result.contains("(string) @string"));
+    }
+
+    #[test]
+    fn worker_source_loading_resolves_inheritance_without_a_language() {
+        let dir = tempdir().unwrap();
+        let base = dir.path().join("queries/base");
+        let child = dir.path().join("queries/child");
+        fs::create_dir_all(&base).unwrap();
+        fs::create_dir_all(&child).unwrap();
+        fs::write(base.join("highlights.scm"), "(identifier) @base\n").unwrap();
+        fs::write(
+            child.join("highlights.scm"),
+            "; inherits: base\n(string_literal) @child\n",
+        )
+        .unwrap();
+
+        let source = QueryLoader::load_query_source_with_inheritance(
+            &[dir.path()],
+            "child",
+            "highlights.scm",
+        )
+        .unwrap();
+
+        assert!(source.contains("(identifier) @base"));
+        assert!(source.contains("(string_literal) @child"));
+        assert!(!source.contains("inherits:"));
+    }
+
+    #[test]
+    fn worker_source_loading_combines_explicit_paths_without_a_language() {
+        let dir = tempdir().unwrap();
+        let first = dir.path().join("first.scm");
+        let second = dir.path().join("second.scm");
+        fs::write(&first, "(identifier) @first").unwrap();
+        fs::write(&second, "(string_literal) @second").unwrap();
+
+        let source = QueryLoader::load_query_source_from_paths(&[first, second]).unwrap();
+
+        assert!(source.contains("(identifier) @first"));
+        assert!(source.contains("(string_literal) @second"));
     }
 
     #[test]
