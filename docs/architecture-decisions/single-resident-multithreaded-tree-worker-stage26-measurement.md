@@ -165,8 +165,9 @@ pre-series pilot, commands, source hash, harness hash, and both release binary
 hashes are recorded in the JSON artifact. The harness hash attests the binary
 that was executed from the original checkout; it is not a bit-reproducible
 target because `CARGO_MANIFEST_DIR` embeds that checkout path. The detached-
-worktree recipe reproduces the exact source revisions, features, and benchmark
-behavior with its own embedded fixture-data path.
+worktree recipe reproduces the exact source revisions and features with its own
+embedded fixture-data path. The original mutable parser/query fixture tree was
+not attested, so a fresh installation is not claimed behavior-equivalent.
 
 ## Decision
 
