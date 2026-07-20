@@ -430,10 +430,10 @@ enum Kind {
     /// so each measured request pays incremental reparse + cache invalidation +
     /// delta diff on top of the (full) token recompute.
     EditDelta,
-    /// Rapid edits supersede several already-issued full requests. Measures
-    /// latency from the final edit/request until the only result the editor can
-    /// still use, while obsolete computation is cooperatively reclaimed.
-    SupersedeBurst { obsolete: usize },
+    /// Rapid edits explicitly cancel several already-issued full requests.
+    /// Measures latency from the final edit/request until the only result the
+    /// editor can still use, while obsolete computation is reclaimed.
+    CancelBurst { obsolete: usize },
     /// Cold-open latency: each iteration opens a FRESH document and times
     /// `didOpen` → first `semanticTokens/full` response — the editor-visible
     /// "open the file, see highlights" latency. The one scenario that captures
@@ -479,8 +479,8 @@ fn measure(
     if let Kind::OpenFirstToken = scn.kind {
         return measure_open(bin, scn, data_dir, iters, warmup);
     }
-    if let Kind::SupersedeBurst { obsolete } = scn.kind {
-        return measure_supersede_burst(bin, scn, data_dir, iters, warmup, obsolete);
+    if let Kind::CancelBurst { obsolete } = scn.kind {
+        return measure_cancel_burst(bin, scn, data_dir, iters, warmup, obsolete);
     }
     let mut server = Server::start(&bin.path, data_dir);
     server.did_open(scn.uri, scn.language_id, &scn.content);
@@ -514,7 +514,7 @@ fn measure(
     samples
 }
 
-fn measure_supersede_burst(
+fn measure_cancel_burst(
     bin: &Binary,
     scn: &Scenario,
     data_dir: &str,
@@ -534,10 +534,12 @@ fn measure_supersede_burst(
             version += 1;
             server.did_change_toggle(scn.uri, version, line, insert);
             insert = !insert;
-            let _ = server.send_semantic_full(scn.uri);
-            // Give ingress enough time to start worker computation; without
-            // this the burst only measures request coalescing before dispatch.
-            std::thread::sleep(Duration::from_millis(5));
+            let obsolete_id = server.send_semantic_full(scn.uri);
+            // Let the request enter worker compute before explicitly
+            // cancelling it; immediate cancellation would only benchmark
+            // ingress coalescing.
+            std::thread::sleep(Duration::from_millis(20));
+            server.notify("$/cancelRequest", json!({ "id": obsolete_id }));
         }
         version += 1;
         let started = Instant::now();
@@ -588,7 +590,7 @@ fn measure_open(
 
 fn seed_result_id(server: &mut Server, scn: &Scenario) -> String {
     match scn.kind {
-        Kind::Full | Kind::Range { .. } | Kind::OpenFirstToken | Kind::SupersedeBurst { .. } => {
+        Kind::Full | Kind::Range { .. } | Kind::OpenFirstToken | Kind::CancelBurst { .. } => {
             String::new()
         }
         // Both delta-based scenarios need an initial result_id to diff against.
@@ -607,8 +609,8 @@ fn run_once(
     match scn.kind {
         // Handled by `measure_open`, which never calls `run_once`.
         Kind::OpenFirstToken => unreachable!("OpenFirstToken uses measure_open"),
-        Kind::SupersedeBurst { .. } => {
-            unreachable!("SupersedeBurst uses measure_supersede_burst")
+        Kind::CancelBurst { .. } => {
+            unreachable!("CancelBurst uses measure_cancel_burst")
         }
         Kind::Full => {
             let _ = server.semantic_full(scn.uri);
@@ -762,12 +764,12 @@ fn main() {
             targets: "edit→reparse→retokenize→delta diff (host path under typing)",
         },
         Scenario {
-            name: "rust_large/supersede_burst",
+            name: "rust_xlarge/cancel_burst",
             language_id: "rust",
             uri: "file:///bench/large_supersede.rs",
-            content: gen_rust(150),
-            kind: Kind::SupersedeBurst { obsolete: 8 },
-            targets: "latest request latency after eight superseded semantic computations",
+            content: gen_rust(600),
+            kind: Kind::CancelBurst { obsolete: 4 },
+            targets: "latest request latency after four explicitly cancelled computations",
         },
         Scenario {
             name: "markdown_injections/edit_delta",
