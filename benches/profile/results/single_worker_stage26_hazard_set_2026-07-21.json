@@ -93,6 +93,13 @@
       "execution_command_template": "target/release/deps/tree_worker_stage2-329ecb03b93d760d --bench --bin target/release/kakehashi --parser deps/test/kakehashi/parser/rust.dylib --requests 500 --threads 4 --lines 200 [--worker-first]",
       "harness_source_path": "benches/tree_worker_stage2.rs",
       "harness_source_sha256": "fe96da0be057f65836e6948334752daeb4d5c0dcd363645e2dbcc0d1a5dbdcab",
+      "parser_artifact": {
+        "path": "deps/test/kakehashi/parser/rust.dylib",
+        "sha256": "5134481a8ce8dfa395ad8c43a67f4623adc25551f03ec339309ca1b51420ea91",
+        "catalog_source": "https://github.com/tree-sitter/tree-sitter-rust",
+        "catalog_revision": "77a3747266f4d621d0757825e6b11edcbf991ca5",
+        "provenance_scope": "source URL and revision come from the mutable deps/test/kakehashi/cache/parsers.lua snapshot; the dylib build toolchain itself was not attested"
+      },
       "stage25_harness_binary_sha256": "d9451d0a4e531c4b7fac5bcf81e5be61294ee7b0f0a462ef0e03d478ddcd10a4",
       "stage26_harness_binary_sha256": "8d906956ab5284f3841c2c4cdba4c40b9a05a99c0024a9f4da5fa7227c645e8d"
     },
@@ -156,10 +163,12 @@
       "environment": ["KAKEHASHI_TREE_WORKER_MODE=authoritative", "KAKEHASHI_TREE_WORKER_THREADS=4"],
       "execution_command_template": "KAKEHASHI_TREE_WORKER_MODE=authoritative KAKEHASHI_TREE_WORKER_THREADS=4 KAKEHASHI_BENCH_BIN_A=<A> KAKEHASHI_BENCH_BIN_B=<B> KAKEHASHI_BENCH_ITERS=40 KAKEHASHI_BENCH_WARMUP=10 KAKEHASHI_BENCH_SCENARIOS=rust_large/edit_delta /tmp/kakehashi-stage26-review-36842edc5/target/release/deps/semantic_tokens-08ebd8d8c816111c --bench",
       "iterations_per_binary_per_pair": 40,
+      "pair_value_statistic": "median_ms",
       "pairs": 8,
       "revision_order": "odd measured->review-converged; even review-converged->measured",
       "scenario": "rust_large/edit_delta",
-      "warmup_iterations_per_binary_per_pair": 10
+      "warmup_iterations_per_binary_per_pair": 10,
+      "sample_retention": "the harness emitted one median per binary per pair; per-iteration samples and p25/p75 were not retained"
     },
     "pilot_ms": {
       "measured_candidate": 45.413,

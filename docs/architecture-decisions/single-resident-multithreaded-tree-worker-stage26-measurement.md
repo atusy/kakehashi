@@ -144,6 +144,9 @@ bound.
 Raw samples, artifact roles and hashes, stable source paths, exact build/run
 commands, metric ordering, and commit identities are in
 `benches/profile/results/single_worker_stage26_hazard_set_2026-07-21.json`.
+The steady-state Rust parser dylib is attested there as SHA-256 `5134481a…`;
+its mutable catalog snapshot names `tree-sitter-rust@77a3747…`, but the dylib
+build toolchain itself was not attested.
 
 ## Post-review semantic scheduling measurement
 
@@ -155,7 +158,9 @@ review-converged binary (`36842edc5`) were compared with the end-to-end
 `rust_large/edit_delta` semantic fixture in authoritative-worker mode.
 
 Eight pairs alternated revision order. Each binary ran 10 warmups and 40
-measured edit/reparse/retokenize/delta cycles per pair with four worker threads.
+measured edit/reparse/retokenize/delta cycles per pair with four worker threads;
+each recorded pair value is the median of those 40 cycles. Per-iteration
+samples and p25/p75 were not retained.
 The measured-candidate median was 39.013 ms and the review-converged median was
 39.021 ms. The paired median delta was +0.146 ms (+0.374%), so central latency
 was indistinguishable. Paired differences ranged from -0.522 to +5.866 ms; two
