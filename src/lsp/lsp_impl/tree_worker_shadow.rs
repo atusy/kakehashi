@@ -345,6 +345,7 @@ struct WorkerLossEvidence {
     class: FailureClass,
     active_grammars: Vec<GrammarIdentity>,
     active_lease_count: usize,
+    snapshot_complete: bool,
 }
 
 impl WorkerLossEvidence {
@@ -353,7 +354,21 @@ impl WorkerLossEvidence {
             class: FailureClass::Systemic,
             active_grammars: Vec::new(),
             active_lease_count: 0,
+            snapshot_complete: true,
         }
+    }
+
+    fn incomplete(active_grammars: Vec<GrammarIdentity>, active_lease_count: usize) -> Self {
+        Self {
+            class: FailureClass::Systemic,
+            active_lease_count,
+            active_grammars,
+            snapshot_complete: false,
+        }
+    }
+
+    fn allows_restart(&self) -> bool {
+        self.snapshot_complete
     }
 }
 
@@ -3103,6 +3118,13 @@ fn recover_worker(
         comparisons,
         failure.active_lease_count,
     );
+    if !failure.allows_restart() {
+        log::error!(
+            target: "kakehashi::tree_worker_shadow",
+            "disabled tree tier because the dead worker hazard snapshot was incomplete",
+        );
+        return false;
+    }
     failure.class = effective_failure_class(failure.class, &initial_quarantine);
     let mut class = failure.class;
 
@@ -3446,15 +3468,15 @@ fn retag_command(command: &mut ShadowCommand, generation: u64) {
 
 fn worker_loss_evidence(client: &Client, error: &std::io::Error) -> WorkerLossEvidence {
     if let Err(drain_error) = client.wait_for_reader_drain(SHADOW_SHUTDOWN_TIMEOUT) {
+        let active_hazards = client.active_grammar_hazards();
+        let active_lease_count = active_hazards.len();
+        let active_grammars = unique_active_grammars(&active_hazards);
         log::error!(
             target: "kakehashi::tree_worker_shadow",
-            "could not obtain a complete worker failure snapshot: {drain_error}",
+            "could not obtain a complete worker failure snapshot; disabling the tree tier with {} currently known grammar(s): {drain_error}",
+            active_grammars.len(),
         );
-        return WorkerLossEvidence {
-            class: FailureClass::Systemic,
-            active_grammars: Vec::new(),
-            active_lease_count: 0,
-        };
+        return WorkerLossEvidence::incomplete(active_grammars, active_lease_count);
     }
     let mut active_hazards = client.active_grammar_hazards();
     active_hazards.sort_unstable_by(|left, right| {
@@ -3500,6 +3522,7 @@ fn worker_loss_evidence(client: &Client, error: &std::io::Error) -> WorkerLossEv
         class,
         active_grammars,
         active_lease_count,
+        snapshot_complete: true,
     }
 }
 
@@ -3894,6 +3917,22 @@ mod tests {
             ),
             FailureClass::NativeEvidenced,
         );
+    }
+
+    #[test]
+    fn incomplete_worker_loss_snapshot_cannot_restart_the_tree_tier() {
+        let evidence = WorkerLossEvidence::incomplete(
+            vec![GrammarIdentity {
+                grammar_symbol: "rust".into(),
+                artifact_digest: "digest-rust".into(),
+            }],
+            2,
+        );
+
+        assert!(!evidence.allows_restart());
+        assert_eq!(evidence.class, FailureClass::Systemic);
+        assert_eq!(evidence.active_grammars.len(), 1);
+        assert_eq!(evidence.active_lease_count, 2);
     }
 
     #[test]
