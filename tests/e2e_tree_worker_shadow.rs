@@ -226,7 +226,10 @@ fn authoritative_worker_serves_injected_node_accessors() {
         }),
     );
     let node = &node["result"];
-    let id = node["id"].as_str().expect("worker node must have an id");
+    let Some(id) = node["id"].as_str() else {
+        let stderr = shutdown_and_stderr(client);
+        panic!("worker node must have an id: {node:?}\n{stderr}");
+    };
     assert_eq!(node["kind"], "identifier");
 
     let text = client.send_request(

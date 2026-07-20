@@ -212,7 +212,9 @@ impl InjectionCoordinator {
             return false;
         };
         let injections = if should_query_worker_injections(
-            self.language.injection_query(&host_language).is_some(),
+            self.language
+                .worker_grammar_descriptor(&host_language)
+                .is_some_and(|grammar| grammar.queries.injections.is_some()),
         ) {
             let generation = self.language.configuration_generation();
             let Some(regions) = self
@@ -493,7 +495,11 @@ impl InjectionCoordinator {
                 .documents
                 .get(uri)
                 .map(|document| (document.incarnation(), document.content_version()))?;
-            if self.language.injection_query(&host_language).is_none() {
+            if self
+                .language
+                .worker_grammar_descriptor(&host_language)
+                .is_none_or(|grammar| grammar.queries.injections.is_none())
+            {
                 return Some((host_language, Vec::new()));
             }
             let regions = self

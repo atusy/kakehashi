@@ -407,10 +407,37 @@ impl QueryLoader {
     }
 
     /// Combine explicit query files without loading a native grammar.
-    pub(crate) fn load_query_source_from_paths<P: AsRef<Path>>(
-        paths: &[P],
-    ) -> LspResult<String> {
+    pub(crate) fn load_query_source_from_paths<P: AsRef<Path>>(paths: &[P]) -> LspResult<String> {
         Self::load_content_from_paths(paths)
+    }
+
+    /// Discover parser identities from filenames only. This deliberately does
+    /// not open or load a dynamic library; the worker validates and loads the
+    /// content-addressed artifact later.
+    pub(crate) fn discover_parser_languages<P: AsRef<Path>>(runtime_bases: &[P]) -> Vec<String> {
+        let mut languages = Vec::new();
+        for base in runtime_bases {
+            let Ok(entries) = fs::read_dir(base.as_ref().join("parser")) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if !path.is_file()
+                    || !path
+                        .extension()
+                        .and_then(|extension| extension.to_str())
+                        .is_some_and(|extension| PARSER_EXTENSIONS.contains(&extension))
+                {
+                    continue;
+                }
+                if let Some(language) = path.file_stem().and_then(|stem| stem.to_str()) {
+                    languages.push(language.to_string());
+                }
+            }
+        }
+        languages.sort();
+        languages.dedup();
+        languages
     }
 
     /// Resolve library path for a language.
@@ -534,6 +561,20 @@ mod tests {
 
         assert!(source.contains("(identifier) @first"));
         assert!(source.contains("(string_literal) @second"));
+    }
+
+    #[test]
+    fn worker_asset_discovery_lists_parser_files_without_loading_them() {
+        let dir = tempdir().unwrap();
+        let parser_dir = dir.path().join("parser");
+        fs::create_dir_all(&parser_dir).unwrap();
+        fs::write(parser_dir.join("rust.dylib"), b"not-a-library").unwrap();
+        fs::write(parser_dir.join("python.so"), b"not-a-library").unwrap();
+        fs::write(parser_dir.join("README.md"), b"ignored").unwrap();
+
+        let languages = QueryLoader::discover_parser_languages(&[dir.path()]);
+
+        assert_eq!(languages, vec!["python", "rust"]);
     }
 
     #[test]

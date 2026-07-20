@@ -109,6 +109,7 @@ pub(crate) struct LanguageCoordinator {
     worker_artifact_dir: Option<tempfile::TempDir>,
     worker_settings: RwLock<Arc<WorkspaceSettings>>,
     worker_settings_epoch: std::sync::atomic::AtomicU64,
+    worker_owns_native: std::sync::atomic::AtomicBool,
     /// Single-flight marker for [`ensure_language_loaded_async`](Self::ensure_language_loaded_async):
     /// a language with an in-flight first load has an entry here, so a
     /// concurrent request for the same language parks on the winner's
@@ -178,6 +179,7 @@ impl LanguageCoordinator {
                 .ok(),
             worker_settings: RwLock::new(Arc::new(WorkspaceSettings::default())),
             worker_settings_epoch: std::sync::atomic::AtomicU64::new(0),
+            worker_owns_native: std::sync::atomic::AtomicBool::new(false),
             config_warnings: RwLock::new(Vec::new()),
             load_inflight: dashmap::DashMap::new(),
         }
@@ -188,6 +190,16 @@ impl LanguageCoordinator {
     /// Visibility: pub(crate) - called by LSP layer (semantic_tokens, selection_range)
     /// and analysis modules to ensure parsers are available before use.
     pub(crate) fn ensure_language_loaded(&self, language_id: &str) -> LanguageLoadResult {
+        if self
+            .worker_owns_native
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return if self.worker_grammar_descriptor(language_id).is_some() {
+                LanguageLoadResult::success_with(Vec::new())
+            } else {
+                LanguageLoadResult::default()
+            };
+        }
         loop {
             let current_generation = self
                 .load_generation
@@ -296,6 +308,16 @@ impl LanguageCoordinator {
         self: &Arc<Self>,
         language_id: &str,
     ) -> LanguageLoadResult {
+        if self
+            .worker_owns_native
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return if self.worker_grammar_descriptor(language_id).is_some() {
+                LanguageLoadResult::success_with(Vec::new())
+            } else {
+                LanguageLoadResult::default()
+            };
+        }
         loop {
             let current_generation = self
                 .load_generation
@@ -440,6 +462,8 @@ impl LanguageCoordinator {
             .settings_reload_lock
             .lock()
             .recover_poison("LanguageCoordinator::load_settings(reload)");
+        self.worker_owns_native
+            .store(false, std::sync::atomic::Ordering::Release);
         self.worker_settings_epoch
             .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
         *self
@@ -519,6 +543,46 @@ impl LanguageCoordinator {
         self.worker_settings_epoch
             .fetch_add(1, std::sync::atomic::Ordering::Release);
         summary
+    }
+
+    /// Apply language settings while leaving every native parser and compiled
+    /// query exclusively owned by the isolated tree worker.
+    pub(crate) fn load_worker_owned_settings(
+        &self,
+        settings: &WorkspaceSettings,
+    ) -> LanguageLoadSummary {
+        let _reload = self
+            .settings_reload_lock
+            .lock()
+            .recover_poison("LanguageCoordinator::load_worker_owned_settings(reload)");
+        self.worker_owns_native
+            .store(true, std::sync::atomic::Ordering::Release);
+        self.worker_settings_epoch
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        *self
+            .worker_settings
+            .write()
+            .recover_poison("LanguageCoordinator::load_worker_owned_settings(worker_settings)") =
+            Arc::new(settings.clone());
+        self.config_store.update_from_settings(settings);
+        self.clear_derived_languages();
+        {
+            let _registration = self
+                .registration_lock
+                .lock()
+                .recover_poison("LanguageCoordinator::load_worker_owned_settings(generation)");
+            self.load_generation
+                .fetch_add(1, std::sync::atomic::Ordering::Release);
+        }
+        self.failed_loads.clear();
+        self.configured_load_failures.clear();
+        self.build_base_map(&settings.languages);
+        self.worker_settings_epoch
+            .fetch_add(1, std::sync::atomic::Ordering::Release);
+        LanguageLoadSummary {
+            events: self.config_warning_events(),
+            ..LanguageLoadSummary::default()
+        }
     }
 
     /// Load a derived language by copying parser and queries from its base.
@@ -1265,6 +1329,12 @@ impl LanguageCoordinator {
     /// Visibility: pub(crate) - called by LSP layer (lsp_impl) to check parser
     /// availability before attempting language operations.
     pub(crate) fn has_parser_available(&self, language_name: &str) -> bool {
+        if self
+            .worker_owns_native
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return self.worker_grammar_descriptor(language_name).is_some();
+        }
         let generation = self
             .load_generation
             .load(std::sync::atomic::Ordering::Acquire);
@@ -1950,22 +2020,96 @@ impl LanguageCoordinator {
             parser_path: artifact.path,
             grammar_symbol,
             artifact_digest: artifact.digest,
-            queries: crate::tree_worker::WorkerQuerySources {
-                highlights: self
-                    .query_store
-                    .query_source(QueryKind::Highlights, language_id)
-                    .map(|source| source.to_string()),
-                bindings: self
-                    .query_store
-                    .query_source(QueryKind::Bindings, language_id)
-                    .map(|source| source.to_string()),
-                injections: self
-                    .query_store
-                    .query_source(QueryKind::Injections, language_id)
-                    .map(|source| source.to_string()),
-            },
+            queries: self.worker_query_sources(&settings, language_id),
             configuration_generation,
         })
+    }
+
+    fn worker_query_sources(
+        &self,
+        settings: &WorkspaceSettings,
+        language_id: &str,
+    ) -> crate::tree_worker::WorkerQuerySources {
+        self.worker_query_sources_inner(settings, language_id, &mut HashSet::new())
+    }
+
+    fn worker_query_sources_inner(
+        &self,
+        settings: &WorkspaceSettings,
+        language_id: &str,
+        visiting: &mut HashSet<String>,
+    ) -> crate::tree_worker::WorkerQuerySources {
+        if !visiting.insert(language_id.to_string()) {
+            return crate::tree_worker::WorkerQuerySources::default();
+        }
+        let configured = settings.languages.get(language_id);
+        let sources = match configured.and_then(|config| config.queries.as_ref()) {
+            Some(queries) => {
+                let source_for = |kind| {
+                    let paths = queries
+                        .iter()
+                        .filter(|query| {
+                            query.kind.or_else(|| infer_query_kind(&query.path)) == Some(kind)
+                        })
+                        .map(|query| query.path.as_str())
+                        .collect::<Vec<_>>();
+                    if paths.is_empty() {
+                        None
+                    } else {
+                        QueryLoader::load_query_source_from_paths(&paths).ok()
+                    }
+                };
+                crate::tree_worker::WorkerQuerySources {
+                    highlights: source_for(QueryKind::Highlights),
+                    bindings: source_for(QueryKind::Bindings),
+                    injections: source_for(QueryKind::Injections),
+                }
+            }
+            None if configured
+                .and_then(|config| config.base.as_deref())
+                .is_some() =>
+            {
+                let base = configured
+                    .and_then(|config| config.base.as_deref())
+                    .expect("base checked above");
+                self.worker_query_sources_inner(settings, base, visiting)
+            }
+            None => {
+                let search_paths = self.config_store.search_paths();
+                let source_for = |kind: QueryKind| {
+                    QueryLoader::load_query_source_with_inheritance(
+                        &search_paths,
+                        language_id,
+                        kind.filename(),
+                    )
+                    .ok()
+                };
+                crate::tree_worker::WorkerQuerySources {
+                    highlights: source_for(QueryKind::Highlights),
+                    bindings: source_for(QueryKind::Bindings),
+                    injections: source_for(QueryKind::Injections),
+                }
+            }
+        };
+        visiting.remove(language_id);
+
+        crate::tree_worker::WorkerQuerySources {
+            highlights: self
+                .query_store
+                .query_source(QueryKind::Highlights, language_id)
+                .map(|source| source.to_string())
+                .or(sources.highlights),
+            bindings: self
+                .query_store
+                .query_source(QueryKind::Bindings, language_id)
+                .map(|source| source.to_string())
+                .or(sources.bindings),
+            injections: self
+                .query_store
+                .query_source(QueryKind::Injections, language_id)
+                .map(|source| source.to_string())
+                .or(sources.injections),
+        }
     }
 
     /// Snapshot every configured language into immutable worker-owned assets.
@@ -1982,6 +2126,9 @@ impl LanguageCoordinator {
             .cloned()
             .collect::<Vec<_>>();
         language_ids.extend(self.language_registry.language_ids());
+        language_ids.extend(QueryLoader::discover_parser_languages(
+            &self.config_store.search_paths(),
+        ));
         language_ids.sort();
         language_ids.dedup();
         let assets = language_ids
@@ -2173,6 +2320,42 @@ mod tests {
         assert_ne!(replaced.artifact_digest, descriptor.artifact_digest);
         assert_ne!(replaced.parser_path, descriptor.parser_path);
         assert_eq!(fs::read(&replaced.parser_path).unwrap(), b"parser-v2");
+    }
+
+    #[test]
+    fn worker_owned_settings_resolve_assets_without_parent_native_loading() {
+        let coordinator = LanguageCoordinator::new();
+        let directory = tempdir().unwrap();
+        let parser_path = directory.path().join("tree-sitter-rust.so");
+        let query_path = directory.path().join("rust-highlights.scm");
+        fs::write(&parser_path, b"worker-only-parser").unwrap();
+        fs::write(&query_path, "(identifier) @variable\n").unwrap();
+        let settings = WorkspaceSettings {
+            languages: HashMap::from([(
+                "rust".to_string(),
+                LanguageSettings {
+                    parser: Some(parser_path.to_string_lossy().into_owned()),
+                    queries: Some(vec![crate::config::settings::QueryItem {
+                        path: query_path.to_string_lossy().into_owned(),
+                        kind: Some(QueryKind::Highlights),
+                    }]),
+                    ..Default::default()
+                },
+            )]),
+            ..Default::default()
+        };
+
+        let summary = coordinator.load_worker_owned_settings(&settings);
+        let descriptor = coordinator.worker_grammar_descriptor("rust").unwrap();
+
+        assert!(summary.loaded.is_empty());
+        assert!(coordinator.ensure_language_loaded("rust").success);
+        assert!(!coordinator.language_registry.contains("rust"));
+        assert!(coordinator.highlight_query("rust").is_none());
+        assert_eq!(
+            descriptor.queries.highlights.as_deref(),
+            Some("(identifier) @variable\n\n")
+        );
     }
 
     /// Pins the #575 single-flight fix: a caller that arrives while another

@@ -103,6 +103,7 @@ pub(super) struct ReloadLanguageState<'a> {
     language: &'a LanguageCoordinator,
     parser_pool: &'a std::sync::Mutex<DocumentParserPool>,
     documents: &'a DocumentStore,
+    worker_owns_native: bool,
     invalidate_documents: bool,
     request_semantic_refresh: bool,
 }
@@ -203,7 +204,13 @@ pub(super) async fn apply_shared_settings_locked(
     crate::analysis::semantic::invalidate_thread_local_parser_caches();
     let parser_reload =
         ParserReloadGuard::begin(language_state.parser_pool, language_state.language);
-    let mut summary = language_state.language.load_settings(&settings);
+    let mut summary = if language_state.worker_owns_native {
+        language_state
+            .language
+            .load_worker_owned_settings(&settings)
+    } else {
+        language_state.language.load_settings(&settings)
+    };
     let reparse_uris = if language_state.invalidate_documents {
         language_state.documents.invalidate_all_parses()
     } else {
@@ -559,6 +566,7 @@ impl Kakehashi {
                 language: &self.language,
                 parser_pool: &self.parser_pool,
                 documents: &self.documents,
+                worker_owns_native: self.tree_worker_shadow.is_authoritative(),
                 invalidate_documents: true,
                 request_semantic_refresh: true,
             },
@@ -623,6 +631,7 @@ impl Kakehashi {
                 language: &self.language,
                 parser_pool: &self.parser_pool,
                 documents: &self.documents,
+                worker_owns_native: self.tree_worker_shadow.is_authoritative(),
                 invalidate_documents: false,
                 request_semantic_refresh: false,
             },
@@ -635,6 +644,7 @@ impl Kakehashi {
         .await
         .into_iter()
         .for_each(|uri| self.schedule_reparse(uri, None));
+        self.refresh_tree_worker_documents(&[]);
         self.warn_on_misconfigured_settings(&warnings).await;
     }
 

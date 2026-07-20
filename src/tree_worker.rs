@@ -1686,20 +1686,32 @@ fn worker_analysis(
         let Some(source) = source else {
             continue;
         };
+        let parsed =
+            crate::language::query_loader::QueryLoader::parse_query(&language, &source, false);
+        if !parsed.skipped.is_empty() {
+            log::warn!(
+                target: "kakehashi::tree_worker",
+                "worker skipped {} invalid {} query pattern(s) for {}",
+                parsed.skipped.len(),
+                kind.name(),
+                language_name,
+            );
+        }
+        let (Some(query), Some(compiled_source)) = (parsed.query, parsed.compiled_source) else {
+            continue;
+        };
         if analysis
             .query_store()
             .query_source(kind, language_name)
-            .is_some_and(|current| current.as_ref() == source)
+            .is_some_and(|current| current.as_ref() == compiled_source)
         {
             continue;
         }
-        let query = tree_sitter::Query::new(&language, &source)
-            .map_err(|error| format!("worker query reconstruction failed: {error}"))?;
         analysis.query_store().insert_query_with_source(
             kind,
             language_name.to_string(),
             Arc::new(query),
-            source,
+            compiled_source,
         );
     }
     Ok(())
@@ -2699,6 +2711,7 @@ fn configure_languages(
         let key = GrammarKey::from_asset(&asset);
         let language_name = asset.language;
         let queries = asset.queries;
+        analysis.query_store().remove_queries(&language_name);
         let response = WORKER_THREAD_STATE.with(|state| {
             state
                 .borrow_mut()
@@ -4935,6 +4948,31 @@ mod tests {
             })
             .unwrap();
         assert!(out_of_bounds.nodes.is_empty());
+    }
+
+    #[test]
+    fn worker_query_compilation_preserves_tolerant_parent_semantics() {
+        let analysis = crate::language::LanguageCoordinator::new();
+
+        super::worker_analysis(
+            &analysis,
+            "rust",
+            tree_sitter_rust::LANGUAGE.into(),
+            WorkerQuerySources {
+                highlights: Some("(identifier) @variable\n(nonexistent_node) @invalid\n".into()),
+                ..WorkerQuerySources::default()
+            },
+            super::WorkerQuerySet::Semantic,
+        )
+        .unwrap();
+
+        assert!(analysis.highlight_query("rust").is_some());
+        let compiled = analysis
+            .query_store()
+            .query_source(crate::config::settings::QueryKind::Highlights, "rust")
+            .unwrap();
+        assert!(compiled.contains("(identifier) @variable"));
+        assert!(!compiled.contains("nonexistent_node"));
     }
 
     #[test]

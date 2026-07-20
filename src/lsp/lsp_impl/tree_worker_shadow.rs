@@ -1705,8 +1705,17 @@ impl TreeWorkerShadow {
 
     fn remember_catalog(&self, generation: u64, catalog: WorkerLanguageCatalog) {
         if catalog.assets.is_empty() {
+            log::debug!(
+                target: "kakehashi::tree_worker_shadow",
+                "ignored empty worker language catalog for generation {generation}",
+            );
             return;
         }
+        log::debug!(
+            target: "kakehashi::tree_worker_shadow",
+            "remembered {} worker language assets for generation {generation}",
+            catalog.assets.len(),
+        );
         let mut documents = self
             .open_documents
             .lock()

@@ -404,6 +404,7 @@ impl InstallCoordinator {
                 language: &self.language,
                 parser_pool: &self.parser_pool,
                 documents: &self.documents,
+                worker_owns_native: self.tree_worker_shadow.is_authoritative(),
                 invalidate_documents: false,
                 request_semantic_refresh: true,
             },
