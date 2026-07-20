@@ -773,7 +773,8 @@ an already-exited or unknown transport state enters worker-loss recovery rather
 than leaving the dead generation published. That recovery is systemic unless
 the preserved child status matches the conservative native-crash evidence
 allowlist; `TimedOut` alone is not parser-fault evidence. Unix evidence is
-restricted to synchronous crash signals rather than external TERM/KILL, and
+restricted to a conservative ABRT/BUS/FPE/ILL/SEGV crash-signal allowlist that
+excludes TERM/KILL, and
 Windows uses an explicit exception/fail-fast allowlist rather than all negative
 codes. A separate hard native-segment deadline starts with the handoff
 allowance when the parent receives
@@ -1362,7 +1363,7 @@ before the blocking response waiter. The original performance binary remains
 the explicitly identified measured candidate rather than being relabeled as
 final HEAD. A separate eight-pair authoritative semantic edit/delta comparison
 between that candidate and the review-converged scheduling path measured
-39.013 ms versus 39.021 ms median latency, with a +0.146 ms (+0.374%) median
+39.013 ms versus 39.021 ms median latency, with a +0.146 ms (+0.376%) median
 paired delta. Two late pairs widened the paired range to -0.522–+5.866 ms, so
 central latency was indistinguishable but tail equivalence was not established.
 Keep the failure-path barrier. Runtime

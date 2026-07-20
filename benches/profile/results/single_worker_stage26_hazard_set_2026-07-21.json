@@ -189,7 +189,8 @@
       "measured_candidate_median_ms": 39.013,
       "review_converged_median_ms": 39.021,
       "median_paired_delta_ms": 0.146,
-      "median_paired_delta_percent": 0.374,
+      "median_paired_delta_percent": 0.376,
+      "median_paired_delta_percent_calculation": "median((review_converged - measured_candidate) / measured_candidate * 100 for each pair)",
       "paired_delta_range_ms": [-0.522, 5.866],
       "interpretation": "central latency was indistinguishable; two late pairs widened the positive tail, so this run does not establish tail equivalence"
     }

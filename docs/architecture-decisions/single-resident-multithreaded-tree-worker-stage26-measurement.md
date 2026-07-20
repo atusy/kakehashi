@@ -171,7 +171,7 @@ measured edit/reparse/retokenize/delta cycles per pair with four worker threads;
 each recorded pair value is the median of those 40 cycles. Per-iteration
 samples and p25/p75 were not retained.
 The measured-candidate median was 39.013 ms and the review-converged median was
-39.021 ms. The paired median delta was +0.146 ms (+0.374%), so central latency
+39.021 ms. The paired median delta was +0.146 ms (+0.376%), so central latency
 was indistinguishable. Paired differences ranged from -0.522 to +5.866 ms; two
 late pairs put the review-converged binary about five milliseconds behind, so
 this run does not establish tail equivalence. The raw pairs, one excluded
