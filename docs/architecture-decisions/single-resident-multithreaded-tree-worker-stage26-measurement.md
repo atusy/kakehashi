@@ -28,49 +28,56 @@ document. A second server session serves Rust and Lua again, proving the
 quarantine is session-local.
 
 A generic request deadline remains insufficient parser-fault evidence. The
-client now sends cancellation at the deadline, waits 250 ms for a terminal
+client sends cancellation at the deadline, waits 250 ms for a terminal
 response, and systemically terminates the generation if native work does not
-cooperate. Parent-initiated termination cannot quarantine an active grammar.
-The saturation E2E parks four distinct committed grammar jobs on all four
-compute threads, then proves that one generation restart releases every route,
-quarantines nothing, full-resynchronizes four documents, and keeps LSP service
-available.
+cooperate. Parent deadline termination has its own cause and cannot quarantine
+an active grammar. The saturation E2E parks four distinct committed grammar
+jobs on all four compute threads, then proves that one generation restart
+releases every route, quarantines nothing, full-resynchronizes four documents,
+and keeps LSP service available.
 
-The focused 63 worker and 40 supervisor tests, the single-crash, multi-hazard,
-single-timeout, and four-thread saturation E2Es, all-target Check, warning-
-denying Clippy, and formatting checks pass locally.
+Reader and writer cleanup do not use the deadline cause. A protocol-failure E2E
+commits a Rust hazard and then sends an invalid release frame. The reader
+classifies the failure as systemic, preserves and quarantines the complete
+active Rust set, restarts once, and serves the healthy Lua document. A
+transport error received during cancellation grace is propagated instead of
+being overwritten as a generic timeout.
+
+The focused 64 worker and 40 supervisor tests, the single-crash, protocol-
+failure, multi-hazard, single-timeout, and four-thread saturation E2Es,
+all-target Check, warning-denying Clippy, and formatting checks pass locally.
 
 ## Recovery measurement
 
-The first final-HEAD measurement compares immutable Stage 25 (`f6e0c2125`) and
-Stage 26 (`33c61b5b6`) with the same single-hazard E2E on macOS 26.5.1
-(`Darwin 25.5.0`, Apple M4). After one warmup per stage, seven pairs run Stage
-25 then Stage 26. The supervisor's `recovery_ms` covers failure recovery through
+The final-HEAD measurement compares immutable Stage 25 (`f6e0c2125`) and Stage
+26 (`30ae589b3`) with the same single-hazard E2E on macOS 26.5.1 (`Darwin
+25.5.0`, Apple M4). After one warmup per stage, 12 pairs alternate revision
+order. The supervisor's `recovery_ms` covers failure recovery through
 replacement spawn and full resync; it is not end-to-end request latency.
 
 | Metric | Stage 25 | Stage 26 | Difference |
 | --- | ---: | ---: | ---: |
-| Median recovery | 1170 ms | 1172 ms | +2 ms (+0.2%) |
-| Mean recovery | 1186 ms | 1168 ms | -18 ms (-1.5%) |
-| Range | 1146–1243 ms | 1133–1204 ms | — |
-| Median paired delta | — | — | -13 ms (-1.1%) |
+| Median recovery | 1202 ms | 1182 ms | -20 ms (-1.7%) |
+| Mean recovery | 1231 ms | 1216 ms | -15 ms (-1.2%) |
+| Range | 1164–1394 ms | 1120–1549 ms | — |
+| Median paired delta | — | — | -47 ms (-3.8%) |
 
-The absolute median and paired median have opposite signs. Seven debug E2E
-pairs therefore provide no evidence of a recovery regression or improvement;
-the difference is noise-scale and the fixed Stage-25-first order remains a
-confounder.
+The medians show no regression, but paired differences span -234 to +385 ms.
+The debug E2E combines process spawn, hashing, backoff, and resync, so this run
+does not isolate hazard-set construction and cannot support a claimed 3.8%
+improvement.
 
 The two-active-grammar E2E also ran seven times. Every run quarantined two
 grammars, restarted once, and resynchronized one healthy document (14 bytes).
-Recovery was 932–967 ms, with a 957 ms median and 951 ms mean. This fixture has
+Recovery was 954–978 ms, with a 962 ms median and 963 ms mean. This fixture has
 a different failure trigger and document set, so its absolute time is not
 directly comparable with the single-hazard fixture. It establishes that two
 attributions remain one recovery action rather than two restarts.
 
 The four-thread saturation E2E ran seven times after one warmup. Its configured
 2,000 ms request deadline and 250 ms cancellation grace are included in the
-measurement. Replacement readiness was 3187–3211 ms after request issue, with a
-3205 ms median and 3202 ms mean. The narrow 24 ms range shows that four leaked
+measurement. Replacement readiness was 3176–3204 ms after request issue, with a
+3197 ms median and 3196 ms mean. The narrow 28 ms range shows that four leaked
 native jobs are reclaimed by one bounded process restart rather than four
 serial per-thread recoveries.
 
@@ -84,26 +91,29 @@ Rust source lines and four worker threads.
 
 | Metric | Stage 25 median | Stage 26 median | Median paired delta |
 | --- | ---: | ---: | ---: |
-| Sequential parent p50 | 453.167 us | 452.771 us | -0.010% |
-| Sequential parent p95 | 489.667 us | 494.979 us | +0.886% |
-| Four-way parallel parent p50 | 558.626 us | 557.104 us | -0.616% |
-| Four-way parallel parent p95 | 629.688 us | 638.125 us | +0.843% |
-| Four-way parallel throughput | 6598 req/s | 6578 req/s | +0.273% |
+| Sequential parent p50 | 415.334 us | 436.667 us | -0.167% |
+| Sequential parent p95 | 474.438 us | 474.250 us | +0.383% |
+| Four-way parallel parent p50 | 554.876 us | 546.188 us | -0.292% |
+| Four-way parallel parent p95 | 632.479 us | 632.688 us | +0.087% |
+| Four-way parallel throughput | 6614 req/s | 6617 req/s | +0.582% |
 
-Directions are mixed and every paired median is below 1%. The atomic admission
-check has no distinguishable steady-state cost in this fixture. One Stage 26
-parallel p95 sample reached 765 us (+21.7% paired) while its throughput fell to
-5942 req/s, so this small run still cannot establish a tail-latency bound.
+Directions are mixed and every paired median is below 1%. Absolute p50 medians
+also move differently from their paired medians because the alternating
+worker/direct order makes these small samples bimodal. The atomic admission
+check therefore has no distinguishable steady-state cost in this fixture. One
+Stage 26 parallel p95 sample reached 1116 us (+77% paired), while another pair
+favored Stage 26 by 24%; this small run cannot establish a tail-latency bound.
 
-Raw samples, artifact hashes, metric ordering, and exact commit identities are
-in `benches/profile/results/single_worker_stage26_hazard_set_2026-07-21.json`.
+Raw samples, artifact roles and hashes, stable source paths, exact build/run
+commands, metric ordering, and commit identities are in
+`benches/profile/results/single_worker_stage26_hazard_set_2026-07-21.json`.
 
 ## Decision
 
 Keep complete-set quarantine, the reader-drain barrier, bounded systemic
-cancellation recovery, and the request-admission fence. The recovery work is
-bounded by active leases, while the measured request-path change is noise-scale
-in both sequential and four-way workloads.
+cancellation recovery, the termination-cause split, and the request-admission
+fence. Recovery work is bounded by active leases, while the measured request-
+path change is noise-scale in both sequential and four-way workloads.
 
 Do not claim a tail-recovery or complete performance-gate pass from these
 samples. Runtime injection identities, independently bounded control transport,
