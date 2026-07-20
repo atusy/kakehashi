@@ -33,6 +33,7 @@ const MAX_SESSION_RESTARTS: u8 = 16;
 const INITIAL_RESTART_BACKOFF: Duration = Duration::from_millis(250);
 const MAX_RESTART_BACKOFF: Duration = Duration::from_secs(300);
 const WORKER_LIVENESS_POLL: Duration = Duration::from_millis(250);
+const WORKER_READ_READY_TIMEOUT: Duration = Duration::from_secs(15);
 const FAST_HEALTHY_INTERVAL: Duration = Duration::from_secs(60);
 const LONG_HEALTHY_INTERVAL: Duration = Duration::from_secs(10 * 60);
 static NEXT_WORKER_GENERATION: AtomicU64 = AtomicU64::new(1);
@@ -1937,7 +1938,7 @@ impl TreeWorkerShadow {
             }
             if self.disabled.load(Ordering::Acquire)
                 || self.sender.is_none()
-                || tokio::time::timeout(Duration::from_secs(2), notified)
+                || tokio::time::timeout(WORKER_READ_READY_TIMEOUT, notified)
                     .await
                     .is_err()
             {
@@ -1973,7 +1974,7 @@ impl TreeWorkerShadow {
                 }
             }
             if !self.is_enabled()
-                || tokio::time::timeout(Duration::from_secs(2), notified)
+                || tokio::time::timeout(WORKER_READ_READY_TIMEOUT, notified)
                     .await
                     .is_err()
             {
@@ -2026,7 +2027,7 @@ impl TreeWorkerShadow {
                 }
             }
             if !self.is_enabled()
-                || tokio::time::timeout(Duration::from_secs(2), notified)
+                || tokio::time::timeout(WORKER_READ_READY_TIMEOUT, notified)
                     .await
                     .is_err()
             {
