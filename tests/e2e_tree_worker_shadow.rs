@@ -139,6 +139,67 @@ fn normal_shutdown_terminates_worker_descendants() {
     assert!(!descendant_survived, "worker descendant survived shutdown");
 }
 
+#[cfg(unix)]
+#[test]
+fn parent_death_terminates_worker_with_a_hung_compute_thread() {
+    use nix::errno::Errno;
+    use nix::sys::signal::{Signal, kill};
+    use nix::unistd::Pid;
+
+    let directory = tempfile::tempdir().unwrap();
+    let worker_pid_path = directory.path().join("worker.pid");
+    let hang_marker = directory.path().join("hung-compute");
+    let mut client = LspClient::builder()
+        .env("KAKEHASHI_TREE_WORKER_MODE", "authoritative")
+        .env(
+            "KAKEHASHI_TREE_WORKER_PID_FILE",
+            worker_pid_path.to_string_lossy(),
+        )
+        .env(
+            "KAKEHASHI_TREE_WORKER_HANG_ONCE_FILE",
+            hang_marker.to_string_lossy(),
+        )
+        .env("KAKEHASHI_TREE_WORKER_HANG_URI_SUFFIX", "/hung.rs")
+        .build();
+    initialize(&mut client);
+    client.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": "file:///hung.rs",
+                "languageId": "rust",
+                "version": 1,
+                "text": "fn hangs_forever() {}\n"
+            }
+        }),
+    );
+    wait_for_file(&hang_marker, "worker compute thread did not enter the hang");
+    let worker = Pid::from_raw(
+        std::fs::read_to_string(&worker_pid_path)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap(),
+    );
+
+    drop(client);
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    let worker_survived = loop {
+        match kill(worker, None) {
+            Err(Errno::ESRCH) => break false,
+            Ok(()) | Err(Errno::EPERM) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            Ok(()) | Err(Errno::EPERM) => break true,
+            Err(error) => panic!("unexpected worker liveness error: {error}"),
+        }
+    };
+    if worker_survived {
+        let _ = kill(worker, Signal::SIGKILL);
+    }
+    assert!(!worker_survived, "worker survived parent death");
+}
+
 #[test]
 fn shadow_worker_matches_authoritative_incremental_lifecycle() {
     let mut client = LspClient::builder()

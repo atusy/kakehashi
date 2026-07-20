@@ -4196,6 +4196,8 @@ pub fn run_stdio_with_memory_budgets(
     compute_threads: usize,
     memory_budgets: WorkerMemoryBudgets,
 ) -> io::Result<()> {
+    #[cfg(feature = "e2e")]
+    publish_test_worker_pid()?;
     #[cfg(all(unix, feature = "e2e"))]
     spawn_test_descendant()?;
     let build_id = artifact_digest(&std::env::current_exe()?)?;
@@ -4206,6 +4208,14 @@ pub fn run_stdio_with_memory_budgets(
         &build_id,
         memory_budgets,
     )
+}
+
+#[cfg(feature = "e2e")]
+fn publish_test_worker_pid() -> io::Result<()> {
+    let Some(pid_path) = std::env::var_os("KAKEHASHI_TREE_WORKER_PID_FILE") else {
+        return Ok(());
+    };
+    std::fs::write(pid_path, std::process::id().to_string())
 }
 
 #[cfg(all(unix, feature = "e2e"))]
