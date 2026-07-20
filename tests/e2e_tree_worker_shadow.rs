@@ -1177,6 +1177,12 @@ fn protocol_abort_marks_the_active_hazard_snapshot_incomplete() {
         stderr.contains("could not obtain a complete worker failure snapshot"),
         "{stderr}"
     );
+    assert!(
+        stderr.contains("quarantined grammar conservatively for this session"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("symbol=rust"), "{stderr}");
+    assert!(!stderr.contains("symbol=e2e-late"), "{stderr}");
     assert!(stderr.contains("disabled tree tier"), "{stderr}");
     assert!(!stderr.contains("restarted worker generation"), "{stderr}");
 }

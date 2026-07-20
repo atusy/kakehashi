@@ -4070,8 +4070,6 @@ where
             let hazard_error = grammar_hazard.and_then(|grammar: WorkerGrammarIdentity| {
                 #[cfg(feature = "e2e")]
                 let e2e_grammar_symbol = grammar.grammar_symbol.clone();
-                #[cfg(feature = "e2e")]
-                let e2e_grammar = grammar.clone();
                 let lease_id = job_next_hazard_lease.fetch_add(1, Ordering::Relaxed);
                 let (committed_tx, committed_rx) = mpsc::channel();
                 if responses
@@ -4134,7 +4132,10 @@ where
                                 Response::GrammarHazardArmed(GrammarHazardArmed {
                                     lease_id: late_lease_id,
                                     context: context.clone(),
-                                    grammar: e2e_grammar,
+                                    grammar: WorkerGrammarIdentity {
+                                        grammar_symbol: "e2e-late".into(),
+                                        artifact_digest: "e2e-late-after-protocol-abort".into(),
+                                    },
                                 }),
                                 None,
                                 None,
