@@ -1338,10 +1338,12 @@ in a median 960 ms, and a fresh server then resolved non-null nodes with both
 grammars. Against Stage 25 on the same single-hazard fixture, alternating
 12-pair medians changed from 1153.5 to 1144.5 ms and the median paired delta was
 +3 ms (+0.26%); the wide -342 to +123 ms paired range does not establish a
-regression. The request-admission fence adds one atomic load under the existing
-route mutex. Paired release measurements moved sequential p50/p95 in the faster
-direction, while parallel p50/p95 and throughput changed by less than 1%, so no
-parallel cost was distinguishable in this fixture. Review convergence later
+regression. The Stage 26 admission path adds one atomic fence load under the
+existing route mutex together with supervisor-reserve classification and
+admission arithmetic. Paired release measurements moved sequential p50/p95 in
+the faster direction, while parallel p50/p95 and throughput changed by less
+than 1%, so no cost from those combined changes was distinguishable in this
+fixture. Review convergence later
 changed only deadline/restart failure branches and stronger E2E assertions; the
 recorded performance binary remains the explicitly identified measured
 candidate rather than being relabeled as final HEAD.

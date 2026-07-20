@@ -54,7 +54,7 @@ planned replacement continues. The regression E2E holds native work beyond the
 full five-second window and proves one replacement, no quarantine, and no
 configuration-gated breaker.
 
-The focused 66 worker and 40 supervisor tests, the single-crash, protocol-
+The focused 67 worker and 40 supervisor tests, the single-crash, protocol-
 failure, multi-hazard, single-timeout, four-thread saturation, planned-restart,
 and delayed-restart-response E2Es,
 all-target Check, warning-denying Clippy, and formatting checks pass locally.
@@ -70,7 +70,8 @@ replacement spawn and full resync; it is not end-to-end request latency.
 
 Review convergence subsequently changed only deadline/restart branches and test
 assertions. Those commits add no operation to the measured admitted-request hot
-path, so the table remains evidence for the admission-fence cost; its binary
+path, so the table remains evidence for the combined Stage 26 admission-path
+cost; its binary
 hashes and raw samples intentionally continue to identify `67c338ca7` rather
 than being relabeled as a final-HEAD run.
 
@@ -102,11 +103,13 @@ serial per-thread recoveries.
 
 ## Steady-state measurement
 
-The admission fence adds one atomic load while the request route mutex is
-already held. To measure that hot-path change, the unchanged Stage 25/26 release
-harness ran 12 measured pairs after one warmup per stage. Revision order and
-worker/direct order alternated. Each run used 500 incremental requests over 200
-Rust source lines and four worker threads.
+The Stage 26 admission path adds one atomic fence load while the request route
+mutex is already held, classifies whether a request may use the supervisor
+reserve, and applies the corresponding admission arithmetic. To measure these
+combined hot-path changes, the unchanged Stage 25/26 release harness ran 12
+measured pairs after one warmup per stage. Revision order and worker/direct
+order alternated. Each run used 500 incremental requests over 200 Rust source
+lines and four worker threads.
 
 | Metric | Stage 25 median | Stage 26 median | Median paired delta |
 | --- | ---: | ---: | ---: |
@@ -119,8 +122,9 @@ Rust source lines and four worker threads.
 Sequential medians move in the faster direction, while all three parallel
 paired medians move by less than 1%. Run-to-run ranges overlap and sequential
 p95 paired deltas span -17.4% to +17.7%, so the fixture does not distinguish a
-causal speedup. It does show no measurable parallel regression from the atomic
-admission check. This small run cannot establish a tail-latency bound.
+causal speedup. It does show no measurable parallel regression from the combined
+Stage 26 admission-path changes. This small run cannot establish a tail-latency
+bound.
 
 Raw samples, artifact roles and hashes, stable source paths, exact build/run
 commands, metric ordering, and commit identities are in
