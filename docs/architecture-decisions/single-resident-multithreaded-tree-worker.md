@@ -1200,6 +1200,15 @@ growth is much larger than duplicated source text, proving that the existing
 accounting, pressure-driven eviction, concurrent-document memory tests, and
 compatibility gates remain open.
 
+The [Stage 16 cache-pressure measurement](single-resident-multithreaded-tree-worker-stage16-measurement.md)
+keeps oversized exact-version semantic results while evicting recomputable
+injection-derived auxiliary caches. Across three simultaneous 1.07 MiB
+injection-heavy documents, stable physical footprint fell 16.82 MiB and peak
+fell 18.52 MiB without a measurable cache-hit latency regression. This improves
+soft pressure hygiene but uses semantic-token size only as a proxy; worker-wide
+derived-state accounting, a hard admission contract, and compatibility gates
+remain open.
+
 The implementation should proceed in measured stages:
 
 1. Prototype the framed transport, supervision, and one high-level
