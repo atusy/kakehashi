@@ -59,6 +59,13 @@ failure, multi-hazard, single-timeout, four-thread saturation, planned-restart,
 and delayed-restart-response E2Es,
 all-target Check, warning-denying Clippy, and formatting checks pass locally.
 
+Cancellation delivery is also ordered without an unbounded unknown-ID
+tombstone set. The parent registers and enqueues a semantic request before
+arming its cancellation guard, while the worker stores tokens only for admitted
+work. An E2E delays creation of the blocking response waiter, cancels during
+that window, observes the cancel on the already-admitted worker request, and
+then serves a healthy follow-up without restarting the generation.
+
 ## Recovery measurement
 
 The performance measurement compares immutable Stage 25 (`f6e0c2125`) and the

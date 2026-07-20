@@ -393,18 +393,18 @@ flips the same cancellation token polled by its tree walks and nested fan-out.
 Cancellation racing a terminal response may observe either terminal outcome,
 but a canceled or stale result cannot populate a cache, mint node state, or be
 published in the parent. Canceling a completed or prior-generation request is a
-no-op; a same-generation unknown ID is retained for the request-delivery race
-described below. A non-cooperative native call remains governed by its hard
-native-call deadline; cancellation alone does not kill the whole worker.
+no-op; an unknown same-generation ID is also a no-op and creates no tombstone.
+A non-cooperative native call remains governed by its hard native-call deadline;
+cancellation alone does not kill the whole worker.
 
 High-level request admission and cancellation share the parent-to-worker control
-writer, but parent task scheduling does not guarantee that a blocking request
-sender runs before the async owner is dropped. Cancellation may therefore
-overtake first observation of the request. The worker retains an idempotent
-same-generation cancellation token for that unknown request ID and consumes it
-if the matching cancellable reader request arrives later; a non-cancellable
-lifecycle request with that ID discards the token. Canceling a prior generation
-remains a no-op, and duplicate terminal and cancel frames remain harmless.
+writer. The async owner synchronously registers the response route and enqueues
+the request frame before it arms cancellation or delegates the response wait to
+a blocking task. Parent scheduling may delay that waiter, but cancellation
+cannot overtake request delivery. The worker therefore keeps tokens only for
+admitted cancellable work; canceling an unknown, completed, or prior-generation
+request remains a no-op, and duplicate terminal and cancel frames remain
+harmless.
 
 Cancellation during hazard commit has explicit cleanup. A hazard whose arm
 frame was committed but whose grammar-backed scope was never entered is
