@@ -1162,6 +1162,12 @@ cap. Reclaiming four already-running obsolete semantic requests improves the
 latest usable response by 33.9% against Stage 9, but ordinary latency remains
 mixed and nested max-min fairness is not yet implemented.
 
+The [Stage 11 hard-deadline measurement](single-resident-multithreaded-tree-worker-stage11-measurement.md)
+proves that a non-cooperative hung request is killed at its process deadline,
+the implicated Rust grammar is session-quarantined, and a replacement generation
+full-resyncs and serves an already-open Lua document. Native hazard handshakes,
+saturated reserved control traffic, and descendant cleanup remain open gates.
+
 The implementation should proceed in measured stages:
 
 1. Prototype the framed transport, supervision, and one high-level
