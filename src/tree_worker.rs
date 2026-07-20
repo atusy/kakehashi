@@ -705,6 +705,10 @@ impl DocumentReplica {
                 .saturating_add(
                     self.injection_token_cache
                         .estimated_document_bytes(&self.uri),
+                )
+                .saturating_add(
+                    self.captures_match_cache
+                        .estimated_document_bytes(&self.uri),
                 ),
         }
     }

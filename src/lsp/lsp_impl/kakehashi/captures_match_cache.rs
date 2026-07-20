@@ -45,7 +45,7 @@ use std::sync::Arc;
 
 use url::Url;
 
-use crate::language::query_exec::MatchData;
+use crate::language::query_exec::{CapturedNode, MatchData};
 
 const FNV_OFFSET: u64 = 0xcbf29ce484222325;
 const FNV_PRIME: u64 = 0x100000001b3;
@@ -207,6 +207,41 @@ pub(crate) struct CapturesMatchCache {
     cache: dashmap::DashMap<Url, DocMatchCache>,
 }
 
+fn estimated_metadata_bytes(metadata: &[(String, Option<String>)], capacity: usize) -> usize {
+    (capacity * std::mem::size_of::<(String, Option<String>)>()).saturating_add(
+        metadata.iter().fold(0, |bytes, (key, value)| {
+            bytes
+                .saturating_add(key.capacity())
+                .saturating_add(value.as_ref().map(String::capacity).unwrap_or_default())
+        }),
+    )
+}
+
+fn estimated_match_bytes(matches: &[MatchData], capacity: usize) -> usize {
+    std::mem::size_of::<Vec<MatchData>>()
+        .saturating_add(capacity * std::mem::size_of::<MatchData>())
+        .saturating_add(matches.iter().fold(0, |bytes, matched| {
+            let captures = matched
+                .captures
+                .iter()
+                .fold(0_usize, |capture_bytes, capture| {
+                    capture_bytes
+                        .saturating_add(capture.name.capacity())
+                        .saturating_add(estimated_metadata_bytes(
+                            &capture.metadata,
+                            capture.metadata.capacity(),
+                        ))
+                });
+            bytes
+                .saturating_add(matched.captures.capacity() * std::mem::size_of::<CapturedNode>())
+                .saturating_add(captures)
+                .saturating_add(estimated_metadata_bytes(
+                    &matched.metadata,
+                    matched.metadata.capacity(),
+                ))
+        }))
+}
+
 impl CapturesMatchCache {
     pub(in crate::lsp::lsp_impl) fn new() -> Self {
         Self::default()
@@ -347,6 +382,35 @@ impl CapturesMatchCache {
 
     pub(in crate::lsp::lsp_impl) fn clear_document(&self, uri: &Url) {
         self.cache.remove(uri);
+    }
+
+    pub(crate) fn estimated_document_bytes(&self, uri: &Url) -> usize {
+        self.cache.get(uri).map_or(0, |document| {
+            let host = document
+                .host
+                .capacity()
+                .saturating_mul(std::mem::size_of::<(String, CachedHostMatches)>());
+            let layers = document
+                .layers
+                .capacity()
+                .saturating_mul(std::mem::size_of::<(u64, CachedLayerMatches)>());
+            let host = document.host.iter().fold(host, |bytes, (kind, cached)| {
+                bytes
+                    .saturating_add(kind.capacity())
+                    .saturating_add(estimated_match_bytes(
+                        cached.matches.as_ref(),
+                        cached.matches.capacity(),
+                    ))
+            });
+            document
+                .layers
+                .values()
+                .fold(host.saturating_add(layers), |bytes, cached| {
+                    bytes.saturating_add(cached.kind.capacity()).saturating_add(
+                        estimated_match_bytes(cached.matches.as_ref(), cached.matches.capacity()),
+                    )
+                })
+        })
     }
 }
 
@@ -598,6 +662,18 @@ mod tests {
             panic!("existing doc slot must not probe liveness")
         });
         assert!(cache.get_layer(&uri, 2, 7).is_some());
+    }
+
+    #[test]
+    fn cache_reports_document_match_capacity() {
+        let cache = CapturesMatchCache::new();
+        let uri = uri();
+        let mut matches = Vec::with_capacity(32);
+        matches.push(match_data(&[(0, 3)]));
+        let match_bytes = matches.capacity() * std::mem::size_of::<MatchData>();
+        cache.store_host(&uri, "highlights", 1, 7, Arc::new(matches), || true);
+
+        assert!(cache.estimated_document_bytes(&uri) >= match_bytes);
     }
 
     #[test]
