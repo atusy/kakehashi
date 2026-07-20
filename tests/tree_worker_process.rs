@@ -248,6 +248,50 @@ fn real_worker_contains_full_sync_above_injected_non_evictable_budget() {
 
 #[cfg(feature = "e2e")]
 #[test]
+fn concurrent_workers_keep_injected_memory_budgets_isolated() {
+    let run = |worker_generation, hard_limit| {
+        let (worker, parser) = memory_test_worker(worker_generation, 1024, hard_limit);
+        let response = worker
+            .sync_document(SyncDocument {
+                context: RequestContext {
+                    request_id: 1,
+                    worker_generation,
+                    uri: format!("file:///isolated-{worker_generation}.rs"),
+                    incarnation: 1,
+                    content_version: 1,
+                    configuration_generation: 0,
+                },
+                language: "rust".into(),
+                grammar_symbol: "rust".into(),
+                source_path: parser.clone(),
+                parser_path: parser.clone(),
+                artifact_digest: digest(&parser),
+                queries: WorkerQuerySources::default(),
+                text: "fn main() {}".into(),
+            })
+            .unwrap();
+        worker.shutdown().unwrap();
+        response
+    };
+    let (restricted, admitted) = std::thread::scope(|scope| {
+        let restricted = scope.spawn(|| run(49, 1));
+        let admitted = scope.spawn(|| run(50, 4096));
+        (restricted.join().unwrap(), admitted.join().unwrap())
+    });
+
+    let Response::Error(error) = restricted else {
+        panic!("restricted worker must reject independently: {restricted:?}");
+    };
+    assert!(
+        error
+            .message
+            .contains("non-evictable budget 1 bytes exceeded")
+    );
+    assert!(matches!(admitted, Response::DocumentAck(_)));
+}
+
+#[cfg(feature = "e2e")]
+#[test]
 fn rejected_full_sync_preserves_replica_and_admission_capacity() {
     let (worker, parser) = memory_test_worker(46, 1024, 1024);
     let original = "fn main() {}";
