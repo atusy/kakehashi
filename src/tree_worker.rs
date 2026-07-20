@@ -2922,7 +2922,7 @@ fn handle_work(
             retained_estimated_document_bytes,
         ),
     };
-    if may_grow_derived_state
+    if pressure_checkpoint_required(may_grow_derived_state, &response)
         && let Err(reason) = enforce_derived_memory_budget(
             documents,
             derived_pressure_lock,
@@ -2937,6 +2937,14 @@ fn handle_work(
     } else {
         response
     }
+}
+
+fn pressure_checkpoint_required(may_grow_derived_state: bool, response: &Response) -> bool {
+    may_grow_derived_state
+        && !matches!(
+            response,
+            Response::SemanticTokens(result) if result.cache_hit
+        )
 }
 
 fn request_may_grow_derived_state(request: &Request) -> bool {
@@ -4740,9 +4748,9 @@ mod tests {
         WireRange, WireSemanticToken, WorkPriority, WorkerError, WorkerQuerySources,
         cache_eviction_plan, close_document, decode_frame, derive_snapshot_with_language,
         encode_frame, enforce_derived_memory_budget, named_node_count, parse_request_timeout,
-        replace_retained_bytes, replace_retained_estimated_bytes, request_may_grow_derived_state,
-        request_priority, reserve_retained_growth, route_response, run, submit_document_job,
-        sync_document, terminate_by_transport, validate_document_size,
+        pressure_checkpoint_required, replace_retained_bytes, replace_retained_estimated_bytes,
+        request_may_grow_derived_state, request_priority, reserve_retained_growth, route_response,
+        run, submit_document_job, sync_document, terminate_by_transport, validate_document_size,
     };
 
     #[derive(Clone, Default)]
@@ -6388,6 +6396,29 @@ mod tests {
                 operation: NodeNavigation::Parent,
             }
         )));
+    }
+
+    #[test]
+    fn semantic_cache_hits_skip_memory_pressure_checkpoint() {
+        let result = |cache_hit| {
+            Response::SemanticTokens(super::DerivedSemanticTokens {
+                context: RequestContext {
+                    request_id: 1,
+                    worker_generation: 3,
+                    uri: "file:///pressure-hit.rs".into(),
+                    incarnation: 4,
+                    content_version: 1,
+                    configuration_generation: 2,
+                },
+                tokens: Vec::new(),
+                queue_wait_ns: 0,
+                compute_ns: 0,
+                cache_hit,
+            })
+        };
+
+        assert!(!pressure_checkpoint_required(true, &result(true)));
+        assert!(pressure_checkpoint_required(true, &result(false)));
     }
 
     #[test]
