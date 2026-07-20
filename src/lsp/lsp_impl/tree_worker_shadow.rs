@@ -2653,16 +2653,23 @@ fn run_actor(
                     }
                 };
                 let failure = worker_loss_evidence(client, &loss_error);
-                if matches!(state.breaker, BreakerState::HalfOpen { .. })
-                    || !recover_worker(
+                if matches!(state.breaker, BreakerState::HalfOpen { .. }) {
+                    let _ = apply_worker_loss_evidence(&mut state, failure, &comparisons);
+                    mark_tree_tier_unavailable(
                         &mut state,
-                        &executable,
-                        compute_threads,
-                        failure,
-                        &comparisons,
-                        RecoveryMode::Normal,
-                    )
-                {
+                        &disabled,
+                        &pending_configuration_generation,
+                    );
+                    continue;
+                }
+                if !recover_worker(
+                    &mut state,
+                    &executable,
+                    compute_threads,
+                    failure,
+                    &comparisons,
+                    RecoveryMode::Normal,
+                ) {
                     mark_tree_tier_unavailable(
                         &mut state,
                         &disabled,
@@ -2868,16 +2875,23 @@ fn run_actor(
                     "worker generation {} transport failed: {error}",
                     state.worker_generation,
                 );
-                if matches!(state.breaker, BreakerState::HalfOpen { .. })
-                    || !recover_worker(
+                if matches!(state.breaker, BreakerState::HalfOpen { .. }) {
+                    let _ = apply_worker_loss_evidence(&mut state, failure, &comparisons);
+                    mark_tree_tier_unavailable(
                         &mut state,
-                        &executable,
-                        compute_threads,
-                        failure,
-                        &comparisons,
-                        RecoveryMode::Normal,
-                    )
-                {
+                        &disabled,
+                        &pending_configuration_generation,
+                    );
+                    continue;
+                }
+                if !recover_worker(
+                    &mut state,
+                    &executable,
+                    compute_threads,
+                    failure,
+                    &comparisons,
+                    RecoveryMode::Normal,
+                ) {
                     mark_tree_tier_unavailable(
                         &mut state,
                         &disabled,
@@ -3121,27 +3135,14 @@ fn recover_worker(
     state: &mut SupervisorState,
     executable: &std::path::Path,
     compute_threads: usize,
-    mut failure: WorkerLossEvidence,
+    failure: WorkerLossEvidence,
     comparisons: &ComparisonStore,
     mode: RecoveryMode,
 ) -> bool {
     let recovery_started = Instant::now();
-    let initial_quarantine = quarantine_grammars(
-        state,
-        std::mem::take(&mut failure.active_grammars),
-        failure.class,
-        comparisons,
-        failure.active_lease_count,
-    );
-    if !failure.allows_restart() {
-        log::error!(
-            target: "kakehashi::tree_worker_shadow",
-            "disabled tree tier because the dead worker hazard snapshot was incomplete",
-        );
+    let Some(mut class) = apply_worker_loss_evidence(state, failure, comparisons) else {
         return false;
-    }
-    failure.class = effective_failure_class(failure.class, &initial_quarantine);
-    let mut class = failure.class;
+    };
 
     let mut first_attempt = true;
     loop {
@@ -3246,6 +3247,28 @@ fn recover_worker(
             }
         }
     }
+}
+
+fn apply_worker_loss_evidence(
+    state: &mut SupervisorState,
+    mut failure: WorkerLossEvidence,
+    comparisons: &ComparisonStore,
+) -> Option<FailureClass> {
+    let quarantine = quarantine_grammars(
+        state,
+        std::mem::take(&mut failure.active_grammars),
+        failure.class,
+        comparisons,
+        failure.active_lease_count,
+    );
+    if !failure.allows_restart() {
+        log::error!(
+            target: "kakehashi::tree_worker_shadow",
+            "disabled tree tier because the dead worker hazard snapshot was incomplete",
+        );
+        return None;
+    }
+    Some(effective_failure_class(failure.class, &quarantine))
 }
 
 fn quarantine_grammars(
@@ -4539,6 +4562,47 @@ mod tests {
             state.restart_budget.backoff(state.restart_policy),
             INITIAL_RESTART_BACKOFF
         );
+    }
+
+    #[test]
+    fn half_open_worker_loss_applies_hazard_evidence_before_refusing_restart() {
+        let started = Instant::now();
+        let grammar = GrammarIdentity {
+            grammar_symbol: "rust".into(),
+            artifact_digest: "digest-rust".into(),
+        };
+        let mut state = SupervisorState {
+            client: None,
+            read_client: Arc::new(ArcSwapOption::empty()),
+            worker_nodes: Arc::new(dashmap::DashMap::new()),
+            worker_generation: 7,
+            replicas: HashMap::new(),
+            open_documents: Arc::new(Mutex::new(OpenDocuments::default())),
+            quarantined: HashSet::new(),
+            restart_budget: RestartBudget::default(),
+            restart_policy: RestartPolicy::default(),
+            breaker: BreakerState::HalfOpen {
+                probe_generation: 7,
+                synchronized_epoch: 0,
+                reconcile_after: started,
+            },
+            healthy_since: Some(started),
+            long_healthy_since: Some(started),
+        };
+
+        let class = apply_worker_loss_evidence(
+            &mut state,
+            WorkerLossEvidence {
+                class: FailureClass::NativeEvidenced,
+                active_grammars: vec![grammar.clone()],
+                active_lease_count: 1,
+                snapshot_complete: true,
+            },
+            &ComparisonStore::default(),
+        );
+
+        assert_eq!(class, Some(FailureClass::NativeEvidenced));
+        assert!(state.quarantined.contains(&grammar));
     }
 
     #[test]
