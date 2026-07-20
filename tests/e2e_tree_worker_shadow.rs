@@ -60,6 +60,41 @@ fn shadow_metric(stderr: &str, name: &str) -> u64 {
     log_metric(summary, name)
 }
 
+fn wait_for_file(path: &std::path::Path, failure: &str) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while !path.exists() && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(path.exists(), "{failure}");
+}
+
+fn open_rust_and_request_tokens(client: &mut LspClient, uri: &str, text: &str) {
+    client.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri,
+                "languageId": "rust",
+                "version": 1,
+                "text": text
+            }
+        }),
+    );
+    let response = client.send_request(
+        "textDocument/semanticTokens/full",
+        json!({ "textDocument": { "uri": uri } }),
+    );
+    assert!(response.get("result").is_some(), "{response:?}");
+}
+
+fn assert_host_tier_available(client: &mut LspClient, command: &str) {
+    let response = client.send_request(
+        "workspace/executeCommand",
+        json!({ "command": command, "arguments": [] }),
+    );
+    assert!(response.get("result").is_some(), "{response:?}");
+}
+
 #[test]
 fn shadow_worker_matches_authoritative_incremental_lifecycle() {
     let mut client = LspClient::builder()
@@ -400,31 +435,8 @@ fn repeated_systemic_failures_open_the_breaker_once_and_keep_lsp_alive() {
         .build();
     initialize(&mut client);
     let uri = "file:///breaker.rs";
-    client.send_notification(
-        "textDocument/didOpen",
-        json!({
-            "textDocument": {
-                "uri": uri,
-                "languageId": "rust",
-                "version": 1,
-                "text": "fn breaker() { let value = 1; }\n"
-            }
-        }),
-    );
-    let response = client.send_request(
-        "textDocument/semanticTokens/full",
-        json!({ "textDocument": { "uri": uri } }),
-    );
-    assert!(response.get("result").is_some(), "{response:?}");
-
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
-    while !breaker_open.exists() && std::time::Instant::now() < deadline {
-        std::thread::sleep(Duration::from_millis(10));
-    }
-    assert!(
-        breaker_open.exists(),
-        "systemic failures did not open breaker"
-    );
+    open_rust_and_request_tokens(&mut client, uri, "fn breaker() { let value = 1; }\n");
+    wait_for_file(&breaker_open, "systemic failures did not open breaker");
 
     for version in 2..=5 {
         client.send_notification(
@@ -435,14 +447,7 @@ fn repeated_systemic_failures_open_the_breaker_once_and_keep_lsp_alive() {
             }),
         );
     }
-    let host_response = client.send_request(
-        "workspace/executeCommand",
-        json!({
-            "command": "kakehashi.test.host-tier-after-breaker",
-            "arguments": []
-        }),
-    );
-    assert!(host_response.get("result").is_some(), "{host_response:?}");
+    assert_host_tier_available(&mut client, "kakehashi.test.host-tier-after-breaker");
 
     let stderr = shutdown_and_stderr(client);
     assert_eq!(
@@ -479,41 +484,17 @@ fn configuration_change_allows_one_failed_half_open_probe() {
         .build();
     initialize(&mut client);
     let uri = "file:///half-open.rs";
-    client.send_notification(
-        "textDocument/didOpen",
-        json!({
-            "textDocument": {
-                "uri": uri,
-                "languageId": "rust",
-                "version": 1,
-                "text": "fn half_open() { let value = 1; }\n"
-            }
-        }),
-    );
-    let response = client.send_request(
-        "textDocument/semanticTokens/full",
-        json!({ "textDocument": { "uri": uri } }),
-    );
-    assert!(response.get("result").is_some(), "{response:?}");
-
-    let initial_deadline = std::time::Instant::now() + Duration::from_secs(5);
-    while !breaker_open.exists() && std::time::Instant::now() < initial_deadline {
-        std::thread::sleep(Duration::from_millis(10));
-    }
-    assert!(breaker_open.exists(), "initial breaker did not open");
+    open_rust_and_request_tokens(&mut client, uri, "fn half_open() { let value = 1; }\n");
+    wait_for_file(&breaker_open, "initial breaker did not open");
     std::fs::remove_file(&breaker_open).unwrap();
 
     client.send_notification(
         "workspace/didChangeConfiguration",
         json!({ "settings": { "autoInstall": false } }),
     );
-    let reopen_deadline = std::time::Instant::now() + Duration::from_secs(5);
-    while !breaker_open.exists() && std::time::Instant::now() < reopen_deadline {
-        std::thread::sleep(Duration::from_millis(10));
-    }
-    assert!(
-        breaker_open.exists(),
-        "failed half-open probe did not reopen breaker"
+    wait_for_file(
+        &breaker_open,
+        "failed half-open probe did not reopen breaker",
     );
 
     for version in 2..=5 {
@@ -525,14 +506,7 @@ fn configuration_change_allows_one_failed_half_open_probe() {
             }),
         );
     }
-    let host_response = client.send_request(
-        "workspace/executeCommand",
-        json!({
-            "command": "kakehashi.test.host-tier-after-half-open",
-            "arguments": []
-        }),
-    );
-    assert!(host_response.get("result").is_some(), "{host_response:?}");
+    assert_host_tier_available(&mut client, "kakehashi.test.host-tier-after-half-open");
 
     let stderr = shutdown_and_stderr(client);
     assert_eq!(
@@ -580,28 +554,12 @@ fn successful_half_open_resync_closes_the_breaker() {
         .build();
     initialize(&mut client);
     let uri = "file:///half-open-success.rs";
-    client.send_notification(
-        "textDocument/didOpen",
-        json!({
-            "textDocument": {
-                "uri": uri,
-                "languageId": "rust",
-                "version": 1,
-                "text": "fn half_open_success() { let value = 1; }\n"
-            }
-        }),
+    open_rust_and_request_tokens(
+        &mut client,
+        uri,
+        "fn half_open_success() { let value = 1; }\n",
     );
-    let response = client.send_request(
-        "textDocument/semanticTokens/full",
-        json!({ "textDocument": { "uri": uri } }),
-    );
-    assert!(response.get("result").is_some(), "{response:?}");
-
-    let initial_deadline = std::time::Instant::now() + Duration::from_secs(5);
-    while !breaker_open.exists() && std::time::Instant::now() < initial_deadline {
-        std::thread::sleep(Duration::from_millis(10));
-    }
-    assert!(breaker_open.exists(), "initial breaker did not open");
+    wait_for_file(&breaker_open, "initial breaker did not open");
     std::fs::remove_file(&failure_gate).unwrap();
     std::fs::remove_file(&breaker_open).unwrap();
 
@@ -609,13 +567,9 @@ fn successful_half_open_resync_closes_the_breaker() {
         "workspace/didChangeConfiguration",
         json!({ "settings": { "autoInstall": false } }),
     );
-    let recovery_deadline = std::time::Instant::now() + Duration::from_secs(5);
-    while !breaker_closed.exists() && std::time::Instant::now() < recovery_deadline {
-        std::thread::sleep(Duration::from_millis(10));
-    }
-    assert!(
-        breaker_closed.exists(),
-        "healthy half-open probe did not close breaker"
+    wait_for_file(
+        &breaker_closed,
+        "healthy half-open probe did not close breaker",
     );
     assert!(!breaker_open.exists(), "successful probe reopened breaker");
 
