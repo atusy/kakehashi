@@ -234,7 +234,6 @@ fn real_worker_keeps_document_text_and_tree_across_incremental_edits() {
                 }))
                 .unwrap(),
                 search_paths: vec![capture_queries.path().into()],
-                ..Default::default()
             },
         })
         .unwrap();
