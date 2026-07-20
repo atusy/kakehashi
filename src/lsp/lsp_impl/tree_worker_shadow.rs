@@ -1357,12 +1357,8 @@ impl TreeWorkerShadow {
         authoritative: &Value,
     ) -> Option<NodeResult> {
         let key = (uri.as_str().to_string(), authoritative_input_id.to_string());
-        let Some(node_id) = self.worker_nodes.get(&key).map(|entry| entry.clone()) else {
-            return None;
-        };
-        let Some(client) = self.read_client.load_full() else {
-            return None;
-        };
+        let node_id = self.worker_nodes.get(&key).map(|entry| entry.clone())?;
+        let client = self.read_client.load_full()?;
         if !self.is_enabled() || node_id.worker_generation != client.worker_generation() {
             self.worker_nodes.remove(&key);
             return None;
@@ -1385,11 +1381,7 @@ impl TreeWorkerShadow {
         .await
         .ok()
         .and_then(Result::ok);
-        let Some(result) =
-            response.and_then(|response| self.admit_node_response(response, &expected))
-        else {
-            return None;
-        };
+        let result = response.and_then(|response| self.admit_node_response(response, &expected))?;
         let authoritative_nodes = match authoritative {
             Value::Null => Vec::new(),
             Value::Object(_) => vec![authoritative],

@@ -2564,6 +2564,7 @@ fn submit_document_job(
     lane.submit(pool, job);
 }
 
+#[allow(clippy::too_many_arguments)]
 fn handle_work(
     request: Request,
     analysis: &Arc<crate::language::LanguageCoordinator>,
@@ -3519,10 +3520,9 @@ where
                 } else if nested_parallelism_was_allowed.load(Ordering::Relaxed)
                     && !nested_parallelism_yield_was_reported.swap(true, Ordering::Relaxed)
                     && trace_fairness
+                    && let Ok(path) = std::env::var("KAKEHASHI_TREE_WORKER_FAIRNESS_YIELDED_FILE")
                 {
-                    if let Ok(path) = std::env::var("KAKEHASHI_TREE_WORKER_FAIRNESS_YIELDED_FILE") {
-                        let _ = std::fs::write(path, b"yielded");
-                    }
+                    let _ = std::fs::write(path, b"yielded");
                 }
                 policy
             };
@@ -3734,11 +3734,11 @@ fn request_timeout(_uri: &str) -> Duration {
         {
             return DEFAULT_REQUEST_TIMEOUT;
         }
-        return parse_request_timeout(
+        parse_request_timeout(
             std::env::var("KAKEHASHI_TREE_WORKER_REQUEST_TIMEOUT_MS")
                 .ok()
                 .as_deref(),
-        );
+        )
     }
     #[cfg(not(feature = "e2e"))]
     DEFAULT_REQUEST_TIMEOUT

@@ -205,21 +205,18 @@ impl Kakehashi {
                         } else {
                             false
                         };
-                        if recovered {
-                            if !is_cli_mode {
-                                if authoritative {
-                                    diagnostic_scheduler
-                                        .spawn_synthetic_diagnostic_task(install_uri);
-                                } else {
-                                    spawn_synthetic_diagnostic_for_incarnation(
-                                        &documents,
-                                        &diagnostic_scheduler,
-                                        install_uri,
-                                        incarnation,
-                                        std::future::ready(()),
-                                    )
-                                    .await;
-                                }
+                        if recovered && !is_cli_mode {
+                            if authoritative {
+                                diagnostic_scheduler.spawn_synthetic_diagnostic_task(install_uri);
+                            } else {
+                                spawn_synthetic_diagnostic_for_incarnation(
+                                    &documents,
+                                    &diagnostic_scheduler,
+                                    install_uri,
+                                    incarnation,
+                                    std::future::ready(()),
+                                )
+                                .await;
                             }
                         }
                     });

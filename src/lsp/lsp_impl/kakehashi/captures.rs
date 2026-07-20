@@ -1413,7 +1413,7 @@ impl Kakehashi {
                 &uri,
                 snapshot.parsed_version,
                 walked.as_ref(),
-                &worker,
+                worker,
             );
         }
         // Arc once; the memo and the returned ComputedCaptures share the

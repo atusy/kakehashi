@@ -109,15 +109,15 @@ impl Kakehashi {
             }
             _ => None,
         };
-        if let Some(worker) = worker.as_ref() {
-            if worker != &authoritative {
-                log::debug!(
-                    target: "kakehashi::tree_worker_shadow",
-                    "node text mismatch authoritative={} worker={}",
-                    authoritative,
-                    worker,
-                );
-            }
+        if let Some(worker) = worker.as_ref()
+            && worker != &authoritative
+        {
+            log::debug!(
+                target: "kakehashi::tree_worker_shadow",
+                "node text mismatch authoritative={} worker={}",
+                authoritative,
+                worker,
+            );
         }
         if self.tree_worker_shadow.is_authoritative() {
             Ok(worker.unwrap_or(Value::Null))

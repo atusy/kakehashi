@@ -220,17 +220,17 @@ impl Kakehashi {
                 .map(selection_range_from_wire)
                 .collect::<Vec<_>>()
         });
-        if let (Some(worker), Some(authoritative)) = (worker.as_ref(), result.as_ref()) {
-            if worker != authoritative {
-                log::debug!(
-                    target: "kakehashi::tree_worker_shadow",
-                    "selectionRange mismatch uri={} version={} authoritative={:?} worker={:?}",
-                    uri,
-                    expected_version,
-                    authoritative,
-                    worker,
-                );
-            }
+        if let (Some(worker), Some(authoritative)) = (worker.as_ref(), result.as_ref())
+            && worker != authoritative
+        {
+            log::debug!(
+                target: "kakehashi::tree_worker_shadow",
+                "selectionRange mismatch uri={} version={} authoritative={:?} worker={:?}",
+                uri,
+                expected_version,
+                authoritative,
+                worker,
+            );
         }
 
         // None = the work-unit panicked (logged by the pool); serve the
