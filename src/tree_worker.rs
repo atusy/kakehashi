@@ -6741,9 +6741,10 @@ mod tests {
             request.context.request_id = request_id;
             requests.push(Request::DeriveSnapshot(request));
         }
-        // One handshake, five pending requests (four ordinary plus the
-        // lifecycle reserve), two completed responses buffered behind the
-        // stalled writer, and one cancellation lookahead frame.
+        // One handshake, five scheduler-pending ordinary requests, one
+        // completed response held by the stalled writer, one completed
+        // response buffered in its channel, and one decoded ordinary
+        // lookahead frame.
         let admitted_prefix_bytes = framed(&requests[..9]).len();
         let framed_requests = framed(&requests);
         let progress = Arc::new((AtomicUsize::new(0), Condvar::new(), Mutex::new(())));
