@@ -2736,6 +2736,12 @@ fn run_actor(
                 "performing planned worker restart for parser artifact replacement",
             );
             if matches!(state.breaker, BreakerState::HalfOpen { .. }) {
+                if let Err(error) = quiesce_published_client(&mut state) {
+                    log::error!(
+                        target: "kakehashi::tree_worker_shadow",
+                        "half-open planned restart could not quiesce before disabling: {error}",
+                    );
+                }
                 mark_tree_tier_unavailable(
                     &mut state,
                     &disabled,
@@ -2844,6 +2850,12 @@ fn run_actor(
                     required.reason
                 );
                 if matches!(state.breaker, BreakerState::HalfOpen { .. }) {
+                    if let Err(error) = quiesce_published_client(&mut state) {
+                        log::error!(
+                            target: "kakehashi::tree_worker_shadow",
+                            "half-open worker-requested restart could not quiesce before disabling: {error}",
+                        );
+                    }
                     mark_tree_tier_unavailable(
                         &mut state,
                         &disabled,
@@ -3064,12 +3076,13 @@ fn retire_client(state: &mut SupervisorState) -> std::io::Result<()> {
 }
 
 fn quiesce_published_client(state: &mut SupervisorState) -> std::io::Result<()> {
-    state.read_client.store(None);
-    state
+    let client = state
         .client
         .as_ref()
-        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotConnected, "worker is absent"))?
-        .wait_for_idle_generation(SHADOW_SHUTDOWN_TIMEOUT)
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotConnected, "worker is absent"))?;
+    client.close_request_admission()?;
+    state.read_client.store(None);
+    client.wait_for_idle_generation(SHADOW_SHUTDOWN_TIMEOUT)
 }
 
 fn mark_tree_tier_unavailable(

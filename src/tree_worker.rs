@@ -4985,6 +4985,7 @@ pub struct Client {
     child: Arc<Mutex<OwnedChild>>,
     terminated_by_transport: Arc<AtomicBool>,
     outbound: Mutex<Option<mpsc::Sender<Request>>>,
+    accepting_requests: AtomicBool,
     active_grammar_hazards: Arc<Mutex<HashMap<u64, GrammarHazardArmed>>>,
     reader_drained: Arc<(Mutex<bool>, Condvar)>,
     routes: Arc<Mutex<HashMap<u64, Route>>>,
@@ -5282,6 +5283,7 @@ impl Client {
             child,
             terminated_by_transport,
             outbound: Mutex::new(Some(outbound)),
+            accepting_requests: AtomicBool::new(true),
             active_grammar_hazards,
             reader_drained,
             routes,
@@ -5364,6 +5366,15 @@ impl Client {
             }
             std::thread::sleep(Duration::from_millis(1));
         }
+    }
+
+    pub fn close_request_admission(&self) -> io::Result<()> {
+        let _routes = self
+            .routes
+            .lock()
+            .map_err(|_| io::Error::other("worker response router is poisoned"))?;
+        self.accepting_requests.store(false, Ordering::Release);
+        Ok(())
     }
 
     /// Idempotently cancel queued or cooperatively running work in this worker
@@ -5550,10 +5561,20 @@ impl Client {
                     format!("tree worker request {request_id} is already active"),
                 ));
             }
-            if !route_is_admissible(routes.len(), self.max_inflight, uses_supervisor_reserve) {
+            let accepting_requests = self.accepting_requests.load(Ordering::Acquire);
+            if !route_is_admissible(
+                routes.len(),
+                self.max_inflight,
+                uses_supervisor_reserve,
+                accepting_requests,
+            ) {
                 return Err(io::Error::new(
-                    io::ErrorKind::WouldBlock,
-                    "tree worker in-flight limit reached",
+                    if accepting_requests {
+                        io::ErrorKind::WouldBlock
+                    } else {
+                        io::ErrorKind::NotConnected
+                    },
+                    "tree worker request admission is unavailable",
                 ));
             }
             routes.insert(
@@ -5647,8 +5668,13 @@ fn request_uses_supervisor_route_reserve(request: &Request) -> bool {
     )
 }
 
-fn route_is_admissible(active: usize, max_inflight: usize, uses_supervisor_reserve: bool) -> bool {
-    active < max_inflight.saturating_add(usize::from(uses_supervisor_reserve))
+fn route_is_admissible(
+    active: usize,
+    max_inflight: usize,
+    uses_supervisor_reserve: bool,
+    accepting_requests: bool,
+) -> bool {
+    accepting_requests && active < max_inflight.saturating_add(usize::from(uses_supervisor_reserve))
 }
 
 fn client_generation_is_idle(active_routes: usize, active_hazards: usize) -> bool {
@@ -6169,9 +6195,10 @@ mod tests {
 
     #[test]
     fn supervisor_lifecycle_request_has_one_reserved_route() {
-        assert!(!route_is_admissible(16, 16, false));
-        assert!(route_is_admissible(16, 16, true));
-        assert!(!route_is_admissible(17, 16, true));
+        assert!(!route_is_admissible(16, 16, false, true));
+        assert!(route_is_admissible(16, 16, true, true));
+        assert!(!route_is_admissible(17, 16, true, true));
+        assert!(!route_is_admissible(0, 16, true, false));
     }
 
     #[test]
