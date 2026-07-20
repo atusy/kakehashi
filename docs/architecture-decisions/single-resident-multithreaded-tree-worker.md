@@ -1297,6 +1297,20 @@ Multiple-hazard quarantine, independently bounded control transport, native
 segment deadlines, protocol and compatibility gates, and legacy-path removal
 remain open.
 
+The [Stage 25 committed-hazard measurement](single-resident-multithreaded-tree-worker-stage25-measurement.md)
+replaces the parent acknowledgment with a worker-local receipt issued only
+after the complete arm frame is committed to the OS pipe. The worker still
+cannot enter grammar-backed work before the parent is guaranteed to decode that
+frame before release or EOF, and the post-arm crash/quarantine E2E remains
+green. Across twenty-four order-reversed pairs, sequential p50 improved by
+3.300% and arm wait by 46.909% against Stage 24. The removed round trip had also
+acted as accidental admission pacing: four-way throughput fell 3.151% and p95
+rose 9.200%. Keep crash ordering independent of scheduling, and recover any
+valuable pacing through an explicit workload-aware admission policy. Runtime
+injection identities, multiple-hazard quarantine, independently bounded control
+transport, native segment deadlines, protocol and compatibility gates, and
+legacy-path removal remain open.
+
 The implementation should proceed in measured stages:
 
 1. Prototype the framed transport, supervision, and one high-level
