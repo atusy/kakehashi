@@ -3303,11 +3303,15 @@ fn quarantine_grammars(
         }
         drop(open_documents);
     }
+    if !should_log_quarantine_summary(&batch) {
+        return batch;
+    }
+    let effective_class = effective_failure_class(class, &batch);
     for grammar in &newly_quarantined {
         log::error!(
             target: "kakehashi::tree_worker_shadow",
             "quarantined grammar conservatively for this session after {:?} worker loss: symbol={} artifact_digest={}",
-            class,
+            effective_class,
             grammar.grammar_symbol,
             grammar.artifact_digest,
         );
@@ -3319,9 +3323,13 @@ fn quarantine_grammars(
         batch.newly_quarantined + batch.already_quarantined,
         batch.newly_quarantined,
         batch.already_quarantined,
-        class,
+        effective_class,
     );
     batch
+}
+
+fn should_log_quarantine_summary(quarantine: &QuarantineBatch) -> bool {
+    quarantine.newly_quarantined + quarantine.already_quarantined > 0
 }
 
 fn effective_failure_class(class: FailureClass, quarantine: &QuarantineBatch) -> FailureClass {
@@ -3964,6 +3972,15 @@ mod tests {
             ),
             FailureClass::NativeEvidenced,
         );
+    }
+
+    #[test]
+    fn quarantine_summary_is_emitted_only_for_nonempty_evidence() {
+        assert!(!should_log_quarantine_summary(&QuarantineBatch::default()));
+        assert!(should_log_quarantine_summary(&QuarantineBatch {
+            newly_quarantined: 0,
+            already_quarantined: 1,
+        }));
     }
 
     #[test]
