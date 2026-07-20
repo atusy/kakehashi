@@ -4955,7 +4955,8 @@ mod tests {
         encode_frame, enforce_derived_memory_budget, named_node_count, parse_request_timeout,
         pressure_checkpoint_required, replace_retained_bytes, replace_retained_estimated_bytes,
         request_may_grow_derived_state, request_priority, reserve_retained_growth, route_response,
-        run, submit_document_job, sync_document, terminate_by_transport, validate_document_size,
+        run, submit_document_job, sync_document, terminate, terminate_by_transport,
+        validate_document_size,
     };
 
     #[derive(Clone, Default)]
@@ -4969,6 +4970,49 @@ mod tests {
         fn flush(&mut self) -> std::io::Result<()> {
             Ok(())
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn termination_reaps_the_owned_process_group() {
+        use std::os::unix::process::CommandExt as _;
+
+        use nix::errno::Errno;
+        use nix::sys::signal::{Signal, kill};
+        use nix::unistd::Pid;
+
+        let directory = tempfile::tempdir().unwrap();
+        let pid_path = directory.path().join("descendant.pid");
+        let script = format!("sleep 30 & echo $! > '{}'; wait", pid_path.display());
+        let mut command = std::process::Command::new("sh");
+        command.args(["-c", &script]).process_group(0);
+        let mut owner = command.spawn().unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let descendant = loop {
+            if let Ok(pid) = std::fs::read_to_string(&pid_path) {
+                break Pid::from_raw(pid.trim().parse().unwrap());
+            }
+            assert!(Instant::now() < deadline, "descendant pid was not published");
+            std::thread::sleep(Duration::from_millis(5));
+        };
+
+        terminate(&mut owner, Duration::from_secs(1));
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let descendant_survived = loop {
+            match kill(descendant, None) {
+                Err(Errno::ESRCH) => break false,
+                Ok(()) | Err(Errno::EPERM) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Ok(()) | Err(Errno::EPERM) => break true,
+                Err(error) => panic!("unexpected descendant liveness error: {error}"),
+            }
+        };
+        if descendant_survived {
+            let _ = kill(descendant, Signal::SIGKILL);
+        }
+        assert!(!descendant_survived, "worker descendant survived cleanup");
     }
 
     #[cfg(unix)]
