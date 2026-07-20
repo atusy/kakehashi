@@ -4387,6 +4387,10 @@ fn arm_windows_parent_liveness<R: Read>(
             "Windows parent handle does not match expected PID",
         ));
     }
+    #[cfg(feature = "e2e")]
+    if std::env::var_os("KAKEHASHI_TREE_WORKER_TEST_SKIP_PARENT_MONITOR").is_some() {
+        return Ok(());
+    }
     std::thread::Builder::new()
         .name("kakehashi-tree-worker-parent-liveness".into())
         .spawn(move || {
@@ -4664,8 +4668,15 @@ impl OwnedChild {
             kill_and_reap(&mut child);
             return Err(error);
         }
+        #[cfg(feature = "e2e")]
+        let skip_job_assignment =
+            std::env::var_os("KAKEHASHI_TREE_WORKER_TEST_SKIP_JOB_ASSIGNMENT").is_some();
+        #[cfg(not(feature = "e2e"))]
+        let skip_job_assignment = false;
         // SAFETY: both handles are valid and the Job was configured before spawn.
-        if unsafe { AssignProcessToJobObject(job.as_raw_handle(), child_handle) } == 0 {
+        if !skip_job_assignment
+            && unsafe { AssignProcessToJobObject(job.as_raw_handle(), child_handle) } == 0
+        {
             let error = io::Error::last_os_error();
             kill_and_reap(&mut child);
             return Err(io::Error::new(
@@ -4688,7 +4699,7 @@ impl OwnedChild {
         }
         Ok(Self {
             child,
-            job: Some(job),
+            job: (!skip_job_assignment).then_some(job),
         })
     }
 

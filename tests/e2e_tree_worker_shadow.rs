@@ -201,8 +201,7 @@ fn parent_death_terminates_worker_with_a_hung_compute_thread() {
 }
 
 #[cfg(windows)]
-#[test]
-fn parent_death_terminates_worker_with_a_hung_compute_thread() {
+fn run_windows_parent_death_case(skip_job: bool, skip_parent_monitor: bool) {
     use std::os::windows::io::{FromRawHandle as _, OwnedHandle};
 
     use windows_sys::Win32::Foundation::{WAIT_OBJECT_0, WAIT_TIMEOUT};
@@ -238,31 +237,35 @@ fn parent_death_terminates_worker_with_a_hung_compute_thread() {
     let worker_pid_path = directory.path().join("worker.pid");
     let descendant_pid_path = directory.path().join("worker-descendant.pid");
     let hang_marker = directory.path().join("hung-compute");
-    let mut client = LspClient::builder()
+    let mut builder = LspClient::builder()
         .env("KAKEHASHI_TREE_WORKER_MODE", "authoritative")
         .env(
             "KAKEHASHI_TREE_WORKER_PID_FILE",
             worker_pid_path.to_string_lossy(),
         )
         .env(
-            "KAKEHASHI_TREE_WORKER_DESCENDANT_PID_FILE",
-            descendant_pid_path.to_string_lossy(),
-        )
-        .env(
-            "KAKEHASHI_TREE_WORKER_DESCENDANT_EXE",
-            env!("CARGO_BIN_EXE_worker-descendant"),
-        )
-        .env(
             "KAKEHASHI_TREE_WORKER_HANG_AFTER_START_FILE",
             hang_marker.to_string_lossy(),
-        )
-        .build();
+        );
+    if !skip_job {
+        builder = builder
+            .env(
+                "KAKEHASHI_TREE_WORKER_DESCENDANT_PID_FILE",
+                descendant_pid_path.to_string_lossy(),
+            )
+            .env(
+                "KAKEHASHI_TREE_WORKER_DESCENDANT_EXE",
+                env!("CARGO_BIN_EXE_worker-descendant"),
+            );
+    } else {
+        builder = builder.env("KAKEHASHI_TREE_WORKER_TEST_SKIP_JOB_ASSIGNMENT", "1");
+    }
+    if skip_parent_monitor {
+        builder = builder.env("KAKEHASHI_TREE_WORKER_TEST_SKIP_PARENT_MONITOR", "1");
+    }
+    let mut client = builder.build();
     initialize(&mut client);
     wait_for_file(&hang_marker, "worker compute thread did not enter the hang");
-    wait_for_file(
-        &descendant_pid_path,
-        "worker descendant pid was not published",
-    );
     let worker = open_process(
         std::fs::read_to_string(worker_pid_path)
             .unwrap()
@@ -270,22 +273,50 @@ fn parent_death_terminates_worker_with_a_hung_compute_thread() {
             .parse()
             .unwrap(),
     );
-    let descendant = open_process(
-        std::fs::read_to_string(descendant_pid_path)
-            .unwrap()
-            .trim()
-            .parse()
-            .unwrap(),
-    );
+    let descendant = if skip_job {
+        None
+    } else {
+        wait_for_file(
+            &descendant_pid_path,
+            "worker descendant pid was not published",
+        );
+        Some(open_process(
+            std::fs::read_to_string(descendant_pid_path)
+                .unwrap()
+                .trim()
+                .parse()
+                .unwrap(),
+        ))
+    };
 
     client.force_kill_and_wait();
     let worker_terminated = wait_for_termination(&worker);
-    let descendant_terminated = wait_for_termination(&descendant);
+    let descendant_terminated = descendant
+        .as_ref()
+        .is_none_or(|descendant| wait_for_termination(descendant));
     assert!(worker_terminated, "worker survived parent death");
     assert!(
         descendant_terminated,
         "worker descendant survived parent death"
     );
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_parent_handle_terminates_hung_worker() {
+    run_windows_parent_death_case(true, false);
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_job_terminates_worker_descendants() {
+    run_windows_parent_death_case(false, true);
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_combined_supervision_terminates_hung_worker_and_descendants() {
+    run_windows_parent_death_case(false, false);
 }
 
 #[test]
