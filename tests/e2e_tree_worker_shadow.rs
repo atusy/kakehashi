@@ -251,7 +251,12 @@ fn authoritative_worker_serves_injected_node_accessors() {
         "textDocument/semanticTokens/full",
         json!({ "textDocument": { "uri": uri } }),
     );
-    assert!(semantic["result"]["data"].is_array(), "{semantic:?}");
+    assert!(
+        semantic["result"]["data"]
+            .as_array()
+            .is_some_and(|data| !data.is_empty()),
+        "{semantic:?}"
+    );
 
     client.send_notification(
         "textDocument/didChange",
@@ -303,7 +308,9 @@ fn authoritative_worker_serves_injected_node_accessors() {
         }),
     );
     assert!(
-        semantic_range["result"]["data"].is_array(),
+        semantic_range["result"]["data"]
+            .as_array()
+            .is_some_and(|data| !data.is_empty()),
         "{semantic_range:?}"
     );
 

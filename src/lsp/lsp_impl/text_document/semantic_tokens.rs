@@ -411,13 +411,14 @@ impl Kakehashi {
             return Ok(None);
         }
 
-        let Some(query) = self.language.highlight_query(&language_name) else {
+        let query = self.language.highlight_query(&language_name);
+        if query.is_none() && !self.tree_worker_shadow.is_authoritative() {
             self.cache.finish_request(&uri, request_id);
             return Ok(Some(SemanticTokensResult::Tokens(SemanticTokens {
                 result_id: None,
                 data: vec![],
             })));
-        };
+        }
 
         // Read the remaining settings-dependent tokenization inputs HERE —
         // together with the query above, with no `.await` in between — so a
@@ -555,7 +556,7 @@ impl Kakehashi {
                     text.clone(),
                     tree.clone()
                         .expect("legacy semantic token computation requires a parse tree"),
-                    query,
+                    query.expect("legacy semantic token computation requires a compiled query"),
                     Some(language_name.clone()),
                     Some(capture_mappings),
                     coordinator,
@@ -860,7 +861,8 @@ impl Kakehashi {
             return Ok(None);
         }
 
-        let Some(query) = self.language.highlight_query(&language_name) else {
+        let query = self.language.highlight_query(&language_name);
+        if query.is_none() && !self.tree_worker_shadow.is_authoritative() {
             self.cache.finish_request(&uri, request_id);
             return Ok(Some(SemanticTokensFullDeltaResult::Tokens(
                 SemanticTokens {
@@ -868,7 +870,7 @@ impl Kakehashi {
                     data: vec![],
                 },
             )));
-        };
+        }
 
         // Read the remaining settings-dependent tokenization inputs HERE — with
         // the query above, no `.await` in between — so a settings reload can't
@@ -1011,7 +1013,7 @@ impl Kakehashi {
                         text.clone(),
                         tree.clone()
                             .expect("legacy semantic token computation requires a parse tree"),
-                        query,
+                        query.expect("legacy semantic token computation requires a compiled query"),
                         Some(language_name.clone()),
                         Some(capture_mappings),
                         coordinator,
@@ -1302,8 +1304,7 @@ impl Kakehashi {
             incarnation: snapshot.incarnation,
             generation,
         };
-        let (Some(language_name), Some(tree)) = (snapshot.language.clone(), snapshot.tree.clone())
-        else {
+        let Some(language_name) = snapshot.language.clone() else {
             self.cache
                 .record_served_semantic_version(&uri, snapshot.parsed_version);
             return Ok(Some(SemanticTokensRangeResult::Tokens(SemanticTokens {
@@ -1311,6 +1312,15 @@ impl Kakehashi {
                 data: vec![],
             })));
         };
+        let tree = snapshot.tree.clone();
+        if tree.is_none() && !self.tree_worker_shadow.is_authoritative() {
+            self.cache
+                .record_served_semantic_version(&uri, snapshot.parsed_version);
+            return Ok(Some(SemanticTokensRangeResult::Tokens(SemanticTokens {
+                result_id: None,
+                data: vec![],
+            })));
+        }
         let text = std::sync::Arc::clone(&snapshot.text);
 
         let language_loaded = self
@@ -1337,14 +1347,15 @@ impl Kakehashi {
                 data: vec![],
             })));
         }
-        let Some(query) = self.language.highlight_query(&language_name) else {
+        let query = self.language.highlight_query(&language_name);
+        if query.is_none() && !self.tree_worker_shadow.is_authoritative() {
             self.cache
                 .record_served_semantic_version(&uri, snapshot.parsed_version);
             return Ok(Some(SemanticTokensRangeResult::Tokens(SemanticTokens {
                 result_id: None,
                 data: vec![],
             })));
-        };
+        }
         drop(_edit_guard);
 
         // Short-circuit an identical-viewport re-request of an unchanged document
@@ -1427,8 +1438,8 @@ impl Kakehashi {
         let local = handle_semantic_tokens_full(
             &self.compute_pool,
             text,
-            tree,
-            query,
+            tree.expect("legacy semantic token computation requires a parse tree"),
+            query.expect("legacy semantic token computation requires a compiled query"),
             Some(language_name.clone()),
             Some(capture_mappings),
             coordinator,
