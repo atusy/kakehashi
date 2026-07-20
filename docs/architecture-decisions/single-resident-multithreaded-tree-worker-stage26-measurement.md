@@ -47,8 +47,10 @@ replacement spawn and full resync; it is not end-to-end request latency.
 | Median paired delta | — | — | +11 ms (+0.9%) |
 
 Stage 26 has two slow samples, 1450 and 1571 ms, so seven runs are insufficient
-to claim a tail-latency bound. The robust center shows that waiting for reader
-drain and building the complete set adds about 11–15 ms in the ordinary case.
+to claim a tail-latency bound. Its median is 15 ms higher and the median paired
+difference is 11 ms, but the fixed Stage-25-first order and the combined
+spawn/backoff/resync timer do not isolate reader drain or set construction.
+Treat the delta as inconclusive rather than as their causal cost.
 
 The second measurement runs the two-active-grammar E2E seven times. Every run
 quarantines two grammars, restarts once, and resyncs one healthy document
