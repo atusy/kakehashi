@@ -1018,8 +1018,10 @@ Implementation is accepted only when all of the following hold:
   install deduplication, cache invalidation, latest-version re-derivation, and
   refusal to load the same quarantined artifact. Same-path parser replacement,
   including migration from the current fixed destination and the loaded-DLL
-  case on Windows, proves a fresh worker executes the content-addressed new
-  artifact rather than acknowledging a new key while retaining old code.
+  case on Windows, refreshes every affected open document from its language's
+  current catalog descriptor, including query sources, and proves a fresh
+  worker executes the content-addressed new artifact rather than acknowledging
+  a new key while retaining old code.
   Concurrent first-start migration proves exactly one revision-1 manifest wins,
   losers follow it, the legacy file remains intact through every failure point,
   and failed validation leaves no selectable partial migration. Late legacy

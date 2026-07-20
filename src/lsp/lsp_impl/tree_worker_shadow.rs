@@ -497,12 +497,25 @@ impl OpenDocuments {
         });
         if artifact_replaced {
             let incoming = incoming.expect("replacement requires an incoming document");
+            let catalog = self
+                .catalog
+                .as_ref()
+                .filter(|(generation, _)| *generation == incoming.context.configuration_generation)
+                .map(|(_, catalog)| catalog);
             for current in self.current.values_mut() {
-                if current.source_path == incoming.source_path {
-                    current.parser_path.clone_from(&incoming.parser_path);
-                    current
-                        .artifact_digest
-                        .clone_from(&incoming.artifact_digest);
+                if current.source_path == incoming.source_path
+                    && let Some(asset) = catalog.and_then(|catalog| {
+                        catalog.assets.iter().find(|asset| {
+                            asset.language == current.language
+                                && asset.source_path == current.source_path
+                        })
+                    })
+                {
+                    current.grammar_symbol.clone_from(&asset.grammar_symbol);
+                    current.source_path.clone_from(&asset.source_path);
+                    current.parser_path.clone_from(&asset.parser_path);
+                    current.artifact_digest.clone_from(&asset.artifact_digest);
+                    current.queries.clone_from(&asset.queries);
                     current.context.configuration_generation =
                         incoming.context.configuration_generation;
                 }
@@ -4528,10 +4541,30 @@ mod tests {
             }
         );
 
+        let replacement_queries = crate::tree_worker::WorkerQuerySources {
+            highlights: Some("(identifier) @variable".into()),
+            bindings: Some("(identifier) @reference".into()),
+            injections: None,
+        };
+        documents.catalog = Some((
+            4,
+            WorkerLanguageCatalog {
+                assets: vec![crate::tree_worker::WorkerLanguageAsset {
+                    language: "rust".into(),
+                    grammar_symbol: "rust".into(),
+                    source_path: "/parser/rust.so".into(),
+                    parser_path: "/private/sha256-rust-v2.so".into(),
+                    artifact_digest: "sha256:rust-v2".into(),
+                    queries: replacement_queries.clone(),
+                }],
+                ..WorkerLanguageCatalog::default()
+            },
+        ));
         let mut replacement = sync("file:///b.rs", 1, 2, 7);
         replacement.parser_path = "/private/sha256-rust-v2.so".into();
         let replacement_path = replacement.parser_path.clone();
         replacement.artifact_digest = "sha256:rust-v2".into();
+        replacement.queries = replacement_queries.clone();
         replacement.context.configuration_generation = 4;
         assert_eq!(
             documents.observe(&ShadowCommand::Sync(replacement)),
@@ -4544,6 +4577,7 @@ mod tests {
             assert_eq!(document.artifact_digest, "sha256:rust-v2");
             assert_eq!(document.parser_path, replacement_path);
             assert_eq!(document.context.configuration_generation, 4);
+            assert_eq!(document.queries, replacement_queries);
         }
 
         let mut alias = sync("file:///c.rs", 1, 1, 7);
