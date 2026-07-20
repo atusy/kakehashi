@@ -1270,6 +1270,17 @@ hardened on Linux, while Windows ownership, abnormal descendant cleanup after
 parent death, native hazard/quarantine control, protocol and compatibility
 gates, and legacy-path removal remain open.
 
+The [Stage 23 Windows supervision measurement](single-resident-multithreaded-tree-worker-stage23-measurement.md)
+proves the two Windows ownership layers independently and together. A validated
+parent-process handle lets a dedicated control thread hard-terminate a worker
+whose compute completion never arrives, while a parent-only kill-on-close Job
+terminates the worker and its descendants after abnormal parent death. Thirty
+order-reversed parser-free release pairs measured a small fixed handshake cost:
+the median increased from 73.649 ms to 74.023 ms (+0.537%, or 0.396 ms paired),
+while clean shutdown was effectively unchanged at +0.171%. Native hazard and
+quarantine control, protocol and compatibility gates, and legacy-path removal
+remain open.
+
 The implementation should proceed in measured stages:
 
 1. Prototype the framed transport, supervision, and one high-level
