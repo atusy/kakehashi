@@ -35,6 +35,10 @@ const SEMANTIC_CACHE_AUXILIARY_TRIM_THRESHOLD_BYTES: usize = 2 * 1024 * 1024;
 // conservative portable weight per retained subtree node; Stage 17 compares
 // the estimate with process footprint rather than treating it as measured RSS.
 const TREE_NODE_ADMISSION_BYTES: usize = 64;
+// Soft cap for recomputable worker-owned caches. This is deliberately below
+// the 512 MiB retained-text guard so cache growth cannot consume the whole
+// worker allowance; Stage 17 measurement validates the initial quarter-share.
+const MAX_RETAINED_DERIVED_BYTES: usize = 128 * 1024 * 1024;
 pub const BUILD_ID: &str = concat!(env!("CARGO_PKG_NAME"), "-", env!("CARGO_PKG_VERSION"));
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -625,6 +629,7 @@ struct EstimatedDocumentMemory {
 }
 
 impl EstimatedDocumentMemory {
+    #[cfg(test)]
     fn evictable_bytes(self) -> usize {
         self.result_cache_bytes
             .saturating_add(self.auxiliary_cache_bytes)
@@ -2801,6 +2806,7 @@ fn handle_work(
     closed_documents: &ClosedDocuments,
     document_capacity: &DocumentCapacity,
     retained_document_bytes: &RetainedDocumentBytes,
+    derived_pressure_lock: &Mutex<()>,
     queue_wait: Duration,
     cancellation: &crate::cancel::CancelToken,
     nested_work_policy: &(dyn Fn() -> crate::analysis::semantic::NestedWorkPolicy + Sync),
@@ -2812,6 +2818,7 @@ fn handle_work(
         return Response::RequestCancelled(RequestCancelled { context });
     }
     let started = Instant::now();
+    let may_grow_derived_state = request_may_grow_derived_state(&request);
     let response = match request {
         Request::Handshake(_) | Request::Cancel(_) => {
             unreachable!("control requests are not scheduled")
@@ -2861,11 +2868,33 @@ fn handle_work(
             retained_document_bytes,
         ),
     };
+    if may_grow_derived_state
+        && let Err(reason) = enforce_derived_memory_budget(
+            documents,
+            derived_pressure_lock,
+            &DocumentKey::from(&context),
+            MAX_RETAINED_DERIVED_BYTES,
+        )
+    {
+        return Response::WorkerRestartRequired(WorkerRestartRequired { context, reason });
+    }
     if cancellation.is_cancelled() {
         Response::RequestCancelled(RequestCancelled { context })
     } else {
         response
     }
+}
+
+fn request_may_grow_derived_state(request: &Request) -> bool {
+    matches!(
+        request,
+        Request::ResolveNode(_)
+            | Request::DeriveSelectionRanges(_)
+            | Request::DeriveInjectionRegions(_)
+            | Request::DeriveSemanticTokens(_)
+            | Request::RunCaptures(_)
+            | Request::DeriveNativeBindings(_)
+    )
 }
 
 fn request_context(request: &Request) -> Option<&RequestContext> {
@@ -3598,6 +3627,7 @@ where
     let closed_documents = Arc::new(dashmap::DashMap::new());
     let document_capacity = Arc::new(Mutex::new(0));
     let retained_document_bytes = Arc::new(AtomicUsize::new(0));
+    let derived_pressure_lock = Arc::new(Mutex::new(()));
     let document_lanes: DocumentLanes = Arc::new(dashmap::DashMap::new());
     let runnable_documents = Arc::new(RunnableDocuments::default());
     let cancellations = Arc::new(dashmap::DashMap::<u64, crate::cancel::CancelToken>::new());
@@ -3664,6 +3694,7 @@ where
         let closed_documents = Arc::clone(&closed_documents);
         let document_capacity = Arc::clone(&document_capacity);
         let retained_document_bytes = Arc::clone(&retained_document_bytes);
+        let derived_pressure_lock = Arc::clone(&derived_pressure_lock);
         let job_cancellations = Arc::clone(&cancellations);
         let lane_key = document_key(&request);
         let priority = request_priority(&request);
@@ -3762,6 +3793,7 @@ where
                 &closed_documents,
                 &document_capacity,
                 &retained_document_bytes,
+                &derived_pressure_lock,
                 enqueued.elapsed(),
                 &cancellation,
                 &nested_work_policy,
@@ -4613,9 +4645,9 @@ mod tests {
         WireByteRange, WirePosition, WireRange, WireSemanticToken, WorkPriority, WorkerError,
         WorkerQuerySources, cache_eviction_plan, close_document, decode_frame,
         derive_snapshot_with_language, encode_frame, enforce_derived_memory_budget,
-        named_node_count, parse_request_timeout, replace_retained_bytes, request_priority,
-        reserve_retained_growth, route_response, run, submit_document_job, sync_document,
-        terminate_by_transport, validate_document_size,
+        named_node_count, parse_request_timeout, replace_retained_bytes,
+        request_may_grow_derived_state, request_priority, reserve_retained_growth, route_response,
+        run, submit_document_job, sync_document, terminate_by_transport, validate_document_size,
     };
 
     #[derive(Clone, Default)]
@@ -6228,6 +6260,39 @@ mod tests {
         assert!(b.semantic_discovery.is_none());
         assert!(a.cached_semantic_tokens.is_none());
         assert!(b.cached_semantic_tokens.is_some());
+    }
+
+    #[test]
+    fn only_cache_growing_requests_run_memory_pressure_checkpoint() {
+        let context = RequestContext {
+            request_id: 1,
+            worker_generation: 3,
+            uri: "file:///pressure.rs".into(),
+            incarnation: 4,
+            content_version: 1,
+            configuration_generation: 2,
+        };
+        assert!(request_may_grow_derived_state(
+            &Request::DeriveSemanticTokens(DeriveSemanticTokens {
+                context: context.clone(),
+                supports_multiline: false,
+            })
+        ));
+        assert!(request_may_grow_derived_state(
+            &Request::DeriveInjectionRegions(DeriveInjectionRegions {
+                context: context.clone(),
+            })
+        ));
+        assert!(!request_may_grow_derived_state(&Request::NavigateNode(
+            NavigateNode {
+                context,
+                node_id: OpaqueNodeId {
+                    worker_generation: 3,
+                    local_id: "node-1".into(),
+                },
+                operation: NodeNavigation::Parent,
+            }
+        )));
     }
 
     #[test]
