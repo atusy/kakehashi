@@ -928,6 +928,7 @@ impl DocumentReplica {
                 retained_estimated_bytes,
                 old_estimated,
                 new_estimated,
+                MAX_RETAINED_ESTIMATED_DOCUMENT_BYTES,
             ) {
                 replace_retained_bytes(retained_text_bytes, text.len(), self.text.len()).expect(
                     "rolling back retained text after estimated admission cannot exceed its budget",
@@ -2035,6 +2036,7 @@ fn replace_retained_estimated_bytes(
     retained_bytes: &AtomicUsize,
     old_bytes: usize,
     new_bytes: usize,
+    hard_limit_bytes: usize,
 ) -> Result<(), String> {
     let mut retained = retained_bytes.load(Ordering::Relaxed);
     loop {
@@ -2042,9 +2044,9 @@ fn replace_retained_estimated_bytes(
             .checked_sub(old_bytes)
             .and_then(|bytes| bytes.checked_add(new_bytes))
             .ok_or_else(|| "estimated document byte accounting overflowed".to_string())?;
-        if next > MAX_RETAINED_ESTIMATED_DOCUMENT_BYTES {
+        if next > hard_limit_bytes {
             return Err(format!(
-                "worker estimated non-evictable budget {MAX_RETAINED_ESTIMATED_DOCUMENT_BYTES} bytes exceeded"
+                "worker estimated non-evictable budget {hard_limit_bytes} bytes exceeded"
             ));
         }
         match retained_bytes.compare_exchange_weak(
@@ -3440,6 +3442,7 @@ fn sync_document_with_analysis(
                             retained_estimated_document_bytes,
                             replaced_estimated_bytes,
                             estimated_bytes,
+                            MAX_RETAINED_ESTIMATED_DOCUMENT_BYTES,
                         ) {
                             return Response::Error(WorkerError {
                                 context: Some(context),
@@ -3652,6 +3655,7 @@ fn close_document(
         retained_estimated_document_bytes,
         removed_estimated_bytes,
         0,
+        MAX_RETAINED_ESTIMATED_DOCUMENT_BYTES,
     )
     .expect("removing a document cannot exceed the estimated non-evictable budget");
     closed_documents.insert(document_key, context.incarnation);
@@ -7179,16 +7183,38 @@ mod tests {
     fn estimated_non_evictable_budget_is_transactional() {
         let retained = AtomicUsize::new(MAX_RETAINED_ESTIMATED_DOCUMENT_BYTES - 8);
 
-        assert!(replace_retained_estimated_bytes(&retained, 0, 9).is_err());
+        assert!(replace_retained_estimated_bytes(
+            &retained,
+            0,
+            9,
+            MAX_RETAINED_ESTIMATED_DOCUMENT_BYTES,
+        )
+        .is_err());
         assert_eq!(
             retained.load(Ordering::Relaxed),
             MAX_RETAINED_ESTIMATED_DOCUMENT_BYTES - 8
         );
-        replace_retained_estimated_bytes(&retained, 0, 8).unwrap();
+        replace_retained_estimated_bytes(
+            &retained,
+            0,
+            8,
+            MAX_RETAINED_ESTIMATED_DOCUMENT_BYTES,
+        )
+        .unwrap();
         assert_eq!(
             retained.load(Ordering::Relaxed),
             MAX_RETAINED_ESTIMATED_DOCUMENT_BYTES
         );
+    }
+
+    #[test]
+    fn estimated_non_evictable_accounting_obeys_injected_hard_budget() {
+        let retained = AtomicUsize::new(0);
+
+        assert!(replace_retained_estimated_bytes(&retained, 0, 9, 8).is_err());
+        assert_eq!(retained.load(Ordering::Relaxed), 0);
+        replace_retained_estimated_bytes(&retained, 0, 8, 8).unwrap();
+        assert_eq!(retained.load(Ordering::Relaxed), 8);
     }
 
     #[test]
