@@ -4996,6 +4996,7 @@ pub struct Client {
 }
 
 const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
+const REQUEST_CANCELLATION_GRACE: Duration = Duration::from_millis(250);
 
 #[cfg(any(test, feature = "e2e"))]
 fn parse_request_timeout(value: Option<&str>) -> Duration {
@@ -5605,7 +5606,11 @@ impl Client {
         let response = match response_rx.recv_timeout(remaining) {
             Ok(response) => response?,
             Err(mpsc::RecvTimeoutError::Timeout) => {
-                let _ = self.cancel_request(request_id);
+                let cancellation_completed = self.cancel_request(request_id).is_ok()
+                    && response_rx.recv_timeout(REQUEST_CANCELLATION_GRACE).is_ok();
+                if !cancellation_completed {
+                    self.terminate_shared(Duration::from_secs(1));
+                }
                 return Err(io::Error::new(
                     io::ErrorKind::TimedOut,
                     format!("tree worker request {request_id} timed out"),

@@ -2903,7 +2903,11 @@ fn run_actor(
             }
             Ok(_) => {}
             Err(error) => {
-                if is_nonfatal_client_error(&error) {
+                let worker_was_terminated = state
+                    .client
+                    .as_ref()
+                    .is_some_and(|client| client.was_terminated_by_transport());
+                if is_nonfatal_client_error(&error) && !worker_was_terminated {
                     log::warn!(
                         target: "kakehashi::tree_worker_shadow",
                         "worker request did not complete without transport loss: {error}",
@@ -3595,6 +3599,13 @@ fn worker_loss_evidence(client: &Client, error: &std::io::Error) -> WorkerLossEv
             active_grammars.len(),
         );
         return WorkerLossEvidence::incomplete(active_grammars, active_lease_count);
+    }
+    if client.was_terminated_by_transport() {
+        log::error!(
+            target: "kakehashi::tree_worker_shadow",
+            "worker generation was terminated by the supervisor; treating its loss as systemic",
+        );
+        return WorkerLossEvidence::systemic();
     }
     let mut active_hazards = client.active_grammar_hazards();
     active_hazards.sort_unstable_by(|left, right| {
