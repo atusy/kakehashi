@@ -37,7 +37,9 @@ an active grammar. A nominally nonfatal timeout may continue only when
 unknown child state enters recovery instead of leaving a dead client published.
 Such a timeout-triggered recovery is systemic unless the preserved child exit
 status independently proves a native crash; the `TimedOut` error kind alone
-never supplies parser-fault evidence.
+never supplies parser-fault evidence. Unix native evidence is limited to
+ABRT/BUS/FPE/ILL/SEGV, excluding external TERM/KILL; Windows uses an explicit
+exception/fail-fast code allowlist rather than every negative exit code.
 The saturation E2E parks four distinct committed grammar
 jobs on all four compute threads, then proves that one generation restart
 releases every route, quarantines nothing, full-resynchronizes four documents,
@@ -60,7 +62,7 @@ planned replacement continues. The regression E2E holds native work beyond the
 full five-second window and proves one replacement, no quarantine, and no
 configuration-gated breaker.
 
-The focused 67 worker and 42 supervisor tests, the single-crash, protocol-
+The focused 67 worker and 43 supervisor tests, the single-crash, protocol-
 failure, multi-hazard, single-timeout, four-thread saturation, planned-restart,
 delayed-restart-response, cancellation-delivery, and reserved-lifecycle
 saturation E2Es,
