@@ -1117,7 +1117,7 @@ fn crashed_grammar_is_quarantined_only_in_session_and_other_grammar_recovers() {
 }
 
 #[test]
-fn protocol_failure_preserves_complete_active_hazard_set() {
+fn protocol_abort_marks_the_active_hazard_snapshot_incomplete() {
     let directory = tempfile::tempdir().unwrap();
     let marker = directory.path().join("invalid-release-once");
     let mut client = LspClient::builder()
@@ -1174,21 +1174,11 @@ fn protocol_failure_preserves_complete_active_hazard_set() {
         "{stderr}"
     );
     assert!(
-        stderr.contains("committed active grammar hazard(s)"),
+        stderr.contains("could not obtain a complete worker failure snapshot"),
         "{stderr}"
     );
-    assert!(stderr.contains("symbol=rust"), "{stderr}");
-    assert!(stderr.contains("class=Systemic"), "{stderr}");
-    assert_eq!(
-        stderr.matches("restarted worker generation").count(),
-        1,
-        "{stderr}"
-    );
-    assert!(
-        stderr.contains("full-resynced 1 open documents"),
-        "{stderr}"
-    );
-    assert!(!stderr.contains("disabled shadow tree tier"), "{stderr}");
+    assert!(stderr.contains("disabled tree tier"), "{stderr}");
+    assert!(!stderr.contains("restarted worker generation"), "{stderr}");
 }
 
 #[test]

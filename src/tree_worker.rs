@@ -4070,6 +4070,8 @@ where
             let hazard_error = grammar_hazard.and_then(|grammar: WorkerGrammarIdentity| {
                 #[cfg(feature = "e2e")]
                 let e2e_grammar_symbol = grammar.grammar_symbol.clone();
+                #[cfg(feature = "e2e")]
+                let e2e_grammar = grammar.clone();
                 let lease_id = job_next_hazard_lease.fetch_add(1, Ordering::Relaxed);
                 let (committed_tx, committed_rx) = mpsc::channel();
                 if responses
@@ -4122,6 +4124,17 @@ where
                                 Response::GrammarHazardReleased(GrammarHazardReleased {
                                     lease_id: u64::MAX,
                                     worker_generation,
+                                }),
+                                None,
+                                None,
+                            ));
+                            let late_lease_id =
+                                job_next_hazard_lease.fetch_add(1, Ordering::Relaxed);
+                            let _ = responses.send((
+                                Response::GrammarHazardArmed(GrammarHazardArmed {
+                                    lease_id: late_lease_id,
+                                    context: context.clone(),
+                                    grammar: e2e_grammar,
                                 }),
                                 None,
                                 None,
@@ -5073,12 +5086,19 @@ pub struct Client {
     outbound: Mutex<Option<mpsc::Sender<Request>>>,
     accepting_requests: AtomicBool,
     active_grammar_hazards: Arc<Mutex<HashMap<u64, GrammarHazardArmed>>>,
-    reader_drained: Arc<(Mutex<bool>, Condvar)>,
+    reader_drain_state: Arc<(Mutex<ReaderDrainState>, Condvar)>,
     routes: Arc<Mutex<HashMap<u64, Route>>>,
     reader: Option<std::thread::JoinHandle<()>>,
     writer: Option<std::thread::JoinHandle<()>>,
     ready: HandshakeReady,
     max_inflight: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ReaderDrainState {
+    Reading,
+    Complete,
+    Incomplete,
 }
 
 const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
@@ -5204,16 +5224,16 @@ impl Client {
         let routes = Arc::new(Mutex::new(HashMap::<u64, Route>::new()));
         let active_grammar_hazards =
             Arc::new(Mutex::new(HashMap::<u64, GrammarHazardArmed>::new()));
-        let reader_drained = Arc::new((Mutex::new(false), Condvar::new()));
+        let reader_drain_state = Arc::new((Mutex::new(ReaderDrainState::Reading), Condvar::new()));
         let reader_routes = Arc::clone(&routes);
         let reader_hazards = Arc::clone(&active_grammar_hazards);
-        let reader_drain_signal = Arc::clone(&reader_drained);
+        let reader_drain_signal = Arc::clone(&reader_drain_state);
         let reader_child = Arc::clone(&child);
         let reader_terminated_by_transport = Arc::clone(&terminated_by_transport);
         let (handshake_tx, handshake_rx) = mpsc::channel();
         let reader = std::thread::spawn(move || {
             let mut handshake_tx = Some(handshake_tx);
-            loop {
+            let drain_state = loop {
                 match decode_frame::<_, Response>(&mut stdout) {
                     Ok(Some(response)) => {
                         if let Some(handshake) = handshake_tx.take() {
@@ -5234,7 +5254,7 @@ impl Client {
                                         io::ErrorKind::InvalidData,
                                         "invalid grammar hazard arm",
                                     );
-                                    break;
+                                    break ReaderDrainState::Incomplete;
                                 }
                                 reader_hazards
                                     .lock()
@@ -5256,7 +5276,7 @@ impl Client {
                                         io::ErrorKind::InvalidData,
                                         "invalid grammar hazard release",
                                     );
-                                    break;
+                                    break ReaderDrainState::Incomplete;
                                 }
                                 continue;
                             }
@@ -5265,7 +5285,7 @@ impl Client {
                                     let kind = error.kind();
                                     let message = error.to_string();
                                     fail_routes(None, &reader_routes, kind, &message);
-                                    break;
+                                    break ReaderDrainState::Incomplete;
                                 }
                             }
                         }
@@ -5277,20 +5297,20 @@ impl Client {
                             io::ErrorKind::UnexpectedEof,
                             "tree worker closed its response stream",
                         );
-                        break;
+                        break ReaderDrainState::Complete;
                     }
                     Err(error) => {
                         let kind = error.kind();
                         let message = error.to_string();
                         fail_routes(handshake_tx.take(), &reader_routes, kind, &message);
-                        break;
+                        break ReaderDrainState::Incomplete;
                     }
                 }
-            }
-            let (drained, ready) = &*reader_drain_signal;
-            *drained
+            };
+            let (state, ready) = &*reader_drain_signal;
+            *state
                 .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner) = true;
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = drain_state;
             ready.notify_all();
             if let Ok(mut child) = reader_child.lock() {
                 terminate_by_transport(
@@ -5385,7 +5405,7 @@ impl Client {
             outbound: Mutex::new(Some(outbound)),
             accepting_requests: AtomicBool::new(true),
             active_grammar_hazards,
-            reader_drained,
+            reader_drain_state,
             routes,
             reader: Some(reader),
             writer: Some(writer),
@@ -5427,20 +5447,23 @@ impl Client {
     }
 
     pub fn wait_for_reader_drain(&self, timeout: Duration) -> io::Result<()> {
-        let (drained, ready) = &*self.reader_drained;
-        let drained = drained
+        let (state, ready) = &*self.reader_drain_state;
+        let state = state
             .lock()
             .map_err(|_| io::Error::other("worker reader drain lock is poisoned"))?;
-        let (drained, _) = ready
-            .wait_timeout_while(drained, timeout, |drained| !*drained)
+        let (state, _) = ready
+            .wait_timeout_while(state, timeout, |state| *state == ReaderDrainState::Reading)
             .map_err(|_| io::Error::other("worker reader drain lock is poisoned"))?;
-        if *drained {
-            Ok(())
-        } else {
-            Err(io::Error::new(
+        match *state {
+            ReaderDrainState::Complete => Ok(()),
+            ReaderDrainState::Incomplete => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "worker response reader aborted before obtaining a complete failure snapshot",
+            )),
+            ReaderDrainState::Reading => Err(io::Error::new(
                 io::ErrorKind::TimedOut,
                 "worker response reader did not drain after worker loss",
-            ))
+            )),
         }
     }
 

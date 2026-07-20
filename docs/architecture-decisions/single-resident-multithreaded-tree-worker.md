@@ -702,8 +702,10 @@ normally exiting failure is systemic. A native-evidenced failure that newly
 quarantines one or more previously allowed grammar keys does not consume the
 global budget: quarantine has removed a concrete cause. Its restart remains
 rate limited by backoff and the independent native-storm budget below. A
-protocol failure may still conservatively quarantine active keys, but it always
-consumes the systemic budget.
+protocol abort may still conservatively quarantine the active keys observed
+before the invalid frame, but it cannot prove that the hazard ledger is
+complete. The parent therefore marks that snapshot incomplete and disables the
+tree tier instead of restarting from a potentially partial quarantine set.
 
 Three systemic worker-generation failures without an intervening 60 seconds of
 healthy service exhaust the budget for the current configuration generation.
@@ -994,10 +996,12 @@ Implementation is accepted only when all of the following hold:
   prove every restart consumes the long-horizon bucket, exponential backoff does
   not reset at the 60-second fast threshold, and the session converges to the
   degraded state instead of resyncing forever.
-* A protocol-corruption or reported Rust-panic fixture while a grammar lease is
-  active may conservatively quarantine that key but still consumes the systemic
-  budget; a signaled native crash with the same lease follows the native-evidence
-  exemption instead.
+* A protocol-corruption fixture followed by another hazard-arm frame proves the
+  reader marks its ledger incomplete and disables the tree tier rather than
+  restarting from the observed subset. A reported Rust-panic fixture while a
+  grammar lease is active may conservatively quarantine that key but still
+  consumes the systemic budget; a signaled native crash with the same lease
+  follows the native-evidence exemption instead.
 * Install/reload tests cover missing host and injected grammars, concurrent
   install deduplication, cache invalidation, latest-version re-derivation, and
   refusal to load the same quarantined artifact. Same-path parser replacement,

@@ -46,10 +46,12 @@ jobs on all four compute threads, then proves that one generation restart
 releases every route, quarantines nothing, full-resynchronizes four documents,
 and keeps LSP service available.
 
-Reader and writer cleanup do not use the deadline cause. A protocol-failure E2E
-commits a Rust hazard and then sends an invalid release frame. The reader
-classifies the failure as systemic, preserves and quarantines the complete
-active Rust set, restarts once, and serves the healthy Lua document. A
+Reader and writer cleanup do not use the deadline cause. A protocol-abort E2E
+commits a Rust hazard, sends an invalid release frame, and queues another arm
+behind it. The reader marks its hazard snapshot incomplete, conservatively
+quarantines the Rust key already observed, disables the tree tier instead of
+restarting from a partial set, and leaves the healthy Lua request served by the
+legacy path. A
 transport error received during cancellation grace is propagated instead of
 being overwritten as a generic timeout. A `WorkerRestartRequired` response
 received after the deadline but inside that grace likewise remains authoritative
