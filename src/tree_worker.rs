@@ -22,7 +22,7 @@ use sha2::{Digest, Sha256};
 
 use crate::language::node_tracker::{EditInfo, NodeTracker};
 
-pub const PROTOCOL_VERSION: u32 = 14;
+pub const PROTOCOL_VERSION: u32 = 15;
 pub const MAX_FRAME_BYTES: usize = 64 * 1024 * 1024;
 pub const MAX_DOCUMENT_REPLICAS: usize = 4_096;
 pub const MAX_DOCUMENT_BYTES: usize = 32 * 1024 * 1024;
@@ -505,8 +505,20 @@ pub struct WorkerRestartRequired {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct CancelRequest {
+    pub request_id: u64,
+    pub worker_generation: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct RequestCancelled {
+    pub context: RequestContext,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum Request {
     Handshake(Handshake),
+    Cancel(CancelRequest),
     DeriveSnapshot(DeriveSnapshot),
     SyncDocument(SyncDocument),
     ApplyDocumentEdits(ApplyDocumentEdits),
@@ -558,6 +570,7 @@ pub enum Response {
     DocumentAck(DocumentAck),
     DocumentClosed(DocumentClosed),
     WorkerRestartRequired(WorkerRestartRequired),
+    RequestCancelled(RequestCancelled),
     Snapshot(DerivedSnapshot),
     Nodes(NodeResult),
     NodeScalar(NodeScalarResult),
@@ -1140,7 +1153,7 @@ impl DocumentReplica {
         &mut self,
         request: DeriveSemanticTokens,
     ) -> Result<DerivedSemanticTokens, String> {
-        self.derive_semantic_tokens_with_telemetry(request, Duration::ZERO, Instant::now())
+        self.derive_semantic_tokens_with_telemetry(request, Duration::ZERO, Instant::now(), None)
     }
 
     fn derive_semantic_tokens_with_telemetry(
@@ -1148,6 +1161,7 @@ impl DocumentReplica {
         request: DeriveSemanticTokens,
         queue_wait: Duration,
         started: Instant,
+        cancellation: Option<&crate::cancel::CancelToken>,
     ) -> Result<DerivedSemanticTokens, String> {
         self.validate_read_identity(&request.context)?;
         if let Some((generation, supports_multiline, tokens)) = &self.cached_semantic_tokens
@@ -1192,7 +1206,7 @@ impl DocumentReplica {
                 incarnation: request.context.incarnation,
                 discovery,
             }),
-            None,
+            cancellation.cloned(),
         )
         .ok_or_else(|| "worker semantic token derivation was cancelled".to_string())?;
         let tokens: Vec<WireSemanticToken> = match result {
@@ -2422,9 +2436,19 @@ fn handle_work(
     document_capacity: &DocumentCapacity,
     retained_document_bytes: &RetainedDocumentBytes,
     queue_wait: Duration,
+    cancellation: &crate::cancel::CancelToken,
 ) -> Response {
+    let context = request_context(&request)
+        .expect("scheduled worker request must have context")
+        .clone();
+    if cancellation.is_cancelled() {
+        return Response::RequestCancelled(RequestCancelled { context });
+    }
     let started = Instant::now();
-    match request {
+    let response = match request {
+        Request::Handshake(_) | Request::Cancel(_) => {
+            unreachable!("control requests are not scheduled")
+        }
         Request::DeriveSnapshot(request) => derive_snapshot(request, queue_wait),
         Request::SyncDocument(request) => sync_document_with_analysis(
             request,
@@ -2453,7 +2477,7 @@ fn handle_work(
         Request::DeriveSelectionRanges(request) => derive_selection_ranges(request, documents),
         Request::DeriveInjectionRegions(request) => derive_injection_regions(request, documents),
         Request::DeriveSemanticTokens(request) => {
-            derive_semantic_tokens(request, documents, queue_wait, started)
+            derive_semantic_tokens(request, documents, queue_wait, started, cancellation)
         }
         Request::RunCaptures(request) => run_captures(request, documents),
         Request::DeriveNativeBindings(request) => derive_native_bindings(request, documents),
@@ -2464,16 +2488,17 @@ fn handle_work(
             closed_documents,
             retained_document_bytes,
         ),
-        Request::Handshake(_) => Response::Error(WorkerError {
-            context: None,
-            message: "handshake may only be sent once".into(),
-        }),
+    };
+    if cancellation.is_cancelled() {
+        Response::RequestCancelled(RequestCancelled { context })
+    } else {
+        response
     }
 }
 
 fn request_context(request: &Request) -> Option<&RequestContext> {
     match request {
-        Request::Handshake(_) => None,
+        Request::Handshake(_) | Request::Cancel(_) => None,
         Request::DeriveSnapshot(request) => Some(&request.context),
         Request::SyncDocument(request) => Some(&request.context),
         Request::ApplyDocumentEdits(request) => Some(&request.context),
@@ -2507,8 +2532,27 @@ fn document_key(request: &Request) -> Option<DocumentKey> {
         Request::RunCaptures(request) => Some(DocumentKey::from(&request.context)),
         Request::DeriveNativeBindings(request) => Some(DocumentKey::from(&request.context)),
         Request::CloseDocument(request) => Some(DocumentKey::from(&request.context)),
-        Request::Handshake(_) | Request::DeriveSnapshot(_) | Request::ConfigureLanguages(_) => None,
+        Request::Handshake(_)
+        | Request::Cancel(_)
+        | Request::DeriveSnapshot(_)
+        | Request::ConfigureLanguages(_) => None,
     }
+}
+
+fn is_cancellable_reader_request(request: &Request) -> bool {
+    matches!(
+        request,
+        Request::DeriveSnapshot(_)
+            | Request::DeriveDocumentSnapshot(_)
+            | Request::ResolveNode(_)
+            | Request::NavigateNode(_)
+            | Request::RunNodeScalar(_)
+            | Request::DeriveSelectionRanges(_)
+            | Request::DeriveInjectionRegions(_)
+            | Request::DeriveSemanticTokens(_)
+            | Request::RunCaptures(_)
+            | Request::DeriveNativeBindings(_)
+    )
 }
 
 fn resolve_node(request: ResolveNode, documents: &DocumentStore) -> Response {
@@ -2634,6 +2678,7 @@ fn derive_semantic_tokens(
     documents: &DocumentStore,
     queue_wait: Duration,
     started: Instant,
+    cancellation: &crate::cancel::CancelToken,
 ) -> Response {
     let context = request.context.clone();
     let Some(replica) = documents
@@ -2647,7 +2692,12 @@ fn derive_semantic_tokens(
     };
     match replica.lock() {
         Ok(mut replica) => {
-            match replica.derive_semantic_tokens_with_telemetry(request, queue_wait, started) {
+            match replica.derive_semantic_tokens_with_telemetry(
+                request,
+                queue_wait,
+                started,
+                Some(cancellation),
+            ) {
                 Ok(result) => Response::SemanticTokens(result),
                 Err(message) => Response::Error(WorkerError {
                     context: Some(context),
@@ -3110,6 +3160,7 @@ where
             .send(())
             .map_err(|_| io::Error::other("worker admission queue stopped"))?;
     }
+    let permit_rx = Arc::new(Mutex::new(permit_rx));
     let (responses, response_rx) =
         mpsc::sync_channel::<(Response, Option<AdmissionPermit>)>(max_inflight);
     let writer_thread = std::thread::spawn(move || -> io::Result<()> {
@@ -3173,7 +3224,105 @@ where
     let document_capacity = Arc::new(Mutex::new(0));
     let retained_document_bytes = Arc::new(AtomicUsize::new(0));
     let document_lanes: DocumentLanes = Arc::new(dashmap::DashMap::new());
+    let cancellations = Arc::new(dashmap::DashMap::<u64, crate::cancel::CancelToken>::new());
+    // The client permits at most four requests per compute thread. Let the
+    // dispatcher own exactly that bounded pending window while leaving one
+    // transport lookahead slot; cancellation frames bypass this work queue.
+    let max_pending = compute_threads.saturating_mul(4).max(1);
+    let (work_tx, work_rx) =
+        mpsc::sync_channel::<(Request, RequestContext, Instant, crate::cancel::CancelToken)>(1);
+    let (completion_tx, completion_rx) = mpsc::channel::<()>();
+    let dispatcher = {
+        let pool = Arc::clone(&pool);
+        let permits = permits.clone();
+        let permit_rx = Arc::clone(&permit_rx);
+        let responses = responses.clone();
+        let documents = Arc::clone(&documents);
+        let analysis = Arc::clone(&analysis);
+        let closed_documents = Arc::clone(&closed_documents);
+        let document_capacity = Arc::clone(&document_capacity);
+        let retained_document_bytes = Arc::clone(&retained_document_bytes);
+        let document_lanes = Arc::clone(&document_lanes);
+        let cancellations = Arc::clone(&cancellations);
+        std::thread::spawn(move || {
+            let mut pending = 0_usize;
+            loop {
+                if pending == max_pending {
+                    completion_rx
+                        .recv()
+                        .expect("worker completion queue stopped before its jobs");
+                    pending -= 1;
+                    continue;
+                }
+                let Ok((request, context, enqueued, cancellation)) = work_rx.recv() else {
+                    break;
+                };
+                pending += 1;
+                let responses = responses.clone();
+                let permits = permits.clone();
+                let permit_rx = Arc::clone(&permit_rx);
+                let completion_tx = completion_tx.clone();
+                let documents = Arc::clone(&documents);
+                let analysis = Arc::clone(&analysis);
+                let closed_documents = Arc::clone(&closed_documents);
+                let document_capacity = Arc::clone(&document_capacity);
+                let retained_document_bytes = Arc::clone(&retained_document_bytes);
+                let request_id = context.request_id;
+                let job_cancellations = Arc::clone(&cancellations);
+                let lane_key = document_key(&request);
+                let action_key = lane_key.clone();
+                let job: LaneJob = Box::new(move || {
+                    permit_rx
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .recv()
+                        .expect("worker admission queue stopped before its jobs");
+                    let permit = AdmissionPermit(permits);
+                    let response = handle_work(
+                        request,
+                        &analysis,
+                        &documents,
+                        &closed_documents,
+                        &document_capacity,
+                        &retained_document_bytes,
+                        enqueued.elapsed(),
+                        &cancellation,
+                    );
+                    job_cancellations.remove(&request_id);
+                    let action = if action_key
+                        .as_ref()
+                        .is_some_and(|key| documents.contains_key(key))
+                    {
+                        LaneAction::Keep
+                    } else {
+                        LaneAction::Retire
+                    };
+                    let _ = responses.send((response, Some(permit)));
+                    let _ = completion_tx.send(());
+                    action
+                });
+                if let Some(lane_key) = lane_key {
+                    submit_document_job(&document_lanes, lane_key, &pool, job);
+                } else {
+                    pool.spawn(move || {
+                        let _ = job();
+                    });
+                }
+            }
+            for _ in 0..pending {
+                completion_rx
+                    .recv()
+                    .expect("worker completion queue stopped before its jobs");
+            }
+        })
+    };
     while let Some(request) = decode_frame::<_, Request>(&mut reader)? {
+        if let Request::Cancel(cancel) = request {
+            if cancel.worker_generation == worker_generation {
+                cancellations.entry(cancel.request_id).or_default().cancel();
+            }
+            continue;
+        }
         let Some(context) = request_context(&request) else {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -3199,53 +3348,26 @@ where
                 .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "worker writer stopped"))?;
             continue;
         }
-        let enqueued = Instant::now();
-        permit_rx
-            .recv()
-            .map_err(|_| io::Error::other("worker admission queue stopped"))?;
-        let responses = responses.clone();
-        let permit = AdmissionPermit(permits.clone());
-        let documents = Arc::clone(&documents);
-        let analysis = Arc::clone(&analysis);
-        let closed_documents = Arc::clone(&closed_documents);
-        let document_capacity = Arc::clone(&document_capacity);
-        let retained_document_bytes = Arc::clone(&retained_document_bytes);
-        let lane_key = document_key(&request);
-        let action_key = lane_key.clone();
-        let job: LaneJob = Box::new(move || {
-            let response = handle_work(
-                request,
-                &analysis,
-                &documents,
-                &closed_documents,
-                &document_capacity,
-                &retained_document_bytes,
-                enqueued.elapsed(),
-            );
-            let action = if action_key
-                .as_ref()
-                .is_some_and(|key| documents.contains_key(key))
-            {
-                LaneAction::Keep
-            } else {
-                LaneAction::Retire
-            };
-            let _ = responses.send((response, Some(permit)));
-            action
-        });
-        if let Some(lane_key) = lane_key {
-            submit_document_job(&document_lanes, lane_key, &pool, job);
+        let context = context.clone();
+        let request_id = context.request_id;
+        let cancellation = if is_cancellable_reader_request(&request) {
+            cancellations.entry(request_id).or_default().clone()
         } else {
-            pool.spawn(move || {
-                let _ = job();
-            });
+            cancellations.remove(&request_id);
+            crate::cancel::CancelToken::default()
+        };
+        if work_tx
+            .send((request, context, Instant::now(), cancellation))
+            .is_err()
+        {
+            cancellations.remove(&request_id);
+            return Err(io::Error::other("worker dispatcher stopped"));
         }
     }
-    for _ in 0..max_inflight {
-        permit_rx
-            .recv()
-            .map_err(|_| io::Error::other("worker admission queue stopped"))?;
-    }
+    drop(work_tx);
+    dispatcher
+        .join()
+        .map_err(|_| io::Error::other("worker dispatcher panicked"))?;
     drop(responses);
     join_writer(writer_thread)
 }
@@ -3351,7 +3473,7 @@ pub fn artifact_digest(path: &std::path::Path) -> io::Result<String> {
 pub struct Client {
     child: Arc<Mutex<Child>>,
     terminated_by_transport: Arc<AtomicBool>,
-    outbound: Mutex<Option<mpsc::SyncSender<Request>>>,
+    outbound: Mutex<Option<mpsc::Sender<Request>>>,
     routes: Arc<Mutex<HashMap<u64, Route>>>,
     reader: Option<std::thread::JoinHandle<()>>,
     writer: Option<std::thread::JoinHandle<()>>,
@@ -3493,7 +3615,10 @@ impl Client {
             }
         };
         let max_inflight = compute_threads.saturating_mul(4).max(1);
-        let (outbound, outbound_rx) = mpsc::sync_channel::<Request>(max_inflight);
+        // The route table is the bounded admission control. Keep the transport
+        // channel unbounded so a cancellation control frame never competes
+        // with work for the final queue slot.
+        let (outbound, outbound_rx) = mpsc::channel::<Request>();
         let writer_routes = Arc::clone(&routes);
         let writer_child = Arc::clone(&child);
         let writer_terminated_by_transport = Arc::clone(&terminated_by_transport);
@@ -3543,6 +3668,25 @@ impl Client {
 
     pub fn worker_generation(&self) -> u64 {
         self.ready.worker_generation
+    }
+
+    /// Idempotently cancel queued or cooperatively running work in this worker
+    /// generation. The original request route remains until its terminal
+    /// response arrives.
+    pub fn cancel_request(&self, request_id: u64) -> io::Result<()> {
+        let outbound = self
+            .outbound
+            .lock()
+            .map_err(|_| io::Error::other("worker outbound lock is poisoned"))?;
+        let outbound = outbound
+            .as_ref()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::BrokenPipe, "worker is shut down"))?;
+        outbound
+            .send(Request::Cancel(CancelRequest {
+                request_id,
+                worker_generation: self.ready.worker_generation,
+            }))
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "tree worker writer stopped"))
     }
 
     /// Stops this generation without requiring unique ownership of the client.
@@ -3761,17 +3905,12 @@ impl Client {
             let outbound = outbound
                 .as_ref()
                 .ok_or_else(|| io::Error::new(io::ErrorKind::BrokenPipe, "worker is shut down"))?;
-            if let Err(error) = outbound.try_send(request) {
+            if outbound.send(request).is_err() {
                 self.remove_route(request_id);
-                return Err(match error {
-                    mpsc::TrySendError::Full(_) => io::Error::new(
-                        io::ErrorKind::WouldBlock,
-                        "tree worker outbound queue is full",
-                    ),
-                    mpsc::TrySendError::Disconnected(_) => {
-                        io::Error::new(io::ErrorKind::BrokenPipe, "tree worker writer stopped")
-                    }
-                });
+                return Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "tree worker writer stopped",
+                ));
             }
         }
         let remaining = timeout.saturating_sub(started.elapsed());
@@ -3867,6 +4006,7 @@ fn response_request_id(response: &Response) -> Option<u64> {
         Response::DocumentAck(ack) => Some(ack.context.request_id),
         Response::DocumentClosed(closed) => Some(closed.context.request_id),
         Response::WorkerRestartRequired(required) => Some(required.context.request_id),
+        Response::RequestCancelled(cancelled) => Some(cancelled.context.request_id),
         Response::Snapshot(snapshot) => Some(snapshot.context.request_id),
         Response::Nodes(result) => Some(result.context.request_id),
         Response::NodeScalar(result) => Some(result.context.request_id),
@@ -3886,6 +4026,7 @@ fn response_context(response: &Response) -> Option<&RequestContext> {
         Response::DocumentAck(ack) => Some(&ack.context),
         Response::DocumentClosed(closed) => Some(&closed.context),
         Response::WorkerRestartRequired(required) => Some(&required.context),
+        Response::RequestCancelled(cancelled) => Some(&cancelled.context),
         Response::Snapshot(snapshot) => Some(&snapshot.context),
         Response::Nodes(result) => Some(&result.context),
         Response::NodeScalar(result) => Some(&result.context),
@@ -4002,20 +4143,20 @@ mod tests {
     use std::io::{Cursor, Read, Write};
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Condvar, Mutex};
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     use super::{
-        ApplyDocumentEdits, BUILD_ID, ByteEdit, CapturesResult, CloseDocument,
+        ApplyDocumentEdits, BUILD_ID, ByteEdit, CancelRequest, CapturesResult, CloseDocument,
         DeriveInjectionRegions, DeriveNativeBindings, DeriveSelectionRanges, DeriveSemanticTokens,
         DeriveSnapshot, DocumentKey, DocumentLane, DocumentReplica, GrammarKey, Handshake,
         HandshakeReady, LaneAction, LaneRegistry, MAX_DOCUMENT_BYTES, MAX_DOCUMENT_REPLICAS,
         MAX_RETAINED_DOCUMENT_BYTES, NavigateNode, NodeLayerSelector, NodeNavigation,
         NodeScalarOperation, NodeScalarValue, OpaqueNodeId, PROTOCOL_VERSION, Request,
-        RequestContext, ResolveNode, Response, Route, RunCaptures, RunNodeScalar, SyncDocument,
-        WireByteRange, WirePosition, WireRange, WorkerError, WorkerQuerySources, close_document,
-        decode_frame, derive_snapshot_with_language, encode_frame, named_node_count,
-        replace_retained_bytes, reserve_retained_growth, route_response, run, submit_document_job,
-        sync_document, terminate_by_transport, validate_document_size,
+        RequestCancelled, RequestContext, ResolveNode, Response, Route, RunCaptures, RunNodeScalar,
+        SyncDocument, WireByteRange, WirePosition, WireRange, WorkerError, WorkerQuerySources,
+        close_document, decode_frame, derive_snapshot_with_language, encode_frame,
+        named_node_count, replace_retained_bytes, reserve_retained_growth, route_response, run,
+        submit_document_job, sync_document, terminate_by_transport, validate_document_size,
     };
 
     #[derive(Clone, Default)]
@@ -4191,6 +4332,21 @@ mod tests {
     #[test]
     fn frame_round_trip_preserves_request() {
         let request = request();
+        let mut bytes = Vec::new();
+        encode_frame(&mut bytes, &request).unwrap();
+
+        assert_eq!(
+            decode_frame(&mut Cursor::new(bytes)).unwrap(),
+            Some(request)
+        );
+    }
+
+    #[test]
+    fn frame_round_trip_preserves_idempotent_cancellation() {
+        let request = Request::Cancel(CancelRequest {
+            request_id: 42,
+            worker_generation: 7,
+        });
         let mut bytes = Vec::new();
         encode_frame(&mut bytes, &request).unwrap();
 
@@ -4395,6 +4551,36 @@ mod tests {
     }
 
     #[test]
+    fn worker_honors_cancellation_that_arrives_before_reader_work() {
+        let output = SharedWriter::default();
+        let captured = output.clone();
+        let cancel = Request::Cancel(CancelRequest {
+            request_id: 7,
+            worker_generation: 3,
+        });
+
+        run(
+            Cursor::new(framed(&[handshake(PROTOCOL_VERSION), cancel, request()])),
+            output,
+            1,
+        )
+        .unwrap();
+
+        let bytes = captured.0.lock().unwrap().clone();
+        let mut bytes = Cursor::new(bytes);
+        assert!(matches!(
+            decode_frame::<_, Response>(&mut bytes).unwrap(),
+            Some(Response::HandshakeReady(_))
+        ));
+        let response = decode_frame::<_, Response>(&mut bytes).unwrap().unwrap();
+        assert!(matches!(
+            response,
+            Response::RequestCancelled(RequestCancelled { context })
+                if context.request_id == 7
+        ));
+    }
+
+    #[test]
     fn worker_backpressures_until_the_response_writer_resumes() {
         let writer = GatedWriter::default();
         let gate = writer.clone();
@@ -4406,7 +4592,7 @@ mod tests {
             request.context.request_id = request_id;
             requests.push(Request::DeriveSnapshot(request));
         }
-        let admitted_prefix_bytes = framed(&requests[..4]).len();
+        let admitted_prefix_bytes = framed(&requests[..8]).len();
         let framed_requests = framed(&requests);
         let progress = Arc::new((AtomicUsize::new(0), Condvar::new(), Mutex::new(())));
         let reader = CountingReader {
@@ -4422,7 +4608,7 @@ mod tests {
         wait_for_read_progress(&progress, admitted_prefix_bytes);
         assert!(
             progress.0.load(Ordering::Relaxed) <= admitted_prefix_bytes,
-            "worker read past two admitted requests plus one bounded lookahead"
+            "worker read past its pending, response, and lookahead bounds"
         );
         assert!(
             progress.0.load(Ordering::Relaxed) < framed_requests.len(),
@@ -5169,6 +5355,60 @@ mod tests {
         assert!(
             cached.cache_hit,
             "same-version semantic requests should reuse worker facts"
+        );
+    }
+
+    #[test]
+    fn cancelled_semantic_tokens_are_not_published_or_cached() {
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_rust::LANGUAGE.into())
+            .unwrap();
+        let context = RequestContext {
+            request_id: 1,
+            worker_generation: 3,
+            uri: "file:///cancelled-semantic.rs".into(),
+            incarnation: 4,
+            content_version: 1,
+            configuration_generation: 2,
+        };
+        let (mut replica, _) = DocumentReplica::sync(
+            SyncDocument {
+                context: context.clone(),
+                language: "rust".into(),
+                grammar_symbol: "rust".into(),
+                source_path: "/unused/static-language".into(),
+                parser_path: "/unused/static-language".into(),
+                artifact_digest: "sha256:rust-v1".into(),
+                queries: WorkerQuerySources {
+                    highlights: Some("(identifier) @variable".into()),
+                    ..WorkerQuerySources::default()
+                },
+                text: "fn main() {}".into(),
+            },
+            &mut parser,
+        )
+        .unwrap();
+        let cancellation = crate::cancel::CancelToken::default();
+        cancellation.cancel_after_polls(1);
+
+        let result = replica.derive_semantic_tokens_with_telemetry(
+            DeriveSemanticTokens {
+                context,
+                supports_multiline: false,
+            },
+            Duration::ZERO,
+            Instant::now(),
+            Some(&cancellation),
+        );
+
+        assert_eq!(
+            result.unwrap_err(),
+            "worker semantic token derivation was cancelled"
+        );
+        assert!(
+            replica.cached_semantic_tokens.is_none(),
+            "cancelled results must never become reusable worker facts"
         );
     }
 
