@@ -616,20 +616,27 @@ struct CachedInjectionLayer {
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 struct EstimatedDocumentMemory {
     non_evictable_bytes: usize,
-    evictable_bytes: usize,
+    result_cache_bytes: usize,
+    auxiliary_cache_bytes: usize,
+}
+
+impl EstimatedDocumentMemory {
+    fn evictable_bytes(self) -> usize {
+        self.result_cache_bytes
+            .saturating_add(self.auxiliary_cache_bytes)
+    }
 }
 
 impl DocumentReplica {
     fn estimated_memory(&self) -> EstimatedDocumentMemory {
         EstimatedDocumentMemory {
             non_evictable_bytes: self.text.capacity(),
-            evictable_bytes: self
+            result_cache_bytes: self
                 .cached_semantic_tokens
                 .as_ref()
-                .map(|(_, _, tokens)| {
-                    tokens.capacity() * std::mem::size_of::<WireSemanticToken>()
-                })
+                .map(|(_, _, tokens)| tokens.capacity() * std::mem::size_of::<WireSemanticToken>())
                 .unwrap_or_default(),
+            auxiliary_cache_bytes: 0,
         }
     }
 
@@ -5861,7 +5868,10 @@ mod tests {
 
         let after = replica.estimated_memory();
         assert_eq!(after.non_evictable_bytes, before.non_evictable_bytes);
-        assert_eq!(after.evictable_bytes, before.evictable_bytes + semantic_bytes);
+        assert_eq!(
+            after.evictable_bytes(),
+            before.evictable_bytes() + semantic_bytes
+        );
     }
 
     #[test]
