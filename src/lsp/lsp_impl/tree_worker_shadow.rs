@@ -2968,6 +2968,10 @@ fn observe_healthy_service(state: &mut SupervisorState, now: Instant) {
                 target: "kakehashi::tree_worker_shadow",
                 "closed shadow worker breaker after configuration generation {probe_generation} completed 60 seconds of healthy service",
             );
+            #[cfg(feature = "e2e")]
+            if let Ok(path) = std::env::var("KAKEHASHI_TREE_WORKER_BREAKER_CLOSED_FILE") {
+                let _ = std::fs::write(path, b"closed");
+            }
         }
     }
     let Some(last_restore) = state.long_healthy_since else {

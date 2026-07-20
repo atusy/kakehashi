@@ -4083,6 +4083,18 @@ fn inject_worker_failure_once(request: &Request) -> Option<Response> {
     let Request::SyncDocument(sync) = request else {
         return None;
     };
+    if std::env::var("KAKEHASHI_TREE_WORKER_RESTART_WHILE_FILE")
+        .ok()
+        .is_some_and(|path| std::path::Path::new(&path).exists())
+        && std::env::var("KAKEHASHI_TREE_WORKER_RESTART_WHILE_URI_SUFFIX")
+            .ok()
+            .is_none_or(|suffix| sync.context.uri.ends_with(&suffix))
+    {
+        return Some(Response::WorkerRestartRequired(WorkerRestartRequired {
+            context: sync.context.clone(),
+            reason: "injected gated systemic restart".into(),
+        }));
+    }
     if std::env::var("KAKEHASHI_TREE_WORKER_RESTART_ALWAYS_URI_SUFFIX")
         .ok()
         .is_some_and(|suffix| sync.context.uri.ends_with(&suffix))

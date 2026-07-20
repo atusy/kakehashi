@@ -547,6 +547,95 @@ fn configuration_change_allows_one_failed_half_open_probe() {
 }
 
 #[test]
+fn successful_half_open_resync_closes_the_breaker() {
+    let directory = tempfile::tempdir().unwrap();
+    let failure_gate = directory.path().join("restart-while-present");
+    let breaker_open = directory.path().join("breaker-open");
+    let breaker_closed = directory.path().join("breaker-closed");
+    std::fs::write(&failure_gate, b"fail").unwrap();
+    let mut client = LspClient::builder()
+        .env("KAKEHASHI_TREE_WORKER_SHADOW", "true")
+        .env("KAKEHASHI_TREE_WORKER_THREADS", "4")
+        .env(
+            "KAKEHASHI_TREE_WORKER_RESTART_WHILE_FILE",
+            failure_gate.to_string_lossy().into_owned(),
+        )
+        .env(
+            "KAKEHASHI_TREE_WORKER_RESTART_WHILE_URI_SUFFIX",
+            "/half-open-success.rs",
+        )
+        .env(
+            "KAKEHASHI_TREE_WORKER_BREAKER_OPEN_FILE",
+            breaker_open.to_string_lossy().into_owned(),
+        )
+        .env(
+            "KAKEHASHI_TREE_WORKER_BREAKER_CLOSED_FILE",
+            breaker_closed.to_string_lossy().into_owned(),
+        )
+        .env("KAKEHASHI_TREE_WORKER_FAST_COOLDOWN_MS", "25")
+        .env(
+            "RUST_LOG",
+            "kakehashi::tree_worker_shadow=info,kakehashi::tree_worker_shadow_metrics=info",
+        )
+        .build();
+    initialize(&mut client);
+    let uri = "file:///half-open-success.rs";
+    client.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri,
+                "languageId": "rust",
+                "version": 1,
+                "text": "fn half_open_success() { let value = 1; }\n"
+            }
+        }),
+    );
+    let response = client.send_request(
+        "textDocument/semanticTokens/full",
+        json!({ "textDocument": { "uri": uri } }),
+    );
+    assert!(response.get("result").is_some(), "{response:?}");
+
+    let initial_deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while !breaker_open.exists() && std::time::Instant::now() < initial_deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(breaker_open.exists(), "initial breaker did not open");
+    std::fs::remove_file(&failure_gate).unwrap();
+    std::fs::remove_file(&breaker_open).unwrap();
+
+    client.send_notification(
+        "workspace/didChangeConfiguration",
+        json!({ "settings": { "autoInstall": false } }),
+    );
+    let recovery_deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while !breaker_closed.exists() && std::time::Instant::now() < recovery_deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        breaker_closed.exists(),
+        "healthy half-open probe did not close breaker"
+    );
+    assert!(!breaker_open.exists(), "successful probe reopened breaker");
+
+    let recovered = client.send_request(
+        "textDocument/semanticTokens/full",
+        json!({ "textDocument": { "uri": uri } }),
+    );
+    assert!(recovered.get("result").is_some(), "{recovered:?}");
+
+    let stderr = shutdown_and_stderr(client);
+    assert_eq!(stderr.matches("full resync failed").count(), 3, "{stderr}");
+    assert!(
+        stderr.contains("entered shadow worker half-open probation"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("closed shadow worker breaker"), "{stderr}");
+    assert!(!stderr.contains("quarantined grammar"), "{stderr}");
+}
+
+#[test]
 fn systemic_worker_restart_measures_many_document_full_resync() {
     let directory = tempfile::tempdir().unwrap();
     let marker = directory.path().join("restart-many-once");
