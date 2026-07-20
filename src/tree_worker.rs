@@ -5089,6 +5089,7 @@ pub struct Client {
     active_grammar_hazards: Arc<Mutex<HashMap<u64, GrammarHazardArmed>>>,
     reader_drain_state: Arc<(Mutex<ReaderDrainState>, Condvar)>,
     routes: Arc<Mutex<HashMap<u64, Route>>>,
+    document_grammars: Arc<Mutex<HashMap<String, Arc<WorkerGrammarIdentity>>>>,
     reader: Option<std::thread::JoinHandle<()>>,
     writer: Option<std::thread::JoinHandle<()>>,
     ready: HandshakeReady,
@@ -5140,6 +5141,8 @@ fn request_timeout(_uri: &str) -> Duration {
 
 struct Route {
     expected: RequestContext,
+    expected_grammar: Option<Arc<WorkerGrammarIdentity>>,
+    document_grammar_update: Option<DocumentGrammarUpdate>,
     sender: mpsc::Sender<io::Result<Response>>,
 }
 
@@ -5153,7 +5156,10 @@ fn record_grammar_hazard_arm(
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .get(&armed.context.request_id)
-        .is_some_and(|route| route.expected == armed.context);
+        .is_some_and(|route| {
+            route.expected == armed.context
+                && route.expected_grammar.as_deref() == Some(&armed.grammar)
+        });
     let mut hazards = hazards
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -5175,6 +5181,11 @@ pub struct PendingResponse {
     response_rx: mpsc::Receiver<io::Result<Response>>,
     started: Instant,
     timeout: Duration,
+}
+
+enum DocumentGrammarUpdate {
+    Set(String, Arc<WorkerGrammarIdentity>),
+    Remove(String),
 }
 
 impl Client {
@@ -5250,10 +5261,12 @@ impl Client {
         let child = Arc::new(Mutex::new(child));
         let terminated_by_transport = Arc::new(AtomicBool::new(false));
         let routes = Arc::new(Mutex::new(HashMap::<u64, Route>::new()));
+        let document_grammars = Arc::new(Mutex::new(HashMap::new()));
         let active_grammar_hazards =
             Arc::new(Mutex::new(HashMap::<u64, GrammarHazardArmed>::new()));
         let reader_drain_state = Arc::new((Mutex::new(ReaderDrainState::Reading), Condvar::new()));
         let reader_routes = Arc::clone(&routes);
+        let reader_document_grammars = Arc::clone(&document_grammars);
         let reader_hazards = Arc::clone(&active_grammar_hazards);
         let reader_drain_signal = Arc::clone(&reader_drain_state);
         let reader_child = Arc::clone(&child);
@@ -5307,7 +5320,11 @@ impl Client {
                                 continue;
                             }
                             response => {
-                                if let Err(error) = route_response(&reader_routes, response) {
+                                if let Err(error) = route_response(
+                                    &reader_routes,
+                                    &reader_document_grammars,
+                                    response,
+                                ) {
                                     let kind = error.kind();
                                     let message = error.to_string();
                                     fail_routes(None, &reader_routes, kind, &message);
@@ -5433,6 +5450,7 @@ impl Client {
             active_grammar_hazards,
             reader_drain_state,
             routes,
+            document_grammars,
             reader: Some(reader),
             writer: Some(writer),
             ready,
@@ -5736,8 +5754,37 @@ impl Client {
                 "request targets a stale worker generation",
             ));
         }
+        let outbound = self
+            .outbound
+            .lock()
+            .map_err(|_| io::Error::other("worker outbound lock is poisoned"))?;
+        let outbound = outbound
+            .as_ref()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::BrokenPipe, "worker is shut down"))?;
         let request_id = expected.request_id;
         let (response_tx, response_rx) = mpsc::channel();
+        let direct_grammar = direct_request_grammar_identity(&request);
+        let inherited_grammar_uri =
+            inherited_request_grammar_context(&request).map(|context| context.uri.as_str());
+        let committed_grammar = if let Some(uri) = inherited_grammar_uri {
+            self.document_grammars
+                .lock()
+                .map_err(|_| io::Error::other("worker document grammar lock is poisoned"))?
+                .get(uri)
+                .cloned()
+        } else {
+            None
+        };
+        let document_grammar_update = match (&request, &direct_grammar) {
+            (Request::SyncDocument(request), Some(grammar)) => Some(DocumentGrammarUpdate::Set(
+                request.context.uri.clone(),
+                Arc::clone(grammar),
+            )),
+            (Request::CloseDocument(request), _) => {
+                Some(DocumentGrammarUpdate::Remove(request.context.uri.clone()))
+            }
+            _ => None,
+        };
         {
             let mut routes = self
                 .routes
@@ -5747,6 +5794,31 @@ impl Client {
                 return Err(io::Error::new(
                     io::ErrorKind::AlreadyExists,
                     format!("tree worker request {request_id} is already active"),
+                ));
+            }
+            let active_sync_grammar = inherited_grammar_uri.and_then(|uri| {
+                routes
+                    .values()
+                    .filter(|route| {
+                        matches!(
+                            &route.document_grammar_update,
+                            Some(DocumentGrammarUpdate::Set(route_uri, _)) if route_uri == uri
+                        )
+                    })
+                    .max_by_key(|route| route.expected.request_id)
+                    .and_then(|route| route.expected_grammar.clone())
+            });
+            let expected_grammar = direct_grammar
+                .clone()
+                .or(active_sync_grammar)
+                .or(committed_grammar);
+            if inherited_grammar_uri.is_some() && expected_grammar.is_none() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "document grammar is unavailable for {}",
+                        inherited_grammar_uri.unwrap_or_default()
+                    ),
                 ));
             }
             let accepting_requests = self.accepting_requests.load(Ordering::Acquire);
@@ -5769,25 +5841,18 @@ impl Client {
                 request_id,
                 Route {
                     expected,
+                    expected_grammar,
+                    document_grammar_update,
                     sender: response_tx,
                 },
             );
         }
-        {
-            let outbound = self
-                .outbound
-                .lock()
-                .map_err(|_| io::Error::other("worker outbound lock is poisoned"))?;
-            let outbound = outbound
-                .as_ref()
-                .ok_or_else(|| io::Error::new(io::ErrorKind::BrokenPipe, "worker is shut down"))?;
-            if outbound.send(request).is_err() {
-                self.remove_route(request_id);
-                return Err(io::Error::new(
-                    io::ErrorKind::BrokenPipe,
-                    "tree worker writer stopped",
-                ));
-            }
+        if outbound.send(request).is_err() {
+            self.remove_route(request_id);
+            return Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "tree worker writer stopped",
+            ));
         }
         Ok(PendingResponse {
             request_id,
@@ -5879,6 +5944,43 @@ fn cancellation_grace_response(
         Ok(Ok(response)) => Ok(Some(response)),
         Ok(Err(error)) => Err(error),
         Err(mpsc::RecvTimeoutError::Timeout | mpsc::RecvTimeoutError::Disconnected) => Ok(None),
+    }
+}
+
+fn direct_request_grammar_identity(request: &Request) -> Option<Arc<WorkerGrammarIdentity>> {
+    match request {
+        Request::DeriveSnapshot(request) => Some(Arc::new(WorkerGrammarIdentity {
+            grammar_symbol: request.grammar_symbol.clone(),
+            artifact_digest: request.artifact_digest.clone(),
+        })),
+        Request::SyncDocument(request) => Some(Arc::new(WorkerGrammarIdentity {
+            grammar_symbol: request.grammar_symbol.clone(),
+            artifact_digest: request.artifact_digest.clone(),
+        })),
+        _ => None,
+    }
+}
+
+fn inherited_request_grammar_context(request: &Request) -> Option<&RequestContext> {
+    match request {
+        Request::ApplyDocumentEdits(request) => Some(&request.context),
+        Request::ApplyDocumentEditsAndDerive(request) => Some(&request.context),
+        Request::DeriveDocumentSnapshot(request) => Some(&request.context),
+        Request::ResolveNode(request) => Some(&request.context),
+        Request::NavigateNode(request) => Some(&request.context),
+        Request::RunNodeScalar(request) => Some(&request.context),
+        Request::DeriveSelectionRanges(request) => Some(&request.context),
+        Request::DeriveInjectionRegions(request) => Some(&request.context),
+        Request::DeriveSemanticTokens(request) => Some(&request.context),
+        Request::RunCaptures(request) => Some(&request.context),
+        Request::DeriveNativeBindings(request) => Some(&request.context),
+        Request::Handshake(_)
+        | Request::Cancel(_)
+        | Request::DeriveSnapshot(_)
+        | Request::ConfigureLanguages(_)
+        | Request::SyncDocument(_)
+        | Request::InspectDocumentMemory(_)
+        | Request::CloseDocument(_) => None,
     }
 }
 
@@ -5983,7 +6085,11 @@ fn response_context(response: &Response) -> Option<&RequestContext> {
     }
 }
 
-fn route_response(routes: &Mutex<HashMap<u64, Route>>, response: Response) -> io::Result<()> {
+fn route_response(
+    routes: &Mutex<HashMap<u64, Route>>,
+    document_grammars: &Mutex<HashMap<String, Arc<WorkerGrammarIdentity>>>,
+    response: Response,
+) -> io::Result<()> {
     let Some(request_id) = response_request_id(&response) else {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -6009,6 +6115,21 @@ fn route_response(routes: &Mutex<HashMap<u64, Route>>, response: Response) -> io
             .sender
             .send(Err(io::Error::new(error.kind(), error.to_string())));
         return Err(error);
+    }
+    match (&route.document_grammar_update, &response) {
+        (Some(DocumentGrammarUpdate::Set(uri, grammar)), Response::DocumentAck(_)) => {
+            document_grammars
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(uri.clone(), Arc::clone(grammar));
+        }
+        (Some(DocumentGrammarUpdate::Remove(uri)), Response::DocumentClosed(_)) => {
+            document_grammars
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(uri);
+        }
+        _ => {}
     }
     let _ = route.sender.send(Ok(response));
     Ok(())
@@ -6625,6 +6746,7 @@ mod tests {
     #[test]
     fn response_router_rejects_unknown_request_id() {
         let routes = Mutex::new(HashMap::new());
+        let document_grammars = Mutex::new(HashMap::new());
         let response = Response::Error(WorkerError {
             context: Some(RequestContext {
                 request_id: 99,
@@ -6637,7 +6759,7 @@ mod tests {
             message: "unexpected".into(),
         });
 
-        let error = route_response(&routes, response).unwrap_err();
+        let error = route_response(&routes, &document_grammars, response).unwrap_err();
 
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
         assert!(error.to_string().contains("unknown request id 99"));
@@ -6658,6 +6780,8 @@ mod tests {
             7,
             Route {
                 expected: expected.clone(),
+                expected_grammar: None,
+                document_grammar_update: None,
                 sender,
             },
         )]));
@@ -6666,6 +6790,7 @@ mod tests {
 
         let error = route_response(
             &routes,
+            &Mutex::new(HashMap::new()),
             Response::Error(WorkerError {
                 context: Some(stale),
                 message: "stale".into(),
@@ -6692,6 +6817,11 @@ mod tests {
             7,
             Route {
                 expected: expected.clone(),
+                expected_grammar: Some(Arc::new(WorkerGrammarIdentity {
+                    grammar_symbol: "rust".into(),
+                    artifact_digest: "sha256:expected".into(),
+                })),
+                document_grammar_update: None,
                 sender,
             },
         )]));
@@ -6717,13 +6847,31 @@ mod tests {
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
         assert!(hazards.lock().unwrap().is_empty());
 
+        let error = record_grammar_hazard_arm(
+            &routes,
+            &hazards,
+            GrammarHazardArmed {
+                lease_id: 10,
+                context: expected.clone(),
+                grammar: WorkerGrammarIdentity {
+                    grammar_symbol: "lua".into(),
+                    artifact_digest: "sha256:forged".into(),
+                },
+            },
+            3,
+        )
+        .unwrap_err();
+
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(hazards.lock().unwrap().is_empty());
+
         let mut unknown = expected;
         unknown.request_id = 99;
         let error = record_grammar_hazard_arm(
             &routes,
             &hazards,
             GrammarHazardArmed {
-                lease_id: 10,
+                lease_id: 11,
                 context: unknown,
                 grammar: WorkerGrammarIdentity {
                     grammar_symbol: "lua".into(),
