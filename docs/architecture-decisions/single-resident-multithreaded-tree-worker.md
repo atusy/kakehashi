@@ -1281,6 +1281,22 @@ while clean shutdown was effectively unchanged at +0.171%. Native hazard and
 quarantine control, protocol and compatibility gates, and legacy-path removal
 remain open.
 
+The [Stage 24 grammar-hazard measurement](single-resident-multithreaded-tree-worker-stage24-measurement.md)
+prototypes an acknowledged parent-visible lease around grammar-backed work. A
+post-acknowledgment crash was attributed to the exact Rust artifact, quarantined
+only for the current session, and recovered through worker restart and document
+resynchronization while a healthy Lua grammar remained available. Twenty-four
+order-reversed release pairs found a repeatable hot-path cost: sequential p50
+rose by a median paired 5.382%, or 77 microseconds. The same handshake acted as
+accidental admission pacing under four-way concurrency, improving throughput by
+3.898% and p95 by 10.021%; that scheduling effect must be preserved or replaced
+explicitly rather than coupled to safety IPC. Keep the lease as the correctness
+reference, but do not pass the fine-grained latency gate until a
+parent-visible-before-entry mechanism removes the synchronous pipe round trip.
+Multiple-hazard quarantine, independently bounded control transport, native
+segment deadlines, protocol and compatibility gates, and legacy-path removal
+remain open.
+
 The implementation should proceed in measured stages:
 
 1. Prototype the framed transport, supervision, and one high-level
