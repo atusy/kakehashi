@@ -4118,6 +4118,39 @@ where
                             }
                         }
                         #[cfg(feature = "e2e")]
+                        if let Ok(trigger) = std::env::var(
+                            "KAKEHASHI_TREE_WORKER_HANG_ALL_COMMITTED_HAZARDS_TRIGGER_FILE",
+                        ) && std::path::Path::new(&trigger).exists()
+                            && std::env::var(
+                                "KAKEHASHI_TREE_WORKER_HANG_ALL_COMMITTED_HAZARDS_URI_PREFIX",
+                            )
+                            .ok()
+                            .is_some_and(|prefix| context.uri.starts_with(&prefix))
+                            && let Ok(directory) = std::env::var(
+                                "KAKEHASHI_TREE_WORKER_HANG_ALL_COMMITTED_HAZARDS_MARKER_DIR",
+                            )
+                        {
+                            let _ = std::fs::write(
+                                std::path::Path::new(&directory)
+                                    .join(context.request_id.to_string()),
+                                b"hung",
+                            );
+                            let expected = std::env::var(
+                                "KAKEHASHI_TREE_WORKER_HANG_ALL_COMMITTED_HAZARDS_COUNT",
+                            )
+                            .ok()
+                            .and_then(|value| value.parse::<usize>().ok())
+                            .unwrap_or(4);
+                            if std::fs::read_dir(&directory)
+                                .is_ok_and(|entries| entries.count() >= expected)
+                            {
+                                let _ = std::fs::remove_file(trigger);
+                            }
+                            loop {
+                                std::thread::park();
+                            }
+                        }
+                        #[cfg(feature = "e2e")]
                         if std::env::var_os("KAKEHASHI_TREE_WORKER_MULTI_HAZARD_TRIGGER_FILE")
                             .is_some_and(|path| std::path::Path::new(&path).exists())
                             && !std::env::var_os("KAKEHASHI_TREE_WORKER_RECOVERY_READY_FILE")
@@ -5010,6 +5043,11 @@ fn parse_request_timeout(value: Option<&str>) -> Duration {
 fn request_timeout(_uri: &str) -> Duration {
     #[cfg(feature = "e2e")]
     {
+        if std::env::var_os("KAKEHASHI_TREE_WORKER_REQUEST_TIMEOUT_TRIGGER_FILE")
+            .is_some_and(|path| !std::path::Path::new(&path).exists())
+        {
+            return DEFAULT_REQUEST_TIMEOUT;
+        }
         if std::env::var("KAKEHASHI_TREE_WORKER_REQUEST_TIMEOUT_URI_SUFFIX")
             .ok()
             .is_some_and(|suffix| !_uri.ends_with(&suffix))

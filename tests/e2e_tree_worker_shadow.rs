@@ -1407,6 +1407,135 @@ fn request_timeout_without_native_segment_does_not_quarantine_grammar() {
 }
 
 #[test]
+fn noncooperative_jobs_saturating_all_compute_threads_recover_as_one_generation() {
+    let directory = tempfile::tempdir().unwrap();
+    let trigger = directory.path().join("trigger");
+    let markers = directory.path().join("hung-jobs");
+    let recovery_ready = directory.path().join("recovery-ready");
+    std::fs::create_dir(&markers).unwrap();
+    let mut client = LspClient::builder()
+        .env("KAKEHASHI_TREE_WORKER_MODE", "authoritative")
+        .env("KAKEHASHI_TREE_WORKER_THREADS", "4")
+        .env("KAKEHASHI_TREE_WORKER_REQUEST_TIMEOUT_MS", "2000")
+        .env(
+            "KAKEHASHI_TREE_WORKER_REQUEST_TIMEOUT_TRIGGER_FILE",
+            trigger.to_string_lossy(),
+        )
+        .env(
+            "KAKEHASHI_TREE_WORKER_HANG_ALL_COMMITTED_HAZARDS_URI_PREFIX",
+            "file:///saturated-",
+        )
+        .env(
+            "KAKEHASHI_TREE_WORKER_HANG_ALL_COMMITTED_HAZARDS_TRIGGER_FILE",
+            trigger.to_string_lossy(),
+        )
+        .env(
+            "KAKEHASHI_TREE_WORKER_HANG_ALL_COMMITTED_HAZARDS_MARKER_DIR",
+            markers.to_string_lossy(),
+        )
+        .env(
+            "KAKEHASHI_TREE_WORKER_RECOVERY_READY_FILE",
+            recovery_ready.to_string_lossy(),
+        )
+        .env("RUST_LOG", "kakehashi::tree_worker_shadow=info")
+        .build();
+    initialize(&mut client);
+
+    let documents = (0..4)
+        .map(|index| {
+            (
+                format!("file:///saturated-{index}.rs"),
+                format!("fn saturated_{index}() {{}}\n"),
+            )
+        })
+        .collect::<Vec<_>>();
+    for (uri, text) in &documents {
+        client.send_notification(
+            "textDocument/didOpen",
+            json!({
+                "textDocument": {
+                    "uri": uri,
+                    "languageId": "rust",
+                    "version": 1,
+                    "text": text
+                }
+            }),
+        );
+        let response = client.send_request(
+            "textDocument/semanticTokens/full",
+            json!({ "textDocument": { "uri": uri } }),
+        );
+        assert!(response.get("result").is_some(), "{response:?}");
+    }
+
+    std::fs::write(&trigger, b"trigger").unwrap();
+    let started = std::time::Instant::now();
+    let request_ids = documents
+        .iter()
+        .map(|(uri, _)| {
+            client.send_request_async(
+                "kakehashi/node",
+                json!({
+                    "textDocument": { "uri": uri },
+                    "position": { "line": 0, "character": 4 }
+                }),
+            )
+        })
+        .collect::<std::collections::HashSet<_>>();
+    let marker_deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while std::fs::read_dir(&markers).unwrap().count() < 4
+        && std::time::Instant::now() < marker_deadline
+    {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(
+        std::fs::read_dir(&markers).unwrap().count(),
+        4,
+        "all compute threads must enter noncooperative jobs"
+    );
+
+    let mut completed = std::collections::HashSet::new();
+    for _ in 0..4 {
+        let response = client.receive_next_response_public();
+        assert!(response.get("result").is_some(), "{response:?}");
+        completed.insert(response.get("id").and_then(|id| id.as_i64()).unwrap());
+    }
+    assert_eq!(completed, request_ids);
+    wait_for_file(
+        &recovery_ready,
+        "saturated worker did not recover as a replacement generation",
+    );
+    let recovery_elapsed = started.elapsed();
+    eprintln!(
+        "saturated_noncooperative_recovery_ms={}",
+        recovery_elapsed.as_millis()
+    );
+
+    let healthy = client.send_request(
+        "textDocument/semanticTokens/full",
+        json!({ "textDocument": { "uri": &documents[0].0 } }),
+    );
+    assert!(healthy.get("result").is_some(), "{healthy:?}");
+
+    let stderr = shutdown_and_stderr(client);
+    assert!(
+        recovery_elapsed < Duration::from_secs(6),
+        "{recovery_elapsed:?}\n{stderr}"
+    );
+    assert_eq!(
+        stderr.matches("restarted worker generation").count(),
+        1,
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("full-resynced 4 open documents"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("quarantined grammar"), "{stderr}");
+    assert!(!stderr.contains("disabled tree tier"), "{stderr}");
+}
+
+#[test]
 fn competing_document_finishes_while_injection_fanout_is_running() {
     let force_nested = std::env::var_os("KAKEHASHI_E2E_FORCE_NESTED_PARALLELISM").is_some();
     let mut builder = LspClient::builder()
