@@ -93,6 +93,9 @@ enum Commands {
         /// Internal hard budget for retained source and host-tree estimates.
         #[arg(long, default_value_t = 512 * 1024 * 1024)]
         non_evictable_estimate_hard_bytes: usize,
+        /// Parent-owned liveness pipe inherited by the worker on Unix.
+        #[arg(long)]
+        parent_liveness_fd: Option<i32>,
     },
     /// Report diagnostics for files via the configured downstream language servers
     ///
@@ -355,6 +358,7 @@ fn main() -> ExitCode {
             threads,
             derived_cache_soft_bytes,
             non_evictable_estimate_hard_bytes,
+            parent_liveness_fd,
         }) => kakehashi::tree_worker::WorkerMemoryBudgets::new(
             derived_cache_soft_bytes,
             non_evictable_estimate_hard_bytes,
@@ -364,12 +368,15 @@ fn main() -> ExitCode {
             ExitCode::FAILURE
         })
         .and_then(|memory_budgets| {
-            kakehashi::tree_worker::run_stdio_with_memory_budgets(threads, memory_budgets).map_err(
-                |error| {
-                    eprintln!("tree worker failed: {error}");
-                    ExitCode::FAILURE
-                },
+            kakehashi::tree_worker::run_stdio_with_parent_liveness(
+                threads,
+                memory_budgets,
+                parent_liveness_fd,
             )
+            .map_err(|error| {
+                eprintln!("tree worker failed: {error}");
+                ExitCode::FAILURE
+            })
         }),
         None => {
             // Start LSP server (backward compatible default behavior)

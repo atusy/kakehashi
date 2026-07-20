@@ -4196,6 +4196,21 @@ pub fn run_stdio_with_memory_budgets(
     compute_threads: usize,
     memory_budgets: WorkerMemoryBudgets,
 ) -> io::Result<()> {
+    run_stdio_with_parent_liveness(compute_threads, memory_budgets, None)
+}
+
+#[doc(hidden)]
+pub fn run_stdio_with_parent_liveness(
+    compute_threads: usize,
+    memory_budgets: WorkerMemoryBudgets,
+    parent_liveness_fd: Option<i32>,
+) -> io::Result<()> {
+    #[cfg(unix)]
+    if let Some(fd) = parent_liveness_fd {
+        arm_parent_liveness(fd)?;
+    }
+    #[cfg(not(unix))]
+    let _ = parent_liveness_fd;
     #[cfg(feature = "e2e")]
     publish_test_worker_pid()?;
     #[cfg(all(unix, feature = "e2e"))]
@@ -4208,6 +4223,39 @@ pub fn run_stdio_with_memory_budgets(
         &build_id,
         memory_budgets,
     )
+}
+
+#[cfg(unix)]
+fn arm_parent_liveness(fd: i32) -> io::Result<()> {
+    use std::os::fd::FromRawFd as _;
+
+    if fd < 3 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "parent liveness fd must not alias standard I/O",
+        ));
+    }
+    // SAFETY: the parent passes ownership of this inherited descriptor to the
+    // worker. This function is called exactly once before any worker threads
+    // can otherwise acquire or close it.
+    let read_end = unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) };
+    std::thread::Builder::new()
+        .name("kakehashi-tree-worker-parent-liveness".into())
+        .spawn(move || {
+            let mut byte = [0_u8; 1];
+            loop {
+                match nix::unistd::read(&read_end, &mut byte) {
+                    Ok(0) => break,
+                    Ok(_) | Err(nix::errno::Errno::EINTR) => continue,
+                    Err(_) => break,
+                }
+            }
+            // SAFETY: `_exit` is deliberately used from the control thread so
+            // parent death cannot wait for or run destructors held by a hung
+            // native compute thread.
+            unsafe { nix::libc::_exit(1) }
+        })
+        .map(|_| ())
 }
 
 #[cfg(feature = "e2e")]
@@ -4255,10 +4303,53 @@ struct OwnedChild {
     child: Child,
     #[cfg(unix)]
     process_group: nix::unistd::Pid,
+    #[cfg(unix)]
+    _parent_liveness: Option<std::os::fd::OwnedFd>,
 }
 
 impl OwnedChild {
-    fn spawn(mut command: Command) -> io::Result<Self> {
+    #[cfg(test)]
+    fn spawn(command: Command) -> io::Result<Self> {
+        Self::spawn_configured(command, None)
+    }
+
+    fn spawn_worker(mut command: Command) -> io::Result<Self> {
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsRawFd as _;
+            use std::os::unix::process::CommandExt as _;
+
+            use nix::fcntl::{FcntlArg, FdFlag, fcntl};
+
+            let (read_end, write_end) = nix::unistd::pipe()?;
+            fcntl(&read_end, FcntlArg::F_SETFD(FdFlag::FD_CLOEXEC))?;
+            fcntl(&write_end, FcntlArg::F_SETFD(FdFlag::FD_CLOEXEC))?;
+            let read_fd = read_end.as_raw_fd();
+            command.arg("--parent-liveness-fd").arg(read_fd.to_string());
+            // SAFETY: `fcntl` is async-signal-safe. The closure only clears
+            // CLOEXEC on the one pipe end intentionally inherited by this
+            // worker and allocates nothing after fork.
+            unsafe {
+                command.pre_exec(move || {
+                    if nix::libc::fcntl(read_fd, nix::libc::F_SETFD, 0) == -1 {
+                        return Err(io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
+            let child = Self::spawn_configured(command, Some(write_end));
+            drop(read_end);
+            child
+        }
+        #[cfg(not(unix))]
+        Self::spawn_configured(command, None)
+    }
+
+    fn spawn_configured(
+        mut command: Command,
+        #[cfg(unix)] parent_liveness: Option<std::os::fd::OwnedFd>,
+        #[cfg(not(unix))] _parent_liveness: Option<()>,
+    ) -> io::Result<Self> {
         #[cfg(unix)]
         {
             use std::os::unix::process::CommandExt as _;
@@ -4272,6 +4363,8 @@ impl OwnedChild {
             child,
             #[cfg(unix)]
             process_group,
+            #[cfg(unix)]
+            _parent_liveness: parent_liveness,
         })
     }
 
@@ -4409,7 +4502,7 @@ impl Client {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit());
-        let mut child = OwnedChild::spawn(command)?;
+        let mut child = OwnedChild::spawn_worker(command)?;
         let mut stdin = child
             .stdin
             .take()
