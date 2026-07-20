@@ -7183,24 +7183,21 @@ mod tests {
     fn estimated_non_evictable_budget_is_transactional() {
         let retained = AtomicUsize::new(MAX_RETAINED_ESTIMATED_DOCUMENT_BYTES - 8);
 
-        assert!(replace_retained_estimated_bytes(
-            &retained,
-            0,
-            9,
-            MAX_RETAINED_ESTIMATED_DOCUMENT_BYTES,
-        )
-        .is_err());
+        assert!(
+            replace_retained_estimated_bytes(
+                &retained,
+                0,
+                9,
+                MAX_RETAINED_ESTIMATED_DOCUMENT_BYTES,
+            )
+            .is_err()
+        );
         assert_eq!(
             retained.load(Ordering::Relaxed),
             MAX_RETAINED_ESTIMATED_DOCUMENT_BYTES - 8
         );
-        replace_retained_estimated_bytes(
-            &retained,
-            0,
-            8,
-            MAX_RETAINED_ESTIMATED_DOCUMENT_BYTES,
-        )
-        .unwrap();
+        replace_retained_estimated_bytes(&retained, 0, 8, MAX_RETAINED_ESTIMATED_DOCUMENT_BYTES)
+            .unwrap();
         assert_eq!(
             retained.load(Ordering::Relaxed),
             MAX_RETAINED_ESTIMATED_DOCUMENT_BYTES
