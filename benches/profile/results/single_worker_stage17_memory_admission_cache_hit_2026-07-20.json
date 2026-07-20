@@ -1,0 +1,51 @@
+{
+  "experiment": "single worker stage 17 memory admission exact-version cache hit",
+  "date": "2026-07-20",
+  "baseline": {
+    "stage": 16,
+    "binary_sha256": "810f3a43b16002eebdb15a30f0da765131d485c82760894aa18b69790decca78"
+  },
+  "candidate": {
+    "stage": 17,
+    "binary_sha256": "fb44ffe210efa84f088914bc38e81e0b98120789f4c066d709d6cef77eb6c57d"
+  },
+  "scenario": {
+    "language": "markdown",
+    "generated_size": 5000,
+    "documents": 1,
+    "measured_requests": 20,
+    "warm_semantic_cache": true,
+    "settle_seconds": 0.5,
+    "memory_sampling": false,
+    "order": [
+      ["baseline", "candidate"],
+      ["candidate", "baseline"],
+      ["baseline", "candidate"],
+      ["candidate", "baseline"],
+      ["baseline", "candidate"],
+      ["candidate", "baseline"]
+    ]
+  },
+  "runs": {
+    "baseline": [
+      {"p50_ms": 78.1, "p95_ms": 82.4, "wall_ms_per_cycle": 125.54},
+      {"p50_ms": 75.6, "p95_ms": 80.5, "wall_ms_per_cycle": 118.32},
+      {"p50_ms": 74.9, "p95_ms": 79.7, "wall_ms_per_cycle": 117.74},
+      {"p50_ms": 75.3, "p95_ms": 79.1, "wall_ms_per_cycle": 117.78},
+      {"p50_ms": 75.1, "p95_ms": 80.0, "wall_ms_per_cycle": 117.77},
+      {"p50_ms": 76.6, "p95_ms": 78.9, "wall_ms_per_cycle": 117.45}
+    ],
+    "candidate": [
+      {"p50_ms": 76.8, "p95_ms": 80.9, "wall_ms_per_cycle": 119.48},
+      {"p50_ms": 76.2, "p95_ms": 81.5, "wall_ms_per_cycle": 122.68},
+      {"p50_ms": 75.5, "p95_ms": 79.9, "wall_ms_per_cycle": 117.33},
+      {"p50_ms": 76.2, "p95_ms": 80.2, "wall_ms_per_cycle": 119.22},
+      {"p50_ms": 76.9, "p95_ms": 79.8, "wall_ms_per_cycle": 118.99},
+      {"p50_ms": 76.3, "p95_ms": 80.4, "wall_ms_per_cycle": 118.64}
+    ]
+  },
+  "medians": {
+    "baseline": {"p50_ms": 75.45, "p95_ms": 79.85, "wall_ms_per_cycle": 117.775},
+    "candidate": {"p50_ms": 76.25, "p95_ms": 80.30, "wall_ms_per_cycle": 119.105}
+  }
+}

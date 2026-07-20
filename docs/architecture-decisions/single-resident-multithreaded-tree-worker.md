@@ -1209,6 +1209,15 @@ soft pressure hygiene but uses semantic-token size only as a proxy; worker-wide
 derived-state accounting, a hard admission contract, and compatibility gates
 remain open.
 
+The [Stage 17 memory-admission measurement](single-resident-multithreaded-tree-worker-stage17-measurement.md)
+adds worker-wide estimates for non-evictable, result-cache, and auxiliary-cache
+memory, deterministic soft eviction, and transactional rejection of growth over
+an independent hard bound. A three-document admitted workload showed mixed
+noise-scale memory deltas and exact-version latency moved by only +0.6% to
++1.1%. This establishes a deterministic admission contract without claiming an
+RSS cap; configurable-boundary stress, failure injection, protocol and
+compatibility gates remain open.
+
 The implementation should proceed in measured stages:
 
 1. Prototype the framed transport, supervision, and one high-level
