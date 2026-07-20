@@ -4062,7 +4062,9 @@ where
                 .expect("worker admission queue stopped before its jobs");
             let permit = AdmissionPermit(permits);
             let mut announced_lease = None;
-            let hazard_error = grammar_hazard.and_then(|grammar| {
+            let hazard_error = grammar_hazard.and_then(|grammar: WorkerGrammarIdentity| {
+                #[cfg(feature = "e2e")]
+                let e2e_grammar_symbol = grammar.grammar_symbol.clone();
                 let lease_id = job_next_hazard_lease.fetch_add(1, Ordering::Relaxed);
                 let (committed_tx, committed_rx) = mpsc::channel();
                 if responses
@@ -4086,6 +4088,18 @@ where
                 match committed_rx.recv_timeout(Duration::from_secs(5)) {
                     Ok(()) => {
                         #[cfg(feature = "e2e")]
+                        if std::env::var_os("KAKEHASHI_TREE_WORKER_RECOVERY_READY_FILE")
+                            .is_some_and(|path| std::path::Path::new(&path).exists())
+                            && let Ok(path) =
+                                std::env::var("KAKEHASHI_TREE_WORKER_POST_RECOVERY_HAZARD_LOG")
+                            && let Ok(mut log) = std::fs::OpenOptions::new()
+                                .create(true)
+                                .append(true)
+                                .open(path)
+                        {
+                            let _ = writeln!(log, "{e2e_grammar_symbol}");
+                        }
+                        #[cfg(feature = "e2e")]
                         if let Ok(marker) =
                             std::env::var("KAKEHASHI_TREE_WORKER_HANG_AFTER_HAZARD_ARMED_FILE")
                             && std::env::var(
@@ -4106,6 +4120,8 @@ where
                         #[cfg(feature = "e2e")]
                         if std::env::var_os("KAKEHASHI_TREE_WORKER_MULTI_HAZARD_TRIGGER_FILE")
                             .is_some_and(|path| std::path::Path::new(&path).exists())
+                            && !std::env::var_os("KAKEHASHI_TREE_WORKER_RECOVERY_READY_FILE")
+                                .is_some_and(|path| std::path::Path::new(&path).exists())
                         {
                             if std::env::var(
                                 "KAKEHASHI_TREE_WORKER_HOLD_COMMITTED_HAZARD_URI_SUFFIX",

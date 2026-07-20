@@ -1124,6 +1124,7 @@ fn crash_quarantines_every_unique_committed_grammar_hazard() {
     let rust_committed = directory.path().join("rust-committed");
     let lua_committed = directory.path().join("lua-committed");
     let recovery_ready = directory.path().join("recovery-ready");
+    let post_recovery_hazards = directory.path().join("post-recovery-hazards");
     let mut client = LspClient::builder()
         .env("KAKEHASHI_TREE_WORKER_SHADOW", "true")
         .env("KAKEHASHI_TREE_WORKER_THREADS", "4")
@@ -1150,6 +1151,10 @@ fn crash_quarantines_every_unique_committed_grammar_hazard() {
         .env(
             "KAKEHASHI_TREE_WORKER_RECOVERY_READY_FILE",
             recovery_ready.to_string_lossy(),
+        )
+        .env(
+            "KAKEHASHI_TREE_WORKER_POST_RECOVERY_HAZARD_LOG",
+            post_recovery_hazards.to_string_lossy(),
         )
         .env(
             "RUST_LOG",
@@ -1215,6 +1220,31 @@ fn crash_quarantines_every_unique_committed_grammar_hazard() {
     wait_for_file(
         &recovery_ready,
         "replacement worker did not complete quarantine-aware resync",
+    );
+
+    for (uri, text) in [
+        ("file:///active-rust.rs", "fn active_rust_v2() {}\n"),
+        ("file:///active-lua.lua", "local active_lua_v2 = true\n"),
+        ("file:///healthy.yaml", "healthy: still\n"),
+    ] {
+        client.send_notification(
+            "textDocument/didChange",
+            json!({
+                "textDocument": { "uri": uri, "version": 2 },
+                "contentChanges": [{ "text": text }]
+            }),
+        );
+    }
+    wait_for_file(
+        &post_recovery_hazards,
+        "healthy YAML did not cross the post-recovery actor barrier",
+    );
+    let post_recovery_hazards = std::fs::read_to_string(&post_recovery_hazards).unwrap();
+    assert!(
+        post_recovery_hazards
+            .lines()
+            .all(|grammar| grammar == "yaml"),
+        "quarantined grammar was rearmed in the same session: {post_recovery_hazards}"
     );
 
     let healthy = client.send_request(
