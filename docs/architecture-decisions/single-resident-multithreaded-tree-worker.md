@@ -1182,6 +1182,15 @@ changes the next chunk's policy, while 40-request single-document benchmarks
 show no measurable regression. Per-document max-min admission, explicit
 priority classes, other long tree walks, and one-thread fairness remain open.
 
+The [Stage 14 priority measurement](single-resident-multithreaded-tree-worker-stage14-measurement.md)
+adds explicit foreground and background classes at chunk boundaries. With one
+worker and four compute threads, the deterministic contention fixture reduced
+median foreground latency by 27.0% while increasing background completion time
+by 56.3%; ordinary single-document benchmarks did not regress. With one compute
+thread, explicit yielding provided no measured latency benefit, so that path is
+a correctness fallback rather than a performance claim. Memory-pressure
+admission, broader long-walk scheduling, and compatibility gates remain open.
+
 The implementation should proceed in measured stages:
 
 1. Prototype the framed transport, supervision, and one high-level
