@@ -44,14 +44,15 @@ const TREE_NODE_ADMISSION_BYTES: usize = 64;
 const MAX_RETAINED_DERIVED_BYTES: usize = 128 * 1024 * 1024;
 pub const BUILD_ID: &str = concat!(env!("CARGO_PKG_NAME"), "-", env!("CARGO_PKG_VERSION"));
 
+#[doc(hidden)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct WorkerMemoryBudgets {
+pub struct WorkerMemoryBudgets {
     derived_cache_soft_bytes: usize,
     non_evictable_estimate_hard_bytes: usize,
 }
 
 impl WorkerMemoryBudgets {
-    fn new(
+    pub fn new(
         derived_cache_soft_bytes: usize,
         non_evictable_estimate_hard_bytes: usize,
     ) -> Result<Self, String> {
@@ -67,6 +68,9 @@ impl WorkerMemoryBudgets {
         })
     }
 }
+
+#[cfg(feature = "e2e")]
+pub type WorkerTestMemoryBudgets = WorkerMemoryBudgets;
 
 impl Default for WorkerMemoryBudgets {
     fn default() -> Self {
@@ -871,7 +875,7 @@ impl DocumentReplica {
         &mut self,
         request: ApplyDocumentEdits,
         parser: &mut tree_sitter::Parser,
-        retained_bytes: Option<(&AtomicUsize, &AtomicUsize)>,
+        retained_bytes: Option<(&AtomicUsize, &AtomicUsize, usize)>,
     ) -> Result<DocumentAck, String> {
         self.validate_identity(&request.context)?;
         if request.base_version != self.context.content_version {
@@ -920,7 +924,9 @@ impl DocumentReplica {
         let tree = parser
             .parse(text.as_bytes(), Some(&edited_tree))
             .ok_or_else(|| "parser returned no tree during incremental parse".to_string())?;
-        if let Some((retained_text_bytes, retained_estimated_bytes)) = retained_bytes {
+        if let Some((retained_text_bytes, retained_estimated_bytes, hard_limit_bytes)) =
+            retained_bytes
+        {
             replace_retained_bytes(retained_text_bytes, self.text.len(), text.len())?;
             let old_estimated = self.estimated_memory().non_evictable_bytes;
             let new_estimated = estimated_non_evictable_bytes(text.capacity(), &tree);
@@ -928,7 +934,7 @@ impl DocumentReplica {
                 retained_estimated_bytes,
                 old_estimated,
                 new_estimated,
-                MAX_RETAINED_ESTIMATED_DOCUMENT_BYTES,
+                hard_limit_bytes,
             ) {
                 replace_retained_bytes(retained_text_bytes, text.len(), self.text.len()).expect(
                     "rolling back retained text after estimated admission cannot exceed its budget",
@@ -2890,6 +2896,7 @@ fn handle_work(
     retained_document_bytes: &RetainedDocumentBytes,
     retained_estimated_document_bytes: &RetainedEstimatedDocumentBytes,
     derived_pressure_lock: &Mutex<()>,
+    memory_budgets: WorkerMemoryBudgets,
     queue_wait: Duration,
     cancellation: &crate::cancel::CancelToken,
     nested_work_policy: &(dyn Fn() -> crate::analysis::semantic::NestedWorkPolicy + Sync),
@@ -2915,18 +2922,21 @@ fn handle_work(
             document_capacity,
             retained_document_bytes,
             retained_estimated_document_bytes,
+            memory_budgets.non_evictable_estimate_hard_bytes,
         ),
         Request::ApplyDocumentEdits(request) => apply_document_edits(
             request,
             documents,
             retained_document_bytes,
             retained_estimated_document_bytes,
+            memory_budgets.non_evictable_estimate_hard_bytes,
         ),
         Request::ApplyDocumentEditsAndDerive(request) => apply_document_edits_and_derive(
             request,
             documents,
             retained_document_bytes,
             retained_estimated_document_bytes,
+            memory_budgets.non_evictable_estimate_hard_bytes,
             queue_wait,
             started,
         ),
@@ -2955,6 +2965,7 @@ fn handle_work(
             closed_documents,
             retained_document_bytes,
             retained_estimated_document_bytes,
+            memory_budgets.non_evictable_estimate_hard_bytes,
         ),
     };
     if pressure_checkpoint_required(may_grow_derived_state, &response)
@@ -2962,7 +2973,7 @@ fn handle_work(
             documents,
             derived_pressure_lock,
             &DocumentKey::from(&context),
-            MAX_RETAINED_DERIVED_BYTES,
+            memory_budgets.derived_cache_soft_bytes,
         )
     {
         return Response::WorkerRestartRequired(WorkerRestartRequired { context, reason });
@@ -3338,6 +3349,7 @@ fn sync_document(
         document_capacity,
         retained_document_bytes,
         &retained_estimated_document_bytes,
+        MAX_RETAINED_ESTIMATED_DOCUMENT_BYTES,
     )
 }
 
@@ -3349,6 +3361,7 @@ fn sync_document_with_analysis(
     document_capacity: &DocumentCapacity,
     retained_document_bytes: &RetainedDocumentBytes,
     retained_estimated_document_bytes: &RetainedEstimatedDocumentBytes,
+    non_evictable_estimate_hard_bytes: usize,
 ) -> Response {
     let context = request.context.clone();
     let request_text_len = request.text.len();
@@ -3442,7 +3455,7 @@ fn sync_document_with_analysis(
                             retained_estimated_document_bytes,
                             replaced_estimated_bytes,
                             estimated_bytes,
-                            MAX_RETAINED_ESTIMATED_DOCUMENT_BYTES,
+                            non_evictable_estimate_hard_bytes,
                         ) {
                             return Response::Error(WorkerError {
                                 context: Some(context),
@@ -3481,6 +3494,7 @@ fn apply_document_edits(
     documents: &DocumentStore,
     retained_document_bytes: &RetainedDocumentBytes,
     retained_estimated_document_bytes: &RetainedEstimatedDocumentBytes,
+    non_evictable_estimate_hard_bytes: usize,
 ) -> Response {
     let context = request.context.clone();
     let document_key = DocumentKey::from(&context);
@@ -3509,7 +3523,11 @@ fn apply_document_edits(
                 match replica.apply(
                     request,
                     parser,
-                    Some((retained_document_bytes, retained_estimated_document_bytes)),
+                    Some((
+                        retained_document_bytes,
+                        retained_estimated_document_bytes,
+                        non_evictable_estimate_hard_bytes,
+                    )),
                 ) {
                     Ok(ack) => Response::DocumentAck(ack),
                     Err(message) => Response::Error(WorkerError {
@@ -3526,6 +3544,7 @@ fn apply_document_edits_and_derive(
     documents: &DocumentStore,
     retained_document_bytes: &RetainedDocumentBytes,
     retained_estimated_document_bytes: &RetainedEstimatedDocumentBytes,
+    non_evictable_estimate_hard_bytes: usize,
     queue_wait: Duration,
     started: Instant,
 ) -> Response {
@@ -3561,7 +3580,11 @@ fn apply_document_edits_and_derive(
                 if let Err(message) = replica.apply(
                     edits,
                     parser,
-                    Some((retained_document_bytes, retained_estimated_document_bytes)),
+                    Some((
+                        retained_document_bytes,
+                        retained_estimated_document_bytes,
+                        non_evictable_estimate_hard_bytes,
+                    )),
                 ) {
                     return Response::Error(WorkerError {
                         context: Some(context),
@@ -3621,6 +3644,7 @@ fn close_document(
     closed_documents: &ClosedDocuments,
     retained_document_bytes: &RetainedDocumentBytes,
     retained_estimated_document_bytes: &RetainedEstimatedDocumentBytes,
+    non_evictable_estimate_hard_bytes: usize,
 ) -> Response {
     let context = request.context;
     let document_key = DocumentKey::from(&context);
@@ -3655,7 +3679,7 @@ fn close_document(
         retained_estimated_document_bytes,
         removed_estimated_bytes,
         0,
-        MAX_RETAINED_ESTIMATED_DOCUMENT_BYTES,
+        non_evictable_estimate_hard_bytes,
     )
     .expect("removing a document cannot exceed the estimated non-evictable budget");
     closed_documents.insert(document_key, context.incarnation);
@@ -3667,7 +3691,13 @@ where
     R: Read,
     W: Write + Send + 'static,
 {
-    run_with_build_id(reader, writer, compute_threads, BUILD_ID)
+    run_with_build_id(
+        reader,
+        writer,
+        compute_threads,
+        BUILD_ID,
+        WorkerMemoryBudgets::default(),
+    )
 }
 
 fn run_with_build_id<R, W>(
@@ -3675,6 +3705,7 @@ fn run_with_build_id<R, W>(
     writer: W,
     compute_threads: usize,
     build_id: &str,
+    memory_budgets: WorkerMemoryBudgets,
 ) -> io::Result<()>
 where
     R: Read,
@@ -3933,6 +3964,7 @@ where
                 &retained_document_bytes,
                 &retained_estimated_document_bytes,
                 &derived_pressure_lock,
+                memory_budgets,
                 enqueued.elapsed(),
                 &cancellation,
                 &nested_work_policy,
@@ -4080,12 +4112,21 @@ impl Drop for AdmissionPermit {
 }
 
 pub fn run_stdio(compute_threads: usize) -> io::Result<()> {
+    run_stdio_with_memory_budgets(compute_threads, WorkerMemoryBudgets::default())
+}
+
+#[doc(hidden)]
+pub fn run_stdio_with_memory_budgets(
+    compute_threads: usize,
+    memory_budgets: WorkerMemoryBudgets,
+) -> io::Result<()> {
     let build_id = artifact_digest(&std::env::current_exe()?)?;
     run_with_build_id(
         std::io::stdin(),
         std::io::stdout(),
         compute_threads,
         &build_id,
+        memory_budgets,
     )
 }
 
@@ -4155,6 +4196,35 @@ impl Client {
         compute_threads: usize,
         worker_generation: u64,
     ) -> io::Result<Self> {
+        Self::spawn_with_memory_budgets(
+            executable,
+            compute_threads,
+            worker_generation,
+            WorkerMemoryBudgets::default(),
+        )
+    }
+
+    #[cfg(feature = "e2e")]
+    pub fn spawn_with_test_memory_budgets(
+        executable: &std::path::Path,
+        compute_threads: usize,
+        worker_generation: u64,
+        memory_budgets: WorkerTestMemoryBudgets,
+    ) -> io::Result<Self> {
+        Self::spawn_with_memory_budgets(
+            executable,
+            compute_threads,
+            worker_generation,
+            memory_budgets,
+        )
+    }
+
+    fn spawn_with_memory_budgets(
+        executable: &std::path::Path,
+        compute_threads: usize,
+        worker_generation: u64,
+        memory_budgets: WorkerMemoryBudgets,
+    ) -> io::Result<Self> {
         if compute_threads == 0 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -4162,8 +4232,20 @@ impl Client {
             ));
         }
         let build_id = artifact_digest(executable)?;
+        let compute_threads_arg = compute_threads.to_string();
+        let derived_cache_soft_bytes = memory_budgets.derived_cache_soft_bytes.to_string();
+        let non_evictable_estimate_hard_bytes =
+            memory_budgets.non_evictable_estimate_hard_bytes.to_string();
         let mut child = Command::new(executable)
-            .args(["__tree-worker", "--threads", &compute_threads.to_string()])
+            .args([
+                "__tree-worker",
+                "--threads",
+                &compute_threads_arg,
+                "--derived-cache-soft-bytes",
+                &derived_cache_soft_bytes,
+                "--non-evictable-estimate-hard-bytes",
+                &non_evictable_estimate_hard_bytes,
+            ])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
@@ -7141,6 +7223,7 @@ mod tests {
             &closed_documents,
             &retained,
             &retained_estimated,
+            MAX_RETAINED_ESTIMATED_DOCUMENT_BYTES,
         );
         assert!(matches!(close_response, Response::WorkerRestartRequired(_)));
         assert!(documents.contains_key(&key));

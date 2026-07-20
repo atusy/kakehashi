@@ -7,6 +7,7 @@ use kakehashi::tree_worker::{
     DeriveNativeBindings, DeriveSemanticTokens, NavigateNode, NodeNavigation, NodeScalarOperation,
     NodeScalarValue, OpaqueNodeId, ResolveNode, RunCaptures, RunNodeScalar, SyncDocument,
     WireByteRange, WirePosition, WorkerLanguageAsset, WorkerLanguageCatalog, WorkerQuerySources,
+    WorkerTestMemoryBudgets,
 };
 use kakehashi::tree_worker::{Client, DeriveSnapshot, RequestContext, Response};
 
@@ -180,6 +181,57 @@ fn real_worker_derives_a_snapshot_from_an_installed_grammar() {
     };
     assert_eq!(snapshot.parser_cache_hit, Some(true));
     assert!(snapshot.compute_ns > 0);
+    worker.shutdown().unwrap();
+}
+
+#[cfg(feature = "e2e")]
+#[test]
+fn real_worker_contains_full_sync_above_injected_non_evictable_budget() {
+    let data_dir = kakehashi::install::test_support::test_data_dir_path();
+    std::fs::create_dir_all(&data_dir).unwrap();
+    kakehashi::install::test_support::ensure_test_languages_installed(&data_dir).unwrap();
+    let parser = data_dir
+        .join("parser")
+        .join(format!("rust.{}", std::env::consts::DLL_EXTENSION));
+    let executable = PathBuf::from(env!("CARGO_BIN_EXE_kakehashi"));
+    let worker = Client::spawn_with_test_memory_budgets(
+        &executable,
+        1,
+        45,
+        WorkerTestMemoryBudgets::new(1024, 1).unwrap(),
+    )
+    .unwrap();
+    let context = RequestContext {
+        request_id: 1,
+        worker_generation: 45,
+        uri: "file:///hard-budget.rs".into(),
+        incarnation: 1,
+        content_version: 1,
+        configuration_generation: 0,
+    };
+
+    let response = worker
+        .sync_document(SyncDocument {
+            context,
+            language: "rust".into(),
+            grammar_symbol: "rust".into(),
+            source_path: parser.clone(),
+            parser_path: parser.clone(),
+            artifact_digest: digest(&parser),
+            queries: WorkerQuerySources::default(),
+            text: "fn main() {}".into(),
+        })
+        .unwrap();
+
+    let Response::Error(error) = response else {
+        panic!("hard admission must be a contained worker error: {response:?}");
+    };
+    assert!(
+        error
+            .message
+            .contains("non-evictable budget 1 bytes exceeded")
+    );
+    assert_eq!(worker.worker_generation(), 45);
     worker.shutdown().unwrap();
 }
 

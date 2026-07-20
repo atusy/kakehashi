@@ -87,6 +87,12 @@ enum Commands {
         /// Fixed compute budget selected by the parent process.
         #[arg(long)]
         threads: usize,
+        /// Internal soft budget for recomputable worker caches.
+        #[arg(long, default_value_t = 128 * 1024 * 1024)]
+        derived_cache_soft_bytes: usize,
+        /// Internal hard budget for retained source and host-tree estimates.
+        #[arg(long, default_value_t = 512 * 1024 * 1024)]
+        non_evictable_estimate_hard_bytes: usize,
     },
     /// Report diagnostics for files via the configured downstream language servers
     ///
@@ -345,11 +351,26 @@ fn main() -> ExitCode {
             grammar_dir,
             output_path,
         }) => run_compile_parser(&grammar_dir, &output_path),
-        Some(Commands::TreeWorker { threads }) => kakehashi::tree_worker::run_stdio(threads)
-            .map_err(|error| {
-                eprintln!("tree worker failed: {error}");
-                ExitCode::FAILURE
-            }),
+        Some(Commands::TreeWorker {
+            threads,
+            derived_cache_soft_bytes,
+            non_evictable_estimate_hard_bytes,
+        }) => kakehashi::tree_worker::WorkerMemoryBudgets::new(
+            derived_cache_soft_bytes,
+            non_evictable_estimate_hard_bytes,
+        )
+        .map_err(|error| {
+            eprintln!("tree worker configuration failed: {error}");
+            ExitCode::FAILURE
+        })
+        .and_then(|memory_budgets| {
+            kakehashi::tree_worker::run_stdio_with_memory_budgets(threads, memory_budgets).map_err(
+                |error| {
+                    eprintln!("tree worker failed: {error}");
+                    ExitCode::FAILURE
+                },
+            )
+        }),
         None => {
             // Start LSP server (backward compatible default behavior)
             // Only LSP mode needs a tokio runtime; CLI subcommands are synchronous
