@@ -1168,6 +1168,13 @@ the implicated Rust grammar is session-quarantined, and a replacement generation
 full-resyncs and serves an already-open Lua document. Native hazard handshakes,
 saturated reserved control traffic, and descendant cleanup remain open gates.
 
+The [Stage 12 cross-document fairness measurement](single-resident-multithreaded-tree-worker-stage12-measurement.md)
+suppresses nested semantic fan-out when another document is already runnable.
+In a deterministic injection-contention fixture this reduced median
+user-blocking node latency by 9.3% without partitioning the worker pool. The
+decision is still made only at derivation admission; late-arrival chunking,
+priority classes, and one-thread cooperative fairness remain open gates.
+
 The implementation should proceed in measured stages:
 
 1. Prototype the framed transport, supervision, and one high-level
