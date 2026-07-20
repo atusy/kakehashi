@@ -3932,9 +3932,10 @@ where
     let runnable_documents = Arc::new(RunnableDocuments::default());
     let cancellations = Arc::new(dashmap::DashMap::<u64, crate::cancel::CancelToken>::new());
     let next_hazard_lease = Arc::new(std::sync::atomic::AtomicU64::new(1));
-    // The client permits at most four requests per compute thread. Decode one
-    // frame beyond this pending window so cancellation stays observable under
-    // saturation, but wait before scheduling any excess ordinary work.
+    // Match the client's four ordinary admissions per compute thread plus its
+    // reserved lifecycle slot. Decode one frame beyond this pending window so
+    // cancellation stays observable under saturation, but wait before
+    // scheduling any excess ordinary work.
     let max_pending = compute_threads.saturating_mul(4).max(1).saturating_add(1);
     let (completion_tx, completion_rx) = mpsc::channel::<()>();
     #[cfg(feature = "e2e")]
@@ -6717,7 +6718,10 @@ mod tests {
             request.context.request_id = request_id;
             requests.push(Request::DeriveSnapshot(request));
         }
-        let admitted_prefix_bytes = framed(&requests[..8]).len();
+        // One handshake, five pending requests (four ordinary plus the
+        // lifecycle reserve), two completed responses buffered behind the
+        // stalled writer, and one cancellation lookahead frame.
+        let admitted_prefix_bytes = framed(&requests[..9]).len();
         let framed_requests = framed(&requests);
         let progress = Arc::new((AtomicUsize::new(0), Condvar::new(), Mutex::new(())));
         let reader = CountingReader {
