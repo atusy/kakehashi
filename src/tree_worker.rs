@@ -3956,9 +3956,7 @@ where
     let mut pending = injected_hung_compute;
     while let Some(request) = decode_frame::<_, Request>(&mut reader)? {
         if let Request::Cancel(cancel) = request {
-            if cancel.worker_generation == worker_generation {
-                cancellations.entry(cancel.request_id).or_default().cancel();
-            }
+            cancel_active_request(&cancellations, &cancel, worker_generation);
             continue;
         }
         let Some(context) = request_context(&request) else {
@@ -4359,6 +4357,21 @@ where
     }
     drop(responses);
     join_writer(writer_thread)
+}
+
+fn cancel_active_request(
+    cancellations: &dashmap::DashMap<u64, crate::cancel::CancelToken>,
+    cancel: &CancelRequest,
+    worker_generation: u64,
+) -> bool {
+    if cancel.worker_generation != worker_generation {
+        return false;
+    }
+    let Some(token) = cancellations.get(&cancel.request_id) else {
+        return false;
+    };
+    token.cancel();
+    true
 }
 
 #[cfg(feature = "e2e")]
@@ -5998,11 +6011,11 @@ mod tests {
         LaneAction, LaneRegistry, MAX_DOCUMENT_BYTES, MAX_DOCUMENT_REPLICAS,
         MAX_RETAINED_DOCUMENT_BYTES, MAX_RETAINED_ESTIMATED_DOCUMENT_BYTES, NavigateNode,
         NodeLayerSelector, NodeNavigation, NodeScalarOperation, NodeScalarValue, OpaqueNodeId,
-        OwnedChild, PROTOCOL_VERSION, ParentLiveness, Request, RequestCancelled, RequestContext,
-        ResolveNode, Response, Route, RunCaptures, RunNodeScalar, RunnableDocuments,
+        OwnedChild, PROTOCOL_VERSION, ParentLiveness, Request, RequestContext, ResolveNode,
+        Response, Route, RunCaptures, RunNodeScalar, RunnableDocuments,
         SEMANTIC_CACHE_AUXILIARY_TRIM_THRESHOLD_BYTES, SyncDocument, WireByteRange, WirePosition,
         WireRange, WireSemanticToken, WorkPriority, WorkerError, WorkerGrammarIdentity,
-        WorkerQuerySources, WorkerRestartRequired, cache_eviction_plan,
+        WorkerQuerySources, WorkerRestartRequired, cache_eviction_plan, cancel_active_request,
         cancellation_grace_response, client_generation_is_idle, close_document, decode_frame,
         derive_snapshot_with_language, encode_frame, enforce_derived_memory_budget,
         named_node_count, parse_request_timeout, pressure_checkpoint_required,
@@ -6601,7 +6614,7 @@ mod tests {
     }
 
     #[test]
-    fn worker_honors_cancellation_that_arrives_before_reader_work() {
+    fn worker_ignores_cancellation_that_precedes_request_admission() {
         let output = SharedWriter::default();
         let captured = output.clone();
         let cancel = Request::Cancel(CancelRequest {
@@ -6623,11 +6636,27 @@ mod tests {
             Some(Response::HandshakeReady(_))
         ));
         let response = decode_frame::<_, Response>(&mut bytes).unwrap().unwrap();
-        assert!(matches!(
-            response,
-            Response::RequestCancelled(RequestCancelled { context })
-                if context.request_id == 7
-        ));
+        assert!(
+            matches!(response, Response::Error(WorkerError { context, .. }) if
+            context.as_ref().is_some_and(|context| context.request_id == 7))
+        );
+    }
+
+    #[test]
+    fn late_cancellation_does_not_recreate_completed_request_state() {
+        let cancellations = dashmap::DashMap::new();
+        let token = crate::cancel::CancelToken::default();
+        cancellations.insert(7, token.clone());
+        let cancel = CancelRequest {
+            request_id: 7,
+            worker_generation: 3,
+        };
+
+        assert!(cancel_active_request(&cancellations, &cancel, 3));
+        assert!(token.is_cancelled());
+        cancellations.remove(&7);
+        assert!(!cancel_active_request(&cancellations, &cancel, 3));
+        assert!(cancellations.is_empty());
     }
 
     #[test]

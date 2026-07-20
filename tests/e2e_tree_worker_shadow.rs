@@ -1614,7 +1614,7 @@ fn deadline_grace_preserves_a_delayed_worker_restart_requirement() {
     let mut client = LspClient::builder()
         .env("KAKEHASHI_TREE_WORKER_MODE", "authoritative")
         .env("KAKEHASHI_TREE_WORKER_THREADS", "2")
-        .env("KAKEHASHI_TREE_WORKER_REQUEST_TIMEOUT_MS", "500")
+        .env("KAKEHASHI_TREE_WORKER_REQUEST_TIMEOUT_MS", "2000")
         .env(
             "KAKEHASHI_TREE_WORKER_REQUEST_TIMEOUT_URI_SUFFIX",
             "/grace-restart.rs",
@@ -1627,7 +1627,7 @@ fn deadline_grace_preserves_a_delayed_worker_restart_requirement() {
             "KAKEHASHI_TREE_WORKER_RESTART_URI_SUFFIX",
             "/grace-restart.rs",
         )
-        .env("KAKEHASHI_TREE_WORKER_RESTART_RESPONSE_DELAY_MS", "600")
+        .env("KAKEHASHI_TREE_WORKER_RESTART_RESPONSE_DELAY_MS", "2100")
         .env(
             "KAKEHASHI_TREE_WORKER_RECOVERY_READY_FILE",
             recovery_ready.to_string_lossy(),
