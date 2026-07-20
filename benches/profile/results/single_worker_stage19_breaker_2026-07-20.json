@@ -1,0 +1,81 @@
+{
+  "schema": 1,
+  "experiment": "single-tree-worker-stage19-systemic-breaker",
+  "date": "2026-07-20",
+  "environment": {
+    "source_commit": "f03392f45eb74c0530cb6298c99657e144cc9115",
+    "baseline_stage": 18,
+    "baseline_binary_sha256": "ce06bbfd7bce95d7b0867142008e5a381a16d3ef26b6d0064c230d288b75dfc4",
+    "candidate_stage": 19,
+    "candidate_binary_sha256": "72dda444029ebdb9122e71401e36b960dca67b3165ebf5c3649480d5c2e35468",
+    "release_build": "cargo build --locked --release --bin kakehashi",
+    "features": "default"
+  },
+  "cache_hit": {
+    "scenario": {
+      "language": "markdown",
+      "generated_size": 5000,
+      "documents": 1,
+      "measured_requests": 20,
+      "warm_semantic_cache": true,
+      "settle_seconds": 0.5,
+      "worker_threads": 4,
+      "order": "baseline-candidate on odd runs; candidate-baseline on even runs"
+    },
+    "runs": [
+      {"run": 1, "baseline": {"p50_ms": 73.8, "p95_ms": 76.0, "wall_ms_per_cycle": 115.64}, "candidate": {"p50_ms": 73.9, "p95_ms": 79.8, "wall_ms_per_cycle": 116.87}},
+      {"run": 2, "baseline": {"p50_ms": 72.5, "p95_ms": 78.1, "wall_ms_per_cycle": 112.92}, "candidate": {"p50_ms": 72.3, "p95_ms": 79.0, "wall_ms_per_cycle": 115.86}},
+      {"run": 3, "baseline": {"p50_ms": 73.4, "p95_ms": 78.7, "wall_ms_per_cycle": 114.93}, "candidate": {"p50_ms": 73.7, "p95_ms": 77.3, "wall_ms_per_cycle": 114.85}},
+      {"run": 4, "baseline": {"p50_ms": 72.2, "p95_ms": 73.6, "wall_ms_per_cycle": 110.59}, "candidate": {"p50_ms": 72.1, "p95_ms": 75.2, "wall_ms_per_cycle": 112.73}},
+      {"run": 5, "baseline": {"p50_ms": 71.8, "p95_ms": 75.8, "wall_ms_per_cycle": 111.39}, "candidate": {"p50_ms": 73.1, "p95_ms": 77.3, "wall_ms_per_cycle": 114.12}},
+      {"run": 6, "baseline": {"p50_ms": 72.2, "p95_ms": 86.5, "wall_ms_per_cycle": 116.82}, "candidate": {"p50_ms": 72.7, "p95_ms": 75.5, "wall_ms_per_cycle": 112.70}},
+      {"run": 7, "baseline": {"p50_ms": 73.2, "p95_ms": 77.3, "wall_ms_per_cycle": 112.42}, "candidate": {"p50_ms": 72.1, "p95_ms": 75.3, "wall_ms_per_cycle": 114.33}},
+      {"run": 8, "baseline": {"p50_ms": 74.8, "p95_ms": 78.2, "wall_ms_per_cycle": 118.98}, "candidate": {"p50_ms": 74.8, "p95_ms": 88.1, "wall_ms_per_cycle": 119.33}},
+      {"run": 9, "baseline": {"p50_ms": 71.6, "p95_ms": 96.4, "wall_ms_per_cycle": 115.48}, "candidate": {"p50_ms": 76.7, "p95_ms": 81.3, "wall_ms_per_cycle": 121.49}},
+      {"run": 10, "baseline": {"p50_ms": 71.5, "p95_ms": 74.1, "wall_ms_per_cycle": 111.95}, "candidate": {"p50_ms": 72.1, "p95_ms": 74.7, "wall_ms_per_cycle": 110.56}},
+      {"run": 11, "baseline": {"p50_ms": 72.9, "p95_ms": 75.3, "wall_ms_per_cycle": 113.09}, "candidate": {"p50_ms": 71.4, "p95_ms": 75.6, "wall_ms_per_cycle": 111.38}},
+      {"run": 12, "baseline": {"p50_ms": 72.4, "p95_ms": 75.1, "wall_ms_per_cycle": 111.78}, "candidate": {"p50_ms": 74.8, "p95_ms": 95.3, "wall_ms_per_cycle": 120.39}}
+    ]
+  },
+  "cold_start": {
+    "scenario": {
+      "language": "rust",
+      "generated_size": 15,
+      "documents": 1,
+      "measured_requests": 1,
+      "settle_seconds": 0,
+      "worker_threads": 4,
+      "isolation": "fresh XDG config and state directory for every run",
+      "order": "baseline-candidate on odd runs; candidate-baseline on even runs"
+    },
+    "runs": [
+      {"run": 1, "baseline": {"elapsed_ms": 2330.833, "request_ms": 1819.5, "wall_ms_per_cycle": 1820.01}, "candidate": {"elapsed_ms": 2373.443, "request_ms": 2052.7, "wall_ms_per_cycle": 2053.15}},
+      {"run": 2, "baseline": {"elapsed_ms": 2142.772, "request_ms": 1834.2, "wall_ms_per_cycle": 1834.70}, "candidate": {"elapsed_ms": 2334.161, "request_ms": 2028.7, "wall_ms_per_cycle": 2029.13}},
+      {"run": 3, "baseline": {"elapsed_ms": 2195.586, "request_ms": 1904.6, "wall_ms_per_cycle": 1905.05}, "candidate": {"elapsed_ms": 2223.188, "request_ms": 1922.9, "wall_ms_per_cycle": 1923.34}},
+      {"run": 4, "baseline": {"elapsed_ms": 2159.006, "request_ms": 1847.2, "wall_ms_per_cycle": 1847.69}, "candidate": {"elapsed_ms": 2250.144, "request_ms": 1936.7, "wall_ms_per_cycle": 1937.15}},
+      {"run": 5, "baseline": {"elapsed_ms": 2205.964, "request_ms": 1892.7, "wall_ms_per_cycle": 1893.14}, "candidate": {"elapsed_ms": 2229.558, "request_ms": 1930.6, "wall_ms_per_cycle": 1931.04}},
+      {"run": 6, "baseline": {"elapsed_ms": 2221.514, "request_ms": 1913.7, "wall_ms_per_cycle": 1914.19}, "candidate": {"elapsed_ms": 2174.503, "request_ms": 1872.8, "wall_ms_per_cycle": 1873.33}},
+      {"run": 7, "baseline": {"elapsed_ms": 2196.746, "request_ms": 1888.2, "wall_ms_per_cycle": 1888.68}, "candidate": {"elapsed_ms": 2295.373, "request_ms": 1995.4, "wall_ms_per_cycle": 1995.87}},
+      {"run": 8, "baseline": {"elapsed_ms": 2324.842, "request_ms": 2021.7, "wall_ms_per_cycle": 2022.21}, "candidate": {"elapsed_ms": 2200.254, "request_ms": 1894.2, "wall_ms_per_cycle": 1894.68}},
+      {"run": 9, "baseline": {"elapsed_ms": 2305.127, "request_ms": 2002.6, "wall_ms_per_cycle": 2003.10}, "candidate": {"elapsed_ms": 2317.742, "request_ms": 2002.9, "wall_ms_per_cycle": 2003.36}},
+      {"run": 10, "baseline": {"elapsed_ms": 2332.483, "request_ms": 2019.9, "wall_ms_per_cycle": 2020.40}, "candidate": {"elapsed_ms": 2280.736, "request_ms": 1968.9, "wall_ms_per_cycle": 1969.37}},
+      {"run": 11, "baseline": {"elapsed_ms": 2262.957, "request_ms": 1958.0, "wall_ms_per_cycle": 1958.51}, "candidate": {"elapsed_ms": 2271.339, "request_ms": 1964.9, "wall_ms_per_cycle": 1965.43}},
+      {"run": 12, "baseline": {"elapsed_ms": 2322.185, "request_ms": 2022.1, "wall_ms_per_cycle": 2022.81}, "candidate": {"elapsed_ms": 2298.531, "request_ms": 1989.0, "wall_ms_per_cycle": 1989.51}}
+    ]
+  },
+  "failure_e2e": {
+    "build": "debug integration-test binary with e2e feature",
+    "note": "elapsed time covers complete LSP test setup, breaker transitions, assertions, and shutdown; it is not a fine-grained recovery latency",
+    "runs": [
+      {"case": "repeated_systemic_failures_open_the_breaker_once_and_keep_lsp_alive", "run": 1, "elapsed_ms": 21703.473, "passed": true},
+      {"case": "repeated_systemic_failures_open_the_breaker_once_and_keep_lsp_alive", "run": 2, "elapsed_ms": 21564.337, "passed": true},
+      {"case": "repeated_systemic_failures_open_the_breaker_once_and_keep_lsp_alive", "run": 3, "elapsed_ms": 21321.163, "passed": true},
+      {"case": "configuration_change_allows_one_failed_half_open_probe", "run": 1, "elapsed_ms": 23293.143, "passed": true},
+      {"case": "configuration_change_allows_one_failed_half_open_probe", "run": 2, "elapsed_ms": 23248.555, "passed": true},
+      {"case": "configuration_change_allows_one_failed_half_open_probe", "run": 3, "elapsed_ms": 23052.772, "passed": true},
+      {"case": "successful_half_open_resync_closes_the_breaker", "run": 1, "elapsed_ms": 23838.508, "passed": true},
+      {"case": "successful_half_open_resync_closes_the_breaker", "run": 2, "elapsed_ms": 23593.228, "passed": true},
+      {"case": "successful_half_open_resync_closes_the_breaker", "run": 3, "elapsed_ms": 23805.842, "passed": true}
+    ]
+  }
+}

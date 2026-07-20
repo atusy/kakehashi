@@ -1229,6 +1229,19 @@ wide margin. This validates the admission policy end to end without claiming a
 total-RSS cap or a repeatable default-memory change. Failure injection,
 protocol and compatibility gates, and legacy-path removal remain open.
 
+The [Stage 19 systemic-breaker measurement](single-resident-multithreaded-tree-worker-stage19-measurement.md)
+proves that three rapid systemic failures converge to one unavailable tree tier
+while parser-independent LSP service remains alive and later edits cannot cause
+respawn. A newer configuration generation admits one cooldown-fenced half-open
+candidate: failed full resync immediately reopens the breaker, while successful
+full resync and a healthy probation interval restore tree-backed service.
+Default release median paired cache-hit and cold-start differences remained at
+or below 1.4% and inside wide sign-changing variation. The measurement also
+distinguishes the existing generic timeout and normal `exit(86)` fixtures from
+the ADR's future OS/native-segment evidence; descendant cleanup, grammar hazard
+and quarantine readiness, protocol and compatibility gates, and legacy-path
+removal remain open.
+
 The implementation should proceed in measured stages:
 
 1. Prototype the framed transport, supervision, and one high-level
