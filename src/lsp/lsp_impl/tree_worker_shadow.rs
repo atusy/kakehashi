@@ -3086,7 +3086,14 @@ fn quiesce_published_client(state: &mut SupervisorState) -> std::io::Result<()> 
         .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotConnected, "worker is absent"))?;
     client.close_request_admission()?;
     state.read_client.store(None);
-    client.wait_for_idle_generation(SHADOW_SHUTDOWN_TIMEOUT)
+    if let Err(error) = client.wait_for_idle_generation(SHADOW_SHUTDOWN_TIMEOUT) {
+        log::warn!(
+            target: "kakehashi::tree_worker_shadow",
+            "forcibly retiring non-quiescent worker generation during restart: {error}",
+        );
+        client.terminate_shared(SHADOW_SHUTDOWN_TIMEOUT);
+    }
+    Ok(())
 }
 
 fn mark_tree_tier_unavailable(

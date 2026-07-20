@@ -1482,6 +1482,113 @@ fn request_timeout_without_native_segment_does_not_quarantine_grammar() {
 }
 
 #[test]
+fn planned_restart_retires_a_noncooperative_published_request() {
+    let directory = tempfile::tempdir().unwrap();
+    let hang_marker = directory.path().join("hung-request");
+    let recovery_ready = directory.path().join("recovery-ready");
+    std::fs::write(&hang_marker, b"suppress initial hang").unwrap();
+    let mut client = LspClient::builder()
+        .env("KAKEHASHI_TREE_WORKER_MODE", "authoritative")
+        .env("KAKEHASHI_TREE_WORKER_THREADS", "2")
+        .env(
+            "KAKEHASHI_TREE_WORKER_HANG_AFTER_HAZARD_ARMED_FILE",
+            hang_marker.to_string_lossy(),
+        )
+        .env(
+            "KAKEHASHI_TREE_WORKER_HANG_AFTER_HAZARD_ARMED_URI_SUFFIX",
+            "/planned-restart.rs",
+        )
+        .env(
+            "KAKEHASHI_TREE_WORKER_RECOVERY_READY_FILE",
+            recovery_ready.to_string_lossy(),
+        )
+        .env("RUST_LOG", "kakehashi::tree_worker_shadow=info")
+        .build();
+    initialize(&mut client);
+
+    let uri = "file:///planned-restart.rs";
+    open_rust_and_request_tokens(&mut client, uri, "fn planned_restart() {}\n");
+    std::fs::remove_file(&hang_marker).unwrap();
+    let hung_request = client.send_request_async(
+        "kakehashi/node",
+        json!({
+            "textDocument": { "uri": uri },
+            "position": { "line": 0, "character": 4 }
+        }),
+    );
+    wait_for_file(
+        &hang_marker,
+        "published request did not enter noncooperative native work",
+    );
+
+    let started = std::time::Instant::now();
+    client.send_notification(
+        "workspace/didChangeConfiguration",
+        json!({
+            "settings": {
+                "autoInstall": false,
+                "searchPaths": ["/definitely/missing-kakehashi-parsers"]
+            }
+        }),
+    );
+    let recovery_deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while !recovery_ready.exists() && std::time::Instant::now() < recovery_deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    if !recovery_ready.exists() {
+        client.force_kill_and_wait();
+        let stderr = client.drain_stderr();
+        panic!("planned restart did not replace the noncooperative generation: {stderr}");
+    }
+    assert!(
+        started.elapsed() >= Duration::from_secs(5),
+        "request did not outlive the cooperative quiescence window"
+    );
+    let hung_response = client.receive_response_for_id_public(hung_request);
+    assert!(hung_response.get("result").is_some(), "{hung_response:?}");
+
+    client.send_notification(
+        "workspace/didChangeConfiguration",
+        json!({
+            "settings": {
+                "autoInstall": false,
+                "searchPaths": ["${KAKEHASHI_DATA_DIR}"]
+            }
+        }),
+    );
+
+    let healthy_uri = "file:///after-planned-restart.lua";
+    client.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": healthy_uri,
+                "languageId": "lua",
+                "version": 1,
+                "text": "local after_planned_restart = true\n"
+            }
+        }),
+    );
+    let healthy = client.send_request(
+        "kakehashi/node",
+        json!({
+            "textDocument": { "uri": healthy_uri },
+            "position": { "line": 0, "character": 6 }
+        }),
+    );
+    assert!(healthy.get("result").is_some(), "{healthy:?}");
+
+    let stderr = shutdown_and_stderr(client);
+    assert_eq!(
+        stderr.matches("restarted worker generation").count(),
+        1,
+        "{stderr}"
+    );
+    assert!(!stderr.contains("quarantined grammar"), "{stderr}");
+    assert!(!stderr.contains("disabled tree tier"), "{stderr}");
+}
+
+#[test]
 fn noncooperative_jobs_saturating_all_compute_threads_recover_as_one_generation() {
     let directory = tempfile::tempdir().unwrap();
     let trigger = directory.path().join("trigger");
