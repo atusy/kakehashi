@@ -1191,6 +1191,15 @@ thread, explicit yielding provided no measured latency benefit, so that path is
 a correctness fallback rather than a performance claim. Memory-pressure
 admission, broader long-walk scheduling, and compatibility gates remain open.
 
+The [Stage 15 memory measurement](single-resident-multithreaded-tree-worker-stage15-measurement.md)
+adds order-reversed release measurements of aggregate RSS and macOS shared-aware
+physical footprint. The authoritative worker added 6.65 MiB for a 32 KiB
+Markdown document and 33.38 MiB for a 1.07 MiB injection-heavy document. The
+growth is much larger than duplicated source text, proving that the existing
+512 MiB retained-text limit is not a total-memory admission bound. Derived-state
+accounting, pressure-driven eviction, concurrent-document memory tests, and
+compatibility gates remain open.
+
 The implementation should proceed in measured stages:
 
 1. Prototype the framed transport, supervision, and one high-level
