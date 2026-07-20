@@ -3956,9 +3956,9 @@ where
     let mut pending = injected_hung_compute;
     while let Some(request) = decode_frame::<_, Request>(&mut reader)? {
         if let Request::Cancel(cancel) = request {
-            let cancelled = cancel_active_request(&cancellations, &cancel, worker_generation);
+            let _cancelled = cancel_active_request(&cancellations, &cancel, worker_generation);
             #[cfg(feature = "e2e")]
-            if cancelled
+            if _cancelled
                 && let Ok(path) = std::env::var("KAKEHASHI_TREE_WORKER_CANCEL_OBSERVED_FILE")
             {
                 let _ = std::fs::write(path, cancel.request_id.to_string());
