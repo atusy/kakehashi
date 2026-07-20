@@ -2798,6 +2798,36 @@ fn run_actor(
             }
             Ok(_) => {}
             Err(error) => {
+                let acknowledged_hazards = state
+                    .client
+                    .as_ref()
+                    .expect("failed request retains its worker client")
+                    .active_grammar_hazards();
+                if !acknowledged_hazards.is_empty() {
+                    log::error!(
+                        target: "kakehashi::tree_worker_shadow",
+                        "worker generation {} failed with {} acknowledged active grammar hazard(s): {}",
+                        state.worker_generation,
+                        acknowledged_hazards.len(),
+                        acknowledged_hazards
+                            .iter()
+                            .map(|hazard| format!(
+                                "lease={} request={} symbol={} artifact_digest={}",
+                                hazard.lease_id,
+                                hazard.context.request_id,
+                                hazard.grammar.grammar_symbol,
+                                hazard.grammar.artifact_digest,
+                            ))
+                            .collect::<Vec<_>>()
+                            .join(", "),
+                    );
+                }
+                let acknowledged_grammar =
+                    acknowledged_hazards.first().map(|hazard| GrammarIdentity {
+                        grammar_symbol: hazard.grammar.grammar_symbol.clone(),
+                        artifact_digest: hazard.grammar.artifact_digest.clone(),
+                    });
+                let implicated_grammar = acknowledged_grammar.or(implicated_grammar);
                 let class = classify_transport_failure(
                     state
                         .client

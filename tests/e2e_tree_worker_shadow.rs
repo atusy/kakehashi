@@ -1027,7 +1027,7 @@ fn crashed_grammar_is_quarantined_only_in_session_and_other_grammar_recovers() {
         .env("KAKEHASHI_TREE_WORKER_SHADOW", "true")
         .env("KAKEHASHI_TREE_WORKER_THREADS", "4")
         .env(
-            "KAKEHASHI_TREE_WORKER_CRASH_ONCE_FILE",
+            "KAKEHASHI_TREE_WORKER_CRASH_AFTER_HAZARD_ARMED_FILE",
             marker.to_string_lossy().into_owned(),
         )
         .env(
@@ -1070,6 +1070,10 @@ fn crashed_grammar_is_quarantined_only_in_session_and_other_grammar_recovers() {
 
     let stderr = shutdown_and_stderr(client);
     assert!(marker.exists(), "failure injection did not run: {stderr}");
+    assert!(
+        stderr.contains("acknowledged active grammar hazard(s)"),
+        "{stderr}"
+    );
     assert!(
         stderr.contains("quarantined grammar conservatively for this session"),
         "{stderr}"
