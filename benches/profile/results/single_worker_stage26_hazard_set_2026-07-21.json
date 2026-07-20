@@ -137,7 +137,9 @@
       "review_converged_server_sha256": "a3cdaa3de70efba44ec0a3d6835689c6939d9b924185b45ae4cd41e6f770e870",
       "harness_source_path": "benches/semantic_tokens.rs",
       "harness_source_sha256": "018cbd1750758496421073bdd3fbaf6588702a52d8986db5be5384f2faebd8bf",
-      "harness_binary_sha256": "4c279d229e422afed5d00ab5636f6704cc51e7507b31dbbfb13a571b6a7d6378"
+      "harness_binary_sha256": "4c279d229e422afed5d00ab5636f6704cc51e7507b31dbbfb13a571b6a7d6378",
+      "harness_binary_sha256_role": "attests the binary executed from the original checkout; it is not a bit-reproducible rebuild target because CARGO_MANIFEST_DIR is embedded",
+      "rebuild_scope": "the detached-worktree commands reproduce source, revision, features, and benchmark behavior, but intentionally use a different embedded fixture-data path"
     },
     "method": {
       "build_profile": "release (optimized)",
