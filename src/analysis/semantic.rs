@@ -118,8 +118,13 @@ pub(crate) fn compute_semantic_tokens_full(
     supports_multiline: bool,
     injection_cache: Option<InjectionCacheParams>,
     cancel: Option<crate::cancel::CancelToken>,
+    nested_parallelism: Option<&(dyn Fn() -> bool + Sync)>,
 ) -> Option<SemanticTokensResult> {
     let is_cancelled = || crate::cancel::is_cancelled(cancel.as_ref());
+    let allow_nested_parallelism = || {
+        compute_threads > 1
+            && nested_parallelism.is_none_or(|allow_parallelism| allow_parallelism())
+    };
     let compute_started = std::time::Instant::now();
     let mut host_tokens: Vec<RawToken> = Vec::with_capacity(1000);
     let lines: Vec<&str> = text.lines().collect();
@@ -150,19 +155,20 @@ pub(crate) fn compute_semantic_tokens_full(
         discovery: p.discovery.as_deref(),
     });
 
-    let should_parallelize = cache_ctx.as_ref().is_some_and(|ctx| {
-        should_parallelize_host_and_injections(
-            compute_threads,
-            ctx.generation,
-            ctx.discovery.map(|discovery| {
-                (
-                    discovery.generation,
-                    discovery.complete,
-                    discovery.regions.len(),
-                )
-            }),
-        )
-    });
+    let should_parallelize = allow_nested_parallelism()
+        && cache_ctx.as_ref().is_some_and(|ctx| {
+            should_parallelize_host_and_injections(
+                compute_threads,
+                ctx.generation,
+                ctx.discovery.map(|discovery| {
+                    (
+                        discovery.generation,
+                        discovery.complete,
+                        discovery.regions.len(),
+                    )
+                }),
+            )
+        });
     let mut host_work = || {
         let started = std::time::Instant::now();
         let complete = collect_host_tokens(
@@ -197,7 +203,7 @@ pub(crate) fn compute_semantic_tokens_full(
             supports_multiline,
             cache_ctx.as_ref(),
             cancel.as_ref(),
-            compute_threads > 1,
+            &allow_nested_parallelism,
         );
         (result, started.elapsed())
     };
@@ -305,6 +311,7 @@ pub(crate) async fn handle_semantic_tokens_full(
             supports_multiline,
             injection_cache,
             cancel,
+            None,
         )
     })
     .await

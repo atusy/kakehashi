@@ -1254,8 +1254,33 @@ pub(crate) fn collect_injection_tokens_parallel(
         supports_multiline,
         cache_ctx,
         cancel,
-        true,
+        &|| true,
     )
+}
+
+fn map_fanout_chunks<T, R, Parallel, Map>(
+    items: &[T],
+    chunk_size: usize,
+    should_parallelize: Parallel,
+    map: Map,
+) -> Vec<R>
+where
+    T: Sync,
+    R: Send,
+    Parallel: Fn() -> bool,
+    Map: Fn(&T) -> R + Sync,
+{
+    use rayon::prelude::*;
+
+    let mut output = Vec::with_capacity(items.len());
+    for chunk in items.chunks(chunk_size.max(1)) {
+        if should_parallelize() {
+            output.extend(chunk.par_iter().map(&map).collect::<Vec<_>>());
+        } else {
+            output.extend(chunk.iter().map(&map));
+        }
+    }
+    output
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1270,10 +1295,9 @@ pub(crate) fn collect_injection_tokens_with_parallelism(
     supports_multiline: bool,
     cache_ctx: Option<&InjectionCacheCtx>,
     cancel: Option<&crate::cancel::CancelToken>,
-    allow_parallelism: bool,
+    allow_parallelism: &(dyn Fn() -> bool + Sync),
 ) -> (Vec<RawToken>, Vec<ActiveInjectionBounds>) {
     use crate::cancel::is_cancelled;
-    use rayon::prelude::*;
 
     // Reuse the discovery `populate_injections` already ran on this exact tree,
     // when present and still generation-current (#529 companion lever): rebuild
@@ -1407,6 +1431,21 @@ pub(crate) fn collect_injection_tokens_with_parallelism(
             );
         }
         #[cfg(feature = "e2e")]
+        if let Ok(path) = std::env::var("KAKEHASHI_TREE_WORKER_FANOUT_STARTED_FILE") {
+            let _ = std::fs::write(path, b"started");
+        }
+        #[cfg(feature = "e2e")]
+        if std::env::var("KAKEHASHI_TREE_WORKER_FAIRNESS_ALLOWED_FILE")
+            .ok()
+            .is_some_and(|path| std::path::Path::new(&path).exists())
+            && let Ok(path) = std::env::var("KAKEHASHI_TREE_WORKER_FANOUT_RELEASE_FILE")
+        {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while !std::path::Path::new(&path).exists() && std::time::Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        }
+        #[cfg(feature = "e2e")]
         if let Some(cache_ctx) = cache_ctx
             && std::env::var("KAKEHASHI_TREE_WORKER_INJECTION_DELAY_URI_SUFFIX")
                 .ok()
@@ -1433,12 +1472,16 @@ pub(crate) fn collect_injection_tokens_with_parallelism(
             ),
         )
     };
-    let processed: Vec<(usize, InjectionTokens)> =
-        if allow_parallelism && miss_indices.len() >= PARALLEL_THRESHOLD {
-            miss_indices.par_iter().map(|&i| process_one(i)).collect()
-        } else {
-            miss_indices.iter().map(|&i| process_one(i)).collect()
-        };
+    let processed: Vec<(usize, InjectionTokens)> = if miss_indices.len() >= PARALLEL_THRESHOLD {
+        map_fanout_chunks(
+            &miss_indices,
+            rayon::current_num_threads(),
+            allow_parallelism,
+            |&i| process_one(i),
+        )
+    } else {
+        miss_indices.iter().map(|&i| process_one(i)).collect()
+    };
 
     // Store region-local tokens for newly computed eligible, fully-loaded regions
     // (#529, write half), single-threaded after fan-in so cache writes never run
@@ -1632,11 +1675,28 @@ fn byte_to_line_col(
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use tree_sitter::Query;
 
     use super::super::token_collector::build_line_start_bytes;
     use super::*;
+
+    #[test]
+    fn fanout_rechecks_parallelism_before_each_bounded_chunk() {
+        let checks = AtomicUsize::new(0);
+        let items = (0..10).collect::<Vec<_>>();
+
+        let output = map_fanout_chunks(
+            &items,
+            4,
+            || checks.fetch_add(1, Ordering::SeqCst) == 0,
+            |item| *item,
+        );
+
+        assert_eq!(output, items);
+        assert_eq!(checks.load(Ordering::SeqCst), 3);
+    }
 
     #[test]
     fn reusable_region_visit_stops_on_mid_loop_cancel() {

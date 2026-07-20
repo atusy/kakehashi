@@ -1159,6 +1159,7 @@ impl DocumentReplica {
             Instant::now(),
             rayon::current_num_threads(),
             None,
+            None,
         )
     }
 
@@ -1169,6 +1170,7 @@ impl DocumentReplica {
         started: Instant,
         compute_threads: usize,
         cancellation: Option<&crate::cancel::CancelToken>,
+        nested_parallelism: Option<&(dyn Fn() -> bool + Sync)>,
     ) -> Result<DerivedSemanticTokens, String> {
         self.validate_read_identity(&request.context)?;
         if let Some((generation, supports_multiline, tokens)) = &self.cached_semantic_tokens
@@ -1214,6 +1216,7 @@ impl DocumentReplica {
                 discovery,
             }),
             cancellation.cloned(),
+            nested_parallelism,
         )
         .ok_or_else(|| "worker semantic token derivation was cancelled".to_string())?;
         let tokens: Vec<WireSemanticToken> = match result {
@@ -2485,7 +2488,7 @@ fn handle_work(
     retained_document_bytes: &RetainedDocumentBytes,
     queue_wait: Duration,
     cancellation: &crate::cancel::CancelToken,
-    allow_nested_parallelism: bool,
+    nested_parallelism: &(dyn Fn() -> bool + Sync),
 ) -> Response {
     let context = request_context(&request)
         .expect("scheduled worker request must have context")
@@ -2531,7 +2534,7 @@ fn handle_work(
             queue_wait,
             started,
             cancellation,
-            allow_nested_parallelism,
+            nested_parallelism,
         ),
         Request::RunCaptures(request) => run_captures(request, documents),
         Request::DeriveNativeBindings(request) => derive_native_bindings(request, documents),
@@ -2733,7 +2736,7 @@ fn derive_semantic_tokens(
     queue_wait: Duration,
     started: Instant,
     cancellation: &crate::cancel::CancelToken,
-    allow_nested_parallelism: bool,
+    nested_parallelism: &(dyn Fn() -> bool + Sync),
 ) -> Response {
     let context = request.context.clone();
     let Some(replica) = documents
@@ -2751,8 +2754,9 @@ fn derive_semantic_tokens(
                 request,
                 queue_wait,
                 started,
-                semantic_compute_threads(rayon::current_num_threads(), allow_nested_parallelism),
+                rayon::current_num_threads(),
                 Some(cancellation),
+                Some(nested_parallelism),
             ) {
                 Ok(result) => Response::SemanticTokens(result),
                 Err(message) => Response::Error(WorkerError {
@@ -2762,14 +2766,6 @@ fn derive_semantic_tokens(
             }
         }
         Err(_) => poisoned_document_restart(context),
-    }
-}
-
-fn semantic_compute_threads(pool_threads: usize, allow_nested_parallelism: bool) -> usize {
-    if allow_nested_parallelism {
-        pool_threads
-    } else {
-        1
     }
 }
 
@@ -3358,6 +3354,15 @@ where
         let runnable_guard = lane_key
             .as_ref()
             .map(|key| runnable_documents.enter(key.clone()));
+        #[cfg(feature = "e2e")]
+        if lane_key.as_ref().is_some_and(|key| {
+            std::env::var("KAKEHASHI_TREE_WORKER_RUNNABLE_ENTERED_URI_SUFFIX")
+                .ok()
+                .is_some_and(|suffix| key.uri.ends_with(&suffix))
+        }) && let Ok(path) = std::env::var("KAKEHASHI_TREE_WORKER_RUNNABLE_ENTERED_FILE")
+        {
+            let _ = std::fs::write(path, b"runnable");
+        }
         let job_runnable_documents = Arc::clone(&runnable_documents);
         let action_key = lane_key.clone();
         let job: LaneJob = Box::new(move || {
@@ -3372,6 +3377,12 @@ where
                     .parse::<u64>()
             {
                 std::thread::sleep(Duration::from_millis(milliseconds));
+                if let Ok(path) = std::env::var("KAKEHASHI_TREE_WORKER_ADMISSION_RELEASE_FILE") {
+                    let deadline = Instant::now() + Duration::from_secs(10);
+                    while !std::path::Path::new(&path).exists() && Instant::now() < deadline {
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                }
             }
             permit_rx
                 .lock()
@@ -3379,10 +3390,41 @@ where
                 .recv()
                 .expect("worker admission queue stopped before its jobs");
             let permit = AdmissionPermit(permits);
-            let allow_nested_parallelism = !job_runnable_documents.has_competitor();
             #[cfg(feature = "e2e")]
-            let allow_nested_parallelism = allow_nested_parallelism
-                || std::env::var_os("KAKEHASHI_TREE_WORKER_FORCE_NESTED_PARALLELISM").is_some();
+            let nested_parallelism_was_allowed = AtomicBool::new(false);
+            #[cfg(feature = "e2e")]
+            let nested_parallelism_yield_was_reported = AtomicBool::new(false);
+            let allow_nested_parallelism = || {
+                #[cfg(feature = "e2e")]
+                if std::env::var_os("KAKEHASHI_TREE_WORKER_FORCE_NESTED_PARALLELISM").is_some() {
+                    return true;
+                }
+                let allowed = !job_runnable_documents.has_competitor();
+                #[cfg(feature = "e2e")]
+                let trace_fairness = action_key.as_ref().is_some_and(|key| {
+                    std::env::var("KAKEHASHI_TREE_WORKER_FAIRNESS_TRACE_URI_SUFFIX")
+                        .ok()
+                        .is_some_and(|suffix| key.uri.ends_with(&suffix))
+                });
+                #[cfg(feature = "e2e")]
+                if allowed {
+                    if trace_fairness
+                        && let Ok(path) =
+                            std::env::var("KAKEHASHI_TREE_WORKER_FAIRNESS_ALLOWED_FILE")
+                    {
+                        let _ = std::fs::write(path, b"allowed");
+                    }
+                    nested_parallelism_was_allowed.store(true, Ordering::Relaxed);
+                } else if nested_parallelism_was_allowed.load(Ordering::Relaxed)
+                    && !nested_parallelism_yield_was_reported.swap(true, Ordering::Relaxed)
+                    && trace_fairness
+                {
+                    if let Ok(path) = std::env::var("KAKEHASHI_TREE_WORKER_FAIRNESS_YIELDED_FILE") {
+                        let _ = std::fs::write(path, b"yielded");
+                    }
+                }
+                allowed
+            };
             let response = handle_work(
                 request,
                 &analysis,
@@ -3392,7 +3434,7 @@ where
                 &retained_document_bytes,
                 enqueued.elapsed(),
                 &cancellation,
-                allow_nested_parallelism,
+                &allow_nested_parallelism,
             );
             job_cancellations.remove(&request_id);
             let action = if action_key
@@ -4216,8 +4258,8 @@ mod tests {
         RunnableDocuments, SyncDocument, WireByteRange, WirePosition, WireRange, WorkerError,
         WorkerQuerySources, close_document, decode_frame, derive_snapshot_with_language,
         encode_frame, named_node_count, parse_request_timeout, replace_retained_bytes,
-        reserve_retained_growth, route_response, run, semantic_compute_threads,
-        submit_document_job, sync_document, terminate_by_transport, validate_document_size,
+        reserve_retained_growth, route_response, run, submit_document_job, sync_document,
+        terminate_by_transport, validate_document_size,
     };
 
     #[derive(Clone, Default)]
@@ -4796,9 +4838,21 @@ mod tests {
     }
 
     #[test]
-    fn competing_document_disables_nested_semantic_parallelism() {
-        assert_eq!(semantic_compute_threads(4, true), 4);
-        assert_eq!(semantic_compute_threads(4, false), 1);
+    fn nested_parallelism_gate_tracks_competing_document_lifetime() {
+        let runnable = Arc::new(RunnableDocuments::default());
+        let first = runnable.enter(DocumentKey {
+            uri: "file:///a.rs".into(),
+        });
+        let allow_nested_parallelism = || !runnable.has_competitor();
+        assert!(allow_nested_parallelism());
+
+        let competitor = runnable.enter(DocumentKey {
+            uri: "file:///b.rs".into(),
+        });
+        assert!(!allow_nested_parallelism());
+        drop(competitor);
+        assert!(allow_nested_parallelism());
+        drop(first);
     }
 
     #[test]
@@ -5506,6 +5560,7 @@ mod tests {
             Instant::now(),
             rayon::current_num_threads(),
             Some(&cancellation),
+            None,
         );
 
         assert_eq!(

@@ -827,3 +827,151 @@ fn competing_document_finishes_while_injection_fanout_is_running() {
         "cross-document force_nested={force_nested} foreground_latency={foreground_elapsed:?} heavy_completion={heavy_elapsed:?}"
     );
 }
+
+#[test]
+fn late_competing_document_reduces_fanout_at_a_chunk_boundary() {
+    let force_nested = std::env::var_os("KAKEHASHI_E2E_FORCE_NESTED_PARALLELISM").is_some();
+    let marker_dir = tempfile::tempdir().expect("create fanout marker directory");
+    let fanout_started = marker_dir.path().join("started");
+    let fanout_release = marker_dir.path().join("release");
+    let fanout_allowed = marker_dir.path().join("allowed");
+    let fanout_yielded = marker_dir.path().join("yielded");
+    let competitor_runnable = marker_dir.path().join("competitor-runnable");
+    let mut builder = LspClient::builder()
+        .env("KAKEHASHI_TREE_WORKER_MODE", "authoritative")
+        .env("KAKEHASHI_TREE_WORKER_THREADS", "4")
+        .env(
+            "KAKEHASHI_TREE_WORKER_INJECTION_DELAY_URI_SUFFIX",
+            "/late-fair-a.md",
+        )
+        .env("KAKEHASHI_TREE_WORKER_INJECTION_DELAY_MS", "50")
+        .env(
+            "KAKEHASHI_TREE_WORKER_ADMISSION_DELAY_URI_SUFFIX",
+            "/late-fair-b.rs",
+        )
+        .env("KAKEHASHI_TREE_WORKER_ADMISSION_DELAY_MS", "200")
+        .env(
+            "KAKEHASHI_TREE_WORKER_ADMISSION_RELEASE_FILE",
+            fanout_yielded.to_string_lossy(),
+        )
+        .env(
+            "KAKEHASHI_TREE_WORKER_RUNNABLE_ENTERED_URI_SUFFIX",
+            "/late-fair-b.rs",
+        )
+        .env(
+            "KAKEHASHI_TREE_WORKER_RUNNABLE_ENTERED_FILE",
+            competitor_runnable.to_string_lossy(),
+        )
+        .env(
+            "KAKEHASHI_TREE_WORKER_FAIRNESS_TRACE_URI_SUFFIX",
+            "/late-fair-a.md",
+        )
+        .env(
+            "KAKEHASHI_TREE_WORKER_FANOUT_STARTED_FILE",
+            fanout_started.to_string_lossy(),
+        )
+        .env(
+            "KAKEHASHI_TREE_WORKER_FANOUT_RELEASE_FILE",
+            fanout_release.to_string_lossy(),
+        )
+        .env(
+            "KAKEHASHI_TREE_WORKER_FAIRNESS_YIELDED_FILE",
+            fanout_yielded.to_string_lossy(),
+        )
+        .env(
+            "KAKEHASHI_TREE_WORKER_FAIRNESS_ALLOWED_FILE",
+            fanout_allowed.to_string_lossy(),
+        );
+    if force_nested {
+        builder = builder.env("KAKEHASHI_TREE_WORKER_FORCE_NESTED_PARALLELISM", "1");
+    }
+    let mut client = builder.build();
+    initialize(&mut client);
+    let heavy_uri = "file:///late-fair-a.md";
+    let heavy = (0..8)
+        .map(|index| format!("```rust\nfn late_injected_{index}() {{}}\n```\n"))
+        .collect::<String>();
+    client.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": heavy_uri,
+                "languageId": "markdown",
+                "version": 1,
+                "text": heavy
+            }
+        }),
+    );
+    let foreground_uri = "file:///late-fair-b.rs";
+    let heavy_started = std::time::Instant::now();
+    let heavy_request = client.send_request_async(
+        "textDocument/semanticTokens/full",
+        json!({ "textDocument": { "uri": heavy_uri } }),
+    );
+    let marker_deadline = std::time::Instant::now() + Duration::from_secs(30);
+    while (!fanout_started.exists() || !fanout_allowed.exists())
+        && std::time::Instant::now() < marker_deadline
+    {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(fanout_started.exists(), "heavy fanout did not start");
+    assert!(
+        fanout_allowed.exists(),
+        "heavy fanout never observed idle capacity"
+    );
+    client.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": foreground_uri,
+                "languageId": "rust",
+                "version": 1,
+                "text": "fn late_foreground() {}\n"
+            }
+        }),
+    );
+    let foreground_started = std::time::Instant::now();
+    let foreground_request = client.send_request_async(
+        "kakehashi/node",
+        json!({
+            "textDocument": { "uri": foreground_uri },
+            "position": { "line": 0, "character": 4 }
+        }),
+    );
+    let competitor_deadline = std::time::Instant::now() + Duration::from_secs(30);
+    while !competitor_runnable.exists() && std::time::Instant::now() < competitor_deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        competitor_runnable.exists(),
+        "competing worker job was not registered as runnable"
+    );
+    std::fs::write(&fanout_release, b"release").expect("release the first fanout chunk");
+
+    let mut foreground_elapsed = None;
+    let mut heavy_elapsed = None;
+    for _ in 0..2 {
+        let response = client.receive_next_response_public();
+        assert!(response.get("result").is_some(), "{response:?}");
+        match response.get("id").and_then(|id| id.as_i64()) {
+            Some(id) if id == foreground_request => {
+                foreground_elapsed = Some(foreground_started.elapsed())
+            }
+            Some(id) if id == heavy_request => heavy_elapsed = Some(heavy_started.elapsed()),
+            _ => panic!("unexpected response while measuring late fairness: {response:?}"),
+        }
+    }
+    let foreground_elapsed = foreground_elapsed.expect("foreground response must arrive");
+    let heavy_elapsed = heavy_elapsed.expect("heavy response must arrive");
+    let _stderr = shutdown_and_stderr(client);
+    eprintln!(
+        "late cross-document force_nested={force_nested} foreground_latency={foreground_elapsed:?} heavy_completion={heavy_elapsed:?} yielded={}",
+        fanout_yielded.exists(),
+    );
+    if !force_nested {
+        assert!(
+            fanout_yielded.exists(),
+            "late competitor did not change a later chunk's admission"
+        );
+    }
+}
