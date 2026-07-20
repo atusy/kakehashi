@@ -3784,7 +3784,19 @@ fn classify_transport_observation(
 fn process_status_is_native_crash(status: &std::process::ExitStatus) -> bool {
     use std::os::unix::process::ExitStatusExt;
 
-    status.signal().is_some()
+    status.signal().is_some_and(unix_signal_is_native_crash)
+}
+
+#[cfg(unix)]
+fn unix_signal_is_native_crash(signal: i32) -> bool {
+    matches!(
+        signal,
+        nix::libc::SIGABRT
+            | nix::libc::SIGBUS
+            | nix::libc::SIGFPE
+            | nix::libc::SIGILL
+            | nix::libc::SIGSEGV
+    )
 }
 
 #[cfg(windows)]
@@ -3799,7 +3811,19 @@ fn process_status_is_native_crash(_status: &std::process::ExitStatus) -> bool {
 
 #[cfg(any(test, windows))]
 fn windows_exit_code_is_exception(code: i32) -> bool {
-    code.is_negative()
+    matches!(
+        code as u32,
+        0xc000_0005 // access violation
+            | 0xc000_001d // illegal instruction
+            | 0xc000_008e // floating-point divide by zero
+            | 0xc000_0090 // floating-point invalid operation
+            | 0xc000_0094 // integer divide by zero
+            | 0xc000_0095 // integer overflow
+            | 0xc000_00fd // stack overflow
+            | 0xc000_0374 // heap corruption
+            | 0xc000_0409 // stack buffer overrun / fail fast
+            | 0xc000_0602 // fail-fast exception
+    )
 }
 
 fn command_uri(command: &ShadowCommand) -> Option<&str> {
@@ -4241,6 +4265,16 @@ mod tests {
     fn windows_exception_status_is_native_crash_evidence() {
         assert!(windows_exit_code_is_exception(0xc000_0409_u32 as i32));
         assert!(!windows_exit_code_is_exception(86));
+        assert!(!windows_exit_code_is_exception(-1));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn external_unix_termination_is_not_native_crash_evidence() {
+        assert!(unix_signal_is_native_crash(nix::libc::SIGABRT));
+        assert!(unix_signal_is_native_crash(nix::libc::SIGSEGV));
+        assert!(!unix_signal_is_native_crash(nix::libc::SIGTERM));
+        assert!(!unix_signal_is_native_crash(nix::libc::SIGKILL));
     }
 
     #[test]
