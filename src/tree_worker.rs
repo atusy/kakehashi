@@ -27,6 +27,10 @@ pub const MAX_FRAME_BYTES: usize = 64 * 1024 * 1024;
 pub const MAX_DOCUMENT_REPLICAS: usize = 4_096;
 pub const MAX_DOCUMENT_BYTES: usize = 32 * 1024 * 1024;
 pub const MAX_RETAINED_DOCUMENT_BYTES: usize = 512 * 1024 * 1024;
+// Preserve ordinary exact-version hits, but stop a multi-megabyte semantic
+// result from retaining a second full set of injection-derived caches. Stage 15
+// measured 74 KiB for the small fixture and 2.35 MiB for the pressure fixture.
+const SEMANTIC_CACHE_AUXILIARY_TRIM_THRESHOLD_BYTES: usize = 2 * 1024 * 1024;
 pub const BUILD_ID: &str = concat!(env!("CARGO_PKG_NAME"), "-", env!("CARGO_PKG_VERSION"));
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -610,6 +614,22 @@ struct CachedInjectionLayer {
 }
 
 impl DocumentReplica {
+    fn trim_auxiliary_caches_for_pressure(&mut self) -> bool {
+        let semantic_bytes = self
+            .cached_semantic_tokens
+            .as_ref()
+            .map(|(_, _, tokens)| tokens.capacity() * std::mem::size_of::<WireSemanticToken>())
+            .unwrap_or_default();
+        if semantic_bytes <= SEMANTIC_CACHE_AUXILIARY_TRIM_THRESHOLD_BYTES {
+            return false;
+        }
+        self.semantic_discovery = None;
+        self.resolved_injections = None;
+        self.injection_layers.clear();
+        self.injection_token_cache.clear_document(&self.uri);
+        true
+    }
+
     fn sync(
         request: SyncDocument,
         parser: &mut tree_sitter::Parser,
@@ -1239,6 +1259,7 @@ impl DocumentReplica {
             request.supports_multiline,
             Arc::new(tokens.clone()),
         ));
+        self.trim_auxiliary_caches_for_pressure();
         Ok(DerivedSemanticTokens {
             context: request.context,
             tokens,
@@ -4358,8 +4379,9 @@ mod tests {
         MAX_DOCUMENT_REPLICAS, MAX_RETAINED_DOCUMENT_BYTES, NavigateNode, NodeLayerSelector,
         NodeNavigation, NodeScalarOperation, NodeScalarValue, OpaqueNodeId, PROTOCOL_VERSION,
         Request, RequestCancelled, RequestContext, ResolveNode, Response, Route, RunCaptures,
-        RunNodeScalar, RunnableDocuments, SyncDocument, WireByteRange, WirePosition, WireRange,
-        WorkPriority, WorkerError, WorkerQuerySources, close_document, decode_frame,
+        RunNodeScalar, RunnableDocuments, SEMANTIC_CACHE_AUXILIARY_TRIM_THRESHOLD_BYTES,
+        SyncDocument, WireByteRange, WirePosition, WireRange, WireSemanticToken, WorkPriority,
+        WorkerError, WorkerQuerySources, close_document, decode_frame,
         derive_snapshot_with_language, encode_frame, named_node_count, parse_request_timeout,
         replace_retained_bytes, request_priority, reserve_retained_growth, route_response, run,
         submit_document_job, sync_document, terminate_by_transport, validate_document_size,
@@ -5685,6 +5707,97 @@ mod tests {
             cached.cache_hit,
             "same-version semantic requests should reuse worker facts"
         );
+    }
+
+    #[test]
+    fn oversized_semantic_cache_trims_only_recomputable_auxiliary_state() {
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_rust::LANGUAGE.into())
+            .unwrap();
+        let context = RequestContext {
+            request_id: 1,
+            worker_generation: 3,
+            uri: "file:///memory-pressure.rs".into(),
+            incarnation: 4,
+            content_version: 1,
+            configuration_generation: 2,
+        };
+        let (mut replica, _) = DocumentReplica::sync(
+            SyncDocument {
+                context,
+                language: "rust".into(),
+                grammar_symbol: "rust".into(),
+                source_path: "/unused/static-language".into(),
+                parser_path: "/unused/static-language".into(),
+                artifact_digest: "sha256:rust-v1".into(),
+                queries: WorkerQuerySources::default(),
+                text: "fn main() {}".into(),
+            },
+            &mut parser,
+        )
+        .unwrap();
+        let token = WireSemanticToken {
+            delta_line: 0,
+            delta_start: 0,
+            length: 1,
+            token_type: 0,
+            token_modifiers_bitset: 0,
+        };
+        let token_count = SEMANTIC_CACHE_AUXILIARY_TRIM_THRESHOLD_BYTES
+            / std::mem::size_of::<WireSemanticToken>()
+            + 1;
+        replica.cached_semantic_tokens = Some((2, false, Arc::new(vec![token; token_count])));
+        replica.semantic_discovery = Some(Arc::new(crate::document::DiscoveredInjections {
+            generation: 2,
+            complete: true,
+            regions: Vec::new(),
+        }));
+
+        assert!(replica.trim_auxiliary_caches_for_pressure());
+        assert!(replica.cached_semantic_tokens.is_some());
+        assert!(replica.semantic_discovery.is_none());
+        assert_eq!(replica.context.content_version, 1);
+        assert_eq!(replica.tree.root_node().kind(), "source_file");
+    }
+
+    #[test]
+    fn small_semantic_cache_keeps_auxiliary_state() {
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_rust::LANGUAGE.into())
+            .unwrap();
+        let context = RequestContext {
+            request_id: 1,
+            worker_generation: 3,
+            uri: "file:///small-cache.rs".into(),
+            incarnation: 4,
+            content_version: 1,
+            configuration_generation: 2,
+        };
+        let (mut replica, _) = DocumentReplica::sync(
+            SyncDocument {
+                context,
+                language: "rust".into(),
+                grammar_symbol: "rust".into(),
+                source_path: "/unused/static-language".into(),
+                parser_path: "/unused/static-language".into(),
+                artifact_digest: "sha256:rust-v1".into(),
+                queries: WorkerQuerySources::default(),
+                text: "fn main() {}".into(),
+            },
+            &mut parser,
+        )
+        .unwrap();
+        replica.cached_semantic_tokens = Some((2, false, Arc::new(Vec::new())));
+        replica.semantic_discovery = Some(Arc::new(crate::document::DiscoveredInjections {
+            generation: 2,
+            complete: true,
+            regions: Vec::new(),
+        }));
+
+        assert!(!replica.trim_auxiliary_caches_for_pressure());
+        assert!(replica.semantic_discovery.is_some());
     }
 
     #[test]
