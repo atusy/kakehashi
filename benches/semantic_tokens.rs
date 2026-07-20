@@ -125,6 +125,13 @@ impl Server {
         )
     }
 
+    fn send_semantic_full(&mut self, uri: &str) -> i64 {
+        self.send_request(
+            "textDocument/semanticTokens/full",
+            json!({ "textDocument": { "uri": uri } }),
+        )
+    }
+
     /// `semanticTokens/full/delta` against `previous_result_id`.
     fn semantic_delta(&mut self, uri: &str, previous_result_id: &str) -> Value {
         self.request(
@@ -183,6 +190,11 @@ impl Server {
     }
 
     fn request(&mut self, method: &str, params: Value) -> Value {
+        let id = self.send_request(method, params);
+        self.recv_response(id)
+    }
+
+    fn send_request(&mut self, method: &str, params: Value) -> i64 {
         self.next_id += 1;
         let id = self.next_id;
         self.send(&json!({
@@ -191,7 +203,7 @@ impl Server {
             "method": method,
             "params": params,
         }));
-        self.recv_response(id)
+        id
     }
 
     fn notify(&mut self, method: &str, params: Value) {
@@ -418,6 +430,10 @@ enum Kind {
     /// so each measured request pays incremental reparse + cache invalidation +
     /// delta diff on top of the (full) token recompute.
     EditDelta,
+    /// Rapid edits supersede several already-issued full requests. Measures
+    /// latency from the final edit/request until the only result the editor can
+    /// still use, while obsolete computation is cooperatively reclaimed.
+    SupersedeBurst { obsolete: usize },
     /// Cold-open latency: each iteration opens a FRESH document and times
     /// `didOpen` → first `semanticTokens/full` response — the editor-visible
     /// "open the file, see highlights" latency. The one scenario that captures
@@ -463,6 +479,9 @@ fn measure(
     if let Kind::OpenFirstToken = scn.kind {
         return measure_open(bin, scn, data_dir, iters, warmup);
     }
+    if let Kind::SupersedeBurst { obsolete } = scn.kind {
+        return measure_supersede_burst(bin, scn, data_dir, iters, warmup, obsolete);
+    }
     let mut server = Server::start(&bin.path, data_dir);
     server.did_open(scn.uri, scn.language_id, &scn.content);
     // Let the initial parse settle (didOpen parse may be async).
@@ -491,6 +510,44 @@ fn measure(
         let start = Instant::now();
         run_once(&mut server, scn, &mut prev_result_id, &mut edit);
         samples.push(start.elapsed());
+    }
+    samples
+}
+
+fn measure_supersede_burst(
+    bin: &Binary,
+    scn: &Scenario,
+    data_dir: &str,
+    iters: usize,
+    warmup: usize,
+    obsolete: usize,
+) -> Vec<Duration> {
+    let mut server = Server::start(&bin.path, data_dir);
+    server.did_open(scn.uri, scn.language_id, &scn.content);
+    std::thread::sleep(Duration::from_millis(300));
+    let mut version = 1_i64;
+    let mut insert = true;
+    let line = (scn.content.lines().count() / 2) as u32;
+    let mut samples = Vec::with_capacity(iters);
+    for iteration in 0..(warmup + iters) {
+        for _ in 0..obsolete {
+            version += 1;
+            server.did_change_toggle(scn.uri, version, line, insert);
+            insert = !insert;
+            let _ = server.send_semantic_full(scn.uri);
+            // Give ingress enough time to start worker computation; without
+            // this the burst only measures request coalescing before dispatch.
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        version += 1;
+        let started = Instant::now();
+        server.did_change_toggle(scn.uri, version, line, insert);
+        insert = !insert;
+        let final_id = server.send_semantic_full(scn.uri);
+        let _ = server.recv_response(final_id);
+        if iteration >= warmup {
+            samples.push(started.elapsed());
+        }
     }
     samples
 }
@@ -531,7 +588,9 @@ fn measure_open(
 
 fn seed_result_id(server: &mut Server, scn: &Scenario) -> String {
     match scn.kind {
-        Kind::Full | Kind::Range { .. } | Kind::OpenFirstToken => String::new(),
+        Kind::Full | Kind::Range { .. } | Kind::OpenFirstToken | Kind::SupersedeBurst { .. } => {
+            String::new()
+        }
         // Both delta-based scenarios need an initial result_id to diff against.
         Kind::DeltaNoop | Kind::EditDelta => {
             result_id_of(&server.semantic_full(scn.uri)).unwrap_or_default()
@@ -548,6 +607,9 @@ fn run_once(
     match scn.kind {
         // Handled by `measure_open`, which never calls `run_once`.
         Kind::OpenFirstToken => unreachable!("OpenFirstToken uses measure_open"),
+        Kind::SupersedeBurst { .. } => {
+            unreachable!("SupersedeBurst uses measure_supersede_burst")
+        }
         Kind::Full => {
             let _ = server.semantic_full(scn.uri);
         }
@@ -698,6 +760,14 @@ fn main() {
             content: gen_rust(150),
             kind: Kind::EditDelta,
             targets: "edit→reparse→retokenize→delta diff (host path under typing)",
+        },
+        Scenario {
+            name: "rust_large/supersede_burst",
+            language_id: "rust",
+            uri: "file:///bench/large_supersede.rs",
+            content: gen_rust(150),
+            kind: Kind::SupersedeBurst { obsolete: 8 },
+            targets: "latest request latency after eight superseded semantic computations",
         },
         Scenario {
             name: "markdown_injections/edit_delta",
