@@ -701,7 +701,11 @@ impl DocumentReplica {
                 .saturating_add(estimated_injection_layer_bytes(
                     &self.injection_layers,
                     self.injection_layers.capacity(),
-                )),
+                ))
+                .saturating_add(
+                    self.injection_token_cache
+                        .estimated_document_bytes(&self.uri),
+                ),
         }
     }
 

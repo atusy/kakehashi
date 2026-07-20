@@ -593,6 +593,26 @@ impl InjectionTokenCache {
         self.cache.remove(uri);
     }
 
+    pub(crate) fn estimated_document_bytes(&self, uri: &Url) -> usize {
+        self.cache.get(uri).map_or(0, |document| {
+            let entries = document
+                .capacity()
+                .saturating_mul(std::mem::size_of::<(u64, CachedRegionTokens)>());
+            document.iter().fold(entries, |bytes, (_, cached)| {
+                let tokens = cached.tokens.as_ref();
+                let payload = std::mem::size_of::<Vec<RawToken>>()
+                    .saturating_add(tokens.capacity() * std::mem::size_of::<RawToken>());
+                let boxed_names = tokens.iter().fold(0_usize, |names, token| {
+                    names.saturating_add(match &token.kind {
+                        crate::analysis::semantic::TokenKind::MappedUnknown(name) => name.len(),
+                        _ => 0,
+                    })
+                });
+                bytes.saturating_add(payload).saturating_add(boxed_names)
+            })
+        })
+    }
+
     /// Drop every cached entry. Used on a settings/query reload (alongside the
     /// generation bump) to reclaim memory: the generation fold already makes
     /// old-generation entries unreachable — this just stops them leaking until
@@ -1263,6 +1283,18 @@ mod tests {
         // Non-existent URI returns None
         let other_uri = Url::parse("file:///other.md").unwrap();
         assert!(cache.get(&other_uri, 0xAA, 0).is_none());
+    }
+
+    #[test]
+    fn injection_token_cache_reports_document_token_capacity() {
+        let cache = InjectionTokenCache::new();
+        let uri = Url::parse("file:///memory.md").unwrap();
+        let mut tokens = Vec::with_capacity(32);
+        tokens.push(raw_token(0, 0, 5));
+        let token_bytes = tokens.capacity() * std::mem::size_of::<RawToken>();
+        cache.store(&uri, 0xAA, 0, tokens);
+
+        assert!(cache.estimated_document_bytes(&uri) >= token_bytes);
     }
 
     #[test]
