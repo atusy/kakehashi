@@ -87,6 +87,44 @@ jobs:
           cargo test --features e2e --test e2e_tree_worker_shadow
           windows_ -- --nocapture
 
+  windows-worker-startup-measurement:
+    name: Windows worker startup measurement
+    if: github.event_name == 'pull_request'
+    runs-on: windows-latest
+    env:
+      BASELINE_COMMIT: e812a7945639963c71dc35c7cc7e91977ab1e9c5
+      CANDIDATE_COMMIT: ${{ github.event.pull_request.head.sha }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          ref: ${{ github.event.pull_request.head.sha }}
+      - name: Build immutable Stage 22 and Stage 23 harnesses
+        run: |
+          git worktree add --detach "$env:RUNNER_TEMP/stage22-source" $env:BASELINE_COMMIT
+          New-Item -ItemType Directory -Force "$env:RUNNER_TEMP/stage22-source/examples"
+          New-Item -ItemType Directory -Force "examples"
+          Copy-Item "benches/profile/tree_worker_startup.rs" "$env:RUNNER_TEMP/stage22-source/examples/tree_worker_startup.rs"
+          Copy-Item "benches/profile/tree_worker_startup.rs" "examples/tree_worker_startup.rs"
+          $env:CARGO_TARGET_DIR = "$env:RUNNER_TEMP/stage22-target"
+          cargo build --locked --release --bin kakehashi --example tree_worker_startup --manifest-path "$env:RUNNER_TEMP/stage22-source/Cargo.toml"
+          $env:CARGO_TARGET_DIR = "$env:RUNNER_TEMP/stage23-target"
+          cargo build --locked --release --bin kakehashi --example tree_worker_startup
+      - name: Measure order-reversed startup pairs
+        run: >-
+          python benches/profile/compare_worker_handshake.py
+          --baseline-harness "$env:RUNNER_TEMP/stage22-target/release/examples/tree_worker_startup.exe"
+          --candidate-harness "$env:RUNNER_TEMP/stage23-target/release/examples/tree_worker_startup.exe"
+          --baseline-commit "$env:BASELINE_COMMIT"
+          --candidate-commit "$env:CANDIDATE_COMMIT"
+          --pairs 30 --warmup-pairs 5 --threads 4
+          --output stage23-windows-worker-startup.json
+      - uses: actions/upload-artifact@v7
+        with:
+          name: stage23-windows-worker-startup
+          path: stage23-windows-worker-startup.json
+
   fmt:
     name: Format
     runs-on: ubuntu-latest
