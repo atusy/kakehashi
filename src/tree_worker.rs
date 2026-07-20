@@ -4214,7 +4214,7 @@ fn spawn_test_descendant() -> io::Result<()> {
         return Ok(());
     };
     let _descendant = Command::new("sh")
-        .args(["-c", "echo $$ > \"$1\"; exec sleep 30", "worker-descendant"])
+        .args(["-c", "echo $$ > \"$1\"; exec sleep 300", "worker-descendant"])
         .arg(pid_path)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
