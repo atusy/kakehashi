@@ -406,6 +406,12 @@ admitted cancellable work; canceling an unknown, completed, or prior-generation
 request remains a no-op, and duplicate terminal and cancel frames remain
 harmless.
 
+The client admits at most `4*T` ordinary routes plus one supervisor lifecycle
+route. The worker scheduler mirrors that `4*T+1` pending bound so it never stops
+after decoding the reserved lifecycle frame while later FIFO cancellation
+frames wait unread. Control frames remain independently processable at full
+ordinary admission.
+
 Cancellation during hazard commit has explicit cleanup. A hazard whose arm
 frame was committed but whose grammar-backed scope was never entered is
 released; a native segment that

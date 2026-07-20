@@ -56,7 +56,8 @@ configuration-gated breaker.
 
 The focused 67 worker and 40 supervisor tests, the single-crash, protocol-
 failure, multi-hazard, single-timeout, four-thread saturation, planned-restart,
-and delayed-restart-response E2Es,
+delayed-restart-response, cancellation-delivery, and reserved-lifecycle
+saturation E2Es,
 all-target Check, warning-denying Clippy, and formatting checks pass locally.
 
 Cancellation delivery is also ordered without an unbounded unknown-ID
@@ -65,6 +66,13 @@ arming its cancellation guard, while the worker stores tokens only for admitted
 work. An E2E delays creation of the blocking response waiter, cancels during
 that window, observes the cancel on the already-admitted worker request, and
 then serves a healthy follow-up without restarting the generation.
+
+The worker scheduler's pending bound includes the same one lifecycle slot that
+the client reserves above its ordinary `4*T` route limit. A saturation E2E fills
+all 16 ordinary routes, schedules the 17th lifecycle request, and proves later
+FIFO cancellation frames still reach the worker control fast path. With the old
+16-request bound the same test deterministically times out waiting for the
+cancel marker; with the aligned bound it recovers once without quarantine.
 
 ## Recovery measurement
 
