@@ -771,11 +771,11 @@ kills and restarts the complete generation, and does not quarantine any active
 grammar. A timeout can remain nonfatal only when the child is confirmed live;
 an already-exited or unknown transport state enters worker-loss recovery rather
 than leaving the dead generation published. That recovery is systemic unless
-the preserved child status independently proves a native crash; `TimedOut`
-alone is not parser-fault evidence. Unix evidence is restricted to synchronous
-crash signals rather than external TERM/KILL, and Windows uses an explicit
-exception/fail-fast allowlist rather than all negative codes. A separate hard native-segment
-deadline starts with the handoff
+the preserved child status matches the conservative native-crash evidence
+allowlist; `TimedOut` alone is not parser-fault evidence. Unix evidence is
+restricted to synchronous crash signals rather than external TERM/KILL, and
+Windows uses an explicit exception/fail-fast allowlist rather than all negative
+codes. A separate hard native-segment deadline starts with the handoff
 allowance when the parent receives
 `NativeSegmentEntered`; only after that allowance does it consume the native
 budget, and it ends at `NativeSegmentExited`. It does not run while an arm frame

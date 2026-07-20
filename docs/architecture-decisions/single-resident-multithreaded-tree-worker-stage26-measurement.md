@@ -36,9 +36,10 @@ an active grammar. A nominally nonfatal timeout may continue only when
 `try_wait` confirms the worker transport is still live; an already-exited or
 unknown child state enters recovery instead of leaving a dead client published.
 Such a timeout-triggered recovery is systemic unless the preserved child exit
-status independently proves a native crash; the `TimedOut` error kind alone
-never supplies parser-fault evidence. Unix native evidence is limited to
-ABRT/BUS/FPE/ILL/SEGV, excluding external TERM/KILL; Windows uses an explicit
+status matches the conservative native-crash evidence allowlist; the `TimedOut`
+error kind alone never supplies parser-fault evidence. Unix native evidence is
+limited to ABRT/BUS/FPE/ILL/SEGV, excluding external TERM/KILL; Windows uses an
+explicit
 exception/fail-fast code allowlist rather than every negative exit code.
 The saturation E2E parks four distinct committed grammar
 jobs on all four compute threads, then proves that one generation restart
