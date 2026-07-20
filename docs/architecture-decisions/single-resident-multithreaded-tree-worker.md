@@ -1242,6 +1242,16 @@ the ADR's future OS/native-segment evidence; descendant cleanup, grammar hazard
 and quarantine readiness, protocol and compatibility gates, and legacy-path
 removal remain open.
 
+The [Stage 20 descendant-cleanup measurement](single-resident-multithreaded-tree-worker-stage20-measurement.md)
+proves that explicit worker termination and normal LSP shutdown kill the Unix
+process group owned by the worker, including a five-minute descendant that
+cannot expire naturally within the test. The parent still reaps the direct
+worker with a bounded wait. Twelve order-reversed cold-start pairs found no
+regression: median paired driver and first-request deltas were -0.4% and -0.6%.
+This does not satisfy abnormal parent-death or Windows Job Object requirements;
+those remain open with native hazard/quarantine, protocol and compatibility
+gates, and legacy-path removal.
+
 The implementation should proceed in measured stages:
 
 1. Prototype the framed transport, supervision, and one high-level

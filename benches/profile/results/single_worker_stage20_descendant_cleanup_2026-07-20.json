@@ -1,0 +1,51 @@
+{
+  "schema": 1,
+  "experiment": "single-tree-worker-stage20-descendant-cleanup",
+  "date": "2026-07-20",
+  "environment": {
+    "source_commit": "38840cd6d561b3cf99dfc5bb5fd85fb787867649",
+    "baseline_stage": 19,
+    "baseline_binary_sha256": "72dda444029ebdb9122e71401e36b960dca67b3165ebf5c3649480d5c2e35468",
+    "candidate_stage": 20,
+    "candidate_binary_sha256": "ac0b197a425cb5812270cc89d9e108448d83f09b7ede7973b8b18658882a1761",
+    "release_build": "cargo build --locked --release --bin kakehashi",
+    "features": "default",
+    "platform": "macOS"
+  },
+  "cold_start": {
+    "scenario": {
+      "language": "rust",
+      "generated_size": 15,
+      "documents": 1,
+      "measured_requests": 1,
+      "settle_seconds": 0,
+      "worker_threads": 4,
+      "isolation": "fresh XDG config and state directory for every run",
+      "order": "baseline-candidate on odd runs; candidate-baseline on even runs"
+    },
+    "runs": [
+      {"run": 1, "baseline": {"elapsed_ms": 3381.901, "request_ms": 3030.3, "wall_ms_per_cycle": 3030.85}, "candidate": {"elapsed_ms": 3376.098, "request_ms": 2040.7, "wall_ms_per_cycle": 2041.29}},
+      {"run": 2, "baseline": {"elapsed_ms": 2331.929, "request_ms": 2012.7, "wall_ms_per_cycle": 2013.14}, "candidate": {"elapsed_ms": 2328.621, "request_ms": 2021.3, "wall_ms_per_cycle": 2021.76}},
+      {"run": 3, "baseline": {"elapsed_ms": 2343.896, "request_ms": 2034.7, "wall_ms_per_cycle": 2035.36}, "candidate": {"elapsed_ms": 2393.226, "request_ms": 2073.4, "wall_ms_per_cycle": 2074.10}},
+      {"run": 4, "baseline": {"elapsed_ms": 2319.304, "request_ms": 2007.8, "wall_ms_per_cycle": 2008.42}, "candidate": {"elapsed_ms": 2337.631, "request_ms": 2031.1, "wall_ms_per_cycle": 2031.64}},
+      {"run": 5, "baseline": {"elapsed_ms": 2335.081, "request_ms": 2028.2, "wall_ms_per_cycle": 2028.84}, "candidate": {"elapsed_ms": 2396.653, "request_ms": 2093.8, "wall_ms_per_cycle": 2094.43}},
+      {"run": 6, "baseline": {"elapsed_ms": 2373.920, "request_ms": 2035.6, "wall_ms_per_cycle": 2036.32}, "candidate": {"elapsed_ms": 2350.667, "request_ms": 2013.1, "wall_ms_per_cycle": 2013.76}},
+      {"run": 7, "baseline": {"elapsed_ms": 2332.368, "request_ms": 2030.6, "wall_ms_per_cycle": 2031.18}, "candidate": {"elapsed_ms": 2348.747, "request_ms": 2022.0, "wall_ms_per_cycle": 2022.66}},
+      {"run": 8, "baseline": {"elapsed_ms": 2469.494, "request_ms": 2119.6, "wall_ms_per_cycle": 2120.25}, "candidate": {"elapsed_ms": 2453.343, "request_ms": 2104.8, "wall_ms_per_cycle": 2105.49}},
+      {"run": 9, "baseline": {"elapsed_ms": 2367.868, "request_ms": 2045.3, "wall_ms_per_cycle": 2045.98}, "candidate": {"elapsed_ms": 2339.682, "request_ms": 2025.9, "wall_ms_per_cycle": 2026.52}},
+      {"run": 10, "baseline": {"elapsed_ms": 2423.287, "request_ms": 2081.7, "wall_ms_per_cycle": 2082.33}, "candidate": {"elapsed_ms": 2409.411, "request_ms": 2086.9, "wall_ms_per_cycle": 2087.45}},
+      {"run": 11, "baseline": {"elapsed_ms": 2358.570, "request_ms": 2037.7, "wall_ms_per_cycle": 2038.35}, "candidate": {"elapsed_ms": 2320.973, "request_ms": 2012.3, "wall_ms_per_cycle": 2012.73}},
+      {"run": 12, "baseline": {"elapsed_ms": 2446.028, "request_ms": 2105.9, "wall_ms_per_cycle": 2106.43}, "candidate": {"elapsed_ms": 2317.170, "request_ms": 2011.3, "wall_ms_per_cycle": 2012.00}}
+    ]
+  },
+  "descendant_cleanup_e2e": {
+    "platform": "unix",
+    "fixture_descendant_seconds": 300,
+    "note": "elapsed time covers LSP initialization, worker and descendant startup, normal shutdown, process-group termination, liveness assertion, and server exit",
+    "runs": [
+      {"run": 1, "elapsed_ms": 4239.503, "passed": true},
+      {"run": 2, "elapsed_ms": 4078.988, "passed": true},
+      {"run": 3, "elapsed_ms": 3937.486, "passed": true}
+    ]
+  }
+}
