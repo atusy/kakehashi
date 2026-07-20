@@ -2730,6 +2730,18 @@ fn run_actor(
                 );
                 continue;
             }
+            if let Err(error) = quiesce_published_client(&mut state) {
+                log::error!(
+                    target: "kakehashi::tree_worker_shadow",
+                    "disabled tree tier because planned restart could not quiesce: {error}",
+                );
+                mark_tree_tier_unavailable(
+                    &mut state,
+                    &disabled,
+                    &pending_configuration_generation,
+                );
+                continue;
+            }
             if !recover_worker(
                 &mut state,
                 &executable,
@@ -2818,16 +2830,34 @@ fn run_actor(
                     state.worker_generation,
                     required.reason
                 );
-                if matches!(state.breaker, BreakerState::HalfOpen { .. })
-                    || !recover_worker(
+                if matches!(state.breaker, BreakerState::HalfOpen { .. }) {
+                    mark_tree_tier_unavailable(
                         &mut state,
-                        &executable,
-                        compute_threads,
-                        WorkerLossEvidence::systemic(),
-                        &comparisons,
-                        RecoveryMode::Normal,
-                    )
-                {
+                        &disabled,
+                        &pending_configuration_generation,
+                    );
+                    continue;
+                }
+                if let Err(error) = quiesce_published_client(&mut state) {
+                    log::error!(
+                        target: "kakehashi::tree_worker_shadow",
+                        "disabled tree tier because worker-requested restart could not quiesce: {error}",
+                    );
+                    mark_tree_tier_unavailable(
+                        &mut state,
+                        &disabled,
+                        &pending_configuration_generation,
+                    );
+                    continue;
+                }
+                if !recover_worker(
+                    &mut state,
+                    &executable,
+                    compute_threads,
+                    WorkerLossEvidence::systemic(),
+                    &comparisons,
+                    RecoveryMode::Normal,
+                ) {
                     mark_tree_tier_unavailable(
                         &mut state,
                         &disabled,
@@ -3018,6 +3048,15 @@ fn retire_client(state: &mut SupervisorState) -> std::io::Result<()> {
             Ok(())
         }
     }
+}
+
+fn quiesce_published_client(state: &mut SupervisorState) -> std::io::Result<()> {
+    state.read_client.store(None);
+    state
+        .client
+        .as_ref()
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotConnected, "worker is absent"))?
+        .wait_for_idle_generation(SHADOW_SHUTDOWN_TIMEOUT)
 }
 
 fn mark_tree_tier_unavailable(

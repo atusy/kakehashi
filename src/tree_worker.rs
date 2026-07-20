@@ -5338,6 +5338,34 @@ impl Client {
         }
     }
 
+    pub fn wait_for_idle_generation(&self, timeout: Duration) -> io::Result<()> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            let active_routes = self
+                .routes
+                .lock()
+                .map_err(|_| io::Error::other("worker response router is poisoned"))?
+                .len();
+            let active_hazards = self
+                .active_grammar_hazards
+                .lock()
+                .map_err(|_| io::Error::other("worker grammar hazard ledger is poisoned"))?
+                .len();
+            if client_generation_is_idle(active_routes, active_hazards) {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    format!(
+                        "worker generation did not quiesce (routes={active_routes} hazards={active_hazards})"
+                    ),
+                ));
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
     /// Idempotently cancel queued or cooperatively running work in this worker
     /// generation. The original request route remains until its terminal
     /// response arrives.
@@ -5623,6 +5651,10 @@ fn route_is_admissible(active: usize, max_inflight: usize, uses_supervisor_reser
     active < max_inflight.saturating_add(usize::from(uses_supervisor_reserve))
 }
 
+fn client_generation_is_idle(active_routes: usize, active_hazards: usize) -> bool {
+    active_routes == 0 && active_hazards == 0
+}
+
 fn failed_spawn(
     child: Arc<Mutex<OwnedChild>>,
     stdin: ChildStdin,
@@ -5814,8 +5846,8 @@ mod tests {
         ResolveNode, Response, Route, RunCaptures, RunNodeScalar, RunnableDocuments,
         SEMANTIC_CACHE_AUXILIARY_TRIM_THRESHOLD_BYTES, SyncDocument, WireByteRange, WirePosition,
         WireRange, WireSemanticToken, WorkPriority, WorkerError, WorkerGrammarIdentity,
-        WorkerQuerySources, cache_eviction_plan, close_document, decode_frame,
-        derive_snapshot_with_language, encode_frame, enforce_derived_memory_budget,
+        WorkerQuerySources, cache_eviction_plan, client_generation_is_idle, close_document,
+        decode_frame, derive_snapshot_with_language, encode_frame, enforce_derived_memory_budget,
         named_node_count, parse_request_timeout, pressure_checkpoint_required,
         replace_retained_bytes, replace_retained_estimated_bytes, request_may_grow_derived_state,
         request_priority, reserve_retained_growth, route_is_admissible, route_response, run,
@@ -6140,6 +6172,13 @@ mod tests {
         assert!(!route_is_admissible(16, 16, false));
         assert!(route_is_admissible(16, 16, true));
         assert!(!route_is_admissible(17, 16, true));
+    }
+
+    #[test]
+    fn cooperative_restart_requires_routes_and_hazards_to_drain() {
+        assert!(client_generation_is_idle(0, 0));
+        assert!(!client_generation_is_idle(1, 0));
+        assert!(!client_generation_is_idle(0, 1));
     }
 
     #[test]
