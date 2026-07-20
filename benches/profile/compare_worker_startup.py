@@ -102,7 +102,8 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--baseline-bin", type=pathlib.Path, required=True)
     parser.add_argument("--candidate-bin", type=pathlib.Path, required=True)
-    parser.add_argument("--bench", type=pathlib.Path, required=True)
+    parser.add_argument("--baseline-bench", type=pathlib.Path, required=True)
+    parser.add_argument("--candidate-bench", type=pathlib.Path, required=True)
     parser.add_argument("--parser", type=pathlib.Path, required=True)
     parser.add_argument("--data-dir", type=pathlib.Path, required=True)
     parser.add_argument("--baseline-commit", required=True)
@@ -115,11 +116,12 @@ def main():
         parser.error("pairs must be positive and warmup pairs non-negative")
 
     binaries = {"baseline": args.baseline_bin, "candidate": args.candidate_bin}
+    benches = {"baseline": args.baseline_bench, "candidate": args.candidate_bench}
     script_dir = pathlib.Path(__file__).resolve().parent
 
     def run(kind):
         binary = binaries[kind]
-        handshake_us = run_handshake(args.bench, binary, args.parser)
+        handshake_us = run_handshake(benches[kind], binary, args.parser)
         lsp_elapsed_ms, lsp_request_ms = run_lsp(binary, args.data_dir, script_dir)
         return {
             "handshake_us": handshake_us,

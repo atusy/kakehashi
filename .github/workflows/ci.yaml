@@ -95,6 +95,9 @@ jobs:
           CARGO_TARGET_DIR="$RUNNER_TEMP/stage21-target" \
             cargo build --locked --release --bin kakehashi \
             --manifest-path "$RUNNER_TEMP/stage21-source/Cargo.toml"
+          CARGO_TARGET_DIR="$RUNNER_TEMP/stage21-target" \
+            cargo build --locked --release --bench tree_worker_stage1 \
+            --manifest-path "$RUNNER_TEMP/stage21-source/Cargo.toml"
           CARGO_TARGET_DIR="$RUNNER_TEMP/stage22-target" \
             cargo build --locked --release --bin kakehashi
           CARGO_TARGET_DIR="$RUNNER_TEMP/stage22-target" \
@@ -105,13 +108,17 @@ jobs:
           language install rust --data-dir "$RUNNER_TEMP/kakehashi-data" --force
       - name: Measure order-reversed startup pairs
         run: |
-          BENCH_BIN=$(find "$RUNNER_TEMP/stage22-target/release/deps" \
+          BASELINE_BENCH=$(find "$RUNNER_TEMP/stage21-target/release/deps" \
             -maxdepth 1 -type f -name 'tree_worker_stage1-*' -perm -111 | head -n 1)
-          test -n "$BENCH_BIN"
+          CANDIDATE_BENCH=$(find "$RUNNER_TEMP/stage22-target/release/deps" \
+            -maxdepth 1 -type f -name 'tree_worker_stage1-*' -perm -111 | head -n 1)
+          test -n "$BASELINE_BENCH"
+          test -n "$CANDIDATE_BENCH"
           python3 benches/profile/compare_worker_startup.py \
             --baseline-bin "$RUNNER_TEMP/stage21-target/release/kakehashi" \
             --candidate-bin "$RUNNER_TEMP/stage22-target/release/kakehashi" \
-            --bench "$BENCH_BIN" \
+            --baseline-bench "$BASELINE_BENCH" \
+            --candidate-bench "$CANDIDATE_BENCH" \
             --parser "$RUNNER_TEMP/kakehashi-data/parser/rust.so" \
             --data-dir "$RUNNER_TEMP/kakehashi-data" \
             --baseline-commit "$BASELINE_COMMIT" \
