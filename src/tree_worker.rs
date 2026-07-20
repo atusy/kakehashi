@@ -666,6 +666,16 @@ fn estimated_resolved_injection_bytes(
         }))
 }
 
+fn estimated_injection_layer_bytes(layers: &[CachedInjectionLayer], capacity: usize) -> usize {
+    (capacity * std::mem::size_of::<CachedInjectionLayer>()).saturating_add(layers.iter().fold(
+        0,
+        |bytes, layer| {
+            bytes
+                .saturating_add(layer.ranges.capacity() * std::mem::size_of::<tree_sitter::Range>())
+        },
+    ))
+}
+
 impl DocumentReplica {
     fn estimated_memory(&self) -> EstimatedDocumentMemory {
         EstimatedDocumentMemory {
@@ -687,7 +697,11 @@ impl DocumentReplica {
                             estimated_resolved_injection_bytes(resolved, resolved.capacity())
                         })
                         .unwrap_or_default(),
-                ),
+                )
+                .saturating_add(estimated_injection_layer_bytes(
+                    &self.injection_layers,
+                    self.injection_layers.capacity(),
+                )),
         }
     }
 
@@ -4449,19 +4463,20 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use super::{
-        ApplyDocumentEdits, BUILD_ID, ByteEdit, CancelRequest, CapturesResult, CloseDocument,
-        DeriveInjectionRegions, DeriveNativeBindings, DeriveSelectionRanges, DeriveSemanticTokens,
-        DeriveSnapshot, DocumentCompetition, DocumentKey, DocumentLane, DocumentReplica,
-        GrammarKey, Handshake, HandshakeReady, LaneAction, LaneRegistry, MAX_DOCUMENT_BYTES,
-        MAX_DOCUMENT_REPLICAS, MAX_RETAINED_DOCUMENT_BYTES, NavigateNode, NodeLayerSelector,
-        NodeNavigation, NodeScalarOperation, NodeScalarValue, OpaqueNodeId, PROTOCOL_VERSION,
-        Request, RequestCancelled, RequestContext, ResolveNode, Response, Route, RunCaptures,
-        RunNodeScalar, RunnableDocuments, SEMANTIC_CACHE_AUXILIARY_TRIM_THRESHOLD_BYTES,
-        SyncDocument, WireByteRange, WirePosition, WireRange, WireSemanticToken, WorkPriority,
-        WorkerError, WorkerQuerySources, close_document, decode_frame,
-        derive_snapshot_with_language, encode_frame, named_node_count, parse_request_timeout,
-        replace_retained_bytes, request_priority, reserve_retained_growth, route_response, run,
-        submit_document_job, sync_document, terminate_by_transport, validate_document_size,
+        ApplyDocumentEdits, BUILD_ID, ByteEdit, CachedInjectionLayer, CancelRequest,
+        CapturesResult, CloseDocument, DeriveInjectionRegions, DeriveNativeBindings,
+        DeriveSelectionRanges, DeriveSemanticTokens, DeriveSnapshot, DocumentCompetition,
+        DocumentKey, DocumentLane, DocumentReplica, GrammarKey, Handshake, HandshakeReady,
+        LaneAction, LaneRegistry, MAX_DOCUMENT_BYTES, MAX_DOCUMENT_REPLICAS,
+        MAX_RETAINED_DOCUMENT_BYTES, NavigateNode, NodeLayerSelector, NodeNavigation,
+        NodeScalarOperation, NodeScalarValue, OpaqueNodeId, PROTOCOL_VERSION, Request,
+        RequestCancelled, RequestContext, ResolveNode, Response, Route, RunCaptures, RunNodeScalar,
+        RunnableDocuments, SEMANTIC_CACHE_AUXILIARY_TRIM_THRESHOLD_BYTES, SyncDocument,
+        WireByteRange, WirePosition, WireRange, WireSemanticToken, WorkPriority, WorkerError,
+        WorkerQuerySources, close_document, decode_frame, derive_snapshot_with_language,
+        encode_frame, named_node_count, parse_request_timeout, replace_retained_bytes,
+        request_priority, reserve_retained_growth, route_response, run, submit_document_job,
+        sync_document, terminate_by_transport, validate_document_size,
     };
 
     #[derive(Clone, Default)]
@@ -6010,6 +6025,46 @@ mod tests {
         assert_eq!(
             after.auxiliary_cache_bytes,
             before.auxiliary_cache_bytes + resolved_bytes
+        );
+    }
+
+    #[test]
+    fn injection_layer_capacity_is_reported_as_auxiliary_memory() {
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_rust::LANGUAGE.into())
+            .unwrap();
+        let context = RequestContext {
+            request_id: 1,
+            worker_generation: 3,
+            uri: "file:///layer-accounting.rs".into(),
+            incarnation: 4,
+            content_version: 1,
+            configuration_generation: 2,
+        };
+        let (mut replica, _) = DocumentReplica::sync(
+            SyncDocument {
+                context,
+                language: "rust".into(),
+                grammar_symbol: "rust".into(),
+                source_path: "/unused/static-language".into(),
+                parser_path: "/unused/static-language".into(),
+                artifact_digest: "sha256:rust-v1".into(),
+                queries: WorkerQuerySources::default(),
+                text: "fn main() {}".into(),
+            },
+            &mut parser,
+        )
+        .unwrap();
+        let before = replica.estimated_memory();
+        replica.injection_layers = Vec::with_capacity(8);
+        let layer_bytes =
+            replica.injection_layers.capacity() * std::mem::size_of::<CachedInjectionLayer>();
+
+        let after = replica.estimated_memory();
+        assert_eq!(
+            after.auxiliary_cache_bytes,
+            before.auxiliary_cache_bytes + layer_bytes
         );
     }
 
