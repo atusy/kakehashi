@@ -1260,6 +1260,16 @@ pairs found noise-scale median paired deltas of +0.15% for driver elapsed and
 +0.05% for the first request. Linux parent-death-signal hardening and Windows
 ownership remain open with the later protocol and migration gates.
 
+The [Stage 22 Linux parent-death measurement](single-resident-multithreaded-tree-worker-stage22-measurement.md)
+proves kernel parent-death delivery independently of pipe EOF and closes the
+registration race with an immediate expected-parent PID comparison. Twelve
+order-reversed Linux release pairs found no startup regression: median paired
+deltas were -0.028% for the worker handshake, +0.430% for full LSP process
+lifetime, and +0.284% for the first semantic request. The direct worker is now
+hardened on Linux, while Windows ownership, abnormal descendant cleanup after
+parent death, native hazard/quarantine control, protocol and compatibility
+gates, and legacy-path removal remain open.
+
 The implementation should proceed in measured stages:
 
 1. Prototype the framed transport, supervision, and one high-level

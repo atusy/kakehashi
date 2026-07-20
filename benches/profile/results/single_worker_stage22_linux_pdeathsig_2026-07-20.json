@@ -1,0 +1,45 @@
+{
+  "schema": 1,
+  "experiment": "single-tree-worker-stage22-linux-pdeathsig",
+  "environment": {
+    "platform": "Linux-6.17.0-1020-azure-x86_64-with-glibc2.39",
+    "cpu": "AMD EPYC 9V74 80-Core Processor",
+    "python": "3.12.3",
+    "baseline_commit": "09a6fd7248dd70916468a6335fd62485474bd83a",
+    "candidate_commit": "ab95f78c1da7ac044d54d60cada3eec583d750f8",
+    "baseline_binary_sha256": "462861c7ea413629a1576c095d6b696e2b1cb6c83869570e2ce682186f169a09",
+    "candidate_binary_sha256": "97c8a1994267913899c3b4d4fb0f71a48be170756b00f9684389d0ce2532124f"
+  },
+  "scenario": {
+    "worker_threads": 4,
+    "language": "rust",
+    "generated_size": 15,
+    "measured_requests": 1,
+    "fresh_xdg_per_lsp_run": true,
+    "order": "baseline-candidate on odd runs; candidate-baseline on even runs",
+    "handshake_definition": "Client::spawn through HandshakeReady",
+    "lsp_elapsed_definition": "process spawn through validated request and clean shutdown",
+    "lsp_request_definition": "semantic request send through validated response"
+  },
+  "warmup_pairs": 2,
+  "measured_pairs": 12,
+  "pairs": [
+    {"run":1,"order":"baseline-candidate","baseline":{"handshake_us":80067.72600000001,"lsp_elapsed_ms":273.09223899999324,"lsp_request_ms":101.22083600003862},"candidate":{"handshake_us":95151.552,"lsp_elapsed_ms":275.26084800001627,"lsp_request_ms":101.5247459999955}},
+    {"run":2,"order":"candidate-baseline","candidate":{"handshake_us":80514.382,"lsp_elapsed_ms":273.796184000048,"lsp_request_ms":102.54470500001389},"baseline":{"handshake_us":79712.14899999999,"lsp_elapsed_ms":274.73775299995395,"lsp_request_ms":101.5596380000261}},
+    {"run":3,"order":"baseline-candidate","baseline":{"handshake_us":79255.12299999999,"lsp_elapsed_ms":271.61454200006574,"lsp_request_ms":100.210089999905},"candidate":{"handshake_us":79843.924,"lsp_elapsed_ms":274.2999010000631,"lsp_request_ms":101.7965879999565}},
+    {"run":4,"order":"candidate-baseline","candidate":{"handshake_us":80094.58499999999,"lsp_elapsed_ms":273.93572300002234,"lsp_request_ms":101.67794300002697},"baseline":{"handshake_us":79150.56400000001,"lsp_elapsed_ms":272.6811289999205,"lsp_request_ms":101.68222899994817}},
+    {"run":5,"order":"baseline-candidate","baseline":{"handshake_us":78647.248,"lsp_elapsed_ms":280.22685899998123,"lsp_request_ms":104.5321399999466},"candidate":{"handshake_us":80364.827,"lsp_elapsed_ms":279.7530259999803,"lsp_request_ms":102.62902700003451}},
+    {"run":6,"order":"candidate-baseline","candidate":{"handshake_us":79256.697,"lsp_elapsed_ms":270.2418750000106,"lsp_request_ms":99.43271700001333},"baseline":{"handshake_us":81276.043,"lsp_elapsed_ms":272.91292699999303,"lsp_request_ms":101.55292299998564}},
+    {"run":7,"order":"baseline-candidate","baseline":{"handshake_us":80589.852,"lsp_elapsed_ms":269.9770780000108,"lsp_request_ms":98.99479299997438},"candidate":{"handshake_us":78762.96500000001,"lsp_elapsed_ms":269.5501239999203,"lsp_request_ms":98.7146780000785}},
+    {"run":8,"order":"candidate-baseline","candidate":{"handshake_us":79673.043,"lsp_elapsed_ms":272.5248179999653,"lsp_request_ms":101.25068000002102},"baseline":{"handshake_us":79936.473,"lsp_elapsed_ms":271.43979499999205,"lsp_request_ms":100.0089010000238}},
+    {"run":9,"order":"baseline-candidate","baseline":{"handshake_us":79313.44499999999,"lsp_elapsed_ms":274.9427269999387,"lsp_request_ms":100.28402800003278},"candidate":{"handshake_us":79529.805,"lsp_elapsed_ms":272.0970130000069,"lsp_request_ms":100.01502900001924}},
+    {"run":10,"order":"candidate-baseline","candidate":{"handshake_us":80567.929,"lsp_elapsed_ms":278.24481499999365,"lsp_request_ms":102.99358099996425},"baseline":{"handshake_us":81897.966,"lsp_elapsed_ms":276.90479500006404,"lsp_request_ms":102.4547030000349}},
+    {"run":11,"order":"baseline-candidate","baseline":{"handshake_us":81476.887,"lsp_elapsed_ms":275.5916859999843,"lsp_request_ms":103.57526799998595},"candidate":{"handshake_us":80497.87299999999,"lsp_elapsed_ms":279.91548900001817,"lsp_request_ms":103.8524470000084}},
+    {"run":12,"order":"candidate-baseline","candidate":{"handshake_us":79954.149,"lsp_elapsed_ms":282.8334680000353,"lsp_request_ms":102.96995200008041},"baseline":{"handshake_us":80646.428,"lsp_elapsed_ms":277.97494399999323,"lsp_request_ms":102.33066500006771}}
+  ],
+  "summary": {
+    "handshake_us": {"baseline_median":80002.09950000001,"candidate_median":80024.367,"median_paired_delta_percent":-0.02837905746431446,"baseline_min":78647.248,"baseline_max":81897.966,"candidate_min":78762.96500000001,"candidate_max":95151.552},
+    "lsp_elapsed_ms": {"baseline_median":273.9149959999736,"candidate_median":274.1178120000427,"median_paired_delta_percent":0.42991221615051106,"baseline_min":269.9770780000108,"baseline_max":280.22685899998123,"candidate_min":269.5501239999203,"candidate_max":282.8334680000353},
+    "lsp_request_ms": {"baseline_median":101.55628050000587,"candidate_median":101.73726549999174,"median_paired_delta_percent":0.2839278449796575,"baseline_min":98.99479299997438,"baseline_max":104.5321399999466,"candidate_min":98.7146780000785,"candidate_max":103.8524470000084}
+  }
+}
