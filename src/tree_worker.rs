@@ -4196,7 +4196,7 @@ pub fn run_stdio_with_memory_budgets(
     compute_threads: usize,
     memory_budgets: WorkerMemoryBudgets,
 ) -> io::Result<()> {
-    run_stdio_with_parent_liveness(compute_threads, memory_budgets, None)
+    run_stdio_with_parent_liveness(compute_threads, memory_budgets, None, None)
 }
 
 #[doc(hidden)]
@@ -4204,13 +4204,23 @@ pub fn run_stdio_with_parent_liveness(
     compute_threads: usize,
     memory_budgets: WorkerMemoryBudgets,
     parent_liveness_fd: Option<i32>,
+    expected_parent_pid: Option<u32>,
 ) -> io::Result<()> {
+    let parent_liveness = ParentLiveness::from_parts(parent_liveness_fd, expected_parent_pid)?;
+    #[cfg(target_os = "linux")]
+    if let Some(expected_parent_pid) = parent_liveness.expected_parent_pid() {
+        wait_at_test_registration_barrier()?;
+        if let Err(error) = arm_linux_parent_death_signal(expected_parent_pid) {
+            eprintln!(
+                "tree worker Linux parent-death signal unavailable ({error}); \
+                 close-on-exec liveness pipe remains armed"
+            );
+        }
+    }
     #[cfg(unix)]
-    if let Some(fd) = parent_liveness_fd {
+    if let Some(fd) = parent_liveness.read_fd() {
         arm_parent_liveness(fd)?;
     }
-    #[cfg(not(unix))]
-    let _ = parent_liveness_fd;
     #[cfg(feature = "e2e")]
     publish_test_worker_pid()?;
     #[cfg(all(unix, feature = "e2e"))]
@@ -4223,6 +4233,127 @@ pub fn run_stdio_with_parent_liveness(
         &build_id,
         memory_budgets,
     )
+}
+
+enum ParentLiveness {
+    Detached,
+    #[cfg(unix)]
+    Pipe {
+        read_fd: i32,
+        #[cfg(target_os = "linux")]
+        expected_parent_pid: u32,
+    },
+}
+
+impl ParentLiveness {
+    fn from_parts(read_fd: Option<i32>, expected_parent_pid: Option<u32>) -> io::Result<Self> {
+        #[cfg(target_os = "linux")]
+        return match (read_fd, expected_parent_pid) {
+            (None, None) => Ok(Self::Detached),
+            (Some(read_fd), Some(expected_parent_pid)) if expected_parent_pid > 0 => {
+                Ok(Self::Pipe {
+                    read_fd,
+                    expected_parent_pid,
+                })
+            }
+            _ => Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Linux worker parent liveness requires both fd and expected PID",
+            )),
+        };
+        #[cfg(all(unix, not(target_os = "linux")))]
+        return match (read_fd, expected_parent_pid) {
+            (None, None) => Ok(Self::Detached),
+            (Some(read_fd), None) => Ok(Self::Pipe { read_fd }),
+            _ => Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "non-Linux Unix worker parent liveness accepts an fd only",
+            )),
+        };
+        #[cfg(not(unix))]
+        match (read_fd, expected_parent_pid) {
+            (None, None) => Ok(Self::Detached),
+            _ => Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "worker parent liveness is unsupported on this platform",
+            )),
+        }
+    }
+
+    #[cfg(unix)]
+    fn read_fd(&self) -> Option<i32> {
+        match self {
+            Self::Detached => None,
+            Self::Pipe { read_fd, .. } => Some(*read_fd),
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn expected_parent_pid(&self) -> Option<u32> {
+        match self {
+            Self::Detached => None,
+            Self::Pipe {
+                expected_parent_pid,
+                ..
+            } => Some(*expected_parent_pid),
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn arm_linux_parent_death_signal(expected_parent_pid: u32) -> io::Result<()> {
+    // SAFETY: PR_SET_PDEATHSIG consumes the integer signal value and no
+    // pointer arguments. SIGKILL is valid on Linux.
+    if unsafe { nix::libc::prctl(nix::libc::PR_SET_PDEATHSIG, nix::libc::SIGKILL, 0, 0, 0) } == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    // No allocation, logging, or fallible work may occur between registration
+    // and this race check. The numeric PID detects a parent already lost; the
+    // kernel retains the actual spawning-thread relationship thereafter.
+    let actual_parent_pid = unsafe { nix::libc::getppid() };
+    if actual_parent_pid != expected_parent_pid as nix::libc::pid_t {
+        // SAFETY: immediate exit is required before any worker state becomes
+        // observable when the parent disappeared before registration.
+        unsafe { nix::libc::_exit(1) }
+    }
+    publish_test_pdeathsig_marker()
+}
+
+#[cfg(all(target_os = "linux", feature = "e2e"))]
+fn wait_at_test_registration_barrier() -> io::Result<()> {
+    let Some(before) = std::env::var_os("KAKEHASHI_TREE_WORKER_PDEATHSIG_BEFORE_MARKER") else {
+        return Ok(());
+    };
+    std::fs::write(before, "before")?;
+    if let Some(gate) = std::env::var_os("KAKEHASHI_TREE_WORKER_PDEATHSIG_GATE") {
+        while std::path::Path::new(&gate).exists() {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(all(target_os = "linux", not(feature = "e2e")))]
+fn wait_at_test_registration_barrier() -> io::Result<()> {
+    Ok(())
+}
+
+#[cfg(all(target_os = "linux", feature = "e2e"))]
+fn publish_test_pdeathsig_marker() -> io::Result<()> {
+    let Some(marker) = std::env::var_os("KAKEHASHI_TREE_WORKER_PDEATHSIG_MARKER") else {
+        return Ok(());
+    };
+    let mut signal = 0;
+    // SAFETY: PR_GET_PDEATHSIG writes one integer through a valid local pointer.
+    if unsafe { nix::libc::prctl(nix::libc::PR_GET_PDEATHSIG, &mut signal) } == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    std::fs::write(marker, signal.to_string())
+}
+
+#[cfg(all(target_os = "linux", not(feature = "e2e")))]
+fn publish_test_pdeathsig_marker() -> io::Result<()> {
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -4326,6 +4457,10 @@ impl OwnedChild {
             fcntl(&write_end, FcntlArg::F_SETFD(FdFlag::FD_CLOEXEC))?;
             let read_fd = read_end.as_raw_fd();
             command.arg("--parent-liveness-fd").arg(read_fd.to_string());
+            #[cfg(target_os = "linux")]
+            command
+                .arg("--expected-parent-pid")
+                .arg(std::process::id().to_string());
             // SAFETY: `fcntl` is async-signal-safe. The closure only clears
             // CLOEXEC on the one pipe end intentionally inherited by this
             // worker and allocates nothing after fork.
@@ -5122,20 +5257,35 @@ mod tests {
         GrammarKey, Handshake, HandshakeReady, LaneAction, LaneRegistry, MAX_DOCUMENT_BYTES,
         MAX_DOCUMENT_REPLICAS, MAX_RETAINED_DOCUMENT_BYTES, MAX_RETAINED_ESTIMATED_DOCUMENT_BYTES,
         NavigateNode, NodeLayerSelector, NodeNavigation, NodeScalarOperation, NodeScalarValue,
-        OpaqueNodeId, OwnedChild, PROTOCOL_VERSION, Request, RequestCancelled, RequestContext,
-        ResolveNode, Response, Route, RunCaptures, RunNodeScalar, RunnableDocuments,
-        SEMANTIC_CACHE_AUXILIARY_TRIM_THRESHOLD_BYTES, SyncDocument, WireByteRange, WirePosition,
-        WireRange, WireSemanticToken, WorkPriority, WorkerError, WorkerQuerySources,
-        cache_eviction_plan, close_document, decode_frame, derive_snapshot_with_language,
-        encode_frame, enforce_derived_memory_budget, named_node_count, parse_request_timeout,
-        pressure_checkpoint_required, replace_retained_bytes, replace_retained_estimated_bytes,
-        request_may_grow_derived_state, request_priority, reserve_retained_growth, route_response,
-        run, submit_document_job, sync_document, terminate, terminate_by_transport,
-        validate_document_size,
+        OpaqueNodeId, OwnedChild, PROTOCOL_VERSION, ParentLiveness, Request, RequestCancelled,
+        RequestContext, ResolveNode, Response, Route, RunCaptures, RunNodeScalar,
+        RunnableDocuments, SEMANTIC_CACHE_AUXILIARY_TRIM_THRESHOLD_BYTES, SyncDocument,
+        WireByteRange, WirePosition, WireRange, WireSemanticToken, WorkPriority, WorkerError,
+        WorkerQuerySources, cache_eviction_plan, close_document, decode_frame,
+        derive_snapshot_with_language, encode_frame, enforce_derived_memory_budget,
+        named_node_count, parse_request_timeout, pressure_checkpoint_required,
+        replace_retained_bytes, replace_retained_estimated_bytes, request_may_grow_derived_state,
+        request_priority, reserve_retained_growth, route_response, run, submit_document_job,
+        sync_document, terminate, terminate_by_transport, validate_document_size,
     };
 
     #[derive(Clone, Default)]
     struct SharedWriter(Arc<Mutex<Vec<u8>>>);
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_parent_liveness_rejects_partial_or_zero_identity() {
+        assert!(ParentLiveness::from_parts(Some(7), None).is_err());
+        assert!(ParentLiveness::from_parts(None, Some(42)).is_err());
+        assert!(ParentLiveness::from_parts(Some(7), Some(0)).is_err());
+        assert!(ParentLiveness::from_parts(Some(7), Some(42)).is_ok());
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn non_linux_parent_liveness_rejects_linux_identity() {
+        assert!(ParentLiveness::from_parts(None, Some(42)).is_err());
+    }
 
     impl Write for SharedWriter {
         fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {

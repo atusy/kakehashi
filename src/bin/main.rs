@@ -96,6 +96,9 @@ enum Commands {
         /// Parent-owned liveness pipe inherited by the worker on Unix.
         #[arg(long)]
         parent_liveness_fd: Option<i32>,
+        /// PID of the Linux thread-group whose thread spawned this worker.
+        #[arg(long)]
+        expected_parent_pid: Option<u32>,
     },
     /// Report diagnostics for files via the configured downstream language servers
     ///
@@ -359,6 +362,7 @@ fn main() -> ExitCode {
             derived_cache_soft_bytes,
             non_evictable_estimate_hard_bytes,
             parent_liveness_fd,
+            expected_parent_pid,
         }) => kakehashi::tree_worker::WorkerMemoryBudgets::new(
             derived_cache_soft_bytes,
             non_evictable_estimate_hard_bytes,
@@ -372,6 +376,7 @@ fn main() -> ExitCode {
                 threads,
                 memory_budgets,
                 parent_liveness_fd,
+                expected_parent_pid,
             )
             .map_err(|error| {
                 eprintln!("tree worker failed: {error}");
