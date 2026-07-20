@@ -1,10 +1,12 @@
 {
   "baseline": {
+    "binary_sha256": "66cb417321d9dc694aee35860819050799ed0624398ddebf518125977826b2d1",
     "commit": "f6e0c2125f6f2c93e799ab3b0b4c7b6471691f53",
     "stage": 25
   },
   "candidate": {
-    "commit": "370d13d2cdcdd7bf6e1b8927e768319116fe8a97",
+    "binary_sha256": "26480f59d243aaba8dc0b6830c3bf6343f6ced7ebb99e982b491e19becfb3d60",
+    "commit": "33c61b5b660e003dcfcc84e4883e17ad78bd8cfa",
     "stage": 26
   },
   "environment": {
@@ -24,23 +26,23 @@
       "warmup_runs_per_stage": 1
     },
     "samples_ms": [
-      { "pair": 1, "stage25": 1275, "stage26": 1251 },
-      { "pair": 2, "stage25": 1266, "stage26": 1277 },
-      { "pair": 3, "stage25": 1299, "stage26": 1283 },
-      { "pair": 4, "stage25": 1254, "stage26": 1571 },
-      { "pair": 5, "stage25": 1264, "stage26": 1281 },
-      { "pair": 6, "stage25": 1250, "stage26": 1450 },
-      { "pair": 7, "stage25": 1279, "stage26": 1278 }
+      { "pair": 1, "stage25": 1146, "stage26": 1133 },
+      { "pair": 2, "stage25": 1170, "stage26": 1151 },
+      { "pair": 3, "stage25": 1159, "stage26": 1184 },
+      { "pair": 4, "stage25": 1236, "stage26": 1150 },
+      { "pair": 5, "stage25": 1183, "stage26": 1172 },
+      { "pair": 6, "stage25": 1168, "stage26": 1184 },
+      { "pair": 7, "stage25": 1243, "stage26": 1204 }
     ],
     "summary": {
-      "median_paired_delta_ms": 11,
-      "median_paired_delta_percent": 0.869,
-      "stage25_mean_ms": 1269.571,
-      "stage25_median_ms": 1266,
-      "stage25_range_ms": [1250, 1299],
-      "stage26_mean_ms": 1341.571,
-      "stage26_median_ms": 1281,
-      "stage26_range_ms": [1251, 1571]
+      "median_paired_delta_ms": -13,
+      "median_paired_delta_percent": -1.111,
+      "stage25_mean_ms": 1186.429,
+      "stage25_median_ms": 1170,
+      "stage25_range_ms": [1146, 1243],
+      "stage26_mean_ms": 1168.286,
+      "stage26_median_ms": 1172,
+      "stage26_range_ms": [1133, 1204]
     }
   },
   "two_active_grammars": {
@@ -58,11 +60,81 @@
       "threads": 4,
       "warmup_runs": 1
     },
-    "samples_ms": [959, 971, 974, 971, 1126, 981, 990],
+    "samples_ms": [957, 957, 957, 936, 932, 954, 967],
     "summary": {
-      "mean_ms": 996,
-      "median_ms": 974,
-      "range_ms": [959, 1126]
+      "mean_ms": 951.429,
+      "median_ms": 957,
+      "range_ms": [932, 967]
+    }
+  },
+  "saturated_noncooperative_timeout": {
+    "assertions_per_run": {
+      "committed_hazards": 4,
+      "compute_threads_saturated": 4,
+      "full_resynced_documents": 4,
+      "newly_quarantined_grammars": 0,
+      "restarts": 1
+    },
+    "method": {
+      "build_profile": "test (unoptimized + debuginfo)",
+      "cancellation_grace_ms": 250,
+      "measurement": "request issue through replacement readiness after all four compute threads park",
+      "request_deadline_ms": 2000,
+      "runs": 7,
+      "test": "noncooperative_jobs_saturating_all_compute_threads_recover_as_one_generation",
+      "threads": 4,
+      "warmup_runs": 1
+    },
+    "samples_ms": [3211, 3205, 3198, 3187, 3206, 3209, 3201],
+    "summary": {
+      "mean_ms": 3202.429,
+      "median_ms": 3205,
+      "range_ms": [3187, 3211]
+    }
+  },
+  "steady_state": {
+    "artifacts": {
+      "harness_source_sha256": "fe96da0be057f65836e6948334752daeb4d5c0dcd363645e2dbcc0d1a5dbdcab",
+      "stage25_harness_binary_sha256": "d9451d0a4e531c4b7fac5bcf81e5be61294ee7b0f0a462ef0e03d478ddcd10a4",
+      "stage26_harness_binary_sha256": "58d1335409085da3ff59c2aa54a0c707482c5f66357d8c64b903f15f76eab5ef"
+    },
+    "method": {
+      "build_profile": "release (optimized)",
+      "lines": 200,
+      "pairs": 12,
+      "requests_per_run": 500,
+      "revision_order": "alternating stage25/stage26",
+      "threads": 4,
+      "warmup_runs_per_stage": 1,
+      "worker_direct_order": "alternating"
+    },
+    "pairs": [
+      { "pair": 1, "stage25": [475.250, 545.375, 576.375, 651.834, 6368.433], "stage26": [453.333, 495.166, 558.208, 675.375, 6443.960] },
+      { "pair": 2, "stage25": [476.583, 540.000, 566.042, 638.042, 6494.290], "stage26": [530.084, 623.792, 550.000, 642.250, 6569.356] },
+      { "pair": 3, "stage25": [453.833, 482.166, 559.083, 622.417, 6602.349], "stage26": [452.333, 498.750, 556.000, 623.500, 6601.277] },
+      { "pair": 4, "stage25": [438.708, 468.334, 546.834, 628.667, 6789.677], "stage26": [450.458, 477.833, 536.042, 631.250, 6885.657] },
+      { "pair": 5, "stage25": [452.959, 494.458, 560.416, 626.291, 6562.598], "stage26": [455.959, 513.791, 562.292, 621.166, 6599.527] },
+      { "pair": 6, "stage25": [453.375, 497.583, 545.875, 625.500, 6810.887], "stage26": [443.500, 477.417, 549.417, 646.875, 6763.943] },
+      { "pair": 7, "stage25": [450.666, 479.917, 554.125, 629.958, 6620.748], "stage26": [451.167, 484.916, 563.708, 636.666, 6477.443] },
+      { "pair": 8, "stage25": [452.959, 484.875, 544.959, 629.417, 6815.471], "stage26": [449.541, 478.375, 534.167, 642.875, 6878.194] },
+      { "pair": 9, "stage25": [408.458, 467.417, 563.208, 638.667, 6520.509], "stage26": [409.875, 470.833, 559.375, 628.791, 6586.708] },
+      { "pair": 10, "stage25": [455.834, 496.209, 529.500, 633.083, 6954.643], "stage26": [454.667, 495.417, 559.459, 639.583, 6528.353] },
+      { "pair": 11, "stage25": [447.625, 475.875, 558.417, 632.250, 6594.403], "stage26": [453.209, 494.792, 561.250, 626.333, 6538.505] },
+      { "pair": 12, "stage25": [478.000, 542.958, 558.834, 628.375, 6555.425], "stage26": [477.375, 542.250, 540.625, 765.000, 5941.930] }
+    ],
+    "pair_value_order": [
+      "sequential_parent_p50_us",
+      "sequential_parent_p95_us",
+      "parallel_parent_p50_us",
+      "parallel_parent_p95_us",
+      "parallel_requests_per_second"
+    ],
+    "summary": {
+      "parallel_parent_p50_us": { "stage25_median": 558.626, "stage26_median": 557.104, "median_paired_delta_percent": -0.616 },
+      "parallel_parent_p95_us": { "stage25_median": 629.688, "stage26_median": 638.125, "median_paired_delta_percent": 0.843 },
+      "parallel_requests_per_second": { "stage25_median": 6598.376, "stage26_median": 6578.032, "median_paired_delta_percent": 0.273 },
+      "sequential_parent_p50_us": { "stage25_median": 453.167, "stage26_median": 452.771, "median_paired_delta_percent": -0.010 },
+      "sequential_parent_p95_us": { "stage25_median": 489.667, "stage26_median": 494.979, "median_paired_delta_percent": 0.886 }
     }
   }
 }
