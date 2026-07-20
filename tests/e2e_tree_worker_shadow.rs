@@ -652,3 +652,89 @@ fn crashed_grammar_is_quarantined_only_in_session_and_other_grammar_recovers() {
             .expect("restart measurement log must be present")
     );
 }
+
+#[test]
+fn hung_grammar_hits_hard_deadline_and_other_grammar_recovers() {
+    let directory = tempfile::tempdir().unwrap();
+    let marker = directory.path().join("hang-once");
+    let mut client = LspClient::builder()
+        .env("KAKEHASHI_TREE_WORKER_SHADOW", "true")
+        .env("KAKEHASHI_TREE_WORKER_THREADS", "4")
+        .env("KAKEHASHI_TREE_WORKER_REQUEST_TIMEOUT_MS", "250")
+        .env(
+            "KAKEHASHI_TREE_WORKER_REQUEST_TIMEOUT_URI_SUFFIX",
+            "/hung.rs",
+        )
+        .env(
+            "KAKEHASHI_TREE_WORKER_HANG_ONCE_FILE",
+            marker.to_string_lossy().into_owned(),
+        )
+        .env("KAKEHASHI_TREE_WORKER_HANG_URI_SUFFIX", "/hung.rs")
+        .env(
+            "RUST_LOG",
+            "kakehashi::tree_worker_shadow=info,kakehashi::tree_worker_shadow_metrics=info",
+        )
+        .build();
+    initialize(&mut client);
+    let healthy_uri = "file:///survives-hang.lua";
+    client.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": healthy_uri,
+                "languageId": "lua",
+                "version": 1,
+                "text": "local recovered = true\n"
+            }
+        }),
+    );
+    let initial = client.send_request(
+        "textDocument/semanticTokens/full",
+        json!({ "textDocument": { "uri": healthy_uri } }),
+    );
+    assert!(initial.get("result").is_some(), "{initial:?}");
+
+    client.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": "file:///hung.rs",
+                "languageId": "rust",
+                "version": 1,
+                "text": "fn hangs_forever() {}\n"
+            }
+        }),
+    );
+    std::thread::sleep(Duration::from_secs(2));
+
+    let response = client.send_request(
+        "textDocument/semanticTokens/full",
+        json!({ "textDocument": { "uri": healthy_uri } }),
+    );
+    assert!(response.get("result").is_some(), "{response:?}");
+    std::thread::sleep(Duration::from_secs(1));
+
+    let stderr = shutdown_and_stderr(client);
+    assert!(marker.exists(), "failure injection did not run: {stderr}");
+    assert!(stderr.contains("timed out"), "{stderr}");
+    assert!(
+        stderr.contains("quarantined grammar conservatively for this session"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("symbol=rust"), "{stderr}");
+    assert!(stderr.contains("restarted worker generation"), "{stderr}");
+    assert!(
+        stderr.contains("full-resynced 1 open documents"),
+        "{stderr}"
+    );
+    assert_eq!(shadow_metric(&stderr, "matched"), 1, "{stderr}");
+    assert!(stderr.contains("pending=0"), "{stderr}");
+    assert!(!stderr.contains("disabled shadow tree tier"), "{stderr}");
+    eprintln!(
+        "hard-deadline recovery measurement: {}",
+        stderr
+            .lines()
+            .find(|line| line.contains("restarted worker generation"))
+            .expect("restart measurement log must be present")
+    );
+}

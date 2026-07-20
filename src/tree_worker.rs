@@ -3343,6 +3343,20 @@ fn inject_worker_failure_once(request: &Request) -> Option<Response> {
     let Request::SyncDocument(sync) = request else {
         return None;
     };
+    if let Ok(marker) = std::env::var("KAKEHASHI_TREE_WORKER_HANG_ONCE_FILE")
+        && std::env::var("KAKEHASHI_TREE_WORKER_HANG_URI_SUFFIX")
+            .ok()
+            .is_none_or(|suffix| sync.context.uri.ends_with(&suffix))
+        && std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(marker)
+            .is_ok()
+    {
+        loop {
+            std::thread::park();
+        }
+    }
     if let Ok(marker) = std::env::var("KAKEHASHI_TREE_WORKER_CRASH_ONCE_FILE")
         && std::fs::OpenOptions::new()
             .write(true)
@@ -3445,6 +3459,35 @@ pub struct Client {
     writer: Option<std::thread::JoinHandle<()>>,
     ready: HandshakeReady,
     max_inflight: usize,
+}
+
+const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
+
+fn parse_request_timeout(value: Option<&str>) -> Duration {
+    value
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|milliseconds| *milliseconds > 0)
+        .map(Duration::from_millis)
+        .unwrap_or(DEFAULT_REQUEST_TIMEOUT)
+}
+
+fn request_timeout(_uri: &str) -> Duration {
+    #[cfg(feature = "e2e")]
+    {
+        if std::env::var("KAKEHASHI_TREE_WORKER_REQUEST_TIMEOUT_URI_SUFFIX")
+            .ok()
+            .is_some_and(|suffix| !_uri.ends_with(&suffix))
+        {
+            return DEFAULT_REQUEST_TIMEOUT;
+        }
+        return parse_request_timeout(
+            std::env::var("KAKEHASHI_TREE_WORKER_REQUEST_TIMEOUT_MS")
+                .ok()
+                .as_deref(),
+        );
+    }
+    #[cfg(not(feature = "e2e"))]
+    DEFAULT_REQUEST_TIMEOUT
 }
 
 struct Route {
@@ -3671,7 +3714,8 @@ impl Client {
     }
 
     pub fn derive(&self, request: DeriveSnapshot) -> io::Result<Response> {
-        self.derive_with_timeout(request, Duration::from_secs(60))
+        let timeout = request_timeout(&request.context.uri);
+        self.derive_with_timeout(request, timeout)
     }
 
     /// Sends one request with a process-level recovery deadline.
@@ -3690,20 +3734,14 @@ impl Client {
 
     pub fn sync_document(&self, request: SyncDocument) -> io::Result<Response> {
         let context = request.context.clone();
-        self.request_with_timeout(
-            Request::SyncDocument(request),
-            context,
-            Duration::from_secs(60),
-        )
+        let timeout = request_timeout(&context.uri);
+        self.request_with_timeout(Request::SyncDocument(request), context, timeout)
     }
 
     pub fn apply_document_edits(&self, request: ApplyDocumentEdits) -> io::Result<Response> {
         let context = request.context.clone();
-        self.request_with_timeout(
-            Request::ApplyDocumentEdits(request),
-            context,
-            Duration::from_secs(60),
-        )
+        let timeout = request_timeout(&context.uri);
+        self.request_with_timeout(Request::ApplyDocumentEdits(request), context, timeout)
     }
 
     pub fn apply_document_edits_and_derive(
@@ -3711,10 +3749,11 @@ impl Client {
         request: ApplyDocumentEditsAndDerive,
     ) -> io::Result<Response> {
         let context = request.context.clone();
+        let timeout = request_timeout(&context.uri);
         self.request_with_timeout(
             Request::ApplyDocumentEditsAndDerive(request),
             context,
-            Duration::from_secs(60),
+            timeout,
         )
     }
 
@@ -3723,47 +3762,32 @@ impl Client {
         request: DeriveDocumentSnapshot,
     ) -> io::Result<Response> {
         let context = request.context.clone();
-        self.request_with_timeout(
-            Request::DeriveDocumentSnapshot(request),
-            context,
-            Duration::from_secs(60),
-        )
+        let timeout = request_timeout(&context.uri);
+        self.request_with_timeout(Request::DeriveDocumentSnapshot(request), context, timeout)
     }
 
     pub fn resolve_node(&self, request: ResolveNode) -> io::Result<Response> {
         let context = request.context.clone();
-        self.request_with_timeout(
-            Request::ResolveNode(request),
-            context,
-            Duration::from_secs(60),
-        )
+        let timeout = request_timeout(&context.uri);
+        self.request_with_timeout(Request::ResolveNode(request), context, timeout)
     }
 
     pub fn navigate_node(&self, request: NavigateNode) -> io::Result<Response> {
         let context = request.context.clone();
-        self.request_with_timeout(
-            Request::NavigateNode(request),
-            context,
-            Duration::from_secs(60),
-        )
+        let timeout = request_timeout(&context.uri);
+        self.request_with_timeout(Request::NavigateNode(request), context, timeout)
     }
 
     pub fn run_node_scalar(&self, request: RunNodeScalar) -> io::Result<Response> {
         let context = request.context.clone();
-        self.request_with_timeout(
-            Request::RunNodeScalar(request),
-            context,
-            Duration::from_secs(60),
-        )
+        let timeout = request_timeout(&context.uri);
+        self.request_with_timeout(Request::RunNodeScalar(request), context, timeout)
     }
 
     pub fn derive_selection_ranges(&self, request: DeriveSelectionRanges) -> io::Result<Response> {
         let context = request.context.clone();
-        self.request_with_timeout(
-            Request::DeriveSelectionRanges(request),
-            context,
-            Duration::from_secs(60),
-        )
+        let timeout = request_timeout(&context.uri);
+        self.request_with_timeout(Request::DeriveSelectionRanges(request), context, timeout)
     }
 
     pub fn derive_injection_regions(
@@ -3771,56 +3795,38 @@ impl Client {
         request: DeriveInjectionRegions,
     ) -> io::Result<Response> {
         let context = request.context.clone();
-        self.request_with_timeout(
-            Request::DeriveInjectionRegions(request),
-            context,
-            Duration::from_secs(60),
-        )
+        let timeout = request_timeout(&context.uri);
+        self.request_with_timeout(Request::DeriveInjectionRegions(request), context, timeout)
     }
 
     pub fn derive_semantic_tokens(&self, request: DeriveSemanticTokens) -> io::Result<Response> {
         let context = request.context.clone();
-        self.request_with_timeout(
-            Request::DeriveSemanticTokens(request),
-            context,
-            Duration::from_secs(60),
-        )
+        let timeout = request_timeout(&context.uri);
+        self.request_with_timeout(Request::DeriveSemanticTokens(request), context, timeout)
     }
 
     pub fn run_captures(&self, request: RunCaptures) -> io::Result<Response> {
         let context = request.context.clone();
-        self.request_with_timeout(
-            Request::RunCaptures(request),
-            context,
-            Duration::from_secs(60),
-        )
+        let timeout = request_timeout(&context.uri);
+        self.request_with_timeout(Request::RunCaptures(request), context, timeout)
     }
 
     pub fn derive_native_bindings(&self, request: DeriveNativeBindings) -> io::Result<Response> {
         let context = request.context.clone();
-        self.request_with_timeout(
-            Request::DeriveNativeBindings(request),
-            context,
-            Duration::from_secs(60),
-        )
+        let timeout = request_timeout(&context.uri);
+        self.request_with_timeout(Request::DeriveNativeBindings(request), context, timeout)
     }
 
     pub fn configure_languages(&self, request: ConfigureLanguages) -> io::Result<Response> {
         let context = request.context.clone();
-        self.request_with_timeout(
-            Request::ConfigureLanguages(request),
-            context,
-            Duration::from_secs(60),
-        )
+        let timeout = request_timeout(&context.uri);
+        self.request_with_timeout(Request::ConfigureLanguages(request), context, timeout)
     }
 
     pub fn close_document(&self, request: CloseDocument) -> io::Result<Response> {
         let context = request.context.clone();
-        self.request_with_timeout(
-            Request::CloseDocument(request),
-            context,
-            Duration::from_secs(60),
-        )
+        let timeout = request_timeout(&context.uri);
+        self.request_with_timeout(Request::CloseDocument(request), context, timeout)
     }
 
     fn request_with_timeout(
@@ -4121,8 +4127,9 @@ mod tests {
         RequestCancelled, RequestContext, ResolveNode, Response, Route, RunCaptures, RunNodeScalar,
         SyncDocument, WireByteRange, WirePosition, WireRange, WorkerError, WorkerQuerySources,
         close_document, decode_frame, derive_snapshot_with_language, encode_frame,
-        named_node_count, replace_retained_bytes, reserve_retained_growth, route_response, run,
-        submit_document_job, sync_document, terminate_by_transport, validate_document_size,
+        named_node_count, parse_request_timeout, replace_retained_bytes, reserve_retained_growth,
+        route_response, run, submit_document_job, sync_document, terminate_by_transport,
+        validate_document_size,
     };
 
     #[derive(Clone, Default)]
@@ -4320,6 +4327,20 @@ mod tests {
             decode_frame(&mut Cursor::new(bytes)).unwrap(),
             Some(request)
         );
+    }
+
+    #[test]
+    fn request_timeout_override_is_positive_milliseconds() {
+        assert_eq!(
+            parse_request_timeout(Some("125")),
+            Duration::from_millis(125)
+        );
+        assert_eq!(parse_request_timeout(Some("0")), Duration::from_secs(60));
+        assert_eq!(
+            parse_request_timeout(Some("invalid")),
+            Duration::from_secs(60)
+        );
+        assert_eq!(parse_request_timeout(None), Duration::from_secs(60));
     }
 
     #[test]
