@@ -361,6 +361,134 @@ fn rejected_full_sync_preserves_replica_and_admission_capacity() {
 
 #[cfg(feature = "e2e")]
 #[test]
+fn rejected_incremental_edit_preserves_replica_and_admission_capacity() {
+    let data_dir = kakehashi::install::test_support::test_data_dir_path();
+    std::fs::create_dir_all(&data_dir).unwrap();
+    kakehashi::install::test_support::ensure_test_languages_installed(&data_dir).unwrap();
+    let parser = data_dir
+        .join("parser")
+        .join(format!("rust.{}", std::env::consts::DLL_EXTENSION));
+    let executable = PathBuf::from(env!("CARGO_BIN_EXE_kakehashi"));
+    let worker = Client::spawn_with_test_memory_budgets(
+        &executable,
+        1,
+        47,
+        WorkerTestMemoryBudgets::new(1024, 1024).unwrap(),
+    )
+    .unwrap();
+    let original = "fn main() {}";
+    let context = RequestContext {
+        request_id: 1,
+        worker_generation: 47,
+        uri: "file:///incremental-transaction.rs".into(),
+        incarnation: 1,
+        content_version: 1,
+        configuration_generation: 0,
+    };
+    let response = worker
+        .sync_document(SyncDocument {
+            context: context.clone(),
+            language: "rust".into(),
+            grammar_symbol: "rust".into(),
+            source_path: parser.clone(),
+            parser_path: parser.clone(),
+            artifact_digest: digest(&parser),
+            queries: WorkerQuerySources::default(),
+            text: original.into(),
+        })
+        .unwrap();
+    assert!(matches!(response, Response::DocumentAck(_)));
+    let response = worker
+        .resolve_node(ResolveNode {
+            context: RequestContext {
+                request_id: 11,
+                ..context.clone()
+            },
+            byte_offset: 3,
+            named: true,
+            layer: kakehashi::tree_worker::NodeLayerSelector::Host,
+        })
+        .unwrap();
+    let Response::Nodes(nodes) = response else {
+        panic!("original node identity must be minted: {response:?}");
+    };
+    let original_node = nodes.nodes[0].id.clone();
+
+    let oversized = (0..200)
+        .map(|index| format!("let value_{index} = {index};"))
+        .collect::<String>();
+    let rejected = worker
+        .apply_document_edits(ApplyDocumentEdits {
+            context: RequestContext {
+                request_id: 2,
+                content_version: 2,
+                ..context.clone()
+            },
+            base_version: 1,
+            edits: vec![ByteEdit {
+                start_byte: original.len() - 1,
+                old_end_byte: original.len() - 1,
+                new_text: oversized,
+            }],
+        })
+        .unwrap();
+    let Response::Error(error) = rejected else {
+        panic!("oversized incremental edit must be contained: {rejected:?}");
+    };
+    assert!(
+        error
+            .message
+            .contains("non-evictable budget 1024 bytes exceeded")
+    );
+
+    let response = worker
+        .derive_document_snapshot(DeriveDocumentSnapshot {
+            context: RequestContext {
+                request_id: 3,
+                ..context.clone()
+            },
+        })
+        .unwrap();
+    let Response::Snapshot(snapshot) = response else {
+        panic!("rejected edit must preserve version 1: {response:?}");
+    };
+    assert_eq!(snapshot.root_end_byte, original.len());
+    let response = worker
+        .run_node_scalar(RunNodeScalar {
+            context: RequestContext {
+                request_id: 31,
+                ..context.clone()
+            },
+            node_id: original_node,
+            operation: NodeScalarOperation::Text,
+        })
+        .unwrap();
+    let Response::NodeScalar(node) = response else {
+        panic!("rejected edit must preserve node identity: {response:?}");
+    };
+    assert_eq!(node.value, Some(NodeScalarValue::String("main".into())));
+
+    let response = worker
+        .apply_document_edits(ApplyDocumentEdits {
+            context: RequestContext {
+                request_id: 4,
+                content_version: 2,
+                ..context
+            },
+            base_version: 1,
+            edits: vec![ByteEdit {
+                start_byte: 3,
+                old_end_byte: 7,
+                new_text: "next".into(),
+            }],
+        })
+        .unwrap();
+    assert!(matches!(response, Response::DocumentAck(_)));
+    worker.shutdown().unwrap();
+}
+
+#[cfg(feature = "e2e")]
+#[test]
 fn real_worker_keeps_document_text_and_tree_across_incremental_edits() {
     let data_dir = kakehashi::install::test_support::test_data_dir_path();
     std::fs::create_dir_all(&data_dir).unwrap();
