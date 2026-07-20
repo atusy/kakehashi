@@ -1145,6 +1145,13 @@ the paired legacy mode remains faster in every measured end-to-end scenario.
 Queue wait is not the dominant miss cost, so the result supports keeping one
 worker while rejecting an overall performance-win claim.
 
+The [Stage 9 native-loading measurement](single-resident-multithreaded-tree-worker-stage9-measurement.md)
+moves dynamic grammar loading and tolerant query compilation fully behind the
+worker boundary. One fixed worker is measurably faster than legacy for the two
+injection-heavy steady-state workloads, while large serial misses and cold open
+remain slower. The mixed result confirms performance potential without passing
+the general non-regression gate or justifying worker sharding.
+
 The implementation should proceed in measured stages:
 
 1. Prototype the framed transport, supervision, and one high-level
