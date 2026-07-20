@@ -892,7 +892,7 @@ impl DocumentReplica {
         &mut self,
         request: ApplyDocumentEdits,
         parser: &mut tree_sitter::Parser,
-        retained_bytes: Option<(&AtomicUsize, &AtomicUsize, usize)>,
+        memory_admission: Option<DocumentMemoryAdmission<'_>>,
     ) -> Result<DocumentAck, String> {
         self.validate_identity(&request.context)?;
         if request.base_version != self.context.content_version {
@@ -941,19 +941,26 @@ impl DocumentReplica {
         let tree = parser
             .parse(text.as_bytes(), Some(&edited_tree))
             .ok_or_else(|| "parser returned no tree during incremental parse".to_string())?;
-        if let Some((retained_text_bytes, retained_estimated_bytes, hard_limit_bytes)) =
-            retained_bytes
-        {
-            replace_retained_bytes(retained_text_bytes, self.text.len(), text.len())?;
+        if let Some(memory_admission) = memory_admission {
+            replace_retained_bytes(
+                memory_admission.retained_text_bytes,
+                self.text.len(),
+                text.len(),
+            )?;
             let old_estimated = self.estimated_memory().non_evictable_bytes;
             let new_estimated = estimated_non_evictable_bytes(text.capacity(), &tree);
             if let Err(message) = replace_retained_estimated_bytes(
-                retained_estimated_bytes,
+                memory_admission.retained_estimated_bytes,
                 old_estimated,
                 new_estimated,
-                hard_limit_bytes,
+                memory_admission.non_evictable_estimate_hard_bytes,
             ) {
-                replace_retained_bytes(retained_text_bytes, text.len(), self.text.len()).expect(
+                replace_retained_bytes(
+                    memory_admission.retained_text_bytes,
+                    text.len(),
+                    self.text.len(),
+                )
+                .expect(
                     "rolling back retained text after estimated admission cannot exceed its budget",
                 );
                 return Err(message);
@@ -2669,6 +2676,13 @@ type RetainedDocumentBytes = Arc<AtomicUsize>;
 type RetainedEstimatedDocumentBytes = Arc<AtomicUsize>;
 type LaneJob = Box<dyn FnOnce() -> LaneAction + Send + 'static>;
 
+#[derive(Clone, Copy)]
+struct DocumentMemoryAdmission<'a> {
+    retained_text_bytes: &'a AtomicUsize,
+    retained_estimated_bytes: &'a AtomicUsize,
+    non_evictable_estimate_hard_bytes: usize,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum WorkPriority {
     Foreground,
@@ -2927,6 +2941,11 @@ fn handle_work(
     }
     let started = Instant::now();
     let may_grow_derived_state = request_may_grow_derived_state(&request);
+    let memory_admission = DocumentMemoryAdmission {
+        retained_text_bytes: retained_document_bytes.as_ref(),
+        retained_estimated_bytes: retained_estimated_document_bytes.as_ref(),
+        non_evictable_estimate_hard_bytes: memory_budgets.non_evictable_estimate_hard_bytes,
+    };
     let response = match request {
         Request::Handshake(_) | Request::Cancel(_) => {
             unreachable!("control requests are not scheduled")
@@ -2938,23 +2957,15 @@ fn handle_work(
             documents,
             closed_documents,
             document_capacity,
-            retained_document_bytes,
-            retained_estimated_document_bytes,
-            memory_budgets.non_evictable_estimate_hard_bytes,
+            memory_admission,
         ),
-        Request::ApplyDocumentEdits(request) => apply_document_edits(
-            request,
-            documents,
-            retained_document_bytes,
-            retained_estimated_document_bytes,
-            memory_budgets.non_evictable_estimate_hard_bytes,
-        ),
+        Request::ApplyDocumentEdits(request) => {
+            apply_document_edits(request, documents, memory_admission)
+        }
         Request::ApplyDocumentEditsAndDerive(request) => apply_document_edits_and_derive(
             request,
             documents,
-            retained_document_bytes,
-            retained_estimated_document_bytes,
-            memory_budgets.non_evictable_estimate_hard_bytes,
+            memory_admission,
             queue_wait,
             started,
         ),
@@ -2980,14 +2991,9 @@ fn handle_work(
         Request::InspectDocumentMemory(request) => {
             inspect_document_memory(request, documents, memory_budgets)
         }
-        Request::CloseDocument(request) => close_document(
-            request,
-            documents,
-            closed_documents,
-            retained_document_bytes,
-            retained_estimated_document_bytes,
-            memory_budgets.non_evictable_estimate_hard_bytes,
-        ),
+        Request::CloseDocument(request) => {
+            close_document(request, documents, closed_documents, memory_admission)
+        }
     };
     if pressure_checkpoint_required(may_grow_derived_state, &response)
         && let Err(reason) = enforce_derived_memory_budget(
@@ -3407,9 +3413,11 @@ fn sync_document(
         documents,
         closed_documents,
         document_capacity,
-        retained_document_bytes,
-        &retained_estimated_document_bytes,
-        MAX_RETAINED_ESTIMATED_DOCUMENT_BYTES,
+        DocumentMemoryAdmission {
+            retained_text_bytes: retained_document_bytes.as_ref(),
+            retained_estimated_bytes: retained_estimated_document_bytes.as_ref(),
+            non_evictable_estimate_hard_bytes: MAX_RETAINED_ESTIMATED_DOCUMENT_BYTES,
+        },
     )
 }
 
@@ -3419,9 +3427,7 @@ fn sync_document_with_analysis(
     documents: &DocumentStore,
     closed_documents: &ClosedDocuments,
     document_capacity: &DocumentCapacity,
-    retained_document_bytes: &RetainedDocumentBytes,
-    retained_estimated_document_bytes: &RetainedEstimatedDocumentBytes,
-    non_evictable_estimate_hard_bytes: usize,
+    memory_admission: DocumentMemoryAdmission<'_>,
 ) -> Response {
     let context = request.context.clone();
     let request_text_len = request.text.len();
@@ -3488,22 +3494,25 @@ fn sync_document_with_analysis(
         }
         *known_documents += 1;
     }
-    let reserved_growth =
-        match reserve_retained_growth(retained_document_bytes, replaced_bytes, request_text_len) {
-            Ok(reserved) => reserved,
-            Err(message) => {
-                if reserves_slot {
-                    let mut known_documents = document_capacity
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    *known_documents = known_documents.saturating_sub(1);
-                }
-                return Response::Error(WorkerError {
-                    context: Some(context),
-                    message,
-                });
+    let reserved_growth = match reserve_retained_growth(
+        memory_admission.retained_text_bytes,
+        replaced_bytes,
+        request_text_len,
+    ) {
+        Ok(reserved) => reserved,
+        Err(message) => {
+            if reserves_slot {
+                let mut known_documents = document_capacity
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                *known_documents = known_documents.saturating_sub(1);
             }
-        };
+            return Response::Error(WorkerError {
+                context: Some(context),
+                message,
+            });
+        }
+    };
     let response = WORKER_THREAD_STATE.with(|state| {
         state
             .borrow_mut()
@@ -3512,10 +3521,10 @@ fn sync_document_with_analysis(
                     Ok((replica, ack)) => {
                         let estimated_bytes = replica.estimated_memory().non_evictable_bytes;
                         if let Err(message) = replace_retained_estimated_bytes(
-                            retained_estimated_document_bytes,
+                            memory_admission.retained_estimated_bytes,
                             replaced_estimated_bytes,
                             estimated_bytes,
-                            non_evictable_estimate_hard_bytes,
+                            memory_admission.non_evictable_estimate_hard_bytes,
                         ) {
                             return Response::Error(WorkerError {
                                 context: Some(context),
@@ -3540,11 +3549,19 @@ fn sync_document_with_analysis(
         *known_documents = known_documents.saturating_sub(1);
     }
     if matches!(&response, Response::DocumentAck(_)) && request_text_len < replaced_bytes {
-        replace_retained_bytes(retained_document_bytes, replaced_bytes, request_text_len)
-            .expect("committing a document shrink cannot exceed the retained-byte budget");
+        replace_retained_bytes(
+            memory_admission.retained_text_bytes,
+            replaced_bytes,
+            request_text_len,
+        )
+        .expect("committing a document shrink cannot exceed the retained-byte budget");
     } else if !matches!(&response, Response::DocumentAck(_)) && reserved_growth {
-        replace_retained_bytes(retained_document_bytes, request_text_len, replaced_bytes)
-            .expect("rolling back retained growth cannot exceed the retained-byte budget");
+        replace_retained_bytes(
+            memory_admission.retained_text_bytes,
+            request_text_len,
+            replaced_bytes,
+        )
+        .expect("rolling back retained growth cannot exceed the retained-byte budget");
     }
     response
 }
@@ -3552,9 +3569,7 @@ fn sync_document_with_analysis(
 fn apply_document_edits(
     request: ApplyDocumentEdits,
     documents: &DocumentStore,
-    retained_document_bytes: &RetainedDocumentBytes,
-    retained_estimated_document_bytes: &RetainedEstimatedDocumentBytes,
-    non_evictable_estimate_hard_bytes: usize,
+    memory_admission: DocumentMemoryAdmission<'_>,
 ) -> Response {
     let context = request.context.clone();
     let document_key = DocumentKey::from(&context);
@@ -3580,15 +3595,7 @@ fn apply_document_edits(
                 let Ok(mut replica) = replica.lock() else {
                     return poisoned_document_restart(context);
                 };
-                match replica.apply(
-                    request,
-                    parser,
-                    Some((
-                        retained_document_bytes,
-                        retained_estimated_document_bytes,
-                        non_evictable_estimate_hard_bytes,
-                    )),
-                ) {
+                match replica.apply(request, parser, Some(memory_admission)) {
                     Ok(ack) => Response::DocumentAck(ack),
                     Err(message) => Response::Error(WorkerError {
                         context: Some(context),
@@ -3602,9 +3609,7 @@ fn apply_document_edits(
 fn apply_document_edits_and_derive(
     request: ApplyDocumentEditsAndDerive,
     documents: &DocumentStore,
-    retained_document_bytes: &RetainedDocumentBytes,
-    retained_estimated_document_bytes: &RetainedEstimatedDocumentBytes,
-    non_evictable_estimate_hard_bytes: usize,
+    memory_admission: DocumentMemoryAdmission<'_>,
     queue_wait: Duration,
     started: Instant,
 ) -> Response {
@@ -3637,15 +3642,7 @@ fn apply_document_edits_and_derive(
                     base_version: request.base_version,
                     edits: request.edits,
                 };
-                if let Err(message) = replica.apply(
-                    edits,
-                    parser,
-                    Some((
-                        retained_document_bytes,
-                        retained_estimated_document_bytes,
-                        non_evictable_estimate_hard_bytes,
-                    )),
-                ) {
+                if let Err(message) = replica.apply(edits, parser, Some(memory_admission)) {
                     return Response::Error(WorkerError {
                         context: Some(context),
                         message,
@@ -3702,9 +3699,7 @@ fn close_document(
     request: CloseDocument,
     documents: &DocumentStore,
     closed_documents: &ClosedDocuments,
-    retained_document_bytes: &RetainedDocumentBytes,
-    retained_estimated_document_bytes: &RetainedEstimatedDocumentBytes,
-    non_evictable_estimate_hard_bytes: usize,
+    memory_admission: DocumentMemoryAdmission<'_>,
 ) -> Response {
     let context = request.context;
     let document_key = DocumentKey::from(&context);
@@ -3733,13 +3728,13 @@ fn close_document(
         Err(_) => return poisoned_document_restart(context),
     };
     documents.remove(&document_key);
-    replace_retained_bytes(retained_document_bytes, removed_bytes, 0)
+    replace_retained_bytes(memory_admission.retained_text_bytes, removed_bytes, 0)
         .expect("removing a document cannot exceed the retained-byte budget");
     replace_retained_estimated_bytes(
-        retained_estimated_document_bytes,
+        memory_admission.retained_estimated_bytes,
         removed_estimated_bytes,
         0,
-        non_evictable_estimate_hard_bytes,
+        memory_admission.non_evictable_estimate_hard_bytes,
     )
     .expect("removing a document cannot exceed the estimated non-evictable budget");
     closed_documents.insert(document_key, context.incarnation);
@@ -4927,12 +4922,12 @@ mod tests {
         ApplyDocumentEdits, BUILD_ID, ByteEdit, CacheEviction, CacheEvictionCandidate,
         CachedInjectionLayer, CancelRequest, CapturesResult, CloseDocument, DeriveInjectionRegions,
         DeriveNativeBindings, DeriveSelectionRanges, DeriveSemanticTokens, DeriveSnapshot,
-        DocumentCompetition, DocumentKey, DocumentLane, DocumentReplica, GrammarKey, Handshake,
-        HandshakeReady, LaneAction, LaneRegistry, MAX_DOCUMENT_BYTES, MAX_DOCUMENT_REPLICAS,
-        MAX_RETAINED_DOCUMENT_BYTES, MAX_RETAINED_ESTIMATED_DOCUMENT_BYTES, NavigateNode,
-        NodeLayerSelector, NodeNavigation, NodeScalarOperation, NodeScalarValue, OpaqueNodeId,
-        PROTOCOL_VERSION, Request, RequestCancelled, RequestContext, ResolveNode, Response, Route,
-        RunCaptures, RunNodeScalar, RunnableDocuments,
+        DocumentCompetition, DocumentKey, DocumentLane, DocumentMemoryAdmission, DocumentReplica,
+        GrammarKey, Handshake, HandshakeReady, LaneAction, LaneRegistry, MAX_DOCUMENT_BYTES,
+        MAX_DOCUMENT_REPLICAS, MAX_RETAINED_DOCUMENT_BYTES, MAX_RETAINED_ESTIMATED_DOCUMENT_BYTES,
+        NavigateNode, NodeLayerSelector, NodeNavigation, NodeScalarOperation, NodeScalarValue,
+        OpaqueNodeId, PROTOCOL_VERSION, Request, RequestCancelled, RequestContext, ResolveNode,
+        Response, Route, RunCaptures, RunNodeScalar, RunnableDocuments,
         SEMANTIC_CACHE_AUXILIARY_TRIM_THRESHOLD_BYTES, SyncDocument, WireByteRange, WirePosition,
         WireRange, WireSemanticToken, WorkPriority, WorkerError, WorkerQuerySources,
         cache_eviction_plan, close_document, decode_frame, derive_snapshot_with_language,
@@ -7291,9 +7286,11 @@ mod tests {
             },
             &documents,
             &closed_documents,
-            &retained,
-            &retained_estimated,
-            MAX_RETAINED_ESTIMATED_DOCUMENT_BYTES,
+            DocumentMemoryAdmission {
+                retained_text_bytes: retained.as_ref(),
+                retained_estimated_bytes: retained_estimated.as_ref(),
+                non_evictable_estimate_hard_bytes: MAX_RETAINED_ESTIMATED_DOCUMENT_BYTES,
+            },
         );
         assert!(matches!(close_response, Response::WorkerRestartRequired(_)));
         assert!(documents.contains_key(&key));
