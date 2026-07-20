@@ -16,6 +16,30 @@ fn digest(path: &std::path::Path) -> String {
     kakehashi::tree_worker::artifact_digest(path).unwrap()
 }
 
+#[cfg(feature = "e2e")]
+fn memory_test_worker(
+    worker_generation: u64,
+    derived_cache_soft_bytes: usize,
+    non_evictable_estimate_hard_bytes: usize,
+) -> (Client, PathBuf) {
+    let data_dir = kakehashi::install::test_support::test_data_dir_path();
+    std::fs::create_dir_all(&data_dir).unwrap();
+    kakehashi::install::test_support::ensure_test_languages_installed(&data_dir).unwrap();
+    let parser = data_dir
+        .join("parser")
+        .join(format!("rust.{}", std::env::consts::DLL_EXTENSION));
+    let executable = PathBuf::from(env!("CARGO_BIN_EXE_kakehashi"));
+    let worker = Client::spawn_with_test_memory_budgets(
+        &executable,
+        1,
+        worker_generation,
+        WorkerTestMemoryBudgets::new(derived_cache_soft_bytes, non_evictable_estimate_hard_bytes)
+            .unwrap(),
+    )
+    .unwrap();
+    (worker, parser)
+}
+
 #[test]
 fn real_worker_handshakes_and_contains_request_errors() {
     let executable = PathBuf::from(env!("CARGO_BIN_EXE_kakehashi"));
@@ -187,20 +211,7 @@ fn real_worker_derives_a_snapshot_from_an_installed_grammar() {
 #[cfg(feature = "e2e")]
 #[test]
 fn real_worker_contains_full_sync_above_injected_non_evictable_budget() {
-    let data_dir = kakehashi::install::test_support::test_data_dir_path();
-    std::fs::create_dir_all(&data_dir).unwrap();
-    kakehashi::install::test_support::ensure_test_languages_installed(&data_dir).unwrap();
-    let parser = data_dir
-        .join("parser")
-        .join(format!("rust.{}", std::env::consts::DLL_EXTENSION));
-    let executable = PathBuf::from(env!("CARGO_BIN_EXE_kakehashi"));
-    let worker = Client::spawn_with_test_memory_budgets(
-        &executable,
-        1,
-        45,
-        WorkerTestMemoryBudgets::new(1024, 1).unwrap(),
-    )
-    .unwrap();
+    let (worker, parser) = memory_test_worker(45, 1024, 1);
     let context = RequestContext {
         request_id: 1,
         worker_generation: 45,
@@ -238,20 +249,7 @@ fn real_worker_contains_full_sync_above_injected_non_evictable_budget() {
 #[cfg(feature = "e2e")]
 #[test]
 fn rejected_full_sync_preserves_replica_and_admission_capacity() {
-    let data_dir = kakehashi::install::test_support::test_data_dir_path();
-    std::fs::create_dir_all(&data_dir).unwrap();
-    kakehashi::install::test_support::ensure_test_languages_installed(&data_dir).unwrap();
-    let parser = data_dir
-        .join("parser")
-        .join(format!("rust.{}", std::env::consts::DLL_EXTENSION));
-    let executable = PathBuf::from(env!("CARGO_BIN_EXE_kakehashi"));
-    let worker = Client::spawn_with_test_memory_budgets(
-        &executable,
-        1,
-        46,
-        WorkerTestMemoryBudgets::new(1024, 1024).unwrap(),
-    )
-    .unwrap();
+    let (worker, parser) = memory_test_worker(46, 1024, 1024);
     let original = "fn main() {}";
     let context = RequestContext {
         request_id: 1,
@@ -362,20 +360,7 @@ fn rejected_full_sync_preserves_replica_and_admission_capacity() {
 #[cfg(feature = "e2e")]
 #[test]
 fn rejected_incremental_edit_preserves_replica_and_admission_capacity() {
-    let data_dir = kakehashi::install::test_support::test_data_dir_path();
-    std::fs::create_dir_all(&data_dir).unwrap();
-    kakehashi::install::test_support::ensure_test_languages_installed(&data_dir).unwrap();
-    let parser = data_dir
-        .join("parser")
-        .join(format!("rust.{}", std::env::consts::DLL_EXTENSION));
-    let executable = PathBuf::from(env!("CARGO_BIN_EXE_kakehashi"));
-    let worker = Client::spawn_with_test_memory_budgets(
-        &executable,
-        1,
-        47,
-        WorkerTestMemoryBudgets::new(1024, 1024).unwrap(),
-    )
-    .unwrap();
+    let (worker, parser) = memory_test_worker(47, 1024, 1024);
     let original = "fn main() {}";
     let context = RequestContext {
         request_id: 1,
@@ -490,20 +475,7 @@ fn rejected_incremental_edit_preserves_replica_and_admission_capacity() {
 #[cfg(feature = "e2e")]
 #[test]
 fn soft_budget_evicts_non_current_result_without_invalidating_identity() {
-    let data_dir = kakehashi::install::test_support::test_data_dir_path();
-    std::fs::create_dir_all(&data_dir).unwrap();
-    kakehashi::install::test_support::ensure_test_languages_installed(&data_dir).unwrap();
-    let parser = data_dir
-        .join("parser")
-        .join(format!("rust.{}", std::env::consts::DLL_EXTENSION));
-    let executable = PathBuf::from(env!("CARGO_BIN_EXE_kakehashi"));
-    let worker = Client::spawn_with_test_memory_budgets(
-        &executable,
-        1,
-        48,
-        WorkerTestMemoryBudgets::new(20, 4096).unwrap(),
-    )
-    .unwrap();
+    let (worker, parser) = memory_test_worker(48, 20, 4096);
     let catalog_context = RequestContext {
         request_id: 1,
         worker_generation: 48,
