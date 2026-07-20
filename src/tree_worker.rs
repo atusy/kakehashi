@@ -356,6 +356,7 @@ pub struct DerivedSemanticTokens {
     pub tokens: Vec<WireSemanticToken>,
     pub queue_wait_ns: u64,
     pub compute_ns: u64,
+    pub cache_hit: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -583,6 +584,7 @@ struct DocumentReplica {
     captures_match_cache: crate::lsp::lsp_impl::kakehashi::captures_match_cache::CapturesMatchCache,
     injection_token_cache: Arc<crate::analysis::InjectionTokenCache>,
     injection_cache_edits: u8,
+    cached_semantic_tokens: Option<(u64, bool, Arc<Vec<WireSemanticToken>>)>,
     semantic_discovery: Option<Arc<crate::document::DiscoveredInjections>>,
     resolved_injections: Option<(u64, Arc<Vec<crate::language::injection::ResolvedInjection>>)>,
     injection_layers: Vec<CachedInjectionLayer>,
@@ -654,6 +656,7 @@ impl DocumentReplica {
                 captures_match_cache: Default::default(),
                 injection_token_cache: Arc::new(crate::analysis::InjectionTokenCache::new()),
                 injection_cache_edits: 0,
+                cached_semantic_tokens: None,
                 semantic_discovery: None,
                 resolved_injections: None,
                 injection_layers: Vec::new(),
@@ -730,6 +733,7 @@ impl DocumentReplica {
         self.node_tracker
             .apply_input_edits(&self.uri, &tracker_edits);
         self.context = request.context;
+        self.cached_semantic_tokens = None;
         Ok(DocumentAck {
             context: self.context.clone(),
             incremental: true,
@@ -1146,6 +1150,18 @@ impl DocumentReplica {
         started: Instant,
     ) -> Result<DerivedSemanticTokens, String> {
         self.validate_read_identity(&request.context)?;
+        if let Some((generation, supports_multiline, tokens)) = &self.cached_semantic_tokens
+            && *generation == request.context.configuration_generation
+            && *supports_multiline == request.supports_multiline
+        {
+            return Ok(DerivedSemanticTokens {
+                context: request.context,
+                tokens: tokens.as_ref().clone(),
+                queue_wait_ns: duration_ns(queue_wait),
+                compute_ns: duration_ns(started.elapsed()),
+                cache_hit: true,
+            });
+        }
         worker_analysis(
             &self.analysis,
             &self.language,
@@ -1179,7 +1195,7 @@ impl DocumentReplica {
             None,
         )
         .ok_or_else(|| "worker semantic token derivation was cancelled".to_string())?;
-        let tokens = match result {
+        let tokens: Vec<WireSemanticToken> = match result {
             tower_lsp_server::ls_types::SemanticTokensResult::Tokens(tokens) => tokens.data,
             tower_lsp_server::ls_types::SemanticTokensResult::Partial(partial) => partial.data,
         }
@@ -1192,11 +1208,17 @@ impl DocumentReplica {
             token_modifiers_bitset: token.token_modifiers_bitset,
         })
         .collect();
+        self.cached_semantic_tokens = Some((
+            request.context.configuration_generation,
+            request.supports_multiline,
+            Arc::new(tokens.clone()),
+        ));
         Ok(DerivedSemanticTokens {
             context: request.context,
             tokens,
             queue_wait_ns: duration_ns(queue_wait),
             compute_ns: duration_ns(started.elapsed()),
+            cache_hit: false,
         })
     }
 
@@ -5062,6 +5084,25 @@ mod tests {
         assert_eq!(result.tokens[0].length, 4);
         assert!(result.compute_ns > 0);
         assert_eq!(result.queue_wait_ns, 0);
+        assert!(!result.cache_hit);
+
+        let cached = replica
+            .derive_semantic_tokens(DeriveSemanticTokens {
+                context: RequestContext {
+                    request_id: 2,
+                    worker_generation: 3,
+                    uri: "file:///semantic.rs".into(),
+                    incarnation: 4,
+                    content_version: 1,
+                    configuration_generation: 2,
+                },
+                supports_multiline: false,
+            })
+            .unwrap();
+        assert!(
+            cached.cache_hit,
+            "same-version semantic requests should reuse worker facts"
+        );
     }
 
     #[test]
