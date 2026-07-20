@@ -768,7 +768,10 @@ terminal response releases the client without a restart, except that
 generation even when it arrives during grace. If native work does not cooperate,
 the parent publishes the systemic deadline-termination cause,
 kills and restarts the complete generation, and does not quarantine any active
-grammar. A separate hard native-segment deadline starts with the handoff
+grammar. A timeout can remain nonfatal only when the child is confirmed live;
+an already-exited or unknown transport state enters worker-loss recovery rather
+than leaving the dead generation published. A separate hard native-segment
+deadline starts with the handoff
 allowance when the parent receives
 `NativeSegmentEntered`; only after that allowance does it consume the native
 budget, and it ends at `NativeSegmentExited`. It does not run while an arm frame
