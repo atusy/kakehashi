@@ -701,6 +701,8 @@ fact alone does not classify the cause as native or exempt the restart. The
 exception is a generation that the parent itself selected for generic request-
 deadline termination: that loss is systemic and suppresses parser attribution
 because the deadline is not evidence that an active grammar caused the hang.
+The deadline and transport cause markers are derived from one pre-kill process
+state observation before the parent immediately terminates the process group.
 
 Classification precedence is explicit. A supervisor-observed startup,
 handshake, framing/protocol, failed bounded resynchronization, parent-liveness,

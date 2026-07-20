@@ -32,7 +32,9 @@ A generic request deadline remains insufficient parser-fault evidence. The
 client sends cancellation at the deadline, waits 250 ms for a terminal
 response, and systemically terminates the generation if native work does not
 cooperate. Parent deadline termination has its own cause and cannot quarantine
-an active grammar. A nominally nonfatal timeout may continue only when
+an active grammar. Its deadline and transport cause markers come from the same
+single pre-kill child-state observation, so a native exit cannot fall between
+two contradictory classifications. A nominally nonfatal timeout may continue only when
 `try_wait` confirms the worker transport is still live; an already-exited or
 unknown child state enters recovery instead of leaving a dead client published.
 Such a timeout-triggered recovery is systemic unless the preserved child exit

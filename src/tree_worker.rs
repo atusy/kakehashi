@@ -6181,9 +6181,13 @@ fn wait_until(child: &mut OwnedChild, timeout: Duration) -> io::Result<std::proc
 }
 
 fn terminate(child: &mut OwnedChild, timeout: Duration) {
-    let exited = child.try_wait().ok().flatten().is_some();
+    let running = child.try_wait().ok().flatten().is_none();
+    terminate_after_observation(child, running, timeout);
+}
+
+fn terminate_after_observation(child: &mut OwnedChild, running: bool, timeout: Duration) {
     child.kill_all();
-    if !exited {
+    if running {
         let _ = wait_until(child, timeout);
     }
 }
@@ -6193,7 +6197,7 @@ fn terminate_by_transport(child: &mut OwnedChild, marker: &AtomicBool, timeout: 
     if terminated {
         marker.store(true, Ordering::Release);
     }
-    terminate(child, timeout);
+    terminate_after_observation(child, terminated, timeout);
     terminated
 }
 
@@ -6203,10 +6207,12 @@ fn terminate_by_transport_for_request_deadline(
     request_deadline_marker: &AtomicBool,
     timeout: Duration,
 ) {
-    if child.try_wait().ok().flatten().is_none() {
+    let terminated = child.try_wait().ok().flatten().is_none();
+    if terminated {
+        transport_marker.store(true, Ordering::Release);
         request_deadline_marker.store(true, Ordering::Release);
     }
-    terminate_by_transport(child, transport_marker, timeout);
+    terminate_after_observation(child, terminated, timeout);
 }
 
 #[cfg(test)]
