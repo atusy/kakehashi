@@ -250,9 +250,8 @@ ResolveNode(context, selector)
 NavigateNode(context, opaque_node_id, operation)
 RunCaptures(context, query, range)
 CancelRequest(request_id, worker_generation)
-GrammarHazardStarting(lease_id, request_id, grammar_key)
-GrammarHazardArmed(lease_id, worker_generation)
-GrammarHazardReleased(lease_id)
+GrammarHazardArmed(lease_id, request_context, grammar_key)
+GrammarHazardReleased(lease_id, worker_generation)
 NativeSegmentStarting(segment_id, lease_id)
 NativeSegmentArmed(segment_id, worker_generation)
 NativeSegmentEntered(segment_id, worker_generation)
@@ -407,8 +406,9 @@ if the matching cancellable reader request arrives later; a non-cancellable
 lifecycle request with that ID discards the token. Canceling a prior generation
 remains a no-op, and duplicate terminal and cancel frames remain harmless.
 
-Cancellation during a handshake has explicit cleanup. A hazard that was armed
-but never entered its grammar-backed scope is released; a native segment that
+Cancellation during hazard commit has explicit cleanup. A hazard whose arm
+frame was committed but whose grammar-backed scope was never entered is
+released; a native segment that
 was started or armed but never entered emits `NativeSegmentAborted`; an entered
 segment must exit before its hazard can be released. `RequestHazardsReleased` is sent
 only after every lease and segment owned by that request is released, exited, or
@@ -443,10 +443,13 @@ whose raw pointers ultimately depend on the grammar mapping. It is intentionally
 broader than the lexical call into `Parser::parse`: native corruption may become
 observable only during a later tree walk.
 
-Before the first such dereference, the worker sends `GrammarHazardStarting` with
-the actual runtime grammar identity and waits. The parent records the lease in
-its session-local active set before replying with `GrammarHazardArmed`; the
-worker must not enter the hazard scope without that reply. Each grammar
+Before the first such dereference, the worker sends `GrammarHazardArmed` with
+the actual runtime grammar identity through its single response writer and
+waits for a worker-local completion receipt. The writer issues that receipt only
+after the complete frame has been committed to the OS pipe. The worker must not
+enter the hazard scope without the receipt; if it later dies, the parent reader
+must decode the complete arm before a later release or EOF. The parent records
+the lease in its session-local active set. Each grammar
 encountered by a fused host/injection operation is leased separately and remains
 active until the complete high-level operation has stopped consuming every
 value backed by that grammar. Only then does `GrammarHazardReleased` remove it
@@ -655,13 +658,14 @@ It logs:
 * the session quarantine action.
 
 With internal parallelism, an externally observed process crash may leave more
-than one acknowledged grammar hazard lease active. The initial safe policy
-quarantines the complete set of active `grammar_key` values recorded by the parent. This can
-conservatively disable an innocent concurrently active grammar, but only for the
-current session. Exact cross-platform identification of the faulting thread
-would require a separate crash-reporting design and is not assumed by this
-decision. A worker failure with no acknowledged grammar hazard lease is treated as a
-worker/protocol failure and does not invent a parser quarantine.
+than one committed grammar hazard lease active. The initial safe policy
+quarantines the complete set of active `grammar_key` values recorded by the
+parent. This can conservatively disable an innocent concurrently active
+grammar, but only for the current session. Exact cross-platform identification
+of the faulting thread would require a separate crash-reporting design and is
+not assumed by this decision. A worker failure with no committed grammar hazard
+lease is treated as a worker/protocol failure and does not invent a parser
+quarantine.
 
 After recording attribution and updating quarantine, the parent clears every
 hazard lease and native-segment record belonging to the dead `worker_gen` before
@@ -1307,9 +1311,22 @@ green. Across twenty-four order-reversed pairs, sequential p50 improved by
 acted as accidental admission pacing: four-way throughput fell 3.151% and p95
 rose 9.200%. Keep crash ordering independent of scheduling, and recover any
 valuable pacing through an explicit workload-aware admission policy. Runtime
-injection identities, multiple-hazard quarantine, independently bounded control
+injection identities, independently bounded control
 transport, native segment deadlines, protocol and compatibility gates, and
 legacy-path removal remain open.
+
+The [Stage 26 hazard-set measurement](single-resident-multithreaded-tree-worker-stage26-measurement.md)
+extends crash attribution from the first observed lease to the complete exact
+set. The parent drains the dead generation's response reader before snapshot,
+deduplicates every committed active grammar identity, installs the full set,
+and then restarts once. The two-grammar E2E consistently quarantined Rust and
+Lua while resyncing only healthy YAML; seven runs recovered in a median 974 ms.
+Against Stage 25 on the same single-hazard fixture, median recovery changed from
+1266 to 1281 ms and the median paired delta was +11 ms (+0.9%). Keep the
+failure-path barrier; no production request hot path was added. Runtime
+injection identities, independently bounded control transport, native segment
+deadlines, explicit workload-aware admission, protocol and compatibility
+gates, and legacy-path removal remain open.
 
 The implementation should proceed in measured stages:
 

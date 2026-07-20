@@ -1,0 +1,68 @@
+{
+  "baseline": {
+    "commit": "f6e0c2125f6f2c93e799ab3b0b4c7b6471691f53",
+    "stage": 25
+  },
+  "candidate": {
+    "commit": "370d13d2cdcdd7bf6e1b8927e768319116fe8a97",
+    "stage": 26
+  },
+  "environment": {
+    "cpu": "Apple M4",
+    "os": "macOS 26.5.1 Darwin 25.5.0 arm64",
+    "rustc": "1.95.0 (59807616e 2026-04-14)"
+  },
+  "measured_at": "2026-07-21",
+  "single_hazard_recovery": {
+    "method": {
+      "build_profile": "test (unoptimized + debuginfo)",
+      "measurement": "supervisor recovery_ms from recovery start through replacement spawn and full resync",
+      "order": "stage25 then stage26 in each pair",
+      "pairs": 7,
+      "test": "crashed_grammar_is_quarantined_only_in_session_and_other_grammar_recovers",
+      "threads": 4,
+      "warmup_runs_per_stage": 1
+    },
+    "samples_ms": [
+      { "pair": 1, "stage25": 1275, "stage26": 1251 },
+      { "pair": 2, "stage25": 1266, "stage26": 1277 },
+      { "pair": 3, "stage25": 1299, "stage26": 1283 },
+      { "pair": 4, "stage25": 1254, "stage26": 1571 },
+      { "pair": 5, "stage25": 1264, "stage26": 1281 },
+      { "pair": 6, "stage25": 1250, "stage26": 1450 },
+      { "pair": 7, "stage25": 1279, "stage26": 1278 }
+    ],
+    "summary": {
+      "median_paired_delta_ms": 11,
+      "median_paired_delta_percent": 0.869,
+      "stage25_mean_ms": 1269.571,
+      "stage25_median_ms": 1266,
+      "stage25_range_ms": [1250, 1299],
+      "stage26_mean_ms": 1341.571,
+      "stage26_median_ms": 1281,
+      "stage26_range_ms": [1251, 1571]
+    }
+  },
+  "two_active_grammars": {
+    "assertions_per_run": {
+      "full_resynced_bytes": 14,
+      "full_resynced_documents": 1,
+      "newly_quarantined_grammars": 2,
+      "restarts": 1
+    },
+    "method": {
+      "build_profile": "test (unoptimized + debuginfo)",
+      "measurement": "supervisor recovery_ms from recovery start through replacement spawn and quarantine-aware full resync",
+      "runs": 7,
+      "test": "crash_quarantines_every_unique_committed_grammar_hazard",
+      "threads": 4,
+      "warmup_runs": 1
+    },
+    "samples_ms": [959, 971, 974, 971, 1126, 981, 990],
+    "summary": {
+      "mean_ms": 996,
+      "median_ms": 974,
+      "range_ms": [959, 1126]
+    }
+  }
+}
