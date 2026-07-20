@@ -627,6 +627,25 @@ impl EstimatedDocumentMemory {
     }
 }
 
+fn estimated_discovery_bytes(discovery: &crate::document::DiscoveredInjections) -> usize {
+    std::mem::size_of::<crate::document::DiscoveredInjections>()
+        .saturating_add(
+            discovery.regions.capacity() * std::mem::size_of::<crate::document::DiscoveredRegion>(),
+        )
+        .saturating_add(discovery.regions.iter().fold(0, |bytes, region| {
+            bytes
+                .saturating_add(region.resolved_lang.capacity())
+                .saturating_add(
+                    region
+                        .included_ranges
+                        .as_ref()
+                        .map(|ranges| ranges.capacity() * std::mem::size_of::<tree_sitter::Range>())
+                        .unwrap_or_default(),
+                )
+                .saturating_add(region.prefix_byte_widths.capacity() * std::mem::size_of::<usize>())
+        }))
+}
+
 impl DocumentReplica {
     fn estimated_memory(&self) -> EstimatedDocumentMemory {
         EstimatedDocumentMemory {
@@ -636,7 +655,11 @@ impl DocumentReplica {
                 .as_ref()
                 .map(|(_, _, tokens)| tokens.capacity() * std::mem::size_of::<WireSemanticToken>())
                 .unwrap_or_default(),
-            auxiliary_cache_bytes: 0,
+            auxiliary_cache_bytes: self
+                .semantic_discovery
+                .as_deref()
+                .map(estimated_discovery_bytes)
+                .unwrap_or_default(),
         }
     }
 
@@ -5871,6 +5894,51 @@ mod tests {
         assert_eq!(
             after.evictable_bytes(),
             before.evictable_bytes() + semantic_bytes
+        );
+    }
+
+    #[test]
+    fn semantic_discovery_capacity_is_reported_as_auxiliary_memory() {
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_rust::LANGUAGE.into())
+            .unwrap();
+        let context = RequestContext {
+            request_id: 1,
+            worker_generation: 3,
+            uri: "file:///discovery-accounting.rs".into(),
+            incarnation: 4,
+            content_version: 1,
+            configuration_generation: 2,
+        };
+        let (mut replica, _) = DocumentReplica::sync(
+            SyncDocument {
+                context,
+                language: "rust".into(),
+                grammar_symbol: "rust".into(),
+                source_path: "/unused/static-language".into(),
+                parser_path: "/unused/static-language".into(),
+                artifact_digest: "sha256:rust-v1".into(),
+                queries: WorkerQuerySources::default(),
+                text: "fn main() {}".into(),
+            },
+            &mut parser,
+        )
+        .unwrap();
+        let before = replica.estimated_memory();
+        let regions = Vec::with_capacity(32);
+        let discovery_bytes = std::mem::size_of::<crate::document::DiscoveredInjections>()
+            + regions.capacity() * std::mem::size_of::<crate::document::DiscoveredRegion>();
+        replica.semantic_discovery = Some(Arc::new(crate::document::DiscoveredInjections {
+            generation: 2,
+            complete: true,
+            regions,
+        }));
+
+        let after = replica.estimated_memory();
+        assert_eq!(
+            after.auxiliary_cache_bytes,
+            before.auxiliary_cache_bytes + discovery_bytes
         );
     }
 
