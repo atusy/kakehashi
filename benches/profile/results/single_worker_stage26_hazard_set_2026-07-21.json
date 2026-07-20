@@ -142,15 +142,17 @@
     "method": {
       "build_profile": "release (optimized)",
       "build_commands": [
+        "mkdir -p /tmp/kakehashi-stage26-semantic-ab",
         "git worktree add --detach /tmp/kakehashi-stage26-measured-67c338ca7 67c338ca7955faf1021c0951a8f039a915b5a0d0",
+        "git worktree add --detach /tmp/kakehashi-stage26-review-36842edc5 36842edc5fc2c13864d9d39cecc77a78a9ed56fa",
         "cargo build --release --locked --bin kakehashi --manifest-path /tmp/kakehashi-stage26-measured-67c338ca7/Cargo.toml --target-dir /tmp/kakehashi-stage26-measured-67c338ca7/target",
         "cp /tmp/kakehashi-stage26-measured-67c338ca7/target/release/kakehashi /tmp/kakehashi-stage26-semantic-ab/measured-67c338ca7",
-        "cargo build --release --locked --bin kakehashi",
-        "cp target/release/kakehashi /tmp/kakehashi-stage26-semantic-ab/final-36842edc5",
-        "cargo bench --locked --bench semantic_tokens --features e2e --no-run"
+        "cargo build --release --locked --bin kakehashi --manifest-path /tmp/kakehashi-stage26-review-36842edc5/Cargo.toml --target-dir /tmp/kakehashi-stage26-review-36842edc5/target",
+        "cp /tmp/kakehashi-stage26-review-36842edc5/target/release/kakehashi /tmp/kakehashi-stage26-semantic-ab/final-36842edc5",
+        "cargo bench --locked --bench semantic_tokens --features e2e --no-run --manifest-path /tmp/kakehashi-stage26-review-36842edc5/Cargo.toml --target-dir /tmp/kakehashi-stage26-review-36842edc5/target"
       ],
       "environment": ["KAKEHASHI_TREE_WORKER_MODE=authoritative", "KAKEHASHI_TREE_WORKER_THREADS=4"],
-      "execution_command_template": "KAKEHASHI_TREE_WORKER_MODE=authoritative KAKEHASHI_TREE_WORKER_THREADS=4 KAKEHASHI_BENCH_BIN_A=<A> KAKEHASHI_BENCH_BIN_B=<B> KAKEHASHI_BENCH_ITERS=40 KAKEHASHI_BENCH_WARMUP=10 KAKEHASHI_BENCH_SCENARIOS=rust_large/edit_delta target/release/deps/semantic_tokens-08ebd8d8c816111c --bench",
+      "execution_command_template": "KAKEHASHI_TREE_WORKER_MODE=authoritative KAKEHASHI_TREE_WORKER_THREADS=4 KAKEHASHI_BENCH_BIN_A=<A> KAKEHASHI_BENCH_BIN_B=<B> KAKEHASHI_BENCH_ITERS=40 KAKEHASHI_BENCH_WARMUP=10 KAKEHASHI_BENCH_SCENARIOS=rust_large/edit_delta /tmp/kakehashi-stage26-review-36842edc5/target/release/deps/semantic_tokens-08ebd8d8c816111c --bench",
       "iterations_per_binary_per_pair": 40,
       "pairs": 8,
       "revision_order": "odd measured->review-converged; even review-converged->measured",
