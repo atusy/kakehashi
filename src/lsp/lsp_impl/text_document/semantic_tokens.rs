@@ -572,6 +572,7 @@ impl Kakehashi {
                 snapshot.parsed_version,
                 worker_configuration_generation,
                 supports_multiline,
+                Some(cancel_token.clone()),
             );
             let authoritative_worker = self.tree_worker_shadow.is_authoritative();
             let combined = async {
@@ -1029,6 +1030,7 @@ impl Kakehashi {
                     snapshot.parsed_version,
                     worker_configuration_generation,
                     supports_multiline,
+                    Some(cancel_token.clone()),
                 );
                 let authoritative_worker = self.tree_worker_shadow.is_authoritative();
                 let combined = async {
@@ -1453,6 +1455,7 @@ impl Kakehashi {
             snapshot.parsed_version,
             worker_configuration_generation,
             supports_multiline,
+            None,
         );
         let (result, worker) = if self.tree_worker_shadow.is_authoritative() {
             (None, worker.await)

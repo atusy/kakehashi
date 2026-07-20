@@ -45,6 +45,36 @@ enum TreeWorkerMode {
     Authoritative,
 }
 
+/// Cancels worker-side reader work when the async LSP request that owns it is
+/// superseded, explicitly cancelled, or dropped during shutdown.
+struct WorkerRequestCancellation {
+    client: Arc<Client>,
+    request_id: u64,
+    armed: bool,
+}
+
+impl WorkerRequestCancellation {
+    fn new(client: Arc<Client>, request_id: u64) -> Self {
+        Self {
+            client,
+            request_id,
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for WorkerRequestCancellation {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = self.client.cancel_request(self.request_id);
+        }
+    }
+}
+
 pub(super) struct WorkerInjectionView {
     pub(super) text: Arc<str>,
     pub(super) language: String,
@@ -949,21 +979,32 @@ impl TreeWorkerShadow {
         content_version: u64,
         configuration_generation: u64,
         supports_multiline: bool,
+        supersede: Option<crate::cancel::CancelToken>,
     ) -> Option<DerivedSemanticTokens> {
         let (client, context) = self
             .synchronized_query_read(uri, incarnation, content_version, configuration_generation)
             .await?;
         let expected = context.clone();
         let started = Instant::now();
+        let mut cancellation =
+            WorkerRequestCancellation::new(Arc::clone(&client), context.request_id);
         let response = tokio::task::spawn_blocking(move || {
             client.derive_semantic_tokens(DeriveSemanticTokens {
                 context,
                 supports_multiline,
             })
-        })
-        .await
-        .ok()?
-        .ok()?;
+        });
+        let response = if let Some(supersede) = supersede {
+            tokio::select! {
+                biased;
+                _ = supersede.cancelled() => return None,
+                response = response => response,
+            }
+        } else {
+            response.await
+        };
+        cancellation.disarm();
+        let response = response.ok()?.ok()?;
         let Response::SemanticTokens(result) = response else {
             return None;
         };
