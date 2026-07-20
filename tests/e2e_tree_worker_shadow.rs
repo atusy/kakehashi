@@ -1384,6 +1384,17 @@ fn windows_and_unix_crash_quarantine_every_unique_committed_grammar_hazard() {
         "file:///next-session.rs",
         "fn next_session() {}\n",
     );
+    let rust = next_session.send_request(
+        "kakehashi/node",
+        json!({
+            "textDocument": { "uri": "file:///next-session.rs" },
+            "position": { "line": 0, "character": 4 }
+        }),
+    );
+    assert!(
+        rust.get("result").is_some_and(|result| !result.is_null()),
+        "next session did not parse Rust: {rust:?}"
+    );
     next_session.send_notification(
         "textDocument/didOpen",
         json!({
@@ -1396,10 +1407,16 @@ fn windows_and_unix_crash_quarantine_every_unique_committed_grammar_hazard() {
         }),
     );
     let lua = next_session.send_request(
-        "textDocument/semanticTokens/full",
-        json!({ "textDocument": { "uri": "file:///next-session.lua" } }),
+        "kakehashi/node",
+        json!({
+            "textDocument": { "uri": "file:///next-session.lua" },
+            "position": { "line": 0, "character": 6 }
+        }),
     );
-    assert!(lua.get("result").is_some(), "{lua:?}");
+    assert!(
+        lua.get("result").is_some_and(|result| !result.is_null()),
+        "next session did not parse Lua: {lua:?}"
+    );
     let _stderr = shutdown_and_stderr(next_session);
 }
 
