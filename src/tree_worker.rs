@@ -5486,6 +5486,7 @@ impl Client {
         timeout: Duration,
     ) -> io::Result<Response> {
         let started = Instant::now();
+        let uses_supervisor_reserve = request_uses_supervisor_route_reserve(&request);
         if expected.worker_generation != self.ready.worker_generation {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -5505,7 +5506,7 @@ impl Client {
                     format!("tree worker request {request_id} is already active"),
                 ));
             }
-            if routes.len() >= self.max_inflight {
+            if !route_is_admissible(routes.len(), self.max_inflight, uses_supervisor_reserve) {
                 return Err(io::Error::new(
                     io::ErrorKind::WouldBlock,
                     "tree worker in-flight limit reached",
@@ -5592,6 +5593,21 @@ impl Client {
             )))
         }
     }
+}
+
+fn request_uses_supervisor_route_reserve(request: &Request) -> bool {
+    matches!(
+        request,
+        Request::SyncDocument(_)
+            | Request::ApplyDocumentEdits(_)
+            | Request::ApplyDocumentEditsAndDerive(_)
+            | Request::DeriveDocumentSnapshot(_)
+            | Request::CloseDocument(_)
+    )
+}
+
+fn route_is_admissible(active: usize, max_inflight: usize, uses_supervisor_reserve: bool) -> bool {
+    active < max_inflight.saturating_add(usize::from(uses_supervisor_reserve))
 }
 
 fn failed_spawn(
@@ -5789,8 +5805,9 @@ mod tests {
         derive_snapshot_with_language, encode_frame, enforce_derived_memory_budget,
         named_node_count, parse_request_timeout, pressure_checkpoint_required,
         replace_retained_bytes, replace_retained_estimated_bytes, request_may_grow_derived_state,
-        request_priority, reserve_retained_growth, route_response, run, submit_document_job,
-        sync_document, terminate, terminate_by_transport, validate_document_size,
+        request_priority, reserve_retained_growth, route_is_admissible, route_response, run,
+        submit_document_job, sync_document, terminate, terminate_by_transport,
+        validate_document_size,
     };
 
     #[derive(Clone, Default)]
@@ -6103,6 +6120,13 @@ mod tests {
             Duration::from_secs(60)
         );
         assert_eq!(parse_request_timeout(None), Duration::from_secs(60));
+    }
+
+    #[test]
+    fn supervisor_lifecycle_request_has_one_reserved_route() {
+        assert!(!route_is_admissible(16, 16, false));
+        assert!(route_is_admissible(16, 16, true));
+        assert!(!route_is_admissible(17, 16, true));
     }
 
     #[test]

@@ -2841,6 +2841,21 @@ fn run_actor(
             }
             Ok(_) => {}
             Err(error) => {
+                if is_local_client_error(&error) {
+                    log::error!(
+                        target: "kakehashi::tree_worker_shadow",
+                        "disabled tree tier after local worker request admission failure: {error}",
+                    );
+                    if let Some((uri, incarnation)) = command_document {
+                        comparisons.mark_closed(&uri, incarnation);
+                    }
+                    mark_tree_tier_unavailable(
+                        &mut state,
+                        &disabled,
+                        &pending_configuration_generation,
+                    );
+                    continue;
+                }
                 let failure = worker_loss_evidence(
                     state
                         .client
@@ -3526,6 +3541,15 @@ fn worker_loss_evidence(client: &Client, error: &std::io::Error) -> WorkerLossEv
     }
 }
 
+fn is_local_client_error(error: &std::io::Error) -> bool {
+    matches!(
+        error.kind(),
+        std::io::ErrorKind::InvalidInput
+            | std::io::ErrorKind::AlreadyExists
+            | std::io::ErrorKind::WouldBlock
+    )
+}
+
 fn unique_active_grammars(
     active_hazards: &[crate::tree_worker::GrammarHazardArmed],
 ) -> Vec<GrammarIdentity> {
@@ -3933,6 +3957,21 @@ mod tests {
         assert_eq!(evidence.class, FailureClass::Systemic);
         assert_eq!(evidence.active_grammars.len(), 1);
         assert_eq!(evidence.active_lease_count, 2);
+    }
+
+    #[test]
+    fn local_admission_errors_are_not_worker_loss() {
+        for kind in [
+            std::io::ErrorKind::InvalidInput,
+            std::io::ErrorKind::AlreadyExists,
+            std::io::ErrorKind::WouldBlock,
+        ] {
+            assert!(is_local_client_error(&std::io::Error::new(kind, "local")));
+        }
+        assert!(!is_local_client_error(&std::io::Error::new(
+            std::io::ErrorKind::BrokenPipe,
+            "transport",
+        )));
     }
 
     #[test]
