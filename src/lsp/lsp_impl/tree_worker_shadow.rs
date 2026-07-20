@@ -2927,8 +2927,10 @@ fn run_actor(
                     .as_ref()
                     .expect("failed request retains its worker client");
                 let worker_was_terminated = client.was_terminated_for_request_deadline();
-                let worker_transport_is_live =
-                    client.try_wait().is_ok_and(|status| status.is_none());
+                let observed_status = client.try_wait();
+                let worker_transport_is_live = observed_status
+                    .as_ref()
+                    .is_ok_and(|status| status.is_none());
                 if may_continue_after_client_error(
                     &error,
                     worker_was_terminated,
@@ -2958,12 +2960,15 @@ fn run_actor(
                     );
                     continue;
                 }
-                let failure = worker_loss_evidence(
-                    state
-                        .client
-                        .as_ref()
-                        .expect("failed request retains its worker client"),
+                let observed_native_crash = match observed_status.as_ref() {
+                    Ok(Some(status)) => Some(process_status_is_native_crash(status)),
+                    Err(_) => Some(false),
+                    Ok(None) => None,
+                };
+                let failure = worker_loss_evidence_with_observed_status(
+                    client,
                     &error,
+                    observed_native_crash,
                 );
                 log::error!(
                     target: "kakehashi::tree_worker_shadow",
@@ -3622,6 +3627,14 @@ fn retag_command(command: &mut ShadowCommand, generation: u64) {
 }
 
 fn worker_loss_evidence(client: &Client, error: &std::io::Error) -> WorkerLossEvidence {
+    worker_loss_evidence_with_observed_status(client, error, None)
+}
+
+fn worker_loss_evidence_with_observed_status(
+    client: &Client,
+    error: &std::io::Error,
+    observed_native_crash: Option<bool>,
+) -> WorkerLossEvidence {
     if client.was_terminated_for_request_deadline() {
         log::error!(
             target: "kakehashi::tree_worker_shadow",
@@ -3679,7 +3692,12 @@ fn worker_loss_evidence(client: &Client, error: &std::io::Error) -> WorkerLossEv
             leases,
         );
     }
-    let class = classify_transport_failure(client, error, !active_grammars.is_empty());
+    let class = classify_transport_failure(
+        client,
+        error,
+        !active_grammars.is_empty(),
+        observed_native_crash,
+    );
     WorkerLossEvidence {
         class,
         active_grammars,
@@ -3729,19 +3747,33 @@ fn classify_transport_failure(
     client: &Client,
     error: &std::io::Error,
     has_active_hazards: bool,
+    observed_native_crash: Option<bool>,
 ) -> FailureClass {
-    if !has_active_hazards || error.kind() == std::io::ErrorKind::InvalidData {
-        return FailureClass::Systemic;
-    }
-    if error.kind() == std::io::ErrorKind::TimedOut {
-        return FailureClass::NativeEvidenced;
-    }
-    if !client.was_terminated_by_transport()
-        && client
+    let native_crash = observed_native_crash.unwrap_or_else(|| {
+        client
             .try_wait()
             .ok()
             .flatten()
             .is_some_and(|status| process_status_is_native_crash(&status))
+    });
+    classify_transport_observation(
+        error.kind(),
+        has_active_hazards,
+        client.was_terminated_by_transport(),
+        native_crash,
+    )
+}
+
+fn classify_transport_observation(
+    error_kind: std::io::ErrorKind,
+    has_active_hazards: bool,
+    terminated_by_transport: bool,
+    observed_native_crash: bool,
+) -> FailureClass {
+    if has_active_hazards
+        && error_kind != std::io::ErrorKind::InvalidData
+        && !terminated_by_transport
+        && observed_native_crash
     {
         return FailureClass::NativeEvidenced;
     }
@@ -4187,6 +4219,22 @@ mod tests {
             false,
             true,
         ));
+    }
+
+    #[test]
+    fn timeout_exit_is_native_only_with_independent_crash_evidence() {
+        assert_eq!(
+            classify_transport_observation(std::io::ErrorKind::TimedOut, true, false, false,),
+            FailureClass::Systemic,
+        );
+        assert_eq!(
+            classify_transport_observation(std::io::ErrorKind::TimedOut, true, false, true,),
+            FailureClass::NativeEvidenced,
+        );
+        assert_eq!(
+            classify_transport_observation(std::io::ErrorKind::TimedOut, true, true, true,),
+            FailureClass::Systemic,
+        );
     }
 
     #[test]
