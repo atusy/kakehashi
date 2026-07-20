@@ -144,6 +144,44 @@ enum FailureClass {
     NativeEvidenced,
 }
 
+#[derive(Clone, Copy)]
+struct RestartPolicy {
+    initial_backoff: Duration,
+    max_backoff: Duration,
+    fast_healthy_interval: Duration,
+    long_healthy_interval: Duration,
+}
+
+impl RestartPolicy {
+    fn from_environment() -> Self {
+        let policy = Self::default();
+        #[cfg(feature = "e2e")]
+        let policy = {
+            let mut policy = policy;
+            if let Some(milliseconds) = std::env::var("KAKEHASHI_TREE_WORKER_FAST_COOLDOWN_MS")
+                .ok()
+                .and_then(|value| value.parse::<u64>().ok())
+                .filter(|milliseconds| *milliseconds > 0)
+            {
+                policy.fast_healthy_interval = Duration::from_millis(milliseconds);
+            }
+            policy
+        };
+        policy
+    }
+}
+
+impl Default for RestartPolicy {
+    fn default() -> Self {
+        Self {
+            initial_backoff: INITIAL_RESTART_BACKOFF,
+            max_backoff: MAX_RESTART_BACKOFF,
+            fast_healthy_interval: FAST_HEALTHY_INTERVAL,
+            long_healthy_interval: LONG_HEALTHY_INTERVAL,
+        }
+    }
+}
+
 struct RestartBudget {
     systemic: u8,
     native: u8,
@@ -207,11 +245,12 @@ impl RestartBudget {
         self.tokens
     }
 
-    fn backoff(&self) -> Duration {
+    fn backoff(&self, policy: RestartPolicy) -> Duration {
         let exponent = self.backoff_count.saturating_sub(1).min(10) as u32;
-        INITIAL_RESTART_BACKOFF
+        policy
+            .initial_backoff
             .saturating_mul(1_u32 << exponent)
-            .min(MAX_RESTART_BACKOFF)
+            .min(policy.max_backoff)
     }
 }
 
@@ -264,6 +303,7 @@ struct SupervisorState {
     open_documents: Arc<Mutex<OpenDocuments>>,
     quarantined: HashSet<GrammarIdentity>,
     restart_budget: RestartBudget,
+    restart_policy: RestartPolicy,
     breaker: BreakerState,
     healthy_since: Option<Instant>,
     long_healthy_since: Option<Instant>,
@@ -2455,6 +2495,7 @@ fn run_actor(
         open_documents,
         quarantined: HashSet::new(),
         restart_budget: RestartBudget::default(),
+        restart_policy: RestartPolicy::from_environment(),
         breaker: BreakerState::Closed,
         healthy_since: initial_healthy_since,
         long_healthy_since: initial_healthy_since,
@@ -2900,9 +2941,9 @@ fn mark_tree_tier_unavailable(
         opened_at: Instant::now(),
         baseline_generation: pending_configuration_generation.load(Ordering::Acquire),
         cooldown: if state.restart_budget.tokens_remaining() == 0 {
-            LONG_HEALTHY_INTERVAL
+            state.restart_policy.long_healthy_interval
         } else {
-            FAST_HEALTHY_INTERVAL
+            state.restart_policy.fast_healthy_interval
         },
     };
     disabled.store(true, Ordering::Release);
@@ -2916,7 +2957,7 @@ fn observe_healthy_service(state: &mut SupervisorState, now: Instant) {
     let Some(healthy_since) = state.healthy_since else {
         return;
     };
-    if now.saturating_duration_since(healthy_since) >= FAST_HEALTHY_INTERVAL {
+    if now.saturating_duration_since(healthy_since) >= state.restart_policy.fast_healthy_interval {
         state.restart_budget.reset_fast();
         if let BreakerState::HalfOpen {
             probe_generation, ..
@@ -2933,13 +2974,18 @@ fn observe_healthy_service(state: &mut SupervisorState, now: Instant) {
         return;
     };
     let elapsed = now.saturating_duration_since(last_restore);
-    let intervals = elapsed.as_secs() / LONG_HEALTHY_INTERVAL.as_secs();
+    let intervals = elapsed.as_secs() / state.restart_policy.long_healthy_interval.as_secs();
     if intervals == 0 {
         return;
     }
     state.restart_budget.restore_long(intervals);
-    state.long_healthy_since =
-        Some(last_restore + LONG_HEALTHY_INTERVAL.saturating_mul(intervals as u32));
+    state.long_healthy_since = Some(
+        last_restore
+            + state
+                .restart_policy
+                .long_healthy_interval
+                .saturating_mul(intervals as u32),
+    );
 }
 
 fn execute_command(
@@ -3031,7 +3077,7 @@ fn recover_worker(
             log::warn!(target: "kakehashi::tree_worker_shadow", "failed worker cleanup: {error}");
         }
         if charged {
-            std::thread::sleep(state.restart_budget.backoff());
+            std::thread::sleep(state.restart_budget.backoff(state.restart_policy));
         }
         let generation = NEXT_WORKER_GENERATION.fetch_add(1, Ordering::Relaxed);
         let replacement = match Client::spawn(executable, compute_threads, generation) {
@@ -4107,7 +4153,10 @@ mod tests {
         }
         assert!(!native.consume(FailureClass::NativeEvidenced));
 
-        assert_eq!(systemic.backoff(), Duration::from_secs(1));
+        assert_eq!(
+            systemic.backoff(RestartPolicy::default()),
+            Duration::from_secs(1)
+        );
     }
 
     #[test]
@@ -4122,6 +4171,7 @@ mod tests {
             open_documents: Arc::new(Mutex::new(OpenDocuments::default())),
             quarantined: HashSet::new(),
             restart_budget: RestartBudget::default(),
+            restart_policy: RestartPolicy::default(),
             breaker: BreakerState::HalfOpen {
                 probe_generation: 7,
                 synchronized_epoch: 0,
@@ -4145,7 +4195,10 @@ mod tests {
             state.restart_budget.tokens_remaining(),
             MAX_SESSION_RESTARTS - 4
         );
-        assert_eq!(state.restart_budget.backoff(), Duration::from_secs(2));
+        assert_eq!(
+            state.restart_budget.backoff(state.restart_policy),
+            Duration::from_secs(2)
+        );
 
         observe_healthy_service(
             &mut state,
@@ -4155,7 +4208,10 @@ mod tests {
             state.restart_budget.tokens_remaining(),
             MAX_SESSION_RESTARTS - 3
         );
-        assert_eq!(state.restart_budget.backoff(), INITIAL_RESTART_BACKOFF);
+        assert_eq!(
+            state.restart_budget.backoff(state.restart_policy),
+            INITIAL_RESTART_BACKOFF
+        );
     }
 
     #[test]
