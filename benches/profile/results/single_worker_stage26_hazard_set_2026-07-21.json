@@ -5,8 +5,8 @@
     "stage": 25
   },
   "candidate": {
-    "commit": "30ae589b3b81a525cc3209dae5d9b61c108303c8",
-    "release_server_binary_sha256": "e4fa45dfb73588ab93448e52ec4425076a1342d099dc7000d6a1d4b796032b5a",
+    "commit": "67c338ca7955faf1021c0951a8f039a915b5a0d0",
+    "release_server_binary_sha256": "8139d7e2b3b8b661a15110e2795b7cd09caa63a2dd5cc6873e309eb54bf3ab6a",
     "stage": 26
   },
   "environment": {
@@ -18,14 +18,10 @@
   "recovery_artifacts": {
     "build_command": "cargo test --features e2e --test e2e_tree_worker_shadow --no-run",
     "execution_command_template": "cargo test --features e2e --test e2e_tree_worker_shadow <test> -- --exact --nocapture",
-    "stage25_e2e_binary": {
-      "path": "target/debug/deps/e2e_tree_worker_shadow-0b7a6c7b84f4b502",
-      "sha256": "74fc0069fdb422454e7a8af36d0c5b771d0d15fbaff144f357cc660a54aa540c"
-    },
-    "stage26_e2e_binary": {
-      "path": "target/debug/deps/e2e_tree_worker_shadow-0b7a6c7b84f4b502",
-      "sha256": "8f81a229e0cb437021ca504f7e806783535e7042cfe67fed06026a7e96c7fe42"
-    }
+    "stage25_debug_server": { "path": "target/debug/kakehashi", "sha256": "d96476057b71c6801ac31bf326b0f51f1f9c07837bb552693a45ae49a921f054" },
+    "stage25_e2e_binary": { "path": "target/debug/deps/e2e_tree_worker_shadow-0b7a6c7b84f4b502", "sha256": "74fc0069fdb422454e7a8af36d0c5b771d0d15fbaff144f357cc660a54aa540c" },
+    "stage26_debug_server": { "path": "target/debug/kakehashi", "sha256": "e9f1ad718b25667006a3d2f39421c1c8e313adc855dd98045d6a94aab664255d" },
+    "stage26_e2e_binary": { "path": "target/debug/deps/e2e_tree_worker_shadow-0b7a6c7b84f4b502", "sha256": "c8f1a4d02f59a4cc0451476751004fe95d801474a553ef0146af868da71a4629" }
   },
   "single_hazard_recovery": {
     "method": {
@@ -38,38 +34,33 @@
       "warmup_runs_per_stage": 1
     },
     "samples_ms": [
-      { "pair": 1, "stage25": 1176, "stage26": 1177 },
-      { "pair": 2, "stage25": 1167, "stage26": 1174 },
-      { "pair": 3, "stage25": 1200, "stage26": 1120 },
-      { "pair": 4, "stage25": 1373, "stage26": 1139 },
-      { "pair": 5, "stage25": 1204, "stage26": 1131 },
-      { "pair": 6, "stage25": 1164, "stage26": 1549 },
-      { "pair": 7, "stage25": 1184, "stage26": 1318 },
-      { "pair": 8, "stage25": 1230, "stage26": 1172 },
-      { "pair": 9, "stage25": 1278, "stage26": 1196 },
-      { "pair": 10, "stage25": 1170, "stage26": 1232 },
-      { "pair": 11, "stage25": 1394, "stage26": 1187 },
-      { "pair": 12, "stage25": 1228, "stage26": 1192 }
+      { "pair": 1, "stage25": 1137, "stage26": 1140 },
+      { "pair": 2, "stage25": 1140, "stage26": 1146 },
+      { "pair": 3, "stage25": 1137, "stage26": 1140 },
+      { "pair": 4, "stage25": 1139, "stage26": 1146 },
+      { "pair": 5, "stage25": 1245, "stage26": 1132 },
+      { "pair": 6, "stage25": 1179, "stage26": 1141 },
+      { "pair": 7, "stage25": 1140, "stage26": 1143 },
+      { "pair": 8, "stage25": 1144, "stage26": 1147 },
+      { "pair": 9, "stage25": 1166, "stage26": 1152 },
+      { "pair": 10, "stage25": 1477, "stage26": 1135 },
+      { "pair": 11, "stage25": 1174, "stage26": 1297 },
+      { "pair": 12, "stage25": 1163, "stage26": 1205 }
     ],
     "summary": {
-      "median_paired_delta_ms": -47,
-      "median_paired_delta_percent": -3.824,
-      "paired_delta_range_ms": [-234, 385],
-      "stage25_mean_ms": 1230.667,
-      "stage25_median_ms": 1202,
-      "stage25_range_ms": [1164, 1394],
-      "stage26_mean_ms": 1215.583,
-      "stage26_median_ms": 1182,
-      "stage26_range_ms": [1120, 1549]
+      "median_paired_delta_ms": 3,
+      "median_paired_delta_percent": 0.264,
+      "paired_delta_range_ms": [-342, 123],
+      "stage25_mean_ms": 1186.750,
+      "stage25_median_ms": 1153.500,
+      "stage25_range_ms": [1137, 1477],
+      "stage26_mean_ms": 1160.333,
+      "stage26_median_ms": 1144.500,
+      "stage26_range_ms": [1132, 1297]
     }
   },
   "two_active_grammars": {
-    "assertions_per_run": {
-      "full_resynced_bytes": 14,
-      "full_resynced_documents": 1,
-      "newly_quarantined_grammars": 2,
-      "restarts": 1
-    },
+    "assertions_per_run": { "full_resynced_bytes": 14, "full_resynced_documents": 1, "newly_quarantined_grammars": 2, "restarts": 1 },
     "method": {
       "build_profile": "test (unoptimized + debuginfo)",
       "measurement": "supervisor recovery_ms from recovery start through replacement spawn and quarantine-aware full resync",
@@ -78,21 +69,11 @@
       "threads": 4,
       "warmup_runs": 1
     },
-    "samples_ms": [978, 962, 961, 967, 954, 962, 957],
-    "summary": {
-      "mean_ms": 963,
-      "median_ms": 962,
-      "range_ms": [954, 978]
-    }
+    "samples_ms": [960, 965, 954, 959, 964, 964, 950],
+    "summary": { "mean_ms": 959.429, "median_ms": 960, "range_ms": [950, 965] }
   },
   "saturated_noncooperative_timeout": {
-    "assertions_per_run": {
-      "committed_hazards": 4,
-      "compute_threads_saturated": 4,
-      "full_resynced_documents": 4,
-      "newly_quarantined_grammars": 0,
-      "restarts": 1
-    },
+    "assertions_per_run": { "committed_hazards": 4, "compute_threads_saturated": 4, "full_resynced_documents": 4, "newly_quarantined_grammars": 0, "restarts": 1 },
     "method": {
       "build_profile": "test (unoptimized + debuginfo)",
       "cancellation_grace_ms": 250,
@@ -103,24 +84,17 @@
       "threads": 4,
       "warmup_runs": 1
     },
-    "samples_ms": [3197, 3204, 3196, 3200, 3204, 3176, 3195],
-    "summary": {
-      "mean_ms": 3196,
-      "median_ms": 3197,
-      "range_ms": [3176, 3204]
-    }
+    "samples_ms": [3200, 3194, 3202, 3181, 3218, 3187, 3185],
+    "summary": { "mean_ms": 3195.286, "median_ms": 3194, "range_ms": [3181, 3218] }
   },
   "steady_state": {
     "artifacts": {
-      "build_commands": [
-        "cargo build --release --locked --bin kakehashi",
-        "cargo bench --locked --bench tree_worker_stage2 --no-run"
-      ],
+      "build_commands": ["cargo build --release --locked --bin kakehashi", "cargo bench --locked --bench tree_worker_stage2 --no-run"],
       "execution_command_template": "target/release/deps/tree_worker_stage2-329ecb03b93d760d --bench --bin target/release/kakehashi --parser deps/test/kakehashi/parser/rust.dylib --requests 500 --threads 4 --lines 200 [--worker-first]",
       "harness_source_path": "benches/tree_worker_stage2.rs",
       "harness_source_sha256": "fe96da0be057f65836e6948334752daeb4d5c0dcd363645e2dbcc0d1a5dbdcab",
       "stage25_harness_binary_sha256": "d9451d0a4e531c4b7fac5bcf81e5be61294ee7b0f0a462ef0e03d478ddcd10a4",
-      "stage26_harness_binary_sha256": "5624184c1ad89e51b25698b86970ce08ad2a5024bdd84897d8cf10405a39ea6f"
+      "stage26_harness_binary_sha256": "8d906956ab5284f3841c2c4cdba4c40b9a05a99c0024a9f4da5fa7227c645e8d"
     },
     "method": {
       "build_profile": "release (optimized)",
@@ -133,32 +107,26 @@
       "worker_direct_order": "odd direct->worker; even worker->direct"
     },
     "pairs": [
-      { "pair": 1, "stage25": [462.209, 521.166, 560.959, 628.834, 6500.936], "stage26": [454.375, 486.084, 564.791, 633.375, 6482.320] },
-      { "pair": 2, "stage25": [441.708, 476.958, 532.417, 635.000, 6931.300], "stage26": [400.000, 471.458, 532.042, 629.834, 6886.238] },
-      { "pair": 3, "stage25": [388.959, 473.792, 565.333, 632.667, 6596.469], "stage26": [426.834, 474.250, 555.041, 635.209, 6622.125] },
-      { "pair": 4, "stage25": [446.000, 475.084, 551.459, 638.708, 6612.179], "stage26": [446.500, 492.375, 542.584, 632.000, 6691.056] },
-      { "pair": 5, "stage25": [387.750, 457.458, 563.875, 628.875, 6511.660], "stage26": [385.500, 457.708, 567.792, 692.125, 6320.616] },
-      { "pair": 6, "stage25": [387.875, 461.209, 550.291, 618.583, 6801.032], "stage26": [406.584, 474.250, 534.166, 630.333, 6896.401] },
-      { "pair": 7, "stage25": [387.750, 462.167, 560.291, 626.125, 6548.370], "stage26": [446.750, 473.958, 559.875, 627.417, 6612.459] },
-      { "pair": 8, "stage25": [385.709, 454.125, 558.292, 636.916, 6673.544], "stage26": [383.042, 450.250, 541.042, 636.709, 6853.446] },
-      { "pair": 9, "stage25": [484.416, 604.459, 563.042, 889.875, 5357.131], "stage26": [518.750, 610.458, 547.083, 675.125, 5591.674] },
-      { "pair": 10, "stage25": [521.500, 612.834, 540.334, 630.417, 6616.083], "stage26": [548.333, 715.959, 545.292, 1116.375, 5767.947] },
-      { "pair": 11, "stage25": [465.416, 528.666, 547.375, 636.833, 6654.559], "stage26": [453.500, 494.542, 560.375, 631.875, 6556.621] },
-      { "pair": 12, "stage25": [383.250, 411.416, 531.042, 632.291, 6924.640], "stage26": [381.541, 414.167, 528.334, 624.166, 6978.314] }
+      { "pair": 1, "stage25": [451.750, 478.709, 558.916, 635.666, 6550.744], "stage26": [450.458, 498.709, 565.750, 635.167, 6489.963] },
+      { "pair": 2, "stage25": [512.625, 624.333, 555.834, 628.500, 6555.521], "stage26": [475.166, 535.000, 561.708, 652.917, 6292.946] },
+      { "pair": 3, "stage25": [455.042, 492.375, 549.875, 617.208, 6689.534], "stage26": [381.958, 406.500, 553.042, 635.083, 6588.028] },
+      { "pair": 4, "stage25": [390.042, 464.708, 535.958, 637.041, 6941.665], "stage26": [380.333, 407.917, 518.625, 655.125, 7018.324] },
+      { "pair": 5, "stage25": [403.250, 471.459, 561.708, 633.542, 6554.508], "stage26": [381.792, 409.041, 558.125, 627.917, 6617.250] },
+      { "pair": 6, "stage25": [392.708, 481.417, 526.834, 635.709, 6900.319], "stage26": [382.958, 412.792, 535.916, 628.834, 6842.426] },
+      { "pair": 7, "stage25": [386.625, 467.458, 563.375, 625.333, 6565.568], "stage26": [383.667, 459.750, 559.458, 629.666, 6588.690] },
+      { "pair": 8, "stage25": [380.792, 408.333, 520.916, 626.333, 7008.556], "stage26": [411.334, 480.708, 539.542, 645.708, 6869.154] },
+      { "pair": 9, "stage25": [383.000, 410.250, 556.833, 629.834, 6602.055], "stage26": [381.167, 406.542, 559.333, 651.709, 6535.923] },
+      { "pair": 10, "stage25": [384.458, 423.542, 522.041, 629.791, 6917.954], "stage26": [385.375, 456.958, 536.292, 633.166, 6894.416] },
+      { "pair": 11, "stage25": [381.833, 402.625, 557.584, 630.375, 6610.656], "stage26": [385.750, 464.833, 554.500, 630.708, 6596.705] },
+      { "pair": 12, "stage25": [391.416, 476.375, 548.375, 635.792, 6676.834], "stage26": [382.583, 408.875, 506.416, 624.958, 7207.263] }
     ],
-    "pair_value_order": [
-      "sequential_parent_p50_us",
-      "sequential_parent_p95_us",
-      "parallel_parent_p50_us",
-      "parallel_parent_p95_us",
-      "parallel_requests_per_second"
-    ],
+    "pair_value_order": ["sequential_parent_p50_us", "sequential_parent_p95_us", "parallel_parent_p50_us", "parallel_parent_p95_us", "parallel_requests_per_second"],
     "summary": {
-      "parallel_parent_p50_us": { "stage25_median": 554.876, "stage26_median": 546.188, "median_paired_delta_percent": -0.292 },
-      "parallel_parent_p95_us": { "stage25_median": 632.479, "stage26_median": 632.688, "median_paired_delta_percent": 0.087 },
-      "parallel_requests_per_second": { "stage25_median": 6614.131, "stage26_median": 6617.292, "median_paired_delta_percent": 0.582 },
-      "sequential_parent_p50_us": { "stage25_median": 415.334, "stage26_median": 436.667, "median_paired_delta_percent": -0.167 },
-      "sequential_parent_p95_us": { "stage25_median": 474.438, "stage26_median": 474.250, "median_paired_delta_percent": 0.383 }
+      "parallel_parent_p50_us": { "stage25_median": 552.855, "stage26_median": 553.771, "median_paired_delta_percent": 0.512 },
+      "parallel_parent_p95_us": { "stage25_median": 630.105, "stage26_median": 634.125, "median_paired_delta_percent": 0.614 },
+      "parallel_requests_per_second": { "stage25_median": 6643.745, "stage26_median": 6606.978, "median_paired_delta_percent": -0.590 },
+      "sequential_parent_p50_us": { "stage25_median": 390.729, "stage26_median": 383.313, "median_paired_delta_percent": -1.511 },
+      "sequential_parent_p95_us": { "stage25_median": 469.459, "stage26_median": 434.875, "median_paired_delta_percent": -6.935 }
     }
   }
 }

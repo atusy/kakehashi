@@ -1328,12 +1328,13 @@ set. The parent drains the dead generation's response reader before snapshot,
 deduplicates every committed active grammar identity, installs the full set,
 and then restarts once. The two-grammar E2E consistently quarantined Rust and
 Lua while resyncing only healthy YAML; seven final-HEAD runs recovered in a
-median 962 ms. Against Stage 25 on the same single-hazard fixture, alternating
-12-pair medians changed from 1202 to 1182 ms and the median paired delta was
--47 ms (-3.8%), but the wide -234 to +385 ms paired range does not establish an
-improvement. The request-admission fence adds one atomic load under the existing
-route mutex; paired release measurements put every sequential and four-way
-median delta below 1%, so its cost was not distinguishable in this fixture.
+median 960 ms. Against Stage 25 on the same single-hazard fixture, alternating
+12-pair medians changed from 1153.5 to 1144.5 ms and the median paired delta was
++3 ms (+0.26%); the wide -342 to +123 ms paired range does not establish a
+regression. The request-admission fence adds one atomic load under the existing
+route mutex. Paired release measurements moved sequential p50/p95 in the faster
+direction, while parallel p50/p95 and throughput changed by less than 1%, so no
+parallel cost was distinguishable in this fixture.
 Keep the failure-path barrier. Runtime
 injection identities, independently bounded control transport, native segment
 deadlines, explicit workload-aware admission, protocol and compatibility

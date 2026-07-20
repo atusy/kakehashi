@@ -43,41 +43,41 @@ active Rust set, restarts once, and serves the healthy Lua document. A
 transport error received during cancellation grace is propagated instead of
 being overwritten as a generic timeout.
 
-The focused 64 worker and 40 supervisor tests, the single-crash, protocol-
+The focused 65 worker and 40 supervisor tests, the single-crash, protocol-
 failure, multi-hazard, single-timeout, and four-thread saturation E2Es,
 all-target Check, warning-denying Clippy, and formatting checks pass locally.
 
 ## Recovery measurement
 
 The final-HEAD measurement compares immutable Stage 25 (`f6e0c2125`) and Stage
-26 (`30ae589b3`) with the same single-hazard E2E on macOS 26.5.1 (`Darwin
+26 (`67c338ca7`) with the same single-hazard E2E on macOS 26.5.1 (`Darwin
 25.5.0`, Apple M4). After one warmup per stage, 12 pairs alternate revision
 order. The supervisor's `recovery_ms` covers failure recovery through
 replacement spawn and full resync; it is not end-to-end request latency.
 
 | Metric | Stage 25 | Stage 26 | Difference |
 | --- | ---: | ---: | ---: |
-| Median recovery | 1202 ms | 1182 ms | -20 ms (-1.7%) |
-| Mean recovery | 1231 ms | 1216 ms | -15 ms (-1.2%) |
-| Range | 1164–1394 ms | 1120–1549 ms | — |
-| Median paired delta | — | — | -47 ms (-3.8%) |
+| Median recovery | 1153.5 ms | 1144.5 ms | -9 ms (-0.8%) |
+| Mean recovery | 1186.8 ms | 1160.3 ms | -26.4 ms (-2.2%) |
+| Range | 1137–1477 ms | 1132–1297 ms | — |
+| Median paired delta | — | — | +3 ms (+0.26%) |
 
-The medians show no regression, but paired differences span -234 to +385 ms.
+The medians show no regression, but paired differences span -342 to +123 ms.
 The debug E2E combines process spawn, hashing, backoff, and resync, so this run
-does not isolate hazard-set construction and cannot support a claimed 3.8%
-improvement.
+does not isolate hazard-set construction. The +3 ms paired median is
+noise-scale and does not establish a regression.
 
 The two-active-grammar E2E also ran seven times. Every run quarantined two
 grammars, restarted once, and resynchronized one healthy document (14 bytes).
-Recovery was 954–978 ms, with a 962 ms median and 963 ms mean. This fixture has
+Recovery was 950–965 ms, with a 960 ms median and 959 ms mean. This fixture has
 a different failure trigger and document set, so its absolute time is not
 directly comparable with the single-hazard fixture. It establishes that two
 attributions remain one recovery action rather than two restarts.
 
 The four-thread saturation E2E ran seven times after one warmup. Its configured
 2,000 ms request deadline and 250 ms cancellation grace are included in the
-measurement. Replacement readiness was 3176–3204 ms after request issue, with a
-3197 ms median and 3196 ms mean. The narrow 28 ms range shows that four leaked
+measurement. Replacement readiness was 3181–3218 ms after request issue, with a
+3194 ms median and 3195 ms mean. The narrow 37 ms range shows that four leaked
 native jobs are reclaimed by one bounded process restart rather than four
 serial per-thread recoveries.
 
@@ -91,18 +91,17 @@ Rust source lines and four worker threads.
 
 | Metric | Stage 25 median | Stage 26 median | Median paired delta |
 | --- | ---: | ---: | ---: |
-| Sequential parent p50 | 415.334 us | 436.667 us | -0.167% |
-| Sequential parent p95 | 474.438 us | 474.250 us | +0.383% |
-| Four-way parallel parent p50 | 554.876 us | 546.188 us | -0.292% |
-| Four-way parallel parent p95 | 632.479 us | 632.688 us | +0.087% |
-| Four-way parallel throughput | 6614 req/s | 6617 req/s | +0.582% |
+| Sequential parent p50 | 390.729 us | 383.313 us | -1.511% |
+| Sequential parent p95 | 469.459 us | 434.875 us | -6.935% |
+| Four-way parallel parent p50 | 552.855 us | 553.771 us | +0.512% |
+| Four-way parallel parent p95 | 630.105 us | 634.125 us | +0.614% |
+| Four-way parallel throughput | 6644 req/s | 6607 req/s | -0.590% |
 
-Directions are mixed and every paired median is below 1%. Absolute p50 medians
-also move differently from their paired medians because the alternating
-worker/direct order makes these small samples bimodal. The atomic admission
-check therefore has no distinguishable steady-state cost in this fixture. One
-Stage 26 parallel p95 sample reached 1116 us (+77% paired), while another pair
-favored Stage 26 by 24%; this small run cannot establish a tail-latency bound.
+Sequential medians move in the faster direction, while all three parallel
+paired medians move by less than 1%. Run-to-run ranges overlap and sequential
+p95 paired deltas span -17.4% to +17.7%, so the fixture does not distinguish a
+causal speedup. It does show no measurable parallel regression from the atomic
+admission check. This small run cannot establish a tail-latency bound.
 
 Raw samples, artifact roles and hashes, stable source paths, exact build/run
 commands, metric ordering, and commit identities are in
