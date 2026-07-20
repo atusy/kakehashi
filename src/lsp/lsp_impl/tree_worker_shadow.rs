@@ -971,13 +971,14 @@ impl TreeWorkerShadow {
         }
         log::debug!(
             target: "kakehashi::tree_worker_shadow_metrics",
-            "semantic uri={} version={} parent_us={} queue_us={} compute_us={} tokens={}",
+            "semantic uri={} version={} parent_us={} queue_us={} compute_us={} tokens={} cache_hit={}",
             result.context.uri,
             result.context.content_version,
             started.elapsed().as_micros(),
             result.queue_wait_ns / 1_000,
             result.compute_ns / 1_000,
             result.tokens.len(),
+            result.cache_hit,
         );
         let current = self
             .open_documents
@@ -2890,11 +2891,13 @@ fn execute_command(
         ShadowCommand::Apply { request, fallback } => {
             let uri = fallback.context.uri.clone();
             let identity = ReplicaIdentity::from_sync(&fallback);
-            if replica_requires_sync(replicas, &uri, &identity) {
+            if replica_requires_sync(replicas, &uri, &identity, request.base_version) {
                 (sync_and_derive(client, fallback), Some(identity))
             } else {
                 match client.apply_document_edits_and_derive(request) {
-                    Ok(Response::Snapshot(snapshot)) => (Ok(Response::Snapshot(snapshot)), None),
+                    Ok(Response::Snapshot(snapshot)) => {
+                        (Ok(Response::Snapshot(snapshot)), Some(identity))
+                    }
                     Ok(Response::WorkerRestartRequired(required)) => {
                         (Ok(Response::WorkerRestartRequired(required)), None)
                     }
@@ -3298,8 +3301,20 @@ fn replica_requires_sync(
     replicas: &HashMap<String, ReplicaIdentity>,
     uri: &str,
     desired: &ReplicaIdentity,
+    base_version: u64,
 ) -> bool {
-    replicas.get(uri) != Some(desired)
+    replicas.get(uri).is_none_or(|current| {
+        current.incarnation != desired.incarnation
+            || current.content_version != base_version
+            || desired.content_version <= base_version
+            || current.language != desired.language
+            || current.grammar_symbol != desired.grammar_symbol
+            || current.source_path != desired.source_path
+            || current.parser_path != desired.parser_path
+            || current.artifact_digest != desired.artifact_digest
+            || current.queries != desired.queries
+            || current.configuration_generation != desired.configuration_generation
+    })
 }
 
 enum ComparisonSide {
@@ -3902,6 +3917,34 @@ mod tests {
     }
 
     #[test]
+    fn advancing_version_uses_incremental_replica_when_stable_identity_matches() {
+        let current = ReplicaIdentity::from_sync(&sync("file:///a.rs", 1, 1, 7));
+        let desired = ReplicaIdentity::from_sync(&sync("file:///a.rs", 1, 2, 7));
+        let replicas = HashMap::from([("file:///a.rs".to_string(), current)]);
+
+        assert!(!replica_requires_sync(
+            &replicas,
+            "file:///a.rs",
+            &desired,
+            1,
+        ));
+        assert!(replica_requires_sync(
+            &replicas,
+            "file:///a.rs",
+            &desired,
+            0,
+        ));
+        let mut changed_grammar = desired;
+        changed_grammar.artifact_digest = "sha256:rust-v2".into();
+        assert!(replica_requires_sync(
+            &replicas,
+            "file:///a.rs",
+            &changed_grammar,
+            1,
+        ));
+    }
+
+    #[test]
     fn configuration_mirroring_publishes_a_complete_registry_before_enqueue() {
         let (sender, receiver) = mpsc::sync_channel(4);
         let shadow = shadow(sender);
@@ -4139,27 +4182,29 @@ mod tests {
             shadow.sync_request(&uri, 2, 4, "rust".into(), grammar(), "fn main() {}".into());
         let identity = ReplicaIdentity::from_sync(&request);
         let mut replicas = HashMap::from([(uri.as_str().to_string(), identity.clone())]);
+        let mut desired = identity.clone();
+        desired.content_version = 5;
 
-        assert!(!replica_requires_sync(&replicas, uri.as_str(), &identity));
+        assert!(!replica_requires_sync(&replicas, uri.as_str(), &desired, 4,));
 
-        let mut changed = identity.clone();
+        let mut changed = desired.clone();
         changed.language = "bash".into();
-        assert!(replica_requires_sync(&replicas, uri.as_str(), &changed));
+        assert!(replica_requires_sync(&replicas, uri.as_str(), &changed, 4,));
 
-        changed = identity.clone();
+        changed = desired.clone();
         changed.grammar_symbol = "rust_with_changes".into();
-        assert!(replica_requires_sync(&replicas, uri.as_str(), &changed));
+        assert!(replica_requires_sync(&replicas, uri.as_str(), &changed, 4,));
 
-        changed = identity.clone();
+        changed = desired.clone();
         changed.configuration_generation += 1;
-        assert!(replica_requires_sync(&replicas, uri.as_str(), &changed));
+        assert!(replica_requires_sync(&replicas, uri.as_str(), &changed, 4,));
 
-        changed = identity.clone();
+        changed = desired.clone();
         changed.queries.bindings = Some("(identifier) @reference".into());
-        assert!(replica_requires_sync(&replicas, uri.as_str(), &changed));
+        assert!(replica_requires_sync(&replicas, uri.as_str(), &changed, 4,));
 
         replicas.remove(uri.as_str());
-        assert!(replica_requires_sync(&replicas, uri.as_str(), &identity));
+        assert!(replica_requires_sync(&replicas, uri.as_str(), &desired, 4,));
     }
 
     #[test]
