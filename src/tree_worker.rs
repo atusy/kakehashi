@@ -3859,7 +3859,23 @@ where
     // saturation, but wait before scheduling any excess ordinary work.
     let max_pending = compute_threads.saturating_mul(4).max(1);
     let (completion_tx, completion_rx) = mpsc::channel::<()>();
-    let mut pending = 0_usize;
+    #[cfg(feature = "e2e")]
+    let injected_hung_compute =
+        if let Some(marker) = std::env::var_os("KAKEHASHI_TREE_WORKER_HANG_AFTER_START_FILE") {
+            pool.spawn(move || {
+                if std::fs::write(marker, "hung").is_ok() {
+                    loop {
+                        std::thread::park();
+                    }
+                }
+            });
+            1_usize
+        } else {
+            0_usize
+        };
+    #[cfg(not(feature = "e2e"))]
+    let injected_hung_compute = 0_usize;
+    let mut pending = injected_hung_compute;
     while let Some(request) = decode_frame::<_, Request>(&mut reader)? {
         if let Request::Cancel(cancel) = request {
             if cancel.worker_generation == worker_generation {
@@ -4207,6 +4223,14 @@ pub fn run_stdio_with_parent_liveness(
     expected_parent_pid: Option<u32>,
 ) -> io::Result<()> {
     let parent_liveness = ParentLiveness::from_parts(parent_liveness_fd, expected_parent_pid)?;
+    #[cfg(windows)]
+    let mut stdin = std::io::stdin();
+    #[cfg(not(windows))]
+    let stdin = std::io::stdin();
+    #[cfg(windows)]
+    if let Some(expected_parent_pid) = parent_liveness.expected_parent_pid() {
+        arm_windows_parent_liveness(&mut stdin, expected_parent_pid)?;
+    }
     #[cfg(target_os = "linux")]
     if let Some(expected_parent_pid) = parent_liveness.expected_parent_pid() {
         wait_at_test_registration_barrier()?;
@@ -4223,11 +4247,11 @@ pub fn run_stdio_with_parent_liveness(
     }
     #[cfg(feature = "e2e")]
     publish_test_worker_pid()?;
-    #[cfg(all(unix, feature = "e2e"))]
+    #[cfg(feature = "e2e")]
     spawn_test_descendant()?;
     let build_id = artifact_digest(&std::env::current_exe()?)?;
     run_with_build_id(
-        std::io::stdin(),
+        stdin,
         std::io::stdout(),
         compute_threads,
         &build_id,
@@ -4241,6 +4265,10 @@ enum ParentLiveness {
     Pipe {
         read_fd: i32,
         #[cfg(target_os = "linux")]
+        expected_parent_pid: u32,
+    },
+    #[cfg(windows)]
+    WindowsBootstrap {
         expected_parent_pid: u32,
     },
 }
@@ -4270,13 +4298,36 @@ impl ParentLiveness {
                 "non-Linux Unix worker parent liveness accepts an fd only",
             )),
         };
-        #[cfg(not(unix))]
+        #[cfg(windows)]
+        return match (read_fd, expected_parent_pid) {
+            (None, None) => Ok(Self::Detached),
+            (None, Some(expected_parent_pid)) if expected_parent_pid > 0 => {
+                Ok(Self::WindowsBootstrap {
+                    expected_parent_pid,
+                })
+            }
+            _ => Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Windows worker parent liveness requires an expected PID and no fd",
+            )),
+        };
+        #[cfg(all(not(unix), not(windows)))]
         match (read_fd, expected_parent_pid) {
             (None, None) => Ok(Self::Detached),
             _ => Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "worker parent liveness is unsupported on this platform",
             )),
+        }
+    }
+
+    #[cfg(windows)]
+    fn expected_parent_pid(&self) -> Option<u32> {
+        match self {
+            Self::Detached => None,
+            Self::WindowsBootstrap {
+                expected_parent_pid,
+            } => Some(*expected_parent_pid),
         }
     }
 
@@ -4298,6 +4349,58 @@ impl ParentLiveness {
             } => Some(*expected_parent_pid),
         }
     }
+}
+
+#[cfg(windows)]
+#[derive(Serialize, Deserialize)]
+struct WindowsParentBootstrap {
+    expected_parent_pid: u32,
+    parent_handle: usize,
+}
+
+#[cfg(windows)]
+fn arm_windows_parent_liveness<R: Read>(
+    reader: &mut R,
+    expected_parent_pid: u32,
+) -> io::Result<()> {
+    use std::os::windows::io::{AsRawHandle as _, FromRawHandle as _, OwnedHandle};
+
+    use windows_sys::Win32::System::Threading::{
+        GetCurrentProcess, GetProcessId, INFINITE, TerminateProcess, WaitForSingleObject,
+    };
+
+    let bootstrap = decode_frame::<_, WindowsParentBootstrap>(reader)?
+        .ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "missing Windows bootstrap"))?;
+    if bootstrap.expected_parent_pid != expected_parent_pid || bootstrap.parent_handle == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid Windows parent bootstrap",
+        ));
+    }
+    // SAFETY: the parent duplicated this handle directly into this process and
+    // transferred its sole ownership in the bootstrap frame.
+    let parent = unsafe { OwnedHandle::from_raw_handle(bootstrap.parent_handle as _) };
+    // SAFETY: `parent` is a live process handle with query access.
+    if unsafe { GetProcessId(parent.as_raw_handle()) } != expected_parent_pid {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Windows parent handle does not match expected PID",
+        ));
+    }
+    std::thread::Builder::new()
+        .name("kakehashi-tree-worker-parent-liveness".into())
+        .spawn(move || {
+            // SAFETY: the owned parent handle remains valid until this wait returns.
+            unsafe { WaitForSingleObject(parent.as_raw_handle(), INFINITE) };
+            // Any return is terminal. Besides ordinary parent death, a failed or
+            // otherwise impossible wait must fail closed rather than detach.
+            // SAFETY: hard termination is intentional: normal unwinding can
+            // deadlock on a native parser mutex held by a hung compute thread.
+            if unsafe { TerminateProcess(GetCurrentProcess(), 1) } == 0 {
+                std::process::abort();
+            }
+        })
+        .map(|_| ())
 }
 
 #[cfg(target_os = "linux")]
@@ -4416,6 +4519,21 @@ fn spawn_test_descendant() -> io::Result<()> {
     Ok(())
 }
 
+#[cfg(all(windows, feature = "e2e"))]
+fn spawn_test_descendant() -> io::Result<()> {
+    let Some(pid_path) = std::env::var_os("KAKEHASHI_TREE_WORKER_DESCENDANT_PID_FILE") else {
+        return Ok(());
+    };
+    let executable = std::env::var_os("KAKEHASHI_TREE_WORKER_DESCENDANT_EXE")
+        .ok_or_else(|| io::Error::other("missing Windows worker descendant executable"))?;
+    let descendant = Command::new(executable)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+    std::fs::write(pid_path, descendant.id().to_string())
+}
+
 pub fn artifact_digest(path: &std::path::Path) -> io::Result<String> {
     let mut file = std::fs::File::open(path)?;
     let mut digest = Sha256::new();
@@ -4436,6 +4554,8 @@ struct OwnedChild {
     process_group: nix::unistd::Pid,
     #[cfg(unix)]
     _parent_liveness: Option<std::os::fd::OwnedFd>,
+    #[cfg(windows)]
+    job: Option<std::os::windows::io::OwnedHandle>,
 }
 
 impl OwnedChild {
@@ -4476,8 +4596,100 @@ impl OwnedChild {
             drop(read_end);
             child
         }
-        #[cfg(not(unix))]
+        #[cfg(windows)]
+        return Self::spawn_windows_worker(command);
+        #[cfg(all(not(unix), not(windows)))]
         Self::spawn_configured(command, None)
+    }
+
+    #[cfg(windows)]
+    fn spawn_windows_worker(mut command: Command) -> io::Result<Self> {
+        use std::ffi::c_void;
+        use std::os::windows::io::{AsRawHandle as _, FromRawHandle as _, OwnedHandle};
+
+        use windows_sys::Win32::Foundation::DuplicateHandle;
+        use windows_sys::Win32::System::JobObjects::{
+            AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+            JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
+            SetInformationJobObject,
+        };
+        use windows_sys::Win32::System::Threading::{
+            GetCurrentProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
+        };
+
+        // SAFETY: null attributes/name request a private, non-inheritable Job handle.
+        let raw_job = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
+        if raw_job.is_null() {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: CreateJobObjectW returned a newly owned handle.
+        let job = unsafe { OwnedHandle::from_raw_handle(raw_job) };
+        let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+        limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        // SAFETY: the information pointer and byte length describe `limits` exactly.
+        if unsafe {
+            SetInformationJobObject(
+                job.as_raw_handle(),
+                JobObjectExtendedLimitInformation,
+                (&raw const limits).cast::<c_void>(),
+                std::mem::size_of_val(&limits) as u32,
+            )
+        } == 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+
+        let expected_parent_pid = std::process::id();
+        command
+            .arg("--expected-parent-pid")
+            .arg(expected_parent_pid.to_string());
+        let mut child = command.spawn()?;
+        let child_handle = child.as_raw_handle();
+        let mut target_parent_handle = std::ptr::null_mut();
+        // SAFETY: the current-process pseudo-handle is duplicated directly into
+        // the newly spawned child; no globally inheritable handle is created.
+        if unsafe {
+            DuplicateHandle(
+                GetCurrentProcess(),
+                GetCurrentProcess(),
+                child_handle,
+                &mut target_parent_handle,
+                PROCESS_SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION,
+                0,
+                0,
+            )
+        } == 0
+        {
+            let error = io::Error::last_os_error();
+            kill_and_reap(&mut child);
+            return Err(error);
+        }
+        // SAFETY: both handles are valid and the Job was configured before spawn.
+        if unsafe { AssignProcessToJobObject(job.as_raw_handle(), child_handle) } == 0 {
+            let error = io::Error::last_os_error();
+            kill_and_reap(&mut child);
+            return Err(io::Error::new(
+                error.kind(),
+                format!("failed to assign tree worker to kill-on-close Job: {error}"),
+            ));
+        }
+        let bootstrap = WindowsParentBootstrap {
+            expected_parent_pid,
+            parent_handle: target_parent_handle as usize,
+        };
+        let bootstrap_result = child
+            .stdin
+            .as_mut()
+            .ok_or_else(|| io::Error::other("worker stdin was not piped"))
+            .and_then(|stdin| encode_frame(stdin, &bootstrap));
+        if let Err(error) = bootstrap_result {
+            kill_and_reap(&mut child);
+            return Err(error);
+        }
+        Ok(Self {
+            child,
+            job: Some(job),
+        })
     }
 
     fn spawn_configured(
@@ -4500,6 +4712,8 @@ impl OwnedChild {
             process_group,
             #[cfg(unix)]
             _parent_liveness: parent_liveness,
+            #[cfg(windows)]
+            job: None,
         })
     }
 
@@ -4512,8 +4726,26 @@ impl OwnedChild {
                 return;
             }
         }
+        #[cfg(windows)]
+        if let Some(job) = &self.job {
+            use std::os::windows::io::AsRawHandle as _;
+
+            // SAFETY: the owned Job handle remains valid for this call.
+            if unsafe {
+                windows_sys::Win32::System::JobObjects::TerminateJobObject(job.as_raw_handle(), 1)
+            } != 0
+            {
+                return;
+            }
+        }
         let _ = self.child.kill();
     }
+}
+
+#[cfg(windows)]
+fn kill_and_reap(child: &mut Child) {
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
 impl std::ops::Deref for OwnedChild {

@@ -96,7 +96,7 @@ enum Commands {
         /// Parent-owned liveness pipe inherited by the worker on Unix.
         #[arg(long)]
         parent_liveness_fd: Option<i32>,
-        /// PID of the Linux thread-group whose thread spawned this worker.
+        /// PID of the process that spawned this worker (Linux and Windows).
         #[arg(long)]
         expected_parent_pid: Option<u32>,
     },

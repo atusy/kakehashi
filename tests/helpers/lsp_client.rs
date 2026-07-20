@@ -571,6 +571,11 @@ impl LspClient {
         let _ = self.child.wait();
     }
 
+    /// Abruptly terminate and reap the server without an LSP shutdown exchange.
+    pub(crate) fn force_kill_and_wait(&mut self) {
+        self.kill();
+    }
+
     /// Close stdin to signal EOF (for shutdown testing).
     pub(crate) fn close_stdin(&mut self) {
         self.stdin = None;

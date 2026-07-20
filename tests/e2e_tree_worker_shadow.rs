@@ -200,6 +200,94 @@ fn parent_death_terminates_worker_with_a_hung_compute_thread() {
     assert!(!worker_survived, "worker survived parent death");
 }
 
+#[cfg(windows)]
+#[test]
+fn parent_death_terminates_worker_with_a_hung_compute_thread() {
+    use std::os::windows::io::{FromRawHandle as _, OwnedHandle};
+
+    use windows_sys::Win32::Foundation::{WAIT_OBJECT_0, WAIT_TIMEOUT};
+    use windows_sys::Win32::System::Threading::{
+        OpenProcess, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE, TerminateProcess, WaitForSingleObject,
+    };
+
+    fn open_process(pid: u32) -> OwnedHandle {
+        // SAFETY: OpenProcess returns a newly owned kernel handle on success.
+        let handle = unsafe { OpenProcess(PROCESS_SYNCHRONIZE | PROCESS_TERMINATE, 0, pid) };
+        assert!(
+            !handle.is_null(),
+            "failed to open process {pid}: {}",
+            std::io::Error::last_os_error()
+        );
+        // SAFETY: the successful OpenProcess result is owned by this test.
+        unsafe { OwnedHandle::from_raw_handle(handle) }
+    }
+
+    fn wait_for_termination(handle: &OwnedHandle) -> bool {
+        use std::os::windows::io::AsRawHandle as _;
+
+        // SAFETY: the owned process handle remains valid for the duration of the wait.
+        let result = unsafe { WaitForSingleObject(handle.as_raw_handle(), 2_000) };
+        if result == WAIT_TIMEOUT {
+            // Avoid leaking a deliberately surviving RED-test process into the runner.
+            unsafe { TerminateProcess(handle.as_raw_handle(), 99) };
+        }
+        result == WAIT_OBJECT_0
+    }
+
+    let directory = tempfile::tempdir().unwrap();
+    let worker_pid_path = directory.path().join("worker.pid");
+    let descendant_pid_path = directory.path().join("worker-descendant.pid");
+    let hang_marker = directory.path().join("hung-compute");
+    let mut client = LspClient::builder()
+        .env("KAKEHASHI_TREE_WORKER_MODE", "authoritative")
+        .env(
+            "KAKEHASHI_TREE_WORKER_PID_FILE",
+            worker_pid_path.to_string_lossy(),
+        )
+        .env(
+            "KAKEHASHI_TREE_WORKER_DESCENDANT_PID_FILE",
+            descendant_pid_path.to_string_lossy(),
+        )
+        .env(
+            "KAKEHASHI_TREE_WORKER_DESCENDANT_EXE",
+            env!("CARGO_BIN_EXE_worker-descendant"),
+        )
+        .env(
+            "KAKEHASHI_TREE_WORKER_HANG_AFTER_START_FILE",
+            hang_marker.to_string_lossy(),
+        )
+        .build();
+    initialize(&mut client);
+    wait_for_file(&hang_marker, "worker compute thread did not enter the hang");
+    wait_for_file(
+        &descendant_pid_path,
+        "worker descendant pid was not published",
+    );
+    let worker = open_process(
+        std::fs::read_to_string(worker_pid_path)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap(),
+    );
+    let descendant = open_process(
+        std::fs::read_to_string(descendant_pid_path)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap(),
+    );
+
+    client.force_kill_and_wait();
+    let worker_terminated = wait_for_termination(&worker);
+    let descendant_terminated = wait_for_termination(&descendant);
+    assert!(worker_terminated, "worker survived parent death");
+    assert!(
+        descendant_terminated,
+        "worker descendant survived parent death"
+    );
+}
+
 #[test]
 fn shadow_worker_matches_authoritative_incremental_lifecycle() {
     let mut client = LspClient::builder()

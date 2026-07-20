@@ -18,6 +18,13 @@ required-features = ["e2e"]
 test = false
 bench = false
 
+[[bin]]
+name = "worker-descendant"
+path = "tests/bin/worker_descendant.rs"
+required-features = ["e2e"]
+test = false
+bench = false
+
 # Profiling build: optimized like release but with debug symbols retained (not
 # stripped) so flamegraph/samply + atos can symbolicate the semantic-tokens hot
 # path. Build with `cargo build --profile profiling --bin kakehashi`.
@@ -112,6 +119,14 @@ futures = "0.3.31"
 # Unix-only dependencies (signal handling; "fs" for FD_CLOEXEC in tests)
 [target.'cfg(unix)'.dependencies]
 nix = { version = "0.31", features = ["signal", "process", "fs"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_JobObjects",
+    "Win32_System_Threading",
+] }
 
 [features]
 e2e = []

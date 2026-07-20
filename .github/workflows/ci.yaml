@@ -76,6 +76,18 @@ jobs:
           cargo test --features e2e --test linux_tree_worker_pdeathsig
           -- --nocapture
 
+  windows-worker-lifecycle:
+    name: Windows worker lifecycle
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - run: >-
+          cargo test --features e2e --test e2e_tree_worker_shadow
+          parent_death_terminates_worker_with_a_hung_compute_thread
+          -- --exact --nocapture
+
   fmt:
     name: Format
     runs-on: ubuntu-latest
