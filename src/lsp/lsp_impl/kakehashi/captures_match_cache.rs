@@ -380,7 +380,7 @@ impl CapturesMatchCache {
         }
     }
 
-    pub(in crate::lsp::lsp_impl) fn clear_document(&self, uri: &Url) {
+    pub(crate) fn clear_document(&self, uri: &Url) {
         self.cache.remove(uri);
     }
 

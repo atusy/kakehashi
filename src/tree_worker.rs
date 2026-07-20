@@ -738,11 +738,21 @@ impl DocumentReplica {
         if semantic_bytes <= SEMANTIC_CACHE_AUXILIARY_TRIM_THRESHOLD_BYTES {
             return false;
         }
+        self.clear_auxiliary_caches()
+    }
+
+    fn clear_auxiliary_caches(&mut self) -> bool {
+        let retained = self.estimated_memory().auxiliary_cache_bytes;
         self.semantic_discovery = None;
         self.resolved_injections = None;
         self.injection_layers.clear();
         self.injection_token_cache.clear_document(&self.uri);
-        true
+        self.captures_match_cache.clear_document(&self.uri);
+        retained > 0
+    }
+
+    fn clear_result_cache(&mut self) -> bool {
+        self.cached_semantic_tokens.take().is_some()
     }
 
     fn sync(
@@ -2494,6 +2504,53 @@ fn cache_eviction_plan(
         }
     }
     plan
+}
+
+fn enforce_derived_memory_budget(
+    documents: &DocumentStore,
+    pressure_lock: &Mutex<()>,
+    current: &DocumentKey,
+    target_bytes: usize,
+) -> Result<(), String> {
+    let _pressure = pressure_lock
+        .lock()
+        .map_err(|_| "worker memory-pressure lock is poisoned".to_string())?;
+    let mut candidates = Vec::with_capacity(documents.len());
+    for entry in documents.iter() {
+        let key = entry.key().clone();
+        let replica = Arc::clone(entry.value());
+        drop(entry);
+        let estimate = replica
+            .lock()
+            .map_err(|_| "document replica lock is poisoned during memory pressure".to_string())?
+            .estimated_memory();
+        candidates.push(CacheEvictionCandidate {
+            current: key == *current,
+            key,
+            result_bytes: estimate.result_cache_bytes,
+            auxiliary_bytes: estimate.auxiliary_cache_bytes,
+        });
+    }
+    for eviction in cache_eviction_plan(candidates, target_bytes) {
+        let key = match &eviction {
+            CacheEviction::Auxiliary(key) | CacheEviction::Result(key) => key,
+        };
+        let Some(replica) = documents.get(key).map(|entry| Arc::clone(entry.value())) else {
+            continue;
+        };
+        let mut replica = replica
+            .lock()
+            .map_err(|_| "document replica lock is poisoned during cache eviction".to_string())?;
+        match eviction {
+            CacheEviction::Auxiliary(_) => {
+                replica.clear_auxiliary_caches();
+            }
+            CacheEviction::Result(_) => {
+                replica.clear_result_cache();
+            }
+        }
+    }
+    Ok(())
 }
 
 type DocumentStore = Arc<dashmap::DashMap<DocumentKey, Arc<Mutex<DocumentReplica>>>>;
@@ -4555,9 +4612,10 @@ mod tests {
         RunnableDocuments, SEMANTIC_CACHE_AUXILIARY_TRIM_THRESHOLD_BYTES, SyncDocument,
         WireByteRange, WirePosition, WireRange, WireSemanticToken, WorkPriority, WorkerError,
         WorkerQuerySources, cache_eviction_plan, close_document, decode_frame,
-        derive_snapshot_with_language, encode_frame, named_node_count, parse_request_timeout,
-        replace_retained_bytes, request_priority, reserve_retained_growth, route_response, run,
-        submit_document_job, sync_document, terminate_by_transport, validate_document_size,
+        derive_snapshot_with_language, encode_frame, enforce_derived_memory_budget,
+        named_node_count, parse_request_timeout, replace_retained_bytes, request_priority,
+        reserve_retained_growth, route_response, run, submit_document_job, sync_document,
+        terminate_by_transport, validate_document_size,
     };
 
     #[derive(Clone, Default)]
@@ -6087,6 +6145,89 @@ mod tests {
                 }),
             ]
         );
+    }
+
+    #[test]
+    fn worker_pressure_evicts_auxiliary_then_non_current_result_state() {
+        let documents: super::DocumentStore = Arc::new(dashmap::DashMap::new());
+        let make_replica = |uri: &str| {
+            let mut parser = tree_sitter::Parser::new();
+            parser
+                .set_language(&tree_sitter_rust::LANGUAGE.into())
+                .unwrap();
+            DocumentReplica::sync(
+                SyncDocument {
+                    context: RequestContext {
+                        request_id: 1,
+                        worker_generation: 3,
+                        uri: uri.into(),
+                        incarnation: 4,
+                        content_version: 1,
+                        configuration_generation: 2,
+                    },
+                    language: "rust".into(),
+                    grammar_symbol: "rust".into(),
+                    source_path: "/unused/static-language".into(),
+                    parser_path: "/unused/static-language".into(),
+                    artifact_digest: "sha256:rust-v1".into(),
+                    queries: WorkerQuerySources::default(),
+                    text: "fn main() {}".into(),
+                },
+                &mut parser,
+            )
+            .unwrap()
+            .0
+        };
+        for uri in ["file:///a.rs", "file:///b.rs"] {
+            let mut replica = make_replica(uri);
+            replica.cached_semantic_tokens = Some((
+                2,
+                false,
+                Arc::new(vec![
+                    WireSemanticToken {
+                        delta_line: 0,
+                        delta_start: 0,
+                        length: 1,
+                        token_type: 0,
+                        token_modifiers_bitset: 0,
+                    };
+                    16
+                ]),
+            ));
+            replica.semantic_discovery = Some(Arc::new(crate::document::DiscoveredInjections {
+                generation: 2,
+                complete: true,
+                regions: Vec::with_capacity(16),
+            }));
+            documents.insert(
+                DocumentKey { uri: uri.into() },
+                Arc::new(Mutex::new(replica)),
+            );
+        }
+        let current = DocumentKey {
+            uri: "file:///b.rs".into(),
+        };
+        let get = |key: &DocumentKey| Arc::clone(documents.get(key).unwrap().value());
+        let current_replica = get(&current);
+        let target = current_replica
+            .lock()
+            .unwrap()
+            .estimated_memory()
+            .result_cache_bytes;
+
+        enforce_derived_memory_budget(&documents, &Mutex::new(()), &current, target).unwrap();
+
+        let a_key = DocumentKey {
+            uri: "file:///a.rs".into(),
+        };
+        let a_replica = get(&a_key);
+        let b_replica = get(&current);
+        let a = a_replica.lock().unwrap();
+        let b = b_replica.lock().unwrap();
+        assert!(a.semantic_discovery.is_none());
+        assert!(b.semantic_discovery.is_none());
+        assert!(a.cached_semantic_tokens.is_none());
+        assert!(b.cached_semantic_tokens.is_some());
     }
 
     #[test]
