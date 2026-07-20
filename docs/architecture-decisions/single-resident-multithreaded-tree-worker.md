@@ -393,15 +393,19 @@ generation. A queued request is removed before execution; a running request
 flips the same cancellation token polled by its tree walks and nested fan-out.
 Cancellation racing a terminal response may observe either terminal outcome,
 but a canceled or stale result cannot populate a cache, mint node state, or be
-published in the parent. Canceling an unknown, completed, or prior-generation
-request is a no-op. A non-cooperative native call remains governed by its hard
+published in the parent. Canceling a completed or prior-generation request is a
+no-op; a same-generation unknown ID is retained for the request-delivery race
+described below. A non-cooperative native call remains governed by its hard
 native-call deadline; cancellation alone does not kill the whole worker.
 
 High-level request admission and cancellation share the parent-to-worker control
-writer. If cancellation wins before admission is enqueued, the request is never
-sent. Otherwise the request frame precedes its cancel frame on that ordered
-stream, so an unknown-cancel no-op cannot be followed by first observation of
-the canceled request. Duplicate terminal and cancel frames remain harmless.
+writer, but parent task scheduling does not guarantee that a blocking request
+sender runs before the async owner is dropped. Cancellation may therefore
+overtake first observation of the request. The worker retains an idempotent
+same-generation cancellation token for that unknown request ID and consumes it
+if the matching cancellable reader request arrives later; a non-cancellable
+lifecycle request with that ID discards the token. Canceling a prior generation
+remains a no-op, and duplicate terminal and cancel frames remain harmless.
 
 Cancellation during a handshake has explicit cleanup. A hazard that was armed
 but never entered its grammar-backed scope is released; a native segment that
@@ -1151,6 +1155,12 @@ worker boundary. One fixed worker is measurably faster than legacy for the two
 injection-heavy steady-state workloads, while large serial misses and cold open
 remain slower. The mixed result confirms performance potential without passing
 the general non-regression gate or justifying worker sharding.
+
+The [Stage 10 cancellation measurement](single-resident-multithreaded-tree-worker-stage10-measurement.md)
+adds explicit queued/running cancellation and an outer per-document admission
+cap. Reclaiming four already-running obsolete semantic requests improves the
+latest usable response by 33.9% against Stage 9, but ordinary latency remains
+mixed and nested max-min fairness is not yet implemented.
 
 The implementation should proceed in measured stages:
 
