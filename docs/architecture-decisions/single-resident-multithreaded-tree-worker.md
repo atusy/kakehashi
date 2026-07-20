@@ -760,7 +760,7 @@ control-protocol progress use the supervisor's bounded handshake/liveness
 timeout rather than consuming a grammar's native execution budget. A
 cooperative timeout that returns control from Tree-sitter does not require a
 worker restart. If an entered segment exceeds the hard deadline, the parent
-kills and restarts the worker and quarantines the complete acknowledged active
+kills and restarts the worker and quarantines the complete committed active
 grammar set. This remains correct when one
 `DeriveSnapshot` reaches several injected grammars or when unrelated documents
 parse concurrently.
@@ -892,7 +892,7 @@ runtime reload crosses into the worker.
 Implementation is accepted only when all of the following hold:
 
 * A child grammar fixture that calls `abort` proves that the LSP process stays
-  alive, emits an attributable crash log, quarantines the acknowledged active
+  alive, emits an attributable crash log, quarantines the committed active
   grammar set for the session, restarts the worker, and successfully reparses an
   open document in another language.
 * Failure injection immediately after `GrammarHazardArmed` proves that the parent
