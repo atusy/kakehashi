@@ -13,6 +13,7 @@ import tempfile
 import threading
 import time
 import re
+import shutil
 
 from collect_worker_proxy import (
     artifact_identity,
@@ -31,9 +32,10 @@ from collect_worker_proxy import (
 )
 
 
-def scenario_arguments(language, size, requests):
+def scenario_arguments(language, size, requests, documents=1):
     return [
         "--lang", language, "--size", str(size), "--requests", str(requests),
+        "--documents", str(documents),
         "--warm-semantic-cache", "--settle", "0.5", "--hold-open", "1.0",
     ]
 
@@ -212,23 +214,43 @@ def order(batch_index):
     return ("authoritative", "legacy")
 
 
+def comparison_order(batch_index):
+    if batch_index % 2 == 0:
+        return ("baseline", "candidate")
+    return ("candidate", "baseline")
+
+
 def collect(args):
     source_script_dir = pathlib.Path(__file__).resolve().parent
     binary_sha256 = sha256_file(args.bin)
+    compare_binary_sha256 = sha256_file(args.compare_bin) if args.compare_bin else None
     source_harness = harness_identity(source_script_dir)
     source_artifacts = artifact_identity(args.data_dir)
     staging, binary, data_dir, script_dir = stage_measurement_inputs(
         args.bin, args.data_dir, source_script_dir
     )
-    scenario = scenario_arguments(args.lang, args.size, args.requests)
+    compare_binary = None
+    if args.compare_bin:
+        compare_binary = pathlib.Path(staging.name) / "kakehashi-compare"
+        shutil.copy2(args.compare_bin, compare_binary)
+    scenario = scenario_arguments(args.lang, args.size, args.requests, args.documents)
     try:
         batches = []
         for index in range(args.batches):
-            batch = {"batch": index + 1, "order": list(order(index))}
-            for kind in order(index):
+            variant_order = (
+                comparison_order(index) if compare_binary else order(index)
+            )
+            batch = {"batch": index + 1, "order": list(variant_order)}
+            for kind in variant_order:
+                mode = "authoritative" if compare_binary else kind
+                variant_binary = (
+                    binary
+                    if not compare_binary or kind == "baseline"
+                    else compare_binary
+                )
                 batch[kind] = run_variant(
-                    kind,
-                    binary,
+                    mode,
+                    variant_binary,
                     data_dir,
                     script_dir,
                     scenario,
@@ -243,6 +265,8 @@ def collect(args):
         if artifact_identity(data_dir) != source_artifacts:
             raise RuntimeError("runtime artifacts changed during collection")
         verify_file_sha256(binary, binary_sha256)
+        if compare_binary:
+            verify_file_sha256(compare_binary, compare_binary_sha256)
         if harness_identity(source_script_dir) != source_harness:
             raise RuntimeError("benchmark harness changed during collection")
     finally:
@@ -256,6 +280,7 @@ def collect(args):
             "rustc": tool_version(["rustc", "--version"]),
             "cpu_model": cpu_model(),
             "binary_sha256": binary_sha256,
+            "compare_binary_sha256": compare_binary_sha256,
             "retained_environment": portable_environment(os.environ),
         },
         "artifacts": source_artifacts,
@@ -267,6 +292,10 @@ def collect(args):
             "sample_interval_ms": args.sample_interval_ms,
             "footprint_interval_ms": args.footprint_interval_ms,
             "metric": "sum of RSS for every descendant of the benchmark driver",
+            "comparison": (
+                "two authoritative binaries" if compare_binary_sha256
+                else "legacy versus authoritative in one binary"
+            ),
         },
         "scenario": scenario,
         "batches": batches,
@@ -278,12 +307,14 @@ def main():
     require_posix()
     parser = argparse.ArgumentParser()
     parser.add_argument("--bin", type=pathlib.Path, required=True)
+    parser.add_argument("--compare-bin", type=pathlib.Path)
     parser.add_argument("--data-dir", type=pathlib.Path, required=True)
     parser.add_argument("--output", type=pathlib.Path, required=True)
     parser.add_argument("--batches", type=int, default=4)
     parser.add_argument("--lang", choices=("rust", "markdown"), default="markdown")
     parser.add_argument("--size", type=int, default=150)
     parser.add_argument("--requests", type=int, default=500)
+    parser.add_argument("--documents", type=int, default=1)
     parser.add_argument("--worker-threads", type=int, default=4)
     parser.add_argument("--sample-interval-ms", type=float, default=10)
     parser.add_argument("--footprint-interval-ms", type=float, default=250)
@@ -293,6 +324,7 @@ def main():
         args.batches,
         args.size,
         args.requests,
+        args.documents,
         args.worker_threads,
         args.sample_interval_ms,
         args.footprint_interval_ms,

@@ -222,6 +222,17 @@ def warm_semantic_tokens(request, uri):
     semantic_token_data(response)
 
 
+def sibling_document_uris(uri, count):
+    stem, separator, extension = uri.rpartition(".")
+    if not separator:
+        stem, extension = uri, ""
+    uris = [uri]
+    for index in range(2, count + 1):
+        suffix = f"-{index}"
+        uris.append(f"{stem}{suffix}.{extension}" if extension else f"{stem}{suffix}")
+    return uris
+
+
 def terminate_server(server, timeout_seconds=3):
     """Give a server (and relay cleanup handler) a bounded graceful exit."""
     if server.poll() is not None:
@@ -253,6 +264,9 @@ def main() -> None:
     ap.add_argument("--lang", choices=["rust", "markdown"], default="rust")
     ap.add_argument("--size", type=int, default=150)
     ap.add_argument("--requests", type=int, default=300)
+    ap.add_argument(
+        "--documents", type=int, default=1,
+        help="open this many copies and round-robin measured requests across them")
     ap.add_argument(
         "--warm-semantic-cache", action="store_true",
         help="issue one unmeasured semanticTokens/full request before timing")
@@ -301,6 +315,8 @@ def main() -> None:
     args = ap.parse_args()
     if args.requests <= 0:
         ap.error("--requests must be positive")  # avoids divide-by-zero in the summary
+    if args.documents <= 0:
+        ap.error("--documents must be positive")
     if args.burst <= 0:
         ap.error("--burst must be positive")
     if args.burst_edits and args.burst <= 1:
@@ -313,6 +329,8 @@ def main() -> None:
         ap.error("--burst cannot be combined with captures modes")
     if args.concurrent_captures:
         args.captures = True
+    if args.documents > 1 and (args.edits or args.burst_edits or args.captures):
+        ap.error("multiple documents cannot be combined with edits or captures modes")
 
     if args.file:
         if args.file.endswith(".md"):
@@ -328,6 +346,7 @@ def main() -> None:
         uri, lang, text = "file:///profile/large.rs", "rust", gen_rust(args.size)
     else:
         uri, lang, text = "file:///profile/inj.md", "markdown", gen_markdown_injections(args.size)
+    document_uris = sibling_document_uris(uri, args.documents)
 
     env = dict(os.environ, KAKEHASHI_DATA_DIR=args.data_dir)
     # Let the server's stderr through (it's silent unless RUST_LOG is set) so a
@@ -506,12 +525,14 @@ def main() -> None:
                                                 "tokenTypes": [], "tokenModifiers": [],
                                                 "formats": ["relative"]}}}})
         notify("initialized", {})
-        notify("textDocument/didOpen", {"textDocument": {
-            "uri": uri, "languageId": lang, "version": 1, "text": text}})
+        for document_uri in document_uris:
+            notify("textDocument/didOpen", {"textDocument": {
+                "uri": document_uri, "languageId": lang, "version": 1, "text": text}})
         if args.settle > 0:
             time.sleep(args.settle)  # let the initial parse settle
         if args.warm_semantic_cache:
-            warm_semantic_tokens(request, uri)
+            for document_uri in document_uris:
+                warm_semantic_tokens(request, document_uri)
 
         captures_result_id = None
         if args.captures:
@@ -548,6 +569,7 @@ def main() -> None:
             })
 
         for i in range(args.requests):
+            request_uri = document_uris[i % len(document_uris)]
             for j in range(args.edits):
                 # A no-op didChange would be deduped by hashes.
                 send_toggle_edit()
@@ -559,7 +581,7 @@ def main() -> None:
             )
             semantic_request = (
                 "textDocument/semanticTokens/full",
-                {"textDocument": {"uri": uri}},
+                {"textDocument": {"uri": request_uri}},
             )
             captures_requests = [
                 ("kakehashi/captures/full/delta",
@@ -634,6 +656,7 @@ def main() -> None:
     n_lines = len(text.splitlines())
     source = (f"file={args.file} ({n_bytes}B/{n_lines}L)"
               if args.file else f"size={args.size}")
+    source += f" documents={args.documents}"
     firsts = " ".join(f"{t*1000:.0f}" for t in req_times[:5])
     measured_responses = sum(len(samples) for samples in request_samples.values())
     sys.stderr.write(f"[drive] first-cycle ms: {firsts}\n")

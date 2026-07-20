@@ -17,6 +17,7 @@ from drive import (
     count_semantic_outcomes,
     next_toggle_change,
     response_result_id,
+    sibling_document_uris,
     send_timed_request,
     server_request_result,
     summarize_samples,
@@ -28,6 +29,16 @@ from process_test_utils import readline_with_timeout
 
 
 class RequestSummaryTest(unittest.TestCase):
+    def test_sibling_document_uris_preserve_extension_and_first_uri(self):
+        self.assertEqual(
+            sibling_document_uris("file:///profile/input.md", 3),
+            [
+                "file:///profile/input.md",
+                "file:///profile/input-2.md",
+                "file:///profile/input-3.md",
+            ],
+        )
+
     def test_capture_result_validates_full_and_delta_lineage(self):
         self.assertEqual(capture_result_id({
             "result": {"resultId": "full", "matches": [], "skipped": []}

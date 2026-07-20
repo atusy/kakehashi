@@ -7,6 +7,7 @@ import unittest
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 
 from collect_worker_memory import (
+    comparison_order,
     descendant_pids,
     order,
     parse_footprint_bytes,
@@ -21,11 +22,16 @@ class WorkerMemoryCollectorTest(unittest.TestCase):
         self.assertEqual(order(0), ("legacy", "authoritative"))
         self.assertEqual(order(1), ("authoritative", "legacy"))
 
+    def test_comparison_order_reverses_each_batch(self):
+        self.assertEqual(comparison_order(0), ("baseline", "candidate"))
+        self.assertEqual(comparison_order(1), ("candidate", "baseline"))
+
     def test_scenario_arguments_preserve_requested_scale(self):
         self.assertEqual(
-            scenario_arguments("rust", 5000, 10),
+            scenario_arguments("rust", 5000, 10, 3),
             [
                 "--lang", "rust", "--size", "5000", "--requests", "10",
+                "--documents", "3",
                 "--warm-semantic-cache", "--settle", "0.5",
                 "--hold-open", "1.0",
             ],
