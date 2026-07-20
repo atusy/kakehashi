@@ -11,13 +11,13 @@ use crate::error::LockResultExt;
 use crate::language::coordinator::WorkerGrammarDescriptor;
 use crate::lsp::text_sync::SequentialByteEdit;
 use crate::tree_worker::{
-    ApplyDocumentEditsAndDerive, ByteEdit, CapturesResult, Client, CloseDocument,
-    ConfigureLanguages, DeriveDocumentSnapshot, DeriveInjectionRegions, DeriveNativeBindings,
-    DeriveSelectionRanges, DeriveSemanticTokens, DerivedSemanticTokens, InjectionRegionsResult,
-    NativeBindingsFacts, NativeBindingsResult, NavigateNode, NodeNavigation, NodeResult,
-    NodeScalarOperation, NodeScalarValue, OpaqueNodeId, RequestContext, ResolveNode, Response,
-    RunCaptures, RunNodeScalar, SelectionRangesResult, SyncDocument, WirePosition, WireRange,
-    WorkerLanguageCatalog, named_node_count,
+    ApplyDocumentEdits, ApplyDocumentEditsAndDerive, ByteEdit, CapturesResult, Client,
+    CloseDocument, ConfigureLanguages, DeriveDocumentSnapshot, DeriveInjectionRegions,
+    DeriveNativeBindings, DeriveSelectionRanges, DeriveSemanticTokens, DerivedSemanticTokens,
+    InjectionRegionsResult, NativeBindingsFacts, NativeBindingsResult, NavigateNode,
+    NodeNavigation, NodeResult, NodeScalarOperation, NodeScalarValue, OpaqueNodeId, RequestContext,
+    ResolveNode, Response, RunCaptures, RunNodeScalar, SelectionRangesResult, SyncDocument,
+    WirePosition, WireRange, WorkerLanguageCatalog, named_node_count,
 };
 
 use super::Kakehashi;
@@ -56,6 +56,7 @@ enum ShadowCommand {
     Apply {
         request: ApplyDocumentEditsAndDerive,
         fallback: SyncDocument,
+        derive_snapshot: bool,
     },
     Close(CloseDocument),
     Forget(RequestContext),
@@ -1610,7 +1611,11 @@ impl TreeWorkerShadow {
                 })
                 .collect(),
         };
-        self.observe_and_submit(ShadowCommand::Apply { request, fallback });
+        self.observe_and_submit(ShadowCommand::Apply {
+            request,
+            fallback,
+            derive_snapshot: should_derive_edit_snapshot(self.mode),
+        });
     }
 
     pub(super) fn mirror_close(
@@ -2333,6 +2338,10 @@ fn configured_mode() -> TreeWorkerMode {
     )
 }
 
+fn should_derive_edit_snapshot(mode: TreeWorkerMode) -> bool {
+    mode == TreeWorkerMode::Shadow
+}
+
 fn parse_mode(mode: Option<&str>, legacy_shadow: Option<&str>) -> TreeWorkerMode {
     match mode {
         Some("authoritative") => TreeWorkerMode::Authoritative,
@@ -2648,6 +2657,16 @@ fn run_actor(
                     ComparisonSide::Shadow(TreeSummary::from_snapshot(&snapshot)),
                 );
             }
+            Ok(Response::DocumentAck(ack)) => {
+                if let Some(identity) = synced_identity {
+                    state.replicas.insert(ack.context.uri.clone(), identity);
+                }
+                state
+                    .open_documents
+                    .lock()
+                    .recover_poison("run_actor(acknowledge edit)")
+                    .acknowledge(ack.context);
+            }
             Ok(Response::WorkerRestartRequired(required)) => {
                 log::warn!(
                     target: "kakehashi::tree_worker_shadow",
@@ -2888,15 +2907,31 @@ fn execute_command(
             comparisons.open(&request.context.uri, request.context.incarnation);
             (sync_and_derive(client, request), Some(identity))
         }
-        ShadowCommand::Apply { request, fallback } => {
+        ShadowCommand::Apply {
+            request,
+            fallback,
+            derive_snapshot,
+        } => {
             let uri = fallback.context.uri.clone();
             let identity = ReplicaIdentity::from_sync(&fallback);
             if replica_requires_sync(replicas, &uri, &identity, request.base_version) {
                 (sync_and_derive(client, fallback), Some(identity))
             } else {
-                match client.apply_document_edits_and_derive(request) {
+                let response = if derive_snapshot {
+                    client.apply_document_edits_and_derive(request)
+                } else {
+                    client.apply_document_edits(ApplyDocumentEdits {
+                        context: request.context,
+                        base_version: request.base_version,
+                        edits: request.edits,
+                    })
+                };
+                match response {
                     Ok(Response::Snapshot(snapshot)) => {
                         (Ok(Response::Snapshot(snapshot)), Some(identity))
+                    }
+                    Ok(Response::DocumentAck(ack)) => {
+                        (Ok(Response::DocumentAck(ack)), Some(identity))
                     }
                     Ok(Response::WorkerRestartRequired(required)) => {
                         (Ok(Response::WorkerRestartRequired(required)), None)
@@ -3211,7 +3246,9 @@ fn replica_was_closed(
 fn retag_command(command: &mut ShadowCommand, generation: u64) {
     match command {
         ShadowCommand::Sync(request) => request.context.worker_generation = generation,
-        ShadowCommand::Apply { request, fallback } => {
+        ShadowCommand::Apply {
+            request, fallback, ..
+        } => {
             request.context.worker_generation = generation;
             fallback.context.worker_generation = generation;
         }
@@ -3524,6 +3561,8 @@ mod tests {
             parse_mode(Some("invalid"), Some("true")),
             TreeWorkerMode::Legacy
         );
+        assert!(should_derive_edit_snapshot(TreeWorkerMode::Shadow));
+        assert!(!should_derive_edit_snapshot(TreeWorkerMode::Authoritative));
     }
 
     #[test]
@@ -3671,6 +3710,7 @@ mod tests {
                 edits: Vec::new(),
             },
             fallback: sync("file:///a.rs", 1, 2, 7),
+            derive_snapshot: true,
         });
 
         let latest = documents.current.get("file:///a.rs").unwrap();
@@ -3704,6 +3744,7 @@ mod tests {
                 edits: Vec::new(),
             },
             fallback: sync(uri, 1, 2, 7),
+            derive_snapshot: true,
         });
 
         assert!(!documents.worker_regions.contains_key(uri));
@@ -3892,10 +3933,14 @@ mod tests {
                 edits: Vec::new(),
             },
             fallback: sync("file:///a.rs", 1, 2, 7),
+            derive_snapshot: true,
         };
         retag_command(&mut command, 11);
 
-        let ShadowCommand::Apply { request, fallback } = command else {
+        let ShadowCommand::Apply {
+            request, fallback, ..
+        } = command
+        else {
             unreachable!();
         };
         assert_eq!(request.context.worker_generation, 11);
@@ -4139,7 +4184,10 @@ mod tests {
             ]),
         );
 
-        let ShadowCommand::Apply { request, fallback } = receiver.recv().unwrap() else {
+        let ShadowCommand::Apply {
+            request, fallback, ..
+        } = receiver.recv().unwrap()
+        else {
             panic!("incremental mirror must enqueue an apply command");
         };
         assert_eq!(request.base_version, 4);
