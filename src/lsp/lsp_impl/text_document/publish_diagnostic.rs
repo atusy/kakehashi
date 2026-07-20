@@ -269,14 +269,15 @@ mod tests {
 
     #[tokio::test]
     async fn panicked_region_task_is_counted_as_prefetch_failure() {
-        let sink = Some(Arc::new(AtomicUsize::new(0)));
+        let sink = Arc::new(AtomicUsize::new(0));
+        let optional_sink = Some(Arc::clone(&sink));
         let mut join_set = JoinSet::new();
         join_set.spawn(async { panic!("region task failed") });
 
-        let diagnostics = collect_joined_region_diagnostics(join_set, &sink, "test").await;
+        let diagnostics = collect_joined_region_diagnostics(join_set, &optional_sink, "test").await;
 
         assert!(diagnostics.is_empty());
-        assert_eq!(sink.unwrap().load(Ordering::Relaxed), 1);
+        assert_eq!(sink.load(Ordering::Relaxed), 1);
     }
 
     /// An all-incapable virt snapshot must still publish an (empty) pull layer,

@@ -1572,8 +1572,11 @@ mod tests {
     fn combined_content_snaps_stale_span_start_before_slicing() {
         let text = "éx\n";
 
-        let (content, offsets) =
-            build_combined_virtual_content(text, 1..text.len(), &[1..text.len()]);
+        let (content, offsets) = build_combined_virtual_content(
+            text,
+            1..text.len(),
+            std::slice::from_ref(&(1..text.len())),
+        );
 
         assert_eq!(content, "x\n");
         assert_eq!(offsets, vec![1, 0]);
@@ -1582,8 +1585,11 @@ mod tests {
     #[test]
     fn combined_blank_included_line_records_its_prefix_offset() {
         let text = "> \n";
-        let (content, offsets) =
-            build_combined_virtual_content(text, 0..text.len(), &[2..text.len()]);
+        let (content, offsets) = build_combined_virtual_content(
+            text,
+            0..text.len(),
+            std::slice::from_ref(&(2..text.len())),
+        );
 
         assert_eq!(content, "\n");
         assert_eq!(offsets, vec![2, 0]);

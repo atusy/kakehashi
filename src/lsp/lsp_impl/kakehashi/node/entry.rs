@@ -680,6 +680,7 @@ impl Kakehashi {
 }
 
 #[cfg(test)]
+#[allow(clippy::items_after_test_module)]
 mod tests {
     use super::*;
     use tower_lsp_server::LspService;
