@@ -208,15 +208,24 @@ impl InjectionCoordinator {
         incarnation: u64,
         content_version: u64,
     ) -> bool {
-        let generation = self.language.configuration_generation();
-        let Some(regions) = self
-            .tree_worker_shadow
-            .worker_injection_regions(uri, incarnation, content_version, generation)
-            .await
-        else {
+        let Some(host_language) = self.get_language_for_document(uri) else {
             return false;
         };
-        let injections = bridge_injections_from_resolved(&regions);
+        let injections = if should_query_worker_injections(
+            self.language.injection_query(&host_language).is_some(),
+        ) {
+            let generation = self.language.configuration_generation();
+            let Some(regions) = self
+                .tree_worker_shadow
+                .worker_injection_regions(uri, incarnation, content_version, generation)
+                .await
+            else {
+                return false;
+            };
+            bridge_injections_from_resolved(&regions)
+        } else {
+            Vec::new()
+        };
         self.process_injections_after_lifecycle_lock(
             uri,
             forward_did_change,
@@ -542,9 +551,22 @@ fn parser_enabled_injection_language(language: &str) -> bool {
     language != "plaintext"
 }
 
+fn should_query_worker_injections(has_injection_query: bool) -> bool {
+    has_injection_query
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{bridge_injections_from_resolved, parser_enabled_injection_language};
+    use super::{
+        bridge_injections_from_resolved, parser_enabled_injection_language,
+        should_query_worker_injections,
+    };
+
+    #[test]
+    fn worker_derivation_is_skipped_without_an_injection_query() {
+        assert!(!should_query_worker_injections(false));
+        assert!(should_query_worker_injections(true));
+    }
 
     #[test]
     fn worker_bridge_injection_preserves_identity_language_and_content() {
