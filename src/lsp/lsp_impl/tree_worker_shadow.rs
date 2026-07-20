@@ -953,6 +953,7 @@ impl TreeWorkerShadow {
             .synchronized_query_read(uri, incarnation, content_version, configuration_generation)
             .await?;
         let expected = context.clone();
+        let started = Instant::now();
         let response = tokio::task::spawn_blocking(move || {
             client.derive_semantic_tokens(DeriveSemanticTokens {
                 context,
@@ -968,6 +969,16 @@ impl TreeWorkerShadow {
         if result.context != expected {
             return None;
         }
+        log::debug!(
+            target: "kakehashi::tree_worker_shadow_metrics",
+            "semantic uri={} version={} parent_us={} queue_us={} compute_us={} tokens={}",
+            result.context.uri,
+            result.context.content_version,
+            started.elapsed().as_micros(),
+            result.queue_wait_ns / 1_000,
+            result.compute_ns / 1_000,
+            result.tokens.len(),
+        );
         let current = self
             .open_documents
             .lock()

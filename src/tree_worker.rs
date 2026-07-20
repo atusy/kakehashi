@@ -22,7 +22,7 @@ use sha2::{Digest, Sha256};
 
 use crate::language::node_tracker::{EditInfo, NodeTracker};
 
-pub const PROTOCOL_VERSION: u32 = 13;
+pub const PROTOCOL_VERSION: u32 = 14;
 pub const MAX_FRAME_BYTES: usize = 64 * 1024 * 1024;
 pub const MAX_DOCUMENT_REPLICAS: usize = 4_096;
 pub const MAX_DOCUMENT_BYTES: usize = 32 * 1024 * 1024;
@@ -354,6 +354,8 @@ pub struct InjectionRegionsResult {
 pub struct DerivedSemanticTokens {
     pub context: RequestContext,
     pub tokens: Vec<WireSemanticToken>,
+    pub queue_wait_ns: u64,
+    pub compute_ns: u64,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -1129,9 +1131,19 @@ impl DocumentReplica {
         })
     }
 
+    #[cfg(test)]
     fn derive_semantic_tokens(
         &mut self,
         request: DeriveSemanticTokens,
+    ) -> Result<DerivedSemanticTokens, String> {
+        self.derive_semantic_tokens_with_telemetry(request, Duration::ZERO, Instant::now())
+    }
+
+    fn derive_semantic_tokens_with_telemetry(
+        &mut self,
+        request: DeriveSemanticTokens,
+        queue_wait: Duration,
+        started: Instant,
     ) -> Result<DerivedSemanticTokens, String> {
         self.validate_read_identity(&request.context)?;
         worker_analysis(
@@ -1183,6 +1195,8 @@ impl DocumentReplica {
         Ok(DerivedSemanticTokens {
             context: request.context,
             tokens,
+            queue_wait_ns: duration_ns(queue_wait),
+            compute_ns: duration_ns(started.elapsed()),
         })
     }
 
@@ -2396,7 +2410,9 @@ fn handle_work(
         Request::RunNodeScalar(request) => run_node_scalar(request, documents),
         Request::DeriveSelectionRanges(request) => derive_selection_ranges(request, documents),
         Request::DeriveInjectionRegions(request) => derive_injection_regions(request, documents),
-        Request::DeriveSemanticTokens(request) => derive_semantic_tokens(request, documents),
+        Request::DeriveSemanticTokens(request) => {
+            derive_semantic_tokens(request, documents, queue_wait, started)
+        }
         Request::RunCaptures(request) => run_captures(request, documents),
         Request::DeriveNativeBindings(request) => derive_native_bindings(request, documents),
         Request::ConfigureLanguages(request) => configure_languages(request, analysis),
@@ -2571,7 +2587,12 @@ fn derive_injection_regions(
     }
 }
 
-fn derive_semantic_tokens(request: DeriveSemanticTokens, documents: &DocumentStore) -> Response {
+fn derive_semantic_tokens(
+    request: DeriveSemanticTokens,
+    documents: &DocumentStore,
+    queue_wait: Duration,
+    started: Instant,
+) -> Response {
     let context = request.context.clone();
     let Some(replica) = documents
         .get(&DocumentKey::from(&context))
@@ -2583,13 +2604,15 @@ fn derive_semantic_tokens(request: DeriveSemanticTokens, documents: &DocumentSto
         });
     };
     match replica.lock() {
-        Ok(mut replica) => match replica.derive_semantic_tokens(request) {
-            Ok(result) => Response::SemanticTokens(result),
-            Err(message) => Response::Error(WorkerError {
-                context: Some(context),
-                message,
-            }),
-        },
+        Ok(mut replica) => {
+            match replica.derive_semantic_tokens_with_telemetry(request, queue_wait, started) {
+                Ok(result) => Response::SemanticTokens(result),
+                Err(message) => Response::Error(WorkerError {
+                    context: Some(context),
+                    message,
+                }),
+            }
+        }
         Err(_) => poisoned_document_restart(context),
     }
 }
@@ -5037,6 +5060,8 @@ mod tests {
         assert_eq!(result.tokens.len(), 1);
         assert_eq!(result.tokens[0].delta_start, 3);
         assert_eq!(result.tokens[0].length, 4);
+        assert!(result.compute_ns > 0);
+        assert_eq!(result.queue_wait_ns, 0);
     }
 
     #[test]

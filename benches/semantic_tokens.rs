@@ -59,11 +59,16 @@ struct Server {
 impl Server {
     /// Spawn `bin`, run the LSP handshake, and return a ready server.
     fn start(bin: &str, data_dir: &str) -> Server {
+        let stderr = if std::env::var_os("KAKEHASHI_BENCH_SERVER_STDERR").is_some() {
+            Stdio::inherit()
+        } else {
+            Stdio::null()
+        };
         let mut child = Command::new(bin)
             .env("KAKEHASHI_DATA_DIR", data_dir)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
+            .stderr(stderr)
             .spawn()
             .unwrap_or_else(|e| panic!("failed to spawn server binary {bin:?}: {e}"));
 
