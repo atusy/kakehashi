@@ -1500,6 +1500,7 @@ impl DocumentReplica {
                 discovery,
             }),
             cancellation.cloned(),
+            Some(initial_nested_work_policy),
             nested_work_policy,
         )
         .ok_or_else(|| "worker semantic token derivation was cancelled".to_string())?;
@@ -8339,6 +8340,76 @@ mod tests {
             replica.semantic_discovery.is_none(),
             "semantic-only discovery belongs inside the injection branch so it can overlap the host walk"
         );
+
+        replica.cached_semantic_tokens = None;
+        replica.semantic_discovery = None;
+        let sequential_after_admission = || crate::analysis::semantic::NestedWorkPolicy::Sequential;
+        replica
+            .derive_semantic_tokens_with_telemetry(
+                DeriveSemanticTokens {
+                    context: RequestContext {
+                        request_id: 2,
+                        ..replica.context.clone()
+                    },
+                    supports_multiline: false,
+                },
+                Duration::ZERO,
+                Instant::now(),
+                3,
+                None,
+                Some(&sequential_after_admission),
+            )
+            .unwrap();
+        assert!(
+            replica.semantic_discovery.is_some(),
+            "a request admitted after policy turns sequential must retain discovery"
+        );
+
+        for (settled_policy, label) in [
+            (
+                crate::analysis::semantic::NestedWorkPolicy::Sequential,
+                "sequential",
+            ),
+            (
+                crate::analysis::semantic::NestedWorkPolicy::Yield,
+                "yielding",
+            ),
+        ] {
+            replica.cached_semantic_tokens = None;
+            replica.semantic_discovery = None;
+            let policy_reads = std::sync::atomic::AtomicUsize::new(0);
+            let transition_after_admission = || {
+                if policy_reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                    crate::analysis::semantic::NestedWorkPolicy::Parallel
+                } else {
+                    settled_policy
+                }
+            };
+            replica
+                .derive_semantic_tokens_with_telemetry(
+                    DeriveSemanticTokens {
+                        context: RequestContext {
+                            request_id: 3,
+                            ..replica.context.clone()
+                        },
+                        supports_multiline: false,
+                    },
+                    Duration::ZERO,
+                    Instant::now(),
+                    3,
+                    None,
+                    Some(&transition_after_admission),
+                )
+                .unwrap();
+            assert!(
+                replica.semantic_discovery.is_none(),
+                "a parallel outer admission must remain paired with deferred discovery after a {label} transition"
+            );
+            assert!(
+                policy_reads.load(std::sync::atomic::Ordering::SeqCst) >= 2,
+                "the test must observe the live {label} policy after outer admission"
+            );
+        }
     }
 
     #[test]

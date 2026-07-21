@@ -144,6 +144,7 @@ pub(crate) fn compute_semantic_tokens_full(
     supports_multiline: bool,
     injection_cache: Option<InjectionCacheParams>,
     cancel: Option<crate::cancel::CancelToken>,
+    admitted_outer_work_policy: Option<NestedWorkPolicy>,
     nested_work_policy: Option<&(dyn Fn() -> NestedWorkPolicy + Sync)>,
 ) -> Option<SemanticTokensResult> {
     let is_cancelled = || crate::cancel::is_cancelled(cancel.as_ref());
@@ -185,7 +186,12 @@ pub(crate) fn compute_semantic_tokens_full(
         discovery: p.discovery.as_deref(),
     });
 
-    let initial_nested_work_policy = nested_work_policy();
+    // The worker samples outer-branch admission before deciding whether to
+    // retain discovery. Keep that decision stable for this work unit; the live
+    // policy still controls inner injection chunks so newly arriving competing
+    // documents can suppress deeper fan-out without reopening the admission
+    // TOCTOU window.
+    let initial_nested_work_policy = admitted_outer_work_policy.unwrap_or_else(nested_work_policy);
     let undiscovered_large_injection_work = cache_ctx
         .as_ref()
         .is_some_and(|ctx| ctx.discovery.is_none())
@@ -355,6 +361,7 @@ pub(crate) async fn handle_semantic_tokens_full(
             supports_multiline,
             injection_cache,
             cancel,
+            None,
             None,
         )
     })
