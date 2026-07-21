@@ -4361,6 +4361,18 @@ where
         }
         #[cfg(feature = "e2e")]
         if scheduled_key.as_ref().is_some_and(|key| {
+            std::env::var("KAKEHASHI_TREE_WORKER_SCHEDULED_MARKER_URI_PREFIX")
+                .ok()
+                .is_some_and(|prefix| key.uri.starts_with(&prefix))
+        }) && let Ok(directory) = std::env::var("KAKEHASHI_TREE_WORKER_SCHEDULED_MARKER_DIR")
+        {
+            let _ = std::fs::write(
+                std::path::Path::new(&directory).join(request_id.to_string()),
+                b"scheduled",
+            );
+        }
+        #[cfg(feature = "e2e")]
+        if scheduled_key.as_ref().is_some_and(|key| {
             std::env::var("KAKEHASHI_TREE_WORKER_SCHEDULED_URI_SUFFIX")
                 .ok()
                 .is_some_and(|suffix| key.uri.ends_with(&suffix))

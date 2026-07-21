@@ -1873,10 +1873,12 @@ fn reserved_lifecycle_slot_does_not_block_cancellation_under_full_admission() {
     let directory = tempfile::tempdir().unwrap();
     let trigger = directory.path().join("trigger");
     let markers = directory.path().join("hung-jobs");
+    let scheduled_routes = directory.path().join("scheduled-routes");
     let lifecycle_scheduled = directory.path().join("lifecycle-scheduled");
     let cancel_observed = directory.path().join("cancel-observed");
     let recovery_ready = directory.path().join("recovery-ready");
     std::fs::create_dir(&markers).unwrap();
+    std::fs::create_dir(&scheduled_routes).unwrap();
     let mut client = LspClient::builder()
         .env("KAKEHASHI_TREE_WORKER_MODE", "authoritative")
         .env("KAKEHASHI_TREE_WORKER_THREADS", "4")
@@ -1900,6 +1902,14 @@ fn reserved_lifecycle_slot_does_not_block_cancellation_under_full_admission() {
         .env(
             "KAKEHASHI_TREE_WORKER_HANG_ALL_COMMITTED_HAZARDS_COUNT",
             "4",
+        )
+        .env(
+            "KAKEHASHI_TREE_WORKER_SCHEDULED_MARKER_URI_PREFIX",
+            "file:///reserve-saturated-",
+        )
+        .env(
+            "KAKEHASHI_TREE_WORKER_SCHEDULED_MARKER_DIR",
+            scheduled_routes.to_string_lossy(),
         )
         .env(
             "KAKEHASHI_TREE_WORKER_SCHEDULED_URI_SUFFIX",
@@ -1931,6 +1941,9 @@ fn reserved_lifecycle_slot_does_not_block_cancellation_under_full_admission() {
         .collect::<Vec<_>>();
     for (uri, text) in &documents {
         open_rust_and_request_tokens(&mut client, uri, text);
+    }
+    for marker in std::fs::read_dir(&scheduled_routes).unwrap() {
+        std::fs::remove_file(marker.unwrap().path()).unwrap();
     }
     let lifecycle_uri = "file:///reserve-lifecycle.lua";
     client.send_notification(
@@ -1970,6 +1983,13 @@ fn reserved_lifecycle_slot_does_not_block_cancellation_under_full_admission() {
             )
         })
         .collect::<std::collections::HashSet<_>>();
+    let admission_deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while std::fs::read_dir(&scheduled_routes).unwrap().count() < 16
+        && std::time::Instant::now() < admission_deadline
+    {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(std::fs::read_dir(&scheduled_routes).unwrap().count(), 16);
     let marker_deadline = std::time::Instant::now() + Duration::from_secs(5);
     while std::fs::read_dir(&markers).unwrap().count() < 4
         && std::time::Instant::now() < marker_deadline

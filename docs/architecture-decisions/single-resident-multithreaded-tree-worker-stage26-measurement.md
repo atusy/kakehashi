@@ -82,7 +82,8 @@ then serves a healthy follow-up without restarting the generation.
 
 The worker scheduler's pending bound includes the same one lifecycle slot that
 the client reserves above its ordinary `4*T` route limit. A saturation E2E fills
-all 16 ordinary routes, schedules the 17th lifecycle request, and proves later
+all 16 ordinary routes, using one worker scheduling marker per request as the
+admission barrier, schedules the 17th lifecycle request, and proves later
 FIFO cancellation frames still reach the worker control fast path. With the old
 16-request bound the same test deterministically times out waiting for the
 cancel marker; with the aligned bound it recovers once without quarantine.
