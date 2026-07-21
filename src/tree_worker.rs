@@ -13,7 +13,7 @@ use std::{
     collections::{HashMap, VecDeque},
     sync::{
         Arc, Condvar, Mutex, Weak,
-        atomic::{AtomicBool, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
 };
 
@@ -5095,6 +5095,7 @@ pub struct Client {
     terminated_by_transport: Arc<AtomicBool>,
     terminated_for_request_deadline: AtomicBool,
     outbound: Mutex<Option<mpsc::Sender<Request>>>,
+    next_enqueue_order: AtomicU64,
     accepting_requests: AtomicBool,
     active_grammar_hazards: Arc<Mutex<HashMap<u64, GrammarHazardArmed>>>,
     reader_drain_state: Arc<(Mutex<ReaderDrainState>, Condvar)>,
@@ -5151,10 +5152,27 @@ fn request_timeout(_uri: &str) -> Duration {
 
 struct Route {
     expected: RequestContext,
+    enqueue_order: u64,
     response_contract: ResponseContract,
     expected_grammar: Option<Arc<WorkerGrammarIdentity>>,
     document_grammar_update: Option<DocumentGrammarUpdate>,
     sender: mpsc::Sender<io::Result<Response>>,
+}
+
+fn latest_pending_sync_grammar(
+    routes: &HashMap<u64, Route>,
+    uri: &str,
+) -> Option<Arc<WorkerGrammarIdentity>> {
+    routes
+        .values()
+        .filter_map(|route| match &route.document_grammar_update {
+            Some(DocumentGrammarUpdate::Set(route_uri, grammar)) if route_uri == uri => {
+                Some((route.enqueue_order, Arc::clone(grammar)))
+            }
+            _ => None,
+        })
+        .max_by_key(|(enqueue_order, _)| *enqueue_order)
+        .map(|(_, grammar)| grammar)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -5479,6 +5497,7 @@ impl Client {
             terminated_by_transport,
             terminated_for_request_deadline: AtomicBool::new(false),
             outbound: Mutex::new(Some(outbound)),
+            next_enqueue_order: AtomicU64::new(0),
             accepting_requests: AtomicBool::new(true),
             active_grammar_hazards,
             reader_drain_state,
@@ -5794,6 +5813,12 @@ impl Client {
         let outbound = outbound
             .as_ref()
             .ok_or_else(|| io::Error::new(io::ErrorKind::BrokenPipe, "worker is shut down"))?;
+        let enqueue_order = self
+            .next_enqueue_order
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |order| {
+                order.checked_add(1)
+            })
+            .map_err(|_| io::Error::other("worker enqueue order is exhausted"))?;
         let request_id = expected.request_id;
         let (response_tx, response_rx) = mpsc::channel();
         let direct_grammar = direct_request_grammar_identity(&request);
@@ -5829,18 +5854,8 @@ impl Client {
                     format!("tree worker request {request_id} is already active"),
                 ));
             }
-            let active_sync_grammar = inherited_grammar_uri.and_then(|uri| {
-                routes
-                    .values()
-                    .filter(|route| {
-                        matches!(
-                            &route.document_grammar_update,
-                            Some(DocumentGrammarUpdate::Set(route_uri, _)) if route_uri == uri
-                        )
-                    })
-                    .max_by_key(|route| route.expected.request_id)
-                    .and_then(|route| route.expected_grammar.clone())
-            });
+            let active_sync_grammar =
+                inherited_grammar_uri.and_then(|uri| latest_pending_sync_grammar(&routes, uri));
             let expected_grammar = direct_grammar
                 .clone()
                 .or(active_sync_grammar)
@@ -5874,6 +5889,7 @@ impl Client {
                 request_id,
                 Route {
                     expected,
+                    enqueue_order,
                     response_contract: response_contract(&request),
                     expected_grammar,
                     document_grammar_update,
@@ -6325,24 +6341,26 @@ mod tests {
         ApplyDocumentEdits, BUILD_ID, ByteEdit, CacheEviction, CacheEvictionCandidate,
         CachedInjectionLayer, CancelRequest, CapturesResult, CloseDocument, DeriveInjectionRegions,
         DeriveNativeBindings, DeriveSelectionRanges, DeriveSemanticTokens, DeriveSnapshot,
-        DocumentCompetition, DocumentKey, DocumentLane, DocumentMemoryAdmission, DocumentReplica,
-        GrammarHazardArmed, GrammarHazardReleased, GrammarKey, Handshake, HandshakeReady,
-        LaneAction, LaneRegistry, LanguageCatalogAck, MAX_DOCUMENT_BYTES, MAX_DOCUMENT_REPLICAS,
-        MAX_RETAINED_DOCUMENT_BYTES, MAX_RETAINED_ESTIMATED_DOCUMENT_BYTES, NavigateNode,
-        NodeLayerSelector, NodeNavigation, NodeScalarOperation, NodeScalarValue, OpaqueNodeId,
-        OwnedChild, PROTOCOL_VERSION, ParentLiveness, Request, RequestContext, ResolveNode,
-        Response, ResponseContract, Route, RunCaptures, RunNodeScalar, RunnableDocuments,
+        DocumentCompetition, DocumentGrammarUpdate, DocumentKey, DocumentLane,
+        DocumentMemoryAdmission, DocumentReplica, GrammarHazardArmed, GrammarHazardReleased,
+        GrammarKey, Handshake, HandshakeReady, LaneAction, LaneRegistry, LanguageCatalogAck,
+        MAX_DOCUMENT_BYTES, MAX_DOCUMENT_REPLICAS, MAX_RETAINED_DOCUMENT_BYTES,
+        MAX_RETAINED_ESTIMATED_DOCUMENT_BYTES, NavigateNode, NodeLayerSelector, NodeNavigation,
+        NodeScalarOperation, NodeScalarValue, OpaqueNodeId, OwnedChild, PROTOCOL_VERSION,
+        ParentLiveness, Request, RequestContext, ResolveNode, Response, ResponseContract, Route,
+        RunCaptures, RunNodeScalar, RunnableDocuments,
         SEMANTIC_CACHE_AUXILIARY_TRIM_THRESHOLD_BYTES, SuccessResponseKind, SyncDocument,
         WireByteRange, WirePosition, WireRange, WireSemanticToken, WorkPriority, WorkerError,
         WorkerGrammarIdentity, WorkerQuerySources, WorkerRestartRequired, cache_eviction_plan,
         cancel_active_request, cancellation_grace_response, client_generation_is_idle,
         close_document, decode_frame, derive_snapshot_with_language, encode_frame,
-        enforce_derived_memory_budget, named_node_count, parse_request_timeout,
-        pressure_checkpoint_required, record_grammar_hazard_arm, replace_retained_bytes,
-        replace_retained_estimated_bytes, request_grammar_identity, request_may_grow_derived_state,
-        request_priority, reserve_retained_growth, route_is_admissible, route_response, run,
-        submit_document_job, sync_document, terminate, terminate_by_transport,
-        terminate_by_transport_for_request_deadline, validate_document_size,
+        enforce_derived_memory_budget, latest_pending_sync_grammar, named_node_count,
+        parse_request_timeout, pressure_checkpoint_required, record_grammar_hazard_arm,
+        replace_retained_bytes, replace_retained_estimated_bytes, request_grammar_identity,
+        request_may_grow_derived_state, request_priority, reserve_retained_growth,
+        route_is_admissible, route_response, run, submit_document_job, sync_document, terminate,
+        terminate_by_transport, terminate_by_transport_for_request_deadline,
+        validate_document_size,
     };
 
     #[derive(Clone, Default)]
@@ -6882,6 +6900,7 @@ mod tests {
             7,
             Route {
                 expected: expected.clone(),
+                enqueue_order: 0,
                 response_contract: ResponseContract {
                     success: SuccessResponseKind::DocumentAck,
                     cancellable: false,
@@ -6923,6 +6942,7 @@ mod tests {
             7,
             Route {
                 expected: expected.clone(),
+                enqueue_order: 0,
                 response_contract: ResponseContract {
                     success: SuccessResponseKind::DocumentAck,
                     cancellable: false,
@@ -6948,6 +6968,48 @@ mod tests {
     }
 
     #[test]
+    fn pending_sync_grammar_follows_enqueue_order_not_request_id() {
+        let uri = "file:///pipelined.rs";
+        let grammar = |symbol: &str| {
+            Arc::new(WorkerGrammarIdentity {
+                grammar_symbol: symbol.into(),
+                artifact_digest: format!("sha256:{symbol}"),
+            })
+        };
+        let route = |request_id, enqueue_order, grammar: Arc<WorkerGrammarIdentity>| {
+            let (sender, _receiver) = std::sync::mpsc::channel();
+            Route {
+                expected: RequestContext {
+                    request_id,
+                    worker_generation: 3,
+                    uri: uri.into(),
+                    incarnation: 1,
+                    content_version: enqueue_order,
+                    configuration_generation: 1,
+                },
+                enqueue_order,
+                response_contract: ResponseContract {
+                    success: SuccessResponseKind::DocumentAck,
+                    cancellable: false,
+                },
+                expected_grammar: Some(Arc::clone(&grammar)),
+                document_grammar_update: Some(DocumentGrammarUpdate::Set(uri.into(), grammar)),
+                sender,
+            }
+        };
+        let earlier_high_id = grammar("rust");
+        let later_low_id = grammar("lua");
+        let routes = HashMap::from([
+            (90, route(90, 1, earlier_high_id)),
+            (7, route(7, 2, Arc::clone(&later_low_id))),
+        ]);
+
+        let selected = latest_pending_sync_grammar(&routes, uri).unwrap();
+
+        assert!(Arc::ptr_eq(&selected, &later_low_id));
+    }
+
+    #[test]
     fn grammar_hazard_arm_requires_the_exact_request_route() {
         let expected = RequestContext {
             request_id: 7,
@@ -6962,6 +7024,7 @@ mod tests {
             7,
             Route {
                 expected: expected.clone(),
+                enqueue_order: 0,
                 response_contract: ResponseContract {
                     success: SuccessResponseKind::DocumentAck,
                     cancellable: false,
