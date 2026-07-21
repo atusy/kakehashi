@@ -893,16 +893,37 @@ fn parser_source_dir(
 }
 
 #[cfg(any(windows, test))]
-fn strip_windows_verbatim_prefix(path: &str) -> Option<String> {
-    path.strip_prefix(r"\\?\UNC\")
-        .map(|path| format!(r"\\{path}"))
-        .or_else(|| path.strip_prefix(r"\\?\").map(str::to_owned))
+fn strip_windows_verbatim_prefix_units(path: &[u16]) -> Option<Vec<u16>> {
+    const VERBATIM: &[u16] = &[b'\\' as u16, b'\\' as u16, b'?' as u16, b'\\' as u16];
+    const VERBATIM_UNC: &[u16] = &[
+        b'\\' as u16,
+        b'\\' as u16,
+        b'?' as u16,
+        b'\\' as u16,
+        b'U' as u16,
+        b'N' as u16,
+        b'C' as u16,
+        b'\\' as u16,
+    ];
+    if let Some(path) = path.strip_prefix(VERBATIM_UNC) {
+        let mut normalized = vec![b'\\' as u16, b'\\' as u16];
+        normalized.extend_from_slice(path);
+        Some(normalized)
+    } else {
+        path.strip_prefix(VERBATIM).map(<[u16]>::to_vec)
+    }
 }
 
 fn compiler_compatible_canonical_path(path: PathBuf) -> PathBuf {
     #[cfg(windows)]
-    if let Some(path) = strip_windows_verbatim_prefix(&path.to_string_lossy()) {
-        return PathBuf::from(path);
+    {
+        use std::ffi::OsString;
+        use std::os::windows::ffi::{OsStrExt, OsStringExt};
+
+        let units = path.as_os_str().encode_wide().collect::<Vec<_>>();
+        if let Some(path) = strip_windows_verbatim_prefix_units(&units) {
+            return PathBuf::from(OsString::from_wide(&path));
+        }
     }
     path
 }
@@ -960,16 +981,24 @@ mod tests {
         "https://github.com/tree-sitter/tree-sitter-json/archive/v0.24.8.tar.gz";
 
     #[test]
-    fn compiler_path_strips_windows_verbatim_prefixes() {
+    fn compiler_path_strips_windows_verbatim_prefixes_losslessly() {
+        let units = |path: &str| path.encode_utf16().collect::<Vec<_>>();
         assert_eq!(
-            strip_windows_verbatim_prefix(r"\\?\C:\runner\parser"),
-            Some(r"C:\runner\parser".into())
+            strip_windows_verbatim_prefix_units(&units(r"\\?\C:\runner\parser")),
+            Some(units(r"C:\runner\parser"))
         );
         assert_eq!(
-            strip_windows_verbatim_prefix(r"\\?\UNC\server\share\parser"),
-            Some(r"\\server\share\parser".into())
+            strip_windows_verbatim_prefix_units(&units(r"\\?\UNC\server\share\parser")),
+            Some(units(r"\\server\share\parser"))
         );
-        assert_eq!(strip_windows_verbatim_prefix(r"C:\runner\parser"), None);
+        assert_eq!(
+            strip_windows_verbatim_prefix_units(&units(r"C:\runner\parser")),
+            None
+        );
+        let mut unpaired_surrogate = units(r"\\?\C:\runner\");
+        unpaired_surrogate.push(0xd800);
+        let stripped = strip_windows_verbatim_prefix_units(&unpaired_surrogate).unwrap();
+        assert_eq!(stripped.last(), Some(&0xd800));
     }
 
     #[test]
