@@ -465,7 +465,9 @@ The worker resolves a document request's runtime identity only after that job
 reaches the head of its document lane, so a preceding queued sync cannot leave
 the arm bound to the prior replica.
 An unknown or mismatched route is an incomplete protocol abort, not quarantine
-evidence. Each grammar
+evidence. Terminal responses are likewise accepted only when their variant is
+valid for that request type; a matching ID and context cannot turn the wrong
+payload into a registry update. Each grammar
 encountered by a fused host/injection operation is leased separately and remains
 active until the complete high-level operation has stopped consuming every
 value backed by that grammar. Only then does `GrammarHazardReleased` remove it

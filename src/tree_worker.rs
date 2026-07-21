@@ -5139,9 +5139,32 @@ fn request_timeout(_uri: &str) -> Duration {
 
 struct Route {
     expected: RequestContext,
+    response_contract: ResponseContract,
     expected_grammar: Option<Arc<WorkerGrammarIdentity>>,
     document_grammar_update: Option<DocumentGrammarUpdate>,
     sender: mpsc::Sender<io::Result<Response>>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SuccessResponseKind {
+    DocumentAck,
+    DocumentClosed,
+    Snapshot,
+    Nodes,
+    NodeScalar,
+    SelectionRanges,
+    InjectionRegions,
+    SemanticTokens,
+    Captures,
+    NativeBindings,
+    LanguageCatalogAck,
+    DocumentMemory,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ResponseContract {
+    success: SuccessResponseKind,
+    cancellable: bool,
 }
 
 fn record_grammar_hazard_arm(
@@ -5839,6 +5862,7 @@ impl Client {
                 request_id,
                 Route {
                     expected,
+                    response_contract: response_contract(&request),
                     expected_grammar,
                     document_grammar_update,
                     sender: response_tx,
@@ -5982,6 +6006,34 @@ fn inherited_request_grammar_context(request: &Request) -> Option<&RequestContex
     }
 }
 
+fn response_contract(request: &Request) -> ResponseContract {
+    let success = match request {
+        Request::DeriveSnapshot(_)
+        | Request::ApplyDocumentEditsAndDerive(_)
+        | Request::DeriveDocumentSnapshot(_) => SuccessResponseKind::Snapshot,
+        Request::SyncDocument(_) | Request::ApplyDocumentEdits(_) => {
+            SuccessResponseKind::DocumentAck
+        }
+        Request::ResolveNode(_) | Request::NavigateNode(_) => SuccessResponseKind::Nodes,
+        Request::RunNodeScalar(_) => SuccessResponseKind::NodeScalar,
+        Request::DeriveSelectionRanges(_) => SuccessResponseKind::SelectionRanges,
+        Request::DeriveInjectionRegions(_) => SuccessResponseKind::InjectionRegions,
+        Request::DeriveSemanticTokens(_) => SuccessResponseKind::SemanticTokens,
+        Request::RunCaptures(_) => SuccessResponseKind::Captures,
+        Request::DeriveNativeBindings(_) => SuccessResponseKind::NativeBindings,
+        Request::ConfigureLanguages(_) => SuccessResponseKind::LanguageCatalogAck,
+        Request::InspectDocumentMemory(_) => SuccessResponseKind::DocumentMemory,
+        Request::CloseDocument(_) => SuccessResponseKind::DocumentClosed,
+        Request::Handshake(_) | Request::Cancel(_) => {
+            unreachable!("control requests do not create response routes")
+        }
+    };
+    ResponseContract {
+        success,
+        cancellable: is_cancellable_reader_request(request),
+    }
+}
+
 fn request_uses_supervisor_route_reserve(request: &Request) -> bool {
     matches!(
         request,
@@ -6083,6 +6135,30 @@ fn response_context(response: &Response) -> Option<&RequestContext> {
     }
 }
 
+fn response_matches_contract(response: &Response, contract: ResponseContract) -> bool {
+    match response {
+        Response::Error(_) | Response::WorkerRestartRequired(_) => true,
+        Response::RequestCancelled(_) => contract.cancellable,
+        Response::DocumentAck(_) => contract.success == SuccessResponseKind::DocumentAck,
+        Response::DocumentClosed(_) => contract.success == SuccessResponseKind::DocumentClosed,
+        Response::Snapshot(_) => contract.success == SuccessResponseKind::Snapshot,
+        Response::Nodes(_) => contract.success == SuccessResponseKind::Nodes,
+        Response::NodeScalar(_) => contract.success == SuccessResponseKind::NodeScalar,
+        Response::SelectionRanges(_) => contract.success == SuccessResponseKind::SelectionRanges,
+        Response::InjectionRegions(_) => contract.success == SuccessResponseKind::InjectionRegions,
+        Response::SemanticTokens(_) => contract.success == SuccessResponseKind::SemanticTokens,
+        Response::Captures(_) => contract.success == SuccessResponseKind::Captures,
+        Response::NativeBindings(_) => contract.success == SuccessResponseKind::NativeBindings,
+        Response::LanguageCatalogAck(_) => {
+            contract.success == SuccessResponseKind::LanguageCatalogAck
+        }
+        Response::DocumentMemory(_) => contract.success == SuccessResponseKind::DocumentMemory,
+        Response::HandshakeReady(_)
+        | Response::GrammarHazardArmed(_)
+        | Response::GrammarHazardReleased(_) => false,
+    }
+}
+
 fn route_response(
     routes: &Mutex<HashMap<u64, Route>>,
     document_grammars: &Mutex<HashMap<String, Arc<WorkerGrammarIdentity>>>,
@@ -6108,6 +6184,16 @@ fn route_response(
         let error = io::Error::new(
             io::ErrorKind::InvalidData,
             format!("response context mismatch for request {request_id}"),
+        );
+        let _ = route
+            .sender
+            .send(Err(io::Error::new(error.kind(), error.to_string())));
+        return Err(error);
+    }
+    if !response_matches_contract(&response, route.response_contract) {
+        let error = io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("response variant mismatch for request {request_id}"),
         );
         let _ = route
             .sender
@@ -6229,21 +6315,21 @@ mod tests {
         DeriveNativeBindings, DeriveSelectionRanges, DeriveSemanticTokens, DeriveSnapshot,
         DocumentCompetition, DocumentKey, DocumentLane, DocumentMemoryAdmission, DocumentReplica,
         GrammarHazardArmed, GrammarHazardReleased, GrammarKey, Handshake, HandshakeReady,
-        LaneAction, LaneRegistry, MAX_DOCUMENT_BYTES, MAX_DOCUMENT_REPLICAS,
+        LaneAction, LaneRegistry, LanguageCatalogAck, MAX_DOCUMENT_BYTES, MAX_DOCUMENT_REPLICAS,
         MAX_RETAINED_DOCUMENT_BYTES, MAX_RETAINED_ESTIMATED_DOCUMENT_BYTES, NavigateNode,
         NodeLayerSelector, NodeNavigation, NodeScalarOperation, NodeScalarValue, OpaqueNodeId,
         OwnedChild, PROTOCOL_VERSION, ParentLiveness, Request, RequestContext, ResolveNode,
-        Response, Route, RunCaptures, RunNodeScalar, RunnableDocuments,
-        SEMANTIC_CACHE_AUXILIARY_TRIM_THRESHOLD_BYTES, SyncDocument, WireByteRange, WirePosition,
-        WireRange, WireSemanticToken, WorkPriority, WorkerError, WorkerGrammarIdentity,
-        WorkerQuerySources, WorkerRestartRequired, cache_eviction_plan, cancel_active_request,
-        cancellation_grace_response, client_generation_is_idle, close_document, decode_frame,
-        derive_snapshot_with_language, encode_frame, enforce_derived_memory_budget,
-        named_node_count, parse_request_timeout, pressure_checkpoint_required,
-        record_grammar_hazard_arm, replace_retained_bytes, replace_retained_estimated_bytes,
-        request_grammar_identity, request_may_grow_derived_state, request_priority,
-        reserve_retained_growth, route_is_admissible, route_response, run, submit_document_job,
-        sync_document, terminate, terminate_by_transport,
+        Response, ResponseContract, Route, RunCaptures, RunNodeScalar, RunnableDocuments,
+        SEMANTIC_CACHE_AUXILIARY_TRIM_THRESHOLD_BYTES, SuccessResponseKind, SyncDocument,
+        WireByteRange, WirePosition, WireRange, WireSemanticToken, WorkPriority, WorkerError,
+        WorkerGrammarIdentity, WorkerQuerySources, WorkerRestartRequired, cache_eviction_plan,
+        cancel_active_request, cancellation_grace_response, client_generation_is_idle,
+        close_document, decode_frame, derive_snapshot_with_language, encode_frame,
+        enforce_derived_memory_budget, named_node_count, parse_request_timeout,
+        pressure_checkpoint_required, record_grammar_hazard_arm, replace_retained_bytes,
+        replace_retained_estimated_bytes, request_grammar_identity, request_may_grow_derived_state,
+        request_priority, reserve_retained_growth, route_is_admissible, route_response, run,
+        submit_document_job, sync_document, terminate, terminate_by_transport,
         terminate_by_transport_for_request_deadline, validate_document_size,
     };
 
@@ -6784,6 +6870,10 @@ mod tests {
             7,
             Route {
                 expected: expected.clone(),
+                response_contract: ResponseContract {
+                    success: SuccessResponseKind::DocumentAck,
+                    cancellable: false,
+                },
                 expected_grammar: None,
                 document_grammar_update: None,
                 sender,
@@ -6807,6 +6897,45 @@ mod tests {
     }
 
     #[test]
+    fn response_router_rejects_a_wrong_terminal_variant() {
+        let expected = RequestContext {
+            request_id: 7,
+            worker_generation: 3,
+            uri: "file:///sync.rs".into(),
+            incarnation: 11,
+            content_version: 5,
+            configuration_generation: 2,
+        };
+        let (sender, _receiver) = std::sync::mpsc::channel();
+        let routes = Mutex::new(HashMap::from([(
+            7,
+            Route {
+                expected: expected.clone(),
+                response_contract: ResponseContract {
+                    success: SuccessResponseKind::DocumentAck,
+                    cancellable: false,
+                },
+                expected_grammar: None,
+                document_grammar_update: None,
+                sender,
+            },
+        )]));
+
+        let error = route_response(
+            &routes,
+            &Mutex::new(HashMap::new()),
+            Response::LanguageCatalogAck(LanguageCatalogAck {
+                context: expected,
+                languages: 1,
+            }),
+        )
+        .unwrap_err();
+
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("variant mismatch"));
+    }
+
+    #[test]
     fn grammar_hazard_arm_requires_the_exact_request_route() {
         let expected = RequestContext {
             request_id: 7,
@@ -6821,6 +6950,10 @@ mod tests {
             7,
             Route {
                 expected: expected.clone(),
+                response_contract: ResponseContract {
+                    success: SuccessResponseKind::DocumentAck,
+                    cancellable: false,
+                },
                 expected_grammar: Some(Arc::new(WorkerGrammarIdentity {
                     grammar_symbol: "rust".into(),
                     artifact_digest: "sha256:expected".into(),
