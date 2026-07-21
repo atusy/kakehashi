@@ -453,6 +453,9 @@ enum Kind {
     /// Sustained typing through unique document states. Unlike `EditDelta`, this
     /// never toggles back to a previously cached whole-document snapshot.
     TypingDelta,
+    /// Several unique edits arrive without waiting for intermediate token
+    /// requests, followed by one delta for the only version still usable.
+    TypingBurst { edits: usize },
     /// Rapid edits explicitly cancel several already-issued full requests.
     /// Measures latency from the final edit/request until the only result the
     /// editor can still use, while obsolete computation is reclaimed.
@@ -619,7 +622,7 @@ fn seed_result_id(server: &mut Server, scn: &Scenario) -> String {
             String::new()
         }
         // Delta-based scenarios need an initial result_id to diff against.
-        Kind::DeltaNoop | Kind::EditDelta | Kind::TypingDelta => {
+        Kind::DeltaNoop | Kind::EditDelta | Kind::TypingDelta | Kind::TypingBurst { .. } => {
             result_id_of(&server.semantic_full(scn.uri)).unwrap_or_default()
         }
     }
@@ -689,6 +692,24 @@ fn run_once(
             let id = result_id_of(&result).unwrap_or_else(|| {
                 panic!(
                     "typing_delta returned no usable semantic-token baseline for {}: {result}",
+                    scn.name
+                )
+            });
+            *prev_result_id = id;
+        }
+        Kind::TypingBurst { edits } => {
+            for _ in 0..edits {
+                edit.version += 1;
+                server.did_change_insert_space(scn.uri, edit.version, edit.line);
+            }
+            let result = if prev_result_id.is_empty() {
+                server.semantic_full(scn.uri)
+            } else {
+                server.semantic_delta(scn.uri, prev_result_id)
+            };
+            let id = result_id_of(&result).unwrap_or_else(|| {
+                panic!(
+                    "typing_burst returned no usable semantic-token baseline for {}: {result}",
                     scn.name
                 )
             });
@@ -817,6 +838,14 @@ fn main() {
             targets: "unique edit states→reparse→retokenize→delta; excludes A/B cache returns",
         },
         Scenario {
+            name: "rust_large/typing_burst",
+            language_id: "rust",
+            uri: "file:///bench/large_typing_burst.rs",
+            content: gen_rust(150),
+            kind: Kind::TypingBurst { edits: 8 },
+            targets: "eight queued unique edits→current delta; latest-wins follow latency",
+        },
+        Scenario {
             name: "rust_xlarge/cancel_burst",
             language_id: "rust",
             uri: "file:///bench/large_supersede.rs",
@@ -839,6 +868,14 @@ fn main() {
             content: gen_markdown_injections(60),
             kind: Kind::TypingDelta,
             targets: "unique edit states→injection reuse→delta; excludes A/B cache returns",
+        },
+        Scenario {
+            name: "markdown_injections/typing_burst",
+            language_id: "markdown",
+            uri: "file:///bench/injections_typing_burst.md",
+            content: gen_markdown_injections(60),
+            kind: Kind::TypingBurst { edits: 8 },
+            targets: "eight queued unique edits→current injection delta; latest-wins follow latency",
         },
         // Cold-open latency scenarios for the #6 off-ingress flip. The reader gates
         // on the **host parse** via the watermark (≤200ms budget), then falls back to
