@@ -549,14 +549,12 @@ fn measure_cancel_burst(
     server.did_open(scn.uri, scn.language_id, &scn.content);
     std::thread::sleep(Duration::from_millis(300));
     let mut version = 1_i64;
-    let mut insert = true;
     let line = (scn.content.lines().count() / 2) as u32;
     let mut samples = Vec::with_capacity(iters);
     for iteration in 0..(warmup + iters) {
         for _ in 0..obsolete {
             version += 1;
-            server.did_change_toggle(scn.uri, version, line, insert);
-            insert = !insert;
+            server.did_change_insert_space(scn.uri, version, line);
             let obsolete_id = server.send_semantic_full(scn.uri);
             // Let the request enter worker compute before explicitly
             // cancelling it; immediate cancellation would only benchmark
@@ -566,10 +564,14 @@ fn measure_cancel_burst(
         }
         version += 1;
         let started = Instant::now();
-        server.did_change_toggle(scn.uri, version, line, insert);
-        insert = !insert;
+        server.did_change_insert_space(scn.uri, version, line);
         let final_id = server.send_semantic_full(scn.uri);
-        let _ = server.recv_response(final_id);
+        let result = server.recv_response(final_id);
+        assert!(
+            result_id_of(&result).is_some(),
+            "cancel_burst final request returned no usable semantic-token baseline for {}: {result}",
+            scn.name
+        );
         if iteration >= warmup {
             samples.push(started.elapsed());
         }
@@ -820,7 +822,7 @@ fn main() {
             uri: "file:///bench/large_supersede.rs",
             content: gen_rust(600),
             kind: Kind::CancelBurst { obsolete: 4 },
-            targets: "latest request latency after four explicitly cancelled computations",
+            targets: "current-token latency after four superseded unique edit states",
         },
         Scenario {
             name: "markdown_injections/edit_delta",

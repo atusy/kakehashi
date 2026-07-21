@@ -170,6 +170,16 @@ The internal scheduler provides:
   every compute thread indefinitely; and
 * cooperative cancellation checkpoints within interruptible tree walks.
 
+Latest-wins is an admission policy, not a trailing-only debounce. An edit may
+supersede queued parse or semantic-token work for an older version, but it must
+make the newest version immediately eligible to run. Sustained input therefore
+may skip intermediate token sets that the client can no longer apply, while the
+observable performance contract remains the latency from the latest edit to a
+usable token result for that current version. Measurement must use unique edit
+states and verify that the final response advances a usable semantic-token
+baseline; edit/undo toggles can revisit the whole-document cache and hide
+starvation or tail-latency regressions.
+
 One worker process is not a promise to serialize all documents. Independent
 documents and injection regions may execute on different worker threads within
 the shared budget.
