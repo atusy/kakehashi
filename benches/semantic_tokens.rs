@@ -39,6 +39,7 @@
 //! `KAKEHASHI_BENCH_SAMPLES_FILE` (optional raw-sample JSON output path).
 
 use serde_json::{Value, json};
+use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::PathBuf;
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
@@ -55,6 +56,7 @@ struct Server {
     stdin: ChildStdin,
     stdout: BufReader<ChildStdout>,
     next_id: i64,
+    buffered_responses: HashMap<i64, Value>,
 }
 
 impl Server {
@@ -80,6 +82,7 @@ impl Server {
             stdin,
             stdout,
             next_id: 0,
+            buffered_responses: HashMap::new(),
         };
 
         server.request(
@@ -244,6 +247,20 @@ impl Server {
     /// Read messages until the response for `id` arrives, skipping
     /// notifications and server-to-client requests.
     fn recv_response(&mut self, id: i64) -> Value {
+        let msg = self.recv_raw_response(id);
+        // Fail fast on a JSON-RPC error: a misconfigured server (missing
+        // parser/query, bad setup) must not silently produce Null and bogus
+        // timings.
+        if let Some(error) = msg.get("error") {
+            panic!("server returned a JSON-RPC error for request id={id}: {error}");
+        }
+        msg.get("result").cloned().unwrap_or(Value::Null)
+    }
+
+    fn recv_raw_response(&mut self, id: i64) -> Value {
+        if let Some(response) = self.buffered_responses.remove(&id) {
+            return response;
+        }
         let deadline = Instant::now() + Duration::from_secs(60);
         loop {
             if Instant::now() > deadline {
@@ -254,15 +271,13 @@ impl Server {
             if msg.get("method").is_some() {
                 continue;
             }
-            if msg.get("id").and_then(Value::as_i64) == Some(id) {
-                // Fail fast on a JSON-RPC error: a misconfigured server (missing
-                // parser/query, bad setup) must not silently produce Null and
-                // bogus timings.
-                if let Some(error) = msg.get("error") {
-                    panic!("server returned a JSON-RPC error for request id={id}: {error}");
-                }
-                return msg.get("result").cloned().unwrap_or(Value::Null);
+            let Some(response_id) = msg.get("id").and_then(Value::as_i64) else {
+                continue;
+            };
+            if response_id == id {
+                return msg;
             }
+            self.buffered_responses.insert(response_id, msg);
         }
     }
 
@@ -651,6 +666,7 @@ fn measure_cancel_burst(
     let line = baseline.tracked_line;
     let mut samples = Vec::with_capacity(iters);
     for iteration in 0..(warmup + iters) {
+        let mut obsolete_ids = Vec::with_capacity(obsolete);
         for _ in 0..obsolete {
             version += 1;
             server.did_change_insert_space(scn.uri, version, line);
@@ -661,6 +677,7 @@ fn measure_cancel_burst(
             // ingress coalescing.
             std::thread::sleep(Duration::from_millis(20));
             server.notify("$/cancelRequest", json!({ "id": obsolete_id }));
+            obsolete_ids.push(obsolete_id);
         }
         version += 1;
         let started = Instant::now();
@@ -669,8 +686,18 @@ fn measure_cancel_burst(
         let final_id = server.send_semantic_full(scn.uri);
         let result = server.recv_response(final_id);
         baseline.apply_and_verify(&result, scn.name);
+        let elapsed = started.elapsed();
+        for obsolete_id in obsolete_ids {
+            let response = server.recv_raw_response(obsolete_id);
+            assert_eq!(
+                response.pointer("/error/code").and_then(Value::as_i64),
+                Some(-32800),
+                "cancel_burst obsolete request {obsolete_id} did not return RequestCancelled for {}: {response}",
+                scn.name
+            );
+        }
         if iteration >= warmup {
-            samples.push(started.elapsed());
+            samples.push(elapsed);
         }
     }
     samples
