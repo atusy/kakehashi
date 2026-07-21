@@ -1389,8 +1389,8 @@ between that candidate and the review-converged scheduling path measured
 paired delta. Two late pairs widened the paired range to -0.522–+5.866 ms, so
 central latency was indistinguishable but tail equivalence was not established.
 Because later review fixes also touched grammar-route and response
-authentication, final code HEAD `9b5605abd` was remeasured against the earlier
-review-converged binary. Across eight alternating pairs, semantic edit/delta
+authentication, final worker-path revision `9b5605abd` was remeasured against
+the earlier review-converged binary. Across eight alternating pairs, semantic edit/delta
 latency changed by a median +0.077 ms (+0.259%); no central regression was
 distinguishable, while the -4.010–+3.673 ms range still does not establish tail
 equivalence. Keep the failure-path barrier. Runtime

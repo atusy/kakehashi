@@ -853,7 +853,9 @@ fn parser_source_dir(
     location: Option<&str>,
 ) -> Result<PathBuf, ParserInstallError> {
     let Some(location) = location else {
-        return Ok(clone_dir.canonicalize()?);
+        return Ok(compiler_compatible_canonical_path(
+            clone_dir.canonicalize()?,
+        ));
     };
     if location.is_empty()
         || Path::new(location)
@@ -887,7 +889,22 @@ fn parser_source_dir(
         )));
     }
 
-    Ok(source_dir)
+    Ok(compiler_compatible_canonical_path(source_dir))
+}
+
+#[cfg(any(windows, test))]
+fn strip_windows_verbatim_prefix(path: &str) -> Option<String> {
+    path.strip_prefix(r"\\?\UNC\")
+        .map(|path| format!(r"\\{path}"))
+        .or_else(|| path.strip_prefix(r"\\?\").map(str::to_owned))
+}
+
+fn compiler_compatible_canonical_path(path: PathBuf) -> PathBuf {
+    #[cfg(windows)]
+    if let Some(path) = strip_windows_verbatim_prefix(&path.to_string_lossy()) {
+        return PathBuf::from(path);
+    }
+    path
 }
 
 fn reject_parser_source_symlinks(path: &Path) -> Result<(), ParserInstallError> {
@@ -941,6 +958,19 @@ mod tests {
 
     const TREE_SITTER_JSON_URL: &str =
         "https://github.com/tree-sitter/tree-sitter-json/archive/v0.24.8.tar.gz";
+
+    #[test]
+    fn compiler_path_strips_windows_verbatim_prefixes() {
+        assert_eq!(
+            strip_windows_verbatim_prefix(r"\\?\C:\runner\parser"),
+            Some(r"C:\runner\parser".into())
+        );
+        assert_eq!(
+            strip_windows_verbatim_prefix(r"\\?\UNC\server\share\parser"),
+            Some(r"\\server\share\parser".into())
+        );
+        assert_eq!(strip_windows_verbatim_prefix(r"C:\runner\parser"), None);
+    }
 
     #[test]
     fn install_parser_rejects_unsafe_language_name() {

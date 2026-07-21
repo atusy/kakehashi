@@ -188,16 +188,17 @@ worktree recipe reproduces the exact source revisions and features with its own
 embedded fixture-data path. The original mutable parser/query fixture tree was
 not attested, so a fresh installation is not claimed behavior-equivalent.
 
-## Final-HEAD semantic remeasurement
+## Final worker-path semantic remeasurement
 
 Later review fixes added grammar-route authentication, current-artifact query
 refresh, and response-variant authentication on the semantic request path. To
 cover those changes, the earlier review-converged binary (`36842edc5`) was
-compared with the final code HEAD (`9b5605abd`) using the same authoritative
-four-thread `rust_large/edit_delta` method: eight alternating pairs, with 10
-warmups and 40 measured cycles per binary and pair.
+compared with the final worker-path revision (`9b5605abd`) using the same
+authoritative four-thread `rust_large/edit_delta` method: eight alternating
+pairs, with 10 warmups and 40 measured cycles per binary and pair.
 
-The earlier binary's median was 29.765 ms and final HEAD's median was 29.845 ms.
+The earlier binary's median was 29.765 ms and the final worker-path revision's
+median was 29.845 ms.
 The paired median delta was +0.077 ms (+0.259%), so this run found no measurable
 central-latency regression. Paired differences ranged from -4.010 to +3.673 ms
 (-11.859% to +12.314%), and therefore do not establish tail equivalence. These
@@ -207,8 +208,9 @@ paired comparison within each series is meaningful.
 
 The JSON artifact records the exact source revisions, release binary hashes,
 harness source and binary hashes, method, and all pair medians. Commit
-`9b5605abd` is the measured code revision; the subsequent documentation-only
-commit that records this result does not alter the measured binary.
+`9b5605abd` is the measured worker-path revision. Subsequent documentation and
+Windows parser-install path compatibility commits do not execute on this
+benchmark path.
 
 ## Decision
 
@@ -216,8 +218,8 @@ Keep complete-set quarantine, the reader-drain barrier, bounded systemic
 cancellation recovery, the termination-cause split, and the request-admission
 fence. Recovery work is bounded by active leases, while the measured request-
 path change is noise-scale in both sequential and four-way workloads. The
-final-HEAD semantic remeasurement likewise found a +0.259% paired median change
-without a distinguishable central regression.
+final worker-path semantic remeasurement likewise found a +0.259% paired median
+change without a distinguishable central regression.
 
 Do not claim a tail-recovery or complete performance-gate pass from these
 samples. Runtime injection identities, independently bounded control transport,
