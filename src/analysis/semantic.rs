@@ -190,7 +190,11 @@ pub(crate) fn compute_semantic_tokens_full(
     // retain discovery. Keep that decision stable for this work unit; the live
     // policy still controls inner injection chunks so newly arriving competing
     // documents can suppress deeper fan-out without reopening the admission
-    // TOCTOU window.
+    // TOCTOU window. Deliberately do not recheck immediately before `join`: that
+    // would pair deferred discovery with a sequential fallback again. The
+    // bounded cost of a post-admission competition change is one already-admitted
+    // outer branch using one extra pool thread; every deeper chunk and the next
+    // work unit observe the live policy.
     let initial_nested_work_policy = admitted_outer_work_policy.unwrap_or_else(nested_work_policy);
     let undiscovered_large_injection_work = cache_ctx
         .as_ref()
