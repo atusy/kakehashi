@@ -23,12 +23,9 @@
   "measured_at": "2026-07-22",
   "artifacts": {
     "harness_source_path": "benches/semantic_tokens.rs",
-    "harness_source_sha256": "12a9d78bdec0bec9f10776ed146456fff5d9622404430eb325fd6b7195b2f1af",
-    "harness_binary_sha256": "c4ed1ef405fa8b8e24b7bf77a16866fdb34942321a7c1e703719388e72ab969c",
-    "rust_parser_sha256": "7b13797d43a47a7c192f57d011ee9cae55fcc4a2c06a444639a6e141c3cdcde4",
-    "post_measurement_change": "The final baseline adds benchmark-only conventional median and obsolete-cancellation validation. The final candidate additionally snapshots outer admission to close a dynamic-policy TOCTOU; timed runs used stable no-competition policy, for which measured and reviewed server paths are identical.",
-    "reviewed_harness_source_sha256": "b21634ccf6943b0c45455e5345e29ce70a5f0f65a69ce9e6657cffc1b4fbdecc",
-    "reviewed_harness_binary_sha256": "108f32382aedec7c73c9b2784e5da3d91d00b8486487629e34a0272a98dbf339",
+    "post_measurement_change": "Older hashes are scoped under pre_review_series. The attested final series uses the reviewed harness, complete fixture manifest, reviewed Stage 29 binary, and strengthened current/cancellation validation.",
+    "reviewed_harness_source_sha256": "72b8f1e5f223919ec0f91f9829544e99e82402b44fa8f7cc4b83f5597127e037",
+    "reviewed_harness_binary_sha256": "65a9ddc1da305c05a9dd8a883f6e71c3cfc1fe2c1de76d2ff4d82659544cfa26",
     "fixture_manifest": {
       "path": "benches/profile/results/single_worker_stage29_fixture_manifest_2026-07-22.sha256",
       "sha256": "7f6eaaa8341a71fb723a70f21703e9239f4d7205a3b06041604cb15754024e61",
@@ -38,7 +35,18 @@
       "patch_path": "benches/profile/results/single_worker_stage29_measured_to_reviewed.patch",
       "patch_sha256": "f6bdfc57ee2e69bdee14e45b1fd9e1907953e0d985313009f3044487bb6a08a5",
       "reviewed_source_commit": "510b8157d68a5c51d7b95883fe2a42a8a148afde",
-      "reconstruct_measured_command": "git checkout perf/tree-worker-stage29-parallel-discovery && git apply -R benches/profile/results/single_worker_stage29_measured_to_reviewed.patch"
+      "reconstruct_measured_command": "git checkout 510b8157d68a5c51d7b95883fe2a42a8a148afde && git show origin/perf/tree-worker-stage29-parallel-discovery:benches/profile/results/single_worker_stage29_measured_to_reviewed.patch | git apply -R"
+    },
+    "pre_review_series": {
+      "harness_source_sha256": "12a9d78bdec0bec9f10776ed146456fff5d9622404430eb325fd6b7195b2f1af",
+      "harness_binary_sha256": "c4ed1ef405fa8b8e24b7bf77a16866fdb34942321a7c1e703719388e72ab969c",
+      "rust_parser_sha256": "7b13797d43a47a7c192f57d011ee9cae55fcc4a2c06a444639a6e141c3cdcde4"
+    },
+    "baseline_source_reconstruction": {
+      "path": "benches/profile/results/single_worker_stage28_source_reconstruction_2026-07-22.json",
+      "sha256": "8fe565ae535802c5643ad4b56ac24e835658bfde80e81db72d08b60bfba9f1e1",
+      "reviewed_source_commit": "5c8a21ffa1880512240cd07b1773cd16eacd5b34",
+      "reconstruct_measured_server_command": "git checkout 5c8a21ffa1880512240cd07b1773cd16eacd5b34"
     }
   },
   "method": {
@@ -4286,6 +4294,16 @@
           }
         ]
       }
-    ]
+    ],
+    "harness_source_sha256": "72b8f1e5f223919ec0f91f9829544e99e82402b44fa8f7cc4b83f5597127e037",
+    "harness_binary_sha256": "65a9ddc1da305c05a9dd8a883f6e71c3cfc1fe2c1de76d2ff4d82659544cfa26",
+    "fixture_manifest": {
+      "path": "benches/profile/results/single_worker_stage29_fixture_manifest_2026-07-22.sha256",
+      "sha256": "7f6eaaa8341a71fb723a70f21703e9239f4d7205a3b06041604cb15754024e61",
+      "files": 35,
+      "rust_parser_sha256": "0ff022908b29b87a1a015918457cb0c23a24ae17b3907bfc1e431a2a463aff8f",
+      "markdown_parser_sha256": "4855203167932411d1c038313811b09ddcc862538e6c650a6d76a7ad819349a6",
+      "note": "The manifest is authoritative for every parser, query, marker, lock, and catalog file, including injected languages."
+    }
   }
 }
