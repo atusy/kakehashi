@@ -3424,13 +3424,15 @@ fn quarantine_grammars(
         }
     }
     if !newly_quarantined.is_empty() {
-        let newly_quarantined_set = newly_quarantined.iter().cloned().collect::<HashSet<_>>();
         let open_documents = state
             .open_documents
             .lock()
             .recover_poison("quarantine_grammars(open documents)");
         for request in open_documents.current.values() {
-            if newly_quarantined_set.contains(&GrammarIdentity::from_sync(request)) {
+            if newly_quarantined
+                .binary_search(&GrammarIdentity::from_sync(request))
+                .is_ok()
+            {
                 comparisons.mark_closed(&request.context.uri, request.context.incarnation);
             }
         }
