@@ -1,0 +1,8 @@
+{
+  "measured_commit": "7f93363e2e7a136e141d4d58f9d3098eb7545874",
+  "reviewed_commit": "5c8a21ffa1880512240cd07b1773cd16eacd5b34",
+  "path_scope": "src",
+  "diff_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "interpretation": "The server source trees are identical in this path scope; intervening commits change only the benchmark harness.",
+  "reconstruct_measured_server_command": "git checkout 5c8a21ffa1880512240cd07b1773cd16eacd5b34"
+}
