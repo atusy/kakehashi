@@ -363,26 +363,35 @@ fn main() -> ExitCode {
             non_evictable_estimate_hard_bytes,
             parent_liveness_fd,
             expected_parent_pid,
-        }) => kakehashi::tree_worker::WorkerMemoryBudgets::new(
-            derived_cache_soft_bytes,
-            non_evictable_estimate_hard_bytes,
-        )
-        .map_err(|error| {
-            eprintln!("tree worker configuration failed: {error}");
-            ExitCode::FAILURE
-        })
-        .and_then(|memory_budgets| {
-            kakehashi::tree_worker::run_stdio_with_parent_liveness(
-                threads,
-                memory_budgets,
-                parent_liveness_fd,
-                expected_parent_pid,
+        }) => {
+            // The worker owns performance-critical parse/query phases whose
+            // debug telemetry cannot be reconstructed from parent-side round
+            // trip timings. Keep stdout protocol-only and expose those logs on
+            // inherited stderr under the same RUST_LOG contract as LSP mode.
+            let _ = env_logger::Builder::from_default_env()
+                .target(env_logger::Target::Stderr)
+                .try_init();
+            kakehashi::tree_worker::WorkerMemoryBudgets::new(
+                derived_cache_soft_bytes,
+                non_evictable_estimate_hard_bytes,
             )
             .map_err(|error| {
-                eprintln!("tree worker failed: {error}");
+                eprintln!("tree worker configuration failed: {error}");
                 ExitCode::FAILURE
             })
-        }),
+            .and_then(|memory_budgets| {
+                kakehashi::tree_worker::run_stdio_with_parent_liveness(
+                    threads,
+                    memory_budgets,
+                    parent_liveness_fd,
+                    expected_parent_pid,
+                )
+                .map_err(|error| {
+                    eprintln!("tree worker failed: {error}");
+                    ExitCode::FAILURE
+                })
+            })
+        }
         None => {
             // Start LSP server (backward compatible default behavior)
             // Only LSP mode needs a tokio runtime; CLI subcommands are synchronous
