@@ -35,7 +35,7 @@
       "patch_path": "benches/profile/results/single_worker_stage29_measured_to_reviewed.patch",
       "patch_sha256": "f6bdfc57ee2e69bdee14e45b1fd9e1907953e0d985313009f3044487bb6a08a5",
       "reviewed_source_commit": "510b8157d68a5c51d7b95883fe2a42a8a148afde",
-      "reconstruct_measured_command": "git checkout 510b8157d68a5c51d7b95883fe2a42a8a148afde && git show e736b0e99:benches/profile/results/single_worker_stage29_measured_to_reviewed.patch > /tmp/kakehashi-stage29-measured-to-reviewed.patch && test \"$(shasum -a 256 /tmp/kakehashi-stage29-measured-to-reviewed.patch | cut -d ' ' -f 1)\" = f6bdfc57ee2e69bdee14e45b1fd9e1907953e0d985313009f3044487bb6a08a5 && git apply -R /tmp/kakehashi-stage29-measured-to-reviewed.patch"
+      "reconstruct_measured_command": "git checkout 510b8157d68a5c51d7b95883fe2a42a8a148afde && patch_file=$(mktemp \"${TMPDIR:-/tmp}/kakehashi-stage29-measured-to-reviewed.XXXXXX\") && trap 'rm -f \"$patch_file\"' EXIT && git show e736b0e99f015a559a4d8f0539f51c3908c88f15:benches/profile/results/single_worker_stage29_measured_to_reviewed.patch > \"$patch_file\" && test \"$(shasum -a 256 \"$patch_file\" | cut -d ' ' -f 1)\" = f6bdfc57ee2e69bdee14e45b1fd9e1907953e0d985313009f3044487bb6a08a5 && git apply -R \"$patch_file\""
     },
     "pre_review_series": {
       "harness_source_sha256": "12a9d78bdec0bec9f10776ed146456fff5d9622404430eb325fd6b7195b2f1af",
