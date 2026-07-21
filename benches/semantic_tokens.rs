@@ -423,8 +423,14 @@ fn summarize(samples: &[Duration]) -> Stats {
     let mut samples = samples.to_vec();
     samples.sort_unstable();
     let pick = |q: f64| samples[((samples.len() as f64 * q) as usize).min(samples.len() - 1)];
+    let middle = samples.len() / 2;
+    let median = if samples.len().is_multiple_of(2) {
+        (samples[middle - 1] + samples[middle]) / 2
+    } else {
+        samples[middle]
+    };
     Stats {
-        median: pick(0.50),
+        median,
         p25: pick(0.25),
         p75: pick(0.75),
         p95: pick(0.95),
