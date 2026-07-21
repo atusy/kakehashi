@@ -68,6 +68,16 @@ pub(crate) use token_collector::RawToken;
 // name is included in the retained-cache estimate.
 pub(crate) use token_collector::TokenKind;
 
+/// Below this size, preparing reusable discovery before token collection is
+/// cheaper than introducing a second Rayon branch for unknown injection work.
+pub(crate) const SEMANTIC_PARALLEL_DISCOVERY_MIN_BYTES: usize = 32 * 1024;
+pub(crate) const SEMANTIC_PARALLEL_DISCOVERY_MIN_NODES: usize = 4 * 1024;
+
+pub(crate) fn is_large_semantic_host(text_len: usize, node_count: usize) -> bool {
+    text_len >= SEMANTIC_PARALLEL_DISCOVERY_MIN_BYTES
+        && node_count >= SEMANTIC_PARALLEL_DISCOVERY_MIN_NODES
+}
+
 // Test-only imports
 #[cfg(test)]
 use {delta::calculate_semantic_tokens_delta, tower_lsp_server::ls_types::SemanticTokens};
@@ -76,13 +86,17 @@ fn should_parallelize_host_and_injections(
     compute_threads: usize,
     current_generation: u64,
     discovery: Option<(u64, bool, usize)>,
+    undiscovered_large_injection_work: bool,
 ) -> bool {
     compute_threads >= 3
-        && discovery.is_some_and(|(generation, complete, region_count)| {
-            generation == current_generation
-                && complete
-                && region_count >= INJECTION_CACHE_MIN_REGIONS
-        })
+        && match discovery {
+            Some((generation, complete, region_count)) => {
+                generation == current_generation
+                    && complete
+                    && region_count >= INJECTION_CACHE_MIN_REGIONS
+            }
+            None => undiscovered_large_injection_work,
+        }
 }
 
 fn run_sequential_injection<T>(
@@ -158,6 +172,13 @@ pub(crate) fn compute_semantic_tokens_full(
         discovery: p.discovery.as_deref(),
     });
 
+    let undiscovered_large_injection_work = cache_ctx
+        .as_ref()
+        .is_some_and(|ctx| ctx.discovery.is_none())
+        && is_large_semantic_host(text.len(), tree.root_node().descendant_count())
+        && filetype
+            .as_deref()
+            .is_some_and(|language| coordinator.injection_query(language).is_some());
     let should_parallelize = nested_work_policy() == NestedWorkPolicy::Parallel
         && cache_ctx.as_ref().is_some_and(|ctx| {
             should_parallelize_host_and_injections(
@@ -170,6 +191,7 @@ pub(crate) fn compute_semantic_tokens_full(
                         discovery.regions.len(),
                     )
                 }),
+                undiscovered_large_injection_work,
             )
         });
     let mut host_work = || {
@@ -329,14 +351,30 @@ mod tests {
     fn parallel_host_injection_gate_checks_pool_and_discovery_contract() {
         let threshold = INJECTION_CACHE_MIN_REGIONS;
         let cases = [
-            (1, 7, None, false, "single-thread pool"),
-            (2, 7, Some((7, true, threshold)), false, "two-thread pool"),
-            (3, 7, None, false, "absent discovery"),
-            (3, 7, Some((6, true, threshold)), false, "stale discovery"),
+            (1, 7, None, true, false, "single-thread pool"),
+            (
+                2,
+                7,
+                Some((7, true, threshold)),
+                false,
+                false,
+                "two-thread pool",
+            ),
+            (3, 7, None, false, false, "absent small discovery"),
+            (3, 7, None, true, true, "absent large discovery"),
+            (
+                3,
+                7,
+                Some((6, true, threshold)),
+                true,
+                false,
+                "stale discovery",
+            ),
             (
                 3,
                 7,
                 Some((7, false, threshold)),
+                true,
                 false,
                 "partial discovery",
             ),
@@ -344,14 +382,15 @@ mod tests {
                 3,
                 7,
                 Some((7, true, threshold - 1)),
+                true,
                 false,
                 "below threshold",
             ),
-            (3, 7, Some((7, true, threshold)), true, "eligible"),
+            (3, 7, Some((7, true, threshold)), false, true, "eligible"),
         ];
-        for (threads, generation, discovery, expected, label) in cases {
+        for (threads, generation, discovery, unknown, expected, label) in cases {
             assert_eq!(
-                should_parallelize_host_and_injections(threads, generation, discovery),
+                should_parallelize_host_and_injections(threads, generation, discovery, unknown),
                 expected,
                 "{label}"
             );

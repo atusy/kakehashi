@@ -1451,7 +1451,30 @@ impl DocumentReplica {
             .analysis
             .highlight_query(&self.language)
             .ok_or_else(|| "worker highlight query is unavailable".to_string())?;
-        let discovery = self.semantic_discovery(request.context.configuration_generation);
+        // Reuse discovery when another worker-owned reader already materialized
+        // it for this exact generation. Small documents preserve the cheap
+        // serial preparation path. On large documents, leave a cache miss for
+        // the semantic pipeline's injection branch so its one discovery walk
+        // overlaps the independent host highlight walk.
+        let generation = request.context.configuration_generation;
+        let mut discovery = self
+            .semantic_discovery
+            .as_ref()
+            .filter(|discovery| discovery.generation == generation)
+            .cloned();
+        if discovery.is_none()
+            && !crate::analysis::semantic::is_large_semantic_host(
+                self.text.len(),
+                self.tree.root_node().descendant_count(),
+            )
+        {
+            self.ensure_injection_facts(generation, false);
+            discovery = self
+                .semantic_discovery
+                .as_ref()
+                .filter(|discovery| discovery.generation == generation)
+                .cloned();
+        }
         let result = crate::analysis::compute_semantic_tokens_full(
             compute_threads,
             Arc::from(self.text.as_str()),
@@ -1500,21 +1523,6 @@ impl DocumentReplica {
             compute_ns: duration_ns(started.elapsed()),
             cache_hit: false,
         })
-    }
-
-    fn semantic_discovery(
-        &mut self,
-        generation: u64,
-    ) -> Option<Arc<crate::document::DiscoveredInjections>> {
-        if self
-            .semantic_discovery
-            .as_ref()
-            .is_some_and(|discovery| discovery.generation == generation)
-        {
-            return self.semantic_discovery.clone();
-        }
-        self.ensure_injection_facts(generation, false);
-        self.semantic_discovery.clone()
     }
 
     fn ensure_injection_facts(&mut self, generation: u64, needs_resolved: bool) {
@@ -8233,6 +8241,69 @@ mod tests {
         assert!(
             cached.cache_hit,
             "same-version semantic requests should reuse worker facts"
+        );
+    }
+
+    #[test]
+    fn semantic_tokens_do_not_precompute_discovery_before_the_parallel_pipeline() {
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_rust::LANGUAGE.into())
+            .unwrap();
+        let context = RequestContext {
+            request_id: 1,
+            worker_generation: 3,
+            uri: "file:///semantic-injections.rs".into(),
+            incarnation: 4,
+            content_version: 1,
+            configuration_generation: 2,
+        };
+        let text = (0..1500)
+            .map(|index| {
+                format!(
+                    "// fn inner_{index}() {{}}\nfn host_{index}() {{ let value_{index} = {index}; }}\n"
+                )
+            })
+            .collect::<String>();
+        let (mut replica, _) = DocumentReplica::sync(
+            SyncDocument {
+                context: context.clone(),
+                language: "rust".into(),
+                grammar_symbol: "rust".into(),
+                source_path: "/unused/static-language".into(),
+                parser_path: "/unused/static-language".into(),
+                artifact_digest: "sha256:rust-v1".into(),
+                queries: WorkerQuerySources {
+                    highlights: Some("(identifier) @variable".into()),
+                    injections: Some(
+                        r#"((line_comment) @injection.content
+                            (#set! injection.language "rust")
+                            (#offset! @injection.content 0 3 0 0))"#
+                            .into(),
+                    ),
+                    ..WorkerQuerySources::default()
+                },
+                text,
+            },
+            &mut parser,
+        )
+        .unwrap();
+        assert!(crate::analysis::semantic::is_large_semantic_host(
+            replica.text.len(),
+            replica.tree.root_node().descendant_count(),
+        ));
+        assert!(replica.semantic_discovery.is_none());
+
+        replica
+            .derive_semantic_tokens(DeriveSemanticTokens {
+                context,
+                supports_multiline: false,
+            })
+            .unwrap();
+
+        assert!(
+            replica.semantic_discovery.is_none(),
+            "semantic-only discovery belongs inside the injection branch so it can overlap the host walk"
         );
     }
 
