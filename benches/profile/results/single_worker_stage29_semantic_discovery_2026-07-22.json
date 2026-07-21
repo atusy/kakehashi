@@ -2,14 +2,15 @@
   "baseline": {
     "stage": 28,
     "measured_commit": "7f93363e2e7a136e141d4d58f9d3098eb7545874",
-    "reviewed_server_source_commit": "a09c4fed8aadeb063efa4ebd68a7fc25b247fa76",
+    "reviewed_server_source_commit": "875a92e5c83d1c3dcc6932ae8b95c62ad719ec0a",
     "release_server_binary_sha256": "eb388fc40b8bba6050258e936ea0a38004087b65b5fcc30a990a0faf87e6f0a0"
   },
   "candidate": {
     "stage": 29,
     "measured_commit": "081dc0e4f9c2761356790cac6864e31ce0325f08",
-    "reviewed_server_source_commit": "0439c8ad473fea538893ffb1095f2ecb2197260d",
-    "release_server_binary_sha256": "5f7c53b31833193c8789f0529ed60b21fc164d9d7421a50f93024715f1c94e96"
+    "reviewed_server_source_commit": "c665735f8f4d16ebd5bb18c45e9bd8ba2adae27c",
+    "release_server_binary_sha256": "5f7c53b31833193c8789f0529ed60b21fc164d9d7421a50f93024715f1c94e96",
+    "reviewed_release_server_binary_sha256": "421ecba956065305f382d2663cdfff2ac22729e60134fa47646cba7758aa9e75"
   },
   "environment": {
     "cpu": "Apple M4 (10 logical CPUs)",
@@ -25,7 +26,7 @@
     "harness_source_sha256": "12a9d78bdec0bec9f10776ed146456fff5d9622404430eb325fd6b7195b2f1af",
     "harness_binary_sha256": "c4ed1ef405fa8b8e24b7bf77a16866fdb34942321a7c1e703719388e72ab969c",
     "rust_parser_sha256": "7b13797d43a47a7c192f57d011ee9cae55fcc4a2c06a444639a6e141c3cdcde4",
-    "post_measurement_change": "The final rebase changes only three lint-equivalent expressions in benches/semantic_tokens.rs. git diff is empty under src/ between each measured commit and its reviewed_server_source_commit."
+    "post_measurement_change": "The final baseline adds benchmark-only conventional median and obsolete-cancellation validation. The final candidate additionally snapshots outer admission to close a dynamic-policy TOCTOU; timed runs used stable no-competition policy, for which measured and reviewed server paths are identical."
   },
   "method": {
     "build_profile": "release (optimized)",
@@ -56,8 +57,8 @@
       "p95_delta_percent": -2.670
     },
     "rust_xlarge/cancel_burst": {
-      "median_delta_percent": -8.353,
-      "p95_delta_percent": -0.003
+      "median_delta_percent": -8.841,
+      "p95_delta_percent": -11.599
     },
     "markdown_injections/typing_delta": {
       "median_delta_percent": -0.416,
@@ -68,7 +69,21 @@
       "p95_delta_percent": 2.016
     }
   },
-  "interpretation": "All 1,200 timed responses represented the latest edit. Eligible Rust paths improved central latency in all three scenarios; paired p95 improved for single-edit and burst typing and was neutral for cancellation. Markdown retained generation-current discovery (debug telemetry reported regions_reused=182), so Stage 29 did not take the new undiscovered-discovery path there; its sign-changing pair deltas are a control for machine/order noise and are not attributed to the candidate.",
+  "paired_p95_delta_ranges_percent": {
+    "rust_large/typing_delta": [
+      -15.304,
+      1.969
+    ],
+    "rust_large/typing_burst": [
+      -11.554,
+      24.958
+    ],
+    "rust_xlarge/cancel_burst": [
+      -17.570,
+      32.698
+    ]
+  },
+  "interpretation": "All 1,200 main-series timed responses represented the latest edit. Eligible Rust paths showed lower median latency by the reported median-of-pairs statistic, although single-edit and burst medians each regressed in one of four pairs. A separate reviewed-binary cancellation series verified all 960 obsolete responses as RequestCancelled and all 240 final responses as current; all four paired medians favored Stage 29. With 30 samples per run, p95 is the second-largest observation and its sign-changing ranges remain too unstable for a tail claim. Markdown retained generation-current discovery (debug telemetry reported regions_reused=182), so Stage 29 did not take the new undiscovered-discovery path there.",
   "raw_measurement_runs": [
     {
       "schema_version": 1,
@@ -1618,5 +1633,784 @@
         }
       ]
     }
-  ]
+  ],
+  "post_review_validation": {
+    "purpose": "Confirm the admission-snapshot fix preserves the stable no-competition path measured in the main series.",
+    "order": "measured->reviewed",
+    "iterations_per_binary": 30,
+    "warmup_iterations_per_binary": 6,
+    "interpretation": "Current-token validation passed for every response. Single-edit and burst medians were within 0.3%; other sign-changing deltas remain descriptive only.",
+    "raw_measurement": {
+      "schema_version": 1,
+      "iterations": 30,
+      "warmup_iterations": 6,
+      "binaries": [
+        {
+          "label": "measured",
+          "path": "/tmp/kakehashi-stage29-081dc0e4f"
+        },
+        {
+          "label": "reviewed",
+          "path": "/tmp/kakehashi-stage29-final-ea6d5303b"
+        }
+      ],
+      "runs": [
+        {
+          "binary_label": "measured",
+          "binary_path": "/tmp/kakehashi-stage29-081dc0e4f",
+          "scenario": "rust_large/typing_delta",
+          "samples_ns": [
+            26419625,
+            28555000,
+            28643875,
+            28690833,
+            28867875,
+            28376291,
+            28396750,
+            37167958,
+            31663959,
+            33794875,
+            34158625,
+            34130333,
+            33831833,
+            33861125,
+            33703500,
+            34241583,
+            33757708,
+            34126292,
+            33785458,
+            33976333,
+            25656834,
+            33017042,
+            33479541,
+            33161542,
+            33548292,
+            33347625,
+            33083166,
+            32777959,
+            33208500,
+            32985667
+          ]
+        },
+        {
+          "binary_label": "reviewed",
+          "binary_path": "/tmp/kakehashi-stage29-final-ea6d5303b",
+          "scenario": "rust_large/typing_delta",
+          "samples_ns": [
+            31027333,
+            33860542,
+            43028791,
+            25156625,
+            34032125,
+            33138917,
+            33305875,
+            33225250,
+            33237834,
+            33424541,
+            33022917,
+            33193459,
+            33457625,
+            33203208,
+            33659708,
+            33180167,
+            33366292,
+            33339917,
+            33532333,
+            33332917,
+            33141875,
+            33085083,
+            32991750,
+            32768083,
+            32922000,
+            41642958,
+            34249334,
+            34109417,
+            34067166,
+            33726416
+          ]
+        },
+        {
+          "binary_label": "measured",
+          "binary_path": "/tmp/kakehashi-stage29-081dc0e4f",
+          "scenario": "rust_large/typing_burst",
+          "samples_ns": [
+            48857500,
+            55100125,
+            53591542,
+            52690500,
+            53033542,
+            52607417,
+            52883125,
+            53442042,
+            53427833,
+            52743458,
+            53253292,
+            54763208,
+            52856750,
+            52909333,
+            52876583,
+            54857083,
+            51204542,
+            52772584,
+            52935042,
+            54351833,
+            52701875,
+            50449709,
+            53386334,
+            52842084,
+            52860709,
+            52393291,
+            52541666,
+            52979667,
+            52559458,
+            53039583
+          ]
+        },
+        {
+          "binary_label": "reviewed",
+          "binary_path": "/tmp/kakehashi-stage29-final-ea6d5303b",
+          "scenario": "rust_large/typing_burst",
+          "samples_ns": [
+            47699042,
+            50720958,
+            52208292,
+            50430166,
+            52448083,
+            50270083,
+            62532666,
+            36052958,
+            52871042,
+            50734625,
+            52616625,
+            52617375,
+            52705666,
+            52523625,
+            52809458,
+            51791375,
+            52405417,
+            52536833,
+            52421000,
+            53448083,
+            53010083,
+            53478625,
+            53193875,
+            52816875,
+            52973625,
+            55803417,
+            62537625,
+            63008125,
+            62825208,
+            64586208
+          ]
+        },
+        {
+          "binary_label": "measured",
+          "binary_path": "/tmp/kakehashi-stage29-081dc0e4f",
+          "scenario": "rust_xlarge/cancel_burst",
+          "samples_ns": [
+            117448125,
+            148439875,
+            168471667,
+            175706833,
+            171592125,
+            176915417,
+            170366375,
+            174556708,
+            151006333,
+            198888208,
+            133455625,
+            144253625,
+            169848583,
+            186887500,
+            144521250,
+            168113875,
+            150154000,
+            140822791,
+            183374083,
+            171371250,
+            180280500,
+            222411333,
+            186396875,
+            239660125,
+            242807458,
+            170872167,
+            203015458,
+            134858458,
+            227301917,
+            167657250
+          ]
+        },
+        {
+          "binary_label": "reviewed",
+          "binary_path": "/tmp/kakehashi-stage29-final-ea6d5303b",
+          "scenario": "rust_xlarge/cancel_burst",
+          "samples_ns": [
+            166031834,
+            171438916,
+            137092875,
+            143984750,
+            215061458,
+            187972708,
+            174580375,
+            168354000,
+            177205791,
+            173898667,
+            147001000,
+            160330458,
+            159157375,
+            146045667,
+            166677292,
+            158967750,
+            152497583,
+            139450292,
+            156079916,
+            149583583,
+            172564041,
+            134480708,
+            147493625,
+            149534125,
+            150212375,
+            161357750,
+            166825958,
+            168152458,
+            174526042,
+            154998459
+          ]
+        },
+        {
+          "binary_label": "measured",
+          "binary_path": "/tmp/kakehashi-stage29-081dc0e4f",
+          "scenario": "markdown_injections/typing_delta",
+          "samples_ns": [
+            7866917,
+            7744750,
+            7735125,
+            7534834,
+            7584125,
+            7528917,
+            7705250,
+            7495541,
+            7500292,
+            7561208,
+            7663958,
+            7746167,
+            7481417,
+            7454208,
+            7523250,
+            7605833,
+            7662833,
+            7526791,
+            7602958,
+            7483625,
+            7645750,
+            7714625,
+            7560333,
+            7362875,
+            7546834,
+            7622292,
+            7493417,
+            8516667,
+            8369125,
+            9822000
+          ]
+        },
+        {
+          "binary_label": "reviewed",
+          "binary_path": "/tmp/kakehashi-stage29-final-ea6d5303b",
+          "scenario": "markdown_injections/typing_delta",
+          "samples_ns": [
+            7514541,
+            7900083,
+            7822291,
+            7640000,
+            7860833,
+            7747000,
+            7672458,
+            7759417,
+            7493958,
+            7496833,
+            7548750,
+            7304166,
+            7511750,
+            7740000,
+            7569292,
+            7523541,
+            7520583,
+            7472792,
+            7449167,
+            7540834,
+            7445583,
+            7484958,
+            7656000,
+            7644833,
+            7404958,
+            7809292,
+            8379667,
+            8421334,
+            8438625,
+            8412250
+          ]
+        },
+        {
+          "binary_label": "measured",
+          "binary_path": "/tmp/kakehashi-stage29-081dc0e4f",
+          "scenario": "markdown_injections/typing_burst",
+          "samples_ns": [
+            16082417,
+            16155708,
+            15644541,
+            16517750,
+            16012542,
+            16337250,
+            15937459,
+            16278542,
+            17648459,
+            17619583,
+            17251083,
+            18384708,
+            18322708,
+            18497375,
+            18257958,
+            17982041,
+            18065625,
+            18251167,
+            18686834,
+            18126917,
+            18318250,
+            18241417,
+            18307833,
+            20483541,
+            20442333,
+            18469250,
+            18353250,
+            18102208,
+            18310167,
+            18493917
+          ]
+        },
+        {
+          "binary_label": "reviewed",
+          "binary_path": "/tmp/kakehashi-stage29-final-ea6d5303b",
+          "scenario": "markdown_injections/typing_burst",
+          "samples_ns": [
+            16644000,
+            16772917,
+            16426458,
+            17281791,
+            18685958,
+            18178708,
+            18055875,
+            18400875,
+            18414833,
+            18579125,
+            18179625,
+            18090792,
+            18169167,
+            18418792,
+            18327375,
+            18062667,
+            18020667,
+            18047000,
+            17976125,
+            18452917,
+            18291000,
+            18068625,
+            18261792,
+            18206500,
+            18303083,
+            18252166,
+            18581709,
+            18008167,
+            18142125,
+            18085084
+          ]
+        }
+      ]
+    }
+  },
+  "validated_cancellation_series": {
+    "purpose": "Verify both attribution and final-source behavior: every obsolete request must return JSON-RPC -32800 and every final token set must match the latest edit before its sample is accepted.",
+    "harness_source_sha256": "b21634ccf6943b0c45455e5345e29ce70a5f0f65a69ce9e6657cffc1b4fbdecc",
+    "harness_binary_sha256": "108f32382aedec7c73c9b2784e5da3d91d00b8486487629e34a0272a98dbf339",
+    "pairs": 4,
+    "iterations_per_binary_per_pair": 30,
+    "warmup_iterations_per_binary_per_pair": 6,
+    "verified_obsolete_request_cancelled_responses": 960,
+    "verified_current_final_responses": 240,
+    "summary": {
+      "median_paired_median_delta_percent": -8.841,
+      "median_paired_p95_delta_percent": -11.599,
+      "p95_delta_range_percent": [
+        -17.570,
+        32.698
+      ],
+      "interpretation": "All four paired medians favored Stage 29; p95 remains inconclusive because one pair regressed by 32.7%."
+    },
+    "raw_measurement_runs": [
+      {
+        "schema_version": 1,
+        "iterations": 30,
+        "warmup_iterations": 6,
+        "binaries": [
+          {
+            "label": "stage28",
+            "path": "/tmp/kakehashi-stage28-7f93363e2"
+          },
+          {
+            "label": "stage29-reviewed",
+            "path": "/tmp/kakehashi-stage29-final-ea6d5303b"
+          }
+        ],
+        "runs": [
+          {
+            "binary_label": "stage28",
+            "binary_path": "/tmp/kakehashi-stage28-7f93363e2",
+            "scenario": "rust_xlarge/cancel_burst",
+            "samples_ns": [
+              180474167,
+              199662666,
+              195789708,
+              202080917,
+              184763625,
+              160446083,
+              171472291,
+              155728542,
+              171827000,
+              177075834,
+              150173334,
+              183421166,
+              169508000,
+              187451875,
+              148853125,
+              165110917,
+              170746750,
+              186011667,
+              150816000,
+              163395875,
+              157667667,
+              179353458,
+              154443041,
+              185626125,
+              197617917,
+              167707875,
+              184611584,
+              191199125,
+              179785792,
+              176320875
+            ]
+          },
+          {
+            "binary_label": "stage29-reviewed",
+            "binary_path": "/tmp/kakehashi-stage29-final-ea6d5303b",
+            "scenario": "rust_xlarge/cancel_burst",
+            "samples_ns": [
+              164291875,
+              152726000,
+              154918542,
+              161792292,
+              137144917,
+              164787834,
+              140493791,
+              122268125,
+              162437250,
+              153010833,
+              152848959,
+              164581958,
+              126422417,
+              152957416,
+              157668500,
+              158956875,
+              127745000,
+              149552833,
+              163877333,
+              140225583,
+              151973916,
+              149518292,
+              151268167,
+              164501750,
+              155642500,
+              163078792,
+              160369000,
+              147681583,
+              149116209,
+              160886208
+            ]
+          }
+        ]
+      },
+      {
+        "schema_version": 1,
+        "iterations": 30,
+        "warmup_iterations": 6,
+        "binaries": [
+          {
+            "label": "stage29-reviewed",
+            "path": "/tmp/kakehashi-stage29-final-ea6d5303b"
+          },
+          {
+            "label": "stage28",
+            "path": "/tmp/kakehashi-stage28-7f93363e2"
+          }
+        ],
+        "runs": [
+          {
+            "binary_label": "stage29-reviewed",
+            "binary_path": "/tmp/kakehashi-stage29-final-ea6d5303b",
+            "scenario": "rust_xlarge/cancel_burst",
+            "samples_ns": [
+              165966375,
+              159748000,
+              173745000,
+              172489792,
+              171242666,
+              172521166,
+              120341709,
+              155896667,
+              153257958,
+              167861000,
+              141026250,
+              181746584,
+              183425083,
+              235958709,
+              191172583,
+              213772458,
+              186653125,
+              175916333,
+              176843542,
+              112610958,
+              170929458,
+              169976542,
+              160551917,
+              148452667,
+              141594625,
+              156852500,
+              146516041,
+              149388291,
+              151218958,
+              179670041
+            ]
+          },
+          {
+            "binary_label": "stage28",
+            "binary_path": "/tmp/kakehashi-stage28-7f93363e2",
+            "scenario": "rust_xlarge/cancel_burst",
+            "samples_ns": [
+              155377542,
+              181306667,
+              168478958,
+              179837792,
+              206185167,
+              206590959,
+              258181458,
+              229618291,
+              256577459,
+              244059041,
+              205145375,
+              202500791,
+              200301708,
+              156153084,
+              151329625,
+              168960750,
+              165020125,
+              152922708,
+              128363167,
+              166729042,
+              148143041,
+              151299750,
+              173161875,
+              145843250,
+              163664209,
+              182344375,
+              182374250,
+              133289625,
+              180310459,
+              188301083
+            ]
+          }
+        ]
+      },
+      {
+        "schema_version": 1,
+        "iterations": 30,
+        "warmup_iterations": 6,
+        "binaries": [
+          {
+            "label": "stage28",
+            "path": "/tmp/kakehashi-stage28-7f93363e2"
+          },
+          {
+            "label": "stage29-reviewed",
+            "path": "/tmp/kakehashi-stage29-final-ea6d5303b"
+          }
+        ],
+        "runs": [
+          {
+            "binary_label": "stage28",
+            "binary_path": "/tmp/kakehashi-stage28-7f93363e2",
+            "scenario": "rust_xlarge/cancel_burst",
+            "samples_ns": [
+              194210792,
+              185152709,
+              181663750,
+              185529708,
+              155548583,
+              161503042,
+              154449041,
+              177203459,
+              179343417,
+              173890167,
+              165798292,
+              175487542,
+              154009416,
+              153845792,
+              143553000,
+              154489333,
+              172146917,
+              168818000,
+              159319500,
+              164243959,
+              193164292,
+              170830500,
+              161541791,
+              162885458,
+              153268958,
+              155931791,
+              186097458,
+              173120333,
+              180687417,
+              138400916
+            ]
+          },
+          {
+            "binary_label": "stage29-reviewed",
+            "binary_path": "/tmp/kakehashi-stage29-final-ea6d5303b",
+            "scenario": "rust_xlarge/cancel_burst",
+            "samples_ns": [
+              155484125,
+              170722458,
+              173533750,
+              173161959,
+              182180166,
+              155585917,
+              138439958,
+              144100958,
+              149039875,
+              154530041,
+              143552459,
+              155724375,
+              178597541,
+              143875333,
+              141160792,
+              157217667,
+              180581125,
+              132461250,
+              148270084,
+              158872916,
+              142500042,
+              160894125,
+              135552417,
+              178777166,
+              175167000,
+              150332292,
+              154593666,
+              166319458,
+              157122167,
+              134893042
+            ]
+          }
+        ]
+      },
+      {
+        "schema_version": 1,
+        "iterations": 30,
+        "warmup_iterations": 6,
+        "binaries": [
+          {
+            "label": "stage29-reviewed",
+            "path": "/tmp/kakehashi-stage29-final-ea6d5303b"
+          },
+          {
+            "label": "stage28",
+            "path": "/tmp/kakehashi-stage28-7f93363e2"
+          }
+        ],
+        "runs": [
+          {
+            "binary_label": "stage29-reviewed",
+            "binary_path": "/tmp/kakehashi-stage29-final-ea6d5303b",
+            "scenario": "rust_xlarge/cancel_burst",
+            "samples_ns": [
+              176458875,
+              232805458,
+              138061375,
+              251196792,
+              285887042,
+              217029500,
+              178099000,
+              209167291,
+              194992125,
+              183144542,
+              172577583,
+              145974416,
+              170952916,
+              148838708,
+              143524792,
+              128122500,
+              141926750,
+              158822042,
+              154265542,
+              146181917,
+              128851334,
+              141275584,
+              149166208,
+              124786916,
+              145617375,
+              160791333,
+              111101250,
+              151669458,
+              156308458,
+              177734750
+            ]
+          },
+          {
+            "binary_label": "stage28",
+            "binary_path": "/tmp/kakehashi-stage28-7f93363e2",
+            "scenario": "rust_xlarge/cancel_burst",
+            "samples_ns": [
+              182762792,
+              176571708,
+              158174416,
+              170560666,
+              183968000,
+              179682000,
+              164819917,
+              169788833,
+              189299042,
+              188606375,
+              173249042,
+              162209750,
+              152581125,
+              187584250,
+              174323708,
+              158649042,
+              154570708,
+              165984625,
+              163503542,
+              159206959,
+              202944416,
+              170986709,
+              152178750,
+              182721875,
+              175454584,
+              187032542,
+              139823458,
+              174884708,
+              186309417,
+              179063833
+            ]
+          }
+        ]
+      }
+    ]
+  }
 }

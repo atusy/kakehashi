@@ -42,12 +42,28 @@ Four pairs alternated binary order; each binary received six warmups and 30 time
 iterations per scenario. The retained artifact contains all raw nanosecond samples,
 p95 values, exact commits, binary and harness hashes, environment, and commands.
 
-The median of paired Stage-29 deltas relative to Stage 28 was:
+The observed median of paired Stage-29 deltas relative to Stage 28 was:
 
 - Rust single-edit typing: median -3.2%, p95 -6.2%.
 - Rust eight-edit burst followed by the current delta: median -3.8%, p95 -2.7%.
-- Rust four-cancellation burst followed by the current full result: median -8.4%,
-  p95 effectively unchanged (-0.003%).
+- Rust four-cancellation burst followed by the current full result: median -8.8%,
+  p95 median-of-pairs -11.6% in the reviewed-binary validation series.
+
+These are descriptive measurements, not tail-confidence claims. Single-edit and
+eight-edit median latency each regressed in one of four pairs. With 30 samples per
+run, p95 is only the second-largest observation: paired p95 deltas ranged from
+-15.3% to +2.0% for single-edit typing, -11.6% to +25.0% for eight-edit bursts,
+and -17.6% to +32.7% for cancellation bursts. The series therefore supports a
+modest central-latency improvement in this workload, while tail improvement or
+equivalence remains inconclusive.
+
+The cancellation series uses the strengthened harness: before accepting each
+sample it requires all four obsolete requests to return JSON-RPC
+`RequestCancelled (-32800)` and verifies the final token set against the latest
+edit. Across four alternating pairs it validated 960 obsolete cancellation
+responses and 240 current final responses; all four paired medians favored Stage
+29. This establishes cancellation attribution for the central-latency observation,
+but the sign-changing p95 range still precludes a tail claim.
 
 Markdown retained generation-current discovery (`regions_reused=182` in an
 untimed debug validation), so it did not take Stage 29's new undiscovered-work
@@ -61,5 +77,5 @@ sixteen-edit measurements were noise-scale or changed sign across runs, and one
 eight-edit Rust run regressed by 12.6%. Another discovery candidate removed the
 serial preparation without opening the parallel gate and regressed single-edit
 Rust by 16.7%; it was likewise rejected. The accepted design is the smallest
-measured change that improves burst follow latency while preserving the existing
-small-document path.
+measured change that showed lower central follow latency without coalescing edits;
+tail behavior remains an explicit subject for further measurement.
