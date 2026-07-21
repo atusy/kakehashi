@@ -35,7 +35,8 @@
 //!
 //! Tunables (env): `KAKEHASHI_BENCH_ITERS` (default 80),
 //! `KAKEHASHI_BENCH_WARMUP` (default 10), `KAKEHASHI_BENCH_SCENARIOS`
-//! (optional comma-separated scenario-name substrings).
+//! (optional comma-separated scenario-name substrings), and
+//! `KAKEHASHI_BENCH_SAMPLES_FILE` (optional raw-sample JSON output path).
 
 use serde_json::{Value, json};
 use std::io::{BufRead, BufReader, Read, Write};
@@ -415,15 +416,18 @@ struct Stats {
     median: Duration,
     p25: Duration,
     p75: Duration,
+    p95: Duration,
 }
 
-fn summarize(mut samples: Vec<Duration>) -> Stats {
+fn summarize(samples: &[Duration]) -> Stats {
+    let mut samples = samples.to_vec();
     samples.sort_unstable();
     let pick = |q: f64| samples[((samples.len() as f64 * q) as usize).min(samples.len() - 1)];
     Stats {
         median: pick(0.50),
         p25: pick(0.25),
         p75: pick(0.75),
+        p95: pick(0.95),
     }
 }
 
@@ -1063,23 +1067,60 @@ fn main() {
     }
     println!();
 
+    let mut raw_runs = Vec::new();
+
     if binaries.len() == 2 {
         print_ab_header(&binaries[0].label, &binaries[1].label);
         for scn in &scenarios {
             // Interleave A and B at the scenario level (separate processes); the
             // two runs are back-to-back to minimize machine drift between them.
-            let a = summarize(measure(&binaries[0], scn, &data_dir, iters, warmup));
-            let b = summarize(measure(&binaries[1], scn, &data_dir, iters, warmup));
+            let a_samples = measure(&binaries[0], scn, &data_dir, iters, warmup);
+            let b_samples = measure(&binaries[1], scn, &data_dir, iters, warmup);
+            record_raw_run(&mut raw_runs, &binaries[0], scn, &a_samples);
+            record_raw_run(&mut raw_runs, &binaries[1], scn, &b_samples);
+            let a = summarize(&a_samples);
+            let b = summarize(&b_samples);
             print_ab_row(scn, &a, &b);
         }
     } else {
         print_single_header();
         for scn in &scenarios {
-            let s = summarize(measure(&binaries[0], scn, &data_dir, iters, warmup));
+            let samples = measure(&binaries[0], scn, &data_dir, iters, warmup);
+            record_raw_run(&mut raw_runs, &binaries[0], scn, &samples);
+            let s = summarize(&samples);
             print_single_row(scn, &s);
         }
     }
+    write_raw_samples(iters, warmup, &binaries, raw_runs);
     println!();
+}
+
+fn record_raw_run(raw_runs: &mut Vec<Value>, bin: &Binary, scn: &Scenario, samples: &[Duration]) {
+    raw_runs.push(json!({
+        "binary_label": bin.label,
+        "binary_path": bin.path,
+        "scenario": scn.name,
+        "samples_ns": samples.iter().map(Duration::as_nanos).collect::<Vec<_>>(),
+    }));
+}
+
+fn write_raw_samples(iters: usize, warmup: usize, binaries: &[Binary], raw_runs: Vec<Value>) {
+    let Some(path) = std::env::var_os("KAKEHASHI_BENCH_SAMPLES_FILE") else {
+        return;
+    };
+    let output = json!({
+        "schema_version": 1,
+        "iterations": iters,
+        "warmup_iterations": warmup,
+        "binaries": binaries.iter().map(|bin| json!({
+            "label": bin.label,
+            "path": bin.path,
+        })).collect::<Vec<_>>(),
+        "runs": raw_runs,
+    });
+    let bytes = serde_json::to_vec_pretty(&output).expect("serialize raw benchmark samples");
+    std::fs::write(&path, bytes)
+        .unwrap_or_else(|error| panic!("write raw samples to {:?}: {error}", path));
 }
 
 fn filter_scenarios(scenarios: Vec<Scenario>) -> Vec<Scenario> {
@@ -1109,19 +1150,20 @@ fn filter_scenarios(scenarios: Vec<Scenario>) -> Vec<Scenario> {
 
 fn print_single_header() {
     println!(
-        "{:<34} {:>10} {:>10} {:>10}",
-        "scenario", "median", "p25", "p75"
+        "{:<34} {:>10} {:>10} {:>10} {:>10}",
+        "scenario", "median", "p25", "p75", "p95"
     );
-    println!("{}", "-".repeat(68));
+    println!("{}", "-".repeat(79));
 }
 
 fn print_single_row(scn: &Scenario, s: &Stats) {
     println!(
-        "{:<34} {:>9.3}ms {:>9.3}ms {:>9.3}ms",
+        "{:<34} {:>9.3}ms {:>9.3}ms {:>9.3}ms {:>9.3}ms",
         scn.name,
         ms(s.median),
         ms(s.p25),
-        ms(s.p75)
+        ms(s.p75),
+        ms(s.p95)
     );
     println!("    └ targets: {}", scn.targets);
 }
@@ -1150,6 +1192,7 @@ fn print_ab_row(scn: &Scenario, a: &Stats, b: &Stats) {
         "{:<34} {:>10.3}ms {:>10.3}ms {:>8}{:.1}%",
         scn.name, am, bm, sign, delta_pct
     );
+    println!("    p95: {:>10.3}ms {:>10.3}ms", ms(a.p95), ms(b.p95));
     println!("    └ targets: {}", scn.targets);
 }
 
