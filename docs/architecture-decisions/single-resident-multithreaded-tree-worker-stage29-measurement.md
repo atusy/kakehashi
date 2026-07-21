@@ -39,31 +39,34 @@ unchanged.
 Release binaries for Stage 28 and Stage 29 were measured end to end over LSP in
 authoritative-worker mode on an Apple M4 with eight worker compute threads.
 Four pairs alternated binary order; each binary received six warmups and 30 timed
-iterations per scenario. The retained artifact contains all raw nanosecond samples,
-p95 values, exact commits, binary and harness hashes, environment, and commands.
+iterations per scenario. The final series used a content-addressed data directory;
+its manifest hashes all 35 parser, query, marker, lock, and catalog files. The
+retained artifact contains all raw nanosecond samples, p95 values, exact commits,
+binary and harness hashes, environment, commands, the fixture manifest, and a
+reverse patch that reconstructs the force-pushed measured source.
 
 The observed median of paired Stage-29 deltas relative to Stage 28 was:
 
-- Rust single-edit typing: median -3.2%, p95 -6.2%.
-- Rust eight-edit burst followed by the current delta: median -3.8%, p95 -2.7%.
-- Rust four-cancellation burst followed by the current full result: median -8.8%,
-  p95 median-of-pairs -11.6% in the reviewed-binary validation series.
+- Rust single-edit typing: median -3.5%, descriptive p95 -9.3%.
+- Rust eight-edit burst followed by the current delta: median -7.3%, descriptive
+  p95 -8.2%.
+- Rust four-cancellation burst followed by the current full result: median -9.9%,
+  descriptive p95 -9.4%.
 
-These are descriptive measurements, not tail-confidence claims. Single-edit and
-eight-edit median latency each regressed in one of four pairs. With 30 samples per
-run, p95 is only the second-largest observation: paired p95 deltas ranged from
--15.3% to +2.0% for single-edit typing, -11.6% to +25.0% for eight-edit bursts,
-and -17.6% to +32.7% for cancellation bursts. The series therefore supports a
-modest central-latency improvement in this workload, while tail improvement or
-equivalence remains inconclusive.
+These are descriptive measurements, not tail-confidence claims. Single-edit
+median latency regressed in one of four pairs; eight-edit and cancellation medians
+improved in all four. With 30 samples per run, p95 is only the second-largest
+observation: paired p95 deltas ranged from -13.9% to +23.5% for single-edit typing,
+-13.8% to +2.8% for eight-edit bursts, and -14.9% to -1.2% for cancellation
+bursts. The series therefore supports a central-latency improvement in this
+workload, while a general tail guarantee would require a larger series.
 
-The cancellation series uses the strengthened harness: before accepting each
+The final series uses the strengthened harness: before accepting each cancellation
 sample it requires all four obsolete requests to return JSON-RPC
 `RequestCancelled (-32800)` and verifies the final token set against the latest
 edit. Across four alternating pairs it validated 960 obsolete cancellation
-responses and 240 current final responses; all four paired medians favored Stage
-29. This establishes cancellation attribution for the central-latency observation,
-but the sign-changing p95 range still precludes a tail claim.
+responses; all 1,200 timed responses across the five scenarios passed latest-edit
+token validation.
 
 Markdown retained generation-current discovery (`regions_reused=182` in an
 untimed debug validation), so it did not take Stage 29's new undiscovered-work
