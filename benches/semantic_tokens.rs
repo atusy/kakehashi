@@ -189,6 +189,26 @@ impl Server {
         );
     }
 
+    /// A unique typing edit: insert one more space at the cursor without
+    /// toggling back to an earlier whole-document cache key. Real typing grows
+    /// through distinct document states; an A/B toggle would turn every other
+    /// request into an unrealistic whole-document cache hit.
+    fn did_change_insert_space(&mut self, uri: &str, version: i64, line: u32) {
+        self.notify(
+            "textDocument/didChange",
+            json!({
+                "textDocument": { "uri": uri, "version": version },
+                "contentChanges": [{
+                    "range": {
+                        "start": { "line": line, "character": 0 },
+                        "end": { "line": line, "character": 0 },
+                    },
+                    "text": " ",
+                }],
+            }),
+        );
+    }
+
     fn request(&mut self, method: &str, params: Value) -> Value {
         let id = self.send_request(method, params);
         self.recv_response(id)
@@ -430,6 +450,9 @@ enum Kind {
     /// so each measured request pays incremental reparse + cache invalidation +
     /// delta diff on top of the (full) token recompute.
     EditDelta,
+    /// Sustained typing through unique document states. Unlike `EditDelta`, this
+    /// never toggles back to a previously cached whole-document snapshot.
+    TypingDelta,
     /// Rapid edits explicitly cancel several already-issued full requests.
     /// Measures latency from the final edit/request until the only result the
     /// editor can still use, while obsolete computation is reclaimed.
@@ -593,8 +616,8 @@ fn seed_result_id(server: &mut Server, scn: &Scenario) -> String {
         Kind::Full | Kind::Range { .. } | Kind::OpenFirstToken | Kind::CancelBurst { .. } => {
             String::new()
         }
-        // Both delta-based scenarios need an initial result_id to diff against.
-        Kind::DeltaNoop | Kind::EditDelta => {
+        // Delta-based scenarios need an initial result_id to diff against.
+        Kind::DeltaNoop | Kind::EditDelta | Kind::TypingDelta => {
             result_id_of(&server.semantic_full(scn.uri)).unwrap_or_default()
         }
     }
@@ -645,9 +668,29 @@ fn run_once(
             } else {
                 server.semantic_delta(scn.uri, prev_result_id)
             };
-            if let Some(id) = result_id_of(&result) {
-                *prev_result_id = id;
-            }
+            let id = result_id_of(&result).unwrap_or_else(|| {
+                panic!(
+                    "edit_delta returned no usable semantic-token baseline for {}: {result}",
+                    scn.name
+                )
+            });
+            *prev_result_id = id;
+        }
+        Kind::TypingDelta => {
+            edit.version += 1;
+            server.did_change_insert_space(scn.uri, edit.version, edit.line);
+            let result = if prev_result_id.is_empty() {
+                server.semantic_full(scn.uri)
+            } else {
+                server.semantic_delta(scn.uri, prev_result_id)
+            };
+            let id = result_id_of(&result).unwrap_or_else(|| {
+                panic!(
+                    "typing_delta returned no usable semantic-token baseline for {}: {result}",
+                    scn.name
+                )
+            });
+            *prev_result_id = id;
         }
     }
 }
@@ -764,6 +807,14 @@ fn main() {
             targets: "edit→reparse→retokenize→delta diff (host path under typing)",
         },
         Scenario {
+            name: "rust_large/typing_delta",
+            language_id: "rust",
+            uri: "file:///bench/large_typing.rs",
+            content: gen_rust(150),
+            kind: Kind::TypingDelta,
+            targets: "unique edit states→reparse→retokenize→delta; excludes A/B cache returns",
+        },
+        Scenario {
             name: "rust_xlarge/cancel_burst",
             language_id: "rust",
             uri: "file:///bench/large_supersede.rs",
@@ -778,6 +829,14 @@ fn main() {
             content: gen_markdown_injections(60),
             kind: Kind::EditDelta,
             targets: "edit→reparse→injection re-detect→cache invalidation→delta (typing)",
+        },
+        Scenario {
+            name: "markdown_injections/typing_delta",
+            language_id: "markdown",
+            uri: "file:///bench/injections_typing.md",
+            content: gen_markdown_injections(60),
+            kind: Kind::TypingDelta,
+            targets: "unique edit states→injection reuse→delta; excludes A/B cache returns",
         },
         // Cold-open latency scenarios for the #6 off-ingress flip. The reader gates
         // on the **host parse** via the watermark (≤200ms budget), then falls back to
