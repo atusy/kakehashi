@@ -199,8 +199,8 @@
     "artifacts": {
       "review_converged_commit": "36842edc5fc2c13864d9d39cecc77a78a9ed56fa",
       "review_converged_server_sha256": "a3cdaa3de70efba44ec0a3d6835689c6939d9b924185b45ae4cd41e6f770e870",
-      "final_head_commit": "72f58a8b491f5270b796dd6ed61f70f43c0ac17b",
-      "final_head_server_sha256": "d6c0e512cef8250bcd6750685e5898c36635f08ca5c86cb2de72c8e36fa2b7c7",
+      "final_head_commit": "9b5605abdc06a48d5547b0b122bdfbdd083a57bf",
+      "final_head_server_sha256": "1afa1a2c5794be1f88ef00d152fb9e6152eb023b2b26f4dfdba72963854ba370",
       "harness_source_path": "benches/semantic_tokens.rs",
       "harness_source_sha256": "018cbd1750758496421073bdd3fbaf6588702a52d8986db5be5384f2faebd8bf",
       "harness_binary_sha256": "c9338da3fd92ad4150ed6db3630223ef19f3f5e5f70165d836272fa6c3dd0081",
@@ -211,7 +211,7 @@
       "build_profile": "release (optimized)",
       "build_commands": [
         "cargo build --release --locked --bin kakehashi",
-        "cp target/release/kakehashi /tmp/kakehashi-stage26-semantic-ab/final-72f58a8b4",
+        "cp target/release/kakehashi /tmp/kakehashi-stage26-semantic-ab/final-9b5605abd",
         "cargo bench --locked --bench semantic_tokens --features e2e --no-run"
       ],
       "environment": ["KAKEHASHI_TREE_WORKER_MODE=authoritative", "KAKEHASHI_TREE_WORKER_THREADS=4"],
@@ -225,23 +225,23 @@
       "sample_retention": "the harness emitted one median per binary per pair; per-iteration samples and p25/p75 were not retained"
     },
     "pairs_ms": [
-      { "pair": 1, "review_converged": 24.582, "final_head": 26.809 },
-      { "pair": 2, "review_converged": 26.788, "final_head": 28.910 },
-      { "pair": 3, "review_converged": 29.460, "final_head": 26.900 },
-      { "pair": 4, "review_converged": 26.830, "final_head": 26.707 },
-      { "pair": 5, "review_converged": 26.744, "final_head": 26.716 },
-      { "pair": 6, "review_converged": 26.826, "final_head": 26.954 },
-      { "pair": 7, "review_converged": 26.739, "final_head": 26.684 },
-      { "pair": 8, "review_converged": 26.687, "final_head": 26.825 }
+      { "pair": 1, "review_converged": 26.992, "final_head": 30.026 },
+      { "pair": 2, "review_converged": 29.669, "final_head": 29.764 },
+      { "pair": 3, "review_converged": 29.828, "final_head": 33.501 },
+      { "pair": 4, "review_converged": 29.827, "final_head": 29.698 },
+      { "pair": 5, "review_converged": 29.702, "final_head": 29.761 },
+      { "pair": 6, "review_converged": 29.483, "final_head": 29.885 },
+      { "pair": 7, "review_converged": 33.815, "final_head": 29.805 },
+      { "pair": 8, "review_converged": 29.968, "final_head": 29.945 }
     ],
     "summary": {
-      "review_converged_median_ms": 26.766,
-      "final_head_median_ms": 26.817,
-      "median_paired_delta_ms": 0.050,
-      "median_paired_delta_percent": 0.186,
+      "review_converged_median_ms": 29.765,
+      "final_head_median_ms": 29.845,
+      "median_paired_delta_ms": 0.077,
+      "median_paired_delta_percent": 0.259,
       "median_paired_delta_percent_calculation": "median((final_head - review_converged) / review_converged * 100 for each pair)",
-      "paired_delta_range_ms": [-2.560, 2.227],
-      "paired_delta_percent_range": [-8.690, 9.059],
+      "paired_delta_range_ms": [-4.010, 3.673],
+      "paired_delta_percent_range": [-11.859, 12.314],
       "interpretation": "central latency remained indistinguishable after the final hot-path review fixes; the wide early-pair range means this run does not establish tail equivalence"
     }
   }

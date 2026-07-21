@@ -193,21 +193,21 @@ not attested, so a fresh installation is not claimed behavior-equivalent.
 Later review fixes added grammar-route authentication, current-artifact query
 refresh, and response-variant authentication on the semantic request path. To
 cover those changes, the earlier review-converged binary (`36842edc5`) was
-compared with the final code HEAD (`72f58a8b4`) using the same authoritative
+compared with the final code HEAD (`9b5605abd`) using the same authoritative
 four-thread `rust_large/edit_delta` method: eight alternating pairs, with 10
 warmups and 40 measured cycles per binary and pair.
 
-The earlier binary's median was 26.766 ms and final HEAD's median was 26.817 ms.
-The paired median delta was +0.050 ms (+0.186%), so this run found no measurable
-central-latency regression. Paired differences ranged from -2.560 to +2.227 ms
-(-8.690% to +9.059%), and therefore do not establish tail equivalence. These
+The earlier binary's median was 29.765 ms and final HEAD's median was 29.845 ms.
+The paired median delta was +0.077 ms (+0.259%), so this run found no measurable
+central-latency regression. Paired differences ranged from -4.010 to +3.673 ms
+(-11.859% to +12.314%), and therefore do not establish tail equivalence. These
 absolute values must not be compared with the preceding 39 ms series: the
 harness was rebuilt later against mutable fixture and machine state. Only the
 paired comparison within each series is meaningful.
 
 The JSON artifact records the exact source revisions, release binary hashes,
 harness source and binary hashes, method, and all pair medians. Commit
-`72f58a8b4` is the measured code revision; the subsequent documentation-only
+`9b5605abd` is the measured code revision; the subsequent documentation-only
 commit that records this result does not alter the measured binary.
 
 ## Decision
@@ -216,7 +216,7 @@ Keep complete-set quarantine, the reader-drain barrier, bounded systemic
 cancellation recovery, the termination-cause split, and the request-admission
 fence. Recovery work is bounded by active leases, while the measured request-
 path change is noise-scale in both sequential and four-way workloads. The
-final-HEAD semantic remeasurement likewise found a +0.186% paired median change
+final-HEAD semantic remeasurement likewise found a +0.259% paired median change
 without a distinguishable central regression.
 
 Do not claim a tail-recovery or complete performance-gate pass from these
