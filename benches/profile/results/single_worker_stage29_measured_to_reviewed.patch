@@ -1,0 +1,292 @@
+diff --git a/benches/semantic_tokens.rs b/benches/semantic_tokens.rs
+index 96d4b5fff..743cff439 100644
+--- a/benches/semantic_tokens.rs
++++ b/benches/semantic_tokens.rs
+@@ -37,8 +37,11 @@
+ //! `KAKEHASHI_BENCH_WARMUP` (default 10), `KAKEHASHI_BENCH_SCENARIOS`
+ //! (optional comma-separated scenario-name substrings), and
+ //! `KAKEHASHI_BENCH_SAMPLES_FILE` (optional raw-sample JSON output path).
++//! `KAKEHASHI_BENCH_DATA_DIR` can point both servers at an attested fixture
++//! snapshot instead of the checkout-local persistent test directory.
+ 
+ use serde_json::{Value, json};
++use std::collections::HashMap;
+ use std::io::{BufRead, BufReader, Read, Write};
+ use std::path::PathBuf;
+ use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+@@ -55,6 +58,7 @@ struct Server {
+     stdin: ChildStdin,
+     stdout: BufReader<ChildStdout>,
+     next_id: i64,
++    buffered_responses: HashMap<i64, Value>,
+ }
+ 
+ impl Server {
+@@ -80,6 +84,7 @@ impl Server {
+             stdin,
+             stdout,
+             next_id: 0,
++            buffered_responses: HashMap::new(),
+         };
+ 
+         server.request(
+@@ -244,6 +249,20 @@ impl Server {
+     /// Read messages until the response for `id` arrives, skipping
+     /// notifications and server-to-client requests.
+     fn recv_response(&mut self, id: i64) -> Value {
++        let msg = self.recv_raw_response(id);
++        // Fail fast on a JSON-RPC error: a misconfigured server (missing
++        // parser/query, bad setup) must not silently produce Null and bogus
++        // timings.
++        if let Some(error) = msg.get("error") {
++            panic!("server returned a JSON-RPC error for request id={id}: {error}");
++        }
++        msg.get("result").cloned().unwrap_or(Value::Null)
++    }
++
++    fn recv_raw_response(&mut self, id: i64) -> Value {
++        if let Some(response) = self.buffered_responses.remove(&id) {
++            return response;
++        }
+         let deadline = Instant::now() + Duration::from_secs(60);
+         loop {
+             if Instant::now() > deadline {
+@@ -254,15 +273,13 @@ impl Server {
+             if msg.get("method").is_some() {
+                 continue;
+             }
+-            if msg.get("id").and_then(Value::as_i64) == Some(id) {
+-                // Fail fast on a JSON-RPC error: a misconfigured server (missing
+-                // parser/query, bad setup) must not silently produce Null and
+-                // bogus timings.
+-                if let Some(error) = msg.get("error") {
+-                    panic!("server returned a JSON-RPC error for request id={id}: {error}");
+-                }
+-                return msg.get("result").cloned().unwrap_or(Value::Null);
++            let Some(response_id) = msg.get("id").and_then(Value::as_i64) else {
++                continue;
++            };
++            if response_id == id {
++                return msg;
+             }
++            self.buffered_responses.insert(response_id, msg);
+         }
+     }
+ 
+@@ -423,8 +440,14 @@ fn summarize(samples: &[Duration]) -> Stats {
+     let mut samples = samples.to_vec();
+     samples.sort_unstable();
+     let pick = |q: f64| samples[((samples.len() as f64 * q) as usize).min(samples.len() - 1)];
++    let middle = samples.len() / 2;
++    let median = if samples.len().is_multiple_of(2) {
++        (samples[middle - 1] + samples[middle]) / 2
++    } else {
++        samples[middle]
++    };
+     Stats {
+-        median: pick(0.50),
++        median,
+         p25: pick(0.25),
+         p75: pick(0.75),
+         p95: pick(0.95),
+@@ -532,7 +555,7 @@ impl SemanticBaseline {
+                     .unwrap_or_else(|| {
+                         panic!("semantic delta edit has no deleteCount for {scenario}: {edit}")
+                     }) as usize;
+-                let end = start.checked_add(delete_count).unwrap_or(usize::MAX);
++                let end = start.saturating_add(delete_count);
+                 assert!(
+                     end <= self.data.len(),
+                     "semantic delta edit is out of bounds for {scenario}: {edit}"
+@@ -645,6 +668,7 @@ fn measure_cancel_burst(
+     let line = baseline.tracked_line;
+     let mut samples = Vec::with_capacity(iters);
+     for iteration in 0..(warmup + iters) {
++        let mut obsolete_ids = Vec::with_capacity(obsolete);
+         for _ in 0..obsolete {
+             version += 1;
+             server.did_change_insert_space(scn.uri, version, line);
+@@ -655,6 +679,7 @@ fn measure_cancel_burst(
+             // ingress coalescing.
+             std::thread::sleep(Duration::from_millis(20));
+             server.notify("$/cancelRequest", json!({ "id": obsolete_id }));
++            obsolete_ids.push(obsolete_id);
+         }
+         version += 1;
+         let started = Instant::now();
+@@ -663,8 +688,18 @@ fn measure_cancel_burst(
+         let final_id = server.send_semantic_full(scn.uri);
+         let result = server.recv_response(final_id);
+         baseline.apply_and_verify(&result, scn.name);
++        let elapsed = started.elapsed();
++        for obsolete_id in obsolete_ids {
++            let response = server.recv_raw_response(obsolete_id);
++            assert_eq!(
++                response.pointer("/error/code").and_then(Value::as_i64),
++                Some(-32800),
++                "cancel_burst obsolete request {obsolete_id} did not return RequestCancelled for {}: {response}",
++                scn.name
++            );
++        }
+         if iteration >= warmup {
+-            samples.push(started.elapsed());
++            samples.push(elapsed);
+         }
+     }
+     samples
+@@ -841,7 +876,7 @@ fn nearest_token_line(data: &[u32], preferred_line: u32) -> Option<u32> {
+             continue;
+         }
+         previous_line = Some(line);
+-        if fallback.map_or(true, |current: u32| {
++        if fallback.is_none_or(|current: u32| {
+             line.abs_diff(preferred_line) < current.abs_diff(preferred_line)
+         }) {
+             fallback = Some(line);
+@@ -849,7 +884,7 @@ fn nearest_token_line(data: &[u32], preferred_line: u32) -> Option<u32> {
+         // Leading-space edits preserve the grammar most reliably on an already
+         // indented token line (not headings/fences at column zero in Markdown).
+         if start > 0
+-            && nearest.map_or(true, |current: u32| {
++            && nearest.is_none_or(|current: u32| {
+                 line.abs_diff(preferred_line) < current.abs_diff(preferred_line)
+             })
+         {
+@@ -871,7 +906,9 @@ fn result_id_of(result: &Value) -> Option<String> {
+ 
+ fn main() {
+     // Ensure parsers/queries exist, and reuse the test data dir both binaries read.
+-    let data_dir: PathBuf = kakehashi::install::test_support::test_data_dir_path();
++    let data_dir: PathBuf = std::env::var_os("KAKEHASHI_BENCH_DATA_DIR")
++        .map(PathBuf::from)
++        .unwrap_or_else(kakehashi::install::test_support::test_data_dir_path);
+     std::fs::create_dir_all(&data_dir).expect("create data dir");
+     kakehashi::install::test_support::ensure_test_languages_installed(&data_dir)
+         .expect("install test languages");
+diff --git a/src/analysis/semantic.rs b/src/analysis/semantic.rs
+index 7f1c273d3..2cadf505d 100644
+--- a/src/analysis/semantic.rs
++++ b/src/analysis/semantic.rs
+@@ -144,6 +144,7 @@ pub(crate) fn compute_semantic_tokens_full(
+     supports_multiline: bool,
+     injection_cache: Option<InjectionCacheParams>,
+     cancel: Option<crate::cancel::CancelToken>,
++    admitted_outer_work_policy: Option<NestedWorkPolicy>,
+     nested_work_policy: Option<&(dyn Fn() -> NestedWorkPolicy + Sync)>,
+ ) -> Option<SemanticTokensResult> {
+     let is_cancelled = || crate::cancel::is_cancelled(cancel.as_ref());
+@@ -185,7 +186,16 @@ pub(crate) fn compute_semantic_tokens_full(
+         discovery: p.discovery.as_deref(),
+     });
+ 
+-    let initial_nested_work_policy = nested_work_policy();
++    // The worker samples outer-branch admission before deciding whether to
++    // retain discovery. Keep that decision stable for this work unit; the live
++    // policy still controls inner injection chunks so newly arriving competing
++    // documents can suppress deeper fan-out without reopening the admission
++    // TOCTOU window. Deliberately do not recheck immediately before `join`: that
++    // would pair deferred discovery with a sequential fallback again. The
++    // bounded cost of a post-admission competition change is one already-admitted
++    // outer branch using one extra pool thread; every deeper chunk and the next
++    // work unit observe the live policy.
++    let initial_nested_work_policy = admitted_outer_work_policy.unwrap_or_else(nested_work_policy);
+     let undiscovered_large_injection_work = cache_ctx
+         .as_ref()
+         .is_some_and(|ctx| ctx.discovery.is_none())
+@@ -356,6 +366,7 @@ pub(crate) async fn handle_semantic_tokens_full(
+             injection_cache,
+             cancel,
+             None,
++            None,
+         )
+     })
+     .await
+diff --git a/src/tree_worker.rs b/src/tree_worker.rs
+index 830c8dce7..c91e97552 100644
+--- a/src/tree_worker.rs
++++ b/src/tree_worker.rs
+@@ -1500,6 +1500,7 @@ impl DocumentReplica {
+                 discovery,
+             }),
+             cancellation.cloned(),
++            Some(initial_nested_work_policy),
+             nested_work_policy,
+         )
+         .ok_or_else(|| "worker semantic token derivation was cancelled".to_string())?;
+@@ -8339,6 +8340,76 @@ mod tests {
+             replica.semantic_discovery.is_none(),
+             "semantic-only discovery belongs inside the injection branch so it can overlap the host walk"
+         );
++
++        replica.cached_semantic_tokens = None;
++        replica.semantic_discovery = None;
++        let sequential_after_admission = || crate::analysis::semantic::NestedWorkPolicy::Sequential;
++        replica
++            .derive_semantic_tokens_with_telemetry(
++                DeriveSemanticTokens {
++                    context: RequestContext {
++                        request_id: 2,
++                        ..replica.context.clone()
++                    },
++                    supports_multiline: false,
++                },
++                Duration::ZERO,
++                Instant::now(),
++                3,
++                None,
++                Some(&sequential_after_admission),
++            )
++            .unwrap();
++        assert!(
++            replica.semantic_discovery.is_some(),
++            "a request admitted after policy turns sequential must retain discovery"
++        );
++
++        for (settled_policy, label) in [
++            (
++                crate::analysis::semantic::NestedWorkPolicy::Sequential,
++                "sequential",
++            ),
++            (
++                crate::analysis::semantic::NestedWorkPolicy::Yield,
++                "yielding",
++            ),
++        ] {
++            replica.cached_semantic_tokens = None;
++            replica.semantic_discovery = None;
++            let policy_reads = std::sync::atomic::AtomicUsize::new(0);
++            let transition_after_admission = || {
++                if policy_reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
++                    crate::analysis::semantic::NestedWorkPolicy::Parallel
++                } else {
++                    settled_policy
++                }
++            };
++            replica
++                .derive_semantic_tokens_with_telemetry(
++                    DeriveSemanticTokens {
++                        context: RequestContext {
++                            request_id: 3,
++                            ..replica.context.clone()
++                        },
++                        supports_multiline: false,
++                    },
++                    Duration::ZERO,
++                    Instant::now(),
++                    3,
++                    None,
++                    Some(&transition_after_admission),
++                )
++                .unwrap();
++            assert!(
++                replica.semantic_discovery.is_none(),
++                "a parallel outer admission must remain paired with deferred discovery after a {label} transition"
++            );
++            assert!(
++                policy_reads.load(std::sync::atomic::Ordering::SeqCst) >= 2,
++                "the test must observe the live {label} policy after outer admission"
++            );
++        }
+     }
+ 
+     #[test]
