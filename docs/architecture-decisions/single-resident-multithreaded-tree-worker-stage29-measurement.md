@@ -19,36 +19,41 @@ hard-coding a language and preserves the low-overhead path for small files.
 ## Correctness result
 
 A worker-unit regression constructs a large Rust tree with injection captures and
-proves semantic derivation does not populate snapshot-owned discovery before the
-parallel pipeline. The existing discovery gate test covers one- and two-thread
-pools, absent small work, absent eligible work, stale discovery, partial discovery,
-below-threshold discovery, and generation-current eligible discovery. The focused
-73 worker tests and warning-denying all-target/all-feature Clippy pass.
+proves both sides of the admission boundary: a two-thread worker prepares and
+retains discovery serially, while a three-thread worker leaves it to the parallel
+pipeline. The shared discovery gate also covers sequential and yielding nested-work
+policies, a missing injection query, both size thresholds, absent eligible work,
+stale discovery, partial discovery, and generation-current eligible discovery.
+The focused worker tests and warning-denying all-target/all-feature Clippy pass.
 
-The optimization does not return tokens for an intermediate edit. The existing
-serve-current fence, request supersession token, worker request cancellation, and
-post-compute document/version validation are unchanged. It therefore improves the
-time to the current token set without weakening typing follow semantics.
+The benchmark now applies every full or delta response to a client-side token
+baseline. A sample is accepted only if the first token on the tracked edit line
+moves by exactly the inserted prefix length. This caught stale-content blind spots
+that checking only `resultId` cannot detect. All 1,200 timed responses in the final
+series represented the latest edit. The existing serve-current fence, request
+supersession token, worker cancellation, and post-compute version validation are
+unchanged.
 
 ## Performance result
 
 Release binaries for Stage 28 and Stage 29 were measured end to end over LSP in
-authoritative-worker mode on macOS/Apple Silicon. Every edit creates a unique
-document state and every measured response must advance a usable semantic-token
-baseline. Six 30-iteration Rust pairs alternated binary order after six warmups.
+authoritative-worker mode on an Apple M4 with eight worker compute threads.
+Four pairs alternated binary order; each binary received six warmups and 30 timed
+iterations per scenario. The retained artifact contains all raw nanosecond samples,
+p95 values, exact commits, binary and harness hashes, environment, and commands.
 
-For single-edit typing, Stage 29 was faster in five of six pairs. Stage-29 deltas
-relative to Stage 28 were approximately -7.4%, -7.1%, +0.6%, -1.6%, -3.7%, and
--8.6%; the median improvement was about 5.4%. For eight-edit bursts followed by
-one current delta, Stage 29 was faster in all six pairs, with a median improvement
-of about 10%.
+The median of paired Stage-29 deltas relative to Stage 28 was:
 
-A separate 60-iteration validation with ten warmups preserved the intended
-small/shallow-document path: injection-heavy Markdown measured -1.7% for
-single-edit typing and -7.5% for the eight-edit burst in that run. These figures
-are not claimed as a Markdown speedup because run order materially affects
-absolute timings; they establish no observed regression after adding the host
-node-count gate.
+- Rust single-edit typing: median -3.2%, p95 -6.2%.
+- Rust eight-edit burst followed by the current delta: median -3.8%, p95 -2.7%.
+- Rust four-cancellation burst followed by the current full result: median -8.4%,
+  p95 effectively unchanged (-0.003%).
+
+Markdown retained generation-current discovery (`regions_reused=182` in an
+untimed debug validation), so it did not take Stage 29's new undiscovered-work
+path. Its sign-changing pair deltas are the control for machine and ordering noise,
+not evidence for either a speedup or regression. The authoritative evidence is
+[`benches/profile/results/single_worker_stage29_semantic_discovery_2026-07-22.json`](../../benches/profile/results/single_worker_stage29_semantic_discovery_2026-07-22.json).
 
 An earlier candidate retained contiguous pending byte edits to avoid full sync
 after coalescing. It was rejected before publication: two-, four-, eight-, and
