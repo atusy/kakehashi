@@ -37,6 +37,8 @@
 //! `KAKEHASHI_BENCH_WARMUP` (default 10), `KAKEHASHI_BENCH_SCENARIOS`
 //! (optional comma-separated scenario-name substrings), and
 //! `KAKEHASHI_BENCH_SAMPLES_FILE` (optional raw-sample JSON output path).
+//! `KAKEHASHI_BENCH_DATA_DIR` can point both servers at an attested fixture
+//! snapshot instead of the checkout-local persistent test directory.
 
 use serde_json::{Value, json};
 use std::collections::HashMap;
@@ -904,7 +906,9 @@ fn result_id_of(result: &Value) -> Option<String> {
 
 fn main() {
     // Ensure parsers/queries exist, and reuse the test data dir both binaries read.
-    let data_dir: PathBuf = kakehashi::install::test_support::test_data_dir_path();
+    let data_dir: PathBuf = std::env::var_os("KAKEHASHI_BENCH_DATA_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(kakehashi::install::test_support::test_data_dir_path);
     std::fs::create_dir_all(&data_dir).expect("create data dir");
     kakehashi::install::test_support::ensure_test_languages_installed(&data_dir)
         .expect("install test languages");
