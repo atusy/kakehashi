@@ -478,6 +478,86 @@ struct EditState {
     range_next: u32,
 }
 
+/// Client-side semantic-token state. A fresh `resultId` alone does not prove
+/// that a response represents the latest document version, so typing scenarios
+/// also reconstruct full token data and verify the edited line moved exactly as
+/// far as the inserted/removed prefix.
+struct SemanticBaseline {
+    result_id: String,
+    data: Vec<u32>,
+    tracked_line: u32,
+    initial_start: u32,
+    expected_shift: u32,
+}
+
+impl SemanticBaseline {
+    fn seed(result: &Value, preferred_line: u32, scenario: &str) -> Self {
+        let result_id = result_id_of(result).unwrap_or_else(|| {
+            panic!("initial semantic response has no resultId for {scenario}: {result}")
+        });
+        let data = token_data_of(result).unwrap_or_else(|| {
+            panic!("initial semantic response has no token data for {scenario}: {result}")
+        });
+        let tracked_line = nearest_token_line(&data, preferred_line)
+            .unwrap_or_else(|| panic!("initial semantic response has no tokens for {scenario}"));
+        let initial_start = first_token_start_on_line(&data, tracked_line)
+            .expect("nearest semantic-token line must contain a token");
+        Self {
+            result_id,
+            data,
+            tracked_line,
+            initial_start,
+            expected_shift: 0,
+        }
+    }
+
+    fn apply_and_verify(&mut self, result: &Value, scenario: &str) {
+        if let Some(data) = token_data_of(result) {
+            self.data = data;
+        } else if let Some(edits) = result.get("edits").and_then(Value::as_array) {
+            for edit in edits {
+                let start = edit
+                    .get("start")
+                    .and_then(Value::as_u64)
+                    .unwrap_or_else(|| {
+                        panic!("semantic delta edit has no start for {scenario}: {edit}")
+                    }) as usize;
+                let delete_count = edit
+                    .get("deleteCount")
+                    .and_then(Value::as_u64)
+                    .unwrap_or_else(|| {
+                        panic!("semantic delta edit has no deleteCount for {scenario}: {edit}")
+                    }) as usize;
+                let end = start.checked_add(delete_count).unwrap_or(usize::MAX);
+                assert!(
+                    end <= self.data.len(),
+                    "semantic delta edit is out of bounds for {scenario}: {edit}"
+                );
+                let replacement = edit.get("data").map(parse_token_array).unwrap_or_default();
+                self.data.splice(start..end, replacement);
+            }
+        } else {
+            panic!("semantic response has neither data nor edits for {scenario}: {result}");
+        }
+
+        self.result_id = result_id_of(result).unwrap_or_else(|| {
+            panic!("semantic response has no resultId for {scenario}: {result}")
+        });
+        let actual =
+            first_token_start_on_line(&self.data, self.tracked_line).unwrap_or_else(|| {
+                panic!(
+                    "latest semantic response lost every token on tracked line {} for {scenario}",
+                    self.tracked_line
+                )
+            });
+        assert_eq!(
+            actual,
+            self.initial_start + self.expected_shift,
+            "semantic tokens did not follow the latest edit for {scenario}"
+        );
+    }
+}
+
 struct Scenario {
     name: &'static str,
     language_id: &'static str,
@@ -513,10 +593,6 @@ fn measure(
     // Let the initial parse settle (didOpen parse may be async).
     std::thread::sleep(Duration::from_millis(300));
 
-    // For delta/edit scenarios we need a valid previous result_id; seed it from a
-    // full request, then keep it current (a no-op delta may or may not rotate).
-    let mut prev_result_id = seed_result_id(&mut server, scn);
-
     // did_open used version 1; edits continue from there. Edit a line in the
     // middle of the document (representative of typical cursor position).
     let mut edit = EditState {
@@ -527,14 +603,21 @@ fn measure(
         range_next: 0,
     };
 
+    // Delta/edit scenarios keep a complete client-side baseline. This validates
+    // both the delta protocol and that tokens represent the latest typed state.
+    let mut baseline = seed_baseline(&mut server, scn, edit.line);
+    if let Some(baseline) = &baseline {
+        edit.line = baseline.tracked_line;
+    }
+
     for _ in 0..warmup {
-        run_once(&mut server, scn, &mut prev_result_id, &mut edit);
+        run_once(&mut server, scn, &mut baseline, &mut edit);
     }
 
     let mut samples = Vec::with_capacity(iters);
     for _ in 0..iters {
         let start = Instant::now();
-        run_once(&mut server, scn, &mut prev_result_id, &mut edit);
+        run_once(&mut server, scn, &mut baseline, &mut edit);
         samples.push(start.elapsed());
     }
     samples
@@ -552,12 +635,16 @@ fn measure_cancel_burst(
     server.did_open(scn.uri, scn.language_id, &scn.content);
     std::thread::sleep(Duration::from_millis(300));
     let mut version = 1_i64;
-    let line = (scn.content.lines().count() / 2) as u32;
+    let preferred_line = (scn.content.lines().count() / 2) as u32;
+    let mut baseline =
+        SemanticBaseline::seed(&server.semantic_full(scn.uri), preferred_line, scn.name);
+    let line = baseline.tracked_line;
     let mut samples = Vec::with_capacity(iters);
     for iteration in 0..(warmup + iters) {
         for _ in 0..obsolete {
             version += 1;
             server.did_change_insert_space(scn.uri, version, line);
+            baseline.expected_shift += 1;
             let obsolete_id = server.send_semantic_full(scn.uri);
             // Let the request enter worker compute before explicitly
             // cancelling it; immediate cancellation would only benchmark
@@ -568,13 +655,10 @@ fn measure_cancel_burst(
         version += 1;
         let started = Instant::now();
         server.did_change_insert_space(scn.uri, version, line);
+        baseline.expected_shift += 1;
         let final_id = server.send_semantic_full(scn.uri);
         let result = server.recv_response(final_id);
-        assert!(
-            result_id_of(&result).is_some(),
-            "cancel_burst final request returned no usable semantic-token baseline for {}: {result}",
-            scn.name
-        );
+        baseline.apply_and_verify(&result, scn.name);
         if iteration >= warmup {
             samples.push(started.elapsed());
         }
@@ -616,22 +700,24 @@ fn measure_open(
     samples
 }
 
-fn seed_result_id(server: &mut Server, scn: &Scenario) -> String {
+fn seed_baseline(
+    server: &mut Server,
+    scn: &Scenario,
+    tracked_line: u32,
+) -> Option<SemanticBaseline> {
     match scn.kind {
-        Kind::Full | Kind::Range { .. } | Kind::OpenFirstToken | Kind::CancelBurst { .. } => {
-            String::new()
-        }
+        Kind::Full | Kind::Range { .. } | Kind::OpenFirstToken | Kind::CancelBurst { .. } => None,
         // Delta-based scenarios need an initial result_id to diff against.
-        Kind::DeltaNoop | Kind::EditDelta | Kind::TypingDelta | Kind::TypingBurst { .. } => {
-            result_id_of(&server.semantic_full(scn.uri)).unwrap_or_default()
-        }
+        Kind::DeltaNoop | Kind::EditDelta | Kind::TypingDelta | Kind::TypingBurst { .. } => Some(
+            SemanticBaseline::seed(&server.semantic_full(scn.uri), tracked_line, scn.name),
+        ),
     }
 }
 
 fn run_once(
     server: &mut Server,
     scn: &Scenario,
-    prev_result_id: &mut String,
+    baseline: &mut Option<SemanticBaseline>,
     edit: &mut EditState,
 ) {
     match scn.kind {
@@ -654,11 +740,9 @@ fn run_once(
             let _ = server.semantic_range(scn.uri, start_line + offset, end_line + offset);
         }
         Kind::DeltaNoop => {
-            let result = server.semantic_delta(scn.uri, prev_result_id);
-            // Keep the id valid for the next request whether or not it rotated.
-            if let Some(id) = result_id_of(&result) {
-                *prev_result_id = id;
-            }
+            let baseline = baseline.as_mut().expect("delta baseline");
+            let result = server.semantic_delta(scn.uri, &baseline.result_id);
+            baseline.apply_and_verify(&result, scn.name);
         }
         Kind::EditDelta => {
             // Apply one toggle edit, then request a delta against the prior id.
@@ -666,56 +750,112 @@ fn run_once(
             edit.insert_next = !edit.insert_next;
             edit.version += 1;
             server.did_change_toggle(scn.uri, edit.version, edit.line, insert);
-            // Fall back to a full request if we don't yet have a valid id
-            // (e.g. a prior delta was cancelled and returned no result).
-            let result = if prev_result_id.is_empty() {
-                server.semantic_full(scn.uri)
+            let baseline = baseline.as_mut().expect("edit baseline");
+            if insert {
+                baseline.expected_shift += 1;
             } else {
-                server.semantic_delta(scn.uri, prev_result_id)
-            };
-            let id = result_id_of(&result).unwrap_or_else(|| {
-                panic!(
-                    "edit_delta returned no usable semantic-token baseline for {}: {result}",
-                    scn.name
-                )
-            });
-            *prev_result_id = id;
+                baseline.expected_shift -= 1;
+            }
+            let result = server.semantic_delta(scn.uri, &baseline.result_id);
+            baseline.apply_and_verify(&result, scn.name);
         }
         Kind::TypingDelta => {
             edit.version += 1;
             server.did_change_insert_space(scn.uri, edit.version, edit.line);
-            let result = if prev_result_id.is_empty() {
-                server.semantic_full(scn.uri)
-            } else {
-                server.semantic_delta(scn.uri, prev_result_id)
-            };
-            let id = result_id_of(&result).unwrap_or_else(|| {
-                panic!(
-                    "typing_delta returned no usable semantic-token baseline for {}: {result}",
-                    scn.name
-                )
-            });
-            *prev_result_id = id;
+            let baseline = baseline.as_mut().expect("typing baseline");
+            baseline.expected_shift += 1;
+            let result = server.semantic_delta(scn.uri, &baseline.result_id);
+            baseline.apply_and_verify(&result, scn.name);
         }
         Kind::TypingBurst { edits } => {
             for _ in 0..edits {
                 edit.version += 1;
                 server.did_change_insert_space(scn.uri, edit.version, edit.line);
             }
-            let result = if prev_result_id.is_empty() {
-                server.semantic_full(scn.uri)
-            } else {
-                server.semantic_delta(scn.uri, prev_result_id)
-            };
-            let id = result_id_of(&result).unwrap_or_else(|| {
-                panic!(
-                    "typing_burst returned no usable semantic-token baseline for {}: {result}",
-                    scn.name
-                )
-            });
-            *prev_result_id = id;
+            let baseline = baseline.as_mut().expect("typing baseline");
+            baseline.expected_shift += edits as u32;
+            let result = server.semantic_delta(scn.uri, &baseline.result_id);
+            baseline.apply_and_verify(&result, scn.name);
         }
     }
+}
+
+fn token_data_of(result: &Value) -> Option<Vec<u32>> {
+    result.get("data").map(parse_token_array)
+}
+
+fn parse_token_array(value: &Value) -> Vec<u32> {
+    value
+        .as_array()
+        .unwrap_or_else(|| panic!("semantic token data is not an array: {value}"))
+        .iter()
+        .map(|value| {
+            value
+                .as_u64()
+                .and_then(|value| u32::try_from(value).ok())
+                .unwrap_or_else(|| panic!("semantic token value is not u32: {value}"))
+        })
+        .collect()
+}
+
+fn first_token_start_on_line(data: &[u32], tracked_line: u32) -> Option<u32> {
+    assert_eq!(data.len() % 5, 0, "semantic token data is not 5-tuples");
+    let mut line = 0_u32;
+    let mut start = 0_u32;
+    for token in data.chunks_exact(5) {
+        line += token[0];
+        start = if token[0] == 0 {
+            start + token[1]
+        } else {
+            token[1]
+        };
+        if line == tracked_line {
+            return Some(start);
+        }
+        if line > tracked_line {
+            return None;
+        }
+    }
+    None
+}
+
+fn nearest_token_line(data: &[u32], preferred_line: u32) -> Option<u32> {
+    assert_eq!(data.len() % 5, 0, "semantic token data is not 5-tuples");
+    let mut line = 0_u32;
+    let mut start = 0_u32;
+    let mut nearest = None;
+    let mut fallback = None;
+    let mut previous_line = None;
+    for token in data.chunks_exact(5) {
+        line += token[0];
+        start = if token[0] == 0 {
+            start + token[1]
+        } else {
+            token[1]
+        };
+        if previous_line == Some(line) {
+            continue;
+        }
+        previous_line = Some(line);
+        if fallback.map_or(true, |current: u32| {
+            line.abs_diff(preferred_line) < current.abs_diff(preferred_line)
+        }) {
+            fallback = Some(line);
+        }
+        // Leading-space edits preserve the grammar most reliably on an already
+        // indented token line (not headings/fences at column zero in Markdown).
+        if start > 0
+            && nearest.map_or(true, |current: u32| {
+                line.abs_diff(preferred_line) < current.abs_diff(preferred_line)
+            })
+        {
+            nearest = Some(line);
+        }
+        if line > preferred_line && nearest.is_some() {
+            break;
+        }
+    }
+    nearest.or(fallback)
 }
 
 fn result_id_of(result: &Value) -> Option<String> {
