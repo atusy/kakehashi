@@ -1388,7 +1388,12 @@ between that candidate and the review-converged scheduling path measured
 39.013 ms versus 39.021 ms median latency, with a +0.146 ms (+0.376%) median
 paired delta. Two late pairs widened the paired range to -0.522–+5.866 ms, so
 central latency was indistinguishable but tail equivalence was not established.
-Keep the failure-path barrier. Runtime
+Because later review fixes also touched grammar-route and response
+authentication, final code HEAD `72f58a8b4` was remeasured against the earlier
+review-converged binary. Across eight alternating pairs, semantic edit/delta
+latency changed by a median +0.050 ms (+0.186%); no central regression was
+distinguishable, while the -2.560–+2.227 ms range still does not establish tail
+equivalence. Keep the failure-path barrier. Runtime
 injection identities, independently bounded control transport, native segment
 deadlines, explicit workload-aware admission, protocol and compatibility
 gates, and legacy-path removal remain open.
