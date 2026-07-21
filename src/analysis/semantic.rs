@@ -78,6 +78,19 @@ pub(crate) fn is_large_semantic_host(text_len: usize, node_count: usize) -> bool
         && node_count >= SEMANTIC_PARALLEL_DISCOVERY_MIN_NODES
 }
 
+pub(crate) fn should_defer_semantic_discovery(
+    compute_threads: usize,
+    policy: NestedWorkPolicy,
+    text_len: usize,
+    node_count: usize,
+    has_injection_query: bool,
+) -> bool {
+    compute_threads >= 3
+        && policy == NestedWorkPolicy::Parallel
+        && has_injection_query
+        && is_large_semantic_host(text_len, node_count)
+}
+
 // Test-only imports
 #[cfg(test)]
 use {delta::calculate_semantic_tokens_delta, tower_lsp_server::ls_types::SemanticTokens};
@@ -172,14 +185,20 @@ pub(crate) fn compute_semantic_tokens_full(
         discovery: p.discovery.as_deref(),
     });
 
+    let initial_nested_work_policy = nested_work_policy();
     let undiscovered_large_injection_work = cache_ctx
         .as_ref()
         .is_some_and(|ctx| ctx.discovery.is_none())
-        && is_large_semantic_host(text.len(), tree.root_node().descendant_count())
-        && filetype
-            .as_deref()
-            .is_some_and(|language| coordinator.injection_query(language).is_some());
-    let should_parallelize = nested_work_policy() == NestedWorkPolicy::Parallel
+        && should_defer_semantic_discovery(
+            compute_threads,
+            initial_nested_work_policy,
+            text.len(),
+            tree.root_node().descendant_count(),
+            filetype
+                .as_deref()
+                .is_some_and(|language| coordinator.injection_query(language).is_some()),
+        );
+    let should_parallelize = initial_nested_work_policy == NestedWorkPolicy::Parallel
         && cache_ctx.as_ref().is_some_and(|ctx| {
             should_parallelize_host_and_injections(
                 compute_threads,
@@ -395,6 +414,52 @@ mod tests {
                 "{label}"
             );
         }
+    }
+
+    #[test]
+    fn deferred_discovery_requires_an_available_parallel_branch() {
+        let large_bytes = SEMANTIC_PARALLEL_DISCOVERY_MIN_BYTES;
+        let large_nodes = SEMANTIC_PARALLEL_DISCOVERY_MIN_NODES;
+        let cases = [
+            (2, NestedWorkPolicy::Parallel, true, false, "two threads"),
+            (
+                3,
+                NestedWorkPolicy::Sequential,
+                true,
+                false,
+                "sequential policy",
+            ),
+            (3, NestedWorkPolicy::Yield, true, false, "yield policy"),
+            (3, NestedWorkPolicy::Parallel, false, false, "no query"),
+            (3, NestedWorkPolicy::Parallel, true, true, "eligible"),
+        ];
+        for (threads, policy, has_query, expected, label) in cases {
+            assert_eq!(
+                should_defer_semantic_discovery(
+                    threads,
+                    policy,
+                    large_bytes,
+                    large_nodes,
+                    has_query,
+                ),
+                expected,
+                "{label}"
+            );
+        }
+        assert!(!should_defer_semantic_discovery(
+            3,
+            NestedWorkPolicy::Parallel,
+            large_bytes - 1,
+            large_nodes,
+            true,
+        ));
+        assert!(!should_defer_semantic_discovery(
+            3,
+            NestedWorkPolicy::Parallel,
+            large_bytes,
+            large_nodes - 1,
+            true,
+        ));
     }
 
     #[test]

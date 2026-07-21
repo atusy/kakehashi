@@ -1462,12 +1462,18 @@ impl DocumentReplica {
             .as_ref()
             .filter(|discovery| discovery.generation == generation)
             .cloned();
-        if discovery.is_none()
-            && !crate::analysis::semantic::is_large_semantic_host(
-                self.text.len(),
-                self.tree.root_node().descendant_count(),
-            )
-        {
+        let initial_nested_work_policy = nested_work_policy.map_or(
+            crate::analysis::semantic::NestedWorkPolicy::Parallel,
+            |policy| policy(),
+        );
+        let can_defer_discovery = crate::analysis::semantic::should_defer_semantic_discovery(
+            compute_threads,
+            initial_nested_work_policy,
+            self.text.len(),
+            self.tree.root_node().descendant_count(),
+            self.analysis.injection_query(&self.language).is_some(),
+        );
+        if discovery.is_none() && !can_defer_discovery {
             self.ensure_injection_facts(generation, false);
             discovery = self
                 .semantic_discovery
@@ -8245,7 +8251,7 @@ mod tests {
     }
 
     #[test]
-    fn semantic_tokens_do_not_precompute_discovery_before_the_parallel_pipeline() {
+    fn semantic_tokens_defer_discovery_only_when_the_parallel_pipeline_can_run() {
         let mut parser = tree_sitter::Parser::new();
         parser
             .set_language(&tree_sitter_rust::LANGUAGE.into())
@@ -8294,11 +8300,39 @@ mod tests {
         ));
         assert!(replica.semantic_discovery.is_none());
 
+        let parallel = || crate::analysis::semantic::NestedWorkPolicy::Parallel;
         replica
-            .derive_semantic_tokens(DeriveSemanticTokens {
-                context,
-                supports_multiline: false,
-            })
+            .derive_semantic_tokens_with_telemetry(
+                DeriveSemanticTokens {
+                    context: context.clone(),
+                    supports_multiline: false,
+                },
+                Duration::ZERO,
+                Instant::now(),
+                2,
+                None,
+                Some(&parallel),
+            )
+            .unwrap();
+        assert!(
+            replica.semantic_discovery.is_some(),
+            "a two-thread pool must retain serially prepared discovery"
+        );
+
+        replica.cached_semantic_tokens = None;
+        replica.semantic_discovery = None;
+        replica
+            .derive_semantic_tokens_with_telemetry(
+                DeriveSemanticTokens {
+                    context,
+                    supports_multiline: false,
+                },
+                Duration::ZERO,
+                Instant::now(),
+                3,
+                None,
+                Some(&parallel),
+            )
             .unwrap();
 
         assert!(
