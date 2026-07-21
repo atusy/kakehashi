@@ -5153,6 +5153,7 @@ fn request_timeout(_uri: &str) -> Duration {
 struct Route {
     expected: RequestContext,
     enqueue_order: u64,
+    inherited_grammar_uri: Option<String>,
     response_contract: ResponseContract,
     expected_grammar: Option<Arc<WorkerGrammarIdentity>>,
     document_grammar_update: Option<DocumentGrammarUpdate>,
@@ -5890,6 +5891,7 @@ impl Client {
                 Route {
                     expected,
                     enqueue_order,
+                    inherited_grammar_uri: inherited_grammar_uri.map(str::to_owned),
                     response_contract: response_contract(&request),
                     expected_grammar,
                     document_grammar_update,
@@ -6242,6 +6244,28 @@ fn route_response(
                 .remove(uri);
         }
         _ => {}
+    }
+    if let Some(DocumentGrammarUpdate::Set(uri, grammar)) = &route.document_grammar_update {
+        let grammar = if matches!(response, Response::DocumentAck(_)) {
+            Some(Arc::clone(grammar))
+        } else {
+            document_grammars
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .get(uri)
+                .cloned()
+        };
+        for dependent in routes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .values_mut()
+            .filter(|dependent| {
+                dependent.enqueue_order > route.enqueue_order
+                    && dependent.inherited_grammar_uri.as_deref() == Some(uri)
+            })
+        {
+            dependent.expected_grammar = grammar.clone();
+        }
     }
     let _ = route.sender.send(Ok(response));
     Ok(())
@@ -6901,6 +6925,7 @@ mod tests {
             Route {
                 expected: expected.clone(),
                 enqueue_order: 0,
+                inherited_grammar_uri: None,
                 response_contract: ResponseContract {
                     success: SuccessResponseKind::DocumentAck,
                     cancellable: false,
@@ -6943,6 +6968,7 @@ mod tests {
             Route {
                 expected: expected.clone(),
                 enqueue_order: 0,
+                inherited_grammar_uri: None,
                 response_contract: ResponseContract {
                     success: SuccessResponseKind::DocumentAck,
                     cancellable: false,
@@ -6988,6 +7014,7 @@ mod tests {
                     configuration_generation: 1,
                 },
                 enqueue_order,
+                inherited_grammar_uri: None,
                 response_contract: ResponseContract {
                     success: SuccessResponseKind::DocumentAck,
                     cancellable: false,
@@ -7010,6 +7037,84 @@ mod tests {
     }
 
     #[test]
+    fn failed_pending_sync_restores_inherited_route_grammar() {
+        let uri = "file:///pipelined.rs";
+        let grammar = |symbol: &str| {
+            Arc::new(WorkerGrammarIdentity {
+                grammar_symbol: symbol.into(),
+                artifact_digest: format!("sha256:{symbol}"),
+            })
+        };
+        let old_grammar = grammar("rust");
+        let rejected_grammar = grammar("lua");
+        let sync_context = RequestContext {
+            request_id: 90,
+            worker_generation: 3,
+            uri: uri.into(),
+            incarnation: 1,
+            content_version: 2,
+            configuration_generation: 1,
+        };
+        let query_context = RequestContext {
+            request_id: 7,
+            content_version: 1,
+            ..sync_context.clone()
+        };
+        let (sync_sender, _sync_receiver) = std::sync::mpsc::channel();
+        let (query_sender, _query_receiver) = std::sync::mpsc::channel();
+        let routes = Mutex::new(HashMap::from([
+            (
+                90,
+                Route {
+                    expected: sync_context.clone(),
+                    enqueue_order: 1,
+                    inherited_grammar_uri: None,
+                    response_contract: ResponseContract {
+                        success: SuccessResponseKind::DocumentAck,
+                        cancellable: false,
+                    },
+                    expected_grammar: Some(Arc::clone(&rejected_grammar)),
+                    document_grammar_update: Some(DocumentGrammarUpdate::Set(
+                        uri.into(),
+                        rejected_grammar,
+                    )),
+                    sender: sync_sender,
+                },
+            ),
+            (
+                7,
+                Route {
+                    expected: query_context,
+                    enqueue_order: 2,
+                    inherited_grammar_uri: Some(uri.into()),
+                    response_contract: ResponseContract {
+                        success: SuccessResponseKind::Snapshot,
+                        cancellable: true,
+                    },
+                    expected_grammar: Some(grammar("lua")),
+                    document_grammar_update: None,
+                    sender: query_sender,
+                },
+            ),
+        ]));
+        let document_grammars = Mutex::new(HashMap::from([(uri.into(), Arc::clone(&old_grammar))]));
+
+        route_response(
+            &routes,
+            &document_grammars,
+            Response::Error(WorkerError {
+                context: Some(sync_context),
+                message: "injected document rejection".into(),
+            }),
+        )
+        .unwrap();
+
+        let routes = routes.lock().unwrap();
+        let selected = routes.get(&7).unwrap().expected_grammar.as_ref().unwrap();
+        assert!(Arc::ptr_eq(selected, &old_grammar));
+    }
+
+    #[test]
     fn grammar_hazard_arm_requires_the_exact_request_route() {
         let expected = RequestContext {
             request_id: 7,
@@ -7025,6 +7130,7 @@ mod tests {
             Route {
                 expected: expected.clone(),
                 enqueue_order: 0,
+                inherited_grammar_uri: None,
                 response_contract: ResponseContract {
                     success: SuccessResponseKind::DocumentAck,
                     cancellable: false,
