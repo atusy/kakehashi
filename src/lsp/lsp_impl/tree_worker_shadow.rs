@@ -3768,24 +3768,17 @@ fn classify_transport_failure(
             .flatten()
             .is_some_and(|status| process_status_is_native_crash(&status))
     });
-    classify_transport_observation(
-        error.kind(),
-        has_active_hazards,
-        client.was_terminated_by_transport(),
-        native_crash,
-    )
+    // Cleanup uses SIGKILL or exit code 1, neither of which is classified as a
+    // native crash, so a positive status remains independent crash evidence.
+    classify_transport_observation(error.kind(), has_active_hazards, native_crash)
 }
 
 fn classify_transport_observation(
     error_kind: std::io::ErrorKind,
     has_active_hazards: bool,
-    terminated_by_transport: bool,
     observed_native_crash: bool,
 ) -> FailureClass {
-    if has_active_hazards
-        && error_kind != std::io::ErrorKind::InvalidData
-        && !terminated_by_transport
-        && observed_native_crash
+    if has_active_hazards && error_kind != std::io::ErrorKind::InvalidData && observed_native_crash
     {
         return FailureClass::NativeEvidenced;
     }
@@ -4258,17 +4251,21 @@ mod tests {
     }
 
     #[test]
-    fn timeout_exit_is_native_only_with_independent_crash_evidence() {
+    fn native_crash_status_is_independent_evidence() {
         assert_eq!(
-            classify_transport_observation(std::io::ErrorKind::TimedOut, true, false, false,),
+            classify_transport_observation(std::io::ErrorKind::TimedOut, true, false,),
             FailureClass::Systemic,
         );
         assert_eq!(
-            classify_transport_observation(std::io::ErrorKind::TimedOut, true, false, true,),
+            classify_transport_observation(std::io::ErrorKind::TimedOut, true, true,),
             FailureClass::NativeEvidenced,
         );
         assert_eq!(
-            classify_transport_observation(std::io::ErrorKind::TimedOut, true, true, true,),
+            classify_transport_observation(std::io::ErrorKind::InvalidData, true, true,),
+            FailureClass::Systemic,
+        );
+        assert_eq!(
+            classify_transport_observation(std::io::ErrorKind::TimedOut, false, true,),
             FailureClass::Systemic,
         );
     }
