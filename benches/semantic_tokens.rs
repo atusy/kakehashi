@@ -532,7 +532,7 @@ impl SemanticBaseline {
                     .unwrap_or_else(|| {
                         panic!("semantic delta edit has no deleteCount for {scenario}: {edit}")
                     }) as usize;
-                let end = start.checked_add(delete_count).unwrap_or(usize::MAX);
+                let end = start.saturating_add(delete_count);
                 assert!(
                     end <= self.data.len(),
                     "semantic delta edit is out of bounds for {scenario}: {edit}"
@@ -841,7 +841,7 @@ fn nearest_token_line(data: &[u32], preferred_line: u32) -> Option<u32> {
             continue;
         }
         previous_line = Some(line);
-        if fallback.map_or(true, |current: u32| {
+        if fallback.is_none_or(|current: u32| {
             line.abs_diff(preferred_line) < current.abs_diff(preferred_line)
         }) {
             fallback = Some(line);
@@ -849,7 +849,7 @@ fn nearest_token_line(data: &[u32], preferred_line: u32) -> Option<u32> {
         // Leading-space edits preserve the grammar most reliably on an already
         // indented token line (not headings/fences at column zero in Markdown).
         if start > 0
-            && nearest.map_or(true, |current: u32| {
+            && nearest.is_none_or(|current: u32| {
                 line.abs_diff(preferred_line) < current.abs_diff(preferred_line)
             })
         {
