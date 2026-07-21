@@ -512,7 +512,6 @@ impl OpenDocuments {
                     })
                 {
                     current.grammar_symbol.clone_from(&asset.grammar_symbol);
-                    current.source_path.clone_from(&asset.source_path);
                     current.parser_path.clone_from(&asset.parser_path);
                     current.artifact_digest.clone_from(&asset.artifact_digest);
                     current.queries.clone_from(&asset.queries);
