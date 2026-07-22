@@ -416,13 +416,25 @@ fn install_queries_recursive(
 
 pub fn query_install_is_complete(queries_dir: &Path) -> bool {
     let highlights_path = queries_dir.join("highlights.scm");
-    let Ok(metadata) = fs::metadata(&highlights_path) else {
+    let Ok(metadata) = fs::symlink_metadata(&highlights_path) else {
         return false;
     };
     // The marker is written only after a staged install has written all
     // required files. Legacy direct-write directories did not have it, so a
     // non-empty highlights.scm still counts as installed to avoid clobbering
     // valid user-managed or pre-marker query directories.
+    metadata.file_type().is_file()
+        && (queries_dir.join(QUERY_INSTALL_COMPLETE_MARKER).is_file() || metadata.len() > 0)
+}
+
+/// Whether a kakehashi-owned crash backup is safe to restore as the exact
+/// pre-replacement state. Unlike active install completeness, recovery keeps
+/// the existing user-managed symlink contract: the next install can then
+/// classify and repair the restored directory without losing its contents.
+fn query_backup_is_recoverable(queries_dir: &Path) -> bool {
+    let Ok(metadata) = fs::metadata(queries_dir.join("highlights.scm")) else {
+        return false;
+    };
     metadata.is_file()
         && (queries_dir.join(QUERY_INSTALL_COMPLETE_MARKER).is_file() || metadata.len() > 0)
 }
@@ -810,7 +822,7 @@ fn newest_complete_backup_dir(
         if !generated_backup_matches_language(name, language) {
             continue;
         }
-        if !backup_is_owned(&path) || !query_install_is_complete(&path) {
+        if !backup_is_owned(&path) || !query_backup_is_recoverable(&path) {
             continue;
         }
         let modified = entry
@@ -983,6 +995,47 @@ fn download_file(url: &str, http_policy: QueryHttpPolicy) -> Result<String, Quer
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_highlights_file_is_not_a_complete_install() {
+        use std::os::unix::fs::symlink;
+
+        let temp = TempDir::new().unwrap();
+        let queries_dir = temp.path().join("queries/lua");
+        let outside = temp.path().join("outside.scm");
+        std::fs::create_dir_all(&queries_dir).unwrap();
+        std::fs::write(&outside, "(identifier) @variable\n").unwrap();
+        symlink(&outside, queries_dir.join("highlights.scm")).unwrap();
+
+        assert!(
+            !query_install_is_complete(&queries_dir),
+            "managed query files must not be satisfied by an external symlink target"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recovery_restores_owned_backup_with_symlinked_highlights() {
+        use std::os::unix::fs::symlink;
+
+        let temp = TempDir::new().unwrap();
+        let queries_parent = temp.path().join("queries");
+        let backup = queries_parent.join(".lua.123.0.backup");
+        let outside = temp.path().join("outside.scm");
+        std::fs::create_dir_all(&backup).unwrap();
+        std::fs::write(&outside, "(identifier) @variable\n").unwrap();
+        symlink(&outside, backup.join("highlights.scm")).unwrap();
+        write_backup_ownership_marker(&backup).unwrap();
+
+        recover_interrupted_query_install(&queries_parent, "lua").unwrap();
+
+        assert!(
+            queries_parent.join("lua/highlights.scm").is_symlink(),
+            "crash recovery must restore the exact pre-replacement directory"
+        );
+        assert!(!backup.exists());
+    }
 
     #[test]
     fn remove_dir_all_tolerates_a_confirmed_vanished_dir() {
