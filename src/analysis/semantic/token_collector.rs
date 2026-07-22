@@ -147,12 +147,12 @@ impl CaptureKinds {
     }
 }
 
-const QUERY_METADATA_CACHE_MIN_SOURCE_BYTES: usize = 32 * 1024;
-const QUERY_METADATA_CACHE_MIN_NODES: usize = 4 * 1024;
+const QUERY_METADATA_CACHE_MIN_OBSERVED_ITEMS: usize = 64;
 
-fn should_cache_query_metadata(source_bytes: usize, node_count: usize) -> bool {
-    source_bytes >= QUERY_METADATA_CACHE_MIN_SOURCE_BYTES
-        && node_count >= QUERY_METADATA_CACHE_MIN_NODES
+// Admit query-wide tables only after enough actual lookups can amortize them.
+// Source size and syntax-tree density are poor proxies for query match volume.
+fn should_cache_query_metadata(observed_items: usize) -> bool {
+    observed_items >= QUERY_METADATA_CACHE_MIN_OBSERVED_ITEMS
 }
 
 /// The semantic role of a collected token.
@@ -462,10 +462,10 @@ pub(super) fn collect_host_tokens(
     let mut utf16_cache: Vec<Option<Utf16LineIndex>> = Vec::new();
 
     // Collect tokens from this document's highlight query
-    let cache_query_metadata =
-        should_cache_query_metadata(text.len(), tree.root_node().descendant_count());
-    let mut priorities = cache_query_metadata.then(|| PatternPriorities::new(query));
-    let mut kinds_by_capture = cache_query_metadata.then(|| CaptureKinds::new(query));
+    let mut priorities = None;
+    let mut kinds_by_capture = None;
+    let mut observed_matches = 0;
+    let mut observed_captures = 0;
     let mut cursor = QueryCursor::new();
     let mut matches = cursor.matches(query, tree.root_node(), text.as_bytes());
 
@@ -473,8 +473,11 @@ pub(super) fn collect_host_tokens(
         if is_cancelled_periodically(cancel, &mut work_items) {
             return false;
         }
-        let priority = if let Some(priorities) = priorities.as_mut() {
-            priorities.get(query, m.pattern_index)
+        observed_matches += 1;
+        let priority = if should_cache_query_metadata(observed_matches) {
+            priorities
+                .get_or_insert_with(|| PatternPriorities::new(query))
+                .get(query, m.pattern_index)
         } else {
             parse_priority_for_pattern(query, m.pattern_index)
         };
@@ -496,8 +499,11 @@ pub(super) fn collect_host_tokens(
             let is_single_line = start_pos.row == end_pos.row;
             let is_trailing_newline = end_pos.row == start_pos.row + 1 && end_pos.column == 0;
 
-            let kind = if let Some(kinds_by_capture) = kinds_by_capture.as_mut() {
-                kinds_by_capture.get(query, c.index as usize, filetype, capture_mappings)
+            observed_captures += 1;
+            let kind = if should_cache_query_metadata(observed_captures) {
+                kinds_by_capture
+                    .get_or_insert_with(|| CaptureKinds::new(query))
+                    .get(query, c.index as usize, filetype, capture_mappings)
             } else {
                 resolve_token_kind(capture_name, filetype, capture_mappings)
             };
@@ -773,26 +779,9 @@ mod tests {
     }
 
     #[test]
-    fn query_metadata_cache_requires_large_dense_source() {
-        assert!(!should_cache_query_metadata(32 * 1024 - 1, 4 * 1024));
-        assert!(!should_cache_query_metadata(32 * 1024, 4 * 1024 - 1));
-        assert!(should_cache_query_metadata(32 * 1024, 4 * 1024));
-    }
-
-    #[test]
-    fn query_metadata_cache_rejects_gate_sized_sparse_tree() {
-        let suffix = "*/\nfn sparse_marker() {}\n";
-        let mut text = String::from("/*");
-        text.extend(std::iter::repeat_n(
-            'x',
-            QUERY_METADATA_CACHE_MIN_SOURCE_BYTES - text.len() - suffix.len(),
-        ));
-        text.push_str(suffix);
-        let node_count = parse_rust_tree(&text).root_node().descendant_count();
-
-        assert_eq!(text.len(), QUERY_METADATA_CACHE_MIN_SOURCE_BYTES);
-        assert!(node_count < QUERY_METADATA_CACHE_MIN_NODES);
-        assert!(!should_cache_query_metadata(text.len(), node_count));
+    fn query_metadata_cache_requires_repeated_query_work() {
+        assert!(!should_cache_query_metadata(63));
+        assert!(should_cache_query_metadata(64));
     }
 
     #[test]
@@ -825,15 +814,8 @@ mod tests {
         )]);
         let snippet = "fn alpha() { let beta = 1; // note\n}\n";
         let direct_text = snippet.to_string();
-        let cached_text = snippet.repeat(QUERY_METADATA_CACHE_MIN_SOURCE_BYTES / snippet.len() + 1);
-        assert!(!should_cache_query_metadata(
-            direct_text.len(),
-            parse_rust_tree(&direct_text).root_node().descendant_count()
-        ));
-        assert!(should_cache_query_metadata(
-            cached_text.len(),
-            parse_rust_tree(&cached_text).root_node().descendant_count()
-        ));
+        let cached_text = snippet.repeat(QUERY_METADATA_CACHE_MIN_OBSERVED_ITEMS);
+        assert!(cached_text.matches("fn alpha").count() >= 64);
 
         let collect = |text: &str| {
             let tree = parse_rust_tree(text);
