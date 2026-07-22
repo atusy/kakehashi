@@ -1,6 +1,6 @@
 import unittest
 
-from semantic_summary import conventional_median, summarize_pairs
+from semantic_summary import conventional_median, summarize_pairs, validate_collection
 
 
 def pair_document(pair_index, order, a_samples, b_samples):
@@ -21,6 +21,28 @@ def pair_document(pair_index, order, a_samples, b_samples):
         "order": order,
         "runs": [runs[label] for label in order],
     }
+
+
+def attested_document(pair_index, order="AB"):
+    document = pair_document(pair_index, order, [90, 110], [72, 88])
+    document.update(
+        {
+            "schema_version": 3,
+            "iterations": 2,
+            "warmup_iterations": 1,
+            "harness_commit": "harness-commit",
+            "harness_sha256": "harness-hash",
+            "fixture_sha256": "fixture-hash",
+            "binaries": [
+                {"label": label, "sha256": f"{label}-hash"} for label in order
+            ],
+        }
+    )
+    for run in document["runs"]:
+        label = run["binary_label"]
+        run["binary_sha256"] = f"{label}-hash"
+        run["validation"] = {"retained_samples": 2, "discarded_attempts": 0}
+    return document
 
 
 class SemanticSummaryTest(unittest.TestCase):
@@ -49,6 +71,52 @@ class SemanticSummaryTest(unittest.TestCase):
         document["runs"].pop()
         with self.assertRaisesRegex(ValueError, "incomplete pair"):
             summarize_pairs([document])
+
+    def test_validates_complete_attested_collection(self):
+        documents = [attested_document(1), attested_document(2, "BA")]
+        validated = validate_collection(
+            documents,
+            pair_count=2,
+            scenarios={"rust/typing_delta"},
+            iterations=2,
+            warmup=1,
+            binary_sha256={"A": "A-hash", "B": "B-hash"},
+            harness_commit="harness-commit",
+            harness_sha256="harness-hash",
+            fixture_sha256="fixture-hash",
+        )
+        self.assertEqual([int(document["pair_index"]) for document in validated], [1, 2])
+
+    def test_rejects_duplicate_pair_documents(self):
+        document = attested_document(1)
+        with self.assertRaisesRegex(ValueError, "duplicate pair document"):
+            validate_collection(
+                [document, document],
+                pair_count=2,
+                scenarios={"rust/typing_delta"},
+                iterations=2,
+                warmup=1,
+                binary_sha256={"A": "A-hash", "B": "B-hash"},
+                harness_commit="harness-commit",
+                harness_sha256="harness-hash",
+                fixture_sha256="fixture-hash",
+            )
+
+    def test_rejects_discarded_cancellation_attempts(self):
+        documents = [attested_document(1), attested_document(2, "BA")]
+        documents[1]["runs"][0]["validation"]["discarded_attempts"] = 1
+        with self.assertRaisesRegex(ValueError, "discarded attempts"):
+            validate_collection(
+                documents,
+                pair_count=2,
+                scenarios={"rust/typing_delta"},
+                iterations=2,
+                warmup=1,
+                binary_sha256={"A": "A-hash", "B": "B-hash"},
+                harness_commit="harness-commit",
+                harness_sha256="harness-hash",
+                fixture_sha256="fixture-hash",
+            )
 
 
 if __name__ == "__main__":

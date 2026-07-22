@@ -8,18 +8,20 @@ import hashlib
 import json
 import os
 import platform
+import shutil
 import signal
 import subprocess
+import sys
 import tempfile
 from pathlib import Path
 from typing import Any
 
-from semantic_summary import summarize_pairs
+from semantic_summary import summarize_pairs, validate_collection
 
 
 DEFAULT_SCENARIOS = ",".join(
     [
-        "rust_large/full",
+        "rust_large/full_cache_hit",
         "rust_large/typing_delta",
         "rust_sparse_32k_minus/typing_delta",
         "rust_sparse_32k_exact/typing_delta",
@@ -27,10 +29,10 @@ DEFAULT_SCENARIOS = ",".join(
         "rust_sparse_64k/typing_delta",
         "rust_large/typing_burst",
         "rust_xlarge/cancel_burst",
-        "markdown_injections_large/full",
+        "markdown_injections_large/full_cache_hit",
         "markdown_injections/typing_delta",
         "markdown_injections/typing_burst",
-        "unicode_rust/full",
+        "unicode_rust/full_cache_hit",
     ]
 )
 
@@ -69,8 +71,44 @@ def run(
     return subprocess.CompletedProcess(command, process.returncode, stdout, None)
 
 
-def output(command: list[str], *, cwd: Path) -> str:
-    return subprocess.check_output(command, cwd=cwd, text=True).strip()
+def output(
+    command: list[str], *, cwd: Path, env: dict[str, str] | None = None
+) -> str:
+    return subprocess.check_output(command, cwd=cwd, env=env, text=True).strip()
+
+
+def optional_output(command: list[str], *, cwd: Path, env: dict[str, str]) -> str | None:
+    try:
+        return output(command, cwd=cwd, env=env)
+    except (FileNotFoundError, subprocess.CalledProcessError):
+        return None
+
+
+def isolated_environment(temp: Path) -> dict[str, str]:
+    path = os.environ.get("PATH")
+    if not path:
+        raise RuntimeError("PATH is required to locate the Rust and native toolchains")
+    environment = {
+        "PATH": path,
+        "HOME": str(temp / "home"),
+        "TMPDIR": str(temp / "tmp"),
+        "CARGO_HOME": str(temp / "cargo-home"),
+        "CARGO_TERM_COLOR": "never",
+        "LANG": "C",
+        "LC_ALL": "C",
+    }
+    if rustup_home := os.environ.get("RUSTUP_HOME"):
+        environment["RUSTUP_HOME"] = rustup_home
+    for directory in (environment["HOME"], environment["TMPDIR"], environment["CARGO_HOME"]):
+        Path(directory).mkdir(parents=True)
+    return environment
+
+
+def recorded_environment(environment: dict[str, str], temp: Path) -> dict[str, str]:
+    prefix = str(temp)
+    return {
+        key: value.replace(prefix, "<TEMP>") for key, value in sorted(environment.items())
+    }
 
 
 def file_sha256(path: Path) -> str:
@@ -142,14 +180,18 @@ def add_worktree(repo: Path, path: Path, commit: str) -> None:
     run(["git", "worktree", "add", "--detach", str(path), commit], cwd=repo)
 
 
-def remove_worktree(repo: Path, path: Path) -> None:
-    subprocess.run(
+def remove_worktree(repo: Path, path: Path) -> str | None:
+    completed = subprocess.run(
         ["git", "worktree", "remove", "--force", str(path)],
         cwd=repo,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
         check=False,
     )
+    if completed.returncode:
+        return completed.stdout.strip() or f"exit status {completed.returncode}"
+    return None
 
 
 def assert_attestations(expected: dict[str, str], paths: dict[str, Path]) -> None:
@@ -166,6 +208,8 @@ def assert_attestations(expected: dict[str, str], paths: dict[str, Path]) -> Non
 
 
 def main() -> None:
+    if os.name != "posix":
+        raise RuntimeError("semantic pair collection currently requires POSIX")
     parser = argparse.ArgumentParser()
     parser.add_argument("a_ref")
     parser.add_argument("b_ref")
@@ -190,21 +234,34 @@ def main() -> None:
     output_dir = args.output_dir.resolve()
     if output_dir.exists() and any(output_dir.iterdir()):
         raise RuntimeError(f"output directory is not empty: {output_dir}")
-    output_dir.mkdir(parents=True, exist_ok=True)
+    if output_dir.exists():
+        output_dir.rmdir()
+    output_dir.parent.mkdir(parents=True, exist_ok=True)
+    artifact_dir = Path(
+        tempfile.mkdtemp(
+            prefix=f".{output_dir.name}.staging-", dir=output_dir.parent
+        )
+    )
+    published = False
 
     with tempfile.TemporaryDirectory(prefix="kakehashi-semantic-pairs-") as temporary:
         temp = Path(temporary)
+        base_environment = isolated_environment(temp)
         worktrees = {name: temp / name for name in ("a-src", "b-src", "harness-src")}
+        added_worktrees: list[Path] = []
         fixture: Path | None = None
         try:
             add_worktree(repo, worktrees["a-src"], a_commit)
+            added_worktrees.append(worktrees["a-src"])
             add_worktree(repo, worktrees["b-src"], b_commit)
+            added_worktrees.append(worktrees["b-src"])
             add_worktree(repo, worktrees["harness-src"], harness_commit)
+            added_worktrees.append(worktrees["harness-src"])
 
             binaries = {}
             for label, source in (("A", worktrees["a-src"]), ("B", worktrees["b-src"])):
                 target = temp / f"target-{label.lower()}"
-                env = os.environ | {"CARGO_TARGET_DIR": str(target)}
+                env = base_environment | {"CARGO_TARGET_DIR": str(target)}
                 run(
                     ["cargo", "build", "--release", "--locked", "--bin", "kakehashi"],
                     cwd=source,
@@ -213,7 +270,7 @@ def main() -> None:
                 binaries[label] = target / "release" / "kakehashi"
 
             harness_target = temp / "target-harness"
-            harness_env = os.environ | {"CARGO_TARGET_DIR": str(harness_target)}
+            harness_env = base_environment | {"CARGO_TARGET_DIR": str(harness_target)}
             run(
                 [
                     "cargo",
@@ -241,11 +298,12 @@ def main() -> None:
             run(
                 [str(harness)],
                 cwd=worktrees["harness-src"],
-                env=os.environ | {"KAKEHASHI_BENCH_PREPARE_DATA_DIR": str(fixture)},
+                env=base_environment
+                | {"KAKEHASHI_BENCH_PREPARE_DATA_DIR": str(fixture)},
             )
             set_tree_read_only(fixture)
             fixture_entries = tree_manifest(fixture)
-            (output_dir / "fixture-manifest.json").write_text(
+            (artifact_dir / "fixture-manifest.json").write_text(
                 json.dumps(fixture_entries, indent=2, sort_keys=True) + "\n"
             )
 
@@ -266,10 +324,10 @@ def main() -> None:
             for pair_index in range(1, args.pairs + 1):
                 order = "AB" if pair_index % 2 else "BA"
                 first, second = order
-                raw_path = output_dir / f"pair-{pair_index}.json"
-                text_path = output_dir / f"pair-{pair_index}.txt"
+                raw_path = artifact_dir / f"pair-{pair_index}.json"
+                text_path = artifact_dir / f"pair-{pair_index}.txt"
                 assert_attestations(attestations, paths)
-                env = os.environ | server_env | {
+                env = base_environment | server_env | {
                     "KAKEHASHI_BENCH_BIN_A": str(binaries[first]),
                     "KAKEHASHI_BENCH_LABEL_A": first,
                     "KAKEHASHI_BENCH_SHA256_A": attestations[f"binary_{first.lower()}"],
@@ -309,8 +367,25 @@ def main() -> None:
                     }
                 )
 
+            measured_scenarios = {
+                str(run["scenario"]) for run in raw_documents[0].get("runs", [])
+            }
+            raw_documents = validate_collection(
+                raw_documents,
+                pair_count=args.pairs,
+                scenarios=measured_scenarios,
+                iterations=args.iters,
+                warmup=args.warmup,
+                binary_sha256={
+                    "A": attestations["binary_a"],
+                    "B": attestations["binary_b"],
+                },
+                harness_commit=harness_commit,
+                harness_sha256=attestations["harness"],
+                fixture_sha256=attestations["fixture"],
+            )
             summary = summarize_pairs(raw_documents)
-            (output_dir / "summary.json").write_text(
+            (artifact_dir / "summary.json").write_text(
                 json.dumps(summary, indent=2, sort_keys=True) + "\n"
             )
             source_files = [
@@ -337,7 +412,8 @@ def main() -> None:
                     "pairs": args.pairs,
                     "iterations": args.iters,
                     "warmup_iterations": args.warmup,
-                    "scenarios": args.scenarios.split(","),
+                    "scenario_filters": args.scenarios.split(","),
+                    "scenarios": sorted(measured_scenarios),
                     "server_env": server_env,
                     "run_timeout_seconds": args.run_timeout,
                 },
@@ -345,25 +421,44 @@ def main() -> None:
                     "platform": platform.platform(),
                     "machine": platform.machine(),
                     "processor": platform.processor(),
-                    "rustc": output(["rustc", "-Vv"], cwd=repo),
+                    "build": recorded_environment(base_environment, temp),
+                    "runtime": recorded_environment(
+                        base_environment | server_env, temp
+                    ),
+                    "cargo": output(["cargo", "-Vv"], cwd=repo, env=base_environment),
+                    "rustc": output(["rustc", "-Vv"], cwd=repo, env=base_environment),
+                    "cc": optional_output(["cc", "--version"], cwd=repo, env=base_environment),
+                    "clang": optional_output(
+                        ["clang", "--version"], cwd=repo, env=base_environment
+                    ),
+                    "sdk": optional_output(
+                        ["xcrun", "--show-sdk-version"], cwd=repo, env=base_environment
+                    ),
                 },
                 "raw_files": raw_files,
                 "fixture_manifest": "fixture-manifest.json",
                 "fixture_manifest_sha256": file_sha256(
-                    output_dir / "fixture-manifest.json"
+                    artifact_dir / "fixture-manifest.json"
                 ),
                 "summary": "summary.json",
-                "summary_sha256": file_sha256(output_dir / "summary.json"),
+                "summary_sha256": file_sha256(artifact_dir / "summary.json"),
             }
-            (output_dir / "manifest.json").write_text(
+            (artifact_dir / "manifest.json").write_text(
                 json.dumps(manifest, indent=2, sort_keys=True) + "\n"
             )
+            os.replace(artifact_dir, output_dir)
+            published = True
         finally:
             if fixture is not None:
                 set_tree_writable(fixture)
-            for path in worktrees.values():
-                if path.exists():
-                    remove_worktree(repo, path)
+            cleanup_errors = []
+            for path in reversed(added_worktrees):
+                if error := remove_worktree(repo, path):
+                    cleanup_errors.append(f"{path}: {error}")
+            for error in cleanup_errors:
+                print(f"warning: failed to remove worktree {error}", file=sys.stderr)
+            if not published and artifact_dir.exists():
+                shutil.rmtree(artifact_dir)
 
     print(f"wrote attested benchmark evidence to {output_dir}")
 
