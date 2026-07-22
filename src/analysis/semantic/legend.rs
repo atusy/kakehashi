@@ -287,6 +287,10 @@ mod tests {
     #[case::function_async("function.async", Some((14, 1 << 6)))]
     #[case::variable_readonly_default_library("variable.readonly.defaultLibrary", Some((17, (1 << 2) | (1 << 9))))]
     #[case::function_unknown_modifier_async("function.unknownModifier.async", Some((14, 1 << 6)))]
+    #[case::empty_base_with_modifier(".readonly", None)]
+    #[case::empty_modifier_between_known_modifiers("variable.readonly..static", Some((17, (1 << 2) | (1 << 3))))]
+    #[case::trailing_empty_modifier("variable.readonly.", Some((17, 1 << 2)))]
+    #[case::duplicate_modifier("variable.readonly.readonly", Some((17, 1 << 2)))]
     fn test_map_capture_to_token_type_and_modifiers(
         #[case] capture_name: &str,
         #[case] expected: Option<(u32, u32)>,
