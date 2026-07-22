@@ -1,43 +1,43 @@
 
 semantic-tokens benchmark  (iters=30, warmup=6, lower is better)
-  B = /var/folders/t3/_nc24_w90zq79l3xyz3xzc7c0000gn/T/kakehashi-semantic-pairs-sb70npbs/target-b/release/kakehashi
-  A = /var/folders/t3/_nc24_w90zq79l3xyz3xzc7c0000gn/T/kakehashi-semantic-pairs-sb70npbs/target-a/release/kakehashi
+  B = <TEMP>/target-b/release/kakehashi
+  A = <TEMP>/target-a/release/kakehashi
 
 scenario                                B (med)      A (med) Δ (A vs B)
 ------------------------------------------------------------------------
-rust_large/full_cache_hit               4.381ms      3.727ms         -14.9%
-    p95:      4.490ms      3.928ms
+rust_large/full_cache_hit               4.404ms      6.259ms        +42.1%
+    p95:      4.752ms      6.994ms
     └ targets: large exact-snapshot semantic cache-hit control
-markdown_injections_large/full_cache_hit      0.993ms      0.853ms         -14.1%
-    p95:      1.022ms      0.861ms
+markdown_injections_large/full_cache_hit      1.316ms      1.456ms        +10.6%
+    p95:      1.402ms      1.747ms
     └ targets: large injection document exact-snapshot semantic cache-hit control
-unicode_rust/full_cache_hit             0.767ms      0.761ms         -0.8%
-    p95:      0.807ms      0.790ms
+unicode_rust/full_cache_hit             1.200ms      1.355ms        +13.0%
+    p95:      1.269ms      1.581ms
     └ targets: Unicode document exact-snapshot semantic cache-hit control
-rust_large/typing_delta                39.944ms     43.707ms        +9.4%
-    p95:     45.488ms     51.485ms
+rust_large/typing_delta                48.800ms     50.980ms        +4.5%
+    p95:     54.217ms     55.016ms
     └ targets: unique edit states→reparse→retokenize→delta; excludes A/B cache returns
-rust_sparse_32k_minus/typing_delta      9.204ms     14.743ms        +60.2%
-    p95:      9.836ms     15.327ms
+rust_sparse_32k_minus/typing_delta     10.059ms     15.700ms        +56.1%
+    p95:     13.127ms     18.069ms
     └ targets: sparse low-match control just below 32 KiB
-rust_sparse_32k_exact/typing_delta      7.064ms     12.684ms        +79.6%
-    p95:      8.917ms     16.405ms
+rust_sparse_32k_exact/typing_delta     10.733ms     16.462ms        +53.4%
+    p95:     12.804ms     19.033ms
     └ targets: sparse low-match control at 32 KiB
-rust_sparse_32k_plus/typing_delta       9.714ms     15.680ms        +61.4%
-    p95:     10.896ms     17.163ms
+rust_sparse_32k_plus/typing_delta       9.874ms     16.736ms        +69.5%
+    p95:     12.483ms     18.475ms
     └ targets: sparse low-match control just above 32 KiB
-rust_sparse_64k/typing_delta           17.638ms     29.144ms        +65.2%
-    p95:     21.197ms     30.398ms
+rust_sparse_64k/typing_delta           20.631ms     31.972ms        +55.0%
+    p95:     26.097ms     36.138ms
     └ targets: sparse low-match query walk at 64 KiB
-rust_large/typing_burst                44.326ms     45.901ms        +3.6%
-    p95:     49.050ms     74.247ms
+rust_large/typing_burst                51.256ms     51.979ms        +1.4%
+    p95:     60.974ms     58.184ms
     └ targets: eight queued unique edits→current delta; latest-state follow latency
-rust_xlarge/cancel_burst              204.985ms    198.196ms         -3.3%
-    p95:    240.228ms    219.589ms
+rust_xlarge/cancel_burst              220.285ms    193.723ms         -12.1%
+    p95:    257.622ms    219.737ms
     └ targets: current-token latency after four explicitly cancelled edit states
-markdown_injections/typing_delta        6.785ms     12.714ms        +87.4%
-    p95:      7.380ms     23.001ms
+markdown_injections/typing_delta        7.937ms     11.083ms        +39.6%
+    p95:      8.571ms     11.613ms
     └ targets: unique edit states→injection reuse→delta; excludes A/B cache returns
-markdown_injections/typing_burst        8.530ms     10.668ms        +25.1%
-    p95:     11.424ms     19.679ms
+markdown_injections/typing_burst        8.571ms     10.460ms        +22.0%
+    p95:      8.980ms     10.924ms
     └ targets: eight queued unique edits→current injection delta; latest-state follow latency
