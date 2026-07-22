@@ -90,6 +90,10 @@ impl SemanticBaseline {
         Ok(())
     }
 
+    pub(crate) fn expect_tracked_start(&mut self, start: u32) {
+        self.expected_start = start;
+    }
+
     pub(crate) fn apply_response(&mut self, result: &Value) -> Result<(), ValidationError> {
         let next_result_id = result_id(result)?;
         let next_data = if let Some(data) = full_data(result)? {

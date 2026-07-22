@@ -222,7 +222,7 @@ impl Server {
         );
     }
 
-    fn did_change_replace_ascii(&mut self, uri: &str, version: i64, line: u32, text: char) {
+    fn did_change_replace_prefix(&mut self, uri: &str, version: i64, line: u32, text: &str) {
         self.notify(
             "textDocument/didChange",
             json!({
@@ -230,9 +230,9 @@ impl Server {
                 "contentChanges": [{
                     "range": {
                         "start": { "line": line, "character": 0 },
-                        "end": { "line": line, "character": 1 },
+                        "end": { "line": line, "character": 3 },
                     },
-                    "text": text.to_string(),
+                    "text": text,
                 }],
             }),
         );
@@ -872,12 +872,21 @@ fn run_once(
             });
         }
         Kind::FixedWidthTypingDelta => {
-            const STATES: &[u8] = b"abcdeghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
+            const ALPHABET: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
             edit.version += 1;
-            let replacement = char::from(STATES[edit.fixed_width_next % STATES.len()]);
+            let state = edit.fixed_width_next;
+            let pair = state / 2;
+            let first = char::from(ALPHABET[pair % ALPHABET.len()]);
+            let second = char::from(ALPHABET[(pair / ALPHABET.len()) % ALPHABET.len()]);
+            let (replacement, expected_start) = if state.is_multiple_of(2) {
+                (format!(" {first}{second}"), 1)
+            } else {
+                (format!("{first}{second}x"), 0)
+            };
             edit.fixed_width_next += 1;
-            server.did_change_replace_ascii(scn.uri, edit.version, edit.line, replacement);
+            server.did_change_replace_prefix(scn.uri, edit.version, edit.line, &replacement);
             let baseline = baseline.as_mut().expect("typing baseline");
+            baseline.expect_tracked_start(expected_start);
             let result = server.semantic_delta(scn.uri, baseline.result_id());
             baseline.apply_response(&result).unwrap_or_else(|error| {
                 panic!("invalid semantic response for {}: {error:?}", scn.name)
@@ -1043,7 +1052,7 @@ fn main() {
             language_id: "rust",
             uri: "file:///bench/large_typing.rs",
             content: gen_rust(150),
-            kind: Kind::FixedWidthTypingDelta,
+            kind: Kind::TypingDelta,
             targets: "unique edit states→reparse→retokenize→delta; excludes A/B cache returns",
         },
         Scenario {
@@ -1075,7 +1084,7 @@ fn main() {
             language_id: "rust",
             uri: "file:///bench/sparse_64k.rs",
             content: gen_sparse_rust(64 * 1024),
-            kind: Kind::TypingDelta,
+            kind: Kind::FixedWidthTypingDelta,
             targets: "sparse low-match query walk at 64 KiB",
         },
         Scenario {
