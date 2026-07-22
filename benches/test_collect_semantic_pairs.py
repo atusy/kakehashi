@@ -4,6 +4,7 @@ from pathlib import Path
 
 from collect_semantic_pairs import (
     manifest_sha256,
+    normalize_captured_stdout,
     set_tree_read_only,
     set_tree_writable,
     tree_manifest,
@@ -11,6 +12,11 @@ from collect_semantic_pairs import (
 
 
 class CollectSemanticPairsTest(unittest.TestCase):
+    def test_captured_stdout_has_exactly_one_terminal_newline(self):
+        self.assertEqual(normalize_captured_stdout("result\n\n"), "result\n")
+        self.assertEqual(normalize_captured_stdout("result"), "result\n")
+        self.assertEqual(normalize_captured_stdout(""), "")
+
     def test_tree_attestation_changes_with_content(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
