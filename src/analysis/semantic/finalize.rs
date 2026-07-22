@@ -178,6 +178,27 @@ impl Ord for HeapEntry {
     }
 }
 
+fn line_requires_overlap_sweep(
+    tokens: &[RawToken],
+    cancel: Option<&crate::cancel::CancelToken>,
+    work_items: &mut usize,
+) -> Option<bool> {
+    let mut furthest_end = 0usize;
+    for (index, token) in tokens.iter().enumerate() {
+        if cancellation_requested(cancel, work_items) {
+            return None;
+        }
+        if token.length == 0
+            || !token.kind.is_emitted()
+            || (index > 0 && token.column < furthest_end)
+        {
+            return Some(true);
+        }
+        furthest_end = furthest_end.max(token.column + token.length);
+    }
+    Some(false)
+}
+
 /// Split overlapping tokens on the same line using a sweep line algorithm.
 ///
 /// For each line, collects breakpoints (start/end columns of all tokens),
@@ -241,6 +262,17 @@ fn split_overlapping_tokens_cancellable(
         }
 
         let line_tokens = &tokens[line_start..line_end];
+
+        if !line_requires_overlap_sweep(line_tokens, cancel, &mut work_items)? {
+            for token in line_tokens {
+                if cancellation_requested(cancel, &mut work_items) {
+                    return None;
+                }
+                result.push(token.clone());
+            }
+            line_start = line_end;
+            continue;
+        }
 
         // 1. Collect all breakpoints (start and end columns)
         breakpoints.clear();
@@ -945,6 +977,35 @@ mod tests {
                 .unwrap();
 
         assert_eq!(result.as_ptr(), input_ptr);
+    }
+
+    #[test]
+    fn disjoint_emitted_line_does_not_require_overlap_sweep() {
+        let disjoint = vec![
+            make_token(0, 0, 3, "keyword", 0, 0),
+            make_token(0, 3, 4, "variable", 0, 1),
+            make_token(0, 8, 2, "string", 0, 2),
+        ];
+        let overlapping = vec![
+            make_token(0, 0, 5, "keyword", 0, 0),
+            make_token(0, 4, 4, "variable", 0, 1),
+        ];
+        let transparent = vec![make_token_full(
+            0,
+            0,
+            3,
+            TokenKind::Transparent,
+            0,
+            0,
+            100,
+            3,
+        )];
+
+        let check =
+            |tokens: &[RawToken]| line_requires_overlap_sweep(tokens, None, &mut 0).unwrap();
+        assert!(!check(&disjoint));
+        assert!(check(&overlapping));
+        assert!(check(&transparent));
     }
 
     #[test]
