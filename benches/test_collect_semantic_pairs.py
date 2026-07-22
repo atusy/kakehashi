@@ -13,10 +13,26 @@ from collect_semantic_pairs import (
     set_tree_read_only,
     set_tree_writable,
     tree_manifest,
+    validate_requested_scenario_filters,
 )
 
 
 class CollectSemanticPairsTest(unittest.TestCase):
+    def test_every_requested_scenario_filter_must_match(self):
+        measured = {
+            "rust_large/full_cache_hit",
+            "markdown_injections/typing_delta",
+        }
+        validate_requested_scenario_filters(
+            "rust_large/full_cache_hit,markdown_injections/typing_delta",
+            measured,
+        )
+        with self.assertRaisesRegex(ValueError, "typo"):
+            validate_requested_scenario_filters(
+                "rust_large/full_cache_hit,typo",
+                measured,
+            )
+
     def test_server_environment_cannot_override_isolation(self):
         for key in [
             "PATH",
