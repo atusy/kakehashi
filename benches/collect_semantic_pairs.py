@@ -215,10 +215,20 @@ def add_worktree(repo: Path, path: Path, commit: str) -> None:
 
 def remove_worktree(repo: Path, path: Path) -> str | None:
     registered = output(["git", "worktree", "list", "--porcelain"], cwd=repo)
-    if f"worktree {path}" not in registered.splitlines():
+    target = Path(os.path.realpath(path))
+    registered_path = next(
+        (
+            Path(line.removeprefix("worktree "))
+            for line in registered.splitlines()
+            if line.startswith("worktree ")
+            and Path(os.path.realpath(line.removeprefix("worktree "))) == target
+        ),
+        None,
+    )
+    if registered_path is None:
         return None
     completed = subprocess.run(
-        ["git", "worktree", "remove", "--force", str(path)],
+        ["git", "worktree", "remove", "--force", str(registered_path)],
         cwd=repo,
         text=True,
         stdout=subprocess.PIPE,
