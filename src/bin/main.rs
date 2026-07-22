@@ -397,9 +397,10 @@ fn run_language_status(verbose: bool) -> Result<(), ExitCode> {
 
     let parser_dir = data_dir.join("parser");
     let queries_dir = data_dir.join("queries");
-    if let Err(e) = queries::recover_interrupted_query_installs(&queries_dir) {
-        eprintln!("Warning: failed to recover interrupted query installs: {e}");
-    }
+    queries::recover_interrupted_query_installs(&queries_dir).map_err(|e| {
+        eprintln!("Error: failed to recover interrupted query installs: {e}");
+        ExitCode::FAILURE
+    })?;
 
     // Collect all installed languages from both parser and queries directories
     let mut languages = BTreeSet::new();
