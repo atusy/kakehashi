@@ -7,6 +7,7 @@ from collect_semantic_pairs import (
     DEFAULT_SCENARIOS,
     manifest_sha256,
     normalize_captured_stdout,
+    parse_server_env,
     redact_temporary_paths,
     recorded_environment,
     set_tree_read_only,
@@ -16,6 +17,26 @@ from collect_semantic_pairs import (
 
 
 class CollectSemanticPairsTest(unittest.TestCase):
+    def test_server_environment_cannot_override_isolation(self):
+        for key in [
+            "PATH",
+            "HOME",
+            "TMPDIR",
+            "CARGO_HOME",
+            "CARGO_TERM_COLOR",
+            "LANG",
+            "LC_ALL",
+            "RUSTUP_HOME",
+        ]:
+            with self.subTest(key=key):
+                with self.assertRaisesRegex(ValueError, "reserved collector key"):
+                    parse_server_env([f"{key}=override"])
+
+        self.assertEqual(
+            parse_server_env(["KAKEHASHI_TREE_WORKER_MODE=legacy"]),
+            {"KAKEHASHI_TREE_WORKER_MODE": "legacy"},
+        )
+
     def test_default_scenarios_exist_in_rust_harness(self):
         harness = (Path(__file__).parent / "semantic_tokens.rs").read_text()
         for scenario in DEFAULT_SCENARIOS.split(","):
