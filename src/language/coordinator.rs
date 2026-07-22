@@ -998,11 +998,22 @@ impl LanguageCoordinator {
             filename,
         ) {
             Ok(r) => r,
-            Err(_) => {
+            Err(crate::language::query_loader::QueryLoadError::NotFound) => {
                 debug!(
                     "Query file {}/{} not found in search paths (this is normal if not provided)",
                     ctx.language_id, filename
                 );
+                return;
+            }
+            Err(err) => {
+                events.push(LanguageEvent::log(
+                    LanguageLogLevel::Warning,
+                    format!(
+                        "Failed to load {} query for {}: {err}",
+                        ctx.query_kind.name(),
+                        ctx.language_id
+                    ),
+                ));
                 return;
             }
         };

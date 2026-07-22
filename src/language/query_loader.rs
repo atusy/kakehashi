@@ -67,6 +67,14 @@ pub(crate) struct ParseResult {
     pub used_inheritance: bool,
 }
 
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum QueryLoadError {
+    #[error("query file not found")]
+    NotFound,
+    #[error(transparent)]
+    Other(#[from] LspError),
+}
+
 /// Format search paths for display in error messages.
 pub(crate) fn format_search_paths<P: AsRef<Path>>(paths: &[P]) -> String {
     if paths.is_empty() {
@@ -211,8 +219,13 @@ impl QueryLoader {
     ) -> Option<PathBuf> {
         for base in runtime_bases {
             let candidate = Self::query_file_path(base.as_ref(), lang_name, file_name);
-            if candidate.exists() {
-                return Some(candidate);
+            match fs::symlink_metadata(&candidate) {
+                Ok(_) => return Some(candidate),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                // Presence probing must not downgrade inaccessible/broken
+                // assets to an ordinary optional-kind absence. Return the
+                // candidate so the real read reports its concrete I/O error.
+                Err(_) => return Some(candidate),
             }
         }
         None
@@ -362,9 +375,18 @@ impl QueryLoader {
         runtime_bases: &[P],
         lang_name: &str,
         file_name: &str,
-    ) -> LspResult<ParseResult> {
+    ) -> Result<ParseResult, QueryLoadError> {
         // Load the original file once and pass to resolver to avoid double-loading
-        let original_content = Self::load_query_file(runtime_bases, lang_name, file_name)?;
+        let Some(path) = Self::find_query_file(runtime_bases, lang_name, file_name) else {
+            return Err(QueryLoadError::NotFound);
+        };
+        let original_content = fs::read_to_string(&path).map_err(|e| {
+            LspError::query(format!(
+                "Failed to read query file {}: {}",
+                path.display(),
+                e
+            ))
+        })?;
         let used_inheritance = !Self::parse_inherits_directive(&original_content).is_empty();
 
         let mut visited = std::collections::HashSet::new();
@@ -482,6 +504,30 @@ mod tests {
         // Test not finding a non-existent file
         let result = QueryLoader::find_query_file(NO_SEARCH_PATHS, "rust", "highlights.scm");
         assert!(result.is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn find_query_file_treats_dangling_symlink_as_present_asset() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempdir().unwrap();
+        let query_dir = dir.path().join("queries/rust");
+        fs::create_dir_all(&query_dir).unwrap();
+        let query_file = query_dir.join("highlights.scm");
+        symlink("missing-target.scm", &query_file).unwrap();
+
+        assert_eq!(
+            QueryLoader::find_query_file(&[dir.path()], "rust", "highlights.scm"),
+            Some(query_file),
+            "a broken configured asset must not be classified as ordinary absence"
+        );
+
+        let error = QueryLoader::load_query_file(&[dir.path()], "rust", "highlights.scm")
+            .expect_err("the present-but-broken asset must surface its read failure");
+        let message = error.to_string();
+        assert!(message.contains("Failed to read query file"), "{message}");
+        assert!(message.contains("highlights.scm"), "{message}");
     }
 
     #[test]
