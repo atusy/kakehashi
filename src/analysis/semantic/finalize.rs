@@ -82,9 +82,26 @@ fn split_multiline_tokens_cancellable(
         return None;
     }
 
-    let mut result = Vec::with_capacity(tokens.len());
     let mut line_widths: Vec<Option<usize>> = Vec::new();
     let mut work_items = 0usize;
+    let mut has_multiline_token = false;
+    for token in &tokens {
+        if cancellation_requested(cancel, &mut work_items) {
+            return None;
+        }
+        let Some(line_width) = cached_utf16_width(&mut line_widths, lines, token.line) else {
+            continue;
+        };
+        if token.column + token.length > line_width {
+            has_multiline_token = true;
+            break;
+        }
+    }
+    if !has_multiline_token {
+        return Some(tokens);
+    }
+
+    let mut result = Vec::with_capacity(tokens.len());
     for token in tokens {
         if cancellation_requested(cancel, &mut work_items) {
             return None;
@@ -911,6 +928,21 @@ mod tests {
         let input_ptr = tokens.as_ptr();
 
         let result = apply_none_preprocessing(tokens, None).unwrap();
+
+        assert_eq!(result.as_ptr(), input_ptr);
+    }
+
+    #[test]
+    fn single_line_split_reuses_the_input_allocation() {
+        let tokens = vec![
+            make_token(0, 0, 3, "keyword", 0, 0),
+            make_token(1, 4, 4, "variable", 0, 1),
+        ];
+        let input_ptr = tokens.as_ptr();
+
+        let result =
+            split_multiline_tokens_cancellable(tokens, &["short line", "another line"], None)
+                .unwrap();
 
         assert_eq!(result.as_ptr(), input_ptr);
     }
