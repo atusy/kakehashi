@@ -35,7 +35,10 @@
 //!
 //! Tunables (env): `KAKEHASHI_BENCH_ITERS` (default 80),
 //! `KAKEHASHI_BENCH_WARMUP` (default 10), `KAKEHASHI_BENCH_SCENARIOS`
-//! (optional comma-separated scenario-name substrings).
+//! (optional comma-separated scenario-name substrings), and
+//! `KAKEHASHI_BENCH_SAMPLES_FILE` (optional raw JSON output). Reproducible
+//! comparisons should use `benches/collect_semantic_pairs.py`, which supplies
+//! the fixture and binary attestations required by raw output.
 
 #[path = "support/semantic_baseline.rs"]
 mod semantic_baseline;
@@ -476,15 +479,23 @@ struct Stats {
     median: Duration,
     p25: Duration,
     p75: Duration,
+    p95: Duration,
 }
 
 fn summarize(mut samples: Vec<Duration>) -> Stats {
     samples.sort_unstable();
     let pick = |q: f64| samples[((samples.len() as f64 * q) as usize).min(samples.len() - 1)];
+    let middle = samples.len() / 2;
+    let median = if samples.len().is_multiple_of(2) {
+        (samples[middle - 1] + samples[middle]) / 2
+    } else {
+        samples[middle]
+    };
     Stats {
-        median: pick(0.50),
+        median,
         p25: pick(0.25),
         p75: pick(0.75),
+        p95: pick(0.95),
     }
 }
 
@@ -551,6 +562,12 @@ struct Scenario {
 struct Binary {
     label: String,
     path: String,
+    sha256: String,
+}
+
+struct Measurement {
+    samples: Vec<Duration>,
+    discarded_attempts: usize,
 }
 
 /// Run one scenario against one binary and return per-request timing samples.
@@ -561,7 +578,7 @@ fn measure(
     data_dir: &str,
     iters: usize,
     warmup: usize,
-) -> Vec<Duration> {
+) -> Measurement {
     if let Kind::CancelBurst { obsolete } = scn.kind {
         return measure_cancel_burst(bin, scn, data_dir, iters, warmup, obsolete);
     }
@@ -594,7 +611,10 @@ fn measure(
         run_once(&mut server, scn, &mut baseline, &mut edit);
         samples.push(start.elapsed());
     }
-    samples
+    Measurement {
+        samples,
+        discarded_attempts: 0,
+    }
 }
 
 fn measure_cancel_burst(
@@ -604,7 +624,7 @@ fn measure_cancel_burst(
     iters: usize,
     warmup: usize,
     obsolete: usize,
-) -> Vec<Duration> {
+) -> Measurement {
     let mut server = Server::start(&bin.path, data_dir);
     server.did_open(scn.uri, scn.language_id, &scn.content);
     std::thread::sleep(Duration::from_millis(300));
@@ -689,7 +709,10 @@ fn measure_cancel_burst(
             scn.name
         );
     }
-    samples
+    Measurement {
+        samples,
+        discarded_attempts: discarded,
+    }
 }
 
 /// Cold-open latency loop for [`Kind::OpenFirstToken`]. Each iteration opens a
@@ -707,7 +730,7 @@ fn measure_open(
     data_dir: &str,
     iters: usize,
     warmup: usize,
-) -> Vec<Duration> {
+) -> Measurement {
     let mut server = Server::start(&bin.path, data_dir);
     let mut samples = Vec::with_capacity(iters);
     for i in 0..(warmup + iters) {
@@ -723,7 +746,10 @@ fn measure_open(
             samples.push(elapsed);
         }
     }
-    samples
+    Measurement {
+        samples,
+        discarded_attempts: 0,
+    }
 }
 
 fn seed_baseline(server: &mut Server, scn: &Scenario) -> Option<SemanticBaseline> {
@@ -821,11 +847,30 @@ fn run_once(
 }
 
 fn main() {
-    // Ensure parsers/queries exist, and reuse the test data dir both binaries read.
-    let data_dir: PathBuf = kakehashi::install::test_support::test_data_dir_path();
-    std::fs::create_dir_all(&data_dir).expect("create data dir");
-    kakehashi::install::test_support::ensure_test_languages_installed(&data_dir)
-        .expect("install test languages");
+    if let Some(path) = std::env::var_os("KAKEHASHI_BENCH_PREPARE_DATA_DIR") {
+        let path = PathBuf::from(path);
+        std::fs::create_dir_all(&path).expect("create benchmark fixture");
+        kakehashi::install::test_support::ensure_test_languages_installed(&path)
+            .expect("install benchmark fixture languages");
+        validate_fixture(&path);
+        println!("prepared benchmark fixture at {}", path.display());
+        return;
+    }
+
+    // An explicit fixture is attested input: verify it without installing or
+    // otherwise mutating it. The implicit checkout-local fixture retains the
+    // convenient install-on-first-run behavior for interactive use.
+    let data_dir = if let Some(path) = std::env::var_os("KAKEHASHI_BENCH_DATA_DIR") {
+        let path = PathBuf::from(path);
+        validate_fixture(&path);
+        path
+    } else {
+        let path = kakehashi::install::test_support::test_data_dir_path();
+        std::fs::create_dir_all(&path).expect("create data dir");
+        kakehashi::install::test_support::ensure_test_languages_installed(&path)
+            .expect("install test languages");
+        path
+    };
     let data_dir = data_dir.to_string_lossy().to_string();
 
     let iters = env_usize("KAKEHASHI_BENCH_ITERS", 80);
@@ -1050,23 +1095,110 @@ fn main() {
     }
     println!();
 
+    let mut raw_runs = Vec::new();
+
     if binaries.len() == 2 {
         print_ab_header(&binaries[0].label, &binaries[1].label);
         for scn in &scenarios {
             // Interleave A and B at the scenario level (separate processes); the
             // two runs are back-to-back to minimize machine drift between them.
-            let a = summarize(measure(&binaries[0], scn, &data_dir, iters, warmup));
-            let b = summarize(measure(&binaries[1], scn, &data_dir, iters, warmup));
+            let a_measurement = measure(&binaries[0], scn, &data_dir, iters, warmup);
+            let b_measurement = measure(&binaries[1], scn, &data_dir, iters, warmup);
+            record_raw_run(&mut raw_runs, &binaries[0], scn, &a_measurement);
+            record_raw_run(&mut raw_runs, &binaries[1], scn, &b_measurement);
+            let a = summarize(a_measurement.samples);
+            let b = summarize(b_measurement.samples);
             print_ab_row(scn, &a, &b);
         }
     } else {
         print_single_header();
         for scn in &scenarios {
-            let s = summarize(measure(&binaries[0], scn, &data_dir, iters, warmup));
+            let measurement = measure(&binaries[0], scn, &data_dir, iters, warmup);
+            record_raw_run(&mut raw_runs, &binaries[0], scn, &measurement);
+            let s = summarize(measurement.samples);
             print_single_row(scn, &s);
         }
     }
+    write_raw_samples(iters, warmup, &binaries, raw_runs);
     println!();
+}
+
+fn record_raw_run(
+    raw_runs: &mut Vec<Value>,
+    bin: &Binary,
+    scn: &Scenario,
+    measurement: &Measurement,
+) {
+    raw_runs.push(json!({
+        "binary_label": bin.label,
+        "binary_path": bin.path,
+        "binary_sha256": bin.sha256,
+        "scenario": scn.name,
+        "samples_ns": measurement.samples.iter().map(Duration::as_nanos).collect::<Vec<_>>(),
+        "validation": {
+            "retained_samples": measurement.samples.len(),
+            "discarded_attempts": measurement.discarded_attempts,
+        },
+    }));
+}
+
+fn write_raw_samples(iters: usize, warmup: usize, binaries: &[Binary], raw_runs: Vec<Value>) {
+    let Some(path) = std::env::var_os("KAKEHASHI_BENCH_SAMPLES_FILE") else {
+        return;
+    };
+    assert!(
+        binaries.iter().all(|binary| !binary.sha256.is_empty()),
+        "raw samples require attested binary SHA-256 values"
+    );
+    let output = json!({
+        "schema_version": 3,
+        "pair_index": env_optional("KAKEHASHI_BENCH_PAIR_INDEX"),
+        "order": env_optional("KAKEHASHI_BENCH_ORDER"),
+        "iterations": iters,
+        "warmup_iterations": warmup,
+        "harness_commit": env_optional("KAKEHASHI_BENCH_HARNESS_COMMIT"),
+        "harness_sha256": env_optional("KAKEHASHI_BENCH_HARNESS_SHA256"),
+        "fixture_sha256": env_optional("KAKEHASHI_BENCH_FIXTURE_SHA256"),
+        "binaries": binaries.iter().map(|bin| json!({
+            "label": bin.label,
+            "path": bin.path,
+            "sha256": bin.sha256,
+        })).collect::<Vec<_>>(),
+        "runs": raw_runs,
+    });
+    let bytes = serde_json::to_vec_pretty(&output).expect("serialize raw benchmark samples");
+    std::fs::write(&path, bytes)
+        .unwrap_or_else(|error| panic!("write raw samples to {:?}: {error}", path));
+}
+
+fn validate_fixture(data_dir: &std::path::Path) {
+    assert!(
+        data_dir.join(".installed").is_file(),
+        "attested fixture has no .installed marker: {}",
+        data_dir.display()
+    );
+    let parser_entries = std::fs::read_dir(data_dir.join("parser"))
+        .unwrap_or_else(|error| panic!("read fixture parsers in {}: {error}", data_dir.display()))
+        .collect::<Result<Vec<_>, _>>()
+        .expect("read fixture parser entry");
+    for language in kakehashi::install::test_support::TEST_LANGUAGES {
+        assert!(
+            parser_entries.iter().any(|entry| {
+                entry.path().file_stem().and_then(|stem| stem.to_str()) == Some(language)
+            }),
+            "attested fixture has no {language} parser: {}",
+            data_dir.display()
+        );
+        assert!(
+            data_dir
+                .join("queries")
+                .join(language)
+                .join(".kakehashi-install-complete")
+                .is_file(),
+            "attested fixture has incomplete {language} queries: {}",
+            data_dir.display()
+        );
+    }
 }
 
 fn filter_scenarios(scenarios: Vec<Scenario>) -> Vec<Scenario> {
@@ -1096,19 +1228,20 @@ fn filter_scenarios(scenarios: Vec<Scenario>) -> Vec<Scenario> {
 
 fn print_single_header() {
     println!(
-        "{:<34} {:>10} {:>10} {:>10}",
-        "scenario", "median", "p25", "p75"
+        "{:<34} {:>10} {:>10} {:>10} {:>10}",
+        "scenario", "median", "p25", "p75", "p95"
     );
-    println!("{}", "-".repeat(68));
+    println!("{}", "-".repeat(79));
 }
 
 fn print_single_row(scn: &Scenario, s: &Stats) {
     println!(
-        "{:<34} {:>9.3}ms {:>9.3}ms {:>9.3}ms",
+        "{:<34} {:>9.3}ms {:>9.3}ms {:>9.3}ms {:>9.3}ms",
         scn.name,
         ms(s.median),
         ms(s.p25),
-        ms(s.p75)
+        ms(s.p75),
+        ms(s.p95)
     );
     println!("    └ targets: {}", scn.targets);
 }
@@ -1137,6 +1270,7 @@ fn print_ab_row(scn: &Scenario, a: &Stats, b: &Stats) {
         "{:<34} {:>10.3}ms {:>10.3}ms {:>8}{:.1}%",
         scn.name, am, bm, sign, delta_pct
     );
+    println!("    p95: {:>10.3}ms {:>10.3}ms", ms(a.p95), ms(b.p95));
     println!("    └ targets: {}", scn.targets);
 }
 
@@ -1149,6 +1283,10 @@ fn env_usize(key: &str, default: usize) -> usize {
         .unwrap_or(default)
 }
 
+fn env_optional(key: &str) -> Option<String> {
+    std::env::var(key).ok().filter(|value| !value.is_empty())
+}
+
 /// Resolve which binaries to benchmark from the environment.
 /// A/B mode if both `_A` and `_B` are set; otherwise single-binary mode.
 fn resolve_binaries() -> Vec<Binary> {
@@ -1159,10 +1297,12 @@ fn resolve_binaries() -> Vec<Binary> {
             Binary {
                 label: std::env::var("KAKEHASHI_BENCH_LABEL_A").unwrap_or_else(|_| "A".into()),
                 path: a,
+                sha256: std::env::var("KAKEHASHI_BENCH_SHA256_A").unwrap_or_default(),
             },
             Binary {
                 label: std::env::var("KAKEHASHI_BENCH_LABEL_B").unwrap_or_else(|_| "B".into()),
                 path: b,
+                sha256: std::env::var("KAKEHASHI_BENCH_SHA256_B").unwrap_or_default(),
             },
         ];
     }
@@ -1171,5 +1311,6 @@ fn resolve_binaries() -> Vec<Binary> {
     vec![Binary {
         label: "binary".into(),
         path: single,
+        sha256: std::env::var("KAKEHASHI_BENCH_SHA256").unwrap_or_default(),
     }]
 }
