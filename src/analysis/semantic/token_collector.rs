@@ -779,6 +779,94 @@ mod tests {
     }
 
     #[test]
+    fn cached_query_metadata_matches_direct_collection() {
+        use crate::config::QueryTypeMappings;
+
+        let language: tree_sitter::Language = tree_sitter_rust::LANGUAGE.into();
+        let query = tree_sitter::Query::new(
+            &language,
+            r#"
+            ((function_item name: (identifier) @function.readonly)
+              (#set! priority 250))
+            (identifier) @variable
+            (integer_literal) @number
+            (line_comment) @comment
+            "#,
+        )
+        .unwrap();
+        let mappings = CaptureMappings::from([(
+            "rust".to_string(),
+            QueryTypeMappings {
+                highlights: [
+                    ("variable".to_string(), String::new()),
+                    ("number".to_string(), "not_in_legend".to_string()),
+                    ("comment".to_string(), "comment.documentation".to_string()),
+                ]
+                .into(),
+                ..QueryTypeMappings::default()
+            },
+        )]);
+        let snippet = "fn alpha() { let beta = 1; // note\n}\n";
+        let direct_text = snippet.to_string();
+        let cached_text = snippet.repeat(QUERY_METADATA_CACHE_MIN_SOURCE_BYTES / snippet.len() + 1);
+        assert!(!should_cache_query_metadata(direct_text.len()));
+        assert!(should_cache_query_metadata(cached_text.len()));
+
+        let collect = |text: &str| {
+            let tree = parse_rust_tree(text);
+            let lines = text.lines().collect::<Vec<_>>();
+            let mut tokens = Vec::new();
+            assert!(collect_host_tokens(
+                text,
+                &tree,
+                &query,
+                Some("rust"),
+                Some(&mappings),
+                text,
+                &lines,
+                &build_line_start_bytes(text),
+                0,
+                0,
+                false,
+                &[],
+                &[],
+                None,
+                &mut tokens,
+            ));
+            tokens
+        };
+
+        let direct_tokens = collect(&direct_text);
+        let cached_prefix = collect(&cached_text)
+            .into_iter()
+            .filter(|token| token.line < direct_text.lines().count())
+            .collect::<Vec<_>>();
+
+        assert_eq!(cached_prefix, direct_tokens);
+        assert_eq!(
+            direct_tokens.len(),
+            3,
+            "suppressed identifiers must stay absent"
+        );
+        let function_readonly = resolve_token_kind("function.readonly", None, None).unwrap();
+        let comment_documentation =
+            resolve_token_kind("comment.documentation", None, None).unwrap();
+        assert!(
+            direct_tokens
+                .iter()
+                .any(|token| { token.priority == 250 && token.kind == function_readonly })
+        );
+        assert!(direct_tokens.iter().any(|token| {
+            token.priority == 100 && token.kind == TokenKind::MappedUnknown("not_in_legend".into())
+        }));
+        assert!(
+            direct_tokens
+                .iter()
+                .any(|token| { token.priority == 100 && token.kind == comment_documentation })
+        );
+    }
+
+    #[test]
     fn is_in_exclusion_range_empty_ranges_returns_false() {
         let tree = parse_rust_tree("fn main() {}");
         let root = tree.root_node();
