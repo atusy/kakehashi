@@ -14,6 +14,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 from typing import Any
 
@@ -39,17 +40,31 @@ DEFAULT_SCENARIOS = ",".join(
 
 
 def terminate_process_group(process: subprocess.Popen[str]) -> None:
-    if process.poll() is not None:
-        return
     try:
         os.killpg(process.pid, signal.SIGTERM)
     except ProcessLookupError:
-        return
-    try:
-        process.communicate(timeout=5)
-    except subprocess.TimeoutExpired:
-        os.killpg(process.pid, signal.SIGKILL)
-        process.communicate()
+        pass
+    def group_exists() -> bool:
+        try:
+            os.killpg(process.pid, 0)
+        except ProcessLookupError:
+            return False
+        return True
+
+    deadline = time.monotonic() + 5
+    while group_exists() and time.monotonic() < deadline:
+        time.sleep(0.05)
+    if group_exists():
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        deadline = time.monotonic() + 5
+        while group_exists() and time.monotonic() < deadline:
+            time.sleep(0.05)
+        if group_exists():
+            raise RuntimeError(f"process group {process.pid} survived SIGKILL")
+    process.communicate()
 
 
 def raise_keyboard_interrupt(_signum: int, _frame: Any) -> None:
@@ -521,11 +536,17 @@ def main() -> None:
                 blocked_signals.add(signal.SIGHUP)
             previous_mask = signal.pthread_sigmask(signal.SIG_BLOCK, blocked_signals)
             try:
-                if fixture is not None:
-                    set_tree_writable(fixture)
                 cleanup_errors = []
+                if fixture is not None:
+                    try:
+                        set_tree_writable(fixture)
+                    except Exception as error:
+                        cleanup_errors.append(f"restore fixture permissions: {error}")
                 for path in reversed(added_worktrees):
-                    if error := remove_worktree(repo, path):
+                    try:
+                        if error := remove_worktree(repo, path):
+                            cleanup_errors.append(f"{path}: {error}")
+                    except Exception as error:
                         cleanup_errors.append(f"{path}: {error}")
             finally:
                 signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
