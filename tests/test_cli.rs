@@ -779,6 +779,192 @@ fn test_language_status_shows_installed() {
     );
 }
 
+/// Status must not report an install as empty when it could not inspect it.
+#[test]
+fn test_language_status_fails_when_install_directory_is_not_a_directory() {
+    use std::fs;
+
+    let test_dir = tempfile::tempdir().expect("Failed to create temp dir");
+    fs::write(test_dir.path().join("parser"), "not a directory")
+        .expect("Failed to create invalid parser directory");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_kakehashi"))
+        .args([
+            "language",
+            "status",
+            "--data-dir",
+            test_dir.path().to_str().unwrap(),
+        ])
+        .output()
+        .expect("Failed to execute command");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "stderr: {stderr}");
+    assert!(
+        stderr.contains("failed to inspect parser directory"),
+        "stderr: {stderr}"
+    );
+    assert!(
+        !stderr.contains("No languages installed"),
+        "stderr: {stderr}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn test_language_status_fails_for_dangling_install_directory_symlink() {
+    use std::os::unix::fs::symlink;
+
+    let test_dir = tempfile::tempdir().expect("Failed to create temp dir");
+    symlink("missing-parser-directory", test_dir.path().join("parser"))
+        .expect("Failed to create dangling parser symlink");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_kakehashi"))
+        .args([
+            "language",
+            "status",
+            "--data-dir",
+            test_dir.path().to_str().unwrap(),
+        ])
+        .output()
+        .expect("Failed to execute command");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "stderr: {stderr}");
+    assert!(
+        stderr.contains("failed to inspect parser directory"),
+        "stderr: {stderr}"
+    );
+    assert!(
+        !stderr.contains("No languages installed"),
+        "stderr: {stderr}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn test_language_status_fails_for_dangling_data_directory_symlink() {
+    use std::os::unix::fs::symlink;
+
+    let test_dir = tempfile::tempdir().expect("Failed to create temp dir");
+    let data_dir = test_dir.path().join("data");
+    symlink("missing-data-directory", &data_dir).expect("Failed to create dangling data symlink");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_kakehashi"))
+        .args([
+            "language",
+            "status",
+            "--data-dir",
+            data_dir.to_str().unwrap(),
+        ])
+        .output()
+        .expect("Failed to execute command");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "stderr: {stderr}");
+    assert!(
+        stderr.contains("failed to inspect data directory"),
+        "stderr: {stderr}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn test_language_status_fails_below_dangling_data_directory_ancestor() {
+    use std::os::unix::fs::symlink;
+
+    let test_dir = tempfile::tempdir().expect("Failed to create temp dir");
+    let dangling = test_dir.path().join("dangling");
+    symlink("missing-data-directory", &dangling).expect("Failed to create dangling data ancestor");
+    let data_dir = dangling.join("nested-data");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_kakehashi"))
+        .args([
+            "language",
+            "status",
+            "--data-dir",
+            data_dir.to_str().unwrap(),
+        ])
+        .output()
+        .expect("Failed to execute command");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "stderr: {stderr}");
+    assert!(
+        stderr.contains("failed to inspect data directory"),
+        "stderr: {stderr}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn test_language_status_fails_for_dangling_parser_entry_symlink() {
+    use std::fs;
+    use std::os::unix::fs::symlink;
+
+    let test_dir = tempfile::tempdir().expect("Failed to create temp dir");
+    let parser_dir = test_dir.path().join("parser");
+    fs::create_dir(&parser_dir).expect("Failed to create parser directory");
+    symlink(
+        "missing-parser",
+        parser_dir.join(format!("rust.{}", std::env::consts::DLL_EXTENSION)),
+    )
+    .expect("Failed to create dangling parser symlink");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_kakehashi"))
+        .args([
+            "language",
+            "status",
+            "--data-dir",
+            test_dir.path().to_str().unwrap(),
+        ])
+        .output()
+        .expect("Failed to execute command");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "stderr: {stderr}");
+    assert!(
+        stderr.contains("failed to inspect parser directory"),
+        "stderr: {stderr}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn test_language_status_fails_for_dangling_query_entry_symlink() {
+    use std::fs;
+    use std::os::unix::fs::symlink;
+
+    let test_dir = tempfile::tempdir().expect("Failed to create temp dir");
+    fs::create_dir(test_dir.path().join("queries")).expect("Failed to create queries directory");
+    symlink(
+        "missing-query-directory",
+        test_dir.path().join("queries/rust"),
+    )
+    .expect("Failed to create dangling query symlink");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_kakehashi"))
+        .args([
+            "language",
+            "status",
+            "--data-dir",
+            test_dir.path().to_str().unwrap(),
+        ])
+        .output()
+        .expect("Failed to execute command");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "stderr: {stderr}");
+    assert!(
+        stderr.contains("failed to inspect query directory"),
+        "stderr: {stderr}"
+    );
+    assert!(
+        !stderr.contains("No languages installed"),
+        "stderr: {stderr}"
+    );
+}
+
 /// Test that language status shows missing queries
 #[test]
 fn test_language_status_missing_queries() {
@@ -900,6 +1086,36 @@ fn test_language_status_ignores_internal_query_dirs() {
     assert!(
         combined.contains("No languages installed"),
         "Only internal query dirs should not count as installed languages. Got: {combined}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn test_language_status_ignores_dangling_internal_query_symlink() {
+    use std::fs;
+    use std::os::unix::fs::symlink;
+
+    let test_dir = tempfile::tempdir().expect("Failed to create temp dir");
+    let queries_dir = test_dir.path().join("queries");
+    fs::create_dir(&queries_dir).expect("Failed to create queries directory");
+    symlink("missing", queries_dir.join(".rust.123.tmp"))
+        .expect("Failed to create internal query symlink");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_kakehashi"))
+        .args([
+            "language",
+            "status",
+            "--data-dir",
+            test_dir.path().to_str().unwrap(),
+        ])
+        .output()
+        .expect("Failed to execute command");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "stderr: {stderr}");
+    assert!(
+        stderr.contains("No languages installed"),
+        "stderr: {stderr}"
     );
 }
 

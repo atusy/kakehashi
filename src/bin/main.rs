@@ -388,10 +388,17 @@ const DOC_LINK: &str =
 /// Run the language status command
 fn run_language_status(verbose: bool) -> Result<(), ExitCode> {
     use std::collections::BTreeSet;
-    use std::fs;
 
     let data_dir = default_data_dir().ok_or_else(|| {
         eprintln!("Error: Could not determine data directory. Please specify --data-dir.");
+        ExitCode::FAILURE
+    })?;
+
+    validate_install_root(&data_dir).map_err(|e| {
+        eprintln!(
+            "Error: failed to inspect data directory '{}': {e}",
+            data_dir.display()
+        );
         ExitCode::FAILURE
     })?;
 
@@ -404,28 +411,59 @@ fn run_language_status(verbose: bool) -> Result<(), ExitCode> {
     // Collect all installed languages from both parser and queries directories
     let mut languages = BTreeSet::new();
 
-    // Scan parser directory for .so, .dylib, .dll files
-    if let Ok(entries) = fs::read_dir(&parser_dir) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            let is_parser = path
-                .extension()
-                .map(|ext| ext == std::env::consts::DLL_EXTENSION)
-                .unwrap_or(false);
-            if is_parser && let Some(stem) = path.file_stem() {
-                languages.insert(stem.to_string_lossy().to_string());
-            }
+    // Scan parser directory for .so, .dylib, .dll files. A fresh data
+    // directory legitimately has no parser directory yet; every other I/O
+    // failure means status cannot truthfully report the installation as empty.
+    visit_install_directory(&parser_dir, |entry| {
+        let path = entry.path();
+        let is_parser = path
+            .extension()
+            .map(|ext| ext == std::env::consts::DLL_EXTENSION)
+            .unwrap_or(false);
+        if !is_parser {
+            return Ok(());
         }
-    }
+        let is_file = match std::fs::metadata(&path) {
+            Ok(metadata) => metadata.is_file(),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                match std::fs::symlink_metadata(&path) {
+                    Err(metadata_error)
+                        if metadata_error.kind() == std::io::ErrorKind::NotFound =>
+                    {
+                        return Ok(());
+                    }
+                    _ => return Err(error),
+                }
+            }
+            Err(error) => return Err(error),
+        };
+        if is_file && let Some(stem) = path.file_stem() {
+            languages.insert(stem.to_string_lossy().to_string());
+        }
+        Ok(())
+    })
+    .map_err(|e| {
+        eprintln!(
+            "Error: failed to inspect parser directory '{}': {e}",
+            parser_dir.display()
+        );
+        ExitCode::FAILURE
+    })?;
 
     // Also check queries directory for languages that might only have queries
-    if let Ok(entries) = fs::read_dir(&queries_dir) {
-        for entry in entries.flatten() {
-            if let Some(name) = installed_query_language_name(&entry.path()) {
-                languages.insert(name);
-            }
+    visit_install_directory(&queries_dir, |entry| {
+        if let Some(name) = installed_query_language_name_checked(&entry.path())? {
+            languages.insert(name);
         }
-    }
+        Ok(())
+    })
+    .map_err(|e| {
+        eprintln!(
+            "Error: failed to inspect query directory '{}': {e}",
+            queries_dir.display()
+        );
+        ExitCode::FAILURE
+    })?;
 
     if languages.is_empty() {
         eprintln!("No languages installed in {}", data_dir.display());
@@ -466,18 +504,113 @@ fn run_language_status(verbose: bool) -> Result<(), ExitCode> {
     Ok(())
 }
 
-fn installed_query_language_name(path: &Path) -> Option<String> {
-    if !path.is_dir() {
-        return None;
+fn validate_install_root(path: &Path) -> std::io::Result<()> {
+    let path = if path.is_absolute() {
+        std::borrow::Cow::Borrowed(path)
+    } else {
+        std::borrow::Cow::Owned(std::env::current_dir()?.join(path))
+    };
+    let path = path.as_ref();
+    match std::fs::metadata(path) {
+        Ok(metadata) if metadata.is_dir() => Ok(()),
+        Ok(_) => Err(std::io::Error::new(
+            std::io::ErrorKind::NotADirectory,
+            "install data path is not a directory",
+        )),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            for ancestor in path.ancestors() {
+                match std::fs::symlink_metadata(ancestor) {
+                    Err(metadata_error)
+                        if metadata_error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(metadata_error) => return Err(metadata_error),
+                    Ok(metadata) if metadata.file_type().is_symlink() => {
+                        let target = std::fs::metadata(ancestor)?;
+                        return if target.is_dir() {
+                            Ok(())
+                        } else {
+                            Err(std::io::Error::new(
+                                std::io::ErrorKind::NotADirectory,
+                                "install data ancestor is not a directory",
+                            ))
+                        };
+                    }
+                    Ok(metadata) if metadata.is_dir() => return Ok(()),
+                    Ok(_) => {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::NotADirectory,
+                            "install data ancestor is not a directory",
+                        ));
+                    }
+                }
+            }
+            Err(e)
+        }
+        Err(e) => Err(e),
     }
-    let name = path.file_name()?.to_string_lossy();
+}
+
+/// Visit every entry in an installation directory.
+///
+/// Missing directories are the normal state before the first install. Other
+/// directory-open errors and per-entry iteration errors mean the caller did
+/// not observe the complete installation and must not report an empty result.
+fn visit_install_directory(
+    path: &Path,
+    mut visit: impl FnMut(std::fs::DirEntry) -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    let entries = match std::fs::read_dir(path) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            match std::fs::symlink_metadata(path) {
+                // No directory entry is the normal pre-install state.
+                Err(metadata_error) if metadata_error.kind() == std::io::ErrorKind::NotFound => {
+                    return Ok(());
+                }
+                // A dangling symlink (or another entry read_dir could not
+                // follow) exists, so preserve the original scan failure.
+                Ok(_) => return Err(e),
+                Err(metadata_error) => return Err(metadata_error),
+            }
+        }
+        Err(e) => return Err(e),
+    };
+    for entry in entries {
+        visit(entry?)?;
+    }
+    Ok(())
+}
+
+fn installed_query_language_name(path: &Path) -> Option<String> {
+    installed_query_language_name_checked(path).ok().flatten()
+}
+
+fn installed_query_language_name_checked(path: &Path) -> std::io::Result<Option<String>> {
+    let Some(file_name) = path.file_name() else {
+        return Ok(None);
+    };
+    let name = file_name.to_string_lossy();
     if name.starts_with('.') {
-        return None;
+        return Ok(None);
     }
     if !queries::is_safe_language_name(&name) {
-        return None;
+        return Ok(None);
     }
-    Some(name.to_string())
+    let is_dir = match std::fs::metadata(path) {
+        Ok(metadata) => metadata.is_dir(),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            match std::fs::symlink_metadata(path) {
+                Err(metadata_error) if metadata_error.kind() == std::io::ErrorKind::NotFound => {
+                    return Ok(None);
+                }
+                _ => return Err(error),
+            }
+        }
+        Err(error) => return Err(error),
+    };
+    if !is_dir {
+        return Ok(None);
+    }
+    Ok(Some(name.to_string()))
 }
 
 /// Run the language uninstall command
