@@ -42,9 +42,12 @@ mod semantic_baseline;
 
 use semantic_baseline::{SemanticBaseline, TRACKED_MARKER, tracked_marker_line};
 use serde_json::{Value, json};
-use std::io::{BufRead, BufReader, Read, Write};
+use std::collections::HashMap;
+use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
-use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::process::{Child, ChildStdin, Command, Stdio};
+use std::sync::mpsc::{self, Receiver};
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 // ───────────────────────────── Minimal LSP client ─────────────────────────────
@@ -56,8 +59,10 @@ use std::time::{Duration, Instant};
 struct Server {
     child: Child,
     stdin: ChildStdin,
-    stdout: BufReader<ChildStdout>,
+    responses: Receiver<Result<Value, String>>,
+    reader: Option<JoinHandle<()>>,
     next_id: i64,
+    buffered_responses: HashMap<i64, Value>,
 }
 
 impl Server {
@@ -72,12 +77,25 @@ impl Server {
             .unwrap_or_else(|e| panic!("failed to spawn server binary {bin:?}: {e}"));
 
         let stdin = child.stdin.take().expect("stdin");
-        let stdout = BufReader::new(child.stdout.take().expect("stdout"));
+        let stdout = child.stdout.take().expect("stdout");
+        let (sender, responses) = mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            let mut stdout = BufReader::new(stdout);
+            loop {
+                let message = recv_message(&mut stdout);
+                let should_stop = message.is_err();
+                if sender.send(message).is_err() || should_stop {
+                    break;
+                }
+            }
+        });
         let mut server = Server {
             child,
             stdin,
-            stdout,
+            responses,
+            reader: Some(reader),
             next_id: 0,
+            buffered_responses: HashMap::new(),
         };
 
         server.request(
@@ -200,6 +218,11 @@ impl Server {
     }
 
     fn request(&mut self, method: &str, params: Value) -> Value {
+        let id = self.send_request(method, params);
+        self.recv_response(id)
+    }
+
+    fn send_request(&mut self, method: &str, params: Value) -> i64 {
         self.next_id += 1;
         let id = self.next_id;
         self.send(&json!({
@@ -208,7 +231,7 @@ impl Server {
             "method": method,
             "params": params,
         }));
-        self.recv_response(id)
+        id
     }
 
     fn notify(&mut self, method: &str, params: Value) {
@@ -228,49 +251,72 @@ impl Server {
     /// Read messages until the response for `id` arrives, skipping
     /// notifications and server-to-client requests.
     fn recv_response(&mut self, id: i64) -> Value {
+        let response = self.recv_raw_response(id);
+        if let Some(error) = response.get("error") {
+            panic!("server returned a JSON-RPC error for request id={id}: {error}");
+        }
+        response.get("result").cloned().unwrap_or(Value::Null)
+    }
+
+    fn recv_raw_response(&mut self, id: i64) -> Value {
+        if let Some(response) = self.buffered_responses.remove(&id) {
+            return response;
+        }
+
         let deadline = Instant::now() + Duration::from_secs(60);
         loop {
-            if Instant::now() > deadline {
-                panic!("timed out waiting for response id={id}");
-            }
-            let msg = self.recv_message();
+            let remaining = deadline
+                .checked_duration_since(Instant::now())
+                .unwrap_or(Duration::ZERO);
+            let msg = self
+                .responses
+                .recv_timeout(remaining)
+                .unwrap_or_else(|error| panic!("failed waiting for response id={id}: {error}"))
+                .unwrap_or_else(|error| panic!("failed reading server response: {error}"));
             // Server-to-client requests carry a "method"; skip them.
             if msg.get("method").is_some() {
                 continue;
             }
-            if msg.get("id").and_then(Value::as_i64) == Some(id) {
-                // Fail fast on a JSON-RPC error: a misconfigured server (missing
-                // parser/query, bad setup) must not silently produce Null and
-                // bogus timings.
-                if let Some(error) = msg.get("error") {
-                    panic!("server returned a JSON-RPC error for request id={id}: {error}");
-                }
-                return msg.get("result").cloned().unwrap_or(Value::Null);
+            let Some(response_id) = msg.get("id").and_then(Value::as_i64) else {
+                continue;
+            };
+            if response_id == id {
+                return msg;
             }
+            self.buffered_responses.insert(response_id, msg);
         }
     }
+}
 
-    fn recv_message(&mut self) -> Value {
-        // Parse Content-Length framing.
-        let mut content_length = None;
-        loop {
-            let mut line = String::new();
-            if self.stdout.read_line(&mut line).unwrap() == 0 {
-                panic!("server closed stdout unexpectedly");
-            }
-            let trimmed = line.trim_end();
-            if trimmed.is_empty() {
-                break; // end of headers
-            }
-            if let Some(v) = trimmed.strip_prefix("Content-Length:") {
-                content_length = Some(v.trim().parse::<usize>().expect("content-length"));
-            }
+fn recv_message(stdout: &mut impl BufRead) -> Result<Value, String> {
+    let mut content_length = None;
+    loop {
+        let mut line = String::new();
+        let read = stdout
+            .read_line(&mut line)
+            .map_err(|error| format!("failed reading LSP header: {error}"))?;
+        if read == 0 {
+            return Err("server closed stdout unexpectedly".to_owned());
         }
-        let len = content_length.expect("missing Content-Length");
-        let mut buf = vec![0u8; len];
-        self.stdout.read_exact(&mut buf).unwrap();
-        serde_json::from_slice(&buf).expect("valid json body")
+        let trimmed = line.trim_end();
+        if trimmed.is_empty() {
+            break;
+        }
+        if let Some(value) = trimmed.strip_prefix("Content-Length:") {
+            content_length = Some(
+                value
+                    .trim()
+                    .parse::<usize>()
+                    .map_err(|error| format!("invalid Content-Length: {error}"))?,
+            );
+        }
     }
+    let len = content_length.ok_or_else(|| "missing Content-Length".to_owned())?;
+    let mut body = vec![0_u8; len];
+    stdout
+        .read_exact(&mut body)
+        .map_err(|error| format!("failed reading LSP body: {error}"))?;
+    serde_json::from_slice(&body).map_err(|error| format!("invalid JSON body: {error}"))
 }
 
 impl Drop for Server {
@@ -278,6 +324,9 @@ impl Drop for Server {
         // Best-effort shutdown; kill if it doesn't exit promptly.
         let _ = self.child.kill();
         let _ = self.child.wait();
+        if let Some(reader) = self.reader.take() {
+            let _ = reader.join();
+        }
     }
 }
 
@@ -468,6 +517,9 @@ enum Kind {
     /// Several edits arrive before the one semantic-token request whose result
     /// is still useful to an editor.
     TypingBurst { edits: usize },
+    /// Several full requests become obsolete and are explicitly cancelled
+    /// before the one response an editor can still use.
+    CancelBurst { obsolete: usize },
     /// Cold-open latency: each iteration opens a FRESH document and times
     /// `didOpen` → first `semanticTokens/full` response — the editor-visible
     /// "open the file, see highlights" latency. The one scenario that captures
@@ -510,6 +562,9 @@ fn measure(
     iters: usize,
     warmup: usize,
 ) -> Vec<Duration> {
+    if let Kind::CancelBurst { obsolete } = scn.kind {
+        return measure_cancel_burst(bin, scn, data_dir, iters, warmup, obsolete);
+    }
     if let Kind::OpenFirstToken = scn.kind {
         return measure_open(bin, scn, data_dir, iters, warmup);
     }
@@ -538,6 +593,101 @@ fn measure(
         let start = Instant::now();
         run_once(&mut server, scn, &mut baseline, &mut edit);
         samples.push(start.elapsed());
+    }
+    samples
+}
+
+fn measure_cancel_burst(
+    bin: &Binary,
+    scn: &Scenario,
+    data_dir: &str,
+    iters: usize,
+    warmup: usize,
+    obsolete: usize,
+) -> Vec<Duration> {
+    let mut server = Server::start(&bin.path, data_dir);
+    server.did_open(scn.uri, scn.language_id, &scn.content);
+    std::thread::sleep(Duration::from_millis(300));
+
+    let tracked_line = tracked_marker_line(&scn.content)
+        .unwrap_or_else(|error| panic!("invalid tracked marker for {}: {error:?}", scn.name));
+    let mut baseline = SemanticBaseline::from_full(&server.semantic_full(scn.uri), tracked_line)
+        .unwrap_or_else(|error| panic!("invalid semantic baseline for {}: {error:?}", scn.name));
+    let mut version = 1_i64;
+    let required = warmup + iters;
+    let max_attempts = required.saturating_mul(20).max(20);
+    let mut retained = 0_usize;
+    let mut discarded = 0_usize;
+    let mut samples = Vec::with_capacity(iters);
+
+    for _ in 0..max_attempts {
+        if retained == required {
+            break;
+        }
+
+        let mut obsolete_ids = Vec::with_capacity(obsolete);
+        for _ in 0..obsolete {
+            version += 1;
+            server.did_change_insert_space(scn.uri, version, tracked_line);
+            baseline
+                .record_prefix_insert(1)
+                .expect("tracked position remains valid");
+            let id = server.send_request(
+                "textDocument/semanticTokens/full",
+                json!({ "textDocument": { "uri": scn.uri } }),
+            );
+            // Give dispatch a chance to start computation. If it completes in
+            // this interval, the attempt is classified as unusable below.
+            std::thread::sleep(Duration::from_millis(1));
+            server.notify("$/cancelRequest", json!({ "id": id }));
+            obsolete_ids.push(id);
+        }
+
+        version += 1;
+        let started = Instant::now();
+        server.did_change_insert_space(scn.uri, version, tracked_line);
+        baseline
+            .record_prefix_insert(1)
+            .expect("tracked position remains valid");
+        let result = server.semantic_full(scn.uri);
+        let elapsed = started.elapsed();
+        baseline.apply_response(&result).unwrap_or_else(|error| {
+            panic!("invalid semantic response for {}: {error:?}", scn.name)
+        });
+
+        let mut all_cancelled = true;
+        for id in obsolete_ids {
+            let response = server.recv_raw_response(id);
+            match response.pointer("/error/code").and_then(Value::as_i64) {
+                Some(-32800) => {}
+                None if response.get("result").is_some() => all_cancelled = false,
+                code => panic!(
+                    "obsolete request {id} returned unexpected status {code:?} for {}: {response}",
+                    scn.name
+                ),
+            }
+        }
+
+        if !all_cancelled {
+            discarded += 1;
+            continue;
+        }
+        if retained >= warmup {
+            samples.push(elapsed);
+        }
+        retained += 1;
+    }
+
+    assert_eq!(
+        retained, required,
+        "could not retain {required} cancellation samples for {} after {max_attempts} attempts; discarded {discarded}",
+        scn.name
+    );
+    if discarded > 0 {
+        eprintln!(
+            "{}: discarded {discarded} attempts whose obsolete request completed before cancellation",
+            scn.name
+        );
     }
     samples
 }
@@ -578,7 +728,7 @@ fn measure_open(
 
 fn seed_baseline(server: &mut Server, scn: &Scenario) -> Option<SemanticBaseline> {
     match scn.kind {
-        Kind::Full | Kind::Range { .. } | Kind::OpenFirstToken => None,
+        Kind::Full | Kind::Range { .. } | Kind::OpenFirstToken | Kind::CancelBurst { .. } => None,
         Kind::DeltaNoop | Kind::EditDelta | Kind::TypingDelta | Kind::TypingBurst { .. } => {
             let tracked_line = tracked_marker_line(&scn.content).unwrap_or_else(|error| {
                 panic!("invalid tracked marker for {}: {error:?}", scn.name)
@@ -602,6 +752,7 @@ fn run_once(
     match scn.kind {
         // Handled by `measure_open`, which never calls `run_once`.
         Kind::OpenFirstToken => unreachable!("OpenFirstToken uses measure_open"),
+        Kind::CancelBurst { .. } => unreachable!("CancelBurst uses measure_cancel_burst"),
         Kind::Full => {
             let _ = server.semantic_full(scn.uri);
         }
@@ -820,6 +971,14 @@ fn main() {
             content: gen_rust(150),
             kind: Kind::TypingBurst { edits: 8 },
             targets: "eight queued unique edits→current delta; latest-state follow latency",
+        },
+        Scenario {
+            name: "rust_xlarge/cancel_burst",
+            language_id: "rust",
+            uri: "file:///bench/large_supersede.rs",
+            content: gen_rust(600),
+            kind: Kind::CancelBurst { obsolete: 4 },
+            targets: "current-token latency after four explicitly cancelled edit states",
         },
         Scenario {
             name: "markdown_injections/edit_delta",
