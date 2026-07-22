@@ -130,6 +130,7 @@
     "b_commit": "f3febbf4ae553f38d0e0569da7daa710fec9d0e8",
     "b_ref": "benchmark/semantic-worker-legacy-2026-07-23",
     "harness_commit": "ae91bf14dc7edc75d01a674e5e3d6f0680d5cba8",
+    "harness_ref": "benchmark/semantic-harness-2026-07-23",
     "harness_sources_sha256": {
       "benches/collect_semantic_pairs.py": "0f8f36c6daafedaf22579935ff966edfd48da21195279bc6140d6631dcfd3c74",
       "benches/semantic_summary.py": "8aab3d2622ec7bfface33f29fee8fd695297b31eb2007fc5b2b20d8be2e3d1d0",
