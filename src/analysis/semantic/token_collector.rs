@@ -84,6 +84,12 @@ fn parse_priority_for_pattern(query: &Query, pattern_index: usize) -> u32 {
     DEFAULT_PRIORITY
 }
 
+fn pattern_priorities(query: &Query) -> Vec<u32> {
+    (0..query.pattern_count())
+        .map(|pattern_index| parse_priority_for_pattern(query, pattern_index))
+        .collect()
+}
+
 /// The semantic role of a collected token.
 ///
 /// Mirrors the relevant variants of [`CaptureResult`] but lives on the
@@ -391,6 +397,7 @@ pub(super) fn collect_host_tokens(
     let mut utf16_cache: Vec<Option<Utf16LineIndex>> = Vec::new();
 
     // Collect tokens from this document's highlight query
+    let priorities = pattern_priorities(query);
     let mut cursor = QueryCursor::new();
     let mut matches = cursor.matches(query, tree.root_node(), text.as_bytes());
 
@@ -398,7 +405,7 @@ pub(super) fn collect_host_tokens(
         if is_cancelled_periodically(cancel, &mut work_items) {
             return false;
         }
-        let priority = parse_priority_for_pattern(query, m.pattern_index);
+        let priority = priorities[m.pattern_index];
         let filtered_captures = crate::language::filter_captures(query, m, text);
 
         for c in filtered_captures {
@@ -618,6 +625,22 @@ mod tests {
     /// first child (or root itself) for exclusion-range testing.
     fn parse_rust_tree(text: &str) -> tree_sitter::Tree {
         parse_with_language(text, tree_sitter_rust::LANGUAGE.into())
+    }
+
+    #[test]
+    fn pattern_priorities_precompute_explicit_and_default_values() {
+        let language: tree_sitter::Language = tree_sitter_rust::LANGUAGE.into();
+        let query = tree_sitter::Query::new(
+            &language,
+            r#"
+            ((identifier) @variable
+              (#set! priority 250))
+            (line_comment) @comment
+            "#,
+        )
+        .unwrap();
+
+        assert_eq!(pattern_priorities(&query), vec![250, 100]);
     }
 
     #[test]
