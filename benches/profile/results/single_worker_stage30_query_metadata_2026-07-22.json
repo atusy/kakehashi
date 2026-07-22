@@ -1,6 +1,7 @@
 {
-  "schema_version": 2,
+  "schema_version": 3,
   "measured_at": "2026-07-22",
+  "decision": "rejected",
   "baseline": {
     "stage": 29,
     "branch_head": "bcde3187abac23b2f218751c44415778e20e2689",
@@ -32,31 +33,31 @@
     "iterations_per_binary_per_pair": 30,
     "warmup_iterations_per_binary_per_pair": 6,
     "summary_statistic": "median of four paired percent deltas; an even-sized median averages its middle values",
-    "validation": "Every delta/full response is reconstructed client-side and the tracked semantic token must equal the latest inserted prefix before its latency sample is accepted; every obsolete cancellation-burst request, including warmups, must return JSON-RPC RequestCancelled (-32800).",
-    "execution_command_template": "KAKEHASHI_TREE_WORKER_MODE=authoritative KAKEHASHI_TREE_WORKER_THREADS=8 KAKEHASHI_BENCH_DATA_DIR=<content-addressed-fixture>/kakehashi KAKEHASHI_BENCH_BIN_A=<first> KAKEHASHI_BENCH_BIN_B=<second> KAKEHASHI_BENCH_ITERS=30 KAKEHASHI_BENCH_WARMUP=6 KAKEHASHI_BENCH_SCENARIOS=rust_large/typing_delta,rust_large/typing_burst,rust_xlarge/cancel_burst,markdown_injections/typing_delta,markdown_injections/typing_burst,rust_sparse_ KAKEHASHI_BENCH_SAMPLES_FILE=<run.json> target/release/deps/semantic_tokens-08ebd8d8c816111c"
+    "validation": "Every delta/full response is reconstructed client-side and the tracked semantic token must equal the latest inserted prefix before its latency sample is accepted; every obsolete cancellation-burst request, including warmups, must return JSON-RPC RequestCancelled (-32800). Each raw binary and run record includes the SHA-256 computed by the harness before measurement.",
+    "execution_command_template": "KAKEHASHI_TREE_WORKER_MODE=authoritative KAKEHASHI_TREE_WORKER_THREADS=8 KAKEHASHI_BENCH_DATA_DIR=<content-addressed-fixture>/kakehashi KAKEHASHI_BENCH_BIN_A=<content-addressed-first> KAKEHASHI_BENCH_BIN_B=<content-addressed-second> KAKEHASHI_BENCH_ITERS=30 KAKEHASHI_BENCH_WARMUP=6 KAKEHASHI_BENCH_SCENARIOS=rust_large/typing_delta,rust_large/typing_burst,rust_xlarge/cancel_burst,markdown_injections/typing_delta,markdown_injections/typing_burst,rust_sparse_ KAKEHASHI_BENCH_SAMPLES_FILE=<run.json> target/release/deps/semantic_tokens-08ebd8d8c816111c"
   },
   "artifacts": {
     "harness_source_path": "benches/semantic_tokens.rs",
-    "harness_source_sha256": "ab047491c477d42a3a62d92b8377c726979eb69eb1431d3d43506d8fb89a5310",
-    "harness_binary_sha256": "0aca43a36ca660f5a8ed67d014cc5d7323cafa81541e9059884804116eed21fd",
+    "harness_source_sha256": "c149e4d0fdf95709828caf7039c122e139e42db43fc65b406b7ebe00105dfddf",
+    "harness_binary_sha256": "349caff1a800098ffc899cbd1d5ca3fcd5950d1f0d1177a29c062714bcb618f4",
     "fixture_manifest_path": "benches/profile/results/single_worker_stage29_fixture_manifest_2026-07-22.sha256",
     "fixture_manifest_sha256": "7f6eaaa8341a71fb723a70f21703e9239f4d7205a3b06041604cb15754024e61",
     "raw_runs": [
       {
         "path": "benches/profile/results/single_worker_stage30_amortized_metadata_final_pair1_2026-07-22.json",
-        "sha256": "b5b38ce952711f13cf6186e40ccfd8cc8872dec1b763ec2bc347ef44cf699509"
+        "sha256": "c1baa481da14adf718f1667435f4de65239a62b1adfe8c4569110afcd5103f8a"
       },
       {
         "path": "benches/profile/results/single_worker_stage30_amortized_metadata_final_pair2_2026-07-22.json",
-        "sha256": "1b555f0ec88e8efcf9ec93440f77ce129bd7275902089b99c886c6eba1bc31c3"
+        "sha256": "05a5061b409d50c00a34ffb8fcd654930a727c8fead01fb91cd4d5512e520eb8"
       },
       {
         "path": "benches/profile/results/single_worker_stage30_amortized_metadata_final_pair3_2026-07-22.json",
-        "sha256": "96fbe3a8ce80de0187046fb8b0c69ea86c81790fce9601e17cbfff22fedac40a"
+        "sha256": "008bd56613124b4d1f34ea1473070850a03698d05293f7a947892130bc2c4f28"
       },
       {
         "path": "benches/profile/results/single_worker_stage30_amortized_metadata_final_pair4_2026-07-22.json",
-        "sha256": "cfba8fb40d9c2be93e0bded26d0094e26ecb9f4f2baa9bed98f5dfd5a57984b7"
+        "sha256": "9ab991a221960aeb49327bbbc4cfc15bdd5fe3040d2f9f050961bea32b55ecf3"
       }
     ]
   },
@@ -65,119 +66,119 @@
   "paired_summary": [
     {
       "scenario": "rust_large/typing_delta",
-      "median_paired_median_delta_percent": -12.656973957126283,
+      "median_paired_median_delta_percent": 10.005736243664975,
       "median_delta_range_percent": [
-        -29.69255348619645,
-        14.18932406475113
+        -26.00291611549871,
+        28.65210764012682
       ],
-      "median_paired_p95_delta_percent": -8.019902050500033,
+      "median_paired_p95_delta_percent": 34.908813317587914,
       "p95_delta_range_percent": [
-        -42.143989039206275,
-        32.99156526745477
+        -41.7221152840812,
+        71.32429119087583
       ]
     },
     {
       "scenario": "rust_sparse_32k_minus/typing_delta",
-      "median_paired_median_delta_percent": -1.5809486536324358,
+      "median_paired_median_delta_percent": 6.183022117872932,
       "median_delta_range_percent": [
-        -13.567876996268168,
-        0.8642573762762007
+        -13.277362949800086,
+        43.37445929354935
       ],
-      "median_paired_p95_delta_percent": -5.41004341395307,
+      "median_paired_p95_delta_percent": 6.867842878667075,
       "p95_delta_range_percent": [
-        -15.826897720851385,
-        3.052325095094899
+        -12.88134551796598,
+        45.0036469730124
       ]
     },
     {
       "scenario": "rust_sparse_32k_exact/typing_delta",
-      "median_paired_median_delta_percent": -0.03963409508492277,
+      "median_paired_median_delta_percent": 8.139754496078522,
       "median_delta_range_percent": [
-        -0.6450534111908324,
-        35.00467631275734
+        -12.094539790651782,
+        21.273288725210506
       ],
-      "median_paired_p95_delta_percent": -0.3318143724535594,
+      "median_paired_p95_delta_percent": 9.341795867692381,
       "p95_delta_range_percent": [
-        -2.3395608045583938,
-        22.186659366502127
+        -0.43266306012044176,
+        97.40911619657923
       ]
     },
     {
       "scenario": "rust_sparse_32k_plus/typing_delta",
-      "median_paired_median_delta_percent": 0.7765085055305321,
+      "median_paired_median_delta_percent": 2.038764420265343,
       "median_delta_range_percent": [
-        -5.272430872125799,
-        18.960203383185625
+        -14.755440494457927,
+        20.717017120082136
       ],
-      "median_paired_p95_delta_percent": 0.727455129699528,
+      "median_paired_p95_delta_percent": 2.904780849919508,
       "p95_delta_range_percent": [
-        -6.325632365174427,
-        21.234526260931563
+        -14.065528397988281,
+        20.884126795873858
       ]
     },
     {
       "scenario": "rust_sparse_64k/typing_delta",
-      "median_paired_median_delta_percent": 0.4403151529189575,
+      "median_paired_median_delta_percent": 11.59934303694795,
       "median_delta_range_percent": [
-        -0.9170138341103584,
-        17.970076402771305
+        1.2123954009201965,
+        14.74930655841995
       ],
-      "median_paired_p95_delta_percent": 8.536311901644156,
+      "median_paired_p95_delta_percent": 8.556599784569851,
       "p95_delta_range_percent": [
-        -12.45209124284531,
-        18.99281933504573
+        -17.73578573942579,
+        19.169905993866365
       ]
     },
     {
       "scenario": "rust_large/typing_burst",
-      "median_paired_median_delta_percent": -14.226315566075643,
+      "median_paired_median_delta_percent": 2.002580878554161,
       "median_delta_range_percent": [
-        -29.665854406527647,
-        3.038267429177388
+        -15.558641365204018,
+        9.13700938627473
       ],
-      "median_paired_p95_delta_percent": -13.479526781661145,
+      "median_paired_p95_delta_percent": -0.11683217319178851,
       "p95_delta_range_percent": [
-        -38.30893074429152,
-        14.462003207557705
+        -13.96917670366581,
+        11.149678560481968
       ]
     },
     {
       "scenario": "rust_xlarge/cancel_burst",
-      "median_paired_median_delta_percent": -9.25557446768272,
+      "median_paired_median_delta_percent": -12.016711863804424,
       "median_delta_range_percent": [
-        -13.7107981251544,
-        0.42758627064705124
+        -15.327063239513983,
+        -4.508840260253888
       ],
-      "median_paired_p95_delta_percent": 4.613281976686112,
+      "median_paired_p95_delta_percent": -11.804172201617025,
       "p95_delta_range_percent": [
-        -14.063677268529828,
-        17.20448693817005
+        -19.940661083388832,
+        -5.540392825454898
       ]
     },
     {
       "scenario": "markdown_injections/typing_delta",
-      "median_paired_median_delta_percent": 4.048496443880111,
+      "median_paired_median_delta_percent": -0.02913308859121,
       "median_delta_range_percent": [
-        -7.607331705783437,
-        32.76595758596446
+        -0.4430943317979219,
+        13.080834810242624
       ],
-      "median_paired_p95_delta_percent": 4.62389932003664,
+      "median_paired_p95_delta_percent": 0.9279977549997209,
       "p95_delta_range_percent": [
-        -3.3422436414639933,
-        25.782055985704066
+        -1.2807660429784429,
+        21.73867376807468
       ]
     },
     {
       "scenario": "markdown_injections/typing_burst",
-      "median_paired_median_delta_percent": 0.45490537155262745,
+      "median_paired_median_delta_percent": 1.720020907910158,
       "median_delta_range_percent": [
-        -1.0659580403530766,
-        1.527602324066657
+        -13.846510190679883,
+        21.831462469782647
       ],
-      "median_paired_p95_delta_percent": 0.3577949394756197,
+      "median_paired_p95_delta_percent": -3.4443351223248992,
       "p95_delta_range_percent": [
-        -10.873198806958994,
-        9.998634532668804
+        -43.80080962893204,
+        15.556295408211751
       ]
     }
   ]
