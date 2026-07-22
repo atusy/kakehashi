@@ -61,16 +61,17 @@ warmups, returned JSON-RPC `RequestCancelled (-32800)`.
 
 The median of four paired Stage 30 deltas relative to Stage 29 was:
 
-- Rust single-edit typing: **+10.0%** (regression).
-- Rust eight-edit burst: **+2.0%** (no improvement).
+- Rust single-edit typing: **+10.0%** (range -26.0% to +28.7%).
+- Rust eight-edit burst: **+2.0%** (range -15.6% to +9.1%).
 - Rust four-cancellation burst: **-12.0%** (improvement).
 - Sparse Rust 64 KiB control: **+11.6%** (regression in all four pairs).
-- Markdown single-edit typing: **-0.03%** (neutral).
-- Markdown injection burst: **+1.7%** (no improvement).
+- Markdown single-edit typing: **-0.03%** (range -0.44% to +13.1%).
+- Markdown injection burst: **+1.7%** (range -13.8% to +21.8%).
 
-The candidate improved cancellation latency, but the user's primary typing
-paths did not improve and sparse input regressed. Shipping it would exchange
-general typing performance for a narrower cancellation win.
+The rerun demonstrated a cancellation-latency improvement and a consistent
+sparse-64-KiB regression, but did not demonstrate a reliable primary typing-path
+improvement. That evidence does not justify shipping the candidate for the
+narrower cancellation win.
 
 Authoritative raw evidence:
 
