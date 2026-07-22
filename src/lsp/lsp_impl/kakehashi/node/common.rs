@@ -18,7 +18,7 @@ use ulid::Ulid;
 use url::Url;
 
 use crate::lsp::lsp_impl::kakehashi::node::injection_stack::{
-    with_resolved_node_pair, with_resolved_node_ranges,
+    NodeResolution, with_resolved_node_pair, with_resolved_node_ranges,
 };
 use crate::lsp::lsp_impl::{Kakehashi, uri_to_url};
 
@@ -249,13 +249,17 @@ impl Kakehashi {
         // diagnosing drift — mirroring `node/parent` and `node/children` — and
         // is distinct from the silent `None` cases above (never-issued ULID,
         // unparsed document), which are expected and collapse to `null` quietly.
-        let Some(result) = resolved else {
-            log::warn!(
-                target: "kakehashi::node",
-                "tracker hit but no matching node in minting layer {} for ulid={} uri={} range=[{},{}) kind={}",
-                layer, ulid, uri, start, end, kind
-            );
-            return None;
+        let result = match resolved {
+            NodeResolution::Found(result) => result,
+            NodeResolution::Ambiguous => return None,
+            NodeResolution::NotFound => {
+                log::warn!(
+                    target: "kakehashi::node",
+                    "tracker hit but no matching node in minting layer {} for ulid={} uri={} range=[{},{}) kind={}",
+                    layer, ulid, uri, start, end, kind
+                );
+                return None;
+            }
         };
         Some((uri, layer, snapshot.incarnation, result))
     }
@@ -405,7 +409,7 @@ impl Kakehashi {
             return Value::Null;
         }
 
-        let Some(picked) = with_resolved_node_pair(
+        let resolution = with_resolved_node_pair(
             &self.language,
             &host_language,
             host_text,
@@ -414,19 +418,20 @@ impl Kakehashi {
             (desc_start, desc_end, desc_kind),
             layer,
             f,
-        ) else {
-            // Unlike the single-id drift warning, pair-resolution failure is
-            // an expected outcome, not just drift: ids minted at the same
-            // depth in *different* regions (two separate code blocks, or the
-            // #350 overlap caveat) legitimately fail to share a tree and
-            // collapse to the contract's null. debug, not warn — a normal
-            // cross-region query must not look like document drift in logs.
-            log::debug!(
-                target: "kakehashi::node",
-                "pair did not resolve in one minting-layer tree (layer {}) for uri={} self=[{},{}) {} descendant=[{},{}) {}",
-                layer, uri, start, end, kind, desc_start, desc_end, desc_kind
-            );
-            return Value::Null;
+        );
+        let picked = match resolution {
+            NodeResolution::Found(picked) => picked,
+            NodeResolution::Ambiguous => return Value::Null,
+            NodeResolution::NotFound => {
+                // Pair-resolution failure is expected: ids minted at the same
+                // depth in different regions legitimately fail to share a tree.
+                log::debug!(
+                    target: "kakehashi::node",
+                    "pair did not resolve in one minting-layer tree (layer {}) for uri={} self=[{},{}) {} descendant=[{},{}) {}",
+                    layer, uri, start, end, kind, desc_start, desc_end, desc_kind
+                );
+                return Value::Null;
+            }
         };
         match picked {
             Some(triple) => self.mint_node_info(&uri, layer, snapshot.incarnation, triple),

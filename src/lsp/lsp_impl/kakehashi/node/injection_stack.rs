@@ -39,6 +39,52 @@ pub(super) struct InjectionLayer {
     /// parent's, so container exclusions (e.g. blockquote `> ` prefixes) are
     /// inherited down the nesting chain.
     pub(super) ranges: Vec<tree_sitter::Range>,
+    /// This layer or one of its ancestors had more than one same-depth
+    /// injection region containing the cursor. A depth-only id cannot identify
+    /// the minting sibling, and descendants cannot recover that lost identity,
+    /// so id-based accessors must reject this layer.
+    ambiguous: bool,
+}
+
+impl InjectionLayer {
+    pub(super) fn is_ambiguous(&self) -> bool {
+        self.ambiguous
+    }
+}
+
+/// Layers rebuilt at an anchor plus ambiguity discovered at an unparseable
+/// next layer.
+///
+/// `terminal_ambiguous` matters when multiple ID-minting candidates existed,
+/// but every bounded reparse failed. There is no tree to append in that case,
+/// yet a missing requested layer must still fail closed as `Ambiguous` rather
+/// than being misreported as ordinary edit drift.
+pub(super) struct InjectionStack {
+    layers: Vec<InjectionLayer>,
+    terminal_ambiguous: bool,
+}
+
+impl std::ops::Deref for InjectionStack {
+    type Target = [InjectionLayer];
+
+    fn deref(&self) -> &Self::Target {
+        &self.layers
+    }
+}
+
+impl InjectionStack {
+    fn missing_layer_is_ambiguous(&self) -> bool {
+        self.terminal_ambiguous || self.last().is_some_and(|entry| entry.ambiguous)
+    }
+}
+
+/// Outcome of resolving a depth-keyed node reference.
+pub(super) enum NodeResolution<R> {
+    Found(R),
+    NotFound,
+    /// Multiple same-depth siblings contain the anchor, so choosing one would
+    /// risk returning a node from a tree that did not mint the id (#350).
+    Ambiguous,
 }
 
 /// Whether `pattern_index` carries an `#offset!` directive. Used to decide if
@@ -71,21 +117,24 @@ fn whole_document_range(host_text: &str) -> tree_sitter::Range {
 /// Regex chain consults the markdown, then python, then regex injection
 /// queries in turn — matching the semantic-tokens parallel collector.
 ///
-/// The returned `Vec` always contains at least the host layer (layer 0); the
+/// The returned stack always contains at least the host layer (layer 0); the
 /// function never fails — a parse/registry miss at any depth simply stops the
-/// walk and returns the layers gathered so far.
+/// walk and returns the layers gathered so far, plus any terminal ambiguity.
 pub(super) fn injection_stack_at(
     coordinator: &LanguageCoordinator,
     host_language: &str,
     host_text: &str,
     host_tree: &tree_sitter::Tree,
     byte: usize,
-) -> Vec<InjectionLayer> {
-    let mut stack: Vec<InjectionLayer> = Vec::new();
-    stack.push(InjectionLayer {
-        tree: host_tree.clone(),
-        ranges: vec![whole_document_range(host_text)],
-    });
+) -> InjectionStack {
+    let mut stack = InjectionStack {
+        layers: vec![InjectionLayer {
+            tree: host_tree.clone(),
+            ranges: vec![whole_document_range(host_text)],
+            ambiguous: false,
+        }],
+        terminal_ambiguous: false,
+    };
 
     let mut current_language: String = host_language.to_string();
 
@@ -106,6 +155,7 @@ pub(super) fn injection_stack_at(
         let parent_layer = stack
             .last()
             .expect("stack always contains at least the host layer");
+        let parent_ambiguous = parent_layer.ambiguous;
         let parent_ranges = parent_layer.ranges.clone();
         let root = parent_layer.tree.root_node();
         let Some(injections) = collect_all_injections(&root, host_text, Some(&injection_query))
@@ -163,42 +213,62 @@ pub(super) fn injection_stack_at(
             }
             candidates.push((region, absolute_ranges));
         }
-        // Smallest effective span wins — that's the most specific injection at
-        // the cursor after offset/include adjustments.
+        // Try smallest effective spans first — the first viable tree is the
+        // most specific injection at the cursor that can actually mint IDs.
         candidates.sort_by_key(|(_, ranges)| total_span(ranges));
-        let Some((region, absolute_ranges)) = candidates.into_iter().next() else {
+        let mut selected = None;
+        let mut viable_candidates = 0usize;
+        for (region, absolute_ranges) in candidates {
+            // Pass the actual injection content to the language resolver so its
+            // shebang / first-line heuristics can fire for nested injections.
+            let content =
+                &host_text[region.content_node.start_byte()..region.content_node.end_byte()];
+            let Some((resolved_lang, _)) =
+                coordinator.resolve_injection_language(&region.language, content)
+            else {
+                continue;
+            };
+            // Only resolved candidates with a loaded grammar can mint node
+            // IDs. `walk_document_layers` likewise skips unresolved or
+            // unloaded siblings rather than visiting them.
+            let Some(language) = coordinator
+                .language_registry_for_parallel()
+                .get(&resolved_lang)
+            else {
+                continue;
+            };
+            // A loaded candidate could have minted IDs during the snapshot
+            // walk even if this bounded reparse transiently times out. Count
+            // it before parsing so a timeout cannot erase sibling ambiguity.
+            viable_candidates += 1;
+            if selected.is_some() {
+                // A selection implies one prior viable candidate; reaching
+                // this branch proves a second, so ambiguity is conclusive.
+                break;
+            }
+            let Some(injected_tree) =
+                parse_with_absolute_ranges(&language, host_text, &absolute_ranges)
+            else {
+                continue;
+            };
+            selected = Some((resolved_lang, injected_tree, absolute_ranges));
+            if parent_ambiguous || viable_candidates > 1 {
+                break;
+            }
+        }
+        // Once an ancestor was ambiguous, every descendant is ambiguous too:
+        // rebuilding the same child path inside the chosen smallest parent
+        // still cannot prove that parent was the sibling which minted the id.
+        let ambiguous = parent_ambiguous || viable_candidates > 1;
+        let Some((resolved_lang, injected_tree, absolute_ranges)) = selected else {
+            stack.terminal_ambiguous = ambiguous;
             break;
         };
 
-        // Pass the actual injection content to the language resolver so its
-        // shebang / first-line heuristics (language-detection-fallback-chain) can fire for nested
-        // injections — passing "" would silently disable detection.
-        let content = &host_text[region.content_node.start_byte()..region.content_node.end_byte()];
-        let Some((resolved_lang, _)) =
-            coordinator.resolve_injection_language(&region.language, content)
-        else {
-            break;
-        };
-        // `get` clones the grammar out (owned `Language`) and releases its
-        // internal DashMap ref before returning, so there is no read guard to
-        // scope around the parse below. Fetched inline (not via a function-
-        // level binding) to keep that intent obvious.
-        let Some(language) = coordinator
-            .language_registry_for_parallel()
-            .get(&resolved_lang)
-        else {
-            break;
-        };
-
-        let Some(injected_tree) =
-            parse_with_absolute_ranges(&language, host_text, &absolute_ranges)
-        else {
-            break;
-        };
-
-        stack.push(InjectionLayer {
+        stack.layers.push(InjectionLayer {
             tree: injected_tree,
             ranges: absolute_ranges,
+            ambiguous,
         });
         current_language = resolved_lang;
     }
@@ -220,23 +290,24 @@ pub(super) fn injection_stack_at(
 /// would otherwise be indistinguishable here (issue #313).
 ///
 /// Across edits the depth index is a weaker guarantee. If an edit makes the
-/// stack shallower than `layer`, `stack.get(layer)` is `None` and we return
-/// `None` — a safe "re-acquire" signal. But `layer` is only a depth, not a tree
-/// identity: an edit that restructures the nesting while keeping
+/// stack shallower than `layer`, resolution returns a safe "re-acquire"
+/// signal: `Ambiguous` when the rebuilt prefix already lost sibling identity,
+/// and `NotFound` otherwise. But `layer` is only a depth, not a tree identity:
+/// an edit that restructures the nesting while keeping
 /// `stack.len() > layer` can leave a *different* tree at that depth. Resolution
 /// then succeeds only if that tree happens to hold a node at the identical
-/// `(start, end, kind)`, and otherwise returns `None`. We do not (and with a
-/// depth index cannot) detect that case, so the "re-acquire on `null`" contract
-/// — not a wrong-tree guarantee — is what protects clients. See the
+/// `(start, end, kind)`, and otherwise returns `NotFound`. The resolver returns
+/// `Ambiguous` when multiple same-depth regions contain the anchor, closing the
+/// known overlapping-sibling path (#350), but a depth index still cannot
+/// detect every cross-edit replacement of one non-overlapping region by
+/// another. See the
 /// layer-discriminator options in lazy-node-identity-tracking for the
 /// region-ULID alternative that would close this gap.
 ///
-/// `f` is invoked at most once, with the matching `Node`. Returning `None`
-/// from `f` is distinguishable from the "no match" outcome only by
-/// the caller's outer `Option` — both surface as `Option<R>` because the
-/// outer call returns `None` when nothing matched. Callers that need to
-/// distinguish "found node but operation returned nothing" (e.g. parent of
-/// a root) from "no match" should use a richer `R` like `Option<T>`.
+/// `f` is invoked at most once, with the matching `Node`, and its result is
+/// wrapped in `NodeResolution::Found`. This preserves `Found(None)` for an
+/// operation such as asking a tree root for its parent, distinct from both
+/// `NotFound` and `Ambiguous`.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn with_resolved_node<R>(
     coordinator: &LanguageCoordinator,
@@ -248,7 +319,7 @@ pub(super) fn with_resolved_node<R>(
     kind: &'static str,
     layer: usize,
     mut f: impl FnMut(tree_sitter::Node<'_>) -> R,
-) -> Option<R> {
+) -> NodeResolution<R> {
     with_resolved_node_ranges(
         coordinator,
         host_language,
@@ -284,18 +355,20 @@ pub(super) fn with_resolved_node_ranges<R>(
     kind: &'static str,
     layer: usize,
     mut f: impl FnMut(tree_sitter::Node<'_>, &[tree_sitter::Range]) -> R,
-) -> Option<R> {
+) -> NodeResolution<R> {
     // Reject obviously-invalid ranges up front — same guard `find_node_at`
     // applies internally, but checking here also avoids the expensive
     // `injection_stack_at` walk (which clones and re-parses layers) for a
     // stale tracker entry whose range no longer fits the document.
     if start > end || end > host_text.len() {
-        return None;
+        return NodeResolution::NotFound;
     }
 
     // Host layer: resolve against the host tree without the stack walk.
     if layer == 0 {
-        let node = find_node_at(host_tree, start, end, kind)?;
+        let Some(node) = find_node_at(host_tree, start, end, kind) else {
+            return NodeResolution::NotFound;
+        };
         // This is the shared prelude for EVERY id-based accessor, so the
         // whole-document range must be O(1): reuse the root's end position
         // instead of whole_document_range, whose byte_to_point would rescan
@@ -308,15 +381,26 @@ pub(super) fn with_resolved_node_ranges<R>(
             start_point: tree_sitter::Point { row: 0, column: 0 },
             end_point: host_tree.root_node().end_position(),
         }];
-        return Some(f(node, &ranges));
+        return NodeResolution::Found(f(node, &ranges));
     }
 
     // Deeper layer: rebuild the stack at `start` and search the minting layer
     // only. `stack.get(layer)` is None when the nesting is now shallower.
     let stack = injection_stack_at(coordinator, host_language, host_text, host_tree, start);
-    let layer_entry = stack.get(layer)?;
-    let node = find_node_at(&layer_entry.tree, start, end, kind)?;
-    Some(f(node, &layer_entry.ranges))
+    let Some(layer_entry) = stack.get(layer) else {
+        return if stack.missing_layer_is_ambiguous() {
+            NodeResolution::Ambiguous
+        } else {
+            NodeResolution::NotFound
+        };
+    };
+    if layer_entry.ambiguous {
+        return NodeResolution::Ambiguous;
+    }
+    let Some(node) = find_node_at(&layer_entry.tree, start, end, kind) else {
+        return NodeResolution::NotFound;
+    };
+    NodeResolution::Found(f(node, &layer_entry.ranges))
 }
 
 /// Resolve **two** tracked nodes in the **same** minting layer and run `f` on
@@ -328,9 +412,9 @@ pub(super) fn with_resolved_node_ranges<R>(
 /// start byte — the method's contract requires the descendant to lie inside
 /// `node`, so when the pair is genuinely related the smallest-region path at
 /// that byte reaches the layer that minted both. An unrelated pair (descendant
-/// outside `node`, or minted from a different same-depth region — the #350
-/// overlap caveat applies here too) simply fails one of the lookups and
-/// collapses to `None`, the protocol's re-acquire signal.
+/// outside `node`, or minted from different disjoint regions) returns
+/// `NotFound`. Overlapping same-depth ancestry returns `Ambiguous` instead;
+/// both outcomes surface as the protocol's null re-acquire signal.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn with_resolved_node_pair<R>(
     coordinator: &LanguageCoordinator,
@@ -341,7 +425,7 @@ pub(super) fn with_resolved_node_pair<R>(
     descendant: (usize, usize, &'static str),
     layer: usize,
     mut f: impl FnMut(tree_sitter::Node<'_>, tree_sitter::Node<'_>) -> R,
-) -> Option<R> {
+) -> NodeResolution<R> {
     let (node_start, node_end, node_kind) = node;
     let (desc_start, desc_end, desc_kind) = descendant;
     // Same defensive range guards as the single-node path: a stale tracker
@@ -351,40 +435,58 @@ pub(super) fn with_resolved_node_pair<R>(
         || desc_start > desc_end
         || desc_end > host_text.len()
     {
-        return None;
+        return NodeResolution::NotFound;
     }
 
     // Host layer: both resolve against the host tree, no stack walk.
     if layer == 0 {
-        let resolved_node = find_node_at(host_tree, node_start, node_end, node_kind)?;
-        let resolved_desc = find_node_at(host_tree, desc_start, desc_end, desc_kind)?;
-        return Some(f(resolved_node, resolved_desc));
+        let Some(resolved_node) = find_node_at(host_tree, node_start, node_end, node_kind) else {
+            return NodeResolution::NotFound;
+        };
+        let Some(resolved_desc) = find_node_at(host_tree, desc_start, desc_end, desc_kind) else {
+            return NodeResolution::NotFound;
+        };
+        return NodeResolution::Found(f(resolved_node, resolved_desc));
     }
 
     let stack = injection_stack_at(coordinator, host_language, host_text, host_tree, desc_start);
-    let layer_entry = stack.get(layer)?;
-    let resolved_node = find_node_at(&layer_entry.tree, node_start, node_end, node_kind)?;
-    let resolved_desc = find_node_at(&layer_entry.tree, desc_start, desc_end, desc_kind)?;
-    Some(f(resolved_node, resolved_desc))
+    let Some(layer_entry) = stack.get(layer) else {
+        return if stack.missing_layer_is_ambiguous() {
+            NodeResolution::Ambiguous
+        } else {
+            NodeResolution::NotFound
+        };
+    };
+    if layer_entry.ambiguous {
+        return NodeResolution::Ambiguous;
+    }
+    let Some(resolved_node) = find_node_at(&layer_entry.tree, node_start, node_end, node_kind)
+    else {
+        return NodeResolution::NotFound;
+    };
+    let Some(resolved_desc) = find_node_at(&layer_entry.tree, desc_start, desc_end, desc_kind)
+    else {
+        return NodeResolution::NotFound;
+    };
+    NodeResolution::Found(f(resolved_node, resolved_desc))
 }
 
 /// Collect the injection languages along the cursor's injection path at
 /// `byte`, at all depths that are currently parseable.
 ///
-/// Unlike a whole-document scan, this follows only the single smallest-
-/// containing injection at each level — exactly the path `injection_stack_at`
-/// would take — so its cost is O(depth at the cursor) rather than O(all
+/// Unlike a whole-document scan, this follows only the first viable candidate
+/// among the smallest-first containing injections at each level — exactly the
+/// path `injection_stack_at` would take — so its cost is O(depth at the cursor)
+/// rather than O(all
 /// injections in the document). That matters for large files with many code
 /// blocks: we only need grammars for the layers that actually wrap the cursor.
 ///
-/// A language is *recorded* as soon as its `@injection.language` is resolved,
-/// even if its parser is not yet loaded. But the walk only *descends* into a
-/// layer whose parser is already in the registry — parsing requires a loaded
-/// grammar. This makes the function a single fixpoint step: callers that
-/// auto-install the returned set and call again will, on the next pass, be
-/// able to parse one level deeper and surface the next language on the path.
-/// Iterating to a fixpoint discovers the full nested chain at the cursor
-/// (Markdown → Python → Regex …) without ever parsing with a missing grammar.
+/// Language resolution loads the parser before returning a canonical language.
+/// The walk descends only while that loaded grammar remains in the registry;
+/// a concurrent unload is treated like any unavailable candidate and scanning
+/// continues with the next containing sibling. Iterating this discovery to a
+/// fixpoint discovers the full nested chain at the cursor (Markdown → Python →
+/// Regex …) without ever parsing with a missing grammar.
 ///
 /// Bounded by [`MAX_INJECTION_DEPTH`] so a misconfigured grammar cycle cannot
 /// loop forever.
@@ -443,34 +545,41 @@ pub(super) fn collect_injection_languages_at(
             candidates.push((region, absolute_ranges));
         }
         candidates.sort_by_key(|(_, ranges)| total_span(ranges));
-        let Some((region, absolute_ranges)) = candidates.into_iter().next() else {
-            break;
-        };
+        let mut selected = None;
+        for (region, absolute_ranges) in candidates {
+            let content =
+                &host_text[region.content_node.start_byte()..region.content_node.end_byte()];
+            let Some((resolved_lang, _)) =
+                coordinator.resolve_injection_language(&region.language, content)
+            else {
+                continue;
+            };
+            languages.insert(resolved_lang.clone());
 
-        let content = &host_text[region.content_node.start_byte()..region.content_node.end_byte()];
-        let Some((resolved_lang, _)) =
-            coordinator.resolve_injection_language(&region.language, content)
-        else {
+            // `resolve_injection_language` only returns after successfully
+            // loading a parser. A miss here therefore means it was unloaded
+            // concurrently; mirror stack rebuilding and try the next sibling.
+            let Some(language) = coordinator
+                .language_registry_for_parallel()
+                .get(&resolved_lang)
+            else {
+                continue;
+            };
+            let Some(injected_tree) =
+                parse_with_absolute_ranges(&language, host_text, &absolute_ranges)
+            else {
+                // Match `injection_stack_at`: an unavailable or transiently
+                // unparseable smallest candidate must not hide a later viable
+                // sibling at the same depth.
+                continue;
+            };
+            selected = Some((resolved_lang, injected_tree, absolute_ranges));
             break;
-        };
-        languages.insert(resolved_lang.clone());
+        }
 
-        // Descend only if the parser is loaded; otherwise stop and let the
-        // caller install it, then re-run for the next tier (fixpoint).
-        // `get` returns an owned `Language` (clones out, drops its DashMap ref
-        // internally), so no read guard spans the parse; fetched inline.
-        let Some(language) = coordinator
-            .language_registry_for_parallel()
-            .get(&resolved_lang)
-        else {
+        let Some((resolved_lang, injected_tree, absolute_ranges)) = selected else {
             break;
         };
-        let Some(injected_tree) =
-            parse_with_absolute_ranges(&language, host_text, &absolute_ranges)
-        else {
-            break;
-        };
-
         current_tree = injected_tree;
         parent_ranges = absolute_ranges;
         current_lang = resolved_lang;
@@ -785,15 +894,12 @@ pub(crate) fn collect_document_layer_trees(
 /// [`collect_injection_languages_in_document`]. `byte_filter` prunes regions
 /// (and their entire subtrees) that don't intersect the given host-byte range.
 ///
-/// Known limitation (#350): when two injection regions at the same depth
-/// **overlap**, the walker visits both, but [`with_resolved_node`] resolves a
-/// minted id by rebuilding the cursor-path stack, which keeps only the
-/// smallest region containing the byte — so an id minted from the larger
-/// sibling may resolve in the **wrong same-depth region** (if that region's
-/// tree happens to hold a node with the identical `(start, end, kind)`) or
-/// return `null` (the protocol's re-acquire signal). Same depth-as-identity
-/// weakness documented in lazy-node-identity-tracking; disjoint same-depth
-/// regions (the norm) are unaffected.
+/// Overlapping same-depth regions remain unaddressable by the depth index:
+/// the walker visits both, while the cursor-path stack keeps the smallest.
+/// [`with_resolved_node`] therefore rejects such an ambiguous layer instead
+/// of risking wrong-tree resolution (#350). A durable region identity is
+/// still required to make those ids navigable; disjoint same-depth regions
+/// (the norm) are unaffected.
 pub(in crate::lsp::lsp_impl::kakehashi) fn walk_document_layers(
     coordinator: &LanguageCoordinator,
     host_language: &str,
@@ -892,6 +998,67 @@ fn walk_child_layers(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unparseable_ambiguous_next_layer_stays_ambiguous() {
+        let stack = InjectionStack {
+            layers: Vec::new(),
+            terminal_ambiguous: true,
+        };
+
+        assert!(stack.missing_layer_is_ambiguous());
+    }
+
+    #[test]
+    fn language_discovery_skips_an_unresolvable_smaller_sibling() {
+        let query_root = tempfile::tempdir().expect("create query root");
+        let query_dir = query_root.path().join("queries/markdown");
+        std::fs::create_dir_all(&query_dir).expect("create markdown query dir");
+        std::fs::write(
+            query_dir.join("injections.scm"),
+            r#"
+            ((paragraph) @injection.content
+              (#set! injection.language "definitely_unknown_language")
+              (#set! injection.include-children))
+            ((section) @injection.content
+              (#set! injection.language "lua")
+              (#set! injection.include-children))
+            "#,
+        )
+        .expect("write fallback injection query");
+
+        let grammar_root = std::env::var("TREE_SITTER_GRAMMARS")
+            .unwrap_or_else(|_| "deps/test/kakehashi".to_string());
+        let coordinator = LanguageCoordinator::new();
+        let settings = crate::config::WorkspaceSettings {
+            search_paths: vec![
+                query_root.path().to_string_lossy().into_owned(),
+                grammar_root,
+            ],
+            ..Default::default()
+        };
+        let _ = coordinator.load_settings(&settings);
+        assert!(coordinator.ensure_language_loaded("markdown").success);
+        assert!(
+            coordinator
+                .language_registry_for_parallel()
+                .get("lua")
+                .is_none(),
+            "fallback grammar starts unloaded"
+        );
+
+        let text = "# heading\n\nfallback here\n";
+        let mut pool = coordinator.create_document_parser_pool();
+        let mut parser = pool.acquire("markdown").expect("acquire markdown parser");
+        let tree = parser.parse(text, None).expect("parse markdown");
+        pool.release("markdown".to_string(), parser);
+        let byte = text.find("fallback").unwrap();
+
+        let languages = collect_injection_languages_at(&coordinator, "markdown", text, &tree, byte);
+
+        assert!(languages.contains("lua"));
+        assert!(!languages.contains("definitely_unknown_language"));
+    }
 
     /// The stored layer trees must be exactly what the inline walk would
     /// visit over the same (text, tree): same (language, depth) sequence and
@@ -1023,6 +1190,177 @@ mod tests {
         assert_eq!(
             ranges[0].end_point,
             tree_sitter::Point { row: 3, column: 0 }
+        );
+    }
+
+    #[test]
+    fn overlapping_same_depth_regions_do_not_resolve_an_ambiguous_node() {
+        let query_root = tempfile::tempdir().expect("create query root");
+        let query_dir = query_root.path().join("queries/markdown");
+        std::fs::create_dir_all(&query_dir).expect("create markdown query dir");
+        std::fs::write(
+            query_dir.join("injections.scm"),
+            r#"
+            ((section) @injection.content
+              (#set! injection.language "markdown")
+              (#set! injection.include-children))
+            ((paragraph) @injection.content
+              (#set! injection.language "markdown")
+              (#set! injection.include-children))
+            "#,
+        )
+        .expect("write overlapping injection query");
+
+        let grammar_root = std::env::var("TREE_SITTER_GRAMMARS")
+            .unwrap_or_else(|_| "deps/test/kakehashi".to_string());
+        let coordinator = LanguageCoordinator::new();
+        let settings = crate::config::WorkspaceSettings {
+            search_paths: vec![
+                query_root.path().to_string_lossy().into_owned(),
+                grammar_root,
+            ],
+            ..Default::default()
+        };
+        let _ = coordinator.load_settings(&settings);
+        assert!(
+            coordinator.ensure_language_loaded("markdown").success,
+            "markdown parser fixture is required"
+        );
+
+        let text = "# heading\n\nambiguous paragraph\n";
+        let mut pool = coordinator.create_document_parser_pool();
+        let mut parser = pool.acquire("markdown").expect("acquire markdown parser");
+        let tree = parser.parse(text, None).expect("parse markdown");
+        pool.release("markdown".to_string(), parser);
+
+        let paragraph_byte = text.find("ambiguous").unwrap();
+        let mut paragraph = tree
+            .root_node()
+            .descendant_for_byte_range(paragraph_byte, paragraph_byte)
+            .expect("paragraph node");
+        while paragraph.kind() != "paragraph" {
+            paragraph = paragraph.parent().expect("paragraph ancestor");
+        }
+        assert_eq!(paragraph.kind(), "paragraph");
+
+        let stack = injection_stack_at(
+            &coordinator,
+            "markdown",
+            text,
+            &tree,
+            paragraph.start_byte(),
+        );
+        assert!(
+            stack.len() > 2,
+            "recursive markdown fixture has a child layer"
+        );
+        assert!(stack[1].ambiguous, "the overlapping siblings are detected");
+        assert!(
+            stack[2].ambiguous,
+            "an ambiguous ancestor taints its descendant layer"
+        );
+
+        let resolved = with_resolved_node(
+            &coordinator,
+            "markdown",
+            text,
+            &tree,
+            paragraph.start_byte(),
+            paragraph.end_byte(),
+            paragraph.kind(),
+            1,
+            |node| (node.start_byte(), node.end_byte(), node.kind()),
+        );
+
+        assert!(
+            matches!(resolved, NodeResolution::Ambiguous),
+            "a depth-only id cannot prove which overlapping sibling minted it"
+        );
+
+        let pair = with_resolved_node_pair(
+            &coordinator,
+            "markdown",
+            text,
+            &tree,
+            (
+                paragraph.start_byte(),
+                paragraph.end_byte(),
+                paragraph.kind(),
+            ),
+            (
+                paragraph.start_byte(),
+                paragraph.end_byte(),
+                paragraph.kind(),
+            ),
+            1,
+            |_, _| (),
+        );
+        assert!(
+            matches!(pair, NodeResolution::Ambiguous),
+            "pair resolution must reject the same ambiguous layer"
+        );
+
+        let truncated = with_resolved_node(
+            &coordinator,
+            "markdown",
+            text,
+            &tree,
+            paragraph.start_byte(),
+            paragraph.end_byte(),
+            paragraph.kind(),
+            stack.len() + 1,
+            |_| (),
+        );
+        assert!(
+            matches!(truncated, NodeResolution::Ambiguous),
+            "a truncated stack below an ambiguous ancestor is still ambiguous"
+        );
+    }
+
+    #[test]
+    fn unavailable_overlapping_region_does_not_make_loaded_layer_ambiguous() {
+        let query_root = tempfile::tempdir().expect("create query root");
+        let query_dir = query_root.path().join("queries/markdown");
+        std::fs::create_dir_all(&query_dir).expect("create markdown query dir");
+        std::fs::write(
+            query_dir.join("injections.scm"),
+            r#"
+            ((section) @injection.content
+              (#set! injection.language "unavailable-language")
+              (#set! injection.include-children))
+            ((paragraph) @injection.content
+              (#set! injection.language "markdown")
+              (#set! injection.include-children))
+            "#,
+        )
+        .expect("write overlapping injection query");
+
+        let grammar_root = std::env::var("TREE_SITTER_GRAMMARS")
+            .unwrap_or_else(|_| "deps/test/kakehashi".to_string());
+        let coordinator = LanguageCoordinator::new();
+        let settings = crate::config::WorkspaceSettings {
+            search_paths: vec![
+                query_root.path().to_string_lossy().into_owned(),
+                grammar_root,
+            ],
+            ..Default::default()
+        };
+        let _ = coordinator.load_settings(&settings);
+        assert!(coordinator.ensure_language_loaded("markdown").success);
+
+        let text = "# heading\n\nresolvable paragraph\n";
+        let mut pool = coordinator.create_document_parser_pool();
+        let mut parser = pool.acquire("markdown").expect("acquire markdown parser");
+        let tree = parser.parse(text, None).expect("parse markdown");
+        pool.release("markdown".to_string(), parser);
+        let byte = text.find("resolvable").expect("paragraph byte");
+
+        let stack = injection_stack_at(&coordinator, "markdown", text, &tree, byte);
+
+        assert!(stack.len() > 1, "the loaded paragraph layer materializes");
+        assert!(
+            !stack[1].ambiguous,
+            "a sibling which cannot mint IDs must not taint the loaded layer"
         );
     }
 }
