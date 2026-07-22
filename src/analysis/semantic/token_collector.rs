@@ -454,9 +454,8 @@ pub(super) fn collect_host_tokens(
             .copied()
             .unwrap_or(0);
 
-    // Most captures are single-line. Materialize the content-local line table
-    // only if a multiline capture actually needs random row access.
-    let mut content_lines = None;
+    // Split content text into lines for byte offset calculations.
+    let content_lines: Vec<&str> = text.lines().collect();
 
     // Lazily-built byte->UTF-16 lookup per host line, shared across every
     // capture below. See `cached_line_index`.
@@ -545,8 +544,6 @@ pub(super) fn collect_host_tokens(
                     node_byte_len,
                 });
             } else {
-                let content_lines =
-                    content_lines.get_or_insert_with(|| text.lines().collect::<Vec<_>>());
                 // Compute effective prefix widths: injection-level widths
                 // are passed in; HOST-level nodes detect structural prefix
                 // children to avoid spanning line-leading prefixes.
