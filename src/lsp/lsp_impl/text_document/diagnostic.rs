@@ -28,7 +28,9 @@ use crate::lsp::aggregation::server::{
     dispatch_host_preferred, dispatch_preferred,
 };
 use crate::lsp::bridge::{LanguageServerPool, RegionOffset};
-use crate::lsp::diagnostic_cache::{DiagnosticSource, cached_push_diagnostics, push_slot_servers};
+use crate::lsp::diagnostic_cache::{
+    DiagnosticCoverageStamp, DiagnosticSource, cached_push_diagnostics, push_slot_servers,
+};
 use crate::lsp::lsp_impl::bridge_context::{
     DocumentRequestContext, HostRequestContext, resolve_aggregation_config_from_settings,
 };
@@ -124,20 +126,16 @@ impl Kakehashi {
         // refresh redundant, never skips a needed one. Recorded only on the paths
         // that return a report for this open doc (not the cancel path).
         //
-        // Known limitation (deferred epoch class, like `did_close.rs`): if this doc
-        // is closed and re-opened while this pull is in flight, `forget_coverage`
-        // resets the entry to 0 and this captured version becomes stale-HIGH for the
-        // re-opened incarnation. `mark_served` then sets `served` above the re-opened
-        // `current`, leaving the gate briefly stuck-clean → a needed refresh can be
-        // skipped (narrow staleness) until `current` catches back up. Closing this
-        // fully needs a per-incarnation epoch; the editor's own re-open pull
-        // self-heals it.
-        let served_version = self.diagnostics.current_version(&uri);
+        // The stamp includes the coverage-entry lifetime: if this document closes
+        // and reopens while the pull is in flight, the eventual `mark_served` is a
+        // no-op against the new lifetime rather than poisoning it with a stale-high
+        // version (#745).
+        let coverage_stamp = self.diagnostics.coverage_stamp(&uri);
 
         // Get the language for this document
         let Some(language_name) = self.document_language(&uri) else {
             log::debug!(target: "kakehashi::diagnostic", "No language detected");
-            self.mark_pull_covered(&uri, served_version);
+            self.mark_pull_covered(&uri, coverage_stamp);
             return Ok(empty_diagnostic_report());
         };
 
@@ -158,7 +156,7 @@ impl Kakehashi {
                 "no diagnostic layer enabled for {} (layers.aggregation priorities / bridge._self)",
                 language_name
             );
-            self.mark_pull_covered(&uri, served_version);
+            self.mark_pull_covered(&uri, coverage_stamp);
             return Ok(empty_diagnostic_report());
         }
 
@@ -402,7 +400,7 @@ impl Kakehashi {
                     .request_pull_diagnostic_refresh(true);
             }
         } else {
-            self.mark_pull_covered(&uri, served_version);
+            self.mark_pull_covered(&uri, coverage_stamp);
         }
 
         let items = combine_layer_diagnostics(&layer_cfg, virt_items, host_items);
@@ -424,8 +422,8 @@ impl Kakehashi {
     /// coverage `served` marker and clear any earlier degraded-pull debt —
     /// every covering exit must do both, or a stale debt would later fire an
     /// unnecessary (though coverage-gated) recovery refresh.
-    fn mark_pull_covered(&self, uri: &Url, served_version: u64) {
-        self.diagnostics.mark_served(uri, served_version);
+    fn mark_pull_covered(&self, uri: &Url, coverage_stamp: Option<DiagnosticCoverageStamp>) {
+        self.diagnostics.mark_served(uri, coverage_stamp);
         self.diagnostics.forget_degraded_pull(uri);
     }
 

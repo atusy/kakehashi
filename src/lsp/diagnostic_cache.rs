@@ -392,12 +392,18 @@ pub(crate) struct DiagnosticAggregator {
     forwarded_refresh_debounce: Mutex<ForwardedRefreshDebounce>,
     /// Per-host coverage versions for the refresh **coverage gate** (#497, commit 2).
     /// `current` bumps on every set-changing republish (the editor's pulled view is
-    /// now stale); `served` records the `current` a pull was answered against. A
+    /// now stale); a pull captures the epoch plus `current` version through
+    /// [`Self::coverage_stamp`], and `served` records that version. A
     /// gated refresh fires only when some host has `current > served` ("dirty") — so
     /// a change the editor already re-pulled (its own `didChange` pull advances
     /// `served`) sends no redundant nudge. Drives [`Self::bump_current`],
     /// [`Self::mark_served`], [`Self::is_dirty`]; forgotten on `didClose`.
     coverage: Mutex<HashMap<Url, HostCoverage>>,
+    /// Mints a distinct lifetime for each newly-created coverage entry. A pull
+    /// captures this epoch and the current version in [`Self::coverage_stamp`];
+    /// after `didClose` removes the entry, its completion must not advance a
+    /// later reopened lifetime's `served` value.
+    next_coverage_epoch: AtomicU64,
     /// Hosts whose LAST pull was answered degraded — the bounded parse wait
     /// lapsed while the aggregator held live region pushes, so the response
     /// was missing the region fold and deliberately did not `mark_served`.
@@ -580,13 +586,21 @@ impl PartialEq for WireAdmit {
 impl Eq for WireAdmit {}
 
 /// Per-host coverage versions for the refresh gate (#497, commit 2).
-#[derive(Default, Clone, Copy)]
+#[derive(Clone, Copy)]
 struct HostCoverage {
+    epoch: u64,
     /// Bumped on each set-changing republish for this host.
     current: u64,
     /// The `current` value a pull was last answered against (a lower bound — read
     /// before the pull's fold, so never ahead of what the editor actually received).
     served: u64,
+}
+
+/// The diagnostic coverage observed when a pull begins.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DiagnosticCoverageStamp {
+    epoch: u64,
+    version: u64,
 }
 
 /// Always-on diagnostic-path counters (#533). The four counts trace the refresh
@@ -1259,6 +1273,7 @@ impl DiagnosticAggregator {
             coverage.insert(
                 host.clone(),
                 HostCoverage {
+                    epoch: self.next_coverage_epoch.fetch_add(1, Ordering::Relaxed),
                     current: 1,
                     served: 0,
                 },
@@ -1266,9 +1281,10 @@ impl DiagnosticAggregator {
         }
     }
 
-    /// Read a host's current coverage version (`0` if it has never changed). A pull
-    /// captures this *before* its fold and later passes it to [`Self::mark_served`],
-    /// so `served` is a lower bound (never ahead of the set the editor received).
+    /// Read a host's current coverage version (`0` if it has never changed).
+    /// Test-only numeric view; production pulls use [`Self::coverage_stamp`] so
+    /// close/reopen lifetimes cannot be confused (#745).
+    #[cfg(test)]
     pub(crate) fn current_version(&self, host: &Url) -> u64 {
         self.coverage
             .lock()
@@ -1277,21 +1293,39 @@ impl DiagnosticAggregator {
             .map_or(0, |c| c.current)
     }
 
+    /// Capture both the current version and the coverage-entry lifetime.
+    /// Returns `None` when the host has no active coverage entry, including
+    /// after `didClose`; passing that through to [`Self::mark_served`] is a no-op.
+    pub(crate) fn coverage_stamp(&self, host: &Url) -> Option<DiagnosticCoverageStamp> {
+        self.coverage
+            .lock()
+            .recover_poison("DiagnosticAggregator::coverage")
+            .get(host)
+            .map(|coverage| DiagnosticCoverageStamp {
+                epoch: coverage.epoch,
+                version: coverage.current,
+            })
+    }
+
     /// Record that a pull was answered for `host` against coverage version
-    /// `version` (#497): the editor now has the set as of `version`, so it is no
+    /// `stamp` (#497): the editor now has the set as of its version, so it is no
     /// longer dirty up to there. Pure bookkeeping — it must **never** bump `current`
     /// or republish, so a refresh→pull→`mark_served` cannot beget another refresh
     /// (keeps #496/#499 loop-safety). Monotonic via `max`, so a slower concurrent
-    /// pull can't regress `served`. No-op for a host with no coverage entry (nothing
-    /// was ever pushed → nothing to be dirty about).
-    pub(crate) fn mark_served(&self, host: &Url, version: u64) {
+    /// pull can't regress `served`. A missing stamp or one from a closed document
+    /// lifetime is a no-op (#745).
+    pub(crate) fn mark_served(&self, host: &Url, stamp: Option<DiagnosticCoverageStamp>) {
+        let Some(stamp) = stamp else {
+            return;
+        };
         if let Some(cov) = self
             .coverage
             .lock()
             .recover_poison("DiagnosticAggregator::coverage")
             .get_mut(host)
+            && cov.epoch == stamp.epoch
         {
-            cov.served = cov.served.max(version);
+            cov.served = cov.served.max(stamp.version);
         }
     }
 
@@ -3771,7 +3805,8 @@ mod tests {
         agg.bump_current(&h); // current=2
         assert!(!agg.try_begin_refresh(false), "in-flight → pending");
         // The editor pulls and is answered against the latest version → not dirty.
-        agg.mark_served(&h, 2);
+        let stamp = agg.coverage_stamp(&h);
+        agg.mark_served(&h, stamp);
         assert!(!agg.is_dirty(), "the pull covered both changes");
         // Completion: pending was set, but nothing is dirty and it wasn't forced →
         // the trailing is suppressed.
@@ -3829,8 +3864,15 @@ mod tests {
         agg.bump_current(&h);
         assert_eq!(agg.current_version(&h), 2);
         // `served` is monotonic: a stale (lower) mark can't regress it.
-        agg.mark_served(&h, 2);
-        agg.mark_served(&h, 1);
+        let current = agg.coverage_stamp(&h).expect("coverage exists");
+        agg.mark_served(&h, Some(current));
+        agg.mark_served(
+            &h,
+            Some(DiagnosticCoverageStamp {
+                version: 1,
+                ..current
+            }),
+        );
         assert!(
             !agg.is_dirty(),
             "served caught up and a stale mark didn't regress it"
@@ -3844,6 +3886,26 @@ mod tests {
             "a closed host no longer keeps the workspace dirty"
         );
         assert_eq!(agg.current_version(&h), 0, "re-open starts fresh");
+    }
+
+    #[test]
+    fn stale_pull_does_not_mark_reopened_coverage_served() {
+        let agg = DiagnosticAggregator::new();
+        let h = host();
+        agg.bump_current(&h);
+        agg.bump_current(&h);
+        let stale = agg
+            .coverage_stamp(&h)
+            .expect("coverage exists before close");
+
+        agg.forget_coverage(&h);
+        agg.bump_current(&h);
+        agg.mark_served(&h, Some(stale));
+
+        assert!(
+            agg.is_dirty(),
+            "a pull from the closed lifetime must not cover the reopened host"
+        );
     }
 
     #[test]
