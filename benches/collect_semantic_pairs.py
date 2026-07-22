@@ -38,6 +38,17 @@ DEFAULT_SCENARIOS = ",".join(
     ]
 )
 
+ISOLATED_ENVIRONMENT_KEYS = {
+    "PATH",
+    "HOME",
+    "TMPDIR",
+    "CARGO_HOME",
+    "CARGO_TERM_COLOR",
+    "LANG",
+    "LC_ALL",
+    "RUSTUP_HOME",
+}
+
 
 def terminate_process_group(process: subprocess.Popen[str]) -> None:
     try:
@@ -247,6 +258,8 @@ def parse_server_env(values: list[str]) -> dict[str, str]:
         key, separator, item = value.partition("=")
         if not separator or not key:
             raise ValueError(f"server env must be KEY=VALUE: {value}")
+        if key in ISOLATED_ENVIRONMENT_KEYS:
+            raise ValueError(f"server env uses reserved collector key: {key}")
         parsed[key] = item
     return parsed
 
