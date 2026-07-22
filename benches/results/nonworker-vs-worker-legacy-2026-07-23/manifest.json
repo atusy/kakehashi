@@ -1,9 +1,9 @@
 {
   "attestations": {
-    "binary_a": "befb25b0e20d04a3c90a08fbedd719a9039fe56016310ab4c6a207d28b89083b",
-    "binary_b": "ccf844a39bbfd383e098ead70fef6b3cb5c708215fa036436c139c4adf0546de",
-    "fixture": "0dfa7d41e962f6fb08877e2d0298c574a4e4ccc44202008ec08b2efe9d94258a",
-    "harness": "2bcec70752dc590ff693f5bc920d5ee6b9ad2b6648924a633b8b598c2094d4c0"
+    "binary_a": "e84b9b0cbdd8def5484643f2be22c46f024c6cded794dbb45bc024320abf7694",
+    "binary_b": "e347db7402d82c46e2ff0203b12fe48165a7b2717e6f0f44e4452dfe173290d8",
+    "fixture": "e808aee646a8833e7ef6166a01788996412769afa41b602b93b1271775a2315a",
+    "harness": "a66f8787c5dc0c019909ebc41a12a0cc2293ca87709b2b141bb88da637bad0bf"
   },
   "configuration": {
     "iterations": 30,
@@ -49,8 +49,8 @@
       "HOME": "<TEMP>/home",
       "LANG": "C",
       "LC_ALL": "C",
-      "PATH": "/Users/atusy/.local/bin:/Users/atusy/.bun/install/global/node_modules/@openai/codex-darwin-arm64/vendor/aarch64-apple-darwin/codex-path:/Users/atusy/.codex/tmp/arg0/codex-arg0NTfz1D:/opt/homebrew/bin:/opt/homebrew/sbin:/nix/var/nix/profiles/default/bin:/Users/atusy/.nix-profile/bin:/run/current-system/sw/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/Users/atusy/.local/lastresort/bin",
-      "RUSTUP_HOME": "/Users/atusy/.rustup",
+      "PATH": "<USER_HOME_PATH>:<USER_HOME_PATH>:<USER_HOME_PATH>:/opt/homebrew/bin:/opt/homebrew/sbin:/nix/var/nix/profiles/default/bin:<USER_HOME_PATH>:/run/current-system/sw/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:<USER_HOME_PATH>",
+      "RUSTUP_HOME": "<USER_HOME>/.rustup",
       "TMPDIR": "<TEMP>/tmp"
     },
     "cc": "Apple clang version 21.0.0 (clang-2100.1.1.101)\nTarget: arm64-apple-darwin25.5.0\nThread model: posix\nInstalledDir: /Library/Developer/CommandLineTools/usr/bin",
@@ -65,8 +65,8 @@
       "KAKEHASHI_TREE_WORKER_MODE": "legacy",
       "LANG": "C",
       "LC_ALL": "C",
-      "PATH": "/Users/atusy/.local/bin:/Users/atusy/.bun/install/global/node_modules/@openai/codex-darwin-arm64/vendor/aarch64-apple-darwin/codex-path:/Users/atusy/.codex/tmp/arg0/codex-arg0NTfz1D:/opt/homebrew/bin:/opt/homebrew/sbin:/nix/var/nix/profiles/default/bin:/Users/atusy/.nix-profile/bin:/run/current-system/sw/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/Users/atusy/.local/lastresort/bin",
-      "RUSTUP_HOME": "/Users/atusy/.rustup",
+      "PATH": "<USER_HOME_PATH>:<USER_HOME_PATH>:<USER_HOME_PATH>:/opt/homebrew/bin:/opt/homebrew/sbin:/nix/var/nix/profiles/default/bin:<USER_HOME_PATH>:/run/current-system/sw/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:<USER_HOME_PATH>",
+      "RUSTUP_HOME": "<USER_HOME>/.rustup",
       "TMPDIR": "<TEMP>/tmp"
     },
     "sdk": "26.5",
@@ -86,57 +86,57 @@
     }
   },
   "fixture_archive": "fixture",
-  "fixture_archive_sha256": "0dfa7d41e962f6fb08877e2d0298c574a4e4ccc44202008ec08b2efe9d94258a",
+  "fixture_archive_sha256": "e808aee646a8833e7ef6166a01788996412769afa41b602b93b1271775a2315a",
   "fixture_manifest": "fixture-manifest.json",
-  "fixture_manifest_sha256": "ea996c0f076ce059333bb8d6974bb39907f4d16325ddd28e7b45a7f50cf1fcbe",
+  "fixture_manifest_sha256": "ed20842341ee9fd3d848e42873eb7d3fef2af461e2f374ec93299312853631e9",
   "raw_files": [
     {
       "order": "AB",
       "pair_index": 1,
       "samples": "pair-1.json",
-      "samples_sha256": "d6b81c6a41797c2927870ea7f7581f347fddf726f61b37147fc9284c4517f1c9",
+      "samples_sha256": "aec64631fb0b69305106af66f7effda6b6918fbfcda8eb267faa60646aa5cee0",
       "stdout": "pair-1.txt",
-      "stdout_sha256": "38c0b3e8dc8447d8c9ace83fc2d4c08e23d379b8a216c1e39a6130222b8547ca"
+      "stdout_sha256": "c6034a95b5ae9b0488bf8e1d733b5242a6a01df8bd3229a938e63a1912cca908"
     },
     {
       "order": "BA",
       "pair_index": 2,
       "samples": "pair-2.json",
-      "samples_sha256": "42d71d07dbab3afd277462966aed6f535b49e663ff33237e1e9645712ac1064a",
+      "samples_sha256": "6e5a77f1fe252506aa58fd2da4cc29f26ac22064da0eb0515e0d5650d1f04984",
       "stdout": "pair-2.txt",
-      "stdout_sha256": "f83e3e17fbfd8f21044c9636b9707f10599c9163c518a4107b77b9985bb88eb1"
+      "stdout_sha256": "9f01803103d1873a43b0bd91204f8a67c4f8a4c10d0269ff7fd959a862276cd3"
     },
     {
       "order": "AB",
       "pair_index": 3,
       "samples": "pair-3.json",
-      "samples_sha256": "230170a2b560d3d1d93c798ca7ac68b58a6ea2e6c1fccf47c6bb015ae25c464a",
+      "samples_sha256": "ae9c9953a2456772aa70162b0be4063f1ac4297ae0f028f918ac1613d6c02ab1",
       "stdout": "pair-3.txt",
-      "stdout_sha256": "e36454a166f31c14c44a6bc7bc623d4a28e65474511fff4088650bb21c475e54"
+      "stdout_sha256": "4226e44a6223300fa2d4a41c03bfa4ffc0fbc95cdca3ef7a2d8e33081c68711d"
     },
     {
       "order": "BA",
       "pair_index": 4,
       "samples": "pair-4.json",
-      "samples_sha256": "78dfe78d91a4dc125dd1ce5e9677d3a2b7e4e6106c8fe6e99f918016621722ca",
+      "samples_sha256": "2777cd4df9cf7b2d82b8c538d1019d6bd94246a7e0a3877c34612a8f8bcf31f4",
       "stdout": "pair-4.txt",
-      "stdout_sha256": "d522a446d0da355e02387e9bb567390e74f3409b3f7ea0fdbd9addbb5cb011d9"
+      "stdout_sha256": "c7c86e53b40f775894ec11a0e9f2685af171178a0b628299f0600d5028eec936"
     }
   ],
   "schema_version": 1,
   "source": {
     "a_commit": "a1278be5fdff24d109d9e03134c6bdb880577f64",
-    "a_ref": "a1278be5fdff",
+    "a_ref": "origin/main",
     "b_commit": "f3febbf4ae553f38d0e0569da7daa710fec9d0e8",
     "b_ref": "benchmark/semantic-worker-legacy-2026-07-23",
-    "harness_commit": "f907cd177503d0ead0977448ceedceb12f8f6c53",
+    "harness_commit": "22e9291cdc3c7e634698f46269224d301e035406",
     "harness_sources_sha256": {
-      "benches/collect_semantic_pairs.py": "f80876e1c7ba67d7dd9b0a32c5d6fba3208f06394c91b38da799e71370e38bbd",
-      "benches/semantic_summary.py": "f2f365098ef0e7338627fde041d29f512936f5bb79c57f1d422965f315728d94",
+      "benches/collect_semantic_pairs.py": "3375f96368085484bf565542ca56492276feab5085e3c3d800776b9cf86a7a94",
+      "benches/semantic_summary.py": "8aab3d2622ec7bfface33f29fee8fd695297b31eb2007fc5b2b20d8be2e3d1d0",
       "benches/semantic_tokens.rs": "a269cccf73974ed53e522f5b72bb8257e8796c4dd54d5b97b83355bdc43a04e3",
-      "benches/support/semantic_baseline.rs": "7a1445a4a40de5975a3a22b360ddd4786c69d98d21bfd5e36c872fd15907666c"
+      "benches/support/semantic_baseline.rs": "4ab35bab7a05b32d652262c61c4cd4c720a21bfe3d1730694ea9dda5b306410c"
     }
   },
   "summary": "summary.json",
-  "summary_sha256": "b48a33d6c96489442b53a2ad01ccf3e67358b7ad556e4c22fdc888ae04550917"
+  "summary_sha256": "30b0806db412b6ef216b1bdd18e2aad0b8201db7f2b5965df2cf853336022a7d"
 }
