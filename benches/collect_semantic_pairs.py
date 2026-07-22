@@ -106,6 +106,22 @@ def manifest_sha256(entries: list[dict[str, Any]]) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
+def set_tree_read_only(root: Path) -> None:
+    for path in root.rglob("*"):
+        if not path.is_symlink():
+            path.chmod(0o555 if path.is_dir() else 0o444)
+    root.chmod(0o555)
+
+
+def set_tree_writable(root: Path) -> None:
+    if not root.exists():
+        return
+    root.chmod(0o755)
+    for path in root.rglob("*"):
+        if not path.is_symlink():
+            path.chmod(0o755 if path.is_dir() else 0o644)
+
+
 def parse_server_env(values: list[str]) -> dict[str, str]:
     parsed = {}
     for value in values:
@@ -179,6 +195,7 @@ def main() -> None:
     with tempfile.TemporaryDirectory(prefix="kakehashi-semantic-pairs-") as temporary:
         temp = Path(temporary)
         worktrees = {name: temp / name for name in ("a-src", "b-src", "harness-src")}
+        fixture: Path | None = None
         try:
             add_worktree(repo, worktrees["a-src"], a_commit)
             add_worktree(repo, worktrees["b-src"], b_commit)
@@ -226,6 +243,7 @@ def main() -> None:
                 cwd=worktrees["harness-src"],
                 env=os.environ | {"KAKEHASHI_BENCH_PREPARE_DATA_DIR": str(fixture)},
             )
+            set_tree_read_only(fixture)
             fixture_entries = tree_manifest(fixture)
             (output_dir / "fixture-manifest.json").write_text(
                 json.dumps(fixture_entries, indent=2, sort_keys=True) + "\n"
@@ -341,6 +359,8 @@ def main() -> None:
                 json.dumps(manifest, indent=2, sort_keys=True) + "\n"
             )
         finally:
+            if fixture is not None:
+                set_tree_writable(fixture)
             for path in worktrees.values():
                 if path.exists():
                     remove_worktree(repo, path)
