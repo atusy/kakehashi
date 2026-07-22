@@ -350,9 +350,9 @@ const SPARSE_CONTROL_BOUNDARY_BYTES: usize = 32 * 1024;
 
 /// Syntactically valid Rust with only a handful of captures, sized exactly.
 ///
-/// This isolates query-metadata table setup from dense capture walking around
-/// the server's 32 KiB admission boundary. The marker stays on its own line so
-/// typing scenarios can insert harmless leading spaces at a tracked token.
+/// These fixed byte sizes control for sparse capture walking independently of
+/// dense Rust fixtures. The marker stays on its own line so typing scenarios
+/// can insert harmless leading spaces at a tracked token.
 fn gen_sparse_rust(bytes: usize) -> String {
     const PREFIX: &str = "/*";
     const SUFFIX: &str = "*/\nfn sparse_marker() {}\n";
@@ -1079,7 +1079,7 @@ fn main() {
             uri: "file:///bench/sparse_64k.rs",
             content: gen_sparse_rust(64 * 1024),
             kind: Kind::TypingDelta,
-            targets: "64 KiB sparse source kept below observed-work admission",
+            targets: "sparse low-match query walk at 64 KiB",
         },
         Scenario {
             name: "rust_large/typing_burst",

@@ -38,7 +38,9 @@
   },
   "artifacts": {
     "harness_source_path": "benches/semantic_tokens.rs",
-    "harness_source_sha256": "c149e4d0fdf95709828caf7039c122e139e42db43fc65b406b7ebe00105dfddf",
+    "harness_source_sha256_at_measurement": "c149e4d0fdf95709828caf7039c122e139e42db43fc65b406b7ebe00105dfddf",
+    "current_harness_source_sha256": "8a79270323242ddd139b38eb425f048a2242a4d8c01051b37b4f606e969a51f8",
+    "post_measurement_source_change": "scenario descriptions only",
     "harness_binary_sha256": "349caff1a800098ffc899cbd1d5ca3fcd5950d1f0d1177a29c062714bcb618f4",
     "fixture_manifest_path": "benches/profile/results/single_worker_stage29_fixture_manifest_2026-07-22.sha256",
     "fixture_manifest_sha256": "7f6eaaa8341a71fb723a70f21703e9239f4d7205a3b06041604cb15754024e61",
