@@ -41,4 +41,6 @@ the median and range of paired median deltas. Per-run p95 is descriptive only.
 If a measured source is not retained by the repository's main history, give it
 a durable tag before collection and use that tag as the collector ref. This
 keeps every source commit named by archived evidence fetchable after temporary
-development branches are deleted.
+development branches are deleted. Before merging archived evidence, also retain
+the recorded harness commit with a durable tag and add that tag as
+`source.harness_ref` in the published manifest.
