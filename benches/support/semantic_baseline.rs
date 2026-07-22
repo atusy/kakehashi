@@ -1,11 +1,14 @@
 use serde_json::Value;
 
 const TOKEN_WIDTH: usize = 5;
+pub(crate) const TRACKED_MARKER: &str = "fn semantic_benchmark_marker() {}";
 
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum ValidationError {
     MissingResultId,
     MissingTokenPayload,
+    MissingTrackedMarker,
+    DuplicateTrackedMarker,
     InvalidUnsignedInteger {
         field: &'static str,
     },
@@ -27,6 +30,18 @@ pub(crate) enum ValidationError {
         delete_count: usize,
         token_data_len: usize,
     },
+}
+
+pub(crate) fn tracked_marker_line(content: &str) -> Result<u32, ValidationError> {
+    let mut lines = content
+        .lines()
+        .enumerate()
+        .filter(|(_, line)| line.trim() == TRACKED_MARKER);
+    let (line, _) = lines.next().ok_or(ValidationError::MissingTrackedMarker)?;
+    if lines.next().is_some() {
+        return Err(ValidationError::DuplicateTrackedMarker);
+    }
+    u32::try_from(line).map_err(|_| ValidationError::PositionOverflow)
 }
 
 #[derive(Debug)]
@@ -53,10 +68,6 @@ impl SemanticBaseline {
 
     pub(crate) fn result_id(&self) -> &str {
         &self.result_id
-    }
-
-    pub(crate) fn data(&self) -> &[u32] {
-        &self.data
     }
 
     pub(crate) fn tracked_line(&self) -> u32 {

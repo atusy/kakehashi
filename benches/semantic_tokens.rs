@@ -37,6 +37,10 @@
 //! `KAKEHASHI_BENCH_WARMUP` (default 10), `KAKEHASHI_BENCH_SCENARIOS`
 //! (optional comma-separated scenario-name substrings).
 
+#[path = "support/semantic_baseline.rs"]
+mod semantic_baseline;
+
+use semantic_baseline::{SemanticBaseline, TRACKED_MARKER, tracked_marker_line};
 use serde_json::{Value, json};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::PathBuf;
@@ -177,6 +181,24 @@ impl Server {
         );
     }
 
+    /// Insert a new leading space without returning to an earlier document
+    /// state. This models sustained typing without whole-document cache hits.
+    fn did_change_insert_space(&mut self, uri: &str, version: i64, line: u32) {
+        self.notify(
+            "textDocument/didChange",
+            json!({
+                "textDocument": { "uri": uri, "version": version },
+                "contentChanges": [{
+                    "range": {
+                        "start": { "line": line, "character": 0 },
+                        "end": { "line": line, "character": 0 },
+                    },
+                    "text": " ",
+                }],
+            }),
+        );
+    }
+
     fn request(&mut self, method: &str, params: Value) -> Value {
         self.next_id += 1;
         let id = self.next_id;
@@ -266,6 +288,8 @@ impl Drop for Server {
 fn gen_rust(funcs: usize) -> String {
     let mut s = String::with_capacity(funcs * 400);
     s.push_str("use std::collections::HashMap;\nuse std::fmt;\n\n");
+    s.push_str(TRACKED_MARKER);
+    s.push_str("\n\n");
     for i in 0..funcs {
         s.push_str(&format!(
             "/// Documentation comment for function number {i}.\n\
@@ -290,6 +314,25 @@ fn gen_rust(funcs: usize) -> String {
     s
 }
 
+const SPARSE_CONTROL_BOUNDARY_BYTES: usize = 32 * 1024;
+
+/// Syntactically valid sparse Rust with exact byte size and a stable edit line.
+fn gen_sparse_rust(bytes: usize) -> String {
+    const PREFIX: &str = "/*";
+    let suffix = format!("*/\n{TRACKED_MARKER}\n");
+
+    assert!(bytes >= PREFIX.len() + suffix.len());
+    let mut source = String::with_capacity(bytes);
+    source.push_str(PREFIX);
+    source.extend(std::iter::repeat_n(
+        'x',
+        bytes - PREFIX.len() - suffix.len(),
+    ));
+    source.push_str(&suffix);
+    assert_eq!(source.len(), bytes);
+    source
+}
+
 /// Markdown with many fenced code blocks in rust/lua/python — each block is a
 /// separate injection region. Exercises the injection pipeline: included-range
 /// computation, active-region detection, and host/injection coordinate mapping.
@@ -300,9 +343,15 @@ fn gen_markdown_injections(blocks: usize) -> String {
         s.push_str(&format!(
             "## Section {i}\n\nProse describing the code in section {i} before the fence.\n\n"
         ));
+        let tracked_marker = if i == 0 {
+            format!("{TRACKED_MARKER}\n")
+        } else {
+            String::new()
+        };
         match i % 3 {
             0 => s.push_str(&format!(
                 "```rust\n\
+                 {tracked_marker}\
                  fn rust_block_{i}(x: i32) -> i32 {{\n\
                 \x20   let doubled = x * 2; // a comment\n\
                 \x20   let label = \"section {i}\";\n\
@@ -413,6 +462,12 @@ enum Kind {
     /// so each measured request pays incremental reparse + cache invalidation +
     /// delta diff on top of the (full) token recompute.
     EditDelta,
+    /// Sustained typing through unique document states. Unlike `EditDelta`,
+    /// this never toggles back to a previously cached snapshot.
+    TypingDelta,
+    /// Several edits arrive before the one semantic-token request whose result
+    /// is still useful to an editor.
+    TypingBurst { edits: usize },
     /// Cold-open latency: each iteration opens a FRESH document and times
     /// `didOpen` → first `semanticTokens/full` response — the editor-visible
     /// "open the file, see highlights" latency. The one scenario that captures
@@ -463,28 +518,25 @@ fn measure(
     // Let the initial parse settle (didOpen parse may be async).
     std::thread::sleep(Duration::from_millis(300));
 
-    // For delta/edit scenarios we need a valid previous result_id; seed it from a
-    // full request, then keep it current (a no-op delta may or may not rotate).
-    let mut prev_result_id = seed_result_id(&mut server, scn);
-
-    // did_open used version 1; edits continue from there. Edit a line in the
-    // middle of the document (representative of typical cursor position).
+    // Delta scenarios retain and validate the complete client-side baseline,
+    // rather than treating a fresh resultId as proof of a current response.
+    let mut baseline = seed_baseline(&mut server, scn);
     let mut edit = EditState {
         version: 1,
         // First edit must insert (the document opens with no extra space).
         insert_next: true,
-        line: (scn.content.lines().count() / 2) as u32,
+        line: baseline.as_ref().map_or(0, SemanticBaseline::tracked_line),
         range_next: 0,
     };
 
     for _ in 0..warmup {
-        run_once(&mut server, scn, &mut prev_result_id, &mut edit);
+        run_once(&mut server, scn, &mut baseline, &mut edit);
     }
 
     let mut samples = Vec::with_capacity(iters);
     for _ in 0..iters {
         let start = Instant::now();
-        run_once(&mut server, scn, &mut prev_result_id, &mut edit);
+        run_once(&mut server, scn, &mut baseline, &mut edit);
         samples.push(start.elapsed());
     }
     samples
@@ -524,12 +576,19 @@ fn measure_open(
     samples
 }
 
-fn seed_result_id(server: &mut Server, scn: &Scenario) -> String {
+fn seed_baseline(server: &mut Server, scn: &Scenario) -> Option<SemanticBaseline> {
     match scn.kind {
-        Kind::Full | Kind::Range { .. } | Kind::OpenFirstToken => String::new(),
-        // Both delta-based scenarios need an initial result_id to diff against.
-        Kind::DeltaNoop | Kind::EditDelta => {
-            result_id_of(&server.semantic_full(scn.uri)).unwrap_or_default()
+        Kind::Full | Kind::Range { .. } | Kind::OpenFirstToken => None,
+        Kind::DeltaNoop | Kind::EditDelta | Kind::TypingDelta | Kind::TypingBurst { .. } => {
+            let tracked_line = tracked_marker_line(&scn.content).unwrap_or_else(|error| {
+                panic!("invalid tracked marker for {}: {error:?}", scn.name)
+            });
+            Some(
+                SemanticBaseline::from_full(&server.semantic_full(scn.uri), tracked_line)
+                    .unwrap_or_else(|error| {
+                        panic!("invalid semantic baseline for {}: {error:?}", scn.name)
+                    }),
+            )
         }
     }
 }
@@ -537,7 +596,7 @@ fn seed_result_id(server: &mut Server, scn: &Scenario) -> String {
 fn run_once(
     server: &mut Server,
     scn: &Scenario,
-    prev_result_id: &mut String,
+    baseline: &mut Option<SemanticBaseline>,
     edit: &mut EditState,
 ) {
     match scn.kind {
@@ -557,11 +616,11 @@ fn run_once(
             let _ = server.semantic_range(scn.uri, start_line + offset, end_line + offset);
         }
         Kind::DeltaNoop => {
-            let result = server.semantic_delta(scn.uri, prev_result_id);
-            // Keep the id valid for the next request whether or not it rotated.
-            if let Some(id) = result_id_of(&result) {
-                *prev_result_id = id;
-            }
+            let baseline = baseline.as_mut().expect("delta baseline");
+            let result = server.semantic_delta(scn.uri, baseline.result_id());
+            baseline.apply_response(&result).unwrap_or_else(|error| {
+                panic!("invalid semantic response for {}: {error:?}", scn.name)
+            });
         }
         Kind::EditDelta => {
             // Apply one toggle edit, then request a delta against the prior id.
@@ -569,25 +628,45 @@ fn run_once(
             edit.insert_next = !edit.insert_next;
             edit.version += 1;
             server.did_change_toggle(scn.uri, edit.version, edit.line, insert);
-            // Fall back to a full request if we don't yet have a valid id
-            // (e.g. a prior delta was cancelled and returned no result).
-            let result = if prev_result_id.is_empty() {
-                server.semantic_full(scn.uri)
+            let baseline = baseline.as_mut().expect("edit baseline");
+            let updated = if insert {
+                baseline.record_prefix_insert(1)
             } else {
-                server.semantic_delta(scn.uri, prev_result_id)
+                baseline.record_prefix_delete(1)
             };
-            if let Some(id) = result_id_of(&result) {
-                *prev_result_id = id;
+            updated.expect("tracked position remains valid");
+            let result = server.semantic_delta(scn.uri, baseline.result_id());
+            baseline.apply_response(&result).unwrap_or_else(|error| {
+                panic!("invalid semantic response for {}: {error:?}", scn.name)
+            });
+        }
+        Kind::TypingDelta => {
+            edit.version += 1;
+            server.did_change_insert_space(scn.uri, edit.version, edit.line);
+            let baseline = baseline.as_mut().expect("typing baseline");
+            baseline
+                .record_prefix_insert(1)
+                .expect("tracked position remains valid");
+            let result = server.semantic_delta(scn.uri, baseline.result_id());
+            baseline.apply_response(&result).unwrap_or_else(|error| {
+                panic!("invalid semantic response for {}: {error:?}", scn.name)
+            });
+        }
+        Kind::TypingBurst { edits } => {
+            for _ in 0..edits {
+                edit.version += 1;
+                server.did_change_insert_space(scn.uri, edit.version, edit.line);
             }
+            let baseline = baseline.as_mut().expect("typing baseline");
+            baseline
+                .record_prefix_insert(u32::try_from(edits).expect("edit count fits u32"))
+                .expect("tracked position remains valid");
+            let result = server.semantic_delta(scn.uri, baseline.result_id());
+            baseline.apply_response(&result).unwrap_or_else(|error| {
+                panic!("invalid semantic response for {}: {error:?}", scn.name)
+            });
         }
     }
-}
-
-fn result_id_of(result: &Value) -> Option<String> {
-    result
-        .get("resultId")
-        .and_then(Value::as_str)
-        .map(str::to_string)
 }
 
 fn main() {
@@ -695,12 +774,76 @@ fn main() {
             targets: "edit→reparse→retokenize→delta diff (host path under typing)",
         },
         Scenario {
+            name: "rust_large/typing_delta",
+            language_id: "rust",
+            uri: "file:///bench/large_typing.rs",
+            content: gen_rust(150),
+            kind: Kind::TypingDelta,
+            targets: "unique edit states→reparse→retokenize→delta; excludes A/B cache returns",
+        },
+        Scenario {
+            name: "rust_sparse_32k_minus/typing_delta",
+            language_id: "rust",
+            uri: "file:///bench/sparse_32k_minus.rs",
+            content: gen_sparse_rust(SPARSE_CONTROL_BOUNDARY_BYTES - 128),
+            kind: Kind::TypingDelta,
+            targets: "sparse low-match control just below 32 KiB",
+        },
+        Scenario {
+            name: "rust_sparse_32k_exact/typing_delta",
+            language_id: "rust",
+            uri: "file:///bench/sparse_32k_exact.rs",
+            content: gen_sparse_rust(SPARSE_CONTROL_BOUNDARY_BYTES),
+            kind: Kind::TypingDelta,
+            targets: "sparse low-match control at 32 KiB",
+        },
+        Scenario {
+            name: "rust_sparse_32k_plus/typing_delta",
+            language_id: "rust",
+            uri: "file:///bench/sparse_32k_plus.rs",
+            content: gen_sparse_rust(SPARSE_CONTROL_BOUNDARY_BYTES + 128),
+            kind: Kind::TypingDelta,
+            targets: "sparse low-match control just above 32 KiB",
+        },
+        Scenario {
+            name: "rust_sparse_64k/typing_delta",
+            language_id: "rust",
+            uri: "file:///bench/sparse_64k.rs",
+            content: gen_sparse_rust(64 * 1024),
+            kind: Kind::TypingDelta,
+            targets: "sparse low-match query walk at 64 KiB",
+        },
+        Scenario {
+            name: "rust_large/typing_burst",
+            language_id: "rust",
+            uri: "file:///bench/large_typing_burst.rs",
+            content: gen_rust(150),
+            kind: Kind::TypingBurst { edits: 8 },
+            targets: "eight queued unique edits→current delta; latest-state follow latency",
+        },
+        Scenario {
             name: "markdown_injections/edit_delta",
             language_id: "markdown",
             uri: "file:///bench/injections_edit.md",
             content: gen_markdown_injections(60),
             kind: Kind::EditDelta,
             targets: "edit→reparse→injection re-detect→cache invalidation→delta (typing)",
+        },
+        Scenario {
+            name: "markdown_injections/typing_delta",
+            language_id: "markdown",
+            uri: "file:///bench/injections_typing.md",
+            content: gen_markdown_injections(60),
+            kind: Kind::TypingDelta,
+            targets: "unique edit states→injection reuse→delta; excludes A/B cache returns",
+        },
+        Scenario {
+            name: "markdown_injections/typing_burst",
+            language_id: "markdown",
+            uri: "file:///bench/injections_typing_burst.md",
+            content: gen_markdown_injections(60),
+            kind: Kind::TypingBurst { edits: 8 },
+            targets: "eight queued unique edits→current injection delta; latest-state follow latency",
         },
         // Cold-open latency scenarios for the #6 off-ingress flip. The reader gates
         // on the **host parse** via the watermark (≤200ms budget), then falls back to

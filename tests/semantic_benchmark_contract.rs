@@ -1,7 +1,7 @@
 #[path = "../benches/support/semantic_baseline.rs"]
 mod semantic_baseline;
 
-use semantic_baseline::{SemanticBaseline, ValidationError};
+use semantic_baseline::{SemanticBaseline, TRACKED_MARKER, ValidationError, tracked_marker_line};
 use serde_json::json;
 
 fn initial_tokens() -> serde_json::Value {
@@ -16,6 +16,12 @@ fn initial_tokens() -> serde_json::Value {
 }
 
 #[test]
+fn locates_a_scenario_fixed_marker_independently_of_server_tokens() {
+    let content = format!("// setup\n\n{TRACKED_MARKER}\nfn work() {{}}\n");
+    assert_eq!(tracked_marker_line(&content), Ok(2));
+}
+
+#[test]
 fn reconstructs_delta_and_validates_the_latest_typed_position() {
     let mut baseline = SemanticBaseline::from_full(&initial_tokens(), 1).unwrap();
     baseline.record_prefix_insert(2).unwrap();
@@ -26,14 +32,19 @@ fn reconstructs_delta_and_validates_the_latest_typed_position() {
             "edits": [{
                 "start": 5,
                 "deleteCount": 5,
-                "data": [1, 6, 2, 3, 0]
+                "data": [1, 6, 2, 3, 0, 0, 5, 1, 4, 0]
             }]
         }))
         .unwrap();
 
     assert_eq!(baseline.result_id(), "baseline-2");
     assert_eq!(baseline.tracked_line(), 1);
-    assert_eq!(baseline.data()[5..10], [1, 6, 2, 3, 0]);
+    baseline
+        .apply_response(&json!({
+            "resultId": "baseline-3",
+            "edits": [{"start": 15, "deleteCount": 5}]
+        }))
+        .unwrap();
 }
 
 #[test]
@@ -88,13 +99,10 @@ fn rejects_out_of_bounds_delta_edits() {
         })
     );
     assert_eq!(baseline.result_id(), "baseline-1");
-    assert_eq!(
-        baseline.data(),
-        initial_tokens()["data"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|value| value.as_u64().unwrap() as u32)
-            .collect::<Vec<_>>()
-    );
+    baseline
+        .apply_response(&json!({
+            "resultId": "baseline-3",
+            "edits": [{"start": 10, "deleteCount": 5, "data": [0, 5, 1, 4, 0]}]
+        }))
+        .unwrap();
 }
