@@ -1,0 +1,43 @@
+
+semantic-tokens benchmark  (iters=30, warmup=6, lower is better)
+  A = /var/folders/t3/_nc24_w90zq79l3xyz3xzc7c0000gn/T/kakehashi-semantic-pairs-ekrmy896/target-a/release/kakehashi
+  B = /var/folders/t3/_nc24_w90zq79l3xyz3xzc7c0000gn/T/kakehashi-semantic-pairs-ekrmy896/target-b/release/kakehashi
+
+scenario                                A (med)      B (med) Δ (B vs A)
+------------------------------------------------------------------------
+rust_large/full_cache_hit               3.716ms      3.721ms        +0.1%
+    p95:      3.790ms      3.814ms
+    └ targets: large exact-snapshot semantic cache-hit control
+markdown_injections_large/full_cache_hit      0.865ms      0.769ms         -11.0%
+    p95:      0.902ms      0.809ms
+    └ targets: large injection document exact-snapshot semantic cache-hit control
+unicode_rust/full_cache_hit             0.674ms      0.685ms        +1.6%
+    p95:      0.700ms      0.700ms
+    └ targets: Unicode document exact-snapshot semantic cache-hit control
+rust_large/typing_delta                33.565ms     44.920ms        +33.8%
+    p95:     46.192ms     49.724ms
+    └ targets: unique edit states→reparse→retokenize→delta; excludes A/B cache returns
+rust_sparse_32k_minus/typing_delta     14.593ms      7.593ms         -48.0%
+    p95:     17.320ms      8.746ms
+    └ targets: sparse low-match control just below 32 KiB
+rust_sparse_32k_exact/typing_delta     12.290ms      6.810ms         -44.6%
+    p95:     12.721ms      7.082ms
+    └ targets: sparse low-match control at 32 KiB
+rust_sparse_32k_plus/typing_delta      12.485ms      9.171ms         -26.5%
+    p95:     15.256ms      9.552ms
+    └ targets: sparse low-match control just above 32 KiB
+rust_sparse_64k/typing_delta           29.959ms     16.927ms         -43.5%
+    p95:     32.427ms     19.594ms
+    └ targets: sparse low-match query walk at 64 KiB
+rust_large/typing_burst                35.603ms     44.962ms        +26.3%
+    p95:     46.696ms     48.465ms
+    └ targets: eight queued unique edits→current delta; latest-state follow latency
+rust_xlarge/cancel_burst              186.747ms    181.880ms         -2.6%
+    p95:    202.959ms    199.381ms
+    └ targets: current-token latency after four explicitly cancelled edit states
+markdown_injections/typing_delta        8.729ms      6.357ms         -27.2%
+    p95:      9.027ms      6.810ms
+    └ targets: unique edit states→injection reuse→delta; excludes A/B cache returns
+markdown_injections/typing_burst        7.936ms      6.292ms         -20.7%
+    p95:      9.069ms      7.029ms
+    └ targets: eight queued unique edits→current injection delta; latest-state follow latency
