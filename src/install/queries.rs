@@ -519,11 +519,34 @@ pub fn remove_query_install_and_backups(
     queries_parent: &Path,
     language: &str,
 ) -> Result<QueryRemoval, QueryInstallError> {
+    remove_query_install_and_backups_with_tombstone_writer(
+        queries_parent,
+        language,
+        write_uninstall_tombstone_at,
+    )
+}
+
+fn remove_query_install_and_backups_with_tombstone_writer(
+    queries_parent: &Path,
+    language: &str,
+    write_tombstone: impl FnOnce(&cap_std::fs::Dir, &Path, &str) -> Result<(), QueryInstallError>,
+) -> Result<QueryRemoval, QueryInstallError> {
+    remove_query_install_and_backups_with_hooks(queries_parent, language, write_tombstone, |_| {})
+}
+
+fn remove_query_install_and_backups_with_hooks(
+    queries_parent: &Path,
+    language: &str,
+    write_tombstone: impl FnOnce(&cap_std::fs::Dir, &Path, &str) -> Result<(), QueryInstallError>,
+    before_remove: impl FnOnce(&Path),
+) -> Result<QueryRemoval, QueryInstallError> {
     validate_safe_language_name(language)?;
     fs::create_dir_all(queries_parent)?;
-    let _replace_lock = QueryReplaceLockGuard::acquire(queries_parent, language)?;
-    write_uninstall_tombstone(queries_parent, language)?;
-    let queries_dir = queries_parent.join(language);
+    let pinned_parent =
+        cap_std::fs::Dir::open_ambient_dir(queries_parent, cap_std::ambient_authority())?;
+    let _replace_lock = QueryReplaceLockGuard::acquire_at(&pinned_parent, language)?;
+    write_tombstone(&pinned_parent, queries_parent, language)?;
+    before_remove(queries_parent);
     let mut removal = QueryRemoval {
         removed_queries: false,
         removed_backups: false,
@@ -533,14 +556,14 @@ pub fn remove_query_install_and_backups(
     // (e.g. PermissionDenied), which would skip removal and report "not
     // installed" over a still-present unreadable dir. The tolerant removal
     // reports whether anything was actually removed.
-    removal.removed_queries = remove_dir_all_tolerating_vanished(&queries_dir)?;
+    removal.removed_queries = remove_dir_all_at_tolerating_vanished(&pinned_parent, language)?;
 
     // Propagate per-entry read_dir errors: uninstall must not report success
     // while backups it could not even enumerate stay behind.
-    for entry in fs::read_dir(queries_parent)? {
+    for entry in pinned_parent.entries()? {
         let entry = entry?;
-        let path = entry.path();
-        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+        let file_name = entry.file_name();
+        let Some(name) = file_name.to_str() else {
             continue;
         };
         // file_type() over path.is_dir(): is_dir() swallows metadata errors
@@ -548,18 +571,20 @@ pub fn remove_query_install_and_backups(
         // while uninstall reports success.
         if entry.file_type()?.is_dir()
             && generated_backup_matches_language(name, language)
-            && backup_is_owned(&path)
+            && pinned_parent
+                .metadata(backup_ownership_sidecar_name(name))
+                .is_ok_and(|metadata| metadata.is_file())
         {
-            let ownership = backup_ownership_sidecar(&path);
+            let ownership = backup_ownership_sidecar_name(name);
             // Same NotFound tolerance as the canonical dir above: a backup
             // deleted externally after enumeration is already the end state.
-            let removed_dir = remove_dir_all_tolerating_vanished(&path)?;
+            let removed_dir = remove_dir_all_at_tolerating_vanished(&pinned_parent, &file_name)?;
             // The sidecar is a kakehashi-owned artifact too: deleting it
             // counts as removal even when the dir itself vanished first —
             // and, like every other I/O in this loop, only NotFound is
             // tolerated (an unremovable marker must fail the uninstall, not
             // linger behind a success report).
-            let removed_sidecar = match fs::remove_file(ownership) {
+            let removed_sidecar = match pinned_parent.remove_file(ownership) {
                 Ok(()) => true,
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
                 Err(e) => return Err(QueryInstallError::IoError(e)),
@@ -570,6 +595,23 @@ pub fn remove_query_install_and_backups(
         }
     }
     Ok(removal)
+}
+
+fn remove_dir_all_at_tolerating_vanished(
+    parent: &cap_std::fs::Dir,
+    name: impl AsRef<Path>,
+) -> Result<bool, QueryInstallError> {
+    let name = name.as_ref();
+    match parent.remove_dir_all(name) {
+        Ok(()) => Ok(true),
+        Err(e)
+            if e.kind() == std::io::ErrorKind::NotFound
+                && matches!(parent.try_exists(name), Ok(false)) =>
+        {
+            Ok(false)
+        }
+        Err(e) => Err(QueryInstallError::IoError(e)),
+    }
 }
 
 /// `fs::remove_dir_all` that treats a CONFIRMED-vanished directory as the
@@ -584,6 +626,7 @@ pub fn remove_query_install_and_backups(
 /// deleted, and (b) `Path::exists()` returns false on ANY metadata error
 /// (e.g. PermissionDenied), which must propagate the original error instead
 /// of being mistaken for absence.
+#[cfg(test)]
 fn remove_dir_all_tolerating_vanished(dir: &Path) -> Result<bool, QueryInstallError> {
     match fs::remove_dir_all(dir) {
         Ok(()) => Ok(true),
@@ -753,14 +796,573 @@ fn uninstall_tombstone_path(queries_parent: &Path, language: &str) -> PathBuf {
     queries_parent.join(format!(".{language}{QUERY_UNINSTALL_TOMBSTONE_SUFFIX}"))
 }
 
+#[cfg(test)]
 fn write_uninstall_tombstone(
     queries_parent: &Path,
     language: &str,
 ) -> Result<(), QueryInstallError> {
+    let pinned = cap_std::fs::Dir::open_ambient_dir(queries_parent, cap_std::ambient_authority())?;
+    write_uninstall_tombstone_at(&pinned, queries_parent, language)
+}
+
+#[cfg(unix)]
+fn write_uninstall_tombstone_at(
+    queries_parent: &cap_std::fs::Dir,
+    ambient_path: &Path,
+    language: &str,
+) -> Result<(), QueryInstallError> {
+    write_uninstall_tombstone_at_with_hooks(
+        queries_parent,
+        ambient_path,
+        language,
+        |_, _, _| {},
+        |parent| parent.try_clone()?.into_std_file().sync_all(),
+    )
+}
+
+#[cfg(unix)]
+fn write_uninstall_tombstone_at_with_hooks(
+    queries_parent: &cap_std::fs::Dir,
+    _ambient_path: &Path,
+    language: &str,
+    before_publish: impl FnOnce(&cap_std::fs::Dir, &str, &str),
+    sync_parent: impl FnOnce(&cap_std::fs::Dir) -> std::io::Result<()>,
+) -> Result<(), QueryInstallError> {
+    use cap_fs_ext::{
+        FollowSymlinks, MetadataExt as CapMetadataExt, OpenOptionsFollowExt, OpenOptionsSyncExt,
+    };
+
     validate_safe_language_name(language)?;
-    let mut file = fs::File::create(uninstall_tombstone_path(queries_parent, language))?;
-    file.write_all(b"ok\n")?;
-    Ok(())
+    let tombstone_name = format!(".{language}{QUERY_UNINSTALL_TOMBSTONE_SUFFIX}");
+    let mut existing_options = cap_std::fs::OpenOptions::new();
+    existing_options
+        .write(true)
+        .follow(FollowSymlinks::No)
+        .nonblock(true);
+    let existing_permissions = match queries_parent.open_with(&tombstone_name, &existing_options) {
+        Ok(file) => {
+            let metadata = file.metadata()?;
+            if !metadata.is_file() {
+                return Err(QueryInstallError::IoError(std::io::Error::other(
+                    "query uninstall tombstone is not a regular file",
+                )));
+            }
+            require_single_link(CapMetadataExt::nlink(&metadata))?;
+            Some(file.into_std().metadata()?.permissions())
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(QueryInstallError::IoError(error)),
+    };
+
+    let stage_name = loop {
+        let counter = QUERY_TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let candidate = format!(
+            ".{language}.uninstalled.{}.{}.tmp",
+            std::process::id(),
+            counter
+        );
+        let mut options = cap_std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        match queries_parent.open_with(&candidate, &options) {
+            Ok(file) => break (candidate, file.into_std()),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(QueryInstallError::IoError(error)),
+        }
+    };
+    let (stage_name, mut staged) = stage_name;
+    let result = (|| -> Result<(), QueryInstallError> {
+        if let Some(permissions) = existing_permissions {
+            staged.set_permissions(permissions)?;
+        }
+        staged.write_all(b"ok\n")?;
+        staged.sync_all()?;
+        let staged_metadata = staged.metadata()?;
+        before_publish(queries_parent, &tombstone_name, &stage_name);
+        queries_parent.rename(&stage_name, queries_parent, &tombstone_name)?;
+
+        let mut published_options = cap_std::fs::OpenOptions::new();
+        published_options
+            .read(true)
+            .follow(FollowSymlinks::No)
+            .nonblock(true);
+        let published = queries_parent
+            .open_with(&tombstone_name, &published_options)?
+            .into_std();
+        let published_metadata = published.metadata()?;
+        if !published_metadata.is_file()
+            || std::os::unix::fs::MetadataExt::dev(&published_metadata)
+                != std::os::unix::fs::MetadataExt::dev(&staged_metadata)
+            || std::os::unix::fs::MetadataExt::ino(&published_metadata)
+                != std::os::unix::fs::MetadataExt::ino(&staged_metadata)
+        {
+            return Err(QueryInstallError::IoError(std::io::Error::other(
+                "published query uninstall tombstone changed identity",
+            )));
+        }
+        require_single_link(std::os::unix::fs::MetadataExt::nlink(&published_metadata))?;
+        sync_parent(queries_parent)?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = queries_parent.remove_file(&stage_name);
+    }
+    result
+}
+
+#[cfg(windows)]
+fn write_uninstall_tombstone_at(
+    queries_parent: &cap_std::fs::Dir,
+    ambient_path: &Path,
+    language: &str,
+) -> Result<(), QueryInstallError> {
+    write_uninstall_tombstone_at_with_hooks(
+        queries_parent,
+        ambient_path,
+        language,
+        |_, _, _| {},
+        |_| Ok(()),
+    )
+}
+
+#[cfg(windows)]
+fn write_uninstall_tombstone_at_with_hooks(
+    queries_parent: &cap_std::fs::Dir,
+    _ambient_path: &Path,
+    language: &str,
+    before_publish: impl FnOnce(&cap_std::fs::Dir, &str, &str),
+    sync_parent: impl FnOnce(&cap_std::fs::Dir) -> std::io::Result<()>,
+) -> Result<(), QueryInstallError> {
+    write_uninstall_tombstone_at_with_security_copy(
+        queries_parent,
+        _ambient_path,
+        language,
+        before_publish,
+        sync_parent,
+        copy_windows_tombstone_security,
+    )
+}
+
+#[cfg(windows)]
+fn write_uninstall_tombstone_at_with_security_copy(
+    queries_parent: &cap_std::fs::Dir,
+    _ambient_path: &Path,
+    language: &str,
+    before_publish: impl FnOnce(&cap_std::fs::Dir, &str, &str),
+    sync_parent: impl FnOnce(&cap_std::fs::Dir) -> std::io::Result<()>,
+    copy_security: impl FnOnce(&fs::File, &fs::File) -> std::io::Result<()>,
+) -> Result<(), QueryInstallError> {
+    use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt};
+    use std::os::windows::ffi::OsStrExt as _;
+    use std::os::windows::io::{AsRawHandle as _, FromRawHandle as _};
+    use windows_sys::Win32::Foundation::{GENERIC_READ, GENERIC_WRITE, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::Storage::FileSystem::{
+        DELETE, FILE_FLAG_WRITE_THROUGH, FILE_RENAME_INFO, FILE_SHARE_DELETE, FILE_SHARE_READ,
+        FILE_SHARE_WRITE, FileRenameInfo, ReOpenFile, SetFileInformationByHandle,
+    };
+
+    validate_safe_language_name(language)?;
+    let tombstone_name = format!(".{language}{QUERY_UNINSTALL_TOMBSTONE_SUFFIX}");
+    let mut existing_options = cap_std::fs::OpenOptions::new();
+    existing_options.write(true).follow(FollowSymlinks::No);
+    let (existing_permissions, existing_file) =
+        match queries_parent.open_with(&tombstone_name, &existing_options) {
+            Ok(file) => {
+                let file = file.into_std();
+                let metadata = file.metadata()?;
+                if !metadata.is_file() {
+                    return Err(QueryInstallError::IoError(std::io::Error::other(
+                        "query uninstall tombstone is not a regular file",
+                    )));
+                }
+                require_single_link(u64::from(windows_file_information(&file)?.nNumberOfLinks))?;
+                (Some(metadata.permissions()), Some(file))
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => (None, None),
+            Err(error) => return Err(QueryInstallError::IoError(error)),
+        };
+
+    let (stage_name, mut staged) = loop {
+        let counter = QUERY_TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let candidate = format!(
+            ".{language}.uninstalled.{}.{}.tmp",
+            std::process::id(),
+            counter
+        );
+        let mut options = cap_std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        match queries_parent.open_with(&candidate, &options) {
+            Ok(file) => break (candidate, file.into_std()),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(QueryInstallError::IoError(error)),
+        }
+    };
+    let result = (|| -> Result<(), QueryInstallError> {
+        if let Some(permissions) = existing_permissions {
+            staged.set_permissions(permissions)?;
+        }
+        staged.write_all(b"ok\n")?;
+        staged.sync_all()?;
+        let directory = queries_parent.try_clone()?.into_std_file();
+        // SAFETY: `staged` owns a valid handle; success returns a new owned handle.
+        let handle = unsafe {
+            ReOpenFile(
+                staged.as_raw_handle(),
+                GENERIC_READ | GENERIC_WRITE | DELETE,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                FILE_FLAG_WRITE_THROUGH,
+            )
+        };
+        if handle == INVALID_HANDLE_VALUE {
+            return Err(QueryInstallError::IoError(std::io::Error::last_os_error()));
+        }
+        // SAFETY: successful ReOpenFile returned a newly owned handle.
+        let rename_handle = unsafe { fs::File::from_raw_handle(handle) };
+        normalize_windows_stage_attributes(&rename_handle)?;
+        if let Some(existing_file) = &existing_file {
+            copy_security(existing_file, &rename_handle)?;
+        }
+        before_publish(queries_parent, &tombstone_name, &stage_name);
+        let filename: Vec<u16> = std::ffi::OsStr::new(&tombstone_name)
+            .encode_wide()
+            .collect();
+        let header = std::mem::offset_of!(FILE_RENAME_INFO, FileName);
+        let size = header + filename.len() * std::mem::size_of::<u16>();
+        let units = size.div_ceil(std::mem::size_of::<FILE_RENAME_INFO>());
+        let mut buffer = vec![FILE_RENAME_INFO::default(); units];
+        let information = buffer.as_mut_ptr();
+        // SAFETY: the buffer covers the header/name and both handles stay valid.
+        let succeeded = unsafe {
+            (*information).Anonymous.ReplaceIfExists = true;
+            (*information).RootDirectory = directory.as_raw_handle();
+            (*information).FileNameLength = u32::try_from(filename.len() * 2).unwrap();
+            std::ptr::copy_nonoverlapping(
+                filename.as_ptr(),
+                (*information).FileName.as_mut_ptr(),
+                filename.len(),
+            );
+            SetFileInformationByHandle(
+                rename_handle.as_raw_handle(),
+                FileRenameInfo,
+                information.cast(),
+                u32::try_from(size).unwrap(),
+            )
+        };
+        if succeeded == 0 {
+            return Err(QueryInstallError::IoError(std::io::Error::last_os_error()));
+        }
+        let mut published_options = cap_std::fs::OpenOptions::new();
+        published_options.read(true).follow(FollowSymlinks::No);
+        let published = queries_parent
+            .open_with(&tombstone_name, &published_options)?
+            .into_std();
+        let expected = windows_file_information(&rename_handle)?;
+        let actual = windows_file_information(&published)?;
+        if expected.dwVolumeSerialNumber != actual.dwVolumeSerialNumber
+            || expected.nFileIndexHigh != actual.nFileIndexHigh
+            || expected.nFileIndexLow != actual.nFileIndexLow
+        {
+            return Err(QueryInstallError::IoError(std::io::Error::other(
+                "published query uninstall tombstone changed identity",
+            )));
+        }
+        require_single_link(u64::from(actual.nNumberOfLinks))?;
+        sync_parent(queries_parent)?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = queries_parent.remove_file(&stage_name);
+    }
+    result
+}
+
+#[cfg(test)]
+fn write_uninstall_tombstone_with_before_publish(
+    queries_parent: &Path,
+    language: &str,
+    before_publish: impl FnOnce(&Path, &Path),
+    sync_parent: impl FnOnce(&Path) -> std::io::Result<()>,
+) -> Result<(), QueryInstallError> {
+    let pinned = cap_std::fs::Dir::open_ambient_dir(queries_parent, cap_std::ambient_authority())?;
+    write_uninstall_tombstone_at_with_hooks(
+        &pinned,
+        queries_parent,
+        language,
+        |_, tombstone_name, stage_name| {
+            before_publish(
+                &queries_parent.join(tombstone_name),
+                &queries_parent.join(stage_name),
+            );
+        },
+        |_| sync_parent(queries_parent),
+    )
+}
+
+#[cfg(windows)]
+fn normalize_windows_stage_attributes(file: &fs::File) -> std::io::Result<()> {
+    use std::os::windows::io::AsRawHandle as _;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_TEMPORARY, FILE_BASIC_INFO, FileBasicInfo,
+        GetFileInformationByHandleEx, SetFileInformationByHandle,
+    };
+
+    let mut information = FILE_BASIC_INFO::default();
+    // SAFETY: `information` is the exact buffer for FileBasicInfo and `file`
+    // keeps the handle valid throughout both calls.
+    let read = unsafe {
+        GetFileInformationByHandleEx(
+            file.as_raw_handle(),
+            FileBasicInfo,
+            (&mut information as *mut FILE_BASIC_INFO).cast(),
+            u32::try_from(std::mem::size_of::<FILE_BASIC_INFO>()).unwrap(),
+        )
+    };
+    if read == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    information.FileAttributes &= !FILE_ATTRIBUTE_TEMPORARY;
+    if information.FileAttributes == 0 {
+        information.FileAttributes = FILE_ATTRIBUTE_NORMAL;
+    }
+    // SAFETY: same valid handle and correctly sized initialized structure.
+    let written = unsafe {
+        SetFileInformationByHandle(
+            file.as_raw_handle(),
+            FileBasicInfo,
+            (&information as *const FILE_BASIC_INFO).cast(),
+            u32::try_from(std::mem::size_of::<FILE_BASIC_INFO>()).unwrap(),
+        )
+    };
+    if written == 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(windows)]
+fn copy_windows_tombstone_security(source: &fs::File, target: &fs::File) -> std::io::Result<()> {
+    use std::os::windows::io::{AsRawHandle as _, FromRawHandle as _};
+    use windows_sys::Win32::Foundation::{ERROR_SUCCESS, LocalFree};
+    use windows_sys::Win32::Security::Authorization::{
+        GetSecurityInfo, SE_FILE_OBJECT, SetSecurityInfo,
+    };
+    use windows_sys::Win32::Security::{
+        DACL_SECURITY_INFORMATION, EqualSid, GROUP_SECURITY_INFORMATION,
+        GetSecurityDescriptorControl, OWNER_SECURITY_INFORMATION,
+        PROTECTED_DACL_SECURITY_INFORMATION, SE_DACL_PRESENT, SE_DACL_PROTECTED,
+        UNPROTECTED_DACL_SECURITY_INFORMATION,
+    };
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, READ_CONTROL, ReOpenFile, WRITE_DAC,
+        WRITE_OWNER,
+    };
+
+    struct SecurityDescriptor(windows_sys::Win32::Security::PSECURITY_DESCRIPTOR);
+    impl Drop for SecurityDescriptor {
+        fn drop(&mut self) {
+            // SAFETY: GetSecurityInfo allocates this descriptor with LocalAlloc.
+            unsafe { LocalFree(self.0.cast()) };
+        }
+    }
+
+    unsafe fn read_security(
+        file: &fs::File,
+    ) -> std::io::Result<(
+        SecurityDescriptor,
+        windows_sys::Win32::Security::PSID,
+        windows_sys::Win32::Security::PSID,
+        *mut windows_sys::Win32::Security::ACL,
+    )> {
+        use std::os::windows::io::AsRawHandle as _;
+
+        let mut owner = std::ptr::null_mut();
+        let mut group = std::ptr::null_mut();
+        let mut dacl = std::ptr::null_mut();
+        let mut descriptor = std::ptr::null_mut();
+        // SAFETY: output pointers remain valid until the returned descriptor is dropped.
+        let status = unsafe {
+            GetSecurityInfo(
+                file.as_raw_handle(),
+                SE_FILE_OBJECT,
+                OWNER_SECURITY_INFORMATION | GROUP_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+                &mut owner,
+                &mut group,
+                &mut dacl,
+                std::ptr::null_mut(),
+                &mut descriptor,
+            )
+        };
+        if status != ERROR_SUCCESS {
+            return Err(std::io::Error::other(format!(
+                "GetSecurityInfo failed: {}",
+                std::io::Error::from_raw_os_error(status as i32)
+            )));
+        }
+        Ok((SecurityDescriptor(descriptor), owner, group, dacl))
+    }
+
+    // SAFETY: both handles remain open and descriptor-owned pointers stay valid.
+    let (source_descriptor, source_owner, source_group, source_dacl) =
+        unsafe { read_security(source)? };
+    // SAFETY: same contract for the already-opened private stage.
+    let (_target_descriptor, target_owner, target_group, _) = unsafe { read_security(target)? };
+    let mut control = 0;
+    let mut revision = 0;
+    // SAFETY: descriptor is valid and outputs are initialized by the API.
+    if unsafe { GetSecurityDescriptorControl(source_descriptor.0, &mut control, &mut revision) }
+        == 0
+    {
+        return Err(std::io::Error::other(format!(
+            "GetSecurityDescriptorControl failed: {}",
+            std::io::Error::last_os_error()
+        )));
+    }
+    if control & SE_DACL_PRESENT == 0 {
+        return Err(std::io::Error::other(
+            "validated tombstone security descriptor has no DACL presence bit",
+        ));
+    }
+    let dacl_mode = if control & SE_DACL_PROTECTED != 0 {
+        PROTECTED_DACL_SECURITY_INFORMATION
+    } else {
+        UNPROTECTED_DACL_SECURITY_INFORMATION
+    };
+    // New stages normally inherit the same owner/group. Only request the
+    // privileged WRITE_OWNER path when either SID actually differs.
+    let sids_differ = |source: windows_sys::Win32::Security::PSID,
+                       target: windows_sys::Win32::Security::PSID| {
+        if source.is_null() || target.is_null() {
+            source != target
+        } else {
+            // SAFETY: both non-null pointers refer to descriptor-owned SIDs.
+            (unsafe { EqualSid(source, target) }) == 0
+        }
+    };
+    let owner_differs = sids_differ(source_owner, target_owner);
+    let group_differs = sids_differ(source_group, target_group);
+    let mut owner_information = 0;
+    if owner_differs {
+        owner_information |= OWNER_SECURITY_INFORMATION;
+    }
+    if group_differs {
+        owner_information |= GROUP_SECURITY_INFORMATION;
+    }
+    let mut security_access = READ_CONTROL | WRITE_DAC;
+    if owner_information != 0 {
+        security_access |= WRITE_OWNER;
+    }
+    // Keep security mutation on a distinct handle so the proven
+    // DELETE-capable/write-through rename handle retains its original access
+    // contract. Success returns a new owned handle for the same stage inode.
+    let security_handle = unsafe {
+        ReOpenFile(
+            target.as_raw_handle(),
+            security_access,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            0,
+        )
+    };
+    if security_handle.is_null()
+        || security_handle == windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE
+    {
+        return Err(std::io::Error::other(format!(
+            "ReOpenFile security access failed: {}",
+            std::io::Error::last_os_error()
+        )));
+    }
+    // SAFETY: successful ReOpenFile returned a newly owned handle.
+    let security_file = unsafe { fs::File::from_raw_handle(security_handle) };
+    apply_windows_security_parts(
+        owner_information,
+        || {
+            // SAFETY: selected SID pointers remain owned by source_descriptor.
+            let status = unsafe {
+                SetSecurityInfo(
+                    security_file.as_raw_handle(),
+                    SE_FILE_OBJECT,
+                    owner_information,
+                    source_owner,
+                    source_group,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                )
+            };
+            if status != ERROR_SUCCESS {
+                return Err(std::io::Error::other(format!(
+                    "SetSecurityInfo owner/group failed: {}",
+                    std::io::Error::from_raw_os_error(status as i32)
+                )));
+            }
+            Ok(())
+        },
+        || {
+            // SAFETY: target has WRITE_DAC and the source DACL remains descriptor-owned.
+            let status = unsafe {
+                SetSecurityInfo(
+                    security_file.as_raw_handle(),
+                    SE_FILE_OBJECT,
+                    DACL_SECURITY_INFORMATION | dacl_mode,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    source_dacl,
+                    std::ptr::null_mut(),
+                )
+            };
+            if status != ERROR_SUCCESS {
+                return Err(std::io::Error::other(format!(
+                    "SetSecurityInfo DACL failed: {}",
+                    std::io::Error::from_raw_os_error(status as i32)
+                )));
+            }
+            Ok(())
+        },
+    )
+}
+
+#[cfg(windows)]
+fn apply_windows_security_parts(
+    owner_information: u32,
+    apply_owner_group: impl FnOnce() -> std::io::Result<()>,
+    apply_dacl: impl FnOnce() -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    // A restrictive source DACL may deny reopening with WRITE_OWNER, so owner
+    // and group must be complete before the DACL is installed.
+    if owner_information != 0 {
+        apply_owner_group()?;
+    }
+    apply_dacl()
+}
+
+#[cfg(any(unix, windows))]
+fn require_single_link(links: u64) -> std::io::Result<()> {
+    if links != 1 {
+        Err(std::io::Error::other(
+            "query uninstall tombstone must have exactly one hard link",
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(windows)]
+fn windows_file_information(
+    file: &fs::File,
+) -> std::io::Result<windows_sys::Win32::Storage::FileSystem::BY_HANDLE_FILE_INFORMATION> {
+    use std::os::windows::io::AsRawHandle as _;
+    use windows_sys::Win32::Storage::FileSystem::{
+        BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
+    };
+
+    let mut information = std::mem::MaybeUninit::<BY_HANDLE_FILE_INFORMATION>::uninit();
+    // SAFETY: `file` keeps this handle valid for the call, and Windows
+    // initializes the complete output structure whenever it reports success.
+    let succeeded =
+        unsafe { GetFileInformationByHandle(file.as_raw_handle(), information.as_mut_ptr()) };
+    if succeeded == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: GetFileInformationByHandle succeeded above.
+    Ok(unsafe { information.assume_init() })
 }
 
 fn clear_uninstall_tombstone(
@@ -849,6 +1451,10 @@ fn backup_ownership_sidecar(backup_dir: &Path) -> PathBuf {
             .unwrap_or(".query.backup"),
         QUERY_BACKUP_OWNERSHIP_MARKER
     ))
+}
+
+fn backup_ownership_sidecar_name(backup_name: &str) -> String {
+    format!("{backup_name}{QUERY_BACKUP_OWNERSHIP_MARKER}")
 }
 
 fn write_backup_ownership_marker(backup_dir: &Path) -> Result<(), QueryInstallError> {
@@ -948,6 +1554,20 @@ impl QueryReplaceLockGuard {
             .write(true)
             .truncate(false)
             .open(path)?;
+        file.lock_exclusive()?;
+        Ok(Self { _file: file })
+    }
+
+    fn acquire_at(
+        queries_parent: &cap_std::fs::Dir,
+        language: &str,
+    ) -> Result<Self, QueryInstallError> {
+        validate_safe_language_name(language)?;
+        let mut options = cap_std::fs::OpenOptions::new();
+        options.create(true).write(true).truncate(false);
+        let file = queries_parent
+            .open_with(format!(".{language}.replace.lock"), &options)?
+            .into_std();
         file.lock_exclusive()?;
         Ok(Self { _file: file })
     }
@@ -1190,6 +1810,533 @@ mod tests {
             !queries_parent.exists(),
             "unsafe cleanup must not even create the queries directory"
         );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn remove_query_install_rejects_symlinked_uninstall_tombstone() {
+        use std::os::unix::fs::symlink;
+
+        let temp = TempDir::new().unwrap();
+        let queries_parent = temp.path().join("queries");
+        fs::create_dir_all(&queries_parent).unwrap();
+        let victim = temp.path().join("victim");
+        fs::write(&victim, "keep me\n").unwrap();
+        symlink(&victim, uninstall_tombstone_path(&queries_parent, "rust")).unwrap();
+
+        let result = remove_query_install_and_backups(&queries_parent, "rust");
+
+        assert_eq!(
+            fs::read_to_string(&victim).unwrap(),
+            "keep me\n",
+            "opening the tombstone must not follow and overwrite its target"
+        );
+        assert!(
+            matches!(result, Err(QueryInstallError::IoError(_))),
+            "a managed tombstone symlink must fail the uninstall"
+        );
+    }
+
+    #[test]
+    fn remove_query_install_reuses_regular_uninstall_tombstone() {
+        let temp = TempDir::new().unwrap();
+        let queries_parent = temp.path().join("queries");
+        fs::create_dir_all(&queries_parent).unwrap();
+        let tombstone = uninstall_tombstone_path(&queries_parent, "rust");
+        fs::write(&tombstone, "stale tombstone contents\n").unwrap();
+
+        remove_query_install_and_backups(&queries_parent, "rust").unwrap();
+
+        assert_eq!(fs::read_to_string(tombstone).unwrap(), "ok\n");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn remove_query_install_supports_symlinked_queries_parent() {
+        use std::os::unix::fs::symlink;
+
+        let temp = TempDir::new().unwrap();
+        let real_queries = temp.path().join("real-queries");
+        fs::create_dir_all(&real_queries).unwrap();
+        let linked_queries = temp.path().join("queries");
+        symlink(&real_queries, &linked_queries).unwrap();
+
+        remove_query_install_and_backups(&linked_queries, "rust").unwrap();
+
+        assert_eq!(
+            fs::read_to_string(uninstall_tombstone_path(&real_queries, "rust")).unwrap(),
+            "ok\n"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn remove_query_install_stays_bound_when_symlinked_parent_is_retargeted() {
+        use std::os::unix::fs::symlink;
+
+        let temp = TempDir::new().unwrap();
+        let original = temp.path().join("original-queries");
+        let replacement = temp.path().join("replacement-queries");
+        fs::create_dir_all(original.join("rust")).unwrap();
+        fs::create_dir_all(replacement.join("rust")).unwrap();
+        fs::write(original.join("rust/highlights.scm"), "original\n").unwrap();
+        fs::write(replacement.join("rust/highlights.scm"), "outside\n").unwrap();
+        let linked = temp.path().join("queries");
+        symlink(&original, &linked).unwrap();
+
+        remove_query_install_and_backups_with_hooks(
+            &linked,
+            "rust",
+            |pinned, ambient_parent, language| {
+                fs::remove_file(ambient_parent).unwrap();
+                symlink(&replacement, ambient_parent).unwrap();
+                write_uninstall_tombstone_at(pinned, ambient_parent, language)
+            },
+            |_| {},
+        )
+        .unwrap();
+
+        assert!(
+            !original.join("rust").exists(),
+            "cleanup must stay in the directory that received durable intent"
+        );
+        assert_eq!(
+            fs::read_to_string(replacement.join("rust/highlights.scm")).unwrap(),
+            "outside\n",
+            "retargeting must not redirect destructive cleanup"
+        );
+        assert!(
+            uninstall_tombstone_path(&original, "rust").exists(),
+            "the pinned directory retains its uninstall intent"
+        );
+        assert!(
+            !uninstall_tombstone_path(&replacement, "rust").exists(),
+            "the replacement directory must remain untouched"
+        );
+    }
+
+    #[test]
+    fn remove_query_install_rejects_hard_linked_uninstall_tombstone() {
+        let temp = TempDir::new().unwrap();
+        let queries_parent = temp.path().join("queries");
+        fs::create_dir_all(&queries_parent).unwrap();
+        let victim = temp.path().join("victim");
+        fs::write(&victim, "keep me\n").unwrap();
+        fs::hard_link(&victim, uninstall_tombstone_path(&queries_parent, "rust")).unwrap();
+
+        let result = remove_query_install_and_backups(&queries_parent, "rust");
+
+        assert_eq!(
+            fs::read_to_string(&victim).unwrap(),
+            "keep me\n",
+            "opening the tombstone must not overwrite another hard-link name"
+        );
+        assert!(
+            matches!(result, Err(QueryInstallError::IoError(_))),
+            "an already multiply linked managed tombstone must fail the uninstall"
+        );
+    }
+
+    #[test]
+    fn uninstall_sync_failure_preserves_queries_and_backups() {
+        let temp = TempDir::new().unwrap();
+        let queries_parent = temp.path().join("queries");
+        let queries_dir = queries_parent.join("rust");
+        fs::create_dir_all(&queries_dir).unwrap();
+        fs::write(queries_dir.join("highlights.scm"), "old queries\n").unwrap();
+        let backup = queries_parent.join(".rust.123.0.backup");
+        fs::create_dir(&backup).unwrap();
+        fs::write(backup.join("highlights.scm"), "backup\n").unwrap();
+        write_backup_ownership_marker(&backup).unwrap();
+
+        let result = remove_query_install_and_backups_with_tombstone_writer(
+            &queries_parent,
+            "rust",
+            |_, _, _| {
+                Err(QueryInstallError::IoError(std::io::Error::other(
+                    "injected durability failure",
+                )))
+            },
+        );
+
+        assert!(matches!(result, Err(QueryInstallError::IoError(_))));
+        assert!(queries_dir.exists(), "canonical queries are not removed");
+        assert!(backup.exists(), "owned backup is not removed");
+        assert!(
+            backup_ownership_sidecar(&backup).exists(),
+            "backup ownership evidence is not removed"
+        );
+    }
+
+    #[test]
+    fn tombstone_publish_does_not_truncate_raced_hard_link_alias() {
+        let temp = TempDir::new().unwrap();
+        let queries_parent = temp.path().join("queries");
+        fs::create_dir_all(&queries_parent).unwrap();
+        let tombstone = uninstall_tombstone_path(&queries_parent, "rust");
+        fs::write(&tombstone, "old tombstone\n").unwrap();
+        let outside_alias = temp.path().join("outside-alias");
+
+        write_uninstall_tombstone_with_before_publish(
+            &queries_parent,
+            "rust",
+            |path, _| {
+                fs::hard_link(path, &outside_alias).unwrap();
+            },
+            |_| Ok(()),
+        )
+        .unwrap();
+
+        assert_eq!(
+            fs::read_to_string(&outside_alias).unwrap(),
+            "old tombstone\n",
+            "a link raced after validation must retain the old inode contents"
+        );
+        assert_eq!(fs::read_to_string(tombstone).unwrap(), "ok\n");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn tombstone_publish_rejects_substituted_private_stage() {
+        use std::os::unix::fs::symlink;
+
+        let temp = TempDir::new().unwrap();
+        let queries_parent = temp.path().join("queries");
+        fs::create_dir_all(&queries_parent).unwrap();
+        let victim = temp.path().join("victim");
+        fs::write(&victim, "keep me\n").unwrap();
+
+        let result = write_uninstall_tombstone_with_before_publish(
+            &queries_parent,
+            "rust",
+            |_, staged_path| {
+                fs::remove_file(staged_path).unwrap();
+                symlink(&victim, staged_path).unwrap();
+            },
+            |_| Ok(()),
+        );
+
+        assert!(
+            result.is_err(),
+            "publication must reject a stage path detached from its opened handle"
+        );
+        assert_eq!(fs::read_to_string(victim).unwrap(), "keep me\n");
+    }
+
+    #[test]
+    fn failed_tombstone_publish_cleans_private_stage() {
+        let temp = TempDir::new().unwrap();
+        let queries_parent = temp.path().join("queries");
+        fs::create_dir_all(&queries_parent).unwrap();
+        let tombstone = uninstall_tombstone_path(&queries_parent, "rust");
+        fs::write(&tombstone, "old tombstone\n").unwrap();
+
+        let result = write_uninstall_tombstone_with_before_publish(
+            &queries_parent,
+            "rust",
+            |path, _| {
+                fs::remove_file(path).unwrap();
+                fs::create_dir(path).unwrap();
+            },
+            |_| Ok(()),
+        );
+
+        assert!(result.is_err(), "a directory cannot be replaced by a file");
+        let names: Vec<_> = fs::read_dir(&queries_parent)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(
+            names,
+            vec![tombstone.file_name().unwrap().to_os_string()],
+            "the private stage must be removed on every persist failure"
+        );
+    }
+
+    #[test]
+    fn tombstone_publish_propagates_parent_sync_failure() {
+        let temp = TempDir::new().unwrap();
+        let queries_parent = temp.path().join("queries");
+        fs::create_dir_all(&queries_parent).unwrap();
+        let sync_called = std::cell::Cell::new(false);
+
+        let result = write_uninstall_tombstone_with_before_publish(
+            &queries_parent,
+            "rust",
+            |_, _| {},
+            |_| {
+                sync_called.set(true);
+                Err(std::io::Error::other("injected parent sync failure"))
+            },
+        );
+
+        assert!(sync_called.get(), "publication must cross the sync gate");
+        assert!(
+            matches!(result, Err(QueryInstallError::IoError(_))),
+            "sync failure must prevent uninstall from reaching removal"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn tombstone_atomic_publish_preserves_file_create_umask_mode() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let temp = TempDir::new().unwrap();
+        let queries_parent = temp.path().join("queries");
+        fs::create_dir_all(&queries_parent).unwrap();
+        let control = queries_parent.join("control");
+        fs::File::create(&control).unwrap();
+
+        write_uninstall_tombstone(&queries_parent, "rust").unwrap();
+
+        let expected = fs::metadata(control).unwrap().permissions().mode() & 0o777;
+        let actual = fs::metadata(uninstall_tombstone_path(&queries_parent, "rust"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn tombstone_atomic_publish_preserves_existing_mode() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let temp = TempDir::new().unwrap();
+        let queries_parent = temp.path().join("queries");
+        fs::create_dir_all(&queries_parent).unwrap();
+        let tombstone = uninstall_tombstone_path(&queries_parent, "rust");
+        fs::write(&tombstone, "old\n").unwrap();
+        fs::set_permissions(&tombstone, fs::Permissions::from_mode(0o600)).unwrap();
+
+        write_uninstall_tombstone(&queries_parent, "rust").unwrap();
+
+        assert_eq!(
+            fs::metadata(tombstone).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn remove_query_install_supports_windows_symlinked_queries_parent() {
+        use std::os::windows::fs::symlink_dir;
+
+        let temp = TempDir::new().unwrap();
+        let real_queries = temp.path().join("real-queries");
+        fs::create_dir_all(&real_queries).unwrap();
+        let linked_queries = temp.path().join("queries");
+        symlink_dir(&real_queries, &linked_queries).unwrap();
+
+        remove_query_install_and_backups(&linked_queries, "rust").unwrap();
+
+        assert_eq!(
+            fs::read_to_string(uninstall_tombstone_path(&real_queries, "rust")).unwrap(),
+            "ok\n"
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn windows_tombstone_publish_replaces_raced_symlink_entry() {
+        use std::os::windows::fs::MetadataExt as _;
+        use std::os::windows::fs::symlink_file;
+        use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_TEMPORARY;
+
+        let temp = TempDir::new().unwrap();
+        let queries_parent = temp.path().join("queries");
+        fs::create_dir_all(&queries_parent).unwrap();
+        let tombstone = uninstall_tombstone_path(&queries_parent, "rust");
+        fs::write(&tombstone, "old\n").unwrap();
+        let victim = temp.path().join("victim");
+        fs::write(&victim, "keep me\n").unwrap();
+
+        write_uninstall_tombstone_with_before_publish(
+            &queries_parent,
+            "rust",
+            |path, _| {
+                fs::remove_file(path).unwrap();
+                symlink_file(&victim, path).unwrap();
+            },
+            |_| Ok(()),
+        )
+        .unwrap();
+
+        assert_eq!(fs::read_to_string(victim).unwrap(), "keep me\n");
+        assert!(
+            fs::symlink_metadata(&tombstone)
+                .unwrap()
+                .file_type()
+                .is_file(),
+            "handle-relative replace must replace the symlink entry itself"
+        );
+        assert_eq!(fs::read_to_string(tombstone).unwrap(), "ok\n");
+        assert_eq!(
+            fs::metadata(uninstall_tombstone_path(&queries_parent, "rust"))
+                .unwrap()
+                .file_attributes()
+                & FILE_ATTRIBUTE_TEMPORARY,
+            0,
+            "published tombstone must not retain tempfile cache semantics"
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn windows_security_copy_failure_aborts_before_tombstone_publication() {
+        let temp = TempDir::new().unwrap();
+        let queries_parent = temp.path().join("queries");
+        fs::create_dir_all(queries_parent.join("rust")).unwrap();
+        let tombstone = uninstall_tombstone_path(&queries_parent, "rust");
+        fs::write(&tombstone, "old\n").unwrap();
+        let pinned =
+            cap_std::fs::Dir::open_ambient_dir(&queries_parent, cap_std::ambient_authority())
+                .unwrap();
+
+        let result = write_uninstall_tombstone_at_with_security_copy(
+            &pinned,
+            &queries_parent,
+            "rust",
+            |_, _, _| {},
+            |_| Ok(()),
+            |_, _| {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "denied",
+                ))
+            },
+        );
+
+        assert!(matches!(result, Err(QueryInstallError::IoError(_))));
+        assert_eq!(fs::read_to_string(&tombstone).unwrap(), "old\n");
+        assert!(queries_parent.join("rust").exists());
+        assert_eq!(
+            fs::read_dir(&queries_parent)
+                .unwrap()
+                .filter_map(Result::ok)
+                .filter(|entry| entry.file_name().to_string_lossy().ends_with(".tmp"))
+                .count(),
+            0,
+            "a denied security copy must clean the private stage"
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn windows_differing_owner_is_applied_before_restrictive_dacl() {
+        use std::cell::RefCell;
+        use windows_sys::Win32::Security::OWNER_SECURITY_INFORMATION;
+
+        let operations = RefCell::new(Vec::new());
+        apply_windows_security_parts(
+            OWNER_SECURITY_INFORMATION,
+            || {
+                if operations.borrow().contains(&"dacl") {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        "restrictive DACL already installed",
+                    ));
+                }
+                operations.borrow_mut().push("owner");
+                Ok(())
+            },
+            || {
+                operations.borrow_mut().push("dacl");
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        assert_eq!(operations.into_inner(), ["owner", "dacl"]);
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn windows_tombstone_preserves_null_protected_dacl() {
+        use std::os::windows::io::{AsRawHandle as _, FromRawHandle as _};
+        use windows_sys::Win32::Foundation::{ERROR_SUCCESS, INVALID_HANDLE_VALUE, LocalFree};
+        use windows_sys::Win32::Security::Authorization::{
+            GetSecurityInfo, SE_FILE_OBJECT, SetSecurityInfo,
+        };
+        use windows_sys::Win32::Security::{
+            DACL_SECURITY_INFORMATION, GetSecurityDescriptorControl,
+            PROTECTED_DACL_SECURITY_INFORMATION, SE_DACL_PROTECTED,
+        };
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, READ_CONTROL, ReOpenFile,
+            WRITE_DAC,
+        };
+
+        let temp = TempDir::new().unwrap();
+        let queries_parent = temp.path().join("queries");
+        fs::create_dir_all(&queries_parent).unwrap();
+        let tombstone = uninstall_tombstone_path(&queries_parent, "rust");
+        fs::write(&tombstone, "old\n").unwrap();
+        let existing = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&tombstone)
+            .unwrap();
+        // SAFETY: success returns a distinct owned handle with WRITE_DAC.
+        let security_handle = unsafe {
+            ReOpenFile(
+                existing.as_raw_handle(),
+                READ_CONTROL | WRITE_DAC,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                0,
+            )
+        };
+        assert_ne!(security_handle, INVALID_HANDLE_VALUE);
+        // SAFETY: successful ReOpenFile returned a newly owned handle.
+        let security_file = unsafe { fs::File::from_raw_handle(security_handle) };
+        // SAFETY: the handle is valid; a null DACL is intentional and grants
+        // full access while remaining observably distinct from an inherited ACL.
+        let status = unsafe {
+            SetSecurityInfo(
+                security_file.as_raw_handle(),
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        };
+        assert_eq!(status, ERROR_SUCCESS);
+        drop(existing);
+
+        write_uninstall_tombstone(&queries_parent, "rust").unwrap();
+
+        let published = fs::File::open(&tombstone).unwrap();
+        let mut dacl = std::ptr::null_mut();
+        let mut descriptor = std::ptr::null_mut();
+        // SAFETY: outputs live until descriptor is released below.
+        let status = unsafe {
+            GetSecurityInfo(
+                published.as_raw_handle(),
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                &mut dacl,
+                std::ptr::null_mut(),
+                &mut descriptor,
+            )
+        };
+        assert_eq!(status, ERROR_SUCCESS);
+        let mut control = 0;
+        let mut revision = 0;
+        // SAFETY: descriptor was returned successfully by GetSecurityInfo.
+        assert_ne!(
+            unsafe { GetSecurityDescriptorControl(descriptor, &mut control, &mut revision) },
+            0
+        );
+        assert!(dacl.is_null(), "the explicit null DACL must be preserved");
+        assert_ne!(control & SE_DACL_PROTECTED, 0);
+        // SAFETY: GetSecurityInfo allocates the descriptor with LocalAlloc.
+        unsafe { LocalFree(descriptor.cast()) };
     }
 
     #[test]

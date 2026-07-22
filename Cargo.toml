@@ -49,6 +49,8 @@ opt-level = 3
 
 [dependencies]
 arc-swap = "1"
+cap-std = "4.0.2"
+cap-fs-ext = "4.0.2"
 clap = { version = "4", features = ["derive"] }
 dashmap = "6"
 dirs = "6"
@@ -104,6 +106,9 @@ futures = "0.3.31"
 # Unix-only dependencies (signal handling; "fs" for FD_CLOEXEC in tests)
 [target.'cfg(unix)'.dependencies]
 nix = { version = "0.31", features = ["signal", "process", "fs"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_Storage_FileSystem"] }
 
 [features]
 e2e = []
