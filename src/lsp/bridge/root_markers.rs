@@ -37,6 +37,14 @@ fn is_valid_marker(marker: &str) -> bool {
         && components.all(|c| matches!(c, std::path::Component::Normal(_)))
 }
 
+/// Whether the configured marker has a directory entry at this ancestor.
+///
+/// Marker contents and symlink targets are irrelevant: the configured name is
+/// the signal, so use non-following metadata to retain dangling symlinks.
+fn marker_entry_exists(path: &Path) -> bool {
+    std::fs::symlink_metadata(path).is_ok()
+}
+
 /// Resolve the marker root for `document_path` following Neovim's
 /// `vim.fs.root` `(string|string[])[]` priority: entries are tried in order,
 /// and each entry is searched up the document's ancestors nearest-first
@@ -63,10 +71,11 @@ fn find_marker_root(document_path: &Path, markers: &[RootMarker]) -> Option<Path
         if names.is_empty() {
             continue;
         }
-        if let Some(dir) = parent
-            .ancestors()
-            .find(|dir| names.iter().any(|marker| dir.join(marker).exists()))
-        {
+        if let Some(dir) = parent.ancestors().find(|dir| {
+            names
+                .iter()
+                .any(|marker| marker_entry_exists(&dir.join(marker)))
+        }) {
             return Some(dir.to_path_buf());
         }
     }
@@ -171,6 +180,24 @@ mod tests {
             root.map(|p| p.canonicalize().unwrap()),
             Some(inner.canonicalize().unwrap()),
             "nearest marker wins over the outer one"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dangling_symlink_entry_counts_as_workspace_marker() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path().join("project");
+        std::fs::create_dir_all(project.join("src")).unwrap();
+        symlink("missing-target", project.join(".project-root")).unwrap();
+        let doc = project.join("src/main.rs");
+
+        assert_eq!(
+            find_marker_root(&doc, &markers(&[".project-root"])),
+            Some(project),
+            "marker presence is defined by its directory entry, not its target"
         );
     }
 
