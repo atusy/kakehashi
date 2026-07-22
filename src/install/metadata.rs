@@ -6,7 +6,6 @@
 //! The main branch of nvim-treesitter uses a consolidated format where each language
 //! entry contains url, revision, and location all in one place.
 
-use regex::Regex;
 use std::collections::HashMap;
 use std::path::Path;
 use std::time::Duration;
@@ -104,16 +103,48 @@ fn fetch_parsers_lua_with_options(
         }
     });
 
-    // Try cache first
-    if let Some(ref cache) = cache
+    load_parsers_lua(cache.as_ref(), fetch_parsers_lua)
+}
+
+fn load_parsers_lua(
+    cache: Option<&MetadataCache>,
+    fetch: impl FnOnce() -> Result<String, MetadataError>,
+) -> Result<HashMap<String, ParserMetadata>, MetadataError> {
+    if let Some(cache) = cache
         && let Some(cached_content) = cache.read()
+        && let Ok(parsers) = parse_complete_parsers_lua(&cached_content)
     {
-        return parse_parsers_lua(&cached_content);
+        return Ok(parsers);
     }
 
-    // Cache miss or no cache - fetch from network
-    let agent = agent_with_timeout(PARSERS_LUA_HTTP_TIMEOUT);
+    let content = fetch()?;
+    let parsers = parse_complete_parsers_lua(&content)?;
+    if let Some(cache) = cache {
+        // Ignore cache write errors - caching is best-effort
+        let _ = cache.write(&content);
+    }
+    Ok(parsers)
+}
 
+fn parse_complete_parsers_lua(
+    content: &str,
+) -> Result<HashMap<String, ParserMetadata>, MetadataError> {
+    // A prefix ending after one complete language entry can still yield a
+    // non-empty map. Require the outer `return { ... }` table to close before
+    // accepting or publishing metadata.
+    if returned_table_start(content)
+        .and_then(|start| find_matching_brace(&content[start..]))
+        .is_none()
+    {
+        return Err(MetadataError::ParseError(
+            "incomplete parsers.lua document".to_string(),
+        ));
+    }
+    parse_parsers_lua(content)
+}
+
+fn fetch_parsers_lua() -> Result<String, MetadataError> {
+    let agent = agent_with_timeout(PARSERS_LUA_HTTP_TIMEOUT);
     let mut response = agent.get(PARSERS_LUA_URL).call().map_err(|e| match e {
         ureq::Error::Timeout(_) => MetadataError::Timeout,
         ureq::Error::StatusCode(code) => {
@@ -122,18 +153,10 @@ fn fetch_parsers_lua_with_options(
         e => MetadataError::HttpError(e.to_string()),
     })?;
 
-    let content = response.body_mut().read_to_string().map_err(|e| match e {
+    response.body_mut().read_to_string().map_err(|e| match e {
         ureq::Error::Timeout(_) => MetadataError::Timeout,
         e => MetadataError::HttpError(e.to_string()),
-    })?;
-
-    // Update cache if available
-    if let Some(cache) = cache {
-        // Ignore cache write errors - caching is best-effort
-        let _ = cache.write(&content);
-    }
-
-    parse_parsers_lua(&content)
+    })
 }
 
 /// Parse the parsers.lua content to extract parser information.
@@ -142,24 +165,25 @@ fn fetch_parsers_lua_with_options(
 fn parse_parsers_lua(content: &str) -> Result<HashMap<String, ParserMetadata>, MetadataError> {
     let mut parsers = HashMap::new();
 
-    // Pattern to match parser entries in main branch format: lang = { ... }
-    // The pattern matches language names at the start of a line (with optional indentation)
-    // followed by = {
-    let lang_pattern = Regex::new(r#"(?m)^\s*([a-zA-Z][a-zA-Z0-9_]*)\s*=\s*\{"#)
-        .expect("valid regex for lang pattern");
-
-    // Find all language names first
-    let lang_names: Vec<String> = lang_pattern
-        .captures_iter(content)
-        .filter_map(|cap| cap.get(1).map(|m| m.as_str().to_string()))
-        // Filter out non-language keys like "return", "install_info", etc.
-        .filter(|name| !is_reserved_key(name))
-        .collect();
+    let lang_names = top_level_table_keys(content)?;
 
     // For each language, find its block and extract metadata
-    for lang in lang_names {
-        if let Some(info) = extract_parser_metadata(content, &lang) {
-            parsers.insert(lang, info);
+    for (lang, block) in lang_names {
+        // Query-only entries (for example upstream `ecma`) intentionally have
+        // no install_info and are not installable parsers.
+        match install_info(block) {
+            InstallInfo::Absent => {}
+            InstallInfo::Invalid => {
+                return Err(MetadataError::ParseError(format!(
+                    "invalid install_info for {lang}"
+                )));
+            }
+            InstallInfo::Table(install_info) => {
+                let info = extract_parser_metadata_from_block(install_info).ok_or_else(|| {
+                    MetadataError::ParseError(format!("incomplete parser metadata for {lang}"))
+                })?;
+                parsers.insert(lang, info);
+            }
         }
     }
 
@@ -168,6 +192,193 @@ fn parse_parsers_lua(content: &str) -> Result<HashMap<String, ParserMetadata>, M
     }
 
     Ok(parsers)
+}
+
+fn top_level_table_keys(s: &str) -> Result<Vec<(String, &str)>, MetadataError> {
+    let Some(offset) = returned_table_start(s) else {
+        return Ok(Vec::new());
+    };
+    table_entries(s, offset)
+        .into_iter()
+        .filter_map(|(name, value)| match (is_reserved_key(&name), value) {
+            (true, _) => None,
+            (false, LuaValue::Table(block)) => Some(Ok((name, block))),
+            (false, LuaValue::String(_) | LuaValue::Other) => Some(Err(MetadataError::ParseError(
+                format!("invalid parser entry for {name}"),
+            ))),
+        })
+        .collect()
+}
+
+fn table_entries(s: &str, mut offset: usize) -> Vec<(String, LuaValue<'_>)> {
+    let mut keys = Vec::new();
+    let mut depth = 0;
+    let mut quote = None;
+    let mut escaped = false;
+    let mut line_comment = false;
+    let mut long_bracket = None;
+
+    while offset < s.len() {
+        if let Some(equals) = long_bracket {
+            if is_long_bracket_close(&s[offset..], equals) {
+                offset += equals + 2;
+                long_bracket = None;
+            } else if let Some(c) = s[offset..].chars().next() {
+                offset += c.len_utf8();
+            }
+            continue;
+        }
+
+        let Some(c) = s[offset..].chars().next() else {
+            break;
+        };
+        let char_len = c.len_utf8();
+        if line_comment {
+            if c == '\n' {
+                line_comment = false;
+            }
+            offset += char_len;
+            continue;
+        }
+        if let Some(delimiter) = quote {
+            if escaped {
+                escaped = false;
+            } else if c == '\\' {
+                escaped = true;
+            } else if c == delimiter {
+                quote = None;
+            }
+            offset += char_len;
+            continue;
+        }
+        if s[offset..].starts_with("--") {
+            offset += 2;
+            if let Some(equals) = long_bracket_open(&s[offset..]) {
+                offset += equals + 2;
+                long_bracket = Some(equals);
+            } else {
+                line_comment = true;
+            }
+            continue;
+        }
+        if let Some(equals) = long_bracket_open(&s[offset..]) {
+            offset += equals + 2;
+            long_bracket = Some(equals);
+            continue;
+        }
+
+        if depth == 1
+            && c.is_ascii_alphabetic()
+            && (offset == 0
+                || !s[..offset]
+                    .chars()
+                    .next_back()
+                    .is_some_and(is_lua_identifier_char))
+        {
+            let name_len = s[offset..]
+                .chars()
+                .take_while(|next| is_lua_identifier_char(*next))
+                .map(char::len_utf8)
+                .sum::<usize>();
+            let name_end = offset + name_len;
+            let whitespace = s[name_end..]
+                .chars()
+                .take_while(|next| next.is_whitespace())
+                .map(char::len_utf8)
+                .sum::<usize>();
+            let equals = name_end + whitespace;
+            if s[equals..].starts_with('=') {
+                let after_equals = equals + 1;
+                let whitespace = s[after_equals..]
+                    .chars()
+                    .take_while(|next| next.is_whitespace())
+                    .map(char::len_utf8)
+                    .sum::<usize>();
+                let value_start = after_equals + whitespace;
+                let name = s[offset..name_end].to_string();
+                if s[value_start..].starts_with('{') {
+                    if let Some(block) = find_matching_brace(&s[value_start..]) {
+                        if has_valid_field_terminator(&s[value_start + block.len()..]) {
+                            keys.push((name, LuaValue::Table(block)));
+                        } else {
+                            keys.push((name, LuaValue::Other));
+                        }
+                    } else {
+                        keys.push((name, LuaValue::Other));
+                    }
+                } else if matches!(s[value_start..].chars().next(), Some('\'' | '"'))
+                    && let Some(value) = quoted_string(&s[value_start..])
+                {
+                    let delimiter_len = s[value_start..].chars().next().unwrap().len_utf8();
+                    let value_end = value_start + delimiter_len + value.len() + delimiter_len;
+                    if has_valid_field_terminator(&s[value_end..]) {
+                        keys.push((name, LuaValue::String(value)));
+                    } else {
+                        keys.push((name, LuaValue::Other));
+                    }
+                } else {
+                    keys.push((name, LuaValue::Other));
+                }
+            }
+        }
+
+        match c {
+            '\'' | '"' => quote = Some(c),
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    break;
+                }
+            }
+            _ => {}
+        }
+        offset += char_len;
+    }
+    keys
+}
+
+fn has_valid_field_terminator(mut rest: &str) -> bool {
+    loop {
+        rest = rest.trim_start_matches(char::is_whitespace);
+        if let Some(comment) = rest.strip_prefix("--") {
+            if let Some(equals) = long_bracket_open(comment) {
+                let opener_len = equals + 2;
+                let closer = format!("]{}]", "=".repeat(equals));
+                let Some(close_offset) = comment[opener_len..].find(&closer) else {
+                    return false;
+                };
+                rest = &comment[opener_len + close_offset + closer.len()..];
+            } else if let Some(newline) = comment.find('\n') {
+                rest = &comment[newline + 1..];
+            } else {
+                return false;
+            }
+            continue;
+        }
+        return matches!(rest.chars().next(), Some(',' | ';' | '}'));
+    }
+}
+
+fn quoted_string(s: &str) -> Option<&str> {
+    let delimiter = s.chars().next()?;
+    let mut escaped = false;
+    for (offset, c) in s[delimiter.len_utf8()..].char_indices() {
+        if escaped {
+            escaped = false;
+        } else if c == '\\' {
+            escaped = true;
+        } else if c == delimiter {
+            return Some(&s[delimiter.len_utf8()..delimiter.len_utf8() + offset]);
+        }
+    }
+    None
+}
+
+enum LuaValue<'a> {
+    Table(&'a str),
+    String(&'a str),
+    Other,
 }
 
 /// Check if a key is a reserved/internal key (not a language name)
@@ -185,39 +396,21 @@ fn is_reserved_key(name: &str) -> bool {
     )
 }
 
-/// Extract parser metadata for a specific language from parsers.lua content.
-fn extract_parser_metadata(content: &str, language: &str) -> Option<ParserMetadata> {
-    // Find the start of this language's block
-    // Use word boundary to avoid matching substrings (e.g., "c" matching "cpp")
-    let block_start_pattern = format!(r#"(?m)^\s*{}\s*=\s*\{{"#, regex::escape(language));
-    let block_start_re = Regex::new(&block_start_pattern).ok()?;
-
-    let block_start = block_start_re.find(content)?;
-    let start_pos = block_start.start();
-
-    // Find the end of this block by counting braces
-    let block_content = find_matching_brace(&content[start_pos..])?;
-
-    // Extract URL (required)
-    let url_re = Regex::new(r#"url\s*=\s*'([^']+)'"#).ok()?;
-    let url = url_re
-        .captures(block_content)
-        .and_then(|cap| cap.get(1))
-        .map(|m| m.as_str().to_string())?;
-
-    // Extract revision (required) - in main branch, revision is inside install_info
-    let revision_re = Regex::new(r#"revision\s*=\s*'([^']+)'"#).ok()?;
-    let revision = revision_re
-        .captures(block_content)
-        .and_then(|cap| cap.get(1))
-        .map(|m| m.as_str().to_string())?;
-
-    // Extract location (optional)
-    let location_re = Regex::new(r#"location\s*=\s*'([^']+)'"#).ok()?;
-    let location = location_re
-        .captures(block_content)
-        .and_then(|cap| cap.get(1))
-        .map(|m| m.as_str().to_string());
+fn extract_parser_metadata_from_block(install_info: &str) -> Option<ParserMetadata> {
+    let fields = table_entries(install_info, 0);
+    let string_field = |key: &str| {
+        fields.iter().find_map(|(name, value)| match value {
+            LuaValue::String(value) if name == key => Some((*value).to_string()),
+            _ => None,
+        })
+    };
+    let url = string_field("url")?;
+    let revision = string_field("revision")?;
+    let location = match fields.iter().find(|(name, _)| name == "location") {
+        None => None,
+        Some((_, LuaValue::String(value))) => Some((*value).to_string()),
+        Some(_) => return None,
+    };
 
     Some(ParserMetadata {
         url,
@@ -226,31 +419,212 @@ fn extract_parser_metadata(content: &str, language: &str) -> Option<ParserMetada
     })
 }
 
+enum InstallInfo<'a> {
+    Absent,
+    Table(&'a str),
+    Invalid,
+}
+
+fn install_info(block: &str) -> InstallInfo<'_> {
+    match table_entries(block, 0)
+        .into_iter()
+        .find(|(name, _)| name == "install_info")
+    {
+        None => InstallInfo::Absent,
+        Some((_, LuaValue::Table(table))) => InstallInfo::Table(table),
+        Some(_) => InstallInfo::Invalid,
+    }
+}
+
 /// Find the content within matching braces starting from the first `{`.
 fn find_matching_brace(s: &str) -> Option<&str> {
-    let start = s.find('{')?;
+    let mut start = None;
     let mut depth = 0;
-    let mut end = start;
+    let mut end = 0;
+    let mut quote = None;
+    let mut escaped = false;
+    let mut line_comment = false;
+    let mut long_bracket = None;
+    let mut offset = 0;
 
-    for (i, c) in s[start..].char_indices() {
+    while offset < s.len() {
+        if let Some(equals) = long_bracket {
+            if is_long_bracket_close(&s[offset..], equals) {
+                offset += equals + 2;
+                long_bracket = None;
+            } else {
+                offset += s[offset..].chars().next()?.len_utf8();
+            }
+            continue;
+        }
+
+        let c = s[offset..].chars().next()?;
+        let char_len = c.len_utf8();
+        if line_comment {
+            if c == '\n' {
+                line_comment = false;
+            }
+            offset += char_len;
+            continue;
+        }
+        if let Some(delimiter) = quote {
+            if escaped {
+                escaped = false;
+            } else if c == '\\' {
+                escaped = true;
+            } else if c == delimiter {
+                quote = None;
+            }
+            offset += char_len;
+            continue;
+        }
+
+        if s[offset..].starts_with("--") {
+            offset += 2;
+            if let Some(equals) = long_bracket_open(&s[offset..]) {
+                offset += equals + 2;
+                long_bracket = Some(equals);
+            } else {
+                line_comment = true;
+            }
+            continue;
+        }
+        if let Some(equals) = long_bracket_open(&s[offset..]) {
+            offset += equals + 2;
+            long_bracket = Some(equals);
+            continue;
+        }
+
         match c {
-            '{' => depth += 1,
+            '\'' | '"' => quote = Some(c),
+            '{' => {
+                if depth == 0 {
+                    start = Some(offset);
+                }
+                depth += 1;
+            }
             '}' => {
                 depth -= 1;
                 if depth == 0 {
-                    end = start + i + 1;
+                    end = offset + char_len;
                     break;
                 }
             }
             _ => {}
         }
+        offset += char_len;
     }
 
     if depth == 0 {
-        Some(&s[start..end])
+        Some(&s[start?..end])
     } else {
         None
     }
+}
+
+fn returned_table_start(s: &str) -> Option<usize> {
+    let mut quote = None;
+    let mut escaped = false;
+    let mut line_comment = false;
+    let mut long_bracket = None;
+    let mut offset = 0;
+
+    while offset < s.len() {
+        if let Some(equals) = long_bracket {
+            if is_long_bracket_close(&s[offset..], equals) {
+                offset += equals + 2;
+                long_bracket = None;
+            } else {
+                offset += s[offset..].chars().next()?.len_utf8();
+            }
+            continue;
+        }
+
+        let c = s[offset..].chars().next()?;
+        let char_len = c.len_utf8();
+        if line_comment {
+            if c == '\n' {
+                line_comment = false;
+            }
+            offset += char_len;
+            continue;
+        }
+        if let Some(delimiter) = quote {
+            if escaped {
+                escaped = false;
+            } else if c == '\\' {
+                escaped = true;
+            } else if c == delimiter {
+                quote = None;
+            }
+            offset += char_len;
+            continue;
+        }
+
+        if s[offset..].starts_with("--") {
+            offset += 2;
+            if let Some(equals) = long_bracket_open(&s[offset..]) {
+                offset += equals + 2;
+                long_bracket = Some(equals);
+            } else {
+                line_comment = true;
+            }
+            continue;
+        }
+        if let Some(equals) = long_bracket_open(&s[offset..]) {
+            offset += equals + 2;
+            long_bracket = Some(equals);
+            continue;
+        }
+        if s[offset..].starts_with("return")
+            && (offset == 0
+                || !s[..offset]
+                    .chars()
+                    .next_back()
+                    .is_some_and(is_lua_identifier_char))
+            && !s[offset + "return".len()..]
+                .chars()
+                .next()
+                .is_some_and(is_lua_identifier_char)
+        {
+            let table_start = offset + "return".len();
+            let whitespace = s[table_start..]
+                .chars()
+                .take_while(|next| next.is_whitespace())
+                .map(char::len_utf8)
+                .sum::<usize>();
+            if s[table_start + whitespace..].starts_with('{') {
+                return Some(table_start + whitespace);
+            }
+        }
+
+        match c {
+            '\'' | '"' => quote = Some(c),
+            _ => {}
+        }
+        offset += char_len;
+    }
+    None
+}
+
+fn is_lua_identifier_char(c: char) -> bool {
+    c == '_' || c.is_ascii_alphanumeric()
+}
+
+fn long_bracket_open(s: &str) -> Option<usize> {
+    let bytes = s.as_bytes();
+    if bytes.first() != Some(&b'[') {
+        return None;
+    }
+    let equals = bytes[1..].iter().take_while(|byte| **byte == b'=').count();
+    (bytes.get(equals + 1) == Some(&b'[')).then_some(equals)
+}
+
+fn is_long_bracket_close(s: &str, equals: usize) -> bool {
+    let bytes = s.as_bytes();
+    bytes.first() == Some(&b']')
+        && bytes[1..].iter().take(equals).all(|byte| *byte == b'=')
+        && bytes.get(equals + 1) == Some(&b']')
 }
 
 /// Fetch parser metadata for a language from nvim-treesitter.
@@ -302,7 +676,146 @@ pub fn is_language_supported(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use tempfile::tempdir;
+
+    #[test]
+    fn corrupt_fresh_cache_falls_back_to_fetch() {
+        let temp = tempdir().expect("temp dir");
+        let cache = MetadataCache::with_default_ttl(temp.path());
+        cache.write("truncated").expect("write corrupt cache");
+        let fetched = AtomicBool::new(false);
+
+        let parsers = load_parsers_lua(Some(&cache), || {
+            fetched.store(true, Ordering::Relaxed);
+            Ok("return {\nlua = { install_info = { url = 'https://example.com/lua', revision = 'abc' } },\n}"
+                .to_string())
+        })
+        .expect("corrupt cache should be repaired from the source");
+
+        assert!(fetched.load(Ordering::Relaxed));
+        assert!(parsers.contains_key("lua"));
+        assert!(
+            cache
+                .read()
+                .and_then(|content| parse_parsers_lua(&content).ok())
+                .is_some_and(|cached| cached.contains_key("lua")),
+            "successful recovery must replace the corrupt cache"
+        );
+    }
+
+    #[test]
+    fn cache_truncated_after_complete_entry_falls_back_to_fetch() {
+        let temp = tempdir().expect("temp dir");
+        let cache = MetadataCache::with_default_ttl(temp.path());
+        cache
+            .write("return {\nlua = { install_info = { url = 'https://stale/lua', revision = 'old' } },")
+            .expect("write partial cache");
+
+        let parsers = load_parsers_lua(Some(&cache), || {
+            Ok("return {\nrust = { install_info = { url = 'https://example.com/rust', revision = 'new' } },\n}"
+                .to_string())
+        })
+        .expect("partial document must be refetched");
+
+        assert!(parsers.contains_key("rust"));
+        assert!(!parsers.contains_key("lua"));
+    }
+
+    #[test]
+    fn braces_in_strings_and_comments_do_not_hide_truncation() {
+        let partial = "return {\n-- } is not the table end\nlua = { url = 'https://example/}', revision = 'ok' },";
+        assert!(matches!(
+            parse_complete_parsers_lua(partial),
+            Err(MetadataError::ParseError(_))
+        ));
+    }
+
+    #[test]
+    fn braces_in_preamble_comments_do_not_complete_the_document() {
+        let partial = "-- {} is not the returned table\nreturn {\nlua = { install_info = { url = 'https://example/lua', revision = 'ok' } },";
+        assert!(matches!(
+            parse_complete_parsers_lua(partial),
+            Err(MetadataError::ParseError(_))
+        ));
+    }
+
+    #[test]
+    fn braces_in_long_strings_and_comments_do_not_hide_truncation() {
+        let partial = "return {\n--[=[ } is not the table end ]=]\nlua = { note = [==[ } is data ]==], install_info = { url = 'https://example/lua', revision = 'ok' } },";
+        assert!(matches!(
+            parse_complete_parsers_lua(partial),
+            Err(MetadataError::ParseError(_))
+        ));
+    }
+
+    #[test]
+    fn malformed_top_level_entry_rejects_the_whole_document() {
+        let content = "return {\nlua = { install_info = { url = 'https://example/lua', revision = 'ok' } },\nrust = { install_info = { url = 'https://example/rust' } },\n}";
+        assert!(matches!(
+            parse_complete_parsers_lua(content),
+            Err(MetadataError::ParseError(_))
+        ));
+    }
+
+    #[test]
+    fn top_level_entries_do_not_depend_on_indentation() {
+        let content = "return {\nlua = { install_info = { url = 'https://example/lua', revision = 'lua-rev' } },\n  rust = { install_info = { url = 'https://example/rust', revision = 'rust-rev' } },\n}";
+        let parsers = parse_complete_parsers_lua(content).expect("complete metadata");
+
+        assert_eq!(parsers.len(), 2);
+        assert!(parsers.contains_key("lua"));
+        assert!(parsers.contains_key("rust"));
+    }
+
+    #[test]
+    fn preamble_examples_do_not_shadow_returned_entries() {
+        let content = "--[=[\nlua = { install_info = { url = 'https://example/wrong', revision = 'wrong' } }\n]=]\nreturn {\nlua = { install_info = { url = 'https://example/lua', revision = 'right' } },\n}";
+        let parsers = parse_complete_parsers_lua(content).expect("complete metadata");
+
+        assert_eq!(parsers["lua"].url, "https://example/lua");
+        assert_eq!(parsers["lua"].revision, "right");
+    }
+
+    #[test]
+    fn commented_metadata_fields_do_not_validate_an_entry() {
+        let content = "return {\nlua = { install_info = {\n-- url = 'https://example/wrong'\n-- revision = 'wrong'\n} },\n}";
+
+        assert!(matches!(
+            parse_complete_parsers_lua(content),
+            Err(MetadataError::ParseError(_))
+        ));
+    }
+
+    #[test]
+    fn non_table_install_info_invalidates_the_document() {
+        let content = "return {\nlua = { install_info = { url = 'https://example/lua', revision = 'ok' } },\nrust = { install_info = 'damaged' },\n}";
+
+        assert!(matches!(
+            parse_complete_parsers_lua(content),
+            Err(MetadataError::ParseError(_))
+        ));
+    }
+
+    #[test]
+    fn scalar_parser_entry_invalidates_the_document() {
+        let content = "return {\nlua = { install_info = { url = 'https://example/lua', revision = 'ok' } },\nrust = false,\n}";
+
+        assert!(matches!(
+            parse_complete_parsers_lua(content),
+            Err(MetadataError::ParseError(_))
+        ));
+    }
+
+    #[test]
+    fn scalar_location_invalidates_the_document() {
+        let content = "return {\nlua = { install_info = { url = 'https://example/lua', revision = 'ok', location = false } },\n}";
+
+        assert!(matches!(
+            parse_complete_parsers_lua(content),
+            Err(MetadataError::ParseError(_))
+        ));
+    }
 
     #[test]
     fn test_fetch_parser_metadata_with_caching() {
@@ -390,6 +903,28 @@ return {
     }
 
     #[test]
+    fn rejects_unclosed_nested_table() {
+        let content = "return { lua = { install_info = { url = 'x', revision = 'r' } }";
+        assert!(matches!(
+            parse_complete_parsers_lua(content),
+            Err(MetadataError::ParseError(_))
+        ));
+    }
+
+    #[test]
+    fn rejects_missing_table_field_separators() {
+        for content in [
+            "return { lua = { install_info = { url = 'x', revision = 'r' } } rust = { install_info = { url = 'y', revision = 's' } }, }",
+            "return { lua = { install_info = { url = 'x' revision = 'r' }, }, }",
+        ] {
+            assert!(matches!(
+                parse_complete_parsers_lua(content),
+                Err(MetadataError::ParseError(_))
+            ));
+        }
+    }
+
+    #[test]
     fn test_find_matching_brace() {
         let s = "{ foo { bar } baz }";
         let result = find_matching_brace(s);
@@ -398,11 +933,14 @@ return {
         let s2 = "prefix { inner } suffix";
         let result2 = find_matching_brace(s2);
         assert_eq!(result2, Some("{ inner }"));
+
+        let with_comment_brace = "-- { ignored\n{ real }";
+        assert_eq!(find_matching_brace(with_comment_brace), Some("{ real }"));
     }
 
     #[test]
     fn test_extract_parser_metadata() {
-        let content = r#"
+        let content = r#"return {
   rust = {
     install_info = {
       revision = 'abc123',
@@ -410,9 +948,11 @@ return {
     },
     tier = 1,
   },
+}
 "#;
 
-        let info = extract_parser_metadata(content, "rust").expect("should extract");
+        let parsers = parse_parsers_lua(content).expect("should parse");
+        let info = parsers.get("rust").expect("should extract");
         assert_eq!(info.url, "https://github.com/tree-sitter/tree-sitter-rust");
         assert_eq!(info.revision, "abc123");
         assert!(info.location.is_none());
@@ -420,7 +960,7 @@ return {
 
     #[test]
     fn test_extract_parser_metadata_with_location() {
-        let content = r#"
+        let content = r#"return {
   markdown = {
     install_info = {
       location = 'tree-sitter-markdown',
@@ -429,9 +969,11 @@ return {
     },
     tier = 2,
   },
+}
 "#;
 
-        let info = extract_parser_metadata(content, "markdown").expect("should extract");
+        let parsers = parse_parsers_lua(content).expect("should parse");
+        let info = parsers.get("markdown").expect("should extract");
         assert_eq!(
             info.url,
             "https://github.com/tree-sitter-grammars/tree-sitter-markdown"
@@ -578,22 +1120,18 @@ return {
     }
 
     #[test]
-    fn test_is_language_supported_returns_error_for_invalid_metadata() {
+    fn invalid_source_still_returns_metadata_error_after_cache_miss() {
         use crate::install::test_helpers::setup_mock_metadata_cache;
 
         let temp = tempdir().expect("Failed to create temp dir");
-        let options = FetchOptions {
-            data_dir: Some(temp.path()),
-            use_cache: true,
-        };
+        setup_mock_metadata_cache(temp.path(), "truncated cache");
+        let cache = MetadataCache::with_default_ttl(temp.path());
 
-        let mock_parsers_lua = "return {}";
-        setup_mock_metadata_cache(temp.path(), mock_parsers_lua);
-
-        let result = is_language_supported("lua", Some(&options));
+        let result = load_parsers_lua(Some(&cache), || Ok("return {}".to_string()));
         assert!(
             matches!(result, Err(MetadataError::EmptyMetadata)),
-            "Expected empty metadata error for invalid metadata"
+            "invalid fetched metadata must not be cached as a successful result"
         );
+        assert_eq!(cache.read().as_deref(), Some("truncated cache"));
     }
 }
