@@ -740,7 +740,8 @@ fn measure_open(
         // Blocks until the server answers — i.e. until the (off-ingress) open parse
         // has produced a tree the reader can tokenize, or the reader fell back to an
         // on-demand parse.
-        let _ = server.semantic_full(&uri);
+        let result = server.semantic_full(&uri);
+        validate_full_response(scn, &result);
         let elapsed = start.elapsed();
         if i >= warmup {
             samples.push(elapsed);
@@ -750,6 +751,13 @@ fn measure_open(
         samples,
         discarded_attempts: 0,
     }
+}
+
+fn validate_full_response(scn: &Scenario, result: &Value) {
+    let tracked_line = tracked_marker_line(&scn.content)
+        .unwrap_or_else(|error| panic!("invalid tracked marker for {}: {error:?}", scn.name));
+    SemanticBaseline::from_full(result, tracked_line)
+        .unwrap_or_else(|error| panic!("invalid full response for {}: {error:?}", scn.name));
 }
 
 fn seed_baseline(server: &mut Server, scn: &Scenario) -> Option<SemanticBaseline> {
@@ -780,7 +788,8 @@ fn run_once(
         Kind::OpenFirstToken => unreachable!("OpenFirstToken uses measure_open"),
         Kind::CancelBurst { .. } => unreachable!("CancelBurst uses measure_cancel_burst"),
         Kind::Full => {
-            let _ = server.semantic_full(scn.uri);
+            let result = server.semantic_full(scn.uri);
+            validate_full_response(scn, &result);
         }
         Kind::Range {
             start_line,

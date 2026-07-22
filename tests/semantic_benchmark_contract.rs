@@ -48,6 +48,28 @@ fn reconstructs_delta_and_validates_the_latest_typed_position() {
 }
 
 #[test]
+fn applies_multiple_delta_edits_against_the_original_token_array() {
+    let mut baseline = SemanticBaseline::from_full(&initial_tokens(), 1).unwrap();
+    baseline.record_prefix_insert(2).unwrap();
+
+    baseline
+        .apply_response(&json!({
+            "resultId": "baseline-2",
+            "edits": [
+                {"start": 0, "deleteCount": 5},
+                {
+                    "start": 5,
+                    "deleteCount": 5,
+                    "data": [1, 6, 2, 3, 0]
+                }
+            ]
+        }))
+        .unwrap();
+
+    assert_eq!(baseline.result_id(), "baseline-2");
+}
+
+#[test]
 fn validates_a_position_after_deleting_a_typed_prefix() {
     let mut baseline = SemanticBaseline::from_full(&initial_tokens(), 1).unwrap();
     baseline.record_prefix_insert(2).unwrap();

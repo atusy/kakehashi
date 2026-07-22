@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import atexit
 import hashlib
 import json
 import os
@@ -97,7 +98,12 @@ def isolated_environment(temp: Path) -> dict[str, str]:
         "LANG": "C",
         "LC_ALL": "C",
     }
-    if rustup_home := os.environ.get("RUSTUP_HOME"):
+    rustup_home = os.environ.get("RUSTUP_HOME")
+    if rustup_home is None and (ambient_home := os.environ.get("HOME")):
+        default_rustup_home = Path(ambient_home) / ".rustup"
+        if default_rustup_home.is_dir():
+            rustup_home = str(default_rustup_home)
+    if rustup_home:
         environment["RUSTUP_HOME"] = rustup_home
     for directory in (environment["HOME"], environment["TMPDIR"], environment["CARGO_HOME"]):
         Path(directory).mkdir(parents=True)
@@ -122,6 +128,11 @@ def file_sha256(path: Path) -> str:
 def normalize_captured_stdout(stdout: str) -> str:
     """Keep captured output readable without introducing whitespace errors."""
     return stdout.rstrip() + "\n" if stdout else ""
+
+
+def remove_tree_if_exists(path: Path) -> None:
+    if path.exists():
+        shutil.rmtree(path)
 
 
 def tree_manifest(root: Path) -> list[dict[str, Any]]:
@@ -247,6 +258,7 @@ def main() -> None:
             prefix=f".{output_dir.name}.staging-", dir=output_dir.parent
         )
     )
+    atexit.register(remove_tree_if_exists, artifact_dir)
     published = False
 
     with tempfile.TemporaryDirectory(prefix="kakehashi-semantic-pairs-") as temporary:
@@ -306,11 +318,15 @@ def main() -> None:
                 env=base_environment
                 | {"KAKEHASHI_BENCH_PREPARE_DATA_DIR": str(fixture)},
             )
-            set_tree_read_only(fixture)
             fixture_entries = tree_manifest(fixture)
+            fixture_archive = artifact_dir / "fixture"
+            shutil.copytree(fixture, fixture_archive, symlinks=True)
+            if tree_manifest(fixture_archive) != fixture_entries:
+                raise RuntimeError("archived fixture differs from measured fixture")
             (artifact_dir / "fixture-manifest.json").write_text(
                 json.dumps(fixture_entries, indent=2, sort_keys=True) + "\n"
             )
+            set_tree_read_only(fixture)
 
             paths = {
                 "binary_a": binaries["A"],
@@ -446,6 +462,10 @@ def main() -> None:
                 "fixture_manifest_sha256": file_sha256(
                     artifact_dir / "fixture-manifest.json"
                 ),
+                "fixture_archive": "fixture",
+                "fixture_archive_sha256": manifest_sha256(
+                    tree_manifest(fixture_archive)
+                ),
                 "summary": "summary.json",
                 "summary_sha256": file_sha256(artifact_dir / "summary.json"),
             }
@@ -454,6 +474,7 @@ def main() -> None:
             )
             os.replace(artifact_dir, output_dir)
             published = True
+            atexit.unregister(remove_tree_if_exists)
         finally:
             if fixture is not None:
                 set_tree_writable(fixture)
@@ -464,7 +485,7 @@ def main() -> None:
             for error in cleanup_errors:
                 print(f"warning: failed to remove worktree {error}", file=sys.stderr)
             if not published and artifact_dir.exists():
-                shutil.rmtree(artifact_dir)
+                remove_tree_if_exists(artifact_dir)
 
     print(f"wrote attested benchmark evidence to {output_dir}")
 
