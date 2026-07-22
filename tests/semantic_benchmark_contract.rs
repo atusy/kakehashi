@@ -107,6 +107,21 @@ fn rejects_a_semantically_stale_full_response() {
 }
 
 #[test]
+fn rejects_a_stale_response_after_a_fixed_width_edit() {
+    let mut baseline = SemanticBaseline::from_full(&initial_tokens(), 1).unwrap();
+    baseline.expect_tracked_start(5);
+
+    assert_eq!(
+        baseline.apply_response(&initial_tokens()),
+        Err(ValidationError::TrackedTokenMismatch {
+            line: 1,
+            expected_start: 5,
+            actual_start: 4,
+        })
+    );
+}
+
+#[test]
 fn rejects_out_of_bounds_delta_edits() {
     let mut baseline = SemanticBaseline::from_full(&initial_tokens(), 1).unwrap();
 

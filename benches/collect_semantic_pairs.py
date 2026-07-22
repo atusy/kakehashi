@@ -214,6 +214,9 @@ def add_worktree(repo: Path, path: Path, commit: str) -> None:
 
 
 def remove_worktree(repo: Path, path: Path) -> str | None:
+    registered = output(["git", "worktree", "list", "--porcelain"], cwd=repo)
+    if f"worktree {path}" not in registered.splitlines():
+        return None
     completed = subprocess.run(
         ["git", "worktree", "remove", "--force", str(path)],
         cwd=repo,
@@ -285,15 +288,12 @@ def main() -> None:
         temp = Path(temporary)
         base_environment = isolated_environment(temp)
         worktrees = {name: temp / name for name in ("a-src", "b-src", "harness-src")}
-        added_worktrees: list[Path] = []
+        added_worktrees = list(worktrees.values())
         fixture: Path | None = None
         try:
             add_worktree(repo, worktrees["a-src"], a_commit)
-            added_worktrees.append(worktrees["a-src"])
             add_worktree(repo, worktrees["b-src"], b_commit)
-            added_worktrees.append(worktrees["b-src"])
             add_worktree(repo, worktrees["harness-src"], harness_commit)
-            added_worktrees.append(worktrees["harness-src"])
 
             binaries = {}
             for label, source in (("A", worktrees["a-src"]), ("B", worktrees["b-src"])):
@@ -506,12 +506,19 @@ def main() -> None:
                 json.dumps(manifest, indent=2, sort_keys=True) + "\n"
             )
         finally:
-            if fixture is not None:
-                set_tree_writable(fixture)
-            cleanup_errors = []
-            for path in reversed(added_worktrees):
-                if error := remove_worktree(repo, path):
-                    cleanup_errors.append(f"{path}: {error}")
+            blocked_signals = {signal.SIGINT, signal.SIGTERM}
+            if hasattr(signal, "SIGHUP"):
+                blocked_signals.add(signal.SIGHUP)
+            previous_mask = signal.pthread_sigmask(signal.SIG_BLOCK, blocked_signals)
+            try:
+                if fixture is not None:
+                    set_tree_writable(fixture)
+                cleanup_errors = []
+                for path in reversed(added_worktrees):
+                    if error := remove_worktree(repo, path):
+                        cleanup_errors.append(f"{path}: {error}")
+            finally:
+                signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
             if cleanup_errors:
                 remove_tree_if_exists(artifact_dir)
                 raise RuntimeError(
