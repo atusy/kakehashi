@@ -117,36 +117,6 @@ fn resolve_token_kind(
     }
 }
 
-struct CaptureKinds {
-    values: Vec<Option<Option<TokenKind>>>,
-}
-
-impl CaptureKinds {
-    fn new(query: &Query) -> Self {
-        Self {
-            values: vec![None; query.capture_names().len()],
-        }
-    }
-
-    fn get(
-        &mut self,
-        query: &Query,
-        capture_index: usize,
-        filetype: Option<&str>,
-        capture_mappings: Option<&CaptureMappings>,
-    ) -> Option<TokenKind> {
-        self.values[capture_index]
-            .get_or_insert_with(|| {
-                resolve_token_kind(
-                    query.capture_names()[capture_index],
-                    filetype,
-                    capture_mappings,
-                )
-            })
-            .clone()
-    }
-}
-
 const QUERY_METADATA_CACHE_MIN_OBSERVED_ITEMS: usize = 256;
 
 // Admit query-wide tables only after enough actual lookups can amortize them.
@@ -463,9 +433,7 @@ pub(super) fn collect_host_tokens(
 
     // Collect tokens from this document's highlight query
     let mut priorities = None;
-    let mut kinds_by_capture = None;
     let mut observed_matches = 0;
-    let mut observed_captures = 0;
     let mut cursor = QueryCursor::new();
     let mut matches = cursor.matches(query, tree.root_node(), text.as_bytes());
 
@@ -499,14 +467,7 @@ pub(super) fn collect_host_tokens(
             let is_single_line = start_pos.row == end_pos.row;
             let is_trailing_newline = end_pos.row == start_pos.row + 1 && end_pos.column == 0;
 
-            observed_captures += 1;
-            let kind = if should_cache_query_metadata(observed_captures) {
-                kinds_by_capture
-                    .get_or_insert_with(|| CaptureKinds::new(query))
-                    .get(query, c.index as usize, filetype, capture_mappings)
-            } else {
-                resolve_token_kind(capture_name, filetype, capture_mappings)
-            };
+            let kind = resolve_token_kind(capture_name, filetype, capture_mappings);
             let Some(kind) = kind else {
                 continue;
             };
@@ -726,33 +687,7 @@ mod tests {
     }
 
     #[test]
-    fn capture_kinds_precompute_legend_and_special_roles() {
-        let language: tree_sitter::Language = tree_sitter_rust::LANGUAGE.into();
-        let query = tree_sitter::Query::new(
-            &language,
-            r#"
-            (identifier) @variable
-            (line_comment) @none
-            (string_literal) @unknown.capture
-            "#,
-        )
-        .unwrap();
-
-        let mut kinds = CaptureKinds::new(&query);
-        assert_eq!(
-            (0..query.capture_names().len())
-                .map(|capture_index| kinds.get(&query, capture_index, None, None))
-                .collect::<Vec<_>>(),
-            vec![
-                Some(TokenKind::Mapped(17, 0)),
-                Some(TokenKind::NoneCapture),
-                Some(TokenKind::Transparent),
-            ]
-        );
-    }
-
-    #[test]
-    fn semantic_query_tables_resolve_only_requested_indices() {
+    fn pattern_priority_table_resolves_only_requested_indices() {
         let language: tree_sitter::Language = tree_sitter_rust::LANGUAGE.into();
         let query = tree_sitter::Query::new(
             &language,
@@ -764,18 +699,11 @@ mod tests {
         )
         .unwrap();
         let mut priorities = PatternPriorities::new(&query);
-        let mut kinds = CaptureKinds::new(&query);
 
         assert!(priorities.values.iter().all(Option::is_none));
-        assert!(kinds.values.iter().all(Option::is_none));
 
         assert_eq!(priorities.get(&query, 1), 100);
-        assert_eq!(
-            kinds.get(&query, 1, None, None),
-            Some(TokenKind::Mapped(0, 0))
-        );
         assert_eq!(priorities.values.iter().filter(|v| v.is_some()).count(), 1);
-        assert_eq!(kinds.values.iter().filter(|v| v.is_some()).count(), 1);
     }
 
     #[test]
