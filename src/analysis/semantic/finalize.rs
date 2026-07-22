@@ -511,13 +511,15 @@ fn apply_none_preprocessing(
     if crate::cancel::is_cancelled(cancel) {
         return None;
     }
+    if !tokens
+        .iter()
+        .any(|token| token.kind == TokenKind::NoneCapture)
+    {
+        return Some(tokens);
+    }
     let (none_tokens, tokens): (Vec<_>, Vec<_>) = tokens
         .into_iter()
         .partition(|t| t.kind == TokenKind::NoneCapture);
-
-    if none_tokens.is_empty() {
-        return Some(tokens);
-    }
 
     // Build per-line @none intervals with their node sizes for O(1) lookup.
     let mut none_intervals: HashMap<usize, Vec<(usize, usize, usize)>> = HashMap::new();
@@ -898,6 +900,19 @@ mod tests {
     fn finalize_tokens_returns_none_for_empty_input() {
         let tokens: Vec<RawToken> = vec![];
         assert!(finalize_tokens(tokens, &[], &[]).is_none());
+    }
+
+    #[test]
+    fn none_free_preprocessing_reuses_the_input_allocation() {
+        let tokens = vec![
+            make_token(0, 0, 3, "keyword", 0, 0),
+            make_token(0, 4, 4, "variable", 0, 1),
+        ];
+        let input_ptr = tokens.as_ptr();
+
+        let result = apply_none_preprocessing(tokens, None).unwrap();
+
+        assert_eq!(result.as_ptr(), input_ptr);
     }
 
     #[test]
