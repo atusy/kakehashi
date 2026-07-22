@@ -41,6 +41,7 @@
 //! snapshot instead of the checkout-local persistent test directory.
 
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::PathBuf;
@@ -621,6 +622,13 @@ struct Scenario {
 struct Binary {
     label: String,
     path: String,
+    sha256: String,
+}
+
+fn file_sha256(path: &str) -> String {
+    let bytes = std::fs::read(path)
+        .unwrap_or_else(|error| panic!("read benchmark binary {path:?}: {error}"));
+    format!("{:x}", Sha256::digest(bytes))
 }
 
 /// Run one scenario against one binary and return per-request timing samples.
@@ -1191,6 +1199,7 @@ fn record_raw_run(raw_runs: &mut Vec<Value>, bin: &Binary, scn: &Scenario, sampl
     raw_runs.push(json!({
         "binary_label": bin.label,
         "binary_path": bin.path,
+        "binary_sha256": bin.sha256,
         "scenario": scn.name,
         "samples_ns": samples.iter().map(Duration::as_nanos).collect::<Vec<_>>(),
     }));
@@ -1201,12 +1210,13 @@ fn write_raw_samples(iters: usize, warmup: usize, binaries: &[Binary], raw_runs:
         return;
     };
     let output = json!({
-        "schema_version": 1,
+        "schema_version": 2,
         "iterations": iters,
         "warmup_iterations": warmup,
         "binaries": binaries.iter().map(|bin| json!({
             "label": bin.label,
             "path": bin.path,
+            "sha256": bin.sha256,
         })).collect::<Vec<_>>(),
         "runs": raw_runs,
     });
@@ -1303,21 +1313,27 @@ fn resolve_binaries() -> Vec<Binary> {
     let a = std::env::var("KAKEHASHI_BENCH_BIN_A").ok();
     let b = std::env::var("KAKEHASHI_BENCH_BIN_B").ok();
     if let (Some(a), Some(b)) = (a, b) {
+        let a_sha256 = file_sha256(&a);
+        let b_sha256 = file_sha256(&b);
         return vec![
             Binary {
                 label: std::env::var("KAKEHASHI_BENCH_LABEL_A").unwrap_or_else(|_| "A".into()),
                 path: a,
+                sha256: a_sha256,
             },
             Binary {
                 label: std::env::var("KAKEHASHI_BENCH_LABEL_B").unwrap_or_else(|_| "B".into()),
                 path: b,
+                sha256: b_sha256,
             },
         ];
     }
     let single = std::env::var("KAKEHASHI_BENCH_BIN")
         .unwrap_or_else(|_| "target/release/kakehashi".to_string());
+    let sha256 = file_sha256(&single);
     vec![Binary {
         label: "binary".into(),
         path: single,
+        sha256,
     }]
 }
