@@ -147,6 +147,12 @@ impl CaptureKinds {
     }
 }
 
+const QUERY_METADATA_CACHE_MIN_SOURCE_BYTES: usize = 32 * 1024;
+
+fn should_cache_query_metadata(source_bytes: usize) -> bool {
+    source_bytes >= QUERY_METADATA_CACHE_MIN_SOURCE_BYTES
+}
+
 /// The semantic role of a collected token.
 ///
 /// Mirrors the relevant variants of [`CaptureResult`] but lives on the
@@ -455,8 +461,9 @@ pub(super) fn collect_host_tokens(
     let mut utf16_cache: Vec<Option<Utf16LineIndex>> = Vec::new();
 
     // Collect tokens from this document's highlight query
-    let mut priorities = PatternPriorities::new(query);
-    let mut kinds_by_capture = CaptureKinds::new(query);
+    let cache_query_metadata = should_cache_query_metadata(text.len());
+    let mut priorities = cache_query_metadata.then(|| PatternPriorities::new(query));
+    let mut kinds_by_capture = cache_query_metadata.then(|| CaptureKinds::new(query));
     let mut cursor = QueryCursor::new();
     let mut matches = cursor.matches(query, tree.root_node(), text.as_bytes());
 
@@ -464,7 +471,11 @@ pub(super) fn collect_host_tokens(
         if is_cancelled_periodically(cancel, &mut work_items) {
             return false;
         }
-        let priority = priorities.get(query, m.pattern_index);
+        let priority = if let Some(priorities) = priorities.as_mut() {
+            priorities.get(query, m.pattern_index)
+        } else {
+            parse_priority_for_pattern(query, m.pattern_index)
+        };
         let filtered_captures = crate::language::filter_captures(query, m, text);
 
         for c in filtered_captures {
@@ -483,9 +494,12 @@ pub(super) fn collect_host_tokens(
             let is_single_line = start_pos.row == end_pos.row;
             let is_trailing_newline = end_pos.row == start_pos.row + 1 && end_pos.column == 0;
 
-            let Some(kind) =
+            let kind = if let Some(kinds_by_capture) = kinds_by_capture.as_mut() {
                 kinds_by_capture.get(query, c.index as usize, filetype, capture_mappings)
-            else {
+            } else {
+                resolve_token_kind(capture_name, filetype, capture_mappings)
+            };
+            let Some(kind) = kind else {
                 continue;
             };
 
@@ -756,6 +770,12 @@ mod tests {
         );
         assert_eq!(priorities.values.iter().filter(|v| v.is_some()).count(), 1);
         assert_eq!(kinds.values.iter().filter(|v| v.is_some()).count(), 1);
+    }
+
+    #[test]
+    fn query_metadata_cache_requires_large_source() {
+        assert!(!should_cache_query_metadata(32 * 1024 - 1));
+        assert!(should_cache_query_metadata(32 * 1024));
     }
 
     #[test]
