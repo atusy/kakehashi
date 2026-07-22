@@ -525,13 +525,25 @@ fn apply_none_preprocessing(
     tokens: Vec<RawToken>,
     cancel: Option<&crate::cancel::CancelToken>,
 ) -> Option<Vec<RawToken>> {
+    const CANCEL_CHECK_CHUNK_TOKENS: usize = 64;
+
     if crate::cancel::is_cancelled(cancel) {
         return None;
     }
-    if !tokens
-        .iter()
-        .any(|token| token.kind == TokenKind::NoneCapture)
-    {
+    let mut has_none_capture = false;
+    for chunk in tokens.chunks(CANCEL_CHECK_CHUNK_TOKENS) {
+        if crate::cancel::is_cancelled(cancel) {
+            return None;
+        }
+        if chunk
+            .iter()
+            .any(|token| token.kind == TokenKind::NoneCapture)
+        {
+            has_none_capture = true;
+            break;
+        }
+    }
+    if !has_none_capture {
         return Some(tokens);
     }
     let (none_tokens, tokens): (Vec<_>, Vec<_>) = tokens
@@ -930,6 +942,18 @@ mod tests {
         let result = apply_none_preprocessing(tokens, None).unwrap();
 
         assert_eq!(result.as_ptr(), input_ptr);
+    }
+
+    #[test]
+    fn none_free_preprocessing_stops_at_periodic_mid_scan_checkpoint() {
+        let cancel = crate::cancel::CancelToken::default();
+        cancel.cancel_after_polls(2);
+        let tokens = (0..128)
+            .map(|column| make_token(0, column, 1, "variable", 0, 0))
+            .collect();
+
+        assert!(apply_none_preprocessing(tokens, Some(&cancel)).is_none());
+        assert!(cancel.is_cancelled());
     }
 
     #[test]

@@ -8,10 +8,9 @@ the original token vector instead of partitioning every token into fresh
 vectors. If every token already fits on one line, multiline preprocessing also
 returns the original vector instead of allocating and moving the full set.
 
-Both checks are request-local linear scans. Multiline admission retains the
-existing periodic cancellation checkpoint. Neither path changes request
-admission, latest-wins behavior, token ordering, overlap resolution, or retained
-worker state.
+Both checks are request-local linear scans and poll cancellation every 64
+tokens. Neither path changes request admission, latest-wins behavior, token
+ordering, overlap resolution, or retained worker state.
 
 ## Correctness result
 
