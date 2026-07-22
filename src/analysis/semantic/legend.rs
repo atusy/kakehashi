@@ -133,18 +133,18 @@ fn resolve_user_mapping(mapped: &str) -> CaptureResult {
 /// Names follow `type.modifier1.modifier2`. Returns `None` for unknown types
 /// (not in LEGEND_TYPES); unknown modifiers are silently ignored.
 pub(super) fn map_capture_to_token_type_and_modifiers(capture_name: &str) -> Option<(u32, u32)> {
-    let parts: Vec<&str> = capture_name.split('.').collect();
-    let token_type_name = parts.first().copied().filter(|s| !s.is_empty())?;
+    let mut parts = capture_name.split('.');
+    let token_type_name = parts.next().filter(|s| !s.is_empty())?;
 
     let token_type_index = LEGEND_TYPES
         .iter()
         .position(|t| t.as_str() == token_type_name)? as u32;
 
     let mut modifiers_bitset = 0u32;
-    for modifier_name in &parts[1..] {
+    for modifier_name in parts {
         if let Some(index) = LEGEND_MODIFIERS
             .iter()
-            .position(|m| m.as_str() == *modifier_name)
+            .position(|m| m.as_str() == modifier_name)
         {
             modifiers_bitset |= 1 << index;
         }
