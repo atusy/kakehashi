@@ -723,6 +723,15 @@ impl ConnectionHandle {
         }
     }
 
+    /// Whether this connection's static execute-command capability advertises
+    /// the exact raw palette command name. Unlike [`Self::has_capability`], this
+    /// distinguishes collisions between command names across live connections.
+    pub(crate) fn advertises_execute_command(&self, command: &str) -> bool {
+        self.server_capabilities()
+            .and_then(|caps| caps.execute_command_provider.as_ref())
+            .is_some_and(|provider| provider.commands.iter().any(|name| name == command))
+    }
+
     /// Whether this server accepts a **textless** `textDocument/didSave` from the
     /// virt save fan-out (#357): it must advertise `save` in its STATIC
     /// (initialize) `textDocumentSync` *without* demanding `includeText = true`.
@@ -1941,6 +1950,34 @@ mod tests {
         let handle = spawn_sink_handle().await;
         // No capabilities set, no dynamic registrations
         assert!(!handle.has_capability("textDocument/diagnostic"));
+    }
+
+    #[tokio::test]
+    async fn replacement_rejects_a_removed_execute_command_name() {
+        let original = spawn_sink_handle().await;
+        original.set_server_capabilities(ServerCapabilities {
+            execute_command_provider: Some(tower_lsp_server::ls_types::ExecuteCommandOptions {
+                commands: vec!["source.fixAll".to_string()],
+                work_done_progress_options: Default::default(),
+            }),
+            ..Default::default()
+        });
+        assert!(original.advertises_execute_command("source.fixAll"));
+
+        let replacement = spawn_sink_handle().await;
+        replacement.set_server_capabilities(ServerCapabilities {
+            execute_command_provider: Some(tower_lsp_server::ls_types::ExecuteCommandOptions {
+                commands: vec!["source.organizeImports".to_string()],
+                work_done_progress_options: Default::default(),
+            }),
+            ..Default::default()
+        });
+
+        assert!(replacement.advertises_execute_command("source.organizeImports"));
+        assert!(
+            !replacement.advertises_execute_command("source.fixAll"),
+            "a replacement must not inherit a historical raw command name"
+        );
     }
 
     /// Test has_capability returns true with static capability only.

@@ -27,12 +27,34 @@ use crate::config::settings::WorkspaceSettings;
 use crate::config::{merge_bridge_server_configs, resolve_with_wildcard};
 use crate::lsp::bridge::actor::RouterCleanupGuard;
 use crate::lsp::bridge::decode_command;
-use crate::lsp::bridge::pool::{ConnectionHandle, LanguageServerPool, UpstreamId};
+use crate::lsp::bridge::pool::{ConnectionHandle, ConnectionState, LanguageServerPool, UpstreamId};
 use crate::lsp::bridge::protocol::{JsonRpcRequest, response_has_jsonrpc_error};
 use tower_lsp_server::ls_types::ExecuteCommandParams;
 use url::Url;
 
 const METHOD: &str = "workspace/executeCommand";
+
+#[derive(Debug, PartialEq, Eq)]
+enum ReadyPaletteOrigin {
+    None,
+    Unique(crate::lsp::bridge::ConnectionKey),
+    Ambiguous,
+}
+
+fn select_ready_palette_origin(
+    origins: &[crate::lsp::bridge::ConnectionKey],
+    mut is_ready: impl FnMut(&crate::lsp::bridge::ConnectionKey) -> bool,
+) -> ReadyPaletteOrigin {
+    let mut ready = origins.iter().filter(|key| is_ready(key));
+    let Some(first) = ready.next() else {
+        return ReadyPaletteOrigin::None;
+    };
+    if ready.next().is_some() {
+        ReadyPaletteOrigin::Ambiguous
+    } else {
+        ReadyPaletteOrigin::Unique(first.clone())
+    }
+}
 
 impl LanguageServerPool {
     /// Route a bridged `workspace/executeCommand` back to the origin downstream
@@ -147,26 +169,66 @@ impl LanguageServerPool {
     }
 
     /// Route a PALETTE-fired command (a raw downstream command name, no action
-    /// envelope) to the exact connection that advertised it — recorded in the
-    /// [`command_origins`](Self::command_origins) registry at handshake — so it
-    /// runs in the same `(server, root)` workspace context (#628). Reuses the
-    /// live advertising connection; only if it has since been shut down AND the
-    /// key is a plain client-root fallback does it reconnect. Forwards the command
-    /// name and arguments verbatim; fails soft (foreign command, unspawnable or
-    /// unreachable origin) like every other branch.
+    /// envelope) to the sole live connection advertising that exact name. If no
+    /// advertiser is live, the handshake registry can reconnect one unambiguous
+    /// client-root origin. Multiple live or historical origins fail soft because
+    /// the raw request carries no workspace identity (#823). Forwards the command
+    /// name and arguments verbatim; other failures remain fail-soft like the
+    /// encoded-command path.
     async fn dispatch_palette_command(
         &self,
         params: ExecuteCommandParams,
         settings: &WorkspaceSettings,
         upstream_id: Option<UpstreamId>,
     ) -> Option<Value> {
-        let Some(key) = self.command_origins().route(&params.command) else {
+        let origins = self.command_origins().origins(&params.command);
+        if origins.is_empty() {
             warn!(
                 target: "kakehashi::bridge",
                 "executeCommand: {:?} is neither a bridged nor a registered command; ignoring",
                 params.command
             );
             return None;
+        }
+
+        // Resolve liveness from one connections-map snapshot, scanning the
+        // handles' actual advertised command lists rather than only the origin
+        // registry. A handshake publishes its capabilities + Ready state before
+        // recording dynamic palette metadata; consulting only the registry in
+        // that window would miss a live colliding advertiser (#823). The command
+        // linearizes at this snapshot: exactly one Ready advertiser is safe;
+        // several are inherently ambiguous because the raw name carries no
+        // document/workspace identity.
+        let ready_origins: Vec<_> = {
+            let connections = self.connections().await;
+            connections
+                .iter()
+                .filter(|(_, handle)| {
+                    handle.state() == ConnectionState::Ready
+                        && handle.advertises_execute_command(&params.command)
+                })
+                .map(|(key, _)| key.clone())
+                .collect()
+        };
+        let key = match select_ready_palette_origin(&ready_origins, |_| true) {
+            ReadyPaletteOrigin::Unique(key) => key,
+            ReadyPaletteOrigin::Ambiguous => {
+                warn!(
+                    target: "kakehashi::bridge",
+                    "executeCommand: palette command {:?} has multiple live origins; ignoring",
+                    params.command
+                );
+                return None;
+            }
+            ReadyPaletteOrigin::None if origins.len() == 1 => origins[0].clone(),
+            ReadyPaletteOrigin::None => {
+                warn!(
+                    target: "kakehashi::bridge",
+                    "executeCommand: palette command {:?} has multiple registered origins and none is live; ignoring",
+                    params.command
+                );
+                return None;
+            }
         };
         let origin = key.server();
         let handle = match self.ready_connection_by_key(&key).await {
@@ -244,15 +306,15 @@ impl LanguageServerPool {
                 return None;
             }
         };
-        if !handle.has_capability(METHOD) {
-            // The advertising connection was Ready (capabilities set) when it
-            // registered the command, but the RECONNECT path can hand back a
-            // still-`Initializing` handle whose capabilities aren't set yet, so
-            // this is reachable. Warn rather than drop silently (every other
-            // failure branch warns) so a fail-soft `null` is diagnosable.
+        if !handle.advertises_execute_command(&params.command) {
+            // Revalidate the exact command on the handle fetched after the live
+            // snapshot. A no-live fallback may reconnect to an upgraded server,
+            // or the snapshotted handle may be replaced under the same key; mere
+            // provider presence must not forward a historical command the new
+            // process removed (#823).
             warn!(
                 target: "kakehashi::bridge",
-                "executeCommand: origin {origin:?} for palette command {:?} does not (yet) advertise executeCommandProvider; ignoring",
+                "executeCommand: origin {origin:?} no longer advertises palette command {:?}; ignoring",
                 params.command
             );
             return None;
@@ -373,6 +435,38 @@ fn parse_execute_command_response(mut response: Value) -> Option<Value> {
 mod tests {
     use super::*;
     use serde_json::json;
+    use std::collections::HashSet;
+
+    #[test]
+    fn collision_routes_when_exactly_one_advertiser_is_live() {
+        let ruff =
+            crate::lsp::bridge::ConnectionKey::new("ruff", Some("file:///workspace/a".to_string()));
+        let eslint = crate::lsp::bridge::ConnectionKey::new(
+            "eslint",
+            Some("file:///workspace/b".to_string()),
+        );
+        let ready = HashSet::from([eslint.clone()]);
+
+        assert_eq!(
+            select_ready_palette_origin(&[ruff, eslint.clone()], |key| ready.contains(key)),
+            ReadyPaletteOrigin::Unique(eslint),
+        );
+    }
+
+    #[test]
+    fn collision_refuses_to_choose_between_live_advertisers() {
+        let ruff =
+            crate::lsp::bridge::ConnectionKey::new("ruff", Some("file:///workspace/a".to_string()));
+        let eslint = crate::lsp::bridge::ConnectionKey::new(
+            "eslint",
+            Some("file:///workspace/b".to_string()),
+        );
+
+        assert_eq!(
+            select_ready_palette_origin(&[ruff, eslint], |_| true),
+            ReadyPaletteOrigin::Ambiguous,
+        );
+    }
 
     #[test]
     fn parse_relays_a_real_result_verbatim() {
