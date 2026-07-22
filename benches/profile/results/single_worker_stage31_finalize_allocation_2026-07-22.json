@@ -1,0 +1,113 @@
+{
+  "schema_version": 1,
+  "measured_at": "2026-07-22",
+  "baseline": {
+    "stage": 30,
+    "server_source_commit": "973c7fba52fe10382c5b6d014dfc4a2d1e703299",
+    "release_server_binary_sha256": "053cfb2c2e022e0db388b17d8d4da1e50a2c68fb6ec026830cdd2366a60b0392"
+  },
+  "candidate": {
+    "stage": 31,
+    "server_source_commit": "58bda8bea82d371573ed66c1a4b8203317361515",
+    "release_server_binary_sha256": "fa4a291c9f21e86a1d5ed6df792ed0e918d8b52700919a901cb1f79d12ee5f34"
+  },
+  "environment": {
+    "cpu": "Apple M4 (10 logical CPUs)",
+    "os": "macOS 26.5.1 Darwin 25.5.0 arm64",
+    "rustc": "1.95.0 (59807616e 2026-04-14)",
+    "tree_worker_mode": "authoritative",
+    "tree_worker_threads": 8,
+    "rust_log": "unset during timed runs"
+  },
+  "method": {
+    "build_profile": "release (optimized)",
+    "pairs": 4,
+    "revision_order": [
+      "stage30->stage31-alloc",
+      "stage31-alloc->stage30",
+      "stage30->stage31-alloc",
+      "stage31-alloc->stage30"
+    ],
+    "iterations_per_binary_per_pair": 30,
+    "warmup_iterations_per_binary_per_pair": 6,
+    "summary_statistic": "median of four paired percent deltas; an even-sized median averages its middle values",
+    "validation": "Every delta/full response is reconstructed client-side and the tracked semantic token must equal the latest inserted prefix before its latency sample is accepted; every obsolete cancellation-burst request must return JSON-RPC RequestCancelled (-32800).",
+    "execution_command_template": "KAKEHASHI_TREE_WORKER_MODE=authoritative KAKEHASHI_TREE_WORKER_THREADS=8 KAKEHASHI_BENCH_DATA_DIR=<content-addressed-fixture>/kakehashi KAKEHASHI_BENCH_BIN_A=<first> KAKEHASHI_BENCH_BIN_B=<second> KAKEHASHI_BENCH_ITERS=30 KAKEHASHI_BENCH_WARMUP=6 KAKEHASHI_BENCH_SCENARIOS=rust_large/typing_delta,rust_large/typing_burst,rust_xlarge/cancel_burst,markdown_injections/typing_delta,markdown_injections/typing_burst KAKEHASHI_BENCH_SAMPLES_FILE=<run.json> target/release/deps/semantic_tokens-08ebd8d8c816111c --bench"
+  },
+  "artifacts": {
+    "harness_source_path": "benches/semantic_tokens.rs",
+    "harness_source_sha256": "72b8f1e5f223919ec0f91f9829544e99e82402b44fa8f7cc4b83f5597127e037",
+    "harness_binary_sha256": "63bc7e9f0617db2608b982338073690cb3582c0f442ce91641266482e1d99d6b",
+    "fixture_manifest_path": "benches/profile/results/single_worker_stage29_fixture_manifest_2026-07-22.sha256",
+    "fixture_manifest_sha256": "7f6eaaa8341a71fb723a70f21703e9239f4d7205a3b06041604cb15754024e61",
+    "raw_runs": [
+      {
+        "path": "benches/profile/results/single_worker_stage31_finalize_allocation_pair1_2026-07-22.json",
+        "sha256": "c8c0f3ef739002bafb5debe6da49ccfcf013cb9e33a4ecd071edb78935806326"
+      },
+      {
+        "path": "benches/profile/results/single_worker_stage31_finalize_allocation_pair2_2026-07-22.json",
+        "sha256": "f7b502c7669aa29e127e1fbeaa791ebb54fcb26e95232400f87e8fd046ffaaa1"
+      },
+      {
+        "path": "benches/profile/results/single_worker_stage31_finalize_allocation_pair3_2026-07-22.json",
+        "sha256": "c3960a267d2f6e5e83e534fd237fed2bc5b25f4cfb071a988758cc819d9258b0"
+      },
+      {
+        "path": "benches/profile/results/single_worker_stage31_finalize_allocation_pair4_2026-07-22.json",
+        "sha256": "315725d6ae07382fea967f850d650e17b9a02feb970b1cf952aed801352a9392"
+      }
+    ]
+  },
+  "validated_latest_timed_responses": 1200,
+  "validated_obsolete_request_cancelled_responses": 960,
+  "paired_summary": [
+    {
+      "scenario": "rust_large/typing_delta",
+      "median_paired_median_delta_percent": -3.9523111685696666,
+      "median_delta_range_percent": [-13.373088430002621, 1.8745748629736436],
+      "median_paired_p95_delta_percent": 1.1528612515679604,
+      "p95_delta_range_percent": [-43.04785501990479, 28.15740994914544]
+    },
+    {
+      "scenario": "rust_large/typing_burst",
+      "median_paired_median_delta_percent": -4.213341519692743,
+      "median_delta_range_percent": [-9.583682514211223, 19.179290087227628],
+      "median_paired_p95_delta_percent": 16.415322379270556,
+      "p95_delta_range_percent": [-34.27601460341354, 23.924146312075045]
+    },
+    {
+      "scenario": "rust_xlarge/cancel_burst",
+      "median_paired_median_delta_percent": -9.039500768057867,
+      "median_delta_range_percent": [-13.839635334639366, -1.6208856133444471],
+      "median_paired_p95_delta_percent": -17.527364901923516,
+      "p95_delta_range_percent": [-21.691124773205583, 4.66128535537087]
+    },
+    {
+      "scenario": "markdown_injections/typing_delta",
+      "median_paired_median_delta_percent": -6.187264567091461,
+      "median_delta_range_percent": [-11.524289715910152, 13.729905190282544],
+      "median_paired_p95_delta_percent": -0.938912481678944,
+      "p95_delta_range_percent": [-8.585603463828251, 185.41265548751687]
+    },
+    {
+      "scenario": "markdown_injections/typing_burst",
+      "median_paired_median_delta_percent": -3.4606541775725805,
+      "median_delta_range_percent": [-14.788463400448649, 7.171840316444134],
+      "median_paired_p95_delta_percent": 0.8498264514823939,
+      "p95_delta_range_percent": [-56.5634265520866, 46.2537649823306]
+    }
+  ],
+  "rejected_candidate": {
+    "source_commit": "0b6a84241",
+    "release_server_binary_sha256": "9401e74d35a1cf39f883bb54a2e8dbec196b770b0cc4c305ad3b21fd8447f78b",
+    "change": "Skip the breakpoint/heap sweep on visible non-overlapping lines after a preliminary scan.",
+    "reason": "Four authoritative E2E pairs showed flat/slower Rust medians and single-edit p95 regression in every pair despite a shorter isolated finalize phase. The preliminary scan was removed before the accepted series."
+  },
+  "interpretation": {
+    "accepted": true,
+    "central_latency": "The allocation-only candidate improved Rust single-edit and eight-edit central latency in three of four pairs and cancellation follow latency in all four pairs.",
+    "tail_latency": "Cancellation-burst p95 improved in three of four pairs and by 17.5% at the median. Single-edit and eight-edit p95 results remain too variable for a tail claim.",
+    "scope": "The accepted fast paths preserve input token storage when no @none or multiline transformation is needed. They add no retained state and do not change edit admission or cancellation semantics."
+  }
+}
