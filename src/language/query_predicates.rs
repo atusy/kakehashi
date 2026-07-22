@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, LazyLock, RwLock};
 
 use crate::error::LockResultExt;
@@ -312,12 +312,17 @@ fn check_has_parent(args: &[tree_sitter::QueryPredicateArg], node: tree_sitter::
 
 /// Check has-ancestor? predicate - walks parent chain, true if any ancestor's kind matches any arg
 fn check_has_ancestor(args: &[tree_sitter::QueryPredicateArg], node: tree_sitter::Node) -> bool {
+    let kind_args: HashSet<&str> = args
+        .iter()
+        .filter_map(|arg| match arg {
+            tree_sitter::QueryPredicateArg::String(s) => Some(s.as_ref()),
+            _ => None,
+        })
+        .collect();
+
     let mut current = node.parent();
     while let Some(ancestor) = current {
-        let ancestor_kind = ancestor.kind();
-        if args.iter().any(|arg| {
-            matches!(arg, tree_sitter::QueryPredicateArg::String(kind) if kind.as_ref() == ancestor_kind)
-        }) {
+        if kind_args.contains(ancestor.kind()) {
             return true;
         }
         current = ancestor.parent();
