@@ -60,6 +60,52 @@ impl Kakehashi {
             .is_some()
     }
 
+    /// Whether a file discovered during a directory walk identifies a known
+    /// language by path or, for an extensionless path, by a bounded prefix of
+    /// its first line. Content is read only when path-based detection fails.
+    /// The hard cap keeps traversal from scanning arbitrarily large files;
+    /// explicitly named files remain authoritative for markers beyond the cap. Files whose
+    /// first-line I/O fails are retained so the command's normal read path can
+    /// report the operational error; invalid UTF-8 is filtered as non-text.
+    pub(crate) fn cli_can_handle_discovered_file(&self, path: &Path) -> bool {
+        use std::io::{BufRead as _, Read as _};
+
+        if self.cli_can_handle_path(path) {
+            return true;
+        }
+        if path.extension().is_some() {
+            return false;
+        }
+        let Ok(file) = std::fs::File::open(path) else {
+            // Keep the candidate so the command's normal read path reports
+            // the operational error instead of silently treating it as an
+            // unsupported language.
+            return true;
+        };
+        const MAX_FIRST_LINE_BYTES: usize = 8 * 1024;
+        let path_text = path.to_string_lossy();
+        let mut probe = Vec::with_capacity(MAX_FIRST_LINE_BYTES + 1);
+        if std::io::BufReader::new(file.take((MAX_FIRST_LINE_BYTES + 1) as u64))
+            .read_until(b'\n', &mut probe)
+            .is_err()
+        {
+            return true;
+        }
+        let truncated = probe.len() > MAX_FIRST_LINE_BYTES;
+        probe.truncate(MAX_FIRST_LINE_BYTES);
+        let valid = match std::str::from_utf8(&probe) {
+            Ok(valid) => valid,
+            Err(error) if truncated && error.error_len().is_none() => {
+                std::str::from_utf8(&probe[..error.valid_up_to()])
+                    .expect("valid_up_to always identifies valid UTF-8")
+            }
+            Err(_) => return false,
+        };
+        self.language
+            .loadable_language_for_document(&path_text, valid)
+            .is_some()
+    }
+
     /// Gracefully shut down downstream language servers (LSP shutdown/exit
     /// handshake, escalating for unresponsive ones).
     pub(crate) async fn cli_shutdown(&self) {

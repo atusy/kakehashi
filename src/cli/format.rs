@@ -212,7 +212,7 @@ async fn run_paths(server: &Kakehashi, cwd: &Path, options: &FormatOptions) -> u
     }
 
     let collected = match collect_files(cwd, &options.paths, &options.excludes, &|path| {
-        server.cli_can_handle_path(path)
+        server.cli_can_handle_discovered_file(path)
     }) {
         Ok(collected) => collected,
         Err(e) => {

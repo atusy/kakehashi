@@ -107,6 +107,7 @@ mod tests {
     #[case::shebang_node("#!/usr/bin/env node\nconsole.log('hello')", Some("javascript"))]
     #[case::shebang_ruby("#!/usr/bin/env ruby\nputs 'hello'", Some("ruby"))]
     #[case::shebang_perl("#!/usr/bin/perl\nprint 'hello';", Some("perl"))]
+    #[case::cpp_mode_line("    -*- C++ -*-", Some("cpp"))]
     #[case::no_shebang_code("print('hello')", None)]
     #[case::no_shebang_empty("", None)]
     fn test_detect_from_first_line(#[case] content: &str, #[case] expected: Option<&str>) {

@@ -310,6 +310,74 @@ fn e2e_directory_walk_respects_gitignore_but_explicit_path_wins() {
 }
 
 #[test]
+fn e2e_directory_walk_formats_extensionless_shebang_file() {
+    let prefix = "#!/usr/bin/env python ";
+    let padding = " ".repeat(8191 - prefix.len());
+    // The hard 8 KiB probe boundary cuts through this multibyte character.
+    // Discovery must validate the complete prefix and still detect the
+    // shebang language without treating the split code point as binary.
+    let source = format!("{prefix}{padding}é\nvalue = 1\n");
+    let late_mode_line = format!("{}-*- C++ -*-\nvalue = 2\n", " ".repeat(12 * 1024));
+    let ws = workspace_with(&[("tool", &source), ("modeline", &late_mode_line)]);
+    let unknown = "x".repeat(9 * 1024);
+    std::fs::write(ws.path().join("unknown"), &unknown).expect("write unknown text file");
+    let sparse_path = ws.path().join("binary");
+    let sparse = std::fs::File::create(&sparse_path).expect("create extensionless sparse binary");
+    sparse.set_len(16 * 1024).expect("size sparse binary");
+    drop(sparse);
+    use std::io::{Seek as _, Write as _};
+    let mut sparse = std::fs::OpenOptions::new()
+        .write(true)
+        .open(&sparse_path)
+        .expect("open sparse binary");
+    sparse
+        .seek(std::io::SeekFrom::Start(0))
+        .expect("seek sparse binary");
+    sparse.write_all(&[0xff]).expect("mark sparse as binary");
+    std::fs::write(
+        ws.path().join("kakehashi.toml"),
+        format!(
+            "{}\n[languages.cpp]\nbase = \"lua\"\n\n[languages.cpp.bridge._self]\nenabled = true\n",
+            config_toml().replace(
+                "languages = [\"lua\"]",
+                "languages = [\"python\", \"lua\", \"cpp\"]"
+            )
+        ),
+    )
+    .expect("write Python formatter config");
+
+    let output = run_format(ws.path(), &["."]);
+
+    assert!(
+        output.status.success(),
+        "directory format should succeed; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let formatted = read(ws.path(), "tool");
+    assert!(
+        formatted.starts_with("#!/USR/BIN/ENV PYTHON"),
+        "directory walk should use shebang detection; content: {:?}; stderr: {}",
+        formatted,
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(read(ws.path(), "modeline"), late_mode_line);
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("0 unchanged"),
+        "directory discovery should skip markers beyond its bounded prefix; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(read(ws.path(), "unknown"), unknown);
+
+    let explicit = run_format(ws.path(), &["modeline"]);
+    assert!(explicit.status.success());
+    assert!(
+        read(ws.path(), "modeline").contains("-*- C++ -*-\nVALUE = 2"),
+        "an explicit path must use full first-line detection and formatting; stderr: {}",
+        String::from_utf8_lossy(&explicit.stderr)
+    );
+}
+
+#[test]
 fn e2e_tab_size_and_insert_spaces_reach_the_downstream_server() {
     // Workspace whose mock server echoes the FormattingOptions it received.
     let ws = workspace_with(&[("doc.md", MARKDOWN)]);

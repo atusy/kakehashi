@@ -570,3 +570,23 @@ fn e2e_diagnose_directory_walk_respects_gitignore_but_explicit_path_wins() {
         stdout_of(&output)
     );
 }
+
+#[test]
+fn e2e_diagnose_directory_walk_includes_extensionless_shebang_file() {
+    let config = config_toml().replace("languages = [\"lua\"]", "languages = [\"python\"]");
+    let ws = workspace_with(&config, &[("tool", "#!/usr/bin/env python\nvalue = 1\n")]);
+
+    let output = run_diagnose(ws.path(), &[".", "--fail-on-warning"]);
+
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "directory walk should diagnose the shebang file; stderr: {}",
+        stderr_of(&output)
+    );
+    assert!(
+        stdout_of(&output).contains("tool:1:1: warning:"),
+        "diagnostic should name the extensionless file; stdout: {}",
+        stdout_of(&output)
+    );
+}
