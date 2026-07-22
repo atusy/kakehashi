@@ -264,6 +264,22 @@ def parse_server_env(values: list[str]) -> dict[str, str]:
     return parsed
 
 
+def validate_requested_scenario_filters(
+    requested: str, measured_scenarios: set[str]
+) -> None:
+    terms = [term.strip() for term in requested.split(",") if term.strip()]
+    unmatched = [
+        term
+        for term in terms
+        if not any(term in scenario for scenario in measured_scenarios)
+    ]
+    if unmatched:
+        raise ValueError(
+            "requested scenario filters matched no measured scenario: "
+            + ", ".join(unmatched)
+        )
+
+
 def ensure_clean(repo: Path) -> None:
     status = output(["git", "status", "--porcelain"], cwd=repo)
     if status:
@@ -472,6 +488,14 @@ def main() -> None:
                 raw_document = redact_temporary_paths(
                     json.loads(raw_path.read_text()), temp
                 )
+                if pair_index == 1:
+                    validate_requested_scenario_filters(
+                        args.scenarios,
+                        {
+                            str(run["scenario"])
+                            for run in raw_document.get("runs", [])
+                        },
+                    )
                 raw_path.write_text(
                     json.dumps(raw_document, indent=2, sort_keys=True) + "\n"
                 )
