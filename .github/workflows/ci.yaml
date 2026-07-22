@@ -17,6 +17,7 @@ jobs:
       - uses: actions/checkout@v7
       - run: cargo check
       - run: cargo check --bench semantic_tokens --features e2e
+      - run: KAKEHASHI_BENCH_VALIDATE_SCENARIOS=1 cargo test --bench semantic_tokens --features e2e
 
   test:
     name: Test

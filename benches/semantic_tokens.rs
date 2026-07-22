@@ -459,6 +459,8 @@ fn gen_unicode_rust(funcs: usize) -> String {
 /// lua-match regex cache pool optimizes.
 fn gen_rust_predicate_heavy(groups: usize) -> String {
     let mut s = String::with_capacity(groups * 320);
+    s.push_str(TRACKED_MARKER);
+    s.push_str("\n\n");
     for i in 0..groups {
         s.push_str(&format!(
             "pub const MAX_VALUE_{i}: u64 = {i};\n\
@@ -857,7 +859,22 @@ fn run_once(
     }
 }
 
+fn validate_full_response_generators() {
+    for content in [
+        gen_rust(1),
+        gen_rust_predicate_heavy(1),
+        gen_markdown_injections(1),
+        gen_unicode_rust(1),
+    ] {
+        tracked_marker_line(&content).expect("full-response generator has one fixed marker");
+    }
+}
+
 fn main() {
+    validate_full_response_generators();
+    if std::env::var_os("KAKEHASHI_BENCH_VALIDATE_SCENARIOS").is_some() {
+        return;
+    }
     if let Some(path) = std::env::var_os("KAKEHASHI_BENCH_PREPARE_DATA_DIR") {
         let path = PathBuf::from(path);
         std::fs::create_dir_all(&path).expect("create benchmark fixture");
