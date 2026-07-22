@@ -123,10 +123,11 @@
   "schema_version": 1,
   "source": {
     "a_commit": "482efffc5ea0cefcb74abe6f348d25f89e8ae459",
-    "a_ref": "482efffc5ea0cefcb74abe6f348d25f89e8ae459",
+    "a_ref": "benchmark/semantic-sync-core-before-2026-07-23",
     "b_commit": "7fb50f83e53abdfc9271291d93828a87ea5b9b4e",
-    "b_ref": "7fb50f83e53abdfc9271291d93828a87ea5b9b4e",
+    "b_ref": "benchmark/semantic-sync-core-after-2026-07-23",
     "harness_commit": "7fb50f83e53abdfc9271291d93828a87ea5b9b4e",
+    "harness_ref": "benchmark/semantic-sync-core-after-2026-07-23",
     "harness_sources_sha256": {
       "benches/collect_semantic_pairs.py": "53a272f4eff5f8009dd458d863711a5f571e3ba4424b4c3f1556e811b3023c1e",
       "benches/semantic_summary.py": "8aab3d2622ec7bfface33f29fee8fd695297b31eb2007fc5b2b20d8be2e3d1d0",
