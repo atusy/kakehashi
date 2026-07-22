@@ -4,6 +4,7 @@
 //! compiling them with tree-sitter-loader, and installing the resulting shared library.
 
 use std::fs;
+use std::io::{self, Read, Write};
 use std::path::Component;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -66,6 +67,51 @@ impl From<std::io::Error> for ParserInstallError {
 impl From<MetadataError> for ParserInstallError {
     fn from(e: MetadataError) -> Self {
         Self::MetadataError(e)
+    }
+}
+
+#[derive(Debug)]
+enum ArchiveFetchError {
+    Content(String),
+    Unsafe(String),
+    Io(io::Error),
+}
+
+#[derive(Debug)]
+enum ArchiveRecovery {
+    CloneFallback(ArchiveFetchError),
+    Fail(io::Error),
+}
+
+impl ArchiveFetchError {
+    fn into_recovery(self) -> ArchiveRecovery {
+        match self {
+            error @ (Self::Content(_) | Self::Unsafe(_)) => ArchiveRecovery::CloneFallback(error),
+            // InvalidInput is content-driven too: it is what unpacking an
+            // archive path that is invalid on the local filesystem produces,
+            // not a local disk/permission failure — the clone fallback can
+            // still succeed there.
+            Self::Io(error) if error.kind() == io::ErrorKind::InvalidInput => {
+                ArchiveRecovery::CloneFallback(Self::Io(error))
+            }
+            Self::Io(error) => ArchiveRecovery::Fail(error),
+        }
+    }
+}
+
+impl std::fmt::Display for ArchiveFetchError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Content(message) => write!(f, "Archive error: {message}"),
+            Self::Unsafe(message) => write!(f, "Unsafe archive: {message}"),
+            Self::Io(error) => write!(f, "IO error: {error}"),
+        }
+    }
+}
+
+impl From<io::Error> for ArchiveFetchError {
+    fn from(error: io::Error) -> Self {
+        Self::Io(error)
     }
 }
 
@@ -409,7 +455,8 @@ fn clean_url(url: &str) -> &str {
 ///
 /// Strategy:
 /// 1. If the URL is a GitHub HTTPS URL, try downloading the archive tarball.
-/// 2. If archive download fails (or URL is not GitHub), fall back to git clone.
+/// 2. If archive content is unavailable or rejected, fall back to git clone.
+/// 3. If local extraction I/O fails, stop without clone fallback.
 fn fetch_source(url: &str, revision: &str, dest: &Path) -> Result<(), ParserInstallError> {
     validate_parser_source_metadata(url, revision)?;
 
@@ -424,15 +471,25 @@ fn fetch_source(url: &str, revision: &str, dest: &Path) -> Result<(), ParserInst
         );
         match download_and_extract_archive(&archive_url, &repo_name, revision, dest) {
             Ok(()) => return Ok(()),
-            Err(e) => {
-                log::warn!(
-                    target: "kakehashi::install",
-                    "Archive download failed, falling back to git clone: {}",
-                    e
-                );
-                // Clean up partial extraction before fallback
-                let _ = fs::remove_dir_all(dest);
-            }
+            Err(error) => match error.into_recovery() {
+                ArchiveRecovery::CloneFallback(error) => {
+                    // Git checkout may preserve support-file links, but the
+                    // compile surface is validated by parser_source_dir and
+                    // reject_parser_source_symlinks before loader compilation.
+                    log::warn!(
+                        target: "kakehashi::install",
+                        "Archive fetch failed or was rejected, falling back to git clone: {}",
+                        error
+                    );
+                    // Never let git consume a partially extracted archive tree.
+                    // A cleanup failure is local I/O, not recoverable content.
+                    remove_partial_archive_destination(dest)?;
+                }
+                ArchiveRecovery::Fail(error) => {
+                    remove_partial_archive_destination(dest)?;
+                    return Err(ParserInstallError::IoError(error));
+                }
+            },
         }
     }
 
@@ -446,6 +503,20 @@ fn fetch_source(url: &str, revision: &str, dest: &Path) -> Result<(), ParserInst
     clone_repo(url, revision, dest)
 }
 
+fn remove_partial_archive_destination(dest: &Path) -> Result<(), ParserInstallError> {
+    match fs::remove_dir_all(dest) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(ParserInstallError::IoError(io::Error::new(
+            error.kind(),
+            format!(
+                "Failed to remove partial archive destination {}: {error}",
+                dest.display()
+            ),
+        ))),
+    }
+}
+
 /// Download a GitHub archive tarball and extract it to the destination directory.
 ///
 /// The tarball's root directory (e.g., `tree-sitter-json-0.24.8/`) is stripped,
@@ -455,14 +526,14 @@ fn download_and_extract_archive(
     repo_name: &str,
     revision: &str,
     dest: &Path,
-) -> Result<(), ParserInstallError> {
+) -> Result<(), ArchiveFetchError> {
     let agent = agent_with_timeout(ARCHIVE_HTTP_TIMEOUT);
 
     let response = agent.get(archive_url).call().map_err(|e| match e {
         ureq::Error::StatusCode(code) => {
-            ParserInstallError::ArchiveError(format!("HTTP {} downloading {}", code, archive_url))
+            ArchiveFetchError::Content(format!("HTTP {} downloading {}", code, archive_url))
         }
-        e => ParserInstallError::ArchiveError(format!("Download failed: {}", e)),
+        e => ArchiveFetchError::Content(format!("Download failed: {}", e)),
     })?;
 
     // into_reader() streams without a size limit; parser archives can exceed
@@ -473,21 +544,38 @@ fn download_and_extract_archive(
     // GitHub names the root directory `{repo}-{revision_without_v_prefix}`
     let expected_prefix = archive_root_dir_name(repo_name, revision);
 
-    fs::create_dir_all(dest)?;
+    extract_archive(&mut archive, &expected_prefix, dest)
+}
 
-    for entry_result in archive.entries().map_err(|e| {
-        ParserInstallError::ArchiveError(format!("Failed to read archive entries: {}", e))
-    })? {
-        let mut entry = entry_result.map_err(|e| {
-            ParserInstallError::ArchiveError(format!("Failed to read entry: {}", e))
-        })?;
+fn extract_archive<R: Read>(
+    archive: &mut Archive<R>,
+    expected_prefix: &str,
+    dest: &Path,
+) -> Result<(), ArchiveFetchError> {
+    fs::create_dir_all(dest).map_err(|error| {
+        ArchiveFetchError::Io(io::Error::new(
+            error.kind(),
+            format!(
+                "Failed to create archive destination {}: {error}",
+                dest.display()
+            ),
+        ))
+    })?;
 
-        let path = entry.path().map_err(|e| {
-            ParserInstallError::ArchiveError(format!("Invalid path in archive: {}", e))
-        })?;
+    let mut extracted_any = false;
+    for entry_result in archive
+        .entries()
+        .map_err(|e| ArchiveFetchError::Content(format!("Failed to read archive entries: {}", e)))?
+    {
+        let mut entry = entry_result
+            .map_err(|e| ArchiveFetchError::Content(format!("Failed to read entry: {}", e)))?;
+
+        let path = entry
+            .path()
+            .map_err(|e| ArchiveFetchError::Unsafe(format!("Invalid path in archive: {}", e)))?;
 
         // Strip the root directory prefix (e.g., "tree-sitter-json-0.24.8/")
-        let relative = match path.strip_prefix(&expected_prefix) {
+        let relative = match path.strip_prefix(expected_prefix) {
             Ok(p) => p.to_path_buf(),
             Err(_) => continue,
         };
@@ -497,36 +585,224 @@ fn download_and_extract_archive(
             continue;
         }
 
-        // Prevent path traversal attacks (zip slip)
-        if relative
-            .components()
-            .any(|c| matches!(c, std::path::Component::ParentDir))
-        {
-            return Err(ParserInstallError::ArchiveError(format!(
-                "Path traversal attempt detected in archive: {}",
-                relative.display()
+        let safe_relative = safe_archive_relative_path(&relative)?;
+        if safe_relative.as_os_str().is_empty() {
+            continue;
+        }
+
+        let entry_type = entry.header().entry_type();
+        if entry_type.is_symlink() || entry_type.is_hard_link() {
+            return Err(ArchiveFetchError::Unsafe(format!(
+                "Link entry rejected in archive: {}",
+                escaped_path(&safe_relative)
+            )));
+        }
+        if !entry_type.is_dir() && !entry_type.is_file() {
+            return Err(ArchiveFetchError::Unsafe(format!(
+                "Unsupported entry type rejected in archive: {}",
+                escaped_path(&safe_relative)
             )));
         }
 
-        let target = dest.join(&relative);
-
-        if entry.header().entry_type().is_dir() {
-            fs::create_dir_all(&target)?;
+        if entry_type.is_dir() {
+            create_archive_dir(dest, &safe_relative)?;
         } else {
-            if let Some(parent) = target.parent() {
-                fs::create_dir_all(parent)?;
-            }
-            entry.unpack(&target).map_err(|e| {
-                ParserInstallError::ArchiveError(format!(
-                    "Failed to extract {}: {}",
-                    relative.display(),
-                    e
-                ))
-            })?;
+            unpack_archive_file_entry(&mut entry, dest, &safe_relative)?;
+            // Only FILES count as material: an archive of bare directories
+            // under the prefix still produced nothing buildable.
+            extracted_any = true;
         }
     }
 
+    // An archive whose every entry missed `expected_prefix` produced nothing:
+    // surface it as a content mismatch (clone fallback) instead of letting a
+    // later build step fail confusingly on an empty directory.
+    if !extracted_any {
+        return Err(ArchiveFetchError::Content(format!(
+            "Archive contained no entries under the expected prefix {expected_prefix:?}"
+        )));
+    }
     Ok(())
+}
+
+fn unpack_archive_file_entry<R: Read>(
+    entry: &mut tar::Entry<'_, R>,
+    dest: &Path,
+    safe_relative: &Path,
+) -> Result<(), ArchiveFetchError> {
+    let target = ensure_archive_parent(dest, safe_relative)?;
+    match fs::symlink_metadata(&target) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            return Err(ArchiveFetchError::Unsafe(format!(
+                "Archive path crosses symlink: {}",
+                escaped_path(safe_relative)
+            )));
+        }
+        Ok(metadata) if metadata.is_dir() => {
+            return Err(ArchiveFetchError::Unsafe(format!(
+                "Archive file conflicts with existing directory: {}",
+                escaped_path(safe_relative)
+            )));
+        }
+        Ok(_) => {
+            return Err(ArchiveFetchError::Unsafe(format!(
+                "Archive contains a duplicate file path: {}",
+                escaped_path(safe_relative)
+            )));
+        }
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) => return Err(ArchiveFetchError::Io(e)),
+    }
+    // Parser compilation consumes source files directly; do not restore
+    // untrusted archive mode bits or make extracted support files executable.
+    let mut output = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&target)
+        .map_err(|e| {
+            ArchiveFetchError::Io(io::Error::new(
+                e.kind(),
+                format!("Failed to create {}: {}", escaped_path(safe_relative), e),
+            ))
+        })?;
+    let mut buffer = [0; 8192];
+    loop {
+        let read = entry.read(&mut buffer).map_err(|e| {
+            ArchiveFetchError::Content(format!(
+                "Failed to read {}: {}",
+                escaped_path(safe_relative),
+                e
+            ))
+        })?;
+        if read == 0 {
+            break;
+        }
+        output.write_all(&buffer[..read]).map_err(|e| {
+            ArchiveFetchError::Io(io::Error::new(
+                e.kind(),
+                format!("Failed to extract {}: {}", escaped_path(safe_relative), e),
+            ))
+        })?;
+    }
+    Ok(())
+}
+
+fn create_archive_dir(dest: &Path, safe_relative: &Path) -> Result<(), ArchiveFetchError> {
+    let target = ensure_archive_parent(dest, safe_relative)?;
+    match fs::symlink_metadata(&target) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            return Err(ArchiveFetchError::Unsafe(format!(
+                "Archive path crosses symlink: {}",
+                escaped_path(safe_relative)
+            )));
+        }
+        Ok(metadata) if metadata.is_dir() => return Ok(()),
+        Ok(_) => {
+            return Err(ArchiveFetchError::Unsafe(format!(
+                "Archive directory conflicts with existing non-directory: {}",
+                escaped_path(safe_relative)
+            )));
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(ArchiveFetchError::Io(error)),
+    }
+    fs::create_dir(&target).map_err(|e| {
+        ArchiveFetchError::Io(io::Error::new(
+            e.kind(),
+            format!(
+                "Failed to create archive dir {}: {e}",
+                escaped_path(safe_relative)
+            ),
+        ))
+    })?;
+    Ok(())
+}
+
+fn ensure_archive_parent(dest: &Path, safe_relative: &Path) -> Result<PathBuf, ArchiveFetchError> {
+    let target = dest.join(safe_relative);
+    let Some(parent_relative) = safe_relative.parent() else {
+        return Ok(target);
+    };
+    let mut current = dest.to_path_buf();
+    for component in parent_relative.components() {
+        let Component::Normal(part) = component else {
+            continue;
+        };
+        current.push(part);
+        match fs::symlink_metadata(&current) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(ArchiveFetchError::Unsafe(format!(
+                    "Archive path crosses symlink: {}",
+                    escaped_path(safe_relative)
+                )));
+            }
+            Ok(metadata) if metadata.is_dir() => {}
+            Ok(_) => {
+                return Err(ArchiveFetchError::Unsafe(format!(
+                    "Archive path has a non-directory ancestor: {}",
+                    escaped_path(safe_relative)
+                )));
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                fs::create_dir(&current).map_err(|e| {
+                    ArchiveFetchError::Io(io::Error::new(
+                        e.kind(),
+                        format!(
+                            "Failed to create ancestor of archive path {}: {e}",
+                            escaped_path(safe_relative)
+                        ),
+                    ))
+                })?;
+            }
+            Err(e) => return Err(ArchiveFetchError::Io(e)),
+        }
+    }
+    Ok(target)
+}
+
+fn safe_archive_relative_path(path: &Path) -> Result<PathBuf, ArchiveFetchError> {
+    let mut safe = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Normal(part) if !cfg!(windows) || !has_windows_unsafe_component(part) => {
+                safe.push(part);
+            }
+            Component::CurDir => {}
+            _ => {
+                return Err(ArchiveFetchError::Unsafe(format!(
+                    "Unsafe path detected in archive: {}",
+                    escaped_path(path)
+                )));
+            }
+        }
+    }
+    Ok(safe)
+}
+
+fn has_windows_unsafe_component(component: &std::ffi::OsStr) -> bool {
+    if matches!(component.as_encoded_bytes().last(), Some(b' ' | b'.')) {
+        return true;
+    }
+
+    let name = component.to_string_lossy();
+    if name.contains(':') {
+        return true;
+    }
+    let basename = name.split('.').next().unwrap_or_default();
+    if ["CON", "PRN", "AUX", "NUL", "CLOCK$", "CONIN$", "CONOUT$"]
+        .iter()
+        .any(|reserved| basename.eq_ignore_ascii_case(reserved))
+    {
+        return true;
+    }
+    let bytes = basename.as_bytes();
+    bytes.len() == 4
+        && (bytes[..3].eq_ignore_ascii_case(b"COM") || bytes[..3].eq_ignore_ascii_case(b"LPT"))
+        && matches!(bytes[3], b'1'..=b'9')
+}
+
+fn escaped_path(path: &Path) -> String {
+    path.display().to_string().escape_default().to_string()
 }
 
 /// Derive the expected root directory name inside a GitHub archive tarball.
@@ -1478,6 +1754,297 @@ mod tests {
             archive_root_dir_name("tree-sitter-json", "0.24.8"),
             "tree-sitter-json-0.24.8"
         );
+    }
+
+    #[test]
+    fn archive_content_errors_allow_clone_fallback() {
+        for error in [
+            ArchiveFetchError::Unsafe("unsafe metadata".to_string()),
+            ArchiveFetchError::Content("download failed".to_string()),
+        ] {
+            assert!(matches!(
+                error.into_recovery(),
+                ArchiveRecovery::CloneFallback(_)
+            ));
+        }
+        assert!(matches!(
+            ArchiveFetchError::Io(io::Error::other("disk full")).into_recovery(),
+            ArchiveRecovery::Fail(_)
+        ));
+    }
+
+    #[test]
+    fn archive_relative_paths_allow_only_local_components() {
+        assert_eq!(
+            safe_archive_relative_path(Path::new("./src/parser.c")).expect("safe path"),
+            PathBuf::from("src/parser.c")
+        );
+
+        for path in [Path::new("../parser.c"), Path::new("/tmp/parser.c")] {
+            assert!(
+                matches!(
+                    safe_archive_relative_path(path),
+                    Err(ArchiveFetchError::Unsafe(_))
+                ),
+                "non-local archive path must be rejected: {}",
+                path.display()
+            );
+        }
+    }
+
+    #[test]
+    fn windows_component_validation_rejects_aliases_and_devices() {
+        use std::ffi::OsStr;
+
+        for component in [
+            ".. ",
+            "name.",
+            "NUL",
+            "nul.txt",
+            "COM1",
+            "lpt9.log",
+            "file:stream",
+        ] {
+            assert!(
+                has_windows_unsafe_component(OsStr::new(component)),
+                "Windows-unsafe component must be rejected: {component}"
+            );
+        }
+        assert!(!has_windows_unsafe_component(OsStr::new("name")));
+        assert!(!has_windows_unsafe_component(OsStr::new("COM10")));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn archive_relative_paths_reject_windows_normalization_aliases() {
+        for path in [".. /.. /parser.c", "NUL/parser.c", "src/parser.c:stream"] {
+            assert!(matches!(
+                safe_archive_relative_path(Path::new(path)),
+                Err(ArchiveFetchError::Unsafe(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn extract_archive_accepts_regular_files_under_destination() {
+        use std::io::Cursor;
+        use tar::{Builder, Header};
+
+        let mut bytes = Vec::new();
+        {
+            let mut builder = Builder::new(&mut bytes);
+            let body = b"parser source";
+            let mut header = Header::new_gnu();
+            header.set_size(body.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            builder
+                .append_data(&mut header, "parser-1.0.0/src/parser.c", &body[..])
+                .expect("append synthetic regular file");
+            builder.finish().expect("finish synthetic archive");
+        }
+
+        let temp = tempdir().expect("temp dir");
+        let mut archive = Archive::new(Cursor::new(bytes));
+        extract_archive(&mut archive, "parser-1.0.0", temp.path())
+            .expect("regular file should extract");
+
+        assert_eq!(
+            fs::read(temp.path().join("src/parser.c")).expect("read extracted file"),
+            b"parser source"
+        );
+    }
+
+    #[test]
+    fn extract_archive_classifies_entry_read_failures_as_content_errors() {
+        use std::io::Cursor;
+        use tar::{Builder, Header};
+
+        struct FailAfter {
+            inner: Cursor<Vec<u8>>,
+            remaining: usize,
+        }
+
+        impl Read for FailAfter {
+            fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+                if self.remaining == 0 {
+                    return Err(io::Error::other("synthetic read failure"));
+                }
+                let limit = buf.len().min(self.remaining);
+                let read = self.inner.read(&mut buf[..limit])?;
+                self.remaining -= read;
+                Ok(read)
+            }
+        }
+
+        let mut bytes = Vec::new();
+        {
+            let mut builder = Builder::new(&mut bytes);
+            let body = b"parser source";
+            let mut header = Header::new_gnu();
+            header.set_size(body.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            builder
+                .append_data(&mut header, "parser-1.0.0/src/parser.c", &body[..])
+                .expect("append synthetic regular file");
+            builder.finish().expect("finish synthetic archive");
+        }
+
+        let reader = FailAfter {
+            inner: Cursor::new(bytes),
+            remaining: 512 + 4,
+        };
+        let temp = tempdir().expect("temp dir");
+        let mut archive = Archive::new(reader);
+
+        match extract_archive(&mut archive, "parser-1.0.0", temp.path()) {
+            Err(ArchiveFetchError::Content(message)) => assert!(
+                message.contains("synthetic read failure"),
+                "expected source-read context, got: {message}"
+            ),
+            other => panic!("expected archive content error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn extract_archive_classifies_non_directory_parent_as_unsafe_content() {
+        use std::io::Cursor;
+        use tar::{Builder, Header};
+
+        let mut bytes = Vec::new();
+        {
+            let mut builder = Builder::new(&mut bytes);
+            for path in ["parser-1.0.0/src", "parser-1.0.0/src/parser.c"] {
+                let body = b"parser source";
+                let mut header = Header::new_gnu();
+                header.set_size(body.len() as u64);
+                header.set_mode(0o644);
+                header.set_cksum();
+                builder
+                    .append_data(&mut header, path, &body[..])
+                    .expect("append synthetic regular file");
+            }
+            builder.finish().expect("finish synthetic archive");
+        }
+
+        let temp = tempdir().expect("temp dir");
+        let mut archive = Archive::new(Cursor::new(bytes));
+
+        match extract_archive(&mut archive, "parser-1.0.0", temp.path()) {
+            Err(ArchiveFetchError::Unsafe(message)) => assert!(
+                message.contains("non-directory ancestor"),
+                "expected topology-conflict context, got: {message}"
+            ),
+            other => panic!("expected unsafe archive content error, got {other:?}"),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn extract_archive_rejects_link_entries() {
+        use std::io::Cursor;
+        use tar::{Builder, EntryType, Header};
+
+        let mut bytes = Vec::new();
+        {
+            let mut builder = Builder::new(&mut bytes);
+            let mut header = Header::new_gnu();
+            header.set_entry_type(EntryType::Symlink);
+            header.set_size(0);
+            header.set_mode(0o777);
+            header.set_cksum();
+            builder
+                .append_link(&mut header, "parser-1.0.0/link", "target")
+                .expect("append synthetic link entry");
+            builder.finish().expect("finish synthetic archive");
+        }
+
+        let temp = tempdir().expect("temp dir");
+        let mut archive = Archive::new(Cursor::new(bytes));
+        let result = extract_archive(&mut archive, "parser-1.0.0", temp.path());
+
+        match result {
+            Err(ArchiveFetchError::Unsafe(message)) => assert!(
+                message.contains("Link entry rejected in archive: link"),
+                "expected link-entry rejection, got: {message}"
+            ),
+            other => panic!("expected unsafe link-entry error, got {other:?}"),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn extract_archive_rejects_special_entries() {
+        use std::io::Cursor;
+        use tar::{Builder, EntryType, Header};
+
+        let mut bytes = Vec::new();
+        {
+            let mut builder = Builder::new(&mut bytes);
+            let mut header = Header::new_gnu();
+            header.set_entry_type(EntryType::Fifo);
+            header.set_size(0);
+            header.set_mode(0o644);
+            header.set_cksum();
+            builder
+                .append_data(&mut header, "parser-1.0.0/special", &[][..])
+                .expect("append synthetic special entry");
+            builder.finish().expect("finish synthetic archive");
+        }
+
+        let temp = tempdir().expect("temp dir");
+        let mut archive = Archive::new(Cursor::new(bytes));
+        let result = extract_archive(&mut archive, "parser-1.0.0", temp.path());
+
+        match result {
+            Err(ArchiveFetchError::Unsafe(message)) => assert!(
+                message.contains("Unsupported entry type rejected in archive: special"),
+                "expected special-entry rejection, got: {message}"
+            ),
+            other => panic!("expected unsafe special-entry error, got {other:?}"),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn extract_archive_rejects_preexisting_symlink_parent() {
+        use std::io::Cursor;
+        use std::os::unix::fs::symlink;
+        use tar::{Builder, Header};
+
+        let mut bytes = Vec::new();
+        {
+            let mut builder = Builder::new(&mut bytes);
+            let body = b"parser source";
+            let mut header = Header::new_gnu();
+            header.set_size(body.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            builder
+                .append_data(&mut header, "parser-1.0.0/link/parser.c", &body[..])
+                .expect("append synthetic regular file");
+            builder.finish().expect("finish synthetic archive");
+        }
+
+        let temp = tempdir().expect("temp dir");
+        let dest = temp.path().join("dest");
+        let linked_dir = temp.path().join("linked");
+        fs::create_dir_all(&dest).expect("create destination");
+        fs::create_dir_all(&linked_dir).expect("create linked directory");
+        symlink(&linked_dir, dest.join("link")).expect("create destination symlink");
+
+        let mut archive = Archive::new(Cursor::new(bytes));
+        let result = extract_archive(&mut archive, "parser-1.0.0", &dest);
+
+        match result {
+            Err(ArchiveFetchError::Unsafe(message)) => assert!(
+                message.contains("Archive path crosses symlink: link/parser.c"),
+                "expected symlink-parent rejection, got: {message}"
+            ),
+            other => panic!("expected unsafe destination-path error, got {other:?}"),
+        }
+        assert!(!linked_dir.join("parser.c").exists());
     }
 
     /// Test that download_and_extract_archive downloads and extracts a GitHub archive.
