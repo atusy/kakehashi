@@ -75,23 +75,77 @@ pub(crate) struct UserConfig {
 /// Returns:
 /// - `Ok(Some(config))` if the file exists and is valid TOML
 /// - `Ok(None)` if the file does not exist (zero-config experience preserved)
-/// - `Err(UserConfigError)` if the file exists but contains invalid TOML
+/// - `Err(UserConfigError)` if the configured path cannot be read or contains
+///   invalid TOML
 pub fn load_user_config() -> UserConfigResult<Option<UserConfig>> {
     let path = match user_config_path() {
         Some(p) => p,
         None => return Ok(None), // No home directory, silently ignore
     };
 
-    // Check if file exists
-    if !path.exists() {
-        return Ok(None); // Missing file is silently ignored (zero-config)
-    }
-
-    // Read and parse the file
-    let contents = std::fs::read_to_string(&path).map_err(|e| UserConfigError::IoError {
-        path: path.clone(),
-        source: e,
-    })?;
+    // Read first so permission and metadata errors are not collapsed into
+    // "missing" by Path::exists(). A dangling symlink also reports NotFound
+    // when followed, so lstat it before accepting the zero-config case.
+    let contents = match std::fs::read_to_string(&path) {
+        Ok(contents) => contents,
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
+            match std::fs::symlink_metadata(&path) {
+                Err(metadata_error)
+                    if metadata_error.kind() == std::io::ErrorKind::NotFound
+                        && !contains_broken_symlink(&path) =>
+                {
+                    return Ok(None);
+                }
+                Err(metadata_error) => {
+                    return Err(UserConfigError::IoError {
+                        path,
+                        source: metadata_error,
+                    });
+                }
+                Ok(_) => {
+                    // The path may have appeared after the first read. Retry
+                    // once so a concurrent atomic install does not surface a
+                    // stale NotFound; a dangling symlink still fails here.
+                    match std::fs::read_to_string(&path) {
+                        Ok(contents) => contents,
+                        Err(retry_source)
+                            if retry_source.kind() == std::io::ErrorKind::NotFound =>
+                        {
+                            match std::fs::symlink_metadata(&path) {
+                                Err(final_error)
+                                    if final_error.kind() == std::io::ErrorKind::NotFound
+                                        && !contains_broken_symlink(&path) =>
+                                {
+                                    return Ok(None);
+                                }
+                                Err(final_error) => {
+                                    return Err(UserConfigError::IoError {
+                                        path,
+                                        source: final_error,
+                                    });
+                                }
+                                Ok(_) => {
+                                    return Err(UserConfigError::IoError {
+                                        path,
+                                        source: retry_source,
+                                    });
+                                }
+                            }
+                        }
+                        Err(retry_source) => {
+                            return Err(UserConfigError::IoError {
+                                path,
+                                source: retry_source,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+        Err(source) => {
+            return Err(UserConfigError::IoError { path, source });
+        }
+    };
 
     let uses_deprecated_root_markers =
         crate::config::deprecation::toml_uses_deprecated_root_markers(&contents);
@@ -102,6 +156,20 @@ pub fn load_user_config() -> UserConfigResult<Option<UserConfig>> {
         settings,
         uses_deprecated_root_markers,
     }))
+}
+
+fn contains_broken_symlink(path: &std::path::Path) -> bool {
+    let mut prefix = std::path::PathBuf::new();
+    for component in path.components() {
+        prefix.push(component);
+        if let Ok(metadata) = std::fs::symlink_metadata(&prefix)
+            && metadata.file_type().is_symlink()
+            && std::fs::metadata(&prefix).is_err()
+        {
+            return true;
+        }
+    }
+    false
 }
 
 /// Returns the path to the user configuration file.
@@ -160,6 +228,33 @@ mod tests {
     use super::*;
     use serial_test::serial;
     use std::env;
+
+    #[must_use]
+    struct EnvVarGuard {
+        key: &'static str,
+        original: Option<std::ffi::OsString>,
+    }
+
+    impl EnvVarGuard {
+        fn set(key: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
+            let original = env::var_os(key);
+            // SAFETY: callers serialize every test that mutates this key.
+            unsafe { env::set_var(key, value) };
+            Self { key, original }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            // SAFETY: callers serialize every test that mutates this key.
+            unsafe {
+                match &self.original {
+                    Some(value) => env::set_var(self.key, value),
+                    None => env::remove_var(self.key),
+                }
+            }
+        }
+    }
 
     #[test]
     #[serial(xdg_env)]
@@ -274,6 +369,49 @@ mod tests {
         assert!(
             result.unwrap().is_none(),
             "load_user_config should return None when config file is missing"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial(xdg_env)]
+    fn load_user_config_reports_dangling_symlink() {
+        use std::os::unix::fs::symlink;
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().expect("failed to create temp dir");
+        let config_dir = temp_dir.path().join("kakehashi");
+        std::fs::create_dir_all(&config_dir).expect("failed to create config dir");
+        symlink("missing.toml", config_dir.join("kakehashi.toml"))
+            .expect("failed to create dangling config symlink");
+
+        let _xdg = EnvVarGuard::set("XDG_CONFIG_HOME", temp_dir.path());
+        let result = load_user_config();
+
+        assert!(
+            matches!(result, Err(UserConfigError::IoError { .. })),
+            "a configured but broken path must not be treated as absent: {result:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial(xdg_env)]
+    fn load_user_config_reports_dangling_parent_symlink() {
+        use std::os::unix::fs::symlink;
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().expect("failed to create temp dir");
+        let config_home = temp_dir.path().join("config");
+        symlink("missing-config", &config_home)
+            .expect("failed to create dangling config-home symlink");
+
+        let _xdg = EnvVarGuard::set("XDG_CONFIG_HOME", &config_home);
+        let result = load_user_config();
+
+        assert!(
+            matches!(result, Err(UserConfigError::IoError { .. })),
+            "a broken ancestor of the configured path must not be treated as absent: {result:?}"
         );
     }
 
