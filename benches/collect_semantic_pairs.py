@@ -267,10 +267,14 @@ def parse_server_env(values: list[str]) -> dict[str, str]:
     return parsed
 
 
+def scenario_filter_terms(requested: str) -> list[str]:
+    return [term.strip() for term in requested.split(",") if term.strip()]
+
+
 def validate_requested_scenario_filters(
     requested: str, measured_scenarios: set[str]
 ) -> None:
-    terms = [term.strip() for term in requested.split(",") if term.strip()]
+    terms = scenario_filter_terms(requested)
     unmatched = [
         term
         for term in terms
@@ -559,7 +563,7 @@ def main() -> None:
                     "pairs": args.pairs,
                     "iterations": args.iters,
                     "warmup_iterations": args.warmup,
-                    "scenario_filters": args.scenarios.split(","),
+                    "scenario_filters": scenario_filter_terms(args.scenarios),
                     "scenarios": sorted(measured_scenarios),
                     "server_env": server_env,
                     "run_timeout_seconds": args.run_timeout,

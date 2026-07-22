@@ -10,6 +10,7 @@ from collect_semantic_pairs import (
     parse_server_env,
     redact_temporary_paths,
     recorded_environment,
+    scenario_filter_terms,
     set_tree_read_only,
     set_tree_writable,
     tree_manifest,
@@ -18,6 +19,12 @@ from collect_semantic_pairs import (
 
 
 class CollectSemanticPairsTest(unittest.TestCase):
+    def test_scenario_filters_are_normalized_for_execution_and_manifest(self):
+        self.assertEqual(
+            scenario_filter_terms(" rust, , markdown "),
+            ["rust", "markdown"],
+        )
+
     def test_python_cache_cannot_dirty_collector_checkout(self):
         ignore_patterns = (
             (Path(__file__).parent.parent / ".gitignore").read_text().splitlines()
