@@ -147,7 +147,7 @@ impl CaptureKinds {
     }
 }
 
-const QUERY_METADATA_CACHE_MIN_OBSERVED_ITEMS: usize = 64;
+const QUERY_METADATA_CACHE_MIN_OBSERVED_ITEMS: usize = 256;
 
 // Admit query-wide tables only after enough actual lookups can amortize them.
 // Source size and syntax-tree density are poor proxies for query match volume.
@@ -780,8 +780,8 @@ mod tests {
 
     #[test]
     fn query_metadata_cache_requires_repeated_query_work() {
-        assert!(!should_cache_query_metadata(63));
-        assert!(should_cache_query_metadata(64));
+        assert!(!should_cache_query_metadata(255));
+        assert!(should_cache_query_metadata(256));
     }
 
     #[test]
