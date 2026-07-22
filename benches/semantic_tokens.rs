@@ -345,6 +345,29 @@ fn gen_rust(funcs: usize) -> String {
     s
 }
 
+const QUERY_METADATA_GATE_BYTES: usize = 32 * 1024;
+
+/// Syntactically valid Rust with only a handful of captures, sized exactly.
+///
+/// This isolates query-metadata table setup from dense capture walking around
+/// the server's 32 KiB admission boundary. The marker stays on its own line so
+/// typing scenarios can insert harmless leading spaces at a tracked token.
+fn gen_sparse_rust(bytes: usize) -> String {
+    const PREFIX: &str = "/*";
+    const SUFFIX: &str = "*/\nfn sparse_marker() {}\n";
+
+    assert!(bytes >= PREFIX.len() + SUFFIX.len());
+    let mut source = String::with_capacity(bytes);
+    source.push_str(PREFIX);
+    source.extend(std::iter::repeat_n(
+        'x',
+        bytes - PREFIX.len() - SUFFIX.len(),
+    ));
+    source.push_str(SUFFIX);
+    assert_eq!(source.len(), bytes);
+    source
+}
+
 /// Markdown with many fenced code blocks in rust/lua/python — each block is a
 /// separate injection region. Exercises the injection pipeline: included-range
 /// computation, active-region detection, and host/injection coordinate mapping.
@@ -1017,6 +1040,40 @@ fn main() {
             content: gen_rust(150),
             kind: Kind::TypingDelta,
             targets: "unique edit states→reparse→retokenize→delta; excludes A/B cache returns",
+        },
+        Scenario {
+            name: "rust_sparse_below_gate/typing_delta",
+            language_id: "rust",
+            uri: "file:///bench/sparse_below_gate.rs",
+            // Leave enough margin that all warmup/timed leading-space edits
+            // remain below the gate.
+            content: gen_sparse_rust(QUERY_METADATA_GATE_BYTES - 128),
+            kind: Kind::TypingDelta,
+            targets: "sparse query walk below the 32 KiB metadata-table gate",
+        },
+        Scenario {
+            name: "rust_sparse_at_gate/typing_delta",
+            language_id: "rust",
+            uri: "file:///bench/sparse_at_gate.rs",
+            content: gen_sparse_rust(QUERY_METADATA_GATE_BYTES),
+            kind: Kind::TypingDelta,
+            targets: "sparse query walk at the 32 KiB metadata-table gate",
+        },
+        Scenario {
+            name: "rust_sparse_above_gate/typing_delta",
+            language_id: "rust",
+            uri: "file:///bench/sparse_above_gate.rs",
+            content: gen_sparse_rust(QUERY_METADATA_GATE_BYTES + 128),
+            kind: Kind::TypingDelta,
+            targets: "sparse query walk just above the 32 KiB metadata-table gate",
+        },
+        Scenario {
+            name: "rust_sparse_medium/typing_delta",
+            language_id: "rust",
+            uri: "file:///bench/sparse_medium.rs",
+            content: gen_sparse_rust(64 * 1024),
+            kind: Kind::TypingDelta,
+            targets: "gate-enabled 64 KiB source with few query matches",
         },
         Scenario {
             name: "rust_large/typing_burst",
