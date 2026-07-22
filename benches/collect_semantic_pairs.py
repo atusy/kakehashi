@@ -447,8 +447,21 @@ def main() -> None:
                     "runtime": recorded_environment(
                         base_environment | server_env, temp
                     ),
-                    "cargo": output(["cargo", "-Vv"], cwd=repo, env=base_environment),
-                    "rustc": output(["rustc", "-Vv"], cwd=repo, env=base_environment),
+                    "toolchains": {
+                        label: {
+                            "cargo": output(
+                                ["cargo", "-Vv"], cwd=source, env=base_environment
+                            ),
+                            "rustc": output(
+                                ["rustc", "-Vv"], cwd=source, env=base_environment
+                            ),
+                        }
+                        for label, source in {
+                            "a": worktrees["a-src"],
+                            "b": worktrees["b-src"],
+                            "harness": worktrees["harness-src"],
+                        }.items()
+                    },
                     "cc": optional_output(["cc", "--version"], cwd=repo, env=base_environment),
                     "clang": optional_output(
                         ["clang", "--version"], cwd=repo, env=base_environment
