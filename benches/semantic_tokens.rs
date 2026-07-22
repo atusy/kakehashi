@@ -345,7 +345,7 @@ fn gen_rust(funcs: usize) -> String {
     s
 }
 
-const QUERY_METADATA_GATE_BYTES: usize = 32 * 1024;
+const SPARSE_CONTROL_BOUNDARY_BYTES: usize = 32 * 1024;
 
 /// Syntactically valid Rust with only a handful of captures, sized exactly.
 ///
@@ -1042,38 +1042,36 @@ fn main() {
             targets: "unique edit states→reparse→retokenize→delta; excludes A/B cache returns",
         },
         Scenario {
-            name: "rust_sparse_below_gate/typing_delta",
+            name: "rust_sparse_32k_minus/typing_delta",
             language_id: "rust",
-            uri: "file:///bench/sparse_below_gate.rs",
-            // Leave enough margin that all warmup/timed leading-space edits
-            // remain below the gate.
-            content: gen_sparse_rust(QUERY_METADATA_GATE_BYTES - 128),
+            uri: "file:///bench/sparse_32k_minus.rs",
+            content: gen_sparse_rust(SPARSE_CONTROL_BOUNDARY_BYTES - 128),
             kind: Kind::TypingDelta,
-            targets: "sparse query walk below the 32 KiB metadata-table gate",
+            targets: "sparse low-match control just below 32 KiB",
         },
         Scenario {
-            name: "rust_sparse_at_gate/typing_delta",
+            name: "rust_sparse_32k_exact/typing_delta",
             language_id: "rust",
-            uri: "file:///bench/sparse_at_gate.rs",
-            content: gen_sparse_rust(QUERY_METADATA_GATE_BYTES),
+            uri: "file:///bench/sparse_32k_exact.rs",
+            content: gen_sparse_rust(SPARSE_CONTROL_BOUNDARY_BYTES),
             kind: Kind::TypingDelta,
-            targets: "sparse query walk at the 32 KiB metadata-table gate",
+            targets: "sparse low-match control at 32 KiB",
         },
         Scenario {
-            name: "rust_sparse_above_gate/typing_delta",
+            name: "rust_sparse_32k_plus/typing_delta",
             language_id: "rust",
-            uri: "file:///bench/sparse_above_gate.rs",
-            content: gen_sparse_rust(QUERY_METADATA_GATE_BYTES + 128),
+            uri: "file:///bench/sparse_32k_plus.rs",
+            content: gen_sparse_rust(SPARSE_CONTROL_BOUNDARY_BYTES + 128),
             kind: Kind::TypingDelta,
-            targets: "sparse query walk just above the 32 KiB metadata-table gate",
+            targets: "sparse low-match control just above 32 KiB",
         },
         Scenario {
-            name: "rust_sparse_medium/typing_delta",
+            name: "rust_sparse_64k/typing_delta",
             language_id: "rust",
-            uri: "file:///bench/sparse_medium.rs",
+            uri: "file:///bench/sparse_64k.rs",
             content: gen_sparse_rust(64 * 1024),
             kind: Kind::TypingDelta,
-            targets: "gate-enabled 64 KiB source with few query matches",
+            targets: "64 KiB sparse source kept below observed-work admission",
         },
         Scenario {
             name: "rust_large/typing_burst",
