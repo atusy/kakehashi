@@ -1,5 +1,5 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "measured_at": "2026-07-22",
   "baseline": {
     "stage": 29,
@@ -9,8 +9,8 @@
   },
   "candidate": {
     "stage": 30,
-    "server_source_commit": "973c7fba52fe10382c5b6d014dfc4a2d1e703299",
-    "release_server_binary_sha256": "053cfb2c2e022e0db388b17d8d4da1e50a2c68fb6ec026830cdd2366a60b0392"
+    "server_source_commit": "73a766ee0c41114f7b6aefcf418562b0dcfb44af",
+    "release_server_binary_sha256": "f06f3989ad3c138248a190a79ec0da2fd0aaf5e9f6afde1db5dfac016066e435"
   },
   "environment": {
     "cpu": "Apple M4 (10 logical CPUs)",
@@ -24,85 +24,107 @@
     "build_profile": "release (optimized)",
     "pairs": 4,
     "revision_order": [
-      "stage29->stage30-final",
-      "stage30-final->stage29",
-      "stage29->stage30-final",
-      "stage30-final->stage29"
+      "stage29->stage30-metadata-only",
+      "stage30-metadata-only->stage29",
+      "stage29->stage30-metadata-only",
+      "stage30-metadata-only->stage29"
     ],
     "iterations_per_binary_per_pair": 30,
     "warmup_iterations_per_binary_per_pair": 6,
     "summary_statistic": "median of four paired percent deltas; an even-sized median averages its middle values",
-    "validation": "Every delta/full response is reconstructed client-side and the tracked semantic token must equal the latest inserted prefix before its latency sample is accepted; every obsolete cancellation-burst request must return JSON-RPC RequestCancelled (-32800).",
-    "execution_command_template": "KAKEHASHI_TREE_WORKER_MODE=authoritative KAKEHASHI_TREE_WORKER_THREADS=8 KAKEHASHI_BENCH_DATA_DIR=<content-addressed-fixture>/kakehashi KAKEHASHI_BENCH_BIN_A=<first> KAKEHASHI_BENCH_BIN_B=<second> KAKEHASHI_BENCH_ITERS=30 KAKEHASHI_BENCH_WARMUP=6 KAKEHASHI_BENCH_SCENARIOS=rust_large/typing_delta,rust_large/typing_burst,rust_xlarge/cancel_burst,markdown_injections/typing_delta,markdown_injections/typing_burst KAKEHASHI_BENCH_SAMPLES_FILE=<run.json> target/release/deps/semantic_tokens-08ebd8d8c816111c --bench"
+    "validation": "Every delta/full response is reconstructed client-side and the tracked semantic token must equal the latest inserted prefix before its latency sample is accepted; every obsolete cancellation-burst request, including warmups, must return JSON-RPC RequestCancelled (-32800).",
+    "execution_command_template": "KAKEHASHI_TREE_WORKER_MODE=authoritative KAKEHASHI_TREE_WORKER_THREADS=8 KAKEHASHI_BENCH_DATA_DIR=<content-addressed-fixture>/kakehashi KAKEHASHI_BENCH_BIN_A=<first> KAKEHASHI_BENCH_BIN_B=<second> KAKEHASHI_BENCH_ITERS=30 KAKEHASHI_BENCH_WARMUP=6 KAKEHASHI_BENCH_SCENARIOS=rust_large/typing_delta,rust_large/typing_burst,rust_xlarge/cancel_burst,markdown_injections/typing_delta,markdown_injections/typing_burst,rust_sparse_ KAKEHASHI_BENCH_SAMPLES_FILE=<run.json> target/release/deps/semantic_tokens-08ebd8d8c816111c"
   },
   "artifacts": {
     "harness_source_path": "benches/semantic_tokens.rs",
-    "harness_source_sha256": "72b8f1e5f223919ec0f91f9829544e99e82402b44fa8f7cc4b83f5597127e037",
-    "harness_binary_sha256": "63bc7e9f0617db2608b982338073690cb3582c0f442ce91641266482e1d99d6b",
+    "harness_source_sha256": "e22c65e1c3477b01892d51e2779dbb09460b5eaff0260f94bcc8a5de9e29e3e1",
+    "harness_binary_sha256": "42f234d184d513d325d3961154bd8d0745c1ad53191845abff8251d7e80da84a",
     "fixture_manifest_path": "benches/profile/results/single_worker_stage29_fixture_manifest_2026-07-22.sha256",
     "fixture_manifest_sha256": "7f6eaaa8341a71fb723a70f21703e9239f4d7205a3b06041604cb15754024e61",
     "raw_runs": [
       {
-        "path": "benches/profile/results/single_worker_stage30_query_metadata_pair1_2026-07-22.json",
-        "sha256": "ebc7cc3f2a84ddd1f658129870f8a2fe55bf8f3df5acaf2f4b568fe2f06e4845"
+        "path": "benches/profile/results/single_worker_stage30_metadata_only_final_pair1_2026-07-22.json",
+        "sha256": "a4f4df0ed9f71c19a4d6117aa8da0abc1ba8397d7fb1161d7b6adb4cc7465a14"
       },
       {
-        "path": "benches/profile/results/single_worker_stage30_query_metadata_pair2_2026-07-22.json",
-        "sha256": "fe25f0b69aadc7c0a2560c140e5b7103de68bacf29370c31292038249dcef6ef"
+        "path": "benches/profile/results/single_worker_stage30_metadata_only_final_pair2_2026-07-22.json",
+        "sha256": "82da006d38c577020bab1282156f4cbe812444abe3db067466cb3f0279a7bd45"
       },
       {
-        "path": "benches/profile/results/single_worker_stage30_query_metadata_pair3_2026-07-22.json",
-        "sha256": "418a10b15206c35fe5a2fa379e75302e013c4a80e86d56da700cc4c0aaf6b258"
+        "path": "benches/profile/results/single_worker_stage30_metadata_only_final_pair3_2026-07-22.json",
+        "sha256": "8f5690374b591268fc836f681b1889bd76da869ac35174cab618f21a20810627"
       },
       {
-        "path": "benches/profile/results/single_worker_stage30_query_metadata_pair4_2026-07-22.json",
-        "sha256": "3d928c6a12a9a6ea1d304937619689a220fdf285d6b3c653218c1fe029dbbbc0"
+        "path": "benches/profile/results/single_worker_stage30_metadata_only_final_pair4_2026-07-22.json",
+        "sha256": "1d4b858d8d9158bec23dec50fd803f56fa361bf8527766130e504a9b615aabb2"
       }
     ]
   },
-  "validated_latest_timed_responses": 1200,
-  "validated_obsolete_request_cancelled_responses": 960,
+  "validated_latest_timed_responses": 2160,
+  "validated_obsolete_request_cancelled_responses_including_warmups": 1152,
   "paired_summary": [
     {
       "scenario": "rust_large/typing_delta",
-      "median_paired_median_delta_percent": -11.631384143001855,
-      "median_delta_range_percent": [-25.467829459804925, -1.1310760325448421],
-      "median_paired_p95_delta_percent": -13.853915171664871,
-      "p95_delta_range_percent": [-28.27169131773788, 11.732901525963335]
+      "median_paired_median_delta_percent": -12.380418716624364,
+      "median_delta_range_percent": [-17.665391882778138, -5.712863770534627],
+      "median_paired_p95_delta_percent": -11.664172608251338,
+      "p95_delta_range_percent": [-16.360655242696463, 13.84430708675728]
     },
     {
       "scenario": "rust_large/typing_burst",
-      "median_paired_median_delta_percent": -5.630289658077059,
-      "median_delta_range_percent": [-15.932617856509845, 2.1555078540649752],
-      "median_paired_p95_delta_percent": 11.727518475310838,
-      "p95_delta_range_percent": [-12.875579775301016, 33.20169047610217]
+      "median_paired_median_delta_percent": -0.7751538517708156,
+      "median_delta_range_percent": [-7.017613357834051, 13.326221585829522],
+      "median_paired_p95_delta_percent": -0.2686037273601172,
+      "p95_delta_range_percent": [-8.253767513140042, 22.810146028116883]
     },
     {
       "scenario": "rust_xlarge/cancel_burst",
-      "median_paired_median_delta_percent": -12.769321322247979,
-      "median_delta_range_percent": [-16.935764012810083, -10.785759667772776],
-      "median_paired_p95_delta_percent": -17.28315122253136,
-      "p95_delta_range_percent": [-19.40617593344006, -2.376979373672272]
+      "median_paired_median_delta_percent": -9.814377208725489,
+      "median_delta_range_percent": [-16.628139793724948, -6.885219162628808],
+      "median_paired_p95_delta_percent": -6.758567188481401,
+      "p95_delta_range_percent": [-21.3794091905569, 1.2756897637463904]
     },
     {
       "scenario": "markdown_injections/typing_delta",
-      "median_paired_median_delta_percent": -0.2966508715870786,
-      "median_delta_range_percent": [-6.263722375904668, 21.82164207165933],
-      "median_paired_p95_delta_percent": 9.291746802461965,
-      "p95_delta_range_percent": [-7.808810136271083, 274.5451087552075]
+      "median_paired_median_delta_percent": -12.558136004299753,
+      "median_delta_range_percent": [-18.781264018999867, 10.831285153419113],
+      "median_paired_p95_delta_percent": -13.177484867446942,
+      "p95_delta_range_percent": [-34.72814473036991, 15.166916474623026]
     },
     {
       "scenario": "markdown_injections/typing_burst",
-      "median_paired_median_delta_percent": -0.42845299609813314,
-      "median_delta_range_percent": [-9.703267342831523, 2.8978209262963794],
-      "median_paired_p95_delta_percent": -18.278290346013204,
-      "p95_delta_range_percent": [-54.898973578248636, 61.553183053078556]
+      "median_paired_median_delta_percent": -7.410777321060202,
+      "median_delta_range_percent": [-14.049763769950319, 0.6054512852735838],
+      "median_paired_p95_delta_percent": -17.48147574615254,
+      "p95_delta_range_percent": [-24.914258564941626, 4.855281194631722]
+    },
+    {
+      "scenario": "rust_sparse_below_gate/typing_delta",
+      "median_paired_median_delta_percent": -3.180747924797317,
+      "median_delta_range_percent": [-11.623888194420983, 8.798766660779433],
+      "median_paired_p95_delta_percent": -3.8627797505740413,
+      "p95_delta_range_percent": [-48.97039114538989, 11.419974533310917]
+    },
+    {
+      "scenario": "rust_sparse_at_gate/typing_delta",
+      "median_paired_median_delta_percent": -4.7410201752135785,
+      "median_delta_range_percent": [-10.077619433383155, 1.6181731464392834],
+      "median_paired_p95_delta_percent": -5.469255308163429,
+      "p95_delta_range_percent": [-10.54293397403515, -1.3935793186043766]
+    },
+    {
+      "scenario": "rust_sparse_above_gate/typing_delta",
+      "median_paired_median_delta_percent": -4.588223259836111,
+      "median_delta_range_percent": [-24.73152708888825, -0.5812005039724122],
+      "median_paired_p95_delta_percent": -3.328718389649926,
+      "p95_delta_range_percent": [-20.007581661621167, -2.078742280252832]
+    },
+    {
+      "scenario": "rust_sparse_medium/typing_delta",
+      "median_paired_median_delta_percent": -1.186429779903203,
+      "median_delta_range_percent": [-4.554203489944985, 11.726571819837496],
+      "median_paired_p95_delta_percent": -4.148053552364633,
+      "p95_delta_range_percent": [-11.443547369159202, 7.099649771292071]
     }
-  ],
-  "interpretation": {
-    "accepted": true,
-    "central_latency": "Large Rust single-edit typing and cancellation follow latency improved in all four pairs. Eight-edit burst central latency improved in two pairs and was nearly flat in two, yielding a lower median paired delta.",
-    "tail_latency": "The cancellation-burst p95 improved in all four pairs. Single-edit and eight-edit p95 ranges remain too wide for a general tail claim.",
-    "control": "Markdown central deltas changed sign and their medians stayed below 0.5% in magnitude; extreme p95 values are isolated scheduling outliers, not evidence of a control-path change."
-  }
+  ]
 }
