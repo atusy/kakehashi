@@ -33,6 +33,12 @@ artifacts and reports any exact worktree cleanup failure, so the same output
 path can be retried.
 
 The resulting `manifest.json` binds source commits, binary and harness hashes,
-the read-only parser/query fixture, effective build/runtime environment,
+the read-only parser/query fixture (whose exact contents are archived alongside
+the manifest), effective build/runtime environment,
 toolchain versions, raw sample hashes, and summary hash. `summary.json` reports
 the median and range of paired median deltas. Per-run p95 is descriptive only.
+
+If a measured source is not retained by the repository's main history, give it
+a durable tag before collection and use that tag as the collector ref. This
+keeps every source commit named by archived evidence fetchable after temporary
+development branches are deleted.

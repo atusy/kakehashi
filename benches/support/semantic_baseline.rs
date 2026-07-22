@@ -152,7 +152,7 @@ fn parse_usize(value: Option<&Value>, field: &'static str) -> Result<usize, Vali
 }
 
 fn apply_edits(base: &[u32], edits: &[Value]) -> Result<Vec<u32>, ValidationError> {
-    let mut data = base.to_vec();
+    let mut parsed = Vec::with_capacity(edits.len());
     for (edit_index, edit) in edits.iter().enumerate() {
         let start = parse_usize(edit.get("start"), "start")?;
         let delete_count = parse_usize(edit.get("deleteCount"), "deleteCount")?;
@@ -162,14 +162,14 @@ fn apply_edits(base: &[u32], edits: &[Value]) -> Result<Vec<u32>, ValidationErro
                 edit_index,
                 start,
                 delete_count,
-                token_data_len: data.len(),
+                token_data_len: base.len(),
             })?;
-        if end > data.len() {
+        if end > base.len() {
             return Err(ValidationError::EditOutOfBounds {
                 edit_index,
                 start,
                 delete_count,
-                token_data_len: data.len(),
+                token_data_len: base.len(),
             });
         }
 
@@ -178,6 +178,15 @@ fn apply_edits(base: &[u32], edits: &[Value]) -> Result<Vec<u32>, ValidationErro
             .map(parse_u32_array)
             .transpose()?
             .unwrap_or_default();
+        parsed.push((edit_index, start, end, replacement));
+    }
+
+    // Every edit is indexed against the previous response, not against the
+    // result of the preceding edit. Applying from the end keeps those offsets
+    // stable even when an earlier replacement changes the array length.
+    parsed.sort_unstable_by_key(|(_, start, _, _)| std::cmp::Reverse(*start));
+    let mut data = base.to_vec();
+    for (_, start, end, replacement) in parsed {
         data.splice(start..end, replacement);
     }
     Ok(data)
