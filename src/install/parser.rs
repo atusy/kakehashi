@@ -10,6 +10,8 @@ use std::process::Command;
 use std::time::Duration;
 
 use flate2::read::GzDecoder;
+#[cfg(unix)]
+use fs4::fs_std::FileExt;
 use tar::Archive;
 use tree_sitter_loader::Loader;
 
@@ -18,6 +20,7 @@ use super::metadata::{FetchOptions, MetadataError, fetch_parser_metadata};
 
 /// HTTP timeout for archive downloads.
 const ARCHIVE_HTTP_TIMEOUT: Duration = Duration::from_secs(120);
+static PARSER_TMP_COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 /// Error types for parser installation.
 #[derive(Debug)]
@@ -240,7 +243,11 @@ fn self_exe_for_reexec() -> Result<PathBuf, ParserInstallError> {
 /// subprocess") and bound it with [`PARSER_COMPILE_TIMEOUT`]. Re-exec rather than
 /// `fork`: forking a multithreaded process is unsafe past the child's first
 /// non-async-signal-safe call.
-fn compile_parser(grammar_path: &Path, output_path: &Path) -> Result<(), ParserInstallError> {
+fn compile_parser(
+    grammar_path: &Path,
+    output_path: &Path,
+    staging_lock: Option<&fs::File>,
+) -> Result<(), ParserInstallError> {
     let mut cmd = Command::new(self_exe_for_reexec()?);
     cmd.arg("__compile-parser")
         .arg(grammar_path)
@@ -250,6 +257,9 @@ fn compile_parser(grammar_path: &Path, output_path: &Path) -> Result<(), ParserI
         // inherited so `cc` diagnostics land in the logs.
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null());
+    if let Some(staging_lock) = staging_lock {
+        inherit_staging_lock(&mut cmd, staging_lock);
+    }
     let status = run_killable_subprocess(cmd, PARSER_COMPILE_TIMEOUT, "parser compile")?;
     if !status.success() {
         return Err(ParserInstallError::CompileError(format!(
@@ -260,6 +270,32 @@ fn compile_parser(grammar_path: &Path, output_path: &Path) -> Result<(), ParserI
     }
     Ok(())
 }
+
+#[cfg(unix)]
+fn inherit_staging_lock(cmd: &mut Command, staging_lock: &fs::File) {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::process::CommandExt;
+
+    let fd = staging_lock.as_raw_fd();
+    // Only the forked child clears CLOEXEC on its copy. The descriptor then
+    // keeps the advisory lock alive through our re-exec and the compiler it
+    // launches if the installer process exits unexpectedly.
+    unsafe {
+        cmd.pre_exec(move || {
+            let flags = nix::libc::fcntl(fd, nix::libc::F_GETFD);
+            if flags == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if nix::libc::fcntl(fd, nix::libc::F_SETFD, flags & !nix::libc::FD_CLOEXEC) == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+}
+
+#[cfg(not(unix))]
+fn inherit_staging_lock(_cmd: &mut Command, _staging_lock: &fs::File) {}
 
 /// Install a Tree-sitter parser for a language.
 pub fn install_parser(
@@ -280,6 +316,9 @@ pub fn install_parser(
 
     let parser_dir = options.data_dir.join("parser");
     let parser_file = parser_dir.join(format!("{}.{}", language, std::env::consts::DLL_EXTENSION));
+
+    fs::create_dir_all(&parser_dir)?;
+    cleanup_interrupted_parser_installs(&parser_dir)?;
 
     // Check if parser already exists
     if parser_file.exists() && !options.force {
@@ -332,17 +371,11 @@ pub fn install_parser(
     // install dedup. (Windows caveat: replacing a parser that is *currently loaded*
     // by this process still fails at the rename — a loaded DLL can't be removed — a
     // pre-existing platform limitation this scheme doesn't change.)
-    fs::create_dir_all(&parser_dir)?;
-    static TMP_COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-    let tmp_file = parser_dir.join(format!(
-        ".{}.{}.{}.{}.tmp",
-        language,
-        std::process::id(),
-        TMP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
-        std::env::consts::DLL_EXTENSION
-    ));
+    let (tmp_file, tmp_lock) = reserve_parser_staging_file(&parser_dir, language)?;
     let compiled = match options.compile {
-        ParserCompile::KillableSubprocess => compile_parser(&source_dir, &tmp_file),
+        ParserCompile::KillableSubprocess => {
+            compile_parser(&source_dir, &tmp_file, tmp_lock.as_ref())
+        }
         ParserCompile::InProcess => compile_parser_inprocess(&source_dir, &tmp_file),
     };
     match compiled {
@@ -374,6 +407,329 @@ pub fn install_parser(
         install_path: parser_file,
         revision: metadata.revision,
     })
+}
+
+fn reserve_parser_staging_file(
+    parser_dir: &Path,
+    language: &str,
+) -> Result<(PathBuf, Option<fs::File>), ParserInstallError> {
+    loop {
+        let candidate = parser_dir.join(format!(
+            ".{}.{}.{}.{}.tmp",
+            language,
+            std::process::id(),
+            PARSER_TMP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            std::env::consts::DLL_EXTENSION
+        ));
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&candidate)
+        {
+            Ok(file) => {
+                #[cfg(unix)]
+                {
+                    return match file.lock_exclusive() {
+                        Ok(()) => Ok((candidate, Some(file))),
+                        // Locking is an ownership optimization for cleanup,
+                        // not a prerequisite for compilation. On filesystems
+                        // without advisory locks, cleanup also declines to
+                        // claim unlocked artifacts conservatively.
+                        Err(_) => Ok((candidate, None)),
+                    };
+                }
+                #[cfg(not(unix))]
+                {
+                    drop(file);
+                    return Ok((candidate, None));
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(ParserInstallError::IoError(error)),
+        }
+    }
+}
+
+fn staged_parser_pid(path: &Path) -> Option<u32> {
+    let name = path.file_name()?.to_str()?;
+    let rest = name.strip_prefix('.')?.strip_suffix(".tmp")?;
+    let mut parts = rest.split('.');
+    let language = parts.next()?;
+    let pid = parts.next()?;
+    let counter = parts.next()?;
+    let extension = parts.next()?;
+    if parts.next().is_some()
+        || !super::queries::is_safe_language_name(language)
+        || !is_canonical_decimal(pid)
+        || !is_canonical_decimal(counter)
+        || counter.parse::<u64>().is_err()
+        || extension != std::env::consts::DLL_EXTENSION
+    {
+        return None;
+    }
+    let pid = pid.parse().ok()?;
+    (1..=i32::MAX as u32).contains(&pid).then_some(pid)
+}
+
+fn is_canonical_decimal(value: &str) -> bool {
+    !value.is_empty()
+        && value.bytes().all(|byte| byte.is_ascii_digit())
+        && (value == "0" || !value.starts_with('0'))
+}
+
+fn cleanup_claim_pid(path: &Path) -> Option<u32> {
+    let name = path.file_name()?.to_str()?;
+    let rest = name.strip_prefix(".parser-cleanup.")?;
+    let mut parts = rest.split('.');
+    let pid = parts.next()?;
+    let counter = parts.next()?;
+    if parts.next().is_some()
+        || !is_canonical_decimal(pid)
+        || !is_canonical_decimal(counter)
+        || counter.parse::<u64>().is_err()
+    {
+        return None;
+    }
+    let pid = pid.parse().ok()?;
+    (1..=i32::MAX as u32).contains(&pid).then_some(pid)
+}
+
+#[cfg(unix)]
+fn claim_and_unlink_stale_parser_file(
+    parser_dir: &Path,
+    path: &Path,
+) -> Result<Option<PathBuf>, ParserInstallError> {
+    use std::io::Write;
+    use std::os::unix::fs::DirBuilderExt;
+    use std::os::unix::fs::MetadataExt;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let initial = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(ParserInstallError::IoError(error)),
+    };
+    if !initial.file_type().is_file() {
+        return Ok(None);
+    }
+    let file = match fs::OpenOptions::new()
+        .read(true)
+        // The pathname can be replaced after symlink_metadata. Never block if
+        // an external actor swaps in a FIFO before open, and never follow a
+        // symlink swapped into the final path component.
+        .custom_flags(nix::libc::O_NONBLOCK | nix::libc::O_NOFOLLOW)
+        .open(path)
+    {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) if error.raw_os_error() == Some(nix::libc::ELOOP) => return Ok(None),
+        Err(error) => return Err(ParserInstallError::IoError(error)),
+    };
+    if !file.metadata()?.file_type().is_file() {
+        return Ok(None);
+    }
+    match file.try_lock_exclusive() {
+        Ok(()) => {}
+        Err(_) => return Ok(None),
+    }
+    let opened = file.metadata()?;
+    let current = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(ParserInstallError::IoError(error)),
+    };
+    if opened.dev() != current.dev() || opened.ino() != current.ino() {
+        return Ok(None);
+    }
+
+    loop {
+        let candidate = parser_dir.join(format!(
+            ".parser-cleanup.{}.{}",
+            std::process::id(),
+            PARSER_TMP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        let mut builder = fs::DirBuilder::new();
+        builder.mode(0o700);
+        match builder.create(&candidate) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(ParserInstallError::IoError(error)),
+        }
+        let marker = candidate.join("owner");
+        let marker_result = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .custom_flags(nix::libc::O_NOFOLLOW)
+            .open(&marker)
+            .and_then(|mut file| {
+                file.write_all(PARSER_CLEANUP_MARKER)?;
+                file.sync_all()
+            });
+        if let Err(error) = marker_result {
+            // `write_all` or `sync_all` may fail after creating a partial
+            // marker. Remove it before the now-empty claim directory.
+            let _ = fs::remove_file(&marker);
+            let _ = fs::remove_dir(&candidate);
+            return Err(ParserInstallError::IoError(error));
+        }
+        let claimed = candidate.join("artifact");
+        // Among cooperating installers, `path` cannot change here: its
+        // create_new reservation remains present until this atomic rename, and
+        // every cleaner follows this same lock/claim protocol. A same-UID actor
+        // deliberately rewriting the private data directory can also delete an
+        // installed parser directly and is outside this filesystem protocol's
+        // trust boundary. The post-rename inode check still fail-closes without
+        // deleting an unexpected inode.
+        match fs::rename(path, &claimed) {
+            Ok(()) => {
+                let current = fs::symlink_metadata(&claimed)?;
+                if opened.dev() != current.dev() || opened.ino() != current.ino() {
+                    // Never restore with rename: Unix rename would overwrite a
+                    // new entry created at the original pathname. Invalidate
+                    // provenance and retain the unexpected inode in the claim.
+                    let _ = fs::remove_file(&marker);
+                    return Ok(None);
+                }
+                return Ok(Some(candidate));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let _ = fs::remove_file(&marker);
+                let _ = fs::remove_dir(&candidate);
+                return Ok(None);
+            }
+            Err(_) => {
+                let _ = fs::remove_file(&marker);
+                let _ = fs::remove_dir(&candidate);
+                return Ok(None);
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+const PARSER_CLEANUP_MARKER: &[u8] = b"kakehashi parser cleanup v1\n";
+
+#[cfg(unix)]
+fn remove_stale_cleanup_claim(path: &Path) {
+    use std::io::Read;
+    use std::os::unix::fs::MetadataExt;
+
+    use nix::fcntl::{OFlag, open, openat};
+    use nix::sys::stat::Mode;
+    use nix::unistd::{UnlinkatFlags, unlinkat};
+
+    let Ok(dir_fd) = open(
+        path,
+        OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW,
+        Mode::empty(),
+    ) else {
+        return;
+    };
+    let dir = fs::File::from(dir_fd);
+    let Ok(opened) = dir.metadata() else {
+        return;
+    };
+
+    let Ok(marker_fd) = openat(
+        &dir,
+        "owner",
+        OFlag::O_RDONLY | OFlag::O_NOFOLLOW | OFlag::O_NONBLOCK,
+        Mode::empty(),
+    ) else {
+        return;
+    };
+    let file = fs::File::from(marker_fd);
+    if !file
+        .metadata()
+        .is_ok_and(|metadata| metadata.file_type().is_file())
+    {
+        return;
+    }
+    let mut contents = Vec::with_capacity(PARSER_CLEANUP_MARKER.len() + 1);
+    if file
+        .take(PARSER_CLEANUP_MARKER.len() as u64 + 1)
+        .read_to_end(&mut contents)
+        .is_err()
+        || contents != PARSER_CLEANUP_MARKER
+    {
+        return;
+    }
+    // Remove only the two protocol-owned entries through the opened directory
+    // descriptor. A rename-and-replace of `path` cannot redirect these unlinks.
+    let _ = unlinkat(&dir, "artifact", UnlinkatFlags::NoRemoveDir);
+    let _ = unlinkat(&dir, "owner", UnlinkatFlags::NoRemoveDir);
+
+    // The remaining directory is empty. Verify the pathname still names the
+    // opened directory before removing it; never recurse through the pathname.
+    let Ok(current) = fs::symlink_metadata(path) else {
+        return;
+    };
+    if opened.dev() == current.dev() && opened.ino() == current.ino() {
+        let _ = fs::remove_dir(path);
+    }
+}
+
+#[cfg(unix)]
+fn process_is_running(pid: u32) -> bool {
+    let Ok(pid) = i32::try_from(pid) else {
+        return false;
+    };
+    if pid <= 0 {
+        return false;
+    }
+    match nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None) {
+        Ok(()) | Err(nix::errno::Errno::EPERM) => true,
+        Err(nix::errno::Errno::ESRCH) => false,
+        Err(_) => true,
+    }
+}
+
+#[cfg(unix)]
+fn cleanup_interrupted_parser_installs(parser_dir: &Path) -> Result<(), ParserInstallError> {
+    let entries = match fs::read_dir(parser_dir) {
+        Ok(entries) => entries,
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::PermissionDenied
+            ) =>
+        {
+            return Ok(());
+        }
+        Err(error) => return Err(ParserInstallError::IoError(error)),
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if let Some(pid) = cleanup_claim_pid(&path) {
+            if !process_is_running(pid) {
+                remove_stale_cleanup_claim(&path);
+            }
+            continue;
+        }
+        let Some(pid) = staged_parser_pid(&path) else {
+            continue;
+        };
+        if !process_is_running(pid) {
+            // Claim the stale pathname atomically before deleting it. A new
+            // installer reserves staging paths with create_new, so after this
+            // claim it may safely reuse the old PID/counter name without our
+            // cleanup deleting its newly-created output.
+            // Recovery is best-effort. An unreadable or otherwise unclaimable
+            // lookalike must not prevent installation from proceeding.
+            let Ok(Some(claimed)) = claim_and_unlink_stale_parser_file(parser_dir, &path) else {
+                continue;
+            };
+            remove_stale_cleanup_claim(&claimed);
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn cleanup_interrupted_parser_installs(_parser_dir: &Path) -> Result<(), ParserInstallError> {
+    // There is no portable process-liveness API. Keep possibly live staging
+    // files instead of risking deletion of another installer process's output.
+    Ok(())
 }
 
 /// Construct a GitHub archive download URL from a repository URL and revision.
@@ -938,6 +1294,294 @@ fn invalid_metadata(message: String) -> ParserInstallError {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    #[cfg(unix)]
+    fn terminated_child_pid() -> u32 {
+        let mut child = std::process::Command::new(
+            std::env::current_exe().expect("resolve current test executable"),
+        )
+        .arg("--help")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn short-lived child");
+        let pid = child.id();
+        child.wait().expect("wait for short-lived child");
+        assert!(!process_is_running(pid), "reaped child PID is not running");
+        pid
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn staging_lock_is_inherited_through_exec() {
+        let temp = tempdir().expect("temp dir");
+        let path = temp.path().join("staging");
+        let lock = fs::File::create(&path).expect("create staging file");
+        lock.lock_exclusive().expect("lock staging file");
+        let mut cmd = Command::new("sleep");
+        cmd.arg("30");
+        inherit_staging_lock(&mut cmd, &lock);
+        let mut child = cmd.spawn().expect("spawn lock inheritor");
+        drop(lock);
+
+        let contender = fs::File::open(&path).expect("open staging file");
+        assert!(
+            contender.try_lock_exclusive().is_err(),
+            "exec child retains the staging lock after the parent drops it"
+        );
+
+        child.kill().expect("kill lock inheritor");
+        child.wait().expect("reap lock inheritor");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cleanup_removes_staged_parser_from_dead_process() {
+        let temp = tempdir().expect("temp dir");
+        let parser_dir = temp.path().join("parser");
+        fs::create_dir_all(&parser_dir).expect("create parser dir");
+        let pid = terminated_child_pid();
+        let staged = parser_dir.join(format!(
+            ".lua.{pid}.0.{}.tmp",
+            std::env::consts::DLL_EXTENSION
+        ));
+        fs::write(&staged, b"partial parser").expect("write staged parser");
+
+        cleanup_interrupted_parser_installs(&parser_dir).expect("cleanup succeeds");
+
+        assert!(!staged.exists(), "dead process staging file is removed");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cleanup_preserves_staged_parser_from_live_process() {
+        let temp = tempdir().expect("temp dir");
+        let parser_dir = temp.path().join("parser");
+        fs::create_dir_all(&parser_dir).expect("create parser dir");
+        let staged = parser_dir.join(format!(
+            ".lua.{}.0.{}.tmp",
+            std::process::id(),
+            std::env::consts::DLL_EXTENSION
+        ));
+        fs::write(&staged, b"active parser").expect("write staged parser");
+
+        cleanup_interrupted_parser_installs(&parser_dir).expect("cleanup succeeds");
+
+        assert!(staged.exists(), "live process staging file is preserved");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cleanup_preserves_noncanonical_staging_name() {
+        let temp = tempdir().expect("temp dir");
+        let parser_dir = temp.path().join("parser");
+        fs::create_dir_all(&parser_dir).expect("create parser dir");
+        let empty_counter =
+            parser_dir.join(format!(".lua.123..{}.tmp", std::env::consts::DLL_EXTENSION));
+        let leading_zero = parser_dir.join(format!(
+            ".lua.123.01.{}.tmp",
+            std::env::consts::DLL_EXTENSION
+        ));
+        let leading_zero_pid = parser_dir.join(format!(
+            ".lua.000123.0.{}.tmp",
+            std::env::consts::DLL_EXTENSION
+        ));
+        let zero_pid = parser_dir.join(format!(".lua.0.0.{}.tmp", std::env::consts::DLL_EXTENSION));
+        let oversized_pid = parser_dir.join(format!(
+            ".lua.{}.0.{}.tmp",
+            i32::MAX as u32 + 1,
+            std::env::consts::DLL_EXTENSION
+        ));
+        let noncanonical_claim = parser_dir.join(".parser-cleanup.000123.0");
+        let zero_claim = parser_dir.join(".parser-cleanup.0.0");
+        let oversized_claim = parser_dir.join(format!(".parser-cleanup.{}.0", i32::MAX as u32 + 1));
+        fs::write(&empty_counter, b"user file").expect("write user file");
+        fs::write(&leading_zero, b"user file").expect("write user file");
+        fs::write(&leading_zero_pid, b"user file").expect("write user file");
+        fs::write(&zero_pid, b"user file").expect("write user file");
+        fs::write(&oversized_pid, b"user file").expect("write user file");
+        fs::write(&noncanonical_claim, b"user file").expect("write user file");
+        fs::create_dir(&zero_claim).expect("create zero-PID claim lookalike");
+        fs::write(zero_claim.join("owner"), PARSER_CLEANUP_MARKER).expect("write marker");
+        fs::create_dir(&oversized_claim).expect("create oversized-PID claim lookalike");
+        fs::write(oversized_claim.join("owner"), PARSER_CLEANUP_MARKER).expect("write marker");
+
+        cleanup_interrupted_parser_installs(&parser_dir).expect("cleanup succeeds");
+
+        assert!(empty_counter.exists(), "empty counter name is preserved");
+        assert!(leading_zero.exists(), "leading-zero name is preserved");
+        assert!(leading_zero_pid.exists(), "leading-zero PID is preserved");
+        assert!(zero_pid.exists(), "zero PID is preserved");
+        assert!(oversized_pid.exists(), "oversized PID is preserved");
+        assert!(
+            noncanonical_claim.exists(),
+            "leading-zero cleanup claim PID is preserved"
+        );
+        assert!(zero_claim.exists(), "zero-PID cleanup claim is preserved");
+        assert!(
+            oversized_claim.exists(),
+            "oversized-PID cleanup claim is preserved"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cleanup_preserves_staging_file_claimed_by_another_cleaner() {
+        let temp = tempdir().expect("temp dir");
+        let parser_dir = temp.path().join("parser");
+        fs::create_dir_all(&parser_dir).expect("create parser dir");
+        let pid = terminated_child_pid();
+        let staged = parser_dir.join(format!(
+            ".lua.{pid}.0.{}.tmp",
+            std::env::consts::DLL_EXTENSION
+        ));
+        fs::write(&staged, b"partial parser").expect("write staged parser");
+        let claimed_elsewhere = fs::File::open(&staged).expect("open staged parser");
+        claimed_elsewhere
+            .lock_exclusive()
+            .expect("simulate another cleaner's claim");
+
+        cleanup_interrupted_parser_installs(&parser_dir).expect("cleanup succeeds");
+
+        assert!(staged.exists(), "another cleaner owns the staging file");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cleanup_only_removes_proven_cleanup_claims() {
+        let temp = tempdir().expect("temp dir");
+        let parser_dir = temp.path().join("parser");
+        fs::create_dir_all(&parser_dir).expect("create parser dir");
+        let pid = terminated_child_pid();
+        let owned = parser_dir.join(format!(".parser-cleanup.{pid}.0"));
+        let unowned = parser_dir.join(format!(".parser-cleanup.{pid}.1"));
+        fs::create_dir(&owned).expect("create owned cleanup claim");
+        fs::write(owned.join("owner"), PARSER_CLEANUP_MARKER).expect("write ownership marker");
+        fs::write(owned.join("artifact"), b"stale parser").expect("write stale artifact");
+        fs::create_dir(&unowned).expect("create unowned lookalike");
+        nix::unistd::mkfifo(
+            &unowned.join("owner"),
+            nix::sys::stat::Mode::S_IRUSR | nix::sys::stat::Mode::S_IWUSR,
+        )
+        .expect("create marker-shaped FIFO");
+        fs::write(unowned.join("artifact"), b"user data").expect("write user data");
+
+        cleanup_interrupted_parser_installs(&parser_dir).expect("cleanup succeeds");
+
+        assert!(!owned.exists(), "proven abandoned claim is removed");
+        assert!(unowned.exists(), "unmarked lookalike is preserved");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cleanup_skips_non_file_staging_path() {
+        let temp = tempdir().expect("temp dir");
+        let parser_dir = temp.path().join("parser");
+        fs::create_dir_all(&parser_dir).expect("create parser dir");
+        let pid = terminated_child_pid();
+        let staged = parser_dir.join(format!(
+            ".lua.{pid}.0.{}.tmp",
+            std::env::consts::DLL_EXTENSION
+        ));
+        let claim = parser_dir.join(format!(".parser-cleanup.{pid}.0"));
+        fs::create_dir(&staged).expect("create impostor directory");
+        fs::create_dir(&claim).expect("create impostor claim directory");
+
+        cleanup_interrupted_parser_installs(&parser_dir).expect("cleanup succeeds");
+
+        assert!(staged.is_dir(), "non-file staging path is preserved");
+        assert!(claim.is_dir(), "non-file cleanup claim is preserved");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cleanup_skips_unreadable_staging_file() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempdir().expect("temp dir");
+        let parser_dir = temp.path().join("parser");
+        fs::create_dir_all(&parser_dir).expect("create parser dir");
+        let staged = parser_dir.join(format!(
+            ".lua.{}.0.{}.tmp",
+            terminated_child_pid(),
+            std::env::consts::DLL_EXTENSION
+        ));
+        fs::write(&staged, b"unreadable lookalike").expect("write staging file");
+        fs::set_permissions(&staged, fs::Permissions::from_mode(0o000))
+            .expect("remove read permission");
+
+        if fs::File::open(&staged).is_ok() {
+            fs::set_permissions(&staged, fs::Permissions::from_mode(0o600))
+                .expect("restore staging permissions");
+            return;
+        }
+
+        cleanup_interrupted_parser_installs(&parser_dir).expect("cleanup remains best-effort");
+
+        assert!(staged.exists(), "unreadable staging file is preserved");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cleanup_preserves_staging_symlink_and_target() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempdir().expect("temp dir");
+        let parser_dir = temp.path().join("parser");
+        fs::create_dir_all(&parser_dir).expect("create parser dir");
+        let target = temp.path().join("user-file");
+        fs::write(&target, b"user data").expect("write target");
+        let staged = parser_dir.join(format!(
+            ".lua.{}.0.{}.tmp",
+            terminated_child_pid(),
+            std::env::consts::DLL_EXTENSION
+        ));
+        symlink(&target, &staged).expect("create staging-shaped symlink");
+
+        cleanup_interrupted_parser_installs(&parser_dir).expect("cleanup succeeds");
+
+        assert!(
+            fs::symlink_metadata(&staged)
+                .expect("symlink remains")
+                .file_type()
+                .is_symlink(),
+            "staging-shaped symlink is preserved"
+        );
+        assert_eq!(fs::read(&target).expect("read target"), b"user data");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn existing_parser_still_cleans_stale_artifacts() {
+        let temp = tempdir().expect("temp dir");
+        let parser_dir = temp.path().join("parser");
+        fs::create_dir_all(&parser_dir).expect("create parser dir");
+        let installed = parser_dir.join(format!("lua.{}", std::env::consts::DLL_EXTENSION));
+        fs::write(&installed, b"installed parser").expect("write installed parser");
+        let stale = parser_dir.join(format!(
+            ".json.{}.0.{}.tmp",
+            terminated_child_pid(),
+            std::env::consts::DLL_EXTENSION
+        ));
+        fs::write(&stale, b"stale parser").expect("write stale parser");
+        let options = InstallOptions {
+            data_dir: temp.path().to_path_buf(),
+            force: false,
+            verbose: false,
+            no_cache: false,
+            compile: ParserCompile::InProcess,
+        };
+
+        let result = install_parser("lua", &options);
+
+        assert!(
+            matches!(result, Err(ParserInstallError::AlreadyExists(path)) if path == installed)
+        );
+        assert!(
+            !stale.exists(),
+            "recovery runs even when the install is rejected"
+        );
+    }
 
     const TREE_SITTER_JSON_URL: &str =
         "https://github.com/tree-sitter/tree-sitter-json/archive/v0.24.8.tar.gz";
