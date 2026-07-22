@@ -228,6 +228,49 @@ fn load_toml_file(
     }
 }
 
+fn read_workspace_toml_contents(
+    config_path: &Path,
+    events: &mut Vec<SettingsEvent>,
+) -> Option<String> {
+    match fs::read_to_string(config_path) {
+        Ok(contents) => Some(contents),
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
+            match fs::symlink_metadata(config_path) {
+                Err(metadata_error) if metadata_error.kind() == std::io::ErrorKind::NotFound => {
+                    None
+                }
+                Err(metadata_error) => {
+                    events.push(SettingsEvent::warning(format!(
+                        "Failed to read {}: {metadata_error}",
+                        config_path.display()
+                    )));
+                    None
+                }
+                // The path may have appeared after the first read. Retry once;
+                // a dangling symlink remains a read error on the retry.
+                Ok(_) => match fs::read_to_string(config_path) {
+                    Ok(contents) => Some(contents),
+                    Err(retry_error) => {
+                        events.push(SettingsEvent::warning(format!(
+                            "Failed to read {}: {retry_error}",
+                            config_path.display()
+                        )));
+                        None
+                    }
+                },
+            }
+        }
+        Err(err) => {
+            events.push(SettingsEvent::warning(format!(
+                "Failed to read {}: {}",
+                config_path.display(),
+                err
+            )));
+            None
+        }
+    }
+}
+
 fn load_toml_settings(
     root_path: Option<&Path>,
     events: &mut Vec<SettingsEvent>,
@@ -235,36 +278,22 @@ fn load_toml_settings(
 ) -> Option<RawWorkspaceSettings> {
     let root = root_path?;
     let config_path = root.join("kakehashi.toml");
-    if !config_path.exists() {
-        return None;
-    }
-
+    let contents = read_workspace_toml_contents(&config_path, events)?;
     events.push(SettingsEvent::info(format!(
         "Found config file: {}",
         config_path.display()
     )));
 
-    match fs::read_to_string(&config_path) {
-        Ok(contents) => {
-            *used_deprecated_root_markers |=
-                crate::config::deprecation::toml_uses_deprecated_root_markers(&contents);
-            match toml::from_str::<RawWorkspaceSettings>(&contents) {
-                Ok(settings) => {
-                    events.push(SettingsEvent::info("Successfully loaded kakehashi.toml"));
-                    Some(settings)
-                }
-                Err(err) => {
-                    events.push(SettingsEvent::warning(format!(
-                        "Failed to parse kakehashi.toml: {}",
-                        err
-                    )));
-                    None
-                }
-            }
+    *used_deprecated_root_markers |=
+        crate::config::deprecation::toml_uses_deprecated_root_markers(&contents);
+    match toml::from_str::<RawWorkspaceSettings>(&contents) {
+        Ok(settings) => {
+            events.push(SettingsEvent::info("Successfully loaded kakehashi.toml"));
+            Some(settings)
         }
         Err(err) => {
             events.push(SettingsEvent::warning(format!(
-                "Failed to read kakehashi.toml: {}",
+                "Failed to parse kakehashi.toml: {}",
                 err
             )));
             None
@@ -723,5 +752,29 @@ mod tests {
 
         assert!(result.is_some(), "valid project config should parse");
         assert!(used_deprecated, "rootMarkers should set the flag");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn load_toml_settings_reports_dangling_workspace_config() {
+        use std::os::unix::fs::symlink;
+
+        let dir = TempDir::new().unwrap();
+        let config_path = dir.path().join("kakehashi.toml");
+        symlink("missing.toml", &config_path).unwrap();
+
+        let mut events = Vec::new();
+        let mut used_deprecated = false;
+        let result = load_toml_settings(Some(dir.path()), &mut events, &mut used_deprecated);
+
+        assert!(result.is_none());
+        assert!(
+            events.iter().any(|event| {
+                event.kind == SettingsEventKind::Warning
+                    && event.message.contains("Failed to read")
+                    && event.message.contains(&config_path.display().to_string())
+            }),
+            "a configured but broken workspace path must emit a read warning: {events:?}"
+        );
     }
 }
