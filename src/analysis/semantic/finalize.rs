@@ -947,7 +947,9 @@ mod tests {
     #[test]
     fn none_free_preprocessing_stops_at_periodic_mid_scan_checkpoint() {
         let cancel = crate::cancel::CancelToken::default();
-        cancel.cancel_after_polls(2);
+        // Entry and the first chunk consume two polls. The third poll must
+        // happen only after the first 64 tokens have been scanned.
+        cancel.cancel_after_polls(3);
         let tokens = (0..128)
             .map(|column| make_token(0, column, 1, "variable", 0, 0))
             .collect();
