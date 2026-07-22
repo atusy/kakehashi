@@ -99,10 +99,28 @@
     }
   ],
   "rejected_candidate": {
-    "source_commit": "0b6a84241",
+    "source_commit": "0b6a8424122ae1939e8b25431483bcb769ecb880",
     "release_server_binary_sha256": "9401e74d35a1cf39f883bb54a2e8dbec196b770b0cc4c305ad3b21fd8447f78b",
     "change": "Skip the breakpoint/heap sweep on visible non-overlapping lines after a preliminary scan.",
-    "reason": "Four authoritative E2E pairs showed flat/slower Rust medians and single-edit p95 regression in every pair despite a shorter isolated finalize phase. The preliminary scan was removed before the accepted series."
+    "reason": "Four authoritative E2E pairs showed flat/slower Rust medians and single-edit p95 regression in every pair despite a shorter isolated finalize phase. The preliminary scan was removed before the accepted series.",
+    "raw_runs": [
+      {
+        "path": "benches/profile/results/single_worker_stage31_rejected_disjoint_sweep_pair1_2026-07-22.json",
+        "sha256": "b1e14a6c0455f78830dbfe2c7988db182f4c5c363e891450a5be70a33d67ac9b"
+      },
+      {
+        "path": "benches/profile/results/single_worker_stage31_rejected_disjoint_sweep_pair2_2026-07-22.json",
+        "sha256": "5bdbdf6cc86f4f70aea0dda64d1c2524f58e90624443a64eedbf0722bd8d581e"
+      },
+      {
+        "path": "benches/profile/results/single_worker_stage31_rejected_disjoint_sweep_pair3_2026-07-22.json",
+        "sha256": "d36db3ac58e5439d0c1f4a7461b58285e1f591f92bcd51fda19b45bd69aae5ad"
+      },
+      {
+        "path": "benches/profile/results/single_worker_stage31_rejected_disjoint_sweep_pair4_2026-07-22.json",
+        "sha256": "5ce6a619708375febe41721ac687c621b9fda01876b956ae5ef3eb9d4be6e7be"
+      }
+    ]
   },
   "interpretation": {
     "accepted": true,

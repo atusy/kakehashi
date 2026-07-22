@@ -27,7 +27,9 @@ and bypassed breakpoint/heap processing. Although a short debug series reduced
 the reported finalize phase from roughly 3.4–3.6 ms to 2.7–2.8 ms, four
 authoritative E2E pairs showed flat/slower Rust central latency and worse
 single-edit p95 in every pair. That shortcut was removed. The accepted measured
-binary contains only the two allocation-preserving paths.
+binary contains only the two allocation-preserving paths. Four separately
+hashed raw-sample files for the rejected candidate are retained alongside the
+accepted evidence so this rejection remains independently auditable.
 
 All 1,200 timed benchmark results represented the latest edit. All 960 obsolete
 requests in cancellation scenarios returned JSON-RPC
