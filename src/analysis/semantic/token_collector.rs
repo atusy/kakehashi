@@ -783,6 +783,22 @@ mod tests {
     }
 
     #[test]
+    fn query_metadata_cache_rejects_gate_sized_sparse_tree() {
+        let suffix = "*/\nfn sparse_marker() {}\n";
+        let mut text = String::from("/*");
+        text.extend(std::iter::repeat_n(
+            'x',
+            QUERY_METADATA_CACHE_MIN_SOURCE_BYTES - text.len() - suffix.len(),
+        ));
+        text.push_str(suffix);
+        let node_count = parse_rust_tree(&text).root_node().descendant_count();
+
+        assert_eq!(text.len(), QUERY_METADATA_CACHE_MIN_SOURCE_BYTES);
+        assert!(node_count < QUERY_METADATA_CACHE_MIN_NODES);
+        assert!(!should_cache_query_metadata(text.len(), node_count));
+    }
+
+    #[test]
     fn cached_query_metadata_matches_direct_collection() {
         use crate::config::QueryTypeMappings;
 
