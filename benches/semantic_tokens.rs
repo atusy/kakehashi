@@ -437,6 +437,8 @@ fn gen_markdown_injections(blocks: usize) -> String {
 /// forcing the non-ASCII branch of byte→UTF-16 column conversion on most lines.
 fn gen_unicode_rust(funcs: usize) -> String {
     let mut s = String::with_capacity(funcs * 300);
+    s.push_str(TRACKED_MARKER);
+    s.push_str("\n\n");
     for i in 0..funcs {
         s.push_str(&format!(
             "/// 関数番号 {i} のドキュメントコメント — 日本語の説明文です。\n\
