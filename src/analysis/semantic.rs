@@ -85,21 +85,179 @@ fn run_sequential_injection<T>(
     (!cancelled && host_complete).then(injection_work)
 }
 
-/// Compute full-document semantic tokens (host + injections) as one work-unit
-/// on the bounded compute pool; the injection fan-out's `par_iter` runs on the
-/// same pool (a Rayon parallel iterator invoked from a pool thread stays on
-/// that pool), so tokenization can no longer occupy every core via the
-/// process-global Rayon pool (parse-snapshot ADR §4). Thread-local parser
-/// caches avoid cross-thread synchronization on parse. Returns `None` on
-/// cancellation/failure. `text` and `tree` are moved into the work-unit.
+/// Synchronously compute full-document semantic tokens from request-scoped
+/// inputs. The caller must already be running on the bounded compute pool; a
+/// nested Rayon iterator then stays on that pool. Thread-local parser caches
+/// avoid cross-thread synchronization on parse.
 ///
-/// `cancel` (when provided) doubles as the work-unit's dequeue hook (a request
-/// superseded while queued never starts) and is polled during the host-query
-/// walk, per region inside the injection pass, and throughout final token
-/// shaping, so a superseded/cancelled request stops instead of running to
-/// completion. Returns `None` once cancelled: the caller drops the (partial)
-/// result rather than storing it (see the compute-superseded checkpoints in the
-/// handlers).
+/// `cancel` is polled during the host-query walk, per region inside the
+/// injection pass, and throughout final token shaping. Returns `None` once
+/// cancelled so callers cannot publish a partial result.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn compute_semantic_tokens_full(
+    compute_threads: usize,
+    text: std::sync::Arc<str>,
+    tree: Tree,
+    query: std::sync::Arc<Query>,
+    filetype: Option<String>,
+    capture_mappings: Option<std::sync::Arc<CaptureMappings>>,
+    coordinator: std::sync::Arc<crate::language::LanguageCoordinator>,
+    supports_multiline: bool,
+    injection_cache: Option<InjectionCacheParams>,
+    cancel: Option<crate::cancel::CancelToken>,
+) -> Option<SemanticTokensResult> {
+    let is_cancelled = || crate::cancel::is_cancelled(cancel.as_ref());
+    let compute_started = std::time::Instant::now();
+    let mut host_tokens: Vec<RawToken> = Vec::with_capacity(1000);
+    let lines: Vec<&str> = text.lines().collect();
+    let line_starts = build_line_start_bytes(&text);
+
+    // Borrow the owned cache handle into a request-scoped context for the
+    // injection pass (#529); `None` keeps the uncached behavior.
+    let cache_ctx = injection_cache.as_ref().map(|p| InjectionCacheCtx {
+        uri: &p.uri,
+        tracker: p.tracker.as_ref(),
+        cache: p.cache.as_ref(),
+        generation: p.generation,
+        incarnation: p.incarnation,
+        // Currency latch for region-id minting, taken here inside the
+        // work-unit so the race window is the compute itself, not the
+        // pool-queue wait. A stale serve goes read-only on the tracker
+        // (reuse for unshifted regions, no cache entry for unknown ones).
+        mint_regions: p.documents.latest_snapshot(&p.uri).is_some_and(|view| {
+            view.slot.current_incarnation == p.incarnation
+                && view.content_version == p.parsed_version
+        }),
+        discovery: p.discovery.as_deref(),
+    });
+
+    let should_parallelize = cache_ctx.as_ref().is_some_and(|ctx| {
+        should_parallelize_host_and_injections(
+            compute_threads,
+            ctx.generation,
+            ctx.discovery.map(|discovery| {
+                (
+                    discovery.generation,
+                    discovery.complete,
+                    discovery.regions.len(),
+                )
+            }),
+        )
+    });
+    let mut host_work = || {
+        let started = std::time::Instant::now();
+        let complete = collect_host_tokens(
+            &text,
+            &tree,
+            &query,
+            filetype.as_deref(),
+            capture_mappings.as_deref(),
+            &text,
+            &lines,
+            &line_starts,
+            0,
+            0,
+            supports_multiline,
+            &[],
+            &[],
+            cancel.as_ref(),
+            &mut host_tokens,
+        );
+        (complete, started.elapsed())
+    };
+    let injection_work = || {
+        let started = std::time::Instant::now();
+        let result = collect_injection_tokens_parallel(
+            &text,
+            &lines,
+            &line_starts,
+            &tree,
+            filetype.as_deref(),
+            &coordinator,
+            capture_mappings.as_deref(),
+            supports_multiline,
+            cache_ctx.as_ref(),
+            cancel.as_ref(),
+        );
+        (result, started.elapsed())
+    };
+
+    // Host highlighting and a substantial injection pass read the same
+    // immutable snapshot and only meet during finalization. Overlap them
+    // when discovery proves enough injection work exists to amortize the
+    // second Rayon branch; otherwise retain the sequential fast path.
+    let ((host_complete, host_elapsed), (injection_result, injections_elapsed)) =
+        if should_parallelize {
+            // Match the sequential injection boundary: do not dispatch
+            // either Rayon branch when supersession has already landed.
+            if is_cancelled() {
+                return None;
+            }
+            rayon::join(host_work, injection_work)
+        } else {
+            let host_result = host_work();
+            let injection_result =
+                run_sequential_injection(host_result.0, is_cancelled(), injection_work)?;
+            (host_result, injection_result)
+        };
+
+    if !host_complete {
+        return None;
+    }
+    let (injection_tokens, active_injection_regions) = injection_result;
+
+    // A supersede observed during the injection pass leaves a partial token
+    // set; drop it so the handler never stores partial results.
+    if is_cancelled() {
+        return None;
+    }
+
+    // Merge injection tokens with host tokens
+    host_tokens.extend(injection_tokens);
+
+    let finalize_start = std::time::Instant::now();
+    let result = finalize_tokens_cancellable(
+        host_tokens,
+        &active_injection_regions,
+        &lines,
+        cancel.as_ref(),
+    );
+    let finalize_elapsed = finalize_start.elapsed();
+    let compute_elapsed = compute_started.elapsed();
+    if is_cancelled() {
+        return None;
+    }
+
+    // Host/injection durations overlap when `parallel=true`, so `compute`
+    // is the authoritative wall time; branch durations must not be summed.
+    log::debug!(
+        target: "kakehashi::semantic",
+        "[SEMANTIC_TOKENS] compute phases: compute={}us host={}us injections={}us finalize={}us parallel={} regions_reused={}",
+        compute_elapsed.as_micros(),
+        host_elapsed.as_micros(),
+        injections_elapsed.as_micros(),
+        finalize_elapsed.as_micros(),
+        should_parallelize,
+        injection_cache
+            .as_ref()
+            // The same generation gate the reuse path applies: a
+            // present-but-reload-stale discovery is NOT reused, and
+            // reporting its count would mislead profiling.
+            .and_then(|p| {
+                p.discovery
+                    .as_ref()
+                    .filter(|d| d.generation == p.generation && d.complete)
+            })
+            .map(|d| d.regions.len().to_string())
+            .unwrap_or_else(|| "none".to_string()),
+    );
+
+    result
+}
+
+/// Dispatch the synchronous semantic computation as one bounded compute-pool
+/// work unit. The cancellation token also acts as the dequeue hook, so work
+/// superseded while queued never starts.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn handle_semantic_tokens_full(
     pool: &crate::compute_pool::ComputePool,
@@ -114,154 +272,20 @@ pub(crate) async fn handle_semantic_tokens_full(
     cancel: Option<crate::cancel::CancelToken>,
 ) -> Option<SemanticTokensResult> {
     let compute_threads = pool.thread_count();
-    pool.run(cancel.clone(), move || {
-        let is_cancelled = || crate::cancel::is_cancelled(cancel.as_ref());
-        let compute_started = std::time::Instant::now();
-        let mut host_tokens: Vec<RawToken> = Vec::with_capacity(1000);
-        let lines: Vec<&str> = text.lines().collect();
-        let line_starts = build_line_start_bytes(&text);
-
-        // Borrow the owned cache handle into a request-scoped context for the
-        // injection pass (#529); `None` keeps the uncached behavior.
-        let cache_ctx = injection_cache.as_ref().map(|p| InjectionCacheCtx {
-            uri: &p.uri,
-            tracker: p.tracker.as_ref(),
-            cache: p.cache.as_ref(),
-            generation: p.generation,
-            incarnation: p.incarnation,
-            // Currency latch for region-id minting, taken here inside the
-            // work-unit so the race window is the compute itself, not the
-            // pool-queue wait. A stale serve goes read-only on the tracker
-            // (reuse for unshifted regions, no cache entry for unknown ones).
-            mint_regions: p.documents.latest_snapshot(&p.uri).is_some_and(|view| {
-                view.slot.current_incarnation == p.incarnation
-                    && view.content_version == p.parsed_version
-            }),
-            discovery: p.discovery.as_deref(),
-        });
-
-        let should_parallelize = cache_ctx.as_ref().is_some_and(|ctx| {
-            should_parallelize_host_and_injections(
-                compute_threads,
-                ctx.generation,
-                ctx.discovery.map(|discovery| {
-                    (
-                        discovery.generation,
-                        discovery.complete,
-                        discovery.regions.len(),
-                    )
-                }),
-            )
-        });
-        let mut host_work = || {
-            let started = std::time::Instant::now();
-            let complete = collect_host_tokens(
-                &text,
-                &tree,
-                &query,
-                filetype.as_deref(),
-                capture_mappings.as_deref(),
-                &text,
-                &lines,
-                &line_starts,
-                0,
-                0,
-                supports_multiline,
-                &[],
-                &[],
-                cancel.as_ref(),
-                &mut host_tokens,
-            );
-            (complete, started.elapsed())
-        };
-        let injection_work = || {
-            let started = std::time::Instant::now();
-            let result = collect_injection_tokens_parallel(
-                &text,
-                &lines,
-                &line_starts,
-                &tree,
-                filetype.as_deref(),
-                &coordinator,
-                capture_mappings.as_deref(),
-                supports_multiline,
-                cache_ctx.as_ref(),
-                cancel.as_ref(),
-            );
-            (result, started.elapsed())
-        };
-
-        // Host highlighting and a substantial injection pass read the same
-        // immutable snapshot and only meet during finalization. Overlap them
-        // when discovery proves enough injection work exists to amortize the
-        // second Rayon branch; otherwise retain the sequential fast path.
-        let ((host_complete, host_elapsed), (injection_result, injections_elapsed)) =
-            if should_parallelize {
-                // Match the sequential injection boundary: do not dispatch
-                // either Rayon branch when supersession has already landed.
-                if is_cancelled() {
-                    return None;
-                }
-                rayon::join(host_work, injection_work)
-            } else {
-                let host_result = host_work();
-                let injection_result =
-                    run_sequential_injection(host_result.0, is_cancelled(), injection_work)?;
-                (host_result, injection_result)
-            };
-
-        if !host_complete {
-            return None;
-        }
-        let (injection_tokens, active_injection_regions) = injection_result;
-
-        // A supersede observed during the injection pass leaves a partial token
-        // set; drop it so the handler never stores partial results.
-        if is_cancelled() {
-            return None;
-        }
-
-        // Merge injection tokens with host tokens
-        host_tokens.extend(injection_tokens);
-
-        let finalize_start = std::time::Instant::now();
-        let result = finalize_tokens_cancellable(
-            host_tokens,
-            &active_injection_regions,
-            &lines,
-            cancel.as_ref(),
-        );
-        let finalize_elapsed = finalize_start.elapsed();
-        let compute_elapsed = compute_started.elapsed();
-        if is_cancelled() {
-            return None;
-        }
-
-        // Host/injection durations overlap when `parallel=true`, so `compute`
-        // is the authoritative wall time; branch durations must not be summed.
-        log::debug!(
-            target: "kakehashi::semantic",
-            "[SEMANTIC_TOKENS] compute phases: compute={}us host={}us injections={}us finalize={}us parallel={} regions_reused={}",
-            compute_elapsed.as_micros(),
-            host_elapsed.as_micros(),
-            injections_elapsed.as_micros(),
-            finalize_elapsed.as_micros(),
-            should_parallelize,
-            injection_cache
-                .as_ref()
-                // The same generation gate the reuse path applies: a
-                // present-but-reload-stale discovery is NOT reused, and
-                // reporting its count would mislead profiling.
-                .and_then(|p| {
-                    p.discovery
-                        .as_ref()
-                        .filter(|d| d.generation == p.generation && d.complete)
-                })
-                .map(|d| d.regions.len().to_string())
-                .unwrap_or_else(|| "none".to_string()),
-        );
-
-        result
+    let dequeue_cancel = cancel.clone();
+    pool.run(dequeue_cancel, move || {
+        compute_semantic_tokens_full(
+            compute_threads,
+            text,
+            tree,
+            query,
+            filetype,
+            capture_mappings,
+            coordinator,
+            supports_multiline,
+            injection_cache,
+            cancel,
+        )
     })
     .await
     .flatten()
