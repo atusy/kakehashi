@@ -929,39 +929,8 @@ fn validate_full_response_generators() {
 
 fn main() {
     validate_full_response_generators();
-    if std::env::var_os("KAKEHASHI_BENCH_VALIDATE_SCENARIOS").is_some() {
-        return;
-    }
-    if let Some(path) = std::env::var_os("KAKEHASHI_BENCH_PREPARE_DATA_DIR") {
-        let path = PathBuf::from(path);
-        std::fs::create_dir_all(&path).expect("create benchmark fixture");
-        kakehashi::install::test_support::ensure_test_languages_installed(&path)
-            .expect("install benchmark fixture languages");
-        validate_fixture(&path);
-        println!("prepared benchmark fixture at {}", path.display());
-        return;
-    }
-
-    // An explicit fixture is attested input: verify it without installing or
-    // otherwise mutating it. The implicit checkout-local fixture retains the
-    // convenient install-on-first-run behavior for interactive use.
-    let data_dir = if let Some(path) = std::env::var_os("KAKEHASHI_BENCH_DATA_DIR") {
-        let path = PathBuf::from(path);
-        validate_fixture(&path);
-        path
-    } else {
-        let path = kakehashi::install::test_support::test_data_dir_path();
-        std::fs::create_dir_all(&path).expect("create data dir");
-        kakehashi::install::test_support::ensure_test_languages_installed(&path)
-            .expect("install test languages");
-        path
-    };
-    let data_dir = data_dir.to_string_lossy().to_string();
-
-    let iters = env_usize("KAKEHASHI_BENCH_ITERS", 80);
-    let warmup = env_usize("KAKEHASHI_BENCH_WARMUP", 10);
-
-    let binaries = resolve_binaries();
+    let validate_scenarios = std::env::var_os("KAKEHASHI_BENCH_VALIDATE_SCENARIOS").is_some();
+    let prepare_data_dir = std::env::var_os("KAKEHASHI_BENCH_PREPARE_DATA_DIR");
 
     let scenarios = vec![
         Scenario {
@@ -1172,6 +1141,43 @@ fn main() {
         },
     ];
     let scenarios = filter_scenarios(scenarios);
+    for scenario in &scenarios {
+        tracked_marker_line(&scenario.content)
+            .unwrap_or_else(|error| panic!("invalid scenario {}: {error:?}", scenario.name));
+    }
+    if validate_scenarios {
+        return;
+    }
+    if let Some(path) = prepare_data_dir {
+        let path = PathBuf::from(path);
+        std::fs::create_dir_all(&path).expect("create benchmark fixture");
+        kakehashi::install::test_support::ensure_test_languages_installed(&path)
+            .expect("install benchmark fixture languages");
+        validate_fixture(&path);
+        println!("prepared benchmark fixture at {}", path.display());
+        return;
+    }
+
+    // An explicit fixture is attested input: verify it without installing or
+    // otherwise mutating it. The implicit checkout-local fixture retains the
+    // convenient install-on-first-run behavior for interactive use.
+    let data_dir = if let Some(path) = std::env::var_os("KAKEHASHI_BENCH_DATA_DIR") {
+        let path = PathBuf::from(path);
+        validate_fixture(&path);
+        path
+    } else {
+        let path = kakehashi::install::test_support::test_data_dir_path();
+        std::fs::create_dir_all(&path).expect("create data dir");
+        kakehashi::install::test_support::ensure_test_languages_installed(&path)
+            .expect("install test languages");
+        path
+    };
+    let data_dir = data_dir.to_string_lossy().to_string();
+
+    let iters = env_usize("KAKEHASHI_BENCH_ITERS", 80);
+    let warmup = env_usize("KAKEHASHI_BENCH_WARMUP", 10);
+
+    let binaries = resolve_binaries();
 
     println!();
     println!("semantic-tokens benchmark  (iters={iters}, warmup={warmup}, lower is better)");

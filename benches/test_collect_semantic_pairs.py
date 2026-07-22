@@ -4,6 +4,7 @@ from pathlib import Path
 from unittest import mock
 
 from collect_semantic_pairs import (
+    DEFAULT_SCENARIOS,
     manifest_sha256,
     normalize_captured_stdout,
     recorded_environment,
@@ -14,6 +15,12 @@ from collect_semantic_pairs import (
 
 
 class CollectSemanticPairsTest(unittest.TestCase):
+    def test_default_scenarios_exist_in_rust_harness(self):
+        harness = (Path(__file__).parent / "semantic_tokens.rs").read_text()
+        for scenario in DEFAULT_SCENARIOS.split(","):
+            with self.subTest(scenario=scenario):
+                self.assertIn(f'name: "{scenario}"', harness)
+
     def test_captured_stdout_has_exactly_one_terminal_newline(self):
         self.assertEqual(normalize_captured_stdout("result\n\n"), "result\n")
         self.assertEqual(normalize_captured_stdout("result"), "result\n")
