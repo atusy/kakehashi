@@ -73,6 +73,12 @@ class SemanticSummaryTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "incomplete pair"):
             summarize_pairs([document])
 
+    def test_rejects_non_positive_timing_medians(self):
+        for a_samples, b_samples in [([0], [1]), ([1], [-1])]:
+            with self.subTest(a_samples=a_samples, b_samples=b_samples):
+                with self.assertRaisesRegex(ValueError, "non-positive median"):
+                    summarize_pairs([pair_document(1, "AB", a_samples, b_samples)])
+
     def test_validates_complete_attested_collection(self):
         documents = [attested_document(1), attested_document(2, "BA")]
         validated = validate_collection(
