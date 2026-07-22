@@ -9,6 +9,27 @@ use std::process::Stdio;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 
+/// Maximum accepted JSON-RPC body from a downstream language server.
+///
+/// Large semantic-token and workspace responses can legitimately be sizable,
+/// but a declared length must be bounded before allocation because downstream
+/// processes are outside kakehashi's trust boundary.
+const MAX_INBOUND_MESSAGE_SIZE: usize = 64 * 1024 * 1024;
+const MAX_INBOUND_HEADER_SIZE: usize = 8 * 1024;
+const MAX_INBOUND_HEADER_COUNT: usize = 64;
+
+fn validate_inbound_content_length(content_length: usize) -> io::Result<usize> {
+    if content_length > MAX_INBOUND_MESSAGE_SIZE {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "Content-Length {content_length} exceeds inbound message limit {MAX_INBOUND_MESSAGE_SIZE}"
+            ),
+        ));
+    }
+    Ok(content_length)
+}
+
 /// Writer handle for sending LSP messages to downstream language server.
 ///
 /// Wraps `ChildStdin` to provide LSP message framing (Content-Length header).
@@ -50,6 +71,47 @@ impl BridgeReader {
             stdout: BufReader::new(stdout),
         }
     }
+
+    async fn read_header_line(&mut self, remaining: &mut usize) -> io::Result<Vec<u8>> {
+        let mut line = Vec::new();
+        loop {
+            if *remaining == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("downstream message headers exceed limit {MAX_INBOUND_HEADER_SIZE}"),
+                ));
+            }
+            let buffered = self.stdout.fill_buf().await?;
+            if buffered.is_empty() {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "downstream connection closed while reading headers",
+                ));
+            }
+            let consumed = buffered
+                .iter()
+                .position(|byte| *byte == b'\n')
+                .map_or(buffered.len(), |index| index + 1);
+            if consumed > *remaining {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("downstream message headers exceed limit {MAX_INBOUND_HEADER_SIZE}"),
+                ));
+            }
+            line.extend_from_slice(&buffered[..consumed]);
+            *remaining -= consumed;
+            self.stdout.consume(consumed);
+            if line.ends_with(b"\n") {
+                return Ok(line);
+            }
+            if *remaining == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("downstream message headers exceed limit {MAX_INBOUND_HEADER_SIZE}"),
+                ));
+            }
+        }
+    }
 }
 
 impl BridgeReader {
@@ -61,17 +123,31 @@ impl BridgeReader {
         use tokio::io::AsyncReadExt;
 
         let mut content_length: Option<usize> = None;
+        let mut remaining_header_bytes = MAX_INBOUND_HEADER_SIZE;
+        let mut header_count = 0;
 
         // Read headers until empty line
         loop {
-            let mut line = String::new();
-            self.stdout.read_line(&mut line).await?;
+            let line = self.read_header_line(&mut remaining_header_bytes).await?;
+            let line = std::str::from_utf8(&line).map_err(|error| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("invalid LSP header: {error}"),
+                )
+            })?;
 
             // Trim CRLF/LF endings
             let trimmed = line.trim_end_matches(['\r', '\n']);
 
             if trimmed.is_empty() {
                 break; // Empty line = end of headers
+            }
+            header_count += 1;
+            if header_count > MAX_INBOUND_HEADER_COUNT {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("downstream message has more than {MAX_INBOUND_HEADER_COUNT} headers"),
+                ));
             }
 
             if let Some(value) = trimmed.strip_prefix("Content-Length: ") {
@@ -85,9 +161,17 @@ impl BridgeReader {
         let content_length = content_length.ok_or_else(|| {
             io::Error::new(io::ErrorKind::InvalidData, "missing Content-Length header")
         })?;
+        let content_length = validate_inbound_content_length(content_length)?;
 
         // Read exact body bytes
-        let mut body = vec![0u8; content_length];
+        let mut body = Vec::new();
+        body.try_reserve_exact(content_length).map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::OutOfMemory,
+                format!("cannot allocate downstream message body: {error}"),
+            )
+        })?;
+        body.resize(content_length, 0);
         self.stdout.read_exact(&mut body).await?;
 
         Ok(body)
@@ -491,6 +575,93 @@ mod tests {
         assert_eq!(parsed["jsonrpc"], "2.0");
         assert_eq!(parsed["id"], 1);
         assert!(parsed["result"].is_object());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn read_message_rejects_oversized_body_before_waiting_for_it() {
+        let declared_length = MAX_INBOUND_MESSAGE_SIZE + 1;
+        let script = format!("printf 'Content-Length: {declared_length}\\r\\n\\r\\n'; sleep 10");
+        let mut conn =
+            AsyncBridgeConnection::spawn(vec!["sh".to_string(), "-c".to_string(), script])
+                .await
+                .expect("spawn header writer");
+
+        let result = tokio::time::timeout(std::time::Duration::from_secs(1), conn.read_message())
+            .await
+            .expect("oversized header must be rejected before reading its body")
+            .expect_err("oversized message must fail");
+
+        assert_eq!(result.kind(), io::ErrorKind::InvalidData);
+        assert!(result.to_string().contains("exceeds"), "{result}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn read_message_rejects_oversized_unterminated_header() {
+        let script = format!("printf '%0{}d' 0; sleep 10", MAX_INBOUND_HEADER_SIZE + 1);
+        let mut conn =
+            AsyncBridgeConnection::spawn(vec!["sh".to_string(), "-c".to_string(), script])
+                .await
+                .expect("spawn header writer");
+
+        let result = tokio::time::timeout(std::time::Duration::from_secs(1), conn.read_message())
+            .await
+            .expect("oversized header must be rejected before its terminator")
+            .expect_err("oversized header must fail");
+
+        assert_eq!(result.kind(), io::ErrorKind::InvalidData);
+        assert!(result.to_string().contains("headers exceed"), "{result}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn read_message_rejects_exact_limit_unterminated_header_promptly() {
+        let script = format!("printf '%0{}d' 0; sleep 10", MAX_INBOUND_HEADER_SIZE);
+        let mut conn = AsyncBridgeConnection::spawn(vec!["sh".into(), "-c".into(), script])
+            .await
+            .unwrap();
+        let error = tokio::time::timeout(std::time::Duration::from_secs(1), conn.read_message())
+            .await
+            .expect("exhausted header budget must not stall")
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn read_message_reports_eof_mid_header() {
+        let mut conn = AsyncBridgeConnection::spawn(vec![
+            "sh".into(),
+            "-c".into(),
+            "printf 'Content-Length: 1'".into(),
+        ])
+        .await
+        .unwrap();
+        let error = conn.read_message().await.unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn read_message_rejects_excessive_header_count() {
+        let headers = "X: y\r\n".repeat(MAX_INBOUND_HEADER_COUNT + 1);
+        let script = format!("printf '%s\\r\\n' '{}'", headers.replace('\'', "'\\''"));
+        let mut conn = AsyncBridgeConnection::spawn(vec!["sh".into(), "-c".into(), script])
+            .await
+            .unwrap();
+        let error = conn.read_message().await.unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("headers"));
+    }
+
+    #[test]
+    fn inbound_message_limit_accepts_boundary() {
+        assert_eq!(
+            validate_inbound_content_length(MAX_INBOUND_MESSAGE_SIZE).unwrap(),
+            MAX_INBOUND_MESSAGE_SIZE
+        );
+        assert!(validate_inbound_content_length(MAX_INBOUND_MESSAGE_SIZE + 1).is_err());
     }
 
     /// Integration test: Initialize lua-language-server and verify response
