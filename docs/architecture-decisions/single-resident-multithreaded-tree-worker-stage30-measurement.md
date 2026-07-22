@@ -19,10 +19,12 @@ version. This is a compute-path optimization, not edit coalescing or debounce.
 
 Focused tests cover explicit and default pattern priorities, built-in and special
 capture roles, lazy population of only requested pattern/capture indices, and the
-32 KiB admission boundary. The existing semantic suite covers capture mappings,
-multiline projection, overlap resolution, injection exclusion, cancellation, and
-UTF-16 positions. The semantic suite and warning-denying all-target/all-feature
-Clippy pass.
+32 KiB admission boundary. A collector-level parity test compares the direct and
+cached paths over the same query and mappings, including suppression, unknown
+mappings, modifiers, and explicit/default priorities. The existing semantic
+suite covers capture mappings, multiline projection, overlap resolution,
+injection exclusion, cancellation, and UTF-16 positions. The semantic suite and
+warning-denying all-target/all-feature Clippy pass.
 
 An attempted allocation removal in `has-ancestor?` was rejected. Initial control
 measurements still showed a Markdown delta regression, and a direct comparison
