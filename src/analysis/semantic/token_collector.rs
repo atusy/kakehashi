@@ -117,12 +117,44 @@ fn resolve_token_kind(
     }
 }
 
-const QUERY_METADATA_CACHE_MIN_OBSERVED_ITEMS: usize = 256;
+struct CaptureKinds {
+    values: Vec<Option<Option<TokenKind>>>,
+}
 
-// Admit query-wide tables only after enough actual lookups can amortize them.
-// Source size and syntax-tree density are poor proxies for query match volume.
-fn should_cache_query_metadata(observed_items: usize) -> bool {
-    observed_items >= QUERY_METADATA_CACHE_MIN_OBSERVED_ITEMS
+impl CaptureKinds {
+    fn new(query: &Query) -> Self {
+        Self {
+            values: vec![None; query.capture_names().len()],
+        }
+    }
+
+    fn get(
+        &mut self,
+        query: &Query,
+        capture_index: usize,
+        filetype: Option<&str>,
+        capture_mappings: Option<&CaptureMappings>,
+    ) -> Option<TokenKind> {
+        self.values[capture_index]
+            .get_or_insert_with(|| {
+                resolve_token_kind(
+                    query.capture_names()[capture_index],
+                    filetype,
+                    capture_mappings,
+                )
+            })
+            .clone()
+    }
+}
+
+const QUERY_METADATA_CACHE_MIN_NODES: usize = 4 * 1024;
+const QUERY_METADATA_CACHE_MIN_NODES_PER_SLOT: usize = 16;
+
+// Keep setup outside the hot loop, but require enough syntax-walk work to
+// amortize every query-wide slot even for unusually large custom queries.
+fn should_cache_query_metadata(node_count: usize, metadata_slots: usize) -> bool {
+    node_count >= QUERY_METADATA_CACHE_MIN_NODES
+        && node_count >= metadata_slots.saturating_mul(QUERY_METADATA_CACHE_MIN_NODES_PER_SLOT)
 }
 
 /// The semantic role of a collected token.
@@ -432,8 +464,11 @@ pub(super) fn collect_host_tokens(
     let mut utf16_cache: Vec<Option<Utf16LineIndex>> = Vec::new();
 
     // Collect tokens from this document's highlight query
-    let mut priorities = None;
-    let mut observed_matches = 0;
+    let metadata_slots = query.pattern_count() + query.capture_names().len();
+    let cache_query_metadata =
+        should_cache_query_metadata(tree.root_node().descendant_count(), metadata_slots);
+    let mut priorities = cache_query_metadata.then(|| PatternPriorities::new(query));
+    let mut kinds_by_capture = cache_query_metadata.then(|| CaptureKinds::new(query));
     let mut cursor = QueryCursor::new();
     let mut matches = cursor.matches(query, tree.root_node(), text.as_bytes());
 
@@ -441,11 +476,8 @@ pub(super) fn collect_host_tokens(
         if is_cancelled_periodically(cancel, &mut work_items) {
             return false;
         }
-        observed_matches += 1;
-        let priority = if should_cache_query_metadata(observed_matches) {
-            priorities
-                .get_or_insert_with(|| PatternPriorities::new(query))
-                .get(query, m.pattern_index)
+        let priority = if let Some(priorities) = priorities.as_mut() {
+            priorities.get(query, m.pattern_index)
         } else {
             parse_priority_for_pattern(query, m.pattern_index)
         };
@@ -467,7 +499,11 @@ pub(super) fn collect_host_tokens(
             let is_single_line = start_pos.row == end_pos.row;
             let is_trailing_newline = end_pos.row == start_pos.row + 1 && end_pos.column == 0;
 
-            let kind = resolve_token_kind(capture_name, filetype, capture_mappings);
+            let kind = if let Some(kinds_by_capture) = kinds_by_capture.as_mut() {
+                kinds_by_capture.get(query, c.index as usize, filetype, capture_mappings)
+            } else {
+                resolve_token_kind(capture_name, filetype, capture_mappings)
+            };
             let Some(kind) = kind else {
                 continue;
             };
@@ -687,7 +723,33 @@ mod tests {
     }
 
     #[test]
-    fn pattern_priority_table_resolves_only_requested_indices() {
+    fn capture_kinds_precompute_legend_and_special_roles() {
+        let language: tree_sitter::Language = tree_sitter_rust::LANGUAGE.into();
+        let query = tree_sitter::Query::new(
+            &language,
+            r#"
+            (identifier) @variable
+            (line_comment) @none
+            (string_literal) @unknown.capture
+            "#,
+        )
+        .unwrap();
+
+        let mut kinds = CaptureKinds::new(&query);
+        assert_eq!(
+            (0..query.capture_names().len())
+                .map(|capture_index| kinds.get(&query, capture_index, None, None))
+                .collect::<Vec<_>>(),
+            vec![
+                Some(TokenKind::Mapped(17, 0)),
+                Some(TokenKind::NoneCapture),
+                Some(TokenKind::Transparent),
+            ]
+        );
+    }
+
+    #[test]
+    fn semantic_query_tables_resolve_only_requested_indices() {
         let language: tree_sitter::Language = tree_sitter_rust::LANGUAGE.into();
         let query = tree_sitter::Query::new(
             &language,
@@ -699,17 +761,25 @@ mod tests {
         )
         .unwrap();
         let mut priorities = PatternPriorities::new(&query);
+        let mut kinds = CaptureKinds::new(&query);
 
         assert!(priorities.values.iter().all(Option::is_none));
+        assert!(kinds.values.iter().all(Option::is_none));
 
         assert_eq!(priorities.get(&query, 1), 100);
+        assert_eq!(
+            kinds.get(&query, 1, None, None),
+            Some(TokenKind::Mapped(0, 0))
+        );
         assert_eq!(priorities.values.iter().filter(|v| v.is_some()).count(), 1);
+        assert_eq!(kinds.values.iter().filter(|v| v.is_some()).count(), 1);
     }
 
     #[test]
-    fn query_metadata_cache_requires_repeated_query_work() {
-        assert!(!should_cache_query_metadata(255));
-        assert!(should_cache_query_metadata(256));
+    fn query_metadata_cache_requires_amortized_table_slots() {
+        assert!(!should_cache_query_metadata(4 * 1024 - 1, 1));
+        assert!(!should_cache_query_metadata(4 * 1024, 257));
+        assert!(should_cache_query_metadata(4 * 1024, 256));
     }
 
     #[test]
@@ -742,8 +812,16 @@ mod tests {
         )]);
         let snippet = "fn alpha() { let beta = 1; // note\n}\n";
         let direct_text = snippet.to_string();
-        let cached_text = snippet.repeat(QUERY_METADATA_CACHE_MIN_OBSERVED_ITEMS);
-        assert!(cached_text.matches("fn alpha").count() >= 64);
+        let cached_text = snippet.repeat(1024);
+        let metadata_slots = query.pattern_count() + query.capture_names().len();
+        assert!(!should_cache_query_metadata(
+            parse_rust_tree(&direct_text).root_node().descendant_count(),
+            metadata_slots
+        ));
+        assert!(should_cache_query_metadata(
+            parse_rust_tree(&cached_text).root_node().descendant_count(),
+            metadata_slots
+        ));
 
         let collect = |text: &str| {
             let tree = parse_rust_tree(text);
