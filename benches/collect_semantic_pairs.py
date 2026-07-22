@@ -48,6 +48,7 @@ ISOLATED_ENVIRONMENT_KEYS = {
     "LC_ALL",
     "RUSTUP_HOME",
 }
+ALLOWED_SERVER_ENVIRONMENT_KEYS = {"KAKEHASHI_TREE_WORKER_MODE"}
 
 
 def terminate_process_group(process: subprocess.Popen[str]) -> None:
@@ -260,6 +261,8 @@ def parse_server_env(values: list[str]) -> dict[str, str]:
             raise ValueError(f"server env must be KEY=VALUE: {value}")
         if key in ISOLATED_ENVIRONMENT_KEYS:
             raise ValueError(f"server env uses reserved collector key: {key}")
+        if key not in ALLOWED_SERVER_ENVIRONMENT_KEYS:
+            raise ValueError(f"unsupported server env key: {key}")
         parsed[key] = item
     return parsed
 

@@ -53,6 +53,10 @@ class CollectSemanticPairsTest(unittest.TestCase):
             {"KAKEHASHI_TREE_WORKER_MODE": "legacy"},
         )
 
+    def test_server_environment_rejects_unpublished_controls(self):
+        with self.assertRaisesRegex(ValueError, "unsupported server env key"):
+            parse_server_env(["API_TOKEN=secret"])
+
     def test_default_scenarios_exist_in_rust_harness(self):
         harness = (Path(__file__).parent / "semantic_tokens.rs").read_text()
         for scenario in DEFAULT_SCENARIOS.split(","):
