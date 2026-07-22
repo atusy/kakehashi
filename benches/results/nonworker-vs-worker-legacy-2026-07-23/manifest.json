@@ -1,0 +1,126 @@
+{
+  "attestations": {
+    "binary_a": "80a4f49e1929740eecc0eebf99bbc71f2577b0a9bb788648782b6fa9e32824b8",
+    "binary_b": "ea2375e33364aadbf50ebe90d19197817199358efd4c8eff858e92c3cde0f8f6",
+    "fixture": "0366a10aa812b51df62717841d88beb137237fada287479226cbe6bc2ec424d6",
+    "harness": "350e028d32b706ebbff55a0f5494ec0904badf33f9f0e198bed250b3dd39ae98"
+  },
+  "configuration": {
+    "iterations": 30,
+    "pairs": 4,
+    "run_timeout_seconds": 900,
+    "scenario_filters": [
+      "rust_large/full_cache_hit",
+      "rust_large/typing_delta",
+      "rust_sparse_32k_minus/typing_delta",
+      "rust_sparse_32k_exact/typing_delta",
+      "rust_sparse_32k_plus/typing_delta",
+      "rust_sparse_64k/typing_delta",
+      "rust_large/typing_burst",
+      "rust_xlarge/cancel_burst",
+      "markdown_injections_large/full_cache_hit",
+      "markdown_injections/typing_delta",
+      "markdown_injections/typing_burst",
+      "unicode_rust/full_cache_hit"
+    ],
+    "scenarios": [
+      "markdown_injections/typing_burst",
+      "markdown_injections/typing_delta",
+      "markdown_injections_large/full_cache_hit",
+      "rust_large/full_cache_hit",
+      "rust_large/typing_burst",
+      "rust_large/typing_delta",
+      "rust_sparse_32k_exact/typing_delta",
+      "rust_sparse_32k_minus/typing_delta",
+      "rust_sparse_32k_plus/typing_delta",
+      "rust_sparse_64k/typing_delta",
+      "rust_xlarge/cancel_burst",
+      "unicode_rust/full_cache_hit"
+    ],
+    "server_env": {
+      "KAKEHASHI_TREE_WORKER_MODE": "legacy"
+    },
+    "warmup_iterations": 6
+  },
+  "environment": {
+    "build": {
+      "CARGO_HOME": "<TEMP>/cargo-home",
+      "CARGO_TERM_COLOR": "never",
+      "HOME": "<TEMP>/home",
+      "LANG": "C",
+      "LC_ALL": "C",
+      "PATH": "/Users/atusy/.local/bin:/Users/atusy/.bun/install/global/node_modules/@openai/codex-darwin-arm64/vendor/aarch64-apple-darwin/codex-path:/Users/atusy/.codex/tmp/arg0/codex-arg0NTfz1D:/opt/homebrew/bin:/opt/homebrew/sbin:/nix/var/nix/profiles/default/bin:/Users/atusy/.nix-profile/bin:/run/current-system/sw/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/Users/atusy/.local/lastresort/bin",
+      "TMPDIR": "<TEMP>/tmp"
+    },
+    "cargo": "cargo 1.95.0 (f2d3ce0bd 2026-03-21)\nrelease: 1.95.0\ncommit-hash: f2d3ce0bd7f24a49f8f72d9000448f8838c4e850\ncommit-date: 2026-03-21\nhost: aarch64-apple-darwin\nlibgit2: 1.9.2 (sys:0.20.4 vendored)\nlibcurl: 8.20.0 (sys:0.4.83+curl-8.15.0 system ssl:OpenSSL/3.6.2)\nos: Mac OS 26.5.1 [64-bit]",
+    "cc": "Apple clang version 21.0.0 (clang-2100.1.1.101)\nTarget: arm64-apple-darwin25.5.0\nThread model: posix\nInstalledDir: /Library/Developer/CommandLineTools/usr/bin",
+    "clang": "Apple clang version 21.0.0 (clang-2100.1.1.101)\nTarget: arm64-apple-darwin25.5.0\nThread model: posix\nInstalledDir: /Library/Developer/CommandLineTools/usr/bin",
+    "machine": "arm64",
+    "platform": "macOS-26.5.1-arm64-arm-64bit",
+    "processor": "arm",
+    "runtime": {
+      "CARGO_HOME": "<TEMP>/cargo-home",
+      "CARGO_TERM_COLOR": "never",
+      "HOME": "<TEMP>/home",
+      "KAKEHASHI_TREE_WORKER_MODE": "legacy",
+      "LANG": "C",
+      "LC_ALL": "C",
+      "PATH": "/Users/atusy/.local/bin:/Users/atusy/.bun/install/global/node_modules/@openai/codex-darwin-arm64/vendor/aarch64-apple-darwin/codex-path:/Users/atusy/.codex/tmp/arg0/codex-arg0NTfz1D:/opt/homebrew/bin:/opt/homebrew/sbin:/nix/var/nix/profiles/default/bin:/Users/atusy/.nix-profile/bin:/run/current-system/sw/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/Users/atusy/.local/lastresort/bin",
+      "TMPDIR": "<TEMP>/tmp"
+    },
+    "rustc": "rustc 1.95.0 (59807616e 2026-04-14) (built from a source tarball)\nbinary: rustc\ncommit-hash: 59807616e1fa2540724bfbac14d7976d7e4a3860\ncommit-date: 2026-04-14\nhost: aarch64-apple-darwin\nrelease: 1.95.0\nLLVM version: 21.1.8",
+    "sdk": "26.5"
+  },
+  "fixture_manifest": "fixture-manifest.json",
+  "fixture_manifest_sha256": "5368b4af797745726dc25a008a7f98bbdf554317f8c68bcebab6df0567687c86",
+  "raw_files": [
+    {
+      "order": "AB",
+      "pair_index": 1,
+      "samples": "pair-1.json",
+      "samples_sha256": "3dadc16ee5ac2e46939dccd0887a1f8cfa5eadca77f037d55a0dd2f3b8b9a4da",
+      "stdout": "pair-1.txt",
+      "stdout_sha256": "1eefc6cfa70e82a40a5c88694403985f5ebbf65a76af42a428f0a50520e47120"
+    },
+    {
+      "order": "BA",
+      "pair_index": 2,
+      "samples": "pair-2.json",
+      "samples_sha256": "3c15965d8bd02db41ec17360595251708d744e58d3cc8f0e7b0fc84ddf9bfab2",
+      "stdout": "pair-2.txt",
+      "stdout_sha256": "5b18f88235bac9dc3db1e2d3a2a814030094d8a5939b2500b94b55803e15489d"
+    },
+    {
+      "order": "AB",
+      "pair_index": 3,
+      "samples": "pair-3.json",
+      "samples_sha256": "921412b2afc8dc0c063f0972ecff8fa8ae33a9953f07e65c81eac9d51bd00716",
+      "stdout": "pair-3.txt",
+      "stdout_sha256": "bf4d8995e9e2e5d22a4c3ace2cdf8b82184ca23781705e00175a965c03a239da"
+    },
+    {
+      "order": "BA",
+      "pair_index": 4,
+      "samples": "pair-4.json",
+      "samples_sha256": "d598bd8c435db5b800bbc8a9aafb71fc1598c6b8b1dc281177f9e3fec0273c08",
+      "stdout": "pair-4.txt",
+      "stdout_sha256": "46988dc26dfe577703fbd366af5a972686efb2bbe3c49f7c92c1994c163fbc04"
+    }
+  ],
+  "schema_version": 1,
+  "source": {
+    "a_commit": "a1278be5fdff24d109d9e03134c6bdb880577f64",
+    "a_ref": "origin/main",
+    "b_commit": "f3febbf4ae553f38d0e0569da7daa710fec9d0e8",
+    "b_ref": "f3febbf4",
+    "harness_commit": "b15e020f0ab2e283e2345533e6728dbacf066fff",
+    "harness_sources_sha256": {
+      "benches/collect_semantic_pairs.py": "1de6e6ed7c343f5bdd0f1802e715631be0394ed25a8d7bc3a811f78163e29959",
+      "benches/semantic_summary.py": "8e092fe2012842962f063d556838a66957b5684898ceb6321f16e07b67da4eb1",
+      "benches/semantic_tokens.rs": "9e9817177e8e23c2beda12e0be5dfbcb12b0bd8b8f3523c5c2829ff6c38f7314",
+      "benches/support/semantic_baseline.rs": "dcfc40ee19de793fe5eeddddffe938c35789bf9fe080c643c4f513c2647824ad"
+    }
+  },
+  "summary": "summary.json",
+  "summary_sha256": "37243892b6b40a8aeaa83fca723de37b49aa8e4a87d2cc93507af5176a7d0de3"
+}
