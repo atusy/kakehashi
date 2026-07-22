@@ -25,7 +25,7 @@ GitHub serves repository archives at deterministic URLs (`/archive/{revision}.ta
 
 1. **Fastest for the common case**: All nvim-treesitter parsers are on GitHub, so archive download covers 100% of standard usage
 2. **Git becomes optional**: Users without git can still install parsers from GitHub
-3. **Graceful fallback**: Non-GitHub URLs or download failures transparently fall back to git clone
+3. **Graceful fallback**: Non-GitHub URLs or ordinary download/extraction failures transparently fall back to git clone
 4. **No regressions**: The git clone path is preserved and well-tested
 
 ### Implementation
@@ -34,8 +34,9 @@ The `fetch_source()` function implements the strategy:
 
 1. Construct archive URL: `https://github.com/{owner}/{repo}/archive/{revision}.tar.gz`
 2. Download and extract tarball, stripping the root directory prefix (`{repo}-{revision_no_v}/`)
-3. On any failure, clean up and fall back to `clone_repo()`
-4. For non-GitHub URLs, skip directly to git clone
+3. On ordinary archive download/extraction failures, clean up and fall back to `clone_repo()`
+4. On archive size-limit failures, clean up and fail without fallback to preserve the resource budget
+5. For non-GitHub URLs, skip directly to git clone
 
 ### Consequences
 
@@ -49,6 +50,7 @@ The `fetch_source()` function implements the strategy:
 
 * Two new dependencies: `flate2` and `tar` crates (well-established, ~10 transitive crates)
 * Archive root directory naming depends on GitHub's convention (`{repo}-{revision_no_v}/`)
+* Archive size-limit failures are terminal rather than falling back to git, because retrying through another acquisition path would bypass the resource budget
 
 **Neutral:**
 
