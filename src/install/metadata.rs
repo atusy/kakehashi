@@ -228,29 +228,88 @@ fn extract_parser_metadata(content: &str, language: &str) -> Option<ParserMetada
 
 /// Find the content within matching braces starting from the first `{`.
 fn find_matching_brace(s: &str) -> Option<&str> {
-    let start = s.find('{')?;
-    let mut depth = 0;
-    let mut end = start;
+    fn long_bracket_open(bytes: &[u8]) -> Option<(usize, usize)> {
+        (bytes.first() == Some(&b'[')).then_some(())?;
+        let equals = bytes[1..].iter().take_while(|&&byte| byte == b'=').count();
+        (bytes.get(equals + 1) == Some(&b'[')).then_some((equals, equals + 2))
+    }
 
-    for (i, c) in s[start..].char_indices() {
-        match c {
-            '{' => depth += 1,
-            '}' => {
-                depth -= 1;
+    fn long_bracket_close(bytes: &[u8], equals: usize) -> Option<usize> {
+        (bytes.first() == Some(&b']')).then_some(())?;
+        bytes
+            .get(1..equals + 1)
+            .is_some_and(|middle| middle.iter().all(|&byte| byte == b'='))
+            .then_some(())?;
+        (bytes.get(equals + 1) == Some(&b']')).then_some(equals + 2)
+    }
+
+    let start = s.find('{')?;
+    let bytes = s.as_bytes();
+    let mut depth = 0usize;
+    let mut quote = None;
+    let mut escaped = false;
+    let mut line_comment = false;
+    let mut long_bracket = None;
+    let mut i = start;
+
+    while i < bytes.len() {
+        let byte = bytes[i];
+        if line_comment {
+            line_comment = !matches!(byte, b'\n' | b'\r');
+            i += 1;
+            continue;
+        }
+        if let Some(equals) = long_bracket {
+            if let Some(length) = long_bracket_close(&bytes[i..], equals) {
+                long_bracket = None;
+                i += length;
+            } else {
+                i += 1;
+            }
+            continue;
+        }
+        if let Some(delimiter) = quote {
+            if escaped {
+                escaped = false;
+            } else if byte == b'\\' {
+                escaped = true;
+            } else if byte == delimiter {
+                quote = None;
+            }
+            i += 1;
+            continue;
+        }
+
+        if bytes[i..].starts_with(b"--") {
+            if let Some((equals, length)) = long_bracket_open(&bytes[i + 2..]) {
+                long_bracket = Some(equals);
+                i += 2 + length;
+            } else {
+                line_comment = true;
+                i += 2;
+            }
+            continue;
+        }
+        if let Some((equals, length)) = long_bracket_open(&bytes[i..]) {
+            long_bracket = Some(equals);
+            i += length;
+            continue;
+        }
+        match byte {
+            b'\'' | b'"' => quote = Some(byte),
+            b'{' => depth += 1,
+            b'}' => {
+                depth = depth.checked_sub(1)?;
                 if depth == 0 {
-                    end = start + i + 1;
-                    break;
+                    return Some(&s[start..i + 1]);
                 }
             }
             _ => {}
         }
+        i += 1;
     }
 
-    if depth == 0 {
-        Some(&s[start..end])
-    } else {
-        None
-    }
+    None
 }
 
 /// Fetch parser metadata for a language from nvim-treesitter.
@@ -398,6 +457,51 @@ return {
         let s2 = "prefix { inner } suffix";
         let result2 = find_matching_brace(s2);
         assert_eq!(result2, Some("{ inner }"));
+    }
+
+    #[test]
+    fn parser_metadata_ignores_braces_inside_quoted_strings() {
+        let content = r#"
+lua = {
+  readme_note = "write \" } after C:\\tmp",
+  install_info = {
+    url = 'https://github.com/tree-sitter-grammars/tree-sitter-lua',
+    revision = 'main',
+  },
+}
+"#;
+
+        let parsers = parse_parsers_lua(content).expect("valid metadata must parse");
+        let lua = parsers
+            .get("lua")
+            .expect("lua metadata must not be truncated");
+        assert_eq!(lua.revision, "main");
+    }
+
+    #[test]
+    fn parser_metadata_ignores_quotes_inside_comments() {
+        let content = r#"
+lua = {
+  -- don't interpret this apostrophe as a string
+  --[=[ neither "quotes" nor } in a long comment close the table ]=]
+  readme_note = [=[ a long string may contain } too ]=],
+  install_info = {
+    url = 'https://github.com/tree-sitter-grammars/tree-sitter-lua',
+    revision = 'main',
+  },
+}
+"#;
+
+        let parsers = parse_parsers_lua(content).expect("valid commented metadata must parse");
+        assert!(parsers.contains_key("lua"));
+    }
+
+    #[test]
+    fn parser_metadata_ends_line_comments_at_carriage_returns() {
+        let content = "lua = {\r-- don't consume the following fields\rinstall_info = {\rurl = 'https://example.com/lua',\rrevision = 'main',\r},\r}\r";
+
+        let parsers = parse_parsers_lua(content).expect("CR-only metadata must parse");
+        assert!(parsers.contains_key("lua"));
     }
 
     #[test]
