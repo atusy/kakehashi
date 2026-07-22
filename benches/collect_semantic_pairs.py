@@ -119,6 +119,11 @@ def file_sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def normalize_captured_stdout(stdout: str) -> str:
+    """Keep captured output readable without introducing whitespace errors."""
+    return stdout.rstrip() + "\n" if stdout else ""
+
+
 def tree_manifest(root: Path) -> list[dict[str, Any]]:
     entries = []
     for path in sorted(root.rglob("*"), key=lambda item: item.as_posix()):
@@ -352,8 +357,9 @@ def main() -> None:
                     timeout=args.run_timeout,
                     capture=True,
                 )
-                text_path.write_text(completed.stdout or "")
-                print(completed.stdout or "", end="")
+                captured_stdout = normalize_captured_stdout(completed.stdout or "")
+                text_path.write_text(captured_stdout)
+                print(captured_stdout, end="")
                 assert_attestations(attestations, paths)
                 raw_documents.append(json.loads(raw_path.read_text()))
                 raw_files.append(
