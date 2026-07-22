@@ -26,7 +26,7 @@
 //!   cargo bench --bench semantic_tokens --features e2e
 //! ```
 //!
-//! A/B comparison (the common case — see benches/compare_head_vs_main.sh):
+//! A/B comparison (the common case — see benches/README.md):
 //! ```sh
 //! KAKEHASHI_BENCH_BIN_A=/tmp/kakehashi-main KAKEHASHI_BENCH_LABEL_A=main \
 //! KAKEHASHI_BENCH_BIN_B=/tmp/kakehashi-head KAKEHASHI_BENCH_LABEL_B=head \
@@ -880,20 +880,20 @@ fn main() {
 
     let scenarios = vec![
         Scenario {
-            name: "rust_small/full",
+            name: "rust_small/full_cache_hit",
             language_id: "rust",
             uri: "file:///bench/small.rs",
             content: gen_rust(15),
             kind: Kind::Full,
-            targets: "token-index resolution, Arc mappings, lazy filter_captures",
+            targets: "small exact-snapshot semantic cache-hit control",
         },
         Scenario {
-            name: "rust_large/full",
+            name: "rust_large/full_cache_hit",
             language_id: "rust",
             uri: "file:///bench/large.rs",
             content: gen_rust(150),
             kind: Kind::Full,
-            targets: "per-token String removal, ASCII fast-path, Arc mappings (amplified)",
+            targets: "large exact-snapshot semantic cache-hit control",
         },
         Scenario {
             name: "rust_large/range",
@@ -909,28 +909,28 @@ fn main() {
             targets: "range request variation with scrolling viewports; first miss seeds full-cache filtering",
         },
         Scenario {
-            name: "rust_predicate_heavy/full",
+            name: "rust_predicate_heavy/full_cache_hit",
             language_id: "rust",
             uri: "file:///bench/predicates.rs",
             content: gen_rust_predicate_heavy(120),
             kind: Kind::Full,
-            targets: "#lua-match? predicate evaluation — shared regex lazy-DFA cache pool",
+            targets: "predicate-heavy exact-snapshot semantic cache-hit control",
         },
         Scenario {
-            name: "markdown_injections/full",
+            name: "markdown_injections/full_cache_hit",
             language_id: "markdown",
             uri: "file:///bench/injections.md",
             content: gen_markdown_injections(60),
             kind: Kind::Full,
-            targets: "active-region binary search, line/col index, host_lines sharing",
+            targets: "injection document exact-snapshot semantic cache-hit control",
         },
         Scenario {
-            name: "markdown_injections_large/full",
+            name: "markdown_injections_large/full_cache_hit",
             language_id: "markdown",
             uri: "file:///bench/injections_large.md",
             content: gen_markdown_injections(150),
             kind: Kind::Full,
-            targets: "injection pipeline at scale (amplifies region/coord work)",
+            targets: "large injection document exact-snapshot semantic cache-hit control",
         },
         Scenario {
             name: "markdown_injections_large/range",
@@ -946,12 +946,12 @@ fn main() {
             targets: "range request variation across markdown injections; first miss seeds full-cache filtering",
         },
         Scenario {
-            name: "unicode_rust/full",
+            name: "unicode_rust/full_cache_hit",
             language_id: "rust",
             uri: "file:///bench/unicode.rs",
             content: gen_unicode_rust(150),
             kind: Kind::Full,
-            targets: "byte→UTF-16 conversion (non-ASCII fallback) + token path",
+            targets: "Unicode document exact-snapshot semantic cache-hit control",
         },
         Scenario {
             name: "rust_large/delta_noop",
@@ -1252,7 +1252,7 @@ fn print_ab_header(label_a: &str, label_b: &str) {
         "scenario",
         format!("{label_a} (med)"),
         format!("{label_b} (med)"),
-        "Δ (B vs A)"
+        format!("Δ ({label_b} vs {label_a})")
     );
     println!("{}", "-".repeat(72));
 }
