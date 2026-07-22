@@ -761,13 +761,14 @@ mod tests {
         };
 
         // Markdown with a Lua code block
-        let text = r#"# Hello
+        let text: Arc<str> = Arc::from(
+            r#"# Hello
 
 ```lua
 local x = 42
 ```
-"#
-        .to_string();
+"#,
+        );
 
         // Parse the markdown document
         let mut parser_pool = coordinator.create_document_parser_pool();
@@ -775,16 +776,31 @@ local x = 42
             eprintln!("Skipping: could not acquire markdown parser");
             return;
         };
-        let Some(tree) = parser.parse(&text, None) else {
+        let Some(tree) = parser.parse(text.as_bytes(), None) else {
             eprintln!("Skipping: could not parse markdown");
             return;
         };
         parser_pool.release("markdown".to_string(), parser);
 
-        // Call the async handler
-        let result = handle_semantic_tokens_full(
+        // Repeated computations over the same immutable inputs must be exact.
+        // This pins the request-scoped behavior before the synchronous core is
+        // extracted from the compute-pool wrapper.
+        let first = handle_semantic_tokens_full(
             &crate::compute_pool::test_pool(),
-            std::sync::Arc::from(text),
+            Arc::clone(&text),
+            tree.clone(),
+            Arc::clone(&query),
+            Some("markdown".to_string()),
+            None,
+            Arc::clone(&coordinator),
+            false,
+            None,
+            None,
+        )
+        .await;
+        let second = handle_semantic_tokens_full(
+            &crate::compute_pool::test_pool(),
+            text,
             tree,
             query,
             Some("markdown".to_string()),
@@ -795,11 +811,15 @@ local x = 42
             None,
         )
         .await;
+        assert_eq!(
+            first, second,
+            "same immutable inputs must produce exact tokens"
+        );
 
         // Should return tokens including injection tokens
-        assert!(result.is_some(), "Should return semantic tokens");
+        assert!(first.is_some(), "Should return semantic tokens");
 
-        let SemanticTokensResult::Tokens(tokens) = result.unwrap() else {
+        let SemanticTokensResult::Tokens(tokens) = first.unwrap() else {
             panic!("Expected full tokens result");
         };
 
