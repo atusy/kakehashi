@@ -278,6 +278,17 @@ fn install_queries_recursive(
     let queries_dir = data_dir.join("queries").join(language);
     let queries_parent = data_dir.join("queries");
     fs::create_dir_all(&queries_parent)?;
+    {
+        // Avoid downloading while an uninstall tombstone remains. Top-level
+        // installs clear their own tombstone before entering this recursion;
+        // inherited installs deliberately do not. This is only an early-out:
+        // publication checks again under the same lock so an uninstall that
+        // starts after this point still wins.
+        let _replace_lock = QueryReplaceLockGuard::acquire(&queries_parent, language)?;
+        if uninstall_tombstone_path(&queries_parent, language).is_file() {
+            return Err(query_install_superseded_by_uninstall(language));
+        }
+    }
     recover_interrupted_query_install(&queries_parent, language)?;
 
     // Check if queries already exist. A previous interrupted install may
@@ -298,7 +309,6 @@ fn install_queries_recursive(
             let parents = parse_inherits_directive(&content);
             for parent in parents {
                 // Install parent dependencies (don't force, just ensure they exist)
-                clear_uninstall_tombstone(&queries_parent, &parent)?;
                 match install_queries_recursive(
                     base_url,
                     &parent,
@@ -378,10 +388,7 @@ fn install_queries_recursive(
             return Err(QueryInstallError::AlreadyExists(queries_dir));
         }
         Ok(ReplaceQueryDirResult::Uninstalled) => {
-            return Err(QueryInstallError::IoError(std::io::Error::new(
-                std::io::ErrorKind::Interrupted,
-                format!("Query install for {language} was superseded by uninstall"),
-            )));
+            return Err(query_install_superseded_by_uninstall(language));
         }
         Err(e) => {
             return Err(e);
@@ -393,8 +400,11 @@ fn install_queries_recursive(
     // Install parent dependencies
     for parent in parents_to_install {
         eprintln!("Installing inherited queries: {}", parent);
-        // Don't fail if parent already exists
-        clear_uninstall_tombstone(&queries_parent, &parent)?;
+        // An inherited dependency is an implicit install, so it must not
+        // clear an explicit uninstall intent for the parent. Publication
+        // checks that intent while holding only the parent's replace lock;
+        // recursive installs never retain a child's lock while entering the
+        // parent, which also keeps cyclic inheritance deadlock-free.
         match install_queries_recursive(base_url, &parent, data_dir, false, installed, http_policy)
         {
             Ok(_) | Err(QueryInstallError::AlreadyExists(_)) => {}
@@ -412,6 +422,13 @@ fn install_queries_recursive(
         install_path: queries_dir,
         files_downloaded,
     })
+}
+
+fn query_install_superseded_by_uninstall(language: &str) -> QueryInstallError {
+    QueryInstallError::IoError(std::io::Error::new(
+        std::io::ErrorKind::Interrupted,
+        format!("Query install for {language} was superseded by uninstall"),
+    ))
 }
 
 pub fn query_install_is_complete(queries_dir: &Path) -> bool {
@@ -1014,6 +1031,12 @@ mod tests {
 
     /// Serve canned query files over HTTP from an OS-assigned local port.
     fn spawn_query_file_server(routes: Vec<(&str, &str)>) -> String {
+        spawn_recording_query_file_server(routes).0
+    }
+
+    fn spawn_recording_query_file_server(
+        routes: Vec<(&str, &str)>,
+    ) -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
         use std::io::{BufRead, BufReader, Write};
 
         let routes: Vec<(String, String)> = routes
@@ -1021,14 +1044,40 @@ mod tests {
             .map(|(p, b)| (p.to_string(), b.to_string()))
             .collect();
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind local server");
+        listener
+            .set_nonblocking(true)
+            .expect("make local server non-blocking");
         let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let requests = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let server_requests = requests.clone();
 
         std::thread::spawn(move || {
-            // Bounded so the thread (and its socket) terminates instead of
-            // living until process exit: no test downloads anywhere near this
-            // many files (2 query files per language, short inherits chains).
-            for stream in listener.incoming().take(64) {
-                let Ok(mut stream) = stream else { continue };
+            const IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+            const ACCEPT_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(10);
+            let mut idle_deadline = std::time::Instant::now() + IDLE_TIMEOUT;
+            loop {
+                let mut stream = match listener.accept() {
+                    Ok((stream, _)) => {
+                        idle_deadline = std::time::Instant::now() + IDLE_TIMEOUT;
+                        stream
+                    }
+                    Err(error)
+                        if matches!(
+                            error.kind(),
+                            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
+                        ) =>
+                    {
+                        if std::time::Instant::now() >= idle_deadline {
+                            break;
+                        }
+                        std::thread::sleep(ACCEPT_RETRY_DELAY);
+                        continue;
+                    }
+                    Err(_) => break,
+                };
+                stream
+                    .set_nonblocking(false)
+                    .expect("make accepted stream blocking");
                 let mut reader = BufReader::new(&mut stream);
                 let mut request_line = String::new();
                 if reader.read_line(&mut request_line).is_err() {
@@ -1044,6 +1093,7 @@ mod tests {
                     }
                 }
                 let path = request_line.split_whitespace().nth(1).unwrap_or("");
+                server_requests.lock().unwrap().push(path.to_string());
                 let response = match routes.iter().find(|(p, _)| p == path) {
                     Some((_, body)) => format!(
                         "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
@@ -1059,7 +1109,7 @@ mod tests {
             }
         });
 
-        base_url
+        (base_url, requests)
     }
 
     #[cfg(unix)]
@@ -1481,6 +1531,95 @@ mod tests {
         assert!(
             !queries_parent.join("raced_lang").exists(),
             "uninstall tombstone must prevent restoring canonical queries"
+        );
+    }
+
+    #[test]
+    fn inherited_install_does_not_override_explicit_parent_uninstall() {
+        let temp_dir = TempDir::new().unwrap();
+        let data_dir = temp_dir.path().to_path_buf();
+        let queries_parent = data_dir.join("queries");
+        fs::create_dir_all(&queries_parent).unwrap();
+        write_uninstall_tombstone(&queries_parent, "parent_lang").unwrap();
+        let (base_url, requests) = spawn_recording_query_file_server(vec![
+            (
+                "/child_lang/highlights.scm",
+                "; inherits: parent_lang\n(identifier) @variable\n",
+            ),
+            ("/parent_lang/highlights.scm", "(comment) @comment\n"),
+        ]);
+
+        install_queries_with_dependencies_from_allowing_http_for_tests(
+            &base_url,
+            "child_lang",
+            &data_dir,
+            false,
+        )
+        .expect("the explicitly requested child should still install");
+
+        assert!(
+            query_install_is_complete(&queries_parent.join("child_lang")),
+            "the child publication is independent of its inherited parent"
+        );
+        assert!(
+            !queries_parent.join("parent_lang").exists(),
+            "implicit inheritance must not resurrect explicitly uninstalled parent queries"
+        );
+        assert!(
+            uninstall_tombstone_path(&queries_parent, "parent_lang").is_file(),
+            "only an explicit parent install may clear the uninstall intent"
+        );
+        assert!(
+            requests
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|path| !path.starts_with("/parent_lang/")),
+            "a tombstoned inherited parent must be rejected before network I/O"
+        );
+    }
+
+    #[test]
+    fn existing_child_does_not_override_explicit_parent_uninstall() {
+        let temp_dir = TempDir::new().unwrap();
+        let data_dir = temp_dir.path().to_path_buf();
+        let queries_parent = data_dir.join("queries");
+        let child_dir = queries_parent.join("child_lang");
+        fs::create_dir_all(&child_dir).unwrap();
+        fs::write(
+            child_dir.join("highlights.scm"),
+            "; inherits: parent_lang\n(identifier) @variable\n",
+        )
+        .unwrap();
+        write_install_marker(&child_dir).unwrap();
+        write_uninstall_tombstone(&queries_parent, "parent_lang").unwrap();
+        let (base_url, requests) = spawn_recording_query_file_server(vec![(
+            "/parent_lang/highlights.scm",
+            "(comment) @comment\n",
+        )]);
+
+        let result = install_queries_with_dependencies_from_allowing_http_for_tests(
+            &base_url,
+            "child_lang",
+            &data_dir,
+            false,
+        );
+
+        assert!(
+            matches!(result, Err(QueryInstallError::AlreadyExists(path)) if path == child_dir),
+            "the already-installed child keeps its normal result"
+        );
+        assert!(
+            !queries_parent.join("parent_lang").exists(),
+            "dependency discovery from disk must preserve the parent's uninstall intent"
+        );
+        assert!(
+            uninstall_tombstone_path(&queries_parent, "parent_lang").is_file(),
+            "the skipped-child path must not authorize an implicit parent reinstall"
+        );
+        assert!(
+            requests.lock().unwrap().is_empty(),
+            "cached dependency discovery must reject a tombstoned parent before network I/O"
         );
     }
 
