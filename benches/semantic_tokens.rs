@@ -230,7 +230,7 @@ impl Server {
                 "contentChanges": [{
                     "range": {
                         "start": { "line": line, "character": 0 },
-                        "end": { "line": line, "character": 3 },
+                        "end": { "line": line, "character": FIXED_WIDTH_STATE_COUNT },
                     },
                     "text": text,
                 }],
@@ -385,11 +385,15 @@ fn gen_rust(funcs: usize) -> String {
 }
 
 const SPARSE_CONTROL_BOUNDARY_BYTES: usize = 32 * 1024;
+const FIXED_WIDTH_STATE_COUNT: usize = 128;
 
 /// Syntactically valid sparse Rust with exact byte size and a stable edit line.
 fn gen_sparse_rust(bytes: usize) -> String {
     const PREFIX: &str = "/*";
-    let suffix = format!("*/\n{TRACKED_MARKER}\n");
+    let suffix = format!(
+        "*/\n{}{TRACKED_MARKER}\n",
+        " ".repeat(FIXED_WIDTH_STATE_COUNT)
+    );
 
     assert!(bytes >= PREFIX.len() + suffix.len());
     let mut source = String::with_capacity(bytes);
@@ -604,6 +608,13 @@ fn measure(
     iters: usize,
     warmup: usize,
 ) -> Measurement {
+    if matches!(scn.kind, Kind::FixedWidthTypingDelta) {
+        assert!(
+            warmup + iters <= FIXED_WIDTH_STATE_COUNT,
+            "{} requires at most {FIXED_WIDTH_STATE_COUNT} total fixed-width states",
+            scn.name
+        );
+    }
     if let Kind::CancelBurst { obsolete } = scn.kind {
         return measure_cancel_burst(bin, scn, data_dir, iters, warmup, obsolete);
     }
@@ -872,21 +883,17 @@ fn run_once(
             });
         }
         Kind::FixedWidthTypingDelta => {
-            const ALPHABET: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
             edit.version += 1;
             let state = edit.fixed_width_next;
-            let pair = state / 2;
-            let first = char::from(ALPHABET[pair % ALPHABET.len()]);
-            let second = char::from(ALPHABET[(pair / ALPHABET.len()) % ALPHABET.len()]);
-            let (replacement, expected_start) = if state.is_multiple_of(2) {
-                (format!(" {first}{second}"), 1)
-            } else {
-                (format!("{first}{second}x"), 0)
-            };
+            let replacement = format!(
+                "{}x{}",
+                " ".repeat(state),
+                " ".repeat(FIXED_WIDTH_STATE_COUNT - state - 1)
+            );
             edit.fixed_width_next += 1;
             server.did_change_replace_prefix(scn.uri, edit.version, edit.line, &replacement);
             let baseline = baseline.as_mut().expect("typing baseline");
-            baseline.expect_tracked_start(expected_start);
+            baseline.expect_tracked_start(u32::try_from(state).expect("fixed state fits u32"));
             let result = server.semantic_delta(scn.uri, baseline.result_id());
             baseline.apply_response(&result).unwrap_or_else(|error| {
                 panic!("invalid semantic response for {}: {error:?}", scn.name)
