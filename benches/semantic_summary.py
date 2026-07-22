@@ -35,6 +35,7 @@ def validate_collection(
         raise ValueError(f"expected {pair_count} pair documents, got {len(documents)}")
 
     by_pair: dict[int, dict[str, Any]] = {}
+    document_bytes_by_scenario: dict[str, int] = {}
     for document in documents:
         if document.get("schema_version") != 3:
             raise ValueError(f"unexpected raw schema: {document.get('schema_version')}")
@@ -89,6 +90,18 @@ def validate_collection(
                 )
             for run in runs:
                 label = str(run["binary_label"])
+                document_bytes = run.get("document_bytes")
+                if not isinstance(document_bytes, int) or document_bytes < 1:
+                    raise ValueError(
+                        f"pair {pair_index}, scenario {scenario}, {label} has invalid document size"
+                    )
+                previous_bytes = document_bytes_by_scenario.setdefault(
+                    scenario, document_bytes
+                )
+                if document_bytes != previous_bytes:
+                    raise ValueError(
+                        f"pair {pair_index}, scenario {scenario}, {label} document size changed"
+                    )
                 if run.get("binary_sha256") != binary_sha256[label]:
                     raise ValueError(
                         f"pair {pair_index}, scenario {scenario}, {label} hash does not match"

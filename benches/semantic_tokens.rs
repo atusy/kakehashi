@@ -43,7 +43,9 @@
 #[path = "support/semantic_baseline.rs"]
 mod semantic_baseline;
 
-use semantic_baseline::{SemanticBaseline, TRACKED_MARKER, tracked_marker_line};
+use semantic_baseline::{
+    SemanticBaseline, TRACKED_MARKER, tracked_marker_line, validate_token_payload,
+};
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
@@ -215,6 +217,22 @@ impl Server {
                         "end": { "line": line, "character": 0 },
                     },
                     "text": " ",
+                }],
+            }),
+        );
+    }
+
+    fn did_change_replace_ascii(&mut self, uri: &str, version: i64, line: u32, text: char) {
+        self.notify(
+            "textDocument/didChange",
+            json!({
+                "textDocument": { "uri": uri, "version": version },
+                "contentChanges": [{
+                    "range": {
+                        "start": { "line": line, "character": 0 },
+                        "end": { "line": line, "character": 1 },
+                    },
+                    "text": text.to_string(),
                 }],
             }),
         );
@@ -529,6 +547,8 @@ enum Kind {
     /// Sustained typing through unique document states. Unlike `EditDelta`,
     /// this never toggles back to a previously cached snapshot.
     TypingDelta,
+    /// Unique same-width edit states, preserving the scenario's exact byte size.
+    FixedWidthTypingDelta,
     /// Several edits arrive before the one semantic-token request whose result
     /// is still useful to an editor.
     TypingBurst { edits: usize },
@@ -551,6 +571,7 @@ struct EditState {
     insert_next: bool,
     line: u32,
     range_next: u32,
+    fixed_width_next: usize,
 }
 
 struct Scenario {
@@ -603,6 +624,7 @@ fn measure(
         insert_next: true,
         line: baseline.as_ref().map_or(0, SemanticBaseline::tracked_line),
         range_next: 0,
+        fixed_width_next: 0,
     };
 
     for _ in 0..warmup {
@@ -767,7 +789,11 @@ fn validate_full_response(scn: &Scenario, result: &Value) {
 fn seed_baseline(server: &mut Server, scn: &Scenario) -> Option<SemanticBaseline> {
     match scn.kind {
         Kind::Full | Kind::Range { .. } | Kind::OpenFirstToken | Kind::CancelBurst { .. } => None,
-        Kind::DeltaNoop | Kind::EditDelta | Kind::TypingDelta | Kind::TypingBurst { .. } => {
+        Kind::DeltaNoop
+        | Kind::EditDelta
+        | Kind::TypingDelta
+        | Kind::FixedWidthTypingDelta
+        | Kind::TypingBurst { .. } => {
             let tracked_line = tracked_marker_line(&scn.content).unwrap_or_else(|error| {
                 panic!("invalid tracked marker for {}: {error:?}", scn.name)
             });
@@ -803,7 +829,10 @@ fn run_once(
         } => {
             let offset = (edit.range_next % variants.max(1)) * step;
             edit.range_next = edit.range_next.wrapping_add(1);
-            let _ = server.semantic_range(scn.uri, start_line + offset, end_line + offset);
+            let result = server.semantic_range(scn.uri, start_line + offset, end_line + offset);
+            validate_token_payload(&result).unwrap_or_else(|error| {
+                panic!("invalid range response for {}: {error:?}", scn.name)
+            });
         }
         Kind::DeltaNoop => {
             let baseline = baseline.as_mut().expect("delta baseline");
@@ -837,6 +866,18 @@ fn run_once(
             baseline
                 .record_prefix_insert(1)
                 .expect("tracked position remains valid");
+            let result = server.semantic_delta(scn.uri, baseline.result_id());
+            baseline.apply_response(&result).unwrap_or_else(|error| {
+                panic!("invalid semantic response for {}: {error:?}", scn.name)
+            });
+        }
+        Kind::FixedWidthTypingDelta => {
+            const STATES: &[u8] = b"abcdeghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
+            edit.version += 1;
+            let replacement = char::from(STATES[edit.fixed_width_next % STATES.len()]);
+            edit.fixed_width_next += 1;
+            server.did_change_replace_ascii(scn.uri, edit.version, edit.line, replacement);
+            let baseline = baseline.as_mut().expect("typing baseline");
             let result = server.semantic_delta(scn.uri, baseline.result_id());
             baseline.apply_response(&result).unwrap_or_else(|error| {
                 panic!("invalid semantic response for {}: {error:?}", scn.name)
@@ -1002,7 +1043,7 @@ fn main() {
             language_id: "rust",
             uri: "file:///bench/large_typing.rs",
             content: gen_rust(150),
-            kind: Kind::TypingDelta,
+            kind: Kind::FixedWidthTypingDelta,
             targets: "unique edit states→reparse→retokenize→delta; excludes A/B cache returns",
         },
         Scenario {
@@ -1010,7 +1051,7 @@ fn main() {
             language_id: "rust",
             uri: "file:///bench/sparse_32k_minus.rs",
             content: gen_sparse_rust(SPARSE_CONTROL_BOUNDARY_BYTES - 128),
-            kind: Kind::TypingDelta,
+            kind: Kind::FixedWidthTypingDelta,
             targets: "sparse low-match control just below 32 KiB",
         },
         Scenario {
@@ -1018,7 +1059,7 @@ fn main() {
             language_id: "rust",
             uri: "file:///bench/sparse_32k_exact.rs",
             content: gen_sparse_rust(SPARSE_CONTROL_BOUNDARY_BYTES),
-            kind: Kind::TypingDelta,
+            kind: Kind::FixedWidthTypingDelta,
             targets: "sparse low-match control at 32 KiB",
         },
         Scenario {
@@ -1026,7 +1067,7 @@ fn main() {
             language_id: "rust",
             uri: "file:///bench/sparse_32k_plus.rs",
             content: gen_sparse_rust(SPARSE_CONTROL_BOUNDARY_BYTES + 128),
-            kind: Kind::TypingDelta,
+            kind: Kind::FixedWidthTypingDelta,
             targets: "sparse low-match control just above 32 KiB",
         },
         Scenario {
@@ -1162,6 +1203,7 @@ fn record_raw_run(
         "binary_path": bin.path,
         "binary_sha256": bin.sha256,
         "scenario": scn.name,
+        "document_bytes": scn.content.len(),
         "samples_ns": measurement.samples.iter().map(Duration::as_nanos).collect::<Vec<_>>(),
         "validation": {
             "retained_samples": measurement.samples.len(),

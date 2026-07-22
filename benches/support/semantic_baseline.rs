@@ -115,6 +115,14 @@ impl SemanticBaseline {
     }
 }
 
+pub(crate) fn validate_token_payload(result: &Value) -> Result<(), ValidationError> {
+    let data = full_data(result)?.ok_or(ValidationError::MissingTokenPayload)?;
+    if !data.len().is_multiple_of(TOKEN_WIDTH) {
+        return Err(ValidationError::InvalidTokenDataLength { len: data.len() });
+    }
+    Ok(())
+}
+
 fn result_id(result: &Value) -> Result<String, ValidationError> {
     result
         .get("resultId")
