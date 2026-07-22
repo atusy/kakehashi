@@ -7,6 +7,7 @@ from collect_semantic_pairs import (
     DEFAULT_SCENARIOS,
     manifest_sha256,
     normalize_captured_stdout,
+    redact_temporary_paths,
     recorded_environment,
     set_tree_read_only,
     set_tree_writable,
@@ -45,6 +46,22 @@ class CollectSemanticPairsTest(unittest.TestCase):
             )
             self.assertEqual(recorded["RUSTUP_HOME"], "<USER_HOME>/.rustup")
             self.assertNotIn("example", str(recorded))
+
+    def test_redacts_temporary_paths_recursively(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            temp = Path(temporary)
+            value = {
+                "binaries": [{"path": str(temp / "target-a" / "kakehashi")}],
+                "nested": ["unchanged", str(temp / "fixture")],
+            }
+
+            self.assertEqual(
+                redact_temporary_paths(value, temp),
+                {
+                    "binaries": [{"path": "<TEMP>/target-a/kakehashi"}],
+                    "nested": ["unchanged", "<TEMP>/fixture"],
+                },
+            )
 
     def test_tree_attestation_changes_with_content(self):
         with tempfile.TemporaryDirectory() as temporary:
