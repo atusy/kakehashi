@@ -53,6 +53,10 @@ def terminate_process_group(process: subprocess.Popen[str]) -> None:
 
     deadline = time.monotonic() + 5
     while group_exists() and time.monotonic() < deadline:
+        try:
+            process.wait(timeout=0)
+        except subprocess.TimeoutExpired:
+            pass
         time.sleep(0.05)
     if group_exists():
         try:
@@ -61,6 +65,10 @@ def terminate_process_group(process: subprocess.Popen[str]) -> None:
             pass
         deadline = time.monotonic() + 5
         while group_exists() and time.monotonic() < deadline:
+            try:
+                process.wait(timeout=0)
+            except subprocess.TimeoutExpired:
+                pass
             time.sleep(0.05)
         if group_exists():
             raise RuntimeError(f"process group {process.pid} survived SIGKILL")
