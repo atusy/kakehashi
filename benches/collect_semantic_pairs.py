@@ -169,6 +169,19 @@ def recorded_environment(environment: dict[str, str], temp: Path) -> dict[str, s
     return recorded
 
 
+def redact_temporary_paths(value: Any, temp: Path) -> Any:
+    """Replace collector-owned temporary paths in published evidence."""
+    if isinstance(value, str):
+        return value.replace(str(temp), "<TEMP>")
+    if isinstance(value, list):
+        return [redact_temporary_paths(item, temp) for item in value]
+    if isinstance(value, dict):
+        return {
+            key: redact_temporary_paths(item, temp) for key, item in value.items()
+        }
+    return value
+
+
 def file_sha256(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as stream:
@@ -327,7 +340,6 @@ def main() -> None:
         )
     )
     atexit.register(remove_tree_if_exists, artifact_dir)
-    published = False
 
     with tempfile.TemporaryDirectory(prefix="kakehashi-semantic-pairs-") as temporary:
         temp = Path(temporary)
@@ -438,11 +450,19 @@ def main() -> None:
                     timeout=args.run_timeout,
                     capture=True,
                 )
-                captured_stdout = normalize_captured_stdout(completed.stdout or "")
+                captured_stdout = normalize_captured_stdout(
+                    redact_temporary_paths(completed.stdout or "", temp)
+                )
                 text_path.write_text(captured_stdout)
                 print(captured_stdout, end="")
                 assert_attestations(attestations, paths)
-                raw_documents.append(json.loads(raw_path.read_text()))
+                raw_document = redact_temporary_paths(
+                    json.loads(raw_path.read_text()), temp
+                )
+                raw_path.write_text(
+                    json.dumps(raw_document, indent=2, sort_keys=True) + "\n"
+                )
+                raw_documents.append(raw_document)
                 raw_files.append(
                     {
                         "pair_index": pair_index,
@@ -578,7 +598,6 @@ def main() -> None:
             if not artifact_dir.exists():
                 raise RuntimeError("benchmark staging directory disappeared before publication")
         os.replace(artifact_dir, output_dir)
-        published = True
         atexit.unregister(remove_tree_if_exists)
 
     print(f"wrote attested benchmark evidence to {output_dir}")
