@@ -1,7 +1,9 @@
 #[path = "../benches/support/semantic_baseline.rs"]
 mod semantic_baseline;
 
-use semantic_baseline::{SemanticBaseline, TRACKED_MARKER, ValidationError, tracked_marker_line};
+use semantic_baseline::{
+    SemanticBaseline, TRACKED_MARKER, ValidationError, tracked_marker_line, validate_token_payload,
+};
 use serde_json::json;
 
 fn initial_tokens() -> serde_json::Value {
@@ -127,4 +129,17 @@ fn rejects_out_of_bounds_delta_edits() {
             "edits": [{"start": 10, "deleteCount": 5, "data": [0, 5, 1, 4, 0]}]
         }))
         .unwrap();
+}
+
+#[test]
+fn validates_range_token_payload_shape() {
+    assert_eq!(validate_token_payload(&json!({"data": []})), Ok(()));
+    assert_eq!(
+        validate_token_payload(&json!({"data": [0, 1]})),
+        Err(ValidationError::InvalidTokenDataLength { len: 2 })
+    );
+    assert_eq!(
+        validate_token_payload(&serde_json::Value::Null),
+        Err(ValidationError::MissingTokenPayload)
+    );
 }

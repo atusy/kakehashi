@@ -40,6 +40,7 @@ def attested_document(pair_index, order="AB"):
     )
     for run in document["runs"]:
         label = run["binary_label"]
+        run["document_bytes"] = 32_768
         run["binary_sha256"] = f"{label}-hash"
         run["validation"] = {"retained_samples": 2, "discarded_attempts": 0}
     return document

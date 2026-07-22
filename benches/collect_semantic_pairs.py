@@ -38,6 +38,24 @@ DEFAULT_SCENARIOS = ",".join(
 )
 
 
+def terminate_process_group(process: subprocess.Popen[str]) -> None:
+    if process.poll() is not None:
+        return
+    try:
+        os.killpg(process.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        return
+    try:
+        process.communicate(timeout=5)
+    except subprocess.TimeoutExpired:
+        os.killpg(process.pid, signal.SIGKILL)
+        process.communicate()
+
+
+def raise_keyboard_interrupt(_signum: int, _frame: Any) -> None:
+    raise KeyboardInterrupt
+
+
 def run(
     command: list[str],
     *,
@@ -59,12 +77,11 @@ def run(
     try:
         stdout, _ = process.communicate(timeout=timeout)
     except subprocess.TimeoutExpired:
-        os.killpg(process.pid, signal.SIGTERM)
-        try:
-            process.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            os.killpg(process.pid, signal.SIGKILL)
+        terminate_process_group(process)
         raise RuntimeError(f"command timed out after {timeout}s: {' '.join(command)}")
+    except BaseException:
+        terminate_process_group(process)
+        raise
     if process.returncode != 0:
         if stdout:
             print(stdout, end="")
@@ -226,6 +243,9 @@ def assert_attestations(expected: dict[str, str], paths: dict[str, Path]) -> Non
 def main() -> None:
     if os.name != "posix":
         raise RuntimeError("semantic pair collection currently requires POSIX")
+    signal.signal(signal.SIGTERM, raise_keyboard_interrupt)
+    if hasattr(signal, "SIGHUP"):
+        signal.signal(signal.SIGHUP, raise_keyboard_interrupt)
     parser = argparse.ArgumentParser()
     parser.add_argument("a_ref")
     parser.add_argument("b_ref")
@@ -485,9 +505,6 @@ def main() -> None:
             (artifact_dir / "manifest.json").write_text(
                 json.dumps(manifest, indent=2, sort_keys=True) + "\n"
             )
-            os.replace(artifact_dir, output_dir)
-            published = True
-            atexit.unregister(remove_tree_if_exists)
         finally:
             if fixture is not None:
                 set_tree_writable(fixture)
@@ -495,10 +512,16 @@ def main() -> None:
             for path in reversed(added_worktrees):
                 if error := remove_worktree(repo, path):
                     cleanup_errors.append(f"{path}: {error}")
-            for error in cleanup_errors:
-                print(f"warning: failed to remove worktree {error}", file=sys.stderr)
-            if not published and artifact_dir.exists():
+            if cleanup_errors:
                 remove_tree_if_exists(artifact_dir)
+                raise RuntimeError(
+                    "failed to remove benchmark worktrees: " + "; ".join(cleanup_errors)
+                )
+            if not artifact_dir.exists():
+                raise RuntimeError("benchmark staging directory disappeared before publication")
+        os.replace(artifact_dir, output_dir)
+        published = True
+        atexit.unregister(remove_tree_if_exists)
 
     print(f"wrote attested benchmark evidence to {output_dir}")
 
