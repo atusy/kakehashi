@@ -487,9 +487,22 @@ pub fn recover_interrupted_query_installs(queries_parent: &Path) -> Result<(), Q
     // rescans the parent), so running it per backup directory would redo the
     // same scan and lock acquisition for each stranded backup.
     let mut recovered_languages = std::collections::HashSet::new();
-    for entry in entries.flatten() {
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(QueryInstallError::IoError(e)),
+        };
         let path = entry.path();
-        if !path.is_dir() {
+        // Recovery artifacts must be real directories. Do not follow a
+        // staging/backup symlink outside the queries root, and propagate
+        // entry-type errors instead of silently treating them as absent.
+        let file_type = match entry.file_type() {
+            Ok(file_type) => file_type,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(QueryInstallError::IoError(e)),
+        };
+        if !file_type.is_dir() {
             continue;
         }
         if let Some(language) = backup_language_name(&path) {
@@ -502,6 +515,35 @@ pub fn recover_interrupted_query_installs(queries_parent: &Path) -> Result<(), Q
     }
 
     Ok(())
+}
+
+/// Recover only artifacts belonging to `language`.
+///
+/// Targeted uninstall uses this after confirmation so it neither mutates
+/// unrelated languages nor performs recovery when the user cancels.
+pub fn recover_interrupted_query_installs_for_language(
+    queries_parent: &Path,
+    language: &str,
+) -> Result<(), QueryInstallError> {
+    validate_safe_language_name(language)?;
+    let entries = match fs::read_dir(queries_parent) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(QueryInstallError::IoError(e)),
+    };
+    for entry in entries {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        let path = entry.path();
+        if let Some((temp_language, _)) = temp_language_name_and_pid(&path)
+            && temp_language == language
+        {
+            remove_interrupted_temp_query_install(queries_parent, language, &path)?;
+        }
+    }
+    recover_interrupted_query_install(queries_parent, language)
 }
 
 pub struct QueryRemoval {
@@ -631,6 +673,8 @@ fn generated_backup_parts(name: &str) -> Option<(&str, &str, &str)> {
     let pid = parts.next()?;
     let counter = parts.next()?;
     if parts.next().is_none()
+        && !pid.is_empty()
+        && !counter.is_empty()
         && pid.bytes().all(|b| b.is_ascii_digit())
         && counter.bytes().all(|b| b.is_ascii_digit())
     {
@@ -647,6 +691,8 @@ fn generated_temp_parts(name: &str) -> Option<(&str, &str, &str)> {
     let pid = parts.next()?;
     let counter = parts.next()?;
     if parts.next().is_none()
+        && !pid.is_empty()
+        && !counter.is_empty()
         && pid.bytes().all(|b| b.is_ascii_digit())
         && counter.bytes().all(|b| b.is_ascii_digit())
     {
@@ -654,6 +700,20 @@ fn generated_temp_parts(name: &str) -> Option<(&str, &str, &str)> {
     } else {
         None
     }
+}
+
+/// Whether a directory name belongs to the staging/backup namespace that
+/// [`recover_interrupted_query_installs`] may mutate.
+pub fn is_recovery_directory_name(name: &str) -> bool {
+    recovery_directory_language(name).is_some()
+}
+
+/// Returns the language owned by a valid staging/backup directory name.
+pub fn recovery_directory_language(name: &str) -> Option<&str> {
+    generated_backup_parts(name)
+        .or_else(|| generated_temp_parts(name))
+        .map(|(language, _, _)| language)
+        .filter(|language| is_safe_language_name(language))
 }
 
 fn remove_interrupted_temp_query_install(
@@ -791,6 +851,34 @@ fn backup_is_owned(path: &Path) -> bool {
     backup_ownership_sidecar(path).is_file()
 }
 
+fn backup_is_complete_and_owned(path: &Path) -> Result<bool, QueryInstallError> {
+    let regular_file_or_absent = |path: &Path| match fs::symlink_metadata(path) {
+        Ok(metadata) => Ok(Some(metadata)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(QueryInstallError::IoError(e)),
+    };
+
+    let Some(ownership) = regular_file_or_absent(&backup_ownership_sidecar(path))? else {
+        return Ok(false);
+    };
+    if !ownership.is_file() {
+        return Ok(false);
+    }
+    // Query files may intentionally be user-managed symlinks; completeness
+    // follows the same semantics as the installed query directory.
+    let highlights_path = path.join("highlights.scm");
+    let highlights = match fs::metadata(&highlights_path) {
+        Ok(metadata) => metadata,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(QueryInstallError::IoError(e)),
+    };
+    if !highlights.is_file() {
+        return Ok(false);
+    }
+    let marker = regular_file_or_absent(&path.join(QUERY_INSTALL_COMPLETE_MARKER))?;
+    Ok(marker.is_some_and(|metadata| metadata.is_file()) || highlights.len() > 0)
+}
+
 fn newest_complete_backup_dir(
     queries_parent: &Path,
     language: &str,
@@ -802,21 +890,45 @@ fn newest_complete_backup_dir(
     };
     let mut newest: Option<(std::time::SystemTime, PathBuf)> = None;
 
-    for entry in entries.flatten() {
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(QueryInstallError::IoError(e)),
+        };
         let path = entry.path();
+        // This helper is also called independently of the outer recovery scan.
+        // Never follow a generated-name backup symlink or suppress entry-type
+        // errors while selecting a directory to rename into the canonical path.
+        let file_type = match entry.file_type() {
+            Ok(file_type) => file_type,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(QueryInstallError::IoError(e)),
+        };
+        if !file_type.is_dir() {
+            continue;
+        }
         let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
             continue;
         };
         if !generated_backup_matches_language(name, language) {
             continue;
         }
-        if !backup_is_owned(&path) || !query_install_is_complete(&path) {
+        let complete = match backup_is_complete_and_owned(&path) {
+            Ok(complete) => complete,
+            Err(QueryInstallError::IoError(e)) if e.kind() == std::io::ErrorKind::NotFound => {
+                continue;
+            }
+            Err(e) => return Err(e),
+        };
+        if !complete {
             continue;
         }
-        let modified = entry
-            .metadata()
-            .and_then(|metadata| metadata.modified())
-            .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+        let modified = match entry.metadata().and_then(|metadata| metadata.modified()) {
+            Ok(modified) => modified,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(QueryInstallError::IoError(e)),
+        };
         if newest
             .as_ref()
             .is_none_or(|(current, _)| modified > *current)
@@ -982,6 +1094,14 @@ fn download_file(url: &str, http_policy: QueryHttpPolicy) -> Result<String, Quer
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn recovery_directory_names_require_numeric_fields() {
+        assert!(is_recovery_directory_name(".lua.123.0.tmp"));
+        assert!(is_recovery_directory_name(".lua.123.0.backup"));
+        assert!(!is_recovery_directory_name(".lua...tmp"));
+        assert!(!is_recovery_directory_name(".lua...backup"));
+    }
     use tempfile::TempDir;
 
     #[test]
@@ -1225,6 +1345,77 @@ mod tests {
             tmp.exists(),
             "generated staging dirs from live installers must not be collected"
         );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn recover_interrupted_query_installs_does_not_follow_backup_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let temp = TempDir::new().unwrap();
+        let queries_parent = temp.path().join("queries");
+        let outside = temp.path().join("outside");
+        fs::create_dir_all(&queries_parent).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(outside.join("highlights.scm"), "(comment) @comment\n").unwrap();
+        let backup = queries_parent.join(".lua.4294967295.0.backup");
+        symlink(&outside, &backup).unwrap();
+        write_backup_ownership_marker(&backup).unwrap();
+
+        recover_interrupted_query_installs(&queries_parent).unwrap();
+
+        assert!(!queries_parent.join("lua").exists());
+        assert!(fs::symlink_metadata(&backup).is_ok());
+        assert!(outside.join("highlights.scm").exists());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn recover_interrupted_query_install_propagates_unreadable_backup_metadata() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = TempDir::new().unwrap();
+        let queries_parent = temp.path().join("queries");
+        let backup = queries_parent.join(".lua.4294967295.0.backup");
+        fs::create_dir_all(&backup).unwrap();
+        fs::write(backup.join("highlights.scm"), "(comment) @comment").unwrap();
+        fs::write(backup_ownership_sidecar(&backup), b"owned\n").unwrap();
+        fs::set_permissions(&backup, fs::Permissions::from_mode(0o000)).unwrap();
+        if fs::metadata(backup.join("highlights.scm")).is_ok() {
+            fs::set_permissions(&backup, fs::Permissions::from_mode(0o700)).unwrap();
+            return;
+        }
+
+        let result = recover_interrupted_query_install(&queries_parent, "lua");
+
+        fs::set_permissions(&backup, fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(
+            matches!(result, Err(QueryInstallError::IoError(_))),
+            "backup inspection errors must not be treated as an incomplete backup: {result:?}"
+        );
+        assert!(!queries_parent.join("lua").exists());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn per_language_recovery_does_not_follow_backup_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let temp = TempDir::new().unwrap();
+        let queries_parent = temp.path().join("queries");
+        let outside = temp.path().join("outside");
+        fs::create_dir_all(&queries_parent).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(outside.join("highlights.scm"), "(comment) @comment\n").unwrap();
+        let backup = queries_parent.join(".lua.4294967295.0.backup");
+        symlink(&outside, &backup).unwrap();
+        write_backup_ownership_marker(&backup).unwrap();
+
+        recover_interrupted_query_install(&queries_parent, "lua").unwrap();
+
+        assert!(!queries_parent.join("lua").exists());
+        assert!(fs::symlink_metadata(&backup).is_ok());
+        assert!(outside.join("highlights.scm").exists());
     }
 
     #[test]

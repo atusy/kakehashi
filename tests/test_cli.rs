@@ -3,6 +3,18 @@
 
 use std::process::Command;
 
+#[cfg(unix)]
+fn directory_is_enumerable(path: &std::path::Path) -> bool {
+    std::fs::read_dir(path)
+        .and_then(|entries| {
+            for entry in entries {
+                entry?;
+            }
+            Ok(())
+        })
+        .is_ok()
+}
+
 /// Test that --help flag shows help message with program description
 #[test]
 fn test_help_flag_shows_help_message() {
@@ -1261,6 +1273,864 @@ fn test_language_uninstall_all() {
         })
         .unwrap_or_default();
     assert!(queries.is_empty(), "All queries should be removed");
+}
+
+#[cfg(unix)]
+fn assert_uninstall_all_fails_for_unreadable_dir(dir_name: &str) {
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+
+    let test_dir = tempfile::tempdir().expect("Failed to create temp dir");
+    let install_dir = test_dir.path().join(dir_name);
+    if dir_name == "parser" {
+        fs::create_dir_all(&install_dir).expect("Failed to create parser dir");
+        fs::write(
+            install_dir.join(format!("testlang.{}", std::env::consts::DLL_EXTENSION)),
+            "fake",
+        )
+        .expect("Failed to write parser");
+    } else {
+        fs::create_dir_all(install_dir.join("testlang")).expect("Failed to create queries dir");
+        fs::write(
+            install_dir.join("testlang/highlights.scm"),
+            "(comment) @comment",
+        )
+        .expect("Failed to write query");
+    }
+    fs::set_permissions(&install_dir, fs::Permissions::from_mode(0o000))
+        .expect("Failed to make install dir unreadable");
+
+    // Elevated test environments may retain permission to read mode-000 paths.
+    // Skip there rather than asserting a failure the OS cannot produce.
+    if directory_is_enumerable(&install_dir) {
+        fs::set_permissions(&install_dir, fs::Permissions::from_mode(0o700))
+            .expect("Failed to restore install dir permissions");
+        return;
+    }
+
+    let output = Command::new(env!("CARGO_BIN_EXE_kakehashi"))
+        .args([
+            "language",
+            "uninstall",
+            "--all",
+            "--data-dir",
+            test_dir.path().to_str().unwrap(),
+            "--force",
+        ])
+        .output()
+        .expect("Failed to execute command");
+
+    fs::set_permissions(&install_dir, fs::Permissions::from_mode(0o700))
+        .expect("Failed to restore install dir permissions");
+
+    assert!(
+        !output.status.success(),
+        "unreadable install state must fail instead of reporting success; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("Failed to scan installed languages"),
+        "stderr should identify the failed install scan: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// `--all` must not claim success when either asset root cannot be enumerated.
+#[cfg(unix)]
+#[test]
+fn test_language_uninstall_all_fails_for_unreadable_install_dirs() {
+    assert_uninstall_all_fails_for_unreadable_dir("parser");
+    assert_uninstall_all_fails_for_unreadable_dir("queries");
+}
+
+#[cfg(unix)]
+#[test]
+fn test_language_uninstall_all_fails_for_dangling_install_dir() {
+    use std::os::unix::fs::symlink;
+
+    let test_dir = tempfile::tempdir().expect("Failed to create temp dir");
+    symlink("missing-parser-target", test_dir.path().join("parser"))
+        .expect("Failed to create dangling parser link");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_kakehashi"))
+        .args([
+            "language",
+            "uninstall",
+            "--all",
+            "--data-dir",
+            test_dir.path().to_str().unwrap(),
+            "--force",
+        ])
+        .output()
+        .expect("Failed to execute command");
+
+    assert!(
+        !output.status.success(),
+        "a dangling install root must fail; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn test_language_uninstall_all_rejects_symlinked_install_roots() {
+    use std::fs;
+    use std::os::unix::fs::symlink;
+
+    for root_name in ["parser", "queries"] {
+        let test_dir = tempfile::tempdir().expect("Failed to create temp dir");
+        let data_dir = test_dir.path().join("data");
+        let outside = test_dir.path().join("outside");
+        fs::create_dir_all(&data_dir).expect("Failed to create data dir");
+        let asset = if root_name == "parser" {
+            fs::create_dir_all(&outside).expect("Failed to create outside parser dir");
+            let path = outside.join(format!("lua.{}", std::env::consts::DLL_EXTENSION));
+            fs::write(&path, "fake").expect("Failed to write outside parser");
+            path
+        } else {
+            let path = outside.join("lua/highlights.scm");
+            fs::create_dir_all(path.parent().unwrap()).expect("Failed to create outside query dir");
+            fs::write(&path, "(comment) @comment").expect("Failed to write outside query");
+            path
+        };
+        symlink(&outside, data_dir.join(root_name)).expect("Failed to link install root");
+
+        let output = Command::new(env!("CARGO_BIN_EXE_kakehashi"))
+            .args([
+                "language",
+                "uninstall",
+                "--all",
+                "--data-dir",
+                data_dir.to_str().unwrap(),
+                "--force",
+            ])
+            .output()
+            .expect("Failed to execute command");
+
+        assert!(
+            !output.status.success(),
+            "symlinked {root_name} root must fail; stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            asset.exists(),
+            "outside {root_name} asset must remain untouched"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn test_language_uninstall_rejects_symlinked_install_roots() {
+    use std::fs;
+    use std::os::unix::fs::symlink;
+
+    for root_name in ["parser", "queries"] {
+        let test_dir = tempfile::tempdir().expect("Failed to create temp dir");
+        let data_dir = test_dir.path().join("data");
+        let outside = test_dir.path().join("outside");
+        fs::create_dir_all(&data_dir).expect("Failed to create data dir");
+        let asset = if root_name == "parser" {
+            fs::create_dir_all(&outside).expect("Failed to create outside parser dir");
+            let path = outside.join(format!("lua.{}", std::env::consts::DLL_EXTENSION));
+            fs::write(&path, "fake").expect("Failed to write outside parser");
+            path
+        } else {
+            let path = outside.join("lua/highlights.scm");
+            fs::create_dir_all(path.parent().unwrap()).expect("Failed to create outside query dir");
+            fs::write(&path, "(comment) @comment").expect("Failed to write outside query");
+            path
+        };
+        symlink(&outside, data_dir.join(root_name)).expect("Failed to link install root");
+
+        let output = Command::new(env!("CARGO_BIN_EXE_kakehashi"))
+            .args([
+                "language",
+                "uninstall",
+                "lua",
+                "--data-dir",
+                data_dir.to_str().unwrap(),
+                "--force",
+            ])
+            .output()
+            .expect("Failed to execute command");
+
+        assert!(
+            !output.status.success(),
+            "targeted uninstall must reject symlinked {root_name}; stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            asset.exists(),
+            "outside {root_name} asset must remain untouched"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn test_language_uninstall_rejects_non_file_parser_entries_before_query_removal() {
+    use std::fs;
+    use std::os::unix::net::UnixListener;
+
+    for all in [false, true] {
+        for entry_kind in ["directory", "socket"] {
+            let test_dir = tempfile::tempdir().expect("Failed to create temp dir");
+            let parser_dir = test_dir.path().join("parser");
+            let query_dir = test_dir.path().join("queries/lua");
+            fs::create_dir_all(&parser_dir).expect("Failed to create parser dir");
+            fs::create_dir_all(&query_dir).expect("Failed to create query dir");
+            fs::write(query_dir.join("highlights.scm"), "(comment) @comment")
+                .expect("Failed to write query");
+            let parser = parser_dir.join(format!("lua.{}", std::env::consts::DLL_EXTENSION));
+            let _socket = if entry_kind == "directory" {
+                fs::create_dir(&parser).expect("Failed to create parser-shaped directory");
+                None
+            } else {
+                Some(UnixListener::bind(&parser).expect("Failed to create parser-shaped socket"))
+            };
+
+            let mut command = Command::new(env!("CARGO_BIN_EXE_kakehashi"));
+            command.arg("language").arg("uninstall");
+            if all {
+                command.arg("--all");
+            } else {
+                command.arg("lua");
+            }
+            let output = command
+                .arg("--data-dir")
+                .arg(test_dir.path())
+                .arg("--force")
+                .output()
+                .expect("Failed to execute command");
+
+            assert!(
+                !output.status.success(),
+                "{entry_kind} parser entry must fail before mutation; stderr: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(
+                query_dir.exists(),
+                "invalid parser entry must be rejected before query removal"
+            );
+        }
+    }
+}
+
+#[test]
+fn test_language_uninstall_all_rejects_invalid_parser_name_before_removal() {
+    use std::fs;
+
+    let test_dir = tempfile::tempdir().expect("Failed to create temp dir");
+    let parser_dir = test_dir.path().join("parser");
+    let query_dir = test_dir.path().join("queries/a_valid");
+    fs::create_dir_all(&parser_dir).expect("Failed to create parser dir");
+    fs::create_dir_all(&query_dir).expect("Failed to create query dir");
+    let valid_parser = parser_dir.join(format!("a_valid.{}", std::env::consts::DLL_EXTENSION));
+    fs::write(&valid_parser, "fake").expect("Failed to write valid parser");
+    fs::write(
+        parser_dir.join(format!("z.bad.{}", std::env::consts::DLL_EXTENSION)),
+        "fake",
+    )
+    .expect("Failed to write invalid parser");
+    fs::write(query_dir.join("highlights.scm"), "(comment) @comment")
+        .expect("Failed to write query");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_kakehashi"))
+        .args([
+            "language",
+            "uninstall",
+            "--all",
+            "--data-dir",
+            test_dir.path().to_str().unwrap(),
+            "--force",
+        ])
+        .output()
+        .expect("Failed to execute command");
+
+    assert!(!output.status.success(), "invalid parser name must fail");
+    assert!(
+        valid_parser.exists(),
+        "bulk preflight must reject every invalid name before removing valid installs"
+    );
+    assert!(query_dir.exists(), "valid queries must remain untouched");
+}
+
+#[cfg(unix)]
+#[test]
+fn test_language_uninstall_all_rejects_non_directory_query_entries() {
+    use std::fs;
+    use std::os::unix::net::UnixListener;
+
+    for entry_kind in ["file", "socket"] {
+        let test_dir = tempfile::tempdir().expect("Failed to create temp dir");
+        let queries_dir = test_dir.path().join("queries");
+        fs::create_dir_all(&queries_dir).expect("Failed to create queries dir");
+        let query_entry = queries_dir.join("lua");
+        let _socket = if entry_kind == "file" {
+            fs::write(&query_entry, "not a query directory")
+                .expect("Failed to write query-shaped file");
+            None
+        } else {
+            Some(UnixListener::bind(&query_entry).expect("Failed to create query-shaped socket"))
+        };
+
+        let output = Command::new(env!("CARGO_BIN_EXE_kakehashi"))
+            .args([
+                "language",
+                "uninstall",
+                "--all",
+                "--data-dir",
+                test_dir.path().to_str().unwrap(),
+                "--force",
+            ])
+            .output()
+            .expect("Failed to execute command");
+
+        assert!(
+            !output.status.success(),
+            "safe-named query {entry_kind} must fail preflight; stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            fs::symlink_metadata(&query_entry).is_ok(),
+            "malformed query entry must remain for repair"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn test_language_uninstall_all_removes_dangling_parser_entry() {
+    use std::fs;
+    use std::os::unix::fs::symlink;
+
+    let test_dir = tempfile::tempdir().expect("Failed to create temp dir");
+    let parser_dir = test_dir.path().join("parser");
+    fs::create_dir_all(&parser_dir).expect("Failed to create parser dir");
+    let parser = parser_dir.join(format!("lua.{}", std::env::consts::DLL_EXTENSION));
+    symlink("missing-parser-library", &parser).expect("Failed to create dangling parser link");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_kakehashi"))
+        .args([
+            "language",
+            "uninstall",
+            "--all",
+            "--data-dir",
+            test_dir.path().to_str().unwrap(),
+            "--force",
+        ])
+        .output()
+        .expect("Failed to execute command");
+
+    assert!(
+        output.status.success(),
+        "dangling parser entry should be removable; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        fs::symlink_metadata(&parser).is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound),
+        "dangling parser entry must be removed"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn test_language_uninstall_all_removes_query_symlink_entry() {
+    use std::fs;
+    use std::os::unix::fs::symlink;
+
+    let test_dir = tempfile::tempdir().expect("Failed to create temp dir");
+    let parser_dir = test_dir.path().join("parser");
+    let queries_dir = test_dir.path().join("queries");
+    fs::create_dir_all(&parser_dir).expect("Failed to create parser dir");
+    fs::create_dir_all(&queries_dir).expect("Failed to create queries dir");
+    let parser = parser_dir.join(format!("testlang.{}", std::env::consts::DLL_EXTENSION));
+    fs::write(&parser, "fake").expect("Failed to write parser");
+    symlink("loop", queries_dir.join("loop")).expect("Failed to create query symlink loop");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_kakehashi"))
+        .args([
+            "language",
+            "uninstall",
+            "--all",
+            "--data-dir",
+            test_dir.path().to_str().unwrap(),
+            "--force",
+        ])
+        .output()
+        .expect("Failed to execute command");
+
+    assert!(
+        output.status.success(),
+        "query symlink should be removable without resolving its target; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!parser.exists(), "the discovered parser must be removed");
+    assert!(
+        fs::symlink_metadata(queries_dir.join("loop"))
+            .is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound),
+        "query symlink entry must be removed"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn test_language_uninstall_all_preflights_before_query_recovery() {
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+
+    let test_dir = tempfile::tempdir().expect("Failed to create temp dir");
+    let parser_dir = test_dir.path().join("parser");
+    let stranded_tmp = test_dir.path().join("queries/.lua.4294967295.0.tmp");
+    fs::create_dir_all(&parser_dir).expect("Failed to create parser dir");
+    fs::create_dir_all(&stranded_tmp).expect("Failed to create stranded query temp dir");
+    fs::set_permissions(&parser_dir, fs::Permissions::from_mode(0o000))
+        .expect("Failed to make parser dir unreadable");
+    if directory_is_enumerable(&parser_dir) {
+        fs::set_permissions(&parser_dir, fs::Permissions::from_mode(0o700))
+            .expect("Failed to restore parser dir permissions");
+        return;
+    }
+
+    let output = Command::new(env!("CARGO_BIN_EXE_kakehashi"))
+        .args([
+            "language",
+            "uninstall",
+            "--all",
+            "--data-dir",
+            test_dir.path().to_str().unwrap(),
+            "--force",
+        ])
+        .output()
+        .expect("Failed to execute command");
+
+    fs::set_permissions(&parser_dir, fs::Permissions::from_mode(0o700))
+        .expect("Failed to restore parser dir permissions");
+    assert!(!output.status.success(), "unreadable preflight must fail");
+    assert!(
+        stranded_tmp.exists(),
+        "query recovery must not mutate state before all install roots pass preflight"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn test_language_uninstall_all_fails_when_query_recovery_fails() {
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+
+    let test_dir = tempfile::tempdir().expect("Failed to create temp dir");
+    let queries_dir = test_dir.path().join("queries");
+    let stranded_tmp = queries_dir.join(".lua.4294967295.0.tmp");
+    fs::create_dir_all(&stranded_tmp).expect("Failed to create stranded query temp dir");
+    fs::set_permissions(&queries_dir, fs::Permissions::from_mode(0o500))
+        .expect("Failed to make queries dir read-only");
+
+    // Elevated environments may still create the recovery lock.
+    let probe = queries_dir.join("permission-probe");
+    if fs::write(&probe, "probe").is_ok() {
+        let _ = fs::remove_file(probe);
+        fs::set_permissions(&queries_dir, fs::Permissions::from_mode(0o700))
+            .expect("Failed to restore queries dir permissions");
+        return;
+    }
+
+    let output = Command::new(env!("CARGO_BIN_EXE_kakehashi"))
+        .args([
+            "language",
+            "uninstall",
+            "--all",
+            "--data-dir",
+            test_dir.path().to_str().unwrap(),
+            "--force",
+        ])
+        .output()
+        .expect("Failed to execute command");
+
+    fs::set_permissions(&queries_dir, fs::Permissions::from_mode(0o700))
+        .expect("Failed to restore queries dir permissions");
+    assert!(
+        !output.status.success(),
+        "failed recovery must fail --all; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(stranded_tmp.exists(), "failed recovery must stay visible");
+}
+
+#[cfg(unix)]
+#[test]
+fn test_language_uninstall_all_preflights_query_contents_before_parser_removal() {
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+
+    let test_dir = tempfile::tempdir().expect("Failed to create temp dir");
+    let parser_dir = test_dir.path().join("parser");
+    let query_dir = test_dir.path().join("queries/lua");
+    fs::create_dir_all(&parser_dir).expect("Failed to create parser dir");
+    fs::create_dir_all(&query_dir).expect("Failed to create query dir");
+    let parser = parser_dir.join(format!("lua.{}", std::env::consts::DLL_EXTENSION));
+    fs::write(&parser, "fake").expect("Failed to write parser");
+    fs::write(query_dir.join("highlights.scm"), "(comment) @comment")
+        .expect("Failed to write query");
+    fs::set_permissions(&query_dir, fs::Permissions::from_mode(0o000))
+        .expect("Failed to make query dir unreadable");
+    if directory_is_enumerable(&query_dir) {
+        fs::set_permissions(&query_dir, fs::Permissions::from_mode(0o700))
+            .expect("Failed to restore query dir permissions");
+        return;
+    }
+
+    let output = Command::new(env!("CARGO_BIN_EXE_kakehashi"))
+        .args([
+            "language",
+            "uninstall",
+            "--all",
+            "--data-dir",
+            test_dir.path().to_str().unwrap(),
+            "--force",
+        ])
+        .output()
+        .expect("Failed to execute command");
+
+    fs::set_permissions(&query_dir, fs::Permissions::from_mode(0o700))
+        .expect("Failed to restore query dir permissions");
+    assert!(!output.status.success(), "unreadable query tree must fail");
+    assert!(
+        parser.exists(),
+        "query preflight failure must happen before parser removal"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn test_language_uninstall_preflights_target_query_contents() {
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+
+    let test_dir = tempfile::tempdir().expect("Failed to create temp dir");
+    let parser_dir = test_dir.path().join("parser");
+    let query_dir = test_dir.path().join("queries/lua");
+    let nested = query_dir.join("nested");
+    fs::create_dir_all(&parser_dir).expect("Failed to create parser dir");
+    fs::create_dir_all(&nested).expect("Failed to create nested query dir");
+    let parser = parser_dir.join(format!("lua.{}", std::env::consts::DLL_EXTENSION));
+    fs::write(&parser, "fake").expect("Failed to write parser");
+    fs::write(nested.join("query.scm"), "(comment) @comment")
+        .expect("Failed to write nested query");
+    fs::set_permissions(&nested, fs::Permissions::from_mode(0o000))
+        .expect("Failed to make nested query unreadable");
+    if directory_is_enumerable(&nested) {
+        fs::set_permissions(&nested, fs::Permissions::from_mode(0o700))
+            .expect("Failed to restore nested query permissions");
+        return;
+    }
+
+    let output = Command::new(env!("CARGO_BIN_EXE_kakehashi"))
+        .args([
+            "language",
+            "uninstall",
+            "lua",
+            "--data-dir",
+            test_dir.path().to_str().unwrap(),
+            "--force",
+        ])
+        .output()
+        .expect("Failed to execute command");
+
+    fs::set_permissions(&nested, fs::Permissions::from_mode(0o700))
+        .expect("Failed to restore nested query permissions");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "unreadable target tree must fail");
+    assert!(
+        stderr.contains("Failed to preflight targeted query state"),
+        "failure must occur during preflight, before removal: {stderr}"
+    );
+    assert!(parser.exists(), "preflight failure must preserve parser");
+}
+
+#[cfg(unix)]
+#[test]
+fn test_language_uninstall_cancel_does_not_recover_unrelated_languages() {
+    use std::fs;
+    use std::io::Write;
+    use std::process::Stdio;
+
+    let test_dir = tempfile::tempdir().expect("Failed to create temp dir");
+    let unrelated_tmp = test_dir.path().join("queries/.python.4294967295.0.tmp");
+    fs::create_dir_all(&unrelated_tmp).expect("Failed to create unrelated recovery temp");
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_kakehashi"))
+        .args([
+            "language",
+            "uninstall",
+            "lua",
+            "--data-dir",
+            test_dir.path().to_str().unwrap(),
+        ])
+        .stdin(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("Failed to spawn command");
+    child
+        .stdin
+        .take()
+        .expect("child stdin")
+        .write_all(b"n\n")
+        .expect("Failed to cancel uninstall");
+    let output = child
+        .wait_with_output()
+        .expect("Failed to wait for command");
+
+    assert!(output.status.success(), "cancellation should succeed");
+    assert!(
+        unrelated_tmp.exists(),
+        "cancellation must not mutate another language's recovery state"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn test_language_uninstall_ignores_unrelated_unreadable_recovery_state() {
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+
+    let test_dir = tempfile::tempdir().expect("Failed to create temp dir");
+    let unrelated_tmp = test_dir.path().join("queries/.python.4294967295.0.tmp");
+    fs::create_dir_all(&unrelated_tmp).expect("Failed to create unrelated recovery temp");
+    fs::write(unrelated_tmp.join("query.scm"), "(comment) @comment")
+        .expect("Failed to write unrelated recovery query");
+    fs::set_permissions(&unrelated_tmp, fs::Permissions::from_mode(0o000))
+        .expect("Failed to make unrelated recovery state unreadable");
+    if directory_is_enumerable(&unrelated_tmp) {
+        fs::set_permissions(&unrelated_tmp, fs::Permissions::from_mode(0o700))
+            .expect("Failed to restore recovery permissions");
+        return;
+    }
+
+    let output = Command::new(env!("CARGO_BIN_EXE_kakehashi"))
+        .args([
+            "language",
+            "uninstall",
+            "lua",
+            "--data-dir",
+            test_dir.path().to_str().unwrap(),
+            "--force",
+        ])
+        .output()
+        .expect("Failed to execute command");
+
+    fs::set_permissions(&unrelated_tmp, fs::Permissions::from_mode(0o700))
+        .expect("Failed to restore recovery permissions");
+    assert!(
+        output.status.success(),
+        "unrelated recovery state must not block targeted uninstall: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        unrelated_tmp.exists(),
+        "unrelated recovery state must remain"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn test_language_uninstall_all_query_removal_failure_preserves_parser() {
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+
+    let test_dir = tempfile::tempdir().expect("Failed to create temp dir");
+    let parser_dir = test_dir.path().join("parser");
+    let query_dir = test_dir.path().join("queries/lua");
+    fs::create_dir_all(&parser_dir).expect("Failed to create parser dir");
+    fs::create_dir_all(&query_dir).expect("Failed to create query dir");
+    let parser = parser_dir.join(format!("lua.{}", std::env::consts::DLL_EXTENSION));
+    fs::write(&parser, "fake").expect("Failed to write parser");
+    fs::write(query_dir.join("highlights.scm"), "(comment) @comment")
+        .expect("Failed to write query");
+    fs::set_permissions(&query_dir, fs::Permissions::from_mode(0o500))
+        .expect("Failed to make query dir non-writable");
+    let probe = query_dir.join("permission-probe");
+    if fs::write(&probe, "probe").is_ok() {
+        let _ = fs::remove_file(probe);
+        fs::set_permissions(&query_dir, fs::Permissions::from_mode(0o700))
+            .expect("Failed to restore query dir permissions");
+        return;
+    }
+
+    let output = Command::new(env!("CARGO_BIN_EXE_kakehashi"))
+        .args([
+            "language",
+            "uninstall",
+            "--all",
+            "--data-dir",
+            test_dir.path().to_str().unwrap(),
+            "--force",
+        ])
+        .output()
+        .expect("Failed to execute command");
+
+    fs::set_permissions(&query_dir, fs::Permissions::from_mode(0o700))
+        .expect("Failed to restore query dir permissions");
+    assert!(!output.status.success(), "query removal must fail");
+    assert!(
+        parser.exists(),
+        "query removal must finish before the parser is deleted"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn test_language_uninstall_all_preflights_recovery_backups_before_restore() {
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+
+    let test_dir = tempfile::tempdir().expect("Failed to create temp dir");
+    let queries_dir = test_dir.path().join("queries");
+    let backup = queries_dir.join(".lua.4294967295.0.backup");
+    let nested = backup.join("nested");
+    fs::create_dir_all(&nested).expect("Failed to create backup tree");
+    fs::write(backup.join("highlights.scm"), "(comment) @comment")
+        .expect("Failed to write backup query");
+    fs::write(nested.join("query.scm"), "(comment) @comment")
+        .expect("Failed to write nested backup query");
+    fs::write(backup.join(".kakehashi-install-complete"), "ok\n")
+        .expect("Failed to mark backup complete");
+    fs::write(
+        queries_dir.join(".lua.4294967295.0.backup.kakehashi-backup"),
+        "ok\n",
+    )
+    .expect("Failed to mark backup ownership");
+    fs::set_permissions(&nested, fs::Permissions::from_mode(0o000))
+        .expect("Failed to make backup subtree unreadable");
+    if directory_is_enumerable(&nested) {
+        fs::set_permissions(&nested, fs::Permissions::from_mode(0o700))
+            .expect("Failed to restore backup permissions");
+        return;
+    }
+
+    let output = Command::new(env!("CARGO_BIN_EXE_kakehashi"))
+        .args([
+            "language",
+            "uninstall",
+            "--all",
+            "--data-dir",
+            test_dir.path().to_str().unwrap(),
+            "--force",
+        ])
+        .output()
+        .expect("Failed to execute command");
+
+    let restored_nested = queries_dir.join("lua/nested");
+    let nested_to_restore = if nested.exists() {
+        &nested
+    } else {
+        &restored_nested
+    };
+    fs::set_permissions(nested_to_restore, fs::Permissions::from_mode(0o700))
+        .expect("Failed to restore backup subtree permissions");
+    assert!(
+        !output.status.success(),
+        "unreadable backup must fail preflight; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(backup.exists(), "preflight must not restore the backup");
+    assert!(
+        !queries_dir.join("lua").exists(),
+        "failed preflight must not revive the canonical install"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn test_language_uninstall_all_rejects_symlinked_recovery_entries() {
+    use std::fs;
+    use std::os::unix::fs::symlink;
+
+    let test_dir = tempfile::tempdir().expect("Failed to create temp dir");
+    let queries_dir = test_dir.path().join("queries");
+    let outside = test_dir.path().join("outside-backup");
+    fs::create_dir_all(&queries_dir).expect("Failed to create queries dir");
+    fs::create_dir_all(&outside).expect("Failed to create outside backup");
+    let outside_query = outside.join("highlights.scm");
+    fs::write(&outside_query, "(comment) @comment").expect("Failed to write outside query");
+    let backup_name = ".lua.4294967295.0.backup";
+    symlink(&outside, queries_dir.join(backup_name)).expect("Failed to link recovery backup");
+    fs::write(
+        queries_dir.join(format!("{backup_name}.kakehashi-backup")),
+        "ok\n",
+    )
+    .expect("Failed to mark backup ownership");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_kakehashi"))
+        .args([
+            "language",
+            "uninstall",
+            "--all",
+            "--data-dir",
+            test_dir.path().to_str().unwrap(),
+            "--force",
+        ])
+        .output()
+        .expect("Failed to execute command");
+
+    assert!(
+        !output.status.success(),
+        "recovery symlink must fail before recovery; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        outside_query.exists(),
+        "outside recovery target must remain untouched"
+    );
+    assert!(
+        fs::symlink_metadata(queries_dir.join(backup_name)).is_ok(),
+        "recovery symlink must remain for explicit repair"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn test_language_uninstall_all_ignores_unrelated_hidden_query_dirs() {
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+
+    let test_dir = tempfile::tempdir().expect("Failed to create temp dir");
+    let parser_dir = test_dir.path().join("parser");
+    let cache_dir = test_dir.path().join("queries/.cache");
+    fs::create_dir_all(&parser_dir).expect("Failed to create parser dir");
+    fs::create_dir_all(&cache_dir).expect("Failed to create unrelated cache dir");
+    let parser = parser_dir.join(format!("lua.{}", std::env::consts::DLL_EXTENSION));
+    fs::write(&parser, "fake").expect("Failed to write parser");
+    fs::set_permissions(&cache_dir, fs::Permissions::from_mode(0o000))
+        .expect("Failed to make unrelated cache unreadable");
+    if directory_is_enumerable(&cache_dir) {
+        fs::set_permissions(&cache_dir, fs::Permissions::from_mode(0o700))
+            .expect("Failed to restore cache permissions");
+        return;
+    }
+
+    let output = Command::new(env!("CARGO_BIN_EXE_kakehashi"))
+        .args([
+            "language",
+            "uninstall",
+            "--all",
+            "--data-dir",
+            test_dir.path().to_str().unwrap(),
+            "--force",
+        ])
+        .output()
+        .expect("Failed to execute command");
+
+    fs::set_permissions(&cache_dir, fs::Permissions::from_mode(0o700))
+        .expect("Failed to restore cache permissions");
+    assert!(
+        output.status.success(),
+        "unrelated hidden directories must not block uninstall: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!parser.exists(), "valid parser must be removed");
+    assert!(cache_dir.exists(), "unrelated hidden directory must remain");
 }
 
 /// Test that language uninstall --all ignores internal query staging directories

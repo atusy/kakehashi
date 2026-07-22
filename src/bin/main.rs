@@ -467,7 +467,11 @@ fn run_language_status(verbose: bool) -> Result<(), ExitCode> {
 }
 
 fn installed_query_language_name(path: &Path) -> Option<String> {
-    if !path.is_dir() {
+    installed_query_language_name_if_dir(path, path.is_dir())
+}
+
+fn installed_query_language_name_if_dir(path: &Path, is_dir: bool) -> Option<String> {
+    if !is_dir {
         return None;
     }
     let name = path.file_name()?.to_string_lossy();
@@ -480,13 +484,233 @@ fn installed_query_language_name(path: &Path) -> Option<String> {
     Some(name.to_string())
 }
 
+fn preflight_query_install_tree(root: &Path) -> Result<(), String> {
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(dir) = pending.pop() {
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => {
+                return Err(format!(
+                    "cannot read query directory '{}': {e}",
+                    dir.display()
+                ));
+            }
+        };
+        for entry in entries {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) => {
+                    return Err(format!(
+                        "cannot read an entry in query directory '{}': {e}",
+                        dir.display()
+                    ));
+                }
+            };
+            let path = entry.path();
+            let file_type = match entry.file_type() {
+                Ok(file_type) => file_type,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) => {
+                    return Err(format!(
+                        "cannot inspect query entry '{}': {e}",
+                        path.display()
+                    ));
+                }
+            };
+            // remove_dir_all does not follow symlinks, so only real child
+            // directories need traversal preflight.
+            if file_type.is_dir() {
+                pending.push(path);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn installed_query_language_name_for_uninstall(
+    entry: &std::fs::DirEntry,
+) -> Result<Option<String>, String> {
+    let path = entry.path();
+    let file_type = entry
+        .file_type()
+        .map_err(|e| format!("cannot inspect query entry '{}': {e}", path.display()))?;
+    // A safe-named symlink directly under queries/ is itself an uninstallable
+    // query-root entry. Do not follow it: a dangling target or loop must not
+    // make the kakehashi-owned namespace impossible to clean.
+    let is_dir = file_type.is_dir() || file_type.is_symlink();
+    let safe_name = path
+        .file_name()
+        .map(|name| name.to_string_lossy())
+        .filter(|name| !name.starts_with('.') && queries::is_safe_language_name(name));
+    if safe_name.is_some() && !is_dir {
+        return Err(format!(
+            "query entry '{}' is not a directory or symlink",
+            path.display()
+        ));
+    }
+    let language = installed_query_language_name_if_dir(&path, is_dir);
+    // Hidden staging/backup directories are skipped as installed languages,
+    // but recovery can mutate recognized ones into canonical installs. Avoid
+    // traversing unrelated hidden directories that neither recovery nor
+    // uninstall owns.
+    let is_recovery_dir = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(queries::is_recovery_directory_name);
+    if is_recovery_dir && file_type.is_symlink() {
+        return Err(format!(
+            "query recovery entry '{}' must not be a symlink",
+            path.display()
+        ));
+    }
+    if file_type.is_dir() && (language.is_some() || is_recovery_dir) {
+        preflight_query_install_tree(&path)?;
+    }
+    Ok(language)
+}
+
+fn read_optional_install_dir(path: &Path, kind: &str) -> Result<Option<std::fs::ReadDir>, String> {
+    match std::fs::symlink_metadata(path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => {
+            return Err(format!(
+                "cannot inspect {kind} directory '{}': {e}",
+                path.display()
+            ));
+        }
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            return Err(format!(
+                "{kind} directory '{}' must not be a symlink",
+                path.display()
+            ));
+        }
+        Ok(metadata) if !metadata.is_dir() => {
+            return Err(format!(
+                "{kind} path '{}' is not a directory",
+                path.display()
+            ));
+        }
+        Ok(_) => {}
+    }
+    match std::fs::read_dir(path) {
+        Ok(entries) => Ok(Some(entries)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(format!(
+            "cannot read {kind} directory '{}': {e}",
+            path.display()
+        )),
+    }
+}
+
+fn collect_installed_languages_for_uninstall(
+    parser_dir: &Path,
+    queries_dir: &Path,
+) -> Result<std::collections::BTreeSet<String>, String> {
+    let mut languages = std::collections::BTreeSet::new();
+
+    if let Some(entries) = read_optional_install_dir(parser_dir, "parser")? {
+        for entry in entries {
+            let entry = entry.map_err(|e| {
+                format!(
+                    "cannot read an entry in parser directory '{}': {e}",
+                    parser_dir.display()
+                )
+            })?;
+            let path = entry.path();
+            let file_type = entry
+                .file_type()
+                .map_err(|e| format!("cannot inspect parser entry '{}': {e}", path.display()))?;
+            let is_parser = path
+                .extension()
+                .map(|ext| ext == std::env::consts::DLL_EXTENSION)
+                .unwrap_or(false);
+            if is_parser && !(file_type.is_file() || file_type.is_symlink()) {
+                return Err(format!(
+                    "parser entry '{}' is not a file or symlink",
+                    path.display()
+                ));
+            }
+            if is_parser {
+                let language =
+                    path.file_stem()
+                        .and_then(|stem| stem.to_str())
+                        .ok_or_else(|| {
+                            format!("parser entry '{}' has a non-UTF-8 name", path.display())
+                        })?;
+                if !queries::is_safe_language_name(language) {
+                    return Err(format!(
+                        "parser entry '{}' has an invalid language name",
+                        path.display()
+                    ));
+                }
+                languages.insert(language.to_string());
+            }
+        }
+    }
+
+    if let Some(entries) = read_optional_install_dir(queries_dir, "queries")? {
+        for entry in entries {
+            let entry = entry.map_err(|e| {
+                format!(
+                    "cannot read an entry in queries directory '{}': {e}",
+                    queries_dir.display()
+                )
+            })?;
+            if let Some(name) = installed_query_language_name_for_uninstall(&entry)? {
+                languages.insert(name);
+            }
+        }
+    }
+
+    Ok(languages)
+}
+
+fn preflight_targeted_query_state(queries_dir: &Path, language: &str) -> Result<(), String> {
+    let Some(entries) = read_optional_install_dir(queries_dir, "queries")? else {
+        return Ok(());
+    };
+    for entry in entries {
+        let entry = entry.map_err(|e| {
+            format!(
+                "cannot read an entry in queries directory '{}': {e}",
+                queries_dir.display()
+            )
+        })?;
+        let path = entry.path();
+        let name = entry.file_name();
+        let name = name.to_str().unwrap_or_default();
+        let file_type = entry
+            .file_type()
+            .map_err(|e| format!("cannot inspect query entry '{}': {e}", path.display()))?;
+        let is_target = name == language;
+        let is_recovery = queries::recovery_directory_language(name) == Some(language);
+        if is_target && !(file_type.is_dir() || file_type.is_symlink()) {
+            return Err(format!(
+                "query entry '{}' is not a directory or symlink",
+                path.display()
+            ));
+        }
+        if is_recovery && file_type.is_symlink() {
+            return Err(format!(
+                "query recovery entry '{}' must not be a symlink",
+                path.display()
+            ));
+        }
+        if file_type.is_dir() && (is_target || is_recovery) {
+            preflight_query_install_tree(&path)?;
+        }
+    }
+    Ok(())
+}
+
 /// Run the language uninstall command
 fn run_language_uninstall(
     language: Option<String>,
     force: bool,
     all: bool,
 ) -> Result<(), ExitCode> {
-    use std::collections::BTreeSet;
     use std::fs;
     use std::io::{self, Write};
 
@@ -497,39 +721,61 @@ fn run_language_uninstall(
 
     let parser_dir = data_dir.join("parser");
     let queries_dir = data_dir.join("queries");
-    if let Err(e) = queries::recover_interrupted_query_installs(&queries_dir) {
-        eprintln!("Warning: failed to recover interrupted query installs: {e}");
+    let targeted_language = if all {
+        None
+    } else {
+        let language = language
+            .as_deref()
+            .expect("targeted uninstall has a language");
+        if !queries::is_safe_language_name(language) {
+            eprintln!("✗ Invalid language name {:?}", language);
+            return Err(ExitCode::FAILURE);
+        }
+        Some(language)
+    };
+    // `--all` promises to discover the complete install before removing it.
+    // Validate both roots before recovery, which may delete stale staging
+    // directories or restore backups. Discard this first snapshot and rescan
+    // after recovery so restored languages are included in the uninstall set.
+    if all {
+        collect_installed_languages_for_uninstall(&parser_dir, &queries_dir).map_err(|e| {
+            eprintln!("Failed to scan installed languages: {e}");
+            ExitCode::FAILURE
+        })?;
+    } else {
+        // Targeted uninstall does not need to enumerate every entry, but it
+        // still builds removal paths beneath both roots. Reject a symlinked or
+        // non-directory root before recovery/removal can escape data_dir.
+        read_optional_install_dir(&parser_dir, "parser").map_err(|e| {
+            eprintln!("Failed to validate install roots: {e}");
+            ExitCode::FAILURE
+        })?;
+        let language = targeted_language.expect("targeted uninstall has a language");
+        preflight_targeted_query_state(&queries_dir, language).map_err(|e| {
+            eprintln!("Failed to preflight targeted query state: {e}");
+            ExitCode::FAILURE
+        })?;
+    }
+    if all && let Err(e) = queries::recover_interrupted_query_installs(&queries_dir) {
+        eprintln!("Failed to recover interrupted query installs: {e}");
+        return Err(ExitCode::FAILURE);
     }
 
     // Determine which languages to uninstall
     let languages_to_uninstall: Vec<String> = if all {
-        // Collect all installed languages
-        let mut languages = BTreeSet::new();
-
-        if let Ok(entries) = fs::read_dir(&parser_dir) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                let is_parser = path
-                    .extension()
-                    .map(|ext| ext == std::env::consts::DLL_EXTENSION)
-                    .unwrap_or(false);
-                if is_parser && let Some(stem) = path.file_stem() {
-                    languages.insert(stem.to_string_lossy().to_string());
-                }
-            }
-        }
-
-        if let Ok(entries) = fs::read_dir(&queries_dir) {
-            for entry in entries.flatten() {
-                if let Some(name) = installed_query_language_name(&entry.path()) {
-                    languages.insert(name);
-                }
-            }
-        }
-
-        languages.into_iter().collect()
+        collect_installed_languages_for_uninstall(&parser_dir, &queries_dir)
+            .map_err(|e| {
+                eprintln!("Failed to scan installed languages: {e}");
+                ExitCode::FAILURE
+            })?
+            .into_iter()
+            .collect()
     } else {
-        vec![language.expect("language required when --all not specified")]
+        vec![
+            targeted_language
+                .expect("targeted uninstall has a language")
+                .to_string(),
+        ]
     };
 
     if languages_to_uninstall.is_empty() {
@@ -556,6 +802,17 @@ fn run_language_uninstall(
         }
     }
 
+    // Targeted recovery is deliberately after confirmation and scoped to the
+    // requested language: cancellation and invalid input must not mutate any
+    // recovery state, especially not another language's artifacts.
+    if let Some(language) = targeted_language
+        && let Err(e) =
+            queries::recover_interrupted_query_installs_for_language(&queries_dir, language)
+    {
+        eprintln!("Failed to recover interrupted query installs for '{language}': {e}");
+        return Err(ExitCode::FAILURE);
+    }
+
     // Uninstall each language
     let mut any_removed = false;
     let mut any_failed = false;
@@ -570,25 +827,25 @@ fn run_language_uninstall(
             continue;
         }
 
-        let mut removed_something = false;
-
-        // Remove parser file
-        if let Some(parser_path) = find_parser_file(&parser_dir, lang) {
-            match fs::remove_file(&parser_path) {
-                Ok(()) => {
-                    eprintln!("✓ Removed parser: {}", parser_path.display());
-                    removed_something = true;
-                }
-                Err(e) => {
-                    eprintln!("✗ Failed to remove parser {}: {}", parser_path.display(), e);
-                    any_failed = true;
-                }
+        // Inspect the parser entry before mutating queries. Targeted uninstall
+        // does not run bulk discovery, so this is its per-language preflight;
+        // bulk uninstall repeats the check to close races after discovery.
+        let parser_path = match find_parser_file_for_uninstall(&parser_dir, lang) {
+            Ok(path) => path,
+            Err(e) => {
+                eprintln!("✗ Failed to inspect parser for '{}': {e}", lang);
+                any_failed = true;
+                continue;
             }
-        }
+        };
+        let mut removed_something = false;
 
         // Remove queries directory and any kakehashi-created backups under the
         // same lock used by install replacement, so uninstall cannot race a
         // concurrent install into resurrecting queries after reporting success.
+        // Do this before the parser: query removal recursively traverses a tree
+        // and has more ways to fail than deleting one parser entry. If it fails,
+        // preserve the parser rather than leaving the language half-uninstalled.
         match queries::remove_query_install_and_backups(&queries_dir, lang) {
             Ok(removal) => {
                 if removal.removed_queries {
@@ -602,6 +859,21 @@ fn run_language_uninstall(
             Err(e) => {
                 eprintln!("✗ Failed to remove queries for '{}': {}", lang, e);
                 any_failed = true;
+                continue;
+            }
+        }
+
+        // Remove parser file only after query removal completed.
+        if let Some(parser_path) = parser_path {
+            match fs::remove_file(&parser_path) {
+                Ok(()) => {
+                    eprintln!("✓ Removed parser: {}", parser_path.display());
+                    removed_something = true;
+                }
+                Err(e) => {
+                    eprintln!("✗ Failed to remove parser {}: {}", parser_path.display(), e);
+                    any_failed = true;
+                }
             }
         }
 
@@ -631,6 +903,22 @@ fn run_language_uninstall(
 fn find_parser_file(parser_dir: &std::path::Path, lang: &str) -> Option<PathBuf> {
     let path = parser_dir.join(format!("{}.{}", lang, std::env::consts::DLL_EXTENSION));
     if path.exists() { Some(path) } else { None }
+}
+
+fn find_parser_file_for_uninstall(
+    parser_dir: &Path,
+    lang: &str,
+) -> Result<Option<PathBuf>, String> {
+    let path = parser_dir.join(format!("{}.{}", lang, std::env::consts::DLL_EXTENSION));
+    match std::fs::symlink_metadata(&path) {
+        Ok(metadata) if metadata.is_file() || metadata.file_type().is_symlink() => Ok(Some(path)),
+        Ok(_) => Err(format!(
+            "parser entry '{}' is not a file or symlink",
+            path.display()
+        )),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(format!("cannot inspect '{}': {e}", path.display())),
+    }
 }
 
 /// Write content to stdout or a file, with --force / --output semantics.
