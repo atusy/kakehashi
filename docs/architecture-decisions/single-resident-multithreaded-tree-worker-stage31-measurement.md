@@ -1,4 +1,4 @@
-# Single Tree Worker Stage 31 Semantic Finalize Allocation Measurement
+# Single Tree Worker Stage 31 Semantic Finalize Allocation Measurement (Rejected)
 
 ## Scope
 
@@ -25,10 +25,10 @@ An additional line-level shortcut scanned for visible non-overlapping captures
 and bypassed breakpoint/heap processing. Although a short debug series reduced
 the reported finalize phase from roughly 3.4–3.6 ms to 2.7–2.8 ms, four
 authoritative E2E pairs showed flat/slower Rust central latency and worse
-single-edit p95 in every pair. That shortcut was removed. The accepted measured
+single-edit p95 in every pair. That shortcut was removed. The final reviewed
 binary contains only the two allocation-preserving paths. Four separately
 hashed raw-sample files for the rejected candidate are retained alongside the
-accepted evidence so this rejection remains independently auditable.
+allocation-candidate evidence so this rejection remains independently auditable.
 
 All 1,200 timed benchmark results represented the latest edit. All 960 obsolete
 requests in cancellation scenarios returned JSON-RPC
@@ -36,27 +36,31 @@ requests in cancellation scenarios returned JSON-RPC
 
 ## Performance result
 
-Stage 30 and the allocation-only Stage 31 release binaries were measured end to
+After local review added bounded cancellation polling to the `@none` admission
+scan, Stage 30 and the reviewed Stage 31 release binaries were remeasured end to
 end over LSP with the authoritative worker and eight compute threads on an Apple
 M4. Four pairs alternated binary order; each binary received six warmups and 30
-timed iterations per scenario against the same content-addressed fixture.
+timed iterations per scenario against the same content-addressed fixture. This
+final series supersedes the stronger pre-review numbers retained in branch
+history.
 
 The median paired Stage-31 delta relative to Stage 30 was:
 
-- Rust single-edit typing: **-4.0%**. Three of four pairs improved; the range
-  was -13.4% to +1.9%.
-- Rust eight-edit burst: **-4.2%**. Three of four pairs improved; the range was
-  -9.6% to +19.2%.
+- Rust single-edit typing: **+0.8%**. Two of four pairs improved; the range was
+  -5.1% to +35.0%.
+- Rust eight-edit burst: **+1.6%**. Two of four pairs improved; the range was
+  -11.4% to +20.2%.
 - Rust four-cancellation burst: **-9.0%**. All four pairs improved; the range
-  was -13.8% to -1.6%.
-- Markdown typing: **-6.2%** for single edits and **-3.5%** for bursts, both with
-  sign-changing pair results.
+  was -18.1% to -3.7%.
+- Markdown typing: **-1.0%** for single edits and **-0.9%** for bursts, both with
+  sign-changing or near-flat pair results.
 
-Cancellation-burst p95 improved by 17.5% at the median and in three of four
-pairs. Single-edit, eight-edit, and Markdown p95 values were unstable and do not
-support a general tail claim. In particular, the eight-edit candidate regressed
-materially in one pair; Stage 31 is accepted as a central/cancellation-latency
-improvement, not as a universal burst-tail improvement.
+Cancellation-burst p95 improved by 8.9% at the median and in three of four
+pairs. However, Rust single-edit and eight-edit p95 were worse overall, and
+Markdown single-edit p95 regressed in all four pairs. The consistent
+cancellation-follow gain does not compensate for the lack of normal Rust typing
+improvement and the Markdown tail regression. Stage 31 is therefore rejected;
+the allocation fast paths should not be merged in this form.
 
 The authoritative evidence is
 [`single_worker_stage31_finalize_allocation_2026-07-22.json`](../../benches/profile/results/single_worker_stage31_finalize_allocation_2026-07-22.json),

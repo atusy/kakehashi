@@ -8,8 +8,8 @@
   },
   "candidate": {
     "stage": 31,
-    "server_source_commit": "58bda8bea82d371573ed66c1a4b8203317361515",
-    "release_server_binary_sha256": "fa4a291c9f21e86a1d5ed6df792ed0e918d8b52700919a901cb1f79d12ee5f34"
+    "server_source_commit": "77d66bea0b4dbc8cf6ace72edc1eb8ca30aa4941",
+    "release_server_binary_sha256": "581b999a008e652990dd24df8b3b58373ca296cc2dd3b54b6cb914ba35df4890"
   },
   "environment": {
     "cpu": "Apple M4 (10 logical CPUs)",
@@ -23,10 +23,10 @@
     "build_profile": "release (optimized)",
     "pairs": 4,
     "revision_order": [
-      "stage30->stage31-alloc",
-      "stage31-alloc->stage30",
-      "stage30->stage31-alloc",
-      "stage31-alloc->stage30"
+      "stage30->stage31-chunked",
+      "stage31-chunked->stage30",
+      "stage30->stage31-chunked",
+      "stage31-chunked->stage30"
     ],
     "iterations_per_binary_per_pair": 30,
     "warmup_iterations_per_binary_per_pair": 6,
@@ -43,19 +43,19 @@
     "raw_runs": [
       {
         "path": "benches/profile/results/single_worker_stage31_finalize_allocation_pair1_2026-07-22.json",
-        "sha256": "c8c0f3ef739002bafb5debe6da49ccfcf013cb9e33a4ecd071edb78935806326"
+        "sha256": "b0667f21fc8c95bc5b68725b0d3d832ea29d208075d2e7ed24887de7643cfee9"
       },
       {
         "path": "benches/profile/results/single_worker_stage31_finalize_allocation_pair2_2026-07-22.json",
-        "sha256": "f7b502c7669aa29e127e1fbeaa791ebb54fcb26e95232400f87e8fd046ffaaa1"
+        "sha256": "5433d3e4899407169ab61548093e4f3e4b89a4d57de344b6805a1584c514adc3"
       },
       {
         "path": "benches/profile/results/single_worker_stage31_finalize_allocation_pair3_2026-07-22.json",
-        "sha256": "c3960a267d2f6e5e83e534fd237fed2bc5b25f4cfb071a988758cc819d9258b0"
+        "sha256": "f09e10ff1a70abed841696ac8594b3e3836ec57747dde89ef90adeb444c8e5f7"
       },
       {
         "path": "benches/profile/results/single_worker_stage31_finalize_allocation_pair4_2026-07-22.json",
-        "sha256": "315725d6ae07382fea967f850d650e17b9a02feb970b1cf952aed801352a9392"
+        "sha256": "a7afc6384f2afc8ad6ec26b03652bbefe50492179f58a5c7cae0447d76dbd3d9"
       }
     ]
   },
@@ -64,45 +64,45 @@
   "paired_summary": [
     {
       "scenario": "rust_large/typing_delta",
-      "median_paired_median_delta_percent": -3.9523111685696666,
-      "median_delta_range_percent": [-13.373088430002621, 1.8745748629736436],
-      "median_paired_p95_delta_percent": 1.1528612515679604,
-      "p95_delta_range_percent": [-43.04785501990479, 28.15740994914544]
+      "median_paired_median_delta_percent": 0.8336876012598504,
+      "median_delta_range_percent": [-5.072354204411484, 35.01156029176776],
+      "median_paired_p95_delta_percent": 17.680580191623257,
+      "p95_delta_range_percent": [-11.036753006475486, 76.55142234457396]
     },
     {
       "scenario": "rust_large/typing_burst",
-      "median_paired_median_delta_percent": -4.213341519692743,
-      "median_delta_range_percent": [-9.583682514211223, 19.179290087227628],
-      "median_paired_p95_delta_percent": 16.415322379270556,
-      "p95_delta_range_percent": [-34.27601460341354, 23.924146312075045]
+      "median_paired_median_delta_percent": 1.6230388850472957,
+      "median_delta_range_percent": [-11.370975455016913, 20.171887008706438],
+      "median_paired_p95_delta_percent": 16.238552084440794,
+      "p95_delta_range_percent": [-21.544620924422915, 38.60964873313817]
     },
     {
       "scenario": "rust_xlarge/cancel_burst",
-      "median_paired_median_delta_percent": -9.039500768057867,
-      "median_delta_range_percent": [-13.839635334639366, -1.6208856133444471],
-      "median_paired_p95_delta_percent": -17.527364901923516,
-      "p95_delta_range_percent": [-21.691124773205583, 4.66128535537087]
+      "median_paired_median_delta_percent": -9.038024351541832,
+      "median_delta_range_percent": [-18.141269993729257, -3.7481142803287413],
+      "median_paired_p95_delta_percent": -8.86711077337494,
+      "p95_delta_range_percent": [-15.315959877563337, 6.097693796141636]
     },
     {
       "scenario": "markdown_injections/typing_delta",
-      "median_paired_median_delta_percent": -6.187264567091461,
-      "median_delta_range_percent": [-11.524289715910152, 13.729905190282544],
-      "median_paired_p95_delta_percent": -0.938912481678944,
-      "p95_delta_range_percent": [-8.585603463828251, 185.41265548751687]
+      "median_paired_median_delta_percent": -0.992309768519652,
+      "median_delta_range_percent": [-12.763508431369017, 12.349077436780153],
+      "median_paired_p95_delta_percent": 32.92595309860045,
+      "p95_delta_range_percent": [4.535261086016897, 85.2113886388387]
     },
     {
       "scenario": "markdown_injections/typing_burst",
-      "median_paired_median_delta_percent": -3.4606541775725805,
-      "median_delta_range_percent": [-14.788463400448649, 7.171840316444134],
-      "median_paired_p95_delta_percent": 0.8498264514823939,
-      "p95_delta_range_percent": [-56.5634265520866, 46.2537649823306]
+      "median_paired_median_delta_percent": -0.9082373399554752,
+      "median_delta_range_percent": [-4.051911202030533, 0.7014548651037589],
+      "median_paired_p95_delta_percent": -0.3208436019822707,
+      "p95_delta_range_percent": [-9.757618577852769, 23.962421712182966]
     }
   ],
   "rejected_candidate": {
     "source_commit": "0b6a8424122ae1939e8b25431483bcb769ecb880",
     "release_server_binary_sha256": "9401e74d35a1cf39f883bb54a2e8dbec196b770b0cc4c305ad3b21fd8447f78b",
     "change": "Skip the breakpoint/heap sweep on visible non-overlapping lines after a preliminary scan.",
-    "reason": "Four authoritative E2E pairs showed flat/slower Rust medians and single-edit p95 regression in every pair despite a shorter isolated finalize phase. The preliminary scan was removed before the accepted series.",
+    "reason": "Four authoritative E2E pairs showed flat/slower Rust medians and single-edit p95 regression in every pair despite a shorter isolated finalize phase. The preliminary scan was removed before the allocation-only series.",
     "raw_runs": [
       {
         "path": "benches/profile/results/single_worker_stage31_rejected_disjoint_sweep_pair1_2026-07-22.json",
@@ -123,9 +123,9 @@
     ]
   },
   "interpretation": {
-    "accepted": true,
-    "central_latency": "The allocation-only candidate improved Rust single-edit and eight-edit central latency in three of four pairs and cancellation follow latency in all four pairs.",
-    "tail_latency": "Cancellation-burst p95 improved in three of four pairs and by 17.5% at the median. Single-edit and eight-edit p95 results remain too variable for a tail claim.",
-    "scope": "The accepted fast paths preserve input token storage when no @none or multiline transformation is needed. They add no retained state and do not change edit admission or cancellation semantics."
+    "accepted": false,
+    "central_latency": "The reviewed candidate improved cancellation follow latency in all four pairs by 9.0% at the paired median, but Rust single-edit and eight-edit central latency were flat/slower overall.",
+    "tail_latency": "Cancellation-burst p95 improved in three of four pairs, while Markdown single-edit p95 regressed in all four pairs and Rust single-edit/eight-edit p95 were worse overall.",
+    "scope": "The allocation fast paths preserve input token storage and poll @none admission cancellation every 64 tokens. They add no retained state or edit coalescing, but the final E2E tradeoff does not justify merging them."
   }
 }
