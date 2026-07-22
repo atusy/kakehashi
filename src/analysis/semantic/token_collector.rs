@@ -84,32 +84,67 @@ fn parse_priority_for_pattern(query: &Query, pattern_index: usize) -> u32 {
     DEFAULT_PRIORITY
 }
 
-fn pattern_priorities(query: &Query) -> Vec<u32> {
-    (0..query.pattern_count())
-        .map(|pattern_index| parse_priority_for_pattern(query, pattern_index))
-        .collect()
+struct PatternPriorities {
+    values: Vec<Option<u32>>,
 }
 
-fn capture_kinds(
-    query: &Query,
+impl PatternPriorities {
+    fn new(query: &Query) -> Self {
+        Self {
+            values: vec![None; query.pattern_count()],
+        }
+    }
+
+    fn get(&mut self, query: &Query, pattern_index: usize) -> u32 {
+        *self.values[pattern_index]
+            .get_or_insert_with(|| parse_priority_for_pattern(query, pattern_index))
+    }
+}
+
+fn resolve_token_kind(
+    capture_name: &str,
     filetype: Option<&str>,
     capture_mappings: Option<&CaptureMappings>,
-) -> Vec<Option<TokenKind>> {
-    query
-        .capture_names()
-        .iter()
-        .map(
-            |capture_name| match resolve_capture(capture_name, filetype, capture_mappings) {
-                CaptureResult::Suppressed => None,
-                CaptureResult::Mapped(token_type, modifiers) => {
-                    Some(TokenKind::Mapped(token_type, modifiers))
-                }
-                CaptureResult::MappedUnknown(name) => Some(TokenKind::MappedUnknown(name)),
-                CaptureResult::Transparent => Some(TokenKind::Transparent),
-                CaptureResult::NoneCapture => Some(TokenKind::NoneCapture),
-            },
-        )
-        .collect()
+) -> Option<TokenKind> {
+    match resolve_capture(capture_name, filetype, capture_mappings) {
+        CaptureResult::Suppressed => None,
+        CaptureResult::Mapped(token_type, modifiers) => {
+            Some(TokenKind::Mapped(token_type, modifiers))
+        }
+        CaptureResult::MappedUnknown(name) => Some(TokenKind::MappedUnknown(name)),
+        CaptureResult::Transparent => Some(TokenKind::Transparent),
+        CaptureResult::NoneCapture => Some(TokenKind::NoneCapture),
+    }
+}
+
+struct CaptureKinds {
+    values: Vec<Option<Option<TokenKind>>>,
+}
+
+impl CaptureKinds {
+    fn new(query: &Query) -> Self {
+        Self {
+            values: vec![None; query.capture_names().len()],
+        }
+    }
+
+    fn get(
+        &mut self,
+        query: &Query,
+        capture_index: usize,
+        filetype: Option<&str>,
+        capture_mappings: Option<&CaptureMappings>,
+    ) -> Option<TokenKind> {
+        self.values[capture_index]
+            .get_or_insert_with(|| {
+                resolve_token_kind(
+                    query.capture_names()[capture_index],
+                    filetype,
+                    capture_mappings,
+                )
+            })
+            .clone()
+    }
 }
 
 /// The semantic role of a collected token.
@@ -420,8 +455,8 @@ pub(super) fn collect_host_tokens(
     let mut utf16_cache: Vec<Option<Utf16LineIndex>> = Vec::new();
 
     // Collect tokens from this document's highlight query
-    let priorities = pattern_priorities(query);
-    let kinds_by_capture = capture_kinds(query, filetype, capture_mappings);
+    let mut priorities = PatternPriorities::new(query);
+    let mut kinds_by_capture = CaptureKinds::new(query);
     let mut cursor = QueryCursor::new();
     let mut matches = cursor.matches(query, tree.root_node(), text.as_bytes());
 
@@ -429,7 +464,7 @@ pub(super) fn collect_host_tokens(
         if is_cancelled_periodically(cancel, &mut work_items) {
             return false;
         }
-        let priority = priorities[m.pattern_index];
+        let priority = priorities.get(query, m.pattern_index);
         let filtered_captures = crate::language::filter_captures(query, m, text);
 
         for c in filtered_captures {
@@ -448,7 +483,9 @@ pub(super) fn collect_host_tokens(
             let is_single_line = start_pos.row == end_pos.row;
             let is_trailing_newline = end_pos.row == start_pos.row + 1 && end_pos.column == 0;
 
-            let Some(kind) = kinds_by_capture[c.index as usize].clone() else {
+            let Some(kind) =
+                kinds_by_capture.get(query, c.index as usize, filetype, capture_mappings)
+            else {
                 continue;
             };
 
@@ -659,7 +696,13 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(pattern_priorities(&query), vec![250, 100]);
+        let mut priorities = PatternPriorities::new(&query);
+        assert_eq!(
+            (0..query.pattern_count())
+                .map(|pattern_index| priorities.get(&query, pattern_index))
+                .collect::<Vec<_>>(),
+            vec![250, 100]
+        );
     }
 
     #[test]
@@ -675,14 +718,44 @@ mod tests {
         )
         .unwrap();
 
+        let mut kinds = CaptureKinds::new(&query);
         assert_eq!(
-            capture_kinds(&query, None, None),
+            (0..query.capture_names().len())
+                .map(|capture_index| kinds.get(&query, capture_index, None, None))
+                .collect::<Vec<_>>(),
             vec![
                 Some(TokenKind::Mapped(17, 0)),
                 Some(TokenKind::NoneCapture),
                 Some(TokenKind::Transparent),
             ]
         );
+    }
+
+    #[test]
+    fn semantic_query_tables_resolve_only_requested_indices() {
+        let language: tree_sitter::Language = tree_sitter_rust::LANGUAGE.into();
+        let query = tree_sitter::Query::new(
+            &language,
+            r#"
+            ((identifier) @variable
+              (#set! priority 250))
+            (line_comment) @comment
+            "#,
+        )
+        .unwrap();
+        let mut priorities = PatternPriorities::new(&query);
+        let mut kinds = CaptureKinds::new(&query);
+
+        assert!(priorities.values.iter().all(Option::is_none));
+        assert!(kinds.values.iter().all(Option::is_none));
+
+        assert_eq!(priorities.get(&query, 1), 100);
+        assert_eq!(
+            kinds.get(&query, 1, None, None),
+            Some(TokenKind::Mapped(0, 0))
+        );
+        assert_eq!(priorities.values.iter().filter(|v| v.is_some()).count(), 1);
+        assert_eq!(kinds.values.iter().filter(|v| v.is_some()).count(), 1);
     }
 
     #[test]
