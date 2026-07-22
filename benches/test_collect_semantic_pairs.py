@@ -18,6 +18,12 @@ from collect_semantic_pairs import (
 
 
 class CollectSemanticPairsTest(unittest.TestCase):
+    def test_python_cache_cannot_dirty_collector_checkout(self):
+        ignore_patterns = (
+            (Path(__file__).parent.parent / ".gitignore").read_text().splitlines()
+        )
+        self.assertIn("__pycache__/", ignore_patterns)
+
     def test_every_requested_scenario_filter_must_match(self):
         measured = {
             "rust_large/full_cache_hit",
