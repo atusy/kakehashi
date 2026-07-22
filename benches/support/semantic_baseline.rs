@@ -30,6 +30,10 @@ pub(crate) enum ValidationError {
         delete_count: usize,
         token_data_len: usize,
     },
+    OverlappingEdits {
+        first_edit_index: usize,
+        second_edit_index: usize,
+    },
 }
 
 pub(crate) fn tracked_marker_line(content: &str) -> Result<u32, ValidationError> {
@@ -193,10 +197,22 @@ fn apply_edits(base: &[u32], edits: &[Value]) -> Result<Vec<u32>, ValidationErro
         parsed.push((edit_index, start, end, replacement));
     }
 
+    parsed.sort_unstable_by_key(|(_, start, _, _)| *start);
+    for edits in parsed.windows(2) {
+        let (first_index, first_start, first_end, _) = &edits[0];
+        let (second_index, second_start, _, _) = &edits[1];
+        if second_start < first_end || second_start == first_start {
+            return Err(ValidationError::OverlappingEdits {
+                first_edit_index: *first_index,
+                second_edit_index: *second_index,
+            });
+        }
+    }
+
     // Every edit is indexed against the previous response, not against the
     // result of the preceding edit. Applying from the end keeps those offsets
     // stable even when an earlier replacement changes the array length.
-    parsed.sort_unstable_by_key(|(_, start, _, _)| std::cmp::Reverse(*start));
+    parsed.reverse();
     let mut data = base.to_vec();
     for (_, start, end, replacement) in parsed {
         data.splice(start..end, replacement);

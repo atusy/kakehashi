@@ -151,10 +151,22 @@ def isolated_environment(temp: Path) -> dict[str, str]:
 
 
 def recorded_environment(environment: dict[str, str], temp: Path) -> dict[str, str]:
-    prefix = str(temp)
-    return {
-        key: value.replace(prefix, "<TEMP>") for key, value in sorted(environment.items())
-    }
+    temp_prefix = str(temp)
+    user_home = os.environ.get("HOME")
+    recorded = {}
+    for key, value in sorted(environment.items()):
+        value = value.replace(temp_prefix, "<TEMP>")
+        if key == "PATH" and user_home:
+            value = os.pathsep.join(
+                "<USER_HOME_PATH>"
+                if entry == user_home or entry.startswith(f"{user_home}{os.sep}")
+                else entry
+                for entry in value.split(os.pathsep)
+            )
+        elif user_home:
+            value = value.replace(user_home, "<USER_HOME>")
+        recorded[key] = value
+    return recorded
 
 
 def file_sha256(path: Path) -> str:
@@ -167,7 +179,7 @@ def file_sha256(path: Path) -> str:
 
 def normalize_captured_stdout(stdout: str) -> str:
     """Keep captured output readable without introducing whitespace errors."""
-    return stdout.rstrip() + "\n" if stdout else ""
+    return stdout.rstrip("\r\n") + "\n" if stdout else ""
 
 
 def remove_tree_if_exists(path: Path) -> None:

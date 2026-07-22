@@ -1,10 +1,12 @@
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from collect_semantic_pairs import (
     manifest_sha256,
     normalize_captured_stdout,
+    recorded_environment,
     set_tree_read_only,
     set_tree_writable,
     tree_manifest,
@@ -15,7 +17,27 @@ class CollectSemanticPairsTest(unittest.TestCase):
     def test_captured_stdout_has_exactly_one_terminal_newline(self):
         self.assertEqual(normalize_captured_stdout("result\n\n"), "result\n")
         self.assertEqual(normalize_captured_stdout("result"), "result\n")
+        self.assertEqual(normalize_captured_stdout("result  \t\n"), "result  \t\n")
         self.assertEqual(normalize_captured_stdout(""), "")
+
+    def test_recorded_environment_hides_user_specific_paths(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            temp = Path(temporary)
+            environment = {
+                "HOME": str(temp / "home"),
+                "PATH": "/Users/example/.local/bin:/usr/bin:/Users/example/.cache/tool/bin",
+                "RUSTUP_HOME": "/Users/example/.rustup",
+            }
+            with mock.patch.dict("os.environ", {"HOME": "/Users/example"}):
+                recorded = recorded_environment(environment, temp)
+
+            self.assertEqual(recorded["HOME"], "<TEMP>/home")
+            self.assertEqual(
+                recorded["PATH"],
+                "<USER_HOME_PATH>:/usr/bin:<USER_HOME_PATH>",
+            )
+            self.assertEqual(recorded["RUSTUP_HOME"], "<USER_HOME>/.rustup")
+            self.assertNotIn("example", str(recorded))
 
     def test_tree_attestation_changes_with_content(self):
         with tempfile.TemporaryDirectory() as temporary:

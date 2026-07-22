@@ -147,6 +147,35 @@ fn rejects_out_of_bounds_delta_edits() {
 }
 
 #[test]
+fn rejects_overlapping_and_duplicate_start_delta_edits() {
+    let cases = [
+        json!([
+            {"start": 0, "deleteCount": 10},
+            {"start": 5, "deleteCount": 5}
+        ]),
+        json!([
+            {"start": 5, "deleteCount": 0, "data": [0, 0, 0, 0, 0]},
+            {"start": 5, "deleteCount": 5}
+        ]),
+    ];
+
+    for edits in cases {
+        let mut baseline = SemanticBaseline::from_full(&initial_tokens(), 1).unwrap();
+        assert_eq!(
+            baseline.apply_response(&json!({
+                "resultId": "baseline-2",
+                "edits": edits
+            })),
+            Err(ValidationError::OverlappingEdits {
+                first_edit_index: 0,
+                second_edit_index: 1,
+            })
+        );
+        assert_eq!(baseline.result_id(), "baseline-1");
+    }
+}
+
+#[test]
 fn validates_range_token_payload_shape() {
     assert_eq!(validate_token_payload(&json!({"data": []})), Ok(()));
     assert_eq!(

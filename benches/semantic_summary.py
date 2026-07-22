@@ -162,6 +162,11 @@ def summarize_pairs(documents: Iterable[dict[str, Any]]) -> dict[str, Any]:
                 )
             a_ns = values["A"]
             b_ns = values["B"]
+            if a_ns <= 0 or b_ns <= 0:
+                raise ValueError(
+                    f"non-positive median for pair {pair_index}, {scenario}: "
+                    f"A={a_ns}, B={b_ns}"
+                )
             delta_percent = (b_ns - a_ns) / a_ns * 100.0
             pair_rows.append(
                 {
