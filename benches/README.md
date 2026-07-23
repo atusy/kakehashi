@@ -47,3 +47,9 @@ keeps every source commit named by archived evidence fetchable after temporary
 development branches are deleted. Before merging archived evidence, also retain
 the recorded harness commit with a durable tag and add that tag as
 `source.harness_ref` in the published manifest.
+
+The retained scenario set includes dense Rust documents with contiguous 1%,
+10%, and 50% dirty syntax footprints. A footprint replaces that fraction of
+100 generated function units with a unique, line-stable state before requesting
+`semanticTokens/full/delta`. The tracked marker moves within the replaced block,
+so the harness rejects a stale response rather than accepting latency alone.

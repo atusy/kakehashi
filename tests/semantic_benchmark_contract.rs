@@ -1,6 +1,9 @@
+#[path = "../benches/support/dirty_footprint.rs"]
+mod dirty_footprint;
 #[path = "../benches/support/semantic_baseline.rs"]
 mod semantic_baseline;
 
+use dirty_footprint::{gen_dirty_rust, gen_dirty_rust_block};
 use semantic_baseline::{
     SemanticBaseline, TRACKED_MARKER, ValidationError, tracked_marker_line, validate_token_payload,
 };
@@ -185,5 +188,39 @@ fn validates_range_token_payload_shape() {
     assert_eq!(
         validate_token_payload(&serde_json::Value::Null),
         Err(ValidationError::MissingTokenPayload)
+    );
+}
+
+#[test]
+fn dirty_rust_documents_define_exact_syntax_unit_footprints() {
+    for dirty_units in [1, 10, 50] {
+        let document = gen_dirty_rust(100, dirty_units);
+        assert_eq!(
+            document.dirty_units * 100 / document.total_units,
+            dirty_units
+        );
+        assert_eq!(
+            tracked_marker_line(&document.content),
+            Ok(document.edit_start_line)
+        );
+        assert_eq!(
+            document.edit_end_line - document.edit_start_line,
+            u32::try_from(gen_dirty_rust_block(dirty_units, 0).lines().count()).unwrap()
+        );
+    }
+}
+
+#[test]
+fn dirty_rust_replacements_are_unique_line_stable_and_freshness_visible() {
+    let initial = gen_dirty_rust_block(10, 0);
+    let next = gen_dirty_rust_block(10, 1);
+    assert_ne!(initial, next);
+    assert_eq!(initial.lines().count(), next.lines().count());
+    assert!(initial.lines().next().unwrap().starts_with(TRACKED_MARKER));
+    assert!(
+        next.lines()
+            .next()
+            .unwrap()
+            .starts_with(&format!(" {TRACKED_MARKER}"))
     );
 }
