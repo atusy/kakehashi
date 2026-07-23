@@ -24,6 +24,7 @@ from semantic_summary import summarize_pairs, validate_collection
 DEFAULT_SCENARIOS = ",".join(
     [
         "rust_large/full_cache_hit",
+        "rust_large/stable_edit_followup_delta",
         "rust_large/typing_delta",
         "rust_sparse_32k_minus/typing_delta",
         "rust_sparse_32k_exact/typing_delta",
@@ -32,6 +33,7 @@ DEFAULT_SCENARIOS = ",".join(
         "rust_large/typing_burst",
         "rust_xlarge/cancel_burst",
         "markdown_injections_large/full_cache_hit",
+        "markdown_injections/stable_edit_followup_delta",
         "markdown_injections/typing_delta",
         "markdown_injections/typing_burst",
         "unicode_rust/full_cache_hit",
