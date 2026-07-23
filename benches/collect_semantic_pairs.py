@@ -32,7 +32,6 @@ DEFAULT_SCENARIOS = ",".join(
         "rust_sparse_64k/typing_delta",
         "rust_large/typing_burst",
         "rust_xlarge/cancel_burst",
-        SAME_SNAPSHOT_FANOUT_SCENARIO,
         "markdown_injections_large/full_cache_hit",
         "markdown_injections/typing_delta",
         "markdown_injections/typing_burst",
@@ -58,6 +57,20 @@ def requires_semantic_bench_instrumentation(scenarios: str) -> bool:
         term in SAME_SNAPSHOT_FANOUT_SCENARIO
         for term in scenario_filter_terms(scenarios)
     )
+
+
+def validate_instrumented_scenario_selection(scenarios: str) -> None:
+    terms = scenario_filter_terms(scenarios)
+    if not terms:
+        raise ValueError("scenario filters must contain at least one non-empty term")
+    if requires_semantic_bench_instrumentation(scenarios) and not (
+        len(terms) == 1
+        and terms[0] in {SAME_SNAPSHOT_FANOUT_SCENARIO, "same_snapshot_fanout"}
+    ):
+        raise ValueError(
+            f"{SAME_SNAPSHOT_FANOUT_SCENARIO} must be collected alone so "
+            "benchmark-instrumented binaries never contaminate production scenarios"
+        )
 
 
 def require_semantic_bench_instrumentation(source: Path) -> None:
@@ -387,6 +400,7 @@ def main() -> None:
     args = parser.parse_args()
     if args.pairs < 1 or args.iters < 1 or args.warmup < 0:
         parser.error("pairs and iters must be positive; warmup must be non-negative")
+    validate_instrumented_scenario_selection(args.scenarios)
 
     repo = Path(output(["git", "rev-parse", "--show-toplevel"], cwd=Path.cwd()))
     ensure_clean(repo)
@@ -607,6 +621,11 @@ def main() -> None:
                     "scenario_filters": scenario_filter_terms(args.scenarios),
                     "scenarios": sorted(measured_scenarios),
                     "server_env": server_env,
+                    "server_build_features": (
+                        ["semantic-bench-instrumentation"]
+                        if instrument_fanout
+                        else []
+                    ),
                     "run_timeout_seconds": args.run_timeout,
                 },
                 "environment": {

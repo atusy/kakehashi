@@ -33,11 +33,20 @@ artifacts and reports any exact worktree cleanup failure, so the same output
 path can be retried.
 
 The `rust_xlarge/same_snapshot_fanout` scenario synchronizes delta and range
-consumers after both miss the completed-artifact cache. The collector compiles
-measured servers with the opt-in `semantic-bench-instrumentation` feature only
-when this scenario is selected; normal builds contain no synchronization hook.
-Both compared refs must therefore include that feature. Select a scenario list
-without `same_snapshot_fanout` when comparing an older ref.
+consumers after both miss the completed-artifact cache. Collect it separately:
+
+```sh
+python3 benches/collect_semantic_pairs.py \
+  baseline-ref candidate-ref benches/results/same-snapshot-fanout \
+  --scenarios rust_xlarge/same_snapshot_fanout
+```
+
+The collector compiles these measured servers with the opt-in
+`semantic-bench-instrumentation` feature and records that feature in the
+manifest. Instrumented fan-out collection cannot be mixed with production
+scenarios, and the default scenario set remains feature-free. Both refs in a
+fan-out comparison must include the feature; select other scenarios when
+comparing an older ref.
 
 The collector uses kakehashi's installer to create a temporary parser/query
 data directory, freezes it for the timed runs, and removes it afterward. The

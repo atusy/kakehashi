@@ -33,6 +33,11 @@
 //!   cargo bench --bench semantic_tokens --features e2e
 //! ```
 //!
+//! `rust_xlarge/same_snapshot_fanout` is a separately collected instrumented
+//! scenario. Build both measured servers with
+//! `--features semantic-bench-instrumentation`; the harness deliberately fails
+//! rather than retaining an unsynchronized sample when that feature is absent.
+//!
 //! Tunables (env): `KAKEHASHI_BENCH_ITERS` (default 80),
 //! `KAKEHASHI_BENCH_WARMUP` (default 10), `KAKEHASHI_BENCH_SCENARIOS`
 //! (optional comma-separated scenario-name substrings), and

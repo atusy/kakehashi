@@ -16,6 +16,7 @@ from collect_semantic_pairs import (
     set_tree_read_only,
     set_tree_writable,
     tree_manifest,
+    validate_instrumented_scenario_selection,
     validate_requested_scenario_filters,
     write_installed_data_manifest,
 )
@@ -32,6 +33,15 @@ class CollectSemanticPairsTest(unittest.TestCase):
         self.assertFalse(
             requires_semantic_bench_instrumentation("rust_large/typing_delta")
         )
+        validate_instrumented_scenario_selection("same_snapshot_fanout")
+        with self.assertRaisesRegex(ValueError, "must be collected alone"):
+            validate_instrumented_scenario_selection(
+                "same_snapshot_fanout,rust_large/typing_delta"
+            )
+        with self.assertRaisesRegex(ValueError, "must be collected alone"):
+            validate_instrumented_scenario_selection("rust_xlarge")
+        with self.assertRaisesRegex(ValueError, "at least one non-empty term"):
+            validate_instrumented_scenario_selection(" , ")
 
     def test_fanout_instrumentation_requires_feature_on_measured_ref(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -102,6 +112,9 @@ class CollectSemanticPairsTest(unittest.TestCase):
         for scenario in DEFAULT_SCENARIOS.split(","):
             with self.subTest(scenario=scenario):
                 self.assertIn(f'name: "{scenario}"', harness)
+
+    def test_default_scenarios_do_not_enable_benchmark_instrumentation(self):
+        self.assertFalse(requires_semantic_bench_instrumentation(DEFAULT_SCENARIOS))
 
     def test_captured_stdout_has_exactly_one_terminal_newline(self):
         self.assertEqual(normalize_captured_stdout("result\n\n"), "result\n")
