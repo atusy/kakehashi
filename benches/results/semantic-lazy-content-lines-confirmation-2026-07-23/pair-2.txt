@@ -1,0 +1,31 @@
+
+semantic-tokens benchmark  (iters=30, warmup=12, lower is better)
+  B = <TEMP>/target-b/release/kakehashi
+  A = <TEMP>/target-a/release/kakehashi
+
+scenario                                B (med)      A (med) Δ (A vs B)
+------------------------------------------------------------------------
+rust_large/typing_delta                33.307ms     31.138ms         -6.5%
+    p95:     36.023ms     34.563ms
+    └ targets: unique edit states→reparse→retokenize→delta; excludes A/B cache returns
+rust_sparse_32k_minus/typing_delta     10.837ms     12.138ms        +12.0%
+    p95:     14.720ms     14.022ms
+    └ targets: sparse low-match control just below 32 KiB
+rust_sparse_32k_exact/typing_delta     11.937ms     12.367ms        +3.6%
+    p95:     16.118ms     15.046ms
+    └ targets: sparse low-match control at 32 KiB
+rust_sparse_32k_plus/typing_delta      11.003ms     10.731ms         -2.5%
+    p95:     12.906ms     13.266ms
+    └ targets: sparse low-match control just above 32 KiB
+rust_sparse_64k/typing_delta           20.743ms     21.081ms        +1.6%
+    p95:     24.474ms     25.069ms
+    └ targets: sparse low-match query walk at 64 KiB
+rust_large/typing_burst                33.334ms     34.064ms        +2.2%
+    p95:     39.605ms     37.602ms
+    └ targets: eight queued unique edits→current delta; latest-state follow latency
+markdown_injections/typing_delta        6.714ms      6.698ms         -0.2%
+    p95:      6.929ms      6.915ms
+    └ targets: unique edit states→injection reuse→delta; excludes A/B cache returns
+markdown_injections/typing_burst        6.763ms      6.848ms        +1.2%
+    p95:      7.370ms      7.249ms
+    └ targets: eight queued unique edits→current injection delta; latest-state follow latency

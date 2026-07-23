@@ -1,0 +1,194 @@
+[
+  {
+    "path": ".installed",
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "size": 0,
+    "type": "file"
+  },
+  {
+    "path": "cache/parsers.lua",
+    "sha256": "8a3014b92e4087c85288ee8c247764ac6ee0d1036eeee3c8127a63ab7a90207f",
+    "size": 73934,
+    "type": "file"
+  },
+  {
+    "path": "parser/lua.dylib",
+    "sha256": "a7b45ecff855c3b1e4c05c4ddaec5ec1efd9b5290b12a2a01a003d2f4de796cd",
+    "size": 84600,
+    "type": "file"
+  },
+  {
+    "path": "parser/markdown.dylib",
+    "sha256": "ebdcacdfe499262943162065809eb93a9a978b1fdf326d2c56550f0858d3627e",
+    "size": 418088,
+    "type": "file"
+  },
+  {
+    "path": "parser/markdown_inline.dylib",
+    "sha256": "d60c067a9bc4229035a19739b2a8f8d0ec6f75fbe069750e0e6077ff2c49bf9b",
+    "size": 416816,
+    "type": "file"
+  },
+  {
+    "path": "parser/python.dylib",
+    "sha256": "9158a3e161550b5eb3d0ecb0fe5fb20e138bf02059fa0052128cb2f2da075b00",
+    "size": 480920,
+    "type": "file"
+  },
+  {
+    "path": "parser/rust.dylib",
+    "sha256": "c82cc4d16ec2b1a788a0fd3d3b8b6237ff9694aa8b19056741cc3477ef6de5e1",
+    "size": 1142360,
+    "type": "file"
+  },
+  {
+    "path": "parser/yaml.dylib",
+    "sha256": "7bcae755df23cbef4dbcdef2fd0b5019d32e7e1bcc021bc6fa44809779230556",
+    "size": 217176,
+    "type": "file"
+  },
+  {
+    "path": "queries/.lua.replace.lock",
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "size": 0,
+    "type": "file"
+  },
+  {
+    "path": "queries/.markdown.replace.lock",
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "size": 0,
+    "type": "file"
+  },
+  {
+    "path": "queries/.markdown_inline.replace.lock",
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "size": 0,
+    "type": "file"
+  },
+  {
+    "path": "queries/.python.replace.lock",
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "size": 0,
+    "type": "file"
+  },
+  {
+    "path": "queries/.rust.replace.lock",
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "size": 0,
+    "type": "file"
+  },
+  {
+    "path": "queries/.yaml.replace.lock",
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "size": 0,
+    "type": "file"
+  },
+  {
+    "path": "queries/lua/.kakehashi-install-complete",
+    "sha256": "dc51b8c96c2d745df3bd5590d990230a482fd247123599548e0632fdbf97fc22",
+    "size": 3,
+    "type": "file"
+  },
+  {
+    "path": "queries/lua/highlights.scm",
+    "sha256": "ac7dfa89d16ba817c3681aa47c22bdb4441a78a89ed827a757efa755992de67f",
+    "size": 4336,
+    "type": "file"
+  },
+  {
+    "path": "queries/lua/injections.scm",
+    "sha256": "a2ee92c2f00f39ebeeb1d0cc06302dba58c4f1dda77a2f0c9e5d7d7beab0b1ff",
+    "size": 5168,
+    "type": "file"
+  },
+  {
+    "path": "queries/markdown/.kakehashi-install-complete",
+    "sha256": "dc51b8c96c2d745df3bd5590d990230a482fd247123599548e0632fdbf97fc22",
+    "size": 3,
+    "type": "file"
+  },
+  {
+    "path": "queries/markdown/highlights.scm",
+    "sha256": "7b71d4994cf3968e16d033ac59d28bb034427dd41be6a057b7a2985e2dfbe5b8",
+    "size": 2654,
+    "type": "file"
+  },
+  {
+    "path": "queries/markdown/injections.scm",
+    "sha256": "34090de78df99b5ea84c2fbb9324f2b7c32e602043595286e83f1a1ac126073c",
+    "size": 659,
+    "type": "file"
+  },
+  {
+    "path": "queries/markdown_inline/.kakehashi-install-complete",
+    "sha256": "dc51b8c96c2d745df3bd5590d990230a482fd247123599548e0632fdbf97fc22",
+    "size": 3,
+    "type": "file"
+  },
+  {
+    "path": "queries/markdown_inline/highlights.scm",
+    "sha256": "7db9147da61de7491ede9155e554dc033d6a1b86ecd1b21f6849c018be9ac875",
+    "size": 2259,
+    "type": "file"
+  },
+  {
+    "path": "queries/markdown_inline/injections.scm",
+    "sha256": "051f44218e0fe25cd949dfccad80699d5456ee379c7c4cfa18a5165776ecab0e",
+    "size": 207,
+    "type": "file"
+  },
+  {
+    "path": "queries/python/.kakehashi-install-complete",
+    "sha256": "dc51b8c96c2d745df3bd5590d990230a482fd247123599548e0632fdbf97fc22",
+    "size": 3,
+    "type": "file"
+  },
+  {
+    "path": "queries/python/highlights.scm",
+    "sha256": "ab8b66cbe6a7382e0ed7693c194101f1900c39f9ec0085a1749a8817e3e6895c",
+    "size": 9263,
+    "type": "file"
+  },
+  {
+    "path": "queries/python/injections.scm",
+    "sha256": "8558299709200b21d496890e4799153dc069bf302ce1545d23f70a0869c8b65d",
+    "size": 812,
+    "type": "file"
+  },
+  {
+    "path": "queries/rust/.kakehashi-install-complete",
+    "sha256": "dc51b8c96c2d745df3bd5590d990230a482fd247123599548e0632fdbf97fc22",
+    "size": 3,
+    "type": "file"
+  },
+  {
+    "path": "queries/rust/highlights.scm",
+    "sha256": "4e0f5994f30ee545fc63435054a0b029c7d0222632c5c787c4e9c249dc0ef20f",
+    "size": 8638,
+    "type": "file"
+  },
+  {
+    "path": "queries/rust/injections.scm",
+    "sha256": "7dde97bbdabd208f984e13627bd4daae0f73012c41faafab39d670b607710f4e",
+    "size": 2418,
+    "type": "file"
+  },
+  {
+    "path": "queries/yaml/.kakehashi-install-complete",
+    "sha256": "dc51b8c96c2d745df3bd5590d990230a482fd247123599548e0632fdbf97fc22",
+    "size": 3,
+    "type": "file"
+  },
+  {
+    "path": "queries/yaml/highlights.scm",
+    "sha256": "13352b80d2ce28c3328ccb2f321e5144c3365ff6055078e00e7cff118d1488b5",
+    "size": 1700,
+    "type": "file"
+  },
+  {
+    "path": "queries/yaml/injections.scm",
+    "sha256": "8349bd07691e2e610decdfc7b898bb5b01b226aae8745217bc811427f7af6742",
+    "size": 2373,
+    "type": "file"
+  }
+]
