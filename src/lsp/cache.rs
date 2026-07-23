@@ -322,18 +322,20 @@ impl CacheCoordinator {
             // pre-lever path) and defer identity to the next current pass —
             // the tracker is meanwhile kept live by the ordinary didChange
             // edit-shift.
-            let region_keys = regions
-                .iter()
-                .map(|info| {
-                    (
-                        info.content_node.start_byte(),
-                        info.content_node.end_byte(),
-                        info.content_node.kind(),
-                        info.pattern_index,
-                        info.language.as_str(),
-                    )
-                })
-                .collect::<Vec<_>>();
+            let mut work_items = 0;
+            let mut region_keys = Vec::with_capacity(regions.len());
+            for info in &regions {
+                if crate::cancel::is_cancelled_periodically(cancel, &mut work_items) {
+                    return None;
+                }
+                region_keys.push((
+                    info.content_node.start_byte(),
+                    info.content_node.end_byte(),
+                    info.content_node.kind(),
+                    info.pattern_index,
+                    info.language.as_str(),
+                ));
+            }
             let region_ids = tracker.mint_named_batch_if_unshifted_for_incarnation(
                 uri,
                 entry_mint_epoch,
@@ -345,27 +347,36 @@ impl CacheCoordinator {
             // Convert to CacheableInjectionRegion pairing each region with
             // its reconciled ULID (index-aligned with `regions` by the batch
             // contract).
-            let cacheable_regions: Vec<CacheableInjectionRegion> = regions
-                .iter()
-                .zip(&region_ids)
-                .map(|(info, ulid)| {
-                    let region_id = ulid.to_string();
-                    CacheableInjectionRegion::from_region_info(info, &region_id, text)
-                })
-                .collect();
+            if crate::cancel::is_cancelled(cancel) {
+                return None;
+            }
+            let mut cacheable_regions = Vec::with_capacity(regions.len());
+            for (info, ulid) in regions.iter().zip(&region_ids) {
+                if crate::cancel::is_cancelled_periodically(cancel, &mut work_items) {
+                    return None;
+                }
+                let region_id = ulid.to_string();
+                cacheable_regions.push(CacheableInjectionRegion::from_region_info(
+                    info, &region_id, text,
+                ));
+            }
 
             // Resolve once for every consumer that needs resolved language /
             // virtual content. In production the bridge and whole-document
             // gates rise together, so resolving independently would duplicate
             // the language-detection chain on the parse critical path.
-            let resolved = (build_bridge_regions || build_resolved_regions).then(|| {
-                crate::language::injection::InjectionResolver::resolve_from_prebuilt(
+            let resolved = if build_bridge_regions || build_resolved_regions {
+                let resolved = crate::language::injection::InjectionResolver::resolve_from_prebuilt_cancellable(
                     language,
                     &regions,
                     &cacheable_regions,
                     text,
-                )
-            });
+                    cancel,
+                )?;
+                Some(resolved)
+            } else {
+                None
+            };
 
             // Bridge-downstream regions from the SAME collected `regions`
             // (parse-snapshot ADR §3, never discover twice): the exact
@@ -396,6 +407,10 @@ impl CacheCoordinator {
             // mint/hash on this critical path).
             let resolved_regions = build_resolved_regions
                 .then(|| resolved.expect("whole-document regions requested resolution"));
+
+            if crate::cancel::is_cancelled(cancel) {
+                return None;
+            }
 
             // Producer half of the discovery lever: build the owned discovery
             // from the SAME `regions` just collected — the injection query (`Q`)
@@ -436,6 +451,10 @@ impl CacheCoordinator {
                         .collect()
                 })
                 .unwrap_or_default();
+
+            if crate::cancel::is_cancelled(cancel) {
+                return None;
+            }
 
             // Exit half of the mint reconciliation, atomic with coordinate
             // shifts: the commit runs under the tracker entry's exclusive
