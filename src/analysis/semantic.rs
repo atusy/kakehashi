@@ -114,7 +114,18 @@ pub(crate) async fn handle_semantic_tokens_full(
     cancel: Option<crate::cancel::CancelToken>,
 ) -> Option<SemanticTokensResult> {
     let compute_threads = pool.thread_count();
-    pool.run(cancel.clone(), move || {
+    let attribution = injection_cache.as_ref().map_or_else(
+        || crate::compute_pool::ComputeWork::anonymous("semantic_tokens"),
+        |params| {
+            crate::compute_pool::ComputeWork::document(
+                "semantic_tokens",
+                &params.uri,
+                Some(params.incarnation),
+                Some(params.parsed_version),
+            )
+        },
+    );
+    pool.run(attribution, cancel.clone(), move || {
         let is_cancelled = || crate::cancel::is_cancelled(cancel.as_ref());
         let compute_started = std::time::Instant::now();
         let mut host_tokens: Vec<RawToken> = Vec::with_capacity(1000);

@@ -226,9 +226,15 @@ impl Kakehashi {
         // synchronous tree-CPU, run as a compute-pool work-unit together with
         // the accessor closure over the resolved node (parse-snapshot ADR §4).
         let language = std::sync::Arc::clone(&self.language);
+        let attribution = crate::compute_pool::ComputeWork::document(
+            "node_resolve",
+            &uri,
+            Some(snapshot.incarnation),
+            Some(snapshot.parsed_version),
+        );
         let resolved = self
             .compute_pool
-            .run(None, move || {
+            .run(attribution, None, move || {
                 with_resolved_node_ranges(
                     &language,
                     &host_language,

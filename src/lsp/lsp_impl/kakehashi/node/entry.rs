@@ -278,9 +278,15 @@ impl Kakehashi {
         // together with the layer selection and the mint over its result.
         let language = std::sync::Arc::clone(&self.language);
         let tracker = self.bridge.node_tracker_arc();
+        let attribution = crate::compute_pool::ComputeWork::document(
+            "node_entry",
+            &uri,
+            Some(incarnation),
+            Some(snapshot.parsed_version),
+        );
         let result = self
             .compute_pool
-            .run(None, move || {
+            .run(attribution, None, move || {
                 let stack = injection_stack_at(&language, &host_language, &text, &tree, byte);
 
                 let layer_index = match selector {
