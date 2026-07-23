@@ -56,8 +56,8 @@ benches/profile/xctrace.sh --lang markdown --size 150 --requests 160 --edits 1
 
 Allocation and retained-heap profilers need to attach to the spawned server
 rather than the Python driver. The driver exposes an optional file handshake so
-an external profiler can attach to the exact PID after parser/query warmup and
-before measured requests begin:
+an external profiler can attach to the exact PID after an awaited, unmeasured
+semantic-token warmup and before measured requests begin:
 
 ```sh
 profile_dir="$(mktemp -d "${TMPDIR:-/tmp}/kakehashi-profile.XXXXXX")"
@@ -71,12 +71,23 @@ python3 benches/profile/drive.py \
   --profile-hold-seconds 5 &
 driver_pid=$!
 
-# Wait for pid + ready, attach the profiler to "$(cat "$profile_dir/pid")",
-# then release only the semantic-token workload:
+# Wait until the server PID is complete and the semantic warmup has responded.
+while [ ! -s "$profile_dir/pid" ] || [ ! -f "$profile_dir/ready" ]; do
+  sleep 0.05
+done
+server_pid="$(cat "$profile_dir/pid")"
+printf 'Attach the profiler to kakehashi PID %s\n' "$server_pid"
+
+# PAUSE HERE: attach the profiler to "$server_pid" and wait for the profiler to
+# confirm attachment. Only then release the measured semantic-token workload.
 touch "$profile_dir/start"
 
-# "$profile_dir/done" marks the end of measured requests. During the hold
-# interval, retained-heap tools can inspect the still-running server.
+# "$profile_dir/done" marks the end of measured requests. The server remains
+# alive during the hold interval so retained-heap tools can inspect it.
+while [ ! -f "$profile_dir/done" ]; do
+  sleep 0.05
+done
+heap -H "$server_pid"
 wait "$driver_pid"
 ```
 
