@@ -376,6 +376,7 @@ mod tests {
         };
         let (absent_request, _) = tracker.start_request(&uri, absent);
         tracker.finish_absent_request(&uri, absent_request, absent);
+        assert!(!tracker.active_requests.contains_key(&uri));
 
         let (reopened, reopened_token) = tracker.start_request(&uri, scope(1));
         tracker.finish_absent_request(&uri, absent_request, absent);

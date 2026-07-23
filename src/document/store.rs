@@ -38,6 +38,7 @@ pub struct DocumentStore {
     /// snapshot's incarnation against the URI's current one. See
     /// `Kakehashi::store_lineage` (captures-protocol §"Delta semantics").
     open_counter: std::sync::atomic::AtomicU64,
+    semantic_artifact_generation: Arc<std::sync::atomic::AtomicU64>,
     /// Per-document **parse watermark**: the highest ingress writer ticket whose
     /// parse has reached a terminal outcome (a tree, or parsed-to-nothing). It is
     /// monotonic per document and published by the parse path on resolution.
@@ -104,6 +105,7 @@ impl Default for DocumentStore {
             parse_states: DashMap::new(),
             edit_locks: DashMap::new(),
             open_counter: std::sync::atomic::AtomicU64::new(1),
+            semantic_artifact_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             watermarks: DashMap::new(),
         }
     }
@@ -127,11 +129,17 @@ impl DocumentStore {
     /// Cancel semantic artifact producers from older settings generations
     /// without invalidating otherwise reusable parse snapshots.
     pub(crate) fn advance_semantic_artifact_generation(&self, generation: u64) {
+        self.semantic_artifact_generation
+            .fetch_max(generation, std::sync::atomic::Ordering::SeqCst);
         for entry in self.documents.iter() {
             if let Some(snapshot) = entry.latest_snapshot_slot().snapshot {
                 snapshot.advance_semantic_artifact_generation(generation);
             }
         }
+    }
+
+    fn attach_semantic_artifact_generation(&self, document: Document) -> Document {
+        document.with_semantic_artifact_generation(Arc::clone(&self.semantic_artifact_generation))
     }
 
     pub(crate) fn invalidate_all_parses(&self) -> Vec<Url> {
@@ -230,6 +238,7 @@ impl DocumentStore {
             (Some(lang), None) => Document::with_language(text, lang, incarnation),
             _ => Document::new(text, incarnation),
         };
+        let document = self.attach_semantic_artifact_generation(document);
 
         // The parse-state and watermark maps are independent of `documents`, so seed
         // them with the borrowed `&uri` first and let `documents.insert` consume the
@@ -293,18 +302,19 @@ impl DocumentStore {
                     // counter, not `documents`, so drawing it while holding this
                     // entry's shard write lock cannot deadlock.
                     let incarnation = self.next_incarnation();
-                    let has_tree = if let Some(tree) = new_tree {
-                        entry.insert(Document::with_tree(
-                            text,
-                            "unknown".to_string(),
-                            tree,
-                            incarnation,
-                        ));
-                        true
-                    } else {
-                        entry.insert(Document::new(text, incarnation));
-                        false
-                    };
+                    let has_tree =
+                        if let Some(tree) = new_tree {
+                            entry.insert(self.attach_semantic_artifact_generation(
+                                Document::with_tree(text, "unknown".to_string(), tree, incarnation),
+                            ));
+                            true
+                        } else {
+                            entry.insert(self.attach_semantic_artifact_generation(Document::new(
+                                text,
+                                incarnation,
+                            )));
+                            false
+                        };
                     (has_tree, incarnation)
                 }
             }
@@ -354,7 +364,9 @@ impl DocumentStore {
                     // Reordered edit registering an unopened URI: a fresh
                     // lifetime → fresh incarnation (mirrors `update_document`).
                     let incarnation = self.next_incarnation();
-                    entry.insert(Document::new(text, incarnation));
+                    entry.insert(
+                        self.attach_semantic_artifact_generation(Document::new(text, incarnation)),
+                    );
                     incarnation
                 }
             }
@@ -1039,6 +1051,21 @@ mod tests {
                 .get(uri)
                 .map(|doc| doc.publish_snapshot(Arc::new(snapshot)))
                 .unwrap_or(false)
+        }
+
+        #[test]
+        fn snapshot_published_after_reload_inherits_generation_floor() {
+            let store = DocumentStore::new();
+            let uri = Url::parse("file:///generation-floor.rs").unwrap();
+            store.advance_semantic_artifact_generation(7);
+            store.insert(uri.clone(), "a".into(), Some("rust".into()), None);
+
+            assert!(publish(&store, &uri, snap_for(&store, &uri, 0)));
+            let snapshot = store
+                .latest_snapshot(&uri)
+                .and_then(|view| view.slot.snapshot)
+                .expect("published snapshot");
+            assert_eq!(snapshot.semantic_artifact.test_minimum_generation(), 7);
         }
 
         /// A give-up publish releases parked first-parse waiters at

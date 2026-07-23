@@ -2247,6 +2247,123 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn transient_artifact_failure_is_not_cached_by_full_or_delta() {
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+        let uri = Url::parse("file:///artifact_retry.lua").expect("test uri");
+        server.documents.insert(
+            uri.clone(),
+            "local first = 1".to_string(),
+            Some("lua".to_string()),
+            None,
+        );
+        let settings = crate::config::WorkspaceSettings {
+            search_paths: vec![
+                std::env::var("TREE_SITTER_GRAMMARS")
+                    .unwrap_or_else(|_| "deps/tree-sitter".to_string()),
+            ],
+            ..Default::default()
+        };
+        let _ = server.language.load_settings(&settings);
+        if !server.language.ensure_language_loaded("lua").success
+            || server.language.highlight_query("lua").is_none()
+        {
+            eprintln!("Skipping: lua language parser or highlight query not available");
+            return;
+        }
+        server
+            .parse_coordinator()
+            .parse_document(uri.clone(), Some("lua"), None)
+            .await;
+
+        let first_snapshot = server
+            .documents
+            .latest_snapshot(&uri)
+            .and_then(|view| view.slot.snapshot)
+            .expect("first parse snapshot");
+        first_snapshot.semantic_artifact.test_fail_next_producer();
+        assert!(
+            server
+                .semantic_tokens_full_impl(full_params(&uri))
+                .await
+                .expect("failed producer is contained")
+                .is_none()
+        );
+        let first_identity = SemanticSnapshotIdentity {
+            parsed_version: first_snapshot.parsed_version,
+            incarnation: first_snapshot.incarnation,
+            generation: server.cache.semantic_token_generation(),
+        };
+        assert!(
+            server
+                .cache
+                .get_current_tokens_for_snapshot(&uri, "lua", first_identity)
+                .is_none(),
+            "full must not cache transient failure as empty tokens"
+        );
+
+        let full = server
+            .semantic_tokens_full_impl(full_params(&uri))
+            .await
+            .expect("full retry succeeds")
+            .expect("full retry returns tokens");
+        let previous_result_id = match full {
+            SemanticTokensResult::Tokens(tokens) => tokens.result_id.expect("full retry result id"),
+            other => panic!("expected full tokens, got {other:?}"),
+        };
+        assert_eq!(first_snapshot.semantic_artifact.test_producer_starts(), 2);
+
+        server
+            .documents
+            .update_document(uri.clone(), "local second = 2".to_string(), None);
+        server
+            .parse_coordinator()
+            .parse_document(uri.clone(), Some("lua"), None)
+            .await;
+        let second_snapshot = server
+            .documents
+            .latest_snapshot(&uri)
+            .and_then(|view| view.slot.snapshot)
+            .expect("second parse snapshot");
+        second_snapshot.semantic_artifact.test_fail_next_producer();
+        let delta_params = || SemanticTokensDeltaParams {
+            text_document: TextDocumentIdentifier {
+                uri: crate::lsp::lsp_impl::url_to_uri(&uri).expect("test URI"),
+            },
+            previous_result_id: previous_result_id.clone(),
+            work_done_progress_params: WorkDoneProgressParams::default(),
+            partial_result_params: PartialResultParams::default(),
+        };
+        assert!(
+            server
+                .semantic_tokens_full_delta_impl(delta_params())
+                .await
+                .expect("failed delta producer is contained")
+                .is_none()
+        );
+        let second_identity = SemanticSnapshotIdentity {
+            parsed_version: second_snapshot.parsed_version,
+            incarnation: second_snapshot.incarnation,
+            generation: server.cache.semantic_token_generation(),
+        };
+        assert!(
+            server
+                .cache
+                .get_current_tokens_for_snapshot(&uri, "lua", second_identity)
+                .is_none(),
+            "delta must not cache transient failure as empty tokens"
+        );
+        assert!(
+            server
+                .semantic_tokens_full_delta_impl(delta_params())
+                .await
+                .expect("delta retry succeeds")
+                .is_some()
+        );
+        assert_eq!(second_snapshot.semantic_artifact.test_producer_starts(), 2);
+    }
+
     /// Test that a no-op delta (no document change) reuses the previous
     /// result_id instead of rotating it and re-storing identical tokens.
     ///
