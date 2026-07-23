@@ -861,7 +861,7 @@ local x = 42
         );
     }
 
-    /// Test that async handler returns None for empty document (consistent with sync behavior).
+    /// Test that an empty document returns a successful explicit empty token set.
     #[tokio::test]
     async fn test_handle_semantic_tokens_full_with_empty_document() {
         use crate::config::WorkspaceSettings;
