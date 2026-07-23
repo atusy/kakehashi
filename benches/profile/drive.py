@@ -16,8 +16,10 @@ from dataclasses import dataclass
 import json
 import math
 import os
+from pathlib import Path
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 
@@ -44,6 +46,43 @@ class RequestSummary:
     p90_ms: float
     max_ms: float
     wire_bytes: int
+
+
+def publish_marker(path: Path | str | None, content: str) -> Path | None:
+    """Atomically publish a marker consumed by an external profiler."""
+    if path is None:
+        return None
+    marker = Path(path)
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=marker.parent,
+            prefix=f".{marker.name}.",
+            delete=False,
+        ) as handle:
+            temporary = Path(handle.name)
+            handle.write(content)
+        os.replace(temporary, marker)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+    return marker
+
+
+def wait_for_marker(
+    path: Path | str, timeout_seconds: float, poll_seconds: float = 0.01
+) -> Path:
+    """Wait until an external profiler publishes a marker."""
+    marker = Path(path)
+    deadline = time.monotonic() + timeout_seconds
+    while not marker.exists():
+        if time.monotonic() >= deadline:
+            raise TimeoutError(f"timed out waiting for profile marker {marker}")
+        time.sleep(poll_seconds)
+    return marker
 
 
 def summarize_samples(samples: list[RequestSample]) -> RequestSummary:
@@ -197,6 +236,24 @@ def main() -> None:
         help="parser/query data dir; must already contain installed parsers "
              "(populated by `cargo test --features e2e` or `make deps/tree-sitter`), "
              "else the server auto-installs on first request")
+    ap.add_argument(
+        "--profile-pid-file",
+        help="atomically publish the spawned server PID for profiler attachment")
+    ap.add_argument(
+        "--profile-ready-file",
+        help="publish after initialization and warmup are complete")
+    ap.add_argument(
+        "--profile-start-file",
+        help="wait for this external marker before starting measured requests")
+    ap.add_argument(
+        "--profile-done-file",
+        help="publish after measured requests finish, before the hold interval")
+    ap.add_argument(
+        "--profile-hold-seconds", type=float, default=0,
+        help="keep the server alive after measurement for an external snapshot")
+    ap.add_argument(
+        "--profile-wait-timeout", type=float, default=30,
+        help="seconds to wait for --profile-start-file")
     args = ap.parse_args()
     if args.requests <= 0:
         ap.error("--requests must be positive")  # avoids divide-by-zero in the summary
@@ -206,6 +263,10 @@ def main() -> None:
         ap.error("--burst-edits requires --burst greater than 1")
     if args.burst_delay_ms < 0:
         ap.error("--burst-delay-ms must be non-negative")
+    if args.profile_hold_seconds < 0:
+        ap.error("--profile-hold-seconds must be non-negative")
+    if args.profile_wait_timeout <= 0:
+        ap.error("--profile-wait-timeout must be positive")
     if args.burst > 1 and (args.captures or args.concurrent_captures):
         ap.error("--burst cannot be combined with captures modes")
     if args.concurrent_captures:
@@ -396,6 +457,7 @@ def main() -> None:
     # loop, or a shutdown timeout) still reaps the server instead of leaving a
     # stray process behind.
     try:
+        publish_marker(args.profile_pid_file, f"{srv.pid}\n")
         request("initialize", {"processId": None, "rootUri": None, "capabilities": {
             "textDocument": {"semanticTokens": {"requests": {"full": {"delta": True}},
                                                 "tokenTypes": [], "tokenModifiers": [],
@@ -422,6 +484,10 @@ def main() -> None:
                     "captures warmup did not return a resultId; "
                     "cannot measure a real delta lineage"
                 )
+
+        publish_marker(args.profile_ready_file, "ready\n")
+        if args.profile_start_file:
+            wait_for_marker(args.profile_start_file, args.profile_wait_timeout)
 
         ok, canceled, superseded, tokens = 0, 0, 0, 0
         version = 1
@@ -514,6 +580,10 @@ def main() -> None:
             canceled += cycle_canceled
             superseded += cycle_superseded
         elapsed = time.time() - t0
+
+        publish_marker(args.profile_done_file, "done\n")
+        if args.profile_hold_seconds > 0:
+            time.sleep(args.profile_hold_seconds)
 
         request("shutdown", None)
         notify("exit", {})
