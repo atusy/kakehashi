@@ -59,7 +59,7 @@ cache hit, -2.88% for the Unicode full cache hit, and +0.72% for the Rust
 no-op delta. Every target scenario changed sign across the four pairs. Primary
 typing controls stayed near neutral (Rust +0.29%, Markdown -1.44%), so there
 was no compensating throughput benefit. The earlier lookup is rejected because
-the preparation it skips is already cheap after initial language load.
+it did not demonstrate a repeatable end-to-end improvement.
 
 Evidence: `semantic-snapshot-cache-first-2026-07-24/`
 
