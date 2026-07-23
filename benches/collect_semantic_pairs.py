@@ -25,6 +25,9 @@ DEFAULT_SCENARIOS = ",".join(
     [
         "rust_large/full_cache_hit",
         "rust_large/typing_delta",
+        "rust_dirty_01pct/typing_delta",
+        "rust_dirty_10pct/typing_delta",
+        "rust_dirty_50pct/typing_delta",
         "rust_sparse_32k_minus/typing_delta",
         "rust_sparse_32k_exact/typing_delta",
         "rust_sparse_32k_plus/typing_delta",
@@ -36,6 +39,14 @@ DEFAULT_SCENARIOS = ",".join(
         "markdown_injections/typing_burst",
         "unicode_rust/full_cache_hit",
     ]
+)
+
+HARNESS_SOURCE_FILES = (
+    "benches/semantic_tokens.rs",
+    "benches/support/semantic_baseline.rs",
+    "benches/support/dirty_footprint.rs",
+    "benches/collect_semantic_pairs.py",
+    "benches/semantic_summary.py",
 )
 
 ISOLATED_ENVIRONMENT_KEYS = {
@@ -547,12 +558,6 @@ def main() -> None:
             (artifact_dir / "summary.json").write_text(
                 json.dumps(summary, indent=2, sort_keys=True) + "\n"
             )
-            source_files = [
-                "benches/semantic_tokens.rs",
-                "benches/support/semantic_baseline.rs",
-                "benches/collect_semantic_pairs.py",
-                "benches/semantic_summary.py",
-            ]
             manifest = {
                 "schema_version": 1,
                 "source": {
@@ -563,7 +568,7 @@ def main() -> None:
                     "harness_commit": harness_commit,
                     "harness_sources_sha256": {
                         path: file_sha256(worktrees["harness-src"] / path)
-                        for path in source_files
+                        for path in HARNESS_SOURCE_FILES
                     },
                 },
                 "attestations": attestations,
