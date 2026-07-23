@@ -74,6 +74,26 @@ python3 benches/profile/drive.py \
   --profile-hold-seconds 60 &
 driver_pid=$!
 
+cleanup_profile_run() {
+  trap - EXIT HUP INT TERM
+  if [ -s "$profile_dir/pid" ]; then
+    cleanup_server_pid="$(cat "$profile_dir/pid")"
+    kill "$cleanup_server_pid" 2>/dev/null || true
+  fi
+  kill "$driver_pid" 2>/dev/null || true
+  wait "$driver_pid" 2>/dev/null || true
+  # Recheck in case the PID marker appeared while cleanup was starting.
+  if [ -s "$profile_dir/pid" ]; then
+    cleanup_server_pid="$(cat "$profile_dir/pid")"
+    kill "$cleanup_server_pid" 2>/dev/null || true
+  fi
+  [ ! -d "$profile_dir" ] || rm -r "$profile_dir"
+}
+trap cleanup_profile_run EXIT
+trap 'cleanup_profile_run; exit 129' HUP
+trap 'cleanup_profile_run; exit 130' INT
+trap 'cleanup_profile_run; exit 143' TERM
+
 wait_for_driver_marker() {
   marker="$1"
   while [ ! -f "$marker" ]; do
@@ -112,6 +132,10 @@ wait_for_driver_marker "$profile_dir/done" || exit $?
 heap -H "$server_pid"
 touch "$profile_dir/stop"
 wait "$driver_pid"
+driver_status=$?
+trap - EXIT HUP INT TERM
+rm -r "$profile_dir"
+[ "$driver_status" -eq 0 ] || exit "$driver_status"
 ```
 
 Use a fresh marker directory for each run. `pid`, `ready`, and `done` are
