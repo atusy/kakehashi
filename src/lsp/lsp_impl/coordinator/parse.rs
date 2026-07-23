@@ -330,6 +330,7 @@ impl ParseCoordinator {
     /// query — the semantic discovery and the bridge-downstream regions — both
     /// destined for the snapshot this pass publishes (ADR §3,
     /// don't-discover-twice). `(None, None)` when the work-unit panicked.
+    #[allow(clippy::too_many_arguments)] // One immutable parse snapshot plus its version token.
     async fn populate_injections_on_pool(
         &self,
         uri: Url,
