@@ -108,6 +108,36 @@ impl SemanticTokenCache {
         }
     }
 
+    /// Make an existing baseline the current result for a newer snapshot whose
+    /// semantic tokens were proven byte-identical.
+    ///
+    /// This updates only the cache identity and reuses the existing token
+    /// allocation and client-visible result ID.
+    pub fn promote_current(
+        &self,
+        uri: Url,
+        tokens: Arc<SemanticTokens>,
+        language: String,
+        cache_key: u64,
+        snapshot: SemanticSnapshotIdentity,
+    ) {
+        let result_id = tokens.result_id.clone();
+        let mut document = self.documents.entry(uri).or_default();
+        document.current = Some(CachedSemanticTokens {
+            tokens: Arc::clone(&tokens),
+            language,
+            snapshot,
+            cache_key,
+        });
+        if let Some(result_id) = result_id {
+            if document.baselines.contains_key(&result_id) {
+                Self::touch_baseline(&mut document, &result_id);
+            } else {
+                Self::store_baseline(&mut document, result_id, tokens);
+            }
+        }
+    }
+
     fn store_baseline(
         document: &mut SemanticDocumentCache,
         result_id: String,
@@ -718,6 +748,54 @@ mod tests {
         assert!(
             Arc::ptr_eq(&first.tokens, &second.tokens),
             "repeated reads must share one Arc allocation, not deep-copy"
+        );
+    }
+
+    #[test]
+    fn promote_current_reuses_baseline_for_a_new_snapshot_identity() {
+        let cache = SemanticTokenCache::new();
+        let uri = Url::parse("file:///unchanged_tokens.rs").unwrap();
+        let tokens = SemanticTokens {
+            result_id: Some("stable".to_string()),
+            data: vec![SemanticToken {
+                delta_line: 0,
+                delta_start: 0,
+                length: 5,
+                token_type: 0,
+                token_modifiers_bitset: 0,
+            }],
+        };
+        let old_snapshot = snapshot(1, 7, 3);
+        let new_snapshot = snapshot(2, 7, 3);
+        cache.store(uri.clone(), tokens, "rust".to_string(), 11, old_snapshot);
+        let baseline = cache
+            .get_if_valid(&uri, "stable")
+            .expect("stored result must remain a delta baseline");
+
+        cache.promote_current(
+            uri.clone(),
+            Arc::clone(&baseline),
+            "rust".to_string(),
+            12,
+            new_snapshot,
+        );
+
+        let promoted = cache
+            .get_if_same_snapshot(&uri, "rust", new_snapshot)
+            .expect("unchanged tokens must become current for the new snapshot");
+        assert!(
+            Arc::ptr_eq(&baseline, &promoted),
+            "promotion must reuse the existing token allocation"
+        );
+        assert!(
+            cache
+                .get_if_same_snapshot(&uri, "rust", old_snapshot)
+                .is_none(),
+            "the old snapshot must no longer be the current identity"
+        );
+        assert!(
+            cache.get_if_valid(&uri, "stable").is_some(),
+            "promotion must preserve the client-visible delta baseline"
         );
     }
 
