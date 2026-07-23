@@ -967,7 +967,8 @@ impl Kakehashi {
         // `try_unwrap` when the Arc is uniquely owned) instead of routing
         // through `delta_result`'s `Tokens` arm, which would clone it once
         // to build the intermediate value and again for the cache store.
-        let (final_result, tokens_to_store) = if let Some(prev) = previous_tokens {
+        let (final_result, tokens_to_store, tokens_to_promote) = if let Some(prev) = previous_tokens
+        {
             // Calculate delta or return full tokens outside the document edit
             // lock. Only the final currency check and cache commit need to be
             // serialized with didChange/didClose.
@@ -978,11 +979,19 @@ impl Kakehashi {
                 SemanticTokensFullDeltaResult::Tokens(mut tokens) => {
                     tokens.result_id = Some(next_result_id());
                     let stored = tokens.clone();
-                    (SemanticTokensFullDeltaResult::Tokens(tokens), Some(stored))
+                    (
+                        SemanticTokensFullDeltaResult::Tokens(tokens),
+                        Some(stored),
+                        None,
+                    )
                 }
                 SemanticTokensFullDeltaResult::TokensDelta(mut delta) if delta.edits.is_empty() => {
                     delta.result_id = Some(previous_result_id.clone());
-                    (SemanticTokensFullDeltaResult::TokensDelta(delta), None)
+                    (
+                        SemanticTokensFullDeltaResult::TokensDelta(delta),
+                        None,
+                        Some(prev),
+                    )
                 }
                 SemanticTokensFullDeltaResult::TokensDelta(mut delta) => {
                     let mut stored = current_tokens.into_owned();
@@ -991,6 +1000,7 @@ impl Kakehashi {
                     (
                         SemanticTokensFullDeltaResult::TokensDelta(delta),
                         Some(stored),
+                        None,
                     )
                 }
                 SemanticTokensFullDeltaResult::PartialTokensDelta { .. } => {
@@ -1002,14 +1012,22 @@ impl Kakehashi {
                     let mut tokens = current_tokens.into_owned();
                     tokens.result_id = Some(next_result_id());
                     let stored = tokens.clone();
-                    (SemanticTokensFullDeltaResult::Tokens(tokens), Some(stored))
+                    (
+                        SemanticTokensFullDeltaResult::Tokens(tokens),
+                        Some(stored),
+                        None,
+                    )
                 }
             }
         } else {
             let mut tokens = current_tokens.into_owned();
             tokens.result_id = Some(next_result_id());
             let stored = tokens.clone();
-            (SemanticTokensFullDeltaResult::Tokens(tokens), Some(stored))
+            (
+                SemanticTokensFullDeltaResult::Tokens(tokens),
+                Some(stored),
+                None,
+            )
         };
 
         let edit_lock = self.documents.edit_lock(&uri);
@@ -1027,6 +1045,14 @@ impl Kakehashi {
         }
         if let Some(tokens) = tokens_to_store {
             self.cache.store_tokens(
+                uri.clone(),
+                tokens,
+                language_name,
+                cache_key,
+                snapshot_identity,
+            );
+        } else if let Some(tokens) = tokens_to_promote {
+            self.cache.promote_current_tokens(
                 uri.clone(),
                 tokens,
                 language_name,
@@ -2112,6 +2138,103 @@ mod tests {
                 .get_tokens_if_valid(&uri, &initial_result_id)
                 .is_some(),
             "cache should still hold tokens under the reused result_id"
+        );
+    }
+
+    #[tokio::test]
+    async fn unchanged_edit_delta_promotes_tokens_to_the_new_snapshot() {
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+        let uri = Url::parse("file:///stable_edit_delta.lua").expect("should construct test uri");
+
+        server.documents.insert(
+            uri.clone(),
+            "local x = 1".to_string(),
+            Some("lua".to_string()),
+            None,
+        );
+        let settings = crate::config::WorkspaceSettings {
+            search_paths: vec![
+                std::env::var("TREE_SITTER_GRAMMARS")
+                    .unwrap_or_else(|_| "deps/tree-sitter".to_string()),
+            ],
+            ..Default::default()
+        };
+        let _ = server.language.load_settings(&settings);
+        let load_result = server.language.ensure_language_loaded("lua");
+        if !load_result.success || server.language.highlight_query("lua").is_none() {
+            eprintln!("Skipping: lua language parser or highlight query not available");
+            return;
+        }
+
+        server
+            .parse_coordinator()
+            .parse_document(uri.clone(), Some("lua"), None)
+            .await;
+        let document = TextDocumentIdentifier {
+            uri: crate::lsp::lsp_impl::url_to_uri(&uri).expect("test URI should convert"),
+        };
+        let full = server
+            .semantic_tokens_full_impl(SemanticTokensParams {
+                text_document: document.clone(),
+                work_done_progress_params: WorkDoneProgressParams::default(),
+                partial_result_params: PartialResultParams::default(),
+            })
+            .await
+            .expect("full request should succeed")
+            .expect("full request should return tokens");
+        let baseline_id = match full {
+            SemanticTokensResult::Tokens(tokens) => {
+                tokens.result_id.expect("full result should have an id")
+            }
+            other => panic!("expected full tokens, got {other:?}"),
+        };
+
+        server
+            .documents
+            .update_document(uri.clone(), "local x = 1\n".to_string(), None);
+        server
+            .parse_coordinator()
+            .parse_document(uri.clone(), Some("lua"), None)
+            .await;
+        let snapshot = server
+            .current_snapshot(&uri)
+            .await
+            .expect("edited document should publish a snapshot");
+        let snapshot_identity = SemanticSnapshotIdentity {
+            parsed_version: snapshot.parsed_version,
+            incarnation: snapshot.incarnation,
+            generation: server.cache.semantic_token_generation(),
+        };
+
+        let delta = server
+            .semantic_tokens_full_delta_impl(SemanticTokensDeltaParams {
+                text_document: document,
+                previous_result_id: baseline_id.clone(),
+                work_done_progress_params: WorkDoneProgressParams::default(),
+                partial_result_params: PartialResultParams::default(),
+            })
+            .await
+            .expect("delta request should succeed")
+            .expect("delta request should return a result");
+        assert!(
+            matches!(
+                delta,
+                SemanticTokensFullDeltaResult::TokensDelta(ref delta)
+                    if delta.edits.is_empty()
+                        && delta.result_id.as_deref() == Some(baseline_id.as_str())
+            ),
+            "a semantically unchanged edit should reuse the baseline id"
+        );
+
+        let promoted = server
+            .cache
+            .get_current_tokens_for_snapshot(&uri, "lua", snapshot_identity)
+            .expect("the empty delta must promote the baseline to the edited snapshot");
+        assert_eq!(
+            promoted.result_id.as_deref(),
+            Some(baseline_id.as_str()),
+            "snapshot promotion must preserve the client-visible result id"
         );
     }
 

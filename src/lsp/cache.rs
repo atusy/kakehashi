@@ -561,6 +561,20 @@ impl CacheCoordinator {
             .store(uri, tokens, language, cache_key, snapshot);
     }
 
+    /// Promote an existing delta baseline to the current snapshot identity
+    /// after a fresh computation proved that the token payload is unchanged.
+    pub(crate) fn promote_current_tokens(
+        &self,
+        uri: Url,
+        tokens: std::sync::Arc<SemanticTokens>,
+        language: String,
+        cache_key: u64,
+        snapshot: SemanticSnapshotIdentity,
+    ) {
+        self.semantic_cache
+            .promote_current(uri, tokens, language, cache_key, snapshot);
+    }
+
     /// Store the most-recent `semanticTokens/range` result for a document (#535),
     /// tagged with the viewport `range` and the `cache_key` it was computed under.
     pub(crate) fn store_range_tokens(
