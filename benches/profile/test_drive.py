@@ -146,9 +146,14 @@ class RequestSummaryTest(unittest.TestCase):
                     2,
                 )
             finally:
+                publish_marker(warmup_release, "")
+                publish_marker(start, "")
                 if process.poll() is None:
-                    process.kill()
-                    process.wait()
+                    try:
+                        process.communicate(timeout=1)
+                    except subprocess.TimeoutExpired:
+                        process.kill()
+                        process.wait()
 
     def test_profile_markers_are_published_and_waited_for(self):
         with tempfile.TemporaryDirectory() as temporary:
