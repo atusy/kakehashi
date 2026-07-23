@@ -488,6 +488,12 @@ impl Kakehashi {
             // Compute tokens, racing against cancel notification if provided
             let compute_future = handle_semantic_tokens_full(
                 &self.compute_pool,
+                crate::compute_pool::ComputeWork::document(
+                    "semantic_tokens",
+                    &uri,
+                    Some(snapshot.incarnation),
+                    Some(snapshot.parsed_version),
+                ),
                 text.clone(),
                 tree.clone(),
                 query,
@@ -882,6 +888,12 @@ impl Kakehashi {
                 // Compute tokens, racing against cancel notification if provided
                 let compute_future = handle_semantic_tokens_full(
                     &self.compute_pool,
+                    crate::compute_pool::ComputeWork::document(
+                        "semantic_tokens",
+                        &uri,
+                        Some(snapshot.incarnation),
+                        Some(snapshot.parsed_version),
+                    ),
                     text.clone(),
                     tree.clone(),
                     query,
@@ -1225,6 +1237,12 @@ impl Kakehashi {
 
         let result = handle_semantic_tokens_full(
             &self.compute_pool,
+            crate::compute_pool::ComputeWork::document(
+                "semantic_tokens",
+                &uri,
+                Some(snapshot.incarnation),
+                Some(snapshot.parsed_version),
+            ),
             text,
             tree,
             query,

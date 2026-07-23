@@ -103,6 +103,7 @@ fn run_sequential_injection<T>(
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn handle_semantic_tokens_full(
     pool: &crate::compute_pool::ComputePool,
+    attribution: crate::compute_pool::ComputeWork,
     text: std::sync::Arc<str>,
     tree: Tree,
     query: std::sync::Arc<Query>,
@@ -114,17 +115,6 @@ pub(crate) async fn handle_semantic_tokens_full(
     cancel: Option<crate::cancel::CancelToken>,
 ) -> Option<SemanticTokensResult> {
     let compute_threads = pool.thread_count();
-    let attribution = injection_cache.as_ref().map_or_else(
-        || crate::compute_pool::ComputeWork::anonymous("semantic_tokens"),
-        |params| {
-            crate::compute_pool::ComputeWork::document(
-                "semantic_tokens",
-                &params.uri,
-                Some(params.incarnation),
-                Some(params.parsed_version),
-            )
-        },
-    );
     pool.run(attribution, cancel.clone(), move || {
         let is_cancelled = || crate::cancel::is_cancelled(cancel.as_ref());
         let compute_started = std::time::Instant::now();
@@ -796,6 +786,7 @@ local x = 42
         // Call the async handler
         let result = handle_semantic_tokens_full(
             &crate::compute_pool::test_pool(),
+            crate::compute_pool::ComputeWork::anonymous("semantic_tokens"),
             std::sync::Arc::from(text),
             tree,
             query,
@@ -866,6 +857,7 @@ local x = 42
         // Call the async handler with empty document
         let result = handle_semantic_tokens_full(
             &crate::compute_pool::test_pool(),
+            crate::compute_pool::ComputeWork::anonymous("semantic_tokens"),
             std::sync::Arc::from(text),
             tree,
             query,
@@ -940,6 +932,7 @@ local x = 42
         // Use the full pipeline — exclusion now happens in finalize_tokens
         let result = handle_semantic_tokens_full(
             &crate::compute_pool::test_pool(),
+            crate::compute_pool::ComputeWork::anonymous("semantic_tokens"),
             std::sync::Arc::from(text),
             tree,
             md_query,
@@ -1055,6 +1048,7 @@ local x = 42
 
         let result = handle_semantic_tokens_full(
             &crate::compute_pool::test_pool(),
+            crate::compute_pool::ComputeWork::anonymous("semantic_tokens"),
             std::sync::Arc::from(text),
             tree,
             md_query,
@@ -1169,6 +1163,7 @@ local x = 42
         let capture_mappings = std::sync::Arc::new(default_capture_mappings());
         let result = handle_semantic_tokens_full(
             &crate::compute_pool::test_pool(),
+            crate::compute_pool::ComputeWork::anonymous("semantic_tokens"),
             std::sync::Arc::from(text),
             tree,
             md_query,
@@ -1283,6 +1278,7 @@ local x = 42
         // KEY: supports_multiline = true
         let result = handle_semantic_tokens_full(
             &crate::compute_pool::test_pool(),
+            crate::compute_pool::ComputeWork::anonymous("semantic_tokens"),
             std::sync::Arc::from(text),
             tree,
             md_query,
@@ -1416,6 +1412,7 @@ foo
         let capture_mappings = std::sync::Arc::new(default_capture_mappings());
         let result = handle_semantic_tokens_full(
             &crate::compute_pool::test_pool(),
+            crate::compute_pool::ComputeWork::anonymous("semantic_tokens"),
             std::sync::Arc::from(text),
             tree,
             md_query,
@@ -1528,6 +1525,7 @@ foo
 
         let result = handle_semantic_tokens_full(
             &crate::compute_pool::test_pool(),
+            crate::compute_pool::ComputeWork::anonymous("semantic_tokens"),
             std::sync::Arc::from(text),
             tree,
             md_query,

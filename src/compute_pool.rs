@@ -32,6 +32,7 @@ pub(crate) struct ComputeWork {
 }
 
 impl ComputeWork {
+    #[cfg(test)]
     pub(crate) fn anonymous(kind: &'static str) -> Self {
         Self {
             kind,
@@ -222,7 +223,9 @@ impl ComputePool {
             // timing already existed before attribution; execution timing is
             // sampled only when this debug target is enabled.
             let started = work_id.map(|_| std::time::Instant::now());
-            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(work)) {
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(work));
+            let run_us = started.map(|started| started.elapsed().as_micros());
+            match outcome {
                 Ok(value) => {
                     if let Some(work_id) = work_id {
                         log::debug!(
@@ -233,7 +236,7 @@ impl ComputePool {
                                 work: &attribution,
                                 event: "finished",
                                 queue_us: queued_for.as_micros(),
-                                run_us: started.map(|started| started.elapsed().as_micros()),
+                                run_us,
                                 elapsed_us: enqueued.elapsed().as_micros(),
                                 cancelled: crate::cancel::is_cancelled(cancel_for_work.as_ref()),
                             }
@@ -260,7 +263,7 @@ impl ComputePool {
                                 work: &attribution,
                                 event: "panicked",
                                 queue_us: queued_for.as_micros(),
-                                run_us: started.map(|started| started.elapsed().as_micros()),
+                                run_us,
                                 elapsed_us: enqueued.elapsed().as_micros(),
                                 cancelled: crate::cancel::is_cancelled(cancel_for_work.as_ref()),
                             }

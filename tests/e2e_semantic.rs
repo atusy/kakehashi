@@ -102,6 +102,80 @@ fn token_type_name(index: u32) -> &'static str {
     }
 }
 
+fn compute_events(logs: &str) -> Vec<std::collections::HashMap<&str, &str>> {
+    logs.lines()
+        .map(|line| {
+            line.split_whitespace()
+                .filter_map(|field| field.split_once('='))
+                .collect::<std::collections::HashMap<_, _>>()
+        })
+        .filter(|event| {
+            event.contains_key("work_id")
+                && event.contains_key("kind")
+                && event.contains_key("event")
+        })
+        .collect()
+}
+
+fn assert_joinable_compute(
+    events: &[std::collections::HashMap<&str, &str>],
+    kind: &str,
+    uri: &str,
+) -> (String, String) {
+    let started = events
+        .iter()
+        .find(|event| event.get("kind") == Some(&kind) && event.get("event") == Some(&"started"))
+        .unwrap_or_else(|| panic!("missing started {kind} event: {events:?}"));
+    let work_id = started["work_id"];
+    let terminal = events
+        .iter()
+        .filter(|event| {
+            event.get("work_id") == Some(&work_id)
+                && matches!(
+                    event.get("event").copied(),
+                    Some("finished" | "skipped" | "panicked")
+                )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        terminal.len(),
+        1,
+        "work_id={work_id} must have exactly one terminal event: {terminal:?}"
+    );
+    let finished = terminal[0];
+    assert_eq!(finished.get("event"), Some(&"finished"), "{finished:?}");
+
+    for event in [started, finished] {
+        assert_eq!(event.get("uri"), Some(&uri), "{event:?}");
+        assert_ne!(event.get("incarnation"), Some(&"-"), "{event:?}");
+        assert_ne!(event.get("content_version"), Some(&"-"), "{event:?}");
+        assert_eq!(
+            event.get("incarnation"),
+            started.get("incarnation"),
+            "{event:?}"
+        );
+        assert_eq!(
+            event.get("content_version"),
+            started.get("content_version"),
+            "{event:?}"
+        );
+        for timing in ["queue_us", "elapsed_us"] {
+            assert!(
+                event[timing].parse::<u128>().is_ok(),
+                "non-numeric {timing}: {event:?}"
+            );
+        }
+    }
+    assert!(
+        finished["run_us"].parse::<u128>().is_ok(),
+        "non-numeric run_us: {finished:?}"
+    );
+    (
+        started["incarnation"].to_owned(),
+        started["content_version"].to_owned(),
+    )
+}
+
 /// Shared-pool attribution must carry one joinable document identity from
 /// parse through pre-publication injection discovery and semantic compute.
 #[test]
@@ -147,17 +221,72 @@ fn compute_pool_logs_joinable_document_work() {
     );
     assert!(response.get("result").is_some(), "{response}");
 
-    let logs = client.drain_stderr();
-    for kind in ["parse_open", "injection_populate", "semantic_tokens"] {
-        assert!(
-            logs.contains(&format!("kind={kind} uri={uri}")),
-            "missing attributed {kind} event in:\n{logs}"
+    let logs = client.shutdown_and_collect_stderr();
+    let events = compute_events(&logs);
+    let expected_identity = assert_joinable_compute(&events, "parse_open", uri.as_str());
+    for kind in ["injection_populate", "semantic_tokens"] {
+        assert_eq!(
+            assert_joinable_compute(&events, kind, uri.as_str()),
+            expected_identity,
+            "{kind} must join the parse snapshot"
         );
     }
-    assert!(logs.contains("event=started queue_us="), "{logs}");
-    assert!(logs.contains("event=finished queue_us="), "{logs}");
-    assert!(logs.contains("incarnation="), "{logs}");
-    assert!(logs.contains("content_version="), "{logs}");
+}
+
+/// A range miss disables injection-token caching, but the compute still belongs
+/// to the document snapshot and must remain joinable with its parse work.
+#[test]
+fn compute_pool_logs_attribute_semantic_range() {
+    let mut client = LspClient::builder()
+        .env("RUST_LOG", "kakehashi::compute_pool=debug")
+        .build();
+    client.send_request(
+        "initialize",
+        json!({
+            "processId": std::process::id(),
+            "rootUri": null,
+            "capabilities": {
+                "textDocument": {
+                    "semanticTokens": {
+                        "dynamicRegistration": false,
+                        "requests": { "range": true },
+                        "tokenTypes": ["keyword", "variable", "function"],
+                        "tokenModifiers": [],
+                        "formats": ["relative"]
+                    }
+                }
+            }
+        }),
+    );
+    client.send_notification("initialized", json!({}));
+
+    let (uri, content, _temp_file) = create_selection_range_lua_fixture();
+    client.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri,
+                "languageId": "lua",
+                "version": 1,
+                "text": content
+            }
+        }),
+    );
+    let response = client.send_request(
+        "textDocument/semanticTokens/range",
+        json!({
+            "textDocument": { "uri": uri },
+            "range": {
+                "start": { "line": 0, "character": 0 },
+                "end": { "line": 1, "character": 0 }
+            }
+        }),
+    );
+    assert!(response.get("result").is_some(), "{response}");
+
+    let logs = client.shutdown_and_collect_stderr();
+    let events = compute_events(&logs);
+    assert_joinable_compute(&events, "semantic_tokens", uri.as_str());
 }
 
 /// Test semantic tokens for a plain Lua file.
