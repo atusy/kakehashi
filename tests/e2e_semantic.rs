@@ -202,6 +202,85 @@ fn test_semantic_tokens_lua_keyword() {
     );
 }
 
+/// The feature-enabled binary must install the counting allocator and emit one
+/// well-shaped record for a completed semantic-token work-unit. This exercises
+/// the binary boundary that allocator-only unit tests cannot cover.
+#[cfg(feature = "allocation-profile")]
+#[test]
+fn test_allocation_profile_emits_completed_semantic_record() {
+    let mut client = LspClient::builder()
+        .env("RUST_LOG", "kakehashi::semantic=debug")
+        .build();
+
+    client.send_request(
+        "initialize",
+        json!({
+            "processId": std::process::id(),
+            "rootUri": null,
+            "capabilities": {
+                "textDocument": {
+                    "semanticTokens": {
+                        "requests": { "full": true },
+                        "tokenTypes": [],
+                        "tokenModifiers": [],
+                        "formats": ["relative"]
+                    }
+                }
+            }
+        }),
+    );
+    client.send_notification("initialized", json!({}));
+
+    let (uri, content, _temp_file) = create_selection_range_lua_fixture();
+    client.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri,
+                "languageId": "lua",
+                "version": 1,
+                "text": content
+            }
+        }),
+    );
+    std::thread::sleep(Duration::from_millis(500));
+
+    let response = client.send_request(
+        "textDocument/semanticTokens/full",
+        json!({ "textDocument": { "uri": uri } }),
+    );
+    assert!(
+        response.get("result").is_some(),
+        "semantic request must complete before its allocation record: {response:?}"
+    );
+
+    let stderr = client.drain_stderr();
+    let records: Vec<_> = stderr
+        .lines()
+        .filter(|line| line.contains("compute rust allocations:"))
+        .collect();
+    assert_eq!(
+        records.len(),
+        1,
+        "one completed request must emit one allocation record; stderr:\n{stderr}"
+    );
+    let record = records[0];
+    for field in [
+        "allocations=",
+        "allocated_bytes=",
+        "deallocations=",
+        "deallocated_bytes=",
+        "scope=process_global_alloc_delta",
+        "consistency=non_atomic_snapshot",
+        "realloc_accounting=old_deallocation_plus_new_allocation",
+    ] {
+        assert!(
+            record.contains(field),
+            "allocation record must contain {field:?}: {record}"
+        );
+    }
+}
+
 /// Test semantic tokens for markdown with Lua injection.
 ///
 /// Based on test_lsp_semantic.lua test for assets/example.md
