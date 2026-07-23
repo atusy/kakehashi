@@ -71,10 +71,26 @@ python3 benches/profile/drive.py \
   --profile-hold-seconds 5 &
 driver_pid=$!
 
+wait_for_driver_marker() {
+  marker="$1"
+  while [ ! -f "$marker" ]; do
+    if ! kill -0 "$driver_pid" 2>/dev/null; then
+      wait "$driver_pid"
+      status=$?
+      [ "$status" -ne 0 ] || status=1
+      printf 'driver exited before publishing %s\n' "$marker" >&2
+      return "$status"
+    fi
+    sleep 0.05
+  done
+}
+
 # Wait until the server PID is complete and the semantic warmup has responded.
-while [ ! -s "$profile_dir/pid" ] || [ ! -f "$profile_dir/ready" ]; do
-  sleep 0.05
-done
+wait_for_driver_marker "$profile_dir/ready" || exit $?
+[ -s "$profile_dir/pid" ] || {
+  printf 'driver published ready without a PID\n' >&2
+  exit 1
+}
 server_pid="$(cat "$profile_dir/pid")"
 printf 'Attach the profiler to kakehashi PID %s\n' "$server_pid"
 
@@ -84,9 +100,7 @@ touch "$profile_dir/start"
 
 # "$profile_dir/done" marks the end of measured requests. The server remains
 # alive during the hold interval so retained-heap tools can inspect it.
-while [ ! -f "$profile_dir/done" ]; do
-  sleep 0.05
-done
+wait_for_driver_marker "$profile_dir/done" || exit $?
 heap -H "$server_pid"
 wait "$driver_pid"
 ```
