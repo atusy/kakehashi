@@ -149,6 +149,7 @@
     "b_commit": "5e2375c08b58dafae961a24b92f112bcb4f84a03",
     "b_ref": "benchmark/semantic-lazy-content-lines-2026-07-23",
     "harness_commit": "553b901bbf421e3851886c2a3e94b16adca6c34a",
+    "harness_ref": "benchmark/semantic-lazy-content-lines-harness-2026-07-23",
     "harness_sources_sha256": {
       "benches/collect_semantic_pairs.py": "7ce0d8628d2f28ac331d15ccf470e7b1b4fb596d5a475588cfa25689746de798",
       "benches/semantic_summary.py": "8aab3d2622ec7bfface33f29fee8fd695297b31eb2007fc5b2b20d8be2e3d1d0",
