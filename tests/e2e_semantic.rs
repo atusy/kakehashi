@@ -102,6 +102,64 @@ fn token_type_name(index: u32) -> &'static str {
     }
 }
 
+/// Shared-pool attribution must carry one joinable document identity from
+/// parse through pre-publication injection discovery and semantic compute.
+#[test]
+fn compute_pool_logs_joinable_document_work() {
+    let mut client = LspClient::builder()
+        .env("RUST_LOG", "kakehashi::compute_pool=debug")
+        .build();
+    client.send_request(
+        "initialize",
+        json!({
+            "processId": std::process::id(),
+            "rootUri": null,
+            "capabilities": {
+                "textDocument": {
+                    "semanticTokens": {
+                        "dynamicRegistration": false,
+                        "requests": { "full": true },
+                        "tokenTypes": ["keyword", "variable", "function"],
+                        "tokenModifiers": [],
+                        "formats": ["relative"]
+                    }
+                }
+            }
+        }),
+    );
+    client.send_notification("initialized", json!({}));
+
+    let (uri, content, _temp_file) = create_selection_range_lua_fixture();
+    client.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri,
+                "languageId": "lua",
+                "version": 1,
+                "text": content
+            }
+        }),
+    );
+    let response = client.send_request(
+        "textDocument/semanticTokens/full",
+        json!({ "textDocument": { "uri": uri } }),
+    );
+    assert!(response.get("result").is_some(), "{response}");
+
+    let logs = client.drain_stderr();
+    for kind in ["parse_open", "injection_populate", "semantic_tokens"] {
+        assert!(
+            logs.contains(&format!("kind={kind} uri={uri}")),
+            "missing attributed {kind} event in:\n{logs}"
+        );
+    }
+    assert!(logs.contains("event=started queue_us="), "{logs}");
+    assert!(logs.contains("event=finished queue_us="), "{logs}");
+    assert!(logs.contains("incarnation="), "{logs}");
+    assert!(logs.contains("content_version="), "{logs}");
+}
+
 /// Test semantic tokens for a plain Lua file.
 ///
 /// Based on test_lsp_semantic.lua test for assets/example.lua

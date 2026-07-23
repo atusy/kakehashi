@@ -11,6 +11,109 @@
 
 use crate::cancel::CancelToken;
 
+const TRACE_TARGET: &str = "kakehashi::compute_pool";
+static NEXT_WORK_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+struct DocumentIdentity {
+    uri: String,
+    incarnation: Option<u64>,
+    content_version: Option<u64>,
+}
+
+/// Attribution attached to one bounded-pool work unit.
+///
+/// Document identity is materialized only while debug logging for the compute
+/// target is enabled. The production fast path therefore carries only the
+/// static work kind and does not allocate a URI string.
+pub(crate) struct ComputeWork {
+    kind: &'static str,
+    identity: Option<Box<DocumentIdentity>>,
+    trace: bool,
+}
+
+impl ComputeWork {
+    pub(crate) fn anonymous(kind: &'static str) -> Self {
+        Self {
+            kind,
+            identity: None,
+            trace: log::log_enabled!(target: TRACE_TARGET, log::Level::Debug),
+        }
+    }
+
+    pub(crate) fn document(
+        kind: &'static str,
+        uri: &url::Url,
+        incarnation: Option<u64>,
+        content_version: Option<u64>,
+    ) -> Self {
+        let trace = log::log_enabled!(target: TRACE_TARGET, log::Level::Debug);
+        Self {
+            kind,
+            identity: trace.then(|| {
+                Box::new(DocumentIdentity {
+                    uri: uri.to_string(),
+                    incarnation,
+                    content_version,
+                })
+            }),
+            trace,
+        }
+    }
+
+    #[cfg(test)]
+    fn enabled_for_test(
+        kind: &'static str,
+        uri: &str,
+        incarnation: Option<u64>,
+        content_version: Option<u64>,
+    ) -> Self {
+        Self {
+            kind,
+            identity: Some(Box::new(DocumentIdentity {
+                uri: uri.to_owned(),
+                incarnation,
+                content_version,
+            })),
+            trace: true,
+        }
+    }
+}
+
+struct ComputeEvent<'a> {
+    work_id: u64,
+    work: &'a ComputeWork,
+    event: &'static str,
+    queue_us: u128,
+    run_us: Option<u128>,
+    elapsed_us: u128,
+    cancelled: bool,
+}
+
+impl std::fmt::Display for ComputeEvent<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let identity = self.work.identity.as_deref();
+        write!(
+            f,
+            "work_id={} kind={} uri={} incarnation={} content_version={} event={} queue_us={} run_us={} elapsed_us={} cancelled={}",
+            self.work_id,
+            self.work.kind,
+            identity.map_or("-", |identity| identity.uri.as_str()),
+            identity
+                .and_then(|identity| identity.incarnation)
+                .map_or_else(|| "-".to_owned(), |value| value.to_string()),
+            identity
+                .and_then(|identity| identity.content_version)
+                .map_or_else(|| "-".to_owned(), |value| value.to_string()),
+            self.event,
+            self.queue_us,
+            self.run_us
+                .map_or_else(|| "-".to_owned(), |value| value.to_string()),
+            self.elapsed_us,
+            self.cancelled,
+        )
+    }
+}
+
 /// The dedicated Rayon pool all synchronous tree-CPU runs on.
 ///
 /// Sized strictly below `available_parallelism` (reserving cores for the tokio
@@ -58,7 +161,12 @@ impl ComputePool {
     /// Returns `None` if the work was skipped by cancellation or panicked
     /// (the panic is contained to the work-unit and logged by the caller side
     /// observing `None`).
-    pub(crate) async fn run<T, F>(&self, cancel: Option<CancelToken>, work: F) -> Option<T>
+    pub(crate) async fn run<T, F>(
+        &self,
+        attribution: ComputeWork,
+        cancel: Option<CancelToken>,
+        work: F,
+    ) -> Option<T>
     where
         F: FnOnce() -> T + Send + 'static,
         T: Send + 'static,
@@ -72,20 +180,65 @@ impl ComputePool {
         // exactly the split a user-supplied debug log needs to attribute a
         // stall (see the 20s-response investigation).
         let enqueued = std::time::Instant::now();
+        let work_id = attribution
+            .trace
+            .then(|| NEXT_WORK_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
         self.pool.spawn(move || {
             let queued_for = enqueued.elapsed();
-            if queued_for.as_millis() > 100 {
+            if let Some(work_id) = work_id {
                 log::debug!(
-                    target: "kakehashi::compute_pool",
-                    "work unit waited {}ms in the pool queue",
-                    queued_for.as_millis()
+                    target: TRACE_TARGET,
+                    "{}",
+                    ComputeEvent {
+                        work_id,
+                        work: &attribution,
+                        event: "started",
+                        queue_us: queued_for.as_micros(),
+                        run_us: None,
+                        elapsed_us: enqueued.elapsed().as_micros(),
+                        cancelled: crate::cancel::is_cancelled(cancel_for_work.as_ref()),
+                    }
                 );
             }
             if crate::cancel::is_cancelled(cancel_for_work.as_ref()) {
+                if let Some(work_id) = work_id {
+                    log::debug!(
+                        target: TRACE_TARGET,
+                        "{}",
+                        ComputeEvent {
+                            work_id,
+                            work: &attribution,
+                            event: "skipped",
+                            queue_us: queued_for.as_micros(),
+                            run_us: Some(0),
+                            elapsed_us: enqueued.elapsed().as_micros(),
+                            cancelled: true,
+                        }
+                    );
+                }
                 return; // dropping tx resolves the awaiter with None
             }
+            // Avoid a second clock read on the production fast path. Queue
+            // timing already existed before attribution; execution timing is
+            // sampled only when this debug target is enabled.
+            let started = work_id.map(|_| std::time::Instant::now());
             match std::panic::catch_unwind(std::panic::AssertUnwindSafe(work)) {
                 Ok(value) => {
+                    if let Some(work_id) = work_id {
+                        log::debug!(
+                            target: TRACE_TARGET,
+                            "{}",
+                            ComputeEvent {
+                                work_id,
+                                work: &attribution,
+                                event: "finished",
+                                queue_us: queued_for.as_micros(),
+                                run_us: started.map(|started| started.elapsed().as_micros()),
+                                elapsed_us: enqueued.elapsed().as_micros(),
+                                cancelled: crate::cancel::is_cancelled(cancel_for_work.as_ref()),
+                            }
+                        );
+                    }
                     let _ = tx.send(value);
                 }
                 Err(payload) => {
@@ -98,6 +251,21 @@ impl ComputePool {
                         target: "kakehashi::crash_recovery",
                         "compute-pool work unit panicked: {msg}"
                     );
+                    if let Some(work_id) = work_id {
+                        log::debug!(
+                            target: TRACE_TARGET,
+                            "{}",
+                            ComputeEvent {
+                                work_id,
+                                work: &attribution,
+                                event: "panicked",
+                                queue_us: queued_for.as_micros(),
+                                run_us: started.map(|started| started.elapsed().as_micros()),
+                                elapsed_us: enqueued.elapsed().as_micros(),
+                                cancelled: crate::cancel::is_cancelled(cancel_for_work.as_ref()),
+                            }
+                        );
+                    }
                 }
             }
         });
@@ -130,10 +298,30 @@ pub(crate) fn test_pool() -> std::sync::Arc<ComputePool> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn attributed_event_keeps_document_identity_and_phase_timings() {
+        let work =
+            ComputeWork::enabled_for_test("parse", "file:///workspace/main.rs", Some(7), Some(42));
+        let event = ComputeEvent {
+            work_id: 3,
+            work: &work,
+            event: "finished",
+            queue_us: 11,
+            run_us: Some(23),
+            elapsed_us: 34,
+            cancelled: true,
+        };
+
+        assert_eq!(
+            event.to_string(),
+            "work_id=3 kind=parse uri=file:///workspace/main.rs incarnation=7 content_version=42 event=finished queue_us=11 run_us=23 elapsed_us=34 cancelled=true"
+        );
+    }
+
     #[tokio::test]
     async fn run_executes_work_and_returns_result() {
         let pool = ComputePool::new();
-        let result = pool.run(None, || 42).await;
+        let result = pool.run(ComputeWork::anonymous("test"), None, || 42).await;
         assert_eq!(result, Some(42));
     }
 
@@ -142,7 +330,9 @@ mod tests {
         let pool = ComputePool::with_threads(1);
         let token = CancelToken::default();
         token.cancel();
-        let result = pool.run(Some(token), || 42).await;
+        let result = pool
+            .run(ComputeWork::anonymous("test"), Some(token), || 42)
+            .await;
         assert_eq!(result, None, "cancelled work-unit must be skipped");
     }
 
@@ -154,7 +344,7 @@ mod tests {
         let blocker = {
             let pool = std::sync::Arc::clone(&pool);
             tokio::spawn(async move {
-                pool.run(None, move || {
+                pool.run(ComputeWork::anonymous("test"), None, move || {
                     started_tx.send(()).expect("test receiver should wait");
                     release_rx.recv().expect("test should release blocker");
                 })
@@ -164,7 +354,7 @@ mod tests {
         started_rx.await.expect("blocker should start");
 
         let token = CancelToken::default();
-        let queued = pool.run(Some(token.clone()), || 42);
+        let queued = pool.run(ComputeWork::anonymous("test"), Some(token.clone()), || 42);
         token.cancel();
 
         let result = tokio::time::timeout(std::time::Duration::from_millis(100), queued)
@@ -181,9 +371,14 @@ mod tests {
     #[tokio::test]
     async fn run_contains_a_panicking_work_unit() {
         let pool = ComputePool::with_threads(1);
-        let result: Option<i32> = pool.run(None, || panic!("boom")).await;
+        let result: Option<i32> = pool
+            .run(ComputeWork::anonymous("test"), None, || panic!("boom"))
+            .await;
         assert_eq!(result, None);
         // The pool thread survives the panic and keeps serving work.
-        assert_eq!(pool.run(None, || 7).await, Some(7));
+        assert_eq!(
+            pool.run(ComputeWork::anonymous("test"), None, || 7).await,
+            Some(7)
+        );
     }
 }
