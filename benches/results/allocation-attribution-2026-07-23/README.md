@@ -1,8 +1,9 @@
 # Semantic allocation attribution, 2026-07-23
 
-This evidence records Rust `GlobalAlloc` traffic during completed
-`semanticTokens/full` work-units. It is measurement-only evidence for #896; it
-does not claim a latency improvement.
+This evidence records mixed process-wide Rust `GlobalAlloc` traffic during
+completed `semanticTokens/full` compute windows. It is measurement-only
+evidence for #896; it does not claim semantic-only attribution or a latency
+improvement.
 
 ## Environment
 
@@ -46,6 +47,21 @@ measurement_source=089f6e72e8a189e884a02364efeb3d480e519556
 measurement_root="$(mktemp -d "${TMPDIR:-/tmp}/kakehashi-measurement.XXXXXX")"
 measurement_worktree="$measurement_root/source"
 measurement_target="$measurement_root/target"
+
+cleanup_measurement() {
+  trap - EXIT HUP INT TERM
+  if [ -n "${measurement_worktree:-}" ]; then
+    git worktree remove --force "$measurement_worktree" 2>/dev/null || true
+  fi
+  if [ -n "${measurement_root:-}" ] && [ -d "$measurement_root" ]; then
+    rm -r "$measurement_root"
+  fi
+}
+trap cleanup_measurement EXIT
+trap 'cleanup_measurement; exit 129' HUP
+trap 'cleanup_measurement; exit 130' INT
+trap 'cleanup_measurement; exit 143' TERM
+
 git worktree add --detach "$measurement_worktree" "$measurement_source"
 cargo build \
   --manifest-path "$measurement_worktree/Cargo.toml" \
@@ -68,6 +84,8 @@ RUST_LOG=kakehashi::semantic=debug \
     --data-dir "$PWD/deps/test/kakehashi" \
     --lang rust --size 150 --requests 36 --edits 1 \
     2> /tmp/kakehashi-allocation-rust-final.log
+
+cleanup_measurement
 ```
 
 The 36 allocation log lines, with only logger timestamps/prefixes removed, are
@@ -109,10 +127,12 @@ Full-log SHA-256:
 | Rust | allocation events | 30 | 87,132.0 | 94,424 | 108,393 | 58,245 | 108,625 |
 | Rust | requested allocated bytes | 30 | 24,305,204.4 | 24,362,260 | 25,268,752 | 23,196,788 | 25,269,509 |
 
-The Rust workload shows especially high realloc-inclusive requested-capacity
-traffic. This identifies artifact construction and chunk/buffer reuse as
-measurement candidates for #896; this evidence alone does not determine
-retained growth or predict the latency effect of either change.
+The Rust request windows show especially high realloc-inclusive
+requested-capacity traffic. This makes artifact construction and chunk/buffer
+reuse reasonable measurement candidates for #896, but the process-global
+counter cannot assign the traffic to semantic compute versus overlapping
+background work. This evidence alone also does not determine retained growth or
+predict the latency effect of either change.
 
 ## Scope and limitations
 
@@ -123,9 +143,12 @@ retained growth or predict the latency effect of either change.
   full requested new-size allocation even when it happens in place. Counts are
   therefore allocation events, not distinct pointers, and byte totals are
   requested-capacity traffic, not bytes physically copied.
-- The process-wide attribution is meaningful here because the synchronous
-  driver issued no competing requests. Rayon allocations through
-  `GlobalAlloc` remain included.
+- The synchronous driver issued no competing client requests. It does not make
+  the process quiescent: parse-loop injection, bridge, diagnostic, or other
+  background work may overlap after a snapshot is published. The values are
+  therefore mixed process traffic during a semantic compute window, not
+  semantic-only attribution. Rayon allocations through `GlobalAlloc` remain
+  included.
 - The four counters use independent atomic snapshots. Boundary observations
   are approximate, so the aggregate of repeated records is the intended unit
   of evidence; derived net-live values are intentionally not reported.
