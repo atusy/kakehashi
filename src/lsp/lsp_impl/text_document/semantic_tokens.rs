@@ -913,18 +913,12 @@ impl Kakehashi {
                 };
                 // Do not allocate artifact identity or shape a payload for work
                 // already made obsolete while the compute was in flight. The
-                // outer checks remain necessary for cache hits and for a
-                // cancellation racing with materialization itself.
+                // outer cancellation check remains necessary for cache hits and
+                // for a cancellation racing with materialization itself; the
+                // existing activity check immediately after materialization
+                // avoids adding a second DashMap lookup to every computed delta.
                 if cancel_token.is_cancelled() {
                     self.cache.finish_request(&uri, request_id);
-                    log::debug!(
-                        target: "kakehashi::semantic",
-                        "[SEMANTIC_TOKENS_DELTA] CANCELLED uri={} req={} (before artifact)",
-                        uri, request_id
-                    );
-                    return Ok(None);
-                }
-                if !self.cache.is_request_active(&uri, request_id) {
                     log::debug!(
                         target: "kakehashi::semantic",
                         "[SEMANTIC_TOKENS_DELTA] CANCELLED uri={} req={} (before artifact)",
