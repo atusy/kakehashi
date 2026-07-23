@@ -17,6 +17,10 @@ trap 'rm -r "$source_root"' EXIT HUP INT TERM
 
 rm -r "$pinned_source_dir" 2>/dev/null || true
 mkdir -p "$data_dir/cache" "$data_dir/parser" "$pinned_source_dir"
+for language in comment lua markdown markdown_inline python rust; do
+  rm -r "$data_dir/queries/$language" 2>/dev/null || true
+  mkdir -p "$data_dir/queries/$language"
+done
 curl -fL \
   "$nvim_treesitter_raw/lua/nvim-treesitter/parsers.lua" \
   -o "$data_dir/cache/parsers.lua"
@@ -52,7 +56,7 @@ compile_parser markdown https://github.com/tree-sitter-grammars/tree-sitter-mark
 compile_parser markdown_inline https://github.com/tree-sitter-grammars/tree-sitter-markdown \
   c3570720f7f7bbad22fe96603f106276618e0cf5 tree-sitter-markdown-inline
 compile_parser python https://github.com/tree-sitter/tree-sitter-python \
-  v0.25.0 .
+  293fdc02038ee2bf0e2e206711b69c90ac0d413f .
 compile_parser rust https://github.com/tree-sitter/tree-sitter-rust \
   77a3747266f4d621d0757825e6b11edcbf991ca5 .
 
