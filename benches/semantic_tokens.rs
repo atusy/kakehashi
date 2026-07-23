@@ -880,14 +880,18 @@ fn run_once(
             server.did_change_append_newline(scn.uri, edit.version, edit.append_line);
             edit.append_line += 1;
             let baseline = baseline.as_mut().expect("delta baseline");
+            let result_id = baseline.result_id().to_string();
             let edited = server.semantic_delta(scn.uri, baseline.result_id());
+            validate_empty_delta_response(scn, &edited, &result_id, "stable edit");
             baseline.apply_response(&edited).unwrap_or_else(|error| {
                 panic!(
                     "invalid semantic response after stable edit for {}: {error:?}",
                     scn.name
                 )
             });
+            let result_id = baseline.result_id().to_string();
             let follow_up = server.semantic_delta(scn.uri, baseline.result_id());
+            validate_empty_delta_response(scn, &follow_up, &result_id, "same-snapshot follow-up");
             baseline.apply_response(&follow_up).unwrap_or_else(|error| {
                 panic!(
                     "invalid same-snapshot follow-up response for {}: {error:?}",
@@ -957,6 +961,28 @@ fn run_once(
             });
         }
     }
+}
+
+fn validate_empty_delta_response(
+    scn: &Scenario,
+    response: &Value,
+    expected_result_id: &str,
+    phase: &str,
+) {
+    assert_eq!(
+        response.get("resultId").and_then(Value::as_str),
+        Some(expected_result_id),
+        "{phase} must preserve the semantic baseline id for {}: {response}",
+        scn.name
+    );
+    assert!(
+        response
+            .get("edits")
+            .and_then(Value::as_array)
+            .is_some_and(Vec::is_empty),
+        "{phase} must return an empty delta for {}: {response}",
+        scn.name
+    );
 }
 
 fn validate_full_response_generators() {
