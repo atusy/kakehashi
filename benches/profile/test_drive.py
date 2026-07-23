@@ -175,6 +175,8 @@ class RequestSummaryTest(unittest.TestCase):
             marker = pathlib.Path(temporary) / "missing"
             with self.assertRaisesRegex(TimeoutError, "missing"):
                 wait_for_marker(marker, 0.01)
+            with self.assertRaisesRegex(TimeoutError, temporary):
+                wait_for_marker(pathlib.Path(temporary), 0.01)
 
     def test_profile_marker_paths_must_be_distinct(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -193,6 +195,23 @@ class RequestSummaryTest(unittest.TestCase):
                 with self.subTest(paths=paths):
                     with self.assertRaisesRegex(ValueError, "contain one another"):
                         validate_profile_marker_paths(paths)
+        with self.assertRaisesRegex(ValueError, "must not be empty"):
+            validate_profile_marker_paths([""])
+
+        result = subprocess.run(
+            [
+                sys.executable,
+                str(pathlib.Path(__file__).parent / "drive.py"),
+                "--bin=not-used-after-validation",
+                "--requests=1",
+                "--profile-start-file=",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=3,
+        )
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn("must not be empty", result.stderr)
 
     def test_profile_timing_options_must_be_finite(self):
         drive = str(pathlib.Path(__file__).parent / "drive.py")
