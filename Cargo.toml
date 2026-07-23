@@ -107,6 +107,7 @@ nix = { version = "0.31", features = ["signal", "process", "fs"] }
 
 [features]
 e2e = []
+allocation-profile = []
 
 # Unix-only dev dependencies: pipe() for deterministic broken-pipe tests,
 # Signal::SIGPIPE for asserting the termination signal.

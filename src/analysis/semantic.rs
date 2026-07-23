@@ -117,6 +117,8 @@ pub(crate) async fn handle_semantic_tokens_full(
     pool.run(cancel.clone(), move || {
         let is_cancelled = || crate::cancel::is_cancelled(cancel.as_ref());
         let compute_started = std::time::Instant::now();
+        #[cfg(feature = "allocation-profile")]
+        let allocation_started = crate::allocation_profile::snapshot();
         let mut host_tokens: Vec<RawToken> = Vec::with_capacity(1000);
         let lines: Vec<&str> = text.lines().collect();
         let line_starts = build_line_start_bytes(&text);
@@ -260,6 +262,20 @@ pub(crate) async fn handle_semantic_tokens_full(
                 .map(|d| d.regions.len().to_string())
                 .unwrap_or_else(|| "none".to_string()),
         );
+        #[cfg(feature = "allocation-profile")]
+        {
+            let allocation_delta =
+                crate::allocation_profile::snapshot().delta_since(allocation_started);
+            log::debug!(
+                target: "kakehashi::semantic",
+                "[SEMANTIC_TOKENS] compute allocations: allocations={} allocated_bytes={} deallocations={} deallocated_bytes={} live_bytes_change={} scope=process_delta",
+                allocation_delta.allocations,
+                allocation_delta.allocated_bytes,
+                allocation_delta.deallocations,
+                allocation_delta.deallocated_bytes,
+                allocation_delta.live_bytes_change(),
+            );
+        }
 
         result
     })
