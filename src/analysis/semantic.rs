@@ -238,6 +238,12 @@ pub(crate) async fn handle_semantic_tokens_full(
         if is_cancelled() {
             return None;
         }
+        // Close the measurement after request-owned scratch state is released,
+        // while keeping the returned semantic result live for its caller.
+        drop(active_injection_regions);
+        drop(lines);
+        drop(line_starts);
+        drop(cache_ctx);
         #[cfg(feature = "allocation-profile")]
         let allocation_delta =
             crate::allocation_profile::snapshot().delta_since(allocation_started);
