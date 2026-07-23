@@ -259,6 +259,22 @@ class RequestSummaryTest(unittest.TestCase):
         self.assertEqual(result.returncode, 2, result.stderr)
         self.assertIn("must not be empty", result.stderr)
 
+        result = subprocess.run(
+            [
+                sys.executable,
+                str(pathlib.Path(__file__).parent / "drive.py"),
+                "--bin=not-used-after-validation",
+                "--requests=1",
+                "--profile-start-file=~kakehashi-profile-no-such-user/start",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=3,
+        )
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn("invalid profile marker path", result.stderr)
+        self.assertNotIn("Traceback", result.stderr)
+
     def test_profile_timing_options_must_be_finite(self):
         drive = str(pathlib.Path(__file__).parent / "drive.py")
         for option, value in (
