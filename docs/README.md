@@ -831,6 +831,7 @@ kakehashi uses Rust's standard logging with `env_logger`. Configure logging via 
 | `kakehashi::lock_recovery` | warn | Thread synchronization recovery events |
 | `kakehashi::crash_recovery` | error | Parser crash detection and recovery |
 | `kakehashi::query` | info | Query syntax/validation issues |
+| `kakehashi::compute_pool` | debug | Per-work queue/run timing with document version identity |
 
 ### Examples
 
@@ -846,7 +847,17 @@ RUST_LOG=kakehashi::query=info kakehashi
 
 # Show lock recovery events (for debugging thread issues)
 RUST_LOG=kakehashi::lock_recovery=warn kakehashi
+
+# Attribute shared-pool contention without enabling unrelated debug logs
+RUST_LOG=kakehashi::compute_pool=debug kakehashi
 ```
+
+Compute-pool events share a process-local `work_id`. A `started` event reports
+the enqueue-to-start `queue_us`; the matching `finished`, `skipped`, or
+`panicked` event reports total `elapsed_us`, execution `run_us`, cancellation
+state, work kind, and—where the work belongs to a document—URI, incarnation,
+and content version. This lets mixed request logs distinguish queue pressure
+from work that continued after its document version became obsolete.
 
 **Note:** Logs are written to stderr. Stdout is reserved for LSP JSON-RPC protocol messages.
 

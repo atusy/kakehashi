@@ -108,9 +108,15 @@ impl Kakehashi {
         // a user-triggered, infrequent read, so per-request parsers beat
         // cross-request reuse here.
         let language = std::sync::Arc::clone(&self.language);
+        let attribution = crate::compute_pool::ComputeWork::document(
+            "selection_range",
+            &uri,
+            Some(expected_incarnation),
+            Some(expected_version),
+        );
         let result = self
             .compute_pool
-            .run(None, move || {
+            .run(attribution, None, move || {
                 let mut pool = language.create_document_parser_pool();
                 handle_selection_range(
                     &snapshot.text,

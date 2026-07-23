@@ -1178,9 +1178,16 @@ impl Kakehashi {
             }
             (latch, current)
         };
-        let walk_future = self
-            .compute_pool
-            .run(Some(cancel_token.clone()), move || {
+        let attribution = crate::compute_pool::ComputeWork::document(
+            "captures",
+            &uri,
+            Some(incarnation),
+            Some(parsed_version),
+        );
+        let walk_future = self.compute_pool.run(
+            attribution,
+            Some(cancel_token.clone()),
+            move || {
                 // Lazily build the snapshot's layer trees on first use (this
                 // is the same walk the inline path would run) and share them
                 // across every subsequent walk on this snapshot — captures
@@ -1255,7 +1262,8 @@ impl Kakehashi {
                     walked.as_ref().map_or(0, |(m, _)| m.len()),
                 );
                 walked
-            });
+            },
+        );
         let walked = if let Some(cancel_rx) = cancel_rx {
             tokio::pin!(cancel_rx);
             let superseded = walk_cancel.cancelled();

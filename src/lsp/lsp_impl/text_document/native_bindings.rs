@@ -124,7 +124,14 @@ impl Kakehashi {
         // boundaries: a cursor inside an injected region resolves in that
         // region's layer alone.
         let (query, layer_text, layer_tree, layer_offset) = match self
-            .injected_bindings_layer(&uri, &text, &tree, &language, byte)
+            .injected_bindings_layer(
+                &uri,
+                &text,
+                &tree,
+                &language,
+                byte,
+                (incarnation, content_version),
+            )
             .await
         {
             Some(Some(layer)) => layer,
@@ -216,6 +223,7 @@ impl Kakehashi {
         tree: &tree_sitter::Tree,
         host_language: &str,
         byte: usize,
+        snapshot_identity: (u64, u64),
     ) -> Option<Option<LayerInputs>> {
         use crate::language::injection::{
             collect_all_injections, compute_included_ranges, parse_with_ranges,
@@ -264,6 +272,12 @@ impl Kakehashi {
                 &layer_language,
                 uri,
                 content_text.len(),
+                crate::compute_pool::ComputeWork::document(
+                    "native_bindings_parse",
+                    uri,
+                    Some(snapshot_identity.0),
+                    Some(snapshot_identity.1),
+                ),
                 // The work-unit deadline is for main-document parses;
                 // parse_with_ranges self-bounds at NATIVE_PARSE_BUDGET.
                 move |mut parser, _deadline, _generation_retry| {

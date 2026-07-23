@@ -1,0 +1,31 @@
+
+semantic-tokens benchmark  (iters=30, warmup=12, lower is better)
+  B = <TEMP>/target-b/release/kakehashi
+  A = <TEMP>/target-a/release/kakehashi
+
+scenario                                B (med)      A (med) Δ (A vs B)
+------------------------------------------------------------------------
+rust_large/full_cache_hit               2.587ms      2.607ms        +0.8%
+    p95:      2.772ms      2.877ms
+    └ targets: large exact-snapshot semantic cache-hit control
+rust_large/typing_delta                25.988ms     25.432ms         -2.1%
+    p95:     27.757ms     26.090ms
+    └ targets: unique edit states→reparse→retokenize→delta; excludes A/B cache returns
+rust_sparse_32k_minus/typing_delta      8.347ms      8.342ms         -0.1%
+    p95:      8.885ms      9.357ms
+    └ targets: sparse low-match control just below 32 KiB
+rust_sparse_32k_exact/typing_delta      9.409ms      8.640ms         -8.2%
+    p95:     10.439ms     10.166ms
+    └ targets: sparse low-match control at 32 KiB
+rust_sparse_32k_plus/typing_delta       8.129ms      8.540ms        +5.1%
+    p95:      9.281ms      9.163ms
+    └ targets: sparse low-match control just above 32 KiB
+rust_sparse_64k/typing_delta           16.808ms     16.966ms        +0.9%
+    p95:     18.976ms     18.982ms
+    └ targets: sparse low-match query walk at 64 KiB
+rust_large/typing_burst                29.937ms     27.216ms         -9.1%
+    p95:     31.955ms     30.042ms
+    └ targets: eight queued unique edits→current delta; latest-state follow latency
+rust_xlarge/cancel_burst              144.080ms    135.056ms         -6.3%
+    p95:    181.484ms    149.892ms
+    └ targets: current-token latency after four explicitly cancelled edit states

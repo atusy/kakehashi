@@ -1117,6 +1117,7 @@ mod tests {
                 "test",
                 &url::Url::parse("file:///reload-race.test").unwrap(),
                 0,
+                crate::compute_pool::ComputeWork::anonymous("test_parse"),
                 move |parser, _deadline, generation_retry| {
                     let call = calls_for_parse.fetch_add(1, Ordering::SeqCst);
                     assert_eq!(generation_retry, call != 0);
@@ -1194,6 +1195,7 @@ mod tests {
                 "test",
                 &url::Url::parse("file:///stuck-reload.test").unwrap(),
                 0,
+                crate::compute_pool::ComputeWork::anonymous("test_parse"),
                 |parser, _deadline, _generation_retry| (parser, Some(1)),
             )
             .await;
