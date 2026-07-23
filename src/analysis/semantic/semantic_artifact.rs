@@ -110,6 +110,7 @@ pub(crate) struct SemanticArtifact {
 pub(crate) struct SemanticArtifactSlot {
     attempt: std::sync::Mutex<Option<SemanticArtifactAttempt>>,
     minimum_generation: std::sync::atomic::AtomicU64,
+    generation_source: std::sync::OnceLock<Arc<std::sync::atomic::AtomicU64>>,
     retired: std::sync::atomic::AtomicBool,
     #[cfg(test)]
     producer_starts: std::sync::atomic::AtomicUsize,
@@ -201,6 +202,7 @@ impl SemanticArtifactSlot {
         Self {
             attempt: std::sync::Mutex::new(None),
             minimum_generation: std::sync::atomic::AtomicU64::new(0),
+            generation_source: std::sync::OnceLock::new(),
             retired: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
             producer_starts: std::sync::atomic::AtomicUsize::new(0),
@@ -227,11 +229,18 @@ impl SemanticArtifactSlot {
         Fut: std::future::Future<Output = Option<SemanticArtifact>> + Send + 'static,
     {
         let mut attempt = self.attempt.lock().unwrap_or_else(|e| e.into_inner());
+        let minimum_generation = self
+            .generation_source
+            .get()
+            .map_or(0, |source| {
+                source.load(std::sync::atomic::Ordering::Acquire)
+            })
+            .max(
+                self.minimum_generation
+                    .load(std::sync::atomic::Ordering::Acquire),
+            );
         if self.retired.load(std::sync::atomic::Ordering::Acquire)
-            || identity.snapshot.generation
-                < self
-                    .minimum_generation
-                    .load(std::sync::atomic::Ordering::Acquire)
+            || identity.snapshot.generation < minimum_generation
         {
             return SemanticArtifactConsumer::unavailable();
         }
@@ -356,6 +365,20 @@ impl SemanticArtifactSlot {
         {
             previous.control.cancel.cancel();
         }
+    }
+
+    /// Attach the store-wide settings epoch before this slot becomes visible.
+    ///
+    /// Claims read the shared source directly, so a reload's atomic epoch bump
+    /// rejects obsolete work immediately even while its best-effort scan is
+    /// still waiting to cancel already-installed producers.
+    pub(crate) fn attach_generation_source(&self, source: Arc<std::sync::atomic::AtomicU64>) {
+        if let Some(current) = self.generation_source.get() {
+            debug_assert!(Arc::ptr_eq(current, &source));
+        } else {
+            let _ = self.generation_source.set(Arc::clone(&source));
+        }
+        self.advance_minimum_generation(source.load(std::sync::atomic::Ordering::Acquire));
     }
 
     fn remove_failed_attempt(&self, id: u64) {
@@ -892,6 +915,25 @@ mod tests {
                 .materialize_full(current_identity.as_ref(), None)
                 .is_some()
         );
+    }
+
+    #[tokio::test]
+    async fn shared_generation_source_rejects_claim_before_snapshot_scan() {
+        let slot = std::sync::Arc::new(SemanticArtifactSlot::new());
+        let source = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(11));
+        slot.attach_generation_source(std::sync::Arc::clone(&source));
+        source.store(12, std::sync::atomic::Ordering::Release);
+
+        let starts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let obsolete = slot.claim_or_join(identity_at_generation(11), {
+            let starts = std::sync::Arc::clone(&starts);
+            move |_cancel, identity| async move {
+                starts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Some(artifact(identity, 11))
+            }
+        });
+        assert!(obsolete.await.is_none());
+        assert_eq!(starts.load(std::sync::atomic::Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
