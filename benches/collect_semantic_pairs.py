@@ -237,6 +237,18 @@ def manifest_sha256(entries: list[dict[str, Any]]) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
+def write_installed_data_manifest(
+    artifact_dir: Path, entries: list[dict[str, Any]]
+) -> dict[str, str]:
+    """Record installed parser/query identity without publishing the artifacts."""
+    path = artifact_dir / "fixture-manifest.json"
+    path.write_text(json.dumps(entries, indent=2, sort_keys=True) + "\n")
+    return {
+        "fixture_manifest": path.name,
+        "fixture_manifest_sha256": file_sha256(path),
+    }
+
+
 def set_tree_read_only(root: Path) -> None:
     for path in root.rglob("*"):
         if not path.is_symlink():
@@ -432,12 +444,8 @@ def main() -> None:
                 | {"KAKEHASHI_BENCH_PREPARE_DATA_DIR": str(fixture)},
             )
             fixture_entries = tree_manifest(fixture)
-            fixture_archive = artifact_dir / "fixture"
-            shutil.copytree(fixture, fixture_archive, symlinks=True)
-            if tree_manifest(fixture_archive) != fixture_entries:
-                raise RuntimeError("archived fixture differs from measured fixture")
-            (artifact_dir / "fixture-manifest.json").write_text(
-                json.dumps(fixture_entries, indent=2, sort_keys=True) + "\n"
+            fixture_metadata = write_installed_data_manifest(
+                artifact_dir, fixture_entries
             )
             set_tree_read_only(fixture)
 
@@ -600,14 +608,7 @@ def main() -> None:
                     ),
                 },
                 "raw_files": raw_files,
-                "fixture_manifest": "fixture-manifest.json",
-                "fixture_manifest_sha256": file_sha256(
-                    artifact_dir / "fixture-manifest.json"
-                ),
-                "fixture_archive": "fixture",
-                "fixture_archive_sha256": manifest_sha256(
-                    tree_manifest(fixture_archive)
-                ),
+                **fixture_metadata,
                 "summary": "summary.json",
                 "summary_sha256": file_sha256(artifact_dir / "summary.json"),
             }

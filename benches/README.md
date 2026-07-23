@@ -32,11 +32,14 @@ attestation, and raw-contract check succeeds. A failed run removes its staging
 artifacts and reports any exact worktree cleanup failure, so the same output
 path can be retried.
 
-The resulting `manifest.json` binds source commits, binary and harness hashes,
-the read-only parser/query fixture (whose exact contents are archived alongside
-the manifest), effective build/runtime environment,
-toolchain versions, raw sample hashes, and summary hash. `summary.json` reports
-the median and range of paired median deltas. Per-run p95 is descriptive only.
+The collector uses kakehashi's installer to create a temporary parser/query
+data directory, freezes it for the timed runs, and removes it afterward. The
+resulting `manifest.json` binds source commits, binary and harness hashes, the
+installed-data tree hash, effective build/runtime environment, toolchain
+versions, raw sample hashes, and summary hash. `fixture-manifest.json` records
+the installed file names and hashes for provenance; parser libraries and query
+files themselves are not copied into the repository. `summary.json` reports the
+median and range of paired median deltas. Per-run p95 is descriptive only.
 
 If a measured source is not retained by the repository's main history, give it
 a durable tag before collection and use that tag as the collector ref. This
