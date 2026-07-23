@@ -832,7 +832,7 @@ kakehashi uses Rust's standard logging with `env_logger`. Configure logging via 
 | `kakehashi::crash_recovery` | error | Parser crash detection and recovery |
 | `kakehashi::query` | info | Query syntax/validation issues |
 | `kakehashi::compute_pool` | debug | Per-work queue/run timing with document version identity |
-| `kakehashi::semantic_metrics` | debug | Semantic phase timing, token counts, and owned-capacity estimates |
+| `kakehashi::semantic_metrics` | debug | Semantic phase timing, token counts, and owned-capacity estimates; requires `kakehashi::compute_pool=debug` |
 
 ### Examples
 
@@ -868,7 +868,9 @@ for the named owned vectors: `line_index_capacity_bytes` covers the line slices
 and byte index, `collected_raw_capacity_bytes` covers host/injection collection
 and their merge (not allocations internal to finalization), and
 `result_capacity_bytes` covers the encoded semantic-token vector. They are not
-process RSS or allocator counters.
+process RSS or allocator counters. `kakehashi::semantic_metrics=debug` alone
+does not emit events: enable `kakehashi::compute_pool=debug` as in the example
+above so every semantic event has a corresponding compute-work join key.
 
 **Note:** Logs are written to stderr. Stdout is reserved for LSP JSON-RPC protocol messages.
 
