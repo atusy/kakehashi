@@ -1,8 +1,13 @@
-//! Compile-time opt-in Rust `GlobalAlloc` counters for profiling builds.
+//! Compile-time opt-in Rust `GlobalAlloc` traffic counters for profiling builds.
 //!
 //! The global allocator remains [`std::alloc::System`]; this wrapper only adds
 //! relaxed monotonic counters. Keeping the module behind the
 //! `allocation-profile` feature means ordinary builds pay no atomic overhead.
+//! A successful `realloc` is represented as one deallocation of the full old
+//! layout plus one allocation of the full requested new size, even when the
+//! system allocator grows or shrinks in place. The totals are therefore
+//! realloc-inclusive requested-capacity traffic, not counts of distinct
+//! pointers or bytes physically copied.
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicU64, Ordering};
