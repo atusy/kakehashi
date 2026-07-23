@@ -42,7 +42,7 @@ once per host or injection collection rather than once per match.
 Only `rust_sparse_32k_exact/typing_delta` improved in all four pairs (-1.70%
 median). Markdown typing delta and burst had +0.73% and +0.49% medians,
 respectively, while Rust large delta was effectively unchanged (+0.15%).
-Request-local precomputation therefore adds fixed work without demonstrating a
+Collection-local precomputation therefore adds fixed work without demonstrating a
 general end-to-end benefit.
 
 Evidence: `semantic-pattern-priority-table-2026-07-23/`
