@@ -24,6 +24,7 @@ import sys
 import tempfile
 import threading
 import time
+import unicodedata
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from gen_session import gen_rust, gen_markdown_injections  # noqa: E402
@@ -91,17 +92,20 @@ def validate_profile_marker_paths(
     paths: list[Path | str | None],
 ) -> None:
     """Reject aliases that could satisfy a profiling phase prematurely."""
-    seen: dict[Path, Path | str] = {}
+    seen: dict[str, Path | str] = {}
     for path in paths:
         if path is None:
             continue
         resolved = Path(path).expanduser().resolve()
-        if resolved in seen:
-            previous = seen[resolved]
+        # Marker names are a cross-process protocol, so conservatively reject
+        # case/normalization-only differences even on a case-sensitive volume.
+        key = unicodedata.normalize("NFC", str(resolved)).casefold()
+        if key in seen:
+            previous = seen[key]
             raise ValueError(
                 f"profile marker paths must be distinct: {previous} and {path}"
             )
-        seen[resolved] = path
+        seen[key] = path
 
 
 def summarize_samples(samples: list[RequestSample]) -> RequestSummary:
