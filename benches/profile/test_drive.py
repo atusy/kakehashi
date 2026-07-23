@@ -1,5 +1,7 @@
 import pathlib
 import sys
+import tempfile
+import threading
 import unittest
 
 sys.path.insert(0, str(pathlib.Path(__file__).parent))
@@ -8,14 +10,36 @@ from drive import (
     RequestSample,
     count_semantic_outcomes,
     next_toggle_change,
+    publish_marker,
     response_result_id,
     server_request_result,
     summarize_samples,
     summarize_samples_by_status,
+    wait_for_marker,
 )
 
 
 class RequestSummaryTest(unittest.TestCase):
+    def test_profile_markers_are_published_and_waited_for(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            marker = pathlib.Path(temporary) / "nested" / "start"
+            observed = []
+            waiter = threading.Thread(
+                target=lambda: observed.append(wait_for_marker(marker, 1.0))
+            )
+            waiter.start()
+            publish_marker(marker, "ready\n")
+            waiter.join(timeout=2)
+
+            self.assertEqual(observed, [marker])
+            self.assertEqual(marker.read_text(), "ready\n")
+
+    def test_profile_marker_wait_has_a_timeout(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            marker = pathlib.Path(temporary) / "missing"
+            with self.assertRaisesRegex(TimeoutError, "missing"):
+                wait_for_marker(marker, 0.01)
+
     def test_summarizes_latency_status_and_wire_bytes(self):
         samples = [
             RequestSample(seconds=0.010, wire_bytes=100, status="ok"),
