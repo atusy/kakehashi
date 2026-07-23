@@ -285,14 +285,12 @@ impl CacheCoordinator {
         };
 
         // Collect all injection regions from the parsed tree
-        let Some(regions) = crate::language::injection::collect_all_injections_cancellable(
+        let regions = crate::language::injection::collect_all_injections_cancellable(
             &tree.root_node(),
             text,
             Some(injection_query.as_ref()),
             cancel,
-        ) else {
-            return None;
-        };
+        )?;
         if crate::cancel::is_cancelled(cancel) {
             return None;
         }
@@ -485,12 +483,12 @@ impl CacheCoordinator {
                     .retain_document(uri, &live_hashes);
             });
             committed?;
-            return Some(PopulatedInjections {
+            Some(PopulatedInjections {
                 discovery,
                 bridge_regions,
                 resolved_regions,
                 generation,
-            });
+            })
         }
     }
 
