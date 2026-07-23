@@ -60,6 +60,7 @@ an external profiler can attach to the exact PID after an awaited, unmeasured
 semantic-token warmup and before measured requests begin:
 
 ```sh
+cargo build --profile profiling --bin kakehashi
 profile_dir="$(mktemp -d "${TMPDIR:-/tmp}/kakehashi-profile.XXXXXX")"
 python3 benches/profile/drive.py \
   --bin ./target/profiling/kakehashi \
