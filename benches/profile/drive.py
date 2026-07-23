@@ -13,6 +13,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+from collections.abc import Callable
 from collections import Counter, defaultdict
 from dataclasses import dataclass
 import json
@@ -76,12 +77,19 @@ def publish_marker(path: Path | str | None, content: str) -> Path | None:
 
 
 def wait_for_marker(
-    path: Path | str, timeout_seconds: float, poll_seconds: float = 0.01
+    path: Path | str,
+    timeout_seconds: float,
+    poll_seconds: float = 0.01,
+    abort_if: Callable[[], str | None] | None = None,
 ) -> Path:
     """Wait until an external profiler publishes a marker."""
     marker = Path(path)
     deadline = time.monotonic() + timeout_seconds
     while not marker.is_file():
+        if abort_if is not None and (reason := abort_if()) is not None:
+            raise RuntimeError(
+                f"{reason} while waiting for profile marker {marker}"
+            )
         if time.monotonic() >= deadline:
             raise TimeoutError(f"timed out waiting for profile marker {marker}")
         time.sleep(poll_seconds)
@@ -546,7 +554,19 @@ def main() -> None:
 
         publish_marker(args.profile_ready_file, "ready\n")
         if args.profile_start_file:
-            wait_for_marker(args.profile_start_file, args.profile_wait_timeout)
+            def server_exit_reason() -> str | None:
+                status = srv.poll()
+                return (
+                    None
+                    if status is None
+                    else f"server exited with status {status}"
+                )
+
+            wait_for_marker(
+                args.profile_start_file,
+                args.profile_wait_timeout,
+                abort_if=server_exit_reason,
+            )
 
         ok, canceled, superseded, tokens = 0, 0, 0, 0
         version = 1
