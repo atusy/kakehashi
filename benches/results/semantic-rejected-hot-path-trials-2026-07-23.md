@@ -1,6 +1,6 @@
 # Rejected semantic hot-path trials (2026-07-23)
 
-These measurements preserve three implementation trials that did not provide
+These measurements preserve four implementation trials that did not provide
 enough end-to-end evidence to ship. Lower paired delta is better. Every default
 run used four alternating A/B pairs, six warmups, and 30 retained samples per
 scenario. The lazy-line-table confirmation used eight pairs, 12 warmups, and 30
@@ -47,6 +47,22 @@ general end-to-end benefit.
 
 Evidence: `semantic-pattern-priority-table-2026-07-23/`
 
+## Exact-snapshot cache before language preparation
+
+Candidate `0dad66b49356483ae42a91bdde8632d219e7b3c9` moved the existing
+full/delta exact-snapshot cache lookup before language loading and highlight
+query preparation.
+
+The change did not establish an end-to-end cache-hit win. Paired medians were
+-0.69% for the Rust full cache hit, +3.97% for the Markdown injection full
+cache hit, -2.88% for the Unicode full cache hit, and +0.72% for the Rust
+no-op delta. Every target scenario changed sign across the four pairs. Primary
+typing controls stayed near neutral (Rust +0.29%, Markdown -1.44%), so there
+was no compensating throughput benefit. The earlier lookup is rejected because
+the preparation it skips is already cheap after initial language load.
+
+Evidence: `semantic-snapshot-cache-first-2026-07-24/`
+
 ## Consequence
 
 Do not transplant these collection-local forms. These measurements do not rule
@@ -55,3 +71,7 @@ capture roles or pattern properties are revisited, prefer constructing an
 immutable query plan when a query or settings generation is loaded, then
 measure the complete LSP path again. This keeps immutable work out of repeated
 requests without weakening semantic-token freshness.
+
+Also keep the exact-snapshot lookup after language preparation. Revisit that
+ordering only if attribution shows language/query preparation has become
+material on cache-hit requests.
