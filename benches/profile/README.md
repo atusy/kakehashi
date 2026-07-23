@@ -54,6 +54,28 @@ benches/profile/xctrace.sh --lang markdown --size 150 --requests 160 --edits 1
 # -> $TMPDIR/kakehashi-xctrace/semantic-time.trace (+ a target-only summary)
 ```
 
+To attribute allocation traffic to completed semantic compute without relying
+on profiler stack sampling, build the opt-in counting allocator and enable only
+the semantic debug target:
+
+```sh
+cargo build --profile profiling --features allocation-profile --bin kakehashi
+RUST_LOG=kakehashi::semantic=debug \
+  python3 benches/profile/drive.py \
+    --bin ./target/profiling/kakehashi \
+    --lang markdown --size 150 --requests 30 --edits 1
+```
+
+Each completed work-unit emits a `compute allocations` record with allocation
+and deallocation counts/bytes plus the live-byte change. The counters cover the
+whole process between work-unit entry and completion (`scope=process_delta`), so
+use the synchronous driver with no competing requests when attributing one
+semantic path. Rayon allocations made for that work remain included. Atomic
+counting changes timing, so use these records for allocation traffic only and
+report latency from an otherwise identical build without
+`allocation-profile`. Cancelled work intentionally has no completed-compute
+record.
+
 Allocation and retained-heap profilers need to attach to the spawned server
 rather than the Python driver. The driver exposes an optional file handshake so
 an external profiler can attach to the exact PID after an awaited, unmeasured
