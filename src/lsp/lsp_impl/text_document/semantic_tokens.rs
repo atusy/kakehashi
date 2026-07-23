@@ -337,6 +337,39 @@ impl Kakehashi {
         };
         let text = std::sync::Arc::clone(&snapshot.text);
 
+        // An exact snapshot/generation hit is already a complete immutable
+        // semantic result. Serve it before language/query preparation so idle
+        // repeat requests do not take the language-load single-flight or clone
+        // query metadata they will never use.
+        let snapshot_identity = SemanticSnapshotIdentity {
+            parsed_version: snapshot.parsed_version,
+            incarnation: snapshot.incarnation,
+            generation: token_generation,
+        };
+        if let Some(cached) =
+            self.cache
+                .get_current_tokens_for_snapshot(&uri, &language_name, snapshot_identity)
+        {
+            let cached = (*cached).clone();
+            let edit_lock = self.documents.edit_lock(&uri);
+            let _edit_guard = edit_lock.lock().await;
+            let still_current = self.semantic_snapshot_is_current(
+                &uri,
+                snapshot.incarnation,
+                snapshot.parsed_version,
+                token_generation,
+                &edit_lock,
+            );
+            if !still_current || !self.cache.is_request_active(&uri, request_id) {
+                self.cache.finish_request(&uri, request_id);
+                return Ok(None);
+            }
+            self.cache
+                .record_served_semantic_version(&uri, snapshot.parsed_version);
+            self.cache.finish_request(&uri, request_id);
+            return Ok(Some(SemanticTokensResult::Tokens(cached)));
+        }
+
         // Ensure language is loaded before trying to get queries.
         // This handles the race condition where semanticTokens/full arrives
         // before didOpen finishes loading the language.
@@ -386,35 +419,6 @@ impl Kakehashi {
                 uri, request_id
             );
             return Ok(None);
-        }
-
-        let snapshot_identity = SemanticSnapshotIdentity {
-            parsed_version: snapshot.parsed_version,
-            incarnation: snapshot.incarnation,
-            generation: token_generation,
-        };
-        if let Some(cached) =
-            self.cache
-                .get_current_tokens_for_snapshot(&uri, &language_name, snapshot_identity)
-        {
-            let cached = (*cached).clone();
-            let edit_lock = self.documents.edit_lock(&uri);
-            let _edit_guard = edit_lock.lock().await;
-            let still_current = self.semantic_snapshot_is_current(
-                &uri,
-                snapshot.incarnation,
-                snapshot.parsed_version,
-                token_generation,
-                &edit_lock,
-            );
-            if !still_current || !self.cache.is_request_active(&uri, request_id) {
-                self.cache.finish_request(&uri, request_id);
-                return Ok(None);
-            }
-            self.cache
-                .record_served_semantic_version(&uri, snapshot.parsed_version);
-            self.cache.finish_request(&uri, request_id);
-            return Ok(Some(SemanticTokensResult::Tokens(cached)));
         }
 
         // Validity key for the snapshot's text under the generation captured at
@@ -722,6 +726,43 @@ impl Kakehashi {
         };
         let text = std::sync::Arc::clone(&snapshot.text);
 
+        // A matching current artifact proves the delta is empty without any
+        // language/query preparation. The final currency check below remains
+        // mandatory because an edit or settings reload may race this lookup.
+        let snapshot_identity = SemanticSnapshotIdentity {
+            parsed_version: snapshot.parsed_version,
+            incarnation: snapshot.incarnation,
+            generation: token_generation,
+        };
+        if let Some(cached) =
+            self.cache
+                .get_current_tokens_for_snapshot(&uri, &language_name, snapshot_identity)
+            && cached.result_id.as_deref() == Some(previous_result_id.as_str())
+        {
+            let edit_lock = self.documents.edit_lock(&uri);
+            let _edit_guard = edit_lock.lock().await;
+            let still_current = self.semantic_snapshot_is_current(
+                &uri,
+                snapshot.incarnation,
+                snapshot.parsed_version,
+                token_generation,
+                &edit_lock,
+            );
+            if !still_current || !self.cache.is_request_active(&uri, request_id) {
+                self.cache.finish_request(&uri, request_id);
+                return Ok(None);
+            }
+            self.cache
+                .record_served_semantic_version(&uri, snapshot.parsed_version);
+            self.cache.finish_request(&uri, request_id);
+            return Ok(Some(SemanticTokensFullDeltaResult::TokensDelta(
+                tower_lsp_server::ls_types::SemanticTokensDelta {
+                    result_id: Some(previous_result_id),
+                    edits: vec![],
+                },
+            )));
+        }
+
         // Ensure language is loaded before trying to get queries.
         // This handles the race condition where semanticTokens/full/delta arrives
         // before didOpen finishes loading the language.
@@ -773,40 +814,6 @@ impl Kakehashi {
                 uri, request_id
             );
             return Ok(None);
-        }
-
-        let snapshot_identity = SemanticSnapshotIdentity {
-            parsed_version: snapshot.parsed_version,
-            incarnation: snapshot.incarnation,
-            generation: token_generation,
-        };
-        if let Some(cached) =
-            self.cache
-                .get_current_tokens_for_snapshot(&uri, &language_name, snapshot_identity)
-            && cached.result_id.as_deref() == Some(previous_result_id.as_str())
-        {
-            let edit_lock = self.documents.edit_lock(&uri);
-            let _edit_guard = edit_lock.lock().await;
-            let still_current = self.semantic_snapshot_is_current(
-                &uri,
-                snapshot.incarnation,
-                snapshot.parsed_version,
-                token_generation,
-                &edit_lock,
-            );
-            if !still_current || !self.cache.is_request_active(&uri, request_id) {
-                self.cache.finish_request(&uri, request_id);
-                return Ok(None);
-            }
-            self.cache
-                .record_served_semantic_version(&uri, snapshot.parsed_version);
-            self.cache.finish_request(&uri, request_id);
-            return Ok(Some(SemanticTokensFullDeltaResult::TokensDelta(
-                tower_lsp_server::ls_types::SemanticTokensDelta {
-                    result_id: Some(previous_result_id),
-                    edits: vec![],
-                },
-            )));
         }
 
         // Validity key for the snapshot's text under the generation captured at
