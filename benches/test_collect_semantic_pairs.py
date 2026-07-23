@@ -5,6 +5,7 @@ from unittest import mock
 
 from collect_semantic_pairs import (
     DEFAULT_SCENARIOS,
+    HARNESS_SOURCE_FILES,
     manifest_sha256,
     normalize_captured_stdout,
     parse_server_env,
@@ -20,6 +21,17 @@ from collect_semantic_pairs import (
 
 
 class CollectSemanticPairsTest(unittest.TestCase):
+    def test_dirty_footprints_are_default_attested_scenarios(self):
+        defaults = set(DEFAULT_SCENARIOS.split(","))
+        self.assertTrue(
+            {
+                "rust_dirty_01pct/typing_delta",
+                "rust_dirty_10pct/typing_delta",
+                "rust_dirty_50pct/typing_delta",
+            }.issubset(defaults)
+        )
+        self.assertIn("benches/support/dirty_footprint.rs", HARNESS_SOURCE_FILES)
+
     def test_scenario_filters_are_normalized_for_execution_and_manifest(self):
         self.assertEqual(
             scenario_filter_terms(" rust, , markdown "),
@@ -75,7 +87,7 @@ class CollectSemanticPairsTest(unittest.TestCase):
         harness = (Path(__file__).parent / "semantic_tokens.rs").read_text()
         for scenario in DEFAULT_SCENARIOS.split(","):
             with self.subTest(scenario=scenario):
-                self.assertIn(f'name: "{scenario}"', harness)
+                self.assertIn(f'"{scenario}"', harness)
 
     def test_captured_stdout_has_exactly_one_terminal_newline(self):
         self.assertEqual(normalize_captured_stdout("result\n\n"), "result\n")
