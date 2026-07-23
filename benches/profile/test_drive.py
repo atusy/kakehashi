@@ -1,7 +1,10 @@
 import pathlib
+import subprocess
 import sys
 import tempfile
+import textwrap
 import threading
+import time
 import unittest
 
 sys.path.insert(0, str(pathlib.Path(__file__).parent))
@@ -20,6 +23,108 @@ from drive import (
 
 
 class RequestSummaryTest(unittest.TestCase):
+    def test_profile_ready_follows_warmup_and_start_gates_measurement(self):
+        fake_server_source = textwrap.dedent(
+            """\
+            import json
+            import pathlib
+            import sys
+
+            log_path = pathlib.Path(sys.argv[1])
+
+            def read_message():
+                length = None
+                while True:
+                    line = sys.stdin.buffer.readline()
+                    if not line:
+                        raise EOFError
+                    line = line.strip()
+                    if not line:
+                        break
+                    if line.lower().startswith(b"content-length:"):
+                        length = int(line.split(b":", 1)[1])
+                return json.loads(sys.stdin.buffer.read(length))
+
+            def send(message):
+                body = json.dumps(message).encode()
+                sys.stdout.buffer.write(
+                    f"Content-Length: {len(body)}\\r\\n\\r\\n".encode() + body
+                )
+                sys.stdout.buffer.flush()
+
+            while True:
+                try:
+                    message = read_message()
+                except EOFError:
+                    break
+                method = message.get("method")
+                with log_path.open("a") as log:
+                    log.write(f"{method}\\n")
+                if method == "exit":
+                    break
+                if "id" not in message:
+                    continue
+                if method == "initialize":
+                    result = {"capabilities": {}}
+                elif method == "textDocument/semanticTokens/full":
+                    result = {"data": []}
+                else:
+                    result = None
+                send({"jsonrpc": "2.0", "id": message["id"], "result": result})
+            """
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = pathlib.Path(temporary)
+            fake_server = directory / "fake_server.py"
+            fake_server.write_text(fake_server_source)
+            log = directory / "methods.log"
+            ready = directory / "ready"
+            start = directory / "start"
+            done = directory / "done"
+            process = subprocess.Popen(
+                [
+                    sys.executable,
+                    str(pathlib.Path(__file__).parent / "drive.py"),
+                    "--bin",
+                    sys.executable,
+                    f"--server-arg={fake_server}",
+                    f"--server-arg={log}",
+                    "--requests=1",
+                    "--size=1",
+                    "--settle=0",
+                    f"--profile-ready-file={ready}",
+                    f"--profile-start-file={start}",
+                    f"--profile-done-file={done}",
+                ],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            try:
+                wait_for_marker(ready, 3)
+                methods_at_ready = log.read_text().splitlines()
+                self.assertEqual(
+                    methods_at_ready.count("textDocument/semanticTokens/full"),
+                    1,
+                )
+                time.sleep(0.05)
+                self.assertEqual(log.read_text().splitlines(), methods_at_ready)
+
+                publish_marker(start, "")
+                wait_for_marker(done, 3)
+                _, stderr = process.communicate(timeout=3)
+                self.assertEqual(process.returncode, 0, stderr)
+                self.assertEqual(
+                    log.read_text()
+                    .splitlines()
+                    .count("textDocument/semanticTokens/full"),
+                    2,
+                )
+            finally:
+                if process.poll() is None:
+                    process.kill()
+                    process.wait()
+
     def test_profile_markers_are_published_and_waited_for(self):
         with tempfile.TemporaryDirectory() as temporary:
             marker = pathlib.Path(temporary) / "nested" / "start"
