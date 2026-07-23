@@ -1,4 +1,6 @@
+import os
 import pathlib
+import signal
 import subprocess
 import sys
 import tempfile
@@ -239,6 +241,7 @@ class RequestSummaryTest(unittest.TestCase):
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
+                start_new_session=True,
             )
             try:
                 _, stderr = process.communicate(timeout=3)
@@ -247,7 +250,7 @@ class RequestSummaryTest(unittest.TestCase):
                 self.assertIn("semantic warmup response", stderr)
             finally:
                 if process.poll() is None:
-                    process.kill()
+                    os.killpg(process.pid, signal.SIGKILL)
                     process.wait()
 
     def test_profile_markers_are_published_and_waited_for(self):
