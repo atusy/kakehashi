@@ -139,11 +139,13 @@ touch "$profile_dir/stop"
 stop_status=$?
 wait "$driver_pid"
 driver_status=$?
-trap - EXIT HUP INT TERM
 rm -r "$profile_dir"
+remove_status=$?
+[ "$remove_status" -ne 0 ] || trap - EXIT HUP INT TERM
 [ "$heap_status" -eq 0 ] || exit "$heap_status"
 [ "$stop_status" -eq 0 ] || exit "$stop_status"
 [ "$driver_status" -eq 0 ] || exit "$driver_status"
+[ "$remove_status" -eq 0 ] || exit "$remove_status"
 ```
 
 Use a fresh marker directory for each run. `pid`, `ready`, and `done` are
