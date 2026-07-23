@@ -191,7 +191,10 @@ pub(super) async fn apply_shared_settings_locked(
     // until the post-reload bump kept serving old-query products as current.
     // The second bump below then also invalidates anything a racing request
     // built MID-swap against a half-updated query set.
-    cache.bump_semantic_token_generation();
+    let generation = cache.bump_semantic_token_generation();
+    language_state
+        .documents
+        .advance_semantic_artifact_generation(generation);
     crate::analysis::semantic::invalidate_thread_local_parser_caches();
     let parser_reload = ParserReloadGuard::begin(language_state.parser_pool);
     let mut summary = language_state.language.load_settings(&settings);
@@ -211,7 +214,10 @@ pub(super) async fn apply_shared_settings_locked(
     // without this bump those products would be accepted as current for the
     // whole awaited propagate below. (The final bump after apply_settings
     // covers the settings-side inputs the apply swaps.)
-    cache.bump_semantic_token_generation();
+    let generation = cache.bump_semantic_token_generation();
+    language_state
+        .documents
+        .advance_semantic_artifact_generation(generation);
     // Publish the settings snapshot before invalidating downstream connections:
     // once propagation exposes a pool miss, a concurrent request must resolve
     // the NEW launch config rather than respawn from the old snapshot (#587).
@@ -254,7 +260,10 @@ pub(super) async fn apply_shared_settings_locked(
     // an old generation, so its entry can't be served post-reload.
     // `didChange` deliberately does NOT invalidate (delta needs the previous
     // tokens); only a query/config reload does.
-    cache.bump_semantic_token_generation();
+    let generation = cache.bump_semantic_token_generation();
+    language_state
+        .documents
+        .advance_semantic_artifact_generation(generation);
     // Query removal/replacement affects unchanged documents too. Request one
     // workspace refresh for every reload; ClientNotifier capability-gates and
     // coalesces it with any language-specific refresh events in this batch.

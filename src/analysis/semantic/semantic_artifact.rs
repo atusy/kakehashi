@@ -109,6 +109,8 @@ pub(crate) struct SemanticArtifact {
 /// [`ParseSnapshot`]: crate::document::snapshot::ParseSnapshot
 pub(crate) struct SemanticArtifactSlot {
     attempt: std::sync::Mutex<Option<SemanticArtifactAttempt>>,
+    minimum_generation: std::sync::atomic::AtomicU64,
+    retired: std::sync::atomic::AtomicBool,
     #[cfg(test)]
     producer_starts: std::sync::atomic::AtomicUsize,
     #[cfg(test)]
@@ -175,10 +177,29 @@ impl Drop for SemanticArtifactConsumer {
 
 static NEXT_ATTEMPT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
+impl SemanticArtifactConsumer {
+    fn unavailable() -> Self {
+        let cancel = crate::cancel::CancelToken::default();
+        cancel.cancel();
+        Self {
+            future: futures::future::ready(None).boxed().shared(),
+            control: Arc::new(SemanticArtifactAttemptControl {
+                id: 0,
+                cancel,
+                consumers: std::sync::atomic::AtomicUsize::new(1),
+                complete: std::sync::atomic::AtomicBool::new(true),
+                slot: std::sync::Weak::new(),
+            }),
+        }
+    }
+}
+
 impl SemanticArtifactSlot {
     pub(crate) fn new() -> Self {
         Self {
             attempt: std::sync::Mutex::new(None),
+            minimum_generation: std::sync::atomic::AtomicU64::new(0),
+            retired: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
             producer_starts: std::sync::atomic::AtomicUsize::new(0),
             #[cfg(test)]
@@ -202,6 +223,14 @@ impl SemanticArtifactSlot {
         Fut: std::future::Future<Output = Option<SemanticArtifact>> + Send + 'static,
     {
         let mut attempt = self.attempt.lock().unwrap_or_else(|e| e.into_inner());
+        if self.retired.load(std::sync::atomic::Ordering::Acquire)
+            || identity.snapshot.generation
+                < self
+                    .minimum_generation
+                    .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return SemanticArtifactConsumer::unavailable();
+        }
         if let Some(current) = attempt.as_ref()
             && current.identity == identity
         {
@@ -215,6 +244,12 @@ impl SemanticArtifactSlot {
                 future: current.future.clone(),
                 control: Arc::clone(&current.control),
             };
+        }
+
+        if attempt.as_ref().is_some_and(|current| {
+            identity.snapshot.generation < current.identity.snapshot.generation
+        }) {
+            return SemanticArtifactConsumer::unavailable();
         }
 
         if let Some(previous) = attempt.take() {
@@ -275,11 +310,40 @@ impl SemanticArtifactSlot {
         SemanticArtifactConsumer { future, control }
     }
 
-    /// Cancel production because the owning snapshot is no longer current.
+    /// Retire this slot because the owning snapshot is no longer current.
+    ///
+    /// Retirement is sticky: a request that captured the snapshot before an
+    /// edit/replacement cannot install fresh work after the invalidation.
     pub(crate) fn cancel(&self) {
         let attempt = self.attempt.lock().unwrap_or_else(|e| e.into_inner());
+        self.retired
+            .store(true, std::sync::atomic::Ordering::Release);
         if let Some(attempt) = attempt.as_ref() {
             attempt.control.cancel.cancel();
+        }
+    }
+
+    /// Reject attempts from generations older than `minimum_generation`.
+    ///
+    /// Unlike snapshot retirement, a settings reload keeps the parse snapshot
+    /// usable. It only cancels/removes an older-generation producer and allows a
+    /// request using the new settings generation to install its replacement.
+    pub(crate) fn advance_minimum_generation(&self, minimum_generation: u64) {
+        let mut attempt = self.attempt.lock().unwrap_or_else(|e| e.into_inner());
+        let current_minimum = self
+            .minimum_generation
+            .load(std::sync::atomic::Ordering::Acquire);
+        if minimum_generation <= current_minimum {
+            return;
+        }
+        self.minimum_generation
+            .store(minimum_generation, std::sync::atomic::Ordering::Release);
+        if attempt
+            .as_ref()
+            .is_some_and(|attempt| attempt.identity.snapshot.generation < minimum_generation)
+            && let Some(previous) = attempt.take()
+        {
+            previous.control.cancel.cancel();
         }
     }
 
@@ -388,6 +452,12 @@ mod tests {
             },
             true,
         )
+    }
+
+    fn identity_at_generation(generation: u64) -> SemanticArtifactIdentity {
+        let mut identity = identity();
+        identity.snapshot.generation = generation;
+        identity
     }
 
     fn artifact(identity: SemanticArtifactIdentity, token_type: u32) -> SemanticArtifact {
@@ -638,10 +708,12 @@ mod tests {
         let slot = std::sync::Arc::new(SemanticArtifactSlot::new());
         let started = std::sync::Arc::new(tokio::sync::Notify::new());
         let release = std::sync::Arc::new(tokio::sync::Notify::new());
+        let (token_tx, token_rx) = tokio::sync::oneshot::channel();
         let first = slot.claim_or_join(identity(), {
             let started = std::sync::Arc::clone(&started);
             let release = std::sync::Arc::clone(&release);
-            move |_cancel, identity| async move {
+            move |cancel, identity| async move {
+                token_tx.send(cancel.clone()).ok();
                 started.notify_one();
                 release.notified().await;
                 Some(artifact(identity, 4))
@@ -653,7 +725,14 @@ mod tests {
 
         let cancelled_consumer = tokio::spawn(first);
         started.notified().await;
+        let producer_token = token_rx.await.expect("producer exposes its token");
         cancelled_consumer.abort();
+        let cancelled = cancelled_consumer.await;
+        assert!(matches!(cancelled, Err(error) if error.is_cancelled()));
+        assert!(
+            !producer_token.is_cancelled(),
+            "one detached consumer must not cancel a joined producer"
+        );
         release.notify_one();
 
         let artifact = second.await.expect("joined consumer still completes");
@@ -703,6 +782,93 @@ mod tests {
         started.notified().await;
         slot.cancel();
         assert!(task.await.expect("consumer task").is_none());
+
+        let starts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let late = slot.claim_or_join(identity(), {
+            let starts = std::sync::Arc::clone(&starts);
+            move |_cancel, identity| async move {
+                starts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Some(artifact(identity, 9))
+            }
+        });
+        assert!(
+            late.await.is_none(),
+            "retired snapshot must reject late work"
+        );
+        assert_eq!(starts.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn obsolete_generation_cannot_replace_newer_attempt() {
+        let slot = std::sync::Arc::new(SemanticArtifactSlot::new());
+        let release = std::sync::Arc::new(tokio::sync::Notify::new());
+        let (token_tx, token_rx) = tokio::sync::oneshot::channel();
+        let current_identity = identity_at_generation(12);
+        let current = slot.claim_or_join(current_identity.clone(), {
+            let release = std::sync::Arc::clone(&release);
+            move |cancel, identity| async move {
+                token_tx.send(cancel.clone()).ok();
+                release.notified().await;
+                Some(artifact(identity, 12))
+            }
+        });
+        let current = tokio::spawn(current);
+        let current_token = token_rx.await.expect("current producer token");
+
+        let obsolete = slot
+            .claim_or_join(identity_at_generation(11), |_cancel, identity| async move {
+                Some(artifact(identity, 11))
+            });
+        assert!(obsolete.await.is_none());
+        assert!(
+            !current_token.is_cancelled(),
+            "obsolete claim must not cancel the newer producer"
+        );
+
+        release.notify_one();
+        let current = current
+            .await
+            .expect("current consumer task")
+            .expect("current artifact");
+        assert!(
+            current
+                .materialize_full(current_identity.as_ref(), None)
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn generation_floor_cancels_old_attempt_and_allows_new_generation() {
+        let slot = std::sync::Arc::new(SemanticArtifactSlot::new());
+        let old = slot.claim_or_join(identity_at_generation(11), |cancel, _identity| async move {
+            cancel.cancelled().await;
+            None
+        });
+        let old = tokio::spawn(old);
+        tokio::task::yield_now().await;
+
+        slot.advance_minimum_generation(12);
+        assert!(old.await.expect("old consumer task").is_none());
+        assert!(
+            slot.claim_or_join(identity_at_generation(11), |_cancel, identity| async move {
+                Some(artifact(identity, 11))
+            },)
+                .await
+                .is_none()
+        );
+
+        let current_identity = identity_at_generation(12);
+        let current = slot
+            .claim_or_join(current_identity.clone(), |_cancel, identity| async move {
+                Some(artifact(identity, 12))
+            })
+            .await
+            .expect("new generation remains usable");
+        assert!(
+            current
+                .materialize_full(current_identity.as_ref(), None)
+                .is_some()
+        );
     }
 
     #[tokio::test]

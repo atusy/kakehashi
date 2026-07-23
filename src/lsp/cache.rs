@@ -619,9 +619,11 @@ impl CacheCoordinator {
     /// token (computed under the old queries) stops matching, and clear the map
     /// to reclaim the now-dead entries. The bump — not the clear — is what makes
     /// this race-safe against a request that stores tokens after the clear.
-    pub(crate) fn bump_semantic_token_generation(&self) {
-        self.semantic_token_generation
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    pub(crate) fn bump_semantic_token_generation(&self) -> u64 {
+        let generation = self
+            .semantic_token_generation
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            + 1;
         self.semantic_cache.clear();
         // The injection token cache folds the same generation into its key, so
         // old-generation entries are already unreachable after the bump; clear
@@ -631,6 +633,7 @@ impl CacheCoordinator {
         // The range cache folds the same generation into its key, so the bump
         // already invalidates it; clear to reclaim the dead entries (#535).
         self.semantic_range_cache.clear();
+        generation
     }
 
     // ========================================================================
@@ -660,6 +663,16 @@ impl CacheCoordinator {
     /// Finish a request, removing it from tracking if it's still the active one.
     pub(crate) fn finish_request(&self, uri: &Url, request_id: RequestId) {
         self.request_tracker.finish_request(uri, request_id);
+    }
+
+    pub(crate) fn finish_absent_request(
+        &self,
+        uri: &Url,
+        request_id: RequestId,
+        scope: SemanticRequestScope,
+    ) {
+        self.request_tracker
+            .finish_absent_request(uri, request_id, scope);
     }
 
     /// Cancel all requests for a given URI (test helper).
