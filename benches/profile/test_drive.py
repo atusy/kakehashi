@@ -184,6 +184,8 @@ class RequestSummaryTest(unittest.TestCase):
                 validate_profile_marker_paths(
                     [marker, directory / "nested" / ".." / "ready"]
                 )
+            with self.assertRaisesRegex(ValueError, "must be distinct"):
+                validate_profile_marker_paths([marker, directory / "READY"])
 
     def test_summarizes_latency_status_and_wire_bytes(self):
         samples = [
