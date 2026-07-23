@@ -6,6 +6,11 @@ run used four alternating A/B pairs, six warmups, and 30 retained samples per
 scenario. The lazy-line-table confirmation used eight pairs, 12 warmups, and 30
 retained samples.
 
+Every candidate commit is preserved by the pushed `benchmark/...` tag recorded
+as `source.b_ref` in its manifest. The exact-snapshot trial also records a
+pushed baseline tag as `source.a_ref`; the other trials use the preserved
+`origin/main` commit recorded in their manifests.
+
 ## Lazy content line table
 
 Candidate `5e2375c08b58dafae961a24b92f112bcb4f84a03` deferred collecting
