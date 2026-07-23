@@ -97,6 +97,7 @@ class RequestSummaryTest(unittest.TestCase):
             ready = directory / "ready"
             start = directory / "start"
             done = directory / "done"
+            stop = directory / "stop"
             process = subprocess.Popen(
                 [
                     sys.executable,
@@ -112,6 +113,8 @@ class RequestSummaryTest(unittest.TestCase):
                     f"--profile-ready-file={ready}",
                     f"--profile-start-file={start}",
                     f"--profile-done-file={done}",
+                    f"--profile-stop-file={stop}",
+                    "--profile-hold-seconds=3",
                 ],
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
@@ -145,6 +148,9 @@ class RequestSummaryTest(unittest.TestCase):
 
                 publish_marker(start, "")
                 wait_for_marker(done, 3)
+                time.sleep(0.05)
+                self.assertIsNone(process.poll())
+                publish_marker(stop, "")
                 _, stderr = process.communicate(timeout=3)
                 self.assertEqual(process.returncode, 0, stderr)
                 self.assertEqual(
@@ -340,6 +346,20 @@ class RequestSummaryTest(unittest.TestCase):
                 )
                 self.assertEqual(result.returncode, 2, result.stderr)
                 self.assertIn("must be finite", result.stderr)
+        result = subprocess.run(
+            [
+                sys.executable,
+                drive,
+                "--bin=not-used-after-validation",
+                "--requests=1",
+                "--profile-stop-file=stop",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=3,
+        )
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn("requires positive --profile-hold-seconds", result.stderr)
 
     def test_summarizes_latency_status_and_wire_bytes(self):
         samples = [

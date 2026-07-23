@@ -297,6 +297,9 @@ def main() -> None:
         "--profile-done-file",
         help="publish after measured requests finish, before the hold interval")
     ap.add_argument(
+        "--profile-stop-file",
+        help="wait for this controller marker after done, bounded by hold seconds")
+    ap.add_argument(
         "--profile-hold-seconds", type=float, default=0,
         help="keep the server alive after measurement for an external snapshot")
     ap.add_argument(
@@ -319,12 +322,17 @@ def main() -> None:
         ap.error("--profile-wait-timeout must be finite")
     if args.profile_wait_timeout <= 0:
         ap.error("--profile-wait-timeout must be positive")
+    if args.profile_stop_file and args.profile_hold_seconds <= 0:
+        ap.error(
+            "--profile-stop-file requires positive --profile-hold-seconds"
+        )
     try:
         validate_profile_marker_paths([
             args.profile_pid_file,
             args.profile_ready_file,
             args.profile_start_file,
             args.profile_done_file,
+            args.profile_stop_file,
         ])
     except ValueError as error:
         ap.error(str(error))
@@ -353,6 +361,11 @@ def main() -> None:
     # crash or panic is visible instead of being swallowed during profiling.
     srv = subprocess.Popen([args.bin, *args.server_arg], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                            env=env)
+
+    def server_exit_reason() -> str | None:
+        status = srv.poll()
+        return None if status is None else f"server exited with status {status}"
+
     rid = 0
     request_samples = defaultdict(list)
     notification_counts = Counter()
@@ -587,14 +600,6 @@ def main() -> None:
 
         publish_marker(args.profile_ready_file, "ready\n")
         if args.profile_start_file:
-            def server_exit_reason() -> str | None:
-                status = srv.poll()
-                return (
-                    None
-                    if status is None
-                    else f"server exited with status {status}"
-                )
-
             wait_for_marker(
                 args.profile_start_file,
                 args.profile_wait_timeout,
@@ -690,7 +695,19 @@ def main() -> None:
         elapsed = time.time() - t0
 
         publish_marker(args.profile_done_file, "done\n")
-        if args.profile_hold_seconds > 0:
+        if args.profile_stop_file:
+            try:
+                wait_for_marker(
+                    args.profile_stop_file,
+                    args.profile_hold_seconds,
+                    abort_if=server_exit_reason,
+                )
+            except TimeoutError:
+                sys.stderr.write(
+                    "[drive] profile stop marker deadline expired; "
+                    "shutting down server\n"
+                )
+        elif args.profile_hold_seconds > 0:
             time.sleep(args.profile_hold_seconds)
 
         request("shutdown", None)
