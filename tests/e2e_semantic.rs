@@ -283,10 +283,15 @@ fn test_allocation_profile_emits_completed_semantic_record() {
         let value = field
             .strip_prefix(&format!("{name}="))
             .unwrap_or_else(|| panic!("expected {name} field, got {field:?}: {record}"));
-        assert!(
-            value.parse::<u64>().is_ok(),
-            "{name} must be an unsigned integer, got {value:?}: {record}"
-        );
+        let value = value.parse::<u64>().unwrap_or_else(|_| {
+            panic!("{name} must be an unsigned integer, got {value:?}: {record}")
+        });
+        if matches!(name, "allocations" | "allocated_bytes") {
+            assert_ne!(
+                value, 0,
+                "{name} must prove that the semantic window reached the counting allocator: {record}"
+            );
+        }
     }
     assert_eq!(
         fields.collect::<Vec<_>>(),
