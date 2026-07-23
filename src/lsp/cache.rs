@@ -198,6 +198,7 @@ impl CacheCoordinator {
     /// parse.
     #[must_use]
     #[allow(clippy::too_many_arguments)]
+    #[cfg(test)]
     pub(crate) fn populate_injections(
         &self,
         uri: &Url,
