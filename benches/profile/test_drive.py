@@ -253,6 +253,65 @@ class RequestSummaryTest(unittest.TestCase):
                     os.killpg(process.pid, signal.SIGKILL)
                     process.wait()
 
+    def test_profile_signal_reaps_server(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = pathlib.Path(temporary)
+            fake_server = directory / "fake_server.py"
+            fake_server.write_text(FAKE_SERVER_SOURCE)
+            log = directory / "methods.log"
+            warmup_release = directory / "warmup-release"
+            publish_marker(warmup_release, "")
+            pid_file = directory / "pid"
+            ready = directory / "ready"
+            process = subprocess.Popen(
+                [
+                    sys.executable,
+                    str(pathlib.Path(__file__).parent / "drive.py"),
+                    "--bin",
+                    sys.executable,
+                    f"--server-arg={fake_server}",
+                    f"--server-arg={log}",
+                    f"--server-arg={warmup_release}",
+                    "--server-arg=hang-warmup",
+                    "--requests=1",
+                    "--size=1",
+                    "--settle=0",
+                    f"--profile-pid-file={pid_file}",
+                    f"--profile-ready-file={ready}",
+                    "--profile-wait-timeout=10",
+                ],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            server_pid = None
+            try:
+                wait_for_marker(pid_file, 3)
+                server_pid = int(pid_file.read_text())
+                deadline = time.monotonic() + 3
+                while (
+                    not log.exists()
+                    or "textDocument/semanticTokens/full"
+                    not in log.read_text().splitlines()
+                ):
+                    if time.monotonic() >= deadline:
+                        self.fail("fake server did not enter semantic warmup")
+                    time.sleep(0.01)
+
+                process.terminate()
+                process.communicate(timeout=3)
+                with self.assertRaises(ProcessLookupError):
+                    os.kill(server_pid, 0)
+            finally:
+                if process.poll() is None:
+                    process.kill()
+                    process.wait()
+                if server_pid is not None:
+                    try:
+                        os.kill(server_pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+
     def test_profile_markers_are_published_and_waited_for(self):
         with tempfile.TemporaryDirectory() as temporary:
             marker = pathlib.Path(temporary) / "nested" / "start"
