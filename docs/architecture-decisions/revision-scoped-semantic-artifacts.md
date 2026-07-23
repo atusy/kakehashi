@@ -209,14 +209,17 @@ Retention follows reachability and hard budgets:
 Byte accounting includes chunk payloads, indexes, source mappings, and owned
 strings, not only vector capacity. Every completed root retained by a slot or
 baseline participates in both limits; there is no permanently pinned artifact
-exception. Under pressure, evict recomputable prior roots and chunks first, then
-least-recently-used completed current roots by clearing their slot entry. The
-`ParseSnapshot` remains and a later request may recompute its artifact. If one
-current artifact exceeds the per-document limit, its active producer and joined
-requests may use it transiently, but the slot drops the completed root after
-delivery instead of retaining it. Transient production is bounded by compute
-admission rather than counted as cache retention. Eviction may increase CPU but
-cannot change output or freshness.
+exception. A completed slot registers a weak, identity-checked eviction handle
+with the weighted budget index; the index does not retain either the snapshot or
+artifact, and an old handle cannot clear a replacement attempt. Under pressure,
+evict recomputable prior roots and chunks first, then least-recently-used
+completed current roots through that handle. The `ParseSnapshot` remains and a
+later request may recompute its artifact. If one current artifact exceeds the
+per-document limit, its active producer and joined requests may use it
+transiently, but the slot drops the completed root after delivery instead of
+retaining it. Transient production is bounded by compute admission rather than
+counted as cache retention. Eviction may increase CPU but cannot change output
+or freshness.
 
 Numeric byte defaults are an activation gate, not a guess in this ADR: the
 measurement PR must report retained bytes for the required corpus and choose
