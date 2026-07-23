@@ -3,7 +3,7 @@ mod dirty_footprint;
 #[path = "../benches/support/semantic_baseline.rs"]
 mod semantic_baseline;
 
-use dirty_footprint::{gen_dirty_rust, gen_dirty_rust_block};
+use dirty_footprint::{gen_dirty_rust, gen_dirty_rust_block, gen_dirty_rust_replacements};
 use semantic_baseline::{
     SemanticBaseline, TRACKED_MARKER, ValidationError, tracked_marker_line, validate_token_payload,
 };
@@ -223,4 +223,13 @@ fn dirty_rust_replacements_are_unique_line_stable_and_freshness_visible() {
             .unwrap()
             .starts_with(&format!(" {TRACKED_MARKER}"))
     );
+}
+
+#[test]
+fn dirty_rust_replacements_can_be_precomputed_before_timing() {
+    let replacements = gen_dirty_rust_replacements(10, 3);
+    assert_eq!(replacements.len(), 3);
+    for (index, replacement) in replacements.iter().enumerate() {
+        assert!(replacement.starts_with(&" ".repeat(index + 1)));
+    }
 }

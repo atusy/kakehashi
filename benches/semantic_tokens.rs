@@ -45,7 +45,7 @@ mod dirty_footprint;
 #[path = "support/semantic_baseline.rs"]
 mod semantic_baseline;
 
-use dirty_footprint::{DIRTY_STATE_COUNT, gen_dirty_rust, gen_dirty_rust_block};
+use dirty_footprint::{DIRTY_STATE_COUNT, gen_dirty_rust, gen_dirty_rust_replacements};
 use semantic_baseline::{
     SemanticBaseline, TRACKED_MARKER, tracked_marker_line, validate_token_payload,
 };
@@ -610,6 +610,8 @@ struct EditState {
     line: u32,
     range_next: u32,
     fixed_width_next: usize,
+    dirty_state_next: usize,
+    dirty_replacements: Vec<String>,
 }
 
 struct Scenario {
@@ -670,6 +672,12 @@ fn measure(
     // Delta scenarios retain and validate the complete client-side baseline,
     // rather than treating a fresh resultId as proof of a current response.
     let mut baseline = seed_baseline(&mut server, scn);
+    let dirty_replacements = match scn.kind {
+        Kind::DirtyFootprintTypingDelta { dirty_units, .. } => {
+            gen_dirty_rust_replacements(dirty_units, warmup + iters)
+        }
+        _ => Vec::new(),
+    };
     let mut edit = EditState {
         version: 1,
         // First edit must insert (the document opens with no extra space).
@@ -677,6 +685,8 @@ fn measure(
         line: baseline.as_ref().map_or(0, SemanticBaseline::tracked_line),
         range_next: 0,
         fixed_width_next: 0,
+        dirty_state_next: 0,
+        dirty_replacements,
     };
 
     for _ in 0..warmup {
@@ -948,15 +958,15 @@ fn run_once(
             total_units,
         } => {
             edit.version += 1;
-            edit.fixed_width_next += 1;
-            let state = edit.fixed_width_next;
-            let replacement = gen_dirty_rust_block(dirty_units, state);
+            edit.dirty_state_next += 1;
+            let state = edit.dirty_state_next;
+            let replacement = &edit.dirty_replacements[state - 1];
             server.did_change_replace_lines(
                 scn.uri,
                 edit.version,
                 edit_start_line,
                 edit_end_line,
-                &replacement,
+                replacement,
             );
             let baseline = baseline.as_mut().expect("dirty-footprint baseline");
             baseline.expect_tracked_start(u32::try_from(state).expect("dirty state fits u32"));
