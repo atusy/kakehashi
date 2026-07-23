@@ -81,7 +81,7 @@ def wait_for_marker(
     """Wait until an external profiler publishes a marker."""
     marker = Path(path)
     deadline = time.monotonic() + timeout_seconds
-    while not marker.exists():
+    while not marker.is_file():
         if time.monotonic() >= deadline:
             raise TimeoutError(f"timed out waiting for profile marker {marker}")
         time.sleep(poll_seconds)
@@ -96,6 +96,8 @@ def validate_profile_marker_paths(
     for path in paths:
         if path is None:
             continue
+        if isinstance(path, str) and not path:
+            raise ValueError("profile marker paths must not be empty")
         resolved = Path(path).expanduser().resolve()
         # Marker names are a cross-process protocol, so conservatively reject
         # case/normalization-only differences even on a case-sensitive volume.
