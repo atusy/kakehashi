@@ -74,9 +74,12 @@ allocation even when it happens in place
 represent realloc-inclusive requested-capacity traffic rather than distinct
 pointers or bytes physically copied. The counters cover Rust allocations from
 the whole process between work-unit entry and completion
-(`scope=process_global_alloc_delta`), so use the synchronous driver with no
-competing requests when attributing one semantic path. Rayon allocations made
-through `GlobalAlloc` remain included. Native Tree-sitter allocations such as
+(`scope=process_global_alloc_delta`). Use the synchronous driver without
+competing client requests, but interpret the result as mixed process traffic
+during the semantic compute window: parse-loop injection, bridge, diagnostic,
+or other background work may overlap after publishing the snapshot and is not
+separable by this process-global counter. Rayon allocations made through
+`GlobalAlloc` remain included. Native Tree-sitter allocations such as
 `ts_malloc` bypass this counter; use the exact-PID `heap`/MallocStackLogging
 workflow below when native and retained allocations matter. The four monotonic
 counters are sampled independently (`consistency=non_atomic_snapshot`): another
