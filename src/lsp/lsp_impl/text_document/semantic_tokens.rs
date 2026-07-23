@@ -129,7 +129,7 @@ impl Kakehashi {
         snapshot: &std::sync::Arc<crate::document::snapshot::ParseSnapshot>,
         identity: SemanticArtifactIdentity,
         inputs: SemanticArtifactInputs,
-    ) -> crate::analysis::semantic::SharedArtifactFuture {
+    ) -> crate::analysis::semantic::SemanticArtifactConsumer {
         let pool = std::sync::Arc::clone(&self.compute_pool);
         let coordinator = std::sync::Arc::clone(&self.language);
         snapshot

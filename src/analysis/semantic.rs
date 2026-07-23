@@ -20,7 +20,7 @@ pub(crate) use parallel::DISCOVERY_REUSE_HITS;
 pub(crate) use parallel::build_document_discovery;
 pub(crate) use range::filter_semantic_tokens_by_range;
 pub(crate) use semantic_artifact::{
-    SemanticArtifact, SemanticArtifactIdentity, SemanticArtifactSlot, SharedArtifactFuture,
+    SemanticArtifact, SemanticArtifactConsumer, SemanticArtifactIdentity, SemanticArtifactSlot,
 };
 
 // Re-export for parallel processing
