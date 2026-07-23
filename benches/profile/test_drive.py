@@ -289,6 +289,7 @@ class RequestSummaryTest(unittest.TestCase):
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
+                start_new_session=True,
             )
             server_pid = None
             try:
@@ -309,14 +310,12 @@ class RequestSummaryTest(unittest.TestCase):
                 with self.assertRaises(ProcessLookupError):
                     os.kill(server_pid, 0)
             finally:
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
                 if process.poll() is None:
-                    process.kill()
                     process.wait()
-                if server_pid is not None:
-                    try:
-                        os.kill(server_pid, signal.SIGKILL)
-                    except ProcessLookupError:
-                        pass
 
     def test_profile_server_does_not_inherit_blocked_signals(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -348,6 +347,7 @@ class RequestSummaryTest(unittest.TestCase):
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
+                start_new_session=True,
             )
             server_pid = None
             try:
@@ -368,14 +368,12 @@ class RequestSummaryTest(unittest.TestCase):
                 with self.assertRaises(ProcessLookupError):
                     os.kill(server_pid, 0)
             finally:
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
                 if process.poll() is None:
-                    process.kill()
                     process.wait()
-                if server_pid is not None:
-                    try:
-                        os.kill(server_pid, signal.SIGKILL)
-                    except ProcessLookupError:
-                        pass
 
     def test_profile_shutdown_response_has_a_deadline(self):
         with tempfile.TemporaryDirectory() as temporary:
