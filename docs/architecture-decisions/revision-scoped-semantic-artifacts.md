@@ -159,8 +159,14 @@ execution time as one of:
 3. **global/unknown** -- the whole-document oracle must run.
 
 An unclassified construct always selects class 3. A class may serve incremental
-results only after its shadow output has matched the oracle byte-for-byte on the
-retained corpus and randomized edit sequences.
+results only when its accepted query shapes have a reviewed invalidation proof:
+the loader or execution planner mechanically recognizes a syntactic whitelist,
+rejects every unsupported predicate/capture/combination to class 3, and documents
+why the expanded boundary contains every possible output change. Shadow output
+must additionally match the oracle byte-for-byte on the retained corpus and
+randomized edit sequences, but empirical agreement validates the proof rather
+than replacing it. A class without that proof may remain in shadow mode but may
+not serve incremental output.
 
 ### 5. Invalidation
 
@@ -183,7 +189,8 @@ converts failure into a completed empty result.
 
 Retention follows reachability and hard budgets:
 
-- a document retains its current artifact root;
+- a document may retain its current artifact root only while it fits both the
+  per-document and process-global artifact budgets;
 - full/delta preserves the existing bounded LRU history for reissued result IDs:
   at most eight accepted baselines and 512 KiB of flat token payload per document,
   while always keeping the newest baseline; a successful read refreshes a
@@ -200,10 +207,16 @@ Retention follows reachability and hard budgets:
   per-document byte limit and a process-global byte limit exist.
 
 Byte accounting includes chunk payloads, indexes, source mappings, and owned
-strings, not only vector capacity. Under pressure, evict recomputable prior roots
-and chunks before current roots. If the current artifact itself exceeds the
-per-document budget, serve it without caching cross-revision chunks. Eviction may
-increase CPU but cannot change output or freshness.
+strings, not only vector capacity. Every completed root retained by a slot or
+baseline participates in both limits; there is no permanently pinned artifact
+exception. Under pressure, evict recomputable prior roots and chunks first, then
+least-recently-used completed current roots by clearing their slot entry. The
+`ParseSnapshot` remains and a later request may recompute its artifact. If one
+current artifact exceeds the per-document limit, its active producer and joined
+requests may use it transiently, but the slot drops the completed root after
+delivery instead of retaining it. Transient production is bounded by compute
+admission rather than counted as cache retention. Eviction may increase CPU but
+cannot change output or freshness.
 
 Numeric byte defaults are an activation gate, not a guess in this ADR: the
 measurement PR must report retained bytes for the required corpus and choose
@@ -314,13 +327,16 @@ The decision is confirmed incrementally, not by the presence of an artifact type
 - each enabled safety class has zero shadow mismatches across retained and
   randomized edits, including injection, multiline, Unicode, reopen, reload, and
   parser-install cases;
+- each enabled safety class has a reviewed boundary proof and a mechanically
+  enforced query-shape whitelist whose unsupported cases select full fallback;
 - freshness tests prove accepted responses represent the latest edit and that
   cancelling one consumer does not cancel another current consumer;
 - slot tests rotate keys on a generation change, reject completion from the
   detached producer, and retry the same key after cancellation, timeout, or
   panic;
 - retention tests preserve reissued result IDs under the existing bounded LRU,
-  enforce the new artifact byte budgets, and cover close/reopen and cancellation
+  enforce the new artifact byte budgets across prior and current roots, prove an
+  oversized current root is not retained, and cover close/reopen and cancellation
   cleanup;
 - at least one large-document small-edit scenario has repeatable proportional
   work and lower current-response latency without regressing primary controls;
