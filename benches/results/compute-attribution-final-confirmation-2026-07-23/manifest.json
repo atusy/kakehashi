@@ -1,0 +1,164 @@
+{
+  "attestations": {
+    "binary_a": "cbcb15066e281b046ae906e4f9217cedcf1e228f573149eec48b702b156f190e",
+    "binary_b": "a1efb2059ad114843b25e933d42bc05b158929da9d32610fd01cb7e3367bc115",
+    "fixture": "651c22d419d5520dd3c0e887e2e42d8fb28b41cb1189479a9fca95a1c2048012",
+    "harness": "e453cbe11be6ad4866a0bc633db761ce4b5ddfe964b56b56ad3cc4e7d062d745"
+  },
+  "configuration": {
+    "iterations": 30,
+    "pairs": 8,
+    "run_timeout_seconds": 900,
+    "scenario_filters": [
+      "rust_large/full_cache_hit",
+      "rust_large/typing_delta",
+      "rust_large/typing_burst",
+      "rust_sparse_32k_minus/typing_delta",
+      "rust_sparse_32k_exact/typing_delta",
+      "rust_sparse_32k_plus/typing_delta",
+      "rust_sparse_64k/typing_delta",
+      "rust_xlarge/cancel_burst"
+    ],
+    "scenarios": [
+      "rust_large/full_cache_hit",
+      "rust_large/typing_burst",
+      "rust_large/typing_delta",
+      "rust_sparse_32k_exact/typing_delta",
+      "rust_sparse_32k_minus/typing_delta",
+      "rust_sparse_32k_plus/typing_delta",
+      "rust_sparse_64k/typing_delta",
+      "rust_xlarge/cancel_burst"
+    ],
+    "server_env": {},
+    "warmup_iterations": 12
+  },
+  "environment": {
+    "build": {
+      "CARGO_HOME": "<TEMP>/cargo-home",
+      "CARGO_TERM_COLOR": "never",
+      "HOME": "<TEMP>/home",
+      "LANG": "C",
+      "LC_ALL": "C",
+      "PATH": "<USER_HOME_PATH>:<USER_HOME_PATH>:<USER_HOME_PATH>:/opt/homebrew/bin:/opt/homebrew/sbin:/nix/var/nix/profiles/default/bin:<USER_HOME_PATH>:/run/current-system/sw/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:<USER_HOME_PATH>",
+      "RUSTUP_HOME": "<USER_HOME>/.rustup",
+      "TMPDIR": "<TEMP>/tmp"
+    },
+    "cc": "Apple clang version 21.0.0 (clang-2100.1.1.101)\nTarget: arm64-apple-darwin25.5.0\nThread model: posix\nInstalledDir: /Library/Developer/CommandLineTools/usr/bin",
+    "clang": "Apple clang version 21.0.0 (clang-2100.1.1.101)\nTarget: arm64-apple-darwin25.5.0\nThread model: posix\nInstalledDir: /Library/Developer/CommandLineTools/usr/bin",
+    "machine": "arm64",
+    "platform": "macOS-26.5.1-arm64-arm-64bit",
+    "processor": "arm",
+    "runtime": {
+      "CARGO_HOME": "<TEMP>/cargo-home",
+      "CARGO_TERM_COLOR": "never",
+      "HOME": "<TEMP>/home",
+      "LANG": "C",
+      "LC_ALL": "C",
+      "PATH": "<USER_HOME_PATH>:<USER_HOME_PATH>:<USER_HOME_PATH>:/opt/homebrew/bin:/opt/homebrew/sbin:/nix/var/nix/profiles/default/bin:<USER_HOME_PATH>:/run/current-system/sw/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:<USER_HOME_PATH>",
+      "RUSTUP_HOME": "<USER_HOME>/.rustup",
+      "TMPDIR": "<TEMP>/tmp"
+    },
+    "sdk": "26.5",
+    "toolchains": {
+      "a": {
+        "cargo": "cargo 1.95.0 (f2d3ce0bd 2026-03-21)\nrelease: 1.95.0\ncommit-hash: f2d3ce0bd7f24a49f8f72d9000448f8838c4e850\ncommit-date: 2026-03-21\nhost: aarch64-apple-darwin\nlibgit2: 1.9.2 (sys:0.20.4 vendored)\nlibcurl: 8.20.0 (sys:0.4.83+curl-8.15.0 system ssl:OpenSSL/3.6.2)\nos: Mac OS 26.5.1 [64-bit]",
+        "rustc": "rustc 1.95.0 (59807616e 2026-04-14) (built from a source tarball)\nbinary: rustc\ncommit-hash: 59807616e1fa2540724bfbac14d7976d7e4a3860\ncommit-date: 2026-04-14\nhost: aarch64-apple-darwin\nrelease: 1.95.0\nLLVM version: 21.1.8"
+      },
+      "b": {
+        "cargo": "cargo 1.95.0 (f2d3ce0bd 2026-03-21)\nrelease: 1.95.0\ncommit-hash: f2d3ce0bd7f24a49f8f72d9000448f8838c4e850\ncommit-date: 2026-03-21\nhost: aarch64-apple-darwin\nlibgit2: 1.9.2 (sys:0.20.4 vendored)\nlibcurl: 8.20.0 (sys:0.4.83+curl-8.15.0 system ssl:OpenSSL/3.6.2)\nos: Mac OS 26.5.1 [64-bit]",
+        "rustc": "rustc 1.95.0 (59807616e 2026-04-14) (built from a source tarball)\nbinary: rustc\ncommit-hash: 59807616e1fa2540724bfbac14d7976d7e4a3860\ncommit-date: 2026-04-14\nhost: aarch64-apple-darwin\nrelease: 1.95.0\nLLVM version: 21.1.8"
+      },
+      "harness": {
+        "cargo": "cargo 1.95.0 (f2d3ce0bd 2026-03-21)\nrelease: 1.95.0\ncommit-hash: f2d3ce0bd7f24a49f8f72d9000448f8838c4e850\ncommit-date: 2026-03-21\nhost: aarch64-apple-darwin\nlibgit2: 1.9.2 (sys:0.20.4 vendored)\nlibcurl: 8.20.0 (sys:0.4.83+curl-8.15.0 system ssl:OpenSSL/3.6.2)\nos: Mac OS 26.5.1 [64-bit]",
+        "rustc": "rustc 1.95.0 (59807616e 2026-04-14) (built from a source tarball)\nbinary: rustc\ncommit-hash: 59807616e1fa2540724bfbac14d7976d7e4a3860\ncommit-date: 2026-04-14\nhost: aarch64-apple-darwin\nrelease: 1.95.0\nLLVM version: 21.1.8"
+      }
+    }
+  },
+  "fixture_archive": "fixture",
+  "fixture_archive_sha256": "651c22d419d5520dd3c0e887e2e42d8fb28b41cb1189479a9fca95a1c2048012",
+  "fixture_manifest": "fixture-manifest.json",
+  "fixture_manifest_sha256": "78d8027c626a968583ff430762eb9a135f92a0ef147115ee830ebd6e4045ddaa",
+  "raw_files": [
+    {
+      "order": "AB",
+      "pair_index": 1,
+      "samples": "pair-1.json",
+      "samples_sha256": "b2b59c1cb6321a0da989249bff9d3ffb0a163a617556f655963d7ace06fd003f",
+      "stdout": "pair-1.txt",
+      "stdout_sha256": "788253fc496f3443f904fda9005fb92389206b8cb0093e6e2577efa09f49460b"
+    },
+    {
+      "order": "BA",
+      "pair_index": 2,
+      "samples": "pair-2.json",
+      "samples_sha256": "244a3ebe3b1d98401164c9a08b17d59db0dd80a83da776c36904e5f81dd347bd",
+      "stdout": "pair-2.txt",
+      "stdout_sha256": "a383ea26a7b9a8c80d1d32fc7573224eb8b6c9766e321252af97085c2231f3fa"
+    },
+    {
+      "order": "AB",
+      "pair_index": 3,
+      "samples": "pair-3.json",
+      "samples_sha256": "244d6725c33881a05f8c9eb1f59e63688e3aa5e6dc01446b12edd9e12810c456",
+      "stdout": "pair-3.txt",
+      "stdout_sha256": "954cbae7ae47b4371fb9e8b8f7341aeaa0a21c78426758ae9e12c4e5e827a0fc"
+    },
+    {
+      "order": "BA",
+      "pair_index": 4,
+      "samples": "pair-4.json",
+      "samples_sha256": "678fb98966d4d46e53fedaec34b3e1786371e0539ef7db90af0253e81a41112d",
+      "stdout": "pair-4.txt",
+      "stdout_sha256": "f74873166a0f6713f864f8ca7ecaf65d30060cf08915ff6b0395dcb5fd73bc48"
+    },
+    {
+      "order": "AB",
+      "pair_index": 5,
+      "samples": "pair-5.json",
+      "samples_sha256": "286052d28998e24b266d44263965d6ec60cc3521cc0c1125a633880d9f3e3fa8",
+      "stdout": "pair-5.txt",
+      "stdout_sha256": "e7dfc38d7f7cfc24e938a4c64d706622457feb7411aaf53b84df5a200a0412be"
+    },
+    {
+      "order": "BA",
+      "pair_index": 6,
+      "samples": "pair-6.json",
+      "samples_sha256": "c90d1925998508189be87c86dfe202d2a0686aadda890215b938e9f4c1b92382",
+      "stdout": "pair-6.txt",
+      "stdout_sha256": "b7159bb48d531002675232a700b59bcc94900f261c6376e112f10c6c397f3c7f"
+    },
+    {
+      "order": "AB",
+      "pair_index": 7,
+      "samples": "pair-7.json",
+      "samples_sha256": "73ce9797ee466a923b56cf7ef373578ae7edcbe9ddc8cfa51e14c1d7bc69a057",
+      "stdout": "pair-7.txt",
+      "stdout_sha256": "c3216540f5927df87dc72616cb7017cd245004b1c45f466eea25775e44958d3e"
+    },
+    {
+      "order": "BA",
+      "pair_index": 8,
+      "samples": "pair-8.json",
+      "samples_sha256": "ce11802e93e3ef153d50d6209e5c8e04b397ecb29f49ae00471d5d614a25dcda",
+      "stdout": "pair-8.txt",
+      "stdout_sha256": "ab4b7530ea3ee60913254d9b64aa74b1795c4297f860ed2cad277866c029a4f6"
+    }
+  ],
+  "schema_version": 1,
+  "source": {
+    "a_commit": "a1278be5fdff24d109d9e03134c6bdb880577f64",
+    "a_ref": "benchmark/compute-attribution-before-2026-07-23",
+    "b_commit": "af5524660808ea3dee190ec0a20f4e121e7afca2",
+    "b_ref": "benchmark/compute-attribution-final-2026-07-23",
+    "harness_commit": "c4b18715a3c71b15fca6cbe44d573ec23f2f4e83",
+    "harness_ref": "benchmark/compute-attribution-harness-2026-07-23",
+    "harness_sources_sha256": {
+      "benches/collect_semantic_pairs.py": "53a272f4eff5f8009dd458d863711a5f571e3ba4424b4c3f1556e811b3023c1e",
+      "benches/semantic_summary.py": "8aab3d2622ec7bfface33f29fee8fd695297b31eb2007fc5b2b20d8be2e3d1d0",
+      "benches/semantic_tokens.rs": "2d35487ff38a5b7b72540f55c5fb43ae6ca5190b9b579264ae0323e6fd927139",
+      "benches/support/semantic_baseline.rs": "4ab35bab7a05b32d652262c61c4cd4c720a21bfe3d1730694ea9dda5b306410c"
+    }
+  },
+  "summary": "summary.json",
+  "summary_sha256": "862c683effc69ac1ab00646b93a26f032e418b30888b137aa8e5428e2b51bbe9"
+}
