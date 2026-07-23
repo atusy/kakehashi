@@ -393,11 +393,9 @@ impl Kakehashi {
                 // document" and the client would stay dark until its next
                 // didChange-driven request.
                 self.cache.record_served_semantic_version(&uri, 0);
-                self.cache.finish_request(&uri, request_id);
                 return Err(crate::error::content_modified_error());
             }
             TokenSnapshot::Cancelled => {
-                self.cache.finish_request(&uri, request_id);
                 log::debug!(
                     target: "kakehashi::semantic",
                     "[SEMANTIC_TOKENS] CANCELLED via $/cancelRequest uri={} req={} (while parked)",
@@ -408,7 +406,6 @@ impl Kakehashi {
             TokenSnapshot::Superseded => {
                 // Same contract as a compute superseded mid-flight (below):
                 // the newer request answers; this one drops out quietly.
-                self.cache.finish_request(&uri, request_id);
                 log::debug!(
                     target: "kakehashi::semantic",
                     "[SEMANTIC_TOKENS] CANCELLED uri={} req={} (superseded while parked)",
@@ -436,7 +433,6 @@ impl Kakehashi {
             // doesn't keep refreshing a document that has no tokens.
             self.cache
                 .record_served_semantic_version(&uri, snapshot.parsed_version);
-            self.cache.finish_request(&uri, request_id);
             return Ok(Some(SemanticTokensResult::Tokens(SemanticTokens {
                 result_id: None,
                 data: vec![],
@@ -452,7 +448,6 @@ impl Kakehashi {
             .ensure_language_loaded_async(&language_name)
             .await;
         if !load_result.success {
-            self.cache.finish_request(&uri, request_id);
             return Ok(Some(SemanticTokensResult::Tokens(SemanticTokens {
                 result_id: None,
                 data: vec![],
@@ -470,7 +465,6 @@ impl Kakehashi {
         }
 
         let Some(query) = self.language.highlight_query(&language_name) else {
-            self.cache.finish_request(&uri, request_id);
             return Ok(Some(SemanticTokensResult::Tokens(SemanticTokens {
                 result_id: None,
                 data: vec![],
@@ -515,12 +509,10 @@ impl Kakehashi {
                 &edit_lock,
             );
             if !still_current || !self.cache.is_request_active(&uri, request_id) {
-                self.cache.finish_request(&uri, request_id);
                 return Ok(None);
             }
             self.cache
                 .record_served_semantic_version(&uri, snapshot.parsed_version);
-            self.cache.finish_request(&uri, request_id);
             return Ok(Some(SemanticTokensResult::Tokens(cached)));
         }
 
@@ -554,12 +546,10 @@ impl Kakehashi {
                     &edit_lock,
                 );
                 if !still_current || !self.cache.is_request_active(&uri, request_id) {
-                    self.cache.finish_request(&uri, request_id);
                     return Ok(None);
                 }
                 self.cache
                     .record_served_semantic_version(&uri, snapshot.parsed_version);
-                self.cache.finish_request(&uri, request_id);
                 // The wire type owns its data (`ls_types::SemanticTokensResult`
                 // has no borrowing variant), so this is the one legitimate
                 // materialization point — everything upstream (the cache hit
@@ -609,7 +599,6 @@ impl Kakehashi {
                     // snapshot-owned producer remains available to same-scope
                     // full/delta/range consumers.
                     _ = &mut cancel_rx => {
-                        self.cache.finish_request(&uri, request_id);
                         log::debug!(
                             target: "kakehashi::semantic",
                             "[SEMANTIC_TOKENS] CANCELLED via $/cancelRequest uri={} req={}",
@@ -630,7 +619,6 @@ impl Kakehashi {
         // A newer request scope or close wakes this consumer. The artifact's
         // separate snapshot token reclaims obsolete producer work.
         if cancel_token.is_cancelled() {
-            self.cache.finish_request(&uri, request_id);
             log::debug!(
                 target: "kakehashi::semantic",
                 "[SEMANTIC_TOKENS] CANCELLED uri={} req={} (compute superseded)",
@@ -660,13 +648,11 @@ impl Kakehashi {
             // A cancelled, failed, or panicked producer is transient. The slot
             // is vacant and retryable; do not turn this into a reusable empty
             // success for the exact snapshot.
-            self.cache.finish_request(&uri, request_id);
             return Ok(None);
         };
         let Some(tokens_with_id) =
             artifact.materialize_full(expected_artifact_identity, Some(next_result_id()))
         else {
-            self.cache.finish_request(&uri, request_id);
             return Ok(None);
         };
         let stored_tokens = tokens_with_id.clone();
@@ -681,7 +667,6 @@ impl Kakehashi {
             &edit_lock,
         );
         if !still_current || !self.cache.is_request_active(&uri, request_id) {
-            self.cache.finish_request(&uri, request_id);
             return Ok(None);
         }
         // Store keyed by result_id (delta baseline) AND cache_key (so an
@@ -698,7 +683,6 @@ impl Kakehashi {
         // Finish tracking this request
         self.cache
             .record_served_semantic_version(&uri, snapshot.parsed_version);
-        self.cache.finish_request(&uri, request_id);
 
         log::debug!(
             target: "kakehashi::semantic",
@@ -782,11 +766,9 @@ impl Kakehashi {
                 // document" and the client would stay dark until its next
                 // didChange-driven request.
                 self.cache.record_served_semantic_version(&uri, 0);
-                self.cache.finish_request(&uri, request_id);
                 return Err(crate::error::content_modified_error());
             }
             TokenSnapshot::Cancelled => {
-                self.cache.finish_request(&uri, request_id);
                 log::debug!(
                     target: "kakehashi::semantic",
                     "[SEMANTIC_TOKENS_DELTA] CANCELLED via $/cancelRequest uri={} req={} (while parked)",
@@ -797,7 +779,6 @@ impl Kakehashi {
             TokenSnapshot::Superseded => {
                 // Same contract as a compute superseded mid-flight: the newer
                 // request answers; this one drops out quietly.
-                self.cache.finish_request(&uri, request_id);
                 log::debug!(
                     target: "kakehashi::semantic",
                     "[SEMANTIC_TOKENS_DELTA] CANCELLED uri={} req={} (superseded while parked)",
@@ -821,7 +802,6 @@ impl Kakehashi {
         else {
             self.cache
                 .record_served_semantic_version(&uri, snapshot.parsed_version);
-            self.cache.finish_request(&uri, request_id);
             return Ok(Some(SemanticTokensFullDeltaResult::Tokens(
                 SemanticTokens {
                     result_id: None,
@@ -839,7 +819,6 @@ impl Kakehashi {
             .ensure_language_loaded_async(&language_name)
             .await;
         if !load_result.success {
-            self.cache.finish_request(&uri, request_id);
             return Ok(Some(SemanticTokensFullDeltaResult::Tokens(
                 SemanticTokens {
                     result_id: None,
@@ -859,7 +838,6 @@ impl Kakehashi {
         }
 
         let Some(query) = self.language.highlight_query(&language_name) else {
-            self.cache.finish_request(&uri, request_id);
             return Ok(Some(SemanticTokensFullDeltaResult::Tokens(
                 SemanticTokens {
                     result_id: None,
@@ -904,12 +882,10 @@ impl Kakehashi {
                 &edit_lock,
             );
             if !still_current || !self.cache.is_request_active(&uri, request_id) {
-                self.cache.finish_request(&uri, request_id);
                 return Ok(None);
             }
             self.cache
                 .record_served_semantic_version(&uri, snapshot.parsed_version);
-            self.cache.finish_request(&uri, request_id);
             return Ok(Some(SemanticTokensFullDeltaResult::TokensDelta(
                 tower_lsp_server::ls_types::SemanticTokensDelta {
                     result_id: Some(previous_result_id),
@@ -946,12 +922,10 @@ impl Kakehashi {
                         &edit_lock,
                     );
                     if !still_current || !self.cache.is_request_active(&uri, request_id) {
-                        self.cache.finish_request(&uri, request_id);
                         return Ok(None);
                     }
                     self.cache
                         .record_served_semantic_version(&uri, snapshot.parsed_version);
-                    self.cache.finish_request(&uri, request_id);
                     return Ok(Some(SemanticTokensFullDeltaResult::TokensDelta(
                         tower_lsp_server::ls_types::SemanticTokensDelta {
                             result_id: Some(previous_result_id),
@@ -1006,7 +980,6 @@ impl Kakehashi {
                         // Detach only this consumer; another same-scope request
                         // may still need the shared artifact.
                         _ = &mut cancel_rx => {
-                            self.cache.finish_request(&uri, request_id);
                             log::debug!(
                                 target: "kakehashi::semantic",
                                 "[SEMANTIC_TOKENS_DELTA] CANCELLED via $/cancelRequest uri={} req={}",
@@ -1029,7 +1002,6 @@ impl Kakehashi {
                 // existing activity check immediately after materialization
                 // avoids adding a second DashMap lookup to every computed delta.
                 if cancel_token.is_cancelled() {
-                    self.cache.finish_request(&uri, request_id);
                     log::debug!(
                         target: "kakehashi::semantic",
                         "[SEMANTIC_TOKENS_DELTA] CANCELLED uri={} req={} (before artifact)",
@@ -1048,7 +1020,6 @@ impl Kakehashi {
         // A newer request scope or close wakes this consumer. The artifact's
         // separate snapshot token reclaims obsolete producer work.
         if cancel_token.is_cancelled() {
-            self.cache.finish_request(&uri, request_id);
             log::debug!(
                 target: "kakehashi::semantic",
                 "[SEMANTIC_TOKENS_DELTA] CANCELLED uri={} req={} (compute superseded)",
@@ -1063,7 +1034,6 @@ impl Kakehashi {
         let Some(current_tokens) = result else {
             // Preserve the slot's retry contract: transient producer failure
             // must not become an empty delta baseline cached for this snapshot.
-            self.cache.finish_request(&uri, request_id);
             return Ok(None);
         };
 
@@ -1139,7 +1109,6 @@ impl Kakehashi {
             &edit_lock,
         );
         if !still_current || !self.cache.is_request_active(&uri, request_id) {
-            self.cache.finish_request(&uri, request_id);
             return Ok(None);
         }
         if let Some(tokens) = tokens_to_store {
@@ -1155,7 +1124,6 @@ impl Kakehashi {
         // Finish tracking this request
         self.cache
             .record_served_semantic_version(&uri, snapshot.parsed_version);
-        self.cache.finish_request(&uri, request_id);
 
         log::debug!(
             target: "kakehashi::semantic",
