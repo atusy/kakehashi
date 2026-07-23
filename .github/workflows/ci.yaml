@@ -19,6 +19,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - run: cargo check
+      - run: cargo check --features semantic-bench-instrumentation
       - run: cargo check --bench semantic_tokens --features e2e
       - run: KAKEHASHI_BENCH_VALIDATE_SCENARIOS=1 cargo test --bench semantic_tokens --features e2e
 
@@ -45,6 +46,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - run: cargo clippy -- -D warnings
+      - run: cargo clippy --features semantic-bench-instrumentation -- -D warnings
       - run: cargo clippy --bench semantic_tokens --features e2e -- -D warnings
 
   audit:
