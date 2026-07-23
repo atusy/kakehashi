@@ -124,6 +124,28 @@ impl CurrentTokens {
 }
 
 impl Kakehashi {
+    async fn semantic_range_artifact_failure(
+        &self,
+        uri: &Url,
+        snapshot: SemanticSnapshotIdentity,
+    ) -> Result<Option<SemanticTokensRangeResult>> {
+        let edit_lock = self.documents.edit_lock(uri);
+        let _edit_guard = edit_lock.lock().await;
+        if !self.semantic_snapshot_is_current(
+            uri,
+            snapshot.incarnation,
+            snapshot.parsed_version,
+            snapshot.generation,
+            &edit_lock,
+        ) {
+            return Err(crate::error::content_modified_error());
+        }
+
+        // The snapshot is still current, so this was a transient producer
+        // failure rather than invalidation. Keep it retryable and uncached.
+        Ok(None)
+    }
+
     fn shared_semantic_artifact(
         &self,
         snapshot: &std::sync::Arc<crate::document::snapshot::ParseSnapshot>,
@@ -1403,7 +1425,9 @@ impl Kakehashi {
             artifact.materialize_full(expected_artifact_identity, Some(next_result_id()))
         });
         let Some(full_tokens) = full_tokens else {
-            return Ok(None);
+            return self
+                .semantic_range_artifact_failure(&uri, snapshot_identity)
+                .await;
         };
         let range_tokens = filter_semantic_tokens_by_range(&full_tokens, &domain_range);
         let domain_range_result =
@@ -1545,6 +1569,47 @@ mod tests {
             panic!("empty range must return a complete empty token result");
         };
         assert!(tokens.data.is_empty());
+    }
+
+    #[tokio::test]
+    async fn failed_range_artifact_rechecks_snapshot_currency() {
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+        let uri = Url::parse("file:///range_artifact_failure.rs").expect("valid test uri");
+        server.documents.insert(
+            uri.clone(),
+            "fn main() {}".to_string(),
+            Some("rust".to_string()),
+            None,
+        );
+        publish_treeless(server, &uri, "fn main() {}", 0);
+
+        let snapshot = SemanticSnapshotIdentity {
+            parsed_version: 0,
+            incarnation: server
+                .documents
+                .latest_snapshot(&uri)
+                .expect("open document")
+                .slot
+                .current_incarnation,
+            generation: server.cache.semantic_token_generation(),
+        };
+        assert!(
+            server
+                .semantic_range_artifact_failure(&uri, snapshot)
+                .await
+                .expect("current transient failure remains a null retry")
+                .is_none()
+        );
+
+        server
+            .documents
+            .update_document(uri.clone(), "fn main() { todo!() }".to_string(), None);
+        let error = server
+            .semantic_range_artifact_failure(&uri, snapshot)
+            .await
+            .expect_err("stale range failure must request a retry");
+        assert_eq!(error.code, crate::error::content_modified_error().code);
     }
 
     /// Serve-current (the Neovim client contract): a full request arriving
