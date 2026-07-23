@@ -22,69 +22,73 @@ from drive import (
     wait_for_marker,
 )
 
+FAKE_SERVER_SOURCE = textwrap.dedent(
+    """\
+    import json
+    import pathlib
+    import sys
+    import time
+
+    log_path = pathlib.Path(sys.argv[1])
+    warmup_release = pathlib.Path(sys.argv[2])
+    exit_after_warmup = len(sys.argv) > 3 and sys.argv[3] == "exit-after-warmup"
+    semantic_requests = 0
+
+    def read_message():
+        length = None
+        while True:
+            line = sys.stdin.buffer.readline()
+            if not line:
+                raise EOFError
+            line = line.strip()
+            if not line:
+                break
+            if line.lower().startswith(b"content-length:"):
+                length = int(line.split(b":", 1)[1])
+        return json.loads(sys.stdin.buffer.read(length))
+
+    def send(message):
+        body = json.dumps(message).encode()
+        sys.stdout.buffer.write(
+            f"Content-Length: {len(body)}\\r\\n\\r\\n".encode() + body
+        )
+        sys.stdout.buffer.flush()
+
+    while True:
+        try:
+            message = read_message()
+        except EOFError:
+            break
+        method = message.get("method")
+        with log_path.open("a") as log:
+            log.write(f"{method}\\n")
+        if method == "exit":
+            break
+        if "id" not in message:
+            continue
+        if method == "initialize":
+            result = {"capabilities": {}}
+        elif method == "textDocument/semanticTokens/full":
+            semantic_requests += 1
+            if semantic_requests == 1:
+                while not warmup_release.exists():
+                    time.sleep(0.01)
+            result = {"data": []}
+        else:
+            result = None
+        send({"jsonrpc": "2.0", "id": message["id"], "result": result})
+        if exit_after_warmup and semantic_requests == 1:
+            break
+    """
+)
+
 
 class RequestSummaryTest(unittest.TestCase):
     def test_profile_ready_follows_warmup_and_start_gates_measurement(self):
-        fake_server_source = textwrap.dedent(
-            """\
-            import json
-            import pathlib
-            import sys
-            import time
-
-            log_path = pathlib.Path(sys.argv[1])
-            warmup_release = pathlib.Path(sys.argv[2])
-            semantic_requests = 0
-
-            def read_message():
-                length = None
-                while True:
-                    line = sys.stdin.buffer.readline()
-                    if not line:
-                        raise EOFError
-                    line = line.strip()
-                    if not line:
-                        break
-                    if line.lower().startswith(b"content-length:"):
-                        length = int(line.split(b":", 1)[1])
-                return json.loads(sys.stdin.buffer.read(length))
-
-            def send(message):
-                body = json.dumps(message).encode()
-                sys.stdout.buffer.write(
-                    f"Content-Length: {len(body)}\\r\\n\\r\\n".encode() + body
-                )
-                sys.stdout.buffer.flush()
-
-            while True:
-                try:
-                    message = read_message()
-                except EOFError:
-                    break
-                method = message.get("method")
-                with log_path.open("a") as log:
-                    log.write(f"{method}\\n")
-                if method == "exit":
-                    break
-                if "id" not in message:
-                    continue
-                if method == "initialize":
-                    result = {"capabilities": {}}
-                elif method == "textDocument/semanticTokens/full":
-                    semantic_requests += 1
-                    if semantic_requests == 1:
-                        while not warmup_release.exists():
-                            time.sleep(0.01)
-                    result = {"data": []}
-                else:
-                    result = None
-                send({"jsonrpc": "2.0", "id": message["id"], "result": result})
-            """
-        )
         with tempfile.TemporaryDirectory() as temporary:
             directory = pathlib.Path(temporary)
             fake_server = directory / "fake_server.py"
-            fake_server.write_text(fake_server_source)
+            fake_server.write_text(FAKE_SERVER_SOURCE)
             log = directory / "methods.log"
             warmup_release = directory / "warmup-release"
             ready = directory / "ready"
@@ -155,6 +159,48 @@ class RequestSummaryTest(unittest.TestCase):
                     except subprocess.TimeoutExpired:
                         process.kill()
                         process.wait()
+
+    def test_profile_start_wait_aborts_when_server_exits(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = pathlib.Path(temporary)
+            fake_server = directory / "fake_server.py"
+            fake_server.write_text(FAKE_SERVER_SOURCE)
+            log = directory / "methods.log"
+            warmup_release = directory / "warmup-release"
+            publish_marker(warmup_release, "")
+            ready = directory / "ready"
+            start = directory / "start"
+            process = subprocess.Popen(
+                [
+                    sys.executable,
+                    str(pathlib.Path(__file__).parent / "drive.py"),
+                    "--bin",
+                    sys.executable,
+                    f"--server-arg={fake_server}",
+                    f"--server-arg={log}",
+                    f"--server-arg={warmup_release}",
+                    "--server-arg=exit-after-warmup",
+                    "--requests=1",
+                    "--size=1",
+                    "--settle=0",
+                    f"--profile-ready-file={ready}",
+                    f"--profile-start-file={start}",
+                    "--profile-wait-timeout=10",
+                ],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            try:
+                _, stderr = process.communicate(timeout=3)
+                self.assertNotEqual(process.returncode, 0)
+                self.assertTrue(ready.is_file())
+                self.assertIn("server exited", stderr)
+                self.assertIn("waiting for profile marker", stderr)
+            finally:
+                if process.poll() is None:
+                    process.kill()
+                    process.wait()
 
     def test_profile_markers_are_published_and_waited_for(self):
         with tempfile.TemporaryDirectory() as temporary:
