@@ -93,6 +93,10 @@ pub struct Document {
     /// `Document` and with it a fresh cell, which is what clears the version
     /// floor for the new lifetime.
     snapshot_tx: watch::Sender<SnapshotSlot>,
+    /// Store-wide settings generation floor shared with every document so a
+    /// snapshot published concurrently with a reload inherits the new floor
+    /// under the snapshot cell's publication lock.
+    semantic_artifact_generation: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl Document {
@@ -106,6 +110,7 @@ impl Document {
             incarnation,
             content_version: 0,
             snapshot_tx: watch::Sender::new(SnapshotSlot::bootstrap(incarnation)),
+            semantic_artifact_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         }
     }
 
@@ -119,6 +124,7 @@ impl Document {
             incarnation,
             content_version: 0,
             snapshot_tx: watch::Sender::new(SnapshotSlot::bootstrap(incarnation)),
+            semantic_artifact_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         }
     }
 
@@ -137,7 +143,16 @@ impl Document {
             incarnation,
             content_version: 0,
             snapshot_tx: watch::Sender::new(SnapshotSlot::bootstrap(incarnation)),
+            semantic_artifact_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         }
+    }
+
+    pub(crate) fn with_semantic_artifact_generation(
+        mut self,
+        generation: Arc<std::sync::atomic::AtomicU64>,
+    ) -> Self {
+        self.semantic_artifact_generation = generation;
+        self
     }
 
     /// Get the text content
@@ -184,6 +199,10 @@ impl Document {
         let mut installed = false;
         self.snapshot_tx.send_if_modified(|slot| {
             if slot.admits(&snapshot) {
+                snapshot.advance_semantic_artifact_generation(
+                    self.semantic_artifact_generation
+                        .load(std::sync::atomic::Ordering::Acquire),
+                );
                 if let Some(previous) = slot.snapshot.as_ref() {
                     previous.cancel_semantic_artifact();
                 }
@@ -271,6 +290,11 @@ impl Document {
         // Advancing the internal version makes every pre-reload parse result
         // stale and lets the scheduled current-generation snapshot supersede it.
         self.content_version = self.content_version.wrapping_add(1);
+        let semantic_artifact = Arc::new(crate::analysis::SemanticArtifactSlot::new());
+        semantic_artifact.advance_minimum_generation(
+            self.semantic_artifact_generation
+                .load(std::sync::atomic::Ordering::Acquire),
+        );
         self.snapshot_tx.send_replace(SnapshotSlot {
             current_incarnation: self.incarnation,
             snapshot: Some(Arc::new(ParseSnapshot {
@@ -283,7 +307,7 @@ impl Document {
                 bridge_regions: None,
                 resolved_regions: None,
                 layer_trees: std::sync::OnceLock::new(),
-                semantic_artifact: Arc::new(crate::analysis::SemanticArtifactSlot::new()),
+                semantic_artifact,
             })),
         });
     }

@@ -115,6 +115,8 @@ pub(crate) struct SemanticArtifactSlot {
     producer_starts: std::sync::atomic::AtomicUsize,
     #[cfg(test)]
     joins: std::sync::atomic::AtomicUsize,
+    #[cfg(test)]
+    fail_next_producer: std::sync::atomic::AtomicBool,
 }
 
 struct SemanticArtifactAttempt {
@@ -204,6 +206,8 @@ impl SemanticArtifactSlot {
             producer_starts: std::sync::atomic::AtomicUsize::new(0),
             #[cfg(test)]
             joins: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(test)]
+            fail_next_producer: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -271,11 +275,17 @@ impl SemanticArtifactSlot {
         let producer_identity = identity.clone();
         let future = async move {
             #[cfg(test)]
-            if let Some(slot) = weak_slot.upgrade() {
+            let force_failure = weak_slot.upgrade().is_some_and(|slot| {
                 slot.producer_starts
                     .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            }
-            let artifact =
+                slot.fail_next_producer
+                    .swap(false, std::sync::atomic::Ordering::SeqCst)
+            });
+            #[cfg(not(test))]
+            let force_failure = false;
+            let artifact = if force_failure {
+                None
+            } else {
                 match std::panic::AssertUnwindSafe(produce(producer_cancel, producer_identity))
                     .catch_unwind()
                     .await
@@ -288,7 +298,8 @@ impl SemanticArtifactSlot {
                         );
                         None
                     }
-                };
+                }
+            };
             producer_control
                 .complete
                 .store(true, std::sync::atomic::Ordering::Release);
@@ -379,6 +390,18 @@ impl SemanticArtifactSlot {
     #[cfg(test)]
     pub(crate) fn test_joins(&self) -> usize {
         self.joins.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_fail_next_producer(&self) {
+        self.fail_next_producer
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_minimum_generation(&self) -> u64 {
+        self.minimum_generation
+            .load(std::sync::atomic::Ordering::SeqCst)
     }
 }
 
