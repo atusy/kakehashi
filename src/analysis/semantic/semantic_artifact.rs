@@ -1,4 +1,7 @@
 use crate::analysis::SemanticSnapshotIdentity;
+use futures::FutureExt;
+use futures::future::{BoxFuture, Shared};
+use std::sync::Arc;
 use tower_lsp_server::ls_types::{SemanticTokens, SemanticTokensResult};
 use url::Url;
 
@@ -6,7 +9,7 @@ use url::Url;
 ///
 /// The artifact remains scoped to one immutable parse snapshot. Response-local
 /// state such as an LSP `resultId` is deliberately not part of this identity.
-#[derive(Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct SemanticArtifactIdentity {
     uri: Url,
     language: String,
@@ -95,6 +98,150 @@ pub(crate) struct SemanticArtifact {
     tokens: SemanticTokens,
 }
 
+/// One generation-aware single-flight slot owned by a [`ParseSnapshot`].
+///
+/// The slot retains either the in-progress shared future or its completed
+/// immutable artifact. A different identity atomically replaces and cancels
+/// the previous attempt. Failed/cancelled attempts compare-and-remove
+/// themselves so the same identity can be retried; an old attempt can never
+/// clear its replacement.
+///
+/// [`ParseSnapshot`]: crate::document::snapshot::ParseSnapshot
+pub(crate) struct SemanticArtifactSlot {
+    attempt: std::sync::Mutex<Option<SemanticArtifactAttempt>>,
+    #[cfg(test)]
+    producer_starts: std::sync::atomic::AtomicUsize,
+    #[cfg(test)]
+    joins: std::sync::atomic::AtomicUsize,
+}
+
+struct SemanticArtifactAttempt {
+    id: u64,
+    identity: SemanticArtifactIdentity,
+    cancel: crate::cancel::CancelToken,
+    future: SharedArtifactFuture,
+}
+
+pub(crate) type SharedArtifactFuture = Shared<BoxFuture<'static, Option<Arc<SemanticArtifact>>>>;
+
+static NEXT_ATTEMPT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+impl SemanticArtifactSlot {
+    pub(crate) fn new() -> Self {
+        Self {
+            attempt: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            producer_starts: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(test)]
+            joins: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
+    /// Join the attempt for `identity`, or install one lazy producer.
+    ///
+    /// `produce` is called only by the elected producer and receives the
+    /// revision-owned cancellation token. Dropping one returned future merely
+    /// detaches that consumer: the slot retains another clone, so another
+    /// consumer can still join the current-revision work.
+    pub(crate) fn claim_or_join<F, Fut>(
+        self: &Arc<Self>,
+        identity: SemanticArtifactIdentity,
+        produce: F,
+    ) -> SharedArtifactFuture
+    where
+        F: FnOnce(crate::cancel::CancelToken, SemanticArtifactIdentity) -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = Option<SemanticArtifact>> + Send + 'static,
+    {
+        let mut attempt = self.attempt.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(current) = attempt.as_ref()
+            && current.identity == identity
+        {
+            #[cfg(test)]
+            self.joins.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            return current.future.clone();
+        }
+
+        if let Some(previous) = attempt.take() {
+            previous.cancel.cancel();
+        }
+
+        let id = NEXT_ATTEMPT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let cancel = crate::cancel::CancelToken::default();
+        let producer_cancel = cancel.clone();
+        let weak_slot = Arc::downgrade(self);
+        let producer_identity = identity.clone();
+        let future = async move {
+            #[cfg(test)]
+            if let Some(slot) = weak_slot.upgrade() {
+                slot.producer_starts
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+            let artifact =
+                match std::panic::AssertUnwindSafe(produce(producer_cancel, producer_identity))
+                    .catch_unwind()
+                    .await
+                {
+                    Ok(artifact) => artifact.map(Arc::new),
+                    Err(_) => {
+                        log::error!(
+                            target: "kakehashi::crash_recovery",
+                            "semantic artifact producer future panicked"
+                        );
+                        None
+                    }
+                };
+            if artifact.is_none()
+                && let Some(slot) = weak_slot.upgrade()
+            {
+                slot.remove_failed_attempt(id);
+            }
+            artifact
+        }
+        .boxed()
+        .shared();
+
+        *attempt = Some(SemanticArtifactAttempt {
+            id,
+            identity,
+            cancel,
+            future: future.clone(),
+        });
+        future
+    }
+
+    /// Cancel production because the owning snapshot is no longer current.
+    pub(crate) fn cancel(&self) {
+        let attempt = self.attempt.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(attempt) = attempt.as_ref() {
+            attempt.cancel.cancel();
+        }
+    }
+
+    fn remove_failed_attempt(&self, id: u64) {
+        let mut attempt = self.attempt.lock().unwrap_or_else(|e| e.into_inner());
+        if attempt.as_ref().is_some_and(|attempt| attempt.id == id) {
+            *attempt = None;
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_producer_starts(&self) -> usize {
+        self.producer_starts
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_joins(&self) -> usize {
+        self.joins.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+impl Default for SemanticArtifactSlot {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl SemanticArtifact {
     pub(crate) fn from_full_result(
         identity: SemanticArtifactIdentity,
@@ -107,7 +254,8 @@ impl SemanticArtifact {
         Some(Self { identity, tokens })
     }
 
-    pub(crate) fn into_full(
+    #[cfg(test)]
+    fn into_full(
         mut self,
         expected_identity: SemanticArtifactIdentityRef<'_>,
         result_id: Option<String>,
@@ -122,13 +270,8 @@ impl SemanticArtifact {
     /// Materialize one request response while retaining the artifact for other
     /// consumers of the same snapshot slot.
     ///
-    /// Stage 2 has only unique local artifacts and uses [`Self::into_full`] to
-    /// move the payload without cloning. Stage 3 shared-slot consumers use this
-    /// borrowed form and pay the wire-payload clone required for each response.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "shared snapshot slots are introduced in Stage 3")
-    )]
+    /// Shared-slot consumers pay the wire-payload clone required for each
+    /// independent LSP response while retaining one immutable artifact.
     pub(crate) fn materialize_full(
         &self,
         expected_identity: SemanticArtifactIdentityRef<'_>,
@@ -145,7 +288,7 @@ impl SemanticArtifact {
 
 #[cfg(test)]
 mod tests {
-    use super::{SemanticArtifact, SemanticArtifactIdentity};
+    use super::{SemanticArtifact, SemanticArtifactIdentity, SemanticArtifactSlot};
     use crate::analysis::SemanticSnapshotIdentity;
     use tower_lsp_server::ls_types::{
         SemanticToken, SemanticTokens, SemanticTokensPartialResult, SemanticTokensResult,
@@ -163,6 +306,23 @@ mod tests {
             },
             true,
         )
+    }
+
+    fn artifact(identity: SemanticArtifactIdentity, token_type: u32) -> SemanticArtifact {
+        SemanticArtifact::from_full_result(
+            identity,
+            SemanticTokensResult::Tokens(SemanticTokens {
+                result_id: None,
+                data: vec![SemanticToken {
+                    delta_line: 0,
+                    delta_start: 0,
+                    length: 1,
+                    token_type,
+                    token_modifiers_bitset: 0,
+                }],
+            }),
+        )
+        .expect("complete result")
     }
 
     #[test]
@@ -328,5 +488,160 @@ mod tests {
         );
 
         assert!(artifact.is_none());
+    }
+
+    #[tokio::test]
+    async fn same_identity_joins_one_producer() {
+        let slot = std::sync::Arc::new(SemanticArtifactSlot::new());
+        let producers = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let release = std::sync::Arc::new(tokio::sync::Notify::new());
+
+        let first = slot.claim_or_join(identity(), {
+            let producers = std::sync::Arc::clone(&producers);
+            let release = std::sync::Arc::clone(&release);
+            move |_cancel, identity| async move {
+                producers.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                release.notified().await;
+                Some(artifact(identity, 1))
+            }
+        });
+        let second = slot.claim_or_join(identity(), {
+            let producers = std::sync::Arc::clone(&producers);
+            move |_cancel, identity| async move {
+                producers.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Some(artifact(identity, 2))
+            }
+        });
+
+        let joined = tokio::spawn(second);
+        tokio::task::yield_now().await;
+        assert_eq!(producers.load(std::sync::atomic::Ordering::SeqCst), 1);
+        release.notify_waiters();
+
+        let (first, second) = tokio::join!(first, joined);
+        let first = first.expect("producer completes");
+        let second = second.expect("join task").expect("join completes");
+        assert!(std::sync::Arc::ptr_eq(&first, &second));
+        assert_eq!(producers.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn failed_attempt_is_retryable() {
+        let slot = std::sync::Arc::new(SemanticArtifactSlot::new());
+        let failed = slot.claim_or_join(identity(), |_cancel, _identity| async { None });
+        assert!(failed.await.is_none());
+
+        let retried = slot.claim_or_join(identity(), |_cancel, identity| async move {
+            Some(artifact(identity, 7))
+        });
+        assert!(retried.await.is_some());
+    }
+
+    #[tokio::test]
+    async fn panicked_attempt_is_contained_and_retryable() {
+        let slot = std::sync::Arc::new(SemanticArtifactSlot::new());
+        let panicked = slot.claim_or_join(identity(), |_cancel, _identity| async {
+            panic!("test producer panic");
+        });
+        assert!(panicked.await.is_none());
+
+        let retried = slot.claim_or_join(identity(), |_cancel, identity| async move {
+            Some(artifact(identity, 8))
+        });
+        assert!(retried.await.is_some());
+    }
+
+    #[tokio::test]
+    async fn dropping_one_consumer_does_not_cancel_a_joiner() {
+        let slot = std::sync::Arc::new(SemanticArtifactSlot::new());
+        let started = std::sync::Arc::new(tokio::sync::Notify::new());
+        let release = std::sync::Arc::new(tokio::sync::Notify::new());
+        let first = slot.claim_or_join(identity(), {
+            let started = std::sync::Arc::clone(&started);
+            let release = std::sync::Arc::clone(&release);
+            move |_cancel, identity| async move {
+                started.notify_one();
+                release.notified().await;
+                Some(artifact(identity, 4))
+            }
+        });
+        let second = slot.claim_or_join(identity(), |_cancel, identity| async move {
+            Some(artifact(identity, 5))
+        });
+
+        let cancelled_consumer = tokio::spawn(first);
+        started.notified().await;
+        cancelled_consumer.abort();
+        release.notify_one();
+
+        let artifact = second.await.expect("joined consumer still completes");
+        let tokens = artifact
+            .materialize_full(identity().as_ref(), None)
+            .expect("matching identity");
+        assert_eq!(tokens.data[0].token_type, 4);
+    }
+
+    #[tokio::test]
+    async fn snapshot_cancellation_stops_current_attempt() {
+        let slot = std::sync::Arc::new(SemanticArtifactSlot::new());
+        let started = std::sync::Arc::new(tokio::sync::Notify::new());
+        let future = slot.claim_or_join(identity(), {
+            let started = std::sync::Arc::clone(&started);
+            move |cancel, _identity| async move {
+                started.notify_one();
+                cancel.cancelled().await;
+                None
+            }
+        });
+        let task = tokio::spawn(future);
+        started.notified().await;
+        slot.cancel();
+        assert!(task.await.expect("consumer task").is_none());
+    }
+
+    #[tokio::test]
+    async fn replacement_cancels_old_attempt_without_removing_new_one() {
+        let slot = std::sync::Arc::new(SemanticArtifactSlot::new());
+        let old_started = std::sync::Arc::new(tokio::sync::Notify::new());
+        let old = slot.claim_or_join(identity(), {
+            let old_started = std::sync::Arc::clone(&old_started);
+            move |cancel, _identity| async move {
+                old_started.notify_one();
+                cancel.cancelled().await;
+                None
+            }
+        });
+        let old_task = tokio::spawn(old);
+        old_started.notified().await;
+
+        let mut replacement_identity = identity();
+        replacement_identity.snapshot.generation += 1;
+        let replacement = slot.claim_or_join(
+            replacement_identity.clone(),
+            |_cancel, identity| async move { Some(artifact(identity, 9)) },
+        );
+        assert!(old_task.await.expect("old task").is_none());
+        assert!(replacement.await.is_some());
+
+        let joined = slot.claim_or_join(replacement_identity, |_cancel, identity| async move {
+            Some(artifact(identity, 10))
+        });
+        let joined = joined.await.expect("replacement remains installed");
+        let tokens = joined
+            .materialize_full(
+                SemanticArtifactIdentity::expected(
+                    &Url::parse("file:///workspace/main.rs").unwrap(),
+                    "rust",
+                    SemanticSnapshotIdentity {
+                        parsed_version: 7,
+                        incarnation: 3,
+                        generation: 12,
+                    },
+                    true,
+                ),
+                None,
+            )
+            .expect("matching replacement identity");
+        assert_eq!(tokens.data[0].token_type, 9);
     }
 }

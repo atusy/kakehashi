@@ -184,6 +184,9 @@ impl Document {
         let mut installed = false;
         self.snapshot_tx.send_if_modified(|slot| {
             if slot.admits(&snapshot) {
+                if let Some(previous) = slot.snapshot.as_ref() {
+                    previous.cancel_semantic_artifact();
+                }
                 slot.snapshot = Some(Arc::clone(&snapshot));
                 installed = true;
             }
@@ -199,6 +202,7 @@ impl Document {
     /// pass the bootstrap branch. Explicit because stale parse tasks may hold
     /// `Sender` clones that keep the channel alive past this document's drop.
     pub(crate) fn publish_closed(&self) {
+        self.cancel_current_semantic_artifact();
         self.snapshot_tx.send_replace(SnapshotSlot::closed());
     }
 
@@ -234,6 +238,7 @@ impl Document {
     /// snapshot stale early, never serves a wrong one).
     #[cfg(test)]
     pub(crate) fn update_tree_and_text(&mut self, new_tree: Tree, new_text: String) {
+        self.cancel_current_semantic_artifact();
         self.text = Arc::from(new_text);
         self.content_version += 1;
         self.tree = Some(new_tree);
@@ -259,6 +264,7 @@ impl Document {
     }
 
     pub(crate) fn invalidate_parse(&mut self) {
+        self.cancel_current_semantic_artifact();
         self.tree = None;
         self.pending_seed = None;
         // Grammar/query settings are parse inputs even when text is unchanged.
@@ -277,6 +283,7 @@ impl Document {
                 bridge_regions: None,
                 resolved_regions: None,
                 layer_trees: std::sync::OnceLock::new(),
+                semantic_artifact: Arc::new(crate::analysis::SemanticArtifactSlot::new()),
             })),
         });
     }
@@ -308,6 +315,7 @@ impl Document {
     /// incremental contract and corrupted external scanners in #348, so a full-text
     /// sync must parse from scratch.
     pub(crate) fn apply_edit_and_seed(&mut self, new_text: String, edits: &[InputEdit]) {
+        self.cancel_current_semantic_artifact();
         // Base the seed on the reader-visible tree if present, else the seed an
         // earlier coalesced edit already accumulated (the visible tree is cleared
         // on the first edit of a burst, so subsequent edits chain onto the seed).
@@ -336,11 +344,18 @@ impl Document {
     /// Update text and clear layers/state
     #[cfg(test)]
     pub(crate) fn update_text(&mut self, text: String) {
+        self.cancel_current_semantic_artifact();
         self.text = Arc::from(text);
         // Note: Tree needs to be rebuilt after text change
         self.tree = None;
         self.pending_seed = None;
         self.content_version += 1;
+    }
+
+    fn cancel_current_semantic_artifact(&self) {
+        if let Some(snapshot) = self.snapshot_tx.borrow().snapshot.as_ref() {
+            snapshot.cancel_semantic_artifact();
+        }
     }
 }
 

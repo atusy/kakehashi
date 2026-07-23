@@ -19,7 +19,9 @@ pub(crate) use legend::{LEGEND_MODIFIERS, LEGEND_TYPES};
 pub(crate) use parallel::DISCOVERY_REUSE_HITS;
 pub(crate) use parallel::build_document_discovery;
 pub(crate) use range::filter_semantic_tokens_by_range;
-pub(crate) use semantic_artifact::{SemanticArtifact, SemanticArtifactIdentity};
+pub(crate) use semantic_artifact::{
+    SemanticArtifact, SemanticArtifactIdentity, SemanticArtifactSlot, SharedArtifactFuture,
+};
 
 // Re-export for parallel processing
 use parallel::{INJECTION_CACHE_MIN_REGIONS, InjectionCacheCtx, collect_injection_tokens_parallel};
