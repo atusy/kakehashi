@@ -16,13 +16,15 @@ does not claim a latency improvement.
 
 Build the feature-enabled profiling binary, then run one language at a time
 with the synchronous driver and no competing requests. The measurement used
-the project-local data directory whose non-lock files are pinned by
-[`parser-artifacts.sha256`](parser-artifacts.sha256); verify it before running
-so parser or query updates cannot silently change the workload:
+the project-local data directory. [`prepare-data.sh`](prepare-data.sh)
+reconstructs the six workload-relevant languages from nvim-treesitter commit
+`a45a920ec04cda5624f6dea0ff6454c81c3ad2d5`: that commit's `parsers.lua`
+pins each grammar revision, and its query files replace the installer's
+main-branch downloads. The final hashes are verified by
+[`parser-artifacts.sha256`](parser-artifacts.sha256):
 
 ```sh
-shasum -a 256 -c \
-  benches/results/allocation-attribution-2026-07-23/parser-artifacts.sha256
+benches/results/allocation-attribution-2026-07-23/prepare-data.sh
 cargo build --profile profiling --features allocation-profile --bin kakehashi
 
 RUST_LOG=kakehashi::semantic=debug \
@@ -40,24 +42,28 @@ RUST_LOG=kakehashi::semantic=debug \
     2> /tmp/kakehashi-allocation-rust-final.log
 ```
 
-The sanitized allocation records from all 36 responses are retained in
-[`markdown-all.tsv`](markdown-all.tsv) and [`rust-all.tsv`](rust-all.tsv). The
-first 6 completed records in each log are warmups. The remaining 30 records are
-renumbered into [`markdown.tsv`](markdown.tsv) and [`rust.tsv`](rust.tsv).
-Verify that extraction and print the summary with:
+The 36 allocation log lines, with only logger timestamps/prefixes removed, are
+retained in [`markdown.log`](markdown.log) and [`rust.log`](rust.log).
+[`markdown-all.tsv`](markdown-all.tsv) and [`rust-all.tsv`](rust-all.tsv)
+preserve their parsed fields. The first 6 completed records are warmups; the
+remaining 30 are renumbered into [`markdown.tsv`](markdown.tsv) and
+[`rust.tsv`](rust.tsv). Verify both extraction steps and print the summary
+with:
 
 ```sh
 evidence=benches/results/allocation-attribution-2026-07-23
 python3 "$evidence/analyze.py" \
+  "$evidence/markdown.log" \
   "$evidence/markdown-all.tsv" "$evidence/markdown.tsv"
 python3 "$evidence/analyze.py" \
+  "$evidence/rust.log" \
   "$evidence/rust-all.tsv" "$evidence/rust.tsv"
 ```
 
 The script uses the nearest-rank percentile convention
-(`sorted[ceil(p * n) - 1]`). The complete original logs contain unrelated
+(`sorted[ceil(p * n) - 1]`). The complete original logs also contain unrelated
 driver and phase timing records and are not committed; their hashes preserve
-the provenance of the sanitized records:
+the provenance of the sanitized allocation-only logs:
 
 Full-log SHA-256:
 
@@ -97,4 +103,6 @@ retained growth or predict the latency effect of either change.
   of evidence; derived net-live values are intentionally not reported.
 - `allocation-profile` adds atomic counter overhead. Therefore this run makes
   no latency claim; latency comparisons must use builds without that feature.
-- Cancelled work has no completed allocation record.
+- Work whose cancellation is observed by the final compute checkpoint has no
+  completed allocation record. A cancellation racing after that checkpoint may
+  still make the caller discard a result whose record was already emitted.

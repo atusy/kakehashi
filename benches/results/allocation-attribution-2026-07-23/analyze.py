@@ -4,6 +4,7 @@
 import argparse
 import csv
 import math
+import re
 import statistics
 from pathlib import Path
 
@@ -15,6 +16,15 @@ FIELDS = (
     "deallocated_bytes",
 )
 METRICS = ("allocations", "allocated_bytes")
+RECORD = re.compile(
+    r"^\[SEMANTIC_TOKENS\] compute rust allocations: "
+    r"allocations=(?P<allocations>\d+) "
+    r"allocated_bytes=(?P<allocated_bytes>\d+) "
+    r"deallocations=(?P<deallocations>\d+) "
+    r"deallocated_bytes=(?P<deallocated_bytes>\d+) "
+    r"scope=process_global_alloc_delta "
+    r"consistency=non_atomic_snapshot$"
+)
 
 
 def read_rows(path: Path) -> list[dict[str, int]]:
@@ -31,14 +41,31 @@ def percentile(values: list[int], fraction: float) -> int:
     return ordered[math.ceil(fraction * len(ordered)) - 1]
 
 
+def read_log(path: Path) -> list[dict[str, int]]:
+    rows = []
+    for line_number, line in enumerate(path.read_text().splitlines(), 1):
+        match = RECORD.fullmatch(line)
+        if match is None:
+            raise SystemExit(f"{path}:{line_number}: unexpected allocation record")
+        rows.append(
+            {"sample": len(rows) + 1}
+            | {key: int(value) for key, value in match.groupdict().items()}
+        )
+    return rows
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
+    parser.add_argument("raw_log", type=Path)
     parser.add_argument("all_records", type=Path)
     parser.add_argument("retained_records", type=Path)
     parser.add_argument("--warmups", type=int, default=6)
     args = parser.parse_args()
 
+    raw_rows = read_log(args.raw_log)
     all_rows = read_rows(args.all_records)
+    if all_rows != raw_rows:
+        raise SystemExit(f"{args.all_records}: rows differ from {args.raw_log}")
     retained = read_rows(args.retained_records)
     expected = all_rows[args.warmups :]
     for sample, row in enumerate(expected, 1):
