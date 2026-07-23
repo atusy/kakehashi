@@ -87,6 +87,23 @@ def wait_for_marker(
     return marker
 
 
+def validate_profile_marker_paths(
+    paths: list[Path | str | None],
+) -> None:
+    """Reject aliases that could satisfy a profiling phase prematurely."""
+    seen: dict[Path, Path | str] = {}
+    for path in paths:
+        if path is None:
+            continue
+        resolved = Path(path).expanduser().resolve()
+        if resolved in seen:
+            previous = seen[resolved]
+            raise ValueError(
+                f"profile marker paths must be distinct: {previous} and {path}"
+            )
+        seen[resolved] = path
+
+
 def summarize_samples(samples: list[RequestSample]) -> RequestSummary:
     if not samples:
         raise ValueError("cannot summarize an empty request sample")
@@ -269,6 +286,15 @@ def main() -> None:
         ap.error("--profile-hold-seconds must be non-negative")
     if args.profile_wait_timeout <= 0:
         ap.error("--profile-wait-timeout must be positive")
+    try:
+        validate_profile_marker_paths([
+            args.profile_pid_file,
+            args.profile_ready_file,
+            args.profile_start_file,
+            args.profile_done_file,
+        ])
+    except ValueError as error:
+        ap.error(str(error))
     if args.burst > 1 and (args.captures or args.concurrent_captures):
         ap.error("--burst cannot be combined with captures modes")
     if args.concurrent_captures:

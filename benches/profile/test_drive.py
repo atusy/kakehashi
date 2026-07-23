@@ -18,6 +18,7 @@ from drive import (
     server_request_result,
     summarize_samples,
     summarize_samples_by_status,
+    validate_profile_marker_paths,
     wait_for_marker,
 )
 
@@ -174,6 +175,15 @@ class RequestSummaryTest(unittest.TestCase):
             marker = pathlib.Path(temporary) / "missing"
             with self.assertRaisesRegex(TimeoutError, "missing"):
                 wait_for_marker(marker, 0.01)
+
+    def test_profile_marker_paths_must_be_distinct(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = pathlib.Path(temporary)
+            marker = directory / "ready"
+            with self.assertRaisesRegex(ValueError, "must be distinct"):
+                validate_profile_marker_paths(
+                    [marker, directory / "nested" / ".." / "ready"]
+                )
 
     def test_summarizes_latency_status_and_wire_bytes(self):
         samples = [
