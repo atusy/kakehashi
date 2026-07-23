@@ -26,9 +26,12 @@ retiring obsolete revision work can improve latest-response latency, but does
 not show that the current revision's whole-document computation became cheaper.
 
 The editor-facing contract remains strict: every accepted full or delta response
-must describe the latest edit. Debouncing edits, returning `null`, omitting
-intermediate current requests, or coalescing distinct input versions would make
-highlighting lag behind typing and is not an acceptable optimization.
+must describe the latest edit. Debouncing current semantic requests, returning
+`null`, omitting the newest response, or serving one input version's artifact as
+another would make highlighting lag behind typing and is not an acceptable
+optimization. The per-document parse scheduler may continue to coalesce obsolete
+intermediate parses and derive the newest revision; this decision does not restore
+per-edit parse work.
 
 ## Decision Drivers
 
@@ -80,10 +83,20 @@ Every artifact key contains all inputs that can change semantic output:
   token shaping; and
 - the semantic legend generation when capture-to-token mapping changes.
 
-The `ParseSnapshot` owns the current revision's artifact cell. The cell is lazy
-and single-assignment: it may be empty, computing, complete, or failed/cancelled,
-but a partial result is never readable. Artifact data holds no strong reference
-back to its snapshot, avoiding a retention cycle.
+The `ParseSnapshot` owns a generation-aware `SemanticArtifactSlot`. A settings,
+query, legend, or capability generation can change without publishing a new
+parse snapshot, so the slot is replaceable by key rather than single-assignment
+for the snapshot's entire lifetime. Installing a new key cancels and detaches the
+old key's producer; requests already holding its completed `Arc` may finish but
+cannot publish it as current.
+
+Each production **attempt** is lazy and single-assignment, moving from `empty`
+to `computing` to `complete`. An attempt carries an identity so only its producer
+may complete or remove it. Cancellation, timeout, panic, or another failure
+compare-and-removes that attempt back to `empty`; a later request for the same
+key can therefore become producer and retry. A partial result is never readable.
+Artifact data holds no strong reference back to its snapshot, avoiding a
+retention cycle.
 
 Requests clone an `Arc` to the selected snapshot and artifact. The request still
 performs the existing final currency check before delivery. Artifact identity
@@ -106,8 +119,10 @@ Cancellation has two scopes:
 
 Thus a cancelled old request cannot consume CPU indefinitely, while one client's
 `$/cancelRequest` cannot starve another request for the same current revision.
-No edit is debounced or combined, and the newest revision always receives a new
-live cancellation scope.
+Semantic artifact identities are never combined across input versions, and the
+newest revision always receives a new live cancellation scope. This is compatible
+with the parse scheduler dropping obsolete intermediate parse passes before an
+artifact exists.
 
 ### 3. Persistent representation
 
@@ -169,11 +184,18 @@ converts failure into a completed empty result.
 Retention follows reachability and hard budgets:
 
 - a document retains its current artifact root;
-- full/delta retains at most the one previous accepted root needed by that
-  document's live baseline; range requests retain no history;
+- full/delta preserves the existing bounded LRU history for reissued result IDs:
+  at most eight accepted baselines and 512 KiB of flat token payload per document,
+  while always keeping the newest baseline; a successful read refreshes a
+  baseline's recency;
+- prior artifact roots may accompany those flat baselines only within the new
+  artifact byte budgets. If a root is evicted, the retained flat baseline still
+  supports the existing full/delta comparison path; range requests retain no
+  history;
 - active requests may temporarily retain their exact roots until completion;
-- closed incarnations and superseded baselines are removed from lookup
-  immediately, although in-flight `Arc`s may finish dropping naturally; and
+- closed incarnations are removed from lookup immediately. Superseded baselines
+  follow the bounded LRU policy rather than disappearing immediately, while
+  in-flight `Arc`s may finish dropping naturally; and
 - cross-revision reusable chunks enter a weighted cache only after both a
   per-document byte limit and a process-global byte limit exist.
 
@@ -294,8 +316,12 @@ The decision is confirmed incrementally, not by the presence of an artifact type
   parser-install cases;
 - freshness tests prove accepted responses represent the latest edit and that
   cancelling one consumer does not cancel another current consumer;
-- retention tests enforce the current-plus-one-baseline root rule and both byte
-  budgets, including close/reopen and cancellation cleanup;
+- slot tests rotate keys on a generation change, reject completion from the
+  detached producer, and retry the same key after cancellation, timeout, or
+  panic;
+- retention tests preserve reissued result IDs under the existing bounded LRU,
+  enforce the new artifact byte budgets, and cover close/reopen and cancellation
+  cleanup;
 - at least one large-document small-edit scenario has repeatable proportional
   work and lower current-response latency without regressing primary controls;
   and
