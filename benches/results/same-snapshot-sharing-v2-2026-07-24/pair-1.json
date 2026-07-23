@@ -1,0 +1,110 @@
+{
+  "binaries": [
+    {
+      "label": "A",
+      "path": "<TEMP>/target-a/release/kakehashi",
+      "sha256": "c360ce9f1527aef2653430f76ca742f69450b0647855643866afcee87e0febb7"
+    },
+    {
+      "label": "B",
+      "path": "<TEMP>/target-b/release/kakehashi",
+      "sha256": "ec4357af34001cd0ffcadff955c47748b0b51652f36770ce0a795df8a5c66385"
+    }
+  ],
+  "fixture_sha256": "1e5a118e77931643b5062d36c3e49334a99029ab9297597e2696704656e3fbd2",
+  "harness_commit": "08e7deb06e5f269c8e6a16217fec7b5bbd4b87bc",
+  "harness_sha256": "382ead114615d24feb63e5c200790051b906af678cf270f73e5acef8388163a6",
+  "iterations": 30,
+  "order": "AB",
+  "pair_index": "1",
+  "runs": [
+    {
+      "binary_label": "A",
+      "binary_path": "<TEMP>/target-a/release/kakehashi",
+      "binary_sha256": "c360ce9f1527aef2653430f76ca742f69450b0647855643866afcee87e0febb7",
+      "document_bytes": 413151,
+      "samples_ns": [
+        92909250,
+        90450542,
+        89620375,
+        90249917,
+        92696625,
+        91258667,
+        90190833,
+        91418042,
+        89941542,
+        92594500,
+        90167500,
+        91208791,
+        88943125,
+        93658209,
+        91984708,
+        91210125,
+        91539541,
+        89309375,
+        89819625,
+        92770708,
+        89889167,
+        88757000,
+        89055584,
+        90617500,
+        93941041,
+        95561834,
+        89407166,
+        89329833,
+        90667167,
+        93880792
+      ],
+      "scenario": "rust_xlarge/same_snapshot_fanout",
+      "validation": {
+        "discarded_attempts": 0,
+        "retained_samples": 30
+      }
+    },
+    {
+      "binary_label": "B",
+      "binary_path": "<TEMP>/target-b/release/kakehashi",
+      "binary_sha256": "ec4357af34001cd0ffcadff955c47748b0b51652f36770ce0a795df8a5c66385",
+      "document_bytes": 413151,
+      "samples_ns": [
+        68979625,
+        70016083,
+        69333875,
+        68464917,
+        68238916,
+        68189250,
+        67824625,
+        67987750,
+        72972875,
+        72420791,
+        68465208,
+        68682166,
+        70108834,
+        67767084,
+        74244375,
+        69578041,
+        67843625,
+        68522500,
+        67553708,
+        67614750,
+        69965209,
+        71617583,
+        71766916,
+        68528083,
+        70995166,
+        71066500,
+        72028041,
+        74016292,
+        75985834,
+        74748750
+      ],
+      "scenario": "rust_xlarge/same_snapshot_fanout",
+      "validation": {
+        "discarded_attempts": 0,
+        "retained_samples": 30
+      }
+    }
+  ],
+  "schema_version": 3,
+  "warmup_iterations": 6
+}
