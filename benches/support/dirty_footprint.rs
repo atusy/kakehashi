@@ -41,6 +41,14 @@ pub fn gen_dirty_rust_block(dirty_units: usize, state: usize) -> String {
     block
 }
 
+/// Precompute every unique replacement before the timed request loop.
+pub fn gen_dirty_rust_replacements(dirty_units: usize, states: usize) -> Vec<String> {
+    assert!(states < DIRTY_STATE_COUNT);
+    (1..=states)
+        .map(|state| gen_dirty_rust_block(dirty_units, state))
+        .collect()
+}
+
 /// Generate a dense Rust document whose first `dirty_units` out of
 /// `total_units` form one replaceable syntax footprint.
 pub fn gen_dirty_rust(total_units: usize, dirty_units: usize) -> DirtyRustDocument {
