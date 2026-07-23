@@ -20,25 +20,29 @@ struct DocumentIdentity {
     content_version: Option<u64>,
 }
 
+struct ComputeWorkTrace {
+    kind: &'static str,
+    identity: Option<DocumentIdentity>,
+}
+
 /// Attribution attached to one bounded-pool work unit.
 ///
 /// Document identity is materialized only while debug logging for the compute
-/// target is enabled. The production fast path therefore carries only the
-/// static work kind and does not allocate a URI string.
-pub(crate) struct ComputeWork {
-    kind: &'static str,
-    identity: Option<Box<DocumentIdentity>>,
-    trace: bool,
-}
+/// target is enabled. The production fast path is a pointer-sized `None` and
+/// does not carry the kind or allocate a URI string.
+pub(crate) struct ComputeWork(Option<Box<ComputeWorkTrace>>);
 
 impl ComputeWork {
     #[cfg(test)]
     pub(crate) fn anonymous(kind: &'static str) -> Self {
-        Self {
-            kind,
-            identity: None,
-            trace: log::log_enabled!(target: TRACE_TARGET, log::Level::Debug),
-        }
+        Self(
+            log::log_enabled!(target: TRACE_TARGET, log::Level::Debug).then(|| {
+                Box::new(ComputeWorkTrace {
+                    kind,
+                    identity: None,
+                })
+            }),
+        )
     }
 
     pub(crate) fn document(
@@ -47,18 +51,18 @@ impl ComputeWork {
         incarnation: Option<u64>,
         content_version: Option<u64>,
     ) -> Self {
-        let trace = log::log_enabled!(target: TRACE_TARGET, log::Level::Debug);
-        Self {
-            kind,
-            identity: trace.then(|| {
-                Box::new(DocumentIdentity {
-                    uri: uri.to_string(),
-                    incarnation,
-                    content_version,
+        Self(
+            log::log_enabled!(target: TRACE_TARGET, log::Level::Debug).then(|| {
+                Box::new(ComputeWorkTrace {
+                    kind,
+                    identity: Some(DocumentIdentity {
+                        uri: uri.to_string(),
+                        incarnation,
+                        content_version,
+                    }),
                 })
             }),
-            trace,
-        }
+        )
     }
 
     #[cfg(test)]
@@ -68,21 +72,20 @@ impl ComputeWork {
         incarnation: Option<u64>,
         content_version: Option<u64>,
     ) -> Self {
-        Self {
+        Self(Some(Box::new(ComputeWorkTrace {
             kind,
-            identity: Some(Box::new(DocumentIdentity {
+            identity: Some(DocumentIdentity {
                 uri: uri.to_owned(),
                 incarnation,
                 content_version,
-            })),
-            trace: true,
-        }
+            }),
+        })))
     }
 }
 
 struct ComputeEvent<'a> {
     work_id: u64,
-    work: &'a ComputeWork,
+    work: &'a ComputeWorkTrace,
     event: &'static str,
     queue_us: u128,
     run_us: Option<u128>,
@@ -92,7 +95,7 @@ struct ComputeEvent<'a> {
 
 impl std::fmt::Display for ComputeEvent<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let identity = self.work.identity.as_deref();
+        let identity = self.work.identity.as_ref();
         write!(
             f,
             "work_id={} kind={} uri={} incarnation={} content_version={} event={} queue_us={} run_us={} elapsed_us={} cancelled={}",
@@ -182,17 +185,18 @@ impl ComputePool {
         // stall (see the 20s-response investigation).
         let enqueued = std::time::Instant::now();
         let work_id = attribution
-            .trace
-            .then(|| NEXT_WORK_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
+            .0
+            .as_ref()
+            .map(|_| NEXT_WORK_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
         self.pool.spawn(move || {
             let queued_for = enqueued.elapsed();
-            if let Some(work_id) = work_id {
+            if let (Some(work_id), Some(work)) = (work_id, attribution.0.as_deref()) {
                 log::debug!(
                     target: TRACE_TARGET,
                     "{}",
                     ComputeEvent {
                         work_id,
-                        work: &attribution,
+                        work,
                         event: "started",
                         queue_us: queued_for.as_micros(),
                         run_us: None,
@@ -202,13 +206,13 @@ impl ComputePool {
                 );
             }
             if crate::cancel::is_cancelled(cancel_for_work.as_ref()) {
-                if let Some(work_id) = work_id {
+                if let (Some(work_id), Some(work)) = (work_id, attribution.0.as_deref()) {
                     log::debug!(
                         target: TRACE_TARGET,
                         "{}",
                         ComputeEvent {
                             work_id,
-                            work: &attribution,
+                            work,
                             event: "skipped",
                             queue_us: queued_for.as_micros(),
                             run_us: Some(0),
@@ -227,13 +231,13 @@ impl ComputePool {
             let run_us = started.map(|started| started.elapsed().as_micros());
             match outcome {
                 Ok(value) => {
-                    if let Some(work_id) = work_id {
+                    if let (Some(work_id), Some(work)) = (work_id, attribution.0.as_deref()) {
                         log::debug!(
                             target: TRACE_TARGET,
                             "{}",
                             ComputeEvent {
                                 work_id,
-                                work: &attribution,
+                                work,
                                 event: "finished",
                                 queue_us: queued_for.as_micros(),
                                 run_us,
@@ -254,13 +258,13 @@ impl ComputePool {
                         target: "kakehashi::crash_recovery",
                         "compute-pool work unit panicked: {msg}"
                     );
-                    if let Some(work_id) = work_id {
+                    if let (Some(work_id), Some(work)) = (work_id, attribution.0.as_deref()) {
                         log::debug!(
                             target: TRACE_TARGET,
                             "{}",
                             ComputeEvent {
                                 work_id,
-                                work: &attribution,
+                                work,
                                 event: "panicked",
                                 queue_us: queued_for.as_micros(),
                                 run_us,
@@ -350,7 +354,7 @@ mod tests {
             ComputeWork::enabled_for_test("parse", "file:///workspace/main.rs", Some(7), Some(42));
         let event = ComputeEvent {
             work_id: 3,
-            work: &work,
+            work: work.0.as_deref().expect("enabled test work"),
             event: "finished",
             queue_us: 11,
             run_us: Some(23),
@@ -361,6 +365,14 @@ mod tests {
         assert_eq!(
             event.to_string(),
             "work_id=3 kind=parse uri=file:///workspace/main.rs incarnation=7 content_version=42 event=finished queue_us=11 run_us=23 elapsed_us=34 cancelled=true"
+        );
+    }
+
+    #[test]
+    fn disabled_attribution_is_pointer_sized() {
+        assert_eq!(
+            std::mem::size_of::<ComputeWork>(),
+            std::mem::size_of::<usize>()
         );
     }
 
