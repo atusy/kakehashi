@@ -544,21 +544,21 @@ impl Kakehashi {
             );
             return Ok(None);
         }
-        let artifact_identity = std::sync::Arc::new(SemanticArtifactIdentity::new(
-            uri.clone(),
-            language_name.clone(),
+        let expected_artifact_identity = SemanticArtifactIdentity::expected(
+            &uri,
+            &language_name,
             snapshot_identity,
             supports_multiline,
-        ));
+        );
         let artifact = result.and_then(|result| {
-            SemanticArtifact::from_full_result(std::sync::Arc::clone(&artifact_identity), result)
+            SemanticArtifact::from_full_result(expected_artifact_identity.to_owned(), result)
         });
         // The artifact contains no request lineage. Materialization checks the
         // complete identity before assigning this request's result ID.
         let result_id = Some(next_result_id());
         let tokens_with_id = artifact
             .and_then(|artifact| {
-                artifact.materialize_full(artifact_identity.as_ref(), result_id.clone())
+                artifact.materialize_full(expected_artifact_identity, result_id.clone())
             })
             .unwrap_or_else(|| SemanticTokens {
                 result_id,
@@ -870,12 +870,12 @@ impl Kakehashi {
                     // The snapshot's own discovery (ADR §3, don't-discover-twice).
                     discovery: snapshot.injection_regions.clone(),
                 });
-                let artifact_identity = std::sync::Arc::new(SemanticArtifactIdentity::new(
-                    uri.clone(),
-                    language_name.clone(),
+                let expected_artifact_identity = SemanticArtifactIdentity::expected(
+                    &uri,
+                    &language_name,
                     snapshot_identity,
                     supports_multiline,
-                ));
+                );
 
                 // Compute tokens, racing against cancel notification if provided
                 let compute_future = handle_semantic_tokens_full(
@@ -922,12 +922,12 @@ impl Kakehashi {
                 computed
                     .and_then(|result| {
                         SemanticArtifact::from_full_result(
-                            std::sync::Arc::clone(&artifact_identity),
+                            expected_artifact_identity.to_owned(),
                             result,
                         )
                     })
                     .and_then(|artifact| {
-                        artifact.materialize_full(artifact_identity.as_ref(), None)
+                        artifact.materialize_full(expected_artifact_identity, None)
                     })
                     .map(CurrentTokens::Owned)
             }
@@ -1230,12 +1230,12 @@ impl Kakehashi {
         // Use Rayon-based parallel injection processing
         let supports_multiline = self.settings_manager.supports_multiline_tokens();
         let coordinator = std::sync::Arc::clone(&self.language);
-        let artifact_identity = std::sync::Arc::new(SemanticArtifactIdentity::new(
-            uri.clone(),
-            language_name.clone(),
+        let expected_artifact_identity = SemanticArtifactIdentity::expected(
+            &uri,
+            &language_name,
             snapshot_identity,
             supports_multiline,
-        ));
+        );
 
         let result = handle_semantic_tokens_full(
             &self.compute_pool,
@@ -1254,10 +1254,10 @@ impl Kakehashi {
         // Shape immutable payloads before taking the edit lock. Only the final
         // live-snapshot validation and cache commits need to exclude edits.
         let artifact = result.and_then(|result| {
-            SemanticArtifact::from_full_result(std::sync::Arc::clone(&artifact_identity), result)
+            SemanticArtifact::from_full_result(expected_artifact_identity.to_owned(), result)
         });
         let (domain_range_result, tokens_to_store) = match artifact.and_then(|artifact| {
-            artifact.materialize_full(artifact_identity.as_ref(), Some(next_result_id()))
+            artifact.materialize_full(expected_artifact_identity, Some(next_result_id()))
         }) {
             Some(full_tokens) => {
                 let range_tokens = filter_semantic_tokens_by_range(&full_tokens, &domain_range);

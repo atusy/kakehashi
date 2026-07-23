@@ -1,5 +1,4 @@
 use crate::analysis::SemanticSnapshotIdentity;
-use std::sync::Arc;
 use tower_lsp_server::ls_types::{SemanticTokens, SemanticTokensResult};
 use url::Url;
 
@@ -7,7 +6,7 @@ use url::Url;
 ///
 /// The artifact remains scoped to one immutable parse snapshot. Response-local
 /// state such as an LSP `resultId` is deliberately not part of this identity.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Debug, Eq, PartialEq)]
 pub(crate) struct SemanticArtifactIdentity {
     uri: Url,
     language: String,
@@ -29,6 +28,62 @@ impl SemanticArtifactIdentity {
             supports_multiline,
         }
     }
+
+    pub(crate) fn expected<'a>(
+        uri: &'a Url,
+        language: &'a str,
+        snapshot: SemanticSnapshotIdentity,
+        supports_multiline: bool,
+    ) -> SemanticArtifactIdentityRef<'a> {
+        SemanticArtifactIdentityRef {
+            uri,
+            language,
+            snapshot,
+            supports_multiline,
+        }
+    }
+
+    #[cfg(test)]
+    fn as_ref(&self) -> SemanticArtifactIdentityRef<'_> {
+        Self::expected(
+            &self.uri,
+            &self.language,
+            self.snapshot,
+            self.supports_multiline,
+        )
+    }
+
+    fn matches(&self, expected: SemanticArtifactIdentityRef<'_>) -> bool {
+        self.uri == *expected.uri
+            && self.language == expected.language
+            && self.snapshot == expected.snapshot
+            && self.supports_multiline == expected.supports_multiline
+    }
+}
+
+/// Allocation-free request view used to validate a reusable artifact.
+///
+/// Stage 2 constructs the artifact locally, so this comparison is expected to
+/// succeed. Keeping the authoritative request inputs separate makes the same
+/// check non-tautological when Stage 3 retrieves an artifact from a snapshot
+/// slot, without cloning its URI or language for every lookup.
+#[derive(Clone, Copy)]
+pub(crate) struct SemanticArtifactIdentityRef<'a> {
+    uri: &'a Url,
+    language: &'a str,
+    snapshot: SemanticSnapshotIdentity,
+    supports_multiline: bool,
+}
+
+impl SemanticArtifactIdentityRef<'_> {
+    pub(crate) fn to_owned(self) -> SemanticArtifactIdentity {
+        SemanticArtifactIdentity::new(
+            self.uri.clone(),
+            self.language.to_owned(),
+            self.snapshot,
+            self.supports_multiline,
+        )
+    }
 }
 
 /// Complete immutable semantic output for one [`SemanticArtifactIdentity`].
@@ -36,13 +91,13 @@ impl SemanticArtifactIdentity {
 /// Construction accepts only a complete full result. The data stays private
 /// until a request materializes it and supplies its own LSP `resultId`.
 pub(crate) struct SemanticArtifact {
-    identity: Arc<SemanticArtifactIdentity>,
+    identity: SemanticArtifactIdentity,
     tokens: SemanticTokens,
 }
 
 impl SemanticArtifact {
     pub(crate) fn from_full_result(
-        identity: Arc<SemanticArtifactIdentity>,
+        identity: SemanticArtifactIdentity,
         result: SemanticTokensResult,
     ) -> Option<Self> {
         let SemanticTokensResult::Tokens(mut tokens) = result else {
@@ -54,10 +109,10 @@ impl SemanticArtifact {
 
     pub(crate) fn materialize_full(
         mut self,
-        expected_identity: &SemanticArtifactIdentity,
+        expected_identity: SemanticArtifactIdentityRef<'_>,
         result_id: Option<String>,
     ) -> Option<SemanticTokens> {
-        if self.identity.as_ref() != expected_identity {
+        if !self.identity.matches(expected_identity) {
             return None;
         }
         self.tokens.result_id = result_id;
@@ -69,7 +124,6 @@ impl SemanticArtifact {
 mod tests {
     use super::{SemanticArtifact, SemanticArtifactIdentity};
     use crate::analysis::SemanticSnapshotIdentity;
-    use std::sync::Arc;
     use tower_lsp_server::ls_types::{
         SemanticToken, SemanticTokens, SemanticTokensPartialResult, SemanticTokensResult,
     };
@@ -110,7 +164,7 @@ mod tests {
             token_modifiers_bitset: 5,
         };
         let artifact = SemanticArtifact::from_full_result(
-            Arc::new(identity()),
+            identity(),
             SemanticTokensResult::Tokens(SemanticTokens {
                 result_id: Some("compute-local".into()),
                 data: vec![token],
@@ -119,7 +173,7 @@ mod tests {
         .expect("complete result");
 
         let materialized = artifact
-            .materialize_full(&identity(), Some("request-42".into()))
+            .materialize_full(identity().as_ref(), Some("request-42".into()))
             .expect("matching identity");
         assert_eq!(materialized.result_id.as_deref(), Some("request-42"));
         assert_eq!(materialized.data, vec![token]);
@@ -128,7 +182,7 @@ mod tests {
     #[test]
     fn mismatched_identity_cannot_materialize_artifact() {
         let artifact = SemanticArtifact::from_full_result(
-            Arc::new(identity()),
+            identity(),
             SemanticTokensResult::Tokens(SemanticTokens {
                 result_id: None,
                 data: vec![],
@@ -138,13 +192,17 @@ mod tests {
         let mut different = identity();
         different.snapshot.generation += 1;
 
-        assert!(artifact.materialize_full(&different, None).is_none());
+        assert!(
+            artifact
+                .materialize_full(different.as_ref(), None)
+                .is_none()
+        );
     }
 
     #[test]
     fn partial_result_cannot_become_visible_artifact() {
         let artifact = SemanticArtifact::from_full_result(
-            Arc::new(identity()),
+            identity(),
             SemanticTokensResult::Partial(SemanticTokensPartialResult { data: vec![] }),
         );
 
