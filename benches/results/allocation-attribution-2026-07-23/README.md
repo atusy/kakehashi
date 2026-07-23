@@ -15,27 +15,49 @@ does not claim a latency improvement.
 ## Procedure
 
 Build the feature-enabled profiling binary, then run one language at a time
-with the synchronous driver and no competing requests:
+with the synchronous driver and no competing requests. The measurement used
+the project-local data directory whose non-lock files are pinned by
+[`parser-artifacts.sha256`](parser-artifacts.sha256); verify it before running
+so parser or query updates cannot silently change the workload:
 
 ```sh
+shasum -a 256 -c \
+  benches/results/allocation-attribution-2026-07-23/parser-artifacts.sha256
 cargo build --profile profiling --features allocation-profile --bin kakehashi
 
 RUST_LOG=kakehashi::semantic=debug \
   python3 benches/profile/drive.py \
     --bin ./target/profiling/kakehashi \
+    --data-dir "$PWD/deps/test/kakehashi" \
     --lang markdown --size 150 --requests 36 --edits 1 \
     2> /tmp/kakehashi-allocation-markdown-final.log
 
 RUST_LOG=kakehashi::semantic=debug \
   python3 benches/profile/drive.py \
     --bin ./target/profiling/kakehashi \
+    --data-dir "$PWD/deps/test/kakehashi" \
     --lang rust --size 150 --requests 36 --edits 1 \
     2> /tmp/kakehashi-allocation-rust-final.log
 ```
 
-The first 6 completed records in each log are warmups and were discarded. The
-30 retained records are preserved verbatim as columns in
-[`markdown.tsv`](markdown.tsv) and [`rust.tsv`](rust.tsv).
+The sanitized allocation records from all 36 responses are retained in
+[`markdown-all.tsv`](markdown-all.tsv) and [`rust-all.tsv`](rust-all.tsv). The
+first 6 completed records in each log are warmups. The remaining 30 records are
+renumbered into [`markdown.tsv`](markdown.tsv) and [`rust.tsv`](rust.tsv).
+Verify that extraction and print the summary with:
+
+```sh
+evidence=benches/results/allocation-attribution-2026-07-23
+python3 "$evidence/analyze.py" \
+  "$evidence/markdown-all.tsv" "$evidence/markdown.tsv"
+python3 "$evidence/analyze.py" \
+  "$evidence/rust-all.tsv" "$evidence/rust.tsv"
+```
+
+The script uses the nearest-rank percentile convention
+(`sorted[ceil(p * n) - 1]`). The complete original logs contain unrelated
+driver and phase timing records and are not committed; their hashes preserve
+the provenance of the sanitized records:
 
 Full-log SHA-256:
 
@@ -48,22 +70,25 @@ Full-log SHA-256:
 
 | Language | Metric | n | Mean | p50 | p90 | Min | Max |
 | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| Markdown | allocations | 30 | 19,015.6 | 20,022 | 22,883 | 5,269 | 47,317 |
-| Markdown | allocated bytes | 30 | 7,983,801.3 | 8,027,139 | 8,297,091 | 7,349,392 | 8,774,584 |
-| Rust | allocations | 30 | 87,132.0 | 94,424 | 108,393 | 58,245 | 108,625 |
-| Rust | allocated bytes | 30 | 24,305,204.4 | 24,362,260 | 25,268,752 | 23,196,788 | 25,269,509 |
+| Markdown | allocation events | 30 | 19,015.6 | 20,022 | 22,883 | 5,269 | 47,317 |
+| Markdown | requested allocated bytes | 30 | 7,983,801.3 | 8,027,139 | 8,297,091 | 7,349,392 | 8,774,584 |
+| Rust | allocation events | 30 | 87,132.0 | 94,424 | 108,393 | 58,245 | 108,625 |
+| Rust | requested allocated bytes | 30 | 24,305,204.4 | 24,362,260 | 25,268,752 | 23,196,788 | 25,269,509 |
 
-The Rust workload shows especially high allocation traffic. Together with the
-much smaller retained-heap growth seen in the complementary exact-PID heap
-profile, this supports investigating request-owned artifact construction and
-chunk/buffer reuse in #896 rather than treating retained growth as the primary
-problem.
+The Rust workload shows especially high realloc-inclusive requested-capacity
+traffic. This identifies artifact construction and chunk/buffer reuse as
+measurement candidates for #896; this evidence alone does not determine
+retained growth or predict the latency effect of either change.
 
 ## Scope and limitations
 
 - The counters cover Rust `GlobalAlloc` calls in the whole process during the
   semantic work-unit window. Native allocations such as Tree-sitter
   `ts_malloc` are excluded.
+- A successful `realloc` contributes one full old-layout deallocation and one
+  full requested new-size allocation even when it happens in place. Counts are
+  therefore allocation events, not distinct pointers, and byte totals are
+  requested-capacity traffic, not bytes physically copied.
 - The process-wide attribution is meaningful here because the synchronous
   driver issued no competing requests. Rayon allocations through
   `GlobalAlloc` remain included.
