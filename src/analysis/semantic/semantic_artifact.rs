@@ -180,23 +180,72 @@ mod tests {
     }
 
     #[test]
-    fn mismatched_identity_cannot_materialize_artifact() {
-        let artifact = SemanticArtifact::from_full_result(
-            identity(),
-            SemanticTokensResult::Tokens(SemanticTokens {
-                result_id: None,
-                data: vec![],
-            }),
-        )
-        .expect("complete result");
-        let mut different = identity();
-        different.snapshot.generation += 1;
+    fn every_identity_component_discriminates_materialization() {
+        let base = identity();
+        let other_uri = Url::parse("file:///workspace/other.rs").unwrap();
+        let different_parsed_version = SemanticSnapshotIdentity {
+            parsed_version: base.snapshot.parsed_version + 1,
+            ..base.snapshot
+        };
+        let different_incarnation = SemanticSnapshotIdentity {
+            incarnation: base.snapshot.incarnation + 1,
+            ..base.snapshot
+        };
+        let different_generation = SemanticSnapshotIdentity {
+            generation: base.snapshot.generation + 1,
+            ..base.snapshot
+        };
+        let mismatches = [
+            SemanticArtifactIdentity::expected(
+                &other_uri,
+                &base.language,
+                base.snapshot,
+                base.supports_multiline,
+            ),
+            SemanticArtifactIdentity::expected(
+                &base.uri,
+                "python",
+                base.snapshot,
+                base.supports_multiline,
+            ),
+            SemanticArtifactIdentity::expected(
+                &base.uri,
+                &base.language,
+                different_parsed_version,
+                base.supports_multiline,
+            ),
+            SemanticArtifactIdentity::expected(
+                &base.uri,
+                &base.language,
+                different_incarnation,
+                base.supports_multiline,
+            ),
+            SemanticArtifactIdentity::expected(
+                &base.uri,
+                &base.language,
+                different_generation,
+                base.supports_multiline,
+            ),
+            SemanticArtifactIdentity::expected(
+                &base.uri,
+                &base.language,
+                base.snapshot,
+                !base.supports_multiline,
+            ),
+        ];
 
-        assert!(
-            artifact
-                .materialize_full(different.as_ref(), None)
-                .is_none()
-        );
+        for mismatch in mismatches {
+            let artifact = SemanticArtifact::from_full_result(
+                identity(),
+                SemanticTokensResult::Tokens(SemanticTokens {
+                    result_id: None,
+                    data: vec![],
+                }),
+            )
+            .expect("complete result");
+
+            assert!(artifact.materialize_full(mismatch, None).is_none());
+        }
     }
 
     #[test]
