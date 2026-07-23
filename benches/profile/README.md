@@ -150,6 +150,6 @@ the kakehashi/tree-sitter/regex frames for the actual CPU cost.
 | `profile.sh` | end-to-end: build → dSYM → samply record → analyze → SVG |
 | `xctrace.sh` | end-to-end: build → Instruments Time Profiler → XML summary |
 | `drive.py` | synchronous/batched LSP driver with per-method latency and wire-volume output |
-| `test_drive.py` | unit tests for driver metric aggregation |
+| `test_drive.py` | unit and fake-LSP integration tests for metrics and profiler-handshake ordering |
 | `gen_session.py` | document generators + a framed-session emitter |
 | `analyze.py` | atos symbolication, self/inclusive report, collapsed stacks |
