@@ -721,6 +721,59 @@ mod tests {
         );
     }
 
+    #[test]
+    fn promote_current_reuses_baseline_for_a_new_snapshot_identity() {
+        let cache = SemanticTokenCache::new();
+        let uri = Url::parse("file:///unchanged_tokens.rs").unwrap();
+        let tokens = SemanticTokens {
+            result_id: Some("stable".to_string()),
+            data: vec![SemanticToken {
+                delta_line: 0,
+                delta_start: 0,
+                length: 5,
+                token_type: 0,
+                token_modifiers_bitset: 0,
+            }],
+        };
+        let old_snapshot = snapshot(1, 7, 3);
+        let new_snapshot = snapshot(2, 7, 3);
+        cache.store(
+            uri.clone(),
+            tokens,
+            "rust".to_string(),
+            11,
+            old_snapshot,
+        );
+        let baseline = cache
+            .get_if_valid(&uri, "stable")
+            .expect("stored result must remain a delta baseline");
+
+        cache.promote_current(
+            uri.clone(),
+            Arc::clone(&baseline),
+            "rust".to_string(),
+            12,
+            new_snapshot,
+        );
+
+        let promoted = cache
+            .get_if_same_snapshot(&uri, "rust", new_snapshot)
+            .expect("unchanged tokens must become current for the new snapshot");
+        assert!(
+            Arc::ptr_eq(&baseline, &promoted),
+            "promotion must reuse the existing token allocation"
+        );
+        assert!(
+            cache.get_if_same_snapshot(&uri, "rust", old_snapshot)
+                .is_none(),
+            "the old snapshot must no longer be the current identity"
+        );
+        assert!(
+            cache.get_if_valid(&uri, "stable").is_some(),
+            "promotion must preserve the client-visible delta baseline"
+        );
+    }
+
     /// Pins the named worst-case from #576: a delta-baseline read must not
     /// perform an extra `Arc::clone` (refcount bump) to feed the
     /// comparison — `&Arc<T>` deref-coerces to `&T` at the call, so
