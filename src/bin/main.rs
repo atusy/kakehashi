@@ -1226,6 +1226,12 @@ async fn serve_lsp() {
     use tokio::io::{stdin, stdout};
     use tower_lsp_server::{LspService, Server};
 
+    #[cfg(not(feature = "semantic-bench-instrumentation"))]
+    assert!(
+        std::env::var_os("KAKEHASHI_BENCH_SEMANTIC_FANOUT_PARTIES").is_none(),
+        "same-snapshot fan-out requires --features semantic-bench-instrumentation"
+    );
+
     // Initialize logging to stderr (CRITICAL: stdout is used for LSP JSON-RPC)
     // Configure via RUST_LOG, e.g.: RUST_LOG=kakehashi=debug
     Builder::from_default_env()
