@@ -45,7 +45,6 @@ mod semantic_baseline;
 
 use semantic_baseline::{
     SemanticBaseline, TRACKED_MARKER, tracked_marker_line, validate_token_payload,
-    validate_tracked_token,
 };
 use serde_json::{Value, json};
 use std::collections::HashMap;
@@ -74,8 +73,16 @@ struct Server {
 impl Server {
     /// Spawn `bin`, run the LSP handshake, and return a ready server.
     fn start(bin: &str, data_dir: &str) -> Server {
-        let mut child = Command::new(bin)
-            .env("KAKEHASHI_DATA_DIR", data_dir)
+        Self::start_with_fanout_barrier(bin, data_dir, false)
+    }
+
+    fn start_with_fanout_barrier(bin: &str, data_dir: &str, fanout_barrier: bool) -> Server {
+        let mut command = Command::new(bin);
+        command.env("KAKEHASHI_DATA_DIR", data_dir);
+        if fanout_barrier {
+            command.env("KAKEHASHI_BENCH_SEMANTIC_FANOUT_PARTIES", "2");
+        }
+        let mut child = command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -104,7 +111,7 @@ impl Server {
             buffered_responses: HashMap::new(),
         };
 
-        server.request(
+        let initialize = server.request(
             "initialize",
             json!({
                 "processId": std::process::id(),
@@ -113,7 +120,10 @@ impl Server {
                     "textDocument": {
                         "semanticTokens": {
                             "dynamicRegistration": false,
-                            "requests": { "full": { "delta": true } },
+                            "requests": {
+                                "range": true,
+                                "full": { "delta": true }
+                            },
                             "tokenTypes": [],
                             "tokenModifiers": [],
                             "formats": ["relative"]
@@ -121,6 +131,11 @@ impl Server {
                     }
                 }
             }),
+        );
+        assert_eq!(
+            initialize.pointer("/capabilities/semanticTokensProvider/range"),
+            Some(&Value::Bool(true)),
+            "benchmarked server must advertise semanticTokens/range"
         );
         server.notify("initialized", json!({}));
         server
@@ -173,14 +188,28 @@ impl Server {
         )
     }
 
-    /// Wait until the edit's parse is current without populating the semantic
-    /// token cache. Rust has no injection query in the benchmark fixture, so
-    /// this request stops after `ensure_document_parsed`.
-    fn wait_until_parsed(&mut self, uri: &str) {
-        self.request(
-            "textDocument/documentSymbol",
-            json!({ "textDocument": { "uri": uri } }),
-        );
+    /// Positively observe the edited version's current parse without touching
+    /// semantic-token caches. `kakehashi/node` is ingress-ordered behind the
+    /// preceding didChange and returns null when its bounded current-snapshot
+    /// wait expires, so retrying until a node arrives is a real parse barrier.
+    fn wait_until_parsed(&mut self, uri: &str, line: u32, character: u32) {
+        let deadline = Instant::now() + Duration::from_secs(60);
+        loop {
+            let result = self.request(
+                "kakehashi/node",
+                json!({
+                    "textDocument": { "uri": uri },
+                    "position": { "line": line, "character": character },
+                }),
+            );
+            if !result.is_null() {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "current parse did not become observable for {uri}"
+            );
+        }
     }
 
     /// Incremental `didChange` that toggles a single space at the start of
@@ -687,7 +716,7 @@ fn measure_same_snapshot_fanout(
     start_line: u32,
     end_line: u32,
 ) -> Measurement {
-    let mut server = Server::start(&bin.path, data_dir);
+    let mut server = Server::start_with_fanout_barrier(&bin.path, data_dir, true);
     server.did_open(scn.uri, scn.language_id, &scn.content);
     std::thread::sleep(Duration::from_millis(300));
 
@@ -713,7 +742,7 @@ fn measure_same_snapshot_fanout(
         // Keep parse latency outside this measurement. The measured work is
         // specifically the duplicate whole-document semantic computation and
         // request-local delta/range shaping for one immutable snapshot.
-        server.wait_until_parsed(scn.uri);
+        server.wait_until_parsed(scn.uri, tracked_line, 0);
 
         let started = Instant::now();
         let delta_id = server.send_request(
@@ -743,7 +772,8 @@ fn measure_same_snapshot_fanout(
         baseline
             .apply_response(delta_result)
             .unwrap_or_else(|error| panic!("invalid delta response for {}: {error:?}", scn.name));
-        validate_tracked_token(range_result, tracked_line, baseline.expected_start())
+        baseline
+            .validate_line_range(range_result, start_line, end_line)
             .unwrap_or_else(|error| {
                 panic!(
                     "stale or invalid range response for {}: {error:?}",

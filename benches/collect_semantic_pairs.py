@@ -21,6 +21,7 @@ from typing import Any
 from semantic_summary import summarize_pairs, validate_collection
 
 
+SAME_SNAPSHOT_FANOUT_SCENARIO = "rust_xlarge/same_snapshot_fanout"
 DEFAULT_SCENARIOS = ",".join(
     [
         "rust_large/full_cache_hit",
@@ -31,6 +32,7 @@ DEFAULT_SCENARIOS = ",".join(
         "rust_sparse_64k/typing_delta",
         "rust_large/typing_burst",
         "rust_xlarge/cancel_burst",
+        SAME_SNAPSHOT_FANOUT_SCENARIO,
         "markdown_injections_large/full_cache_hit",
         "markdown_injections/typing_delta",
         "markdown_injections/typing_burst",
@@ -49,6 +51,23 @@ ISOLATED_ENVIRONMENT_KEYS = {
     "RUSTUP_HOME",
 }
 ALLOWED_SERVER_ENVIRONMENT_KEYS = {"KAKEHASHI_TREE_WORKER_MODE"}
+
+
+def requires_semantic_bench_instrumentation(scenarios: str) -> bool:
+    return any(
+        term in SAME_SNAPSHOT_FANOUT_SCENARIO
+        for term in scenario_filter_terms(scenarios)
+    )
+
+
+def require_semantic_bench_instrumentation(source: Path) -> None:
+    manifest = (source / "Cargo.toml").read_text()
+    if "semantic-bench-instrumentation = []" not in manifest:
+        raise RuntimeError(
+            f"{source} cannot run {SAME_SNAPSHOT_FANOUT_SCENARIO}: "
+            "the ref predates semantic benchmark instrumentation; select other "
+            "scenarios or compare refs that include the benchmark contract"
+        )
 
 
 def terminate_process_group(process: subprocess.Popen[str]) -> None:
@@ -400,12 +419,26 @@ def main() -> None:
             add_worktree(repo, worktrees["b-src"], b_commit)
             add_worktree(repo, worktrees["harness-src"], harness_commit)
 
+            instrument_fanout = requires_semantic_bench_instrumentation(args.scenarios)
             binaries = {}
             for label, source in (("A", worktrees["a-src"]), ("B", worktrees["b-src"])):
                 target = temp / f"target-{label.lower()}"
                 env = base_environment | {"CARGO_TARGET_DIR": str(target)}
+                build_command = [
+                    "cargo",
+                    "build",
+                    "--release",
+                    "--locked",
+                    "--bin",
+                    "kakehashi",
+                ]
+                if instrument_fanout:
+                    require_semantic_bench_instrumentation(source)
+                    build_command.extend(
+                        ["--features", "semantic-bench-instrumentation"]
+                    )
                 run(
-                    ["cargo", "build", "--release", "--locked", "--bin", "kakehashi"],
+                    build_command,
                     cwd=source,
                     env=env,
                 )

@@ -8,6 +8,8 @@ from collect_semantic_pairs import (
     manifest_sha256,
     normalize_captured_stdout,
     parse_server_env,
+    require_semantic_bench_instrumentation,
+    requires_semantic_bench_instrumentation,
     redact_temporary_paths,
     recorded_environment,
     scenario_filter_terms,
@@ -20,6 +22,30 @@ from collect_semantic_pairs import (
 
 
 class CollectSemanticPairsTest(unittest.TestCase):
+    def test_only_fanout_scenario_requires_benchmark_instrumentation(self):
+        self.assertTrue(
+            requires_semantic_bench_instrumentation(
+                "rust_xlarge/same_snapshot_fanout"
+            )
+        )
+        self.assertTrue(requires_semantic_bench_instrumentation("fanout"))
+        self.assertFalse(
+            requires_semantic_bench_instrumentation("rust_large/typing_delta")
+        )
+
+    def test_fanout_instrumentation_requires_feature_on_measured_ref(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            source = Path(temporary)
+            (source / "Cargo.toml").write_text("[features]\ne2e = []\n")
+            with self.assertRaisesRegex(
+                RuntimeError, "predates semantic benchmark instrumentation"
+            ):
+                require_semantic_bench_instrumentation(source)
+            (source / "Cargo.toml").write_text(
+                "[features]\nsemantic-bench-instrumentation = []\n"
+            )
+            require_semantic_bench_instrumentation(source)
+
     def test_scenario_filters_are_normalized_for_execution_and_manifest(self):
         self.assertEqual(
             scenario_filter_terms(" rust, , markdown "),

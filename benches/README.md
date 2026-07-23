@@ -32,6 +32,13 @@ attestation, and raw-contract check succeeds. A failed run removes its staging
 artifacts and reports any exact worktree cleanup failure, so the same output
 path can be retried.
 
+The `rust_xlarge/same_snapshot_fanout` scenario synchronizes delta and range
+consumers after both miss the completed-artifact cache. The collector compiles
+measured servers with the opt-in `semantic-bench-instrumentation` feature only
+when this scenario is selected; normal builds contain no synchronization hook.
+Both compared refs must therefore include that feature. Select a scenario list
+without `same_snapshot_fanout` when comparing an older ref.
+
 The collector uses kakehashi's installer to create a temporary parser/query
 data directory, freezes it for the timed runs, and removes it afterward. The
 resulting `manifest.json` binds source commits, binary and harness hashes, the
