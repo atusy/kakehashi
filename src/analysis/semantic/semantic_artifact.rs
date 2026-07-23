@@ -275,6 +275,16 @@ mod tests {
         ];
 
         for mismatch in mismatches {
+            let shared_artifact = SemanticArtifact::from_full_result(
+                identity(),
+                SemanticTokensResult::Tokens(SemanticTokens {
+                    result_id: None,
+                    data: vec![],
+                }),
+            )
+            .expect("complete result");
+            assert!(shared_artifact.materialize_full(mismatch, None).is_none());
+
             let artifact = SemanticArtifact::from_full_result(
                 identity(),
                 SemanticTokensResult::Tokens(SemanticTokens {
