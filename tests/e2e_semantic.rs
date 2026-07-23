@@ -109,11 +109,7 @@ fn compute_events(logs: &str) -> Vec<std::collections::HashMap<&str, &str>> {
                 .filter_map(|field| field.split_once('='))
                 .collect::<std::collections::HashMap<_, _>>()
         })
-        .filter(|event| {
-            event.contains_key("work_id")
-                && event.contains_key("kind")
-                && event.contains_key("event")
-        })
+        .filter(|event| event.contains_key("work_id") && event.contains_key("event"))
         .collect()
 }
 
@@ -181,7 +177,10 @@ fn assert_joinable_compute(
 #[test]
 fn compute_pool_logs_joinable_document_work() {
     let mut client = LspClient::builder()
-        .env("RUST_LOG", "kakehashi::compute_pool=debug")
+        .env(
+            "RUST_LOG",
+            "kakehashi::compute_pool=debug,kakehashi::semantic_metrics=debug",
+        )
         .build();
     client.send_request(
         "initialize",
@@ -229,6 +228,55 @@ fn compute_pool_logs_joinable_document_work() {
             assert_joinable_compute(&events, kind, uri.as_str()),
             expected_identity,
             "{kind} must join the parse snapshot"
+        );
+    }
+
+    let semantic_work_id = events
+        .iter()
+        .find(|event| {
+            event.get("kind") == Some(&"semantic_tokens") && event.get("event") == Some(&"started")
+        })
+        .expect("semantic start event")["work_id"];
+    let phase = events
+        .iter()
+        .find(|event| {
+            event.get("work_id") == Some(&semantic_work_id)
+                && event.get("event") == Some(&"semantic_phases")
+        })
+        .unwrap_or_else(|| panic!("missing semantic phase metrics: {events:?}"));
+    for field in [
+        "compute_us",
+        "host_us",
+        "injections_us",
+        "finalize_us",
+        "input_bytes",
+        "input_lines",
+        "host_tokens",
+        "injection_tokens",
+        "active_regions",
+        "reused_regions",
+        "output_tokens",
+        "line_index_capacity_bytes",
+        "raw_token_peak_capacity_bytes",
+        "result_capacity_bytes",
+    ] {
+        assert!(
+            phase[field].parse::<u128>().is_ok(),
+            "non-numeric {field}: {phase:?}"
+        );
+    }
+    for field in [
+        "input_bytes",
+        "input_lines",
+        "host_tokens",
+        "output_tokens",
+        "line_index_capacity_bytes",
+        "raw_token_peak_capacity_bytes",
+        "result_capacity_bytes",
+    ] {
+        assert!(
+            phase[field].parse::<u128>().expect("numeric field") > 0,
+            "fixture must exercise non-empty {field}: {phase:?}"
         );
     }
 }
