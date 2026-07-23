@@ -8,18 +8,54 @@ from collect_semantic_pairs import (
     manifest_sha256,
     normalize_captured_stdout,
     parse_server_env,
+    require_semantic_bench_instrumentation,
+    requires_semantic_bench_instrumentation,
     redact_temporary_paths,
     recorded_environment,
     scenario_filter_terms,
     set_tree_read_only,
     set_tree_writable,
     tree_manifest,
+    validate_instrumented_scenario_selection,
     validate_requested_scenario_filters,
     write_installed_data_manifest,
 )
 
 
 class CollectSemanticPairsTest(unittest.TestCase):
+    def test_only_fanout_scenario_requires_benchmark_instrumentation(self):
+        self.assertTrue(
+            requires_semantic_bench_instrumentation(
+                "rust_xlarge/same_snapshot_fanout"
+            )
+        )
+        self.assertTrue(requires_semantic_bench_instrumentation("fanout"))
+        self.assertFalse(
+            requires_semantic_bench_instrumentation("rust_large/typing_delta")
+        )
+        validate_instrumented_scenario_selection("same_snapshot_fanout")
+        with self.assertRaisesRegex(ValueError, "must be collected alone"):
+            validate_instrumented_scenario_selection(
+                "same_snapshot_fanout,rust_large/typing_delta"
+            )
+        with self.assertRaisesRegex(ValueError, "must be collected alone"):
+            validate_instrumented_scenario_selection("rust_xlarge")
+        with self.assertRaisesRegex(ValueError, "at least one non-empty term"):
+            validate_instrumented_scenario_selection(" , ")
+
+    def test_fanout_instrumentation_requires_feature_on_measured_ref(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            source = Path(temporary)
+            (source / "Cargo.toml").write_text("[features]\ne2e = []\n")
+            with self.assertRaisesRegex(
+                RuntimeError, "predates semantic benchmark instrumentation"
+            ):
+                require_semantic_bench_instrumentation(source)
+            (source / "Cargo.toml").write_text(
+                "[features]\nsemantic-bench-instrumentation = []\n"
+            )
+            require_semantic_bench_instrumentation(source)
+
     def test_scenario_filters_are_normalized_for_execution_and_manifest(self):
         self.assertEqual(
             scenario_filter_terms(" rust, , markdown "),
@@ -76,6 +112,9 @@ class CollectSemanticPairsTest(unittest.TestCase):
         for scenario in DEFAULT_SCENARIOS.split(","):
             with self.subTest(scenario=scenario):
                 self.assertIn(f'name: "{scenario}"', harness)
+
+    def test_default_scenarios_do_not_enable_benchmark_instrumentation(self):
+        self.assertFalse(requires_semantic_bench_instrumentation(DEFAULT_SCENARIOS))
 
     def test_captured_stdout_has_exactly_one_terminal_newline(self):
         self.assertEqual(normalize_captured_stdout("result\n\n"), "result\n")

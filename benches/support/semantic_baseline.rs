@@ -24,6 +24,10 @@ pub(crate) enum ValidationError {
         expected_start: u32,
         actual_start: u32,
     },
+    TokenPayloadMismatch {
+        expected_len: usize,
+        actual_len: usize,
+    },
     EditOutOfBounds {
         edit_index: usize,
         start: usize,
@@ -119,6 +123,23 @@ impl SemanticBaseline {
 
         self.result_id = next_result_id;
         self.data = next_data;
+        Ok(())
+    }
+
+    pub(crate) fn validate_line_range(
+        &self,
+        result: &Value,
+        start_line: u32,
+        end_line: u32,
+    ) -> Result<(), ValidationError> {
+        let actual = full_data(result)?.ok_or(ValidationError::MissingTokenPayload)?;
+        let expected = filter_line_range(&self.data, start_line, end_line)?;
+        if actual != expected {
+            return Err(ValidationError::TokenPayloadMismatch {
+                expected_len: expected.len(),
+                actual_len: actual.len(),
+            });
+        }
         Ok(())
     }
 }
@@ -248,4 +269,52 @@ fn first_token_start(data: &[u32], tracked_line: u32) -> Result<u32, ValidationE
     }
 
     Err(ValidationError::TrackedLineHasNoToken { line: tracked_line })
+}
+
+fn filter_line_range(
+    data: &[u32],
+    start_line: u32,
+    end_line: u32,
+) -> Result<Vec<u32>, ValidationError> {
+    if !data.len().is_multiple_of(TOKEN_WIDTH) {
+        return Err(ValidationError::InvalidTokenDataLength { len: data.len() });
+    }
+
+    let mut line = 0_u32;
+    let mut start = 0_u32;
+    let mut absolute = Vec::new();
+    for token in data.chunks_exact(TOKEN_WIDTH) {
+        line = line
+            .checked_add(token[0])
+            .ok_or(ValidationError::PositionOverflow)?;
+        start = if token[0] == 0 {
+            start
+                .checked_add(token[1])
+                .ok_or(ValidationError::PositionOverflow)?
+        } else {
+            token[1]
+        };
+        if line >= end_line {
+            break;
+        }
+        if line >= start_line {
+            absolute.push((line, start, token[2], token[3], token[4]));
+        }
+    }
+
+    let mut encoded = Vec::with_capacity(absolute.len() * TOKEN_WIDTH);
+    let mut previous_line = 0_u32;
+    let mut previous_start = 0_u32;
+    for (line, start, length, token_type, modifiers) in absolute {
+        let delta_line = line - previous_line;
+        let delta_start = if delta_line == 0 {
+            start - previous_start
+        } else {
+            start
+        };
+        encoded.extend_from_slice(&[delta_line, delta_start, length, token_type, modifiers]);
+        previous_line = line;
+        previous_start = start;
+    }
+    Ok(encoded)
 }
