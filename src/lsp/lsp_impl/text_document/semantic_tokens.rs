@@ -29,8 +29,8 @@ use tower_lsp_server::ls_types::{
 };
 
 use crate::analysis::{
-    SemanticSnapshotIdentity, calculate_delta_or_full, filter_semantic_tokens_by_range,
-    handle_semantic_tokens_full, next_result_id,
+    SemanticArtifact, SemanticArtifactIdentity, SemanticSnapshotIdentity, calculate_delta_or_full,
+    filter_semantic_tokens_by_range, handle_semantic_tokens_full, next_result_id,
 };
 use crate::lsp::current_upstream_id;
 
@@ -73,16 +73,6 @@ enum CurrentTokens {
 }
 
 impl CurrentTokens {
-    fn from_result(result: SemanticTokensResult) -> Self {
-        match result {
-            SemanticTokensResult::Tokens(tokens) => Self::Owned(tokens),
-            SemanticTokensResult::Partial(_) => Self::Owned(SemanticTokens {
-                result_id: None,
-                data: Vec::new(),
-            }),
-        }
-    }
-
     fn as_ref(&self) -> &SemanticTokens {
         match self {
             Self::Cached(arc) => arc,
@@ -554,24 +544,25 @@ impl Kakehashi {
             );
             return Ok(None);
         }
-        let mut tokens_with_id = match result.unwrap_or_else(|| {
-            tower_lsp_server::ls_types::SemanticTokensResult::Tokens(
-                tower_lsp_server::ls_types::SemanticTokens {
-                    result_id: None,
-                    data: Vec::new(),
-                },
-            )
-        }) {
-            tower_lsp_server::ls_types::SemanticTokensResult::Tokens(tokens) => tokens,
-            tower_lsp_server::ls_types::SemanticTokensResult::Partial(_) => {
-                tower_lsp_server::ls_types::SemanticTokens {
-                    result_id: None,
-                    data: Vec::new(),
-                }
-            }
-        };
-        // Use atomic sequential ID for efficient cache validation
-        tokens_with_id.result_id = Some(next_result_id());
+        let expected_artifact_identity = SemanticArtifactIdentity::expected(
+            &uri,
+            &language_name,
+            snapshot_identity,
+            supports_multiline,
+        );
+        let artifact = result.and_then(|result| {
+            SemanticArtifact::from_full_result(expected_artifact_identity.to_owned(), result)
+        });
+        // The artifact contains no request lineage. Materialization checks the
+        // complete identity before assigning this request's result ID.
+        let tokens_with_id = artifact
+            .and_then(|artifact| {
+                artifact.into_full(expected_artifact_identity, Some(next_result_id()))
+            })
+            .unwrap_or_else(|| SemanticTokens {
+                result_id: Some(next_result_id()),
+                data: Vec::new(),
+            });
         let stored_tokens = tokens_with_id.clone();
         let lsp_tokens = tokens_with_id;
         let edit_lock = self.documents.edit_lock(&uri);
@@ -878,7 +869,6 @@ impl Kakehashi {
                     // The snapshot's own discovery (ADR §3, don't-discover-twice).
                     discovery: snapshot.injection_regions.clone(),
                 });
-
                 // Compute tokens, racing against cancel notification if provided
                 let compute_future = handle_semantic_tokens_full(
                     &self.compute_pool,
@@ -921,7 +911,36 @@ impl Kakehashi {
                     // No cancel support - just await the computation
                     compute_future.await
                 };
-                computed.map(CurrentTokens::from_result)
+                // Do not allocate artifact identity or shape a payload for work
+                // already made obsolete while the compute was in flight. The
+                // outer cancellation check remains necessary for cache hits and
+                // for a cancellation racing with materialization itself; the
+                // existing activity check immediately after materialization
+                // avoids adding a second DashMap lookup to every computed delta.
+                if cancel_token.is_cancelled() {
+                    self.cache.finish_request(&uri, request_id);
+                    log::debug!(
+                        target: "kakehashi::semantic",
+                        "[SEMANTIC_TOKENS_DELTA] CANCELLED uri={} req={} (before artifact)",
+                        uri, request_id
+                    );
+                    return Ok(None);
+                }
+                computed
+                    .and_then(|result| {
+                        let expected_artifact_identity = SemanticArtifactIdentity::expected(
+                            &uri,
+                            &language_name,
+                            snapshot_identity,
+                            supports_multiline,
+                        );
+                        SemanticArtifact::from_full_result(
+                            expected_artifact_identity.to_owned(),
+                            result,
+                        )
+                        .and_then(|artifact| artifact.into_full(expected_artifact_identity, None))
+                    })
+                    .map(CurrentTokens::Owned)
             }
         };
 
@@ -1222,7 +1241,6 @@ impl Kakehashi {
         // Use Rayon-based parallel injection processing
         let supports_multiline = self.settings_manager.supports_multiline_tokens();
         let coordinator = std::sync::Arc::clone(&self.language);
-
         let result = handle_semantic_tokens_full(
             &self.compute_pool,
             text,
@@ -1239,19 +1257,26 @@ impl Kakehashi {
 
         // Shape immutable payloads before taking the edit lock. Only the final
         // live-snapshot validation and cache commits need to exclude edits.
-        let (domain_range_result, tokens_to_store) = match result {
-            Some(tower_lsp_server::ls_types::SemanticTokensResult::Tokens(mut full_tokens)) => {
-                full_tokens.result_id = Some(next_result_id());
+        let full_tokens = result.and_then(|result| {
+            let expected_artifact_identity = SemanticArtifactIdentity::expected(
+                &uri,
+                &language_name,
+                snapshot_identity,
+                supports_multiline,
+            );
+            SemanticArtifact::from_full_result(expected_artifact_identity.to_owned(), result)
+                .and_then(|artifact| {
+                    artifact.into_full(expected_artifact_identity, Some(next_result_id()))
+                })
+        });
+        let (domain_range_result, tokens_to_store) = match full_tokens {
+            Some(full_tokens) => {
                 let range_tokens = filter_semantic_tokens_by_range(&full_tokens, &domain_range);
                 let response = tower_lsp_server::ls_types::SemanticTokensRangeResult::from(
                     range_tokens.clone(),
                 );
                 (response, Some((full_tokens, range_tokens)))
             }
-            Some(tower_lsp_server::ls_types::SemanticTokensResult::Partial(partial)) => (
-                tower_lsp_server::ls_types::SemanticTokensRangeResult::from(partial),
-                None,
-            ),
             None => (
                 tower_lsp_server::ls_types::SemanticTokensRangeResult::Tokens(
                     tower_lsp_server::ls_types::SemanticTokens {
