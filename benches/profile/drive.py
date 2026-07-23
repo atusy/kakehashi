@@ -106,7 +106,12 @@ def validate_profile_marker_paths(
             continue
         if isinstance(path, str) and not path:
             raise ValueError("profile marker paths must not be empty")
-        resolved = Path(path).expanduser().resolve()
+        try:
+            resolved = Path(path).expanduser().resolve()
+        except (OSError, RuntimeError) as error:
+            raise ValueError(
+                f"invalid profile marker path {path}: {error}"
+            ) from error
         # Marker names are a cross-process protocol, so conservatively reject
         # case/normalization-only differences even on a case-sensitive volume.
         parts = tuple(
