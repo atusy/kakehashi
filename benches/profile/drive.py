@@ -369,11 +369,16 @@ def main() -> None:
         for profile_signal in profile_signals
     }
     srv = None
+    pid_marker_published = False
 
     def terminate_server() -> None:
+        nonlocal pid_marker_published
         if srv is not None and srv.poll() is None:
             srv.kill()
             srv.wait()
+        if pid_marker_published:
+            Path(args.profile_pid_file).unlink(missing_ok=True)
+            pid_marker_published = False
 
     def restore_profile_signal_handlers() -> None:
         for profile_signal, previous in previous_handlers.items():
@@ -397,6 +402,7 @@ def main() -> None:
             preexec_fn=restore_child_signal_mask,
         )
         publish_marker(args.profile_pid_file, f"{srv.pid}\n")
+        pid_marker_published = args.profile_pid_file is not None
     except BaseException:
         terminate_server()
         restore_profile_signal_handlers()

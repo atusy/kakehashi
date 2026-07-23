@@ -309,6 +309,7 @@ class RequestSummaryTest(unittest.TestCase):
                 process.communicate(timeout=3)
                 with self.assertRaises(ProcessLookupError):
                     os.kill(server_pid, 0)
+                self.assertFalse(pid_file.exists())
             finally:
                 try:
                     os.killpg(process.pid, signal.SIGKILL)
@@ -367,6 +368,7 @@ class RequestSummaryTest(unittest.TestCase):
                 process.communicate(timeout=3)
                 with self.assertRaises(ProcessLookupError):
                     os.kill(server_pid, 0)
+                self.assertFalse(pid_file.exists())
             finally:
                 try:
                     os.killpg(process.pid, signal.SIGKILL)
