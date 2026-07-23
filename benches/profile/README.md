@@ -73,9 +73,11 @@ driver_job_is_running() {
   jobs -l > "$jobs_file" 2>/dev/null || return 1
   awk -v pid="$driver_pid" '
     {
-      state = tolower($0)
-      for (field = 1; field <= NF; field++)
-        if ($field == pid && state !~ /(done|exit|terminated)/) found = 1
+      for (field = 1; field < NF; field++)
+        if ($field == pid) {
+          state = tolower($(field + 1))
+          if (state == "running" || state == "suspended") found = 1
+        }
     }
     END { exit !found }
   ' "$jobs_file"
