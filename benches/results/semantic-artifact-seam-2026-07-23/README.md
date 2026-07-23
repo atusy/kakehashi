@@ -9,7 +9,7 @@ performance improvement.
 - A: `refactor/semantic-sync-core` at
   `265d38b0ac95822b17e5cec19c5e226d3d034bb9`
 - B: `benchmark/semantic-artifact-seam-2026-07-23` at
-  `1805e61907b6f2b6ce4718b5145d131a174c4a2e`
+  `518c1868e7c955d5241b3a5acaadf5d0617981b9`
 - Harness: `benchmark/semantic-lazy-content-lines-harness-2026-07-23` at
   `553b901bbf421e3851886c2a3e94b16adca6c34a`
 - Four alternating AB/BA pairs
@@ -21,20 +21,20 @@ Parser libraries and query files are not archived in this evidence directory.
 
 ## Result
 
-The primary freshly computed paths showed no repeatable regression:
-
 | Scenario | Paired median | Faster/slower pairs |
 | --- | ---: | ---: |
-| Rust typing delta | -0.20% | 2 / 2 |
-| Rust typing burst | +0.26% | 2 / 2 |
-| Rust cancellation burst | -1.82% | 2 / 2 |
-| Markdown typing delta | +3.01% | 1 / 3 |
-| Markdown typing burst | +0.38% | 2 / 2 |
+| Rust typing delta | -4.26% | 4 / 0 |
+| Rust typing burst | -8.30% | 4 / 0 |
+| Rust cancellation burst | +4.04% | 1 / 3 |
+| Markdown typing delta | +7.05% | 1 / 3 |
+| Markdown typing burst | -1.28% | 3 / 1 |
 
-The Markdown delta result had mixed signs and a wide -6.15% to +6.55% range.
-Cache-hit controls were likewise noisy even though they do not traverse the new
-artifact construction path. The result therefore supports non-regression, not
-a speedup claim.
+The run had substantial pair-to-pair noise. Cancellation ranged from -4.05% to
++70.72%, Markdown delta ranged from -10.89% to +17.07%, and cache-hit controls
+that do not traverse artifact construction also moved by a paired median of up
+to +4.88%. The Rust improvements are therefore not claimed as a speedup, while
+the mixed signs and noisy controls provide no repeatable primary-path regression
+signal attributable to the seam.
 
 `manifest.json` attests the exact commits, harness sources, binaries, fixture
 manifest, raw pair files, stdout captures, and aggregate summary.
