@@ -9,7 +9,16 @@ evidence_dir=benches/results/allocation-attribution-2026-07-23
 measurement_bin=${KAKEHASHI_MEASUREMENT_BIN:?set to the profiling binary built from the measured source}
 source_root="$(mktemp -d "${TMPDIR:-/tmp}/kakehashi-parser-source.XXXXXX")"
 pinned_source_dir="$data_dir/pinned-source"
-trap 'rm -r "$source_root"' EXIT HUP INT TERM
+
+cleanup_source() {
+  trap - EXIT HUP INT TERM
+  rm -r "$source_root"
+}
+trap cleanup_source EXIT
+trap 'cleanup_source; exit 129' HUP
+trap 'cleanup_source; exit 130' INT
+trap 'cleanup_source; exit 143' TERM
+
 [ -x "$measurement_bin" ] || {
   printf 'measurement binary is not executable: %s\n' "$measurement_bin" >&2
   exit 1

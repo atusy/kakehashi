@@ -265,20 +265,38 @@ fn test_allocation_profile_emits_completed_semantic_record() {
         "one completed request must emit one allocation record; stderr:\n{stderr}"
     );
     let record = records[0];
-    for field in [
-        "allocations=",
-        "allocated_bytes=",
-        "deallocations=",
-        "deallocated_bytes=",
-        "scope=process_global_alloc_delta",
-        "consistency=non_atomic_snapshot",
-        "realloc_accounting=old_deallocation_plus_new_allocation",
+    let marker = "compute rust allocations: ";
+    let payload = record
+        .split_once(marker)
+        .unwrap_or_else(|| panic!("allocation record must contain {marker:?}: {record}"))
+        .1;
+    let mut fields = payload.split_whitespace();
+    for name in [
+        "allocations",
+        "allocated_bytes",
+        "deallocations",
+        "deallocated_bytes",
     ] {
+        let field = fields
+            .next()
+            .unwrap_or_else(|| panic!("allocation record is missing {name}: {record}"));
+        let value = field
+            .strip_prefix(&format!("{name}="))
+            .unwrap_or_else(|| panic!("expected {name} field, got {field:?}: {record}"));
         assert!(
-            record.contains(field),
-            "allocation record must contain {field:?}: {record}"
+            value.parse::<u64>().is_ok(),
+            "{name} must be an unsigned integer, got {value:?}: {record}"
         );
     }
+    assert_eq!(
+        fields.collect::<Vec<_>>(),
+        [
+            "scope=process_global_alloc_delta",
+            "consistency=non_atomic_snapshot",
+            "realloc_accounting=old_deallocation_plus_new_allocation",
+        ],
+        "allocation record metadata must match the profiling contract: {record}"
+    );
 }
 
 /// Test semantic tokens for markdown with Lua injection.
