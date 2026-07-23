@@ -33,14 +33,13 @@ reproduction/analyzer files intentionally use two revisions:
    `realloc_accounting` suffix.
 
 [`prepare-data.sh`](prepare-data.sh)
-reconstructs the six workload-relevant languages from nvim-treesitter commit
-`a45a920ec04cda5624f6dea0ff6454c81c3ad2d5`: that commit's `parsers.lua`
-pins each grammar revision, and its query files are fetched from the same
-commit. Parser-only compilation avoids the installer's mutable main-branch
-query download. Hashes cover the exact grammar inputs (`grammar.json`,
-`parser.c`, and scanners) plus queries, rather than nondeterministic linked
-Mach-O bytes, and are verified by
-[`parser-artifacts.sha256`](parser-artifacts.sha256):
+uses the measured kakehashi binary's public `language install` command to
+populate a disposable data directory. Parser libraries, grammar sources, and
+query files are deliberately neither copied into this repository nor
+reimplemented by the evidence script. The retained logs are historical
+evidence; because the installer resolves its normal upstream metadata, a later
+reproduction verifies the procedure and log contract rather than recreating
+bit-for-bit identical parser/query artifacts:
 
 ```sh
 set -eu
@@ -50,6 +49,7 @@ measurement_ref=refs/pull/908/head
 measurement_root="$(mktemp -d "${TMPDIR:-/tmp}/kakehashi-measurement.XXXXXX")"
 measurement_worktree="$measurement_root/source"
 measurement_target="$measurement_root/target"
+measurement_data="$measurement_root/data"
 
 cleanup_measurement() {
   trap - EXIT HUP INT TERM
@@ -66,9 +66,9 @@ trap 'cleanup_measurement; exit 130' INT
 trap 'cleanup_measurement; exit 143' TERM
 
 # The measured intermediate commit will not survive a squash as main ancestry.
-# GitHub retains the PR head ref, so fetch it explicitly before resolving the
-# pinned SHA in a fresh or shallow checkout.
-git fetch --no-tags origin "$measurement_ref"
+# GitHub retains the PR head ref, so fetch it explicitly from the canonical
+# repository before resolving the pinned SHA in a fresh or shallow checkout.
+git fetch --no-tags https://github.com/atusy/kakehashi.git "$measurement_ref"
 git merge-base --is-ancestor "$measurement_source" FETCH_HEAD
 git worktree add --detach "$measurement_worktree" "$measurement_source"
 cargo build \
@@ -77,19 +77,20 @@ cargo build \
   --profile profiling --features allocation-profile --bin kakehashi
 measurement_bin="$measurement_target/profiling/kakehashi"
 KAKEHASHI_MEASUREMENT_BIN="$measurement_bin" \
+KAKEHASHI_MEASUREMENT_DATA_DIR="$measurement_data" \
   benches/results/allocation-attribution-2026-07-23/prepare-data.sh
 
 RUST_LOG=kakehashi::semantic=debug \
   python3 "$measurement_worktree/benches/profile/drive.py" \
     --bin "$measurement_bin" \
-    --data-dir "$PWD/deps/test/kakehashi" \
+    --data-dir "$measurement_data" \
     --lang markdown --size 150 --requests 36 --edits 1 \
     2> /tmp/kakehashi-allocation-markdown-final.log
 
 RUST_LOG=kakehashi::semantic=debug \
   python3 "$measurement_worktree/benches/profile/drive.py" \
     --bin "$measurement_bin" \
-    --data-dir "$PWD/deps/test/kakehashi" \
+    --data-dir "$measurement_data" \
     --lang rust --size 150 --requests 36 --edits 1 \
     2> /tmp/kakehashi-allocation-rust-final.log
 
