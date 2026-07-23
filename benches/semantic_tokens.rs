@@ -222,6 +222,22 @@ impl Server {
         );
     }
 
+    fn did_change_append_newline(&mut self, uri: &str, version: i64, line: u32) {
+        self.notify(
+            "textDocument/didChange",
+            json!({
+                "textDocument": { "uri": uri, "version": version },
+                "contentChanges": [{
+                    "range": {
+                        "start": { "line": line, "character": 0 },
+                        "end": { "line": line, "character": 0 },
+                    },
+                    "text": "\n",
+                }],
+            }),
+        );
+    }
+
     fn did_change_replace_prefix(&mut self, uri: &str, version: i64, line: u32, text: &str) {
         self.notify(
             "textDocument/didChange",
@@ -544,6 +560,9 @@ enum Kind {
     },
     /// `semanticTokens/full/delta` with no edit between requests.
     DeltaNoop,
+    /// Append a newline that leaves the token payload unchanged, consume its
+    /// empty delta, then issue a follow-up delta for the same current snapshot.
+    StableEditFollowupDelta,
     /// Realistic editing: a toggle `didChange` then `semanticTokens/full/delta`,
     /// so each measured request pays incremental reparse + cache invalidation +
     /// delta diff on top of the (full) token recompute.
@@ -576,6 +595,7 @@ struct EditState {
     line: u32,
     range_next: u32,
     fixed_width_next: usize,
+    append_line: u32,
 }
 
 struct Scenario {
@@ -636,6 +656,8 @@ fn measure(
         line: baseline.as_ref().map_or(0, SemanticBaseline::tracked_line),
         range_next: 0,
         fixed_width_next: 0,
+        append_line: u32::try_from(scn.content.lines().count())
+            .expect("benchmark line count fits u32"),
     };
 
     for _ in 0..warmup {
@@ -801,6 +823,7 @@ fn seed_baseline(server: &mut Server, scn: &Scenario) -> Option<SemanticBaseline
     match scn.kind {
         Kind::Full | Kind::Range { .. } | Kind::OpenFirstToken | Kind::CancelBurst { .. } => None,
         Kind::DeltaNoop
+        | Kind::StableEditFollowupDelta
         | Kind::EditDelta
         | Kind::TypingDelta
         | Kind::FixedWidthTypingDelta
@@ -850,6 +873,26 @@ fn run_once(
             let result = server.semantic_delta(scn.uri, baseline.result_id());
             baseline.apply_response(&result).unwrap_or_else(|error| {
                 panic!("invalid semantic response for {}: {error:?}", scn.name)
+            });
+        }
+        Kind::StableEditFollowupDelta => {
+            edit.version += 1;
+            server.did_change_append_newline(scn.uri, edit.version, edit.append_line);
+            edit.append_line += 1;
+            let baseline = baseline.as_mut().expect("delta baseline");
+            let edited = server.semantic_delta(scn.uri, baseline.result_id());
+            baseline.apply_response(&edited).unwrap_or_else(|error| {
+                panic!(
+                    "invalid semantic response after stable edit for {}: {error:?}",
+                    scn.name
+                )
+            });
+            let follow_up = server.semantic_delta(scn.uri, baseline.result_id());
+            baseline.apply_response(&follow_up).unwrap_or_else(|error| {
+                panic!(
+                    "invalid same-snapshot follow-up response for {}: {error:?}",
+                    scn.name
+                )
             });
         }
         Kind::EditDelta => {
@@ -1016,6 +1059,14 @@ fn main() {
             targets: "no-op delta result_id reuse",
         },
         Scenario {
+            name: "rust_large/stable_edit_followup_delta",
+            language_id: "rust",
+            uri: "file:///bench/large_stable_edit.rs",
+            content: gen_rust(150),
+            kind: Kind::StableEditFollowupDelta,
+            targets: "unique token-stable edit→empty delta→same-snapshot follow-up",
+        },
+        Scenario {
             name: "rust_large/edit_delta",
             language_id: "rust",
             uri: "file:///bench/large_edit.rs",
@@ -1086,6 +1137,14 @@ fn main() {
             content: gen_markdown_injections(60),
             kind: Kind::EditDelta,
             targets: "edit→reparse→injection re-detect→cache invalidation→delta (typing)",
+        },
+        Scenario {
+            name: "markdown_injections/stable_edit_followup_delta",
+            language_id: "markdown",
+            uri: "file:///bench/injections_stable_edit.md",
+            content: gen_markdown_injections(60),
+            kind: Kind::StableEditFollowupDelta,
+            targets: "unique token-stable injection edit→empty delta→same-snapshot follow-up",
         },
         Scenario {
             name: "markdown_injections/typing_delta",
