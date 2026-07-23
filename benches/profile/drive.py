@@ -383,6 +383,9 @@ def main() -> None:
         terminate_server()
         raise SystemExit(128 + signum)
 
+    def restore_child_signal_mask() -> None:
+        signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
+
     for profile_signal in profile_signals:
         signal.signal(profile_signal, handle_profile_signal)
     try:
@@ -391,6 +394,7 @@ def main() -> None:
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             env=env,
+            preexec_fn=restore_child_signal_mask,
         )
         publish_marker(args.profile_pid_file, f"{srv.pid}\n")
     except BaseException:
