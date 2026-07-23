@@ -1,4 +1,4 @@
-//! Compile-time opt-in process allocation counters for profiling builds.
+//! Compile-time opt-in Rust `GlobalAlloc` counters for profiling builds.
 //!
 //! The global allocator remains [`std::alloc::System`]; this wrapper only adds
 //! relaxed monotonic counters. Keeping the module behind the
