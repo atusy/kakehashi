@@ -54,6 +54,37 @@ benches/profile/xctrace.sh --lang markdown --size 150 --requests 160 --edits 1
 # -> $TMPDIR/kakehashi-xctrace/semantic-time.trace (+ a target-only summary)
 ```
 
+Allocation and retained-heap profilers need to attach to the spawned server
+rather than the Python driver. The driver exposes an optional file handshake so
+an external profiler can attach to the exact PID after parser/query warmup and
+before measured requests begin:
+
+```sh
+profile_dir="$(mktemp -d "${TMPDIR:-/tmp}/kakehashi-profile.XXXXXX")"
+python3 benches/profile/drive.py \
+  --bin ./target/profiling/kakehashi \
+  --file path/to/input.md --requests 80 --edits 1 \
+  --profile-pid-file "$profile_dir/pid" \
+  --profile-ready-file "$profile_dir/ready" \
+  --profile-start-file "$profile_dir/start" \
+  --profile-done-file "$profile_dir/done" \
+  --profile-hold-seconds 5 &
+driver_pid=$!
+
+# Wait for pid + ready, attach the profiler to "$(cat "$profile_dir/pid")",
+# then release only the semantic-token workload:
+touch "$profile_dir/start"
+
+# "$profile_dir/done" marks the end of measured requests. During the hold
+# interval, retained-heap tools can inspect the still-running server.
+wait "$driver_pid"
+```
+
+Use a fresh marker directory for each run. `pid`, `ready`, and `done` are
+published atomically. `start` is owned by the profiler controller; if it is not
+published within `--profile-wait-timeout` (30 seconds by default), the driver
+fails and still reaps the server.
+
 The harness drives the server against `deps/test/kakehashi` for parsers/queries.
 If that dir has no installed parsers, the server auto-installs on the first
 request (slow, needs network) and the profile is dominated by install work —
