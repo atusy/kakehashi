@@ -286,8 +286,12 @@ def main() -> None:
         ap.error("--burst-edits requires --burst greater than 1")
     if args.burst_delay_ms < 0:
         ap.error("--burst-delay-ms must be non-negative")
+    if not math.isfinite(args.profile_hold_seconds):
+        ap.error("--profile-hold-seconds must be finite")
     if args.profile_hold_seconds < 0:
         ap.error("--profile-hold-seconds must be non-negative")
+    if not math.isfinite(args.profile_wait_timeout):
+        ap.error("--profile-wait-timeout must be finite")
     if args.profile_wait_timeout <= 0:
         ap.error("--profile-wait-timeout must be positive")
     try:
