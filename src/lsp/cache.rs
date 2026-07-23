@@ -21,7 +21,7 @@ use crate::analysis::{
 };
 use crate::language::LanguageCoordinator;
 use crate::language::NodeTracker;
-use crate::language::injection::{CacheableInjectionRegion, collect_all_injections};
+use crate::language::injection::CacheableInjectionRegion;
 
 use super::semantic_request_tracker::SemanticRequestTracker;
 
@@ -211,6 +211,39 @@ impl CacheCoordinator {
         build_bridge_regions: bool,
         build_resolved_regions: bool,
     ) -> Option<PopulatedInjections> {
+        self.populate_injections_cancellable(
+            uri,
+            text,
+            tree,
+            language_name,
+            language,
+            tracker,
+            entry_mint_epoch,
+            incarnation,
+            build_bridge_regions,
+            build_resolved_regions,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn populate_injections_cancellable(
+        &self,
+        uri: &Url,
+        text: &str,
+        tree: &Tree,
+        language_name: &str,
+        language: &LanguageCoordinator,
+        tracker: &NodeTracker,
+        entry_mint_epoch: (u64, u64),
+        incarnation: u64,
+        build_bridge_regions: bool,
+        build_resolved_regions: bool,
+        cancel: Option<&crate::cancel::CancelToken>,
+    ) -> Option<PopulatedInjections> {
+        if crate::cancel::is_cancelled(cancel) {
+            return None;
+        }
         // Snapshot the generation FIRST — before reading the injection query or
         // resolving any language below — so the stamp can never be *newer* than
         // the queries the discovery was built with. A reload swaps queries and
@@ -251,8 +284,14 @@ impl CacheCoordinator {
         };
 
         // Collect all injection regions from the parsed tree
-        if let Some(regions) =
-            collect_all_injections(&tree.root_node(), text, Some(injection_query.as_ref()))
+        let Some(regions) = crate::language::injection::collect_all_injections_cancellable(
+            &tree.root_node(),
+            text,
+            Some(injection_query.as_ref()),
+            cancel,
+        ) else {
+            return None;
+        };
         {
             if regions.is_empty() {
                 // Clear any existing regions and caches for this document —
@@ -429,8 +468,6 @@ impl CacheCoordinator {
                 generation,
             });
         }
-
-        Some(PopulatedInjections::empty(generation))
     }
 
     /// Get all injection regions for a document (test helper).
@@ -857,6 +894,53 @@ mod tests {
         // Cancel all requests
         cache.cancel_requests(&uri);
         assert!(!cache.is_request_active(&uri, req));
+    }
+
+    #[test]
+    fn cancelled_populate_commits_no_injection_state() {
+        use tree_sitter::{Parser, Query};
+
+        let cache = CacheCoordinator::new();
+        let tracker = NodeTracker::new();
+        let coordinator = LanguageCoordinator::new();
+        let uri = create_test_uri("cancelled-populate.md");
+        let language: tree_sitter::Language = tree_sitter_md::LANGUAGE.into();
+        let query = Query::new(
+            &language,
+            r#"(fenced_code_block
+                  (info_string (language) @injection.language)
+                  (code_fence_content) @injection.content)"#,
+        )
+        .unwrap();
+        coordinator
+            .query_store()
+            .insert_injection_query("markdown".to_string(), std::sync::Arc::new(query));
+        let text = "```lua\nprint(1)\n```\n";
+        let mut parser = Parser::new();
+        parser.set_language(&language).unwrap();
+        let tree = parser.parse(text, None).unwrap();
+        let cancel = crate::cancel::CancelToken::default();
+        cancel.cancel();
+
+        let populated = cache.populate_injections_cancellable(
+            &uri,
+            text,
+            &tree,
+            "markdown",
+            &coordinator,
+            &tracker,
+            tracker.mint_epoch(&uri),
+            1,
+            true,
+            true,
+            Some(&cancel),
+        );
+
+        assert!(populated.is_none());
+        assert!(
+            cache.get_injections(&uri).is_none(),
+            "cancelled populate must not commit partial regions"
+        );
     }
 
     /// Integration test: language change with stable region_id triggers cache invalidation.
