@@ -84,6 +84,28 @@ fn parse_priority_for_pattern(query: &Query, pattern_index: usize) -> u32 {
     DEFAULT_PRIORITY
 }
 
+fn capture_kinds(
+    query: &Query,
+    filetype: Option<&str>,
+    capture_mappings: Option<&CaptureMappings>,
+) -> Vec<Option<TokenKind>> {
+    query
+        .capture_names()
+        .iter()
+        .map(
+            |capture_name| match resolve_capture(capture_name, filetype, capture_mappings) {
+                CaptureResult::Suppressed => None,
+                CaptureResult::Mapped(token_type, modifiers) => {
+                    Some(TokenKind::Mapped(token_type, modifiers))
+                }
+                CaptureResult::MappedUnknown(name) => Some(TokenKind::MappedUnknown(name)),
+                CaptureResult::Transparent => Some(TokenKind::Transparent),
+                CaptureResult::NoneCapture => Some(TokenKind::NoneCapture),
+            },
+        )
+        .collect()
+}
+
 /// The semantic role of a collected token.
 ///
 /// Mirrors the relevant variants of [`CaptureResult`] but lives on the
@@ -391,6 +413,7 @@ pub(super) fn collect_host_tokens(
     let mut utf16_cache: Vec<Option<Utf16LineIndex>> = Vec::new();
 
     // Collect tokens from this document's highlight query
+    let kinds_by_capture = capture_kinds(query, filetype, capture_mappings);
     let mut cursor = QueryCursor::new();
     let mut matches = cursor.matches(query, tree.root_node(), text.as_bytes());
 
@@ -405,6 +428,7 @@ pub(super) fn collect_host_tokens(
             if is_cancelled_periodically(cancel, &mut work_items) {
                 return false;
             }
+            let capture_name = &query.capture_names()[c.index as usize];
             let node = c.node;
             let start_pos = node.start_position();
             let end_pos = node.end_position();
@@ -416,16 +440,8 @@ pub(super) fn collect_host_tokens(
             let is_single_line = start_pos.row == end_pos.row;
             let is_trailing_newline = end_pos.row == start_pos.row + 1 && end_pos.column == 0;
 
-            // Get the mapped capture name early to avoid repeated mapping
-            let capture_name = &query.capture_names()[c.index as usize];
-            let kind = match resolve_capture(capture_name, filetype, capture_mappings) {
-                CaptureResult::Suppressed => continue,
-                CaptureResult::Mapped(token_type, modifiers) => {
-                    TokenKind::Mapped(token_type, modifiers)
-                }
-                CaptureResult::MappedUnknown(name) => TokenKind::MappedUnknown(name),
-                CaptureResult::Transparent => TokenKind::Transparent,
-                CaptureResult::NoneCapture => TokenKind::NoneCapture,
+            let Some(kind) = kinds_by_capture[c.index as usize].clone() else {
+                continue;
             };
 
             // Skip captures that fall within a child injection region
