@@ -143,9 +143,10 @@ impl ParseCoordinator {
     ///
     /// The caller provides the actual parse logic via `parse_fn`, which receives a
     /// `tree_sitter::Parser`, the work-unit's wall-clock deadline (feed it to
-    /// [`parse_text_with_deadline`]), and whether this attempt follows a parser
-    /// generation change. Incremental callers must drop old-tree seeds on that
-    /// retry because the replacement parser may use a different grammar.
+    /// [`parse_text_with_deadline`]), whether this attempt follows a parser
+    /// generation change, and the optional cancellation token. Incremental callers
+    /// must drop old-tree seeds on that retry because the replacement parser may
+    /// use a different grammar.
     /// The `parser_pool` sync mutex is acquired **only on the pool thread** (the
     /// parse-snapshot ADR's Stage-1 obligation: a tokio worker must never block on
     /// a mutex a compute thread holds), briefly around acquire and release; the
@@ -156,6 +157,7 @@ impl ParseCoordinator {
     /// Returns `None` if:
     /// - No parser is available for the language
     /// - The parse work-unit panicked
+    /// - The document input version became obsolete before or during parsing
     /// - The native parse aborted itself at its `PARSE_TIMEOUT` in-parse
     ///   deadline (anchored at dequeue, via tree-sitter's progress callback),
     ///   so a pathological parse cannot pin a bounded-pool thread past its
