@@ -108,6 +108,36 @@ impl SemanticTokenCache {
         }
     }
 
+    /// Make an existing baseline the current result for a newer snapshot whose
+    /// semantic tokens were proven byte-identical.
+    ///
+    /// This updates only the cache identity and reuses the existing token
+    /// allocation and client-visible result ID.
+    pub fn promote_current(
+        &self,
+        uri: Url,
+        tokens: Arc<SemanticTokens>,
+        language: String,
+        cache_key: u64,
+        snapshot: SemanticSnapshotIdentity,
+    ) {
+        let result_id = tokens.result_id.clone();
+        let mut document = self.documents.entry(uri).or_default();
+        document.current = Some(CachedSemanticTokens {
+            tokens: Arc::clone(&tokens),
+            language,
+            snapshot,
+            cache_key,
+        });
+        if let Some(result_id) = result_id {
+            if document.baselines.contains_key(&result_id) {
+                Self::touch_baseline(&mut document, &result_id);
+            } else {
+                Self::store_baseline(&mut document, result_id, tokens);
+            }
+        }
+    }
+
     fn store_baseline(
         document: &mut SemanticDocumentCache,
         result_id: String,
@@ -737,13 +767,7 @@ mod tests {
         };
         let old_snapshot = snapshot(1, 7, 3);
         let new_snapshot = snapshot(2, 7, 3);
-        cache.store(
-            uri.clone(),
-            tokens,
-            "rust".to_string(),
-            11,
-            old_snapshot,
-        );
+        cache.store(uri.clone(), tokens, "rust".to_string(), 11, old_snapshot);
         let baseline = cache
             .get_if_valid(&uri, "stable")
             .expect("stored result must remain a delta baseline");
@@ -764,7 +788,8 @@ mod tests {
             "promotion must reuse the existing token allocation"
         );
         assert!(
-            cache.get_if_same_snapshot(&uri, "rust", old_snapshot)
+            cache
+                .get_if_same_snapshot(&uri, "rust", old_snapshot)
                 .is_none(),
             "the old snapshot must no longer be the current identity"
         );
