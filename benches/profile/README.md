@@ -84,8 +84,10 @@ process thread allocating across a boundary can split the count and byte
 observations, so aggregate repeated records instead of treating one record or a
 derived net value as exact. Atomic counting changes timing, so use these records
 for allocation traffic only and report latency from an otherwise identical
-build without `allocation-profile`. Cancelled work intentionally has no
-completed-compute record.
+build without `allocation-profile`. Work whose cancellation is observed by the
+final compute checkpoint has no completed-compute record; a cancellation racing
+after that checkpoint may still cause the caller to discard a result whose
+compute record was already emitted.
 
 Allocation and retained-heap profilers need to attach to the spawned server
 rather than the Python driver. The driver exposes an optional file handshake so
