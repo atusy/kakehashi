@@ -1057,8 +1057,8 @@ mod tests {
         fn snapshot_published_after_reload_inherits_generation_floor() {
             let store = DocumentStore::new();
             let uri = Url::parse("file:///generation-floor.rs").unwrap();
-            store.advance_semantic_artifact_generation(7);
             store.insert(uri.clone(), "a".into(), Some("rust".into()), None);
+            store.advance_semantic_artifact_generation(7);
 
             assert!(publish(&store, &uri, snap_for(&store, &uri, 0)));
             let snapshot = store

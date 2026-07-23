@@ -199,10 +199,9 @@ impl Document {
         let mut installed = false;
         self.snapshot_tx.send_if_modified(|slot| {
             if slot.admits(&snapshot) {
-                snapshot.advance_semantic_artifact_generation(
-                    self.semantic_artifact_generation
-                        .load(std::sync::atomic::Ordering::Acquire),
-                );
+                snapshot
+                    .semantic_artifact
+                    .attach_generation_source(Arc::clone(&self.semantic_artifact_generation));
                 if let Some(previous) = slot.snapshot.as_ref() {
                     previous.cancel_semantic_artifact();
                 }
@@ -291,10 +290,7 @@ impl Document {
         // stale and lets the scheduled current-generation snapshot supersede it.
         self.content_version = self.content_version.wrapping_add(1);
         let semantic_artifact = Arc::new(crate::analysis::SemanticArtifactSlot::new());
-        semantic_artifact.advance_minimum_generation(
-            self.semantic_artifact_generation
-                .load(std::sync::atomic::Ordering::Acquire),
-        );
+        semantic_artifact.attach_generation_source(Arc::clone(&self.semantic_artifact_generation));
         self.snapshot_tx.send_replace(SnapshotSlot {
             current_incarnation: self.incarnation,
             snapshot: Some(Arc::new(ParseSnapshot {

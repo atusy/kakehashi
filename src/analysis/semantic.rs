@@ -914,10 +914,14 @@ local x = 42
         )
         .await;
 
-        // Empty document returns None (consistent with finalize_tokens behavior)
+        // A successful zero-token computation is distinct from cancellation or
+        // producer failure, so clients receive an explicit empty token set.
         assert!(
-            result.is_none(),
-            "Empty document should return None (no tokens to return)"
+            matches!(
+                result,
+                Some(SemanticTokensResult::Tokens(tokens)) if tokens.data.is_empty()
+            ),
+            "empty document should return an explicit empty token set"
         );
     }
 
