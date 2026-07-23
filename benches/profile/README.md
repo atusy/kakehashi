@@ -64,16 +64,32 @@ cargo build --profile profiling --bin kakehashi || exit $?
 profile_dir="$(mktemp -d "${TMPDIR:-/tmp}/kakehashi-profile.XXXXXX")" || exit $?
 driver_pid=
 
+driver_job_is_running() {
+  [ -n "$driver_pid" ] || return 1
+  jobs_file="$profile_dir/controller-jobs"
+  jobs -l > "$jobs_file" 2>/dev/null || return 1
+  awk -v pid="$driver_pid" '
+    { for (field = 1; field <= NF; field++) if ($field == pid) found = 1 }
+    END { exit !found }
+  ' "$jobs_file"
+  jobs_status=$?
+  rm -f "$jobs_file"
+  return "$jobs_status"
+}
+
 cleanup_profile_run() {
   trap - EXIT HUP INT TERM
   if [ -s "$profile_dir/pid" ]; then
     cleanup_server_pid="$(cat "$profile_dir/pid")"
     kill "$cleanup_server_pid" 2>/dev/null || true
   fi
-  if [ -n "$driver_pid" ]; then
-    kill "$driver_pid" 2>/dev/null || true
-    wait "$driver_pid" 2>/dev/null || true
+  cleanup_driver_pid="$driver_pid"
+  if driver_job_is_running; then
+    kill "$cleanup_driver_pid" 2>/dev/null || true
   fi
+  driver_pid=
+  [ -z "$cleanup_driver_pid" ] ||
+    wait "$cleanup_driver_pid" 2>/dev/null || true
   # Recheck in case the PID marker appeared while cleanup was starting.
   if [ -s "$profile_dir/pid" ]; then
     cleanup_server_pid="$(cat "$profile_dir/pid")"
@@ -104,6 +120,7 @@ wait_for_driver_marker() {
     if ! kill -0 "$driver_pid" 2>/dev/null; then
       wait "$driver_pid"
       driver_status=$?
+      driver_pid=
       [ -f "$marker" ] && return 0
       [ "$driver_status" -ne 0 ] || driver_status=1
       printf 'driver exited before publishing %s\n' "$marker" >&2
@@ -132,6 +149,7 @@ require_profile_target() {
   profile_target_is_live && return 0
   wait "$driver_pid"
   target_status=$?
+  driver_pid=
   [ "$target_status" -ne 0 ] || target_status=1
   printf 'profile target exited or invalidated PID marker\n' >&2
   return "$target_status"
@@ -152,12 +170,14 @@ touch "$profile_dir/start" || exit $?
 # "$profile_dir/done" marks the end of measured requests. The server remains
 # alive during the hold interval so retained-heap tools can inspect it.
 wait_for_driver_marker "$profile_dir/done" || exit $?
+require_profile_target || exit $?
 heap -H "$server_pid"
 heap_status=$?
 touch "$profile_dir/stop"
 stop_status=$?
 wait "$driver_pid"
 driver_status=$?
+driver_pid=
 rm -r "$profile_dir"
 remove_status=$?
 [ "$remove_status" -ne 0 ] || trap - EXIT HUP INT TERM
