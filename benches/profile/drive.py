@@ -10,16 +10,24 @@ the sampled process actually spends its time in the semantic-tokens hot path.
 Usage:
     drive.py --bin ./target/profiling/kakehashi --lang rust --size 150 --requests 300
 """
+from __future__ import annotations
+
 import argparse
+from collections.abc import Callable
 from collections import Counter, defaultdict
 from dataclasses import dataclass
 import json
 import math
 import os
+from pathlib import Path
+import queue
+import signal
 import subprocess
 import sys
+import tempfile
 import threading
 import time
+import unicodedata
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from gen_session import gen_rust, gen_markdown_injections  # noqa: E402
@@ -44,6 +52,86 @@ class RequestSummary:
     p90_ms: float
     max_ms: float
     wire_bytes: int
+
+
+def publish_marker(path: Path | str | None, content: str) -> Path | None:
+    """Atomically publish a marker consumed by an external profiler."""
+    if path is None:
+        return None
+    marker = Path(path)
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=marker.parent,
+            prefix=f".{marker.name}.",
+            delete=False,
+        ) as handle:
+            temporary = Path(handle.name)
+            handle.write(content)
+        os.replace(temporary, marker)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+    return marker
+
+
+def wait_for_marker(
+    path: Path | str,
+    timeout_seconds: float,
+    poll_seconds: float = 0.01,
+    abort_if: Callable[[], str | None] | None = None,
+) -> Path:
+    """Wait until an external profiler publishes a marker."""
+    marker = Path(path)
+    deadline = time.monotonic() + timeout_seconds
+    while not marker.is_file():
+        if abort_if is not None and (reason := abort_if()) is not None:
+            raise RuntimeError(
+                f"{reason} while waiting for profile marker {marker}"
+            )
+        if time.monotonic() >= deadline:
+            raise TimeoutError(f"timed out waiting for profile marker {marker}")
+        time.sleep(poll_seconds)
+    return marker
+
+
+def validate_profile_marker_paths(
+    paths: list[Path | str | None],
+) -> None:
+    """Reject aliases that could satisfy a profiling phase prematurely."""
+    seen: list[tuple[tuple[str, ...], Path | str]] = []
+    for path in paths:
+        if path is None:
+            continue
+        if isinstance(path, str) and not path:
+            raise ValueError("profile marker paths must not be empty")
+        try:
+            resolved = Path(path).expanduser().resolve()
+        except (OSError, RuntimeError) as error:
+            raise ValueError(
+                f"invalid profile marker path {path}: {error}"
+            ) from error
+        # Marker names are a cross-process protocol, so conservatively reject
+        # case/normalization-only differences even on a case-sensitive volume.
+        parts = tuple(
+            unicodedata.normalize("NFC", part).casefold()
+            for part in resolved.parts
+        )
+        for previous_parts, previous in seen:
+            if parts == previous_parts:
+                raise ValueError(
+                    f"profile marker paths must be distinct: {previous} and {path}"
+                )
+            shared = min(len(parts), len(previous_parts))
+            if parts[:shared] == previous_parts[:shared]:
+                raise ValueError(
+                    "profile marker paths must not contain one another: "
+                    f"{previous} and {path}"
+                )
+        seen.append((parts, path))
 
 
 def summarize_samples(samples: list[RequestSample]) -> RequestSummary:
@@ -197,6 +285,28 @@ def main() -> None:
         help="parser/query data dir; must already contain installed parsers "
              "(populated by `cargo test --features e2e` or `make deps/tree-sitter`), "
              "else the server auto-installs on first request")
+    ap.add_argument(
+        "--profile-pid-file",
+        help="atomically publish the spawned server PID for profiler attachment")
+    ap.add_argument(
+        "--profile-ready-file",
+        help="publish after initialization and an unmeasured semantic warmup")
+    ap.add_argument(
+        "--profile-start-file",
+        help="wait for this external marker before starting measured requests")
+    ap.add_argument(
+        "--profile-done-file",
+        help="publish after measured requests finish, before the hold interval")
+    ap.add_argument(
+        "--profile-stop-file",
+        help="wait for this controller marker after done, bounded by hold seconds")
+    ap.add_argument(
+        "--profile-hold-seconds", type=float, default=0,
+        help="keep the server alive after measurement for an external snapshot")
+    ap.add_argument(
+        "--profile-wait-timeout", type=float, default=30,
+        help="seconds to wait for semantic warmup and start; "
+             "shutdown response is capped at 5 seconds")
     args = ap.parse_args()
     if args.requests <= 0:
         ap.error("--requests must be positive")  # avoids divide-by-zero in the summary
@@ -206,6 +316,28 @@ def main() -> None:
         ap.error("--burst-edits requires --burst greater than 1")
     if args.burst_delay_ms < 0:
         ap.error("--burst-delay-ms must be non-negative")
+    if not math.isfinite(args.profile_hold_seconds):
+        ap.error("--profile-hold-seconds must be finite")
+    if args.profile_hold_seconds < 0:
+        ap.error("--profile-hold-seconds must be non-negative")
+    if not math.isfinite(args.profile_wait_timeout):
+        ap.error("--profile-wait-timeout must be finite")
+    if args.profile_wait_timeout <= 0:
+        ap.error("--profile-wait-timeout must be positive")
+    if args.profile_stop_file and args.profile_hold_seconds <= 0:
+        ap.error(
+            "--profile-stop-file requires positive --profile-hold-seconds"
+        )
+    try:
+        validate_profile_marker_paths([
+            args.profile_pid_file,
+            args.profile_ready_file,
+            args.profile_start_file,
+            args.profile_done_file,
+            args.profile_stop_file,
+        ])
+    except ValueError as error:
+        ap.error(str(error))
     if args.burst > 1 and (args.captures or args.concurrent_captures):
         ap.error("--burst cannot be combined with captures modes")
     if args.concurrent_captures:
@@ -229,8 +361,60 @@ def main() -> None:
     env = dict(os.environ, KAKEHASHI_DATA_DIR=args.data_dir)
     # Let the server's stderr through (it's silent unless RUST_LOG is set) so a
     # crash or panic is visible instead of being swallowed during profiling.
-    srv = subprocess.Popen([args.bin, *args.server_arg], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                           env=env)
+    profile_signals = [signal.SIGINT, signal.SIGTERM]
+    if hasattr(signal, "SIGHUP"):
+        profile_signals.append(signal.SIGHUP)
+    previous_mask = signal.pthread_sigmask(signal.SIG_BLOCK, profile_signals)
+    previous_handlers = {
+        profile_signal: signal.getsignal(profile_signal)
+        for profile_signal in profile_signals
+    }
+    srv = None
+    pid_marker_published = False
+
+    def terminate_server() -> None:
+        nonlocal pid_marker_published
+        if srv is not None and srv.poll() is None:
+            srv.kill()
+            srv.wait()
+        if pid_marker_published:
+            Path(args.profile_pid_file).unlink(missing_ok=True)
+            pid_marker_published = False
+
+    def restore_profile_signal_handlers() -> None:
+        for profile_signal, previous in previous_handlers.items():
+            signal.signal(profile_signal, previous)
+
+    def handle_profile_signal(signum, _frame) -> None:
+        terminate_server()
+        raise SystemExit(128 + signum)
+
+    def restore_child_signal_mask() -> None:
+        signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
+
+    for profile_signal in profile_signals:
+        signal.signal(profile_signal, handle_profile_signal)
+    try:
+        srv = subprocess.Popen(
+            [args.bin, *args.server_arg],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            env=env,
+            preexec_fn=restore_child_signal_mask,
+        )
+        publish_marker(args.profile_pid_file, f"{srv.pid}\n")
+        pid_marker_published = args.profile_pid_file is not None
+    except BaseException:
+        terminate_server()
+        restore_profile_signal_handlers()
+        raise
+    finally:
+        signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
+
+    def server_exit_reason() -> str | None:
+        status = srv.poll()
+        return None if status is None else f"server exited with status {status}"
+
     rid = 0
     request_samples = defaultdict(list)
     notification_counts = Counter()
@@ -238,6 +422,7 @@ def main() -> None:
     server_request_counts = Counter()
     server_request_bytes = Counter()
     send_lock = threading.Lock()
+    request_threads = []
 
     def send(obj):
         body = json.dumps(obj).encode()
@@ -254,6 +439,28 @@ def main() -> None:
     def request(method, params):
         request_id = send_request(method, params)
         return read_until(request_id)
+
+    def request_with_timeout(method, params, timeout_seconds, description):
+        result_queue = queue.Queue(maxsize=1)
+
+        def run_request():
+            try:
+                result_queue.put((request(method, params), None))
+            except BaseException as error:
+                result_queue.put((None, error))
+
+        reader = threading.Thread(target=run_request, daemon=True)
+        request_threads.append(reader)
+        reader.start()
+        try:
+            result, error = result_queue.get(timeout=timeout_seconds)
+        except queue.Empty as error:
+            raise TimeoutError(
+                f"timed out waiting for {description}"
+            ) from error
+        if error is not None:
+            raise error
+        return result
 
     def notify(method, params):
         send({"jsonrpc": "2.0", "method": method, "params": params})
@@ -423,6 +630,30 @@ def main() -> None:
                     "cannot measure a real delta lineage"
                 )
 
+        semantic_request = (
+            "textDocument/semanticTokens/full",
+            {"textDocument": {"uri": uri}},
+        )
+        if args.profile_ready_file or args.profile_start_file:
+            warmup, _ = request_with_timeout(
+                *semantic_request,
+                timeout_seconds=args.profile_wait_timeout,
+                description="semantic warmup response",
+            )
+            if response_status(warmup) != "ok":
+                raise RuntimeError(
+                    "semantic warmup did not return tokens; "
+                    f"status={response_status(warmup)}"
+                )
+
+        publish_marker(args.profile_ready_file, "ready\n")
+        if args.profile_start_file:
+            wait_for_marker(
+                args.profile_start_file,
+                args.profile_wait_timeout,
+                abort_if=server_exit_reason,
+            )
+
         ok, canceled, superseded, tokens = 0, 0, 0, 0
         version = 1
         # LSP `character` offsets are UTF-16 code units, not Unicode code
@@ -453,10 +684,6 @@ def main() -> None:
             t_req = time.perf_counter()
             semantic_sample_start = len(
                 request_samples["textDocument/semanticTokens/full"]
-            )
-            semantic_request = (
-                "textDocument/semanticTokens/full",
-                {"textDocument": {"uri": uri}},
             )
             captures_requests = [
                 ("kakehashi/captures/full/delta",
@@ -515,15 +742,44 @@ def main() -> None:
             superseded += cycle_superseded
         elapsed = time.time() - t0
 
-        request("shutdown", None)
-        notify("exit", {})
-        srv.wait(timeout=5)
+        publish_marker(args.profile_done_file, "done\n")
+        if args.profile_stop_file:
+            try:
+                wait_for_marker(
+                    args.profile_stop_file,
+                    args.profile_hold_seconds,
+                    abort_if=server_exit_reason,
+                )
+            except TimeoutError:
+                sys.stderr.write(
+                    "[drive] profile stop marker deadline expired; "
+                    "shutting down server\n"
+                )
+        elif args.profile_hold_seconds > 0:
+            time.sleep(args.profile_hold_seconds)
+
+        try:
+            request_with_timeout(
+                "shutdown",
+                None,
+                timeout_seconds=min(args.profile_wait_timeout, 5.0),
+                description="shutdown response",
+            )
+        except TimeoutError:
+            sys.stderr.write(
+                "[drive] shutdown response deadline expired; "
+                "killing server\n"
+            )
+        else:
+            notify("exit", {})
+            srv.wait(timeout=5)
     except subprocess.TimeoutExpired:
         pass  # graceful shutdown didn't land in time; the finally kills it
     finally:
-        if srv.poll() is None:
-            srv.kill()
-            srv.wait()
+        terminate_server()
+        for reader in request_threads:
+            reader.join(timeout=1)
+        restore_profile_signal_handlers()
 
     n_bytes = len(text.encode("utf-8"))
     n_lines = len(text.splitlines())
