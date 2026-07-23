@@ -124,7 +124,7 @@ attachment, run the second block in the same shell to release only the measured
 semantic-token workload:
 
 ```sh
-touch "$profile_dir/start"
+touch "$profile_dir/start" || exit $?
 
 # "$profile_dir/done" marks the end of measured requests. The server remains
 # alive during the hold interval so retained-heap tools can inspect it.
