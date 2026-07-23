@@ -46,6 +46,7 @@ Mach-O bytes, and are verified by
 set -eu
 
 measurement_source=089f6e72e8a189e884a02364efeb3d480e519556
+measurement_ref=refs/pull/908/head
 measurement_root="$(mktemp -d "${TMPDIR:-/tmp}/kakehashi-measurement.XXXXXX")"
 measurement_worktree="$measurement_root/source"
 measurement_target="$measurement_root/target"
@@ -64,6 +65,11 @@ trap 'cleanup_measurement; exit 129' HUP
 trap 'cleanup_measurement; exit 130' INT
 trap 'cleanup_measurement; exit 143' TERM
 
+# The measured intermediate commit will not survive a squash as main ancestry.
+# GitHub retains the PR head ref, so fetch it explicitly before resolving the
+# pinned SHA in a fresh or shallow checkout.
+git fetch --no-tags origin "$measurement_ref"
+git merge-base --is-ancestor "$measurement_source" FETCH_HEAD
 git worktree add --detach "$measurement_worktree" "$measurement_source"
 cargo build \
   --manifest-path "$measurement_worktree/Cargo.toml" \
