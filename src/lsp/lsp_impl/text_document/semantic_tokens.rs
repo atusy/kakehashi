@@ -59,7 +59,12 @@ async fn wait_for_same_snapshot_benchmark_peer() {
 }
 
 #[cfg(not(feature = "semantic-bench-instrumentation"))]
-async fn wait_for_same_snapshot_benchmark_peer() {}
+async fn wait_for_same_snapshot_benchmark_peer() {
+    assert!(
+        std::env::var_os("KAKEHASHI_BENCH_SEMANTIC_FANOUT_PARTIES").is_none(),
+        "same-snapshot fan-out requires --features semantic-bench-instrumentation"
+    );
+}
 
 /// Outcome of the serve-current snapshot resolution for the whole-document
 /// token handlers (see [`Kakehashi::current_snapshot_for_tokens`]).
