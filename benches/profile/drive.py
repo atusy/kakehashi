@@ -10,6 +10,8 @@ the sampled process actually spends its time in the semantic-tokens hot path.
 Usage:
     drive.py --bin ./target/profiling/kakehashi --lang rust --size 150 --requests 300
 """
+from __future__ import annotations
+
 import argparse
 from collections import Counter, defaultdict
 from dataclasses import dataclass
