@@ -5,39 +5,39 @@ semantic-tokens benchmark  (iters=30, warmup=6, lower is better)
 
 scenario                                B (med)      A (med) Δ (A vs B)
 ------------------------------------------------------------------------
-rust_large/full_cache_hit               2.079ms      1.951ms         -6.2%
-    p95:      2.139ms      2.068ms
+rust_large/full_cache_hit               1.839ms      1.794ms         -2.4%
+    p95:      2.217ms      2.213ms
     └ targets: large exact-snapshot semantic cache-hit control
-markdown_injections_large/full_cache_hit      0.496ms      0.867ms        +74.8%
-    p95:      0.540ms      1.253ms
+markdown_injections_large/full_cache_hit      0.999ms      0.616ms         -38.4%
+    p95:      1.214ms      0.710ms
     └ targets: large injection document exact-snapshot semantic cache-hit control
-unicode_rust/full_cache_hit             0.630ms      0.412ms         -34.7%
-    p95:      0.767ms      0.435ms
+unicode_rust/full_cache_hit             0.749ms      0.728ms         -2.8%
+    p95:      0.886ms      0.902ms
     └ targets: Unicode document exact-snapshot semantic cache-hit control
-rust_large/typing_delta                15.921ms     18.456ms        +15.9%
-    p95:     17.162ms     23.350ms
+rust_large/typing_delta                15.320ms     15.343ms        +0.2%
+    p95:     15.799ms     16.502ms
     └ targets: unique edit states→reparse→retokenize→delta; excludes A/B cache returns
-rust_sparse_32k_minus/typing_delta      9.367ms      8.704ms         -7.1%
-    p95:     10.007ms      9.892ms
+rust_sparse_32k_minus/typing_delta      5.858ms      5.662ms         -3.4%
+    p95:      6.379ms      6.410ms
     └ targets: sparse low-match control just below 32 KiB
-rust_sparse_32k_exact/typing_delta      8.463ms      8.195ms         -3.2%
-    p95:      8.997ms      8.775ms
+rust_sparse_32k_exact/typing_delta      5.617ms      5.741ms        +2.2%
+    p95:      7.086ms      6.471ms
     └ targets: sparse low-match control at 32 KiB
-rust_sparse_32k_plus/typing_delta       7.181ms      6.533ms         -9.0%
-    p95:      7.613ms      6.989ms
+rust_sparse_32k_plus/typing_delta       5.770ms      5.844ms        +1.3%
+    p95:      6.570ms      6.242ms
     └ targets: sparse low-match control just above 32 KiB
-rust_sparse_64k/typing_delta           13.424ms     14.035ms        +4.6%
-    p95:     14.599ms     15.562ms
+rust_sparse_64k/typing_delta           12.553ms     14.624ms        +16.5%
+    p95:     14.128ms     17.091ms
     └ targets: sparse low-match query walk at 64 KiB
-rust_large/typing_burst                26.676ms     29.682ms        +11.3%
-    p95:     30.511ms     32.734ms
+rust_large/typing_burst                28.552ms     28.319ms         -0.8%
+    p95:     34.047ms     31.581ms
     └ targets: eight queued unique edits→current delta; latest-state follow latency
-rust_xlarge/cancel_burst              137.546ms    143.359ms        +4.2%
-    p95:    147.322ms    159.309ms
+rust_xlarge/cancel_burst              138.657ms    141.984ms        +2.4%
+    p95:    146.308ms    191.214ms
     └ targets: current-token latency after four explicitly cancelled edit states
-markdown_injections/typing_delta        4.383ms      4.179ms         -4.6%
-    p95:      4.857ms      4.944ms
+markdown_injections/typing_delta        7.812ms      7.100ms         -9.1%
+    p95:      9.771ms      7.750ms
     └ targets: unique edit states→injection reuse→delta; excludes A/B cache returns
-markdown_injections/typing_burst        4.197ms      4.225ms        +0.7%
-    p95:      5.403ms      5.960ms
+markdown_injections/typing_burst        6.792ms      6.290ms         -7.4%
+    p95:      7.180ms      6.641ms
     └ targets: eight queued unique edits→current injection delta; latest-state follow latency

@@ -8,8 +8,8 @@ performance improvement.
 
 - A: `refactor/semantic-sync-core` at
   `265d38b0ac95822b17e5cec19c5e226d3d034bb9`
-- B: `benchmark/semantic-artifact-seam-final-2026-07-23` at
-  `518c1868e7c955d5241b3a5acaadf5d0617981b9`
+- B: `benchmark/semantic-artifact-seam-converged-2026-07-23` at
+  `8b966d16f5a3a56c985a71d16b91e2e1fe5ae53f`
 - Harness: `benchmark/semantic-lazy-content-lines-harness-2026-07-23` at
   `553b901bbf421e3851886c2a3e94b16adca6c34a`
 - Four alternating AB/BA pairs
@@ -23,18 +23,17 @@ Parser libraries and query files are not archived in this evidence directory.
 
 | Scenario | Paired median | Faster/slower pairs |
 | --- | ---: | ---: |
-| Rust typing delta | -4.26% | 4 / 0 |
-| Rust typing burst | -8.30% | 4 / 0 |
-| Rust cancellation burst | +4.04% | 1 / 3 |
-| Markdown typing delta | +7.05% | 1 / 3 |
-| Markdown typing burst | -1.28% | 3 / 1 |
+| Rust typing delta | +1.13% | 2 / 2 |
+| Rust typing burst | +0.15% | 2 / 2 |
+| Rust cancellation burst | +0.54% | 2 / 2 |
+| Markdown typing delta | -0.61% | 2 / 2 |
+| Markdown typing burst | +3.49% | 2 / 2 |
 
-The run had substantial pair-to-pair noise. Cancellation ranged from -4.05% to
-+70.72%, Markdown delta ranged from -10.89% to +17.07%, and cache-hit controls
-that do not traverse artifact construction also moved by a paired median of up
-to +4.88%. The Rust improvements are therefore not claimed as a speedup, while
-the mixed signs and noisy controls provide no repeatable primary-path regression
-signal attributable to the seam.
+Every primary scenario had mixed pair signs. Controls that do not traverse
+artifact construction were noisier: Markdown large cache hit had a +23.80%
+paired median with a -38.74% to +62.22% range, while Unicode cache hit ranged
+from -0.77% to +46.36%. The result therefore supports non-regression only, not a
+speedup claim.
 
 `manifest.json` attests the exact commits, harness sources, binaries, fixture
 manifest, raw pair files, stdout captures, and aggregate summary.
