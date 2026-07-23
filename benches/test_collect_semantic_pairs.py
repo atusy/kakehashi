@@ -15,6 +15,7 @@ from collect_semantic_pairs import (
     set_tree_writable,
     tree_manifest,
     validate_requested_scenario_filters,
+    write_installed_data_manifest,
 )
 
 
@@ -127,6 +128,21 @@ class CollectSemanticPairsTest(unittest.TestCase):
             before = manifest_sha256(tree_manifest(fixture))
             file.write_bytes(b"after")
             self.assertNotEqual(before, manifest_sha256(tree_manifest(fixture)))
+
+    def test_installed_data_manifest_does_not_publish_parser_or_query_files(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            artifact_dir = Path(temporary)
+            metadata = write_installed_data_manifest(
+                artifact_dir,
+                [{"path": "parser/rust.dylib", "sha256": "parser-hash"}],
+            )
+
+            self.assertEqual(metadata["fixture_manifest"], "fixture-manifest.json")
+            self.assertNotIn("fixture_archive", metadata)
+            self.assertEqual(
+                list(artifact_dir.iterdir()),
+                [artifact_dir / "fixture-manifest.json"],
+            )
 
     def test_fixture_can_be_frozen_and_restored_for_cleanup(self):
         with tempfile.TemporaryDirectory() as temporary:
