@@ -82,8 +82,6 @@
       }
     }
   },
-  "fixture_archive": "fixture",
-  "fixture_archive_sha256": "18bc76a24d8365acdfd12d59ec419dad30b2537f28dad30626bc154f44cb8b3c",
   "fixture_manifest": "fixture-manifest.json",
   "fixture_manifest_sha256": "3de7b645cbbbf5465d2c0cf1d215b66fb10b9c25145a84d42692a6bab1a98a83",
   "raw_files": [
