@@ -278,6 +278,20 @@ pub(crate) fn collect_all_injections<'a>(
     text: &str,
     injection_query: Option<&Query>,
 ) -> Option<Vec<InjectionRegionInfo<'a>>> {
+    collect_all_injections_cancellable(root, text, injection_query, None)
+}
+
+/// [`collect_all_injections`] with cooperative cancellation for a document
+/// version that became obsolete while the query cursor was walking matches.
+pub(crate) fn collect_all_injections_cancellable<'a>(
+    root: &Node<'a>,
+    text: &str,
+    injection_query: Option<&Query>,
+    cancel: Option<&crate::cancel::CancelToken>,
+) -> Option<Vec<InjectionRegionInfo<'a>>> {
+    if crate::cancel::is_cancelled(cancel) {
+        return None;
+    }
     let query = injection_query?;
 
     let mut cursor = QueryCursor::new();
@@ -286,8 +300,12 @@ pub(crate) fn collect_all_injections<'a>(
     // Deduplicate repeated matches of the same language layer while preserving
     // distinct languages assigned to the same content range (#598).
     let mut injections_map = std::collections::HashMap::new();
+    let mut work_items = 0;
 
     while let Some(match_) = matches.next() {
+        if crate::cancel::is_cancelled_periodically(cancel, &mut work_items) {
+            return None;
+        }
         if !check_match_predicates(query, match_, text) {
             continue;
         }
@@ -295,6 +313,9 @@ pub(crate) fn collect_all_injections<'a>(
             continue;
         };
         for capture in iter_injection_content_captures(match_, query) {
+            if crate::cancel::is_cancelled_periodically(cancel, &mut work_items) {
+                return None;
+            }
             if capture.node.start_byte() >= capture.node.end_byte() {
                 continue;
             }
@@ -325,6 +346,10 @@ pub(crate) fn collect_all_injections<'a>(
                 }
             });
         }
+    }
+
+    if crate::cancel::is_cancelled(cancel) {
+        return None;
     }
 
     // Sort by start_byte (primary) and end_byte (secondary) to ensure deterministic ordering
@@ -894,7 +919,9 @@ impl InjectionResolver {
             regions,
             None,
             text,
+            None,
         )
+        .expect("resolution without cancellation cannot be cancelled")
     }
 
     /// [`resolve_from_regions`](Self::resolve_from_regions) fed with the
@@ -904,13 +931,14 @@ impl InjectionResolver {
     /// where repeating work the caller just did delays the settle signal.
     /// `regions` and `cacheable` must be index-aligned (both derive from one
     /// `collect_all_injections` pass).
-    pub(crate) fn resolve_from_prebuilt(
+    pub(crate) fn resolve_from_prebuilt_cancellable(
         coordinator: &LanguageCoordinator,
         regions: &[InjectionRegionInfo<'_>],
         cacheable: &[CacheableInjectionRegion],
         text: &str,
-    ) -> Vec<ResolvedInjection> {
-        Self::resolve_grouped(coordinator, None, regions, Some(cacheable), text)
+        cancel: Option<&crate::cancel::CancelToken>,
+    ) -> Option<Vec<ResolvedInjection>> {
+        Self::resolve_grouped(coordinator, None, regions, Some(cacheable), text, cancel)
     }
 
     fn resolve_grouped(
@@ -919,7 +947,11 @@ impl InjectionResolver {
         regions: &[InjectionRegionInfo<'_>],
         prebuilt: Option<&[CacheableInjectionRegion]>,
         text: &str,
-    ) -> Vec<ResolvedInjection> {
+        cancel: Option<&crate::cancel::CancelToken>,
+    ) -> Option<Vec<ResolvedInjection>> {
+        if crate::cancel::is_cancelled(cancel) {
+            return None;
+        }
         enum Slot {
             Single(usize),
             Combined(Vec<usize>),
@@ -931,7 +963,11 @@ impl InjectionResolver {
         let mut slots = Vec::new();
         let mut combined_slots: std::collections::HashMap<(&str, usize), usize> =
             std::collections::HashMap::new();
+        let mut work_items = 0;
         for (index, region) in regions.iter().enumerate() {
+            if crate::cancel::is_cancelled_periodically(cancel, &mut work_items) {
+                return None;
+            }
             if region.combined {
                 let key = (region.language.as_str(), region.pattern_index);
                 if let Some(&slot_index) = combined_slots.get(&key) {
@@ -950,6 +986,9 @@ impl InjectionResolver {
 
         let mut resolved = Vec::with_capacity(slots.len());
         for slot in slots {
+            if crate::cancel::is_cancelled_periodically(cancel, &mut work_items) {
+                return None;
+            }
             let index = match slot {
                 Slot::Combined(indices) => {
                     let group: Vec<_> = indices.iter().map(|&i| &regions[i]).collect();
@@ -997,7 +1036,7 @@ impl InjectionResolver {
                 }
             }
         }
-        resolved
+        (!crate::cancel::is_cancelled(cancel)).then_some(resolved)
     }
 }
 
@@ -2491,6 +2530,80 @@ local y = "duplicate"
         assert!(unique_languages.contains("lua"));
         assert!(unique_languages.contains("python"));
         assert_eq!(injections.len(), 3, "2 lua + 1 python");
+    }
+
+    #[test]
+    fn injection_discovery_stops_during_cancelled_walk() {
+        let text = (0..80)
+            .map(|i| format!("```lua\nprint({i})\n```\n"))
+            .collect::<String>();
+        let language: tree_sitter::Language = tree_sitter_md::LANGUAGE.into();
+        let mut parser = Parser::new();
+        parser.set_language(&language).unwrap();
+        let tree = parser.parse(&text, None).unwrap();
+        let query = Query::new(
+            &language,
+            r#"(fenced_code_block
+                  (info_string (language) @injection.language)
+                  (code_fence_content) @injection.content)"#,
+        )
+        .unwrap();
+        let cancel = crate::cancel::CancelToken::default();
+        // Entry consumes the first poll; the next periodic walk checkpoint
+        // flips the token after discovery has started.
+        cancel.cancel_after_polls(2);
+
+        let regions = collect_all_injections_cancellable(
+            &tree.root_node(),
+            &text,
+            Some(&query),
+            Some(&cancel),
+        );
+
+        assert!(regions.is_none(), "cancelled discovery must be discarded");
+        assert!(
+            cancel.is_cancelled(),
+            "cancellation must occur during the walk"
+        );
+    }
+
+    #[test]
+    fn injection_resolution_stops_during_cancelled_walk() {
+        let text = (0..80)
+            .map(|i| format!("```lua\nprint({i})\n```\n"))
+            .collect::<String>();
+        let language: tree_sitter::Language = tree_sitter_md::LANGUAGE.into();
+        let mut parser = Parser::new();
+        parser.set_language(&language).unwrap();
+        let tree = parser.parse(&text, None).unwrap();
+        let query = Query::new(
+            &language,
+            r#"(fenced_code_block
+                  (info_string (language) @injection.language)
+                  (code_fence_content) @injection.content)"#,
+        )
+        .unwrap();
+        let regions = collect_all_injections(&tree.root_node(), &text, Some(&query)).unwrap();
+        let cacheable = regions
+            .iter()
+            .enumerate()
+            .map(|(i, region)| {
+                CacheableInjectionRegion::from_region_info(region, &format!("region-{i}"), &text)
+            })
+            .collect::<Vec<_>>();
+        let cancel = crate::cancel::CancelToken::default();
+        cancel.cancel_after_polls(2);
+
+        let resolved = InjectionResolver::resolve_from_prebuilt_cancellable(
+            &LanguageCoordinator::new(),
+            &regions,
+            &cacheable,
+            &text,
+            Some(&cancel),
+        );
+
+        assert!(resolved.is_none());
+        assert!(cancel.is_cancelled());
     }
 
     // --- stale-tree hardening (#401): byte offsets that no longer match `text`
