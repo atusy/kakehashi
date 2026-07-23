@@ -1,9 +1,9 @@
 {
   "attestations": {
-    "binary_a": "409527ff7fab3534402e8264c316cdb0486435ff31a866644b53761e7f5aa678",
-    "binary_b": "cfead73fe8c6e1a0f0540a8ad66a9f85a368e4d988c841dbd181edb7d839bcf1",
-    "fixture": "aac17aae51200a368f5ab41217b7594a25313cb2a5b3498f25922fc5d9d2ab60",
-    "harness": "848e82e5e3cec662904cdc0f223c5a34bb645440064939f3abace02b5bb2046c"
+    "binary_a": "0a5789c1bfc3d8b4444e52a996e71a2e8af25c7e3c17ab3282487e77cff9f438",
+    "binary_b": "c8b768899d8c5a54aa7994cf6674bf0222ccc3abe9d6f90b3e6b664a26e4e6f7",
+    "fixture": "bda0c04c0a7ebb817c2d6d126ecda9a8ec6fd0307a8eb1548a08c08f61f83dd4",
+    "harness": "4e125ada66252c4f81fc344e6642727315d7746e5cd9b0307c6ff657158f5b2e"
   },
   "configuration": {
     "iterations": 30,
@@ -83,46 +83,46 @@
     }
   },
   "fixture_manifest": "fixture-manifest.json",
-  "fixture_manifest_sha256": "2015cbfd05c9bf7e62cbb0c5be9a136be7ef0b640b9a47ee89e3812edaa9e403",
+  "fixture_manifest_sha256": "5445a436cfd050112a4491dc20dcc456a8274028fc23de904ad8f7c8e2345c52",
   "raw_files": [
     {
       "order": "AB",
       "pair_index": 1,
       "samples": "pair-1.json",
-      "samples_sha256": "eea10a141bbe14edcec99b49c901e49cfea706f0d27bf1d593e9017fc34cf4f4",
+      "samples_sha256": "c8d48eda81863dca16a4ccfc4c47a3273677a3c81bd2cfc62c52014e821380c5",
       "stdout": "pair-1.txt",
-      "stdout_sha256": "48885cc9ce2e97b7fba2956056221a6811ba794245f4d8831c2a7b3c2d8b4800"
+      "stdout_sha256": "c973e5e14d105b8df531e2e232bb7cd56775617990e2a41231b23d84563a67f4"
     },
     {
       "order": "BA",
       "pair_index": 2,
       "samples": "pair-2.json",
-      "samples_sha256": "25669ad010ba4fa304a51fa9dc8520f061762b88a7341b35130a8ceeda3a5f96",
+      "samples_sha256": "63f47a64e56c53eb58715733533d11d19caf9c28f181edde7ab4445c66c1122f",
       "stdout": "pair-2.txt",
-      "stdout_sha256": "4ad84a80faa27c9bcdca80e3bf1c8a24911aa97b7867cafa891576eaf9e60543"
+      "stdout_sha256": "47d5d1c2d8b7ad87067263f8b9f826a20a03b079bfe5a2b1b29f1751d362b0a9"
     },
     {
       "order": "AB",
       "pair_index": 3,
       "samples": "pair-3.json",
-      "samples_sha256": "c706938b456e3e495b97884cfc8c2ead08c531936e6dd7e547a39de2b166035e",
+      "samples_sha256": "bb87a62714a911875af5bdc981b86628f454db4dc4dbdc4779cd904213f89aba",
       "stdout": "pair-3.txt",
-      "stdout_sha256": "4cbf359d44b831761adccb43edb3dc0ac72f7032cc73ed7d2aee7cea6237017b"
+      "stdout_sha256": "7e1575ceeee4a9986ab8e3dd4f2c463e22304b6f3dd3a4e8c622bf331cb50fdc"
     },
     {
       "order": "BA",
       "pair_index": 4,
       "samples": "pair-4.json",
-      "samples_sha256": "5e38e88bb5e77b2c99be8ce49bf1c9d16c4a0bafe7a08b976c7ea25303c0af45",
+      "samples_sha256": "0bf48f2af39def74bc654f36e640fee7b6b08408e5fe084218762fb3faf96259",
       "stdout": "pair-4.txt",
-      "stdout_sha256": "409af599467275d3c4beba7c3d8e8a0c23ffe502b970c1c4345c9ca1850e4ad5"
+      "stdout_sha256": "21d95161c90b28071e1de56af31de8b3a050786308091f8cb39046ff8505c7b7"
     }
   ],
   "schema_version": 1,
   "source": {
     "a_commit": "265d38b0ac95822b17e5cec19c5e226d3d034bb9",
     "a_ref": "refactor/semantic-sync-core",
-    "b_commit": "1805e61907b6f2b6ce4718b5145d131a174c4a2e",
+    "b_commit": "518c1868e7c955d5241b3a5acaadf5d0617981b9",
     "b_ref": "benchmark/semantic-artifact-seam-2026-07-23",
     "harness_commit": "553b901bbf421e3851886c2a3e94b16adca6c34a",
     "harness_ref": "benchmark/semantic-lazy-content-lines-harness-2026-07-23",
@@ -134,5 +134,5 @@
     }
   },
   "summary": "summary.json",
-  "summary_sha256": "04af807227b26851ea797797a419dff0b2fa2faa63729fd30ead4a56bff9fec2"
+  "summary_sha256": "ba158f2adb981eb40ef61ec43d9b879c4b239d0e8423b163e8664b8f22033a59"
 }
