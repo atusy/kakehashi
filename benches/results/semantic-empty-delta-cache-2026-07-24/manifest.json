@@ -145,6 +145,7 @@
     "b_commit": "e77599ec2e937216bf9c028d330ae6dc4983cac3",
     "b_ref": "benchmark/semantic-empty-delta-cache-candidate-2026-07-24",
     "harness_commit": "e77599ec2e937216bf9c028d330ae6dc4983cac3",
+    "harness_ref": "benchmark/semantic-empty-delta-cache-candidate-2026-07-24",
     "harness_sources_sha256": {
       "benches/collect_semantic_pairs.py": "7ce0d8628d2f28ac331d15ccf470e7b1b4fb596d5a475588cfa25689746de798",
       "benches/semantic_summary.py": "8aab3d2622ec7bfface33f29fee8fd695297b31eb2007fc5b2b20d8be2e3d1d0",
