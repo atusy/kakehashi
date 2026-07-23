@@ -1,4 +1,5 @@
 use crate::analysis::SemanticSnapshotIdentity;
+use std::sync::Arc;
 use tower_lsp_server::ls_types::{SemanticTokens, SemanticTokensResult};
 use url::Url;
 
@@ -35,13 +36,13 @@ impl SemanticArtifactIdentity {
 /// Construction accepts only a complete full result. The data stays private
 /// until a request materializes it and supplies its own LSP `resultId`.
 pub(crate) struct SemanticArtifact {
-    identity: SemanticArtifactIdentity,
+    identity: Arc<SemanticArtifactIdentity>,
     tokens: SemanticTokens,
 }
 
 impl SemanticArtifact {
     pub(crate) fn from_full_result(
-        identity: SemanticArtifactIdentity,
+        identity: Arc<SemanticArtifactIdentity>,
         result: SemanticTokensResult,
     ) -> Option<Self> {
         let SemanticTokensResult::Tokens(mut tokens) = result else {
@@ -56,7 +57,7 @@ impl SemanticArtifact {
         expected_identity: &SemanticArtifactIdentity,
         result_id: Option<String>,
     ) -> Option<SemanticTokens> {
-        if &self.identity != expected_identity {
+        if self.identity.as_ref() != expected_identity {
             return None;
         }
         self.tokens.result_id = result_id;
@@ -68,6 +69,7 @@ impl SemanticArtifact {
 mod tests {
     use super::{SemanticArtifact, SemanticArtifactIdentity};
     use crate::analysis::SemanticSnapshotIdentity;
+    use std::sync::Arc;
     use tower_lsp_server::ls_types::{
         SemanticToken, SemanticTokens, SemanticTokensPartialResult, SemanticTokensResult,
     };
@@ -108,7 +110,7 @@ mod tests {
             token_modifiers_bitset: 5,
         };
         let artifact = SemanticArtifact::from_full_result(
-            identity(),
+            Arc::new(identity()),
             SemanticTokensResult::Tokens(SemanticTokens {
                 result_id: Some("compute-local".into()),
                 data: vec![token],
@@ -126,7 +128,7 @@ mod tests {
     #[test]
     fn mismatched_identity_cannot_materialize_artifact() {
         let artifact = SemanticArtifact::from_full_result(
-            identity(),
+            Arc::new(identity()),
             SemanticTokensResult::Tokens(SemanticTokens {
                 result_id: None,
                 data: vec![],
@@ -142,7 +144,7 @@ mod tests {
     #[test]
     fn partial_result_cannot_become_visible_artifact() {
         let artifact = SemanticArtifact::from_full_result(
-            identity(),
+            Arc::new(identity()),
             SemanticTokensResult::Partial(SemanticTokensPartialResult { data: vec![] }),
         );
 
