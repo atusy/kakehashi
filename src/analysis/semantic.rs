@@ -274,7 +274,7 @@ pub(crate) async fn handle_semantic_tokens_full(
         {
             log::debug!(
                 target: "kakehashi::semantic",
-                "[SEMANTIC_TOKENS] compute allocations: allocations={} allocated_bytes={} deallocations={} deallocated_bytes={} scope=process_delta consistency=non_atomic_snapshot",
+                "[SEMANTIC_TOKENS] compute rust allocations: allocations={} allocated_bytes={} deallocations={} deallocated_bytes={} scope=process_global_alloc_delta consistency=non_atomic_snapshot",
                 allocation_delta.allocations(),
                 allocation_delta.allocated_bytes(),
                 allocation_delta.deallocations(),

@@ -54,9 +54,9 @@ benches/profile/xctrace.sh --lang markdown --size 150 --requests 160 --edits 1
 # -> $TMPDIR/kakehashi-xctrace/semantic-time.trace (+ a target-only summary)
 ```
 
-To attribute allocation traffic to completed semantic compute without relying
-on profiler stack sampling, build the opt-in counting allocator and enable only
-the semantic debug target:
+To attribute Rust `GlobalAlloc` traffic to completed semantic compute without
+relying on profiler stack sampling, build the opt-in counting allocator and
+enable only the semantic debug target:
 
 ```sh
 cargo build --profile profiling --features allocation-profile --bin kakehashi
@@ -66,17 +66,20 @@ RUST_LOG=kakehashi::semantic=debug \
     --lang markdown --size 150 --requests 30 --edits 1
 ```
 
-Each completed work-unit emits a `compute allocations` record with allocation
-and deallocation counts/bytes. The counters cover the whole process between
-work-unit entry and completion (`scope=process_delta`), so use the synchronous
-driver with no competing requests when attributing one semantic path. Rayon
-allocations made for that work remain included. The four monotonic counters are
-sampled independently (`consistency=non_atomic_snapshot`): another process
-thread allocating across a boundary can split the count and byte observations,
-so aggregate repeated records instead of treating one record or a derived net
-value as exact. Atomic counting changes timing, so use these records for
-allocation traffic only and report latency from an otherwise identical build
-without `allocation-profile`. Cancelled work intentionally has no
+Each completed work-unit emits a `compute rust allocations` record with
+allocation and deallocation counts/bytes. The counters cover Rust allocations
+from the whole process between work-unit entry and completion
+(`scope=process_global_alloc_delta`), so use the synchronous driver with no
+competing requests when attributing one semantic path. Rayon allocations made
+through `GlobalAlloc` remain included. Native Tree-sitter allocations such as
+`ts_malloc` bypass this counter; use the exact-PID `heap`/MallocStackLogging
+workflow below when native and retained allocations matter. The four monotonic
+counters are sampled independently (`consistency=non_atomic_snapshot`): another
+process thread allocating across a boundary can split the count and byte
+observations, so aggregate repeated records instead of treating one record or a
+derived net value as exact. Atomic counting changes timing, so use these records
+for allocation traffic only and report latency from an otherwise identical
+build without `allocation-profile`. Cancelled work intentionally has no
 completed-compute record.
 
 Allocation and retained-heap profilers need to attach to the spawned server
