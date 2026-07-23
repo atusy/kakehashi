@@ -120,6 +120,24 @@ wait_for_driver_marker "$profile_dir/ready" || exit $?
   exit 1
 }
 server_pid="$(cat "$profile_dir/pid")"
+
+profile_target_is_live() {
+  kill -0 "$driver_pid" 2>/dev/null &&
+    [ -s "$profile_dir/pid" ] &&
+    [ "$(cat "$profile_dir/pid")" = "$server_pid" ] &&
+    kill -0 "$server_pid" 2>/dev/null
+}
+
+require_profile_target() {
+  profile_target_is_live && return 0
+  wait "$driver_pid"
+  target_status=$?
+  [ "$target_status" -ne 0 ] || target_status=1
+  printf 'profile target exited or invalidated PID marker\n' >&2
+  return "$target_status"
+}
+
+require_profile_target || exit $?
 printf 'Attach the profiler to kakehashi PID %s\n' "$server_pid"
 ```
 
@@ -128,6 +146,7 @@ attachment, run the second block in the same shell to release only the measured
 semantic-token workload:
 
 ```sh
+require_profile_target || exit $?
 touch "$profile_dir/start" || exit $?
 
 # "$profile_dir/done" marks the end of measured requests. The server remains
