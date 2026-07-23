@@ -919,7 +919,9 @@ impl InjectionResolver {
             regions,
             None,
             text,
+            None,
         )
+        .expect("resolution without cancellation cannot be cancelled")
     }
 
     /// [`resolve_from_regions`](Self::resolve_from_regions) fed with the
@@ -935,7 +937,18 @@ impl InjectionResolver {
         cacheable: &[CacheableInjectionRegion],
         text: &str,
     ) -> Vec<ResolvedInjection> {
-        Self::resolve_grouped(coordinator, None, regions, Some(cacheable), text)
+        Self::resolve_from_prebuilt_cancellable(coordinator, regions, cacheable, text, None)
+            .expect("resolution without cancellation cannot be cancelled")
+    }
+
+    pub(crate) fn resolve_from_prebuilt_cancellable(
+        coordinator: &LanguageCoordinator,
+        regions: &[InjectionRegionInfo<'_>],
+        cacheable: &[CacheableInjectionRegion],
+        text: &str,
+        cancel: Option<&crate::cancel::CancelToken>,
+    ) -> Option<Vec<ResolvedInjection>> {
+        Self::resolve_grouped(coordinator, None, regions, Some(cacheable), text, cancel)
     }
 
     fn resolve_grouped(
@@ -944,7 +957,11 @@ impl InjectionResolver {
         regions: &[InjectionRegionInfo<'_>],
         prebuilt: Option<&[CacheableInjectionRegion]>,
         text: &str,
-    ) -> Vec<ResolvedInjection> {
+        cancel: Option<&crate::cancel::CancelToken>,
+    ) -> Option<Vec<ResolvedInjection>> {
+        if crate::cancel::is_cancelled(cancel) {
+            return None;
+        }
         enum Slot {
             Single(usize),
             Combined(Vec<usize>),
@@ -956,7 +973,11 @@ impl InjectionResolver {
         let mut slots = Vec::new();
         let mut combined_slots: std::collections::HashMap<(&str, usize), usize> =
             std::collections::HashMap::new();
+        let mut work_items = 0;
         for (index, region) in regions.iter().enumerate() {
+            if crate::cancel::is_cancelled_periodically(cancel, &mut work_items) {
+                return None;
+            }
             if region.combined {
                 let key = (region.language.as_str(), region.pattern_index);
                 if let Some(&slot_index) = combined_slots.get(&key) {
@@ -975,6 +996,9 @@ impl InjectionResolver {
 
         let mut resolved = Vec::with_capacity(slots.len());
         for slot in slots {
+            if crate::cancel::is_cancelled_periodically(cancel, &mut work_items) {
+                return None;
+            }
             let index = match slot {
                 Slot::Combined(indices) => {
                     let group: Vec<_> = indices.iter().map(|&i| &regions[i]).collect();
@@ -1022,7 +1046,7 @@ impl InjectionResolver {
                 }
             }
         }
-        resolved
+        (!crate::cancel::is_cancelled(cancel)).then_some(resolved)
     }
 }
 
@@ -2551,6 +2575,45 @@ local y = "duplicate"
             cancel.is_cancelled(),
             "cancellation must occur during the walk"
         );
+    }
+
+    #[test]
+    fn injection_resolution_stops_during_cancelled_walk() {
+        let text = (0..80)
+            .map(|i| format!("```lua\nprint({i})\n```\n"))
+            .collect::<String>();
+        let language: tree_sitter::Language = tree_sitter_md::LANGUAGE.into();
+        let mut parser = Parser::new();
+        parser.set_language(&language).unwrap();
+        let tree = parser.parse(&text, None).unwrap();
+        let query = Query::new(
+            &language,
+            r#"(fenced_code_block
+                  (info_string (language) @injection.language)
+                  (code_fence_content) @injection.content)"#,
+        )
+        .unwrap();
+        let regions = collect_all_injections(&tree.root_node(), &text, Some(&query)).unwrap();
+        let cacheable = regions
+            .iter()
+            .enumerate()
+            .map(|(i, region)| {
+                CacheableInjectionRegion::from_region_info(region, &format!("region-{i}"), &text)
+            })
+            .collect::<Vec<_>>();
+        let cancel = crate::cancel::CancelToken::default();
+        cancel.cancel_after_polls(2);
+
+        let resolved = InjectionResolver::resolve_from_prebuilt_cancellable(
+            &LanguageCoordinator::new(),
+            &regions,
+            &cacheable,
+            &text,
+            Some(&cancel),
+        );
+
+        assert!(resolved.is_none());
+        assert!(cancel.is_cancelled());
     }
 
     // --- stale-tree hardening (#401): byte offsets that no longer match `text`
