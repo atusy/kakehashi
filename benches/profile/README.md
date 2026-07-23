@@ -82,9 +82,9 @@ cleanup_profile_run() {
   [ ! -d "$profile_dir" ] || rm -r "$profile_dir"
 }
 trap cleanup_profile_run EXIT
-trap 'cleanup_profile_run; exit 129' HUP
-trap 'cleanup_profile_run; exit 130' INT
-trap 'cleanup_profile_run; exit 143' TERM
+trap 'trap - EXIT HUP INT TERM; cleanup_profile_run; exit 129' HUP
+trap 'trap - EXIT HUP INT TERM; cleanup_profile_run; exit 130' INT
+trap 'trap - EXIT HUP INT TERM; cleanup_profile_run; exit 143' TERM
 
 python3 benches/profile/drive.py \
   --bin ./target/profiling/kakehashi \
