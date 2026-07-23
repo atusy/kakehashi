@@ -418,7 +418,7 @@ impl CacheCoordinator {
             // this parse publishes can rebuild its contexts without
             // re-discovering. `None` when not worth reusing
             // (gate/combined/incomplete).
-            let discovery = crate::analysis::semantic::build_document_discovery(
+            let discovery = crate::analysis::semantic::build_document_discovery_cancellable(
                 &regions,
                 &cacheable_regions,
                 injection_query.as_ref(),
@@ -428,7 +428,8 @@ impl CacheCoordinator {
                 tracker,
                 generation,
                 incarnation,
-            );
+                cancel,
+            )?;
 
             // Live-hash set for the content-addressed injection-token cache's
             // eviction sweep, taken from the DISCOVERY's own per-region cache
