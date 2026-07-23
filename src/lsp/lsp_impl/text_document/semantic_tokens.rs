@@ -36,6 +36,31 @@ use crate::lsp::semantic_request_tracker::SemanticRequestScope;
 
 use super::super::{Kakehashi, uri_to_url};
 
+#[cfg(feature = "semantic-bench-instrumentation")]
+async fn wait_for_same_snapshot_benchmark_peer() {
+    static BARRIER: std::sync::LazyLock<Option<tokio::sync::Barrier>> =
+        std::sync::LazyLock::new(|| {
+            std::env::var("KAKEHASHI_BENCH_SEMANTIC_FANOUT_PARTIES")
+                .ok()
+                .map(|value| {
+                    let parties = value
+                        .parse::<usize>()
+                        .expect("KAKEHASHI_BENCH_SEMANTIC_FANOUT_PARTIES must be an integer");
+                    assert!(
+                        parties >= 2,
+                        "semantic fan-out requires at least two parties"
+                    );
+                    tokio::sync::Barrier::new(parties)
+                })
+        });
+    if let Some(barrier) = BARRIER.as_ref() {
+        barrier.wait().await;
+    }
+}
+
+#[cfg(not(feature = "semantic-bench-instrumentation"))]
+async fn wait_for_same_snapshot_benchmark_peer() {}
+
 /// Outcome of the serve-current snapshot resolution for the whole-document
 /// token handlers (see [`Kakehashi::current_snapshot_for_tokens`]).
 pub(crate) enum TokenSnapshot {
@@ -923,6 +948,13 @@ impl Kakehashi {
                 // never needs ownership at all).
                 Some(CurrentTokens::Cached(cached))
             } else {
+                // Benchmark-only rendezvous after the completed-artifact cache
+                // miss. Stage 3 inserts single-flight resolution after this
+                // point, so both the unshared (two producers) and shared (one
+                // producer + one joiner) binaries start from two admitted
+                // consumers of the same immutable snapshot.
+                wait_for_same_snapshot_benchmark_peer().await;
+
                 let expected_artifact_identity = SemanticArtifactIdentity::expected(
                     &uri,
                     &language_name,
@@ -1334,6 +1366,10 @@ impl Kakehashi {
 
         // Get capture mappings for token type resolution
         let capture_mappings = self.language.capture_mappings();
+
+        // See the delta-path note: this is compiled only into benchmark
+        // binaries and runs after both completed-cache lookup paths missed.
+        wait_for_same_snapshot_benchmark_peer().await;
 
         let supports_multiline = self.settings_manager.supports_multiline_tokens();
         let expected_artifact_identity = SemanticArtifactIdentity::expected(
