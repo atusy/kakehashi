@@ -29,8 +29,11 @@ class RequestSummaryTest(unittest.TestCase):
             import json
             import pathlib
             import sys
+            import time
 
             log_path = pathlib.Path(sys.argv[1])
+            warmup_release = pathlib.Path(sys.argv[2])
+            semantic_requests = 0
 
             def read_message():
                 length = None
@@ -67,6 +70,10 @@ class RequestSummaryTest(unittest.TestCase):
                 if method == "initialize":
                     result = {"capabilities": {}}
                 elif method == "textDocument/semanticTokens/full":
+                    semantic_requests += 1
+                    if semantic_requests == 1:
+                        while not warmup_release.exists():
+                            time.sleep(0.01)
                     result = {"data": []}
                 else:
                     result = None
@@ -78,6 +85,7 @@ class RequestSummaryTest(unittest.TestCase):
             fake_server = directory / "fake_server.py"
             fake_server.write_text(fake_server_source)
             log = directory / "methods.log"
+            warmup_release = directory / "warmup-release"
             ready = directory / "ready"
             start = directory / "start"
             done = directory / "done"
@@ -89,6 +97,7 @@ class RequestSummaryTest(unittest.TestCase):
                     sys.executable,
                     f"--server-arg={fake_server}",
                     f"--server-arg={log}",
+                    f"--server-arg={warmup_release}",
                     "--requests=1",
                     "--size=1",
                     "--settle=0",
@@ -101,6 +110,22 @@ class RequestSummaryTest(unittest.TestCase):
                 text=True,
             )
             try:
+                deadline = time.monotonic() + 3
+                while (
+                    not log.exists()
+                    or log.read_text()
+                    .splitlines()
+                    .count("textDocument/semanticTokens/full")
+                    < 1
+                ):
+                    if time.monotonic() >= deadline:
+                        self.fail("fake server did not receive semantic warmup")
+                    time.sleep(0.01)
+                self.assertFalse(ready.exists())
+                time.sleep(0.05)
+                self.assertFalse(ready.exists())
+
+                publish_marker(warmup_release, "")
                 wait_for_marker(ready, 3)
                 methods_at_ready = log.read_text().splitlines()
                 self.assertEqual(
