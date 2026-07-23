@@ -43,6 +43,8 @@ Mach-O bytes, and are verified by
 [`parser-artifacts.sha256`](parser-artifacts.sha256):
 
 ```sh
+set -eu
+
 measurement_source=089f6e72e8a189e884a02364efeb3d480e519556
 measurement_root="$(mktemp -d "${TMPDIR:-/tmp}/kakehashi-measurement.XXXXXX")"
 measurement_worktree="$measurement_root/source"
