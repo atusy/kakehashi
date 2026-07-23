@@ -8,7 +8,7 @@ performance improvement.
 
 - A: `refactor/semantic-sync-core` at
   `265d38b0ac95822b17e5cec19c5e226d3d034bb9`
-- B: `benchmark/semantic-artifact-seam-2026-07-23` at
+- B: `benchmark/semantic-artifact-seam-final-2026-07-23` at
   `518c1868e7c955d5241b3a5acaadf5d0617981b9`
 - Harness: `benchmark/semantic-lazy-content-lines-harness-2026-07-23` at
   `553b901bbf421e3851886c2a3e94b16adca6c34a`
