@@ -171,9 +171,11 @@ Use a fresh marker directory for each run. `pid`, `ready`, and `done` are
 published atomically. `start` and `stop` are owned by the profiler controller.
 If `start` is not published within `--profile-wait-timeout`, the driver fails
 and still reaps the server. The interactive example allows five minutes for
-attachment; the CLI default is 30 seconds. After `done`, `stop` releases the
-server as soon as the retained-heap snapshot finishes; `--profile-hold-seconds`
-is a 60-second safety deadline if the controller never publishes it.
+attachment; the CLI default is 30 seconds. The same timeout bounds the semantic
+warmup response, while shutdown responses are capped at five seconds. After
+`done`, `stop` releases the server as soon as the retained-heap snapshot
+finishes; `--profile-hold-seconds` is a 60-second safety deadline if the
+controller never publishes it.
 
 The harness drives the server against `deps/test/kakehashi` for parsers/queries.
 If that dir has no installed parsers, the server auto-installs on the first

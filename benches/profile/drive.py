@@ -305,7 +305,8 @@ def main() -> None:
         help="keep the server alive after measurement for an external snapshot")
     ap.add_argument(
         "--profile-wait-timeout", type=float, default=30,
-        help="seconds to wait for --profile-start-file")
+        help="seconds to wait for semantic warmup and start; "
+             "shutdown response is capped at 5 seconds")
     args = ap.parse_args()
     if args.requests <= 0:
         ap.error("--requests must be positive")  # avoids divide-by-zero in the summary
