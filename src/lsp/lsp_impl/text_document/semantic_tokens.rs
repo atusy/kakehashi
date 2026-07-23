@@ -29,8 +29,8 @@ use tower_lsp_server::ls_types::{
 };
 
 use crate::analysis::{
-    SemanticSnapshotIdentity, calculate_delta_or_full, filter_semantic_tokens_by_range,
-    handle_semantic_tokens_full, next_result_id,
+    SemanticArtifact, SemanticArtifactIdentity, SemanticSnapshotIdentity, calculate_delta_or_full,
+    filter_semantic_tokens_by_range, handle_semantic_tokens_full, next_result_id,
 };
 use crate::lsp::current_upstream_id;
 
@@ -554,24 +554,24 @@ impl Kakehashi {
             );
             return Ok(None);
         }
-        let mut tokens_with_id = match result.unwrap_or_else(|| {
-            tower_lsp_server::ls_types::SemanticTokensResult::Tokens(
-                tower_lsp_server::ls_types::SemanticTokens {
-                    result_id: None,
-                    data: Vec::new(),
-                },
-            )
-        }) {
-            tower_lsp_server::ls_types::SemanticTokensResult::Tokens(tokens) => tokens,
-            tower_lsp_server::ls_types::SemanticTokensResult::Partial(_) => {
-                tower_lsp_server::ls_types::SemanticTokens {
-                    result_id: None,
-                    data: Vec::new(),
-                }
-            }
-        };
-        // Use atomic sequential ID for efficient cache validation
-        tokens_with_id.result_id = Some(next_result_id());
+        let artifact_identity = SemanticArtifactIdentity::new(
+            uri.clone(),
+            language_name.clone(),
+            snapshot_identity,
+            supports_multiline,
+        );
+        let artifact = result.and_then(|result| {
+            SemanticArtifact::from_full_result(artifact_identity.clone(), result)
+        });
+        // The artifact contains no request lineage. Materialization checks the
+        // complete identity before assigning this request's result ID.
+        let result_id = Some(next_result_id());
+        let tokens_with_id = artifact
+            .and_then(|artifact| artifact.materialize_full(&artifact_identity, result_id.clone()))
+            .unwrap_or_else(|| SemanticTokens {
+                result_id,
+                data: Vec::new(),
+            });
         let stored_tokens = tokens_with_id.clone();
         let lsp_tokens = tokens_with_id;
         let edit_lock = self.documents.edit_lock(&uri);
