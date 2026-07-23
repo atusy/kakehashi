@@ -96,14 +96,13 @@ wait_for_driver_marker "$profile_dir/ready" || exit $?
 }
 server_pid="$(cat "$profile_dir/pid")"
 printf 'Attach the profiler to kakehashi PID %s\n' "$server_pid"
+```
 
-# Attach the profiler to "$server_pid". Continue only after it confirms the
-# attachment; this prompt prevents the full block from releasing work early.
-printf 'Press Enter after the profiler confirms attachment: '
-if ! IFS= read -r profile_confirmation; then
-  printf 'no attachment confirmation received\n' >&2
-  exit 1
-fi
+Pause here and attach the profiler to `"$server_pid"`. After it confirms the
+attachment, run the second block in the same shell to release only the measured
+semantic-token workload:
+
+```sh
 touch "$profile_dir/start"
 
 # "$profile_dir/done" marks the end of measured requests. The server remains
