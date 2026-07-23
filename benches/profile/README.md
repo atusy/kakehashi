@@ -67,8 +67,13 @@ RUST_LOG=kakehashi::semantic=debug \
 ```
 
 Each completed work-unit emits a `compute rust allocations` record with
-allocation and deallocation counts/bytes. The counters cover Rust allocations
-from the whole process between work-unit entry and completion
+allocation and deallocation event counts and requested bytes. A successful
+`realloc` is charged as a full old-layout deallocation plus a full new-size
+allocation even when it happens in place
+(`realloc_accounting=old_deallocation_plus_new_allocation`), so the values
+represent realloc-inclusive requested-capacity traffic rather than distinct
+pointers or bytes physically copied. The counters cover Rust allocations from
+the whole process between work-unit entry and completion
 (`scope=process_global_alloc_delta`), so use the synchronous driver with no
 competing requests when attributing one semantic path. Rayon allocations made
 through `GlobalAlloc` remain included. Native Tree-sitter allocations such as
