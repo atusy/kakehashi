@@ -21,6 +21,7 @@ import math
 import os
 from pathlib import Path
 import queue
+import signal
 import subprocess
 import sys
 import tempfile
@@ -359,8 +360,45 @@ def main() -> None:
     env = dict(os.environ, KAKEHASHI_DATA_DIR=args.data_dir)
     # Let the server's stderr through (it's silent unless RUST_LOG is set) so a
     # crash or panic is visible instead of being swallowed during profiling.
-    srv = subprocess.Popen([args.bin, *args.server_arg], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                           env=env)
+    profile_signals = [signal.SIGINT, signal.SIGTERM]
+    if hasattr(signal, "SIGHUP"):
+        profile_signals.append(signal.SIGHUP)
+    previous_mask = signal.pthread_sigmask(signal.SIG_BLOCK, profile_signals)
+    previous_handlers = {
+        profile_signal: signal.getsignal(profile_signal)
+        for profile_signal in profile_signals
+    }
+    srv = None
+
+    def terminate_server() -> None:
+        if srv is not None and srv.poll() is None:
+            srv.kill()
+            srv.wait()
+
+    def restore_profile_signal_handlers() -> None:
+        for profile_signal, previous in previous_handlers.items():
+            signal.signal(profile_signal, previous)
+
+    def handle_profile_signal(signum, _frame) -> None:
+        terminate_server()
+        raise SystemExit(128 + signum)
+
+    for profile_signal in profile_signals:
+        signal.signal(profile_signal, handle_profile_signal)
+    try:
+        srv = subprocess.Popen(
+            [args.bin, *args.server_arg],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            env=env,
+        )
+        publish_marker(args.profile_pid_file, f"{srv.pid}\n")
+    except BaseException:
+        terminate_server()
+        restore_profile_signal_handlers()
+        raise
+    finally:
+        signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
 
     def server_exit_reason() -> str | None:
         status = srv.poll()
@@ -554,7 +592,6 @@ def main() -> None:
     # loop, or a shutdown timeout) still reaps the server instead of leaving a
     # stray process behind.
     try:
-        publish_marker(args.profile_pid_file, f"{srv.pid}\n")
         request("initialize", {"processId": None, "rootUri": None, "capabilities": {
             "textDocument": {"semanticTokens": {"requests": {"full": {"delta": True}},
                                                 "tokenTypes": [], "tokenModifiers": [],
@@ -716,11 +753,10 @@ def main() -> None:
     except subprocess.TimeoutExpired:
         pass  # graceful shutdown didn't land in time; the finally kills it
     finally:
-        if srv.poll() is None:
-            srv.kill()
-            srv.wait()
+        terminate_server()
         for reader in request_threads:
             reader.join(timeout=1)
+        restore_profile_signal_handlers()
 
     n_bytes = len(text.encode("utf-8"))
     n_lines = len(text.splitlines())
