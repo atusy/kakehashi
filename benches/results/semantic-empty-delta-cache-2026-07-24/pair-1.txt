@@ -1,0 +1,25 @@
+
+semantic-tokens benchmark  (iters=30, warmup=12, lower is better)
+  A = <TEMP>/target-a/release/kakehashi
+  B = <TEMP>/target-b/release/kakehashi
+
+scenario                                A (med)      B (med) Δ (B vs A)
+------------------------------------------------------------------------
+rust_large/full_cache_hit               1.899ms      2.641ms        +39.1%
+    p95:      1.941ms      2.725ms
+    └ targets: large exact-snapshot semantic cache-hit control
+markdown_injections_large/full_cache_hit      0.691ms      0.770ms        +11.5%
+    p95:      0.698ms      0.991ms
+    └ targets: large injection document exact-snapshot semantic cache-hit control
+rust_large/stable_edit_followup_delta     56.798ms     33.257ms         -41.4%
+    p95:     59.214ms     34.191ms
+    └ targets: unique token-stable edit→empty delta→same-snapshot follow-up
+rust_large/typing_delta                33.268ms     31.243ms         -6.1%
+    p95:     34.944ms     34.214ms
+    └ targets: unique edit states→reparse→retokenize→delta; excludes A/B cache returns
+markdown_injections/stable_edit_followup_delta      7.646ms      6.187ms         -19.1%
+    p95:      8.003ms      7.041ms
+    └ targets: unique token-stable injection edit→empty delta→same-snapshot follow-up
+markdown_injections/typing_delta        6.733ms      6.740ms        +0.1%
+    p95:      6.880ms      7.537ms
+    └ targets: unique edit states→injection reuse→delta; excludes A/B cache returns
