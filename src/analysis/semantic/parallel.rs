@@ -964,6 +964,7 @@ fn rebuild_context<'a>(
 /// which bumps the generation, invalidating this discovery — so the store can
 /// never mask a later-loadable region.
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 pub(crate) fn build_document_discovery(
     regions: &[InjectionRegionInfo<'_>],
     // Index-aligned with `regions` (both derive from one
