@@ -155,7 +155,7 @@ mod tests {
     }
 
     #[test]
-    fn artifact_owns_complete_tokens_without_request_result_id() {
+    fn artifact_discards_compute_local_result_id() {
         let token = SemanticToken {
             delta_line: 1,
             delta_start: 2,
@@ -173,10 +173,27 @@ mod tests {
         .expect("complete result");
 
         let materialized = artifact
+            .materialize_full(identity().as_ref(), None)
+            .expect("matching identity");
+        assert_eq!(materialized.result_id, None);
+        assert_eq!(materialized.data, vec![token]);
+    }
+
+    #[test]
+    fn materialization_assigns_request_result_id() {
+        let artifact = SemanticArtifact::from_full_result(
+            identity(),
+            SemanticTokensResult::Tokens(SemanticTokens {
+                result_id: None,
+                data: vec![],
+            }),
+        )
+        .expect("complete result");
+
+        let materialized = artifact
             .materialize_full(identity().as_ref(), Some("request-42".into()))
             .expect("matching identity");
         assert_eq!(materialized.result_id.as_deref(), Some("request-42"));
-        assert_eq!(materialized.data, vec![token]);
     }
 
     #[test]
