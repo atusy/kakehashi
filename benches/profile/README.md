@@ -62,17 +62,7 @@ semantic-token warmup and before measured requests begin:
 ```sh
 cargo build --profile profiling --bin kakehashi || exit $?
 profile_dir="$(mktemp -d "${TMPDIR:-/tmp}/kakehashi-profile.XXXXXX")" || exit $?
-python3 benches/profile/drive.py \
-  --bin ./target/profiling/kakehashi \
-  --file path/to/input.md --requests 80 --edits 1 \
-  --profile-pid-file "$profile_dir/pid" \
-  --profile-ready-file "$profile_dir/ready" \
-  --profile-start-file "$profile_dir/start" \
-  --profile-done-file "$profile_dir/done" \
-  --profile-stop-file "$profile_dir/stop" \
-  --profile-wait-timeout 300 \
-  --profile-hold-seconds 60 &
-driver_pid=$!
+driver_pid=
 
 cleanup_profile_run() {
   trap - EXIT HUP INT TERM
@@ -80,8 +70,10 @@ cleanup_profile_run() {
     cleanup_server_pid="$(cat "$profile_dir/pid")"
     kill "$cleanup_server_pid" 2>/dev/null || true
   fi
-  kill "$driver_pid" 2>/dev/null || true
-  wait "$driver_pid" 2>/dev/null || true
+  if [ -n "$driver_pid" ]; then
+    kill "$driver_pid" 2>/dev/null || true
+    wait "$driver_pid" 2>/dev/null || true
+  fi
   # Recheck in case the PID marker appeared while cleanup was starting.
   if [ -s "$profile_dir/pid" ]; then
     cleanup_server_pid="$(cat "$profile_dir/pid")"
@@ -93,6 +85,18 @@ trap cleanup_profile_run EXIT
 trap 'cleanup_profile_run; exit 129' HUP
 trap 'cleanup_profile_run; exit 130' INT
 trap 'cleanup_profile_run; exit 143' TERM
+
+python3 benches/profile/drive.py \
+  --bin ./target/profiling/kakehashi \
+  --file path/to/input.md --requests 80 --edits 1 \
+  --profile-pid-file "$profile_dir/pid" \
+  --profile-ready-file "$profile_dir/ready" \
+  --profile-start-file "$profile_dir/start" \
+  --profile-done-file "$profile_dir/done" \
+  --profile-stop-file "$profile_dir/stop" \
+  --profile-wait-timeout 300 \
+  --profile-hold-seconds 60 &
+driver_pid=$!
 
 wait_for_driver_marker() {
   marker="$1"
