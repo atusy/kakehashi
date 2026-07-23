@@ -287,6 +287,9 @@ pub(crate) async fn handle_semantic_tokens_full(
             target: "kakehashi::semantic_metrics",
             log::Level::Debug
         ) {
+            // Semantic metrics deliberately require compute-pool tracing: an
+            // event without its compute-work join key would be ambiguous in a
+            // mixed-request LSP log. The README documents the paired targets.
             crate::compute_pool::current_work_id().map(|work_id| {
                 let raw_token_size = std::mem::size_of::<RawToken>();
                 let active_region_size =
