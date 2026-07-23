@@ -330,6 +330,7 @@ impl ParseCoordinator {
         language_name: String,
         incarnation: u64,
         content_version: u64,
+        version_cancel: crate::cancel::CancelToken,
     ) -> PopulatedSnapshotRegions {
         let cache = std::sync::Arc::clone(&self.cache);
         let language = std::sync::Arc::clone(&self.language);
@@ -390,15 +391,16 @@ impl ParseCoordinator {
             .settings_manager
             .load_settings()
             .any_bridge_server_runnable();
+        let cancel_for_work = version_cancel.clone();
         self.compute_pool
-            .run(None, move || {
+            .run(Some(version_cancel), move || {
                 // A refused pass (`None`) maps to all-`None` region fields —
                 // the snapshot then rides WITHOUT regions and readers fall
                 // back to inline resolution. Mapping it to the ran-and-empty
                 // shape instead would publish "no injections" for a pass
                 // that never derived anything, blanking the document's
                 // injections until the next parse.
-                let Some(populated) = cache.populate_injections(
+                let Some(populated) = cache.populate_injections_cancellable(
                     &uri,
                     &text,
                     &tree,
@@ -409,6 +411,7 @@ impl ParseCoordinator {
                     incarnation,
                     build_bridge_regions,
                     build_bridge_regions,
+                    Some(&cancel_for_work),
                 ) else {
                     return PopulatedSnapshotRegions::default();
                 };
@@ -638,6 +641,7 @@ impl ParseCoordinator {
                         language_name.clone(),
                         incarnation,
                         content_version,
+                        version_cancel.clone(),
                     )
                     .await
                 } else {
@@ -925,6 +929,7 @@ impl ParseCoordinator {
                     language_name.clone(),
                     expected_incarnation,
                     content_version,
+                    version_cancel.clone(),
                 )
                 .await
             } else {
@@ -1140,6 +1145,7 @@ impl ParseCoordinator {
                     language_name.clone(),
                     incarnation,
                     content_version,
+                    version_cancel.clone(),
                 )
                 .await
             } else {
