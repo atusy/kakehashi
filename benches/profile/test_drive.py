@@ -249,8 +249,11 @@ class RequestSummaryTest(unittest.TestCase):
                 self.assertFalse(ready.exists())
                 self.assertIn("semantic warmup response", stderr)
             finally:
-                if process.poll() is None:
+                try:
                     os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                if process.poll() is None:
                     process.wait()
 
     def test_profile_signal_reaps_server(self):
