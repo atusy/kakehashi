@@ -366,6 +366,11 @@ impl Kakehashi {
         let token_generation = self.cache.semantic_token_generation();
         let request_scope = self.semantic_request_scope(&uri, token_generation);
         let (mut request_id, mut cancel_token) = self.cache.start_request(&uri, request_scope);
+        let mut consumer_guard = SemanticConsumerGuard {
+            cache: &self.cache,
+            uri: &uri,
+            request_id,
+        };
 
         log::debug!(
             target: "kakehashi::semantic",
@@ -436,8 +441,11 @@ impl Kakehashi {
         };
         let resolved_scope = Self::resolved_semantic_request_scope(&snapshot, token_generation);
         if resolved_scope != request_scope {
-            self.cache.finish_request(&uri, request_id);
-            (request_id, cancel_token) = self.cache.start_request(&uri, resolved_scope);
+            let (resolved_request_id, resolved_cancel) =
+                self.cache.start_request(&uri, resolved_scope);
+            consumer_guard.replace_request(resolved_request_id);
+            request_id = resolved_request_id;
+            cancel_token = resolved_cancel;
             if !self.cache.is_request_active(&uri, request_id) {
                 return Ok(None);
             }
@@ -747,6 +755,11 @@ impl Kakehashi {
         let token_generation = self.cache.semantic_token_generation();
         let request_scope = self.semantic_request_scope(&uri, token_generation);
         let (mut request_id, mut cancel_token) = self.cache.start_request(&uri, request_scope);
+        let mut consumer_guard = SemanticConsumerGuard {
+            cache: &self.cache,
+            uri: &uri,
+            request_id,
+        };
 
         log::debug!(
             target: "kakehashi::semantic",
@@ -817,8 +830,11 @@ impl Kakehashi {
         };
         let resolved_scope = Self::resolved_semantic_request_scope(&snapshot, token_generation);
         if resolved_scope != request_scope {
-            self.cache.finish_request(&uri, request_id);
-            (request_id, cancel_token) = self.cache.start_request(&uri, resolved_scope);
+            let (resolved_request_id, resolved_cancel) =
+                self.cache.start_request(&uri, resolved_scope);
+            consumer_guard.replace_request(resolved_request_id);
+            request_id = resolved_request_id;
+            cancel_token = resolved_cancel;
             if !self.cache.is_request_active(&uri, request_id) {
                 return Ok(None);
             }
@@ -1645,6 +1661,68 @@ mod tests {
             .await
             .expect_err("stale range failure must request a retry");
         assert_eq!(error.code, crate::error::content_modified_error().code);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn aborting_full_and_delta_detaches_request_consumers() {
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let service = std::sync::Arc::new(service);
+        let uri = Url::parse("file:///aborted_semantic_consumer.rs").expect("valid test uri");
+        service.inner().documents.insert(
+            uri.clone(),
+            "fn main() {}".to_string(),
+            Some("rust".to_string()),
+            None,
+        );
+
+        let full_service = std::sync::Arc::clone(&service);
+        let full_uri = uri.clone();
+        let full = tokio::spawn(async move {
+            full_service
+                .inner()
+                .semantic_tokens_full_impl(full_params(&full_uri))
+                .await
+        });
+        tokio::task::yield_now().await;
+        assert_eq!(
+            service.inner().cache.semantic_request_consumer_count(&uri),
+            1
+        );
+        full.abort();
+        let _ = full.await;
+        assert_eq!(
+            service.inner().cache.semantic_request_consumer_count(&uri),
+            0,
+            "dropping a full handler must detach its request consumer"
+        );
+
+        let delta_service = std::sync::Arc::clone(&service);
+        let delta_uri = uri.clone();
+        let delta = tokio::spawn(async move {
+            delta_service
+                .inner()
+                .semantic_tokens_full_delta_impl(SemanticTokensDeltaParams {
+                    text_document: TextDocumentIdentifier {
+                        uri: crate::lsp::lsp_impl::url_to_uri(&delta_uri).expect("test URI"),
+                    },
+                    previous_result_id: "previous".to_string(),
+                    work_done_progress_params: WorkDoneProgressParams::default(),
+                    partial_result_params: PartialResultParams::default(),
+                })
+                .await
+        });
+        tokio::task::yield_now().await;
+        assert_eq!(
+            service.inner().cache.semantic_request_consumer_count(&uri),
+            1
+        );
+        delta.abort();
+        let _ = delta.await;
+        assert_eq!(
+            service.inner().cache.semantic_request_consumer_count(&uri),
+            0,
+            "dropping a delta handler must detach its request consumer"
+        );
     }
 
     /// Serve-current (the Neovim client contract): a full request arriving

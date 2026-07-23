@@ -675,6 +675,11 @@ impl CacheCoordinator {
             .finish_absent_request(uri, request_id, scope);
     }
 
+    #[cfg(test)]
+    pub(crate) fn semantic_request_consumer_count(&self, uri: &Url) -> usize {
+        self.request_tracker.consumer_count(uri)
+    }
+
     /// Cancel all requests for a given URI (test helper).
     #[cfg(test)]
     pub(crate) fn cancel_requests(&self, uri: &Url) {

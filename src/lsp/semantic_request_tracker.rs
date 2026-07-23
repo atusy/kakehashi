@@ -75,6 +75,11 @@ impl ConsumerIds {
     fn is_empty(&self) -> bool {
         self.first == 0
     }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        usize::from(self.first != 0) + self.additional.len()
+    }
 }
 
 /// Monotonically increasing request ID for tracking
@@ -208,6 +213,13 @@ impl SemanticRequestTracker {
                 occupied.remove();
             }
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn consumer_count(&self, uri: &Url) -> usize {
+        self.active_requests
+            .get(uri)
+            .map_or(0, |entry| entry.consumers.len())
     }
 
     /// Cancels all requests for a given URI.
