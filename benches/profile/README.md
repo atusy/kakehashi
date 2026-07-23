@@ -79,10 +79,6 @@ driver_job_is_running() {
 
 cleanup_profile_run() {
   trap - EXIT HUP INT TERM
-  if [ -s "$profile_dir/pid" ]; then
-    cleanup_server_pid="$(cat "$profile_dir/pid")"
-    kill "$cleanup_server_pid" 2>/dev/null || true
-  fi
   cleanup_driver_pid="$driver_pid"
   if driver_job_is_running; then
     kill "$cleanup_driver_pid" 2>/dev/null || true
@@ -90,11 +86,6 @@ cleanup_profile_run() {
   driver_pid=
   [ -z "$cleanup_driver_pid" ] ||
     wait "$cleanup_driver_pid" 2>/dev/null || true
-  # Recheck in case the PID marker appeared while cleanup was starting.
-  if [ -s "$profile_dir/pid" ]; then
-    cleanup_server_pid="$(cat "$profile_dir/pid")"
-    kill "$cleanup_server_pid" 2>/dev/null || true
-  fi
   [ ! -d "$profile_dir" ] || rm -r "$profile_dir"
 }
 trap cleanup_profile_run EXIT
@@ -137,12 +128,24 @@ wait_for_driver_marker "$profile_dir/ready" || exit $?
   exit 1
 }
 server_pid="$(cat "$profile_dir/pid")"
+server_identity="$(
+  ps -o ppid= -o lstart= -p "$server_pid" |
+    awk '{$1 = $1; print}'
+)"
+[ "${server_identity%% *}" = "$driver_pid" ] || {
+  printf 'could not record profile target identity\n' >&2
+  exit 1
+}
 
 profile_target_is_live() {
   kill -0 "$driver_pid" 2>/dev/null &&
     [ -s "$profile_dir/pid" ] &&
     [ "$(cat "$profile_dir/pid")" = "$server_pid" ] &&
-    kill -0 "$server_pid" 2>/dev/null
+    kill -0 "$server_pid" 2>/dev/null &&
+    [ "$(
+      ps -o ppid= -o lstart= -p "$server_pid" |
+        awk '{$1 = $1; print}'
+    )" = "$server_identity" ]
 }
 
 require_profile_target() {
