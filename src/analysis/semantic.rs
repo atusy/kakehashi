@@ -270,10 +270,10 @@ pub(crate) async fn handle_semantic_tokens_full(
             log::debug!(
                 target: "kakehashi::semantic",
                 "[SEMANTIC_TOKENS] compute allocations: allocations={} allocated_bytes={} deallocations={} deallocated_bytes={} live_bytes_change={} scope=process_delta",
-                allocation_delta.allocations,
-                allocation_delta.allocated_bytes,
-                allocation_delta.deallocations,
-                allocation_delta.deallocated_bytes,
+                allocation_delta.allocations(),
+                allocation_delta.allocated_bytes(),
+                allocation_delta.deallocations(),
+                allocation_delta.deallocated_bytes(),
                 allocation_delta.live_bytes_change(),
             );
         }

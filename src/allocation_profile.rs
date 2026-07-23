@@ -12,10 +12,7 @@ static ALLOCATED_BYTES: AtomicU64 = AtomicU64::new(0);
 static DEALLOCATIONS: AtomicU64 = AtomicU64::new(0);
 static DEALLOCATED_BYTES: AtomicU64 = AtomicU64::new(0);
 
-struct CountingAllocator;
-
-#[global_allocator]
-static GLOBAL_ALLOCATOR: CountingAllocator = CountingAllocator;
+pub struct CountingAllocator;
 
 fn record_allocation(size: usize) {
     ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
@@ -67,15 +64,15 @@ unsafe impl GlobalAlloc for CountingAllocator {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct Snapshot {
-    pub(crate) allocations: u64,
-    pub(crate) allocated_bytes: u64,
-    pub(crate) deallocations: u64,
-    pub(crate) deallocated_bytes: u64,
+pub struct Snapshot {
+    allocations: u64,
+    allocated_bytes: u64,
+    deallocations: u64,
+    deallocated_bytes: u64,
 }
 
 impl Snapshot {
-    pub(crate) fn delta_since(self, earlier: Self) -> Delta {
+    pub fn delta_since(self, earlier: Self) -> Delta {
         Delta {
             allocations: self.allocations.wrapping_sub(earlier.allocations),
             allocated_bytes: self.allocated_bytes.wrapping_sub(earlier.allocated_bytes),
@@ -88,20 +85,36 @@ impl Snapshot {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct Delta {
-    pub(crate) allocations: u64,
-    pub(crate) allocated_bytes: u64,
-    pub(crate) deallocations: u64,
-    pub(crate) deallocated_bytes: u64,
+pub struct Delta {
+    allocations: u64,
+    allocated_bytes: u64,
+    deallocations: u64,
+    deallocated_bytes: u64,
 }
 
 impl Delta {
-    pub(crate) fn live_bytes_change(self) -> i128 {
+    pub fn allocations(self) -> u64 {
+        self.allocations
+    }
+
+    pub fn allocated_bytes(self) -> u64 {
+        self.allocated_bytes
+    }
+
+    pub fn deallocations(self) -> u64 {
+        self.deallocations
+    }
+
+    pub fn deallocated_bytes(self) -> u64 {
+        self.deallocated_bytes
+    }
+
+    pub fn live_bytes_change(self) -> i128 {
         i128::from(self.allocated_bytes) - i128::from(self.deallocated_bytes)
     }
 }
 
-pub(crate) fn snapshot() -> Snapshot {
+pub fn snapshot() -> Snapshot {
     Snapshot {
         allocations: ALLOCATIONS.load(Ordering::Relaxed),
         allocated_bytes: ALLOCATED_BYTES.load(Ordering::Relaxed),
@@ -136,20 +149,5 @@ mod tests {
         assert_eq!(delta.deallocations, 3);
         assert_eq!(delta.deallocated_bytes, 500);
         assert_eq!(delta.live_bytes_change(), 400);
-    }
-
-    #[test]
-    fn counting_allocator_observes_real_allocation_and_deallocation() {
-        let before = snapshot();
-        let allocation = std::hint::black_box(Vec::<u8>::with_capacity(4_096));
-        let allocated = snapshot().delta_since(before);
-        assert!(allocated.allocations >= 1);
-        assert!(allocated.allocated_bytes >= 4_096);
-
-        let before_drop = snapshot();
-        drop(allocation);
-        let deallocated = snapshot().delta_since(before_drop);
-        assert!(deallocated.deallocations >= 1);
-        assert!(deallocated.deallocated_bytes >= 4_096);
     }
 }
