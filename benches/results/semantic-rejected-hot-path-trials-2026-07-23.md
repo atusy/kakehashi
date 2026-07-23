@@ -1,4 +1,4 @@
-# Rejected semantic hot-path trials (2026-07-23)
+# Rejected semantic hot-path trials (2026-07-23 to 2026-07-24)
 
 These measurements preserve four implementation trials that did not provide
 enough end-to-end evidence to ship. Lower paired delta is better. Every default
