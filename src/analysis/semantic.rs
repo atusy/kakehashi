@@ -66,7 +66,7 @@ struct SemanticComputeEvent {
     reused_regions: usize,
     output_tokens: usize,
     line_index_capacity_bytes: usize,
-    raw_token_peak_capacity_bytes: usize,
+    collected_raw_capacity_bytes: usize,
     result_capacity_bytes: usize,
 }
 
@@ -79,14 +79,14 @@ struct SemanticComputeInputs {
     active_regions: usize,
     reused_regions: usize,
     line_index_capacity_bytes: usize,
-    raw_token_peak_capacity_bytes: usize,
+    collected_raw_capacity_bytes: usize,
 }
 
 impl std::fmt::Display for SemanticComputeEvent {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "work_id={} event=semantic_phases compute_us={} host_us={} injections_us={} finalize_us={} parallel={} input_bytes={} input_lines={} host_tokens={} injection_tokens={} active_regions={} reused_regions={} output_tokens={} line_index_capacity_bytes={} raw_token_peak_capacity_bytes={} result_capacity_bytes={}",
+            "work_id={} event=semantic_phases compute_us={} host_us={} injections_us={} finalize_us={} parallel={} input_bytes={} input_lines={} host_tokens={} injection_tokens={} active_regions={} reused_regions={} output_tokens={} line_index_capacity_bytes={} collected_raw_capacity_bytes={} result_capacity_bytes={}",
             self.work_id,
             self.compute_us,
             self.host_us,
@@ -101,7 +101,7 @@ impl std::fmt::Display for SemanticComputeEvent {
             self.reused_regions,
             self.output_tokens,
             self.line_index_capacity_bytes,
-            self.raw_token_peak_capacity_bytes,
+            self.collected_raw_capacity_bytes,
             self.result_capacity_bytes,
         )
     }
@@ -308,7 +308,7 @@ pub(crate) async fn handle_semantic_tokens_full(
                         .map_or(0, |discovery| discovery.regions.len()),
                     line_index_capacity_bytes: lines.capacity() * std::mem::size_of::<&str>()
                         + line_starts.capacity() * std::mem::size_of::<usize>(),
-                    raw_token_peak_capacity_bytes: host_tokens.capacity() * raw_token_size
+                    collected_raw_capacity_bytes: host_tokens.capacity() * raw_token_size
                         + injection_tokens.capacity() * raw_token_size
                         + active_injection_regions.capacity() * active_region_size,
                 }
@@ -326,7 +326,7 @@ pub(crate) async fn handle_semantic_tokens_full(
         // Merge injection tokens with host tokens
         host_tokens.extend(injection_tokens);
         let metrics = metrics.map(|mut metrics| {
-            metrics.raw_token_peak_capacity_bytes = metrics.raw_token_peak_capacity_bytes.max(
+            metrics.collected_raw_capacity_bytes = metrics.collected_raw_capacity_bytes.max(
                 host_tokens.capacity() * std::mem::size_of::<RawToken>()
                     + active_injection_regions.capacity()
                         * std::mem::size_of::<token_collector::ActiveInjectionBounds>(),
@@ -367,7 +367,7 @@ pub(crate) async fn handle_semantic_tokens_full(
                     reused_regions: metrics.reused_regions,
                     output_tokens,
                     line_index_capacity_bytes: metrics.line_index_capacity_bytes,
-                    raw_token_peak_capacity_bytes: metrics.raw_token_peak_capacity_bytes,
+                    collected_raw_capacity_bytes: metrics.collected_raw_capacity_bytes,
                     result_capacity_bytes,
                 }
             );
@@ -424,13 +424,13 @@ mod tests {
             reused_regions: 6,
             output_tokens: 280,
             line_index_capacity_bytes: 2048,
-            raw_token_peak_capacity_bytes: 32768,
+            collected_raw_capacity_bytes: 32768,
             result_capacity_bytes: 5600,
         };
 
         assert_eq!(
             event.to_string(),
-            "work_id=17 event=semantic_phases compute_us=101 host_us=40 injections_us=30 finalize_us=20 parallel=true input_bytes=4096 input_lines=128 host_tokens=300 injection_tokens=40 active_regions=8 reused_regions=6 output_tokens=280 line_index_capacity_bytes=2048 raw_token_peak_capacity_bytes=32768 result_capacity_bytes=5600"
+            "work_id=17 event=semantic_phases compute_us=101 host_us=40 injections_us=30 finalize_us=20 parallel=true input_bytes=4096 input_lines=128 host_tokens=300 injection_tokens=40 active_regions=8 reused_regions=6 output_tokens=280 line_index_capacity_bytes=2048 collected_raw_capacity_bytes=32768 result_capacity_bytes=5600"
         );
     }
 

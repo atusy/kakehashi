@@ -257,7 +257,7 @@ fn compute_pool_logs_joinable_document_work() {
         "reused_regions",
         "output_tokens",
         "line_index_capacity_bytes",
-        "raw_token_peak_capacity_bytes",
+        "collected_raw_capacity_bytes",
         "result_capacity_bytes",
     ] {
         assert!(
@@ -271,7 +271,7 @@ fn compute_pool_logs_joinable_document_work() {
         "host_tokens",
         "output_tokens",
         "line_index_capacity_bytes",
-        "raw_token_peak_capacity_bytes",
+        "collected_raw_capacity_bytes",
         "result_capacity_bytes",
     ] {
         assert!(
