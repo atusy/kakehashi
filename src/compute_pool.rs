@@ -301,6 +301,49 @@ pub(crate) fn test_pool() -> std::sync::Arc<ComputePool> {
 mod tests {
     use super::*;
 
+    fn assert_terminal_event(logs: &[String], terminal: &str, cancelled: &str) {
+        let events = logs
+            .iter()
+            .map(|line| {
+                line.split_whitespace()
+                    .filter_map(|field| field.split_once('='))
+                    .collect::<std::collections::HashMap<_, _>>()
+            })
+            .filter(|event| event.get("kind") == Some(&"test_lifecycle"))
+            .collect::<Vec<_>>();
+        assert_eq!(events.len(), 2, "{logs:?}");
+        let started = events
+            .iter()
+            .find(|event| event.get("event") == Some(&"started"))
+            .expect("started event");
+        let finished = events
+            .iter()
+            .find(|event| event.get("event") == Some(&terminal))
+            .unwrap_or_else(|| panic!("missing {terminal} event: {logs:?}"));
+        assert_eq!(started.get("work_id"), finished.get("work_id"));
+        for event in [started, finished] {
+            assert_eq!(event.get("uri"), Some(&"file:///workspace/main.rs"));
+            assert_eq!(event.get("incarnation"), Some(&"7"));
+            assert_eq!(event.get("content_version"), Some(&"42"));
+            assert_eq!(event.get("cancelled"), Some(&cancelled));
+            assert!(event["queue_us"].parse::<u128>().is_ok(), "{event:?}");
+            assert!(event["elapsed_us"].parse::<u128>().is_ok(), "{event:?}");
+        }
+        assert!(finished["run_us"].parse::<u128>().is_ok(), "{finished:?}");
+    }
+
+    fn capture_lifecycle(run: impl FnOnce(ComputePool, ComputeWork) + Send) -> Vec<String> {
+        crate::lsp::test_logging::captured_logs_for(TRACE_TARGET, log::Level::Debug, || {
+            let work = ComputeWork::document(
+                "test_lifecycle",
+                &url::Url::parse("file:///workspace/main.rs").expect("test URI"),
+                Some(7),
+                Some(42),
+            );
+            run(ComputePool::with_threads(1), work);
+        })
+    }
+
     #[test]
     fn attributed_event_keeps_document_identity_and_phase_timings() {
         let work =
@@ -383,5 +426,44 @@ mod tests {
             pool.run(ComputeWork::anonymous("test"), None, || 7).await,
             Some(7)
         );
+    }
+
+    #[test]
+    fn skipped_work_emits_one_joinable_terminal_event() {
+        let logs = capture_lifecycle(|pool, work| {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("test runtime");
+            runtime.block_on(async {
+                let token = CancelToken::default();
+                token.cancel();
+                assert_eq!(pool.run(work, Some(token), || 42).await, None);
+                // `run` resolves immediately from the cancellation branch;
+                // a sentinel on this one-thread pool keeps capture active
+                // until the earlier work emits `skipped`.
+                assert_eq!(
+                    pool.run(ComputeWork::anonymous("sentinel"), None, || ())
+                        .await,
+                    Some(())
+                );
+            });
+        });
+        assert_terminal_event(&logs, "skipped", "true");
+    }
+
+    #[test]
+    fn panicking_work_emits_one_joinable_terminal_event() {
+        let logs = capture_lifecycle(|pool, work| {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("test runtime");
+            runtime.block_on(async {
+                let result: Option<()> = pool.run(work, None, || panic!("boom")).await;
+                assert_eq!(result, None);
+            });
+        });
+        assert_terminal_event(&logs, "panicked", "false");
     }
 }
