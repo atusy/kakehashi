@@ -751,9 +751,21 @@ def main() -> None:
         elif args.profile_hold_seconds > 0:
             time.sleep(args.profile_hold_seconds)
 
-        request("shutdown", None)
-        notify("exit", {})
-        srv.wait(timeout=5)
+        try:
+            request_with_timeout(
+                "shutdown",
+                None,
+                timeout_seconds=min(args.profile_wait_timeout, 5.0),
+                description="shutdown response",
+            )
+        except TimeoutError:
+            sys.stderr.write(
+                "[drive] shutdown response deadline expired; "
+                "killing server\n"
+            )
+        else:
+            notify("exit", {})
+            srv.wait(timeout=5)
     except subprocess.TimeoutExpired:
         pass  # graceful shutdown didn't land in time; the finally kills it
     finally:

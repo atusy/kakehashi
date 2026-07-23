@@ -80,6 +80,9 @@ FAKE_SERVER_SOURCE = textwrap.dedent(
                         time.sleep(1)
             result = {"data": []}
         else:
+            if method == "shutdown" and behavior == "hang-shutdown":
+                while True:
+                    time.sleep(1)
             result = None
         send({"jsonrpc": "2.0", "id": message["id"], "result": result})
         if behavior == "exit-after-warmup" and semantic_requests == 1:
@@ -373,6 +376,46 @@ class RequestSummaryTest(unittest.TestCase):
                         os.kill(server_pid, signal.SIGKILL)
                     except ProcessLookupError:
                         pass
+
+    def test_profile_shutdown_response_has_a_deadline(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = pathlib.Path(temporary)
+            fake_server = directory / "fake_server.py"
+            fake_server.write_text(FAKE_SERVER_SOURCE)
+            log = directory / "methods.log"
+            warmup_release = directory / "warmup-release"
+            publish_marker(warmup_release, "")
+            process = subprocess.Popen(
+                [
+                    sys.executable,
+                    str(pathlib.Path(__file__).parent / "drive.py"),
+                    "--bin",
+                    sys.executable,
+                    f"--server-arg={fake_server}",
+                    f"--server-arg={log}",
+                    f"--server-arg={warmup_release}",
+                    "--server-arg=hang-shutdown",
+                    "--requests=1",
+                    "--size=1",
+                    "--settle=0",
+                    "--profile-wait-timeout=0.05",
+                ],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                start_new_session=True,
+            )
+            try:
+                _, stderr = process.communicate(timeout=3)
+                self.assertEqual(process.returncode, 0, stderr)
+                self.assertIn("shutdown response deadline expired", stderr)
+            finally:
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                if process.poll() is None:
+                    process.wait()
 
     def test_profile_markers_are_published_and_waited_for(self):
         with tempfile.TemporaryDirectory() as temporary:
