@@ -107,7 +107,7 @@ impl SemanticArtifact {
         Some(Self { identity, tokens })
     }
 
-    pub(crate) fn materialize_full(
+    pub(crate) fn into_full(
         mut self,
         expected_identity: SemanticArtifactIdentityRef<'_>,
         result_id: Option<String>,
@@ -117,6 +117,29 @@ impl SemanticArtifact {
         }
         self.tokens.result_id = result_id;
         Some(self.tokens)
+    }
+
+    /// Materialize one request response while retaining the artifact for other
+    /// consumers of the same snapshot slot.
+    ///
+    /// Stage 2 has only unique local artifacts and uses [`Self::into_full`] to
+    /// move the payload without cloning. Stage 3 shared-slot consumers use this
+    /// borrowed form and pay the wire-payload clone required for each response.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "shared snapshot slots are introduced in Stage 3")
+    )]
+    pub(crate) fn materialize_full(
+        &self,
+        expected_identity: SemanticArtifactIdentityRef<'_>,
+        result_id: Option<String>,
+    ) -> Option<SemanticTokens> {
+        if !self.identity.matches(expected_identity) {
+            return None;
+        }
+        let mut tokens = self.tokens.clone();
+        tokens.result_id = result_id;
+        Some(tokens)
     }
 }
 
@@ -173,7 +196,7 @@ mod tests {
         .expect("complete result");
 
         let materialized = artifact
-            .materialize_full(identity().as_ref(), None)
+            .into_full(identity().as_ref(), None)
             .expect("matching identity");
         assert_eq!(materialized.result_id, None);
         assert_eq!(materialized.data, vec![token]);
@@ -191,7 +214,7 @@ mod tests {
         .expect("complete result");
 
         let materialized = artifact
-            .materialize_full(identity().as_ref(), Some("request-42".into()))
+            .into_full(identity().as_ref(), Some("request-42".into()))
             .expect("matching identity");
         assert_eq!(materialized.result_id.as_deref(), Some("request-42"));
     }
@@ -261,8 +284,30 @@ mod tests {
             )
             .expect("complete result");
 
-            assert!(artifact.materialize_full(mismatch, None).is_none());
+            assert!(artifact.into_full(mismatch, None).is_none());
         }
+    }
+
+    #[test]
+    fn shared_artifact_materializes_independent_responses() {
+        let artifact = SemanticArtifact::from_full_result(
+            identity(),
+            SemanticTokensResult::Tokens(SemanticTokens {
+                result_id: None,
+                data: vec![],
+            }),
+        )
+        .expect("complete result");
+
+        let first = artifact
+            .materialize_full(identity().as_ref(), Some("request-1".into()))
+            .expect("matching identity");
+        let second = artifact
+            .materialize_full(identity().as_ref(), Some("request-2".into()))
+            .expect("artifact remains available");
+
+        assert_eq!(first.result_id.as_deref(), Some("request-1"));
+        assert_eq!(second.result_id.as_deref(), Some("request-2"));
     }
 
     #[test]

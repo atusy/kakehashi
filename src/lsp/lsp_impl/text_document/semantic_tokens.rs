@@ -557,9 +557,7 @@ impl Kakehashi {
         // complete identity before assigning this request's result ID.
         let result_id = Some(next_result_id());
         let tokens_with_id = artifact
-            .and_then(|artifact| {
-                artifact.materialize_full(expected_artifact_identity, result_id.clone())
-            })
+            .and_then(|artifact| artifact.into_full(expected_artifact_identity, result_id.clone()))
             .unwrap_or_else(|| SemanticTokens {
                 result_id,
                 data: Vec::new(),
@@ -924,9 +922,7 @@ impl Kakehashi {
                             expected_artifact_identity.to_owned(),
                             result,
                         )
-                        .and_then(|artifact| {
-                            artifact.materialize_full(expected_artifact_identity, None)
-                        })
+                        .and_then(|artifact| artifact.into_full(expected_artifact_identity, None))
                     })
                     .map(CurrentTokens::Owned)
             }
@@ -1254,7 +1250,7 @@ impl Kakehashi {
             );
             SemanticArtifact::from_full_result(expected_artifact_identity.to_owned(), result)
                 .and_then(|artifact| {
-                    artifact.materialize_full(expected_artifact_identity, Some(next_result_id()))
+                    artifact.into_full(expected_artifact_identity, Some(next_result_id()))
                 })
         });
         let (domain_range_result, tokens_to_store) = match full_tokens {
