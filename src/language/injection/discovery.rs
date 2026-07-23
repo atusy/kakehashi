@@ -931,16 +931,6 @@ impl InjectionResolver {
     /// where repeating work the caller just did delays the settle signal.
     /// `regions` and `cacheable` must be index-aligned (both derive from one
     /// `collect_all_injections` pass).
-    pub(crate) fn resolve_from_prebuilt(
-        coordinator: &LanguageCoordinator,
-        regions: &[InjectionRegionInfo<'_>],
-        cacheable: &[CacheableInjectionRegion],
-        text: &str,
-    ) -> Vec<ResolvedInjection> {
-        Self::resolve_from_prebuilt_cancellable(coordinator, regions, cacheable, text, None)
-            .expect("resolution without cancellation cannot be cancelled")
-    }
-
     pub(crate) fn resolve_from_prebuilt_cancellable(
         coordinator: &LanguageCoordinator,
         regions: &[InjectionRegionInfo<'_>],
