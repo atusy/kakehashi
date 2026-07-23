@@ -13,37 +13,37 @@
   },
   {
     "path": "parser/lua.dylib",
-    "sha256": "137f15a3d48479155518f07b24a8463e7cebee169dfdc30055cb6644bcb7340c",
+    "sha256": "a3e334f5c36fbeefb98ae695ae5995f77f336860b0263db6eae588f7caa8b7a6",
     "size": 84600,
     "type": "file"
   },
   {
     "path": "parser/markdown.dylib",
-    "sha256": "008eea0f72ad057df8ad98b7b9bc5a384f48e18bde0d1f6e16fca9ef129bbe39",
+    "sha256": "501c65857242f4c64c00cea889a8626e3b1d28954e9771e23e0c1790424ff793",
     "size": 418088,
     "type": "file"
   },
   {
     "path": "parser/markdown_inline.dylib",
-    "sha256": "15b1ce7e021f683739fe7e3b4128980a12695501e8d1f53a9cb9fa810c025c8b",
+    "sha256": "76f6377a1073a07cd6deb68d9b777d03621cffd6656ebf4a23c2daa53fbb45c5",
     "size": 416816,
     "type": "file"
   },
   {
     "path": "parser/python.dylib",
-    "sha256": "e415f3dca55bb973e40288d2cf9942809424a1eb8d0265a2f07ccdd8ff2febfd",
+    "sha256": "c493dcc9c5a0ea1f46460866b2b3bebf4816823a6a40860fbea08f0ec1e106c9",
     "size": 480920,
     "type": "file"
   },
   {
     "path": "parser/rust.dylib",
-    "sha256": "5e6fbe0afc4c9dd48d78fdbf0443c589f6e6019f656b0e6ae6115bcd534bcd59",
+    "sha256": "46f73f00ee887834ef9944b37ae076e9dec34d9a928fbb3d99a36893b86351f9",
     "size": 1142360,
     "type": "file"
   },
   {
     "path": "parser/yaml.dylib",
-    "sha256": "c3a98dbdae37656c619df531e42ce19a96a546d2b55e46f542d00ad3c11c7d32",
+    "sha256": "d37b595fb304418ed70bbcdab63cfe7ca372dbfeced77876eb6a35bfb711ea91",
     "size": 217176,
     "type": "file"
   },

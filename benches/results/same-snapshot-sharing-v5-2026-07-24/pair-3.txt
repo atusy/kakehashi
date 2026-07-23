@@ -1,10 +1,10 @@
 
 semantic-tokens benchmark  (iters=30, warmup=6, lower is better)
-  B = <TEMP>/target-b/release/kakehashi
   A = <TEMP>/target-a/release/kakehashi
+  B = <TEMP>/target-b/release/kakehashi
 
-scenario                                B (med)      A (med) Δ (A vs B)
+scenario                                A (med)      B (med) Δ (B vs A)
 ------------------------------------------------------------------------
-rust_xlarge/same_snapshot_fanout      118.752ms    168.144ms        +41.6%
-    p95:    128.515ms    184.308ms
+rust_xlarge/same_snapshot_fanout      166.880ms    116.616ms         -30.1%
+    p95:    169.504ms    118.493ms
     └ targets: concurrent delta + range consumers of one freshly parsed snapshot; all-consumer latency and freshness
