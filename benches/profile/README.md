@@ -63,7 +63,8 @@ semantic-token warmup and before measured requests begin:
 cargo build --profile profiling --bin kakehashi || exit $?
 profile_dir="$(mktemp -d "${TMPDIR:-/tmp}/kakehashi-profile.XXXXXX")" || exit $?
 profile_wait_seconds=300
-profile_hold_seconds=60
+heap_timeout_seconds=60
+profile_hold_seconds=72
 controller_grace_seconds=12
 driver_pid=
 
@@ -212,7 +213,7 @@ try:
 except subprocess.TimeoutExpired:
     sys.exit(124)
 sys.exit(completed.returncode)
-' "$profile_hold_seconds" /usr/bin/heap -H "$server_pid"
+' "$heap_timeout_seconds" /usr/bin/heap -H "$server_pid"
 heap_status=$?
 touch "$profile_dir/stop"
 stop_status=$?
@@ -234,10 +235,12 @@ and still reaps the server. The interactive example allows five minutes for
 attachment; the CLI default is 30 seconds. The same timeout bounds the semantic
 warmup response, while shutdown responses are capped at five seconds. After
 `done`, `stop` releases the server as soon as the retained-heap snapshot
-finishes; `--profile-hold-seconds` is a 60-second safety deadline if the
-controller never publishes it. Independently, the shell controller caps
-`ready`/`done` polling at `profile_wait_seconds`, the foreground heap command
-at `profile_hold_seconds`, and driver cleanup at `controller_grace_seconds`
+finishes; `--profile-hold-seconds` is a 72-second safety deadline if the
+controller never publishes it. This gives the driver-side deadline 12 seconds
+of slack beyond the controller's 60-second `heap_timeout_seconds`
+to cover marker polling, identity validation, and process startup.
+Independently, the shell controller caps `ready`/`done` polling at
+`profile_wait_seconds` and driver cleanup at `controller_grace_seconds`
 (12 seconds, longer than the driver's bounded shutdown phases). These variables
 can be raised for intentionally longer profiling runs.
 
