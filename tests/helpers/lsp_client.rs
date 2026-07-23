@@ -420,6 +420,42 @@ impl LspClient {
         }
     }
 
+    /// Shut the server down and collect stderr through EOF.
+    ///
+    /// Unlike [`Self::drain_stderr`], this cannot block waiting for the first
+    /// byte and does not truncate output at 4 KiB. It is intended for tests
+    /// that assert logging behavior, including the failure mode where the
+    /// expected log is absent.
+    pub fn shutdown_and_collect_stderr(&mut self) -> String {
+        use std::io::Read;
+        use std::time::{Duration, Instant};
+
+        let _ = self.send_request("shutdown", Value::Null);
+        self.send_notification("exit", Value::Null);
+        self.close_stdin();
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            match self.child.try_wait() {
+                Ok(Some(_)) => break,
+                Ok(None) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Ok(None) | Err(_) => {
+                    self.kill();
+                    break;
+                }
+            }
+        }
+
+        let Some(mut stderr) = self.stderr.take() else {
+            return String::new();
+        };
+        let mut output = String::new();
+        let _ = stderr.read_to_string(&mut output);
+        output
+    }
+
     /// Send an LSP request and return the response.
     pub fn send_request(&mut self, method: &str, params: Value) -> Value {
         self.request_id += 1;
