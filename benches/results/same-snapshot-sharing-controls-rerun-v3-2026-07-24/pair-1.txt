@@ -1,0 +1,19 @@
+
+semantic-tokens benchmark  (iters=30, warmup=6, lower is better)
+  A = <TEMP>/target-a/release/kakehashi
+  B = <TEMP>/target-b/release/kakehashi
+
+scenario                                A (med)      B (med) Δ (B vs A)
+------------------------------------------------------------------------
+markdown_injections_large/full_cache_hit      0.623ms      0.614ms         -1.4%
+    p95:      0.679ms      0.734ms
+    └ targets: large injection document exact-snapshot semantic cache-hit control
+unicode_rust/full_cache_hit             0.688ms      0.691ms        +0.4%
+    p95:      0.892ms      0.899ms
+    └ targets: Unicode document exact-snapshot semantic cache-hit control
+rust_large/typing_burst                16.016ms     17.334ms        +8.2%
+    p95:     16.726ms     18.421ms
+    └ targets: eight queued unique edits→current delta; latest-state follow latency
+rust_xlarge/cancel_burst               80.213ms    144.960ms        +80.7%
+    p95:     98.595ms    162.867ms
+    └ targets: current-token latency after four explicitly cancelled edit states
