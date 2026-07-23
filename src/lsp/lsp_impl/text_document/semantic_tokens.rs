@@ -58,14 +58,6 @@ async fn wait_for_same_snapshot_benchmark_peer() {
     }
 }
 
-#[cfg(not(feature = "semantic-bench-instrumentation"))]
-async fn wait_for_same_snapshot_benchmark_peer() {
-    assert!(
-        std::env::var_os("KAKEHASHI_BENCH_SEMANTIC_FANOUT_PARTIES").is_none(),
-        "same-snapshot fan-out requires --features semantic-bench-instrumentation"
-    );
-}
-
 /// Outcome of the serve-current snapshot resolution for the whole-document
 /// token handlers (see [`Kakehashi::current_snapshot_for_tokens`]).
 pub(crate) enum TokenSnapshot {
@@ -885,6 +877,7 @@ impl Kakehashi {
                 // point, so both the unshared (two producers) and shared (one
                 // producer + one joiner) binaries start from two admitted
                 // consumers of the same immutable snapshot.
+                #[cfg(feature = "semantic-bench-instrumentation")]
                 wait_for_same_snapshot_benchmark_peer().await;
 
                 // capture_mappings and supports_multiline were read before the await
@@ -1277,6 +1270,7 @@ impl Kakehashi {
 
         // See the delta-path note: this is compiled only into benchmark
         // binaries and runs after both completed-cache lookup paths missed.
+        #[cfg(feature = "semantic-bench-instrumentation")]
         wait_for_same_snapshot_benchmark_peer().await;
 
         // Use Rayon-based parallel injection processing
