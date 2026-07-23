@@ -293,6 +293,9 @@ impl CacheCoordinator {
         ) else {
             return None;
         };
+        if crate::cancel::is_cancelled(cancel) {
+            return None;
+        }
         {
             if regions.is_empty() {
                 // Clear any existing regions and caches for this document —
@@ -942,6 +945,54 @@ mod tests {
             cache.get_injections(&uri).is_none(),
             "cancelled populate must not commit partial regions"
         );
+    }
+
+    #[test]
+    fn populate_stops_after_discovery_when_version_turns_obsolete() {
+        use tree_sitter::{Parser, Query};
+
+        let cache = CacheCoordinator::new();
+        let tracker = NodeTracker::new();
+        let coordinator = LanguageCoordinator::new();
+        let uri = create_test_uri("cancel-after-discovery.md");
+        let language: tree_sitter::Language = tree_sitter_md::LANGUAGE.into();
+        let query = Query::new(
+            &language,
+            r#"(fenced_code_block
+                  (info_string (language) @injection.language)
+                  (code_fence_content) @injection.content)"#,
+        )
+        .unwrap();
+        coordinator
+            .query_store()
+            .insert_injection_query("markdown".to_string(), std::sync::Arc::new(query));
+        let text = "```lua\nprint(1)\n```\n";
+        let mut parser = Parser::new();
+        parser.set_language(&language).unwrap();
+        let tree = parser.parse(text, None).unwrap();
+        let cancel = crate::cancel::CancelToken::default();
+        // Population and discovery poll at entry, then discovery at exit for
+        // this small document. The next population-stage checkpoint must
+        // observe the fourth poll.
+        cancel.cancel_after_polls(4);
+
+        let populated = cache.populate_injections_cancellable(
+            &uri,
+            text,
+            &tree,
+            "markdown",
+            &coordinator,
+            &tracker,
+            tracker.mint_epoch(&uri),
+            1,
+            true,
+            true,
+            Some(&cancel),
+        );
+
+        assert!(populated.is_none());
+        assert!(cancel.is_cancelled());
+        assert!(cache.get_injections(&uri).is_none());
     }
 
     /// Integration test: language change with stable region_id triggers cache invalidation.
