@@ -56,8 +56,11 @@ fn parse_text_with_deadline(
     text: &str,
     old_tree: Option<&tree_sitter::Tree>,
     deadline: std::time::Instant,
+    cancel: Option<&crate::cancel::CancelToken>,
 ) -> Option<tree_sitter::Tree> {
-    crate::language::injection::parse_with_deadline(parser, text, old_tree, deadline)
+    crate::language::injection::parse_with_deadline_cancellable(
+        parser, text, old_tree, deadline, cancel,
+    )
 }
 
 /// The settled+stale gate for the parse loop's `semanticTokens/refresh`
@@ -168,10 +171,16 @@ impl ParseCoordinator {
         language_name: &str,
         uri: &Url,
         text_len: usize,
+        cancel: Option<crate::cancel::CancelToken>,
         parse_fn: F,
     ) -> Option<T>
     where
-        F: FnMut(tree_sitter::Parser, std::time::Instant, bool) -> (tree_sitter::Parser, Option<T>)
+        F: FnMut(
+                tree_sitter::Parser,
+                std::time::Instant,
+                bool,
+                Option<&crate::cancel::CancelToken>,
+            ) -> (tree_sitter::Parser, Option<T>)
             + Send
             + 'static,
         T: Send + 'static,
@@ -180,9 +189,10 @@ impl ParseCoordinator {
 
         let parser_pool = std::sync::Arc::clone(&self.parser_pool);
         let language_name_owned = language_name.to_string();
+        let cancel_for_work = cancel.clone();
         let result = tokio::time::timeout(
             PARSE_AWAIT_BACKSTOP,
-            self.compute_pool.run(None, move || {
+            self.compute_pool.run(cancel, move || {
                 let mut parse_fn = parse_fn;
                 let mut language_name_owned = language_name_owned;
                 for attempt in 0..2 {
@@ -221,7 +231,8 @@ impl ParseCoordinator {
                     // tree-less until the next edit). The awaiter above covers
                     // queue + parse with slack, so the result is not dropped.
                     let deadline = std::time::Instant::now() + PARSE_TIMEOUT;
-                    let (parser, value) = parse_fn(parser, deadline, attempt != 0);
+                    let (parser, value) =
+                        parse_fn(parser, deadline, attempt != 0, cancel_for_work.as_ref());
                     match parser_pool
                         .lock()
                         .recover_poison("ParseCoordinator::parse_with_pool(release)")
@@ -467,10 +478,15 @@ impl ParseCoordinator {
         // wakes its readers (they fall back). Unreachable while this parse is inline on
         // the writer ticket (a `didClose` is gated behind the open); the guard is for
         // the off-ingress open flip (#6), where a `didClose`/reopen can race it.
-        let Some((text, incarnation, content_version)) = self
-            .documents
-            .get(&uri)
-            .map(|doc| (doc.text_arc(), doc.incarnation(), doc.content_version()))
+        let Some((text, incarnation, content_version, version_cancel)) =
+            self.documents.get(&uri).map(|doc| {
+                (
+                    doc.text_arc(),
+                    doc.incarnation(),
+                    doc.content_version(),
+                    doc.version_cancel_token(),
+                )
+            })
         else {
             return false;
         };
@@ -564,10 +580,16 @@ impl ParseCoordinator {
                     &language_name,
                     &uri,
                     text.len(),
-                    move |mut parser, deadline, _generation_retry| {
+                    Some(version_cancel.clone()),
+                    move |mut parser, deadline, _generation_retry, cancel| {
                         let _ = auto_install.begin_parsing(&language_name_clone);
-                        let parse_result =
-                            parse_text_with_deadline(&mut parser, &text_for_parse, None, deadline);
+                        let parse_result = parse_text_with_deadline(
+                            &mut parser,
+                            &text_for_parse,
+                            None,
+                            deadline,
+                            cancel,
+                        );
                         let _ = auto_install.end_parsing(&language_name_clone);
                         (parser, parse_result)
                     },
@@ -822,7 +844,7 @@ impl ParseCoordinator {
             // than parse its text with this lifetime's (possibly relabelled-away)
             // grammar (the CAS would reject it anyway; this just avoids the wasted
             // parses).
-            let (text, content_version) = {
+            let (text, content_version, version_cancel) = {
                 let Some(doc) = self.documents.get(&uri) else {
                     break;
                 };
@@ -835,7 +857,11 @@ impl ParseCoordinator {
                 // `text_arc()` is a refcount bump, not a full copy (#498) — the
                 // original stays here for the CAS while a cheap clone goes to the
                 // blocking parse closure.
-                (doc.text_arc(), doc.content_version())
+                (
+                    doc.text_arc(),
+                    doc.content_version(),
+                    doc.version_cancel_token(),
+                )
             };
 
             let text_len = text.len();
@@ -850,10 +876,16 @@ impl ParseCoordinator {
                     &language_name,
                     &uri,
                     text_len,
-                    move |mut parser, deadline, _generation_retry| {
+                    Some(version_cancel.clone()),
+                    move |mut parser, deadline, _generation_retry, cancel| {
                         let _ = auto_install.begin_parsing(&language_name_clone);
-                        let result =
-                            parse_text_with_deadline(&mut parser, &text_for_parse, None, deadline);
+                        let result = parse_text_with_deadline(
+                            &mut parser,
+                            &text_for_parse,
+                            None,
+                            deadline,
+                            cancel,
+                        );
                         let _ = auto_install.end_parsing(&language_name_clone);
                         (parser, result)
                     },
@@ -973,7 +1005,7 @@ impl ParseCoordinator {
         // `pending_seed` (a cheap `Tree` refcount-clone) is the edit's incremental
         // parse seed stashed by `didChange`; `None` for a full-text sync / freshly
         // installed parse, in which case we parse from scratch.
-        let (language_name, language_id, text, seed, incarnation, content_version) = {
+        let (language_name, language_id, text, seed, incarnation, content_version, version_cancel) = {
             let Some(doc) = self.documents.get(uri) else {
                 return;
             };
@@ -996,6 +1028,7 @@ impl ParseCoordinator {
                 seed,
                 incarnation,
                 doc.content_version(),
+                doc.version_cancel_token(),
             )
         };
 
@@ -1053,7 +1086,8 @@ impl ParseCoordinator {
                 &language_name,
                 uri,
                 text_len,
-                move |mut parser, deadline, generation_retry| {
+                Some(version_cancel.clone()),
+                move |mut parser, deadline, generation_retry, cancel| {
                     let _ = auto_install.begin_parsing(&language_name_clone);
                     let result = parse_text_with_deadline(
                         &mut parser,
@@ -1064,6 +1098,7 @@ impl ParseCoordinator {
                             seed.as_ref()
                         },
                         deadline,
+                        cancel,
                     );
                     let _ = auto_install.end_parsing(&language_name_clone);
                     (parser, result)
@@ -1267,7 +1302,7 @@ mod tests {
 
         let expired = std::time::Instant::now();
         let started = std::time::Instant::now();
-        let aborted = parse_text_with_deadline(&mut parser, &text, None, expired);
+        let aborted = parse_text_with_deadline(&mut parser, &text, None, expired, None);
         assert!(aborted.is_none(), "an expired deadline aborts the parse");
         assert!(
             started.elapsed() < PARSE_TIMEOUT,
@@ -1276,7 +1311,7 @@ mod tests {
 
         // The reset parser is immediately reusable on the same input.
         let future = std::time::Instant::now() + std::time::Duration::from_secs(60);
-        let parsed = parse_text_with_deadline(&mut parser, &text, None, future);
+        let parsed = parse_text_with_deadline(&mut parser, &text, None, future, None);
         assert!(parsed.is_some(), "a live deadline parses normally");
     }
 }
