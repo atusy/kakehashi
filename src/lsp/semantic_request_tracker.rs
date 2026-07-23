@@ -71,6 +71,10 @@ impl ConsumerIds {
             self.additional.retain(|candidate| *candidate != id);
         }
     }
+
+    fn is_empty(&self) -> bool {
+        self.first == 0
+    }
 }
 
 /// Monotonically increasing request ID for tracking
@@ -185,6 +189,24 @@ impl SemanticRequestTracker {
     pub fn finish_request(&self, uri: &Url, request_id: u64) {
         if let Some(mut entry) = self.active_requests.get_mut(uri) {
             entry.consumers.remove(request_id);
+        }
+    }
+
+    /// Finish a request that resolved the URI as absent and remove its empty
+    /// scope marker. The exact-scope comparison prevents an absent request
+    /// racing `didOpen` from removing a newer lifetime's anti-resurrection
+    /// watermark.
+    pub fn finish_absent_request(&self, uri: &Url, request_id: u64, scope: SemanticRequestScope) {
+        if let dashmap::mapref::entry::Entry::Occupied(mut occupied) =
+            self.active_requests.entry(uri.clone())
+        {
+            if occupied.get().scope != scope {
+                return;
+            }
+            occupied.get_mut().consumers.remove(request_id);
+            if occupied.get().consumers.is_empty() {
+                occupied.remove();
+            }
         }
     }
 
@@ -319,6 +341,14 @@ mod tests {
         assert!(tracker.is_active(&uri, second));
         assert!(!token1.is_cancelled());
         assert!(!token2.is_cancelled());
+
+        tracker.finish_request(&uri, first);
+        assert!(!tracker.is_active(&uri, first));
+        assert!(tracker.is_active(&uri, second));
+        assert!(
+            !token2.is_cancelled(),
+            "finishing one same-scope consumer must not cancel its peer"
+        );
     }
 
     #[test]
@@ -333,5 +363,23 @@ mod tests {
         assert!(!tracker.is_active(&uri, obsolete));
         assert!(!current_token.is_cancelled());
         assert!(obsolete_token.is_cancelled());
+    }
+
+    #[test]
+    fn absent_scope_is_removed_without_touching_newer_lifetime() {
+        let tracker = SemanticRequestTracker::new();
+        let uri = Url::parse("file:///missing.lua").unwrap();
+        let absent = SemanticRequestScope {
+            incarnation: 0,
+            generation: 2,
+            content_version: 0,
+        };
+        let (absent_request, _) = tracker.start_request(&uri, absent);
+        tracker.finish_absent_request(&uri, absent_request, absent);
+
+        let (reopened, reopened_token) = tracker.start_request(&uri, scope(1));
+        tracker.finish_absent_request(&uri, absent_request, absent);
+        assert!(tracker.is_active(&uri, reopened));
+        assert!(!reopened_token.is_cancelled());
     }
 }

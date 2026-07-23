@@ -373,7 +373,8 @@ impl Kakehashi {
         {
             TokenSnapshot::Current(snapshot) => snapshot,
             TokenSnapshot::Absent => {
-                self.cache.finish_request(&uri, request_id);
+                self.cache
+                    .finish_absent_request(&uri, request_id, request_scope);
                 return Ok(Some(SemanticTokensResult::Tokens(SemanticTokens {
                     result_id: None,
                     data: vec![],
@@ -647,14 +648,19 @@ impl Kakehashi {
         );
         // The artifact contains no request lineage. Materialization checks the
         // complete identity before assigning this request's result ID.
-        let tokens_with_id = result
-            .and_then(|artifact| {
-                artifact.materialize_full(expected_artifact_identity, Some(next_result_id()))
-            })
-            .unwrap_or_else(|| SemanticTokens {
-                result_id: Some(next_result_id()),
-                data: Vec::new(),
-            });
+        let Some(artifact) = result else {
+            // A cancelled, failed, or panicked producer is transient. The slot
+            // is vacant and retryable; do not turn this into a reusable empty
+            // success for the exact snapshot.
+            self.cache.finish_request(&uri, request_id);
+            return Ok(None);
+        };
+        let Some(tokens_with_id) =
+            artifact.materialize_full(expected_artifact_identity, Some(next_result_id()))
+        else {
+            self.cache.finish_request(&uri, request_id);
+            return Ok(None);
+        };
         let stored_tokens = tokens_with_id.clone();
         let lsp_tokens = tokens_with_id;
         let edit_lock = self.documents.edit_lock(&uri);
@@ -746,7 +752,8 @@ impl Kakehashi {
         {
             TokenSnapshot::Current(snapshot) => snapshot,
             TokenSnapshot::Absent => {
-                self.cache.finish_request(&uri, request_id);
+                self.cache
+                    .finish_absent_request(&uri, request_id, request_scope);
                 return Ok(Some(SemanticTokensFullDeltaResult::Tokens(
                     SemanticTokens {
                         result_id: None,
@@ -1045,12 +1052,12 @@ impl Kakehashi {
         // Current tokens from the result — kept lazy (`CurrentTokens::Cached`
         // stays an `Arc`) until a downstream match arm actually needs an
         // owned value to mutate and store.
-        let current_tokens = result.unwrap_or_else(|| {
-            CurrentTokens::Owned(SemanticTokens {
-                result_id: None,
-                data: Vec::new(),
-            })
-        });
+        let Some(current_tokens) = result else {
+            // Preserve the slot's retry contract: transient producer failure
+            // must not become an empty delta baseline cached for this snapshot.
+            self.cache.finish_request(&uri, request_id);
+            return Ok(None);
+        };
 
         // Early exit check before storing - prevents superseded request from overwriting cache
         if !self.cache.is_request_active(&uri, request_id) {
@@ -1222,6 +1229,8 @@ impl Kakehashi {
             }
         };
         let Some(snapshot) = snapshot else {
+            self.cache
+                .finish_absent_request(&uri, request_id, request_scope);
             return Ok(Some(SemanticTokensRangeResult::Tokens(SemanticTokens {
                 result_id: None,
                 data: vec![],
@@ -1234,6 +1243,8 @@ impl Kakehashi {
         // client's next natural request (this is a per-redraw viewport read)
         // gets the fresh one.
         let Some(view) = self.documents.latest_snapshot(&uri) else {
+            self.cache
+                .finish_absent_request(&uri, request_id, request_scope);
             return Ok(Some(SemanticTokensRangeResult::Tokens(SemanticTokens {
                 result_id: None,
                 data: vec![],
@@ -1426,24 +1437,12 @@ impl Kakehashi {
         let full_tokens = artifact.and_then(|artifact| {
             artifact.materialize_full(expected_artifact_identity, Some(next_result_id()))
         });
-        let (domain_range_result, tokens_to_store) = match full_tokens {
-            Some(full_tokens) => {
-                let range_tokens = filter_semantic_tokens_by_range(&full_tokens, &domain_range);
-                let response = tower_lsp_server::ls_types::SemanticTokensRangeResult::from(
-                    range_tokens.clone(),
-                );
-                (response, Some((full_tokens, range_tokens)))
-            }
-            None => (
-                tower_lsp_server::ls_types::SemanticTokensRangeResult::Tokens(
-                    tower_lsp_server::ls_types::SemanticTokens {
-                        result_id: None,
-                        data: Vec::new(),
-                    },
-                ),
-                None,
-            ),
+        let Some(full_tokens) = full_tokens else {
+            return Ok(None);
         };
+        let range_tokens = filter_semantic_tokens_by_range(&full_tokens, &domain_range);
+        let domain_range_result =
+            tower_lsp_server::ls_types::SemanticTokensRangeResult::from(range_tokens.clone());
 
         // A range is authored against one live document lifetime. A close,
         // reopen, or edit during the uncancellable full-document compute makes
@@ -1463,22 +1462,20 @@ impl Kakehashi {
 
         // Cache ONLY a clean `Tokens` result (#535). Partial/None responses are
         // degraded or transient and must not become reusable cache entries.
-        if let Some((full_tokens, range_tokens)) = tokens_to_store {
-            self.cache.store_tokens(
-                uri.clone(),
-                full_tokens,
-                language_name.clone(),
-                cache_key,
-                snapshot_identity,
-            );
-            self.cache.store_range_tokens(
-                uri.clone(),
-                domain_range,
-                language_name,
-                range_tokens,
-                cache_key,
-            );
-        }
+        self.cache.store_tokens(
+            uri.clone(),
+            full_tokens,
+            language_name.clone(),
+            cache_key,
+            snapshot_identity,
+        );
+        self.cache.store_range_tokens(
+            uri.clone(),
+            domain_range,
+            language_name,
+            range_tokens,
+            cache_key,
+        );
 
         Ok(Some(domain_range_result))
     }

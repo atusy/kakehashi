@@ -124,6 +124,16 @@ impl DocumentStore {
         uris
     }
 
+    /// Cancel semantic artifact producers from older settings generations
+    /// without invalidating otherwise reusable parse snapshots.
+    pub(crate) fn advance_semantic_artifact_generation(&self, generation: u64) {
+        for entry in self.documents.iter() {
+            if let Some(snapshot) = entry.latest_snapshot_slot().snapshot {
+                snapshot.advance_semantic_artifact_generation(generation);
+            }
+        }
+    }
+
     pub(crate) fn invalidate_all_parses(&self) -> Vec<Url> {
         let mut uris = Vec::with_capacity(self.documents.len());
         for mut entry in self.documents.iter_mut() {

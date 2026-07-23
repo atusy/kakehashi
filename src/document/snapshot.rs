@@ -102,6 +102,13 @@ impl ParseSnapshot {
     pub(crate) fn cancel_semantic_artifact(&self) {
         self.semantic_artifact.cancel();
     }
+
+    /// Cancel only producers built under superseded settings while keeping this
+    /// immutable parse snapshot available to the next generation.
+    pub(crate) fn advance_semantic_artifact_generation(&self, generation: u64) {
+        self.semantic_artifact
+            .advance_minimum_generation(generation);
+    }
 }
 
 /// The per-URI `watch` value: the current lifetime plus the latest snapshot.
