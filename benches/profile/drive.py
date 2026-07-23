@@ -241,7 +241,7 @@ def main() -> None:
         help="atomically publish the spawned server PID for profiler attachment")
     ap.add_argument(
         "--profile-ready-file",
-        help="publish after initialization and warmup are complete")
+        help="publish after initialization and an unmeasured semantic warmup")
     ap.add_argument(
         "--profile-start-file",
         help="wait for this external marker before starting measured requests")
@@ -485,6 +485,18 @@ def main() -> None:
                     "cannot measure a real delta lineage"
                 )
 
+        semantic_request = (
+            "textDocument/semanticTokens/full",
+            {"textDocument": {"uri": uri}},
+        )
+        if args.profile_ready_file or args.profile_start_file:
+            warmup, _ = request(*semantic_request)
+            if response_status(warmup) != "ok":
+                raise RuntimeError(
+                    "semantic warmup did not return tokens; "
+                    f"status={response_status(warmup)}"
+                )
+
         publish_marker(args.profile_ready_file, "ready\n")
         if args.profile_start_file:
             wait_for_marker(args.profile_start_file, args.profile_wait_timeout)
@@ -519,10 +531,6 @@ def main() -> None:
             t_req = time.perf_counter()
             semantic_sample_start = len(
                 request_samples["textDocument/semanticTokens/full"]
-            )
-            semantic_request = (
-                "textDocument/semanticTokens/full",
-                {"textDocument": {"uri": uri}},
             )
             captures_requests = [
                 ("kakehashi/captures/full/delta",
