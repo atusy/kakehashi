@@ -182,6 +182,11 @@ impl Document {
         self.content_version
     }
 
+    /// Clone the cancellation scope bound to this document input version.
+    pub(crate) fn version_cancel_token(&self) -> crate::cancel::CancelToken {
+        self.version_cancel.clone()
+    }
+
     fn advance_input_version(&mut self) {
         self.version_cancel.cancel();
         self.version_cancel = crate::cancel::CancelToken::default();
