@@ -51,6 +51,74 @@ pub(crate) struct InjectionCacheParams {
 use finalize::finalize_tokens_cancellable;
 use token_collector::{build_line_start_bytes, collect_host_tokens};
 
+struct SemanticComputeEvent {
+    work_id: u64,
+    compute_us: u128,
+    host_us: u128,
+    injections_us: u128,
+    finalize_us: u128,
+    parallel: bool,
+    input_bytes: usize,
+    input_lines: usize,
+    host_tokens: usize,
+    injection_tokens: usize,
+    active_regions: usize,
+    reused_regions: usize,
+    output_tokens: usize,
+    line_index_capacity_bytes: usize,
+    raw_token_peak_capacity_bytes: usize,
+    result_capacity_bytes: usize,
+}
+
+struct SemanticComputeInputs {
+    work_id: u64,
+    input_bytes: usize,
+    input_lines: usize,
+    host_tokens: usize,
+    injection_tokens: usize,
+    active_regions: usize,
+    reused_regions: usize,
+    line_index_capacity_bytes: usize,
+    raw_token_peak_capacity_bytes: usize,
+}
+
+impl std::fmt::Display for SemanticComputeEvent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "work_id={} event=semantic_phases compute_us={} host_us={} injections_us={} finalize_us={} parallel={} input_bytes={} input_lines={} host_tokens={} injection_tokens={} active_regions={} reused_regions={} output_tokens={} line_index_capacity_bytes={} raw_token_peak_capacity_bytes={} result_capacity_bytes={}",
+            self.work_id,
+            self.compute_us,
+            self.host_us,
+            self.injections_us,
+            self.finalize_us,
+            self.parallel,
+            self.input_bytes,
+            self.input_lines,
+            self.host_tokens,
+            self.injection_tokens,
+            self.active_regions,
+            self.reused_regions,
+            self.output_tokens,
+            self.line_index_capacity_bytes,
+            self.raw_token_peak_capacity_bytes,
+            self.result_capacity_bytes,
+        )
+    }
+}
+
+fn semantic_result_capacity(result: Option<&SemanticTokensResult>) -> (usize, usize) {
+    let data = match result {
+        Some(SemanticTokensResult::Tokens(tokens)) => &tokens.data,
+        Some(SemanticTokensResult::Partial(partial)) => &partial.data,
+        None => return (0, 0),
+    };
+    (
+        data.len(),
+        data.capacity() * std::mem::size_of::<tower_lsp_server::ls_types::SemanticToken>(),
+    )
+}
+
 // Region-local token type persisted by the injection-token cache (#529). Lives
 // in `token_collector`; re-exported here so `semantic_cache` can name it.
 pub(crate) use token_collector::RawToken;
@@ -215,6 +283,39 @@ pub(crate) async fn handle_semantic_tokens_full(
             return None;
         }
         let (injection_tokens, active_injection_regions) = injection_result;
+        let metrics = if log::log_enabled!(
+            target: "kakehashi::semantic_metrics",
+            log::Level::Debug
+        ) {
+            crate::compute_pool::current_work_id().map(|work_id| {
+                let raw_token_size = std::mem::size_of::<RawToken>();
+                let active_region_size =
+                    std::mem::size_of::<token_collector::ActiveInjectionBounds>();
+                SemanticComputeInputs {
+                    work_id,
+                    input_bytes: text.len(),
+                    input_lines: lines.len(),
+                    host_tokens: host_tokens.len(),
+                    injection_tokens: injection_tokens.len(),
+                    active_regions: active_injection_regions.len(),
+                    reused_regions: injection_cache
+                        .as_ref()
+                        .and_then(|params| {
+                            params.discovery.as_ref().filter(|discovery| {
+                                discovery.generation == params.generation && discovery.complete
+                            })
+                        })
+                        .map_or(0, |discovery| discovery.regions.len()),
+                    line_index_capacity_bytes: lines.capacity() * std::mem::size_of::<&str>()
+                        + line_starts.capacity() * std::mem::size_of::<usize>(),
+                    raw_token_peak_capacity_bytes: host_tokens.capacity() * raw_token_size
+                        + injection_tokens.capacity() * raw_token_size
+                        + active_injection_regions.capacity() * active_region_size,
+                }
+            })
+        } else {
+            None
+        };
 
         // A supersede observed during the injection pass leaves a partial token
         // set; drop it so the handler never stores partial results.
@@ -224,6 +325,14 @@ pub(crate) async fn handle_semantic_tokens_full(
 
         // Merge injection tokens with host tokens
         host_tokens.extend(injection_tokens);
+        let metrics = metrics.map(|mut metrics| {
+            metrics.raw_token_peak_capacity_bytes = metrics.raw_token_peak_capacity_bytes.max(
+                host_tokens.capacity() * std::mem::size_of::<RawToken>()
+                    + active_injection_regions.capacity()
+                        * std::mem::size_of::<token_collector::ActiveInjectionBounds>(),
+            );
+            metrics
+        });
 
         let finalize_start = std::time::Instant::now();
         let result = finalize_tokens_cancellable(
@@ -236,6 +345,32 @@ pub(crate) async fn handle_semantic_tokens_full(
         let compute_elapsed = compute_started.elapsed();
         if is_cancelled() {
             return None;
+        }
+
+        if let Some(metrics) = metrics {
+            let (output_tokens, result_capacity_bytes) = semantic_result_capacity(result.as_ref());
+            log::debug!(
+                target: "kakehashi::semantic_metrics",
+                "{}",
+                SemanticComputeEvent {
+                    work_id: metrics.work_id,
+                    compute_us: compute_elapsed.as_micros(),
+                    host_us: host_elapsed.as_micros(),
+                    injections_us: injections_elapsed.as_micros(),
+                    finalize_us: finalize_elapsed.as_micros(),
+                    parallel: should_parallelize,
+                    input_bytes: metrics.input_bytes,
+                    input_lines: metrics.input_lines,
+                    host_tokens: metrics.host_tokens,
+                    injection_tokens: metrics.injection_tokens,
+                    active_regions: metrics.active_regions,
+                    reused_regions: metrics.reused_regions,
+                    output_tokens,
+                    line_index_capacity_bytes: metrics.line_index_capacity_bytes,
+                    raw_token_peak_capacity_bytes: metrics.raw_token_peak_capacity_bytes,
+                    result_capacity_bytes,
+                }
+            );
         }
 
         // Host/injection durations overlap when `parallel=true`, so `compute`
@@ -271,6 +406,33 @@ pub(crate) async fn handle_semantic_tokens_full(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn semantic_compute_event_is_machine_joinable_and_labels_capacity_estimates() {
+        let event = SemanticComputeEvent {
+            work_id: 17,
+            compute_us: 101,
+            host_us: 40,
+            injections_us: 30,
+            finalize_us: 20,
+            parallel: true,
+            input_bytes: 4096,
+            input_lines: 128,
+            host_tokens: 300,
+            injection_tokens: 40,
+            active_regions: 8,
+            reused_regions: 6,
+            output_tokens: 280,
+            line_index_capacity_bytes: 2048,
+            raw_token_peak_capacity_bytes: 32768,
+            result_capacity_bytes: 5600,
+        };
+
+        assert_eq!(
+            event.to_string(),
+            "work_id=17 event=semantic_phases compute_us=101 host_us=40 injections_us=30 finalize_us=20 parallel=true input_bytes=4096 input_lines=128 host_tokens=300 injection_tokens=40 active_regions=8 reused_regions=6 output_tokens=280 line_index_capacity_bytes=2048 raw_token_peak_capacity_bytes=32768 result_capacity_bytes=5600"
+        );
+    }
 
     #[test]
     fn parallel_host_injection_gate_checks_pool_and_discovery_contract() {
