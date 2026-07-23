@@ -116,13 +116,62 @@ pub(crate) struct SemanticArtifactSlot {
 }
 
 struct SemanticArtifactAttempt {
-    id: u64,
     identity: SemanticArtifactIdentity,
-    cancel: crate::cancel::CancelToken,
+    control: Arc<SemanticArtifactAttemptControl>,
     future: SharedArtifactFuture,
 }
 
-pub(crate) type SharedArtifactFuture = Shared<BoxFuture<'static, Option<Arc<SemanticArtifact>>>>;
+struct SemanticArtifactAttemptControl {
+    id: u64,
+    cancel: crate::cancel::CancelToken,
+    consumers: std::sync::atomic::AtomicUsize,
+    complete: std::sync::atomic::AtomicBool,
+    slot: std::sync::Weak<SemanticArtifactSlot>,
+}
+
+type SharedArtifactFuture = Shared<BoxFuture<'static, Option<Arc<SemanticArtifact>>>>;
+
+/// One request-local interest in a shared artifact attempt.
+///
+/// Dropping the last consumer cancels a still-running request-driven producer.
+/// The slot's retained future does not count as interest: it exists only so a
+/// concurrent consumer can join without duplicating work.
+pub(crate) struct SemanticArtifactConsumer {
+    future: SharedArtifactFuture,
+    control: Arc<SemanticArtifactAttemptControl>,
+}
+
+impl std::future::Future for SemanticArtifactConsumer {
+    type Output = Option<Arc<SemanticArtifact>>;
+
+    fn poll(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        std::pin::Pin::new(&mut self.future).poll(cx)
+    }
+}
+
+impl Drop for SemanticArtifactConsumer {
+    fn drop(&mut self) {
+        if self
+            .control
+            .consumers
+            .fetch_sub(1, std::sync::atomic::Ordering::AcqRel)
+            == 1
+            && !self
+                .control
+                .complete
+                .load(std::sync::atomic::Ordering::Acquire)
+        {
+            if let Some(slot) = self.control.slot.upgrade() {
+                slot.cancel_unobserved_attempt(&self.control);
+            } else {
+                self.control.cancel.cancel();
+            }
+        }
+    }
+}
 
 static NEXT_ATTEMPT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
@@ -147,7 +196,7 @@ impl SemanticArtifactSlot {
         self: &Arc<Self>,
         identity: SemanticArtifactIdentity,
         produce: F,
-    ) -> SharedArtifactFuture
+    ) -> SemanticArtifactConsumer
     where
         F: FnOnce(crate::cancel::CancelToken, SemanticArtifactIdentity) -> Fut + Send + 'static,
         Fut: std::future::Future<Output = Option<SemanticArtifact>> + Send + 'static,
@@ -156,19 +205,34 @@ impl SemanticArtifactSlot {
         if let Some(current) = attempt.as_ref()
             && current.identity == identity
         {
+            current
+                .control
+                .consumers
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             #[cfg(test)]
             self.joins.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            return current.future.clone();
+            return SemanticArtifactConsumer {
+                future: current.future.clone(),
+                control: Arc::clone(&current.control),
+            };
         }
 
         if let Some(previous) = attempt.take() {
-            previous.cancel.cancel();
+            previous.control.cancel.cancel();
         }
 
         let id = NEXT_ATTEMPT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let cancel = crate::cancel::CancelToken::default();
         let producer_cancel = cancel.clone();
         let weak_slot = Arc::downgrade(self);
+        let control = Arc::new(SemanticArtifactAttemptControl {
+            id,
+            cancel,
+            consumers: std::sync::atomic::AtomicUsize::new(1),
+            complete: std::sync::atomic::AtomicBool::new(false),
+            slot: std::sync::Weak::clone(&weak_slot),
+        });
+        let producer_control = Arc::clone(&control);
         let producer_identity = identity.clone();
         let future = async move {
             #[cfg(test)]
@@ -190,6 +254,9 @@ impl SemanticArtifactSlot {
                         None
                     }
                 };
+            producer_control
+                .complete
+                .store(true, std::sync::atomic::Ordering::Release);
             if artifact.is_none()
                 && let Some(slot) = weak_slot.upgrade()
             {
@@ -201,25 +268,40 @@ impl SemanticArtifactSlot {
         .shared();
 
         *attempt = Some(SemanticArtifactAttempt {
-            id,
             identity,
-            cancel,
+            control: Arc::clone(&control),
             future: future.clone(),
         });
-        future
+        SemanticArtifactConsumer { future, control }
     }
 
     /// Cancel production because the owning snapshot is no longer current.
     pub(crate) fn cancel(&self) {
         let attempt = self.attempt.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(attempt) = attempt.as_ref() {
-            attempt.cancel.cancel();
+            attempt.control.cancel.cancel();
         }
     }
 
     fn remove_failed_attempt(&self, id: u64) {
         let mut attempt = self.attempt.lock().unwrap_or_else(|e| e.into_inner());
-        if attempt.as_ref().is_some_and(|attempt| attempt.id == id) {
+        if attempt
+            .as_ref()
+            .is_some_and(|attempt| attempt.control.id == id)
+        {
+            *attempt = None;
+        }
+    }
+
+    fn cancel_unobserved_attempt(&self, control: &Arc<SemanticArtifactAttemptControl>) {
+        let mut attempt = self.attempt.lock().unwrap_or_else(|e| e.into_inner());
+        let should_cancel = attempt.as_ref().is_some_and(|attempt| {
+            Arc::ptr_eq(&attempt.control, control)
+                && control.consumers.load(std::sync::atomic::Ordering::Acquire) == 0
+                && !control.complete.load(std::sync::atomic::Ordering::Acquire)
+        });
+        if should_cancel {
+            control.cancel.cancel();
             *attempt = None;
         }
     }
@@ -579,6 +661,30 @@ mod tests {
             .materialize_full(identity().as_ref(), None)
             .expect("matching identity");
         assert_eq!(tokens.data[0].token_type, 4);
+    }
+
+    #[tokio::test]
+    async fn dropping_last_consumer_cancels_and_vacates_attempt() {
+        let slot = std::sync::Arc::new(SemanticArtifactSlot::new());
+        let (token_tx, token_rx) = tokio::sync::oneshot::channel();
+        let first = slot.claim_or_join(identity(), move |cancel, _identity| async move {
+            token_tx.send(cancel.clone()).ok();
+            cancel.cancelled().await;
+            None
+        });
+        let first = tokio::spawn(first);
+        let token = token_rx.await.expect("producer exposes its token");
+        first.abort();
+        token.cancelled().await;
+
+        let retry = slot.claim_or_join(identity(), |_cancel, identity| async move {
+            Some(artifact(identity, 6))
+        });
+        let retry = retry.await.expect("next consumer becomes producer");
+        let tokens = retry
+            .materialize_full(identity().as_ref(), None)
+            .expect("matching identity");
+        assert_eq!(tokens.data[0].token_type, 6);
     }
 
     #[tokio::test]
