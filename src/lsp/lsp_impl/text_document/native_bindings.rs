@@ -130,8 +130,7 @@ impl Kakehashi {
                 &tree,
                 &language,
                 byte,
-                incarnation,
-                content_version,
+                (incarnation, content_version),
             )
             .await
         {
@@ -224,8 +223,7 @@ impl Kakehashi {
         tree: &tree_sitter::Tree,
         host_language: &str,
         byte: usize,
-        incarnation: u64,
-        content_version: u64,
+        snapshot_identity: (u64, u64),
     ) -> Option<Option<LayerInputs>> {
         use crate::language::injection::{
             collect_all_injections, compute_included_ranges, parse_with_ranges,
@@ -277,8 +275,8 @@ impl Kakehashi {
                 crate::compute_pool::ComputeWork::document(
                     "native_bindings_parse",
                     uri,
-                    Some(incarnation),
-                    Some(content_version),
+                    Some(snapshot_identity.0),
+                    Some(snapshot_identity.1),
                 ),
                 // The work-unit deadline is for main-document parses;
                 // parse_with_ranges self-bounds at NATIVE_PARSE_BUDGET.
