@@ -243,7 +243,6 @@ pub(crate) async fn handle_semantic_tokens_full(
         drop(active_injection_regions);
         drop(lines);
         drop(line_starts);
-        drop(cache_ctx);
         #[cfg(feature = "allocation-profile")]
         let allocation_delta =
             crate::allocation_profile::snapshot().delta_since(allocation_started);
@@ -275,12 +274,11 @@ pub(crate) async fn handle_semantic_tokens_full(
         {
             log::debug!(
                 target: "kakehashi::semantic",
-                "[SEMANTIC_TOKENS] compute allocations: allocations={} allocated_bytes={} deallocations={} deallocated_bytes={} live_bytes_change={} scope=process_delta",
+                "[SEMANTIC_TOKENS] compute allocations: allocations={} allocated_bytes={} deallocations={} deallocated_bytes={} scope=process_delta consistency=non_atomic_snapshot",
                 allocation_delta.allocations(),
                 allocation_delta.allocated_bytes(),
                 allocation_delta.deallocations(),
                 allocation_delta.deallocated_bytes(),
-                allocation_delta.live_bytes_change(),
             );
         }
 

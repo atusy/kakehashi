@@ -108,10 +108,6 @@ impl Delta {
     pub fn deallocated_bytes(self) -> u64 {
         self.deallocated_bytes
     }
-
-    pub fn live_bytes_change(self) -> i128 {
-        i128::from(self.allocated_bytes) - i128::from(self.deallocated_bytes)
-    }
 }
 
 pub fn snapshot() -> Snapshot {
@@ -128,7 +124,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn snapshot_delta_reports_traffic_and_live_byte_change() {
+    fn snapshot_delta_reports_allocation_and_deallocation_traffic() {
         let before = Snapshot {
             allocations: 10,
             allocated_bytes: 1_000,
@@ -148,6 +144,5 @@ mod tests {
         assert_eq!(delta.allocated_bytes, 900);
         assert_eq!(delta.deallocations, 3);
         assert_eq!(delta.deallocated_bytes, 500);
-        assert_eq!(delta.live_bytes_change(), 400);
     }
 }
