@@ -130,11 +130,15 @@ touch "$profile_dir/start"
 # alive during the hold interval so retained-heap tools can inspect it.
 wait_for_driver_marker "$profile_dir/done" || exit $?
 heap -H "$server_pid"
+heap_status=$?
 touch "$profile_dir/stop"
+stop_status=$?
 wait "$driver_pid"
 driver_status=$?
 trap - EXIT HUP INT TERM
 rm -r "$profile_dir"
+[ "$heap_status" -eq 0 ] || exit "$heap_status"
+[ "$stop_status" -eq 0 ] || exit "$stop_status"
 [ "$driver_status" -eq 0 ] || exit "$driver_status"
 ```
 
