@@ -133,18 +133,18 @@ fn resolve_user_mapping(mapped: &str) -> CaptureResult {
 /// Names follow `type.modifier1.modifier2`. Returns `None` for unknown types
 /// (not in LEGEND_TYPES); unknown modifiers are silently ignored.
 pub(super) fn map_capture_to_token_type_and_modifiers(capture_name: &str) -> Option<(u32, u32)> {
-    let parts: Vec<&str> = capture_name.split('.').collect();
-    let token_type_name = parts.first().copied().filter(|s| !s.is_empty())?;
+    let mut parts = capture_name.split('.');
+    let token_type_name = parts.next().filter(|s| !s.is_empty())?;
 
     let token_type_index = LEGEND_TYPES
         .iter()
         .position(|t| t.as_str() == token_type_name)? as u32;
 
     let mut modifiers_bitset = 0u32;
-    for modifier_name in &parts[1..] {
+    for modifier_name in parts {
         if let Some(index) = LEGEND_MODIFIERS
             .iter()
-            .position(|m| m.as_str() == *modifier_name)
+            .position(|m| m.as_str() == modifier_name)
         {
             modifiers_bitset |= 1 << index;
         }
@@ -287,6 +287,10 @@ mod tests {
     #[case::function_async("function.async", Some((14, 1 << 6)))]
     #[case::variable_readonly_default_library("variable.readonly.defaultLibrary", Some((17, (1 << 2) | (1 << 9))))]
     #[case::function_unknown_modifier_async("function.unknownModifier.async", Some((14, 1 << 6)))]
+    #[case::empty_base_with_modifier(".readonly", None)]
+    #[case::empty_modifier_between_known_modifiers("variable.readonly..static", Some((17, (1 << 2) | (1 << 3))))]
+    #[case::trailing_empty_modifier("variable.readonly.", Some((17, 1 << 2)))]
+    #[case::duplicate_modifier("variable.readonly.readonly", Some((17, 1 << 2)))]
     fn test_map_capture_to_token_type_and_modifiers(
         #[case] capture_name: &str,
         #[case] expected: Option<(u32, u32)>,
