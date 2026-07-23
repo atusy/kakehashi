@@ -187,6 +187,30 @@ class RequestSummaryTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "must be distinct"):
                 validate_profile_marker_paths([marker, directory / "READY"])
 
+    def test_profile_timing_options_must_be_finite(self):
+        drive = str(pathlib.Path(__file__).parent / "drive.py")
+        for option, value in (
+            ("--profile-wait-timeout", "nan"),
+            ("--profile-wait-timeout", "inf"),
+            ("--profile-hold-seconds", "nan"),
+            ("--profile-hold-seconds", "inf"),
+        ):
+            with self.subTest(option=option, value=value):
+                result = subprocess.run(
+                    [
+                        sys.executable,
+                        drive,
+                        "--bin=not-used-after-validation",
+                        "--requests=1",
+                        f"{option}={value}",
+                    ],
+                    capture_output=True,
+                    text=True,
+                    timeout=3,
+                )
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertIn("must be finite", result.stderr)
+
     def test_summarizes_latency_status_and_wire_bytes(self):
         samples = [
             RequestSample(seconds=0.010, wire_bytes=100, status="ok"),
