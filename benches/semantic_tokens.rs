@@ -40,9 +40,12 @@
 //! comparisons should use `benches/collect_semantic_pairs.py`, which supplies
 //! the fixture and binary attestations required by raw output.
 
+#[path = "support/dirty_footprint.rs"]
+mod dirty_footprint;
 #[path = "support/semantic_baseline.rs"]
 mod semantic_baseline;
 
+use dirty_footprint::{DIRTY_STATE_COUNT, gen_dirty_rust, gen_dirty_rust_replacements};
 use semantic_baseline::{
     SemanticBaseline, TRACKED_MARKER, tracked_marker_line, validate_token_payload,
 };
@@ -231,6 +234,29 @@ impl Server {
                     "range": {
                         "start": { "line": line, "character": 0 },
                         "end": { "line": line, "character": FIXED_WIDTH_STATE_COUNT },
+                    },
+                    "text": text,
+                }],
+            }),
+        );
+    }
+
+    fn did_change_replace_lines(
+        &mut self,
+        uri: &str,
+        version: i64,
+        start_line: u32,
+        end_line: u32,
+        text: &str,
+    ) {
+        self.notify(
+            "textDocument/didChange",
+            json!({
+                "textDocument": { "uri": uri, "version": version },
+                "contentChanges": [{
+                    "range": {
+                        "start": { "line": start_line, "character": 0 },
+                        "end": { "line": end_line, "character": 0 },
                     },
                     "text": text,
                 }],
@@ -553,6 +579,14 @@ enum Kind {
     TypingDelta,
     /// Unique same-width edit states, preserving the scenario's exact byte size.
     FixedWidthTypingDelta,
+    /// Replace a contiguous percentage of dense Rust syntax units while keeping
+    /// line count stable and exposing freshness through the tracked token.
+    DirtyFootprintTypingDelta {
+        edit_start_line: u32,
+        edit_end_line: u32,
+        dirty_units: usize,
+        total_units: usize,
+    },
     /// Several edits arrive before the one semantic-token request whose result
     /// is still useful to an editor.
     TypingBurst { edits: usize },
@@ -576,6 +610,8 @@ struct EditState {
     line: u32,
     range_next: u32,
     fixed_width_next: usize,
+    dirty_state_next: usize,
+    dirty_replacements: Vec<String>,
 }
 
 struct Scenario {
@@ -615,6 +651,13 @@ fn measure(
             scn.name
         );
     }
+    if matches!(scn.kind, Kind::DirtyFootprintTypingDelta { .. }) {
+        assert!(
+            warmup + iters < DIRTY_STATE_COUNT,
+            "{} requires fewer than {DIRTY_STATE_COUNT} total dirty states",
+            scn.name
+        );
+    }
     if let Kind::CancelBurst { obsolete } = scn.kind {
         return measure_cancel_burst(bin, scn, data_dir, iters, warmup, obsolete);
     }
@@ -629,6 +672,12 @@ fn measure(
     // Delta scenarios retain and validate the complete client-side baseline,
     // rather than treating a fresh resultId as proof of a current response.
     let mut baseline = seed_baseline(&mut server, scn);
+    let dirty_replacements = match scn.kind {
+        Kind::DirtyFootprintTypingDelta { dirty_units, .. } => {
+            gen_dirty_rust_replacements(dirty_units, warmup + iters)
+        }
+        _ => Vec::new(),
+    };
     let mut edit = EditState {
         version: 1,
         // First edit must insert (the document opens with no extra space).
@@ -636,6 +685,8 @@ fn measure(
         line: baseline.as_ref().map_or(0, SemanticBaseline::tracked_line),
         range_next: 0,
         fixed_width_next: 0,
+        dirty_state_next: 0,
+        dirty_replacements,
     };
 
     for _ in 0..warmup {
@@ -804,6 +855,7 @@ fn seed_baseline(server: &mut Server, scn: &Scenario) -> Option<SemanticBaseline
         | Kind::EditDelta
         | Kind::TypingDelta
         | Kind::FixedWidthTypingDelta
+        | Kind::DirtyFootprintTypingDelta { .. }
         | Kind::TypingBurst { .. } => {
             let tracked_line = tracked_marker_line(&scn.content).unwrap_or_else(|error| {
                 panic!("invalid tracked marker for {}: {error:?}", scn.name)
@@ -899,6 +951,33 @@ fn run_once(
                 panic!("invalid semantic response for {}: {error:?}", scn.name)
             });
         }
+        Kind::DirtyFootprintTypingDelta {
+            edit_start_line,
+            edit_end_line,
+            dirty_units,
+            total_units,
+        } => {
+            edit.version += 1;
+            edit.dirty_state_next += 1;
+            let state = edit.dirty_state_next;
+            let replacement = &edit.dirty_replacements[state - 1];
+            server.did_change_replace_lines(
+                scn.uri,
+                edit.version,
+                edit_start_line,
+                edit_end_line,
+                replacement,
+            );
+            let baseline = baseline.as_mut().expect("dirty-footprint baseline");
+            baseline.expect_tracked_start(u32::try_from(state).expect("dirty state fits u32"));
+            let result = server.semantic_delta(scn.uri, baseline.result_id());
+            baseline.apply_response(&result).unwrap_or_else(|error| {
+                panic!(
+                    "invalid semantic response for {} ({dirty_units}/{total_units} dirty units): {error:?}",
+                    scn.name
+                )
+            });
+        }
         Kind::TypingBurst { edits } => {
             for _ in 0..edits {
                 edit.version += 1;
@@ -924,6 +1003,29 @@ fn validate_full_response_generators() {
         gen_unicode_rust(1),
     ] {
         tracked_marker_line(&content).expect("full-response generator has one fixed marker");
+    }
+}
+
+fn dirty_footprint_scenario(
+    name: &'static str,
+    uri: &'static str,
+    dirty_units: usize,
+    targets: &'static str,
+) -> Scenario {
+    let document = gen_dirty_rust(100, dirty_units);
+    let kind = Kind::DirtyFootprintTypingDelta {
+        edit_start_line: document.edit_start_line,
+        edit_end_line: document.edit_end_line,
+        dirty_units: document.dirty_units,
+        total_units: document.total_units,
+    };
+    Scenario {
+        name,
+        language_id: "rust",
+        uri,
+        content: document.content,
+        kind,
+        targets,
     }
 }
 
@@ -1031,6 +1133,24 @@ fn main() {
             kind: Kind::TypingDelta,
             targets: "unique edit states→reparse→retokenize→delta; excludes A/B cache returns",
         },
+        dirty_footprint_scenario(
+            "rust_dirty_01pct/typing_delta",
+            "file:///bench/dirty_01pct.rs",
+            1,
+            "1/100 dense syntax units replaced; incremental lower-bound target",
+        ),
+        dirty_footprint_scenario(
+            "rust_dirty_10pct/typing_delta",
+            "file:///bench/dirty_10pct.rs",
+            10,
+            "10/100 dense syntax units replaced; partial-reuse crossover target",
+        ),
+        dirty_footprint_scenario(
+            "rust_dirty_50pct/typing_delta",
+            "file:///bench/dirty_50pct.rs",
+            50,
+            "50/100 dense syntax units replaced; full-fallback crossover control",
+        ),
         Scenario {
             name: "rust_sparse_32k_minus/typing_delta",
             language_id: "rust",
