@@ -175,77 +175,38 @@ impl ComputePool {
         F: FnOnce() -> T + Send + 'static,
         T: Send + 'static,
     {
+        match attribution.0 {
+            Some(trace) => self.run_traced(trace, cancel, work).await,
+            None => self.run_untraced(cancel, work).await,
+        }
+    }
+
+    /// Keep the logging-disabled worker closure equivalent to the original
+    /// compute-pool hot path. In particular, none of the structured lifecycle
+    /// branches or trace timing state becomes part of rapid typing work.
+    #[inline(always)]
+    async fn run_untraced<T, F>(&self, cancel: Option<CancelToken>, work: F) -> Option<T>
+    where
+        F: FnOnce() -> T + Send + 'static,
+        T: Send + 'static,
+    {
         let (tx, rx) = tokio::sync::oneshot::channel();
         let cancel_for_work = cancel.clone();
-        // Scheduling-latency instrumentation: a slow response with a fast
-        // compute means the time went to the pool QUEUE (enqueue→start: pool
-        // threads busy with other work-units) or to the RESUME (work end→
-        // awaiter progress: the tokio runtime not scheduling the handler) —
-        // exactly the split a user-supplied debug log needs to attribute a
-        // stall (see the 20s-response investigation).
         let enqueued = std::time::Instant::now();
-        let work_id = attribution
-            .0
-            .as_ref()
-            .map(|_| NEXT_WORK_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
         self.pool.spawn(move || {
             let queued_for = enqueued.elapsed();
-            if let (Some(work_id), Some(work)) = (work_id, attribution.0.as_deref()) {
+            if queued_for.as_millis() > 100 {
                 log::debug!(
                     target: TRACE_TARGET,
-                    "{}",
-                    ComputeEvent {
-                        work_id,
-                        work,
-                        event: "started",
-                        queue_us: queued_for.as_micros(),
-                        run_us: None,
-                        elapsed_us: enqueued.elapsed().as_micros(),
-                        cancelled: crate::cancel::is_cancelled(cancel_for_work.as_ref()),
-                    }
+                    "work unit waited {}ms in the pool queue",
+                    queued_for.as_millis()
                 );
             }
             if crate::cancel::is_cancelled(cancel_for_work.as_ref()) {
-                if let (Some(work_id), Some(work)) = (work_id, attribution.0.as_deref()) {
-                    log::debug!(
-                        target: TRACE_TARGET,
-                        "{}",
-                        ComputeEvent {
-                            work_id,
-                            work,
-                            event: "skipped",
-                            queue_us: queued_for.as_micros(),
-                            run_us: Some(0),
-                            elapsed_us: enqueued.elapsed().as_micros(),
-                            cancelled: true,
-                        }
-                    );
-                }
-                return; // dropping tx resolves the awaiter with None
+                return;
             }
-            // Avoid a second clock read on the production fast path. Queue
-            // timing already existed before attribution; execution timing is
-            // sampled only when this debug target is enabled.
-            let started = work_id.map(|_| std::time::Instant::now());
-            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(work));
-            let run_us = started.map(|started| started.elapsed().as_micros());
-            match outcome {
+            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(work)) {
                 Ok(value) => {
-                    if let (Some(work_id), Some(work)) = (work_id, attribution.0.as_deref()) {
-                        log::debug!(
-                            target: TRACE_TARGET,
-                            "{}",
-                            ComputeEvent {
-                                work_id,
-                                work,
-                                event: "finished",
-                                queue_us: queued_for.as_micros(),
-                                run_us,
-                                elapsed_us: enqueued.elapsed().as_micros(),
-                                cancelled: crate::cancel::is_cancelled(cancel_for_work.as_ref()),
-                            }
-                        );
-                    }
                     let _ = tx.send(value);
                 }
                 Err(payload) => {
@@ -258,24 +219,117 @@ impl ComputePool {
                         target: "kakehashi::crash_recovery",
                         "compute-pool work unit panicked: {msg}"
                     );
-                    if let (Some(work_id), Some(work)) = (work_id, attribution.0.as_deref()) {
-                        log::debug!(
-                            target: TRACE_TARGET,
-                            "{}",
-                            ComputeEvent {
-                                work_id,
-                                work,
-                                event: "panicked",
-                                queue_us: queued_for.as_micros(),
-                                run_us,
-                                elapsed_us: enqueued.elapsed().as_micros(),
-                                cancelled: crate::cancel::is_cancelled(cancel_for_work.as_ref()),
-                            }
-                        );
-                    }
                 }
             }
         });
+        Self::await_result(cancel, rx).await
+    }
+
+    #[inline(never)]
+    async fn run_traced<T, F>(
+        &self,
+        trace: Box<ComputeWorkTrace>,
+        cancel: Option<CancelToken>,
+        work: F,
+    ) -> Option<T>
+    where
+        F: FnOnce() -> T + Send + 'static,
+        T: Send + 'static,
+    {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let cancel_for_work = cancel.clone();
+        // Scheduling-latency instrumentation: a slow response with a fast
+        // compute means the time went to the pool QUEUE (enqueue→start: pool
+        // threads busy with other work-units) or to the RESUME (work end→
+        // awaiter progress: the tokio runtime not scheduling the handler) —
+        // exactly the split a user-supplied debug log needs to attribute a
+        // stall (see the 20s-response investigation).
+        let enqueued = std::time::Instant::now();
+        let work_id = NEXT_WORK_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.pool.spawn(move || {
+            let queued_for = enqueued.elapsed();
+            log::debug!(
+                target: TRACE_TARGET,
+                "{}",
+                ComputeEvent {
+                    work_id,
+                    work: &trace,
+                    event: "started",
+                    queue_us: queued_for.as_micros(),
+                    run_us: None,
+                    elapsed_us: enqueued.elapsed().as_micros(),
+                    cancelled: crate::cancel::is_cancelled(cancel_for_work.as_ref()),
+                }
+            );
+            if crate::cancel::is_cancelled(cancel_for_work.as_ref()) {
+                log::debug!(
+                    target: TRACE_TARGET,
+                    "{}",
+                    ComputeEvent {
+                        work_id,
+                        work: &trace,
+                        event: "skipped",
+                        queue_us: queued_for.as_micros(),
+                        run_us: Some(0),
+                        elapsed_us: enqueued.elapsed().as_micros(),
+                        cancelled: true,
+                    }
+                );
+                return; // dropping tx resolves the awaiter with None
+            }
+            let started = std::time::Instant::now();
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(work));
+            let run_us = started.elapsed().as_micros();
+            match outcome {
+                Ok(value) => {
+                    log::debug!(
+                        target: TRACE_TARGET,
+                        "{}",
+                        ComputeEvent {
+                            work_id,
+                            work: &trace,
+                            event: "finished",
+                            queue_us: queued_for.as_micros(),
+                            run_us: Some(run_us),
+                            elapsed_us: enqueued.elapsed().as_micros(),
+                            cancelled: crate::cancel::is_cancelled(cancel_for_work.as_ref()),
+                        }
+                    );
+                    let _ = tx.send(value);
+                }
+                Err(payload) => {
+                    let msg = payload
+                        .downcast_ref::<&str>()
+                        .map(|s| s.to_string())
+                        .or_else(|| payload.downcast_ref::<String>().cloned())
+                        .unwrap_or_else(|| "<non-string panic payload>".to_string());
+                    log::error!(
+                        target: "kakehashi::crash_recovery",
+                        "compute-pool work unit panicked: {msg}"
+                    );
+                    log::debug!(
+                        target: TRACE_TARGET,
+                        "{}",
+                        ComputeEvent {
+                            work_id,
+                            work: &trace,
+                            event: "panicked",
+                            queue_us: queued_for.as_micros(),
+                            run_us: Some(run_us),
+                            elapsed_us: enqueued.elapsed().as_micros(),
+                            cancelled: crate::cancel::is_cancelled(cancel_for_work.as_ref()),
+                        }
+                    );
+                }
+            }
+        });
+        Self::await_result(cancel, rx).await
+    }
+
+    async fn await_result<T>(
+        cancel: Option<CancelToken>,
+        rx: tokio::sync::oneshot::Receiver<T>,
+    ) -> Option<T> {
         // The oneshot resolves the moment the work-unit sends. The other
         // latency half — "work done" to "handler resumed" — cannot be
         // measured from inside this future; the runtime-stall watchdog (see
