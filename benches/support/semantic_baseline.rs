@@ -78,6 +78,10 @@ impl SemanticBaseline {
         self.tracked_line
     }
 
+    pub(crate) fn expected_start(&self) -> u32 {
+        self.expected_start
+    }
+
     pub(crate) fn record_prefix_insert(&mut self, count: u32) -> Result<(), ValidationError> {
         self.expected_start = self
             .expected_start
@@ -127,6 +131,23 @@ pub(crate) fn validate_token_payload(result: &Value) -> Result<(), ValidationErr
     let data = full_data(result)?.ok_or(ValidationError::MissingTokenPayload)?;
     if !data.len().is_multiple_of(TOKEN_WIDTH) {
         return Err(ValidationError::InvalidTokenDataLength { len: data.len() });
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_tracked_token(
+    result: &Value,
+    tracked_line: u32,
+    expected_start: u32,
+) -> Result<(), ValidationError> {
+    let data = full_data(result)?.ok_or(ValidationError::MissingTokenPayload)?;
+    let actual_start = first_token_start(&data, tracked_line)?;
+    if actual_start != expected_start {
+        return Err(ValidationError::TrackedTokenMismatch {
+            line: tracked_line,
+            expected_start,
+            actual_start,
+        });
     }
     Ok(())
 }

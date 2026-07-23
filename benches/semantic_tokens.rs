@@ -45,6 +45,7 @@ mod semantic_baseline;
 
 use semantic_baseline::{
     SemanticBaseline, TRACKED_MARKER, tracked_marker_line, validate_token_payload,
+    validate_tracked_token,
 };
 use serde_json::{Value, json};
 use std::collections::HashMap;
@@ -170,6 +171,16 @@ impl Server {
                 }
             }),
         )
+    }
+
+    /// Wait until the edit's parse is current without populating the semantic
+    /// token cache. Rust has no injection query in the benchmark fixture, so
+    /// this request stops after `ensure_document_parsed`.
+    fn wait_until_parsed(&mut self, uri: &str) {
+        self.request(
+            "textDocument/documentSymbol",
+            json!({ "textDocument": { "uri": uri } }),
+        );
     }
 
     /// Incremental `didChange` that toggles a single space at the start of
@@ -559,6 +570,10 @@ enum Kind {
     /// Several full requests become obsolete and are explicitly cancelled
     /// before the one response an editor can still use.
     CancelBurst { obsolete: usize },
+    /// A delta and viewport request for one freshly parsed snapshot are sent
+    /// back-to-back. Both need the same whole-document semantic artifact but
+    /// shape independent LSP responses.
+    SameSnapshotFanout { start_line: u32, end_line: u32 },
     /// Cold-open latency: each iteration opens a FRESH document and times
     /// `didOpen` → first `semanticTokens/full` response — the editor-visible
     /// "open the file, see highlights" latency. The one scenario that captures
@@ -618,6 +633,15 @@ fn measure(
     if let Kind::CancelBurst { obsolete } = scn.kind {
         return measure_cancel_burst(bin, scn, data_dir, iters, warmup, obsolete);
     }
+    if let Kind::SameSnapshotFanout {
+        start_line,
+        end_line,
+    } = scn.kind
+    {
+        return measure_same_snapshot_fanout(
+            bin, scn, data_dir, iters, warmup, start_line, end_line,
+        );
+    }
     if let Kind::OpenFirstToken = scn.kind {
         return measure_open(bin, scn, data_dir, iters, warmup);
     }
@@ -652,6 +676,99 @@ fn measure(
         samples,
         discarded_attempts: 0,
     }
+}
+
+fn measure_same_snapshot_fanout(
+    bin: &Binary,
+    scn: &Scenario,
+    data_dir: &str,
+    iters: usize,
+    warmup: usize,
+    start_line: u32,
+    end_line: u32,
+) -> Measurement {
+    let mut server = Server::start(&bin.path, data_dir);
+    server.did_open(scn.uri, scn.language_id, &scn.content);
+    std::thread::sleep(Duration::from_millis(300));
+
+    let tracked_line = tracked_marker_line(&scn.content)
+        .unwrap_or_else(|error| panic!("invalid tracked marker for {}: {error:?}", scn.name));
+    assert!(
+        start_line <= tracked_line && tracked_line < end_line,
+        "{} range must contain its tracked marker",
+        scn.name
+    );
+    let mut baseline = SemanticBaseline::from_full(&server.semantic_full(scn.uri), tracked_line)
+        .unwrap_or_else(|error| panic!("invalid semantic baseline for {}: {error:?}", scn.name));
+    let mut version = 1_i64;
+    let mut samples = Vec::with_capacity(iters);
+
+    for iteration in 0..(warmup + iters) {
+        version += 1;
+        server.did_change_insert_space(scn.uri, version, tracked_line);
+        baseline
+            .record_prefix_insert(1)
+            .expect("tracked position remains valid");
+
+        // Keep parse latency outside this measurement. The measured work is
+        // specifically the duplicate whole-document semantic computation and
+        // request-local delta/range shaping for one immutable snapshot.
+        server.wait_until_parsed(scn.uri);
+
+        let started = Instant::now();
+        let delta_id = server.send_request(
+            "textDocument/semanticTokens/full/delta",
+            json!({
+                "textDocument": { "uri": scn.uri },
+                "previousResultId": baseline.result_id(),
+            }),
+        );
+        let range_id = server.send_request(
+            "textDocument/semanticTokens/range",
+            json!({
+                "textDocument": { "uri": scn.uri },
+                "range": {
+                    "start": { "line": start_line, "character": 0 },
+                    "end": { "line": end_line, "character": 0 },
+                }
+            }),
+        );
+
+        let delta_response = server.recv_raw_response(delta_id);
+        let range_response = server.recv_raw_response(range_id);
+        let elapsed = started.elapsed();
+        let delta_result = response_result(delta_id, &delta_response);
+        let range_result = response_result(range_id, &range_response);
+
+        baseline
+            .apply_response(delta_result)
+            .unwrap_or_else(|error| panic!("invalid delta response for {}: {error:?}", scn.name));
+        validate_tracked_token(range_result, tracked_line, baseline.expected_start())
+            .unwrap_or_else(|error| {
+                panic!(
+                    "stale or invalid range response for {}: {error:?}",
+                    scn.name
+                )
+            });
+
+        if iteration >= warmup {
+            samples.push(elapsed);
+        }
+    }
+
+    Measurement {
+        samples,
+        discarded_attempts: 0,
+    }
+}
+
+fn response_result(id: i64, response: &Value) -> &Value {
+    if let Some(error) = response.get("error") {
+        panic!("server returned a JSON-RPC error for request id={id}: {error}");
+    }
+    response
+        .get("result")
+        .unwrap_or_else(|| panic!("server response for request id={id} has no result: {response}"))
 }
 
 fn measure_cancel_burst(
@@ -800,6 +917,7 @@ fn validate_full_response(scn: &Scenario, result: &Value) {
 fn seed_baseline(server: &mut Server, scn: &Scenario) -> Option<SemanticBaseline> {
     match scn.kind {
         Kind::Full | Kind::Range { .. } | Kind::OpenFirstToken | Kind::CancelBurst { .. } => None,
+        Kind::SameSnapshotFanout { .. } => None,
         Kind::DeltaNoop
         | Kind::EditDelta
         | Kind::TypingDelta
@@ -828,6 +946,9 @@ fn run_once(
         // Handled by `measure_open`, which never calls `run_once`.
         Kind::OpenFirstToken => unreachable!("OpenFirstToken uses measure_open"),
         Kind::CancelBurst { .. } => unreachable!("CancelBurst uses measure_cancel_burst"),
+        Kind::SameSnapshotFanout { .. } => {
+            unreachable!("SameSnapshotFanout uses measure_same_snapshot_fanout")
+        }
         Kind::Full => {
             let result = server.semantic_full(scn.uri);
             validate_full_response(scn, &result);
@@ -1078,6 +1199,17 @@ fn main() {
             content: gen_rust(600),
             kind: Kind::CancelBurst { obsolete: 4 },
             targets: "current-token latency after four explicitly cancelled edit states",
+        },
+        Scenario {
+            name: "rust_xlarge/same_snapshot_fanout",
+            language_id: "rust",
+            uri: "file:///bench/same_snapshot_fanout.rs",
+            content: gen_rust(600),
+            kind: Kind::SameSnapshotFanout {
+                start_line: 0,
+                end_line: 80,
+            },
+            targets: "concurrent delta + range consumers of one freshly parsed snapshot; all-consumer latency and freshness",
         },
         Scenario {
             name: "markdown_injections/edit_delta",
