@@ -196,8 +196,14 @@ impl ParseCoordinator {
                 let mut parse_fn = parse_fn;
                 let mut language_name_owned = language_name_owned;
                 for attempt in 0..2 {
+                    if crate::cancel::is_cancelled(cancel_for_work.as_ref()) {
+                        return None;
+                    }
                     let reload_wait_deadline = std::time::Instant::now() + RELOAD_WAIT_BACKSTOP;
                     let (parser, parser_generation) = loop {
+                        if crate::cancel::is_cancelled(cancel_for_work.as_ref()) {
+                            return None;
+                        }
                         match parser_pool
                             .lock()
                             .recover_poison("ParseCoordinator::parse_with_pool(acquire)")
