@@ -555,11 +555,12 @@ impl Kakehashi {
         });
         // The artifact contains no request lineage. Materialization checks the
         // complete identity before assigning this request's result ID.
-        let result_id = Some(next_result_id());
         let tokens_with_id = artifact
-            .and_then(|artifact| artifact.into_full(expected_artifact_identity, result_id.clone()))
+            .and_then(|artifact| {
+                artifact.into_full(expected_artifact_identity, Some(next_result_id()))
+            })
             .unwrap_or_else(|| SemanticTokens {
-                result_id,
+                result_id: Some(next_result_id()),
                 data: Vec::new(),
             });
         let stored_tokens = tokens_with_id.clone();
