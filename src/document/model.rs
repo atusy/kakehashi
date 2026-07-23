@@ -93,6 +93,11 @@ pub struct Document {
     /// `Document` and with it a fresh cell, which is what clears the version
     /// floor for the new lifetime.
     snapshot_tx: watch::Sender<SnapshotSlot>,
+    /// Cancellation scope for work derived from the current input version.
+    /// Every input mutation cancels this token before installing a fresh one,
+    /// so queued or running parse/derived work can stop once its
+    /// `(incarnation, content_version)` is obsolete.
+    version_cancel: crate::cancel::CancelToken,
 }
 
 impl Document {
@@ -106,6 +111,7 @@ impl Document {
             incarnation,
             content_version: 0,
             snapshot_tx: watch::Sender::new(SnapshotSlot::bootstrap(incarnation)),
+            version_cancel: crate::cancel::CancelToken::default(),
         }
     }
 
@@ -119,6 +125,7 @@ impl Document {
             incarnation,
             content_version: 0,
             snapshot_tx: watch::Sender::new(SnapshotSlot::bootstrap(incarnation)),
+            version_cancel: crate::cancel::CancelToken::default(),
         }
     }
 
@@ -137,6 +144,7 @@ impl Document {
             incarnation,
             content_version: 0,
             snapshot_tx: watch::Sender::new(SnapshotSlot::bootstrap(incarnation)),
+            version_cancel: crate::cancel::CancelToken::default(),
         }
     }
 
@@ -174,6 +182,12 @@ impl Document {
         self.content_version
     }
 
+    fn advance_input_version(&mut self) {
+        self.version_cancel.cancel();
+        self.version_cancel = crate::cancel::CancelToken::default();
+        self.content_version = self.content_version.wrapping_add(1);
+    }
+
     /// Install `snapshot` in this document's cell iff the slot admits it —
     /// the one publish primitive (parse-snapshot ADR §2), executed inside
     /// `send_if_modified` so the guard and the write are atomic under the
@@ -199,6 +213,7 @@ impl Document {
     /// pass the bootstrap branch. Explicit because stale parse tasks may hold
     /// `Sender` clones that keep the channel alive past this document's drop.
     pub(crate) fn publish_closed(&self) {
+        self.version_cancel.cancel();
         self.snapshot_tx.send_replace(SnapshotSlot::closed());
     }
 
@@ -235,7 +250,7 @@ impl Document {
     #[cfg(test)]
     pub(crate) fn update_tree_and_text(&mut self, new_tree: Tree, new_text: String) {
         self.text = Arc::from(new_text);
-        self.content_version += 1;
+        self.advance_input_version();
         self.tree = Some(new_tree);
         // Any pending incremental seed is for an edit superseded by this fresh
         // tree+text; keep the invariant "visible tree present ⟹ no stale seed" so a
@@ -264,7 +279,7 @@ impl Document {
         // Grammar/query settings are parse inputs even when text is unchanged.
         // Advancing the internal version makes every pre-reload parse result
         // stale and lets the scheduled current-generation snapshot supersede it.
-        self.content_version = self.content_version.wrapping_add(1);
+        self.advance_input_version();
         self.snapshot_tx.send_replace(SnapshotSlot {
             current_incarnation: self.incarnation,
             snapshot: Some(Arc::new(ParseSnapshot {
@@ -323,7 +338,7 @@ impl Document {
             _ => None,
         };
         self.text = Arc::from(new_text);
-        self.content_version += 1;
+        self.advance_input_version();
     }
 
     /// The off-ingress incremental parse seed, if any. **Read only by
@@ -340,7 +355,7 @@ impl Document {
         // Note: Tree needs to be rebuilt after text change
         self.tree = None;
         self.pending_seed = None;
-        self.content_version += 1;
+        self.advance_input_version();
     }
 }
 
@@ -407,6 +422,24 @@ mod tests {
         // An incremental edit bumps.
         doc.apply_edit_and_seed("fn main() {  }".to_string(), &[]);
         assert_eq!(doc.content_version(), 2);
+    }
+
+    #[test]
+    fn input_mutation_cancels_only_obsolete_version_work() {
+        let mut doc = Document::new("fn main() {}".to_string(), 1);
+        let obsolete = doc.version_cancel.clone();
+        assert!(!obsolete.is_cancelled());
+
+        doc.apply_edit_and_seed("fn main() { }".to_string(), &[]);
+
+        assert!(
+            obsolete.is_cancelled(),
+            "work derived from the pre-edit version must be cancelled"
+        );
+        assert!(
+            !doc.version_cancel.is_cancelled(),
+            "the new version must receive a live token"
+        );
     }
 
     #[test]
