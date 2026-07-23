@@ -1,0 +1,110 @@
+{
+  "binaries": [
+    {
+      "label": "A",
+      "path": "<TEMP>/target-a/release/kakehashi",
+      "sha256": "3039ccdc27f480c1afcc0d18e18d5431402aff42b06b8fcc542eb1d42a68fafb"
+    },
+    {
+      "label": "B",
+      "path": "<TEMP>/target-b/release/kakehashi",
+      "sha256": "13d9eacaa3178352da659e9518ca9ad4051cc503f113c224fa4b41cd2868d003"
+    }
+  ],
+  "fixture_sha256": "8f65c90c3179c04098cfbbb6dc70246eccbdb38f23531040b34c177fc27f2df7",
+  "harness_commit": "f77cb4a774fd5b2769cf4daa11c0db784361815c",
+  "harness_sha256": "756775411019e0ed2f0ecad7be8eaf6e01423b812cd0f283f73385cec8df98f1",
+  "iterations": 30,
+  "order": "AB",
+  "pair_index": "1",
+  "runs": [
+    {
+      "binary_label": "A",
+      "binary_path": "<TEMP>/target-a/release/kakehashi",
+      "binary_sha256": "3039ccdc27f480c1afcc0d18e18d5431402aff42b06b8fcc542eb1d42a68fafb",
+      "document_bytes": 413151,
+      "samples_ns": [
+        92772042,
+        97361167,
+        90417708,
+        90062916,
+        90205750,
+        91608209,
+        89247625,
+        92840083,
+        89031667,
+        90352709,
+        90938834,
+        91628791,
+        92552000,
+        90012583,
+        89852333,
+        90703417,
+        95110792,
+        90854250,
+        93276666,
+        91644916,
+        90933791,
+        93950625,
+        91790208,
+        90584583,
+        89778292,
+        91262042,
+        95445541,
+        97885250,
+        99418625,
+        104912750
+      ],
+      "scenario": "rust_xlarge/same_snapshot_fanout",
+      "validation": {
+        "discarded_attempts": 0,
+        "retained_samples": 30
+      }
+    },
+    {
+      "binary_label": "B",
+      "binary_path": "<TEMP>/target-b/release/kakehashi",
+      "binary_sha256": "13d9eacaa3178352da659e9518ca9ad4051cc503f113c224fa4b41cd2868d003",
+      "document_bytes": 413151,
+      "samples_ns": [
+        83686667,
+        89243208,
+        97116292,
+        98017542,
+        112166167,
+        115051834,
+        113386500,
+        114270458,
+        115692750,
+        135549833,
+        129204833,
+        130490083,
+        134299917,
+        137604750,
+        143378583,
+        130772500,
+        138337458,
+        136584125,
+        133757250,
+        129804083,
+        123964000,
+        116372666,
+        123644417,
+        121872209,
+        124514875,
+        118517458,
+        115527459,
+        119690667,
+        115453000,
+        116121167
+      ],
+      "scenario": "rust_xlarge/same_snapshot_fanout",
+      "validation": {
+        "discarded_attempts": 0,
+        "retained_samples": 30
+      }
+    }
+  ],
+  "schema_version": 3,
+  "warmup_iterations": 6
+}
