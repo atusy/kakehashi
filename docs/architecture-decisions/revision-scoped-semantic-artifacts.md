@@ -199,7 +199,8 @@ Retention follows reachability and hard budgets:
   artifact byte budgets. If a root is evicted, the retained flat baseline still
   supports the existing full/delta comparison path; range requests retain no
   history;
-- active requests may temporarily retain their exact roots until completion;
+- active requests may temporarily retain their exact roots until completion,
+  but joined consumers share one `Arc` and do not reserve duplicate payload;
 - closed incarnations are removed from lookup immediately. Superseded baselines
   follow the bounded LRU policy rather than disappearing immediately, while
   in-flight `Arc`s may finish dropping naturally; and
@@ -217,9 +218,24 @@ completed current roots through that handle. The `ParseSnapshot` remains and a
 later request may recompute its artifact. If one current artifact exceeds the
 per-document limit, its active producer and joined requests may use it
 transiently, but the slot drops the completed root after delivery instead of
-retaining it. Transient production is bounded by compute admission rather than
-counted as cache retention. Eviction may increase CPU but cannot change output
-or freshness.
+retaining it.
+
+Transient production has a separate hard admission budget: at most one producer
+per document plus a configurable process-wide producer count, and a
+process-wide byte-credit limit for producing or actively delivered roots. A
+producer reserves an estimate before starting and atomically acquires more
+credit before growing owned payload. If more credit is unavailable, a newest-revision
+foreground request waits cancellably for admission; prefetch is abandoned, and
+an obsolete producer is cancelled. This wait does not return `null`, reuse a
+stale artifact, or omit the newest response. Cancellation releases producer
+waiters without consuming a permit. An admitted producer retains its count and
+byte credits until it acknowledges cancellation and its root actually drops.
+Completed delivery remains charged until the last active request releases its
+`Arc`; transferring that root into a retained slot moves, rather than duplicates,
+the charge into the retention budget. The measurement stage must select the
+producer-count and byte-credit defaults and test saturation and cancellation
+cleanup before artifact production is enabled. Eviction or admission waiting may
+increase latency but cannot change output or freshness.
 
 Numeric byte defaults are an activation gate, not a guess in this ADR: the
 measurement PR must report retained bytes for the required corpus and choose
