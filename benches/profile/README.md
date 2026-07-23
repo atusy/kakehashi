@@ -77,6 +77,7 @@ wait_for_driver_marker() {
     if ! kill -0 "$driver_pid" 2>/dev/null; then
       wait "$driver_pid"
       driver_status=$?
+      [ -f "$marker" ] && return 0
       [ "$driver_status" -ne 0 ] || driver_status=1
       printf 'driver exited before publishing %s\n' "$marker" >&2
       return "$driver_status"
