@@ -14,6 +14,34 @@ use crate::cancel::CancelToken;
 const TRACE_TARGET: &str = "kakehashi::compute_pool";
 static NEXT_WORK_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
+thread_local! {
+    static CURRENT_WORK_ID: std::cell::Cell<Option<u64>> = const {
+        std::cell::Cell::new(None)
+    };
+}
+
+/// Join key for phase metrics emitted inside the currently traced work unit.
+///
+/// The scope exists only on the worker thread while `run_traced` invokes the
+/// closure. The untraced closure stays byte-for-byte free of attribution state.
+pub(crate) fn current_work_id() -> Option<u64> {
+    CURRENT_WORK_ID.get()
+}
+
+struct WorkIdScope(Option<u64>);
+
+impl WorkIdScope {
+    fn enter(work_id: u64) -> Self {
+        Self(CURRENT_WORK_ID.replace(Some(work_id)))
+    }
+}
+
+impl Drop for WorkIdScope {
+    fn drop(&mut self) {
+        CURRENT_WORK_ID.set(self.0);
+    }
+}
+
 struct DocumentIdentity {
     uri: String,
     incarnation: Option<u64>,
@@ -278,7 +306,10 @@ impl ComputePool {
                 return; // dropping tx resolves the awaiter with None
             }
             let started = std::time::Instant::now();
-            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(work));
+            let outcome = {
+                let _work_id_scope = WorkIdScope::enter(work_id);
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(work))
+            };
             let run_us = started.elapsed().as_micros();
             match outcome {
                 Ok(value) => {
@@ -491,6 +522,49 @@ mod tests {
         assert_eq!(
             pool.run(ComputeWork::anonymous("test"), None, || 7).await,
             Some(7)
+        );
+    }
+
+    #[tokio::test]
+    async fn traced_work_exposes_its_id_only_inside_the_worker_scope() {
+        let pool = ComputePool::with_threads(1);
+        let work = ComputeWork::enabled_for_test(
+            "semantic_tokens",
+            "file:///workspace/main.rs",
+            Some(7),
+            Some(42),
+        );
+
+        let traced_id = pool.run(work, None, current_work_id).await.flatten();
+        assert!(traced_id.is_some(), "traced work must expose a join key");
+        assert_eq!(
+            pool.run(ComputeWork(None), None, current_work_id).await,
+            Some(None),
+            "the id must not leak into the next work unit on the same thread"
+        );
+    }
+
+    #[tokio::test]
+    async fn panicking_traced_work_clears_its_worker_scope() {
+        let pool = ComputePool::with_threads(1);
+        let work = ComputeWork::enabled_for_test(
+            "semantic_tokens",
+            "file:///workspace/main.rs",
+            Some(7),
+            Some(42),
+        );
+
+        let result: Option<()> = pool
+            .run(work, None, || {
+                assert!(current_work_id().is_some());
+                panic!("boom")
+            })
+            .await;
+        assert_eq!(result, None);
+        assert_eq!(
+            pool.run(ComputeWork(None), None, current_work_id).await,
+            Some(None),
+            "panic cleanup must clear the thread-local join key"
         );
     }
 

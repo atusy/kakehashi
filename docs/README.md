@@ -832,6 +832,7 @@ kakehashi uses Rust's standard logging with `env_logger`. Configure logging via 
 | `kakehashi::crash_recovery` | error | Parser crash detection and recovery |
 | `kakehashi::query` | info | Query syntax/validation issues |
 | `kakehashi::compute_pool` | debug | Per-work queue/run timing with document version identity |
+| `kakehashi::semantic_metrics` | debug | Semantic phase timing, token counts, and owned-capacity estimates; requires `kakehashi::compute_pool=debug` |
 
 ### Examples
 
@@ -850,6 +851,9 @@ RUST_LOG=kakehashi::lock_recovery=warn kakehashi
 
 # Attribute shared-pool contention without enabling unrelated debug logs
 RUST_LOG=kakehashi::compute_pool=debug kakehashi
+
+# Join semantic phase/working-set estimates to their compute-pool work IDs
+RUST_LOG=kakehashi::compute_pool=debug,kakehashi::semantic_metrics=debug kakehashi
 ```
 
 Compute-pool events share a process-local `work_id`. A `started` event reports
@@ -858,6 +862,15 @@ the enqueue-to-start `queue_us`; the matching `finished`, `skipped`, or
 state, work kind, and—where the work belongs to a document—URI, incarnation,
 and content version. This lets mixed request logs distinguish queue pressure
 from work that continued after its document version became obsolete.
+
+Semantic metric events use the same `work_id`. Capacity fields are estimates
+for the named owned vectors: `line_index_capacity_bytes` covers the line slices
+and byte index, `collected_raw_capacity_bytes` covers host/injection collection
+and their merge (not allocations internal to finalization), and
+`result_capacity_bytes` covers the encoded semantic-token vector. They are not
+process RSS or allocator counters. `kakehashi::semantic_metrics=debug` alone
+does not emit events: enable `kakehashi::compute_pool=debug` as in the example
+above so every semantic event has a corresponding compute-work join key.
 
 **Note:** Logs are written to stderr. Stdout is reserved for LSP JSON-RPC protocol messages.
 
