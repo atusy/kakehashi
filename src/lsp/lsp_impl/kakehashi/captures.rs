@@ -1870,6 +1870,9 @@ mod tests {
                             bridge_regions: None,
                             resolved_regions: None,
                             layer_trees: std::sync::OnceLock::new(),
+                            semantic_artifact: std::sync::Arc::new(
+                                crate::analysis::SemanticArtifactSlot::new(),
+                            ),
                         },
                     ))
                 })
@@ -1962,6 +1965,9 @@ mod tests {
                         bridge_regions: None,
                         resolved_regions: None,
                         layer_trees: std::sync::OnceLock::new(),
+                        semantic_artifact: std::sync::Arc::new(
+                            crate::analysis::SemanticArtifactSlot::new(),
+                        ),
                     },
                 ))
             })
@@ -2040,6 +2046,9 @@ mod tests {
                         bridge_regions: None,
                         resolved_regions: None,
                         layer_trees: std::sync::OnceLock::new(),
+                        semantic_artifact: std::sync::Arc::new(
+                            crate::analysis::SemanticArtifactSlot::new(),
+                        ),
                     },
                 ))
             })
@@ -2225,6 +2234,9 @@ mod tests {
                         bridge_regions: None,
                         resolved_regions: None,
                         layer_trees: std::sync::OnceLock::new(),
+                        semantic_artifact: std::sync::Arc::new(
+                            crate::analysis::SemanticArtifactSlot::new(),
+                        ),
                     },
                 ))
         };
@@ -2342,6 +2354,9 @@ mod tests {
                         bridge_regions: None,
                         resolved_regions: None,
                         layer_trees: std::sync::OnceLock::new(),
+                        semantic_artifact: std::sync::Arc::new(
+                            crate::analysis::SemanticArtifactSlot::new(),
+                        ),
                     },
                 ))
         );

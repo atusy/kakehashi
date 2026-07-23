@@ -533,6 +533,9 @@ impl ParseCoordinator {
                         bridge_regions: None,
                         resolved_regions: None,
                         layer_trees: std::sync::OnceLock::new(),
+                        semantic_artifact: std::sync::Arc::new(
+                            crate::analysis::SemanticArtifactSlot::new(),
+                        ),
                     },
                 );
                 advance_watermark();
@@ -633,6 +636,9 @@ impl ParseCoordinator {
                         bridge_regions: regions.bridge_regions,
                         resolved_regions: regions.resolved_regions,
                         layer_trees: std::sync::OnceLock::new(),
+                        semantic_artifact: std::sync::Arc::new(
+                            crate::analysis::SemanticArtifactSlot::new(),
+                        ),
                     },
                 );
                 if stored {
@@ -681,6 +687,9 @@ impl ParseCoordinator {
                     bridge_regions: None,
                     resolved_regions: None,
                     layer_trees: std::sync::OnceLock::new(),
+                    semantic_artifact: std::sync::Arc::new(
+                        crate::analysis::SemanticArtifactSlot::new(),
+                    ),
                 },
             );
             advance_watermark();
@@ -712,6 +721,9 @@ impl ParseCoordinator {
                 bridge_regions: None,
                 resolved_regions: None,
                 layer_trees: std::sync::OnceLock::new(),
+                semantic_artifact: std::sync::Arc::new(
+                    crate::analysis::SemanticArtifactSlot::new(),
+                ),
             },
         );
         advance_watermark();
@@ -910,6 +922,9 @@ impl ParseCoordinator {
                     bridge_regions: regions.bridge_regions,
                     resolved_regions: regions.resolved_regions,
                     layer_trees: std::sync::OnceLock::new(),
+                    semantic_artifact: std::sync::Arc::new(
+                        crate::analysis::SemanticArtifactSlot::new(),
+                    ),
                 },
             );
             // Serve-stale's heal signal, mirroring reparse_latest: a token
@@ -1127,6 +1142,9 @@ impl ParseCoordinator {
                     bridge_regions: regions.bridge_regions,
                     resolved_regions: regions.resolved_regions,
                     layer_trees: std::sync::OnceLock::new(),
+                    semantic_artifact: std::sync::Arc::new(
+                        crate::analysis::SemanticArtifactSlot::new(),
+                    ),
                 },
             );
             // Serve-stale's heal signal (ADR §3), narrowed to the cases the

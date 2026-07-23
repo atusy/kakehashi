@@ -91,6 +91,17 @@ pub(crate) struct ParseSnapshot {
     /// seeing a generation mismatch bypasses the cell and walks fresh (the
     /// pre-cache per-request cost) until the next snapshot rebuilds it.
     pub(crate) layer_trees: std::sync::OnceLock<(u64, Arc<Vec<SnapshotLayerTree>>)>,
+    /// Generation-aware, complete-only single-flight semantic output derived
+    /// from this immutable `(text, tree, language, version)` snapshot.
+    pub(crate) semantic_artifact: Arc<crate::analysis::SemanticArtifactSlot>,
+}
+
+impl ParseSnapshot {
+    /// Stop artifact production as soon as this snapshot is superseded or
+    /// closed, even while requests still hold the old snapshot `Arc`.
+    pub(crate) fn cancel_semantic_artifact(&self) {
+        self.semantic_artifact.cancel();
+    }
 }
 
 /// The per-URI `watch` value: the current lifetime plus the latest snapshot.
@@ -168,6 +179,7 @@ mod tests {
             bridge_regions: None,
             resolved_regions: None,
             layer_trees: std::sync::OnceLock::new(),
+            semantic_artifact: Arc::new(crate::analysis::SemanticArtifactSlot::new()),
         }
     }
 
@@ -215,6 +227,7 @@ mod tests {
             bridge_regions: None,
             resolved_regions: None,
             layer_trees: std::sync::OnceLock::new(),
+            semantic_artifact: Arc::new(crate::analysis::SemanticArtifactSlot::new()),
         }
     }
 

@@ -907,6 +907,7 @@ impl DocumentStore {
             bridge_regions: None,
             resolved_regions: None,
             layer_trees: std::sync::OnceLock::new(),
+            semantic_artifact: Arc::new(crate::analysis::SemanticArtifactSlot::new()),
         };
         doc.publish_snapshot(Arc::new(snapshot));
     }
@@ -1019,6 +1020,7 @@ mod tests {
                 bridge_regions: None,
                 resolved_regions: None,
                 layer_trees: std::sync::OnceLock::new(),
+                semantic_artifact: Arc::new(crate::analysis::SemanticArtifactSlot::new()),
             }
         }
 

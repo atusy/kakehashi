@@ -6,12 +6,11 @@
 //! - When `$/cancelRequest` is received, the handler aborts and returns `RequestCancelled` (-32800)
 //! - Uses `tokio::select!` to race between cancel notification and token computation
 //! - The blocking Rayon computation is cancelled *cooperatively*: the handler
-//!   flips a [`CancelToken`](crate::cancel::CancelToken) (also flipped when a
-//!   newer request supersedes this one, or the document closes) and the compute
-//!   polls it throughout host and injected-language query walks, injection
-//!   discovery, nested regions, and final shaping. Parsing itself remains
-//!   non-preemptible, but a region that observes cancellation returns incomplete
-//!   output that is neither served nor cached.
+//!   joins a snapshot-owned artifact producer whose revision token is flipped
+//!   by edit/reload/replacement/close. The compute polls it throughout host and
+//!   injected-language query walks, injection discovery, nested regions, and
+//!   final shaping. `$/cancelRequest` detaches only its request; another
+//!   full/delta/range consumer may still need the same producer.
 //!
 //! This is achieved by subscribing to cancel notifications via `CancelForwarder::subscribe()`
 //! and using biased `tokio::select!` to prioritize cancel handling.
@@ -33,6 +32,7 @@ use crate::analysis::{
     filter_semantic_tokens_by_range, handle_semantic_tokens_full, next_result_id,
 };
 use crate::lsp::current_upstream_id;
+use crate::lsp::semantic_request_tracker::SemanticRequestScope;
 
 use super::super::{Kakehashi, uri_to_url};
 
@@ -72,6 +72,35 @@ enum CurrentTokens {
     Owned(SemanticTokens),
 }
 
+struct SemanticArtifactInputs {
+    text: std::sync::Arc<str>,
+    tree: tree_sitter::Tree,
+    query: std::sync::Arc<tree_sitter::Query>,
+    language_name: String,
+    capture_mappings: std::sync::Arc<crate::config::CaptureMappings>,
+    supports_multiline: bool,
+    injection_cache: crate::analysis::semantic::InjectionCacheParams,
+}
+
+struct SemanticConsumerGuard<'a> {
+    cache: &'a crate::lsp::cache::CacheCoordinator,
+    uri: &'a Url,
+    request_id: crate::lsp::cache::RequestId,
+}
+
+impl SemanticConsumerGuard<'_> {
+    fn replace_request(&mut self, request_id: crate::lsp::cache::RequestId) {
+        self.cache.finish_request(self.uri, self.request_id);
+        self.request_id = request_id;
+    }
+}
+
+impl Drop for SemanticConsumerGuard<'_> {
+    fn drop(&mut self) {
+        self.cache.finish_request(self.uri, self.request_id);
+    }
+}
+
 impl CurrentTokens {
     fn as_ref(&self) -> &SemanticTokens {
         match self {
@@ -95,6 +124,60 @@ impl CurrentTokens {
 }
 
 impl Kakehashi {
+    fn shared_semantic_artifact(
+        &self,
+        snapshot: &std::sync::Arc<crate::document::snapshot::ParseSnapshot>,
+        identity: SemanticArtifactIdentity,
+        inputs: SemanticArtifactInputs,
+    ) -> crate::analysis::semantic::SharedArtifactFuture {
+        let pool = std::sync::Arc::clone(&self.compute_pool);
+        let coordinator = std::sync::Arc::clone(&self.language);
+        snapshot
+            .semantic_artifact
+            .claim_or_join(identity, move |cancel, identity| async move {
+                handle_semantic_tokens_full(
+                    &pool,
+                    inputs.text,
+                    inputs.tree,
+                    inputs.query,
+                    Some(inputs.language_name),
+                    Some(inputs.capture_mappings),
+                    coordinator,
+                    inputs.supports_multiline,
+                    Some(inputs.injection_cache),
+                    Some(cancel),
+                )
+                .await
+                .and_then(|result| SemanticArtifact::from_full_result(identity, result))
+            })
+    }
+
+    fn semantic_request_scope(&self, uri: &Url, generation: u64) -> SemanticRequestScope {
+        self.documents.latest_snapshot(uri).map_or(
+            SemanticRequestScope {
+                incarnation: 0,
+                generation,
+                content_version: 0,
+            },
+            |view| SemanticRequestScope {
+                incarnation: view.slot.current_incarnation,
+                generation,
+                content_version: view.content_version,
+            },
+        )
+    }
+
+    fn resolved_semantic_request_scope(
+        snapshot: &crate::document::snapshot::ParseSnapshot,
+        generation: u64,
+    ) -> SemanticRequestScope {
+        SemanticRequestScope {
+            incarnation: snapshot.incarnation,
+            generation,
+            content_version: snapshot.parsed_version,
+        }
+    }
+
     fn semantic_snapshot_is_current(
         &self,
         uri: &Url,
@@ -230,12 +313,6 @@ impl Kakehashi {
             return Ok(None);
         };
 
-        // Start tracking this request - supersedes any previous request for this URI.
-        // `cancel_token` is flipped when a newer request supersedes this one (or
-        // the document closes); it is threaded into the blocking compute so a
-        // superseded request stops mid-flight instead of running to completion.
-        let (request_id, cancel_token) = self.cache.start_request(&uri);
-
         // Snapshot the settings generation NOW, before reading any
         // settings-dependent tokenization input (language resolution, queries,
         // capture mappings) below. Folded into the cache key once the text is
@@ -243,6 +320,8 @@ impl Kakehashi {
         // leaves our stored tokens on the old generation — invisible to
         // post-reload requests — so we can't poison the cache (see `cache_key_for`).
         let token_generation = self.cache.semantic_token_generation();
+        let request_scope = self.semantic_request_scope(&uri, token_generation);
+        let (mut request_id, mut cancel_token) = self.cache.start_request(&uri, request_scope);
 
         log::debug!(
             target: "kakehashi::semantic",
@@ -290,7 +369,6 @@ impl Kakehashi {
                 return Err(crate::error::content_modified_error());
             }
             TokenSnapshot::Cancelled => {
-                cancel_token.cancel();
                 self.cache.finish_request(&uri, request_id);
                 log::debug!(
                     target: "kakehashi::semantic",
@@ -311,6 +389,14 @@ impl Kakehashi {
                 return Ok(None);
             }
         };
+        let resolved_scope = Self::resolved_semantic_request_scope(&snapshot, token_generation);
+        if resolved_scope != request_scope {
+            self.cache.finish_request(&uri, request_id);
+            (request_id, cancel_token) = self.cache.start_request(&uri, resolved_scope);
+            if !self.cache.is_request_active(&uri, request_id) {
+                return Ok(None);
+            }
+        }
         let (Some(language_name), Some(tree)) = (snapshot.language.clone(), snapshot.tree.clone())
         else {
             // No detectable language, or resolved-but-tree-less (no parser
@@ -415,9 +501,8 @@ impl Kakehashi {
         let cache_key = self.cache.cache_key_for(&text, token_generation);
 
         // Compute tokens against the (current-at-resolution) snapshot. An edit
-        // landing after the resolution supersedes this request via the client's
-        // next didChange-driven request; the CancelToken then reclaims the
-        // compute mid-flight.
+        // landing after resolution cancels this snapshot's artifact producer
+        // immediately; a later request resolves the replacement snapshot.
         let result = {
             // Snapshot-identical repeat request: tokens already cached for this
             // exact text are still correct, so skip re-tokenizing. Returns the
@@ -451,42 +536,36 @@ impl Kakehashi {
                 return Ok(Some(SemanticTokensResult::Tokens(cached)));
             }
 
-            // capture_mappings and supports_multiline were read before the await
-            // above (consistent with the query and token_generation). Rayon-based
-            // parallel injection processing uses thread-local parser caching
-            // instead of the shared parser pool, avoiding lock contention.
-            let coordinator = std::sync::Arc::clone(&self.language);
-
-            // Enable per-region injection-token reuse (#529). The generation is
-            // the one snapshotted at the top of the handler (same value folded
-            // into `cache_key`), so a config reload racing this request can't make
-            // it serve or store stale-query tokens.
-            let injection_cache = Some(crate::analysis::semantic::InjectionCacheParams {
-                uri: uri.clone(),
-                tracker: self.bridge.node_tracker_arc(),
-                cache: self.cache.injection_token_cache_arc(),
-                generation: token_generation,
-                documents: std::sync::Arc::clone(&self.documents),
-                parsed_version: snapshot.parsed_version,
-                incarnation: snapshot.incarnation,
-                // The snapshot's own discovery (ADR §3, don't-discover-twice):
-                // rebuilt into contexts instead of re-running the injection
-                // query, when its generation still matches.
-                discovery: snapshot.injection_regions.clone(),
-            });
-
-            // Compute tokens, racing against cancel notification if provided
-            let compute_future = handle_semantic_tokens_full(
-                &self.compute_pool,
-                text.clone(),
-                tree.clone(),
-                query,
-                Some(language_name.clone()),
-                Some(capture_mappings),
-                coordinator,
+            let expected_artifact_identity = SemanticArtifactIdentity::expected(
+                &uri,
+                &language_name,
+                snapshot_identity,
                 supports_multiline,
-                injection_cache,
-                Some(cancel_token.clone()),
+            );
+            let compute_future = self.shared_semantic_artifact(
+                &snapshot,
+                expected_artifact_identity.to_owned(),
+                SemanticArtifactInputs {
+                    text: text.clone(),
+                    tree: tree.clone(),
+                    query,
+                    language_name: language_name.clone(),
+                    capture_mappings,
+                    supports_multiline,
+                    injection_cache: crate::analysis::semantic::InjectionCacheParams {
+                        uri: uri.clone(),
+                        tracker: self.bridge.node_tracker_arc(),
+                        cache: self.cache.injection_token_cache_arc(),
+                        generation: token_generation,
+                        documents: std::sync::Arc::clone(&self.documents),
+                        parsed_version: snapshot.parsed_version,
+                        incarnation: snapshot.incarnation,
+                        // The snapshot's own discovery (ADR §3, don't-discover-twice):
+                        // rebuilt into contexts instead of re-running the injection
+                        // query, when its generation still matches.
+                        discovery: snapshot.injection_regions.clone(),
+                    },
+                },
             );
 
             if let Some(cancel_rx) = cancel_rx {
@@ -495,11 +574,10 @@ impl Kakehashi {
                 tokio::select! {
                     biased;
 
-                    // Cancel notification received - abort immediately. Flip the
-                    // token so the now-detached blocking compute stops early
-                    // instead of running to completion for a discarded result.
+                    // Explicit cancellation detaches only this consumer. The
+                    // snapshot-owned producer remains available to same-scope
+                    // full/delta/range consumers.
                     _ = &mut cancel_rx => {
-                        cancel_token.cancel();
                         self.cache.finish_request(&uri, request_id);
                         log::debug!(
                             target: "kakehashi::semantic",
@@ -518,13 +596,8 @@ impl Kakehashi {
             }
         };
 
-        // A supersede/close between compute start and here flips the token; the
-        // compute then bailed at a checkpoint and returned `None` (a partial
-        // result), so drop the request rather than storing it over the cache.
-        // This is CPU-reclamation, not staleness-rejection: an *un*-superseded
-        // compute over a snapshot the live text has since outrun still serves —
-        // the client's didChange-driven follow-up request supersedes and heals
-        // (§4's narrowed CancelToken role).
+        // A newer request scope or close wakes this consumer. The artifact's
+        // separate snapshot token reclaims obsolete producer work.
         if cancel_token.is_cancelled() {
             self.cache.finish_request(&uri, request_id);
             log::debug!(
@@ -550,14 +623,11 @@ impl Kakehashi {
             snapshot_identity,
             supports_multiline,
         );
-        let artifact = result.and_then(|result| {
-            SemanticArtifact::from_full_result(expected_artifact_identity.to_owned(), result)
-        });
         // The artifact contains no request lineage. Materialization checks the
         // complete identity before assigning this request's result ID.
-        let tokens_with_id = artifact
+        let tokens_with_id = result
             .and_then(|artifact| {
-                artifact.into_full(expected_artifact_identity, Some(next_result_id()))
+                artifact.materialize_full(expected_artifact_identity, Some(next_result_id()))
             })
             .unwrap_or_else(|| SemanticTokens {
                 result_id: Some(next_result_id()),
@@ -621,16 +691,12 @@ impl Kakehashi {
             return Ok(None);
         };
 
-        // Start tracking this request - supersedes any previous request for this
-        // URI. `cancel_token` (flipped on supersede/close) is threaded into the
-        // blocking compute so a superseded delta stops mid-flight — this is the
-        // steady-state typing path where the pile-up is worst.
-        let (request_id, cancel_token) = self.cache.start_request(&uri);
-
         // Snapshot the settings generation NOW, before any settings-dependent
         // tokenization input is read below (same reload-race safety as
         // semanticTokens/full; folded into the cache key once the text is known).
         let token_generation = self.cache.semantic_token_generation();
+        let request_scope = self.semantic_request_scope(&uri, token_generation);
+        let (mut request_id, mut cancel_token) = self.cache.start_request(&uri, request_scope);
 
         log::debug!(
             target: "kakehashi::semantic",
@@ -678,7 +744,6 @@ impl Kakehashi {
                 return Err(crate::error::content_modified_error());
             }
             TokenSnapshot::Cancelled => {
-                cancel_token.cancel();
                 self.cache.finish_request(&uri, request_id);
                 log::debug!(
                     target: "kakehashi::semantic",
@@ -699,6 +764,14 @@ impl Kakehashi {
                 return Ok(None);
             }
         };
+        let resolved_scope = Self::resolved_semantic_request_scope(&snapshot, token_generation);
+        if resolved_scope != request_scope {
+            self.cache.finish_request(&uri, request_id);
+            (request_id, cancel_token) = self.cache.start_request(&uri, resolved_scope);
+            if !self.cache.is_request_active(&uri, request_id) {
+                return Ok(None);
+            }
+        }
         let (Some(language_name), Some(tree)) = (snapshot.language.clone(), snapshot.tree.clone())
         else {
             self.cache
@@ -850,37 +923,33 @@ impl Kakehashi {
                 // never needs ownership at all).
                 Some(CurrentTokens::Cached(cached))
             } else {
-                // capture_mappings and supports_multiline were read before the await
-                // above (consistent with the query and token_generation). Rayon-based
-                // parallel injection processing (SAME as semanticTokens/full).
-                let coordinator = std::sync::Arc::clone(&self.language);
-
-                // Enable per-region injection-token reuse (#529) on the delta
-                // path too — this is the steady-state typing path the cache
-                // targets. Generation pinned to the top-of-handler snapshot.
-                let injection_cache = Some(crate::analysis::semantic::InjectionCacheParams {
-                    uri: uri.clone(),
-                    tracker: self.bridge.node_tracker_arc(),
-                    cache: self.cache.injection_token_cache_arc(),
-                    generation: token_generation,
-                    documents: std::sync::Arc::clone(&self.documents),
-                    parsed_version: snapshot.parsed_version,
-                    incarnation: snapshot.incarnation,
-                    // The snapshot's own discovery (ADR §3, don't-discover-twice).
-                    discovery: snapshot.injection_regions.clone(),
-                });
-                // Compute tokens, racing against cancel notification if provided
-                let compute_future = handle_semantic_tokens_full(
-                    &self.compute_pool,
-                    text.clone(),
-                    tree.clone(),
-                    query,
-                    Some(language_name.clone()),
-                    Some(capture_mappings),
-                    coordinator,
+                let expected_artifact_identity = SemanticArtifactIdentity::expected(
+                    &uri,
+                    &language_name,
+                    snapshot_identity,
                     supports_multiline,
-                    injection_cache,
-                    Some(cancel_token.clone()),
+                );
+                let compute_future = self.shared_semantic_artifact(
+                    &snapshot,
+                    expected_artifact_identity.to_owned(),
+                    SemanticArtifactInputs {
+                        text: text.clone(),
+                        tree: tree.clone(),
+                        query,
+                        language_name: language_name.clone(),
+                        capture_mappings,
+                        supports_multiline,
+                        injection_cache: crate::analysis::semantic::InjectionCacheParams {
+                            uri: uri.clone(),
+                            tracker: self.bridge.node_tracker_arc(),
+                            cache: self.cache.injection_token_cache_arc(),
+                            generation: token_generation,
+                            documents: std::sync::Arc::clone(&self.documents),
+                            parsed_version: snapshot.parsed_version,
+                            incarnation: snapshot.incarnation,
+                            discovery: snapshot.injection_regions.clone(),
+                        },
+                    },
                 );
 
                 let computed = if let Some(cancel_rx) = cancel_rx {
@@ -889,12 +958,9 @@ impl Kakehashi {
                     tokio::select! {
                         biased;
 
-                        // Cancel notification received - abort immediately. Flip
-                        // the token so the now-detached blocking compute stops
-                        // early instead of running to completion for a discarded
-                        // result.
+                        // Detach only this consumer; another same-scope request
+                        // may still need the shared artifact.
                         _ = &mut cancel_rx => {
-                            cancel_token.cancel();
                             self.cache.finish_request(&uri, request_id);
                             log::debug!(
                                 target: "kakehashi::semantic",
@@ -927,28 +993,15 @@ impl Kakehashi {
                     return Ok(None);
                 }
                 computed
-                    .and_then(|result| {
-                        let expected_artifact_identity = SemanticArtifactIdentity::expected(
-                            &uri,
-                            &language_name,
-                            snapshot_identity,
-                            supports_multiline,
-                        );
-                        SemanticArtifact::from_full_result(
-                            expected_artifact_identity.to_owned(),
-                            result,
-                        )
-                        .and_then(|artifact| artifact.into_full(expected_artifact_identity, None))
+                    .and_then(|artifact| {
+                        artifact.materialize_full(expected_artifact_identity, None)
                     })
                     .map(CurrentTokens::Owned)
             }
         };
 
-        // A supersede/close between compute start and here flips the token; the
-        // compute then bailed at a checkpoint and returned `None` (partial), so
-        // drop the request rather than diffing/storing it over the cache. This
-        // is CPU-reclamation, not staleness-rejection (§4's narrowed CancelToken
-        // role).
+        // A newer request scope or close wakes this consumer. The artifact's
+        // separate snapshot token reclaims obsolete producer work.
         if cancel_token.is_cancelled() {
             self.cache.finish_request(&uri, request_id);
             log::debug!(
@@ -1072,6 +1125,8 @@ impl Kakehashi {
         &self,
         params: SemanticTokensRangeParams,
     ) -> Result<Option<SemanticTokensRangeResult>> {
+        let upstream_id = current_upstream_id();
+        let (mut cancel_rx, _subscription_guard) = self.subscribe_cancel(upstream_id.as_ref());
         let lsp_uri = params.text_document.uri;
         let range = params.range;
 
@@ -1096,6 +1151,16 @@ impl Kakehashi {
         // key on the old generation — invisible to post-reload requests (which
         // compute the new-generation key) — so a stale entry can never be served.
         let generation = self.cache.semantic_token_generation();
+        let request_scope = self.semantic_request_scope(&uri, generation);
+        let (request_id, mut cancel_token) = self.cache.start_request(&uri, request_scope);
+        let mut consumer_guard = SemanticConsumerGuard {
+            cache: &self.cache,
+            uri: &uri,
+            request_id,
+        };
+        if !self.cache.is_request_active(&uri, request_id) {
+            return Err(crate::error::content_modified_error());
+        }
 
         // First-parse bound (parse-snapshot ADR §3): resolve through the same
         // bounded first-parse wait as full/delta. Without it, a range request
@@ -1104,7 +1169,29 @@ impl Kakehashi {
         // empty range response has no lineage, so the viewport stayed blank
         // until an incidental re-request. Steady state (snapshot present)
         // resolves immediately.
-        let Some(snapshot) = self.snapshot_for_tokens(&uri).await else {
+        let snapshot_future = self.snapshot_for_tokens(&uri);
+        tokio::pin!(snapshot_future);
+        let snapshot = match cancel_rx.as_mut() {
+            Some(cancel_rx) => {
+                tokio::select! {
+                    biased;
+                    _ = cancel_rx => return Err(Error::request_cancelled()),
+                    _ = cancel_token.cancelled() => {
+                        return Err(crate::error::content_modified_error());
+                    }
+                    snapshot = &mut snapshot_future => snapshot,
+                }
+            }
+            None => {
+                tokio::select! {
+                    _ = cancel_token.cancelled() => {
+                        return Err(crate::error::content_modified_error());
+                    }
+                    snapshot = &mut snapshot_future => snapshot,
+                }
+            }
+        };
+        let Some(snapshot) = snapshot else {
             return Ok(Some(SemanticTokensRangeResult::Tokens(SemanticTokens {
                 result_id: None,
                 data: vec![],
@@ -1126,6 +1213,16 @@ impl Kakehashi {
             || snapshot.parsed_version != view.content_version
         {
             return Err(crate::error::content_modified_error());
+        }
+        let resolved_scope = Self::resolved_semantic_request_scope(&snapshot, generation);
+        if resolved_scope != request_scope {
+            let (resolved_request_id, resolved_cancel) =
+                self.cache.start_request(&uri, resolved_scope);
+            consumer_guard.replace_request(resolved_request_id);
+            cancel_token = resolved_cancel;
+            if !self.cache.is_request_active(&uri, resolved_request_id) {
+                return Err(crate::error::content_modified_error());
+            }
         }
         let snapshot_identity = SemanticSnapshotIdentity {
             parsed_version: snapshot.parsed_version,
@@ -1226,7 +1323,7 @@ impl Kakehashi {
                 return Err(crate::error::content_modified_error());
             }
             self.cache.store_range_tokens(
-                uri,
+                uri.clone(),
                 domain_range,
                 language_name,
                 range_tokens,
@@ -1238,36 +1335,61 @@ impl Kakehashi {
         // Get capture mappings for token type resolution
         let capture_mappings = self.language.capture_mappings();
 
-        // Use Rayon-based parallel injection processing
         let supports_multiline = self.settings_manager.supports_multiline_tokens();
-        let coordinator = std::sync::Arc::clone(&self.language);
-        let result = handle_semantic_tokens_full(
-            &self.compute_pool,
-            text,
-            tree,
-            query,
-            Some(language_name.clone()),
-            Some(capture_mappings),
-            coordinator,
+        let expected_artifact_identity = SemanticArtifactIdentity::expected(
+            &uri,
+            &language_name,
+            snapshot_identity,
             supports_multiline,
-            None,
-            None,
-        )
-        .await;
+        );
+        let artifact_future = self.shared_semantic_artifact(
+            &snapshot,
+            expected_artifact_identity.to_owned(),
+            SemanticArtifactInputs {
+                text,
+                tree,
+                query,
+                language_name: language_name.clone(),
+                capture_mappings,
+                supports_multiline,
+                injection_cache: crate::analysis::semantic::InjectionCacheParams {
+                    uri: uri.clone(),
+                    tracker: self.bridge.node_tracker_arc(),
+                    cache: self.cache.injection_token_cache_arc(),
+                    generation,
+                    documents: std::sync::Arc::clone(&self.documents),
+                    parsed_version: snapshot.parsed_version,
+                    incarnation: snapshot.incarnation,
+                    discovery: snapshot.injection_regions.clone(),
+                },
+            },
+        );
+        tokio::pin!(artifact_future);
+        let artifact = match cancel_rx.as_mut() {
+            Some(cancel_rx) => {
+                tokio::select! {
+                    biased;
+                    _ = cancel_rx => return Err(Error::request_cancelled()),
+                    _ = cancel_token.cancelled() => {
+                        return Err(crate::error::content_modified_error());
+                    }
+                    artifact = &mut artifact_future => artifact,
+                }
+            }
+            None => {
+                tokio::select! {
+                    _ = cancel_token.cancelled() => {
+                        return Err(crate::error::content_modified_error());
+                    }
+                    artifact = &mut artifact_future => artifact,
+                }
+            }
+        };
 
         // Shape immutable payloads before taking the edit lock. Only the final
         // live-snapshot validation and cache commits need to exclude edits.
-        let full_tokens = result.and_then(|result| {
-            let expected_artifact_identity = SemanticArtifactIdentity::expected(
-                &uri,
-                &language_name,
-                snapshot_identity,
-                supports_multiline,
-            );
-            SemanticArtifact::from_full_result(expected_artifact_identity.to_owned(), result)
-                .and_then(|artifact| {
-                    artifact.into_full(expected_artifact_identity, Some(next_result_id()))
-                })
+        let full_tokens = artifact.and_then(|artifact| {
+            artifact.materialize_full(expected_artifact_identity, Some(next_result_id()))
         });
         let (domain_range_result, tokens_to_store) = match full_tokens {
             Some(full_tokens) => {
@@ -1315,7 +1437,7 @@ impl Kakehashi {
                 snapshot_identity,
             );
             self.cache.store_range_tokens(
-                uri,
+                uri.clone(),
                 domain_range,
                 language_name,
                 range_tokens,
@@ -1359,6 +1481,9 @@ mod tests {
                         bridge_regions: None,
                         resolved_regions: None,
                         layer_trees: std::sync::OnceLock::new(),
+                        semantic_artifact: std::sync::Arc::new(
+                            crate::analysis::SemanticArtifactSlot::new(),
+                        ),
                     },
                 ))
             })
@@ -1521,9 +1646,15 @@ mod tests {
             "the handler must be parked awaiting the current snapshot"
         );
 
-        // A newer request for the same URI supersedes the parked one.
+        // A request for a newer input scope supersedes the parked one.
         let woke_at = tokio::time::Instant::now();
-        let _newer = service.inner().cache.start_request(&uri);
+        service
+            .inner()
+            .documents
+            .update_document(uri.clone(), "fn main() {  }".to_string(), None);
+        let generation = service.inner().cache.semantic_token_generation();
+        let scope = service.inner().semantic_request_scope(&uri, generation);
+        let _newer = service.inner().cache.start_request(&uri, scope);
 
         let result = request
             .await
@@ -1800,6 +1931,9 @@ mod tests {
                         bridge_regions: None,
                         resolved_regions: None,
                         layer_trees: std::sync::OnceLock::new(),
+                        semantic_artifact: std::sync::Arc::new(
+                            crate::analysis::SemanticArtifactSlot::new(),
+                        ),
                     },
                 ))
             })
@@ -2029,6 +2163,90 @@ mod tests {
         assert!(
             DISCOVERY_REUSE_HITS.load(std::sync::atomic::Ordering::Relaxed) >= 1,
             "the request must rebuild contexts from the snapshot's discovery"
+        );
+    }
+
+    #[tokio::test]
+    async fn delta_and_range_join_one_same_snapshot_artifact() {
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+        let uri = Url::parse("file:///same_snapshot_fanout.rs").expect("test uri");
+        let text: std::sync::Arc<str> = std::sync::Arc::from("fn after() {}\n");
+        let rust_language: tree_sitter::Language = tree_sitter_rust::LANGUAGE.into();
+        let mut parser = tree_sitter::Parser::new();
+        parser.set_language(&rust_language).expect("rust language");
+        let tree = parser.parse(text.as_ref(), None).expect("rust tree");
+        let query = std::sync::Arc::new(
+            tree_sitter::Query::new(
+                &rust_language,
+                "(function_item name: (identifier) @function)",
+            )
+            .expect("test highlight query"),
+        );
+        let mut highlights = std::collections::HashMap::new();
+        highlights.insert("function".to_string(), "function".to_string());
+        let mut mappings = crate::config::CaptureMappings::new();
+        mappings.insert(
+            "rust".to_string(),
+            crate::config::QueryTypeMappings {
+                highlights,
+                folds: std::collections::HashMap::new(),
+            },
+        );
+        let mappings = std::sync::Arc::new(mappings);
+        let snapshot_identity = SemanticSnapshotIdentity {
+            parsed_version: 2,
+            incarnation: 1,
+            generation: 0,
+        };
+        let snapshot = std::sync::Arc::new(crate::document::snapshot::ParseSnapshot {
+            text: std::sync::Arc::clone(&text),
+            tree: Some(tree.clone()),
+            language: Some("rust".to_string()),
+            parsed_version: snapshot_identity.parsed_version,
+            incarnation: snapshot_identity.incarnation,
+            injection_regions: None,
+            bridge_regions: None,
+            resolved_regions: None,
+            layer_trees: std::sync::OnceLock::new(),
+            semantic_artifact: std::sync::Arc::new(crate::analysis::SemanticArtifactSlot::new()),
+        });
+        let identity = SemanticArtifactIdentity::new(
+            uri.clone(),
+            "rust".to_string(),
+            snapshot_identity,
+            false,
+        );
+        let inputs = || SemanticArtifactInputs {
+            text: std::sync::Arc::clone(&text),
+            tree: tree.clone(),
+            query: std::sync::Arc::clone(&query),
+            language_name: "rust".to_string(),
+            capture_mappings: std::sync::Arc::clone(&mappings),
+            supports_multiline: false,
+            injection_cache: crate::analysis::semantic::InjectionCacheParams {
+                uri: uri.clone(),
+                tracker: server.bridge.node_tracker_arc(),
+                cache: server.cache.injection_token_cache_arc(),
+                generation: 0,
+                documents: std::sync::Arc::clone(&server.documents),
+                parsed_version: snapshot_identity.parsed_version,
+                incarnation: snapshot_identity.incarnation,
+                discovery: None,
+            },
+        };
+
+        let delta_artifact = server.shared_semantic_artifact(&snapshot, identity.clone(), inputs());
+        let range_artifact = server.shared_semantic_artifact(&snapshot, identity, inputs());
+        assert_eq!(snapshot.semantic_artifact.test_joins(), 1);
+        let (delta_artifact, range_artifact) = tokio::join!(delta_artifact, range_artifact);
+        let delta_artifact = delta_artifact.expect("delta artifact");
+        let range_artifact = range_artifact.expect("range artifact");
+        assert!(std::sync::Arc::ptr_eq(&delta_artifact, &range_artifact));
+        assert_eq!(
+            snapshot.semantic_artifact.test_producer_starts(),
+            1,
+            "concurrent delta + range must execute one semantic producer"
         );
     }
 

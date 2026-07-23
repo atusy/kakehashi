@@ -10,11 +10,10 @@
 //!
 //! [`CancelToken`] is the escape hatch. A compute polls it during the host-query
 //! walk, once per injection region during discovery/tokenization, and throughout
-//! final token shaping, then bails early once it is set. The token is flipped when
-//! the request is superseded by a newer one for the same document, when the client
-//! sends `$/cancelRequest`, or when the document closes — so an obsolete compute
-//! stops instead of running to completion (see
-//! `lsp::semantic_request_tracker::SemanticRequestTracker`).
+//! final token shaping, then bails early once it is set. Shared semantic-artifact
+//! production owns a revision token: edit, reload, replacement, or close flips
+//! it, while `$/cancelRequest` detaches only that consumer. Non-shared operations
+//! may still use a request-local token.
 
 /// A shared cancellation signal: cheap to poll from blocking compute AND
 /// awaitable from async parks. Clones share the same state, so one side can
