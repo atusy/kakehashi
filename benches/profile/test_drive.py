@@ -31,7 +31,7 @@ FAKE_SERVER_SOURCE = textwrap.dedent(
 
     log_path = pathlib.Path(sys.argv[1])
     warmup_release = pathlib.Path(sys.argv[2])
-    exit_after_warmup = len(sys.argv) > 3 and sys.argv[3] == "exit-after-warmup"
+    behavior = sys.argv[3] if len(sys.argv) > 3 else "normal"
     semantic_requests = 0
 
     def read_message():
@@ -73,11 +73,14 @@ FAKE_SERVER_SOURCE = textwrap.dedent(
             if semantic_requests == 1:
                 while not warmup_release.exists():
                     time.sleep(0.01)
+                if behavior == "hang-warmup":
+                    while True:
+                        time.sleep(1)
             result = {"data": []}
         else:
             result = None
         send({"jsonrpc": "2.0", "id": message["id"], "result": result})
-        if exit_after_warmup and semantic_requests == 1:
+        if behavior == "exit-after-warmup" and semantic_requests == 1:
             break
     """
 )
@@ -197,6 +200,45 @@ class RequestSummaryTest(unittest.TestCase):
                 self.assertTrue(ready.is_file())
                 self.assertIn("server exited", stderr)
                 self.assertIn("waiting for profile marker", stderr)
+            finally:
+                if process.poll() is None:
+                    process.kill()
+                    process.wait()
+
+    def test_profile_warmup_response_has_a_deadline(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = pathlib.Path(temporary)
+            fake_server = directory / "fake_server.py"
+            fake_server.write_text(FAKE_SERVER_SOURCE)
+            log = directory / "methods.log"
+            warmup_release = directory / "warmup-release"
+            publish_marker(warmup_release, "")
+            ready = directory / "ready"
+            process = subprocess.Popen(
+                [
+                    sys.executable,
+                    str(pathlib.Path(__file__).parent / "drive.py"),
+                    "--bin",
+                    sys.executable,
+                    f"--server-arg={fake_server}",
+                    f"--server-arg={log}",
+                    f"--server-arg={warmup_release}",
+                    "--server-arg=hang-warmup",
+                    "--requests=1",
+                    "--size=1",
+                    "--settle=0",
+                    f"--profile-ready-file={ready}",
+                    "--profile-wait-timeout=0.05",
+                ],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            try:
+                _, stderr = process.communicate(timeout=3)
+                self.assertNotEqual(process.returncode, 0)
+                self.assertFalse(ready.exists())
+                self.assertIn("semantic warmup response", stderr)
             finally:
                 if process.poll() is None:
                     process.kill()

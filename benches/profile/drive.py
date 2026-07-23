@@ -20,6 +20,7 @@ import json
 import math
 import os
 from pathlib import Path
+import queue
 import subprocess
 import sys
 import tempfile
@@ -359,6 +360,7 @@ def main() -> None:
     server_request_counts = Counter()
     server_request_bytes = Counter()
     send_lock = threading.Lock()
+    request_threads = []
 
     def send(obj):
         body = json.dumps(obj).encode()
@@ -375,6 +377,28 @@ def main() -> None:
     def request(method, params):
         request_id = send_request(method, params)
         return read_until(request_id)
+
+    def request_with_timeout(method, params, timeout_seconds, description):
+        result_queue = queue.Queue(maxsize=1)
+
+        def run_request():
+            try:
+                result_queue.put((request(method, params), None))
+            except BaseException as error:
+                result_queue.put((None, error))
+
+        reader = threading.Thread(target=run_request, daemon=True)
+        request_threads.append(reader)
+        reader.start()
+        try:
+            result, error = result_queue.get(timeout=timeout_seconds)
+        except queue.Empty as error:
+            raise TimeoutError(
+                f"timed out waiting for {description}"
+            ) from error
+        if error is not None:
+            raise error
+        return result
 
     def notify(method, params):
         send({"jsonrpc": "2.0", "method": method, "params": params})
@@ -550,7 +574,11 @@ def main() -> None:
             {"textDocument": {"uri": uri}},
         )
         if args.profile_ready_file or args.profile_start_file:
-            warmup, _ = request(*semantic_request)
+            warmup, _ = request_with_timeout(
+                *semantic_request,
+                timeout_seconds=args.profile_wait_timeout,
+                description="semantic warmup response",
+            )
             if response_status(warmup) != "ok":
                 raise RuntimeError(
                     "semantic warmup did not return tokens; "
@@ -674,6 +702,8 @@ def main() -> None:
         if srv.poll() is None:
             srv.kill()
             srv.wait()
+        for reader in request_threads:
+            reader.join(timeout=1)
 
     n_bytes = len(text.encode("utf-8"))
     n_lines = len(text.splitlines())
