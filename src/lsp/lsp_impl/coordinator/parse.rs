@@ -109,6 +109,26 @@ pub(crate) struct ParseCoordinator {
     bridge: std::sync::Arc<BridgeCoordinator>,
 }
 
+/// Run a populate work-unit cooperatively cancelled, but keep awaiting it.
+///
+/// `ComputePool::run(Some(cancel), ..)` releases its async awaiter as soon as
+/// cancellation fires even when the synchronous closure has already started.
+/// Populate mutates shared injection caches at its final epoch-gated commit, so
+/// its caller must not proceed to a newer populate while the old closure can
+/// still be running. The closure polls this token internally and returns
+/// quickly when obsolete; `run(None, ..)` preserves the required join.
+async fn run_awaited_populate<T, F>(
+    pool: &crate::compute_pool::ComputePool,
+    cancel: crate::cancel::CancelToken,
+    work: F,
+) -> Option<T>
+where
+    T: Send + 'static,
+    F: FnOnce(crate::cancel::CancelToken) -> T + Send + 'static,
+{
+    pool.run(None, move || work(cancel)).await
+}
+
 impl ParseCoordinator {
     pub(crate) fn new(server: &Kakehashi) -> Self {
         Self::from_parts(ParseCoordinatorDeps {
@@ -400,42 +420,40 @@ impl ParseCoordinator {
             .settings_manager
             .load_settings()
             .any_bridge_server_runnable();
-        let cancel_for_work = version_cancel.clone();
-        self.compute_pool
-            .run(Some(version_cancel), move || {
-                // A refused pass (`None`) maps to all-`None` region fields —
-                // the snapshot then rides WITHOUT regions and readers fall
-                // back to inline resolution. Mapping it to the ran-and-empty
-                // shape instead would publish "no injections" for a pass
-                // that never derived anything, blanking the document's
-                // injections until the next parse.
-                let Some(populated) = cache.populate_injections_cancellable(
-                    &uri,
-                    &text,
-                    &tree,
-                    &language_name,
-                    &language,
-                    &tracker,
-                    entry_mint_epoch,
-                    incarnation,
-                    build_bridge_regions,
-                    build_bridge_regions,
-                    Some(&cancel_for_work),
-                ) else {
-                    return PopulatedSnapshotRegions::default();
-                };
-                PopulatedSnapshotRegions {
-                    discovery: populated.discovery.map(std::sync::Arc::new),
-                    bridge_regions: populated
-                        .bridge_regions
-                        .map(|regions| (populated.generation, std::sync::Arc::new(regions))),
-                    resolved_regions: populated
-                        .resolved_regions
-                        .map(|regions| (populated.generation, std::sync::Arc::new(regions))),
-                }
-            })
-            .await
-            .unwrap_or_default()
+        run_awaited_populate(&self.compute_pool, version_cancel, move |cancel_for_work| {
+            // A refused pass (`None`) maps to all-`None` region fields —
+            // the snapshot then rides WITHOUT regions and readers fall
+            // back to inline resolution. Mapping it to the ran-and-empty
+            // shape instead would publish "no injections" for a pass
+            // that never derived anything, blanking the document's
+            // injections until the next parse.
+            let Some(populated) = cache.populate_injections_cancellable(
+                &uri,
+                &text,
+                &tree,
+                &language_name,
+                &language,
+                &tracker,
+                entry_mint_epoch,
+                incarnation,
+                build_bridge_regions,
+                build_bridge_regions,
+                Some(&cancel_for_work),
+            ) else {
+                return PopulatedSnapshotRegions::default();
+            };
+            PopulatedSnapshotRegions {
+                discovery: populated.discovery.map(std::sync::Arc::new),
+                bridge_regions: populated
+                    .bridge_regions
+                    .map(|regions| (populated.generation, std::sync::Arc::new(regions))),
+                resolved_regions: populated
+                    .resolved_regions
+                    .map(|regions| (populated.generation, std::sync::Arc::new(regions))),
+            }
+        })
+        .await
+        .unwrap_or_default()
     }
 
     /// Parse the (already-registered) document at `uri` and publish the result.
@@ -1253,6 +1271,40 @@ mod tests {
             .expect("undetectable language must release first-parse waiters");
         assert!(snapshot.tree.is_none());
         assert_eq!(snapshot.incarnation, incarnation);
+    }
+
+    #[tokio::test]
+    async fn cancelled_populate_keeps_awaiter_joined_until_work_returns() {
+        let pool = crate::compute_pool::test_pool();
+        let cancel = crate::cancel::CancelToken::default();
+        let cancel_for_work = cancel.clone();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+
+        let task = tokio::spawn(async move {
+            run_awaited_populate(&pool, cancel_for_work, move |work_cancel| {
+                started_tx.send(()).expect("test receiver should wait");
+                release_rx.recv().expect("test should release work");
+                work_cancel.is_cancelled()
+            })
+            .await
+        });
+        started_rx.await.expect("populate work should start");
+
+        cancel.cancel();
+        tokio::task::yield_now().await;
+        assert!(
+            !task.is_finished(),
+            "version cancellation must not detach an in-flight populate"
+        );
+
+        release_tx
+            .send(())
+            .expect("populate work should still wait");
+        assert_eq!(
+            task.await.expect("populate task should not panic"),
+            Some(true)
+        );
     }
 
     /// The four documented invariants of the settle-refresh gate.
