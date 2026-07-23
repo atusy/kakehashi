@@ -979,6 +979,37 @@ pub(crate) fn build_document_discovery(
     generation: u64,
     incarnation: u64,
 ) -> Option<DiscoveredInjections> {
+    build_document_discovery_cancellable(
+        regions,
+        prebuilt_cacheable,
+        injection_query,
+        text,
+        coordinator,
+        uri,
+        tracker,
+        generation,
+        incarnation,
+        None,
+    )
+    .expect("discovery without cancellation cannot be cancelled")
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn build_document_discovery_cancellable(
+    regions: &[InjectionRegionInfo<'_>],
+    prebuilt_cacheable: &[CacheableInjectionRegion],
+    injection_query: &tree_sitter::Query,
+    text: &str,
+    coordinator: &LanguageCoordinator,
+    uri: &Url,
+    tracker: &NodeTracker,
+    generation: u64,
+    incarnation: u64,
+    cancel: Option<&crate::cancel::CancelToken>,
+) -> Option<Option<DiscoveredInjections>> {
+    if crate::cancel::is_cancelled(cancel) {
+        return None;
+    }
     // Partition exactly as collect_injection_contexts_sync does: an
     // injection.combined pattern (with no effective #offset!) → drop the
     // region and mark the discovery partial; v1 keeps combined groups on the
@@ -987,6 +1018,9 @@ pub(crate) fn build_document_discovery(
     let mut complete = true;
     let mut singles: Vec<(usize, &InjectionRegionInfo)> = Vec::with_capacity(regions.len());
     for (idx, injection) in regions.iter().enumerate() {
+        if crate::cancel::is_cancelled(cancel) {
+            return None;
+        }
         if has_combined_for_pattern(injection_query, injection.pattern_index)
             && effective_offset_for_pattern(injection_query, injection.pattern_index).is_none()
         {
@@ -1010,7 +1044,7 @@ pub(crate) fn build_document_discovery(
             singles.len(),
             INJECTION_CACHE_MIN_REGIONS
         );
-        return None;
+        return Some(None);
     }
 
     let mut discovered = Vec::with_capacity(singles.len());
@@ -1018,6 +1052,9 @@ pub(crate) fn build_document_discovery(
     // would otherwise shift every later single onto the wrong prebuilt
     // identity (wrong ULID + content hash).
     for (idx, injection) in singles {
+        if crate::cancel::is_cancelled(cancel) {
+            return None;
+        }
         let prebuilt = &prebuilt_cacheable[idx];
         // Producer: don't gate on the highlight query — store the region and let
         // reuse re-resolve the query (a load without a generation bump self-heals).
@@ -1053,11 +1090,14 @@ pub(crate) fn build_document_discovery(
         }
     }
 
-    Some(DiscoveredInjections {
+    if crate::cancel::is_cancelled(cancel) {
+        return None;
+    }
+    Some(Some(DiscoveredInjections {
         generation,
         complete,
         regions: discovered,
-    })
+    }))
 }
 
 /// Per-line byte prefix widths from included ranges: each range's
@@ -3499,6 +3539,45 @@ local b = 2
             discovery.regions.len() < regions.len(),
             "the ten zzznotalang fences must not be stored"
         );
+    }
+
+    #[test]
+    fn snapshot_discovery_stops_during_cancelled_region_walk() {
+        let Some(coordinator) = markdown_lua_coordinator() else {
+            return;
+        };
+        let text = eight_lua_block_doc();
+        let tree = parse_markdown(&coordinator, &text);
+        let query = coordinator
+            .injection_query("markdown")
+            .expect("markdown injection query");
+        let regions = crate::language::injection::collect_all_injections(
+            &tree.root_node(),
+            &text,
+            Some(query.as_ref()),
+        )
+        .expect("regions");
+        let uri = Url::parse("file:///cancel-snapshot-discovery.md").unwrap();
+        let tracker = NodeTracker::new();
+        let cacheable = cacheable_for(&regions, &uri, &tracker, &text);
+        let cancel = crate::cancel::CancelToken::default();
+        cancel.cancel_after_polls(3);
+
+        let discovery = build_document_discovery_cancellable(
+            &regions,
+            &cacheable,
+            query.as_ref(),
+            &text,
+            &coordinator,
+            &uri,
+            &tracker,
+            0,
+            0,
+            Some(&cancel),
+        );
+
+        assert!(discovery.is_none());
+        assert!(cancel.is_cancelled());
     }
 
     /// The dominant per-compute cost on a large document is the single-threaded
