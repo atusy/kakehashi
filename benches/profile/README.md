@@ -69,6 +69,7 @@ python3 benches/profile/drive.py \
   --profile-ready-file "$profile_dir/ready" \
   --profile-start-file "$profile_dir/start" \
   --profile-done-file "$profile_dir/done" \
+  --profile-wait-timeout 300 \
   --profile-hold-seconds 5 &
 driver_pid=$!
 
@@ -109,8 +110,9 @@ wait "$driver_pid"
 
 Use a fresh marker directory for each run. `pid`, `ready`, and `done` are
 published atomically. `start` is owned by the profiler controller; if it is not
-published within `--profile-wait-timeout` (30 seconds by default), the driver
-fails and still reaps the server.
+published within `--profile-wait-timeout`, the driver fails and still reaps the
+server. The interactive example allows five minutes for attachment; the CLI
+default is 30 seconds.
 
 The harness drives the server against `deps/test/kakehashi` for parsers/queries.
 If that dir has no installed parsers, the server auto-installs on the first
