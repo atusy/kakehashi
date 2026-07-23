@@ -22,10 +22,10 @@ Evidence:
 - `semantic-lazy-content-lines-2026-07-23/`
 - `semantic-lazy-content-lines-confirmation-2026-07-23/`
 
-## Request-local capture role table
+## Collection-local capture role table
 
 Candidate `0b8626b40950074f6d935a00bed7b0bd05ec2ecb` resolved capture roles
-once per request rather than once per matched capture.
+once per host or injection collection rather than once per matched capture.
 
 Markdown typing delta improved by a median -9.67%, but
 `rust_sparse_32k_minus/typing_delta` regressed in all four pairs with a +8.80%
@@ -34,10 +34,10 @@ not safe to ship as a general hot-path optimization.
 
 Evidence: `semantic-capture-role-table-2026-07-23/`
 
-## Request-local pattern priority table
+## Collection-local pattern priority table
 
 Candidate `5681ae5fff701b9f5570fe4a169aca76ebd8b47a` parsed query priorities
-once per request rather than once per match.
+once per host or injection collection rather than once per match.
 
 Only `rust_sparse_32k_exact/typing_delta` improved in all four pairs (-1.70%
 median). Markdown typing delta and burst had +0.73% and +0.49% medians,
@@ -49,8 +49,9 @@ Evidence: `semantic-pattern-priority-table-2026-07-23/`
 
 ## Consequence
 
-Do not transplant these request-local forms. If capture roles or pattern
-properties are revisited, construct an immutable query plan when a query or
-settings generation is loaded, then measure the complete LSP path again. This
-keeps immutable work out of repeated requests without weakening semantic-token
-freshness.
+Do not transplant these collection-local forms. These measurements do not rule
+out a table shared across all host and injection collections in one request. If
+capture roles or pattern properties are revisited, prefer constructing an
+immutable query plan when a query or settings generation is loaded, then
+measure the complete LSP path again. This keeps immutable work out of repeated
+requests without weakening semantic-token freshness.
