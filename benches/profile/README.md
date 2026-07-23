@@ -54,6 +54,44 @@ benches/profile/xctrace.sh --lang markdown --size 150 --requests 160 --edits 1
 # -> $TMPDIR/kakehashi-xctrace/semantic-time.trace (+ a target-only summary)
 ```
 
+To attribute Rust `GlobalAlloc` traffic to completed semantic compute without
+relying on profiler stack sampling, build the opt-in counting allocator and
+enable only the semantic debug target:
+
+```sh
+cargo build --profile profiling --features allocation-profile --bin kakehashi
+RUST_LOG=kakehashi::semantic=debug \
+  python3 benches/profile/drive.py \
+    --bin ./target/profiling/kakehashi \
+    --lang markdown --size 150 --requests 30 --edits 1
+```
+
+Each completed work-unit emits a `compute rust allocations` record with
+allocation and deallocation event counts and requested bytes. A successful
+`realloc` is charged as a full old-layout deallocation plus a full new-size
+allocation even when it happens in place
+(`realloc_accounting=old_deallocation_plus_new_allocation`), so the values
+represent realloc-inclusive requested-capacity traffic rather than distinct
+pointers or bytes physically copied. The counters cover Rust allocations from
+the whole process between work-unit entry and completion
+(`scope=process_global_alloc_delta`). Use the synchronous driver without
+competing client requests, but interpret the result as mixed process traffic
+during the semantic compute window: parse-loop injection, bridge, diagnostic,
+or other background work may overlap after publishing the snapshot and is not
+separable by this process-global counter. Rayon allocations made through
+`GlobalAlloc` remain included. Native Tree-sitter allocations such as
+`ts_malloc` bypass this counter; use the exact-PID `heap`/MallocStackLogging
+workflow below when native and retained allocations matter. The four monotonic
+counters are sampled independently (`consistency=non_atomic_snapshot`): another
+process thread allocating across a boundary can split the count and byte
+observations, so aggregate repeated records instead of treating one record or a
+derived net value as exact. Atomic counting changes timing, so use these records
+for allocation traffic only and report latency from an otherwise identical
+build without `allocation-profile`. Work whose cancellation is observed by the
+final compute checkpoint has no completed-compute record; a cancellation racing
+after that checkpoint may still cause the caller to discard a result whose
+compute record was already emitted.
+
 Allocation and retained-heap profilers need to attach to the spawned server
 rather than the Python driver. The driver exposes an optional file handshake so
 an external profiler can attach to the exact PID after an awaited, unmeasured

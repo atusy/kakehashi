@@ -3,6 +3,11 @@ use kakehashi::install::{default_data_dir, metadata, parser, queries};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
+#[cfg(feature = "allocation-profile")]
+#[global_allocator]
+static GLOBAL_ALLOCATOR: kakehashi::allocation_profile::CountingAllocator =
+    kakehashi::allocation_profile::CountingAllocator;
+
 /// A Language Server Protocol (LSP) server using Tree-sitter for parsing
 #[derive(Parser)]
 #[command(name = "kakehashi")]
@@ -1077,6 +1082,22 @@ async fn run_lsp_server() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "allocation-profile")]
+    #[test]
+    fn allocation_profile_counts_binary_allocations_and_deallocations() {
+        let before = kakehashi::allocation_profile::snapshot();
+        let allocation = std::hint::black_box(Vec::<u8>::with_capacity(4_096));
+        let allocated = kakehashi::allocation_profile::snapshot().delta_since(before);
+        assert!(allocated.allocations() >= 1);
+        assert!(allocated.allocated_bytes() >= 4_096);
+
+        let before_drop = kakehashi::allocation_profile::snapshot();
+        drop(allocation);
+        let deallocated = kakehashi::allocation_profile::snapshot().delta_since(before_drop);
+        assert!(deallocated.deallocations() >= 1);
+        assert!(deallocated.deallocated_bytes() >= 4_096);
+    }
 
     #[test]
     fn installed_query_language_name_filters_unsafe_dirs() {

@@ -117,6 +117,8 @@ pub(crate) async fn handle_semantic_tokens_full(
     pool.run(cancel.clone(), move || {
         let is_cancelled = || crate::cancel::is_cancelled(cancel.as_ref());
         let compute_started = std::time::Instant::now();
+        #[cfg(feature = "allocation-profile")]
+        let allocation_started = crate::allocation_profile::snapshot();
         let mut host_tokens: Vec<RawToken> = Vec::with_capacity(1000);
         let lines: Vec<&str> = text.lines().collect();
         let line_starts = build_line_start_bytes(&text);
@@ -236,6 +238,14 @@ pub(crate) async fn handle_semantic_tokens_full(
         if is_cancelled() {
             return None;
         }
+        // Close the measurement after request-owned scratch state is released,
+        // while keeping the returned semantic result live for its caller.
+        drop(active_injection_regions);
+        drop(lines);
+        drop(line_starts);
+        #[cfg(feature = "allocation-profile")]
+        let allocation_delta =
+            crate::allocation_profile::snapshot().delta_since(allocation_started);
 
         // Host/injection durations overlap when `parallel=true`, so `compute`
         // is the authoritative wall time; branch durations must not be summed.
@@ -260,6 +270,17 @@ pub(crate) async fn handle_semantic_tokens_full(
                 .map(|d| d.regions.len().to_string())
                 .unwrap_or_else(|| "none".to_string()),
         );
+        #[cfg(feature = "allocation-profile")]
+        {
+            log::debug!(
+                target: "kakehashi::semantic",
+                "[SEMANTIC_TOKENS] compute rust allocations: allocations={} allocated_bytes={} deallocations={} deallocated_bytes={} scope=process_global_alloc_delta consistency=non_atomic_snapshot realloc_accounting=old_deallocation_plus_new_allocation",
+                allocation_delta.allocations(),
+                allocation_delta.allocated_bytes(),
+                allocation_delta.deallocations(),
+                allocation_delta.deallocated_bytes(),
+            );
+        }
 
         result
     })
