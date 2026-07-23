@@ -1,3 +1,5 @@
+#[cfg(feature = "allocation-profile")]
+pub(crate) mod allocation_profile;
 pub(crate) mod analysis;
 pub(crate) mod cancel;
 pub mod cli;
