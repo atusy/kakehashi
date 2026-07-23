@@ -19,7 +19,9 @@ pub(crate) use legend::{LEGEND_MODIFIERS, LEGEND_TYPES};
 pub(crate) use parallel::DISCOVERY_REUSE_HITS;
 pub(crate) use parallel::build_document_discovery;
 pub(crate) use range::filter_semantic_tokens_by_range;
-pub(crate) use semantic_artifact::{SemanticArtifact, SemanticArtifactIdentity};
+pub(crate) use semantic_artifact::{
+    SemanticArtifact, SemanticArtifactConsumer, SemanticArtifactIdentity, SemanticArtifactSlot,
+};
 
 // Re-export for parallel processing
 use parallel::{INJECTION_CACHE_MIN_REGIONS, InjectionCacheCtx, collect_injection_tokens_parallel};
@@ -859,7 +861,7 @@ local x = 42
         );
     }
 
-    /// Test that async handler returns None for empty document (consistent with sync behavior).
+    /// Test that an empty document returns a successful explicit empty token set.
     #[tokio::test]
     async fn test_handle_semantic_tokens_full_with_empty_document() {
         use crate::config::WorkspaceSettings;
@@ -912,10 +914,14 @@ local x = 42
         )
         .await;
 
-        // Empty document returns None (consistent with finalize_tokens behavior)
+        // A successful zero-token computation is distinct from cancellation or
+        // producer failure, so clients receive an explicit empty token set.
         assert!(
-            result.is_none(),
-            "Empty document should return None (no tokens to return)"
+            matches!(
+                result,
+                Some(SemanticTokensResult::Tokens(tokens)) if tokens.data.is_empty()
+            ),
+            "empty document should return an explicit empty token set"
         );
     }
 

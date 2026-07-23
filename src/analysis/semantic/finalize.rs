@@ -736,7 +736,10 @@ pub(super) fn finalize_tokens_cancellable(
     let all_tokens = split_overlapping_tokens_cancellable(all_tokens, cancel)?;
 
     if all_tokens.is_empty() {
-        return None;
+        return Some(SemanticTokensResult::Tokens(SemanticTokens {
+            result_id: None,
+            data: Vec::new(),
+        }));
     }
 
     // Delta-encode
@@ -895,9 +898,10 @@ mod tests {
     }
 
     #[test]
-    fn finalize_tokens_returns_none_for_empty_input() {
+    fn finalize_tokens_returns_empty_result_for_empty_input() {
         let tokens: Vec<RawToken> = vec![];
-        assert!(finalize_tokens(tokens, &[], &[]).is_none());
+        let result = finalize_tokens(tokens, &[], &[]).expect("successful empty result");
+        assert!(matches!(result, SemanticTokensResult::Tokens(tokens) if tokens.data.is_empty()));
     }
 
     #[test]
@@ -918,12 +922,13 @@ mod tests {
     }
 
     #[test]
-    fn finalize_tokens_returns_none_when_all_tokens_are_zero_length() {
+    fn finalize_tokens_returns_empty_result_when_all_tokens_are_zero_length() {
         let tokens = vec![
             make_token(0, 0, 0, "keyword", 0, 0),
             make_token(1, 5, 0, "variable", 0, 0),
         ];
-        assert!(finalize_tokens(tokens, &[], &[]).is_none());
+        let result = finalize_tokens(tokens, &[], &[]).expect("successful empty result");
+        assert!(matches!(result, SemanticTokensResult::Tokens(tokens) if tokens.data.is_empty()));
     }
 
     #[test]

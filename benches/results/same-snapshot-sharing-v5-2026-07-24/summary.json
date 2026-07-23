@@ -1,0 +1,46 @@
+{
+  "scenarios": [
+    {
+      "a_median_ns": 165878541.75,
+      "b_median_ns": 117150250.5,
+      "pair_count": 4,
+      "paired_delta_percent": {
+        "max": 32.095228545401845,
+        "median": -29.371366085899382,
+        "min": -31.66283890320348
+      },
+      "pairs": [
+        {
+          "a_median_ns": 91435125.5,
+          "b_median_ns": 120781438.0,
+          "delta_percent": 32.095228545401845,
+          "order": "AB",
+          "pair_index": 1
+        },
+        {
+          "a_median_ns": 167394312.5,
+          "b_median_ns": 114392521.0,
+          "delta_percent": -31.66283890320348,
+          "order": "BA",
+          "pair_index": 2
+        },
+        {
+          "a_median_ns": 166880291.5,
+          "b_median_ns": 116616271.5,
+          "delta_percent": -30.119805968819275,
+          "order": "AB",
+          "pair_index": 3
+        },
+        {
+          "a_median_ns": 164876792.0,
+          "b_median_ns": 117684229.5,
+          "delta_percent": -28.622926202979492,
+          "order": "BA",
+          "pair_index": 4
+        }
+      ],
+      "scenario": "rust_xlarge/same_snapshot_fanout"
+    }
+  ],
+  "schema_version": 1
+}

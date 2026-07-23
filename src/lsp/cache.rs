@@ -23,7 +23,7 @@ use crate::language::LanguageCoordinator;
 use crate::language::NodeTracker;
 use crate::language::injection::{CacheableInjectionRegion, collect_all_injections};
 
-use super::semantic_request_tracker::SemanticRequestTracker;
+use super::semantic_request_tracker::{SemanticRequestScope, SemanticRequestTracker};
 
 /// Request ID type for tracking semantic token requests.
 pub(crate) type RequestId = u64;
@@ -619,9 +619,11 @@ impl CacheCoordinator {
     /// token (computed under the old queries) stops matching, and clear the map
     /// to reclaim the now-dead entries. The bump — not the clear — is what makes
     /// this race-safe against a request that stores tokens after the clear.
-    pub(crate) fn bump_semantic_token_generation(&self) {
-        self.semantic_token_generation
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    pub(crate) fn bump_semantic_token_generation(&self) -> u64 {
+        let generation = self
+            .semantic_token_generation
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            + 1;
         self.semantic_cache.clear();
         // The injection token cache folds the same generation into its key, so
         // old-generation entries are already unreachable after the bump; clear
@@ -631,6 +633,7 @@ impl CacheCoordinator {
         // The range cache folds the same generation into its key, so the bump
         // already invalidates it; clear to reclaim the dead entries (#535).
         self.semantic_range_cache.clear();
+        generation
     }
 
     // ========================================================================
@@ -640,11 +643,14 @@ impl CacheCoordinator {
     /// Start tracking a new request for the given URI.
     ///
     /// Returns the request ID (for `is_request_active` checkpoints) and a
-    /// [`CancelToken`](crate::cancel::CancelToken) the request's compute should
-    /// poll. Automatically supersedes any previous request for the same URI and
-    /// cancels its in-flight compute.
-    pub(crate) fn start_request(&self, uri: &Url) -> (RequestId, crate::cancel::CancelToken) {
-        self.request_tracker.start_request(uri)
+    /// revision [`CancelToken`](crate::cancel::CancelToken). Same-scope
+    /// consumers coexist; only a newer scope supersedes the prior consumers.
+    pub(crate) fn start_request(
+        &self,
+        uri: &Url,
+        scope: SemanticRequestScope,
+    ) -> (RequestId, crate::cancel::CancelToken) {
+        self.request_tracker.start_request(uri, scope)
     }
 
     /// Check if a request is still active (not superseded by a newer one).
@@ -657,6 +663,21 @@ impl CacheCoordinator {
     /// Finish a request, removing it from tracking if it's still the active one.
     pub(crate) fn finish_request(&self, uri: &Url, request_id: RequestId) {
         self.request_tracker.finish_request(uri, request_id);
+    }
+
+    pub(crate) fn finish_absent_request(
+        &self,
+        uri: &Url,
+        request_id: RequestId,
+        scope: SemanticRequestScope,
+    ) {
+        self.request_tracker
+            .finish_absent_request(uri, request_id, scope);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn semantic_request_consumer_count(&self, uri: &Url) -> usize {
+        self.request_tracker.consumer_count(uri)
     }
 
     /// Cancel all requests for a given URI (test helper).
@@ -681,6 +702,14 @@ mod tests {
 
     fn create_test_uri(path: &str) -> Url {
         Url::parse(&format!("file:///{}", path)).unwrap()
+    }
+
+    fn request_scope(version: u64) -> SemanticRequestScope {
+        SemanticRequestScope {
+            incarnation: 1,
+            generation: 0,
+            content_version: version,
+        }
     }
 
     /// One region-local `RawToken`, for seeding the injection token cache.
@@ -726,7 +755,7 @@ mod tests {
         );
 
         // Start a request
-        let (_request_id, _token) = cache.start_request(&uri);
+        let (_request_id, _token) = cache.start_request(&uri, request_scope(1));
 
         // Remove the document
         cache.remove_document(&uri);
@@ -832,11 +861,11 @@ mod tests {
         let uri = create_test_uri("test.rs");
 
         // Start a request
-        let (req1, _t1) = cache.start_request(&uri);
+        let (req1, _t1) = cache.start_request(&uri, request_scope(1));
         assert!(cache.is_request_active(&uri, req1));
 
         // Start another request - should supersede the first
-        let (req2, _t2) = cache.start_request(&uri);
+        let (req2, _t2) = cache.start_request(&uri, request_scope(2));
         assert!(!cache.is_request_active(&uri, req1));
         assert!(cache.is_request_active(&uri, req2));
 
@@ -851,7 +880,7 @@ mod tests {
         let uri = create_test_uri("test.rs");
 
         // Start a request
-        let (req, _token) = cache.start_request(&uri);
+        let (req, _token) = cache.start_request(&uri, request_scope(1));
         assert!(cache.is_request_active(&uri, req));
 
         // Cancel all requests
