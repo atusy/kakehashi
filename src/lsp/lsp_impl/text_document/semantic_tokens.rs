@@ -73,16 +73,6 @@ enum CurrentTokens {
 }
 
 impl CurrentTokens {
-    fn from_result(result: SemanticTokensResult) -> Self {
-        match result {
-            SemanticTokensResult::Tokens(tokens) => Self::Owned(tokens),
-            SemanticTokensResult::Partial(_) => Self::Owned(SemanticTokens {
-                result_id: None,
-                data: Vec::new(),
-            }),
-        }
-    }
-
     fn as_ref(&self) -> &SemanticTokens {
         match self {
             Self::Cached(arc) => arc,
@@ -878,6 +868,12 @@ impl Kakehashi {
                     // The snapshot's own discovery (ADR §3, don't-discover-twice).
                     discovery: snapshot.injection_regions.clone(),
                 });
+                let artifact_identity = SemanticArtifactIdentity::new(
+                    uri.clone(),
+                    language_name.clone(),
+                    snapshot_identity,
+                    supports_multiline,
+                );
 
                 // Compute tokens, racing against cancel notification if provided
                 let compute_future = handle_semantic_tokens_full(
@@ -921,7 +917,12 @@ impl Kakehashi {
                     // No cancel support - just await the computation
                     compute_future.await
                 };
-                computed.map(CurrentTokens::from_result)
+                computed
+                    .and_then(|result| {
+                        SemanticArtifact::from_full_result(artifact_identity.clone(), result)
+                    })
+                    .and_then(|artifact| artifact.materialize_full(&artifact_identity, None))
+                    .map(CurrentTokens::Owned)
             }
         };
 
@@ -1222,6 +1223,12 @@ impl Kakehashi {
         // Use Rayon-based parallel injection processing
         let supports_multiline = self.settings_manager.supports_multiline_tokens();
         let coordinator = std::sync::Arc::clone(&self.language);
+        let artifact_identity = SemanticArtifactIdentity::new(
+            uri.clone(),
+            language_name.clone(),
+            snapshot_identity,
+            supports_multiline,
+        );
 
         let result = handle_semantic_tokens_full(
             &self.compute_pool,
@@ -1239,19 +1246,19 @@ impl Kakehashi {
 
         // Shape immutable payloads before taking the edit lock. Only the final
         // live-snapshot validation and cache commits need to exclude edits.
-        let (domain_range_result, tokens_to_store) = match result {
-            Some(tower_lsp_server::ls_types::SemanticTokensResult::Tokens(mut full_tokens)) => {
-                full_tokens.result_id = Some(next_result_id());
+        let artifact = result.and_then(|result| {
+            SemanticArtifact::from_full_result(artifact_identity.clone(), result)
+        });
+        let (domain_range_result, tokens_to_store) = match artifact.and_then(|artifact| {
+            artifact.materialize_full(&artifact_identity, Some(next_result_id()))
+        }) {
+            Some(full_tokens) => {
                 let range_tokens = filter_semantic_tokens_by_range(&full_tokens, &domain_range);
                 let response = tower_lsp_server::ls_types::SemanticTokensRangeResult::from(
                     range_tokens.clone(),
                 );
                 (response, Some((full_tokens, range_tokens)))
             }
-            Some(tower_lsp_server::ls_types::SemanticTokensResult::Partial(partial)) => (
-                tower_lsp_server::ls_types::SemanticTokensRangeResult::from(partial),
-                None,
-            ),
             None => (
                 tower_lsp_server::ls_types::SemanticTokensRangeResult::Tokens(
                     tower_lsp_server::ls_types::SemanticTokens {
