@@ -186,6 +186,13 @@ class RequestSummaryTest(unittest.TestCase):
                 )
             with self.assertRaisesRegex(ValueError, "must be distinct"):
                 validate_profile_marker_paths([marker, directory / "READY"])
+            for paths in (
+                [directory / "pid", directory],
+                [directory, directory / "start"],
+            ):
+                with self.subTest(paths=paths):
+                    with self.assertRaisesRegex(ValueError, "contain one another"):
+                        validate_profile_marker_paths(paths)
 
     def test_profile_timing_options_must_be_finite(self):
         drive = str(pathlib.Path(__file__).parent / "drive.py")

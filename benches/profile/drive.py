@@ -92,20 +92,29 @@ def validate_profile_marker_paths(
     paths: list[Path | str | None],
 ) -> None:
     """Reject aliases that could satisfy a profiling phase prematurely."""
-    seen: dict[str, Path | str] = {}
+    seen: list[tuple[tuple[str, ...], Path | str]] = []
     for path in paths:
         if path is None:
             continue
         resolved = Path(path).expanduser().resolve()
         # Marker names are a cross-process protocol, so conservatively reject
         # case/normalization-only differences even on a case-sensitive volume.
-        key = unicodedata.normalize("NFC", str(resolved)).casefold()
-        if key in seen:
-            previous = seen[key]
-            raise ValueError(
-                f"profile marker paths must be distinct: {previous} and {path}"
-            )
-        seen[key] = path
+        parts = tuple(
+            unicodedata.normalize("NFC", part).casefold()
+            for part in resolved.parts
+        )
+        for previous_parts, previous in seen:
+            if parts == previous_parts:
+                raise ValueError(
+                    f"profile marker paths must be distinct: {previous} and {path}"
+                )
+            shared = min(len(parts), len(previous_parts))
+            if parts[:shared] == previous_parts[:shared]:
+                raise ValueError(
+                    "profile marker paths must not contain one another: "
+                    f"{previous} and {path}"
+                )
+        seen.append((parts, path))
 
 
 def summarize_samples(samples: list[RequestSample]) -> RequestSummary:
