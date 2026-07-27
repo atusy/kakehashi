@@ -582,9 +582,11 @@ impl FrameRepairer {
                 // Typed validation upstream caps rangeLength at u32; exactly
                 // u32::MAX would overflow when the rewrite widens it by one,
                 // and the broken field would make tower drop the whole edit.
-                let range_length_can_widen = change
-                    .get("rangeLength")
-                    .is_none_or(|v| v.as_u64().is_some_and(|l| l < u64::from(u32::MAX)));
+                let range_length_can_widen = change.get("rangeLength").is_none_or(|v| {
+                    // Explicit null deserializes to None downstream, same as
+                    // an omitted field.
+                    v.is_null() || v.as_u64().is_some_and(|l| l < u64::from(u32::MAX))
+                });
                 let seam = if is_ranged && range_length_can_widen && entry.leading_low.is_some() {
                     self.pending
                         .get(&uri)
@@ -1697,6 +1699,49 @@ mod tests {
         for chunk in [1, 4, 64] {
             assert_eq!(stream_repair_all(input, chunk), input.to_vec());
         }
+    }
+
+    /// An explicit `"rangeLength": null` deserializes to None downstream,
+    /// exactly like an omitted field — it must not block reassembly.
+    #[tokio::test]
+    async fn null_range_length_still_consumes_the_seam() {
+        let mut input = Vec::new();
+        input.extend_from_slice(&didchange_frame(
+            "file:///t.md",
+            1,
+            &insert_at(0, 0, r"a\uD83D"),
+        ));
+        let continuation = r#"{"range":{"start":{"line":0,"character":2},"end":{"line":0,"character":2}},"rangeLength":null,"text":"\uDE03b"}"#;
+        input.extend_from_slice(&didchange_frame("file:///t.md", 2, continuation));
+        let out = tokio::time::timeout(std::time::Duration::from_secs(5), pump_through(input))
+            .await
+            .expect("pump should finish");
+        let frames = parse_frames(&out);
+        let second = &frames[1]["params"]["contentChanges"][0];
+        assert_eq!(second["text"], "😃b");
+        assert!(second["rangeLength"].is_null(), "null field stays null");
+    }
+
+    /// rangeLength exactly u32::MAX cannot be widened without overflowing
+    /// the typed u32 bound downstream; such an edit must not consume.
+    #[tokio::test]
+    async fn max_range_length_does_not_consume_the_seam() {
+        let mut input = Vec::new();
+        input.extend_from_slice(&didchange_frame(
+            "file:///t.md",
+            1,
+            &insert_at(0, 0, r"a\uD83D"),
+        ));
+        let continuation = r#"{"range":{"start":{"line":0,"character":2},"end":{"line":0,"character":2}},"rangeLength":4294967295,"text":"\uDE03b"}"#;
+        input.extend_from_slice(&didchange_frame("file:///t.md", 2, continuation));
+        let out = tokio::time::timeout(std::time::Duration::from_secs(5), pump_through(input))
+            .await
+            .expect("pump should finish");
+        let frames = parse_frames(&out);
+        assert_eq!(
+            frames[1]["params"]["contentChanges"][0]["text"],
+            "\u{FFFD}b"
+        );
     }
 
     /// Seam keys must match downstream document identity: an edit through an
