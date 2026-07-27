@@ -582,9 +582,9 @@ impl FrameRepairer {
                 // Typed validation upstream caps rangeLength at u32; exactly
                 // u32::MAX would overflow when the rewrite widens it by one,
                 // and the broken field would make tower drop the whole edit.
-                let range_length_can_widen = change.get("rangeLength").map_or(true, |v| {
-                    v.as_u64().is_some_and(|l| l < u64::from(u32::MAX))
-                });
+                let range_length_can_widen = change
+                    .get("rangeLength")
+                    .is_none_or(|v| v.as_u64().is_some_and(|l| l < u64::from(u32::MAX)));
                 let seam = if is_ranged && range_length_can_widen && entry.leading_low.is_some() {
                     self.pending
                         .get(&uri)
