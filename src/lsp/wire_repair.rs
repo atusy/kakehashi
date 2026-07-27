@@ -114,8 +114,33 @@ async fn forward_frames(mut input: impl AsyncRead + Send + Unpin, mut output: Du
         if forwarded.is_err() {
             return; // reader side is gone; nothing left to do
         }
+        // Per spec `exit` is the last message. tower-lsp stops reading right
+        // after it (clients may keep stdin open forever), and the pump must
+        // do the same: a fresh tokio stdin read parks on the blocking pool,
+        // is not cancellable, and would stall runtime shutdown until the
+        // client closes the pipe.
+        if is_exit_notification(&buf[header_end..frame_end]) {
+            return;
+        }
         buf.drain(..frame_end);
     }
+}
+
+/// Is this body the `exit` notification? Bodies above a tiny bound are never
+/// exit frames, so real traffic skips the parse.
+fn is_exit_notification(body: &[u8]) -> bool {
+    const MAX_EXIT_FRAME: usize = 256;
+    if body.len() > MAX_EXIT_FRAME || !body.windows(4).any(|w| w == b"exit") {
+        return false;
+    }
+    serde_json::from_slice::<serde_json::Value>(body)
+        .ok()
+        .and_then(|msg| {
+            msg.get("method")
+                .and_then(|m| m.as_str())
+                .map(|m| m == "exit")
+        })
+        .unwrap_or(false)
 }
 
 /// Reads until `buf` contains a full header block, returning the offset just
@@ -1350,6 +1375,31 @@ mod tests {
             .expect("pump should finish");
         let frames = parse_frames(&out);
         assert_eq!(frames[2]["params"]["contentChanges"][0]["text"], "😃b");
+    }
+
+    /// After `exit` the client may legally keep stdin open while waiting for
+    /// the process to die; the pump must stop reading (EOF downstream)
+    /// instead of parking another non-cancellable stdin read that would
+    /// stall runtime shutdown.
+    #[tokio::test]
+    async fn pump_stops_after_exit_even_with_stdin_open() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let (mut tx, rx) = tokio::io::duplex(1 << 20);
+        let mut repaired = repair_inbound_frames(rx);
+        let exit = frame(r#"{"jsonrpc":"2.0","method":"exit"}"#);
+        tx.write_all(&exit).await.unwrap();
+        // tx deliberately kept alive: no EOF from the "client".
+        let mut out = Vec::new();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            repaired.read_to_end(&mut out),
+        )
+        .await
+        .expect("pump must stop reading after exit")
+        .unwrap();
+        assert_eq!(out, exit);
+        drop(tx);
     }
 
     /// A didChange the downstream drops (typed validation fails: version is
