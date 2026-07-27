@@ -529,9 +529,17 @@ pub(crate) fn repair_lone_surrogates(body: &str) -> Option<BodyRepair> {
                         }
                         None => i += 2, // malformed \u escape; leave as-is
                     },
-                    Some(&escaped) => {
+                    Some(&escaped) if escaped.is_ascii() => {
                         decode.push_escape(escaped);
                         i += 2;
+                    }
+                    Some(_) => {
+                        // `\` before a multi-byte char is invalid JSON, but
+                        // the advance must still land on a char boundary or
+                        // the slices below panic mid-character.
+                        let ch = body[i + 1..].chars().next().unwrap_or('\u{FFFD}');
+                        decode.push_char(ch);
+                        i += 1 + ch.len_utf8();
                     }
                     None => i += 1,
                 }
@@ -684,6 +692,16 @@ mod tests {
     #[test]
     fn truncated_escape_at_end_of_body_is_left_alone() {
         assert_eq!(repair_lone_surrogates(r#"{"text":"\uD8"#), None);
+    }
+
+    /// `\` followed by a raw multi-byte char used to advance the scanner
+    /// into the middle of that char and panic on a non-boundary slice —
+    /// which killed the pump task and hung the whole server.
+    #[test]
+    fn backslash_before_multibyte_char_does_not_panic() {
+        let body = "{\"a\":\"\\é\\uD800\"}";
+        let repair = repair_lone_surrogates(body).expect("lone surrogate should trigger repair");
+        assert_eq!(repair.repaired, "{\"a\":\"\\é\u{FFFD}\"}");
     }
 
     #[test]
