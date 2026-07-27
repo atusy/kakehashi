@@ -95,31 +95,48 @@ async fn forward_frames(mut input: impl AsyncRead + Send + Unpin, mut output: Du
         };
         // Repair needs the whole body in memory (and a second copy lives in
         // the downstream codec's buffer), so monster frames would double
-        // peak memory. Stream them through verbatim instead: chunking
-        // clients split at small sizes, so a frame this large is a full-sync
-        // whose repair value doesn't justify the duplication.
+        // peak memory. Stream them instead, through a byte-length-preserving
+        // stage-1 repair (Content-Length stays valid); only seam reassembly
+        // is skipped at this scale.
         const LARGE_FRAME_BYPASS: usize = 64 * 1024 * 1024;
         if content_len > LARGE_FRAME_BYPASS && buf.len() < frame_end {
-            // An edit this size was never inspected; drop all seam state.
+            // An edit this size gets no seam inspection; drop all state.
             repairer.forget_seams();
-            if output.write_all(&buf).await.is_err() {
+            if output.write_all(&buf[..header_end]).await.is_err() {
                 return;
             }
-            let mut remaining = frame_end - buf.len();
+            let mut stream = StreamRepair::default();
+            let mut scratch: Vec<u8> = Vec::with_capacity(READ_CHUNK_SIZE + 16);
+            let mut tail: Vec<u8> = buf.split_off(header_end);
             buf.clear();
-            while remaining > 0 {
-                if !read_more(&mut input, &mut buf).await {
-                    let _ = output.write_all(&buf).await; // truncated final frame
-                    return;
-                }
+            let mut body_remaining = content_len;
+            loop {
                 // The read may run past the frame into the next one; only
-                // the frame's own bytes are forwarded-and-dropped here.
-                let take = buf.len().min(remaining);
-                if output.write_all(&buf[..take]).await.is_err() {
+                // the frame's own bytes go through the stream repair.
+                let take = tail.len().min(body_remaining);
+                scratch.clear();
+                stream.feed(&tail[..take], &mut scratch);
+                if output.write_all(&scratch).await.is_err() {
                     return;
                 }
-                remaining -= take;
-                buf.drain(..take);
+                body_remaining -= take;
+                if body_remaining == 0 {
+                    scratch.clear();
+                    stream.finish(&mut scratch);
+                    if output.write_all(&scratch).await.is_err() {
+                        return;
+                    }
+                    buf = tail[take..].to_vec(); // over-read: next frame's bytes
+                    break;
+                }
+                tail.clear();
+                if !read_more(&mut input, &mut tail).await {
+                    // Truncated final frame: flush what the repair withheld.
+                    scratch.clear();
+                    stream.finish(&mut scratch);
+                    let _ = output.write_all(&scratch).await;
+                    return;
+                }
             }
             continue;
         }
@@ -250,6 +267,130 @@ fn rewrite_content_length(headers: &[u8], new_len: usize) -> Vec<u8> {
         }
     }
     out
+}
+
+/// Streaming, byte-length-preserving stage-1 repair for frames too large to
+/// buffer: lone surrogate escapes become `�` (6 -> 6 bytes), WTF-8
+/// surrogate triplets become U+FFFD (3 -> 3 bytes), and other invalid UTF-8
+/// bytes become `?` (1 -> 1 byte). Content-Length therefore never changes
+/// and no whole-body buffer is needed. Pair reassembly (stage 2) and the
+/// batch scanner's string-context tracking are deliberately skipped at this
+/// scale: an escaped-backslash false positive rewrites six literal
+/// characters into six other literal characters, preserving geometry.
+#[derive(Default)]
+struct StreamRepair {
+    /// Bytes withheld at a chunk boundary because they could be the prefix
+    /// of a pattern that needs lookahead (at most [`Self::MAX_CARRY`]).
+    carry: Vec<u8>,
+}
+
+impl StreamRepair {
+    /// A high surrogate escape plus all but the last byte of its potential
+    /// low escape: `\uXXXX\uYYY`.
+    const MAX_CARRY: usize = 11;
+
+    fn feed(&mut self, chunk: &[u8], out: &mut Vec<u8>) {
+        let mut work = std::mem::take(&mut self.carry);
+        work.extend_from_slice(chunk);
+        let consumed = repair_stream_into(&work, out, false);
+        debug_assert!(work.len() - consumed <= Self::MAX_CARRY);
+        self.carry = work[consumed..].to_vec();
+    }
+
+    fn finish(&mut self, out: &mut Vec<u8>) {
+        let work = std::mem::take(&mut self.carry);
+        repair_stream_into(&work, out, true);
+    }
+}
+
+/// Core of [`StreamRepair`]: repairs `work` into `out`, returning how many
+/// bytes were consumed. Unless `at_end`, stops short of the tail when it
+/// could be a pattern prefix needing more input. Every rule is
+/// byte-length-preserving.
+fn repair_stream_into(work: &[u8], out: &mut Vec<u8>, at_end: bool) -> usize {
+    const PAIR_LEN: usize = 12; // \uXXXX\uYYYY
+    let mut i = 0;
+    while i < work.len() {
+        let Some(rel) = work[i..].iter().position(|&b| b == b'\\' || b >= 0x80) else {
+            out.extend_from_slice(&work[i..]);
+            return work.len();
+        };
+        out.extend_from_slice(&work[i..i + rel]);
+        i += rel;
+        let b = work[i];
+        if b == b'\\' {
+            if !at_end && i + PAIR_LEN > work.len() {
+                return i; // withhold: could be a pair straddling the chunk
+            }
+            match work.get(i + 1) {
+                Some(b'u') => match parse_hex4(&work[i + 2..]) {
+                    Some(unit) if is_high_surrogate(unit) => {
+                        if low_surrogate_escape(&work[i + 6..]).is_some() {
+                            out.extend_from_slice(&work[i..i + PAIR_LEN]);
+                            i += PAIR_LEN;
+                        } else {
+                            out.extend_from_slice(b"\\uFFFD");
+                            i += 6;
+                        }
+                    }
+                    Some(unit) if is_low_surrogate(unit) => {
+                        out.extend_from_slice(b"\\uFFFD");
+                        i += 6;
+                    }
+                    Some(_) => {
+                        out.extend_from_slice(&work[i..i + 6]);
+                        i += 6;
+                    }
+                    None => {
+                        let take = 2.min(work.len() - i);
+                        out.extend_from_slice(&work[i..i + take]);
+                        i += take;
+                    }
+                },
+                // Pairwise skip keeps backslash parity (`\\` copies whole),
+                // so a later `\uD...` after an escaped backslash is plain
+                // text and never reaches the branch above.
+                Some(_) => {
+                    out.extend_from_slice(&work[i..i + 2]);
+                    i += 2;
+                }
+                None => {
+                    out.push(b);
+                    i += 1;
+                }
+            }
+        } else {
+            let len = match b {
+                0xC0..=0xDF => 2,
+                0xE0..=0xEF => 3,
+                0xF0..=0xF7 => 4,
+                _ => {
+                    out.push(b'?'); // stray continuation or invalid lead
+                    i += 1;
+                    continue;
+                }
+            };
+            if !at_end && i + len > work.len() {
+                return i; // withhold: partial multi-byte sequence
+            }
+            let seq = &work[i..(i + len).min(work.len())];
+            if seq.len() == len && std::str::from_utf8(seq).is_ok() {
+                out.extend_from_slice(seq);
+                i += len;
+            } else if seq.len() >= 3
+                && seq[0] == 0xED
+                && (0xA0..=0xBF).contains(&seq[1])
+                && (0x80..=0xBF).contains(&seq[2])
+            {
+                out.extend_from_slice("\u{FFFD}".as_bytes()); // 3 -> 3 bytes
+                i += 3;
+            } else {
+                out.push(b'?');
+                i += 1;
+            }
+        }
+    }
+    i
 }
 
 /// A lone high surrogate seen at the end of a didChange insertion, waiting
@@ -438,7 +579,13 @@ impl FrameRepairer {
             };
 
             if let (Some((line, character)), Some(entry)) = (start, entry) {
-                let seam = if is_ranged && entry.leading_low.is_some() {
+                // Typed validation upstream caps rangeLength at u32; exactly
+                // u32::MAX would overflow when the rewrite widens it by one,
+                // and the broken field would make tower drop the whole edit.
+                let range_length_can_widen = change.get("rangeLength").map_or(true, |v| {
+                    v.as_u64().is_some_and(|l| l < u64::from(u32::MAX))
+                });
+                let seam = if is_ranged && range_length_can_widen && entry.leading_low.is_some() {
                     self.pending
                         .get(&uri)
                         // A recorded seam always sits just past a non-newline
@@ -1476,11 +1623,11 @@ mod tests {
         drop(tx);
     }
 
-    /// Frames beyond the large-frame bypass stream through verbatim (repair
-    /// would double peak memory), and framing must resume cleanly on the
-    /// next frame.
+    /// Frames beyond the large-frame bypass are streamed (repair buffering
+    /// would double peak memory) through the byte-length-preserving stage-1
+    /// repair, and framing must resume cleanly on the next frame.
     #[tokio::test]
-    async fn monster_frame_streams_through_verbatim() {
+    async fn monster_frame_streams_through_with_length_preserving_repair() {
         let mut body = String::with_capacity(65 * 1024 * 1024);
         body.push_str(r#"{"pad":""#);
         body.push_str(&"a".repeat(64 * 1024 * 1024));
@@ -1490,12 +1637,66 @@ mod tests {
         let out = tokio::time::timeout(std::time::Duration::from_secs(60), pump_through(input))
             .await
             .expect("pump should finish");
-        let mut expected = frame(&body);
+        let repaired_body = body.replace(r"\uD83D", "\\uFFFD");
+        assert_eq!(
+            repaired_body.len(),
+            body.len(),
+            "repair is length-preserving"
+        );
+        let mut expected = frame(&repaired_body);
         expected.extend_from_slice(&frame(r#"{"text":"�"}"#));
         assert!(
             out == expected,
-            "monster frame must pass verbatim and the next frame must repair"
+            "monster frame must stream through repaired and the next frame must repair too"
         );
+    }
+
+    fn stream_repair_all(input: &[u8], chunk: usize) -> Vec<u8> {
+        let mut stream = StreamRepair::default();
+        let mut out = Vec::new();
+        for piece in input.chunks(chunk) {
+            stream.feed(piece, &mut out);
+        }
+        stream.finish(&mut out);
+        out
+    }
+
+    #[test]
+    fn stream_repair_preserves_pairs_and_replaces_lone_surrogates() {
+        let input = format!(r#"{{"a":"x{}{}y\uD83Dz"}}"#, r"\uD83D", r"\uDE03");
+        let expected = format!(r#"{{"a":"x{}{}y{}z"}}"#, r"\uD83D", r"\uDE03", "\\uFFFD");
+        for chunk in [1, 2, 3, 5, 7, 11, 64] {
+            let out = stream_repair_all(input.as_bytes(), chunk);
+            assert_eq!(
+                String::from_utf8(out).unwrap(),
+                expected,
+                "chunk size {chunk}"
+            );
+        }
+    }
+
+    #[test]
+    fn stream_repair_replaces_wtf8_triplets_and_invalid_bytes() {
+        let mut input = b"a".to_vec();
+        input.extend([0xED, 0xA0, 0xBD]); // WTF-8 U+D83D
+        input.push(0xFF);
+        input.extend(b"b\xC3\xA9c"); // valid é must survive
+        let mut expected = b"a".to_vec();
+        expected.extend("\u{FFFD}".as_bytes());
+        expected.extend(b"?b\xC3\xA9c");
+        for chunk in [1, 2, 3, 64] {
+            let out = stream_repair_all(&input, chunk);
+            assert_eq!(out.len(), input.len(), "chunk size {chunk}");
+            assert_eq!(out, expected, "chunk size {chunk}");
+        }
+    }
+
+    #[test]
+    fn stream_repair_keeps_escaped_backslash_text() {
+        let input = br#"{"a":"\\uD83D"}"#;
+        for chunk in [1, 4, 64] {
+            assert_eq!(stream_repair_all(input, chunk), input.to_vec());
+        }
     }
 
     /// Seam keys must match downstream document identity: an edit through an

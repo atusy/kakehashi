@@ -849,16 +849,14 @@ fn run_lsp_server() {
     let served = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         runtime.block_on(serve_lsp());
     }));
-    match served {
-        Ok(()) => runtime.shutdown_background(),
-        Err(panic) => {
-            // Unlike the protocol-clean exit above, a panic skipped the LSP
-            // shutdown sequence: give spawned tasks a bounded window to drop
-            // (killing bridged downstream servers) before the process dies,
-            // without letting the parked stdin read hold us forever.
-            runtime.shutdown_timeout(std::time::Duration::from_secs(3));
-            std::panic::resume_unwind(panic);
-        }
+    // serve() returning proves nothing about protocol-clean shutdown — it
+    // also returns on stdin EOF (editor crash) or a pump failure, where
+    // bridged downstream servers are killed only by task drops. The bounded
+    // window lets those drops run; a client that keeps stdin open after
+    // `exit` pays at most the timeout instead of hanging us forever.
+    runtime.shutdown_timeout(std::time::Duration::from_secs(3));
+    if let Err(panic) = served {
+        std::panic::resume_unwind(panic);
     }
 }
 
