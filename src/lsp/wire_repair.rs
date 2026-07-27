@@ -40,19 +40,27 @@ pub fn repair_inbound_frames(
     server_side
 }
 
-/// Longest header-block terminator; bare-LF blocks (`\n\n`) are accepted
-/// too, matching the leniency of httparse in the codec this pump fronts.
+/// Longest header-block terminator (`\r\n\r\n`); shorter mixed forms exist.
 const HEADER_TERMINATOR_MAX: usize = 4;
 
-/// Finds the earliest header-block terminator (`\r\n\r\n` or `\n\n`) in
-/// `buf`, returning the offset just past it.
+/// Finds the earliest header-block terminator in `buf`, returning the offset
+/// just past it. httparse (the codec's header parser) accepts `\r\n` and
+/// bare `\n` per line independently, so the terminator is any two adjacent
+/// line breaks: `\r\n\r\n`, `\r\n\n`, `\n\r\n`, or `\n\n`.
 fn find_header_end(buf: &[u8]) -> Option<usize> {
-    let crlf = find_subslice(buf, b"\r\n\r\n").map(|p| p + 4);
-    let lf = find_subslice(buf, b"\n\n").map(|p| p + 2);
-    match (crlf, lf) {
-        (Some(c), Some(l)) => Some(c.min(l)),
-        (c, l) => c.or(l),
+    let mut i = 0;
+    while i < buf.len() {
+        let nl = buf[i..].iter().position(|&b| b == b'\n')?;
+        let after = i + nl + 1;
+        match buf.get(after) {
+            Some(&b'\n') => return Some(after + 1),
+            Some(&b'\r') if buf.get(after + 1) == Some(&b'\n') => return Some(after + 2),
+            // Anything else (including a trailing `\r` that may yet complete
+            // to `\r\n` once more bytes arrive): keep scanning / wait.
+            _ => i = after,
+        }
     }
+    None
 }
 
 async fn forward_frames(mut input: impl AsyncRead + Send + Unpin, mut output: DuplexStream) {
@@ -138,10 +146,6 @@ async fn read_more(input: &mut (impl AsyncRead + Unpin), buf: &mut Vec<u8>) -> b
     // read_buf appends into spare capacity directly — no intermediate copy.
     buf.reserve(READ_CHUNK_SIZE);
     matches!(input.read_buf(buf).await, Ok(n) if n > 0)
-}
-
-fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    haystack.windows(needle.len()).position(|w| w == needle)
 }
 
 fn parse_content_length(headers: &[u8]) -> Option<usize> {
@@ -1554,6 +1558,23 @@ mod tests {
         assert_eq!(
             String::from_utf8(out).unwrap(),
             format!("Content-Length: {}\r\n\n{}", repaired.len(), repaired)
+        );
+    }
+
+    /// httparse also accepts a bare-LF header line followed by a CRLF blank
+    /// line (`\n\r\n`); missing it would withhold the frame and then frame a
+    /// later jumbo block against the wrong Content-Length.
+    #[tokio::test]
+    async fn mixed_lf_crlf_terminator_is_framed_and_repaired() {
+        let body = r#"{"text":"\uD83D"}"#;
+        let input = format!("Content-Length: {}\n\r\n{}", body.len(), body).into_bytes();
+        let out = tokio::time::timeout(std::time::Duration::from_secs(5), pump_through(input))
+            .await
+            .expect("pump should finish");
+        let repaired = r#"{"text":"�"}"#;
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            format!("Content-Length: {}\r\n\r\n{}", repaired.len(), repaired)
         );
     }
 
