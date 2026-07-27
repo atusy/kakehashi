@@ -11,7 +11,12 @@
 //! A lone surrogate is one UTF-16 code unit and so is U+FFFD, so replacing it
 //! preserves every subsequent LSP position exactly.
 
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt, SimplexStream, WriteHalf};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt, DuplexStream};
+
+/// Buffer between the pump and the server's codec. Sized so multi-hundred-KB
+/// didChange bursts stream through without a wakeup round-trip per window;
+/// correctness does not depend on the size (write_all applies backpressure).
+const PUMP_BUFFER_SIZE: usize = 1 << 20;
 
 /// Wraps the server's input stream, repairing malformed JSON-RPC frame
 /// bodies in flight so the downstream codec never sees them.
@@ -22,24 +27,18 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt, SimplexStream, WriteHalf
 pub fn repair_inbound_frames(
     inner: impl AsyncRead + Send + Unpin + 'static,
 ) -> impl AsyncRead + Send + Unpin + 'static {
-    let (reader, writer) = tokio::io::simplex(64 * 1024);
-    tokio::spawn(pump_frames(inner, writer));
-    reader
+    // A duplex (not a split simplex) on purpose: dropping a DuplexStream
+    // closes it, so the reader sees EOF on ANY pump exit — including a
+    // panic, which must surface as "stdin closed" rather than a server
+    // that silently stops reading forever.
+    let (pump_side, server_side) = tokio::io::duplex(PUMP_BUFFER_SIZE);
+    tokio::spawn(forward_frames(inner, pump_side));
+    server_side
 }
 
 const HEADER_TERMINATOR: &[u8] = b"\r\n\r\n";
 
-async fn pump_frames(input: impl AsyncRead + Send + Unpin, mut output: WriteHalf<SimplexStream>) {
-    forward_frames(input, &mut output).await;
-    // A dropped split-WriteHalf does NOT close the underlying SimplexStream
-    // (the ReadHalf keeps it alive); EOF must be signalled explicitly.
-    let _ = output.shutdown().await;
-}
-
-async fn forward_frames(
-    mut input: impl AsyncRead + Send + Unpin,
-    output: &mut WriteHalf<SimplexStream>,
-) {
+async fn forward_frames(mut input: impl AsyncRead + Send + Unpin, mut output: DuplexStream) {
     let mut buf: Vec<u8> = Vec::with_capacity(8 * 1024);
     let mut repairer = FrameRepairer::default();
     loop {
@@ -54,7 +53,7 @@ async fn forward_frames(
             if output.write_all(&buf).await.is_err() {
                 return;
             }
-            let _ = tokio::io::copy(&mut input, output).await;
+            let _ = tokio::io::copy(&mut input, &mut output).await;
             return;
         };
         // `content_len` is attacker/bug-controlled; a wrapped add would make
@@ -63,7 +62,7 @@ async fn forward_frames(
             if output.write_all(&buf).await.is_err() {
                 return;
             }
-            let _ = tokio::io::copy(&mut input, output).await;
+            let _ = tokio::io::copy(&mut input, &mut output).await;
             return;
         };
         while buf.len() < frame_end {
