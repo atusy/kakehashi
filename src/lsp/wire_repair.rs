@@ -258,7 +258,19 @@ impl FrameRepairer {
         };
         let strings = repair.as_ref().map_or(&[][..], |r| r.strings.as_slice());
         let rewritten = match msg.get("method").and_then(|m| m.as_str()) {
-            Some("textDocument/didChange") => self.process_didchange(&mut msg, strings),
+            Some("textDocument/didChange") => {
+                if is_applyable_didchange(&msg) {
+                    self.process_didchange(&mut msg, strings)
+                } else {
+                    // The downstream will drop this notification without
+                    // applying it (request form, or params that fail typed
+                    // validation). Tracking seams against an edit that never
+                    // happens would let a stale seam rewrite a live
+                    // character later — forget everything instead.
+                    self.pending.clear();
+                    false
+                }
+            }
             Some("textDocument/didOpen") | Some("textDocument/didClose") => {
                 // The document was replaced or dropped; any recorded seam
                 // position no longer describes it.
@@ -295,7 +307,7 @@ impl FrameRepairer {
         // equal-valued sibling could donate its record and drive a rewrite
         // that merges unrelated values. Flag such texts and leave them to
         // stage 1.
-        let ambiguous = ambiguity_flags(msg);
+        let ambiguous = ambiguity_flags(msg, strings);
         let Some(changes) = msg
             .pointer_mut("/params/contentChanges")
             .and_then(|c| c.as_array_mut())
@@ -404,10 +416,23 @@ impl FrameRepairer {
     }
 }
 
+/// Will the downstream server actually APPLY this didChange? Seam state must
+/// only ever track edits the document receives: tower-lsp drops didChange
+/// requests-with-id and notifications whose params fail typed
+/// deserialization, so the pump validates against the same typed shape.
+fn is_applyable_didchange(msg: &serde_json::Value) -> bool {
+    use tower_lsp_server::ls_types::DidChangeTextDocumentParams;
+
+    msg.get("id").is_none()
+        && msg.get("params").is_some_and(|params| {
+            serde_json::from_value::<DidChangeTextDocumentParams>(params.clone()).is_ok()
+        })
+}
+
 /// For each contentChange, whether its `text` value also appears as some
 /// OTHER string (or object key) anywhere in the message — which would make
 /// value-based record attribution ambiguous.
-fn ambiguity_flags(msg: &serde_json::Value) -> Vec<bool> {
+fn ambiguity_flags(msg: &serde_json::Value, strings: &[RepairedString]) -> Vec<bool> {
     let Some(changes) = msg
         .pointer("/params/contentChanges")
         .and_then(|c| c.as_array())
@@ -419,13 +444,25 @@ fn ambiguity_flags(msg: &serde_json::Value) -> Vec<bool> {
         .filter_map(|c| c.get("text"))
         .map(|t| t as *const _)
         .collect();
+    fn text_of(c: &serde_json::Value) -> Option<&str> {
+        c.get("text").and_then(|t| t.as_str())
+    }
     changes
         .iter()
         .map(|change| {
-            let Some(text) = change.get("text").and_then(|t| t.as_str()) else {
+            let Some(text) = text_of(change) else {
                 return false;
             };
-            other_string_equals(msg, text, &text_values)
+            if other_string_equals(msg, text, &text_values) {
+                return true;
+            }
+            // Body-order pairing of equal-valued texts is only sound when
+            // every occurrence contributed a record; a text whose U+FFFD is
+            // literal content contributes none, and a record from an
+            // equal-valued sibling change would land on it.
+            let texts_with_value = changes.iter().filter(|c| text_of(c) == Some(text)).count();
+            let records_with_value = strings.iter().filter(|s| s.value == text).count();
+            records_with_value > 0 && records_with_value != texts_with_value
         })
         .collect()
 }
@@ -1313,6 +1350,60 @@ mod tests {
             .expect("pump should finish");
         let frames = parse_frames(&out);
         assert_eq!(frames[2]["params"]["contentChanges"][0]["text"], "😃b");
+    }
+
+    /// A didChange the downstream drops (typed validation fails: version is
+    /// a string) must not create seam state — the edit never happens, so a
+    /// later continuation at its coordinates must stay U+FFFD.
+    #[tokio::test]
+    async fn invalid_didchange_shape_does_not_open_a_seam() {
+        let mut input = Vec::new();
+        input.extend_from_slice(&frame(&format!(
+            r#"{{"jsonrpc":"2.0","method":"textDocument/didChange","params":{{"textDocument":{{"uri":"file:///t.md","version":"bad"}},"contentChanges":[{}]}}}}"#,
+            insert_at(0, 0, r"a\uD83D"),
+        )));
+        input.extend_from_slice(&didchange_frame(
+            "file:///t.md",
+            2,
+            &insert_at(0, 2, r"\uDE03b"),
+        ));
+        let out = tokio::time::timeout(std::time::Duration::from_secs(5), pump_through(input))
+            .await
+            .expect("pump should finish");
+        let frames = parse_frames(&out);
+        assert_eq!(
+            frames[1]["params"]["contentChanges"][0]["text"],
+            "\u{FFFD}b"
+        );
+    }
+
+    /// Equal text values where only one occurrence contributed a scanner
+    /// record: body-order pairing would hand the record to the literal-FFFD
+    /// text sitting at the seam. Both must stay unrewritten.
+    #[tokio::test]
+    async fn duplicate_texts_with_missing_record_block_reassembly() {
+        let mut input = Vec::new();
+        input.extend_from_slice(&didchange_frame(
+            "file:///t.md",
+            1,
+            &insert_at(0, 0, r"a\uD83D"),
+        ));
+        let changes = format!(
+            r#"{{"range":{{"start":{{"line":0,"character":2}},"end":{{"line":0,"character":2}}}},"text":"{}z"}},{}"#,
+            '\u{FFFD}',
+            insert_at(9, 0, r"\uDE03z"),
+        );
+        input.extend_from_slice(&didchange_frame("file:///t.md", 2, &changes));
+        let out = tokio::time::timeout(std::time::Duration::from_secs(5), pump_through(input))
+            .await
+            .expect("pump should finish");
+        let frames = parse_frames(&out);
+        let first = &frames[1]["params"]["contentChanges"][0];
+        assert_eq!(first["text"], "\u{FFFD}z", "literal U+FFFD must survive");
+        assert_eq!(
+            first["range"]["start"],
+            serde_json::json!({"line":0,"character":2})
+        );
     }
 
     /// A record from an unrelated string (here an extension property) whose
