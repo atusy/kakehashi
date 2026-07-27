@@ -603,15 +603,24 @@ fn decode_invalid_utf8(body: &[u8]) -> String {
                 if let Ok(valid) = std::str::from_utf8(valid) {
                     out.push_str(valid);
                 }
-                if bad.len() >= 3
+                let is_wtf8_surrogate = bad.len() >= 3
                     && bad[0] == 0xED
                     && (0xA0..=0xBF).contains(&bad[1])
-                    && (0x80..=0xBF).contains(&bad[2])
-                {
-                    let unit = (u32::from(bad[0] & 0x0F) << 12)
-                        | (u32::from(bad[1] & 0x3F) << 6)
-                        | u32::from(bad[2] & 0x3F);
-                    out.push_str(&format!("\\u{unit:04X}"));
+                    && (0x80..=0xBF).contains(&bad[2]);
+                if is_wtf8_surrogate {
+                    // An odd run of backslashes before the insertion point
+                    // would swallow the escape's own backslash and forge the
+                    // literal text `\uXXXX` — fall back to one U+FFFD there
+                    // (one UTF-16 unit either way, so geometry holds).
+                    let trailing = out.bytes().rev().take_while(|&b| b == b'\\').count();
+                    if trailing % 2 == 0 {
+                        let unit = (u32::from(bad[0] & 0x0F) << 12)
+                            | (u32::from(bad[1] & 0x3F) << 6)
+                            | u32::from(bad[2] & 0x3F);
+                        out.push_str(&format!("\\u{unit:04X}"));
+                    } else {
+                        out.push('\u{FFFD}');
+                    }
                     rest = &bad[3..];
                 } else {
                     out.push('\u{FFFD}');
@@ -632,6 +641,11 @@ fn combine_surrogates(high: u16, low: u16) -> char {
 
 fn parse_hex4(bytes: &[u8]) -> Option<u16> {
     let hex = bytes.get(..4)?;
+    // from_str_radix alone would also accept a sign (`+123`), which JSON
+    // escapes never contain.
+    if !hex.iter().all(u8::is_ascii_hexdigit) {
+        return None;
+    }
     let hex = std::str::from_utf8(hex).ok()?;
     u16::from_str_radix(hex, 16).ok()
 }
@@ -714,6 +728,36 @@ mod tests {
     #[test]
     fn truncated_escape_at_end_of_body_is_left_alone() {
         assert_eq!(repair_lone_surrogates(r#"{"text":"\uD8"#), None);
+    }
+
+    /// A raw backslash directly before a WTF-8 surrogate must not have the
+    /// escape spelling appended after it — `\` + `\uD83D` reads back as an
+    /// escaped backslash plus literal text, silently forging content.
+    #[test]
+    fn wtf8_after_raw_backslash_becomes_replacement_char() {
+        let mut body = br#"{"a":"x\"#.to_vec();
+        body.extend([0xED, 0xA0, 0xBD]);
+        body.extend(br#""}"#);
+        assert_eq!(decode_invalid_utf8(&body), "{\"a\":\"x\\\u{FFFD}\"}");
+    }
+
+    #[test]
+    fn wtf8_after_escaped_backslash_keeps_escape_spelling() {
+        let mut body = br#"{"a":"x\\"#.to_vec();
+        body.extend([0xED, 0xA0, 0xBD]);
+        body.extend(br#""}"#);
+        assert_eq!(decode_invalid_utf8(&body), r#"{"a":"x\\\uD83D"}"#);
+    }
+
+    #[test]
+    fn truncated_wtf8_tail_terminates_with_replacement_char() {
+        assert_eq!(decode_invalid_utf8(b"a\xE3\x81"), "a\u{FFFD}");
+    }
+
+    #[test]
+    fn hex_with_sign_is_not_an_escape() {
+        assert_eq!(parse_hex4(b"+123"), None);
+        assert_eq!(parse_hex4(b"D83D"), Some(0xD83D));
     }
 
     /// `\` followed by a raw multi-byte char used to advance the scanner
