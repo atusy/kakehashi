@@ -9,7 +9,11 @@
 //! keeps the server alive.
 //!
 //! A lone surrogate is one UTF-16 code unit and so is U+FFFD, so replacing it
-//! preserves every subsequent LSP position exactly.
+//! preserves every subsequent LSP position exactly. The one place this
+//! guarantee weakens is byte-granular corruption that cuts *inside* a WTF-8
+//! triplet (or any other invalid UTF-8 run): such bytes have no well-defined
+//! UTF-16 width, so the repair is best-effort there — the server survives,
+//! but positions may drift until the next full sync.
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt, DuplexStream};
 
@@ -320,16 +324,21 @@ impl FrameRepairer {
             let is_ranged_insert = change.get("range").is_some() && start.is_some();
 
             if let (Some((line, character)), Some(entry)) = (start, entry) {
-                let consumed = is_ranged_insert
-                    && entry.leading_low.is_some()
-                    && self.pending.get(&uri).is_some_and(|p| {
-                        p.line == line && p.character == character && p.character >= 1
-                    });
-                if consumed {
-                    let Some(p) = self.pending.remove(&uri) else {
-                        continue;
-                    };
-                    let low = entry.leading_low.unwrap_or(0xDC00);
+                let seam = if is_ranged_insert && entry.leading_low.is_some() {
+                    self.pending
+                        .get(&uri)
+                        // A recorded seam always sits just past a non-newline
+                        // `�`, so character >= 1 holds; the check documents
+                        // the invariant that guards the -1 below.
+                        .is_some_and(|p| {
+                            p.line == line && p.character == character && p.character >= 1
+                        })
+                        .then(|| self.pending.remove(&uri))
+                        .flatten()
+                } else {
+                    None
+                };
+                if let (Some(p), Some(low)) = (seam, entry.leading_low) {
                     let pair = combine_surrogates(p.unit, low);
                     let new_text: String = format!("{}{}", pair, &text['\u{FFFD}'.len_utf8()..]);
                     change["range"]["start"]["character"] =
@@ -362,8 +371,11 @@ impl FrameRepairer {
 
     fn remember_seam(&mut self, uri: &str, unit: u16, line: u64, character: u64) {
         // Safety valve against pathological clients that open seams on many
-        // documents and never continue them.
-        if self.pending.len() >= 8 && !self.pending.contains_key(uri) {
+        // documents and never continue them. Clearing is purely conservative:
+        // a dropped seam can only leave stage-1's U+FFFD standing, never
+        // cause a wrong rewrite.
+        const MAX_PENDING_SEAMS: usize = 8;
+        if self.pending.len() >= MAX_PENDING_SEAMS && !self.pending.contains_key(uri) {
             self.pending.clear();
         }
         self.pending.insert(
@@ -419,11 +431,11 @@ fn advance_utf16(line: u64, character: u64, text: &str) -> (u64, u64) {
 
 /// Outcome of repairing one JSON body.
 #[derive(Debug, PartialEq)]
-pub(crate) struct BodyRepair {
+struct BodyRepair {
     /// The body with every lone surrogate escape replaced by `�`.
-    pub(crate) repaired: String,
+    repaired: String,
     /// Strings that contained a lone surrogate at an edge, in body order.
-    pub(crate) strings: Vec<RepairedString>,
+    strings: Vec<RepairedString>,
 }
 
 /// A JSON string that had a lone surrogate as its first or last UTF-16 unit.
@@ -431,14 +443,14 @@ pub(crate) struct BodyRepair {
 /// The original code units are recorded here because the repair erases them:
 /// they are what lets a later frame reassemble a split surrogate pair.
 #[derive(Debug, PartialEq)]
-pub(crate) struct RepairedString {
+struct RepairedString {
     /// Decoded value after repair — exactly what serde_json will parse from
     /// the repaired body, used to attribute this record to a `text` field.
-    pub(crate) value: String,
+    value: String,
     /// Lone low surrogate that was the string's first UTF-16 unit.
-    pub(crate) leading_low: Option<u16>,
+    leading_low: Option<u16>,
     /// Lone high surrogate that was the string's last UTF-16 unit.
-    pub(crate) trailing_high: Option<u16>,
+    trailing_high: Option<u16>,
 }
 
 /// Decodes one JSON string literal while the scanner walks it.
@@ -498,7 +510,7 @@ impl StringDecode {
 /// Replaces lone surrogate escapes in `body` with `�`.
 ///
 /// Returns `None` when the body contains no lone surrogates.
-pub(crate) fn repair_lone_surrogates(body: &str) -> Option<BodyRepair> {
+fn repair_lone_surrogates(body: &str) -> Option<BodyRepair> {
     const ESCAPE_LEN: usize = 6; // \uXXXX
 
     let bytes = body.as_bytes();
@@ -569,7 +581,7 @@ pub(crate) fn repair_lone_surrogates(body: &str) -> Option<BodyRepair> {
                 if let Some(decode) = cur.as_mut() {
                     let ch = body[i..].chars().next().unwrap_or('\u{FFFD}');
                     decode.push_char(ch);
-                    i += ch.len_utf8().max(1);
+                    i += ch.len_utf8();
                 } else {
                     i += 1;
                 }
