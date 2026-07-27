@@ -207,8 +207,12 @@ impl FrameRepairer {
             .as_bytes()
             .windows(3)
             .any(|w| w[0] == b'\\' && w[1] == b'u' && (w[2] == b'd' || w[2] == b'D'));
-        let needs_inspection =
-            !self.pending.is_empty() && find_subslice(body, b"textDocument/did").is_some();
+        // While a seam is pending, EVERY frame must be inspected: matching
+        // on a method-name substring would miss legal alternate spellings
+        // (e.g. `textDocument\/didChange` from serializers that escape `/`),
+        // and a missed invalidation turns a stale seam into a wrong rewrite.
+        // Seam windows are rare and short, so the extra parse is cheap.
+        let needs_inspection = !self.pending.is_empty();
         if decoded.is_none() && !has_surrogate_escape && !needs_inspection {
             return None;
         }
@@ -955,6 +959,39 @@ mod tests {
             .expect("pump should finish");
         let frames = parse_frames(&out);
         assert_eq!(frames[2]["params"]["contentChanges"][0]["text"], "😃b");
+    }
+
+    /// Some serializers legally escape `/` in strings, spelling the method
+    /// `textDocument\/didChange`. Seam invalidation must not depend on the
+    /// spelling: a missed invalidation would leave a stale seam that later
+    /// rewrites a live character (document corruption).
+    #[tokio::test]
+    async fn escaped_slash_didchange_still_invalidates_the_seam() {
+        let mut input = Vec::new();
+        input.extend_from_slice(&didchange_frame(
+            "file:///t.md",
+            1,
+            &insert_at(0, 0, r"a\uD83D"),
+        ));
+        // Same document edited via the escaped method spelling: geometry
+        // shifted, the seam must die.
+        input.extend_from_slice(&frame(&format!(
+            r#"{{"jsonrpc":"2.0","method":"textDocument\/didChange","params":{{"textDocument":{{"uri":"file:\/\/\/t.md","version":2}},"contentChanges":[{}]}}}}"#,
+            insert_at(0, 0, "hello"),
+        )));
+        input.extend_from_slice(&didchange_frame(
+            "file:///t.md",
+            3,
+            &insert_at(0, 2, r"\uDE03b"),
+        ));
+        let out = tokio::time::timeout(std::time::Duration::from_secs(5), pump_through(input))
+            .await
+            .expect("pump should finish");
+        let frames = parse_frames(&out);
+        assert_eq!(
+            frames[2]["params"]["contentChanges"][0]["text"],
+            "\u{FFFD}b"
+        );
     }
 
     #[tokio::test]
