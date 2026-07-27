@@ -1038,9 +1038,9 @@ mod tests {
     /// Replaces `placeholder` in `body` with raw (possibly invalid) bytes.
     fn splice_raw(body: &str, placeholder: &str, raw: &[u8]) -> Vec<u8> {
         let pos = body.find(placeholder).expect("placeholder present");
-        let mut out = body[..pos].as_bytes().to_vec();
+        let mut out = body.as_bytes()[..pos].to_vec();
         out.extend_from_slice(raw);
-        out.extend_from_slice(body[pos + placeholder.len()..].as_bytes());
+        out.extend_from_slice(&body.as_bytes()[pos + placeholder.len()..]);
         out
     }
 
