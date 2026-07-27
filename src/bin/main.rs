@@ -829,8 +829,26 @@ fn run_diagnose(options: kakehashi::cli::diagnose::DiagnoseOptions) -> Result<()
 }
 
 /// Run the LSP server (requires tokio runtime)
-#[tokio::main]
-async fn run_lsp_server() {
+fn run_lsp_server() {
+    let runtime = match tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(e) => {
+            eprintln!("failed to build tokio runtime: {e}");
+            std::process::exit(1);
+        }
+    };
+    runtime.block_on(serve_lsp());
+    // Clients may keep stdin open after `exit`, leaving a parked,
+    // non-cancellable blocking-pool read (tokio::io::stdin). A plain
+    // runtime drop would wait for it and stall process death;
+    // shutdown_background is tokio's documented answer for exactly this.
+    runtime.shutdown_background();
+}
+
+async fn serve_lsp() {
     use env_logger::Builder;
     use kakehashi::lsp::{
         CancelForwarder, IngressOrderGate, Kakehashi, LanguageServerPool, RequestIdCapture,

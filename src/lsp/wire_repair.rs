@@ -114,11 +114,13 @@ async fn forward_frames(mut input: impl AsyncRead + Send + Unpin, mut output: Du
         if forwarded.is_err() {
             return; // reader side is gone; nothing left to do
         }
-        // Per spec `exit` is the last message. tower-lsp stops reading right
-        // after it (clients may keep stdin open forever), and the pump must
-        // do the same: a fresh tokio stdin read parks on the blocking pool,
-        // is not cancellable, and would stall runtime shutdown until the
-        // client closes the pipe.
+        // Per spec `exit` is the last message; tower-lsp stops reading right
+        // after it (clients may keep stdin open forever) and the pump does
+        // the same so no fresh non-cancellable stdin read is parked. This
+        // detection is best-effort (an escape-spelled method name or a
+        // whitespace-padded frame can evade it): the hard guarantee against
+        // a stalled shutdown is main's `runtime.shutdown_background()`,
+        // which never waits for a parked stdin read.
         if is_exit_notification(&buf[header_end..frame_end]) {
             return;
         }
@@ -126,8 +128,9 @@ async fn forward_frames(mut input: impl AsyncRead + Send + Unpin, mut output: Du
     }
 }
 
-/// Is this body the `exit` notification? Bodies above a tiny bound are never
-/// exit frames, so real traffic skips the parse.
+/// Is this body the `exit` notification, as real clients spell it? Bodies
+/// above a tiny bound or without the literal method text skip the parse;
+/// evasive spellings are caught by main's shutdown_background instead.
 fn is_exit_notification(body: &[u8]) -> bool {
     const MAX_EXIT_FRAME: usize = 256;
     if body.len() > MAX_EXIT_FRAME || !body.windows(4).any(|w| w == b"exit") {
