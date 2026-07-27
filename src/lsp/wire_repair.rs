@@ -9,11 +9,14 @@
 //! keeps the server alive.
 //!
 //! A lone surrogate is one UTF-16 code unit and so is U+FFFD, so replacing it
-//! preserves every subsequent LSP position exactly. The one place this
-//! guarantee weakens is byte-granular corruption that cuts *inside* a WTF-8
-//! triplet (or any other invalid UTF-8 run): such bytes have no well-defined
-//! UTF-16 width, so the repair is best-effort there — the server survives,
-//! but positions may drift until the next full sync.
+//! preserves every subsequent LSP position exactly. Two places the guarantee
+//! weakens, both requiring input that is already broken: byte-granular
+//! corruption that cuts *inside* a WTF-8 triplet (no well-defined UTF-16
+//! width — repair is best-effort), and clients that send out-of-range
+//! positions (which document sync clamps: the seam then describes a
+//! coordinate the document never had, and a reassembly there can add one
+//! unit of drift to the pre-existing desync). The server survives both;
+//! positions self-heal on the next full sync.
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt, DuplexStream};
 
@@ -125,6 +128,12 @@ async fn forward_frames(mut input: impl AsyncRead + Send + Unpin, mut output: Du
             return;
         }
         buf.drain(..frame_end);
+        // A single huge frame (full-text sync) must not pin its buffer for
+        // the rest of the session.
+        const BUF_RETAIN_LIMIT: usize = 4 * READ_CHUNK_SIZE;
+        if buf.capacity() > BUF_RETAIN_LIMIT && buf.len() < BUF_RETAIN_LIMIT {
+            buf.shrink_to(BUF_RETAIN_LIMIT);
+        }
     }
 }
 
@@ -220,7 +229,15 @@ struct PendingHigh {
     /// UTF-16 position just past the inserted `�` seam.
     line: u64,
     character: u64,
+    /// Frame index after which this seam is dropped. Chunk continuations
+    /// arrive within a handful of frames; an abandoned seam must not force
+    /// the inspection slow path for the rest of the session.
+    expires_at: u64,
 }
+
+/// How many frames a seam stays alive. The field pattern interleaves at most
+/// ~10 read-only frames between chunks; 32 is generous headroom.
+const SEAM_TTL_FRAMES: u64 = 32;
 
 /// Per-connection frame processor: repairs lone surrogates (stage 1) and
 /// reassembles surrogate pairs split across adjacent didChange chunks
@@ -235,12 +252,19 @@ struct PendingHigh {
 #[derive(Default)]
 struct FrameRepairer {
     pending: std::collections::HashMap<String, PendingHigh>,
+    /// Monotonic count of processed frames, for seam expiry.
+    frame_index: u64,
 }
 
 impl FrameRepairer {
     /// Processes one frame body, returning `None` when it can be forwarded
     /// byte-for-byte.
     fn process(&mut self, body: &[u8]) -> Option<String> {
+        self.frame_index += 1;
+        if !self.pending.is_empty() {
+            let now = self.frame_index;
+            self.pending.retain(|_, seam| seam.expires_at > now);
+        }
         // Bodies that are not valid UTF-8 would fuse the downstream codec
         // exactly like a serde failure; decode them first. WTF-8 surrogate
         // triplets become `\uXXXX` escapes so both spellings of a split
@@ -368,18 +392,23 @@ impl FrameRepairer {
                     })
             };
 
-            let start = match change.get("range") {
+            let (start, is_insert) = match change.get("range") {
                 None => {
                     // Full-text sync replaces the document: any seam is gone.
                     self.pending.remove(&uri);
-                    Some((0, 0))
+                    (Some((0, 0)), false)
                 }
-                Some(range) => range_start_of_insertion(range),
+                Some(range) => match range_bounds(range) {
+                    // Replacements can't consume a seam (their halves are not
+                    // adjacent), but their inserted text still lands at
+                    // range.start, so they can open one.
+                    Some((range_start, range_end)) => (Some(range_start), range_start == range_end),
+                    None => (None, false),
+                },
             };
-            let is_ranged_insert = change.get("range").is_some() && start.is_some();
 
             if let (Some((line, character)), Some(entry)) = (start, entry) {
-                let seam = if is_ranged_insert && entry.leading_low.is_some() {
+                let seam = if is_insert && entry.leading_low.is_some() {
                     self.pending
                         .get(&uri)
                         // A recorded seam always sits just past a non-newline
@@ -439,6 +468,7 @@ impl FrameRepairer {
                 unit,
                 line,
                 character,
+                expires_at: self.frame_index + SEAM_TTL_FRAMES,
             },
         );
     }
@@ -517,14 +547,19 @@ fn other_string_equals(
 }
 
 fn document_uri(msg: &serde_json::Value) -> Option<String> {
+    // Seam keys must be exactly as coarse as the downstream document keys,
+    // or an edit through an alternate spelling of the same document would
+    // miss invalidation and leave a stale seam. Same normalization as the
+    // ingress gate.
     msg.pointer("/params/textDocument/uri")
         .and_then(|u| u.as_str())
-        .map(str::to_owned)
+        .map(crate::lsp::ingress_order::normalize_uri)
 }
 
 /// Returns the start position when `range` denotes an insertion
 /// (start == end), else `None`.
-fn range_start_of_insertion(range: &serde_json::Value) -> Option<(u64, u64)> {
+/// Extracts the validated (start, end) positions of a change range.
+fn range_bounds(range: &serde_json::Value) -> Option<((u64, u64), (u64, u64))> {
     // LSP positions are u32; anything larger cannot describe the downstream
     // document (tower-lsp rejects the whole message) and would overflow the
     // u64 position arithmetic in advance_utf16. Treat it as non-tracking.
@@ -535,8 +570,7 @@ fn range_start_of_insertion(range: &serde_json::Value) -> Option<(u64, u64)> {
         let character = p.get("character")?.as_u64()?;
         (line <= MAX_POSITION && character <= MAX_POSITION).then_some((line, character))
     };
-    let start = pos("start")?;
-    (start == pos("end")?).then_some(start)
+    Some((pos("start")?, pos("end")?))
 }
 
 /// Advances an LSP UTF-16 position across `text` (newlines: \n, \r\n, \r).
@@ -1403,6 +1437,91 @@ mod tests {
         .unwrap();
         assert_eq!(out, exit);
         drop(tx);
+    }
+
+    /// Seam keys must match downstream document identity: an edit through an
+    /// alternate spelling of the same URI (here a dot segment) must still
+    /// invalidate the seam.
+    #[tokio::test]
+    async fn alternate_uri_spelling_still_invalidates_the_seam() {
+        let mut input = Vec::new();
+        input.extend_from_slice(&didchange_frame(
+            "file:///tmp/./t.md",
+            1,
+            &insert_at(0, 0, r"a\uD83D"),
+        ));
+        input.extend_from_slice(&didchange_frame(
+            "file:///tmp/t.md",
+            2,
+            &insert_at(0, 0, "x"),
+        ));
+        input.extend_from_slice(&didchange_frame(
+            "file:///tmp/./t.md",
+            3,
+            &insert_at(0, 2, r"\uDE03b"),
+        ));
+        let out = tokio::time::timeout(std::time::Duration::from_secs(5), pump_through(input))
+            .await
+            .expect("pump should finish");
+        let frames = parse_frames(&out);
+        assert_eq!(
+            frames[2]["params"]["contentChanges"][0]["text"],
+            "\u{FFFD}b"
+        );
+    }
+
+    /// A replacement's inserted text still lands at range.start, so a
+    /// trailing lone high in a replacement opens a consumable seam.
+    #[tokio::test]
+    async fn replacement_with_trailing_high_opens_a_seam() {
+        let mut input = Vec::new();
+        let replacement = r#"{"range":{"start":{"line":0,"character":0},"end":{"line":0,"character":5}},"text":"abc\uD83D"}"#;
+        input.extend_from_slice(&didchange_frame("file:///t.md", 1, replacement));
+        input.extend_from_slice(&didchange_frame(
+            "file:///t.md",
+            2,
+            &insert_at(0, 4, r"\uDE03rest"),
+        ));
+        let out = tokio::time::timeout(std::time::Duration::from_secs(5), pump_through(input))
+            .await
+            .expect("pump should finish");
+        let frames = parse_frames(&out);
+        let second = &frames[1]["params"]["contentChanges"][0];
+        assert_eq!(second["text"], "😃rest");
+        assert_eq!(
+            second["range"],
+            serde_json::json!({"start":{"line":0,"character":3},"end":{"line":0,"character":4}})
+        );
+    }
+
+    /// An abandoned seam expires after a bounded number of frames so it
+    /// cannot force the inspection slow path for the rest of the session.
+    #[tokio::test]
+    async fn abandoned_seam_expires_after_ttl_frames() {
+        let mut input = Vec::new();
+        input.extend_from_slice(&didchange_frame(
+            "file:///t.md",
+            1,
+            &insert_at(0, 0, r"a\uD83D"),
+        ));
+        for n in 0..40 {
+            input.extend_from_slice(&frame(&format!(
+                r#"{{"jsonrpc":"2.0","id":{n},"method":"textDocument/hover","params":{{"textDocument":{{"uri":"file:///t.md"}},"position":{{"line":0,"character":0}}}}}}"#,
+            )));
+        }
+        input.extend_from_slice(&didchange_frame(
+            "file:///t.md",
+            2,
+            &insert_at(0, 2, r"\uDE03b"),
+        ));
+        let out = tokio::time::timeout(std::time::Duration::from_secs(5), pump_through(input))
+            .await
+            .expect("pump should finish");
+        let frames = parse_frames(&out);
+        assert_eq!(
+            frames[41]["params"]["contentChanges"][0]["text"],
+            "\u{FFFD}b"
+        );
     }
 
     /// A didChange the downstream drops (typed validation fails: version is
