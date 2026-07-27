@@ -181,31 +181,43 @@ impl FrameRepairer {
     /// Processes one frame body, returning `None` when it can be forwarded
     /// byte-for-byte.
     fn process(&mut self, body: &[u8]) -> Option<String> {
+        // Bodies that are not valid UTF-8 would fuse the downstream codec
+        // exactly like a serde failure; decode them first. WTF-8 surrogate
+        // triplets become `\uXXXX` escapes so both spellings of a split
+        // pair flow through the same repair below.
+        let decoded = match std::str::from_utf8(body) {
+            Ok(_) => None,
+            Err(_) => Some(decode_invalid_utf8(body)),
+        };
+        let text: &str = match &decoded {
+            Some(owned) => owned,
+            None => std::str::from_utf8(body).ok()?,
+        };
         // Cheap gate: surrogate escapes start with `\ud` or `\uD` (first hex
         // digit of D800..DFFF); bodies without them are forwarded untouched
         // unless a pending seam requires inspecting document notifications.
-        let has_surrogate_escape = body
+        let has_surrogate_escape = text
+            .as_bytes()
             .windows(3)
             .any(|w| w[0] == b'\\' && w[1] == b'u' && (w[2] == b'd' || w[2] == b'D'));
         let needs_inspection =
             !self.pending.is_empty() && find_subslice(body, b"textDocument/did").is_some();
-        if !has_surrogate_escape && !needs_inspection {
+        if decoded.is_none() && !has_surrogate_escape && !needs_inspection {
             return None;
         }
-        let text = std::str::from_utf8(body).ok()?;
         let repair = if has_surrogate_escape {
             repair_lone_surrogates(text)
         } else {
             None
         };
-        if repair.is_none() && !needs_inspection {
+        if decoded.is_none() && repair.is_none() && !needs_inspection {
             return None;
         }
 
         let repaired_text = repair.as_ref().map_or(text, |r| r.repaired.as_str());
         let Ok(mut msg) = serde_json::from_str::<serde_json::Value>(repaired_text) else {
             // Invalid JSON beyond lone surrogates; forward our best repair.
-            return repair.map(|r| r.repaired);
+            return Some(repaired_text.to_owned());
         };
         let strings = repair.as_ref().map_or(&[][..], |r| r.strings.as_slice());
         let rewritten = match msg.get("method").and_then(|m| m.as_str()) {
@@ -223,10 +235,12 @@ impl FrameRepairer {
         if rewritten {
             match serde_json::to_string(&msg) {
                 Ok(serialized) => Some(serialized),
-                Err(_) => repair.map(|r| r.repaired),
+                Err(_) => Some(repaired_text.to_owned()),
             }
+        } else if repair.is_some() || decoded.is_some() {
+            Some(repaired_text.to_owned())
         } else {
-            repair.map(|r| r.repaired)
+            None
         }
     }
 
@@ -531,6 +545,44 @@ pub(crate) fn repair_lone_surrogates(body: &str) -> Option<BodyRepair> {
     }
     repaired.push_str(&body[copied..]);
     Some(BodyRepair { repaired, strings })
+}
+
+/// Decodes a body that is not valid UTF-8. WTF-8-encoded surrogates (the
+/// raw-byte spelling of a lone surrogate: ED A0..BF 80..BF) become `\uXXXX`
+/// escapes so the scanner treats both spellings of a split pair uniformly;
+/// any other invalid sequence becomes U+FFFD.
+fn decode_invalid_utf8(body: &[u8]) -> String {
+    let mut out = String::with_capacity(body.len() + 8);
+    let mut rest = body;
+    loop {
+        match std::str::from_utf8(rest) {
+            Ok(tail) => {
+                out.push_str(tail);
+                return out;
+            }
+            Err(err) => {
+                let (valid, bad) = rest.split_at(err.valid_up_to());
+                if let Ok(valid) = std::str::from_utf8(valid) {
+                    out.push_str(valid);
+                }
+                if bad.len() >= 3
+                    && bad[0] == 0xED
+                    && (0xA0..=0xBF).contains(&bad[1])
+                    && (0x80..=0xBF).contains(&bad[2])
+                {
+                    let unit = (u32::from(bad[0] & 0x0F) << 12)
+                        | (u32::from(bad[1] & 0x3F) << 6)
+                        | u32::from(bad[2] & 0x3F);
+                    out.push_str(&format!("\\u{unit:04X}"));
+                    rest = &bad[3..];
+                } else {
+                    out.push('\u{FFFD}');
+                    let skip = err.error_len().unwrap_or(bad.len()).max(1);
+                    rest = &bad[skip.min(bad.len())..];
+                }
+            }
+        }
+    }
 }
 
 /// Combines a surrogate pair into the character it encodes.
@@ -975,6 +1027,81 @@ mod tests {
             third["range"],
             serde_json::json!({"start":{"line":0,"character":4},"end":{"line":0,"character":5}})
         );
+    }
+
+    fn frame_bytes(body: &[u8]) -> Vec<u8> {
+        let mut out = format!("Content-Length: {}\r\n\r\n", body.len()).into_bytes();
+        out.extend_from_slice(body);
+        out
+    }
+
+    /// Replaces `placeholder` in `body` with raw (possibly invalid) bytes.
+    fn splice_raw(body: &str, placeholder: &str, raw: &[u8]) -> Vec<u8> {
+        let pos = body.find(placeholder).expect("placeholder present");
+        let mut out = body[..pos].as_bytes().to_vec();
+        out.extend_from_slice(raw);
+        out.extend_from_slice(body[pos + placeholder.len()..].as_bytes());
+        out
+    }
+
+    /// A client that ships lone surrogates as raw WTF-8 bytes instead of
+    /// escapes produces a body that is not valid UTF-8; the codec's own
+    /// from_utf8 would error and fuse the stream just like a serde failure.
+    #[tokio::test]
+    async fn raw_wtf8_lone_surrogate_is_repaired() {
+        // ED A0 BD = WTF-8 for U+D83D (high half of the emoji).
+        let body = splice_raw(r#"{"method":"x","text":"a@@"}"#, "@@", &[0xED, 0xA0, 0xBD]);
+        let out = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            pump_through(frame_bytes(&body)),
+        )
+        .await
+        .expect("pump should finish");
+        assert_eq!(out, frame(r#"{"method":"x","text":"a�"}"#));
+    }
+
+    /// Raw WTF-8 chunks pair up exactly like escape-spelled ones.
+    #[tokio::test]
+    async fn raw_wtf8_split_pair_is_reassembled() {
+        let chunk1 = splice_raw(
+            &String::from_utf8(didchange_frame("file:///t.md", 1, &insert_at(0, 0, "a@@")))
+                .unwrap(),
+            "@@",
+            &[0xED, 0xA0, 0xBD], // U+D83D
+        );
+        let chunk2 = splice_raw(
+            &String::from_utf8(didchange_frame("file:///t.md", 2, &insert_at(0, 2, "@@b")))
+                .unwrap(),
+            "@@",
+            &[0xED, 0xB8, 0x83], // U+DE03
+        );
+        let mut input = fix_content_lengths(chunk1);
+        input.extend_from_slice(&fix_content_lengths(chunk2));
+        let out = tokio::time::timeout(std::time::Duration::from_secs(5), pump_through(input))
+            .await
+            .expect("pump should finish");
+        let frames = parse_frames(&out);
+        assert_eq!(frames[1]["params"]["contentChanges"][0]["text"], "😃b");
+    }
+
+    /// Rebuilds the Content-Length of a single spliced frame whose body
+    /// length changed relative to the placeholder.
+    fn fix_content_lengths(spliced: Vec<u8>) -> Vec<u8> {
+        let header_end = find_subslice(&spliced, b"\r\n\r\n").unwrap() + 4;
+        let body = spliced[header_end..].to_vec();
+        frame_bytes(&body)
+    }
+
+    #[tokio::test]
+    async fn arbitrary_invalid_bytes_become_replacement_chars() {
+        let body = splice_raw(r#"{"method":"x","text":"a@@b"}"#, "@@", &[0xFF]);
+        let out = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            pump_through(frame_bytes(&body)),
+        )
+        .await
+        .expect("pump should finish");
+        assert_eq!(out, frame(r#"{"method":"x","text":"a�b"}"#));
     }
 
     /// Regression for the field crash: a didChange whose text chunk was cut
