@@ -402,9 +402,15 @@ fn document_uri(msg: &serde_json::Value) -> Option<String> {
 /// Returns the start position when `range` denotes an insertion
 /// (start == end), else `None`.
 fn range_start_of_insertion(range: &serde_json::Value) -> Option<(u64, u64)> {
+    // LSP positions are u32; anything larger cannot describe the downstream
+    // document (tower-lsp rejects the whole message) and would overflow the
+    // u64 position arithmetic in advance_utf16. Treat it as non-tracking.
+    const MAX_POSITION: u64 = u32::MAX as u64;
     let pos = |which: &str| {
         let p = range.get(which)?;
-        Some((p.get("line")?.as_u64()?, p.get("character")?.as_u64()?))
+        let line = p.get("line")?.as_u64()?;
+        let character = p.get("character")?.as_u64()?;
+        (line <= MAX_POSITION && character <= MAX_POSITION).then_some((line, character))
     };
     let start = pos("start")?;
     (start == pos("end")?).then_some(start)
@@ -1249,6 +1255,30 @@ mod tests {
             .expect("pump should finish");
         let frames = parse_frames(&out);
         assert_eq!(frames[2]["params"]["contentChanges"][0]["text"], "😃b");
+    }
+
+    /// LSP positions are u32; a u64-sized character used to overflow the
+    /// seam position arithmetic (debug panic → dead pump) or wrap in
+    /// release, recording a bogus seam for a message the downstream rejects.
+    #[tokio::test]
+    async fn position_beyond_u32_never_tracks_a_seam() {
+        let mut input = Vec::new();
+        let big = r#"{"range":{"start":{"line":0,"character":18446744073709551615},"end":{"line":0,"character":18446744073709551615}},"text":"a\uD83D"}"#;
+        input.extend_from_slice(&didchange_frame("file:///t.md", 1, big));
+        // Release-mode wrap would have put the seam at character 1.
+        input.extend_from_slice(&didchange_frame(
+            "file:///t.md",
+            2,
+            &insert_at(0, 1, r"\uDE03b"),
+        ));
+        let out = tokio::time::timeout(std::time::Duration::from_secs(5), pump_through(input))
+            .await
+            .expect("pump must not die");
+        let frames = parse_frames(&out);
+        assert_eq!(
+            frames[1]["params"]["contentChanges"][0]["text"],
+            "\u{FFFD}b"
+        );
     }
 
     /// A REPLACEMENT at the seam position must not be rewritten — deleting
