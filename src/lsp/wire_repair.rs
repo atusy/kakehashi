@@ -52,7 +52,7 @@ fn find_header_end(buf: &[u8]) -> Option<usize> {
 }
 
 async fn forward_frames(mut input: impl AsyncRead + Send + Unpin, mut output: DuplexStream) {
-    let mut buf: Vec<u8> = Vec::with_capacity(8 * 1024);
+    let mut buf: Vec<u8> = Vec::with_capacity(READ_CHUNK_SIZE);
     let mut repairer = FrameRepairer::default();
     loop {
         let Some(header_end) = fill_until_header_end(&mut input, &mut buf).await else {
@@ -125,15 +125,15 @@ async fn fill_until_header_end(
     }
 }
 
+/// Read granularity: large enough that a megabyte-scale didChange needs few
+/// blocking-pool round-trips through `tokio::io::stdin`, small enough that
+/// the post-frame drain tail stays cheap.
+const READ_CHUNK_SIZE: usize = 64 * 1024;
+
 async fn read_more(input: &mut (impl AsyncRead + Unpin), buf: &mut Vec<u8>) -> bool {
-    let mut chunk = [0u8; 8 * 1024];
-    match input.read(&mut chunk).await {
-        Ok(0) | Err(_) => false,
-        Ok(n) => {
-            buf.extend_from_slice(&chunk[..n]);
-            true
-        }
-    }
+    // read_buf appends into spare capacity directly — no intermediate copy.
+    buf.reserve(READ_CHUNK_SIZE);
+    matches!(input.read_buf(buf).await, Ok(n) if n > 0)
 }
 
 fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
@@ -209,28 +209,27 @@ impl FrameRepairer {
         // exactly like a serde failure; decode them first. WTF-8 surrogate
         // triplets become `\uXXXX` escapes so both spellings of a split
         // pair flow through the same repair below.
-        let decoded = match std::str::from_utf8(body) {
-            Ok(_) => None,
-            Err(_) => Some(decode_invalid_utf8(body)),
-        };
-        let text: &str = match &decoded {
-            Some(owned) => owned,
-            None => std::str::from_utf8(body).ok()?,
+        let decoded_body;
+        let (text, was_decoded): (&str, bool) = match std::str::from_utf8(body) {
+            Ok(text) => (text, false),
+            Err(_) => {
+                decoded_body = decode_invalid_utf8(body);
+                (&decoded_body, true)
+            }
         };
         // Cheap gate: surrogate escapes start with `\ud` or `\uD` (first hex
         // digit of D800..DFFF); bodies without them are forwarded untouched
         // unless a pending seam requires inspecting document notifications.
-        let has_surrogate_escape = text
-            .as_bytes()
-            .windows(3)
-            .any(|w| w[0] == b'\\' && w[1] == b'u' && (w[2] == b'd' || w[2] == b'D'));
+        // `str::contains` is memchr-accelerated on the first byte, and `\` is
+        // sparse in real bodies, so this beats a scalar windowed scan.
+        let has_surrogate_escape = text.contains("\\ud") || text.contains("\\uD");
         // While a seam is pending, EVERY frame must be inspected: matching
         // on a method-name substring would miss legal alternate spellings
         // (e.g. `textDocument\/didChange` from serializers that escape `/`),
         // and a missed invalidation turns a stale seam into a wrong rewrite.
         // Seam windows are rare and short, so the extra parse is cheap.
         let needs_inspection = !self.pending.is_empty();
-        if decoded.is_none() && !has_surrogate_escape && !needs_inspection {
+        if !was_decoded && !has_surrogate_escape && !needs_inspection {
             return None;
         }
         let repair = if has_surrogate_escape {
@@ -238,7 +237,7 @@ impl FrameRepairer {
         } else {
             None
         };
-        if decoded.is_none() && repair.is_none() && !needs_inspection {
+        if !was_decoded && repair.is_none() && !needs_inspection {
             return None;
         }
 
@@ -247,7 +246,7 @@ impl FrameRepairer {
             // Invalid JSON beyond lone surrogates: forward our best repair,
             // or the frame byte-for-byte when nothing was changed (an
             // inspection pass alone must not rewrite headers).
-            return (repair.is_some() || decoded.is_some()).then(|| repaired_text.to_owned());
+            return (repair.is_some() || was_decoded).then(|| repaired_text.to_owned());
         };
         let strings = repair.as_ref().map_or(&[][..], |r| r.strings.as_slice());
         let rewritten = match msg.get("method").and_then(|m| m.as_str()) {
@@ -267,7 +266,7 @@ impl FrameRepairer {
                 Ok(serialized) => Some(serialized),
                 Err(_) => Some(repaired_text.to_owned()),
             }
-        } else if repair.is_some() || decoded.is_some() {
+        } else if repair.is_some() || was_decoded {
             Some(repaired_text.to_owned())
         } else {
             None
