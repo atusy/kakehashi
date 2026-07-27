@@ -36,7 +36,20 @@ pub fn repair_inbound_frames(
     server_side
 }
 
-const HEADER_TERMINATOR: &[u8] = b"\r\n\r\n";
+/// Longest header-block terminator; bare-LF blocks (`\n\n`) are accepted
+/// too, matching the leniency of httparse in the codec this pump fronts.
+const HEADER_TERMINATOR_MAX: usize = 4;
+
+/// Finds the earliest header-block terminator (`\r\n\r\n` or `\n\n`) in
+/// `buf`, returning the offset just past it.
+fn find_header_end(buf: &[u8]) -> Option<usize> {
+    let crlf = find_subslice(buf, b"\r\n\r\n").map(|p| p + 4);
+    let lf = find_subslice(buf, b"\n\n").map(|p| p + 2);
+    match (crlf, lf) {
+        (Some(c), Some(l)) => Some(c.min(l)),
+        (c, l) => c.or(l),
+    }
+}
 
 async fn forward_frames(mut input: impl AsyncRead + Send + Unpin, mut output: DuplexStream) {
     let mut buf: Vec<u8> = Vec::with_capacity(8 * 1024);
@@ -94,16 +107,16 @@ async fn forward_frames(mut input: impl AsyncRead + Send + Unpin, mut output: Du
 }
 
 /// Reads until `buf` contains a full header block, returning the offset just
-/// past the terminating `\r\n\r\n`, or `None` on EOF.
+/// past the terminator, or `None` on EOF.
 async fn fill_until_header_end(
     input: &mut (impl AsyncRead + Unpin),
     buf: &mut Vec<u8>,
 ) -> Option<usize> {
     let mut searched: usize = 0;
     loop {
-        let from = searched.saturating_sub(HEADER_TERMINATOR.len() - 1);
-        if let Some(pos) = find_subslice(&buf[from..], HEADER_TERMINATOR) {
-            return Some(from + pos + HEADER_TERMINATOR.len());
+        let from = searched.saturating_sub(HEADER_TERMINATOR_MAX - 1);
+        if let Some(end) = find_header_end(&buf[from..]) {
+            return Some(from + end);
         }
         searched = buf.len();
         if !read_more(input, buf).await {
@@ -128,6 +141,10 @@ fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 }
 
 fn parse_content_length(headers: &[u8]) -> Option<usize> {
+    // Last occurrence wins, mirroring the downstream codec's header loop —
+    // the pump and the codec must frame duplicate-header streams identically
+    // or a rewrite would corrupt previously-parseable input.
+    let mut length = None;
     for line in headers.split(|&b| b == b'\n') {
         let Ok(line) = std::str::from_utf8(line) else {
             continue;
@@ -136,10 +153,10 @@ fn parse_content_length(headers: &[u8]) -> Option<usize> {
             continue;
         };
         if name.eq_ignore_ascii_case("content-length") {
-            return value.trim().parse().ok();
+            length = value.trim().parse().ok();
         }
     }
-    None
+    length
 }
 
 /// Rewrites the `Content-Length` value in a header block, preserving every
@@ -1250,6 +1267,48 @@ mod tests {
             .expect("server must keep responding after the malformed frame");
         assert!(saw_shutdown_response);
         server.abort();
+    }
+
+    /// httparse (the codec's header parser) accepts bare-LF header blocks;
+    /// the pump must not hang buffering forever on input the codec accepts.
+    #[tokio::test]
+    async fn bare_lf_header_block_is_framed_and_repaired() {
+        let body = r#"{"text":"\uD83D"}"#;
+        let input = format!("Content-Length: {}\n\n{}", body.len(), body).into_bytes();
+        let out = tokio::time::timeout(std::time::Duration::from_secs(5), pump_through(input))
+            .await
+            .expect("pump should finish");
+        let repaired = r#"{"text":"�"}"#;
+        // The CL line is canonicalized to CRLF; the bare-LF blank line that
+        // terminates the block is preserved byte-for-byte.
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            format!("Content-Length: {}\r\n\n{}", repaired.len(), repaired)
+        );
+    }
+
+    /// The downstream codec's header loop takes the LAST Content-Length; the
+    /// pump must frame identically or a rewrite desyncs the stream.
+    #[tokio::test]
+    async fn duplicate_content_length_takes_the_last_value() {
+        let body = r#"{"text":"\uD83D"}"#;
+        let input = format!(
+            "Content-Length: 5\r\nContent-Length: {}\r\n\r\n{}",
+            body.len(),
+            body
+        )
+        .into_bytes();
+        let out = tokio::time::timeout(std::time::Duration::from_secs(5), pump_through(input))
+            .await
+            .expect("pump should finish");
+        let repaired = r#"{"text":"�"}"#;
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            format!(
+                "Content-Length: {len}\r\nContent-Length: {len}\r\n\r\n{repaired}",
+                len = repaired.len()
+            )
+        );
     }
 
     #[tokio::test]
