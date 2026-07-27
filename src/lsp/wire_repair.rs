@@ -289,6 +289,13 @@ impl FrameRepairer {
         let Some(uri) = document_uri(msg) else {
             return false;
         };
+        // Scanner records carry no JSON path, so attribution goes by decoded
+        // value. That is only sound when no OTHER string in the message (a
+        // key, the uri, an extension property) shares a text's value — an
+        // equal-valued sibling could donate its record and drive a rewrite
+        // that merges unrelated values. Flag such texts and leave them to
+        // stage 1.
+        let ambiguous = ambiguity_flags(msg);
         let Some(changes) = msg
             .pointer_mut("/params/contentChanges")
             .and_then(|c| c.as_array_mut())
@@ -297,7 +304,7 @@ impl FrameRepairer {
         };
         let mut used = vec![false; strings.len()];
         let mut dirty = false;
-        for change in changes.iter_mut() {
+        for (index, change) in changes.iter_mut().enumerate() {
             let Some(text) = change
                 .get("text")
                 .and_then(|t| t.as_str())
@@ -308,14 +315,18 @@ impl FrameRepairer {
             // Attribute the scanner's record to this text field by decoded
             // value, consuming records in body order so identical texts pair
             // with their own occurrence.
-            let entry = strings
-                .iter()
-                .enumerate()
-                .position(|(k, s)| !used[k] && s.value == text)
-                .map(|k| {
-                    used[k] = true;
-                    &strings[k]
-                });
+            let entry = if ambiguous.get(index).copied().unwrap_or(true) {
+                None
+            } else {
+                strings
+                    .iter()
+                    .enumerate()
+                    .position(|(k, s)| !used[k] && s.value == text)
+                    .map(|k| {
+                        used[k] = true;
+                        &strings[k]
+                    })
+            };
 
             let start = match change.get("range") {
                 None => {
@@ -390,6 +401,53 @@ impl FrameRepairer {
                 character,
             },
         );
+    }
+}
+
+/// For each contentChange, whether its `text` value also appears as some
+/// OTHER string (or object key) anywhere in the message — which would make
+/// value-based record attribution ambiguous.
+fn ambiguity_flags(msg: &serde_json::Value) -> Vec<bool> {
+    let Some(changes) = msg
+        .pointer("/params/contentChanges")
+        .and_then(|c| c.as_array())
+    else {
+        return Vec::new();
+    };
+    let text_values: Vec<*const serde_json::Value> = changes
+        .iter()
+        .filter_map(|c| c.get("text"))
+        .map(|t| t as *const _)
+        .collect();
+    changes
+        .iter()
+        .map(|change| {
+            let Some(text) = change.get("text").and_then(|t| t.as_str()) else {
+                return false;
+            };
+            other_string_equals(msg, text, &text_values)
+        })
+        .collect()
+}
+
+/// Does any string in `value` equal `needle`, excluding the values whose
+/// addresses are listed in `exclude` (the contentChange text fields)?
+fn other_string_equals(
+    value: &serde_json::Value,
+    needle: &str,
+    exclude: &[*const serde_json::Value],
+) -> bool {
+    match value {
+        serde_json::Value::String(s) => {
+            s == needle && !exclude.contains(&std::ptr::from_ref(value))
+        }
+        serde_json::Value::Array(items) => items
+            .iter()
+            .any(|v| other_string_equals(v, needle, exclude)),
+        serde_json::Value::Object(map) => map
+            .iter()
+            .any(|(key, v)| key == needle || other_string_equals(v, needle, exclude)),
+        _ => false,
     }
 }
 
@@ -1255,6 +1313,33 @@ mod tests {
             .expect("pump should finish");
         let frames = parse_frames(&out);
         assert_eq!(frames[2]["params"]["contentChanges"][0]["text"], "😃b");
+    }
+
+    /// A record from an unrelated string (here an extension property) whose
+    /// decoded value equals a text field must not drive a rewrite: the text's
+    /// U+FFFD here is literal client content, not a repaired surrogate.
+    #[tokio::test]
+    async fn equal_valued_sibling_string_blocks_reassembly() {
+        let mut input = Vec::new();
+        input.extend_from_slice(&didchange_frame(
+            "file:///t.md",
+            1,
+            &insert_at(0, 0, r"a\uD83D"),
+        ));
+        input.extend_from_slice(&frame(&format!(
+            r#"{{"jsonrpc":"2.0","method":"textDocument/didChange","params":{{"textDocument":{{"uri":"file:///t.md","version":2}},"ext":"\uDE03z","contentChanges":[{{"range":{{"start":{{"line":0,"character":2}},"end":{{"line":0,"character":2}}}},"text":"{}z"}}]}}}}"#,
+            '\u{FFFD}'
+        )));
+        let out = tokio::time::timeout(std::time::Duration::from_secs(5), pump_through(input))
+            .await
+            .expect("pump should finish");
+        let frames = parse_frames(&out);
+        let change = &frames[1]["params"]["contentChanges"][0];
+        assert_eq!(change["text"], "\u{FFFD}z", "literal U+FFFD must survive");
+        assert_eq!(
+            change["range"]["start"],
+            serde_json::json!({"line":0,"character":2})
+        );
     }
 
     /// LSP positions are u32; a u64-sized character used to overflow the
