@@ -93,6 +93,36 @@ async fn forward_frames(mut input: impl AsyncRead + Send + Unpin, mut output: Du
             let _ = tokio::io::copy(&mut input, &mut output).await;
             return;
         };
+        // Repair needs the whole body in memory (and a second copy lives in
+        // the downstream codec's buffer), so monster frames would double
+        // peak memory. Stream them through verbatim instead: chunking
+        // clients split at small sizes, so a frame this large is a full-sync
+        // whose repair value doesn't justify the duplication.
+        const LARGE_FRAME_BYPASS: usize = 64 * 1024 * 1024;
+        if content_len > LARGE_FRAME_BYPASS && buf.len() < frame_end {
+            // An edit this size was never inspected; drop all seam state.
+            repairer.forget_seams();
+            if output.write_all(&buf).await.is_err() {
+                return;
+            }
+            let mut remaining = frame_end - buf.len();
+            buf.clear();
+            while remaining > 0 {
+                if !read_more(&mut input, &mut buf).await {
+                    let _ = output.write_all(&buf).await; // truncated final frame
+                    return;
+                }
+                // The read may run past the frame into the next one; only
+                // the frame's own bytes are forwarded-and-dropped here.
+                let take = buf.len().min(remaining);
+                if output.write_all(&buf[..take]).await.is_err() {
+                    return;
+                }
+                remaining -= take;
+                buf.drain(..take);
+            }
+            continue;
+        }
         while buf.len() < frame_end {
             if !read_more(&mut input, &mut buf).await {
                 let _ = output.write_all(&buf).await; // truncated final frame
@@ -392,23 +422,23 @@ impl FrameRepairer {
                     })
             };
 
-            let (start, is_insert) = match change.get("range") {
+            let (start, is_ranged) = match change.get("range") {
                 None => {
                     // Full-text sync replaces the document: any seam is gone.
                     self.pending.remove(&uri);
                     (Some((0, 0)), false)
                 }
                 Some(range) => match range_bounds(range) {
-                    // Replacements can't consume a seam (their halves are not
-                    // adjacent), but their inserted text still lands at
-                    // range.start, so they can open one.
-                    Some((range_start, range_end)) => (Some(range_start), range_start == range_end),
+                    // Any ranged edit whose start sits at the seam can
+                    // consume it: its inserted text begins right where the
+                    // low half belongs, whether it replaces something or not.
+                    Some((range_start, _)) => (Some(range_start), true),
                     None => (None, false),
                 },
             };
 
             if let (Some((line, character)), Some(entry)) = (start, entry) {
-                let seam = if is_insert && entry.leading_low.is_some() {
+                let seam = if is_ranged && entry.leading_low.is_some() {
                     self.pending
                         .get(&uri)
                         // A recorded seam always sits just past a non-newline
@@ -427,8 +457,10 @@ impl FrameRepairer {
                     let new_text: String = format!("{}{}", pair, &text['\u{FFFD}'.len_utf8()..]);
                     change["range"]["start"]["character"] =
                         serde_json::Value::from(p.character - 1);
-                    if change.get("rangeLength").is_some() {
-                        change["rangeLength"] = serde_json::Value::from(1);
+                    // The rewrite widens the replaced range by the one `�`
+                    // unit in front of it.
+                    if let Some(len) = change.get("rangeLength").and_then(|v| v.as_u64()) {
+                        change["rangeLength"] = serde_json::Value::from(len + 1);
                     }
                     change["text"] = serde_json::Value::from(new_text.as_str());
                     dirty = true;
@@ -451,6 +483,11 @@ impl FrameRepairer {
             }
         }
         dirty
+    }
+
+    /// Drops all seam state (used when a frame skips inspection entirely).
+    fn forget_seams(&mut self) {
+        self.pending.clear();
     }
 
     fn remember_seam(&mut self, uri: &str, unit: u16, line: u64, character: u64) {
@@ -1439,6 +1476,28 @@ mod tests {
         drop(tx);
     }
 
+    /// Frames beyond the large-frame bypass stream through verbatim (repair
+    /// would double peak memory), and framing must resume cleanly on the
+    /// next frame.
+    #[tokio::test]
+    async fn monster_frame_streams_through_verbatim() {
+        let mut body = String::with_capacity(65 * 1024 * 1024);
+        body.push_str(r#"{"pad":""#);
+        body.push_str(&"a".repeat(64 * 1024 * 1024));
+        body.push_str(r#"","x":"\uD83D"}"#);
+        let mut input = frame(&body);
+        input.extend_from_slice(&frame(r#"{"text":"\uD83D"}"#));
+        let out = tokio::time::timeout(std::time::Duration::from_secs(60), pump_through(input))
+            .await
+            .expect("pump should finish");
+        let mut expected = frame(&body);
+        expected.extend_from_slice(&frame(r#"{"text":"�"}"#));
+        assert!(
+            out == expected,
+            "monster frame must pass verbatim and the next frame must repair"
+        );
+    }
+
     /// Seam keys must match downstream document identity: an edit through an
     /// alternate spelling of the same URI (here a dot segment) must still
     /// invalidate the seam.
@@ -1629,28 +1688,30 @@ mod tests {
         );
     }
 
-    /// A REPLACEMENT at the seam position must not be rewritten — deleting
-    /// [P-1,P) on top of a replacement would corrupt geometry.
+    /// A REPLACEMENT starting exactly at the seam consumes it too: its
+    /// inserted low half is adjacent to the high half in the client's
+    /// buffer, so widening the range by the `�` unit is geometry-exact.
     #[tokio::test]
-    async fn replacement_at_seam_position_is_not_rewritten() {
+    async fn replacement_at_seam_position_consumes_the_seam() {
         let mut input = Vec::new();
         input.extend_from_slice(&didchange_frame(
             "file:///t.md",
             1,
             &insert_at(0, 0, r"a\uD83D"),
         ));
-        let replacement = r#"{"range":{"start":{"line":0,"character":2},"end":{"line":0,"character":3}},"text":"\uDE03b"}"#;
+        let replacement = r#"{"range":{"start":{"line":0,"character":2},"end":{"line":0,"character":3}},"rangeLength":1,"text":"\uDE03b"}"#;
         input.extend_from_slice(&didchange_frame("file:///t.md", 2, replacement));
         let out = tokio::time::timeout(std::time::Duration::from_secs(5), pump_through(input))
             .await
             .expect("pump should finish");
         let frames = parse_frames(&out);
         let second = &frames[1]["params"]["contentChanges"][0];
-        assert_eq!(second["text"], "\u{FFFD}b");
+        assert_eq!(second["text"], "😃b");
         assert_eq!(
             second["range"],
-            serde_json::json!({"start":{"line":0,"character":2},"end":{"line":0,"character":3}})
+            serde_json::json!({"start":{"line":0,"character":1},"end":{"line":0,"character":3}})
         );
+        assert_eq!(second["rangeLength"], 2, "widened by the seam unit");
     }
 
     #[tokio::test]
