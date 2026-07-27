@@ -227,8 +227,10 @@ impl FrameRepairer {
 
         let repaired_text = repair.as_ref().map_or(text, |r| r.repaired.as_str());
         let Ok(mut msg) = serde_json::from_str::<serde_json::Value>(repaired_text) else {
-            // Invalid JSON beyond lone surrogates; forward our best repair.
-            return Some(repaired_text.to_owned());
+            // Invalid JSON beyond lone surrogates: forward our best repair,
+            // or the frame byte-for-byte when nothing was changed (an
+            // inspection pass alone must not rewrite headers).
+            return (repair.is_some() || decoded.is_some()).then(|| repaired_text.to_owned());
         };
         let strings = repair.as_ref().map_or(&[][..], |r| r.strings.as_slice());
         let rewritten = match msg.get("method").and_then(|m| m.as_str()) {
@@ -992,6 +994,25 @@ mod tests {
             frames[2]["params"]["contentChanges"][0]["text"],
             "\u{FFFD}b"
         );
+    }
+
+    /// An inspection pass (pending seam) over a frame the pump cannot even
+    /// parse must not rewrite anything — not even the header casing.
+    #[tokio::test]
+    async fn inspection_of_unparseable_frame_forwards_byte_for_byte() {
+        let mut input = Vec::new();
+        input.extend_from_slice(&didchange_frame(
+            "file:///t.md",
+            1,
+            &insert_at(0, 0, r"a\uD83D"),
+        ));
+        let garbage = b"content-length: 8\r\n\r\nnot json".to_vec();
+        input.extend_from_slice(&garbage);
+        let out = tokio::time::timeout(std::time::Duration::from_secs(5), pump_through(input))
+            .await
+            .expect("pump should finish");
+        let tail = &out[out.len() - garbage.len()..];
+        assert_eq!(tail, garbage.as_slice(), "garbage frame must stay verbatim");
     }
 
     #[tokio::test]
