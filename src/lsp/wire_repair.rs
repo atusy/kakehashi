@@ -813,10 +813,14 @@ mod tests {
         frames
     }
 
-    fn didchange_frame(uri: &str, version: u32, changes: &str) -> Vec<u8> {
-        frame(&format!(
+    fn didchange_body(uri: &str, version: u32, changes: &str) -> String {
+        format!(
             r#"{{"jsonrpc":"2.0","method":"textDocument/didChange","params":{{"textDocument":{{"uri":"{uri}","version":{version}}},"contentChanges":[{changes}]}}}}"#,
-        ))
+        )
+    }
+
+    fn didchange_frame(uri: &str, version: u32, changes: &str) -> Vec<u8> {
+        frame(&didchange_body(uri, version, changes))
     }
 
     fn insert_at(line: u32, character: u32, text: &str) -> String {
@@ -1063,33 +1067,23 @@ mod tests {
     /// Raw WTF-8 chunks pair up exactly like escape-spelled ones.
     #[tokio::test]
     async fn raw_wtf8_split_pair_is_reassembled() {
-        let chunk1 = splice_raw(
-            &String::from_utf8(didchange_frame("file:///t.md", 1, &insert_at(0, 0, "a@@")))
-                .unwrap(),
+        let body1 = splice_raw(
+            &didchange_body("file:///t.md", 1, &insert_at(0, 0, "a@@")),
             "@@",
             &[0xED, 0xA0, 0xBD], // U+D83D
         );
-        let chunk2 = splice_raw(
-            &String::from_utf8(didchange_frame("file:///t.md", 2, &insert_at(0, 2, "@@b")))
-                .unwrap(),
+        let body2 = splice_raw(
+            &didchange_body("file:///t.md", 2, &insert_at(0, 2, "@@b")),
             "@@",
             &[0xED, 0xB8, 0x83], // U+DE03
         );
-        let mut input = fix_content_lengths(chunk1);
-        input.extend_from_slice(&fix_content_lengths(chunk2));
+        let mut input = frame_bytes(&body1);
+        input.extend_from_slice(&frame_bytes(&body2));
         let out = tokio::time::timeout(std::time::Duration::from_secs(5), pump_through(input))
             .await
             .expect("pump should finish");
         let frames = parse_frames(&out);
         assert_eq!(frames[1]["params"]["contentChanges"][0]["text"], "😃b");
-    }
-
-    /// Rebuilds the Content-Length of a single spliced frame whose body
-    /// length changed relative to the placeholder.
-    fn fix_content_lengths(spliced: Vec<u8>) -> Vec<u8> {
-        let header_end = find_subslice(&spliced, b"\r\n\r\n").unwrap() + 4;
-        let body = spliced[header_end..].to_vec();
-        frame_bytes(&body)
     }
 
     #[tokio::test]
