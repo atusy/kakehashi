@@ -57,7 +57,15 @@ async fn forward_frames(
             let _ = tokio::io::copy(&mut input, output).await;
             return;
         };
-        let frame_end = header_end + content_len;
+        // `content_len` is attacker/bug-controlled; a wrapped add would make
+        // an inverted slice below and panic the pump.
+        let Some(frame_end) = header_end.checked_add(content_len) else {
+            if output.write_all(&buf).await.is_err() {
+                return;
+            }
+            let _ = tokio::io::copy(&mut input, output).await;
+            return;
+        };
         while buf.len() < frame_end {
             if !read_more(&mut input, &mut buf).await {
                 let _ = output.write_all(&buf).await; // truncated final frame
@@ -786,6 +794,21 @@ mod tests {
         let mut expected = frame(r#"{"text":"�"}"#);
         expected.extend_from_slice(&good);
         assert_eq!(out, expected);
+    }
+
+    /// A Content-Length near usize::MAX used to wrap the frame-end addition
+    /// and panic the pump on an inverted slice, permanently hanging the
+    /// server (the reader never sees EOF). It must degrade to passthrough.
+    #[tokio::test]
+    async fn overflowing_content_length_degrades_to_passthrough() {
+        let input = b"Content-Length: 18446744073709551615\r\n\r\n{}".to_vec();
+        let out = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            pump_through(input.clone()),
+        )
+        .await
+        .expect("pump must not hang");
+        assert_eq!(out, input);
     }
 
     #[tokio::test]
