@@ -1167,6 +1167,221 @@ mod tests {
         );
     }
 
+    /// Both halves arriving inside ONE didChange message: change[0] opens
+    /// the seam, change[1] (positions relative to the doc after change[0])
+    /// consumes it.
+    #[tokio::test]
+    async fn intra_message_split_pair_is_reassembled() {
+        let changes = format!(
+            "{},{}",
+            insert_at(0, 0, r"a\uD83D"),
+            insert_at(0, 2, r"\uDE03b")
+        );
+        let input = didchange_frame("file:///t.md", 1, &changes);
+        let out = tokio::time::timeout(std::time::Duration::from_secs(5), pump_through(input))
+            .await
+            .expect("pump should finish");
+        let frames = parse_frames(&out);
+        let second = &frames[0]["params"]["contentChanges"][1];
+        assert_eq!(second["text"], "😃b");
+        assert_eq!(
+            second["range"],
+            serde_json::json!({"start":{"line":0,"character":1},"end":{"line":0,"character":2}})
+        );
+    }
+
+    /// Two changes whose repaired texts are the identical string must each
+    /// pair with their own scanner record, in body order: record[0] is a
+    /// trailing high, record[1] a leading low — swapping them would leave
+    /// the pair unassembled.
+    #[tokio::test]
+    async fn identical_repaired_values_attribute_in_body_order() {
+        let changes = format!(
+            "{},{}",
+            insert_at(0, 0, r"\uD83D"),
+            insert_at(0, 1, r"\uDE03")
+        );
+        let input = didchange_frame("file:///t.md", 1, &changes);
+        let out = tokio::time::timeout(std::time::Duration::from_secs(5), pump_through(input))
+            .await
+            .expect("pump should finish");
+        let frames = parse_frames(&out);
+        let second = &frames[0]["params"]["contentChanges"][1];
+        assert_eq!(second["text"], "😃");
+        assert_eq!(
+            second["range"],
+            serde_json::json!({"start":{"line":0,"character":0},"end":{"line":0,"character":1}})
+        );
+    }
+
+    /// A lowercase `content-length` falling into the passthrough branch
+    /// would reintroduce the original server death for that client.
+    #[tokio::test]
+    async fn lowercase_content_length_header_is_recognized() {
+        let body = r#"{"text":"\uD83D"}"#;
+        let input = format!("content-length: {}\r\n\r\n{}", body.len(), body).into_bytes();
+        let out = tokio::time::timeout(std::time::Duration::from_secs(5), pump_through(input))
+            .await
+            .expect("pump should finish");
+        assert_eq!(out, frame(r#"{"text":"�"}"#));
+    }
+
+    #[tokio::test]
+    async fn seam_survives_didchange_for_other_document() {
+        let mut input = Vec::new();
+        input.extend_from_slice(&didchange_frame(
+            "file:///a.md",
+            1,
+            &insert_at(0, 0, r"a\uD83D"),
+        ));
+        input.extend_from_slice(&didchange_frame("file:///b.md", 1, &insert_at(0, 0, "x")));
+        input.extend_from_slice(&didchange_frame(
+            "file:///a.md",
+            2,
+            &insert_at(0, 2, r"\uDE03b"),
+        ));
+        let out = tokio::time::timeout(std::time::Duration::from_secs(5), pump_through(input))
+            .await
+            .expect("pump should finish");
+        let frames = parse_frames(&out);
+        assert_eq!(frames[2]["params"]["contentChanges"][0]["text"], "😃b");
+    }
+
+    /// A REPLACEMENT at the seam position must not be rewritten — deleting
+    /// [P-1,P) on top of a replacement would corrupt geometry.
+    #[tokio::test]
+    async fn replacement_at_seam_position_is_not_rewritten() {
+        let mut input = Vec::new();
+        input.extend_from_slice(&didchange_frame(
+            "file:///t.md",
+            1,
+            &insert_at(0, 0, r"a\uD83D"),
+        ));
+        let replacement = r#"{"range":{"start":{"line":0,"character":2},"end":{"line":0,"character":3}},"text":"\uDE03b"}"#;
+        input.extend_from_slice(&didchange_frame("file:///t.md", 2, replacement));
+        let out = tokio::time::timeout(std::time::Duration::from_secs(5), pump_through(input))
+            .await
+            .expect("pump should finish");
+        let frames = parse_frames(&out);
+        let second = &frames[1]["params"]["contentChanges"][0];
+        assert_eq!(second["text"], "\u{FFFD}b");
+        assert_eq!(
+            second["range"],
+            serde_json::json!({"start":{"line":0,"character":2},"end":{"line":0,"character":3}})
+        );
+    }
+
+    #[tokio::test]
+    async fn truncated_final_frame_is_flushed_verbatim() {
+        let input = b"Content-Length: 100\r\n\r\n{\"partial".to_vec();
+        let out = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            pump_through(input.clone()),
+        )
+        .await
+        .expect("pump should finish");
+        assert_eq!(out, input);
+    }
+
+    /// A full-text sync whose text ends in a lone high opens a seam measured
+    /// from (0,0); the next chunk consumes it like any other.
+    #[tokio::test]
+    async fn full_sync_trailing_high_opens_a_consumable_seam() {
+        let mut input = Vec::new();
+        input.extend_from_slice(&didchange_frame("file:///t.md", 1, r#"{"text":"a\uD83D"}"#));
+        input.extend_from_slice(&didchange_frame(
+            "file:///t.md",
+            2,
+            &insert_at(0, 2, r"\uDE03b"),
+        ));
+        let out = tokio::time::timeout(std::time::Duration::from_secs(5), pump_through(input))
+            .await
+            .expect("pump should finish");
+        let frames = parse_frames(&out);
+        assert_eq!(frames[1]["params"]["contentChanges"][0]["text"], "😃b");
+    }
+
+    #[test]
+    fn advance_utf16_counts_crlf_and_lone_cr_as_one_break() {
+        assert_eq!(advance_utf16(0, 0, "x\r\ny"), (1, 1));
+        assert_eq!(advance_utf16(0, 0, "x\ry"), (1, 1));
+        assert_eq!(advance_utf16(0, 0, "😃"), (0, 2));
+    }
+
+    /// The rewrite must not inject the deprecated rangeLength key when the
+    /// client omitted it.
+    #[tokio::test]
+    async fn rewrite_does_not_inject_absent_range_length() {
+        let mut input = Vec::new();
+        input.extend_from_slice(&didchange_frame(
+            "file:///t.md",
+            1,
+            &insert_at(0, 0, r"a\uD83D"),
+        ));
+        let continuation = r#"{"range":{"start":{"line":0,"character":2},"end":{"line":0,"character":2}},"text":"\uDE03b"}"#;
+        input.extend_from_slice(&didchange_frame("file:///t.md", 2, continuation));
+        let out = tokio::time::timeout(std::time::Duration::from_secs(5), pump_through(input))
+            .await
+            .expect("pump should finish");
+        let frames = parse_frames(&out);
+        let second = &frames[1]["params"]["contentChanges"][0];
+        assert_eq!(second["text"], "😃b");
+        assert!(second.get("rangeLength").is_none());
+    }
+
+    #[tokio::test]
+    async fn didopen_between_chunks_clears_the_seam() {
+        let mut input = Vec::new();
+        input.extend_from_slice(&didchange_frame(
+            "file:///t.md",
+            1,
+            &insert_at(0, 0, r"a\uD83D"),
+        ));
+        input.extend_from_slice(&frame(
+            r#"{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///t.md","languageId":"markdown","version":1,"text":"fresh"}}}"#,
+        ));
+        input.extend_from_slice(&didchange_frame(
+            "file:///t.md",
+            2,
+            &insert_at(0, 2, r"\uDE03b"),
+        ));
+        let out = tokio::time::timeout(std::time::Duration::from_secs(5), pump_through(input))
+            .await
+            .expect("pump should finish");
+        let frames = parse_frames(&out);
+        assert_eq!(
+            frames[2]["params"]["contentChanges"][0]["text"],
+            "\u{FFFD}b"
+        );
+    }
+
+    /// Overflowing the seam valve wipes stale seams: a continuation for an
+    /// early document must fall back to stage-1 U+FFFD.
+    #[tokio::test]
+    async fn seam_valve_overflow_drops_stale_seams() {
+        let mut input = Vec::new();
+        for n in 0..9 {
+            input.extend_from_slice(&didchange_frame(
+                &format!("file:///doc{n}.md"),
+                1,
+                &insert_at(0, 0, r"a\uD83D"),
+            ));
+        }
+        input.extend_from_slice(&didchange_frame(
+            "file:///doc0.md",
+            2,
+            &insert_at(0, 2, r"\uDE03b"),
+        ));
+        let out = tokio::time::timeout(std::time::Duration::from_secs(5), pump_through(input))
+            .await
+            .expect("pump should finish");
+        let frames = parse_frames(&out);
+        assert_eq!(
+            frames[9]["params"]["contentChanges"][0]["text"],
+            "\u{FFFD}b"
+        );
+    }
+
     /// The field pattern: middle chunks both start with a low half and end
     /// with a high half, so one frame consumes a seam and opens the next.
     #[tokio::test]
