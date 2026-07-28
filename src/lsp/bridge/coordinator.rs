@@ -2025,6 +2025,35 @@ mod tests {
     }
 
     #[test]
+    fn any_language_server_works_under_the_real_shipped_defaults() {
+        // The hand-built settings above leave `languages` empty, which makes
+        // `resolve_host_language_settings` return None and skips the bridge
+        // filter entirely. Real configs always carry the shipped `languages._`
+        // entry, so the filter branch *is* live — and it is the branch that
+        // decides whether a `"*"` server reaches a language with no
+        // `languages.<lang>` entry of its own. Pin the zero-config path.
+        let coordinator = BridgeCoordinator::new();
+        let mut settings = settings_with_any_language_server();
+        settings.languages = crate::config::defaults::default_settings().languages;
+        assert!(
+            settings.languages.contains_key("_"),
+            "the shipped defaults must carry the wildcard language entry"
+        );
+
+        let names: Vec<String> = coordinator
+            .get_all_configs_for_language(&settings, "markdown", "toml")
+            .into_iter()
+            .map(|r| r.server_name)
+            .collect();
+        assert_eq!(
+            names,
+            vec!["harper-ls".to_string()],
+            "a `\"*\"` server must reach an injection language that no \
+             `languages.<lang>` entry mentions"
+        );
+    }
+
+    #[test]
     fn any_language_server_still_obeys_the_host_bridge_filter() {
         // `"*"` widens the *server* axis (which servers can answer), not the
         // *language* axis (which injections the host bridges at all). A host

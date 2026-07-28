@@ -118,8 +118,13 @@ the other is harder to document than the `_self` gate that already exists.
   maximal. Documented with a recommendation to declare `"*"` on concrete
   servers instead.
 - **Fan-out grows** with each `"*"` server, which now participates in every
-  injection region. Mitigated — not eliminated — by the capability prefilter,
-  which drops servers that have advertised no support for the method.
+  injection region — including languages the user never intended it for. The
+  capability prefilter blunts the *steady-state* cost by dropping servers that
+  have advertised no support for the requested method, but it can only do so
+  once the server is `Ready`: a `"*"` server is still spawned and initialized
+  for every injection language it is a candidate for. Cost is therefore
+  proportional to the number of distinct injection languages opened, and the
+  wildcard should be spent on servers that genuinely answer for all of them.
 
 ### Neutral
 
