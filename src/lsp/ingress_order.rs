@@ -354,7 +354,7 @@ fn text_document_uri(req: &Request) -> Option<String> {
 
 /// Normalize a URI spelling through `Url` so variants of the same document
 /// (percent-encoding, default ports, scheme casing) sequence together.
-fn normalize_uri(raw: &str) -> String {
+pub(crate) fn normalize_uri(raw: &str) -> String {
     url::Url::parse(raw)
         .map(String::from)
         .unwrap_or_else(|_| raw.to_string())

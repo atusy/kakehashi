@@ -829,11 +829,43 @@ fn run_diagnose(options: kakehashi::cli::diagnose::DiagnoseOptions) -> Result<()
 }
 
 /// Run the LSP server (requires tokio runtime)
-#[tokio::main]
-async fn run_lsp_server() {
+fn run_lsp_server() {
+    let runtime = match tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(e) => {
+            eprintln!("failed to build tokio runtime: {e}");
+            std::process::exit(1);
+        }
+    };
+    // Clients may keep stdin open after `exit`, leaving a parked,
+    // non-cancellable blocking-pool read (tokio::io::stdin). A plain
+    // runtime drop — including the drop-during-unwind of a server panic —
+    // would wait for it indefinitely and stall process death. The bounded
+    // shutdown below blocks at most its timeout: long enough for task drops
+    // to kill bridged downstream servers, after which any still-parked
+    // blocking-pool thread is abandoned to die with the process.
+    let served = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        runtime.block_on(serve_lsp());
+    }));
+    // serve() returning proves nothing about protocol-clean shutdown — it
+    // also returns on stdin EOF (editor crash) or a pump failure, where
+    // bridged downstream servers are killed only by task drops. The bounded
+    // window lets those drops run; a client that keeps stdin open after
+    // `exit` pays at most the timeout instead of hanging us forever.
+    runtime.shutdown_timeout(std::time::Duration::from_secs(3));
+    if let Err(panic) = served {
+        std::panic::resume_unwind(panic);
+    }
+}
+
+async fn serve_lsp() {
     use env_logger::Builder;
     use kakehashi::lsp::{
         CancelForwarder, IngressOrderGate, Kakehashi, LanguageServerPool, RequestIdCapture,
+        repair_inbound_frames,
     };
     use std::sync::Arc;
     use tokio::io::{stdin, stdout};
@@ -1068,6 +1100,12 @@ async fn run_lsp_server() {
     // burst (≈10 concurrent reader parks per document) across several
     // documents, with headroom.
     const INGRESS_CONCURRENCY: usize = 64;
+    // Repair malformed inbound frames (e.g. didChange text cut in the middle
+    // of a surrogate pair by chunking clients) before the codec sees them:
+    // tokio-util's
+    // FramedRead fuses on a decode error, so one bad frame would otherwise
+    // end the whole read loop and exit the server.
+    let stdin = repair_inbound_frames(stdin);
     Server::new(stdin, stdout, socket)
         .concurrency_level(INGRESS_CONCURRENCY)
         .serve(service)
