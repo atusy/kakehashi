@@ -345,6 +345,17 @@ mod tests {
             .expect("should have bridge wildcard '_'");
         assert_eq!(bridge_wildcard.enabled, Some(true));
 
+        // No `_self` key: host bridging stays opt-in (host-document-bridge),
+        // and `is_host_bridging_enabled` reads `_self` directly without a
+        // wildcard fallback, so its absence here IS the default-off.
+        // Two coordinator tests rely on this to exercise the gate rather than
+        // short-circuit before it; adding `_self` to the defaults would make
+        // them silently vacuous, so fail loudly on this side instead.
+        assert!(
+            !bridge.contains_key(crate::config::settings::HOST_BRIDGE_KEY),
+            "shipped defaults must not enable the host bridge"
+        );
+
         // Aggregation strategies
         let agg = bridge_wildcard
             .aggregation
