@@ -834,6 +834,7 @@ async fn run_lsp_server() {
     use env_logger::Builder;
     use kakehashi::lsp::{
         CancelForwarder, IngressOrderGate, Kakehashi, LanguageServerPool, RequestIdCapture,
+        repair_inbound_frames,
     };
     use std::sync::Arc;
     use tokio::io::{stdin, stdout};
@@ -1068,6 +1069,11 @@ async fn run_lsp_server() {
     // burst (≈10 concurrent reader parks per document) across several
     // documents, with headroom.
     const INGRESS_CONCURRENCY: usize = 64;
+    // Repair malformed inbound frames (e.g. didChange text cut mid-surrogate
+    // -pair by chunking clients) before the codec sees them: tokio-util's
+    // FramedRead fuses on a decode error, so one bad frame would otherwise
+    // end the whole read loop and exit the server.
+    let stdin = repair_inbound_frames(stdin);
     Server::new(stdin, stdout, socket)
         .concurrency_level(INGRESS_CONCURRENCY)
         .serve(service)

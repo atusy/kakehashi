@@ -9,6 +9,7 @@ pub(crate) mod in_progress_set;
 mod settings_manager;
 mod synthetic_diagnostics;
 mod text_sync;
+mod wire_repair;
 
 mod aggregation;
 mod ingress_order;
@@ -25,3 +26,4 @@ pub use lsp_impl::Kakehashi;
 pub(crate) use request_id::current_upstream_id;
 pub use request_id::{CancelForwarder, RequestIdCapture};
 pub(crate) use settings::{SettingsEvent, SettingsEventKind, SettingsSource, load_settings};
+pub use wire_repair::repair_inbound_frames;
