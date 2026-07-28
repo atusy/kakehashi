@@ -14,11 +14,11 @@ Partially implemented:
 
 - **Schema & gate**: the `_self` reserved key is live. Opt-in is the explicit
   `bridge._self.enabled = true` (`LanguageSettings::is_host_bridging_enabled`);
-  the built-in `_self.enabled = false` default is implemented as an
-  explicit-only rule — the `_` wildcard's `enabled = true` deliberately does
-  not leak into `_self` (equivalent to the Wildcard Merge Safety reasoning
-  below, without materializing built-in default entries). Aggregation fields
-  DO wildcard-merge (`resolve_host_aggregation`).
+  `enabled` is read with a direct `get(_self)` defaulting to `false`, so the
+  `_` wildcard's `enabled = true` (the virt default) cannot leak into `_self`
+  and the shipped defaults declare no `_self` entry at all. Aggregation fields
+  DO wildcard-merge (`resolve_host_aggregation`). See Wildcard Merge Safety
+  below for why the apparent inconsistency must stay.
 - **Dispatch**: implemented for every bridged request method. Because the
   host path needs no URI synthesis or coordinate translation, all methods
   share one generic forwarder
@@ -115,21 +115,24 @@ Design challenges:
 ## Decision Drivers
 
 - **Minimal schema disruption**: no new types in `BridgeServerConfig`, `BridgeLanguageConfig`, or `AggregationConfig`.
-- **Reuse wildcard machinery**: wildcard-config-inheritance's `resolve_with_wildcard` should apply uniformly across host and virt entries.
+- **Reuse wildcard machinery**: wildcard-config-inheritance's `resolve_with_wildcard` should apply to host entries wherever it can, so host bridging needs as little bespoke resolver logic as possible.
 - **Capability vs. policy separation**: `languageServers.*` declares *what* an LS can do; `languages.*.bridge.*` decides *whether and how* it is used.
 - **Opt-in for new behavior**: host bridging defaults *off* so existing configs are unchanged.
 - **Symmetric mental model**: host and virt are both "bridges" — only the LS-matching rule differs.
 
 ## Decision Outcome
 
-**Chosen approach**: Reserve `_self` as a special key in the `bridge` map. It represents the host language acting as its own bridge target. `BridgeLanguageConfig` is reused unchanged. Defaults are declared explicitly at `languages._.bridge._self` (enabled = false) and `languages._.bridge._` (enabled = true), so the existing wildcard merge naturally yields the right answers without special-case resolver logic.
+**Chosen approach**: Reserve `_self` as a special key in the `bridge` map. It represents the host language acting as its own bridge target. `BridgeLanguageConfig` is reused unchanged.
+
+Aggregation fields under `_self` resolve through the ordinary wildcard merge (`resolve_host_aggregation`). The `enabled` field does **not** — it is read with a direct `get(_self)` and defaults to `false`, so absence is the off state and the shipped defaults declare no `_self` key at all.
 
 ### Schema
 
 ```toml
 # ---- Built-in defaults (declared in code; not user-facing) ----
-[languages._.bridge._self]
-enabled = false              # Host bridging is opt-in.
+# There is deliberately NO [languages._.bridge._self] entry: host bridging is
+# opt-in, and `is_host_bridging_enabled` reads `_self.enabled` directly, so
+# absence already means off.
 
 [languages._.bridge._]
 enabled = true               # Virt bridging stays default-on (wildcard-config-inheritance).
@@ -187,34 +190,24 @@ No new fields on `BridgeServerConfig`. An LS that should not act as host for a g
 
 ### Wildcard Merge Safety
 
-Concern: under wildcard-config-inheritance, `resolve_with_wildcard(map, "_self", merge)` merges the `_` wildcard into the `_self` entry. If `_.enabled = true` and `_self.enabled` were absent, the wildcard would silently turn host bridging on.
+Concern: under wildcard-config-inheritance, `resolve_with_wildcard(map, "_self", merge)` merges the `_` wildcard into the `_self` entry. The shipped `_.enabled = true` is the *virt* default; if it reached `_self`, the wildcard would silently turn host bridging on for every language.
 
-Resolution: built-in defaults at `languages._.bridge._self.enabled = false` and `languages._.bridge._.enabled = true` mean that after the *outer* wildcard merge (language layer), every `bridge` map sees `_self` populated with `Some(false)`. During the *inner* wildcard merge (`_self ⊕ _`), key-specific fields win — `_self.enabled = Some(false)` beats `_.enabled = Some(true)`. No special case is needed.
-
-Trace for an unconfigured language `lua`:
+Resolution: `enabled` is exempted from that merge. `is_host_bridging_enabled` reads `bridge._self.enabled` with a **direct** `get(HOST_BRIDGE_KEY)` and `unwrap_or(false)`; there is no `_self` entry in the built-in defaults for `_` to merge into, and none is wanted.
 
 ```
-1. Outer merge:  languages.lua ⊕ languages._
-                 → lua.bridge = {_self: {enabled: false}, _: {enabled: true}}
-2. Inner merge for bridge._self:
-                 _self.enabled = Some(false)  ⊕  _.enabled = Some(true)
-                 → Some(false) wins  ✓ host bridging stays off
-3. Inner merge for bridge._:
-                 _.enabled = Some(true)
-                 → Some(true)         ✓ virt bridging stays on
+Unconfigured language `lua`:
+    lua.bridge = {_: {enabled: true}}          # after the language-layer merge
+    is_host_bridging_enabled → get("_self") = None → false   ✓ host off
+    is_language_bridgeable("python") → resolves via `_` → true  ✓ virt on
+
+User opts markdown in — languages.markdown.bridge._self.enabled = true:
+    markdown.bridge = {_self: {enabled: true}, _: {enabled: true}}
+    is_host_bridging_enabled → get("_self").enabled = Some(true) → true  ✓ host on
 ```
 
-Trace when user opts markdown in:
+**Do not "simplify" this to `resolve_with_wildcard`.** It looks like an inconsistency worth removing, and removing it enables host bridging globally — including for every `languages = ["*"]` server (any-language-server-wildcard), since the host axis selects servers through the same `languages` list. Two tests hold the line: `host_bridging_not_enabled_by_bridge_wildcard` (the `_` wildcard must not leak in) and `default_settings_has_wildcard_language_with_bridge_defaults` (the defaults must not grow a `_self` key).
 
-```
-User: languages.markdown.bridge._self.enabled = true
-1. Outer merge: markdown.bridge = {_self: {enabled: true}, _: {enabled: true (default)}}
-2. Inner merge for bridge._self:
-                _self.enabled = Some(true) ⊕ _.enabled = Some(true)
-                → Some(true)               ✓ host bridging on
-```
-
-The same reasoning extends to any future `_self`-meaningful field: as long as the field carries an explicit default at `languages._.bridge._self`, the wildcard merge is safe without resolver changes.
+Any *future* `_self`-meaningful field has the same choice to make: inherit from `_` like the aggregation fields, or be read directly like `enabled`. Fields whose virt default would be wrong for the host role belong in the second group.
 
 ### URI and Coordinate Handling
 
@@ -246,8 +239,8 @@ Practical consequences:
 ### Positive
 
 - **Zero new types**: `BridgeServerConfig`, `BridgeLanguageConfig`, `AggregationConfig` all unchanged.
-- **Reuses wildcard machinery**: wildcard-config-inheritance's `resolve_with_wildcard` applies uniformly, no host-specific resolver path.
-- **Backward compatible**: `_self.enabled = false` default keeps existing configs inert.
+- **Reuses wildcard machinery**: wildcard-config-inheritance's `resolve_with_wildcard` covers the aggregation fields; only `enabled` needs a direct read.
+- **Backward compatible**: an absent `_self` reads as disabled, so existing configs are inert.
 - **Granular control**: host bridging is per-host-language; aggregation/priorities are per-method.
 - **Symmetric mental model**: virt and host live in the same `bridge` map, with the only operational difference being LS-match key (injection language vs. host language).
 - **LS catalog stays capability-pure**: no host/virt role flags on `BridgeServerConfig`; one LS entry naturally serves both roles when its `languages` field matches.

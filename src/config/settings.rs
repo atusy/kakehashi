@@ -2596,8 +2596,11 @@ kind = "locals""#;
     #[test]
     fn host_bridging_not_enabled_by_bridge_wildcard() {
         // The `_` wildcard's enabled = true is the VIRT default; it must not
-        // silently turn host bridging on (host-document-bridge: the built-in
-        // `_self.enabled = false` default is key-specific and wins).
+        // silently turn host bridging on. The fixture deliberately has NO
+        // `_self` entry, because that is the real shipped shape and absence is
+        // what the direct `get` reads as off — adding `_self = false` here
+        // would make this test vacuous against a switch to
+        // `resolve_with_wildcard` (host-document-bridge § Wildcard Merge Safety).
         let settings = LanguageSettings {
             bridge: Some(HashMap::from([(
                 WILDCARD_KEY.to_string(),
