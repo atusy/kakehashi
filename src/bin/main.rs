@@ -843,9 +843,10 @@ fn run_lsp_server() {
     // Clients may keep stdin open after `exit`, leaving a parked,
     // non-cancellable blocking-pool read (tokio::io::stdin). A plain
     // runtime drop — including the drop-during-unwind of a server panic —
-    // would wait for it and stall process death; shutdown_background is
-    // tokio's documented answer for exactly this, so it must run on the
-    // panic path too.
+    // would wait for it indefinitely and stall process death. The bounded
+    // shutdown below blocks at most its timeout: long enough for task drops
+    // to kill bridged downstream servers, after which any still-parked
+    // blocking-pool thread is abandoned to die with the process.
     let served = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         runtime.block_on(serve_lsp());
     }));

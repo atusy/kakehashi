@@ -70,10 +70,23 @@ async fn forward_frames(mut input: impl AsyncRead + Send + Unpin, mut output: Du
     let mut buf: Vec<u8> = Vec::with_capacity(READ_CHUNK_SIZE);
     let mut repairer = FrameRepairer::default();
     loop {
-        let Some(header_end) = fill_until_header_end(&mut input, &mut buf).await else {
-            // EOF (or write-side gone) before a complete header: flush and stop.
-            let _ = output.write_all(&buf).await;
-            return;
+        let header_end = match fill_until_header_end(&mut input, &mut buf).await {
+            HeaderScan::Complete(header_end) => header_end,
+            HeaderScan::Eof => {
+                // EOF (or write-side gone) before a complete header: flush
+                // and stop.
+                let _ = output.write_all(&buf).await;
+                return;
+            }
+            HeaderScan::Oversized => {
+                // No real client sends headers this large; stop buffering
+                // and degrade to transparent passthrough.
+                if output.write_all(&buf).await.is_err() {
+                    return;
+                }
+                let _ = tokio::io::copy(&mut input, &mut output).await;
+                return;
+            }
         };
         let Some(content_len) = parse_content_length(&buf[..header_end]) else {
             // Framing is impossible without Content-Length; degrade to a
@@ -169,8 +182,8 @@ async fn forward_frames(mut input: impl AsyncRead + Send + Unpin, mut output: Du
         // the same so no fresh non-cancellable stdin read is parked. This
         // detection is best-effort (an escape-spelled method name or a
         // whitespace-padded frame can evade it): the hard guarantee against
-        // a stalled shutdown is main's `runtime.shutdown_background()`,
-        // which never waits for a parked stdin read.
+        // a stalled shutdown is main's bounded `runtime.shutdown_timeout`,
+        // which waits for a parked stdin read only up to its timeout.
         if is_exit_notification(&buf[header_end..frame_end]) {
             return;
         }
@@ -186,7 +199,7 @@ async fn forward_frames(mut input: impl AsyncRead + Send + Unpin, mut output: Du
 
 /// Is this body the `exit` notification, as real clients spell it? Bodies
 /// above a tiny bound or without the literal method text skip the parse;
-/// evasive spellings are caught by main's shutdown_background instead.
+/// evasive spellings are bounded by main's shutdown timeout instead.
 fn is_exit_notification(body: &[u8]) -> bool {
     const MAX_EXIT_FRAME: usize = 256;
     if body.len() > MAX_EXIT_FRAME || !body.windows(4).any(|w| w == b"exit") {
@@ -202,21 +215,36 @@ fn is_exit_notification(body: &[u8]) -> bool {
         .unwrap_or(false)
 }
 
-/// Reads until `buf` contains a full header block, returning the offset just
-/// past the terminator, or `None` on EOF.
+enum HeaderScan {
+    /// Offset just past the header-block terminator.
+    Complete(usize),
+    Eof,
+    /// No terminator within [`MAX_HEADER_BYTES`]; give up buffering.
+    Oversized,
+}
+
+/// Upper bound on a header block while searching for its terminator; real
+/// blocks are a few hundred bytes, and without a bound a stream that never
+/// terminates its headers would buffer unboundedly.
+const MAX_HEADER_BYTES: usize = 64 * 1024;
+
+/// Reads until `buf` contains a full header block.
 async fn fill_until_header_end(
     input: &mut (impl AsyncRead + Unpin),
     buf: &mut Vec<u8>,
-) -> Option<usize> {
+) -> HeaderScan {
     let mut searched: usize = 0;
     loop {
         let from = searched.saturating_sub(HEADER_TERMINATOR_MAX - 1);
         if let Some(end) = find_header_end(&buf[from..]) {
-            return Some(from + end);
+            return HeaderScan::Complete(from + end);
+        }
+        if buf.len() > MAX_HEADER_BYTES {
+            return HeaderScan::Oversized;
         }
         searched = buf.len();
         if !read_more(input, buf).await {
-            return None;
+            return HeaderScan::Eof;
         }
     }
 }
@@ -751,8 +779,6 @@ fn document_uri(msg: &serde_json::Value) -> Option<String> {
         .map(crate::lsp::ingress_order::normalize_uri)
 }
 
-/// Returns the start position when `range` denotes an insertion
-/// (start == end), else `None`.
 /// Extracts the validated (start, end) positions of a change range.
 fn range_bounds(range: &serde_json::Value) -> Option<((u64, u64), (u64, u64))> {
     // LSP positions are u32; anything larger cannot describe the downstream
@@ -1274,6 +1300,30 @@ mod tests {
         .await
         .expect("pump must not hang");
         assert_eq!(out, input);
+    }
+
+    /// A stream that never terminates its "headers" must not buffer without
+    /// bound: past the cap the pump degrades to passthrough, so bytes flow
+    /// while the input is still open.
+    #[tokio::test]
+    async fn oversized_header_block_degrades_to_passthrough() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let (mut tx, rx) = tokio::io::duplex(1 << 20);
+        let mut repaired = repair_inbound_frames(rx);
+        let garbage = vec![b'A'; 80 * 1024];
+        tx.write_all(&garbage).await.unwrap();
+        // tx stays open: only the passthrough degrade can deliver bytes now.
+        let mut out = vec![0u8; garbage.len()];
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            repaired.read_exact(&mut out),
+        )
+        .await
+        .expect("bytes must flow before EOF")
+        .unwrap();
+        assert_eq!(out, garbage);
+        drop(tx);
     }
 
     #[tokio::test]
