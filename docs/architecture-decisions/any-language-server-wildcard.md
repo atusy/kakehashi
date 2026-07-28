@@ -73,7 +73,15 @@ languages = ["*"]
 | `["rust"]` | matches rust only |
 | `["*"]` | matches every language |
 | `["rust", "*"]` | matches every language — membership has no ordering, so the named entry is redundant, not restrictive |
-| `[]` / omitted | **inherit from `languageServers._`** (unchanged); if nothing is inherited the server matches nothing |
+| `[]` / omitted | **not specified at this layer** (unchanged) — see below |
+
+An empty or omitted `languages` is more precisely "absent at this layer" than
+"inherit from `_`". Config layers (defaults < user < project <
+`initializationOptions`) collapse *before* the `_` entry is resolved, and the
+same emptiness rule drives both steps — so `checker.languages = []` in a
+project config first takes the user config's `checker.languages`, and only
+falls through to `languageServers._` when no layer specified it. A lower
+layer's concrete list therefore beats a higher layer's `_` wildcard.
 
 - Resolved at **match time** (`handles_language`), not expanded during config
   merging. "Every language" is an open set with no static enumeration.
@@ -85,8 +93,11 @@ languages = ["*"]
   language ids are taken verbatim from `#set! injection.language` properties and
   from `@injection.language` capture *text*, and canonicalization falls through
   to the raw identifier, so a hand-authored query or a `` ```* `` fence can
-  produce the literal id `*`. The consequence is benign: such a region is
-  matched by exactly the servers that already accept every language.
+  produce the literal id `*`. Reserving the element is therefore not quite a
+  no-op for existing configs: a server that declared `languages = ["*"]` to
+  serve *only* such a pseudo-language now serves every language instead. No
+  real configuration is believed to do this — it needs a hand-authored query
+  emitting `*` — but the reservation is a semantic change, not purely additive.
 
 ### Scope: `priorities` Still Excludes an Unlisted Server
 
@@ -107,6 +118,34 @@ priorities = ["pyright", "ruff"]
 
 The default (absent `priorities` ≡ `["*"]`) includes it everywhere, so this
 only bites configs that have already opted into explicit priority lists.
+
+**This exclusion covers requests kakehashi dispatches, not unsolicited pushes.**
+A server excluded by `priorities` is still a *candidate* — `handles_language`
+put it in the set — so the eager open still opens the region on it, and
+`record_region_push` accepts what it publishes after checking only that the
+server is still spawnable. A push-driven server therefore keeps reaching the
+editor for a language whose `priorities` omit it. That gate predates this
+decision (it bites an excluded pyright/ruff pair the same way), but the
+wildcard makes it far easier to hit, since a `"*"` server is a candidate for
+every language by construction. Tracked separately; the reliable exclusion for
+a push-driven server today is `enabled = false`, which the selection sites
+check first.
+
+### Scope: Turning a Language Off at Runtime Does Not Retract It
+
+Disabling a bridged language while a document is open
+(`languages.<host>.bridge.<lang>.enabled = false` via
+`workspace/didChangeConfiguration`) stops *new* selections but does not retract
+regions already open downstream. `close_replaced_docs` closes a virtual
+document when its region changes language, not when its server stops being a
+candidate, and a host-filter edit does not touch any server's launch config, so
+nothing recycles the connection either — a `same_launch_config` mismatch would.
+The server keeps receiving `didChange` for those regions, and keeps publishing,
+until the host document closes or the connection restarts.
+
+Also pre-existing, also amplified for the same reason: with `"*"` there is
+always a server holding the region. Changing the server's own `languages` *does*
+reconcile, because that is part of the launch config.
 
 ### Scope: What `"*"` Does Not Widen
 
@@ -135,9 +174,9 @@ the other is harder to document than the `_self` gate that already exists.
   set that cannot be known in advance.
 - **Widening becomes expressible** at all, closing the defer-only gap left by
   the inheritance semantics of the empty list.
-- **No behavior change for existing configs**: `"*"` is opt-in, and no existing
-  config could have used it meaningfully — it was a language name matching
-  nothing.
+- **Effectively no behavior change for existing configs**: `"*"` is opt-in, and
+  it previously named a language that only a hand-authored injection query
+  could produce (see the reservation caveat above).
 
 ### Negative
 
