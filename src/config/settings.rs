@@ -1484,6 +1484,60 @@ mod tests {
     }
 
     #[test]
+    fn languages_wildcard_matches_every_language() {
+        // `["*"]` = "attach to any language" (any-language-server-wildcard).
+        // Empty is already spoken for ("inherit from `_`"), so the wildcard
+        // element is the only shape that can *widen* an inherited list.
+        let server = BridgeServerConfig {
+            cmd: vec!["harper-ls".to_string()],
+            languages: vec![LANGUAGES_WILDCARD.to_string()],
+            ..Default::default()
+        };
+
+        assert!(server.handles_language("rust"));
+        assert!(server.handles_language("python"));
+        assert!(server.handles_language("a-language-nobody-configured"));
+    }
+
+    #[test]
+    fn languages_wildcard_mixed_with_names_still_matches_every_language() {
+        // Membership has no ordering, so a named entry alongside `"*"` is
+        // redundant rather than restrictive.
+        let server = BridgeServerConfig {
+            cmd: vec!["harper-ls".to_string()],
+            languages: vec!["rust".to_string(), LANGUAGES_WILDCARD.to_string()],
+            ..Default::default()
+        };
+
+        assert!(server.handles_language("rust"));
+        assert!(server.handles_language("python"));
+    }
+
+    #[test]
+    fn explicit_languages_list_matches_only_listed_languages() {
+        let server = BridgeServerConfig {
+            cmd: vec!["rust-analyzer".to_string()],
+            languages: vec!["rust".to_string()],
+            ..Default::default()
+        };
+
+        assert!(server.handles_language("rust"));
+        assert!(!server.handles_language("python"));
+    }
+
+    #[test]
+    fn empty_languages_matches_nothing() {
+        // An unresolved (still-inheriting) config must not become "any".
+        let server = BridgeServerConfig {
+            cmd: vec!["rust-analyzer".to_string()],
+            languages: vec![],
+            ..Default::default()
+        };
+
+        assert!(!server.handles_language("rust"));
+    }
+
+    #[test]
     fn should_parse_bridge_server_config() {
         // Test that BridgeServerConfig can deserialize all fields:
         // cmd (required), languages (required), initialization_options (optional)
