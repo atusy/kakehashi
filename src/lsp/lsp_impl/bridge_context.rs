@@ -152,8 +152,9 @@ pub(crate) struct HostRequestContext {
     pub(crate) language_id: String,
     /// The current host text, shared across per-server tasks.
     pub(crate) text: std::sync::Arc<str>,
-    /// Host-capable server configs (`languages` contains the host language),
-    /// gated on the explicit `bridge._self.enabled = true` opt-in.
+    /// Host-capable server configs (`languages` matches the host language —
+    /// `handles_language`, so a `"*"` server qualifies too), gated on the
+    /// explicit `bridge._self.enabled = true` opt-in.
     pub(crate) configs: Vec<ResolvedServerConfig>,
     /// Ordered allowlist from `bridge._self.aggregation` (wildcard-merged).
     pub(crate) priorities: Vec<String>,

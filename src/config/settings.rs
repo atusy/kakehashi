@@ -24,15 +24,10 @@ pub(crate) const PRIORITIES_WILDCARD: &str = "*";
 ///
 /// A list element rather than an empty/absent list because both of those
 /// already mean "inherit `languages` from the `_` entry"
-/// ([`crate::config::merge::merge_bridge_server_configs`]). A concrete
-/// server can therefore only *defer* to the wildcard entry, never widen past
-/// it, which is exactly what a language-agnostic server (spell/grammar/typo
-/// checkers, AI completion) needs to say. Keeping it in the list also leaves
-/// room for set algebra (e.g. a future `"!markdown"` exclusion) that a bare
-/// scalar could not express.
-///
-/// Same sigil and same reason as [`PRIORITIES_WILDCARD`]: `_` keys carry
-/// field-level inheritance semantics, list elements do not.
+/// ([`crate::config::merge::merge_bridge_server_configs`]), so a concrete
+/// server could otherwise only *defer* to the wildcard entry, never widen
+/// past it. Same sigil, and same `_`-vs-`*` reasoning, as
+/// [`PRIORITIES_WILDCARD`].
 pub(crate) const LANGUAGES_WILDCARD: &str = "*";
 
 /// The resolved default for an absent `priorities`: `["*"]`, i.e. fan out to
@@ -378,13 +373,15 @@ pub struct BridgeServerConfig {
     /// server whose resolved cmd is still empty is skipped at lookup.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub cmd: Vec<String>,
-    /// Languages this server handles (e.g., ["rust"], ["python"]), or the
-    /// [`LANGUAGES_WILDCARD`] element `"*"` for "any language".
+    /// Languages this server handles (e.g., ["rust"], ["python"]). The element
+    /// `"*"` matches every language, for servers not tied to one.
     /// Optional for the same wildcard-defaults reason as `cmd`; a server
     /// with no languages never matches a lookup.
-    ///
-    /// Test membership through [`Self::handles_language`] rather than
-    /// comparing elements directly, so `"*"` is honored everywhere.
+    // Doc comments on this struct are user-facing: they become the `config
+    // schema` output an editor shows on hover. Keep them free of rustdoc
+    // intra-doc links and implementor notes — match through
+    // `handles_language`, never by comparing elements directly, so that `"*"`
+    // is honored everywhere.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub languages: Vec<String>,
     /// Optional initialization options to pass to the server during initialize

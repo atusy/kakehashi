@@ -33,9 +33,11 @@ The obvious spellings for "any" are already taken:
 - **`languages = []`** — `merge_bridge_server_configs`
   (`src/config/merge.rs`) treats an empty overlay list as "inherit `languages`
   from the `_` entry" (wildcard-config-inheritance).
-- **`languages` omitted / `null`** — `#[serde(default)]` on `Vec<String>`
-  produces the same empty vec, so it lands on the identical inherit path. TOML
-  has no `null` regardless.
+- **`languages` omitted** — `#[serde(default)]` on `Vec<String>` produces that
+  same empty vec, so it lands on the identical inherit path. (`null` is not a
+  third spelling: TOML has no `null`, and an explicit JSON `null` from
+  `initializationOptions` fails to deserialize into `Vec<String>` rather than
+  defaulting — the field is neither `Option` nor `default_on_null`.)
 
 Both therefore mean *defer*. A concrete server has no way to **widen** past an
 inherited narrow list — only to accept it. That is precisely the gap a
@@ -77,8 +79,33 @@ languages = ["*"]
 - Resolution order is unchanged: wildcard *inheritance* (`_`) is applied first,
   then the resolved `languages` list is tested. `languageServers._.languages =
   ["*"]` is therefore legal and inheritable.
-- `"*"` is unambiguous as a marker: tree-sitter language identifiers never
-  contain `*`.
+- `"*"` is safe as a marker in practice — no real tree-sitter language is named
+  `*` — but that is an observation, not an enforced invariant. Injection
+  language ids are taken verbatim from `#set! injection.language` properties and
+  from `@injection.language` capture *text*, and canonicalization falls through
+  to the raw identifier, so a hand-authored query or a `` ```* `` fence can
+  produce the literal id `*`. The consequence is benign: such a region is
+  matched by exactly the servers that already accept every language.
+
+### Scope: `priorities` Still Excludes an Unlisted Server
+
+A third limit, easy to miss because it lives on a different axis:
+`aggregation.<method>.priorities` is an ordered **allowlist over server names**
+(aggregation-priorities-wildcard), and its `"*"` element means "the configured
+servers not named elsewhere in this list" — a different thing from a `"*"`
+*language*. A `"*"` server passes `handles_language` and reaches the candidate
+set, but is still dropped from any target whose `priorities` enumerates server
+names without a `"*"` element.
+
+```toml
+# harper-ls.languages = ["*"] answers in every fence EXCEPT python,
+# because this list names servers explicitly and omits it.
+[languages.markdown.bridge.python.aggregation."_"]
+priorities = ["pyright", "ruff"]
+```
+
+The default (absent `priorities` ≡ `["*"]`) includes it everywhere, so this
+only bites configs that have already opted into explicit priority lists.
 
 ### Scope: What `"*"` Does Not Widen
 
@@ -107,24 +134,50 @@ the other is harder to document than the `_self` gate that already exists.
   set that cannot be known in advance.
 - **Widening becomes expressible** at all, closing the defer-only gap left by
   the inheritance semantics of the empty list.
-- **No behavior change for existing configs**: `"*"` is opt-in and was
-  previously a language name matching nothing.
+- **No behavior change for existing configs**: `"*"` is opt-in, and no existing
+  config could have used it meaningfully — it was a language name matching
+  nothing.
 
 ### Negative
 
 - **`languageServers._.languages = ["*"]` is a footgun**: it attaches every
   server that omits `languages` to every language, silently and totally. It is
   the same hazard any `_.languages` value carries, but the blast radius is
-  maximal. Documented with a recommendation to declare `"*"` on concrete
-  servers instead.
+  maximal — and it crosses config *files*, since layers collapse before `_` is
+  resolved at match time, so a `_` wildcard in the user config also widens
+  servers declared in a project's config. Documented with a recommendation to
+  declare `"*"` on concrete servers instead.
+- **Opting a single server back out is not spellable in `languages`.** Under a
+  `_` wildcard, `[]` means "inherit" and resolves back to `["*"]`; the escape
+  hatch is `enabled = false` (which the selection sites check first, via
+  `is_spawnable`). Narrowing to a real language list does work — a concrete
+  non-empty `languages` overrides the wildcard.
 - **Fan-out grows** with each `"*"` server, which now participates in every
   injection region — including languages the user never intended it for. The
-  capability prefilter blunts the *steady-state* cost by dropping servers that
-  have advertised no support for the requested method, but it can only do so
-  once the server is `Ready`: a `"*"` server is still spawned and initialized
-  for every injection language it is a candidate for. Cost is therefore
-  proportional to the number of distinct injection languages opened, and the
-  wildcard should be spent on servers that genuinely answer for all of them.
+  *process* count does not grow with languages: the connection pool is keyed by
+  `(server, resolved root)` with no language component, so one `"*"` server is
+  one process per root. What scales is per-region work — the server receives a
+  virtual `didOpen` for every region it is a candidate for and joins every
+  region's fan-out. The capability prefilter blunts the steady-state request
+  cost by dropping servers that advertised no support for the method, but only
+  once the server is `Ready`; the first request in any language still pays the
+  spawn and initialize.
+- **A `"*"` server joins first-win races it would previously have sat out.**
+  Under the default `priorities = ["*"]` every matching server lands in one
+  `Rest` group, and the default `preferred` strategy decides that group by
+  arrival time. For methods where the `"*"` server returns a non-empty result
+  (hover, definition, completion), it can beat the language-specific server
+  nondeterministically. Users who care about the ordering must name servers
+  explicitly in `priorities` — which, per the `priorities` scope note above,
+  then also excludes the `"*"` server unless `"*"` is in that list too.
+- **The single-pick site becomes order-dependent for every language.**
+  `get_config_for_language` returns the first match while iterating a
+  `HashMap`, so its pick is not deterministic when several servers match. That
+  was previously reachable only with a genuinely overlapping config (ruff +
+  pyright for python); a `"*"` server makes *every* language have at least two
+  candidates. The site is used for eager virtual-document opening, so the
+  consequence is which server gets warmed up first, not which answers — request
+  paths use the full candidate set.
 
 ### Neutral
 

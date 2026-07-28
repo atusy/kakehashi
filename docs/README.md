@@ -350,7 +350,7 @@ Configure language servers for bridging LSP requests in injection regions.
 | Field | Description |
 |-------|-------------|
 | `cmd` | Command and arguments to start the language server |
-| `languages` | Languages this server handles. The single element `"*"` means **any language**, for servers that are not tied to one (spell/grammar/typo checkers, AI completion) — see below. |
+| `languages` | Languages this server handles. The element `"*"` means **any language**, for servers that are not tied to one (spell/grammar/typo checkers, AI completion) — see below. |
 | `initializationOptions` | Optional initialization options forwarded during the downstream server's `initialize` request |
 | `workspaceMarkers` | Marker files/directories locating the workspace root the server is initialized with, following Neovim's `vim.fs.root` `(string\|string[])[]` shape. (The pre-rename key `rootMarkers` is still accepted as a deprecated alias.) Entries are tried **in list order** (earlier = higher priority): each entry is searched up the triggering document's ancestors nearest-first before the next entry is tried, so a higher-priority marker in a far ancestor outranks a lower-priority one sitting next to the document. A **nested array** is one equal-priority group where the nearest ancestor containing any of its names wins — e.g. `[["stylua.toml", ".luarc.json"], ".git"]` means "nearest of stylua.toml/.luarc.json, otherwise .git". The first matching entry's directory becomes the server's `rootUri` and sole workspace folder. Default: `[".git"]`. No marker hit falls back to the client-supplied root; an explicit `[]` disables the search. The connection pool is keyed by `(server, resolved root)`, so in a multi-root monorepo documents under different marker roots get their own downstream process, each rooted correctly; documents sharing a root (or the no-marker fallback) share one process. Trade-off: process count grows with the number of distinct roots opened, and there is currently no idle-eviction — a long session touching many roots keeps one process per root alive until shutdown. Servers that operate purely on `workspaceFolders` can opt out of this growth with `preferSharedInstance` (below). |
 | `onTypeFormattingTriggers` | Trigger characters for bridged `textDocument/onTypeFormatting` (e.g. `["}", ";"]`). kakehashi advertises the sorted union across all servers at initialize and forwards a request to a downstream server only when that server's own capabilities declare the typed character. Unset everywhere (default) → the capability is not advertised. |
@@ -402,7 +402,15 @@ Two things `"*"` does **not** do:
 Because `languages` is inheritable, `languageServers._.languages = ["*"]`
 attaches **every** server that omits `languages` to **every** language. That
 is occasionally what you want, but it is rarely what you mean — prefer
-declaring `"*"` on the concrete servers that need it.
+declaring `"*"` on the concrete servers that need it. Note the reach crosses
+config *files*: layers collapse before the `_` entry is resolved, so a `_`
+wildcard in your user config widens servers declared in any project's config
+too — servers you never saw when you wrote it.
+
+Opting a single server back out is `enabled = false`, not an empty
+`languages`: `[]` means "inherit", so under a `_` wildcard it resolves right
+back to `["*"]`. A concrete server's own non-empty `languages` does override
+the wildcard, so listing real languages narrows it as expected.
 
 **Bridge Language Configuration:**
 
@@ -417,7 +425,7 @@ Each entry in the `bridge` map configures bridging for one injection language:
 
 The reserved `_self` key makes the host language its own bridge target: with
 it enabled, requests on the host document are forwarded to servers whose
-`languages` contains the **host** language, with the real URI and no
+`languages` matches the **host** language (including a `"*"` server), with the real URI and no
 coordinate translation. All bridged request methods are wired (exceptions:
 semantic tokens; document color stays injection-only; host completion-item
 and code-lens resolves pass through unrouted); by default the host layer is

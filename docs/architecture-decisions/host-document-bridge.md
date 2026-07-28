@@ -172,12 +172,16 @@ The `_self` ⊕ `_` merge is *not* special-cased in the resolver. It works corre
 
 Whether an LS is a candidate for a given request depends entirely on the `languages` field on its `BridgeServerConfig`:
 
-- **Virt path** (`bridge.<inj>` route): select LSes where `languages` contains `<inj>` (the injection language).
-- **Host path** (`bridge._self` route): select LSes where `languages` contains `<host>` (the host language of the document).
+- **Virt path** (`bridge.<inj>` route): select LSes whose `languages` matches `<inj>` (the injection language).
+- **Host path** (`bridge._self` route): select LSes whose `languages` matches `<host>` (the host language of the document).
+
+Matching is list membership, except that the element `"*"` matches every
+language (any-language-server-wildcard) — so a `"*"` LS is a candidate on both
+paths for every language.
 
 The same LS naturally serves both roles when applicable. `pyright` with `languages = ["python"]` is a host candidate for `.py` files *and* a virt candidate for Python injections inside other host languages — both routes flow through one connection (one entry in the pool keyed by its `ConnectionKey`, i.e. `(server_name, resolved root)`).
 
-No new fields on `BridgeServerConfig`. An LS that should not act as host for a given language is excluded by leaving `bridge._self.enabled = false` for that language, or by not listing the language in its `languages` field.
+No new fields on `BridgeServerConfig`. An LS that should not act as host for a given language is excluded by leaving `bridge._self.enabled = false` for that language, or by not listing the language in its `languages` field — the latter being unavailable for a `"*"` LS (any-language-server-wildcard), which only the `_self` gate can exclude.
 
 ### Wildcard Merge Safety
 
