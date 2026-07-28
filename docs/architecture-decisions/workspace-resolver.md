@@ -144,8 +144,10 @@ async-friendliness is achieved at the Rust↔Lua boundary, not inside Lua.
 
 - **Veto (`attach = false`)** is applied as a filter **after** the
   language-based server selection in `src/lsp/bridge/coordinator.rs` (the
-  `c.languages.iter().any(...)` filters). Language match first, resolver
-  refinement second.
+  `c.handles_language(...)` filters). Language match first, resolver
+  refinement second. Match through that predicate rather than testing
+  `languages` membership directly, or the refinement silently drops every
+  `languages = ["*"]` server (any-language-server-wildcard).
 - **The resolved workspace replaces the marker in the existing acquire flow**,
   not signaled separately by the resolver. It is exactly what
   `resolve_marker_and_key` / `resolve_acquire` (`pool.rs`) would otherwise

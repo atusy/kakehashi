@@ -618,8 +618,9 @@ impl BridgeCoordinator {
     /// given host language (host-document-bridge).
     ///
     /// Selection mirrors [`Self::get_all_configs_for_language`] with the
-    /// host-path matching rule: servers whose `languages` contains the
-    /// *host* language itself. Gated on the explicit `bridge._self.enabled =
+    /// host-path matching rule: servers whose `languages` matches the *host*
+    /// language itself, via `handles_language` — so a `"*"` server qualifies
+    /// here too (any-language-server-wildcard). Gated on the explicit `bridge._self.enabled =
     /// true` opt-in ([`LanguageSettings::is_host_bridging_enabled`]) — a
     /// candidate server alone is not consent to use it.
     pub(crate) fn get_host_configs_for_language(
