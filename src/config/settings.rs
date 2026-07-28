@@ -18,6 +18,23 @@ pub(crate) const HOST_BRIDGE_KEY: &str = "_self";
 /// does not.
 pub(crate) const PRIORITIES_WILDCARD: &str = "*";
 
+/// Reserved `languages` element standing for "every language"
+/// (any-language-server-wildcard): a server declaring it is a bridge
+/// candidate for any injected — and any host — language.
+///
+/// A list element rather than an empty/absent list because both of those
+/// already mean "inherit `languages` from the `_` entry"
+/// ([`crate::config::merge::merge_bridge_server_configs`]). A concrete
+/// server can therefore only *defer* to the wildcard entry, never widen past
+/// it, which is exactly what a language-agnostic server (spell/grammar/typo
+/// checkers, AI completion) needs to say. Keeping it in the list also leaves
+/// room for set algebra (e.g. a future `"!markdown"` exclusion) that a bare
+/// scalar could not express.
+///
+/// Same sigil and same reason as [`PRIORITIES_WILDCARD`]: `_` keys carry
+/// field-level inheritance semantics, list elements do not.
+pub(crate) const LANGUAGES_WILDCARD: &str = "*";
+
 /// The resolved default for an absent `priorities`: `["*"]`, i.e. fan out to
 /// every configured server with no ranking (first-win).
 fn default_priorities() -> Vec<String> {
@@ -361,9 +378,13 @@ pub struct BridgeServerConfig {
     /// server whose resolved cmd is still empty is skipped at lookup.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub cmd: Vec<String>,
-    /// Languages this server handles (e.g., ["rust"], ["python"]).
+    /// Languages this server handles (e.g., ["rust"], ["python"]), or the
+    /// [`LANGUAGES_WILDCARD`] element `"*"` for "any language".
     /// Optional for the same wildcard-defaults reason as `cmd`; a server
     /// with no languages never matches a lookup.
+    ///
+    /// Test membership through [`Self::handles_language`] rather than
+    /// comparing elements directly, so `"*"` is honored everywhere.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub languages: Vec<String>,
     /// Optional initialization options to pass to the server during initialize
@@ -449,6 +470,25 @@ impl BridgeServerConfig {
     /// built-in default `true`.
     pub(crate) fn is_enabled(&self) -> bool {
         self.enabled.unwrap_or(true)
+    }
+
+    /// Whether this server is a bridge candidate for `language`.
+    ///
+    /// Plain membership, except that the [`LANGUAGES_WILDCARD`] element
+    /// matches everything (any-language-server-wildcard). The wildcard is
+    /// resolved here, at match time, rather than expanded during config
+    /// merging: "every language" is an open set that cannot be enumerated
+    /// statically — injected languages are discovered from the document.
+    ///
+    /// Applies to both bridge axes, since both select servers by this same
+    /// list: injection candidates
+    /// ([`crate::lsp::bridge::coordinator`]'s per-region lookups) and host
+    /// candidates. On the host axis a candidate is still not consent — that
+    /// path stays gated on the explicit `bridge._self.enabled = true` opt-in.
+    pub(crate) fn handles_language(&self, language: &str) -> bool {
+        self.languages
+            .iter()
+            .any(|l| l == language || l == LANGUAGES_WILDCARD)
     }
 
     /// A resolved config is a real, usable server: it has a command to run

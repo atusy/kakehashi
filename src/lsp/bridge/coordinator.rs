@@ -502,7 +502,7 @@ impl BridgeCoordinator {
             if let Some(resolved_config) =
                 resolve_with_wildcard(servers, server_name, merge_bridge_server_configs)
                     .filter(|c| c.is_spawnable())
-                    .filter(|c| c.languages.iter().any(|l| l == injection_language))
+                    .filter(|c| c.handles_language(injection_language))
             {
                 return Some(ResolvedServerConfig {
                     server_name: server_name.clone(),
@@ -649,7 +649,7 @@ impl BridgeCoordinator {
             .filter_map(|server_name| {
                 resolve_with_wildcard(servers, server_name, merge_bridge_server_configs)
                     .filter(|c| c.is_spawnable())
-                    .filter(|c| c.languages.iter().any(|l| l == injection_language))
+                    .filter(|c| c.handles_language(injection_language))
                     .map(|config| ResolvedServerConfig {
                         server_name: server_name.clone(),
                         config: Arc::new(config),
@@ -690,7 +690,7 @@ impl BridgeCoordinator {
             .filter_map(|server_name| {
                 resolve_with_wildcard(servers, server_name, merge_bridge_server_configs)
                     .filter(|c| c.is_spawnable())
-                    .filter(|c| c.languages.iter().any(|l| l == host_language))
+                    .filter(|c| c.handles_language(host_language))
                     .map(|config| ResolvedServerConfig {
                         server_name: server_name.clone(),
                         config: Arc::new(config),
@@ -1971,6 +1971,164 @@ mod tests {
             result.iter().map(|r| r.server_name.as_str()).collect();
         assert!(names.contains("pyright"), "should contain pyright");
         assert!(names.contains("ruff"), "should contain ruff");
+    }
+
+    /// A server with `languages = ["*"]` plus one concrete-language server.
+    fn settings_with_any_language_server() -> WorkspaceSettings {
+        let servers = HashMap::from([
+            (
+                "harper-ls".to_string(),
+                BridgeServerConfig {
+                    cmd: vec!["harper-ls".to_string()],
+                    languages: vec!["*".to_string()],
+                    ..Default::default()
+                },
+            ),
+            (
+                "rust-analyzer".to_string(),
+                BridgeServerConfig {
+                    cmd: vec!["rust-analyzer".to_string()],
+                    languages: vec!["rust".to_string()],
+                    ..Default::default()
+                },
+            ),
+        ]);
+
+        WorkspaceSettings {
+            auto_install: false,
+            language_servers: servers,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn any_language_server_is_a_candidate_for_every_injection_language() {
+        let coordinator = BridgeCoordinator::new();
+        let settings = settings_with_any_language_server();
+
+        // Named-language server + wildcard server both match rust...
+        let names: std::collections::HashSet<String> = coordinator
+            .get_all_configs_for_language(&settings, "markdown", "rust")
+            .into_iter()
+            .map(|r| r.server_name)
+            .collect();
+        assert!(names.contains("harper-ls"));
+        assert!(names.contains("rust-analyzer"));
+
+        // ...and the wildcard server alone matches a language no server names.
+        let names: Vec<String> = coordinator
+            .get_all_configs_for_language(&settings, "markdown", "toml")
+            .into_iter()
+            .map(|r| r.server_name)
+            .collect();
+        assert_eq!(names, vec!["harper-ls".to_string()]);
+    }
+
+    #[test]
+    fn any_language_server_still_obeys_the_host_bridge_filter() {
+        // `"*"` widens the *server* axis (which servers can answer), not the
+        // *language* axis (which injections the host bridges at all). A host
+        // that only enables python must not gain rust bridging for free.
+        let coordinator = BridgeCoordinator::new();
+        let mut settings = settings_with_any_language_server();
+        settings.languages.insert(
+            "markdown".to_string(),
+            LanguageSettings {
+                bridge: Some(HashMap::from([(
+                    "python".to_string(),
+                    BridgeLanguageConfig {
+                        enabled: Some(true),
+                        ..Default::default()
+                    },
+                )])),
+                ..Default::default()
+            },
+        );
+
+        assert!(
+            coordinator
+                .get_all_configs_for_language(&settings, "markdown", "rust")
+                .is_empty(),
+            "the host's bridge filter must still block rust"
+        );
+        assert!(
+            !coordinator
+                .get_all_configs_for_language(&settings, "markdown", "python")
+                .is_empty(),
+            "the wildcard server must answer the language the host does enable"
+        );
+    }
+
+    #[test]
+    fn any_language_server_reaches_the_host_axis_only_when_opted_in() {
+        // `handles_language` is shared by both axes, so a `"*"` server is a
+        // host candidate for every language — but candidacy is not consent:
+        // `bridge._self.enabled = true` still gates the host path.
+        let coordinator = BridgeCoordinator::new();
+        let mut settings = settings_with_any_language_server();
+
+        assert!(
+            coordinator
+                .get_host_configs_for_language(&settings, "lua")
+                .is_empty(),
+            "without the _self opt-in the host axis stays empty"
+        );
+
+        settings.languages.insert(
+            "lua".to_string(),
+            LanguageSettings {
+                bridge: Some(HashMap::from([(
+                    "_self".to_string(),
+                    BridgeLanguageConfig {
+                        enabled: Some(true),
+                        ..Default::default()
+                    },
+                )])),
+                ..Default::default()
+            },
+        );
+
+        let names: Vec<String> = coordinator
+            .get_host_configs_for_language(&settings, "lua")
+            .into_iter()
+            .map(|r| r.server_name)
+            .collect();
+        assert_eq!(names, vec!["harper-ls".to_string()]);
+    }
+
+    #[test]
+    fn any_language_is_inheritable_from_the_wildcard_server_entry() {
+        // wildcard-config-inheritance: `languageServers._.languages = ["*"]`
+        // reaches a concrete server that omits `languages` entirely.
+        let coordinator = BridgeCoordinator::new();
+        let servers = HashMap::from([
+            (
+                "_".to_string(),
+                BridgeServerConfig {
+                    languages: vec!["*".to_string()],
+                    ..Default::default()
+                },
+            ),
+            (
+                "harper-ls".to_string(),
+                BridgeServerConfig {
+                    cmd: vec!["harper-ls".to_string()],
+                    ..Default::default()
+                },
+            ),
+        ]);
+        let settings = WorkspaceSettings {
+            auto_install: false,
+            language_servers: servers,
+            ..Default::default()
+        };
+
+        let names: Vec<String> = coordinator
+            .get_all_configs_for_language(&settings, "markdown", "toml")
+            .into_iter()
+            .map(|r| r.server_name)
+            .collect();
+        assert_eq!(names, vec!["harper-ls".to_string()]);
     }
 
     #[test]
