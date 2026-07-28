@@ -350,7 +350,7 @@ Configure language servers for bridging LSP requests in injection regions.
 | Field | Description |
 |-------|-------------|
 | `cmd` | Command and arguments to start the language server |
-| `languages` | Languages this server handles |
+| `languages` | Languages this server handles. The single element `"*"` means **any language**, for servers that are not tied to one (spell/grammar/typo checkers, AI completion) — see below. |
 | `initializationOptions` | Optional initialization options forwarded during the downstream server's `initialize` request |
 | `workspaceMarkers` | Marker files/directories locating the workspace root the server is initialized with, following Neovim's `vim.fs.root` `(string\|string[])[]` shape. (The pre-rename key `rootMarkers` is still accepted as a deprecated alias.) Entries are tried **in list order** (earlier = higher priority): each entry is searched up the triggering document's ancestors nearest-first before the next entry is tried, so a higher-priority marker in a far ancestor outranks a lower-priority one sitting next to the document. A **nested array** is one equal-priority group where the nearest ancestor containing any of its names wins — e.g. `[["stylua.toml", ".luarc.json"], ".git"]` means "nearest of stylua.toml/.luarc.json, otherwise .git". The first matching entry's directory becomes the server's `rootUri` and sole workspace folder. Default: `[".git"]`. No marker hit falls back to the client-supplied root; an explicit `[]` disables the search. The connection pool is keyed by `(server, resolved root)`, so in a multi-root monorepo documents under different marker roots get their own downstream process, each rooted correctly; documents sharing a root (or the no-marker fallback) share one process. Trade-off: process count grows with the number of distinct roots opened, and there is currently no idle-eviction — a long session touching many roots keeps one process per root alive until shutdown. Servers that operate purely on `workspaceFolders` can opt out of this growth with `preferSharedInstance` (below). |
 | `onTypeFormattingTriggers` | Trigger characters for bridged `textDocument/onTypeFormatting` (e.g. `["}", ";"]`). kakehashi advertises the sorted union across all servers at initialize and forwards a request to a downstream server only when that server's own capabilities declare the typed character. Unset everywhere (default) → the capability is not advertised. |
@@ -370,6 +370,39 @@ server's explicit value overrides the wildcard, so `_.preferSharedInstance =
 true` can still be opted out of per server with `preferSharedInstance =
 false`. A wildcard-only entry is never spawned itself, and a concrete server
 whose merged `cmd` is still empty is skipped.
+
+**Servers for any language (`languages = ["*"]`)**
+
+Some servers are not tied to a language at all — grammar and spell checkers,
+typo linters, AI completion. Give them the single element `"*"` instead of an
+enumeration:
+
+```toml
+[languageServers.harper-ls]
+cmd = ["harper-ls", "--stdio"]
+languages = ["*"]
+```
+
+`"*"` is a list element for the same reason `priorities` uses one: `_` keys
+carry field-level inheritance, list elements do not. Note that an **empty or
+omitted** `languages` does *not* mean "any" — it means "inherit `languages`
+from the `_` entry" (wildcard-config-inheritance), which is why the widening
+needs its own marker. Keeping it in the list also leaves room for future set
+algebra such as an `"!markdown"` exclusion.
+
+Two things `"*"` does **not** do:
+
+- It does not enable bridging for a language the host blocks. `"*"` widens
+  *which servers may answer*, not *which injections a host bridges at all* —
+  a `languages.markdown.bridge.rust.enabled = false` filter still applies.
+- It does not opt the server into the host-document bridge. A `"*"` server
+  becomes a host candidate for every language, but the host path remains
+  gated on the explicit `bridge._self.enabled = true` opt-in.
+
+Because `languages` is inheritable, `languageServers._.languages = ["*"]`
+attaches **every** server that omits `languages` to **every** language. That
+is occasionally what you want, but it is rarely what you mean — prefer
+declaring `"*"` on the concrete servers that need it.
 
 **Bridge Language Configuration:**
 

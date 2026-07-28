@@ -123,6 +123,21 @@ enabled = false
 # "comment" = ""  # overridden (empty string suppresses the token)
 ```
 
+### Vec fields: empty means "inherit", so it cannot mean anything else
+
+For the `Vec` fields of `languageServers` (`cmd`, `languages`),
+`merge_bridge_server_configs` treats an **empty overlay list as absent** and
+takes the base (`_`) value. That is what lets a concrete server omit `cmd` or
+`languages` and pick them up from the wildcard entry.
+
+The consequence is that a concrete server can only ever *defer* to `_` on those
+fields — it can narrow by listing fewer entries, but it has no spelling for
+"wider than what I inherited", because the widest spelling (`[]`) is the
+inherit sentinel. Where widening must be expressible, it needs a marker
+*inside* the list: see
+[any-language-server-wildcard](any-language-server-wildcard.md) for
+`languages = ["*"]`.
+
 ## Consequences
 
 ### Positive
