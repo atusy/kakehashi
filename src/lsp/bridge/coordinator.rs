@@ -1373,7 +1373,7 @@ mod tests {
 
     use super::*;
     use crate::config::LanguageSettings;
-    use crate::config::settings::BridgeLanguageConfig;
+    use crate::config::settings::{BridgeLanguageConfig, LANGUAGES_WILDCARD};
 
     #[test]
     fn reload_resolution_does_not_resurrect_deleted_server_from_wildcard() {
@@ -1993,7 +1993,7 @@ mod tests {
                 "harper-ls".to_string(),
                 BridgeServerConfig {
                     cmd: vec!["harper-ls".to_string()],
-                    languages: vec!["*".to_string()],
+                    languages: vec![LANGUAGES_WILDCARD.to_string()],
                     ..Default::default()
                 },
             ),
@@ -2176,6 +2176,12 @@ mod tests {
         // `bridge._self.enabled = true` still gates the host path.
         let coordinator = BridgeCoordinator::new();
         let mut settings = settings_with_any_language_server();
+        // The shipped `languages._` carries `bridge._` but no `_self`, so the
+        // gate is genuinely evaluated and genuinely says no. Leaving
+        // `languages` empty would instead make `resolve_host_language_settings`
+        // return None and short-circuit `is_some_and` before the gate runs —
+        // the assertion would then hold even if the gate were deleted.
+        settings.languages = crate::config::defaults::default_settings().languages;
 
         assert!(
             coordinator
@@ -2215,7 +2221,7 @@ mod tests {
             (
                 "_".to_string(),
                 BridgeServerConfig {
-                    languages: vec!["*".to_string()],
+                    languages: vec![LANGUAGES_WILDCARD.to_string()],
                     ..Default::default()
                 },
             ),
@@ -2223,6 +2229,19 @@ mod tests {
                 "harper-ls".to_string(),
                 BridgeServerConfig {
                     cmd: vec!["harper-ls".to_string()],
+                    ..Default::default()
+                },
+            ),
+            // ...but a concrete server that DOES declare `languages` keeps its
+            // own narrower list. This is the containment guarantee for the
+            // documented `_.languages = ["*"]` footgun: the wildcard reaches
+            // only the servers that stayed silent, so listing real languages
+            // is a working opt-out.
+            (
+                "rust-analyzer".to_string(),
+                BridgeServerConfig {
+                    cmd: vec!["rust-analyzer".to_string()],
+                    languages: vec!["rust".to_string()],
                     ..Default::default()
                 },
             ),
@@ -2238,7 +2257,22 @@ mod tests {
             .into_iter()
             .map(|r| r.server_name)
             .collect();
-        assert_eq!(names, vec!["harper-ls".to_string()]);
+        assert_eq!(
+            names,
+            vec!["harper-ls".to_string()],
+            "the wildcard must not leak into a server with its own list"
+        );
+
+        let names: Vec<String> = coordinator
+            .get_all_configs_for_language(&settings, "markdown", "rust")
+            .into_iter()
+            .map(|r| r.server_name)
+            .collect();
+        assert_eq!(
+            names,
+            vec!["harper-ls".to_string(), "rust-analyzer".to_string()],
+            "both answer for rust, in the documented name-sorted order"
+        );
     }
 
     #[test]

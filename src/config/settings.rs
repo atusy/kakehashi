@@ -1574,6 +1574,25 @@ mod tests {
     }
 
     #[test]
+    fn languages_wildcard_is_an_exact_element_not_a_glob() {
+        // Globs are deferred (any-language-server-wildcard, alternative G).
+        // A `.contains('*')`-style implementation would pass every other test
+        // in this file, so pin the narrower contract explicitly.
+        let server = BridgeServerConfig {
+            cmd: vec!["tsgo".to_string()],
+            languages: vec!["ts*".to_string()],
+            ..Default::default()
+        };
+
+        assert!(!server.handles_language("tsx"));
+        assert!(!server.handles_language("typescript"));
+        assert!(
+            server.handles_language("ts*"),
+            "matched literally, not glob"
+        );
+    }
+
+    #[test]
     fn empty_languages_matches_nothing() {
         // An unresolved (still-inheriting) config must not become "any".
         let server = BridgeServerConfig {
