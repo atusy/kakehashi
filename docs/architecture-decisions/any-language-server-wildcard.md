@@ -127,9 +127,9 @@ server is still spawnable. A push-driven server therefore keeps reaching the
 editor for a language whose `priorities` omit it. That gate predates this
 decision (it bites an excluded pyright/ruff pair the same way), but the
 wildcard makes it far easier to hit, since a `"*"` server is a candidate for
-every language by construction. Tracked separately; the reliable exclusion for
-a push-driven server today is `enabled = false`, which the selection sites
-check first.
+every language by construction. Tracked as #916; the reliable exclusion for a
+push-driven server today is `enabled = false`, which the selection sites check
+first.
 
 ### Scope: Turning a Language Off at Runtime Does Not Retract It
 
@@ -145,7 +145,7 @@ until the host document closes or the connection restarts.
 
 Also pre-existing, also amplified for the same reason: with `"*"` there is
 always a server holding the region. Changing the server's own `languages` *does*
-reconcile, because that is part of the launch config.
+reconcile, because that is part of the launch config. Tracked as #917.
 
 ### Scope: What `"*"` Does Not Widen
 
