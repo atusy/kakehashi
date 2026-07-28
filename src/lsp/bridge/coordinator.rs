@@ -2037,6 +2037,68 @@ mod tests {
         assert_eq!(names, vec!["harper-ls".to_string()]);
     }
 
+    fn injection(language: &str, region_id: &str) -> BridgeInjection {
+        BridgeInjection {
+            language: language.to_string(),
+            region_id: region_id.to_string(),
+            content: String::new(),
+        }
+    }
+
+    #[test]
+    fn eager_open_reaches_every_server_matching_the_language() {
+        // The eager open is the ONLY way a push-only server (one that
+        // publishes diagnostics rather than answering pulls) ever receives a
+        // region: it issues no request, so nothing opens the document lazily,
+        // and the pull path returns on its capability check before
+        // `ensure_document_opened`. Resolving one server per language starves
+        // it whenever another server also matches — and for a `"*"` server
+        // that is every language that has a real server of its own.
+        let coordinator = BridgeCoordinator::new();
+        let settings = settings_with_any_language_server();
+
+        let groups = coordinator.eager_open_groups(
+            &settings,
+            "markdown",
+            vec![injection("rust", "r1"), injection("toml", "r2")],
+        );
+
+        let names: Vec<&str> = groups.keys().map(String::as_str).collect();
+        assert_eq!(names, vec!["harper-ls", "rust-analyzer"]);
+
+        // The wildcard server takes both regions; the rust server takes only
+        // the one it handles.
+        let harper: Vec<&str> = groups["harper-ls"]
+            .1
+            .iter()
+            .map(|i| i.region_id.as_str())
+            .collect();
+        assert_eq!(harper, vec!["r1", "r2"]);
+        let ra: Vec<&str> = groups["rust-analyzer"]
+            .1
+            .iter()
+            .map(|i| i.region_id.as_str())
+            .collect();
+        assert_eq!(ra, vec!["r1"]);
+    }
+
+    #[test]
+    fn eager_open_groups_are_empty_when_nothing_bridges() {
+        // Distinguishes "resolved nothing" from "everything already open" for
+        // the caller, which cancels a stale batch only in the former case.
+        let coordinator = BridgeCoordinator::new();
+        let settings = WorkspaceSettings {
+            auto_install: false,
+            ..Default::default()
+        };
+
+        assert!(
+            coordinator
+                .eager_open_groups(&settings, "markdown", vec![injection("rust", "r1")])
+                .is_empty()
+        );
+    }
+
     #[test]
     fn single_pick_prefers_a_server_that_names_the_language_over_a_wildcard() {
         // `get_config_for_language` picks ONE server and feeds the eager
