@@ -48,8 +48,8 @@ Partially implemented:
   the lazy fingerprint sync restores the editor text on the next request.
 - **Document sync deviation**: instead of forwarding `didChange` params
   verbatim, sync sends **full-text** `didChange` with downstream-generated
-  versions whenever the host text's fingerprint changed since the last
-  request. `didOpen` fires eagerly at upstream `didOpen` on every `_self`
+  versions whenever the host text's fingerprint changed since the last sync
+  (which may have been an eager one rather than a request). `didOpen` fires eagerly at upstream `didOpen` on every `_self`
   server (#429, below) and lazily on first request for any server that
   missed it. This
   matches the virt path's full-content `didChange` forwarding and avoids
