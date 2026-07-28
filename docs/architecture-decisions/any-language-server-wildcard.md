@@ -9,9 +9,10 @@
 ## Implementation Status
 
 Implemented. `LANGUAGES_WILDCARD` and the `BridgeServerConfig::handles_language`
-predicate live in `src/config/settings.rs`; the three selection sites that
-consume it (injection single-pick, injection fan-out, host fan-out) are in
-`src/lsp/bridge/coordinator.rs`.
+predicate live in `src/config/settings.rs`, alongside `names_language` (exact
+membership, ignoring the wildcard) for the one site that must rank the two
+apart. The three selection sites that consume them (injection single-pick,
+injection fan-out, host fan-out) are in `src/lsp/bridge/coordinator.rs`.
 
 ## Context
 
@@ -152,16 +153,37 @@ the other is harder to document than the `_self` gate that already exists.
   hatch is `enabled = false` (which the selection sites check first, via
   `is_spawnable`). Narrowing to a real language list does work — a concrete
   non-empty `languages` overrides the wildcard.
-- **Fan-out grows** with each `"*"` server, which now participates in every
-  injection region — including languages the user never intended it for. The
-  *process* count does not grow with languages: the connection pool is keyed by
-  `(server, resolved root)` with no language component, so one `"*"` server is
-  one process per root. What scales is per-region work — the server receives a
-  virtual `didOpen` for every region it is a candidate for and joins every
-  region's fan-out. The capability prefilter blunts the steady-state request
-  cost by dropping servers that advertised no support for the method, but only
-  once the server is `Ready`; the first request in any language still pays the
-  spawn and initialize.
+- **Cost scales with injection *regions*, not with languages — and that is a
+  much bigger number than it sounds.** The process count does not grow at all:
+  the connection pool is keyed by `(server, resolved root)` with no language
+  component, so one `"*"` server is one process per root. What grows is
+  per-region work — a virtual `didOpen` per region, a task and a downstream
+  request per region on whole-document methods, a context per region per
+  diagnostics cycle.
+
+  The worst case is the wildcard's own headline use case. The shipped markdown
+  injection query emits a `markdown_inline` region for *every* inline node and
+  every table cell, so a prose document produces regions on the order of
+  hundreds. Before this change nothing matched `markdown_inline` and every
+  consumer dropped those regions at an `is_empty()` check; a `"*"` grammar
+  checker matches all of them. Nothing bounds this: `maxFanOut` caps servers
+  per region, not regions, and the capability prefilter cannot help for methods
+  the server *does* advertise (diagnostics, hover, codeAction — exactly the
+  ones such a server exists to answer). The prefilter also only acts once the
+  server is `Ready`, so the first request in any language still pays the spawn
+  and initialize.
+
+  The mitigation is the per-host bridge filter, which is evaluated before
+  server selection: disable the injection languages the wildcard server should
+  not see, e.g. `languages.markdown.bridge.markdown_inline.enabled = false`.
+- **Results can duplicate rather than merely multiply.** Diagnostics and
+  codeAction default to `concatenated` and neither path dedups by span. Two
+  shapes follow: same-span alternate-language regions each contribute
+  (a `"*"` server is a candidate for every alternate), and — when combined with
+  `bridge._self.enabled = true` — one process holds both the host document and
+  its virtual regions, so a finding inside an injected region is reported once
+  by the host answer and once by the region answer, at the same host
+  coordinates.
 - **A `"*"` server joins first-win races it would previously have sat out.**
   Under the default `priorities = ["*"]` every matching server lands in one
   `Rest` group, and the default `preferred` strategy decides that group by
@@ -170,14 +192,14 @@ the other is harder to document than the `_self` gate that already exists.
   nondeterministically. Users who care about the ordering must name servers
   explicitly in `priorities` — which, per the `priorities` scope note above,
   then also excludes the `"*"` server unless `"*"` is in that list too.
-- **The single-pick site becomes order-dependent for every language.**
-  `get_config_for_language` returns the first match while iterating a
-  `HashMap`, so its pick is not deterministic when several servers match. That
-  was previously reachable only with a genuinely overlapping config (ruff +
-  pyright for python); a `"*"` server makes *every* language have at least two
-  candidates. The site is used for eager virtual-document opening, so the
-  consequence is which server gets warmed up first, not which answers — request
-  paths use the full candidate set.
+- **The single-pick site needed a tie-break.** `get_config_for_language` picks
+  one server to drive the eager virtual-document open. It previously returned
+  the first `HashMap` match, which a `"*"` server would win about half the time
+  for *every* language, starving the language's real server of its warm start.
+  It now walks sorted and ranks a server that names the language above one that
+  only accepts everything (`names_language` vs `handles_language`), falling
+  back to the wildcard when nothing names the language. That also settles the
+  pre-existing pyright/ruff coin flip.
 
 ### Neutral
 

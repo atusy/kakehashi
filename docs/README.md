@@ -390,6 +390,25 @@ from the `_` entry" (wildcard-config-inheritance), which is why the widening
 needs its own marker. Keeping it in the list also leaves room for future set
 algebra such as an `"!markdown"` exclusion.
 
+**Budget it against regions, not languages.** A `"*"` server is one process per
+workspace root — the connection pool has no language dimension — but it gets a
+virtual `didOpen` for every injection *region* it matches, and joins every
+region's fan-out. That number is larger than it looks in markdown: the shipped
+injection query emits a `markdown_inline` region per inline node and per table
+cell, so a prose file yields regions in the hundreds. Nothing bounds it
+(`maxFanOut` caps servers per region, not regions). Use the per-host bridge
+filter to exclude what the server should not see:
+
+```toml
+# harper-ls checks the prose; it does not need the inline sub-regions too.
+[languages.markdown.bridge.markdown_inline]
+enabled = false
+```
+
+Also note that diagnostics and code actions are concatenated without span
+dedup, so a `"*"` server can report the same finding once per matching region —
+and, with `bridge._self.enabled = true`, once more from the host document.
+
 Two things `"*"` does **not** do:
 
 - It does not enable bridging for a language the host blocks. `"*"` widens
