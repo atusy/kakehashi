@@ -350,9 +350,18 @@ fn repair_stream_into(work: &[u8], out: &mut Vec<u8>, at_end: bool) -> usize {
                 // Pairwise skip keeps backslash parity (`\\` copies whole),
                 // so a later `\uD...` after an escaped backslash is plain
                 // text and never reaches the branch above.
-                Some(_) => {
+                Some(&next) if next.is_ascii() => {
                     out.extend_from_slice(&work[i..i + 2]);
                     i += 2;
+                }
+                // `\` before a non-ASCII byte is never a valid escape, and
+                // pair-copying would split a multi-byte char (emitting raw
+                // invalid bytes). Replace the backslash with `?` (one unit
+                // either way) and let the following bytes take the normal
+                // repair path.
+                Some(_) => {
+                    out.push(b'?');
+                    i += 1;
                 }
                 None => {
                     out.push(b);
@@ -974,8 +983,9 @@ fn decode_invalid_utf8(body: &[u8]) -> String {
                 if is_wtf8_surrogate {
                     // An odd run of backslashes before the insertion point
                     // would swallow the escape's own backslash and forge the
-                    // literal text `\uXXXX` — fall back to one U+FFFD there
-                    // (one UTF-16 unit either way, so geometry holds).
+                    // literal text `\uXXXX`. Escape that dangling backslash
+                    // (`\` -> `\\`, still one decoded unit) and append a
+                    // U+FFFD character instead — valid JSON, same geometry.
                     let trailing = out.bytes().rev().take_while(|&b| b == b'\\').count();
                     if trailing % 2 == 0 {
                         let unit = (u32::from(bad[0] & 0x0F) << 12)
@@ -983,6 +993,7 @@ fn decode_invalid_utf8(body: &[u8]) -> String {
                             | u32::from(bad[2] & 0x3F);
                         out.push_str(&format!("\\u{unit:04X}"));
                     } else {
+                        out.push('\\');
                         out.push('\u{FFFD}');
                     }
                     rest = &bad[3..];
@@ -1096,13 +1107,19 @@ mod tests {
 
     /// A raw backslash directly before a WTF-8 surrogate must not have the
     /// escape spelling appended after it — `\` + `\uD83D` reads back as an
-    /// escaped backslash plus literal text, silently forging content.
+    /// escaped backslash plus literal text, silently forging content. The
+    /// dangling backslash is escaped instead, keeping the body valid JSON
+    /// with the same UTF-16 geometry (backslash + one replacement unit).
     #[test]
-    fn wtf8_after_raw_backslash_becomes_replacement_char() {
+    fn wtf8_after_raw_backslash_stays_valid_json() {
         let mut body = br#"{"a":"x\"#.to_vec();
         body.extend([0xED, 0xA0, 0xBD]);
         body.extend(br#""}"#);
-        assert_eq!(decode_invalid_utf8(&body), "{\"a\":\"x\\\u{FFFD}\"}");
+        let decoded = decode_invalid_utf8(&body);
+        assert_eq!(decoded, "{\"a\":\"x\\\\\u{FFFD}\"}");
+        let parsed: serde_json::Value =
+            serde_json::from_str(&decoded).expect("repaired body must be valid JSON");
+        assert_eq!(parsed["a"], "x\\\u{FFFD}");
     }
 
     #[test]
@@ -1690,6 +1707,34 @@ mod tests {
             let out = stream_repair_all(&input, chunk);
             assert_eq!(out.len(), input.len(), "chunk size {chunk}");
             assert_eq!(out, expected, "chunk size {chunk}");
+        }
+    }
+
+    /// `\` before raw non-ASCII bytes must not be pair-copied: that would
+    /// split a multi-byte char or emit raw invalid bytes downstream. The
+    /// backslash becomes `?` (one unit either way) and the following bytes
+    /// take the normal repair path.
+    #[test]
+    fn stream_repair_backslash_before_raw_wtf8_stays_valid() {
+        let mut input = b"x\\".to_vec();
+        input.extend([0xED, 0xA0, 0xBD]);
+        input.push(b'y');
+        let mut expected = b"x?".to_vec();
+        expected.extend("\u{FFFD}".as_bytes());
+        expected.push(b'y');
+        for chunk in [1, 2, 64] {
+            let out = stream_repair_all(&input, chunk);
+            assert_eq!(out.len(), input.len(), "chunk size {chunk}");
+            assert_eq!(out, expected, "chunk size {chunk}");
+        }
+    }
+
+    #[test]
+    fn stream_repair_backslash_before_multibyte_char_stays_valid() {
+        let input = "x\\éy".as_bytes();
+        for chunk in [1, 2, 64] {
+            let out = stream_repair_all(input, chunk);
+            assert_eq!(out, "x?éy".as_bytes(), "chunk size {chunk}");
         }
     }
 
