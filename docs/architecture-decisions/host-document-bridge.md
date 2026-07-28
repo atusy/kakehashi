@@ -196,7 +196,7 @@ Concern: under wildcard-config-inheritance, `resolve_with_wildcard(map, "_self",
 
 Resolution: `enabled` is exempted from that merge. `is_host_bridging_enabled` reads `bridge._self.enabled` with a **direct** `get(HOST_BRIDGE_KEY)` and `unwrap_or(false)`; there is no `_self` entry in the built-in defaults for `_` to merge into, and none is wanted.
 
-```
+```text
 Unconfigured language `lua`:
     lua.bridge = {_: {enabled: true}}          # after the language-layer merge
     is_host_bridging_enabled → get("_self") = None → false   ✓ host off

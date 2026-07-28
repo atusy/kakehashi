@@ -175,9 +175,12 @@ the other is harder to document than the `_self` gate that already exists.
   set that cannot be known in advance.
 - **Widening becomes expressible** at all, closing the defer-only gap left by
   the inheritance semantics of the empty list.
-- **Effectively no behavior change for existing configs**: `"*"` is opt-in, and
-  it previously named a language that only a hand-authored injection query
-  could produce (see the reservation caveat above).
+- **Language-matching semantics are unchanged for existing configs**: `"*"` is
+  opt-in, and it previously named a language that only a hand-authored
+  injection query could produce (see the reservation caveat above). This is a
+  narrower claim than "no behavior change" — the eager-open fan-out below *is*
+  observable for any config with several servers on one language, wildcard or
+  not.
 
 ### Negative
 
