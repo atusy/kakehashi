@@ -492,26 +492,39 @@ impl BridgeCoordinator {
         // Look for a server that handles this language
         // wildcard-config-inheritance: Resolve each server with wildcard BEFORE checking languages,
         // because languages list may be inherited from languageServers._
+        //
+        // Sorted, and a server naming the language outranks one that only
+        // accepts everything (any-language-server-wildcard). This site picks a
+        // single server and drives the eager virtual-document open, so an
+        // arbitrary pick would starve the language's real server of its warm
+        // start — and `servers` is a HashMap, so "arbitrary" is reshuffled
+        // every process. The fan-out resolvers below sort for the same reason.
         let servers = &settings.language_servers;
-        for server_name in servers.keys() {
-            // Skip wildcard entry - we use it for inheritance, not direct lookup
-            if server_name == "_" {
-                continue;
-            }
+        let mut names: Vec<&String> = servers.keys().filter(|name| *name != "_").collect();
+        names.sort();
 
-            if let Some(resolved_config) =
+        let mut wildcard_pick: Option<ResolvedServerConfig> = None;
+        for server_name in names {
+            let Some(resolved_config) =
                 resolve_with_wildcard(servers, server_name, merge_bridge_server_configs)
                     .filter(|c| c.is_spawnable())
                     .filter(|c| c.handles_language(injection_language))
-            {
-                return Some(ResolvedServerConfig {
-                    server_name: server_name.clone(),
-                    config: Arc::new(resolved_config),
-                });
+            else {
+                continue;
+            };
+
+            let names_it = resolved_config.names_language(injection_language);
+            let pick = ResolvedServerConfig {
+                server_name: server_name.clone(),
+                config: Arc::new(resolved_config),
+            };
+            if names_it {
+                return Some(pick);
             }
+            wildcard_pick.get_or_insert(pick);
         }
 
-        None
+        wildcard_pick
     }
 
     /// Memo-resolving front for [`Self::get_all_configs_for_language`] /
