@@ -163,10 +163,12 @@ languages = ["python"]
 | Key | Meaning | Field-level wildcard fallback |
 |---|---|---|
 | `_` | "any injection target" (virt default) | n/a — `_` is itself the wildcard |
-| `_self` | "host language itself" (host target) | falls back into `_` during normal merge, but explicit `languages._.bridge._self` defaults keep `enabled` / role-relevant fields key-specific |
+| `_self` | "host language itself" (host target) | aggregation fields fall back into `_` during normal merge; `enabled` does not — it is read directly, so absence means off |
 | `<language>` | "specific injection target" (virt) | inherits from `_` |
 
-The `_self` ⊕ `_` merge is *not* special-cased in the resolver. It works correctly because, after language-level wildcard merge, `bridge._self.enabled` is always `Some(false)` (from the built-in default), and wildcard-config-inheritance's key-specific-wins rule ensures it overrides the virt default of `Some(true)` when both are present in the same `bridge` map. See "Wildcard Merge Safety" below.
+The opt-in is enforced by `is_host_bridging_enabled`, which reads `bridge._self.enabled` with a **direct** `get(HOST_BRIDGE_KEY)` and no wildcard fallback, defaulting to `false`. The shipped defaults deliberately contain **no** `_self` key at all, so absence is the off state.
+
+This is worth stating precisely because the obvious refactor is wrong: routing this lookup through `resolve_with_wildcard`, like the aggregation fields legitimately are (`resolve_host_aggregation`), would let the shipped `bridge._.enabled = true` virt default flow into `_self` and turn host bridging on for every language — and, since the host axis selects servers through the same `languages` list, for every `languages = ["*"]` server too (any-language-server-wildcard). `default_settings_has_wildcard_language_with_bridge_defaults` asserts the absence so a defaults change fails loudly.
 
 ### LS Dispatch Rules
 

@@ -2044,6 +2044,43 @@ mod tests {
         assert_eq!(ra, vec!["r1"]);
     }
 
+    #[tokio::test]
+    async fn eager_open_spawns_a_task_for_every_group_not_just_the_first() {
+        // `eager_open_groups` deciding on two servers is worthless if the
+        // dispatch loop below it only acts on one — the push-only server would
+        // still get no `didOpen`. Pin the loop itself: one registered task per
+        // group. The commands are unspawnable on purpose; the assertion is
+        // about dispatch, and the batch is cancelled before anything runs.
+        let coordinator = BridgeCoordinator::new();
+        let mut settings = settings_with_any_language_server();
+        for config in settings.language_servers.values_mut() {
+            config.cmd = vec!["/nonexistent/kakehashi-test-server".to_string()];
+        }
+        let host_uri = Url::parse("file:///test.md").unwrap();
+
+        coordinator
+            .eager_spawn_and_open_documents(
+                &settings,
+                "markdown",
+                &host_uri,
+                1,
+                vec![injection("rust", "r1")],
+            )
+            .await;
+
+        let handles = coordinator
+            .eager_open_tasks
+            .get(&host_uri)
+            .map(|batch| batch.handles.len());
+        coordinator.cancel_eager_open(&host_uri);
+
+        assert_eq!(
+            handles,
+            Some(2),
+            "both the rust server and the wildcard server must get a task"
+        );
+    }
+
     #[test]
     fn eager_open_groups_are_empty_when_nothing_bridges() {
         // Distinguishes "resolved nothing" from "everything already open" for

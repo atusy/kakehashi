@@ -908,12 +908,16 @@ impl LanguageSettings {
     /// enabled for this language.
     ///
     /// Host bridging is **opt-in**: it requires an explicit
-    /// `bridge._self.enabled = true`. Unlike injection entries, the `enabled`
-    /// field deliberately does NOT inherit from the `_` wildcard entry —
-    /// that implements the ADR's built-in `languages._.bridge._self.enabled
-    /// = false` default, which must beat the wildcard's `enabled = true`
-    /// virt default (key-specific wins). Aggregation fields DO inherit from
-    /// `_` via [`Self::resolve_host_aggregation`].
+    /// `bridge._self.enabled = true`. The lookup is deliberately DIRECT — no
+    /// `resolve_with_wildcard` — so an absent `_self` is the off state, and
+    /// the shipped defaults ship no `_self` key at all
+    /// (`default_settings_has_wildcard_language_with_bridge_defaults` pins
+    /// that). Routing this through the wildcard would let the shipped
+    /// `bridge._.enabled = true` virt default flow in and enable host
+    /// bridging for every language — and for every `languages = ["*"]` server
+    /// with it, since the host axis selects through the same list.
+    /// Aggregation fields DO inherit from `_` via
+    /// [`Self::resolve_host_aggregation`]; only `enabled` is special.
     pub(crate) fn is_host_bridging_enabled(&self) -> bool {
         self.bridge
             .as_ref()
