@@ -127,8 +127,14 @@ enabled = false
 
 For the **bare** `Vec` fields of `languageServers` (`cmd`, `languages`),
 `merge_bridge_server_configs` treats an **empty overlay list as absent** and
-takes the base (`_`) value. That is what lets a concrete server omit `cmd` or
+takes the base value. That is what lets a concrete server omit `cmd` or
 `languages` and pick them up from the wildcard entry.
+
+Note that "the base" is not always `_`. The same function also merges a
+same-named server across config *layers*, which happens before wildcard
+resolution — so an empty list means "not specified at this layer" and reaches
+`_` only when no layer specified one. A lower layer's concrete list beats a
+higher layer's `_` wildcard.
 
 The consequence is that a concrete server can only ever *defer* to `_` on those
 fields — it can narrow by listing fewer entries, but it has no spelling for

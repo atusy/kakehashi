@@ -385,10 +385,12 @@ languages = ["*"]
 
 `"*"` is a list element for the same reason `priorities` uses one: `_` keys
 carry field-level inheritance, list elements do not. Note that an **empty or
-omitted** `languages` does *not* mean "any" — it means "inherit `languages`
-from the `_` entry" (wildcard-config-inheritance), which is why the widening
-needs its own marker. Keeping it in the list also leaves room for future set
-algebra such as an `"!markdown"` exclusion.
+omitted** `languages` does *not* mean "any" — it means "not specified here", so
+it falls through to the same server's entry in a lower config layer and, only
+if no layer specified one, to the `_` entry (wildcard-config-inheritance).
+Either way it can only ever *defer*, which is why widening needs its own
+marker. Keeping it in the list also leaves room for future set algebra such as
+an `"!markdown"` exclusion.
 
 **Budget it against regions, not languages.** A `"*"` server is one process per
 workspace root by default — the connection pool has no language dimension, and
@@ -428,9 +430,11 @@ wildcard in your user config widens servers declared in any project's config
 too — servers you never saw when you wrote it.
 
 Opting a single server back out is `enabled = false`, not an empty
-`languages`: `[]` means "inherit", so under a `_` wildcard it resolves right
-back to `["*"]`. A concrete server's own non-empty `languages` does override
-the wildcard, so listing real languages narrows it as expected.
+`languages`: `[]` means "not specified here", so it resolves to whatever the
+next source supplies — that same server's list from a lower config layer if it
+has one, and otherwise the `_` wildcard, i.e. right back to `["*"]`. A concrete
+server's own non-empty `languages` does override the wildcard, so listing real
+languages narrows it as expected.
 
 **Bridge Language Configuration:**
 

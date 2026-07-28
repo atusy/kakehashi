@@ -32,8 +32,9 @@ appears in a document.
 The obvious spellings for "any" are already taken:
 
 - **`languages = []`** — `merge_bridge_server_configs`
-  (`src/config/merge.rs`) treats an empty overlay list as "inherit `languages`
-  from the `_` entry" (wildcard-config-inheritance).
+  (`src/config/merge.rs`) treats an empty overlay list as "not specified here",
+  which resolves to the same server's entry in a lower config layer, or failing
+  that to the `_` entry (wildcard-config-inheritance).
 - **`languages` omitted** — `#[serde(default)]` on `Vec<String>` produces that
   same empty vec, so it lands on the identical inherit path. (`null` is not a
   third spelling: TOML has no `null`, and an explicit JSON `null` from
