@@ -227,11 +227,16 @@ server that currently defers to the wildcard entry into an attach-to-everything
 server. Secondary: a multi-line list whose entries are all commented out
 collapses to `[]`, so the intent would be unrecoverable from the text.
 
-### B. `languages = null` / omitted means "any"
+### B. `languages` omitted means "any"
 
-**Rejected because**: `#[serde(default)]` maps it onto the same empty vec as A,
-inheriting A's problem exactly. TOML has no `null` literal, so it is not even
-spellable in the primary config format.
+**Rejected because**: `#[serde(default)]` maps omission onto the same empty vec
+as A, inheriting A's problem exactly.
+
+`null` is not a separable variant of this: TOML has no `null` literal, and an
+explicit JSON `null` from `initializationOptions` is a deserialization *error*
+for a bare `Vec<String>` — `serde(default)` covers a missing field, not a null
+one. So it could only mean "any" by first adding null handling that does not
+exist, which is strictly more work than A for the same outcome.
 
 ### C. A separate boolean, e.g. `anyLanguage = true`
 
