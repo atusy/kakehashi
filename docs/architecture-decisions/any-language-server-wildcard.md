@@ -204,6 +204,12 @@ the other is harder to document than the `_self` gate that already exists.
   now fans out to every matching server, like every other selection site, and
   the single-pick resolver is gone.
 
+  This is a behavior change for existing non-wildcard configs too: two servers
+  on one language now both spawn and open at `didOpen` where one did before.
+  Note it does *not* multiply the region worst case above — nothing but the
+  `"*"` server matches `markdown_inline`, so the multiplication lands only on
+  languages that already have a real server, where the server count is small.
+
 ### Neutral
 
 - `"*"` here means "everything" whereas the `priorities` `"*"` means "the

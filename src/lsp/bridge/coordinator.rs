@@ -817,13 +817,25 @@ impl BridgeCoordinator {
                     self.get_all_configs_for_language(settings, host_language, &injection.language)
                 });
 
-            for config in resolved.iter() {
+            // Hand the injection itself to the last server and clone only for
+            // the others, so the overwhelmingly common one-server case stays a
+            // move: `BridgeInjection` owns the region text, and this loop runs
+            // on the tokio runtime over every region in the document.
+            let Some((last, rest)) = resolved.split_last() else {
+                continue;
+            };
+            for config in rest {
                 groups
                     .entry(config.server_name.clone())
                     .or_insert_with(|| (config.config.clone(), Vec::new()))
                     .1
                     .push(injection.clone());
             }
+            groups
+                .entry(last.server_name.clone())
+                .or_insert_with(|| (last.config.clone(), Vec::new()))
+                .1
+                .push(injection);
         }
 
         groups
