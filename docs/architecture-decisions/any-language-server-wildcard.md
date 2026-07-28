@@ -9,10 +9,10 @@
 ## Implementation Status
 
 Implemented. `LANGUAGES_WILDCARD` and the `BridgeServerConfig::handles_language`
-predicate live in `src/config/settings.rs`, alongside `names_language` (exact
-membership, ignoring the wildcard) for the one site that must rank the two
-apart. The three selection sites that consume them (injection single-pick,
-injection fan-out, host fan-out) are in `src/lsp/bridge/coordinator.rs`.
+predicate live in `src/config/settings.rs`; the two selection sites that consume
+it — `get_all_configs_for_language` (injections) and
+`get_host_configs_for_language` (host documents) — are in
+`src/lsp/bridge/coordinator.rs`.
 
 ## Context
 
@@ -192,14 +192,17 @@ the other is harder to document than the `_self` gate that already exists.
   nondeterministically. Users who care about the ordering must name servers
   explicitly in `priorities` — which, per the `priorities` scope note above,
   then also excludes the `"*"` server unless `"*"` is in that list too.
-- **The single-pick site needed a tie-break.** `get_config_for_language` picks
-  one server to drive the eager virtual-document open. It previously returned
-  the first `HashMap` match, which a `"*"` server would win about half the time
-  for *every* language, starving the language's real server of its warm start.
-  It now walks sorted and ranks a server that names the language above one that
-  only accepts everything (`names_language` vs `handles_language`), falling
-  back to the wildcard when nothing names the language. That also settles the
-  pre-existing pyright/ruff coin flip.
+- **The eager open had to stop picking one server per language.** It resolved a
+  single server and gave it the virtual `didOpen`, which was survivable while
+  overlapping servers were a deliberate config. A `"*"` server overlaps
+  *everything*, and the starved case is not merely a slower warm start: a
+  **push-only** server — one that publishes diagnostics instead of answering
+  pulls — issues no request, so nothing opens the document lazily and the pull
+  path returns on its capability check before `ensure_document_opened`. Missing
+  the eager open meant never seeing the region at all, for exactly the
+  grammar/spell-checker shape this wildcard exists to support. The eager open
+  now fans out to every matching server, like every other selection site, and
+  the single-pick resolver is gone.
 
 ### Neutral
 

@@ -488,17 +488,6 @@ impl BridgeServerConfig {
             .any(|l| l == language || l == LANGUAGES_WILDCARD)
     }
 
-    /// Whether this server names `language` explicitly, ignoring
-    /// [`LANGUAGES_WILDCARD`].
-    ///
-    /// Only for callers that must rank a server declaring the language above
-    /// one that merely accepts everything — a single-pick site, where handing
-    /// the slot to a wildcard server would starve the language's real server.
-    /// Membership tests want [`Self::handles_language`].
-    pub(crate) fn names_language(&self, language: &str) -> bool {
-        self.languages.iter().any(|l| l == language)
-    }
-
     /// A resolved config is a real, usable server: it has a command to run
     /// AND it hasn't been disabled. Every "is this server usable" call site
     /// (spawn-resolution, capability advertisement, resolve-dispatch) should
