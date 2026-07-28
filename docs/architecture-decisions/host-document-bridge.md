@@ -47,9 +47,11 @@ Partially implemented:
   document state is briefly speculative (it sees the virt-applied text);
   the lazy fingerprint sync restores the editor text on the next request.
 - **Document sync deviation**: instead of forwarding `didChange` params
-  verbatim, sync is *lazy*: `didOpen` with the full host text fires on the
-  first request per `(uri, server)`, and a **full-text** `didChange` fires
-  when the host text's fingerprint changed since the last request. This
+  verbatim, sync sends **full-text** `didChange` with downstream-generated
+  versions whenever the host text's fingerprint changed since the last
+  request. `didOpen` fires eagerly at upstream `didOpen` on every `_self`
+  server (#429, below) and lazily on first request for any server that
+  missed it. This
   matches the virt path's full-content `didChange` forwarding and avoids
   hooking the concurrent upstream `didChange` stream; verbatim forwarding
   remains the target if eager sync proves necessary.
@@ -118,7 +120,7 @@ Design challenges:
 - **Reuse wildcard machinery**: wildcard-config-inheritance's `resolve_with_wildcard` should apply to host entries wherever it can, so host bridging needs as little bespoke resolver logic as possible.
 - **Capability vs. policy separation**: `languageServers.*` declares *what* an LS can do; `languages.*.bridge.*` decides *whether and how* it is used.
 - **Opt-in for new behavior**: host bridging defaults *off* so existing configs are unchanged.
-- **Symmetric mental model**: host and virt are both "bridges" — only the LS-matching rule differs.
+- **Symmetric mental model**: host and virt are both "bridges", differing in the LS-matching key and in how `enabled` resolves.
 
 ## Decision Outcome
 
@@ -217,7 +219,7 @@ Host bridges use the **real URI** as sent by the client. This is the key distinc
 |---|---|---|
 | URI in `textDocument/didOpen` | `vhost://...` synthesized | client URI verbatim |
 | Document text | sub-extracted from host | client text verbatim |
-| `didChange` params | injection-range deltas synthesized | forwarded verbatim |
+| `didChange` params | injection-range deltas synthesized | synthetic full-text, downstream-generated version |
 | Response position/range fixup | required (virt → host coordinates) | identity |
 | `publishDiagnostics` URI | translated to host URI | passed through unchanged |
 
@@ -242,13 +244,13 @@ Practical consequences:
 - **Reuses wildcard machinery**: wildcard-config-inheritance's `resolve_with_wildcard` covers the aggregation fields; only `enabled` needs a direct read.
 - **Backward compatible**: an absent `_self` reads as disabled, so existing configs are inert.
 - **Granular control**: host bridging is per-host-language; aggregation/priorities are per-method.
-- **Symmetric mental model**: virt and host live in the same `bridge` map, with the only operational difference being LS-match key (injection language vs. host language).
+- **Symmetric mental model**: virt and host live in the same `bridge` map, differing operationally in the LS-match key (injection language vs. host language) and in `enabled` resolution (direct vs. wildcard-merged).
 - **LS catalog stays capability-pure**: no host/virt role flags on `BridgeServerConfig`; one LS entry naturally serves both roles when its `languages` field matches.
 - **Real URI for host simplifies coordinate logic**: existing virt position-mapping code remains virt-only and untouched.
 
 ### Negative
 
-- **Two-line opt-in**: users must write both `bridge._self.enabled = true` and per-method `aggregation.<method>.priorities`. Forgetting `enabled = true` produces silent no-response.
+- **Silent no-response when the flag is missed**: `bridge._self.enabled = true` is the whole opt-in — absent `priorities` resolve to `["*"]` (aggregation-priorities-wildcard), so no per-method config is required once a matching server exists. But forgetting `enabled = true` produces no response and no error.
 - **Reserved key cost**: a hypothetical user language literally named `_self` cannot be addressed via `bridge.<lang>`. Acceptable; `_` is already reserved on the same axis, and `_`-prefix names are conventionally reserved.
 
 ### Neutral
@@ -290,7 +292,7 @@ priorities = ["pyright"]
 
 **Rejected because**:
 - Introduces a parallel field with semantically identical structure to `bridge.<key>`. Two resolvers, two wildcard rules, two `enabled` flags to keep in sync — for no expressive gain.
-- Loses the symmetry that host and virt are both "bridges" — only the LS-matching rule differs.
+- Loses the symmetry that host and virt are both "bridges" living in one map.
 
 ### C. Top-level `aggregation` field on `LanguageSettings`
 
@@ -308,7 +310,7 @@ priorities = ["pyright"]
 - Splits bridge configuration into two non-uniform shapes: `bridge.<inj>.aggregation` (nested) vs. `aggregation` (flat). Resolvers diverge.
 - `LanguageSettings.aggregation` requires its own `resolve_aggregation` method, duplicating logic on `BridgeLanguageConfig`.
 - **Less extensibility**: the value type is `AggregationConfig`, so host inherits only fields defined on `AggregationConfig`. Fields on `BridgeLanguageConfig` itself — most notably `enabled` — have no host counterpart, forcing either an ad-hoc parallel field on `LanguageSettings` (e.g., `host_enabled`) or coverage gaps. Any future `BridgeLanguageConfig` field reopens the same asymmetry.
-- Subsumed by treating "host" as just another bridge target (one map, one resolver) per the decision in this decision.
+- Subsumed by treating "host" as just another bridge target in the same `bridge` map per the decision above.
 
 ### D. Role flags on `BridgeServerConfig`
 
