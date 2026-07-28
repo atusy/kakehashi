@@ -2025,6 +2025,74 @@ mod tests {
     }
 
     #[test]
+    fn single_pick_prefers_a_server_that_names_the_language_over_a_wildcard() {
+        // `get_config_for_language` picks ONE server and feeds the eager
+        // virtual-document open. With a `"*"` server configured, every
+        // language has at least two candidates, so an arbitrary pick would
+        // hand the warm start to the wildcard server roughly half the time
+        // and leave the language's real server to open lazily. Iteration is
+        // over a HashMap, so "arbitrary" means "reshuffled every process".
+        let coordinator = BridgeCoordinator::new();
+        let settings = settings_with_any_language_server();
+
+        let picked = coordinator
+            .get_config_for_language(&settings, "markdown", "rust")
+            .expect("a server must be picked for rust");
+        assert_eq!(
+            picked.server_name, "rust-analyzer",
+            "the server naming rust must win over the `\"*\"` server"
+        );
+
+        // The wildcard server is still the pick when nothing names the
+        // language — otherwise it could never warm anything up.
+        let picked = coordinator
+            .get_config_for_language(&settings, "markdown", "toml")
+            .expect("the wildcard server must be picked for an unnamed language");
+        assert_eq!(picked.server_name, "harper-ls");
+    }
+
+    #[test]
+    fn single_pick_is_deterministic_among_equally_matching_servers() {
+        // Two servers naming the same language: the pick must not depend on
+        // HashMap iteration order. Repeating over freshly built settings
+        // exercises several hash seeds' worth of ordering within one process.
+        let coordinator = BridgeCoordinator::new();
+        for _ in 0..16 {
+            let servers = HashMap::from([
+                (
+                    "pyright".to_string(),
+                    BridgeServerConfig {
+                        cmd: vec!["pyright".to_string()],
+                        languages: vec!["python".to_string()],
+                        ..Default::default()
+                    },
+                ),
+                (
+                    "ruff".to_string(),
+                    BridgeServerConfig {
+                        cmd: vec!["ruff".to_string()],
+                        languages: vec!["python".to_string()],
+                        ..Default::default()
+                    },
+                ),
+            ]);
+            let settings = WorkspaceSettings {
+                auto_install: false,
+                language_servers: servers,
+                ..Default::default()
+            };
+
+            let picked = coordinator
+                .get_config_for_language(&settings, "markdown", "python")
+                .expect("a server must be picked");
+            assert_eq!(
+                picked.server_name, "pyright",
+                "ties must break on server name, not hash order"
+            );
+        }
+    }
+
+    #[test]
     fn any_language_server_works_under_the_real_shipped_defaults() {
         // The hand-built settings above leave `languages` empty, which makes
         // `resolve_host_language_settings` return None and skips the bridge
