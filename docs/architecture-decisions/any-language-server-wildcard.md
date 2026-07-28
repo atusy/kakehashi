@@ -156,7 +156,8 @@ the other is harder to document than the `_self` gate that already exists.
 - **Cost scales with injection *regions*, not with languages — and that is a
   much bigger number than it sounds.** The process count does not grow at all:
   the connection pool is keyed by `(server, resolved root)` with no language
-  component, so one `"*"` server is one process per root. What grows is
+  component, so one `"*"` server is one process per root — fewer still under
+  `preferSharedInstance`, which collapses the roots as well. What grows is
   per-region work — a virtual `didOpen` per region, a task and a downstream
   request per region on whole-document methods, a context per region per
   diagnostics cycle.

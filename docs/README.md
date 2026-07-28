@@ -391,7 +391,8 @@ needs its own marker. Keeping it in the list also leaves room for future set
 algebra such as an `"!markdown"` exclusion.
 
 **Budget it against regions, not languages.** A `"*"` server is one process per
-workspace root — the connection pool has no language dimension — but it gets a
+workspace root by default — the connection pool has no language dimension, and
+`preferSharedInstance` can collapse the roots too — but it gets a
 virtual `didOpen` for every injection *region* it matches, and joins every
 region's fan-out. That number is larger than it looks in markdown: the shipped
 injection query emits a `markdown_inline` region per inline node and per table
