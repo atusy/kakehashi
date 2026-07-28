@@ -188,10 +188,11 @@ the other is harder to document than the `_self` gate that already exists.
   resolved at match time, so a `_` wildcard in the user config also widens
   servers declared in a project's config. Documented with a recommendation to
   declare `"*"` on concrete servers instead.
-- **Opting a single server back out is not spellable in `languages`.** Under a
-  `_` wildcard, `[]` means "inherit" and resolves back to `["*"]`; the escape
-  hatch is `enabled = false` (which the selection sites check first, via
-  `is_spawnable`). Narrowing to a real language list does work — a concrete
+- **Opting a single server back out is not spellable in `languages`.** `[]`
+  means "not specified here", so it lands on the same server's list from a
+  lower config layer, or on the `_` wildcard when no layer supplied one —
+  either way not "nothing". The escape hatch is `enabled = false` (which the
+  selection sites check first, via `is_spawnable`). Narrowing to a real language list does work — a concrete
   non-empty `languages` overrides the wildcard.
 - **Cost scales with injection *regions*, not with languages — and that is a
   much bigger number than it sounds.** The process count does not grow at all:
@@ -262,9 +263,10 @@ the other is harder to document than the `_self` gate that already exists.
 
 ### A. `languages = []` means "any"
 
-**Rejected because**: already means "inherit from `_`"
-(`merge_bridge_server_configs`). Redefining it would silently convert every
-server that currently defers to the wildcard entry into an attach-to-everything
+**Rejected because**: already means "not specified at this layer"
+(`merge_bridge_server_configs`), which resolves to a lower layer's list for the
+same server, or to the `_` entry. Redefining it would silently convert every
+server that currently defers — to either source — into an attach-to-everything
 server. Secondary: a multi-line list whose entries are all commented out
 collapses to `[]`, so the intent would be unrecoverable from the text.
 

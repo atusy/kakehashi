@@ -136,10 +136,10 @@ resolution — so an empty list means "not specified at this layer" and reaches
 `_` only when no layer specified one. A lower layer's concrete list beats a
 higher layer's `_` wildcard.
 
-The consequence is that a concrete server can only ever *defer* to `_` on those
-fields — it can narrow by listing fewer entries, but it has no spelling for
-"wider than what I inherited", because the widest spelling (`[]`) is the
-inherit sentinel. Where widening must be expressible, it needs a marker
+The consequence is that a concrete server can only ever *defer* on those fields
+— to a lower layer's value for the same server, or to `_`. It can narrow by
+listing fewer entries, but it has no spelling for "wider than what I
+inherited", because the widest spelling (`[]`) is the defer sentinel. Where widening must be expressible, it needs a marker
 *inside* the list: see any-language-server-wildcard for `languages = ["*"]`.
 
 The `Option<Vec>` fields (`workspaceMarkers`, `onTypeFormattingTriggers`) do
