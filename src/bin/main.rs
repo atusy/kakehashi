@@ -1100,8 +1100,9 @@ async fn serve_lsp() {
     // burst (≈10 concurrent reader parks per document) across several
     // documents, with headroom.
     const INGRESS_CONCURRENCY: usize = 64;
-    // Repair malformed inbound frames (e.g. didChange text cut mid-surrogate
-    // -pair by chunking clients) before the codec sees them: tokio-util's
+    // Repair malformed inbound frames (e.g. didChange text cut in the middle
+    // of a surrogate pair by chunking clients) before the codec sees them:
+    // tokio-util's
     // FramedRead fuses on a decode error, so one bad frame would otherwise
     // end the whole read loop and exit the server.
     let stdin = repair_inbound_frames(stdin);

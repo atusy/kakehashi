@@ -600,7 +600,10 @@ impl FrameRepairer {
                     })
             };
 
-            let (start, is_ranged) = match change.get("range") {
+            // An explicit `"range": null` deserializes to None downstream,
+            // identical to omission — both spell a full-text sync.
+            let range = change.get("range").filter(|r| !r.is_null());
+            let (start, is_ranged) = match range {
                 None => {
                     // Full-text sync replaces the document: any seam is gone.
                     self.pending.remove(&uri);
@@ -2065,6 +2068,28 @@ mod tests {
         .await
         .expect("pump should finish");
         assert_eq!(out, input);
+    }
+
+    /// An explicit `"range": null` is the same full-text sync as an omitted
+    /// range and must open a seam identically.
+    #[tokio::test]
+    async fn null_range_full_sync_opens_a_consumable_seam() {
+        let mut input = Vec::new();
+        input.extend_from_slice(&didchange_frame(
+            "file:///t.md",
+            1,
+            r#"{"range":null,"text":"a\uD83D"}"#,
+        ));
+        input.extend_from_slice(&didchange_frame(
+            "file:///t.md",
+            2,
+            &insert_at(0, 2, r"\uDE03b"),
+        ));
+        let out = tokio::time::timeout(std::time::Duration::from_secs(5), pump_through(input))
+            .await
+            .expect("pump should finish");
+        let frames = parse_frames(&out);
+        assert_eq!(frames[1]["params"]["contentChanges"][0]["text"], "😃b");
     }
 
     /// A full-text sync whose text ends in a lone high opens a seam measured
