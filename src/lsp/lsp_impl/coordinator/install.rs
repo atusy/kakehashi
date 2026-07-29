@@ -204,9 +204,12 @@ impl InstallCoordinator {
             return false;
         }
 
-        // Every no-reparse outcome lands here — Failed/Unsupported/NoDataDir/
-        // Abandoned as well as AlreadyInstalling. None of them publishes a
-        // snapshot anywhere below, so release a parked first-parse waiter with a tree-less
+        // Every no-reparse outcome lands here — Failed/Unsupported/NoDataDir as
+        // well as AlreadyInstalling. (`Abandoned` never reaches this point: it
+        // is produced by `InstallMarkerGuard::drop` into the watch channel, so
+        // it surfaces only as the `terminal` read below.) None of them
+        // publishes a snapshot anywhere below, so release a parked
+        // first-parse waiter with a tree-less
         // snapshot (bootstrap-gated inside) instead of letting every request
         // burn the full first-parse backstop. Harmless for AlreadyInstalling:
         // its eventual reload-reparse lands the same-version tree through the
@@ -820,7 +823,12 @@ mod tests {
         assert!(server.documents.get(&uri).unwrap().tree().is_none());
     }
 
-    #[tokio::test]
+    // `start_paused`: the healthy path returns without awaiting, so the bound
+    // below needs no wall-clock time; a regressed guard instead parks on the
+    // completion wait, the runtime goes idle, and the deadline fires at once.
+    // Without it the bound is real time and a 5s scheduling stall on a loaded
+    // CI box reads as a regression.
+    #[tokio::test(start_paused = true)]
     async fn stale_install_task_stops_before_install_events() {
         let (service, mut socket) = LspService::new(Kakehashi::new);
         let server = service.inner();
