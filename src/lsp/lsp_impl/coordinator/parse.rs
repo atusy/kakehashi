@@ -426,8 +426,8 @@ impl ParseCoordinator {
     ///
     /// `ticket` is the ingress writer ticket of the mutation that scheduled this
     /// parse, or `None` for a caller outside the ingress sequence. On every resolution
-    /// path that still observes this lifetime — a tree, a parsed-to-nothing, a
-    /// previously-crashed parser, or no detectable language — the parse advances the
+    /// path that still observes this lifetime — a tree, a parsed-to-nothing, or no
+    /// detectable language — the parse advances the
     /// store's per-document **watermark** to `ticket` (guarded by the open
     /// incarnation), releasing a reader waiting on it. The one path that does **not**
     /// advance is a document already gone (a `didClose` removed it): its watermark

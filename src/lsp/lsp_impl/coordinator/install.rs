@@ -204,10 +204,9 @@ impl InstallCoordinator {
             return false;
         }
 
-        // Every no-reparse outcome lands here — Failed/Unsupported/NoDataDir
-        // as well as AlreadyInstalling. None of
-        // them publishes a snapshot anywhere
-        // below, so release a parked first-parse waiter with a tree-less
+        // Every no-reparse outcome lands here — Failed/Unsupported/NoDataDir/
+        // Abandoned as well as AlreadyInstalling. None of them publishes a
+        // snapshot anywhere below, so release a parked first-parse waiter with a tree-less
         // snapshot (bootstrap-gated inside) instead of letting every request
         // burn the full first-parse backstop. Harmless for AlreadyInstalling:
         // its eventual reload-reparse lands the same-version tree through the
@@ -826,11 +825,12 @@ mod tests {
         let (service, mut socket) = LspService::new(Kakehashi::new);
         let server = service.inner();
         let language = "stale-install-language";
-        // Hold an install claim so a regressed staleness guard would fall
-        // through to `try_install`'s `AlreadyInstalling` branch — an immediate,
-        // network-free early return that DOES emit an event. Without it the
-        // fall-through would reach the support lookup and emit nothing within
-        // this test's window, hiding the regression.
+        // Hold an install claim so a regressed staleness guard falls through to
+        // `try_install`'s `AlreadyInstalling` branch, which parks on a
+        // completion this test never resolves. That makes the regression
+        // deterministic and network-free: without the claim the fall-through
+        // reaches the metadata-backed support lookup, whose timing depends on
+        // the cache and the network.
         let _claim = server.auto_install.begin_test_claim(language);
         let uri = Url::parse("file:///workspace/stale-install.txt").unwrap();
         let old_incarnation = server.documents.insert(
