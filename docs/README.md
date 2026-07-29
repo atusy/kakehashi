@@ -894,7 +894,7 @@ kakehashi uses Rust's standard logging with `env_logger`. Configure logging via 
 | Target | Level | Description |
 |--------|-------|-------------|
 | `kakehashi::lock_recovery` | warn | Thread synchronization recovery events |
-| `kakehashi::crash_recovery` | error | Parser crash detection and recovery |
+| `kakehashi::crash_recovery` | error | Panics escaping compute-pool work units |
 | `kakehashi::query` | info | Query syntax/validation issues |
 
 ### Examples

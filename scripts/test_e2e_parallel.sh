@@ -17,9 +17,6 @@
 # Safe to run concurrently because each spawned server is isolated:
 #   - KAKEHASHI_DATA_DIR  : shared, read-only after install (parsers/queries)
 #   - XDG_CONFIG_HOME     : per-process temp dir (no user-config bleed)
-#   - KAKEHASHI_STATE_DIR : per-SPAWN temp dir (crash-recovery state, set by the
-#                           test harness so no two concurrent servers — threads
-#                           or processes — ever share/poison those files)
 #
 # Usage:
 #   scripts/test_e2e_parallel.sh

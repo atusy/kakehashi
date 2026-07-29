@@ -51,35 +51,6 @@ fn test_data_dir() -> &'static Path {
     .as_path()
 }
 
-/// A fresh, unique directory for ONE spawned server's crash-recovery state
-/// (`parsing_in_progress`, `failed_parsers`), passed via `KAKEHASHI_STATE_DIR`.
-///
-/// Kept OUT of the shared [`test_data_dir`] so servers never poison each other:
-/// the server's `FailedParserRegistry::init()` reads a leftover
-/// `parsing_in_progress` as a crash and marks that parser failed. A per-SPAWN
-/// (not per-process) dir is what makes the test suite safe under both
-/// cross-process AND intra-process concurrency (parallel test threads in one
-/// binary): no two concurrently-running servers ever share these files, so a
-/// server that persists state on a shutdown-while-parsing can't be read as a
-/// crash by another — and no pre-spawn clearing is needed. The expensive
-/// parser/query install stays shared (read-only) in `test_data_dir`.
-///
-/// All per-spawn dirs live under one base [`tempfile::TempDir`] parked in a
-/// `static` and — like [`isolated_config_dir`] — intentionally never dropped
-/// (statics aren't), so the small tree is left in the OS temp dir when the
-/// process exits (one tree per test process; the same accepted leak).
-fn isolated_state_dir() -> PathBuf {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static BASE: OnceLock<tempfile::TempDir> = OnceLock::new();
-    static SEQ: AtomicU64 = AtomicU64::new(0);
-    let base = BASE
-        .get_or_init(|| tempfile::tempdir().expect("create base dir for KAKEHASHI_STATE_DIR"))
-        .path();
-    let dir = base.join(format!("spawn-{}", SEQ.fetch_add(1, Ordering::Relaxed)));
-    std::fs::create_dir_all(&dir).expect("create per-spawn KAKEHASHI_STATE_DIR");
-    dir
-}
-
 /// Empty `XDG_CONFIG_HOME` for the spawned server, so it never reads the
 /// developer's real `~/.config/kakehashi`. Inherited user config changes the
 /// server's behavior under test — e.g. a host-bridging entry flips the
@@ -219,7 +190,6 @@ impl LspClientBuilder {
         }
         cmd.env("KAKEHASHI_DATA_DIR", test_data_dir());
         cmd.env("XDG_CONFIG_HOME", isolated_config_dir());
-        cmd.env("KAKEHASHI_STATE_DIR", isolated_state_dir());
         for (key, value) in &self.envs {
             cmd.env(key, value);
         }
@@ -369,7 +339,6 @@ impl LspClient {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_kakehashi"));
         cmd.env("KAKEHASHI_DATA_DIR", test_data_dir())
             .env("XDG_CONFIG_HOME", isolated_config_dir())
-            .env("KAKEHASHI_STATE_DIR", isolated_state_dir())
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
