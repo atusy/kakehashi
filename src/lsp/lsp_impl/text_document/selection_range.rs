@@ -91,7 +91,9 @@ impl Kakehashi {
 
         // A resolved-but-tree-less snapshot cannot produce selection ranges. See
         // `ParseSnapshot` for the causes — they include a settings-reload
-        // placeholder that reads as current, so this is not only a failure path.
+        // placeholder that reads as current, so this is not only a failure path:
+        // the wait above breaks on that placeholder and answers `null` instead
+        // of settling for its reparse (#923).
         if snapshot.tree.is_none() {
             return Ok(None);
         }
