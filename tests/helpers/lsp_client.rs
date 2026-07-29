@@ -26,9 +26,8 @@ use std::time::{Duration, Instant};
 ///
 /// The expensive, idempotent setup (dir creation + parser/query install) is
 /// cached once per process via `OnceLock`. The directory is treated as
-/// read-only after install so independent test processes can share it; the
-/// transient crash-recovery files that the server would otherwise write here
-/// are redirected to a per-spawn [`isolated_state_dir`].
+/// read-only after install, which is what lets independent test processes —
+/// and parallel spawns within one process — share it without isolation.
 ///
 /// We always set `KAKEHASHI_DATA_DIR` on the spawned binary to this
 /// path — the binary itself runs without `cfg(test)`, so it cannot
