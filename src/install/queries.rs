@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
-use fs4::fs_std::FileExt;
+use fs4::FileExt;
 
 use super::http::agent_with_timeout;
 #[cfg(test)]
@@ -948,7 +948,12 @@ impl QueryReplaceLockGuard {
             .write(true)
             .truncate(false)
             .open(path)?;
-        file.lock_exclusive()?;
+        // Spelled as UFCS, not `file.lock()`: std stabilized an inherent
+        // `File::lock` in 1.89 which would silently win method resolution and
+        // leave the fs4 import unused. Both are blocking flock(LOCK_EX), so the
+        // behavior is the same either way — this just keeps the source of the
+        // lock explicit. fs4 1.x renamed `lock_exclusive` to `lock`.
+        FileExt::lock(&file)?;
         Ok(Self { _file: file })
     }
 }

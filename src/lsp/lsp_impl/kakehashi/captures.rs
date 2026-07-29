@@ -1563,7 +1563,7 @@ fn execute_captures_walk(
                         incarnation,
                     ) {
                         Some(live) => live,
-                        None => ulid::Ulid::new(),
+                        None => ulid::Ulid::generate(),
                     }
                 })
                 .collect()
