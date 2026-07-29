@@ -130,10 +130,16 @@ check-then-act rather than a cross-map TOCTOU against `Document.incarnation`):
 > bypassed:
 > 1. `snapshot.incarnation == slot.current_incarnation`, **and**
 > 2. `slot.snapshot.is_none()` (bootstrap) **or**
->    `snapshot.parsed_version > slot.snapshot.parsed_version` (strict monotonic).
+>    `snapshot.parsed_version > slot.snapshot.parsed_version` and the incoming
+>    snapshot is not a tree **downgrade** (`Some` -> `None`) **or**
+>    `snapshot.parsed_version == slot.snapshot.parsed_version` and the incoming
+>    snapshot is a tree **upgrade** (`None` -> `Some`).
 >
 > The bootstrap case relaxes only the version compare (clause 2), never the
-> incarnation check (clause 1).
+> incarnation check (clause 1). The equal-version arm is what lets a reparse
+> attach its tree over a same-version tree-less publish — the reload placeholder
+> and the give-up snapshot both depend on it — without which strict `>` alone
+> would strand those documents tree-less until the next edit.
 
 - **Incarnation-scoped, strict monotonicity.** The `>` is strict — equal-version
   double-publishes (e.g. a racing open-parse and reparse both at version 0) must
