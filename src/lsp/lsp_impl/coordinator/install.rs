@@ -207,10 +207,9 @@ impl InstallCoordinator {
         // Every no-reparse outcome lands here — Failed/Unsupported/NoDataDir as
         // well as AlreadyInstalling. (`Abandoned` never reaches this point: it
         // is produced by `InstallMarkerGuard::drop` into the watch channel, so
-        // it surfaces only as the `terminal` read below.) None of them
-        // publishes a snapshot anywhere below, so release a parked
-        // first-parse waiter with a tree-less
-        // snapshot (bootstrap-gated inside) instead of letting every request
+        // it surfaces only as the `terminal` read below.) None of them publishes
+        // a snapshot anywhere below, so release a parked first-parse waiter with
+        // a tree-less snapshot (bootstrap-gated inside) instead of letting every request
         // burn the full first-parse backstop. Harmless for AlreadyInstalling:
         // its eventual reload-reparse lands the same-version tree through the
         // snapshot cell's tree-upgrade clause.

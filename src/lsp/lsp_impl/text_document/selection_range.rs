@@ -89,8 +89,9 @@ impl Kakehashi {
             }
         };
 
-        // A resolved-but-tree-less snapshot (no parser installed / install
-        // failed) cannot produce selection ranges.
+        // A resolved-but-tree-less snapshot (no parser installed, install failed,
+        // or the parse produced nothing — see `ParseSnapshot`) cannot produce
+        // selection ranges.
         if snapshot.tree.is_none() {
             return Ok(None);
         }

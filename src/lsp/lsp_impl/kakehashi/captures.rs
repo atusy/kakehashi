@@ -955,7 +955,8 @@ impl Kakehashi {
         let incarnation = snapshot.incarnation;
         let text = std::sync::Arc::clone(&snapshot.text);
         let Some(tree) = snapshot.tree.clone() else {
-            // Resolved-but-tree-less (no parser installed / install failed).
+            // Resolved-but-tree-less (no parser installed, install failed, or the
+            // parse produced nothing — see `ParseSnapshot`).
             return Ok(None);
         };
 

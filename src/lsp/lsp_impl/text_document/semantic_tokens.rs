@@ -324,7 +324,8 @@ impl Kakehashi {
         let (Some(language_name), Some(tree)) = (snapshot.language.clone(), snapshot.tree.clone())
         else {
             // No detectable language, or resolved-but-tree-less (no parser
-            // installed / install failed): nothing to tokenize. The empty set
+            // installed, install failed, or the parse produced nothing — see
+            // `ParseSnapshot`): nothing to tokenize. The empty set
             // IS this snapshot's served state — record it so the parse loop
             // doesn't keep refreshing a document that has no tokens.
             self.cache

@@ -30,9 +30,10 @@ pub(crate) const CLOSED_INCARNATION: u64 = u64::MAX;
 ///
 /// `tree: Option` makes a **resolved-but-tree-less** outcome representable —
 /// a parse that completed with no usable tree (no parser installed, install
-/// failed), distinct from the pre-first-parse
-/// `None` slot: it advances `parsed_version` and releases first-parse waiters
-/// to their empty/`null`/`ContentModified` fallbacks.
+/// failed, or the parse itself produced nothing — deadline abort, grammar
+/// panic, reload/retry exhaustion), distinct from the pre-first-parse `None`
+/// slot: it advances `parsed_version` and releases first-parse waiters to
+/// their empty/`null`/`ContentModified` fallbacks.
 pub(crate) struct ParseSnapshot {
     pub(crate) text: Arc<str>,
     pub(crate) tree: Option<Tree>,
