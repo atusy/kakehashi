@@ -123,6 +123,30 @@ enabled = false
 # "comment" = ""  # overridden (empty string suppresses the token)
 ```
 
+### Bare `Vec` fields: empty means "inherit", so it cannot mean anything else
+
+For the **bare** `Vec` fields of `languageServers` (`cmd`, `languages`),
+`merge_bridge_server_configs` treats an **empty overlay list as absent** and
+takes the base value. That is what lets a concrete server omit `cmd` or
+`languages` and pick them up from the wildcard entry.
+
+Note that "the base" is not always `_`. The same function also merges a
+same-named server across config *layers*, which happens before wildcard
+resolution — so an empty list means "not specified at this layer" and reaches
+`_` only when no layer specified one. A lower layer's concrete list beats a
+higher layer's `_` wildcard.
+
+The consequence is that a concrete server can only ever *defer* on those fields
+— to a lower layer's value for the same server, or to `_`. It can narrow by
+listing fewer entries, but it has no spelling for "wider than what I
+inherited", because the widest spelling (`[]`) is the defer sentinel. Where widening must be expressible, it needs a marker
+*inside* the list: see any-language-server-wildcard for `languages = ["*"]`.
+
+The `Option<Vec>` fields (`workspaceMarkers`, `onTypeFormattingTriggers`) do
+**not** follow this rule — overlay wins whenever it is `Some`, so an explicit
+`[]` there is preserved and carries its own meaning ("disable the marker
+search"), while `None` is the inherit sentinel.
+
 ## Consequences
 
 ### Positive
@@ -231,3 +255,4 @@ The existing `resolve_capture()` in `legend.rs` already implements lazy fallback
 ## Related Decisions
 
 - [configuration-merging-strategy](configuration-merging-strategy.md): Cross-layer configuration merging strategy
+- [any-language-server-wildcard](any-language-server-wildcard.md): Why widening past an inherited `languages` list needs an in-list marker

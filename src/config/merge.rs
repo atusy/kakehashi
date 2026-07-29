@@ -1805,10 +1805,7 @@ mod tests {
 
             if let Some(resolved_config) =
                 resolve_with_wildcard(&servers, server_name, merge_bridge_server_configs)
-                && resolved_config
-                    .languages
-                    .iter()
-                    .any(|l| l == injection_language)
+                && resolved_config.handles_language(injection_language)
             {
                 found_server = Some(resolved_config);
                 break;

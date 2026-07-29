@@ -18,6 +18,18 @@ pub(crate) const HOST_BRIDGE_KEY: &str = "_self";
 /// does not.
 pub(crate) const PRIORITIES_WILDCARD: &str = "*";
 
+/// Reserved `languages` element standing for "every language"
+/// (any-language-server-wildcard): a server declaring it is a bridge
+/// candidate for any injected — and any host — language.
+///
+/// A list element rather than an empty/absent list because both of those
+/// already mean "inherit `languages` from the `_` entry"
+/// ([`crate::config::merge::merge_bridge_server_configs`]), so a concrete
+/// server could otherwise only *defer* to the wildcard entry, never widen
+/// past it. Same sigil, and same `_`-vs-`*` reasoning, as
+/// [`PRIORITIES_WILDCARD`].
+pub(crate) const LANGUAGES_WILDCARD: &str = "*";
+
 /// The resolved default for an absent `priorities`: `["*"]`, i.e. fan out to
 /// every configured server with no ranking (first-win).
 fn default_priorities() -> Vec<String> {
@@ -361,9 +373,15 @@ pub struct BridgeServerConfig {
     /// server whose resolved cmd is still empty is skipped at lookup.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub cmd: Vec<String>,
-    /// Languages this server handles (e.g., ["rust"], ["python"]).
+    /// Languages this server handles (e.g., ["rust"], ["python"]). The element
+    /// `"*"` matches every language, for servers not tied to one.
     /// Optional for the same wildcard-defaults reason as `cmd`; a server
     /// with no languages never matches a lookup.
+    // Doc comments on this struct are user-facing: they become the `config
+    // schema` output an editor shows on hover. Keep them free of rustdoc
+    // intra-doc links and implementor notes — match through
+    // `handles_language`, never by comparing elements directly, so that `"*"`
+    // is honored everywhere.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub languages: Vec<String>,
     /// Optional initialization options to pass to the server during initialize
@@ -449,6 +467,25 @@ impl BridgeServerConfig {
     /// built-in default `true`.
     pub(crate) fn is_enabled(&self) -> bool {
         self.enabled.unwrap_or(true)
+    }
+
+    /// Whether this server is a bridge candidate for `language`.
+    ///
+    /// Plain membership, except that the [`LANGUAGES_WILDCARD`] element
+    /// matches everything (any-language-server-wildcard). The wildcard is
+    /// resolved here, at match time, rather than expanded during config
+    /// merging: "every language" is an open set that cannot be enumerated
+    /// statically — injected languages are discovered from the document.
+    ///
+    /// Applies to both bridge axes, since both select servers by this same
+    /// list: injection candidates
+    /// ([`crate::lsp::bridge::coordinator`]'s per-region lookups) and host
+    /// candidates. On the host axis a candidate is still not consent — that
+    /// path stays gated on the explicit `bridge._self.enabled = true` opt-in.
+    pub(crate) fn handles_language(&self, language: &str) -> bool {
+        self.languages
+            .iter()
+            .any(|l| l == language || l == LANGUAGES_WILDCARD)
     }
 
     /// A resolved config is a real, usable server: it has a command to run
@@ -871,12 +908,16 @@ impl LanguageSettings {
     /// enabled for this language.
     ///
     /// Host bridging is **opt-in**: it requires an explicit
-    /// `bridge._self.enabled = true`. Unlike injection entries, the `enabled`
-    /// field deliberately does NOT inherit from the `_` wildcard entry —
-    /// that implements the ADR's built-in `languages._.bridge._self.enabled
-    /// = false` default, which must beat the wildcard's `enabled = true`
-    /// virt default (key-specific wins). Aggregation fields DO inherit from
-    /// `_` via [`Self::resolve_host_aggregation`].
+    /// `bridge._self.enabled = true`. The lookup is deliberately DIRECT — no
+    /// `resolve_with_wildcard` — so an absent `_self` is the off state, and
+    /// the shipped defaults ship no `_self` key at all
+    /// (`default_settings_has_wildcard_language_with_bridge_defaults` pins
+    /// that). Routing this through the wildcard would let the shipped
+    /// `bridge._.enabled = true` virt default flow in and enable host
+    /// bridging for every language — and for every `languages = ["*"]` server
+    /// with it, since the host axis selects through the same list.
+    /// Aggregation fields DO inherit from `_` via
+    /// [`Self::resolve_host_aggregation`]; only `enabled` is special.
     pub(crate) fn is_host_bridging_enabled(&self) -> bool {
         self.bridge
             .as_ref()
@@ -1481,6 +1522,79 @@ mod tests {
             settings.queries.as_ref().unwrap()[0].kind,
             Some(QueryKind::Highlights)
         );
+    }
+
+    #[test]
+    fn languages_wildcard_matches_every_language() {
+        // `["*"]` = "attach to any language" (any-language-server-wildcard).
+        // Empty is already spoken for ("inherit from `_`"), so the wildcard
+        // element is the only shape that can *widen* an inherited list.
+        let server = BridgeServerConfig {
+            cmd: vec!["harper-ls".to_string()],
+            languages: vec![LANGUAGES_WILDCARD.to_string()],
+            ..Default::default()
+        };
+
+        assert!(server.handles_language("rust"));
+        assert!(server.handles_language("python"));
+        assert!(server.handles_language("a-language-nobody-configured"));
+    }
+
+    #[test]
+    fn languages_wildcard_mixed_with_names_still_matches_every_language() {
+        // Membership has no ordering, so a named entry alongside `"*"` is
+        // redundant rather than restrictive.
+        let server = BridgeServerConfig {
+            cmd: vec!["harper-ls".to_string()],
+            languages: vec!["rust".to_string(), LANGUAGES_WILDCARD.to_string()],
+            ..Default::default()
+        };
+
+        assert!(server.handles_language("rust"));
+        assert!(server.handles_language("python"));
+    }
+
+    #[test]
+    fn explicit_languages_list_matches_only_listed_languages() {
+        let server = BridgeServerConfig {
+            cmd: vec!["rust-analyzer".to_string()],
+            languages: vec!["rust".to_string()],
+            ..Default::default()
+        };
+
+        assert!(server.handles_language("rust"));
+        assert!(!server.handles_language("python"));
+    }
+
+    #[test]
+    fn languages_wildcard_is_an_exact_element_not_a_glob() {
+        // Globs are deferred (any-language-server-wildcard, alternative G).
+        // A `.contains('*')`-style implementation would pass every other test
+        // in this file, so pin the narrower contract explicitly.
+        let server = BridgeServerConfig {
+            cmd: vec!["tsgo".to_string()],
+            languages: vec!["ts*".to_string()],
+            ..Default::default()
+        };
+
+        assert!(!server.handles_language("tsx"));
+        assert!(!server.handles_language("typescript"));
+        assert!(
+            server.handles_language("ts*"),
+            "matched literally, not glob"
+        );
+    }
+
+    #[test]
+    fn empty_languages_matches_nothing() {
+        // An unresolved (still-inheriting) config must not become "any".
+        let server = BridgeServerConfig {
+            cmd: vec!["rust-analyzer".to_string()],
+            languages: vec![],
+            ..Default::default()
+        };
+
+        assert!(!server.handles_language("rust"));
     }
 
     #[test]
@@ -2482,8 +2596,11 @@ kind = "locals""#;
     #[test]
     fn host_bridging_not_enabled_by_bridge_wildcard() {
         // The `_` wildcard's enabled = true is the VIRT default; it must not
-        // silently turn host bridging on (host-document-bridge: the built-in
-        // `_self.enabled = false` default is key-specific and wins).
+        // silently turn host bridging on. The fixture deliberately has NO
+        // `_self` entry, because that is the real shipped shape and absence is
+        // what the direct `get` reads as off — adding `_self = false` here
+        // would make this test vacuous against a switch to
+        // `resolve_with_wildcard` (host-document-bridge § Wildcard Merge Safety).
         let settings = LanguageSettings {
             bridge: Some(HashMap::from([(
                 WILDCARD_KEY.to_string(),

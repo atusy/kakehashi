@@ -11,11 +11,13 @@
 //! request/cancel machinery are shared with the virt path; only the document
 //! key and the (absent) translation differ.
 //!
-//! Document sync is lazy: the host document is opened on the first request
-//! per `(uri, connection)` and re-synced with a full-text `didChange` whenever
-//! the host text changed since the last request (fingerprint comparison) —
-//! the same full-content sync the virt path uses for its `didChange`
-//! forwarding.
+//! Document sync: the host document is opened eagerly at upstream `didOpen`
+//! on every `_self` server (#429, so a push-only host server pushes on open),
+//! and lazily on the first request per `(uri, connection)` for anything that
+//! missed that. It is re-synced with a full-text `didChange` whenever the host
+//! text changed since the last sync (fingerprint comparison; the sync may have
+//! been an eager one, not a request) — the same
+//! full-content sync the virt path uses for its `didChange` forwarding.
 
 use std::collections::hash_map::Entry;
 use std::hash::{Hash, Hasher};
@@ -64,8 +66,8 @@ pub(crate) type HostTextReader = Arc<dyn Fn() -> Option<Arc<str>> + Send + Sync>
 /// Open or re-sync the host document on a downstream server, mutating the
 /// pool's sync-state map in place.
 ///
-/// - First request for `(uri, connection)`: send `didOpen` with the real URI,
-///   the host language id, and the full host text.
+/// - First sync for `(uri, connection)` — eager or request-driven: send
+///   `didOpen` with the real URI, the host language id, and the full host text.
 /// - Host text changed since the last sync: send a full-text `didChange`
 ///   with an incremented version.
 /// - Unchanged: no-op.

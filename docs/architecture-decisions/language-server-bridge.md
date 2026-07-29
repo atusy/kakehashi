@@ -179,7 +179,7 @@ The bridge requires knowing which server to use for each language. Language serv
 |-------|----------|-------------|
 | `languageServers` | Yes | Server configurations keyed by server name (at root level) |
 | `languageServers.*.cmd` | Yes | Command array: first element is program, rest are arguments |
-| `languageServers.*.languages` | Yes | Languages this server handles |
+| `languageServers.*.languages` | No (inherits from `_`) | Languages this server handles. The element `"*"` matches every language, for servers not tied to one (any-language-server-wildcard). An empty or omitted list is *not* "any": it inherits from the `_` entry (wildcard-config-inheritance) |
 | `languageServers.*.initializationOptions` | No | Passed to server's `initialize` request |
 | `languageServers.*.onTypeFormattingTriggers` | No | Trigger characters for bridged `textDocument/onTypeFormatting`; the sorted union is advertised at initialize, and requests are forwarded only when the downstream also declares the typed character (#354) |
 | `languageServers.*.enabled` | No | Whether this server is eligible to spawn/use at all. Default `true`; inheritable via the `_` wildcard, so `_.enabled: false` disables every server by default while individual servers opt back in with `enabled: true` |
@@ -245,7 +245,7 @@ This enables complementary servers: `pyright` for type checking, `ruff` for lint
 | **Example** | Parser paths, query sources, `bridge` filter | `typos-lsp` for markdown + asciidoc |
 
 This separation allows:
-- **Cross-cutting servers**: `typos-lsp` provides diagnostics for multiple languages
+- **Cross-cutting servers**: `typos-lsp` provides diagnostics for multiple languages — or for *any* language via `languages = ["*"]` (any-language-server-wildcard)
 - **Multiple servers per language**: `pyright` + `ruff` for Python (both in `languageServers`)
 - **Independent lifecycle**: Tree-sitter config doesn't affect server spawning
 - **Per-host filtering**: Each host language can selectively enable/disable bridging via `bridge` field
@@ -506,3 +506,4 @@ See language-server-bridge-request-strategies for per-method implementation deta
 - [language-detection-fallback-chain](language-detection-fallback-chain.md): Language detection applies to both host documents and injection regions
 - [language-server-bridge-virtual-document-model](language-server-bridge-virtual-document-model.md): How multiple injections are represented as virtual documents
 - [language-server-bridge-request-strategies](language-server-bridge-request-strategies.md): Per-method bridge strategies
+- [any-language-server-wildcard](any-language-server-wildcard.md): The `languages = ["*"]` marker for servers not tied to one language

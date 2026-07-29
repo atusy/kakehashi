@@ -33,6 +33,10 @@ pub(crate) struct BridgeInjection {
     pub(crate) content: String,
 }
 
+/// One server's share of an eager-open batch: its spawn config plus the
+/// injections to open on it.
+type ServerGroup = (Arc<BridgeServerConfig>, Vec<BridgeInjection>);
+
 /// Resolved server configuration with server name.
 ///
 /// Carries both the server name (for connection lookup) and the config (for
@@ -424,10 +428,10 @@ impl BridgeCoordinator {
     /// The injections whose language bridges to `server_name`, plus that server's
     /// resolved config. A codeAction fans out to ALL servers bridging an
     /// injection language, so the command's origin may be ANY of them — match by
-    /// name against the full set ([`Self::get_all_configs_for_language`]), not
-    /// [`Self::get_config_for_language`]'s single first pick (which would miss
-    /// the origin when e.g. both ruff and pyright bridge python and the command
-    /// came from ruff). Pure; the async open is separate so it is unit-testable.
+    /// name against the full set ([`Self::get_all_configs_for_language`]). A
+    /// single first pick would miss the origin when e.g. both ruff and pyright
+    /// bridge python and the command came from ruff. Pure; the async open is
+    /// separate so it is unit-testable.
     fn injections_for_server(
         &self,
         settings: &Arc<WorkspaceSettings>,
@@ -459,59 +463,6 @@ impl BridgeCoordinator {
             })
             .collect();
         (for_server, config)
-    }
-
-    /// Resolve `bridge.servers` for `injection_language`, returning the
-    /// `ResolvedServerConfig` (server name for pooling + spawn config) or
-    /// `None` when no server matches, or the host's bridge filter excludes
-    /// this injection. Host lookup uses wildcard resolution (wildcard-config-inheritance):
-    /// undefined hosts inherit `languages._`, letting one default filter apply
-    /// to every host.
-    pub(crate) fn get_config_for_language(
-        &self,
-        settings: &WorkspaceSettings,
-        host_language: &str,
-        injection_language: &str,
-    ) -> Option<ResolvedServerConfig> {
-        // Host-language bridge filters are checked first, with an optional
-        // fallback to the wildcard ("_") entry when the host has no explicit
-        // configuration. This allows using languages._ to define shared
-        // defaults, but does not guarantee that every language inherits them.
-        if let Some(host_settings) = settings.resolve_host_language_settings(host_language)
-            && !host_settings.is_language_bridgeable(injection_language)
-        {
-            log::debug!(
-                target: "kakehashi::bridge",
-                "Bridge filter for {} blocks injection language {}",
-                host_language,
-                injection_language
-            );
-            return None;
-        }
-
-        // Look for a server that handles this language
-        // wildcard-config-inheritance: Resolve each server with wildcard BEFORE checking languages,
-        // because languages list may be inherited from languageServers._
-        let servers = &settings.language_servers;
-        for server_name in servers.keys() {
-            // Skip wildcard entry - we use it for inheritance, not direct lookup
-            if server_name == "_" {
-                continue;
-            }
-
-            if let Some(resolved_config) =
-                resolve_with_wildcard(servers, server_name, merge_bridge_server_configs)
-                    .filter(|c| c.is_spawnable())
-                    .filter(|c| c.languages.iter().any(|l| l == injection_language))
-            {
-                return Some(ResolvedServerConfig {
-                    server_name: server_name.clone(),
-                    config: Arc::new(resolved_config),
-                });
-            }
-        }
-
-        None
     }
 
     /// Memo-resolving front for [`Self::get_all_configs_for_language`] /
@@ -612,10 +563,11 @@ impl BridgeCoordinator {
 
     /// Get all bridge server configs for a given injection language from settings.
     ///
-    /// Unlike `get_config_for_language()` which returns the first matching server,
-    /// this method returns **all** servers configured for the injection language.
-    /// This enables diagnostic fan-out to multiple servers (e.g., pyright + ruff
-    /// both handling Python).
+    /// **All** servers configured for the injection language, not a preferred
+    /// one: every consumer needs the full set — diagnostic fan-out to e.g.
+    /// pyright + ruff, codeAction command routing back to whichever server
+    /// produced it, and the eager open, where a push-only server that is
+    /// skipped never receives the region at all.
     ///
     /// Results are sorted by server name for deterministic ordering.
     ///
@@ -628,7 +580,7 @@ impl BridgeCoordinator {
         host_language: &str,
         injection_language: &str,
     ) -> Vec<ResolvedServerConfig> {
-        // Check bridge filter (same logic as get_config_for_language)
+        // Check the host's bridge filter before considering any server
         if let Some(host_settings) = settings.resolve_host_language_settings(host_language)
             && !host_settings.is_language_bridgeable(injection_language)
         {
@@ -649,7 +601,7 @@ impl BridgeCoordinator {
             .filter_map(|server_name| {
                 resolve_with_wildcard(servers, server_name, merge_bridge_server_configs)
                     .filter(|c| c.is_spawnable())
-                    .filter(|c| c.languages.iter().any(|l| l == injection_language))
+                    .filter(|c| c.handles_language(injection_language))
                     .map(|config| ResolvedServerConfig {
                         server_name: server_name.clone(),
                         config: Arc::new(config),
@@ -666,8 +618,9 @@ impl BridgeCoordinator {
     /// given host language (host-document-bridge).
     ///
     /// Selection mirrors [`Self::get_all_configs_for_language`] with the
-    /// host-path matching rule: servers whose `languages` contains the
-    /// *host* language itself. Gated on the explicit `bridge._self.enabled =
+    /// host-path matching rule: servers whose `languages` matches the *host*
+    /// language itself, via `handles_language` — so a `"*"` server qualifies
+    /// here too (any-language-server-wildcard). Gated on the explicit `bridge._self.enabled =
     /// true` opt-in ([`LanguageSettings::is_host_bridging_enabled`]) — a
     /// candidate server alone is not consent to use it.
     pub(crate) fn get_host_configs_for_language(
@@ -690,7 +643,7 @@ impl BridgeCoordinator {
             .filter_map(|server_name| {
                 resolve_with_wildcard(servers, server_name, merge_bridge_server_configs)
                     .filter(|c| c.is_spawnable())
-                    .filter(|c| c.languages.iter().any(|l| l == host_language))
+                    .filter(|c| c.handles_language(host_language))
                     .map(|config| ResolvedServerConfig {
                         server_name: server_name.clone(),
                         config: Arc::new(config),
@@ -828,6 +781,67 @@ impl BridgeCoordinator {
     // Eager spawn + open (warmup with document content)
     // ========================================
 
+    /// Which servers should receive an eager `didOpen`, and for which
+    /// injections. Grouped by server name, since several languages can share
+    /// one server (e.g. ts/tsx → tsgo).
+    ///
+    /// **Every** matching server, not a preferred one: the eager open is the
+    /// only way a push-only server ever receives a region. It issues no
+    /// request, so nothing opens the document lazily, and the pull path
+    /// returns on its capability check before `ensure_document_opened`. Any
+    /// ranking here would silently starve such a server whenever another
+    /// server also matched the language — which, for an any-language server
+    /// (any-language-server-wildcard), is every language that has a real
+    /// server of its own.
+    ///
+    /// Resolves configs once per DISTINCT language rather than per region:
+    /// resolution walks the wildcard+merge chain, and a fence-heavy document
+    /// has hundreds of regions across a handful of languages — per-region
+    /// resolution was a measured tokio-side hotspot (the caller runs on the
+    /// runtime, and starving it delays every handler).
+    ///
+    /// Pure, so the selection is unit-testable; resolving connection keys and
+    /// skipping already-open regions needs `await` and stays in the caller.
+    fn eager_open_groups(
+        &self,
+        settings: &WorkspaceSettings,
+        host_language: &str,
+        injections: Vec<BridgeInjection>,
+    ) -> BTreeMap<String, ServerGroup> {
+        let mut configs_by_lang: HashMap<String, Vec<ResolvedServerConfig>> = HashMap::new();
+        let mut groups: BTreeMap<String, ServerGroup> = BTreeMap::new();
+
+        for injection in injections {
+            let resolved = configs_by_lang
+                .entry(injection.language.clone())
+                .or_insert_with(|| {
+                    self.get_all_configs_for_language(settings, host_language, &injection.language)
+                });
+
+            // Hand the injection itself to the last server and clone only for
+            // the others, so the overwhelmingly common one-server case stays a
+            // move: `BridgeInjection` owns the region text, and this loop runs
+            // on the tokio runtime over every region in the document.
+            let Some((last, rest)) = resolved.split_last() else {
+                continue;
+            };
+            for config in rest {
+                groups
+                    .entry(config.server_name.clone())
+                    .or_insert_with(|| (config.config.clone(), Vec::new()))
+                    .1
+                    .push(injection.clone());
+            }
+            groups
+                .entry(last.server_name.clone())
+                .or_insert_with(|| (last.config.clone(), Vec::new()))
+                .1
+                .push(injection);
+        }
+
+        groups
+    }
+
     /// Eagerly spawn language servers and open virtual documents for detected injections.
     ///
     /// Sending `didOpen` up front (not just a handshake) lets downstream servers
@@ -853,62 +867,36 @@ impl BridgeCoordinator {
             }
         };
 
-        // Group injections by server name
-        // Multiple injection languages may map to the same server (e.g., ts/tsx → tsgo)
-        type ServerGroup = (Arc<BridgeServerConfig>, Vec<BridgeInjection>);
-        let mut server_groups: BTreeMap<String, ServerGroup> = BTreeMap::new();
+        // Empty means current settings resolve no server for any injection —
+        // the batch belongs to removed configuration and must stop.
+        let resolved_groups = self.eager_open_groups(settings, host_language, injections);
+        if resolved_groups.is_empty() {
+            self.cancel_eager_open(host_uri);
+            return;
+        }
 
-        // Resolve the server config once per DISTINCT language, not per region:
-        // config resolution walks the wildcard+merge chain, and a fence-heavy
-        // document has hundreds of regions across a handful of languages —
-        // per-region resolution was a measured tokio-side hotspot (this loop
-        // runs on the runtime, and starving it delays every handler).
-        let mut config_by_lang: HashMap<String, Option<ResolvedServerConfig>> = HashMap::new();
-        let mut connection_key_by_lang = HashMap::new();
-        let mut any_resolved = false;
-        for injection in injections {
-            let resolved = config_by_lang
-                .entry(injection.language.clone())
-                .or_insert_with(|| {
-                    self.get_config_for_language(settings, host_language, &injection.language)
-                });
-            if let Some(resolved) = resolved {
-                any_resolved = true;
-                let connection_key = match connection_key_by_lang.get(&injection.language) {
-                    Some(key) => key,
-                    None => {
-                        let key = self
-                            .pool
-                            .resolved_connection_key(
-                                &resolved.server_name,
-                                &resolved.config,
-                                host_uri,
-                            )
-                            .await;
-                        connection_key_by_lang.insert(injection.language.clone(), key);
-                        connection_key_by_lang
-                            .get(&injection.language)
-                            .expect("just inserted")
-                    }
-                };
-                if self.injection_open_on_connection(&host_uri_lsp, connection_key, &injection) {
-                    continue;
-                }
-                server_groups
-                    .entry(resolved.server_name.clone())
-                    .or_insert_with(|| (resolved.config.clone(), Vec::new()))
-                    .1
-                    .push(injection);
+        // Drop the regions already open on each server's connection. The key
+        // is per SERVER (`(server, root)`), so it is resolved once per group
+        // rather than once per region.
+        let mut server_groups: BTreeMap<String, ServerGroup> = BTreeMap::new();
+        for (server_name, (config, group_injections)) in resolved_groups {
+            let connection_key = self
+                .pool
+                .resolved_connection_key(&server_name, &config, host_uri)
+                .await;
+            let pending: Vec<BridgeInjection> = group_injections
+                .into_iter()
+                .filter(|injection| {
+                    !self.injection_open_on_connection(&host_uri_lsp, &connection_key, injection)
+                })
+                .collect();
+            if !pending.is_empty() {
+                server_groups.insert(server_name, (config, pending));
             }
         }
 
-        // Empty means either every resolved injection is already sent/open, or
-        // current settings resolve none. Preserve a batch only in the former
-        // case; in the latter it belongs to removed configuration and must stop.
+        // Every resolved injection is already sent/open — preserve the batch.
         if server_groups.is_empty() {
-            if !any_resolved {
-                self.cancel_eager_open(host_uri);
-            }
             return;
         }
 
@@ -1360,7 +1348,7 @@ mod tests {
 
     use super::*;
     use crate::config::LanguageSettings;
-    use crate::config::settings::BridgeLanguageConfig;
+    use crate::config::settings::{BridgeLanguageConfig, LANGUAGES_WILDCARD};
 
     #[test]
     fn reload_resolution_does_not_resurrect_deleted_server_from_wildcard() {
@@ -1497,9 +1485,9 @@ mod tests {
         };
 
         // rust should be blocked by markdown's bridge filter
-        let result = coordinator.get_config_for_language(&settings, "markdown", "rust");
+        let result = coordinator.get_all_configs_for_language(&settings, "markdown", "rust");
         assert!(
-            result.is_none(),
+            result.is_empty(),
             "rust should be blocked by markdown's bridge filter"
         );
     }
@@ -1508,8 +1496,8 @@ mod tests {
     fn injections_for_server_matches_any_fan_out_server_not_just_the_first() {
         // python bridges to BOTH ruff and pyright (codeAction fans out to all).
         // A command routed to either must still select the python injection —
-        // get_config_for_language's single first pick would miss whichever the
-        // command did NOT come from.
+        // a single first pick would miss whichever the command did NOT come
+        // from.
         let coordinator = BridgeCoordinator::new();
 
         let mut bridge_filter = HashMap::new();
@@ -1704,14 +1692,14 @@ mod tests {
         };
 
         // rust should be allowed (no filter)
-        let result = coordinator.get_config_for_language(&settings, "markdown", "rust");
-        assert!(
-            result.is_some(),
+        let result = coordinator.get_all_configs_for_language(&settings, "markdown", "rust");
+        assert_eq!(
+            result.len(),
+            1,
             "rust should be allowed when no filter is set"
         );
-        let resolved = result.unwrap();
-        assert_eq!(resolved.server_name, "rust-analyzer");
-        assert_eq!(resolved.config.cmd, vec!["rust-analyzer".to_string()]);
+        assert_eq!(result[0].server_name, "rust-analyzer");
+        assert_eq!(result[0].config.cmd, vec!["rust-analyzer".to_string()]);
     }
 
     #[test]
@@ -1777,15 +1765,9 @@ mod tests {
 
         assert!(
             coordinator
-                .get_config_for_language(&settings, "markdown", "rust")
-                .is_none(),
-            "a server whose resolved cmd is empty must be skipped"
-        );
-        assert!(
-            coordinator
                 .get_all_configs_for_language(&settings, "markdown", "rust")
                 .is_empty(),
-            "fan-out must also skip servers with empty resolved cmd"
+            "a server whose resolved cmd is empty must be skipped"
         );
         assert!(
             coordinator
@@ -1854,15 +1836,9 @@ mod tests {
 
         assert!(
             coordinator
-                .get_config_for_language(&settings, "markdown", "rust")
-                .is_none(),
-            "a server disabled via the wildcard must be skipped"
-        );
-        assert!(
-            coordinator
                 .get_all_configs_for_language(&settings, "markdown", "rust")
                 .is_empty(),
-            "fan-out must also skip servers disabled via the wildcard"
+            "a server disabled via the wildcard must be skipped"
         );
         assert!(
             coordinator
@@ -1913,9 +1889,9 @@ mod tests {
         };
 
         assert!(
-            coordinator
-                .get_config_for_language(&settings, "markdown", "rust")
-                .is_some(),
+            !coordinator
+                .get_all_configs_for_language(&settings, "markdown", "rust")
+                .is_empty(),
             "a server with an explicit enabled: true must override a disabled wildcard"
         );
     }
@@ -1971,6 +1947,326 @@ mod tests {
             result.iter().map(|r| r.server_name.as_str()).collect();
         assert!(names.contains("pyright"), "should contain pyright");
         assert!(names.contains("ruff"), "should contain ruff");
+    }
+
+    /// A server with `languages = ["*"]` plus one concrete-language server.
+    fn settings_with_any_language_server() -> WorkspaceSettings {
+        let servers = HashMap::from([
+            (
+                "harper-ls".to_string(),
+                BridgeServerConfig {
+                    cmd: vec!["harper-ls".to_string()],
+                    languages: vec![LANGUAGES_WILDCARD.to_string()],
+                    ..Default::default()
+                },
+            ),
+            (
+                "rust-analyzer".to_string(),
+                BridgeServerConfig {
+                    cmd: vec!["rust-analyzer".to_string()],
+                    languages: vec!["rust".to_string()],
+                    ..Default::default()
+                },
+            ),
+        ]);
+
+        WorkspaceSettings {
+            auto_install: false,
+            language_servers: servers,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn any_language_server_is_a_candidate_for_every_injection_language() {
+        let coordinator = BridgeCoordinator::new();
+        let settings = settings_with_any_language_server();
+
+        // Named-language server + wildcard server both match rust...
+        let names: std::collections::HashSet<String> = coordinator
+            .get_all_configs_for_language(&settings, "markdown", "rust")
+            .into_iter()
+            .map(|r| r.server_name)
+            .collect();
+        assert!(names.contains("harper-ls"));
+        assert!(names.contains("rust-analyzer"));
+
+        // ...and the wildcard server alone matches a language no server names.
+        let names: Vec<String> = coordinator
+            .get_all_configs_for_language(&settings, "markdown", "toml")
+            .into_iter()
+            .map(|r| r.server_name)
+            .collect();
+        assert_eq!(names, vec!["harper-ls".to_string()]);
+    }
+
+    fn injection(language: &str, region_id: &str) -> BridgeInjection {
+        BridgeInjection {
+            language: language.to_string(),
+            region_id: region_id.to_string(),
+            content: String::new(),
+        }
+    }
+
+    #[test]
+    fn eager_open_reaches_every_server_matching_the_language() {
+        // The eager open is the ONLY way a push-only server (one that
+        // publishes diagnostics rather than answering pulls) ever receives a
+        // region: it issues no request, so nothing opens the document lazily,
+        // and the pull path returns on its capability check before
+        // `ensure_document_opened`. Resolving one server per language starves
+        // it whenever another server also matches — and for a `"*"` server
+        // that is every language that has a real server of its own.
+        let coordinator = BridgeCoordinator::new();
+        let settings = settings_with_any_language_server();
+
+        let groups = coordinator.eager_open_groups(
+            &settings,
+            "markdown",
+            vec![injection("rust", "r1"), injection("toml", "r2")],
+        );
+
+        let names: Vec<&str> = groups.keys().map(String::as_str).collect();
+        assert_eq!(names, vec!["harper-ls", "rust-analyzer"]);
+
+        // The wildcard server takes both regions; the rust server takes only
+        // the one it handles.
+        let harper: Vec<&str> = groups["harper-ls"]
+            .1
+            .iter()
+            .map(|i| i.region_id.as_str())
+            .collect();
+        assert_eq!(harper, vec!["r1", "r2"]);
+        let ra: Vec<&str> = groups["rust-analyzer"]
+            .1
+            .iter()
+            .map(|i| i.region_id.as_str())
+            .collect();
+        assert_eq!(ra, vec!["r1"]);
+    }
+
+    #[tokio::test]
+    async fn eager_open_spawns_a_task_for_every_group_not_just_the_first() {
+        // `eager_open_groups` deciding on two servers is worthless if the
+        // dispatch loop below it only acts on one — the push-only server would
+        // still get no `didOpen`. Pin the loop itself: one registered task per
+        // group. The commands are unspawnable on purpose; the assertion is
+        // about dispatch, and the batch is cancelled before anything runs.
+        let coordinator = BridgeCoordinator::new();
+        let mut settings = settings_with_any_language_server();
+        for config in settings.language_servers.values_mut() {
+            config.cmd = vec!["/nonexistent/kakehashi-test-server".to_string()];
+        }
+        let host_uri = Url::parse("file:///test.md").unwrap();
+
+        coordinator
+            .eager_spawn_and_open_documents(
+                &settings,
+                "markdown",
+                &host_uri,
+                1,
+                vec![injection("rust", "r1")],
+            )
+            .await;
+
+        let handles = coordinator
+            .eager_open_tasks
+            .get(&host_uri)
+            .map(|batch| batch.handles.len());
+        coordinator.cancel_eager_open(&host_uri);
+
+        assert_eq!(
+            handles,
+            Some(2),
+            "both the rust server and the wildcard server must get a task"
+        );
+    }
+
+    #[test]
+    fn eager_open_groups_are_empty_when_nothing_bridges() {
+        // Distinguishes "resolved nothing" from "everything already open" for
+        // the caller, which cancels a stale batch only in the former case.
+        let coordinator = BridgeCoordinator::new();
+        let settings = WorkspaceSettings {
+            auto_install: false,
+            ..Default::default()
+        };
+
+        assert!(
+            coordinator
+                .eager_open_groups(&settings, "markdown", vec![injection("rust", "r1")])
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn any_language_server_works_under_the_real_shipped_defaults() {
+        // The hand-built settings above leave `languages` empty, which makes
+        // `resolve_host_language_settings` return None and skips the bridge
+        // filter entirely. Real configs always carry the shipped `languages._`
+        // entry, so the filter branch *is* live — and it is the branch that
+        // decides whether a `"*"` server reaches a language with no
+        // `languages.<lang>` entry of its own. Pin the zero-config path.
+        let coordinator = BridgeCoordinator::new();
+        let mut settings = settings_with_any_language_server();
+        settings.languages = crate::config::defaults::default_settings().languages;
+        assert!(
+            settings.languages.contains_key("_"),
+            "the shipped defaults must carry the wildcard language entry"
+        );
+
+        let names: Vec<String> = coordinator
+            .get_all_configs_for_language(&settings, "markdown", "toml")
+            .into_iter()
+            .map(|r| r.server_name)
+            .collect();
+        assert_eq!(
+            names,
+            vec!["harper-ls".to_string()],
+            "a `\"*\"` server must reach an injection language that no \
+             `languages.<lang>` entry mentions"
+        );
+    }
+
+    #[test]
+    fn any_language_server_still_obeys_the_host_bridge_filter() {
+        // `"*"` widens the *server* axis (which servers can answer), not the
+        // *language* axis (which injections the host bridges at all). A host
+        // that only enables python must not gain rust bridging for free.
+        let coordinator = BridgeCoordinator::new();
+        let mut settings = settings_with_any_language_server();
+        settings.languages.insert(
+            "markdown".to_string(),
+            LanguageSettings {
+                bridge: Some(HashMap::from([(
+                    "python".to_string(),
+                    BridgeLanguageConfig {
+                        enabled: Some(true),
+                        ..Default::default()
+                    },
+                )])),
+                ..Default::default()
+            },
+        );
+
+        assert!(
+            coordinator
+                .get_all_configs_for_language(&settings, "markdown", "rust")
+                .is_empty(),
+            "the host's bridge filter must still block rust"
+        );
+        assert!(
+            !coordinator
+                .get_all_configs_for_language(&settings, "markdown", "python")
+                .is_empty(),
+            "the wildcard server must answer the language the host does enable"
+        );
+    }
+
+    #[test]
+    fn any_language_server_reaches_the_host_axis_only_when_opted_in() {
+        // `handles_language` is shared by both axes, so a `"*"` server is a
+        // host candidate for every language — but candidacy is not consent:
+        // `bridge._self.enabled = true` still gates the host path.
+        let coordinator = BridgeCoordinator::new();
+        let mut settings = settings_with_any_language_server();
+        // The shipped `languages._` carries `bridge._` but no `_self`, so the
+        // gate is genuinely evaluated and genuinely says no. Leaving
+        // `languages` empty would instead make `resolve_host_language_settings`
+        // return None and short-circuit `is_some_and` before the gate runs —
+        // the assertion would then hold even if the gate were deleted.
+        settings.languages = crate::config::defaults::default_settings().languages;
+
+        assert!(
+            coordinator
+                .get_host_configs_for_language(&settings, "lua")
+                .is_empty(),
+            "without the _self opt-in the host axis stays empty"
+        );
+
+        settings.languages.insert(
+            "lua".to_string(),
+            LanguageSettings {
+                bridge: Some(HashMap::from([(
+                    "_self".to_string(),
+                    BridgeLanguageConfig {
+                        enabled: Some(true),
+                        ..Default::default()
+                    },
+                )])),
+                ..Default::default()
+            },
+        );
+
+        let names: Vec<String> = coordinator
+            .get_host_configs_for_language(&settings, "lua")
+            .into_iter()
+            .map(|r| r.server_name)
+            .collect();
+        assert_eq!(names, vec!["harper-ls".to_string()]);
+    }
+
+    #[test]
+    fn any_language_is_inheritable_from_the_wildcard_server_entry() {
+        // wildcard-config-inheritance: `languageServers._.languages = ["*"]`
+        // reaches a concrete server that omits `languages` entirely.
+        let coordinator = BridgeCoordinator::new();
+        let servers = HashMap::from([
+            (
+                "_".to_string(),
+                BridgeServerConfig {
+                    languages: vec![LANGUAGES_WILDCARD.to_string()],
+                    ..Default::default()
+                },
+            ),
+            (
+                "harper-ls".to_string(),
+                BridgeServerConfig {
+                    cmd: vec!["harper-ls".to_string()],
+                    ..Default::default()
+                },
+            ),
+            // ...but a concrete server that DOES declare `languages` keeps its
+            // own narrower list. This is the containment guarantee for the
+            // documented `_.languages = ["*"]` footgun: the wildcard reaches
+            // only the servers that stayed silent, so listing real languages
+            // is a working opt-out.
+            (
+                "rust-analyzer".to_string(),
+                BridgeServerConfig {
+                    cmd: vec!["rust-analyzer".to_string()],
+                    languages: vec!["rust".to_string()],
+                    ..Default::default()
+                },
+            ),
+        ]);
+        let settings = WorkspaceSettings {
+            auto_install: false,
+            language_servers: servers,
+            ..Default::default()
+        };
+
+        let names: Vec<String> = coordinator
+            .get_all_configs_for_language(&settings, "markdown", "toml")
+            .into_iter()
+            .map(|r| r.server_name)
+            .collect();
+        assert_eq!(
+            names,
+            vec!["harper-ls".to_string()],
+            "the wildcard must not leak into a server with its own list"
+        );
+
+        let names: Vec<String> = coordinator
+            .get_all_configs_for_language(&settings, "markdown", "rust")
+            .into_iter()
+            .map(|r| r.server_name)
+            .collect();
+        assert_eq!(
+            names,
+            vec!["harper-ls".to_string(), "rust-analyzer".to_string()],
+            "both answer for rust, in the documented name-sorted order"
+        );
     }
 
     #[test]
@@ -2176,9 +2472,9 @@ mod tests {
         };
 
         // "quarto" is configured with an empty bridge — should be blocked
-        let result = coordinator.get_config_for_language(&settings, "quarto", "rust");
+        let result = coordinator.get_all_configs_for_language(&settings, "quarto", "rust");
         assert!(
-            result.is_none(),
+            result.is_empty(),
             "quarto with empty bridge map should block all bridging"
         );
     }
@@ -2403,9 +2699,9 @@ mod tests {
 
         // "markdown" is not in settings.languages (auto-discovered at runtime).
         // It should still inherit "_"'s bridge filter that blocks lua.
-        let result = coordinator.get_config_for_language(&settings, "markdown", "lua");
+        let result = coordinator.get_all_configs_for_language(&settings, "markdown", "lua");
         assert!(
-            result.is_none(),
+            result.is_empty(),
             "unconfigured host should inherit '_'s bridge filter — lua should be blocked"
         );
     }
