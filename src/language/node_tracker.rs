@@ -173,7 +173,7 @@ impl UriEntries {
             }
             self.reverse.remove(&existing.ulid);
         }
-        let ulid = Ulid::new();
+        let ulid = Ulid::generate();
         self.forward.insert(key, TrackedUlid { ulid, incarnation });
         self.reverse
             .insert(ulid, TrackedPosition { key, incarnation });
@@ -1670,7 +1670,7 @@ mod tests {
         let uri = test_uri("reverse_unknown");
 
         // No entries exist for this URI yet.
-        let stray = Ulid::new();
+        let stray = Ulid::generate();
         assert_eq!(tracker.lookup_position(&uri, &stray), None);
 
         // Adding an unrelated entry must not make the stray ULID resolvable.
