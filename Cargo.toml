@@ -128,7 +128,7 @@ tree-sitter-lua = "0.5"
 streaming-iterator = "0.1"
 filetime = "0.2"
 insta = { version = "1", features = ["json", "redactions"] }
-serial_test = "3"
+serial_test = "4"
 rstest = "0.26"
 
 # A/B performance comparison of the semantic-tokens hot path across two server
