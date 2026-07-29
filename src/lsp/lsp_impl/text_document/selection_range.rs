@@ -89,9 +89,9 @@ impl Kakehashi {
             }
         };
 
-        // A resolved-but-tree-less snapshot (no parser installed, install failed,
-        // or the parse produced nothing — see `ParseSnapshot`) cannot produce
-        // selection ranges.
+        // A resolved-but-tree-less snapshot cannot produce selection ranges. See
+        // `ParseSnapshot` for the causes — they include a settings-reload
+        // placeholder that reads as current, so this is not only a failure path.
         if snapshot.tree.is_none() {
             return Ok(None);
         }

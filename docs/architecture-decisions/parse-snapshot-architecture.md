@@ -101,9 +101,9 @@ mapping is not one-to-one and must be stated precisely:
   `slot.snapshot.is_some()` (a parse for this lifetime has completed at least once)
   and **`has_tree`** = `slot.snapshot.as_ref().and_then(|s| s.tree.as_ref()).is_some()`. A
   **resolved-but-tree-less** outcome — a parse that completed with no usable tree
-  (no parser installed, install failed, or the parse produced nothing — deadline
-  abort, grammar panic, reload/retry exhaustion), distinct from the pre-first-parse
-  `None` — is `resolved && !has_tree`; it advances
+  (no parser installed, install failed, no usable tree reached the publish, or a
+  settings-reload placeholder awaiting its reparse — see `ParseSnapshot`), distinct
+  from the pre-first-parse `None` — is `resolved && !has_tree`; it advances
   `parsed_version` and releases first-parse waiters (who then fall through to their
   empty / `null` / `ContentModified` paths), which the old boolean `has_tree` could
   not express.
