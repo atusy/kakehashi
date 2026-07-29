@@ -521,6 +521,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "fs4"
+version = "1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7e72ed92b67c146290f88e9c89d60ca163ea417a446f61ffd7b72df3e7f1dfd5"
+dependencies = [
+ "rustix 1.1.4",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "futures"
 version = "0.3.33"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -968,7 +978,7 @@ dependencies = [
  "env_logger",
  "filetime",
  "flate2",
- "fs4",
+ "fs4 1.1.0",
  "futures",
  "ignore",
  "indexmap",
@@ -2349,7 +2359,7 @@ checksum = "8ac98a906517ad790c8eb896d4ad170479bb72f6081971658ab94f71528a34cf"
 dependencies = [
  "cc",
  "etcetera",
- "fs4",
+ "fs4 0.12.0",
  "indoc",
  "libloading",
  "log",
