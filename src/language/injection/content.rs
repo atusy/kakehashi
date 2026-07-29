@@ -115,6 +115,21 @@ pub(crate) fn parse_with_deadline(
     old_tree: Option<&tree_sitter::Tree>,
     deadline: std::time::Instant,
 ) -> Option<tree_sitter::Tree> {
+    parse_with_deadline_cancellable(parser, text, old_tree, deadline, None)
+}
+
+/// [`parse_with_deadline`] with a version-scoped cooperative cancellation hook.
+pub(crate) fn parse_with_deadline_cancellable(
+    parser: &mut tree_sitter::Parser,
+    text: &str,
+    old_tree: Option<&tree_sitter::Tree>,
+    deadline: std::time::Instant,
+    cancel: Option<&crate::cancel::CancelToken>,
+) -> Option<tree_sitter::Tree> {
+    if crate::cancel::is_cancelled(cancel) {
+        parser.reset();
+        return None;
+    }
     let bytes = text.as_bytes();
     // The callback fires at tree-sitter's internal progress intervals, which
     // can be very frequent on large inputs; sample the clock every 128
@@ -124,7 +139,9 @@ pub(crate) fn parse_with_deadline(
     let mut calls: u32 = 0;
     let mut on_progress = |_: &tree_sitter::ParseState| {
         calls = calls.wrapping_add(1);
-        if calls.is_multiple_of(128) && std::time::Instant::now() >= deadline {
+        let cancelled = calls.is_multiple_of(64) && crate::cancel::is_cancelled(cancel);
+        let timed_out = calls.is_multiple_of(128) && std::time::Instant::now() >= deadline;
+        if cancelled || timed_out {
             std::ops::ControlFlow::Break(())
         } else {
             std::ops::ControlFlow::Continue(())
@@ -244,6 +261,26 @@ mod tests {
     use super::*;
     use crate::language::injection::{collect_all_injections, compute_included_ranges};
     use tree_sitter::{Parser, Query, StreamingIterator};
+
+    #[test]
+    fn native_parse_stops_for_cancelled_version() {
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_rust::LANGUAGE.into())
+            .unwrap();
+        let cancel = crate::cancel::CancelToken::default();
+        cancel.cancel();
+
+        let parsed = parse_with_deadline_cancellable(
+            &mut parser,
+            "fn main() {}",
+            None,
+            std::time::Instant::now() + std::time::Duration::from_secs(60),
+            Some(&cancel),
+        );
+
+        assert!(parsed.is_none(), "obsolete parse must stop without a tree");
+    }
 
     /// Helper to set up a markdown parser and injection query, parse text,
     /// and return the first injection's content node byte range and included ranges.

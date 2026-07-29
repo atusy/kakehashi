@@ -16,7 +16,7 @@ pub(crate) use delta::calculate_delta_or_full;
 pub(crate) use legend::{LEGEND_MODIFIERS, LEGEND_TYPES};
 #[cfg(test)]
 pub(crate) use parallel::DISCOVERY_REUSE_HITS;
-pub(crate) use parallel::build_document_discovery;
+pub(crate) use parallel::build_document_discovery_cancellable;
 pub(crate) use range::filter_semantic_tokens_by_range;
 
 // Re-export for parallel processing

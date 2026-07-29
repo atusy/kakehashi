@@ -21,7 +21,7 @@ use crate::analysis::{
 };
 use crate::language::LanguageCoordinator;
 use crate::language::NodeTracker;
-use crate::language::injection::{CacheableInjectionRegion, collect_all_injections};
+use crate::language::injection::CacheableInjectionRegion;
 
 use super::semantic_request_tracker::SemanticRequestTracker;
 
@@ -198,6 +198,7 @@ impl CacheCoordinator {
     /// parse.
     #[must_use]
     #[allow(clippy::too_many_arguments)]
+    #[cfg(test)]
     pub(crate) fn populate_injections(
         &self,
         uri: &Url,
@@ -211,6 +212,39 @@ impl CacheCoordinator {
         build_bridge_regions: bool,
         build_resolved_regions: bool,
     ) -> Option<PopulatedInjections> {
+        self.populate_injections_cancellable(
+            uri,
+            text,
+            tree,
+            language_name,
+            language,
+            tracker,
+            entry_mint_epoch,
+            incarnation,
+            build_bridge_regions,
+            build_resolved_regions,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn populate_injections_cancellable(
+        &self,
+        uri: &Url,
+        text: &str,
+        tree: &Tree,
+        language_name: &str,
+        language: &LanguageCoordinator,
+        tracker: &NodeTracker,
+        entry_mint_epoch: (u64, u64),
+        incarnation: u64,
+        build_bridge_regions: bool,
+        build_resolved_regions: bool,
+        cancel: Option<&crate::cancel::CancelToken>,
+    ) -> Option<PopulatedInjections> {
+        if crate::cancel::is_cancelled(cancel) {
+            return None;
+        }
         // Snapshot the generation FIRST — before reading the injection query or
         // resolving any language below — so the stamp can never be *newer* than
         // the queries the discovery was built with. A reload swaps queries and
@@ -251,8 +285,15 @@ impl CacheCoordinator {
         };
 
         // Collect all injection regions from the parsed tree
-        if let Some(regions) =
-            collect_all_injections(&tree.root_node(), text, Some(injection_query.as_ref()))
+        let regions = crate::language::injection::collect_all_injections_cancellable(
+            &tree.root_node(),
+            text,
+            Some(injection_query.as_ref()),
+            cancel,
+        )?;
+        if crate::cancel::is_cancelled(cancel) {
+            return None;
+        }
         {
             if regions.is_empty() {
                 // Clear any existing regions and caches for this document —
@@ -279,18 +320,20 @@ impl CacheCoordinator {
             // pre-lever path) and defer identity to the next current pass —
             // the tracker is meanwhile kept live by the ordinary didChange
             // edit-shift.
-            let region_keys = regions
-                .iter()
-                .map(|info| {
-                    (
-                        info.content_node.start_byte(),
-                        info.content_node.end_byte(),
-                        info.content_node.kind(),
-                        info.pattern_index,
-                        info.language.as_str(),
-                    )
-                })
-                .collect::<Vec<_>>();
+            let mut work_items = 0;
+            let mut region_keys = Vec::with_capacity(regions.len());
+            for info in &regions {
+                if crate::cancel::is_cancelled_periodically(cancel, &mut work_items) {
+                    return None;
+                }
+                region_keys.push((
+                    info.content_node.start_byte(),
+                    info.content_node.end_byte(),
+                    info.content_node.kind(),
+                    info.pattern_index,
+                    info.language.as_str(),
+                ));
+            }
             let region_ids = tracker.mint_named_batch_if_unshifted_for_incarnation(
                 uri,
                 entry_mint_epoch,
@@ -302,27 +345,36 @@ impl CacheCoordinator {
             // Convert to CacheableInjectionRegion pairing each region with
             // its reconciled ULID (index-aligned with `regions` by the batch
             // contract).
-            let cacheable_regions: Vec<CacheableInjectionRegion> = regions
-                .iter()
-                .zip(&region_ids)
-                .map(|(info, ulid)| {
-                    let region_id = ulid.to_string();
-                    CacheableInjectionRegion::from_region_info(info, &region_id, text)
-                })
-                .collect();
+            if crate::cancel::is_cancelled(cancel) {
+                return None;
+            }
+            let mut cacheable_regions = Vec::with_capacity(regions.len());
+            for (info, ulid) in regions.iter().zip(&region_ids) {
+                if crate::cancel::is_cancelled_periodically(cancel, &mut work_items) {
+                    return None;
+                }
+                let region_id = ulid.to_string();
+                cacheable_regions.push(CacheableInjectionRegion::from_region_info(
+                    info, &region_id, text,
+                ));
+            }
 
             // Resolve once for every consumer that needs resolved language /
             // virtual content. In production the bridge and whole-document
             // gates rise together, so resolving independently would duplicate
             // the language-detection chain on the parse critical path.
-            let resolved = (build_bridge_regions || build_resolved_regions).then(|| {
-                crate::language::injection::InjectionResolver::resolve_from_prebuilt(
+            let resolved = if build_bridge_regions || build_resolved_regions {
+                let resolved = crate::language::injection::InjectionResolver::resolve_from_prebuilt_cancellable(
                     language,
                     &regions,
                     &cacheable_regions,
                     text,
-                )
-            });
+                    cancel,
+                )?;
+                Some(resolved)
+            } else {
+                None
+            };
 
             // Bridge-downstream regions from the SAME collected `regions`
             // (parse-snapshot ADR §3, never discover twice): the exact
@@ -354,13 +406,17 @@ impl CacheCoordinator {
             let resolved_regions = build_resolved_regions
                 .then(|| resolved.expect("whole-document regions requested resolution"));
 
+            if crate::cancel::is_cancelled(cancel) {
+                return None;
+            }
+
             // Producer half of the discovery lever: build the owned discovery
             // from the SAME `regions` just collected — the injection query (`Q`)
             // is not re-run — so a semanticTokens request bound to the snapshot
             // this parse publishes can rebuild its contexts without
             // re-discovering. `None` when not worth reusing
             // (gate/combined/incomplete).
-            let discovery = crate::analysis::semantic::build_document_discovery(
+            let discovery = crate::analysis::semantic::build_document_discovery_cancellable(
                 &regions,
                 &cacheable_regions,
                 injection_query.as_ref(),
@@ -370,7 +426,8 @@ impl CacheCoordinator {
                 tracker,
                 generation,
                 incarnation,
-            );
+                cancel,
+            )?;
 
             // Live-hash set for the content-addressed injection-token cache's
             // eviction sweep, taken from the DISCOVERY's own per-region cache
@@ -393,6 +450,10 @@ impl CacheCoordinator {
                         .collect()
                 })
                 .unwrap_or_default();
+
+            if crate::cancel::is_cancelled(cancel) {
+                return None;
+            }
 
             // Exit half of the mint reconciliation, atomic with coordinate
             // shifts: the commit runs under the tracker entry's exclusive
@@ -422,15 +483,13 @@ impl CacheCoordinator {
                     .retain_document(uri, &live_hashes);
             });
             committed?;
-            return Some(PopulatedInjections {
+            Some(PopulatedInjections {
                 discovery,
                 bridge_regions,
                 resolved_regions,
                 generation,
-            });
+            })
         }
-
-        Some(PopulatedInjections::empty(generation))
     }
 
     /// Get all injection regions for a document (test helper).
@@ -857,6 +916,101 @@ mod tests {
         // Cancel all requests
         cache.cancel_requests(&uri);
         assert!(!cache.is_request_active(&uri, req));
+    }
+
+    #[test]
+    fn cancelled_populate_commits_no_injection_state() {
+        use tree_sitter::{Parser, Query};
+
+        let cache = CacheCoordinator::new();
+        let tracker = NodeTracker::new();
+        let coordinator = LanguageCoordinator::new();
+        let uri = create_test_uri("cancelled-populate.md");
+        let language: tree_sitter::Language = tree_sitter_md::LANGUAGE.into();
+        let query = Query::new(
+            &language,
+            r#"(fenced_code_block
+                  (info_string (language) @injection.language)
+                  (code_fence_content) @injection.content)"#,
+        )
+        .unwrap();
+        coordinator
+            .query_store()
+            .insert_injection_query("markdown".to_string(), std::sync::Arc::new(query));
+        let text = "```lua\nprint(1)\n```\n";
+        let mut parser = Parser::new();
+        parser.set_language(&language).unwrap();
+        let tree = parser.parse(text, None).unwrap();
+        let cancel = crate::cancel::CancelToken::default();
+        cancel.cancel();
+
+        let populated = cache.populate_injections_cancellable(
+            &uri,
+            text,
+            &tree,
+            "markdown",
+            &coordinator,
+            &tracker,
+            tracker.mint_epoch(&uri),
+            1,
+            true,
+            true,
+            Some(&cancel),
+        );
+
+        assert!(populated.is_none());
+        assert!(
+            cache.get_injections(&uri).is_none(),
+            "cancelled populate must not commit partial regions"
+        );
+    }
+
+    #[test]
+    fn populate_stops_after_discovery_when_version_turns_obsolete() {
+        use tree_sitter::{Parser, Query};
+
+        let cache = CacheCoordinator::new();
+        let tracker = NodeTracker::new();
+        let coordinator = LanguageCoordinator::new();
+        let uri = create_test_uri("cancel-after-discovery.md");
+        let language: tree_sitter::Language = tree_sitter_md::LANGUAGE.into();
+        let query = Query::new(
+            &language,
+            r#"(fenced_code_block
+                  (info_string (language) @injection.language)
+                  (code_fence_content) @injection.content)"#,
+        )
+        .unwrap();
+        coordinator
+            .query_store()
+            .insert_injection_query("markdown".to_string(), std::sync::Arc::new(query));
+        let text = "```lua\nprint(1)\n```\n";
+        let mut parser = Parser::new();
+        parser.set_language(&language).unwrap();
+        let tree = parser.parse(text, None).unwrap();
+        let cancel = crate::cancel::CancelToken::default();
+        // Population and discovery poll at entry, then discovery at exit for
+        // this small document. The next population-stage checkpoint must
+        // observe the fourth poll.
+        cancel.cancel_after_polls(4);
+
+        let populated = cache.populate_injections_cancellable(
+            &uri,
+            text,
+            &tree,
+            "markdown",
+            &coordinator,
+            &tracker,
+            tracker.mint_epoch(&uri),
+            1,
+            true,
+            true,
+            Some(&cancel),
+        );
+
+        assert!(populated.is_none());
+        assert!(cancel.is_cancelled());
+        assert!(cache.get_injections(&uri).is_none());
     }
 
     /// Integration test: language change with stable region_id triggers cache invalidation.

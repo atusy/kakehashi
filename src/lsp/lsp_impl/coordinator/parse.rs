@@ -56,8 +56,11 @@ fn parse_text_with_deadline(
     text: &str,
     old_tree: Option<&tree_sitter::Tree>,
     deadline: std::time::Instant,
+    cancel: Option<&crate::cancel::CancelToken>,
 ) -> Option<tree_sitter::Tree> {
-    crate::language::injection::parse_with_deadline(parser, text, old_tree, deadline)
+    crate::language::injection::parse_with_deadline_cancellable(
+        parser, text, old_tree, deadline, cancel,
+    )
 }
 
 /// The settled+stale gate for the parse loop's `semanticTokens/refresh`
@@ -106,6 +109,26 @@ pub(crate) struct ParseCoordinator {
     bridge: std::sync::Arc<BridgeCoordinator>,
 }
 
+/// Run a populate work-unit cooperatively cancelled, but keep awaiting it.
+///
+/// `ComputePool::run(Some(cancel), ..)` releases its async awaiter as soon as
+/// cancellation fires even when the synchronous closure has already started.
+/// Populate mutates shared injection caches at its final epoch-gated commit, so
+/// its caller must not proceed to a newer populate while the old closure can
+/// still be running. The closure polls this token internally and returns
+/// quickly when obsolete; `run(None, ..)` preserves the required join.
+async fn run_awaited_populate<T, F>(
+    pool: &crate::compute_pool::ComputePool,
+    cancel: crate::cancel::CancelToken,
+    work: F,
+) -> Option<T>
+where
+    T: Send + 'static,
+    F: FnOnce(crate::cancel::CancelToken) -> T + Send + 'static,
+{
+    pool.run(None, move || work(cancel)).await
+}
+
 impl ParseCoordinator {
     pub(crate) fn new(server: &Kakehashi) -> Self {
         Self::from_parts(ParseCoordinatorDeps {
@@ -140,9 +163,10 @@ impl ParseCoordinator {
     ///
     /// The caller provides the actual parse logic via `parse_fn`, which receives a
     /// `tree_sitter::Parser`, the work-unit's wall-clock deadline (feed it to
-    /// [`parse_text_with_deadline`]), and whether this attempt follows a parser
-    /// generation change. Incremental callers must drop old-tree seeds on that
-    /// retry because the replacement parser may use a different grammar.
+    /// [`parse_text_with_deadline`]), whether this attempt follows a parser
+    /// generation change, and the optional cancellation token. Incremental callers
+    /// must drop old-tree seeds on that retry because the replacement parser may
+    /// use a different grammar.
     /// The `parser_pool` sync mutex is acquired **only on the pool thread** (the
     /// parse-snapshot ADR's Stage-1 obligation: a tokio worker must never block on
     /// a mutex a compute thread holds), briefly around acquire and release; the
@@ -153,6 +177,7 @@ impl ParseCoordinator {
     /// Returns `None` if:
     /// - No parser is available for the language
     /// - The parse work-unit panicked
+    /// - The document input version became obsolete before or during parsing
     /// - The native parse aborted itself at its `PARSE_TIMEOUT` in-parse
     ///   deadline (anchored at dequeue, via tree-sitter's progress callback),
     ///   so a pathological parse cannot pin a bounded-pool thread past its
@@ -168,10 +193,16 @@ impl ParseCoordinator {
         language_name: &str,
         uri: &Url,
         text_len: usize,
+        cancel: Option<crate::cancel::CancelToken>,
         parse_fn: F,
     ) -> Option<T>
     where
-        F: FnMut(tree_sitter::Parser, std::time::Instant, bool) -> (tree_sitter::Parser, Option<T>)
+        F: FnMut(
+                tree_sitter::Parser,
+                std::time::Instant,
+                bool,
+                Option<&crate::cancel::CancelToken>,
+            ) -> (tree_sitter::Parser, Option<T>)
             + Send
             + 'static,
         T: Send + 'static,
@@ -180,14 +211,21 @@ impl ParseCoordinator {
 
         let parser_pool = std::sync::Arc::clone(&self.parser_pool);
         let language_name_owned = language_name.to_string();
+        let cancel_for_work = cancel.clone();
         let result = tokio::time::timeout(
             PARSE_AWAIT_BACKSTOP,
-            self.compute_pool.run(None, move || {
+            self.compute_pool.run(cancel, move || {
                 let mut parse_fn = parse_fn;
                 let mut language_name_owned = language_name_owned;
                 for attempt in 0..2 {
+                    if crate::cancel::is_cancelled(cancel_for_work.as_ref()) {
+                        return None;
+                    }
                     let reload_wait_deadline = std::time::Instant::now() + RELOAD_WAIT_BACKSTOP;
                     let (parser, parser_generation) = loop {
+                        if crate::cancel::is_cancelled(cancel_for_work.as_ref()) {
+                            return None;
+                        }
                         match parser_pool
                             .lock()
                             .recover_poison("ParseCoordinator::parse_with_pool(acquire)")
@@ -221,7 +259,8 @@ impl ParseCoordinator {
                     // tree-less until the next edit). The awaiter above covers
                     // queue + parse with slack, so the result is not dropped.
                     let deadline = std::time::Instant::now() + PARSE_TIMEOUT;
-                    let (parser, value) = parse_fn(parser, deadline, attempt != 0);
+                    let (parser, value) =
+                        parse_fn(parser, deadline, attempt != 0, cancel_for_work.as_ref());
                     match parser_pool
                         .lock()
                         .recover_poison("ParseCoordinator::parse_with_pool(release)")
@@ -311,6 +350,7 @@ impl ParseCoordinator {
     /// query — the semantic discovery and the bridge-downstream regions — both
     /// destined for the snapshot this pass publishes (ADR §3,
     /// don't-discover-twice). `(None, None)` when the work-unit panicked.
+    #[allow(clippy::too_many_arguments)] // One immutable parse snapshot plus its version token.
     async fn populate_injections_on_pool(
         &self,
         uri: Url,
@@ -319,6 +359,7 @@ impl ParseCoordinator {
         language_name: String,
         incarnation: u64,
         content_version: u64,
+        version_cancel: crate::cancel::CancelToken,
     ) -> PopulatedSnapshotRegions {
         let cache = std::sync::Arc::clone(&self.cache);
         let language = std::sync::Arc::clone(&self.language);
@@ -379,40 +420,40 @@ impl ParseCoordinator {
             .settings_manager
             .load_settings()
             .any_bridge_server_runnable();
-        self.compute_pool
-            .run(None, move || {
-                // A refused pass (`None`) maps to all-`None` region fields —
-                // the snapshot then rides WITHOUT regions and readers fall
-                // back to inline resolution. Mapping it to the ran-and-empty
-                // shape instead would publish "no injections" for a pass
-                // that never derived anything, blanking the document's
-                // injections until the next parse.
-                let Some(populated) = cache.populate_injections(
-                    &uri,
-                    &text,
-                    &tree,
-                    &language_name,
-                    &language,
-                    &tracker,
-                    entry_mint_epoch,
-                    incarnation,
-                    build_bridge_regions,
-                    build_bridge_regions,
-                ) else {
-                    return PopulatedSnapshotRegions::default();
-                };
-                PopulatedSnapshotRegions {
-                    discovery: populated.discovery.map(std::sync::Arc::new),
-                    bridge_regions: populated
-                        .bridge_regions
-                        .map(|regions| (populated.generation, std::sync::Arc::new(regions))),
-                    resolved_regions: populated
-                        .resolved_regions
-                        .map(|regions| (populated.generation, std::sync::Arc::new(regions))),
-                }
-            })
-            .await
-            .unwrap_or_default()
+        run_awaited_populate(&self.compute_pool, version_cancel, move |cancel_for_work| {
+            // A refused pass (`None`) maps to all-`None` region fields —
+            // the snapshot then rides WITHOUT regions and readers fall
+            // back to inline resolution. Mapping it to the ran-and-empty
+            // shape instead would publish "no injections" for a pass
+            // that never derived anything, blanking the document's
+            // injections until the next parse.
+            let Some(populated) = cache.populate_injections_cancellable(
+                &uri,
+                &text,
+                &tree,
+                &language_name,
+                &language,
+                &tracker,
+                entry_mint_epoch,
+                incarnation,
+                build_bridge_regions,
+                build_bridge_regions,
+                Some(&cancel_for_work),
+            ) else {
+                return PopulatedSnapshotRegions::default();
+            };
+            PopulatedSnapshotRegions {
+                discovery: populated.discovery.map(std::sync::Arc::new),
+                bridge_regions: populated
+                    .bridge_regions
+                    .map(|regions| (populated.generation, std::sync::Arc::new(regions))),
+                resolved_regions: populated
+                    .resolved_regions
+                    .map(|regions| (populated.generation, std::sync::Arc::new(regions))),
+            }
+        })
+        .await
+        .unwrap_or_default()
     }
 
     /// Parse the (already-registered) document at `uri` and publish the result.
@@ -467,10 +508,15 @@ impl ParseCoordinator {
         // wakes its readers (they fall back). Unreachable while this parse is inline on
         // the writer ticket (a `didClose` is gated behind the open); the guard is for
         // the off-ingress open flip (#6), where a `didClose`/reopen can race it.
-        let Some((text, incarnation, content_version)) = self
-            .documents
-            .get(&uri)
-            .map(|doc| (doc.text_arc(), doc.incarnation(), doc.content_version()))
+        let Some((text, incarnation, content_version, version_cancel)) =
+            self.documents.get(&uri).map(|doc| {
+                (
+                    doc.text_arc(),
+                    doc.incarnation(),
+                    doc.content_version(),
+                    doc.version_cancel_token(),
+                )
+            })
         else {
             return false;
         };
@@ -564,10 +610,16 @@ impl ParseCoordinator {
                     &language_name,
                     &uri,
                     text.len(),
-                    move |mut parser, deadline, _generation_retry| {
+                    Some(version_cancel.clone()),
+                    move |mut parser, deadline, _generation_retry, cancel| {
                         let _ = auto_install.begin_parsing(&language_name_clone);
-                        let parse_result =
-                            parse_text_with_deadline(&mut parser, &text_for_parse, None, deadline);
+                        let parse_result = parse_text_with_deadline(
+                            &mut parser,
+                            &text_for_parse,
+                            None,
+                            deadline,
+                            cancel,
+                        );
                         let _ = auto_install.end_parsing(&language_name_clone);
                         (parser, parse_result)
                     },
@@ -616,6 +668,7 @@ impl ParseCoordinator {
                         language_name.clone(),
                         incarnation,
                         content_version,
+                        version_cancel.clone(),
                     )
                     .await
                 } else {
@@ -822,7 +875,7 @@ impl ParseCoordinator {
             // than parse its text with this lifetime's (possibly relabelled-away)
             // grammar (the CAS would reject it anyway; this just avoids the wasted
             // parses).
-            let (text, content_version) = {
+            let (text, content_version, version_cancel) = {
                 let Some(doc) = self.documents.get(&uri) else {
                     break;
                 };
@@ -835,7 +888,11 @@ impl ParseCoordinator {
                 // `text_arc()` is a refcount bump, not a full copy (#498) — the
                 // original stays here for the CAS while a cheap clone goes to the
                 // blocking parse closure.
-                (doc.text_arc(), doc.content_version())
+                (
+                    doc.text_arc(),
+                    doc.content_version(),
+                    doc.version_cancel_token(),
+                )
             };
 
             let text_len = text.len();
@@ -850,10 +907,16 @@ impl ParseCoordinator {
                     &language_name,
                     &uri,
                     text_len,
-                    move |mut parser, deadline, _generation_retry| {
+                    Some(version_cancel.clone()),
+                    move |mut parser, deadline, _generation_retry, cancel| {
                         let _ = auto_install.begin_parsing(&language_name_clone);
-                        let result =
-                            parse_text_with_deadline(&mut parser, &text_for_parse, None, deadline);
+                        let result = parse_text_with_deadline(
+                            &mut parser,
+                            &text_for_parse,
+                            None,
+                            deadline,
+                            cancel,
+                        );
                         let _ = auto_install.end_parsing(&language_name_clone);
                         (parser, result)
                     },
@@ -893,6 +956,7 @@ impl ParseCoordinator {
                     language_name.clone(),
                     expected_incarnation,
                     content_version,
+                    version_cancel.clone(),
                 )
                 .await
             } else {
@@ -973,7 +1037,7 @@ impl ParseCoordinator {
         // `pending_seed` (a cheap `Tree` refcount-clone) is the edit's incremental
         // parse seed stashed by `didChange`; `None` for a full-text sync / freshly
         // installed parse, in which case we parse from scratch.
-        let (language_name, language_id, text, seed, incarnation, content_version) = {
+        let (language_name, language_id, text, seed, incarnation, content_version, version_cancel) = {
             let Some(doc) = self.documents.get(uri) else {
                 return;
             };
@@ -996,6 +1060,7 @@ impl ParseCoordinator {
                 seed,
                 incarnation,
                 doc.content_version(),
+                doc.version_cancel_token(),
             )
         };
 
@@ -1053,7 +1118,8 @@ impl ParseCoordinator {
                 &language_name,
                 uri,
                 text_len,
-                move |mut parser, deadline, generation_retry| {
+                Some(version_cancel.clone()),
+                move |mut parser, deadline, generation_retry, cancel| {
                     let _ = auto_install.begin_parsing(&language_name_clone);
                     let result = parse_text_with_deadline(
                         &mut parser,
@@ -1064,6 +1130,7 @@ impl ParseCoordinator {
                             seed.as_ref()
                         },
                         deadline,
+                        cancel,
                     );
                     let _ = auto_install.end_parsing(&language_name_clone);
                     (parser, result)
@@ -1105,6 +1172,7 @@ impl ParseCoordinator {
                     language_name.clone(),
                     incarnation,
                     content_version,
+                    version_cancel.clone(),
                 )
                 .await
             } else {
@@ -1205,6 +1273,40 @@ mod tests {
         assert_eq!(snapshot.incarnation, incarnation);
     }
 
+    #[tokio::test]
+    async fn cancelled_populate_keeps_awaiter_joined_until_work_returns() {
+        let pool = crate::compute_pool::test_pool();
+        let cancel = crate::cancel::CancelToken::default();
+        let cancel_for_work = cancel.clone();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+
+        let task = tokio::spawn(async move {
+            run_awaited_populate(&pool, cancel_for_work, move |work_cancel| {
+                started_tx.send(()).expect("test receiver should wait");
+                release_rx.recv().expect("test should release work");
+                work_cancel.is_cancelled()
+            })
+            .await
+        });
+        started_rx.await.expect("populate work should start");
+
+        cancel.cancel();
+        tokio::task::yield_now().await;
+        assert!(
+            !task.is_finished(),
+            "version cancellation must not detach an in-flight populate"
+        );
+
+        release_tx
+            .send(())
+            .expect("populate work should still wait");
+        assert_eq!(
+            task.await.expect("populate task should not panic"),
+            Some(true)
+        );
+    }
+
     /// The four documented invariants of the settle-refresh gate.
     #[test]
     fn settle_refresh_gate_emits_only_for_settled_and_stale() {
@@ -1267,7 +1369,7 @@ mod tests {
 
         let expired = std::time::Instant::now();
         let started = std::time::Instant::now();
-        let aborted = parse_text_with_deadline(&mut parser, &text, None, expired);
+        let aborted = parse_text_with_deadline(&mut parser, &text, None, expired, None);
         assert!(aborted.is_none(), "an expired deadline aborts the parse");
         assert!(
             started.elapsed() < PARSE_TIMEOUT,
@@ -1276,7 +1378,7 @@ mod tests {
 
         // The reset parser is immediately reusable on the same input.
         let future = std::time::Instant::now() + std::time::Duration::from_secs(60);
-        let parsed = parse_text_with_deadline(&mut parser, &text, None, future);
+        let parsed = parse_text_with_deadline(&mut parser, &text, None, future, None);
         assert!(parsed.is_some(), "a live deadline parses normally");
     }
 }

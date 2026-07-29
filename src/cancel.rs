@@ -1,4 +1,4 @@
-//! Cooperative cancellation for long-running semantic-token computation.
+//! Cooperative cancellation for long-running blocking computation.
 //!
 //! A full-document semantic-token compute runs on the bounded `ComputePool` and
 //! fans out across its Rayon workers. Dropping its future does **not** preempt
@@ -8,13 +8,13 @@
 //! typing on a large document that turns into a pile-up: every keystroke
 //! supersedes the previous request, but the superseded compute keeps running.
 //!
-//! [`CancelToken`] is the escape hatch. A compute polls it during the host-query
-//! walk, once per injection region during discovery/tokenization, and throughout
-//! final token shaping, then bails early once it is set. The token is flipped when
-//! the request is superseded by a newer one for the same document, when the client
-//! sends `$/cancelRequest`, or when the document closes — so an obsolete compute
-//! stops instead of running to completion (see
-//! `lsp::semantic_request_tracker::SemanticRequestTracker`).
+//! [`CancelToken`] is the escape hatch. Semantic-token work polls it during query
+//! walks and final shaping. Parse and injection-snapshot work additionally polls a
+//! token scoped to the document input version, including while waiting for scarce
+//! pool capacity and inside tree-sitter's progress callback. Tokens are flipped
+//! when a request is superseded, the client sends `$/cancelRequest`, a newer input
+//! version arrives, or the document closes. Obsolete work therefore stops instead
+//! of running to completion.
 
 /// A shared cancellation signal: cheap to poll from blocking compute AND
 /// awaitable from async parks. Clones share the same state, so one side can

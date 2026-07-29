@@ -1117,7 +1117,8 @@ mod tests {
                 "test",
                 &url::Url::parse("file:///reload-race.test").unwrap(),
                 0,
-                move |parser, _deadline, generation_retry| {
+                None,
+                move |parser, _deadline, generation_retry, _cancel| {
                     let call = calls_for_parse.fetch_add(1, Ordering::SeqCst);
                     assert_eq!(generation_retry, call != 0);
                     if call == 0 {
@@ -1194,7 +1195,8 @@ mod tests {
                 "test",
                 &url::Url::parse("file:///stuck-reload.test").unwrap(),
                 0,
-                |parser, _deadline, _generation_retry| (parser, Some(1)),
+                None,
+                |parser, _deadline, _generation_retry, _cancel| (parser, Some(1)),
             )
             .await;
 
