@@ -1,7 +1,6 @@
 pub(crate) mod config_store;
 pub(crate) mod coordinator;
 pub(crate) mod events;
-pub(crate) mod failed_parsers;
 pub(crate) mod heuristic;
 pub mod injection;
 pub(crate) mod loader;
@@ -19,7 +18,6 @@ pub(crate) mod registry;
 
 pub(crate) use coordinator::LanguageCoordinator;
 pub(crate) use events::{LanguageEvent, LanguageLogLevel};
-pub(crate) use failed_parsers::FailedParserRegistry;
 pub(crate) use parser_pool::DocumentParserPool;
 pub(crate) use query_predicates::filter_captures;
 

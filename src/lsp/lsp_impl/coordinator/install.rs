@@ -204,9 +204,8 @@ impl InstallCoordinator {
             return false;
         }
 
-        // Every no-reparse outcome lands here — Failed/Unsupported/NoDataDir/
-        // ParserFailed (the did_open auto-install branch never runs
-        // parse_document regardless) as well as AlreadyInstalling. None of
+        // Every no-reparse outcome lands here — Failed/Unsupported/NoDataDir
+        // as well as AlreadyInstalling. None of
         // them publishes a snapshot anywhere
         // below, so release a parked first-parse waiter with a tree-less
         // snapshot (bootstrap-gated inside) instead of letting every request
@@ -393,7 +392,6 @@ impl InstallCoordinator {
             documents: std::sync::Arc::clone(&self.documents),
             cache: std::sync::Arc::clone(&self.cache),
             settings_manager: std::sync::Arc::clone(&self.settings_manager),
-            auto_install: self.auto_install.clone(),
             bridge: std::sync::Arc::clone(&self.bridge),
         })
     }
@@ -828,11 +826,12 @@ mod tests {
         let (service, mut socket) = LspService::new(Kakehashi::new);
         let server = service.inner();
         let language = "stale-install-language";
-        server
-            .auto_install
-            .failed_parsers_handle()
-            .mark_failed(language)
-            .unwrap();
+        // Hold an install claim so a regressed staleness guard would fall
+        // through to `try_install`'s `AlreadyInstalling` branch — an immediate,
+        // network-free early return that DOES emit an event. Without it the
+        // fall-through would reach the support lookup and emit nothing within
+        // this test's window, hiding the regression.
+        let _claim = server.auto_install.begin_test_claim(language);
         let uri = Url::parse("file:///workspace/stale-install.txt").unwrap();
         let old_incarnation = server.documents.insert(
             uri.clone(),
@@ -849,17 +848,26 @@ mod tests {
         );
         assert_ne!(new_incarnation, old_incarnation);
 
-        assert!(
-            !server
-                .install_coordinator()
-                .maybe_auto_install_language(language, uri, false, Some(old_incarnation), true,)
-                .await
-        );
+        // Bounded: the held claim makes a regressed guard park on the
+        // `AlreadyInstalling` completion wait instead of returning.
+        let stale = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            server.install_coordinator().maybe_auto_install_language(
+                language,
+                uri,
+                false,
+                Some(old_incarnation),
+                true,
+            ),
+        )
+        .await
+        .expect("a stale task must return without awaiting an install");
+        assert!(!stale);
         assert!(
             tokio::time::timeout(std::time::Duration::from_millis(10), socket.next())
                 .await
                 .is_err(),
-            "a stale task must not emit parser failure or install progress events"
+            "a stale task must not emit install progress events"
         );
     }
 }

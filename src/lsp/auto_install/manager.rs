@@ -1,6 +1,5 @@
 //! Parser auto-install coordinator: dedupes concurrent installs
-//! (`InstallingLanguages`), tracks crashed parsers (`FailedParserRegistry`),
-//! and runs the install.
+//! (`InstallingLanguages`) and runs the install.
 //!
 //! Returns `InstallResult` with events instead of calling `ClientNotifier`
 //! directly — keeps this module free of LSP infrastructure so it can be
@@ -21,7 +20,6 @@ use crate::error::LockResultExt;
 use crate::install::support_check::{
     TrackedSupportCheck, should_skip_unsupported_language_tracked,
 };
-use crate::language::FailedParserRegistry;
 
 use super::{InstallingLanguages, InstallingLanguagesExt};
 
@@ -111,8 +109,6 @@ pub(crate) enum InstallOutcome {
     AlreadyInstalling,
     /// The owner disappeared before producing a terminal install result
     Abandoned,
-    /// Parser previously crashed, skipping to protect system
-    ParserFailed,
     /// Language not supported by nvim-treesitter
     Unsupported,
     /// Installation failed
@@ -149,14 +145,11 @@ pub(crate) enum InstallEvent {
 /// Handles installation state and execution without depending on other
 /// coordinators, returning events that Kakehashi dispatches to `ClientNotifier`.
 /// Thread-safe and cheaply cloneable (all `Arc`-based) for sharing across async
-/// tasks: `InstallingLanguages` is `Arc<Mutex<HashSet>>` and
-/// `FailedParserRegistry` uses sharded-lock `DashSet`/`DashMap`.
+/// tasks: `InstallingLanguages` is `Arc<Mutex<HashSet>>`.
 #[derive(Clone)]
 pub(crate) struct AutoInstallManager {
     /// Tracks languages currently being installed to prevent duplicates
     installing_languages: InstallingLanguages,
-    /// Tracks parsers that have crashed to prevent repeated failures
-    failed_parsers: FailedParserRegistry,
     claims: Arc<Mutex<HashMap<String, ClaimState>>>,
 }
 
@@ -164,7 +157,6 @@ impl std::fmt::Debug for AutoInstallManager {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AutoInstallManager")
             .field("installing_languages", &"InstallingLanguages")
-            .field("failed_parsers", &"FailedParserRegistry")
             .finish()
     }
 }
@@ -208,13 +200,9 @@ impl Drop for InstallMarkerGuard {
 
 impl AutoInstallManager {
     /// Create a new `AutoInstallManager`.
-    pub fn new(
-        installing_languages: InstallingLanguages,
-        failed_parsers: FailedParserRegistry,
-    ) -> Self {
+    pub fn new(installing_languages: InstallingLanguages) -> Self {
         Self {
             installing_languages,
-            failed_parsers,
             claims: Arc::new(Mutex::new(HashMap::new())),
         }
     }
@@ -257,77 +245,6 @@ impl AutoInstallManager {
             Vec::new(),
             guard.expect("test result claim is present"),
         )
-    }
-
-    /// Initialize the failed parser registry with crash detection.
-    ///
-    /// State storage location: `KAKEHASHI_STATE_DIR` if set, else the default
-    /// data directory, falling back to a `kakehashi` dir under the OS temp dir
-    /// if neither resolves. Crash-recovery state (`parsing_in_progress`,
-    /// `failed_parsers`) is ephemeral and conceptually distinct from the
-    /// persistent parser/query install assets in the data dir; the override
-    /// lets it live elsewhere — e.g. so concurrent test processes that share one
-    /// read-only install dir can isolate their crash state and not poison each
-    /// other (a leftover `parsing_in_progress` from another process is otherwise
-    /// read as a crash and marks that parser failed).
-    /// If initialization fails, returns an empty registry.
-    pub fn init_failed_parser_registry() -> FailedParserRegistry {
-        let state_dir = std::env::var_os("KAKEHASHI_STATE_DIR")
-            // An empty value resolves to the process cwd (writing crash files
-            // wherever it was started), so treat it as unset — matching how
-            // `resolve_data_dir` handles an empty `KAKEHASHI_DATA_DIR`.
-            .filter(|v| !v.is_empty())
-            .map(PathBuf::from)
-            .or_else(crate::install::default_data_dir)
-            // Platform-aware last resort (not a hard-coded `/tmp`, which doesn't
-            // exist on Windows); only reached if the data dir can't resolve.
-            .unwrap_or_else(|| std::env::temp_dir().join("kakehashi"));
-
-        let registry = FailedParserRegistry::new(&state_dir);
-
-        // Initialize and detect any previous crashes
-        if let Err(e) = registry.init() {
-            log::warn!(
-                target: "kakehashi::crash_recovery",
-                "Failed to initialize crash recovery state: {}",
-                e
-            );
-        }
-
-        registry
-    }
-
-    /// Check if a parser has previously crashed and should be skipped.
-    pub fn is_parser_failed(&self, language: &str) -> bool {
-        self.failed_parsers.is_failed(language)
-    }
-
-    /// Record that parsing is starting for crash detection.
-    ///
-    /// Should be called before parsing a document.
-    pub fn begin_parsing(&self, language: &str) -> std::io::Result<()> {
-        self.failed_parsers.begin_parsing(language)
-    }
-
-    /// Record that parsing completed successfully.
-    ///
-    /// Should be called after parsing completes without crashing.
-    pub fn end_parsing(&self, language: &str) -> std::io::Result<()> {
-        self.failed_parsers.end_parsing_language(language)
-    }
-
-    /// Persist crash detection state on shutdown.
-    ///
-    /// Should be called during graceful shutdown.
-    pub fn persist_state(&self) -> std::io::Result<()> {
-        self.failed_parsers.persist_state()
-    }
-
-    /// Clone-handle to the crash-detection registry (`Arc`-backed), for tasks
-    /// that outlive `&self` — the signal-reap task persists crash-detection
-    /// state before exiting, exactly like the graceful shutdown path.
-    pub fn failed_parsers_handle(&self) -> FailedParserRegistry {
-        self.failed_parsers.clone()
     }
 
     /// Attempt to install a language parser.
@@ -388,24 +305,6 @@ impl AutoInstallManager {
         IFut: Future<Output = crate::install::InstallResult> + Send + 'static,
     {
         let mut events = Vec::new();
-
-        // Check if parser previously failed (crash protection)
-        if self.failed_parsers.is_failed(language) {
-            events.push(InstallEvent::Log {
-                level: MessageType::WARNING,
-                message: format!(
-                    "Parser '{}' previously crashed. Skipping auto-install. \
-                     Clear with: kakehashi language clear-failed {}",
-                    language, language
-                ),
-            });
-            return InstallResult {
-                outcome: InstallOutcome::ParserFailed,
-                events,
-                completion: None,
-                claim: None,
-            };
-        }
 
         // Claim before the network-backed support lookup so concurrent calls
         // for the same language do not all fetch metadata. Ordinary early
@@ -722,14 +621,9 @@ impl AutoInstallManager {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tempfile::tempdir;
 
-    fn create_test_manager() -> (AutoInstallManager, tempfile::TempDir) {
-        let temp = tempdir().expect("Failed to create temp dir");
-        let installing = InstallingLanguages::new();
-        let failed = FailedParserRegistry::new(temp.path());
-        failed.init().expect("Failed to init registry");
-        (AutoInstallManager::new(installing, failed), temp)
+    fn create_test_manager() -> AutoInstallManager {
+        AutoInstallManager::new(InstallingLanguages::new())
     }
 
     async fn wait_for_terminal(
@@ -745,26 +639,6 @@ mod tests {
         })
         .await
         .expect("install claim must publish a terminal outcome")
-    }
-
-    #[test]
-    fn test_is_parser_failed_returns_false_for_new_parser() {
-        let (manager, _temp) = create_test_manager();
-        assert!(!manager.is_parser_failed("lua"));
-    }
-
-    #[test]
-    fn test_crash_tracking_workflow() {
-        let (manager, _temp) = create_test_manager();
-
-        // Start parsing
-        manager.begin_parsing("lua").expect("begin_parsing failed");
-
-        // End parsing successfully
-        manager.end_parsing("lua").expect("end_parsing failed");
-
-        // Parser should not be marked as failed
-        assert!(!manager.is_parser_failed("lua"));
     }
 
     #[test]
@@ -798,7 +672,7 @@ mod tests {
 
     #[tokio::test]
     async fn cancelled_owner_preserves_detached_install_success_for_exact_waiter() {
-        let (manager, _temp) = create_test_manager();
+        let manager = create_test_manager();
         let owner_manager = manager.clone();
         let (started_tx, started_rx) = tokio::sync::oneshot::channel();
         let (release_tx, release_rx) = tokio::sync::oneshot::channel();
@@ -853,7 +727,7 @@ mod tests {
 
     #[tokio::test]
     async fn panicked_support_task_abandons_exact_claim_and_allows_retry() {
-        let (manager, _temp) = create_test_manager();
+        let manager = create_test_manager();
         let owner_manager = manager.clone();
         let (started_tx, started_rx) = tokio::sync::oneshot::channel();
         let (release_tx, release_rx) = tokio::sync::oneshot::channel();
@@ -890,7 +764,7 @@ mod tests {
 
     #[tokio::test]
     async fn panicked_install_task_abandons_exact_claim_and_allows_retry() {
-        let (manager, _temp) = create_test_manager();
+        let manager = create_test_manager();
         let owner_manager = manager.clone();
         let (started_tx, started_rx) = tokio::sync::oneshot::channel();
         let (release_tx, release_rx) = tokio::sync::oneshot::channel();
@@ -936,7 +810,7 @@ mod tests {
             atomic::{AtomicUsize, Ordering},
         };
 
-        let (manager, _temp) = create_test_manager();
+        let manager = create_test_manager();
         let lookup_count = Arc::new(AtomicUsize::new(0));
         let first_manager = manager.clone();
         let first_lookup_count = Arc::clone(&lookup_count);
@@ -1022,7 +896,7 @@ mod tests {
 
     #[tokio::test]
     async fn skipped_support_lookup_releases_install_claim() {
-        let (manager, _temp) = create_test_manager();
+        let manager = create_test_manager();
 
         let result = manager
             .try_install_with_support_check("unsupported", |_, _| async {
@@ -1042,12 +916,9 @@ mod tests {
 
     #[tokio::test]
     async fn stale_installing_marker_is_repaired_without_panicking() {
-        let temp = tempdir().unwrap();
         let installing = InstallingLanguages::new();
         assert!(installing.try_start_install("stale-marker"));
-        let failed = FailedParserRegistry::new(temp.path());
-        failed.init().unwrap();
-        let manager = AutoInstallManager::new(installing.clone(), failed);
+        let manager = AutoInstallManager::new(installing.clone());
 
         let result = manager
             .try_install_with_support_check("stale-marker", |_, _| async {
@@ -1062,7 +933,7 @@ mod tests {
 
     #[tokio::test]
     async fn timed_out_support_work_keeps_claim_until_completion() {
-        let (manager, _temp) = create_test_manager();
+        let manager = create_test_manager();
         let (release_tx, release_rx) = tokio::sync::oneshot::channel();
 
         let result = manager
@@ -1113,7 +984,7 @@ mod tests {
 
     #[tokio::test]
     async fn supported_result_without_returned_claim_fails_closed() {
-        let (manager, _temp) = create_test_manager();
+        let manager = create_test_manager();
 
         let result = manager
             .try_install_with_support_check("lua", |_, _| async {
@@ -1140,7 +1011,7 @@ mod tests {
             atomic::{AtomicUsize, Ordering},
         };
 
-        let (manager, _temp) = create_test_manager();
+        let manager = create_test_manager();
         let task_manager = manager.clone();
         let (started_tx, started_rx) = tokio::sync::oneshot::channel();
         let (release_tx, release_rx) = tokio::sync::oneshot::channel();
@@ -1197,7 +1068,7 @@ mod tests {
 
     #[tokio::test]
     async fn cancelled_caller_keeps_claim_after_lookup_timeout() {
-        let (manager, _temp) = create_test_manager();
+        let manager = create_test_manager();
         let task_manager = manager.clone();
         let (lookup_started_tx, lookup_started_rx) = tokio::sync::oneshot::channel();
         let (timeout_tx, timeout_rx) = tokio::sync::oneshot::channel();
@@ -1243,26 +1114,6 @@ mod tests {
         })
         .await
         .expect("claim keeper must release after timed-out blocking work finishes");
-    }
-
-    #[tokio::test]
-    async fn test_try_install_returns_parser_failed_for_crashed_parser() {
-        let (manager, _temp) = create_test_manager();
-
-        // Mark parser as failed
-        manager
-            .failed_parsers
-            .mark_failed("bad_parser")
-            .expect("mark_failed failed");
-
-        // Try to install
-        let result = manager.try_install("bad_parser").await;
-
-        assert_eq!(result.outcome, InstallOutcome::ParserFailed);
-        assert!(result.events.iter().any(|e| matches!(
-            e,
-            InstallEvent::Log { level: MessageType::WARNING, message } if message.contains("previously crashed")
-        )));
     }
 
     #[test]

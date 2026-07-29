@@ -1,6 +1,5 @@
 use crate::document::DocumentStore;
 use crate::language::{DocumentParserPool, LanguageCoordinator};
-use crate::lsp::auto_install::AutoInstallManager;
 use crate::lsp::bridge::BridgeCoordinator;
 use crate::lsp::cache::CacheCoordinator;
 use crate::lsp::client::ClientNotifier;
@@ -90,7 +89,6 @@ pub(super) struct ParseCoordinatorDeps {
     pub(super) documents: std::sync::Arc<DocumentStore>,
     pub(super) cache: std::sync::Arc<CacheCoordinator>,
     pub(super) settings_manager: std::sync::Arc<SettingsManager>,
-    pub(super) auto_install: AutoInstallManager,
     pub(super) bridge: std::sync::Arc<BridgeCoordinator>,
 }
 
@@ -102,7 +100,6 @@ pub(crate) struct ParseCoordinator {
     documents: std::sync::Arc<DocumentStore>,
     cache: std::sync::Arc<CacheCoordinator>,
     settings_manager: std::sync::Arc<SettingsManager>,
-    auto_install: AutoInstallManager,
     bridge: std::sync::Arc<BridgeCoordinator>,
 }
 
@@ -116,7 +113,6 @@ impl ParseCoordinator {
             documents: std::sync::Arc::clone(&server.documents),
             cache: std::sync::Arc::clone(&server.cache),
             settings_manager: std::sync::Arc::clone(&server.settings_manager),
-            auto_install: server.auto_install.clone(),
             bridge: std::sync::Arc::clone(&server.bridge),
         })
     }
@@ -130,7 +126,6 @@ impl ParseCoordinator {
             documents: deps.documents,
             cache: deps.cache,
             settings_manager: deps.settings_manager,
-            auto_install: deps.auto_install,
             bridge: deps.bridge,
         }
     }
@@ -494,54 +489,6 @@ impl ParseCoordinator {
             .detect_language(uri.path(), &text, None, language_id);
 
         if let Some(language_name) = language_name {
-            if self.auto_install.is_parser_failed(&language_name) {
-                log::warn!(
-                    target: "kakehashi::crash_recovery",
-                    "Skipping parsing for '{}' - parser previously crashed",
-                    language_name
-                );
-                // Mark the parse finished only if the result actually landed: a
-                // `didClose` that removed the document mid-parse (or a `didChange` /
-                // reopen that moved the text or incarnation on) makes the CAS a no-op,
-                // and `mark_parse_finished` would otherwise recreate a parse-state
-                // entry (via `parse_sender`'s vacant insert) for the gone URI. The
-                // text + incarnation guard is what makes this resurrection-safe once
-                // the open parse runs off the ingress ticket (#6).
-                if self.documents.set_parse_result_if_inputs_unchanged(
-                    &uri,
-                    &text,
-                    incarnation,
-                    content_version,
-                    Some(&language_name),
-                    None,
-                ) {
-                    self.documents
-                        .mark_parse_finished(&uri, parse_generation, false);
-                }
-                // Resolved-but-tree-less snapshot (ADR §2): the parse completed
-                // with no usable tree; publishing it advances parsed_version so
-                // a first-parse waiter releases to its empty fallback.
-                self.publish_parse_snapshot(
-                    &uri,
-                    crate::document::snapshot::ParseSnapshot {
-                        text: text.clone(),
-                        tree: None,
-                        language: Some(language_name.clone()),
-                        parsed_version: content_version,
-                        incarnation,
-                        injection_regions: None,
-                        bridge_regions: None,
-                        resolved_regions: None,
-                        layer_trees: std::sync::OnceLock::new(),
-                    },
-                );
-                advance_watermark();
-                self.notifier().log_language_events(&events).await;
-                // No tree landed (the parser previously crashed): the open caller
-                // must not run its tree-dependent downstream.
-                return false;
-            }
-
             let load_result = self
                 .language
                 .ensure_language_loaded_async(&language_name)
@@ -556,8 +503,6 @@ impl ParseCoordinator {
             // text violates tree-sitter's incremental contract and corrupts external
             // scanners (#348).
             let text_for_parse = text.clone();
-            let auto_install = self.auto_install.clone();
-            let language_name_clone = language_name.clone();
 
             let parsed_tree = if load_result.success {
                 self.parse_with_pool(
@@ -565,10 +510,8 @@ impl ParseCoordinator {
                     &uri,
                     text.len(),
                     move |mut parser, deadline, _generation_retry| {
-                        let _ = auto_install.begin_parsing(&language_name_clone);
                         let parse_result =
                             parse_text_with_deadline(&mut parser, &text_for_parse, None, deadline);
-                        let _ = auto_install.end_parsing(&language_name_clone);
                         (parser, parse_result)
                     },
                 )
@@ -798,11 +741,6 @@ impl ParseCoordinator {
                 .publish_giveup_snapshot(&uri, expected_incarnation);
             return;
         };
-        if self.auto_install.is_parser_failed(&language_name) {
-            self.documents
-                .publish_giveup_snapshot(&uri, expected_incarnation);
-            return;
-        }
         let load_result = self
             .language
             .ensure_language_loaded_async(&language_name)
@@ -839,8 +777,6 @@ impl ParseCoordinator {
             };
 
             let text_len = text.len();
-            let auto_install = self.auto_install.clone();
-            let language_name_clone = language_name.clone();
             // Hand a cheap `Arc<str>` clone (refcount bump) to the blocking closure;
             // the original stays here for the CAS below, so the (potentially large)
             // document text is never copied.
@@ -851,10 +787,8 @@ impl ParseCoordinator {
                     &uri,
                     text_len,
                     move |mut parser, deadline, _generation_retry| {
-                        let _ = auto_install.begin_parsing(&language_name_clone);
                         let result =
                             parse_text_with_deadline(&mut parser, &text_for_parse, None, deadline);
-                        let _ = auto_install.end_parsing(&language_name_clone);
                         (parser, result)
                     },
                 )
@@ -1019,11 +953,6 @@ impl ParseCoordinator {
             advance_watermark();
             return;
         };
-        if self.auto_install.is_parser_failed(&language_name) {
-            self.documents.publish_giveup_snapshot(uri, incarnation);
-            advance_watermark();
-            return;
-        }
         let load_result = self
             .language
             .ensure_language_loaded_async(&language_name)
@@ -1038,8 +967,6 @@ impl ParseCoordinator {
         }
 
         let text_len = text.len();
-        let auto_install = self.auto_install.clone();
-        let language_name_clone = language_name.clone();
         // Hand a cheap `Arc<str>` clone (refcount bump) to the blocking closure; the
         // original stays here for the CAS + injection populate below. The seed (also
         // a cheap `Tree` refcount-clone) makes this an **incremental** parse when an
@@ -1054,7 +981,6 @@ impl ParseCoordinator {
                 uri,
                 text_len,
                 move |mut parser, deadline, generation_retry| {
-                    let _ = auto_install.begin_parsing(&language_name_clone);
                     let result = parse_text_with_deadline(
                         &mut parser,
                         &text_for_parse,
@@ -1065,7 +991,6 @@ impl ParseCoordinator {
                         },
                         deadline,
                     );
-                    let _ = auto_install.end_parsing(&language_name_clone);
                     (parser, result)
                 },
             )
