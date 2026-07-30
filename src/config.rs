@@ -693,6 +693,11 @@ mod tests {
                 (
                     "markdown".to_string(),
                     LanguageSettings {
+                        // Self-based so it escapes the wildcard: otherwise the
+                        // reversed-arm mutation would let `_`'s `false` override
+                        // markdown's `true`, and `rmd` would land on `false` for
+                        // the wrong reason — passing this test by accident.
+                        base: Some("markdown".to_string()),
                         auto_install: Some(true),
                         ..Default::default()
                     },

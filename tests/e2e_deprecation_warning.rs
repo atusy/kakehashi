@@ -2,13 +2,13 @@
 //! (`rootMarkers`, the top-level `autoInstall`, and the unwrapped
 //! `didChangeConfiguration` shape).
 //!
-//! The notice is surfaced by `initialize` and `workspace/didChangeConfiguration`
+//! Each notice is surfaced by `initialize` and `workspace/didChangeConfiguration`
 //! sharing a single session-scoped claim guard, so it fires at most once even
-//! when config keeps carrying the deprecated key. This drives it through
-//! didChangeConfiguration (whose notifications, unlike a warning emitted during
-//! the `initialize` request, are observable by the test client) to prove the
-//! warn-path works and the guard suppresses the repeat. The guard and detectors
-//! are also covered in isolation by unit tests.
+//! when config keeps carrying the deprecated key. Most tests drive it through
+//! didChangeConfiguration, whose notifications the ordinary synchronous request
+//! helper does not discard; the one initialize-path test sends `initialize`
+//! asynchronously so the notifications preceding its response are retained too.
+//! The guard and detectors are also covered in isolation by unit tests.
 
 #![cfg(feature = "e2e")]
 
@@ -435,22 +435,31 @@ fn e2e_auto_install_deprecation_warns_at_initialize_and_not_again_on_didchange()
     );
     let (_response, watched) = client
         .receive_response_for_id_watching_notifications(initialize_id, &["window/showMessage"]);
-    let notices: Vec<_> = watched
-        .iter()
-        .filter(|(_, params)| is_auto_install_deprecation_notice(params))
-        .collect();
+    let mut notice = watched
+        .into_iter()
+        .find(|(_, params)| is_auto_install_deprecation_notice(params));
+
+    // The warning is enqueued before the initialize handler returns, but the
+    // server merges its response and its client-notification streams without an
+    // ordering guarantee, so the response can reach stdout first. Position is
+    // therefore not asserted — presence is: if the notice was not in the
+    // pre-response batch it is still in the stream, so wait for it. Delete
+    // `show_warning` and neither place has it, and this times out.
+    client.send_notification("initialized", json!({}));
+    if notice.is_none() {
+        notice = client.wait_for_notification_where(
+            &["window/showMessage"],
+            TIMEOUT,
+            is_auto_install_deprecation_notice,
+        );
+    }
+    let (_, notice_params) =
+        notice.expect("a config file carrying top-level autoInstall must warn at initialize");
     assert_eq!(
-        notices.len(),
-        1,
-        "a config file carrying top-level autoInstall must warn exactly once at \
-         initialize; got: {watched:?}"
-    );
-    assert_eq!(
-        notices[0].1["type"].as_i64(),
+        notice_params["type"].as_i64(),
         Some(2),
         "deprecation notice should be MessageType::WARNING"
     );
-    client.send_notification("initialized", json!({}));
 
     // And the claim it consumed is shared with the didChange path: pushing the
     // same deprecated key now yields the config-updated log with no popup ahead
