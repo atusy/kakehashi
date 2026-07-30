@@ -92,10 +92,13 @@ process's working directory — which for an editor-spawned server belongs to
 whoever launched the editor.
 
 Anchoring and expansion walk the same enumeration,
-`crate::config::paths::path_fields_mut`, which destructures `LanguageSettings`
-exhaustively. Two independent lists would drift silently: a new path field
-expanded but never anchored is this issue back for that field alone, and one
-anchored but never expanded hands a literal `~` to the filesystem.
+`crate::config::paths::path_fields_mut`. Two independent lists would drift
+silently: a new path field expanded but never anchored is this issue back for
+that field alone, and one anchored but never expanded hands a literal `~` to the
+filesystem. The walk destructures `LanguageSettings` and `QueryItem`
+exhaustively, so a new field on either fails to compile until it is classified;
+a new *top-level* path field is not covered, since `searchPaths` reaches the
+walk as a parameter.
 
 Bases per layer: a config file uses its own directory (each `--config-file`
 layer its own), `initializationOptions` and `didChangeConfiguration` use the

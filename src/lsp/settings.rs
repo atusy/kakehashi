@@ -220,9 +220,11 @@ fn read_explicit_layers(
         // catches them there.
         //
         // Judged *before* anchoring, so the value the error quotes is the one
-        // the user can find in their file. The verdict is the same either way —
-        // anchoring only ever prepends literal characters, escaping any `$` in
-        // the directory name — so this costs nothing but reads better.
+        // the user can find in their file. The verdict is the same either way:
+        // anchoring cannot introduce an expansion error, since it prepends an
+        // absolute base whose own `$` it escapes, and cannot remove one, since
+        // it declines to fold a value carrying a variable. So this costs
+        // nothing and reads better.
         if let Some(raw_settings) = layer.as_ref()
             && let Err(errs) = WorkspaceSettings::try_from_settings(raw_settings, home, &env_fn)
             && let Some(details) = errs.path_error_summary()

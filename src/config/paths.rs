@@ -9,9 +9,16 @@
 //! `~` handed to the filesystem). Neither failure is a compile error, and
 //! neither is loud at runtime.
 //!
+//! What the compiler enforces, precisely: [`path_fields_mut`] destructures
+//! [`LanguageSettings`] and [`QueryItem`] exhaustively, so a new field on
+//! either fails to build until someone classifies it. A new *top-level* path
+//! field on `RawWorkspaceSettings` is not covered — `search_paths` reaches this
+//! module as a parameter, because the two callers hold different shapes of it —
+//! so adding one means adding it here by hand.
+//!
 //! [`WorkspaceSettings::try_from_settings`]: crate::config::WorkspaceSettings::try_from_settings
 
-use super::settings::LanguageSettings;
+use super::settings::{LanguageSettings, QueryItem};
 use path_clean::PathClean;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -50,9 +57,13 @@ pub(crate) fn path_fields_mut<'a>(
                 auto_install: _,
             } = language;
 
-            parser
-                .iter_mut()
-                .chain(queries.iter_mut().flatten().map(|query| &mut query.path))
+            parser.iter_mut().chain(
+                queries
+                    .iter_mut()
+                    .flatten()
+                    // Exhaustive for the same reason as above.
+                    .map(|QueryItem { path, kind: _ }| path),
+            )
         }))
 }
 
@@ -61,8 +72,9 @@ pub(crate) fn path_fields_mut<'a>(
 ///
 /// Three cases, and the last two are why this is a syntactic test rather than
 /// `Path::is_absolute` alone — they are not absolute *yet*:
-/// - absolute by the platform's own rule (`/usr/share`, and on Windows a path
-///   carrying a drive prefix or root);
+/// - rooted by the platform's own rule (`/usr/share`; on Windows also `C:\lib`
+///   and the drive-relative `\lib`, which names a directory on the current
+///   drive and so is not `is_absolute` despite already saying where it lives);
 /// - `~`-led, which expansion turns into an absolute path — including `~user`,
 ///   which expansion deliberately passes through unchanged;
 /// - `$`-led, which expansion resolves to wherever the variable points. Joining
@@ -75,10 +87,12 @@ pub(crate) fn path_fields_mut<'a>(
 /// escape from a variable reference, i.e. parsing the expansion syntax here.
 /// To place any of these under the source directory, lead with `./`.
 fn carries_its_own_base(path: &str) -> bool {
-    Path::new(path).is_absolute()
-        // On Windows a POSIX-rooted value is not `is_absolute`, but it is still
-        // rooted and joining a base onto it would be wrong.
-        || path.starts_with('/')
+    // `has_root` rather than `is_absolute`: on Windows the two differ for a
+    // drive-relative `\lib`, which anchoring must leave alone — rebasing it onto
+    // a config directory would move it to that directory's drive. On Unix the
+    // two agree.
+    Path::new(path).has_root()
+        || Path::new(path).is_absolute()
         || path.starts_with('~')
         || path.starts_with('$')
 }
@@ -108,6 +122,22 @@ pub(crate) fn anchor_settings_paths(
         return;
     };
 
+    // Path fields are `String`, so a base the filesystem accepts but UTF-8 does
+    // not cannot be represented here at all. `to_string_lossy` would substitute
+    // U+FFFD and hand back a path that looks resolved and names a file that
+    // does not exist — a silent redirection. Leaving the layer unanchored keeps
+    // the pre-#732 meaning, which is at least a path the user can reason about,
+    // and says so out loud.
+    let Some(base) = base.to_str() else {
+        log::warn!(
+            target: "kakehashi::config",
+            "Configuration directory {} is not valid UTF-8; its relative paths are left as written \
+             and resolve against the working directory",
+            base.display()
+        );
+        return;
+    };
+
     // Anchoring must not *introduce* expansion syntax either. The expansion pass
     // reads `$VAR` anywhere in the value, not just at the front, so a base
     // directory that itself contains a `$` — `/data/$USER/proj`, a directory
@@ -117,7 +147,7 @@ pub(crate) fn anchor_settings_paths(
     // defined. `$$` is the documented escape for a literal `$`; it is what the
     // one expansion pass will turn back into the directory's real name, and
     // `clean` leaves it alone because it folds components, not characters.
-    let base = PathBuf::from(base.to_string_lossy().replace('$', "$$"));
+    let base = PathBuf::from(base.replace('$', "$$"));
 
     for path in path_fields_mut(settings.search_paths.as_mut(), &mut settings.languages) {
         if carries_its_own_base(path) {
@@ -355,14 +385,29 @@ mod tests {
         }
     }
 
-    /// A Windows-absolute value must opt out on Windows, where neither a drive
-    /// prefix nor a bare root starts with `/`.
+    /// A Windows-rooted value must opt out on Windows, where neither a drive
+    /// prefix nor a bare root starts with `/`. `\rooted` is the reason the
+    /// predicate asks `has_root` and not only `is_absolute`: it names the
+    /// current drive, so rebasing it would move it to the config file's drive.
     #[cfg(windows)]
     #[test]
-    fn windows_absolute_paths_opt_out() {
+    fn windows_rooted_paths_opt_out() {
         for path in [r"C:\parsers\lua.dll", r"\\server\share\lua.dll", r"\rooted"] {
             assert!(carries_its_own_base(path), "{path} should opt out");
         }
+    }
+
+    /// A base the filesystem accepts but UTF-8 does not cannot be written into
+    /// a `String` path field. Anchoring lossily would name a file that does not
+    /// exist while looking resolved, so the layer is left alone instead.
+    #[cfg(unix)]
+    #[test]
+    fn a_non_unicode_base_leaves_paths_as_written() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+
+        let base = Path::new(OsStr::from_bytes(b"/tmp/proj-\xFF"));
+        assert_eq!(anchor("./queries", Some(base)), "./queries");
     }
 
     /// One array, three rules: the relative entry moves, the two that carry

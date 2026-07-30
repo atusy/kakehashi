@@ -220,7 +220,7 @@ Each `--config-file` layer uses its own directory, so two files that both say `.
 
 The **workspace root** is the first `workspaceFolders` entry, or the deprecated `rootUri`, or — if the client sends neither, or sends a non-`file:` URI — the server's working directory as a last resort. In that last case a client-supplied relative path is launch-directory-dependent after all; send a workspace folder to avoid it.
 
-A value beginning with `/`, `~`, or `$` is used exactly as written and is **not** rebased — it already says where it lives. On Windows a path carrying a drive letter or root is likewise left alone. This covers three cases worth calling out:
+A value beginning with `/`, `~`, or `$` is used exactly as written and is **not** rebased — it already says where it lives. On Windows a rooted path is likewise left alone, whether it names a drive (`C:\parsers`) or not (`\parsers`, which means the current drive). This covers three cases worth calling out:
 
 - a variable that expands to a *relative* value: `$SHARED/queries` stays relative to the process working directory;
 - `~user`, which is not expanded either and so would otherwise become a directory literally named `~user` under the base;
