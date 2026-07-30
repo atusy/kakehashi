@@ -156,6 +156,33 @@ pub(super) fn expand_path(
     }
 }
 
+/// Whether a configured path already says where it lives, so anchoring must
+/// leave it alone.
+///
+/// Three cases, and the last two are why this is a syntactic test rather than
+/// `Path::is_absolute` alone — they are not absolute *yet*:
+/// - absolute by the platform's own rule (`/usr/share`, and on Windows a path
+///   carrying a drive prefix or root);
+/// - `~`-led, which expansion turns into an absolute path — including `~user`,
+///   which expansion deliberately passes through unchanged;
+/// - `$`-led, which expansion resolves to wherever the variable points. Joining
+///   a base onto that syntax would corrupt it before expansion reads it, and
+///   deciding otherwise would mean expanding here — which would consume the
+///   `${KAKEHASHI_DATA_DIR}` template the defaults layer depends on.
+///
+/// A bare `$$literal` is skipped too, even though it expands to the *relative*
+/// literal `$literal`. Answering otherwise would require distinguishing the
+/// escape from a variable reference, i.e. parsing the expansion syntax here.
+/// To place any of these under the source directory, lead with `./`.
+fn carries_its_own_base(path: &str) -> bool {
+    Path::new(path).is_absolute()
+        // On Windows a POSIX-rooted value is not `is_absolute`, but it is still
+        // rooted and joining a base onto it would be wrong.
+        || path.starts_with('/')
+        || path.starts_with('~')
+        || path.starts_with('$')
+}
+
 /// Rewrite every relative path field in `settings` to sit under `base`.
 ///
 /// Called once per configuration layer, while the directory that layer came
@@ -163,15 +190,13 @@ pub(super) fn expand_path(
 /// longer says which file asked for it, and the only base left is the server's
 /// working directory, which belongs to whoever launched the editor.
 ///
-/// This runs *before* expansion and deliberately stays syntactic. A value
-/// beginning with `/`, `~`, or `$` is left exactly as written: its author has
-/// already said where it lives, and joining a base onto that syntax would
-/// corrupt it before the expansion pass ever reads it. Anchoring a
-/// variable-led value would also mean expanding here, which would consume the
-/// `${KAKEHASHI_DATA_DIR}` template that `effectiveConfiguration` reports and
-/// that the defaults layer relies on reaching expansion intact. To place a
-/// variable *under* the source directory, lead with `./` — `./$LANG/parser.so`
-/// anchors, then expands.
+/// This runs *before* expansion and deliberately stays syntactic; see
+/// [`carries_its_own_base`] for which values it declines to touch and why.
+///
+/// Idempotent, and load-bearingly so: anchoring yields an absolute path, which
+/// `carries_its_own_base` then skips. That is what lets `didChangeConfiguration`
+/// merge a freshly anchored layer onto already-anchored stored settings, and the
+/// post-install reload re-derive settings, without re-basing anything.
 ///
 /// `base` is `None` for layers with no source directory (the programmed
 /// defaults), where every value is left untouched.
@@ -183,14 +208,44 @@ pub(crate) fn anchor_settings_paths(
         return;
     };
 
+    // Anchoring must not *introduce* expansion syntax either. The expansion pass
+    // reads `$VAR` anywhere in the value, not just at the front, so a base
+    // directory that itself contains a `$` — `/data/$USER/proj`, a directory
+    // literally named `a$b` — would be read as a variable reference in every
+    // path this layer anchors. That fails the whole configuration when the name
+    // is undefined, and silently resolves somewhere else when it happens to be
+    // defined. `$$` is the documented escape for a literal `$`; it is what the
+    // one expansion pass will turn back into the directory's real name, and
+    // `clean` leaves it alone because it folds components, not characters.
+    let base = PathBuf::from(base.to_string_lossy().replace('$', "$$"));
+
     let anchor = |path: &mut String| {
-        if path.starts_with('/') || path.starts_with('~') || path.starts_with('$') {
+        if carries_its_own_base(path) {
             return;
         }
-        // `clean` folds away the `./` and `../` segments that joining
-        // introduces. It is purely lexical, so it neither touches the
-        // filesystem nor rewrites the `$` syntax expansion still has to read.
-        *path = base.join(&*path).clean().to_string_lossy().into_owned();
+        let joined = base.join(&*path);
+        // Folding `./` and `../` away keeps the stored value readable, but the
+        // fold is lexical: `..` pops whatever component precedes it, and before
+        // expansion that component may be a variable. Popping `$VAR` resolves
+        // somewhere else the moment the variable holds more than one component,
+        // and it takes any undefined-variable error down with it — expansion can
+        // only reject a variable it still sees. So a value carrying both is left
+        // unfolded for the kernel to resolve. Either alone is safe: with no
+        // `..` there is nothing to pop, and with no variable there is nothing
+        // whose value the fold could get wrong.
+        //
+        // The `.` segments that joining introduces are dropped either way —
+        // a `.` pops nothing, so removing it cannot move the path.
+        *path = if path.contains('$') && path.contains("..") {
+            joined
+                .components()
+                .filter(|component| !matches!(component, std::path::Component::CurDir))
+                .collect::<PathBuf>()
+                .to_string_lossy()
+                .into_owned()
+        } else {
+            joined.clean().to_string_lossy().into_owned()
+        };
     };
 
     if let Some(search_paths) = settings.search_paths.as_mut() {
@@ -336,6 +391,43 @@ mod tests {
         );
     }
 
+    /// A base directory may legally contain a `$`, and the expansion pass reads
+    /// `$VAR` anywhere in a value — not just at the front. Anchoring therefore
+    /// has to escape what it prepends, or every path in that layer would be
+    /// rejected as an undefined variable, or worse, silently resolved to
+    /// somewhere else when the name happens to be defined.
+    #[test]
+    fn a_base_containing_a_dollar_survives_the_expansion_pass() {
+        let anchored = anchor("./queries", Some(Path::new("/work/a$b")));
+        assert_eq!(anchored, "/work/a$$b/queries");
+
+        let env = make_env(&[("b", "SHOULD NOT BE USED")]);
+        assert_eq!(
+            expand_path(&anchored, None, &env).expect("the escaped base must expand cleanly"),
+            "/work/a$b/queries",
+            "expansion must give back the directory's real name"
+        );
+    }
+
+    /// Folding `..` lexically would pop the *unexpanded* component in front of
+    /// it, which is not the same path and can be no path at all: the variable
+    /// disappears along with the undefined-variable error the expansion pass
+    /// owes the user, and a variable holding more than one component resolves
+    /// somewhere else entirely. A value carrying a variable is therefore left
+    /// unfolded for the filesystem to resolve.
+    #[test]
+    fn parent_traversal_after_a_variable_is_left_for_the_filesystem() {
+        assert_eq!(
+            anchor("./a/$VAR/../b", Some(Path::new("/base"))),
+            "/base/a/$VAR/../b"
+        );
+        assert_eq!(
+            anchor("./a/$UNDEFINED/../b", Some(Path::new("/base"))),
+            "/base/a/$UNDEFINED/../b",
+            "the undefined variable must still reach expansion, which rejects it"
+        );
+    }
+
     /// A value that expansion turns into an absolute path is left alone: its
     /// author already said where it lives, and joining a base onto a leading
     /// `~` or `$` would corrupt the syntax before expansion ever sees it.
@@ -352,6 +444,40 @@ mod tests {
             anchor("${KAKEHASHI_DATA_DIR}", base),
             "${KAKEHASHI_DATA_DIR}"
         );
+    }
+
+    /// The opt-out rule, stated once so `docs/README.md` has something to match.
+    #[test]
+    fn carries_its_own_base_covers_every_opt_out_form() {
+        for path in [
+            "/usr/share/kakehashi",
+            "~/parsers",
+            "~",
+            // Expansion passes `~user` through unchanged, so anchoring it would
+            // produce a directory literally named `~bob` under the base.
+            "~bob/parsers",
+            "$KAKEHASHI_DATA_DIR",
+            "${KAKEHASHI_DATA_DIR}/queries",
+            // Skipped despite expanding to the relative literal `$literal`:
+            // telling it apart from a variable means parsing the syntax here.
+            "$$literal",
+        ] {
+            assert!(carries_its_own_base(path), "{path} should opt out");
+        }
+
+        for path in ["queries/x.scm", "./queries/x.scm", "../shared", ".", ""] {
+            assert!(!carries_its_own_base(path), "{path} should be anchored");
+        }
+    }
+
+    /// A Windows-absolute value must opt out on Windows, where neither a drive
+    /// prefix nor a bare root starts with `/`.
+    #[cfg(windows)]
+    #[test]
+    fn windows_absolute_paths_opt_out() {
+        for path in [r"C:\parsers\lua.dll", r"\\server\share\lua.dll", r"\rooted"] {
+            assert!(carries_its_own_base(path), "{path} should opt out");
+        }
     }
 
     /// The programmed defaults have no source directory. Without a base every
