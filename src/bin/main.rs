@@ -13,14 +13,15 @@ struct Cli {
     #[arg(long, global = true)]
     data_dir: Option<PathBuf>,
 
-    /// Config file(s) to use instead of default locations. Can be specified
-    /// multiple times; files merge in order.
+    /// Config file(s) to use instead of default locations, for the commands
+    /// that load settings (LSP server mode, format, diagnose). Can be
+    /// specified multiple times; files merge in order.
     /// Skips ~/.config/kakehashi/kakehashi.toml and ./kakehashi.toml.
-    /// A file that is present but unreadable, malformed, or carrying an
-    /// unexpandable path is a hard error (CLI exit 2); one that is absent is
-    /// skipped (warned about over LSP; the CLI reports only hard errors).
-    /// Relative paths resolve against the working directory of the kakehashi
-    /// process.
+    /// For those commands, a file that is present but unreadable, malformed,
+    /// or carrying an unexpandable path is a hard error (CLI exit 2); one that
+    /// is absent is skipped (warned about over LSP; the CLI reports only hard
+    /// errors). Relative paths resolve against the working directory of the
+    /// kakehashi process.
     #[arg(long, global = true)]
     config_file: Vec<PathBuf>,
 

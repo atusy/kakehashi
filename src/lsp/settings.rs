@@ -116,6 +116,12 @@ pub fn load_settings(
                     None
                 }
             };
+            // Judging a layer in isolation also resolves its language `base`
+            // chains, so a cycle an overlay later removes is still warned about
+            // once here. Accepted: the alternative is threading a "stay quiet"
+            // flag through base resolution to silence a warning that names a
+            // real cycle in a file the user wrote.
+            //
             // Judge each layer's *paths* on its own so a later layer cannot
             // mask an earlier one's undefined variable: path fields are
             // replaced wholesale by the overlay, so the merged result would

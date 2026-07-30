@@ -210,12 +210,19 @@ path the user typed carries intent; a path kakehashi went looking for does not.
      configuration mistakes, and an explicit path is where the user is most
      entitled to be told
 
-3. **An explicit `--config-file` that is absent is skipped with a warning**
+3. **An explicit `--config-file` that is absent is skipped**
    - Layered invocations (`--config-file base.toml --config-file overrides.toml`)
      depend on the overlay being allowed not to exist, and a relative path
      resolves against the process working directory — for an editor-spawned
      server, the editor's rather than the workspace root. Absence is too easily
      accidental to be worth refusing to start over; being unusable is not.
+   - A path whose metadata cannot be read at all counts as unusable, not
+     absent: `exists()` answers "no" to both, and only one of them is the
+     optional-overlay case.
+   - The skip is a `SettingsEvent::warning`, so an editor sees it as
+     `window/logMessage`. `format` and `diagnose` show nothing: CLI mode has no
+     channel for non-fatal settings events at all (the stub client pump
+     discards them), which is a pre-existing gap rather than a decision here.
 
 4. **Where each class of failure is judged**
    - Path expansion: per file, because a later layer replaces path fields
