@@ -80,6 +80,35 @@ queries = [
    - Purpose: Per-session overrides from the editor/client configuration
    - Note: Runtime changes via `didChangeConfiguration` re-trigger the merge process
 
+### Path Anchoring Precedes the Merge
+
+Relative path fields (`searchPaths`, `languages[*].parser`,
+`languages[*].queries[*].path`) are rewritten to sit under their source layer's
+directory *before* the layers are merged, by
+`crate::config::expand::anchor_settings_paths`. Doing it afterwards is not
+possible: the merge replaces path fields wholesale, so a surviving `./queries`
+no longer records which file asked for it, and the only base left is the server
+process's working directory — which for an editor-spawned server belongs to
+whoever launched the editor.
+
+Bases per layer: a config file uses its own directory (each `--config-file`
+layer its own), `initializationOptions` and `didChangeConfiguration` use the
+initialized workspace root, and the programmed defaults have no base.
+
+Anchoring is **syntactic and does not expand**. A value beginning with `/`, `~`,
+or `$` is left as written, so `WorkspaceSettings::try_from_settings` remains the
+only place expansion happens. That single-pass property is load-bearing in three
+ways: the `$$` literal-dollar escape cannot be consumed twice, the cross-field
+invariant checks that live in `try_from_settings` cannot be bypassed by a second
+conversion entry point, and the defaults' `${KAKEHASHI_DATA_DIR}` template
+survives into the raw settings that `kakehashi/internal/effectiveConfiguration`
+reports.
+
+Because each layer is anchored while raw, a language `base` chain that spans
+layers inherits values that are *already* absolute — `resolve_base_configs`
+folds the chain later, so an inherited `parser` keeps the base of the layer that
+wrote it rather than the layer that inherits it.
+
 ### Merge Algorithm
 
 Layers are merged pairwise via `merge_workspace_settings` using `reduce` and `flatten`:

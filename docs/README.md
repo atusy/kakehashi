@@ -208,6 +208,18 @@ Path fields support environment variable expansion and tilde (`~`) expansion, ma
 - `languages[*].parser`
 - `languages[*].queries[*].path`
 
+**Relative paths** resolve against the configuration source that supplied them, not against the directory the server process was launched from:
+
+| Source | Base directory |
+| --- | --- |
+| A TOML config file (user, project, or `--config-file`) | that file's own directory |
+| `initializationOptions` | the initialized workspace root |
+| `workspace/didChangeConfiguration` | the initialized workspace root |
+
+Each `--config-file` layer uses its own directory, so two files that both say `./queries` mean two different directories.
+
+A value beginning with `/`, `~`, or `$` is used exactly as written and is **not** rebased — it already says where it lives. That includes a variable that expands to a relative value: `$SHARED/queries` stays relative to the process working directory. To place a variable underneath the configuration source, lead with `./`, as in `./$LANG/highlights.scm`. When no base is available — the built-in defaults, or a `didChangeConfiguration` push arriving before a workspace root is known — values are left as written.
+
 **Behavior on undefined variables:** If a referenced environment variable is not defined during ordinary startup loading, the merged configuration is discarded and programmed defaults are used. A runtime `workspace/didChangeConfiguration` update is discarded while the previous settings remain active. Explicit `--config-file` inputs are stricter: an expansion failure in one of them rejects LSP initialization or makes the CLI command exit with status 2, rather than falling back to defaults. `initializationOptions` sent by the client keep the ordinary non-fatal behavior even in a `--config-file` session. The exception is `KAKEHASHI_DATA_DIR`, which automatically falls back to the platform-specific default when unset (see [Default Data Directories](#default-data-directories)).
 
 ### Option Reference
