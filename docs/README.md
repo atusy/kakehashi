@@ -231,8 +231,10 @@ The top-level key still works — it answers whenever no per-language value is
 set — but kakehashi shows a one-time migration notice when it is present, and
 it may be removed in a future release.
 
-Move `autoInstall = true` to `[languages._] autoInstall = true` for identical
-behavior, then override per language as needed.
+Move `autoInstall = true` to `[languages._] autoInstall = true` — equivalent in
+every case but one, see the migration caveat under
+[`languages[*].autoInstall`](#languagesautoinstall) — then override per language
+as needed.
 
 #### `languages`
 
@@ -291,7 +293,7 @@ autoInstall = true
 When auto-install is off for a language and its parser is missing, kakehashi
 says so in the log alongside the manual `kakehashi language install` hint, and
 points at the config that decided it. For a language with no entry of its own it
-names the exact key (``` `languages._.autoInstall` is false ```); for one that
+names the exact key (`` `languages._.autoInstall` is false ``); for one that
 does have an entry it names the overriding key and the places the value may have
 come from, since `base`-chain and `_` inheritance are folded together by then.
 
@@ -874,7 +876,6 @@ Using Neovim's built-in LSP client (0.11+):
 vim.lsp.config.kakehashi = {
   cmd = { "kakehashi" },
   init_options = {
-    languages = { _ = { autoInstall = true } },
     -- LSP Bridge configuration (optional)
     languageServers = {
       pyright = {
@@ -887,6 +888,7 @@ vim.lsp.config.kakehashi = {
       },
     },
     languages = {
+      _ = { autoInstall = true },
       markdown = {
         bridge = {
           python = {

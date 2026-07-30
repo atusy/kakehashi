@@ -2,12 +2,18 @@
 //! (`rootMarkers`, the top-level `autoInstall`, and the unwrapped
 //! `didChangeConfiguration` shape).
 //!
-//! Each notice is surfaced by `initialize` and `workspace/didChangeConfiguration`
-//! sharing a single session-scoped claim guard, so it fires at most once even
-//! when config keeps carrying the deprecated key. Most tests drive it through
-//! didChangeConfiguration, whose notifications the ordinary synchronous request
-//! helper does not discard; the one initialize-path test sends `initialize`
-//! asynchronously so the notifications preceding its response are retained too.
+//! The `rootMarkers` and `autoInstall` notices can each be surfaced by
+//! `initialize` OR by `workspace/didChangeConfiguration`, sharing one
+//! session-scoped claim guard so each fires at most once however often config
+//! keeps carrying the key. The unwrapped-shape notice is didChange-only — there
+//! is no initialize payload with that shape.
+//!
+//! Most tests therefore send a notification and then wait on the notification
+//! stream explicitly, because the synchronous request helper discards
+//! notifications that arrive while it awaits a response. The one initialize-path
+//! test cannot do that, so it sends `initialize` asynchronously and keeps the
+//! notifications that precede the response.
+//!
 //! The guard and detectors are also covered in isolation by unit tests.
 
 #![cfg(feature = "e2e")]
@@ -435,9 +441,16 @@ fn e2e_auto_install_deprecation_warns_at_initialize_and_not_again_on_didchange()
     );
     let (_response, watched) = client
         .receive_response_for_id_watching_notifications(initialize_id, &["window/showMessage"]);
-    let mut notice = watched
+    let mut matching: Vec<_> = watched
         .into_iter()
-        .find(|(_, params)| is_auto_install_deprecation_notice(params));
+        .filter(|(_, params)| is_auto_install_deprecation_notice(params))
+        .collect();
+    assert!(
+        matching.len() <= 1,
+        "initialize must warn at most once; got {} notices: {matching:?}",
+        matching.len()
+    );
+    let mut notice = matching.pop();
 
     // The warning is enqueued before the initialize handler returns, but the
     // server merges its response and its client-notification streams without an
