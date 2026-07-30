@@ -262,6 +262,76 @@ mod tests {
     ///
     /// Given a ready server and injection data, calling eager_open_virtual_documents
     /// should result in each virtual document being marked as opened in DocumentTracker.
+    /// The re-open must repair the connection it was CLAIMED for. When a config
+    /// change re-roots the host between purge and respawn, this resolves a
+    /// different connection — opening there would leave the claimed one empty
+    /// while its barrier reports success, which is exactly the state a routed
+    /// command then hits.
+    #[tokio::test]
+    async fn eager_open_skips_a_connection_other_than_the_expected_one() {
+        let pool = LanguageServerPool::new();
+        let server_name = "lua_ls";
+        let config = crate::lsp::bridge::pool::test_helpers::devnull_config_for_language("lua");
+
+        // The connection the host actually routes to.
+        let live_key = crate::lsp::bridge::ConnectionKey::for_server(server_name);
+        let handle = create_handle_with_key(ConnectionState::Ready, live_key.clone()).await;
+        pool.insert_connection(handle).await;
+
+        let host_uri = test_host_uri("eager_open_expected_key");
+        let host_uri_lsp = url_to_uri(&host_uri);
+        pool.open_host_incarnation(&host_uri, 1).await;
+
+        use super::super::super::coordinator::BridgeInjection;
+        let injections = vec![BridgeInjection {
+            language: "lua".to_string(),
+            region_id: TEST_ULID_LUA_0.to_string(),
+            content: "print('hello')".to_string(),
+        }];
+
+        // Expect a DIFFERENT connection than the one this host resolves to.
+        let claimed_elsewhere =
+            crate::lsp::bridge::ConnectionKey::new(server_name, Some("file:///other".to_string()));
+        assert_ne!(claimed_elsewhere, live_key);
+        pool.eager_open_virtual_documents(
+            server_name,
+            &config,
+            &host_uri,
+            &host_uri_lsp,
+            OpenExpectation {
+                incarnation: 1,
+                connection: Some(&claimed_elsewhere),
+            },
+            injections.clone(),
+        )
+        .await;
+
+        let vuri = VirtualDocumentUri::new(&host_uri_lsp, "lua", TEST_ULID_LUA_0);
+        assert!(
+            !pool.is_document_opened(&vuri),
+            "an open for a different connection must not land on this one"
+        );
+
+        // The same call naming the live connection DOES open — proving the skip
+        // came from the key check, not from a broken fixture.
+        pool.eager_open_virtual_documents(
+            server_name,
+            &config,
+            &host_uri,
+            &host_uri_lsp,
+            OpenExpectation {
+                incarnation: 1,
+                connection: Some(&live_key),
+            },
+            injections,
+        )
+        .await;
+        assert!(
+            pool.is_document_opened(&vuri),
+            "an open naming the resolved connection must proceed"
+        );
+    }
+
     #[tokio::test]
     async fn eager_open_marks_documents_as_opened() {
         let pool = LanguageServerPool::new();

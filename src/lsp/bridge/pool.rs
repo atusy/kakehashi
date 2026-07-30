@@ -2602,6 +2602,7 @@ impl LanguageServerPool {
                     // message cannot strand a request for the full bound.
                     if let Some((hosts, done)) = pending_reopen_handoff
                         && let Err(e) = upstream_request_tx.send(UpstreamRequest::ReopenDocuments {
+                            key: command_registration_key.clone(),
                             server: reopen_server_name,
                             hosts,
                             done,

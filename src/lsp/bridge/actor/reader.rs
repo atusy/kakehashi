@@ -218,6 +218,12 @@ pub(crate) enum UpstreamRequest {
     /// degrades to the pre-existing lazy behaviour (the next parse's
     /// `process_injections` opens the documents again).
     ReopenDocuments {
+        /// The connection the purge recorded this set under. The re-open
+        /// resolves each host's connection from the CURRENT settings, so a
+        /// config change that re-roots the host in between would otherwise open
+        /// a DIFFERENT connection while this one — the one `done` signals for,
+        /// and the one a routed command names — stays empty.
+        key: ConnectionKey,
         server: String,
         hosts: Vec<url::Url>,
         done: tokio::sync::watch::Sender<bool>,

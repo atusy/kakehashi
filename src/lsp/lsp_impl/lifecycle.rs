@@ -1281,6 +1281,7 @@ fn spawn_upstream_request(
                 }
             }
             UpstreamRequest::ReopenDocuments {
+                key,
                 server,
                 hosts,
                 done,
@@ -1315,18 +1316,20 @@ fn spawn_upstream_request(
                 );
                 use crate::lsp::bridge::REOPEN_WAIT;
                 let settings = context.settings_manager.load_settings();
-                // The re-open resolves each host's connection from the CURRENT
-                // settings, so a `workspaceMarkers` change between purge and
-                // respawn can open the document on a newly resolved key rather
-                // than the one the purge recorded. That does not strand a
-                // command on the old key: `workspace_markers` is part of
-                // `same_launch_config`, so both by-key routing paths reject a
-                // connection whose config no longer matches and the command
-                // fails soft instead of executing document-less. Opening at the
-                // new location is the correct outcome for the document itself.
-                // Carrying the claimed key here would let the re-open target the
-                // dead key exactly; it buys nothing while that key is
-                // unreachable anyway.
+                // The re-open targets the connection the purge CLAIMED. Without
+                // that, it resolves each host from the CURRENT settings, so a
+                // `workspaceMarkers` change between purge and respawn opens a
+                // newly resolved connection while the claimed one — the one
+                // `done` signals for — stays empty.
+                //
+                // No command could reach the claimed connection in that state
+                // anyway (`workspace_markers` is part of `same_launch_config`,
+                // so both by-key routing paths reject it and the command fails
+                // soft). But that made the safety depend on a comparison in a
+                // different module continuing to include markers: drop the
+                // field there and this silently breaks. Pinning the key here
+                // makes the re-open mean what its barrier claims, without the
+                // remote coupling.
                 // Bound the WAIT, not the work — the shape the inline heal used.
                 // `ensure_server_documents_open` can block up to the init timeout
                 // on a cold downstream, and `done` gates every command on this
@@ -1384,8 +1387,9 @@ fn spawn_upstream_request(
                                 &host,
                                 crate::lsp::bridge::OpenExpectation {
                                     incarnation,
-                                    // Threaded in the next commit; unchanged here.
-                                    connection: None,
+                                    // Repair the connection the purge CLAIMED,
+                                    // not whatever this host routes to now.
+                                    connection: Some(&key),
                                 },
                                 injections,
                                 &reopen_server,
