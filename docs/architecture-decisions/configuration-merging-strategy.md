@@ -250,14 +250,27 @@ path the user typed carries intent; a path kakehashi went looking for does not.
 ### Implementation Notes
 
 **Config loading order:**
-```rust
-fn load_configuration(cli_config_path: Option<&Path>) -> Option<RawWorkspaceSettings> {
-    let defaults = Some(default_settings());  // from src/config/defaults.rs
-    let user_config = load_optional(xdg_config_path());
-    let project_config = load_optional_project_config(cli_config_path);
-    // InitializationOptions applied later in LSP initialize handler
 
-    [defaults, user_config, project_config].into_iter().reduce(merge_workspace_settings).flatten()
+`--config-file` is not an alternative *path* for the project layer — it replaces
+the whole implicit pair, and accepts any number of files that merge in flag
+order. It is also the only layer with a verdict of its own, reached before
+`initialize` stores anything, so the files are read once and carried into the
+merge rather than re-read:
+
+```rust
+// `initialize`, before any request-derived state is stored:
+let explicit = load_explicit_config(home, env_fn);   // None when the flag is absent
+if let Some(error) = explicit.as_ref().and_then(|c| c.fatal_error.clone()) {
+    return Err(configuration_load_error(error));
+}
+
+fn load_settings(root, override_settings, home, env_fn, explicit) -> SettingsLoadOutcome {
+    let defaults = Some(default_settings());          // src/config/defaults.rs
+    let files = match explicit {
+        Some(explicit) => explicit.layers,            // --config-file, in order
+        None => vec![load_user_config(), load_project_config(root)],
+    };
+    // initializationOptions merge last, and are never fatal
 }
 ```
 
@@ -283,7 +296,7 @@ fn load_configuration(cli_config_path: Option<&Path>) -> Option<RawWorkspaceSett
 - **Complexity increase**: Four config sources to understand and debug
 - **Arrays replace, not merge**: `queries` arrays are replaced entirely, not concatenated; overriding one query type requires repeating all
 - **No "unset" mechanism**: Cannot explicitly remove a field inherited from earlier layers (would need `null` support)
-- **File I/O at startup**: Reading up to two config files adds latency (minimal in practice)
+- **File I/O at startup**: Reading the config files adds latency (minimal in practice) — two implicit files, or however many `--config-file` arguments were given
 - **Infrastructure-integration gap**: Phases 1-3 (Sprints 118-120) built infrastructure (schema, merging, user config loading) but delivered ZERO user value until Sprint 124 wired APIs into application. Lesson: infrastructure sprints must be followed by integration sprints within 1-2 sprints to realize value.
 
 ### Neutral

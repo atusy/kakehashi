@@ -228,10 +228,10 @@ impl Kakehashi {
             explicit_config,
         );
 
-        // `settings_outcome.fatal_error` is deliberately not consulted here: it
-        // can only be set by the explicit layers, which the pre-flight above
-        // already judged on exactly the same inputs. Re-checking would be a
-        // guard no input can reach.
+        // There is deliberately no second fatal check here. Every verdict on
+        // the explicit configuration was reached above, before any of the
+        // stores in between — and the files must not be read again to reach
+        // one, since a `--config-file` may name a stream.
         let settings_events = settings_outcome.events;
         let mut default_settings_warning = None;
 
