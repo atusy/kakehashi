@@ -2,6 +2,7 @@ pub mod defaults;
 pub(crate) mod deprecation;
 pub(crate) mod expand;
 pub(crate) mod merge;
+pub(crate) mod paths;
 pub mod settings;
 pub(crate) mod unknown_keys;
 
@@ -316,33 +317,13 @@ impl WorkspaceSettings {
         // Resolve base configs first so expansion only sees effective parser/query paths.
         ws.languages = merge::resolve_base_configs(&ws.languages);
 
-        for p in &mut ws.search_paths {
-            match expand::expand_path(p, home, &env_fn) {
-                Ok(expanded) => *p = expanded,
+        // Same walk the per-layer anchoring uses, so the two passes cannot come
+        // to cover different fields. It visits languages in name order, which is
+        // what keeps the collected errors deterministic.
+        for path in paths::path_fields_mut(Some(&mut ws.search_paths), &mut ws.languages) {
+            match expand::expand_path(path, home, &env_fn) {
+                Ok(expanded) => *path = expanded,
                 Err(e) => errors.push(e),
-            }
-        }
-
-        // Sort keys for deterministic error reporting (HashMap iteration is unordered)
-        let mut lang_names: Vec<_> = ws.languages.keys().cloned().collect();
-        lang_names.sort();
-        for name in lang_names {
-            let Some(lang) = ws.languages.get_mut(&name) else {
-                continue;
-            };
-            if let Some(parser) = lang.parser.as_mut() {
-                match expand::expand_path(parser, home, &env_fn) {
-                    Ok(expanded) => *parser = expanded,
-                    Err(e) => errors.push(e),
-                }
-            }
-            if let Some(queries) = lang.queries.as_mut() {
-                for q in queries.iter_mut() {
-                    match expand::expand_path(&q.path, home, &env_fn) {
-                        Ok(expanded) => q.path = expanded,
-                        Err(e) => errors.push(e),
-                    }
-                }
             }
         }
 

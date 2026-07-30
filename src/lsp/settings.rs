@@ -1,5 +1,5 @@
 use crate::config::deprecation::DeprecatedKeysSeen;
-use crate::config::expand::anchor_settings_paths;
+use crate::config::paths::anchor_settings_paths;
 use crate::config::{
     RawWorkspaceSettings, WorkspaceSettings, defaults::default_settings, load_user_config,
     merge_workspace_settings,

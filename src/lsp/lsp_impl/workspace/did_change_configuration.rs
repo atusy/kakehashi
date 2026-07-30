@@ -166,7 +166,7 @@ impl Kakehashi {
         // that arrived from a config file and was already anchored to that
         // file's directory.
         let root_path = self.settings_manager.root_path();
-        crate::config::expand::anchor_settings_paths(&mut parsed, root_path.as_ref().as_deref());
+        crate::config::paths::anchor_settings_paths(&mut parsed, root_path.as_ref().as_deref());
 
         // Snapshot read, derivation, and publication must share the same reload
         // transaction as post-install search-path updates, or either path can
