@@ -845,7 +845,12 @@ pub fn json_schema() -> schemars::Schema {
 // via RawWorkspaceSettings.
 
 /// Per-language Tree-sitter configuration.
+///
+/// `rename_all` is load-bearing now that a field is multi-word: the config
+/// surface is camelCase throughout (see the `snake_case leak` assertions), and
+/// `KNOWN_LANGUAGE_SETTING_KEYS` is checked against the generated schema.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
 pub struct LanguageSettings {
     /// Base language to inherit unfilled fields from (most-specific-wins).
     /// E.g., `base = "markdown"` on `rmd` means rmd inherits markdown's
@@ -865,6 +870,13 @@ pub struct LanguageSettings {
     /// Deprecated: use `base` on the derived language instead.
     /// Alternative languageId values that should use this parser.
     pub aliases: Option<Vec<String>>,
+    /// Whether missing parsers/queries for this language may be auto-installed.
+    ///
+    /// Omit to inherit from the `base` chain and ultimately the `"_"` wildcard;
+    /// when unset everywhere, the deprecated top-level `autoInstall` answers,
+    /// which itself defaults to enabled. Set `false` on `"_"` and `true` on a
+    /// language (or the reverse) to carve out per-language exceptions.
+    pub auto_install: Option<bool>,
 }
 
 impl LanguageSettings {

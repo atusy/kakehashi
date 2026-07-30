@@ -222,11 +222,12 @@ impl SettingsManager {
     /// - `autoInstall` is explicitly set to `false` in settings
     /// - `searchPaths` doesn't include the default data directory (auto-install
     ///   would install to a location that isn't being searched)
-    pub(crate) fn is_auto_install_enabled(&self) -> bool {
+    pub(crate) fn is_auto_install_enabled(&self, language: &str) -> bool {
         let settings = self.load_settings();
 
-        // If explicitly disabled, return false
-        if !settings.auto_install {
+        // Per-language first: `[languages.<lang>] autoInstall`, else `"_"`,
+        // else the deprecated top-level key.
+        if !settings.auto_install_for(language) {
             return false;
         }
 

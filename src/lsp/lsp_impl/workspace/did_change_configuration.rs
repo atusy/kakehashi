@@ -47,8 +47,15 @@ const KNOWN_BRIDGE_SERVER_SETTING_KEYS: &[&str] = &[
 
 const KNOWN_CAPTURE_MAPPINGS_SETTING_KEYS: &[&str] = &["folds", "highlights"];
 
-const KNOWN_LANGUAGE_SETTING_KEYS: &[&str] =
-    &["aliases", "base", "bridge", "layers", "parser", "queries"];
+const KNOWN_LANGUAGE_SETTING_KEYS: &[&str] = &[
+    "aliases",
+    "autoInstall",
+    "base",
+    "bridge",
+    "layers",
+    "parser",
+    "queries",
+];
 
 const KNOWN_LAYER_AGGREGATION_SETTING_KEYS: &[&str] = &["priorities", "strategy"];
 

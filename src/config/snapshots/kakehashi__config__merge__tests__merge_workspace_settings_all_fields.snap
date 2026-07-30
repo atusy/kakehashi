@@ -13,7 +13,8 @@ expression: result
       "queries": null,
       "bridge": null,
       "layers": null,
-      "aliases": null
+      "aliases": null,
+      "autoInstall": null
     },
     "python": {
       "base": null,
@@ -33,7 +34,8 @@ expression: result
       "layers": null,
       "aliases": [
         "py3"
-      ]
+      ],
+      "autoInstall": null
     },
     "rust": {
       "base": null,
@@ -41,7 +43,8 @@ expression: result
       "queries": null,
       "bridge": null,
       "layers": null,
-      "aliases": null
+      "aliases": null,
+      "autoInstall": null
     }
   },
   "captureMappings": {

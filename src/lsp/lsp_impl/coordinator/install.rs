@@ -114,11 +114,15 @@ impl InstallCoordinator {
         }
     }
 
-    /// Build a human-readable reason why auto-install is disabled.
-    pub(crate) fn auto_install_disabled_reason(&self) -> String {
+    /// Build a human-readable reason why auto-install is disabled for
+    /// `language`.
+    ///
+    /// Names the exact key that turned it off — with per-language overrides the
+    /// answer to "why is this off?" is no longer a single global setting.
+    pub(crate) fn auto_install_disabled_reason(&self, language: &str) -> String {
         let settings = self.settings_manager.load_settings();
-        if !settings.auto_install {
-            return "autoInstall is disabled".to_string();
+        if let Some(key) = settings.auto_install_disabled_key(language) {
+            return format!("`{key}` is false");
         }
         if !self
             .settings_manager

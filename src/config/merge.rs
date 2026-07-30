@@ -153,6 +153,7 @@ pub(crate) fn merge_language_settings(
         bridge: merge_bridge_maps(base.bridge.as_ref(), overlay.bridge.as_ref()),
         layers: merge_layers_configs(base.layers.as_ref(), overlay.layers.as_ref()),
         aliases: overlay.aliases.clone().or_else(|| base.aliases.clone()),
+        auto_install: overlay.auto_install.or(base.auto_install),
     }
 }
 
