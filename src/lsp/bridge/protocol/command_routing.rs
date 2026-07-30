@@ -111,11 +111,12 @@ fn unescape_segment(segment: &str) -> Option<String> {
         if let Some(stripped) = tail.strip_prefix("%25") {
             out.push('%');
             rest = stripped;
-        } else if let Some(stripped) = tail.strip_prefix("%7C") {
-            out.push(SEP);
-            rest = stripped;
         } else {
-            return None;
+            // `escape_segment` emits exactly two escapes, so this `?` IS the
+            // fail-closed branch: anything that is not `%7C` here was not
+            // bridge-minted.
+            rest = tail.strip_prefix("%7C")?;
+            out.push(SEP);
         }
     }
     out.push_str(rest);
