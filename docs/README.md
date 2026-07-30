@@ -718,7 +718,10 @@ When `--config-file` is specified:
   `format` and `diagnose` report only the hard errors above, so a mistyped path
   is silent there.
 - A path whose metadata cannot be read at all — an ancestor directory denying
-  traversal, say — counts as unusable, not absent.
+  traversal, say — counts as unusable, not absent. So does a symlink whose
+  target is gone: the path you named exists, it just does not lead to a config.
+  A path *beneath* a broken symlink is a different case — nothing is there at
+  all, so it is treated as absent, like any other missing directory.
 - A key kakehashi does not recognise is **reported but not fatal**, so a file
   can carry a key a newer version understands without the older one refusing to
   start. Serde would otherwise drop `autoInstal = false` silently and leave you

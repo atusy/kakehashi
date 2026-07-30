@@ -386,6 +386,13 @@ fn load_toml_file(
             // config. `symlink_metadata` does not follow, so it still sees the
             // link itself.
             //
+            // Only the final component is inspected. A path whose *ancestor*
+            // is a dangling link resolves to nothing at all, so nothing is
+            // there to call unusable — that is the absent case, the same as a
+            // missing directory. The line is "does the path the user named
+            // exist?", and a link does while a path beneath a broken one does
+            // not.
+            //
             // This describes the path as of the probe, which is a moment after
             // the failed open. Something appearing there in between is
             // misreported — a config loader does not serialize against the
