@@ -3,11 +3,15 @@
 //! Outbound (editor → bridge → downstream). A `Command` the bridge surfaced in
 //! a code action (bare or embedded) is executed by the client via
 //! `workspace/executeCommand`, which carries only `command` + `arguments` — no
-//! `data` envelope. The origin server + host document are encoded in the command
-//! NAME instead (see [`command_routing`](crate::lsp::bridge::protocol)), so this
-//! handler decodes them, reconnects to the exact `(server, root)` connection
-//! that has the document open, and forwards the request with the downstream's
+//! `data` envelope. The CONNECTION to run on is encoded in the command NAME
+//! instead (see [`command_routing`](crate::lsp::bridge::protocol)), so this
+//! handler decodes that `(server, root)` key, reaches the live connection under
+//! it (or rebuilds one), and forwards the request with the downstream's
 //! ORIGINAL command name and verbatim arguments (checklist §10).
+//!
+//! Routing by the decoded key — rather than by re-resolving a root from a host
+//! document — is what makes this path document-free
+//! (execute-command-routing-token).
 //!
 //! The server's result is relayed verbatim. Most command-style servers answer
 //! executeCommand by sending a `workspace/applyEdit` back (handled inbound by
@@ -30,7 +34,6 @@ use crate::lsp::bridge::decode_command;
 use crate::lsp::bridge::pool::{ConnectionHandle, LanguageServerPool, UpstreamId};
 use crate::lsp::bridge::protocol::{JsonRpcRequest, response_has_jsonrpc_error};
 use tower_lsp_server::ls_types::ExecuteCommandParams;
-use url::Url;
 
 const METHOD: &str = "workspace/executeCommand";
 
@@ -44,25 +47,30 @@ impl LanguageServerPool {
         settings: &WorkspaceSettings,
         upstream_id: Option<UpstreamId>,
     ) -> Option<Value> {
-        // Decode into owned strings first so `params.arguments` can move into
+        // PALETTE FIRST. A downstream's advertised command ids are arbitrary
+        // strings, so one could in principle be shaped exactly like a routed name
+        // (`kakehashi|c|srv||reload`). Decoding first would strip it to `reload`
+        // and send the wrong id. An encoded name can never be in this registry —
+        // it holds RAW advertised names — so an exact hit here is unambiguous
+        // evidence the client meant the palette command.
+        if self.command_origins().route(&params.command).is_some() {
+            return self
+                .dispatch_palette_command(params, settings, upstream_id)
+                .await;
+        }
+        // Decode into an owned key/command so `params.arguments` can move into
         // the outgoing request without a partial-borrow conflict.
-        let (origin, host_uri, command) = match decode_command(&params.command) {
-            Some(route) => (
-                route.origin.to_string(),
-                route.host_uri.to_string(),
-                route.command.to_string(),
-            ),
+        let (key, command) = match decode_command(&params.command) {
+            Some(route) => (route.key, route.command.to_string()),
             None => {
-                // Not an action-encoded command. It may still be a PALETTE
-                // command — a name a downstream advertised via
-                // `executeCommandProvider` that the client fired without an
-                // action context (#628). Route it by the command→origin registry;
-                // otherwise it's foreign and ignored.
+                // Neither a registered raw name nor an action-encoded one. The
+                // palette path re-checks and emits the "foreign command" warn.
                 return self
                     .dispatch_palette_command(params, settings, upstream_id)
                     .await;
             }
         };
+        let origin = key.server().to_string();
 
         // executeCommand is USER-invoked (they picked the action/palette
         // entry): failing soft is right, failing silently is not. The encoded
@@ -88,39 +96,38 @@ impl LanguageServerPool {
             return None;
         };
 
-        // A malformed host_uri must REJECT, not fall through to a client-root
-        // fallback connection (which could execute the command against the
-        // wrong root). The bridge only ever mints a valid `Url::as_str()` here,
-        // so a parse failure means a foreign/corrupt command — fail soft.
-        let Ok(host_url) = Url::parse(&host_uri) else {
-            warn!(
-                target: "kakehashi::bridge",
-                "executeCommand: routed host_uri '{host_uri}' is not a valid URL; ignoring"
-            );
-            return None;
-        };
-        // Wait through initialization like the palette path: after a respawn
-        // the fail-fast variant hands back an Initializing handle whose
-        // capability probe is still false, spuriously dropping the command
-        // with a misleading "does not advertise executeCommandProvider".
+        // Route to the EXACT connection the token names. The live connection is
+        // the common case; a reconnect rebuilds the same `(server, root)` key
+        // rather than re-resolving a root from a document, which is what lets
+        // this path work without one (execute-command-routing-token).
         let handle = match self
-            .get_or_create_connection_wait_ready(
-                &origin,
-                &config,
-                Some(&host_url),
-                std::time::Duration::from_secs(crate::lsp::bridge::pool::INIT_TIMEOUT_SECS),
-            )
+            .ready_connection_by_key_for_config(&key, Some(&config))
             .await
         {
-            Ok(handle) => handle,
-            Err(e) => {
-                warn!(
-                    target: "kakehashi::bridge",
-                    "executeCommand: failed to connect to {origin}: {e}"
-                );
-                return None;
-            }
+            Some(handle) => handle,
+            None => match self.reconnect_by_key(&key, &config).await {
+                Some(handle) => handle,
+                None => return None,
+            },
         };
+        // The command's `arguments` reference documents this connection must
+        // already have open. If it was just respawned, its re-open is in flight
+        // and asynchronous, so wait for it — the outbound queue is FIFO, and
+        // enqueueing the command first would hand the downstream a command for a
+        // document it has not opened yet. Bounded, and a no-op when nothing is
+        // in flight (the common case).
+        //
+        // Drop the command if the wait did not settle. Sending anyway would
+        // waive the exact guarantee this barrier exists for and surface as a
+        // downstream error; a fail-soft null the user can re-fire is better.
+        if !self.wait_for_pending_reopen(&key).await {
+            warn!(
+                target: "kakehashi::bridge",
+                "executeCommand: {origin:?} is still re-opening its documents; \
+                 dropping {command:?} rather than sending it out of order"
+            );
+            return None;
+        }
         if !handle.has_capability(METHOD) {
             // Nearly unreachable: the bridge only mints commands from servers it
             // bridged, and the wait-ready acquisition above rules out the
@@ -181,9 +188,11 @@ impl LanguageServerPool {
             // marker-less acquisition, so reconnecting with `None` would spawn a
             // client-root process instead of the shared instance and run the
             // command in the wrong workspace. A MARKER-rooted key has the same
-            // problem. Both fail soft here (the user re-fires once the origin is
-            // back); reconstructing a shared/marker root without a document is a
-            // deferred follow-up.
+            // problem here; the encoded-command path solves it with
+            // `reconnect_by_key` (which rebuilds the workspace from the root the
+            // token carries), but a palette command's registry entry is only a
+            // key, so wiring this path to the same helper is a follow-up.
+            // Shared keys cannot be re-rooted without a document either way.
             None if key.is_client_fallback() => {
                 // The palette registry is session-persistent, so an origin
                 // removed/disabled from config after registration lands here —
@@ -244,6 +253,19 @@ impl LanguageServerPool {
                 return None;
             }
         };
+        // Same ordering requirement as the encoded path: a palette command can
+        // reference a document too (a downstream is free to take a URI argument),
+        // and this connection may have just respawned with its re-open still in
+        // flight. Bounded, and a no-op when nothing is pending.
+        if !self.wait_for_pending_reopen(&key).await {
+            warn!(
+                target: "kakehashi::bridge",
+                "executeCommand: origin {origin:?} is still re-opening its documents; \
+                 dropping palette command {:?} rather than sending it out of order",
+                params.command
+            );
+            return None;
+        }
         if !handle.has_capability(METHOD) {
             // The advertising connection was Ready (capabilities set) when it
             // registered the command, but the RECONNECT path can hand back a

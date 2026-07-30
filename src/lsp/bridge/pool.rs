@@ -20,6 +20,7 @@ mod execute;
 mod handshake;
 mod liveness_timeout;
 mod message_sender;
+mod pending_reopen;
 mod shutdown;
 mod shutdown_timeout;
 #[cfg(test)]
@@ -37,6 +38,10 @@ use document_tracker::DocumentTracker;
 pub(crate) use document_tracker::OpenedVirtualDoc;
 pub(crate) use dynamic_capability_registry::DynamicCapabilityRegistry;
 pub(crate) use message_sender::{ConnectionHandleSender, MessageSender};
+use pending_reopen::PendingReopenRegistry;
+/// Re-exported so the server-side re-open handler bounds its work by the same
+/// budget requests wait on — the two must not drift apart.
+pub(crate) use pending_reopen::REOPEN_WAIT;
 pub(crate) use shutdown_timeout::GlobalShutdownTimeout;
 
 #[derive(Clone)]
@@ -363,6 +368,10 @@ pub struct LanguageServerPool {
     /// servers via `bridge._self`, with their version and content
     /// fingerprint for lazy full-text re-sync.
     host_documents: Mutex<HashMap<(String, ConnectionKey), HostDocSyncState>>,
+    /// Host documents whose virtual documents a purged connection held, awaiting
+    /// re-open on the replacement connection (execute-command-routing-token).
+    /// `Arc` because the drain runs inside the spawned handshake task.
+    pending_reopen: Arc<PendingReopenRegistry>,
     /// Last full downstream pull report per exact connection/document. Region
     /// diagnostics stay virtual-local and are re-anchored with the request's
     /// current offset when a server answers `unchanged`.
@@ -494,6 +503,7 @@ impl LanguageServerPool {
             host_lifecycle_locks: DashMap::new(),
             latest_virtual_contents: DashMap::new(),
             host_documents: Mutex::new(HashMap::new()),
+            pending_reopen: Arc::new(PendingReopenRegistry::default()),
             diagnostic_pull_baselines: DashMap::new(),
             diagnostic_document_generations: DashMap::new(),
             diagnostic_pull_generations: DashMap::new(),
@@ -537,10 +547,35 @@ impl LanguageServerPool {
         &self,
         key: &ConnectionKey,
     ) -> Option<Arc<ConnectionHandle>> {
+        self.ready_connection_by_key_for_config(key, None).await
+    }
+
+    /// As [`ready_connection_by_key`](Self::ready_connection_by_key), but also
+    /// rejects a connection whose SPAWN config no longer matches `config`.
+    ///
+    /// Every acquisition through `get_or_create_connection_resolved` compares the
+    /// live handle's launch config and treats a mismatch as `Failed` (respawn).
+    /// A by-key fast path that skipped that check would hand back a process
+    /// spawned from a superseded `cmd`: the settings snapshot is published before
+    /// `propagate_settings` finishes invalidating connections, so there is a real
+    /// window in which a request reads new settings and finds the old process.
+    /// Passing `None` keeps the plain state-only filter for callers that have no
+    /// config to compare (execute-command-routing-token).
+    pub(crate) async fn ready_connection_by_key_for_config(
+        &self,
+        key: &ConnectionKey,
+        config: Option<&crate::config::settings::BridgeServerConfig>,
+    ) -> Option<Arc<ConnectionHandle>> {
         let connections = self.connections.lock().await;
         connections
             .get(key)
             .filter(|handle| handle.state() == ConnectionState::Ready)
+            .filter(|handle| match config {
+                Some(config) => handle
+                    .launch_config()
+                    .is_none_or(|live| same_launch_config(live, config)),
+                None => true,
+            })
             .map(Arc::clone)
     }
 
@@ -746,7 +781,8 @@ impl LanguageServerPool {
                 .lock()
                 .await
                 .retain(|(_, connection_key), _| connection_key != &key);
-            self.document_tracker.purge_connection(&key).await;
+            let reopen_hosts = self.document_tracker.purge_connection(&key).await;
+            self.pending_reopen.record(&key, reopen_hosts);
             self.purge_open_transition_locks(&key).await;
             if let Some(handle) = connections.remove(&key) {
                 stale_handles.push((key, handle));
@@ -1157,6 +1193,135 @@ impl LanguageServerPool {
             self.open_transition_locks.remove_if(&key, |_, current| {
                 Arc::ptr_eq(current, &transition) && Arc::strong_count(current) == 2
             });
+        }
+    }
+
+    /// Wait for an in-flight virtual-document re-open on `key` before sending on
+    /// that connection (execute-command-routing-token). Bounded; a no-op when
+    /// none is in flight.
+    /// Returns `false` when the re-open did not finish in time; the caller must
+    /// then fail soft rather than send without the ordering guarantee.
+    pub(super) async fn wait_for_pending_reopen(&self, key: &ConnectionKey) -> bool {
+        self.pending_reopen.wait_for_reopen(key).await
+    }
+
+    /// Reconnect to the exact `(server, root)` a routing token names, with no
+    /// document to re-resolve the root from (execute-command-routing-token).
+    ///
+    /// Acquiring with `document_uri: None` would NOT do: `resolve_acquire`
+    /// answers a marker-less acquisition with the client-root fallback key, so a
+    /// marker-rooted or shared connection would be replaced by a client-rooted
+    /// process and the command would run in the wrong workspace. Passing the
+    /// decoded key straight to the resolved acquisition avoids that re-resolution
+    /// entirely.
+    ///
+    /// Returns `None` (fail soft, warn-logged) for a SHARED key: it is keyed
+    /// without a root, and announcing its workspace folders needs a marker that
+    /// only a document can produce. Routing to a *live* shared connection works;
+    /// only reviving a dead one does not.
+    pub(super) async fn reconnect_by_key(
+        &self,
+        key: &ConnectionKey,
+        config: &crate::config::settings::BridgeServerConfig,
+    ) -> Option<Arc<ConnectionHandle>> {
+        let server = key.server();
+        // A connection can exist under this key and simply not be Ready yet —
+        // `ready_connection_by_key` filters on Ready, so a respawn mid-handshake
+        // lands here. Wait it out rather than spawn a second process: this is the
+        // wait-through-initialization the previous
+        // `get_or_create_connection_wait_ready` call provided, and for a SHARED
+        // key it is the only way to reach the instance at all (the revive path
+        // below cannot re-root one). Cloned out from under the lock so the guard
+        // is not held across the await.
+        let existing = {
+            let connections = self.connections.lock().await;
+            connections.get(key).map(Arc::clone)
+        };
+        if let Some(handle) = existing
+            && handle.state() == ConnectionState::Initializing
+        {
+            return match handle
+                .wait_for_ready(Duration::from_secs(INIT_TIMEOUT_SECS))
+                .await
+            {
+                // Re-check the launch config AFTER the handshake, not before it:
+                // the config is only recorded during the handshake, and a
+                // settings reload can land while we wait. Without this the
+                // Initializing branch would reintroduce exactly the staleness the
+                // Ready fast path is gated against — the handshake can finish
+                // before `propagate_settings` evicts the handle, handing the
+                // command to the superseded executable.
+                Ok(()) => {
+                    if handle
+                        .launch_config()
+                        .is_some_and(|live| !same_launch_config(live, config))
+                    {
+                        log::warn!(
+                            target: "kakehashi::bridge",
+                            "executeCommand: connection {key} finished initializing under a \
+                             superseded config; ignoring"
+                        );
+                        return None;
+                    }
+                    Some(handle)
+                }
+                Err(e) => {
+                    log::warn!(
+                        target: "kakehashi::bridge",
+                        "executeCommand: connection {key} never reached ready: {e}"
+                    );
+                    None
+                }
+            };
+        }
+        if key.is_shared() {
+            // Reviving a DEAD shared instance needs a marker to announce its
+            // workspace folders, and only a document can produce one. A live
+            // instance is reachable above and via `ready_connection_by_key`.
+            log::warn!(
+                target: "kakehashi::bridge",
+                "executeCommand: shared-instance connection for {server:?} is gone and \
+                 cannot be re-rooted without a document; ignoring"
+            );
+            return None;
+        }
+        let marker = match key.marker_root() {
+            Some(root) => {
+                let Some(marker) = Url::parse(root)
+                    .ok()
+                    .and_then(super::root_markers::workspace_at_root)
+                else {
+                    log::warn!(
+                        target: "kakehashi::bridge",
+                        "executeCommand: routed root {root:?} for {server:?} is not a \
+                         usable workspace URI; ignoring"
+                    );
+                    return None;
+                };
+                Some(marker)
+            }
+            // Client-root fallback: no marker to restore, which is exactly the
+            // rooting this key means.
+            None => None,
+        };
+        match self
+            .acquire_resolved_wait_ready(
+                server,
+                config,
+                key.clone(),
+                marker,
+                Duration::from_secs(INIT_TIMEOUT_SECS),
+            )
+            .await
+        {
+            Ok(handle) => Some(handle),
+            Err(e) => {
+                log::warn!(
+                    target: "kakehashi::bridge",
+                    "executeCommand: failed to reconnect to {key}: {e}"
+                );
+                None
+            }
         }
     }
 
@@ -2167,9 +2332,11 @@ impl LanguageServerPool {
                         .lock()
                         .await
                         .retain(|(_, key), _| key != &connection_key);
-                    self.document_tracker
+                    let reopen_hosts = self
+                        .document_tracker
                         .purge_connection(&connection_key)
                         .await;
+                    self.pending_reopen.record(&connection_key, reopen_hosts);
                     self.invalidate_diagnostic_connections(std::slice::from_ref(&connection_key));
                     self.purge_open_transition_locks(&connection_key).await;
                     // Remove only after every async purge completes. If this
@@ -2316,6 +2483,8 @@ impl LanguageServerPool {
         let command_origins = Arc::clone(&self.command_origins);
         let command_registration_key = connection_key.clone();
         let upstream_request_tx = self.upstream_request_tx.clone();
+        let pending_reopen = Arc::clone(&self.pending_reopen);
+        let reopen_server_name = server_name.to_string();
         // The editor accepts a dynamic `workspace/executeCommand` registration
         // only if it advertised `dynamicRegistration` (LSP spec). Compute once.
         let supports_dynamic_command_registration = self
@@ -2383,7 +2552,22 @@ impl LanguageServerPool {
                             build_did_change_configuration_notification(payload),
                         );
                     }
+                    // Claim the previous connection's document set BEFORE
+                    // publishing Ready (execute-command-routing-token). The
+                    // re-open itself is serviced asynchronously upstream, so a
+                    // request unblocked by the Ready transition must be able to
+                    // SEE that one is in flight and wait for it — registering
+                    // after Ready would leave exactly the window in which a
+                    // command overtakes its own didOpen.
+                    let mut pending_reopen_handoff = pending_reopen.take(&command_registration_key);
                     if !handle_for_handshake.transition_initializing_to_ready() {
+                        // Put the claimed set back: `take` drained it, and the
+                        // purge that recorded it already emptied the document
+                        // tracker, so nothing would re-record it for the next
+                        // replacement.
+                        if let Some((hosts, _done)) = pending_reopen_handoff.take() {
+                            pending_reopen.restore(&command_registration_key, hosts);
+                        }
                         return Err(io::Error::new(
                             io::ErrorKind::Interrupted,
                             "bridge: connection was invalidated during initialization",
@@ -2409,6 +2593,30 @@ impl LanguageServerPool {
                                 "Failed to queue palette-command registration \
                                  (forwarding loop gone): {e}"
                             );
+                        }
+                    }
+                    // Hand the claimed set upstream to be re-opened. Sent after
+                    // Ready so the didOpen queues behind the settings push.
+                    // `done` travels with it and releases waiters when the
+                    // re-open finishes — or when it is dropped, so a lost
+                    // message cannot strand a request for the full bound.
+                    if let Some((hosts, done)) = pending_reopen_handoff
+                        && let Err(e) = upstream_request_tx.send(UpstreamRequest::ReopenDocuments {
+                            server: reopen_server_name,
+                            hosts,
+                            done,
+                        })
+                    {
+                        log::warn!(
+                            target: "kakehashi::bridge",
+                            "Failed to queue virtual-document re-open after respawn \
+                             (forwarding loop gone): {e}"
+                        );
+                        // Same reasoning as the Ready-flip failure above: the
+                        // undelivered set is the only record that these documents
+                        // need re-opening.
+                        if let UpstreamRequest::ReopenDocuments { hosts, .. } = e.0 {
+                            pending_reopen.restore(&command_registration_key, hosts);
                         }
                     }
                     Ok(())
@@ -4333,7 +4541,10 @@ mod tests {
                 .contains_key(&(connection_key.clone(), virtual_uri.to_uri_string()))
         );
 
-        pool.document_tracker
+        // Discarded deliberately: this test asserts transition-lock reclamation,
+        // not the re-open hand-off.
+        let _ = pool
+            .document_tracker
             .purge_connection(&connection_key)
             .await;
         pool.purge_open_transition_locks(&connection_key).await;
@@ -4345,6 +4556,157 @@ mod tests {
                 .any(|entry| entry.key().0 == connection_key),
             "respawn cleanup must reclaim document transition locks"
         );
+    }
+
+    /// The purge→re-open→request seam: a purge must leave the pool able to tell
+    /// a request that a re-open is outstanding, and `wait_for_pending_reopen`
+    /// must actually block on it. Without this the ordering the routing token
+    /// depends on is only asserted inside `PendingReopenRegistry`, and the pool
+    /// wiring (which got the `take`-vs-Ready order wrong once) is untested.
+    #[tokio::test]
+    async fn a_request_waits_for_the_reopen_a_purge_scheduled() {
+        let pool = Arc::new(LanguageServerPool::new());
+        let host_uri = Url::parse("file:///test/respawned.md").unwrap();
+        let virtual_uri = VirtualDocumentUri::new(&url_to_uri(&host_uri), "lua", TEST_ULID_LUA_0);
+        let connection_key = ConnectionKey::for_server("lua");
+        let (mut sender, _rx) = tokio::sync::mpsc::channel::<OutboundMessage>(1);
+        pool.ensure_document_opened(
+            &mut sender,
+            &host_uri,
+            &virtual_uri,
+            "print('opened')",
+            &connection_key,
+        )
+        .await
+        .unwrap();
+
+        // Purge records the host; the handshake claims it before going Ready.
+        let hosts = pool
+            .document_tracker
+            .purge_connection(&connection_key)
+            .await;
+        assert_eq!(hosts, vec![host_uri.clone()], "purge reports the host");
+        pool.pending_reopen.record(&connection_key, hosts);
+        let (claimed, done) = pool
+            .pending_reopen
+            .take(&connection_key)
+            .expect("the handshake claims the pending re-open");
+        assert_eq!(claimed, vec![host_uri]);
+
+        let waiter = {
+            let pool = Arc::clone(&pool);
+            let key = connection_key.clone();
+            tokio::spawn(async move { pool.wait_for_pending_reopen(&key).await })
+        };
+        tokio::task::yield_now().await;
+        assert!(
+            !waiter.is_finished(),
+            "a request must not send while the re-open is outstanding"
+        );
+
+        done.send(true).expect("the waiter holds the receiver");
+        waiter.await.expect("the request proceeds once re-opened");
+    }
+
+    /// A by-key fast path must not hand back a process spawned from a
+    /// superseded `cmd`. The settings snapshot is published before connection
+    /// invalidation finishes, so a request can read new settings and still find
+    /// the old process; every other acquisition path treats that as a respawn.
+    #[tokio::test]
+    async fn a_ready_connection_with_a_stale_launch_config_is_rejected() {
+        let pool = LanguageServerPool::new();
+        let key = ConnectionKey::for_server("lua");
+        let config = test_helpers::devnull_config_for_language("lua");
+        let handle =
+            test_helpers::create_handle_with_key(ConnectionState::Ready, key.clone()).await;
+        handle.record_launch_config(&config);
+        pool.connections
+            .lock()
+            .await
+            .insert(key.clone(), Arc::clone(&handle));
+
+        // Same config: the fast path reuses the live connection.
+        assert!(
+            pool.ready_connection_by_key_for_config(&key, Some(&config))
+                .await
+                .is_some(),
+            "an unchanged config must reuse the live connection"
+        );
+
+        // Changed `cmd`: the live process was spawned from a superseded config,
+        // so the fast path must miss and let the caller respawn.
+        let mut changed = config.clone();
+        changed.cmd = vec!["sh".to_string(), "-c".to_string(), "true".to_string()];
+        assert!(
+            pool.ready_connection_by_key_for_config(&key, Some(&changed))
+                .await
+                .is_none(),
+            "a superseded launch config must not be served from the fast path"
+        );
+
+        // `None` keeps the plain state-only filter for callers with no config to
+        // compare (the palette path).
+        assert!(
+            pool.ready_connection_by_key(&key).await.is_some(),
+            "the config-less variant still filters on state alone"
+        );
+    }
+
+    /// A connection mid-handshake is LIVE, and for a shared-instance key it is
+    /// the only way to reach the instance at all — the revive path cannot
+    /// re-root one without a document. Dropping it would fail soft on a
+    /// connection that is seconds from Ready.
+    #[tokio::test]
+    async fn reconnect_waits_for_an_initializing_connection_instead_of_dropping_it() {
+        let pool = LanguageServerPool::new();
+        let key = ConnectionKey::shared("tsgo");
+        let config = test_helpers::devnull_config_for_language("typescript");
+        let handle =
+            test_helpers::create_handle_with_key(ConnectionState::Initializing, key.clone()).await;
+        pool.connections
+            .lock()
+            .await
+            .insert(key.clone(), Arc::clone(&handle));
+
+        // The Ready-only fast path misses, so a request falls through to the
+        // reconnect — which must WAIT rather than take the shared-key bail.
+        assert!(
+            pool.ready_connection_by_key(&key).await.is_none(),
+            "an Initializing connection is not served by the Ready fast path"
+        );
+        let waiter = {
+            let key = key.clone();
+            let config = config.clone();
+            let pool = Arc::new(pool);
+            let pool_for_flip = Arc::clone(&pool);
+            let task = tokio::spawn(async move { pool.reconnect_by_key(&key, &config).await });
+            tokio::task::yield_now().await;
+            assert!(
+                !task.is_finished(),
+                "must wait for the handshake, not bail on the shared key"
+            );
+            // Publish Ready; the waiter should hand back THIS handle.
+            assert!(handle.transition_initializing_to_ready());
+            let _ = pool_for_flip;
+            task
+        };
+        let resolved = waiter.await.expect("waiter completes");
+        assert!(
+            resolved.is_some(),
+            "a shared connection that reached Ready must be routable"
+        );
+    }
+
+    /// The overwhelmingly common case — no respawn — must not pay a wait.
+    #[tokio::test]
+    async fn a_request_on_a_connection_with_no_pending_reopen_does_not_wait() {
+        let pool = LanguageServerPool::new();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            pool.wait_for_pending_reopen(&ConnectionKey::for_server("lua")),
+        )
+        .await
+        .expect("no re-open outstanding, so no wait");
     }
 
     #[tokio::test]
@@ -4514,7 +4876,10 @@ mod tests {
             .await;
         let stale = pool.document_tracker.host_virtual_docs(&host_uri).await[0].clone();
 
-        pool.document_tracker
+        // Discarded deliberately: this test asserts transition-lock reclamation,
+        // not the re-open hand-off.
+        let _ = pool
+            .document_tracker
             .purge_connection(&connection_key)
             .await;
         pool.register_opened_document(&host_uri, &virtual_uri, &connection_key)

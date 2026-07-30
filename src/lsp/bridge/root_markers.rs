@@ -102,7 +102,17 @@ pub(crate) fn resolve_marker_workspace(
     root_markers: Option<&[RootMarker]>,
     document_uri: Option<&Url>,
 ) -> Option<(Url, WorkspaceFolder)> {
-    let root = resolve_marker_root(root_markers, document_uri)?;
+    workspace_at_root(resolve_marker_root(root_markers, document_uri)?)
+}
+
+/// Build the `(root, folder)` pair for an ALREADY-resolved root, skipping the
+/// marker walk.
+///
+/// Used when the root is known without a document to walk up from: a
+/// `workspace/executeCommand` routing token carries the root of the connection
+/// it names, so reconnecting to that connection rebuilds the same workspace
+/// this would have produced at spawn time (execute-command-routing-token).
+pub(crate) fn workspace_at_root(root: Url) -> Option<(Url, WorkspaceFolder)> {
     // `WorkspaceFolder.uri` is `ls_types::Uri`, not `url::Url` — the string
     // parse IS the type conversion, not a redundant round-trip. A root that does
     // not parse yields `None`, so the key falls back too (consistency above).

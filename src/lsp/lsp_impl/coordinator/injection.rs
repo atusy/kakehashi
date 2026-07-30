@@ -440,15 +440,47 @@ impl InjectionCoordinator {
     fn get_language_for_document(&self, uri: &Url) -> Option<String> {
         detect_document_language(&self.language, &self.documents, uri)
     }
+    /// The bridge coordinator, so the respawn re-open can drive the awaited
+    /// `ensure_server_documents_open` (execute-command-routing-token).
+    pub(crate) fn bridge(&self) -> &std::sync::Arc<BridgeCoordinator> {
+        &self.bridge
+    }
+
+    /// `uri`'s reopen generation, which scopes a downstream `didOpen` to the
+    /// document's current lifetime. `None` once the document is closed.
+    pub(crate) fn document_incarnation(&self, uri: &Url) -> Option<u64> {
+        self.documents
+            .get(uri)
+            .map(|document| document.incarnation())
+    }
 
     /// The host language and resolved bridge injections for `uri`, or `None`
     /// when the document has no detectable language. Lets a caller re-derive the
-    /// injected regions on demand (executeCommand doc-sync), mirroring the
+    /// injected regions on demand (the respawn re-open), mirroring the
     /// didOpen/didChange discovery.
     pub(crate) fn bridge_injections(&self, uri: &Url) -> Option<(String, Vec<BridgeInjection>)> {
         let host_language = self.get_language_for_document(uri)?;
         let injections = self.resolve_injection_data(uri, &host_language);
         Some((host_language, injections))
+    }
+
+    /// Wait (bounded) for `uri`'s tree to be current before its injections are
+    /// resolved.
+    ///
+    /// `didChange` clears the tree and reparses off-ingress, so a re-open
+    /// landing right after an edit would resolve ZERO injections and silently
+    /// open nothing — the same reason every request path waits for a fresh tree
+    /// (execute-command-routing-token). This NARROWS that window rather than
+    /// closing it: the wait is bounded, and on expiry the re-open proceeds and
+    /// may still open nothing. Degrading to the pre-existing lazy heal (the next
+    /// parse re-opens) is preferred over stalling the barrier.
+    pub(crate) async fn ensure_document_parsed(&self, uri: &Url) {
+        let _ = crate::lsp::lsp_impl::snapshot_read::wait_for_current_snapshot_in(
+            &self.documents,
+            uri,
+            std::time::Duration::from_millis(200),
+        )
+        .await;
     }
 
     fn install_coordinator(&self) -> InstallCoordinator {

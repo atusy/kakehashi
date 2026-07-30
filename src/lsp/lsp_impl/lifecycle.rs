@@ -433,9 +433,12 @@ impl Kakehashi {
                 // origin server by the encoded command name (#568 PR 6). Gated
                 // on the same literal-support condition as `code_action_provider`.
                 // No STATIC `commands` here: downstream servers connect lazily so
-                // their command names aren't known at initialize (and each routed
-                // name embeds a per-document host_uri, so it could never be a
-                // stable advertised entry anyway). Each server's RAW command
+                // their command names aren't known at initialize. Routed names
+                // are now per-CONNECTION rather than per-document
+                // (execute-command-routing-token), so the set IS finite — but
+                // roots are still discovered lazily, so advertising them remains
+                // a deferred follow-up (see that record's Gap section). Each
+                // server's RAW command
                 // names — those from its static initialize result; a
                 // downstream's later dynamic command registrations are not
                 // collected — are dynamically registered as it reaches Ready
@@ -444,7 +447,7 @@ impl Kakehashi {
                 // — via a session-global registry keyed by raw command id, so
                 // a name advertised by several servers/roots routes to the
                 // latest advertiser (accepted limitation).
-                // Action-embedded commands carry ENCODED per-document names that
+                // Action-embedded commands carry ENCODED per-connection names that
                 // are never registered: a client that dispatches an action's
                 // command on provider PRESENCE (Neovim's built-in client)
                 // executes them regardless; one that only dispatches command ids
@@ -568,6 +571,7 @@ impl Kakehashi {
                     crate::lsp::lsp_impl::coordinator::DiagnosticPublisher::new(self),
                 ),
                 settings_manager: Arc::clone(&self.settings_manager),
+                injection: self.injection_coordinator(),
             }));
             // LSP conditions workspace/applyEdit on the client capability;
             // resolved once here — client capabilities are fixed after
@@ -783,6 +787,11 @@ async fn forward_upstream_request(
 struct UpstreamDeliveryContext {
     diagnostic_publisher: Arc<crate::lsp::lsp_impl::coordinator::DiagnosticPublisher>,
     settings_manager: Arc<crate::lsp::settings_manager::SettingsManager>,
+    /// Re-opens a respawned connection's virtual documents
+    /// (execute-command-routing-token). Lives here because the pool cannot
+    /// resolve injections itself — the document store and injection query are
+    /// server-side — so the pool signals *when* and this supplies *what*.
+    injection: crate::lsp::lsp_impl::coordinator::InjectionCoordinator,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -875,6 +884,7 @@ async fn upstream_forwarding_loop(
                             &client,
                             request,
                             editor_supports_apply_edit,
+                            delivery_context.clone(),
                         )
                     }
                     None => break, // Channel closed
@@ -1206,12 +1216,31 @@ async fn forward_with_cancel(
     }
 }
 
+/// e2e-only fault injection (`KAKEHASHI_E2E_STALL_REOPEN_MS`): hold the respawn
+/// re-open before it enqueues any `didOpen`. Set LONGER than `REOPEN_WAIT` by
+/// the ordering e2e, this forces the barrier's contract to be load-bearing —
+/// the first command must be DROPPED (fail soft), never sent ahead of the
+/// didOpen — rather than won by racing. Unset (every other test, and any
+/// production use of an e2e build), this is a no-op. Not compiled into release
+/// builds at all: `cargo build --release` carries no `e2e` feature.
+#[cfg(feature = "e2e")]
+async fn e2e_stall_reopen() {
+    let Ok(ms) = std::env::var("KAKEHASHI_E2E_STALL_REOPEN_MS") else {
+        return;
+    };
+    let Ok(ms) = ms.parse::<u64>() else {
+        return;
+    };
+    tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+}
+
 fn spawn_upstream_request(
     inbound_request_registry: crate::lsp::bridge::InboundRequestRegistry,
     translators: Option<Arc<UpstreamRequestTranslators>>,
     client: &Client,
     request: crate::lsp::bridge::UpstreamRequest,
     editor_supports_apply_edit: bool,
+    delivery_context: Option<Arc<UpstreamDeliveryContext>>,
 ) {
     use crate::lsp::bridge::UpstreamRequest;
     use tower_lsp_server::ls_types::{
@@ -1249,6 +1278,150 @@ fn spawn_upstream_request(
                         target: "kakehashi::bridge",
                         "Timed out registering palette commands upstream"
                     ),
+                }
+            }
+            UpstreamRequest::ReopenDocuments {
+                server,
+                hosts,
+                done,
+            } => {
+                // A respawned connection has nothing open; re-open what its dead
+                // predecessor held (execute-command-routing-token).
+                //
+                // `ensure_server_documents_open` — NOT `process_injections`.
+                // `process_injections` reaches the open through
+                // `eager_spawn_and_open_documents`, which SPAWNS a detached task
+                // per server and returns; `done` would then be signalled before a
+                // single `didOpen` was enqueued, releasing a waiting command to
+                // overtake the very notification it is waiting for. This path
+                // awaits the open, which is the whole reason the barrier exists.
+                // It is also scoped to the server that respawned, rather than
+                // every server the host bridges to.
+                let Some(context) = delivery_context else {
+                    // Unreachable in the wired server (the loop is spawned with a
+                    // context), but the fallback must not silently skip a heal.
+                    log::warn!(
+                        target: "kakehashi::bridge",
+                        "Cannot re-open {} document(s) for respawned {server:?}: \
+                         no delivery context",
+                        hosts.len()
+                    );
+                    return;
+                };
+                log::debug!(
+                    target: "kakehashi::bridge",
+                    "Re-opening {} document(s) after {server:?} respawned",
+                    hosts.len()
+                );
+                use crate::lsp::bridge::REOPEN_WAIT;
+                let settings = context.settings_manager.load_settings();
+                // The re-open resolves each host's connection from the CURRENT
+                // settings, so a `workspaceMarkers` change between purge and
+                // respawn can open the document on a newly resolved key rather
+                // than the one the purge recorded. That does not strand a
+                // command on the old key: `workspace_markers` is part of
+                // `same_launch_config`, so both by-key routing paths reject a
+                // connection whose config no longer matches and the command
+                // fails soft instead of executing document-less. Opening at the
+                // new location is the correct outcome for the document itself.
+                // Carrying the claimed key here would let the re-open target the
+                // dead key exactly; it buys nothing while that key is
+                // unreachable anyway.
+                // Bound the WAIT, not the work — the shape the inline heal used.
+                // `ensure_server_documents_open` can block up to the init timeout
+                // on a cold downstream, and `done` gates every command on this
+                // connection: an unbounded loop would keep the barrier
+                // outstanding for tens of seconds, making each command pay the
+                // full wait repeatedly. On expiry the opens keep running detached
+                // and waiters are released, degrading to the pre-existing lazy
+                // heal rather than stalling.
+                let injection = context.injection.clone();
+                let reopen_server = server.clone();
+                // `done` moves INTO the work task, so ONLY real completion
+                // signals it. Signalling from the timeout branch below would mark
+                // the re-open complete while its didOpens were still queued, and
+                // any request still waiting would sail through and overtake them
+                // — the failure this barrier exists to prevent. A panic drops the
+                // sender instead, which waiters read as "can never finish".
+                let mut work = tokio::spawn(async move {
+                    // e2e-only fault injection: hold the re-open BEFORE any
+                    // didOpen goes out, so the ordering e2e can force the window
+                    // in which a command could overtake its own didOpen instead
+                    // of racing it (the race resolves correctly by accident on a
+                    // fast machine, which is what made the naive test
+                    // non-discriminating). Compiled only with the `e2e` feature;
+                    // release builds do not contain this branch.
+                    #[cfg(feature = "e2e")]
+                    e2e_stall_reopen().await;
+                    for host in hosts {
+                        // Await the tree first: a re-open racing an edit would
+                        // otherwise resolve no injections and open nothing.
+                        injection.ensure_document_parsed(&host).await;
+                        // Incarnation BEFORE injections, matching the ordering the
+                        // inline heal used: a close+reopen landing between the two
+                        // reads then pairs a stale incarnation with fresh
+                        // injections, which the downstream sync rejects. The
+                        // reverse pairs stale injections with a fresh incarnation,
+                        // which reads as current.
+                        let Some(incarnation) = injection.document_incarnation(&host) else {
+                            continue;
+                        };
+                        let Some((host_language, injections)) = injection.bridge_injections(&host)
+                        else {
+                            continue;
+                        };
+                        if injections.is_empty() {
+                            continue;
+                        }
+                        // Sequential: each host's didOpen goes out on the SAME
+                        // connection, so fanning out would only contend on the
+                        // single-writer outbound queue.
+                        injection
+                            .bridge()
+                            .ensure_server_documents_open(
+                                &settings,
+                                &host_language,
+                                &host,
+                                incarnation,
+                                injections,
+                                &reopen_server,
+                            )
+                            .await;
+                    }
+                    // Every didOpen is now enqueued; release the waiters. A send
+                    // error means a later respawn's claim superseded this
+                    // barrier, and that respawn owns it now.
+                    let _ = done.send(true);
+                });
+                // Bound only how long THIS task waits. The work owns the signal,
+                // so exceeding the budget stops us watching without pretending
+                // the re-open finished: requests still waiting time out and fail
+                // soft, and a request arriving later waits on the same barrier.
+                match tokio::time::timeout(REOPEN_WAIT, &mut work).await {
+                    Ok(Ok(())) => {}
+                    // A panic in the re-open would otherwise vanish with the
+                    // dropped JoinHandle, leaving only "the heal didn't help".
+                    Ok(Err(join_error)) => log::warn!(
+                        target: "kakehashi::bridge",
+                        "Re-open of {server:?} documents failed: {join_error}"
+                    ),
+                    Err(_) => {
+                        log::debug!(
+                            target: "kakehashi::bridge",
+                            "Re-open of {server:?} documents exceeded {REOPEN_WAIT:?}; \
+                             finishing in the background (the barrier stays \
+                             pending until it does)"
+                        );
+                        tokio::spawn(async move {
+                            if let Err(join_error) = work.await {
+                                log::warn!(
+                                    target: "kakehashi::bridge",
+                                    "Background re-open of {server:?} documents failed: \
+                                     {join_error}"
+                                );
+                            }
+                        });
+                    }
                 }
             }
             UpstreamRequest::ShowMessageRequest {
