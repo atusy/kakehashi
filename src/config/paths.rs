@@ -113,7 +113,7 @@ fn carries_its_own_base(path: &str) -> bool {
 /// the strict layer reject a path it cannot honour, rather than accept one that
 /// still depends on where the server started. Always false on Unix, which has
 /// no path prefixes.
-fn is_drive_relative(path: &str) -> bool {
+pub(crate) fn is_drive_relative(path: &str) -> bool {
     matches!(
         Path::new(path).components().next(),
         Some(std::path::Component::Prefix(_))

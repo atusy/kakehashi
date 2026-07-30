@@ -158,7 +158,21 @@ fn merge_explicit_layers(layers: &[Option<RawWorkspaceSettings>]) -> Option<RawW
 /// to anchor to". Only a filesystem root lacks one, which cannot be read as a
 /// config file — so the caller never sees this — but answering `None` would make
 /// the one unanchored outcome indistinguishable from success.
+///
+/// A Windows drive-relative argument (`--config-file D:config.toml`) is refused
+/// for the same reason. Joining does not absolutize it — a prefixed argument
+/// replaces the base — so its parent would be the bare `D:`, and every path
+/// anchored to that would still resolve against drive D's own current
+/// directory. Answering that would be indistinguishable from success while
+/// preserving exactly the launch-directory dependence anchoring removes.
 fn config_file_base(path: &Path) -> std::io::Result<PathBuf> {
+    if crate::config::paths::is_drive_relative(&path.to_string_lossy()) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "path names a drive but no root, so it resolves against that drive's current \
+             directory; give the path in full",
+        ));
+    }
     let absolute = if path.is_absolute() {
         path.to_path_buf()
     } else {
@@ -802,6 +816,25 @@ mod tests {
                 .expect_err("a filesystem root has no parent")
                 .kind(),
             std::io::ErrorKind::InvalidInput
+        );
+    }
+
+    /// `--config-file D:config.toml` cannot be absolutized by joining — a
+    /// prefixed argument replaces the base — so its parent would be the bare
+    /// `D:`, and anchoring a layer to that leaves every path resolving against
+    /// drive D's own current directory. Refused rather than answered.
+    #[cfg(windows)]
+    #[test]
+    fn config_file_base_rejects_a_drive_relative_argument() {
+        assert_eq!(
+            config_file_base(Path::new(r"D:config.toml"))
+                .expect_err("a drive-relative argument has no resolvable directory")
+                .kind(),
+            std::io::ErrorKind::InvalidInput
+        );
+        assert!(
+            config_file_base(Path::new(r"D:\configs\kakehashi.toml")).is_ok(),
+            "a rooted drive path is fine"
         );
     }
 
