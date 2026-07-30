@@ -16,7 +16,8 @@ struct Cli {
     /// Config file(s) to use instead of default locations, for the commands
     /// that load settings (LSP server mode, format, diagnose). Can be
     /// specified multiple times; files merge in order.
-    /// Skips ~/.config/kakehashi/kakehashi.toml and ./kakehashi.toml.
+    /// Skips both default locations: the user config under $XDG_CONFIG_HOME
+    /// (~/.config/kakehashi/kakehashi.toml when unset) and ./kakehashi.toml.
     /// For those commands, a file that is present but unreadable, malformed,
     /// larger than 8 MiB, or carrying an unexpandable path is a hard error:
     /// format and diagnose exit 2, and LSP initialization is rejected with

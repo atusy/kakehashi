@@ -23,7 +23,7 @@ use std::time::Duration;
 use tower_lsp_server::LspService;
 
 use crate::cli::files::collect_files;
-use crate::cli::terminal::escape_terminal_controls_keeping_newlines;
+use crate::cli::terminal::{escape_terminal_controls, escape_terminal_controls_keeping_newlines};
 use crate::lsp::Kakehashi;
 
 /// Write one diagnostic line without turning a closed stderr pipe into panic
@@ -199,7 +199,7 @@ async fn run_stdin(server: &Kakehashi, cwd: &Path, options: &FormatOptions) -> u
         )
         .await;
     for failure in &outcome.server_failures {
-        elnln!("error: {failure}");
+        elnln!("error: {}", escape_terminal_controls(&failure.to_string()));
     }
     let changed = outcome.formatted.as_deref().is_some_and(|f| f != text);
 
@@ -208,7 +208,10 @@ async fn run_stdin(server: &Kakehashi, cwd: &Path, options: &FormatOptions) -> u
             return EXIT_ERROR;
         }
         if changed {
-            elnln!("Would reformat: {}", name.display());
+            elnln!(
+                "Would reformat: {}",
+                escape_terminal_controls(&name.display().to_string())
+            );
             return EXIT_CHANGED;
         }
         return EXIT_OK;
@@ -254,7 +257,7 @@ async fn run_paths(server: &Kakehashi, cwd: &Path, options: &FormatOptions) -> u
     }) {
         Ok(collected) => collected,
         Err(e) => {
-            elnln!("error: {e}");
+            elnln!("error: {}", escape_terminal_controls(&e.to_string()));
             return EXIT_ERROR;
         }
     };
@@ -269,7 +272,12 @@ async fn run_paths(server: &Kakehashi, cwd: &Path, options: &FormatOptions) -> u
     for file in &files {
         // Collected paths are absolute (normalize_path); report them
         // cwd-relative so the output stays readable in deep trees.
-        let display = file.strip_prefix(cwd).unwrap_or(file).display();
+        // Escaped once here rather than at each use: a path comes from a
+        // directory walk, so it is untrusted text on a line-oriented stream.
+        // Newlines are escaped too — unlike the initialization error, these
+        // lines are a stream the user greps, one record per file.
+        let relative = file.strip_prefix(cwd).unwrap_or(file).display().to_string();
+        let display = escape_terminal_controls(&relative);
         let text = match std::fs::read_to_string(file) {
             Ok(text) => text,
             Err(e) => {
@@ -291,7 +299,10 @@ async fn run_paths(server: &Kakehashi, cwd: &Path, options: &FormatOptions) -> u
         // "unchanged" (docs: I/O errors exit 2). Any partial output another
         // server produced is still applied below.
         for failure in &outcome.server_failures {
-            elnln!("error: {display}: {failure}");
+            elnln!(
+                "error: {display}: {}",
+                escape_terminal_controls(&failure.to_string())
+            );
         }
         let server_failed = !outcome.server_failures.is_empty();
         if server_failed {

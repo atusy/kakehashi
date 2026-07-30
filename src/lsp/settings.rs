@@ -224,7 +224,9 @@ fn read_explicit_layers(
         if let Some(raw_settings) = merged.as_ref()
             && let Err(errs) = WorkspaceSettings::try_from_settings(raw_settings, home, &env_fn)
         {
-            fatal_error = Some(format!("Invalid configuration from --config-file: {errs}"));
+            let message = format!("Invalid configuration from --config-file: {errs}");
+            events.push(SettingsEvent::error(message.clone()));
+            fatal_error = Some(message);
         }
     }
 
