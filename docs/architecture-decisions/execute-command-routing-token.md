@@ -203,6 +203,15 @@ set. Rejected in favour of the captured set.
 
 ### Neutral
 
+- A decoded token is unauthenticated editor input, and the root segment can now
+  name a workspace no open document sits under — the marker-walk-derived root it
+  replaced could not. This grants nothing, because the client that could forge a
+  token is the client that supplies `languageServers` (including each `cmd`) in
+  `initializationOptions`, and `server` must still match an exact config entry.
+  It stops being free if a token can ever reach kakehashi from somewhere other
+  than the editor it was minted for; that would need the token authenticated, or
+  checked against the keys the pool actually spawned.
+
 - The token grows a root segment and loses a document segment; net length is
   usually shorter, since a marker root is a prefix of the document path.
 - `arguments` handling is untouched: still forwarded verbatim in the

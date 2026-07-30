@@ -39,6 +39,22 @@
 //! `None` — the handler then tries the raw palette-command registry, and only a
 //! command matching neither route fails soft (never a panic).
 //!
+//! TRUST BOUNDARY. A decoded name is EDITOR input: kakehashi mints it, hands it
+//! to the client, and the client hands it back. It is not authenticated, so a
+//! client can decode to any `(server, root)` it likes — including a configured
+//! server at a root no open document sits under, which the previous encoding
+//! could not express (its root came from a marker walk over a live document).
+//!
+//! That is deliberate, not an oversight. `server` still has to name an EXACT
+//! `languageServers` entry — `is_server_spawnable` does a plain `get(name)`, so
+//! a `_` wildcard does NOT make an invented server spawnable — and the client
+//! that could forge a name is the same one that supplies `languageServers`
+//! (with its `cmd`) via `initializationOptions`. It already decides what runs
+//! and where; a forged root grants nothing further. Anything that changes that
+//! premise — a token reaching kakehashi from a source other than the editor it
+//! was minted for — would need the token authenticated or checked against a
+//! registry of keys the pool actually spawned.
+//!
 //! NOTE: this encoding covers commands surfaced through a bridged action.
 //! Commands the client fires WITHOUT an action context (from a palette) route by
 //! their RAW advertised names instead, via the pool's command-origin registry +
