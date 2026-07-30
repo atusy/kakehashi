@@ -393,9 +393,15 @@ impl BridgeCoordinator {
         let (for_server, config) =
             self.injections_for_server(settings, host_language, injections, server_name);
         let Some(config) = config else {
-            // No injected region on this host bridges to `server_name`, so there
-            // is nothing for THIS server to open — not a failure to repair it.
-            return OpenOutcome::Opened;
+            // No injected region on this host bridges to `server_name`.
+            // With no named connection this is simply nothing to do; but a
+            // caller repairing a NAMED connection asked for documents this host
+            // can no longer supply (server removed from config, or the host's
+            // injections changed), so its repair did NOT happen.
+            return match expect.connection {
+                Some(_) => OpenOutcome::NotOpened,
+                None => OpenOutcome::Opened,
+            };
         };
         let Ok(host_uri_lsp) = crate::lsp::lsp_impl::url_to_uri(host_uri) else {
             return OpenOutcome::NotOpened;

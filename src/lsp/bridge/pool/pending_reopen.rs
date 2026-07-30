@@ -118,8 +118,13 @@ impl PendingReopenRegistry {
     /// Wait (bounded by [`REOPEN_WAIT`]) for an in-flight re-open on `key`.
     ///
     /// Returns `true` when the ordering requirement is met — either nothing was
-    /// outstanding (the common case) or the re-open finished. Returns `false` on
-    /// timeout, where the re-open is still running.
+    /// outstanding (the common case) or the re-open reported that it repaired
+    /// this connection.
+    ///
+    /// Returns `false` in three cases, all meaning "this connection may still be
+    /// missing documents": the wait timed out and the re-open is still running;
+    /// the re-open reported it could not repair this connection; or its sender
+    /// was dropped before reporting success (a handler that died).
     ///
     /// The caller must NOT proceed on `false`. A bounded wait means the guarantee
     /// can be unmet, and sending anyway is the failure this barrier exists to
