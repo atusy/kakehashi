@@ -153,13 +153,23 @@ fn merge_explicit_layers(layers: &[Option<RawWorkspaceSettings>]) -> Option<RawW
 /// directory first: its *parent* would otherwise be relative too, and anchoring
 /// a layer to a relative base leaves the layer relative to the working
 /// directory — the dependence anchoring is meant to remove.
-fn absolute_parent(path: &Path) -> std::io::Result<Option<PathBuf>> {
+///
+/// A path with no parent at all is reported as an error rather than as "no base
+/// to anchor to". Only a filesystem root lacks one, which cannot be read as a
+/// config file — so the caller never sees this — but answering `None` would make
+/// the one unanchored outcome indistinguishable from success.
+fn config_file_base(path: &Path) -> std::io::Result<PathBuf> {
     let absolute = if path.is_absolute() {
         path.to_path_buf()
     } else {
         std::env::current_dir()?.join(path)
     };
-    Ok(absolute.parent().map(Path::to_path_buf))
+    absolute.parent().map(Path::to_path_buf).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "path has no parent directory",
+        )
+    })
 }
 
 /// The body of [`load_explicit_config`], taking the paths directly so it can be
@@ -203,8 +213,8 @@ fn read_explicit_layers(
         // directory, which is the launch-directory dependence this anchoring
         // exists to remove.
         if let Some(raw_settings) = layer.as_mut() {
-            match absolute_parent(path) {
-                Ok(base) => anchor_settings_paths(raw_settings, base.as_deref()),
+            match config_file_base(path) {
+                Ok(base) => anchor_settings_paths(raw_settings, Some(&base)),
                 Err(error) => {
                     let message = format!(
                         "Failed to resolve the directory of {}: {error}",
@@ -726,6 +736,25 @@ mod tests {
         std::fs::create_dir_all(&dir).expect("failed to create user config dir");
         std::fs::write(dir.join("kakehashi.toml"), contents).expect("failed to write user config");
         dir
+    }
+
+    /// A `--config-file` given as a bare filename anchors to the working
+    /// directory, and one with no parent at all is an error rather than a base
+    /// of "nowhere" — otherwise an unanchored layer would be indistinguishable
+    /// from a successfully anchored one.
+    #[test]
+    fn config_file_base_resolves_a_bare_filename_and_rejects_a_parentless_path() {
+        let cwd = std::env::current_dir().expect("a working directory");
+        assert_eq!(
+            config_file_base(Path::new("kakehashi.toml")).expect("a bare filename has a parent"),
+            cwd
+        );
+        assert_eq!(
+            config_file_base(Path::new("/"))
+                .expect_err("a filesystem root has no parent")
+                .kind(),
+            std::io::ErrorKind::InvalidInput
+        );
     }
 
     /// A project-local path resolves against the project config's directory, not
