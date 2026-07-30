@@ -76,9 +76,12 @@ pub struct SettingsLoadOutcome {
     pub deprecated_keys: DeprecatedKeysSeen,
     /// Fatal error from an explicitly requested configuration source.
     ///
-    /// Missing implicit user/project files remain optional, but a path passed
-    /// through `--config-file` represents user intent and must not be skipped.
-    pub fatal_error: Option<String>,
+    /// A `--config-file` path that is *present* but unusable — unreadable,
+    /// malformed, or carrying a path that cannot be expanded — represents a
+    /// user mistake that must not be papered over with defaults. An *absent*
+    /// explicit file stays optional (see `load_toml_file`), as do all
+    /// implicitly discovered user/project files.
+    pub(crate) fatal_error: Option<String>,
 }
 
 pub fn load_settings(
@@ -97,27 +100,35 @@ pub fn load_settings(
     let defaults = Some(default_settings());
 
     // Layers 2+3: config files (either explicit --config-file or default locations)
-    let config_layers: Vec<Option<RawWorkspaceSettings>> = if let Some(files) =
-        crate::config::expand::config_file_override()
-    {
+    let explicit_files = crate::config::expand::config_file_override();
+    let config_layers: Vec<Option<RawWorkspaceSettings>> = if let Some(files) = explicit_files {
         events.push(SettingsEvent::info(format!(
             "Using {} explicit config file(s); default config locations skipped",
             files.len()
         )));
         let mut layers = Vec::with_capacity(files.len());
         for path in files {
-            let event_start = events.len();
-            let layer = load_toml_file(path, &mut events, &mut deprecated_keys);
-            if fatal_error.is_none() {
-                fatal_error = events[event_start..]
-                    .iter()
-                    .find(|event| event.kind == SettingsEventKind::Error)
-                    .map(|event| event.message.clone());
-            }
+            let layer = match load_toml_file(path, &mut events, &mut deprecated_keys) {
+                Ok(layer) => layer,
+                Err(message) => {
+                    events.push(SettingsEvent::error(message.clone()));
+                    fatal_error.get_or_insert(message);
+                    None
+                }
+            };
+            // Judge each layer's *paths* on its own so a later layer cannot
+            // mask an earlier one's undefined variable: path fields are
+            // replaced wholesale by the overlay, so the merged result would
+            // never mention the mistake. Cross-field invariants are excluded
+            // here (see `ExpandErrors::path_error_summary`) — their operands
+            // merge independently, so they are only meaningful once every
+            // layer has been folded together, and `expand_merged_settings`
+            // catches them there.
             if let Some(raw_settings) = layer.as_ref()
                 && let Err(errs) = WorkspaceSettings::try_from_settings(raw_settings, home, &env_fn)
+                && let Some(details) = errs.path_error_summary()
             {
-                let message = format!("Path expansion failed in {}: {errs}", path.display());
+                let message = format!("Path expansion failed in {}: {details}", path.display());
                 events.push(SettingsEvent::error(message.clone()));
                 fatal_error.get_or_insert(message);
             }
@@ -147,8 +158,14 @@ pub fn load_settings(
         .reduce(merge_workspace_settings)
         .flatten();
     let raw_settings = merged.clone();
-    let settings =
-        expand_merged_settings(merged, home, &env_fn, &mut events, fatal_error.is_some());
+    let settings = expand_merged_settings(
+        merged,
+        home,
+        &env_fn,
+        &mut events,
+        &mut fatal_error,
+        explicit_files.is_some(),
+    );
 
     SettingsLoadOutcome {
         settings,
@@ -159,26 +176,35 @@ pub fn load_settings(
     }
 }
 
+/// Expand and validate the fully merged configuration.
+///
+/// `explicit_config` marks a session driven by `--config-file`. Those paths
+/// represent user intent, so a merged configuration that cannot be expanded is
+/// fatal rather than silently degrading to programmed defaults. This is also
+/// the only place a cross-layer invariant violation can be caught — one file
+/// supplying `debounceMs` and another `maxWaitMs` is valid in neither file
+/// alone, yet the pair must still be checked once merged.
 fn expand_merged_settings(
     merged: Option<RawWorkspaceSettings>,
     home: Option<&str>,
     env_fn: impl Fn(&str) -> Option<String>,
     events: &mut Vec<SettingsEvent>,
-    skip_due_to_fatal_error: bool,
+    fatal_error: &mut Option<String>,
+    explicit_config: bool,
 ) -> Option<WorkspaceSettings> {
-    if skip_due_to_fatal_error {
-        return None;
-    }
-
     merged.and_then(|settings| {
         match WorkspaceSettings::try_from_settings(&settings, home, env_fn) {
             Ok(settings) => Some(settings),
             Err(errs) => {
-                events.push(SettingsEvent::error(format!(
+                let message = format!(
                     "Invalid configuration: {errs}. \
                      This configuration has been discarded. \
                      Please correct the invalid settings or remove them from your config.",
-                )));
+                );
+                events.push(SettingsEvent::error(message.clone()));
+                if explicit_config {
+                    fatal_error.get_or_insert(message);
+                }
                 None
             }
         }
@@ -214,19 +240,28 @@ fn load_user_config_with_events(
 
 /// Load a TOML config file from an explicit path (used with `--config-file`).
 ///
-/// Unlike `load_toml_settings`, non-existent files are treated as errors
-/// because explicit paths represent user intent (configuration-merging-strategy).
+/// Every `Err` returned here is fatal to the session: unlike
+/// `load_toml_settings`, a file the user named explicitly and that is actually
+/// present must not be skipped in favour of defaults
+/// (configuration-merging-strategy).
+///
+/// An absent file is `Ok(None)`, not an error. Layered invocations
+/// (`--config-file base.toml --config-file overrides.toml`) rely on the overlay
+/// being optional, and a relative path resolves against the process working
+/// directory — for an editor-spawned server that is the editor's, not the
+/// workspace root — so absence is too easily accidental to be worth aborting
+/// over. It is still reported as a warning so the skip is visible.
 fn load_toml_file(
     path: &Path,
     events: &mut Vec<SettingsEvent>,
     deprecated_keys: &mut DeprecatedKeysSeen,
-) -> Option<RawWorkspaceSettings> {
+) -> Result<Option<RawWorkspaceSettings>, String> {
     if !path.exists() {
-        events.push(SettingsEvent::error(format!(
-            "Config file not found: {}",
+        events.push(SettingsEvent::warning(format!(
+            "Config file not found, skipping: {}",
             path.display()
         )));
-        return None;
+        return Ok(None);
     }
 
     events.push(SettingsEvent::info(format!(
@@ -234,36 +269,17 @@ fn load_toml_file(
         path.display()
     )));
 
-    match fs::read_to_string(path) {
-        Ok(contents) => {
-            deprecated_keys.merge(crate::config::deprecation::toml_deprecated_keys(&contents));
-            match toml::from_str::<RawWorkspaceSettings>(&contents) {
-                Ok(settings) => {
-                    events.push(SettingsEvent::info(format!(
-                        "Successfully loaded {}",
-                        path.display()
-                    )));
-                    Some(settings)
-                }
-                Err(err) => {
-                    events.push(SettingsEvent::error(format!(
-                        "Failed to parse {}: {}",
-                        path.display(),
-                        err
-                    )));
-                    None
-                }
-            }
-        }
-        Err(err) => {
-            events.push(SettingsEvent::error(format!(
-                "Failed to read {}: {}",
-                path.display(),
-                err
-            )));
-            None
-        }
-    }
+    let contents = fs::read_to_string(path)
+        .map_err(|err| format!("Failed to read {}: {}", path.display(), err))?;
+    deprecated_keys.merge(crate::config::deprecation::toml_deprecated_keys(&contents));
+    let settings = toml::from_str::<RawWorkspaceSettings>(&contents)
+        .map_err(|err| format!("Failed to parse {}: {}", path.display(), err))?;
+
+    events.push(SettingsEvent::info(format!(
+        "Successfully loaded {}",
+        path.display()
+    )));
+    Ok(Some(settings))
 }
 
 fn load_toml_settings(
@@ -613,26 +629,50 @@ mod tests {
         );
     }
 
+    /// A merged configuration that fails expansion is fatal only when the user
+    /// named the files explicitly; implicit discovery keeps degrading to
+    /// defaults so the zero-config experience survives a stray config file.
     #[test]
-    fn fatal_explicit_error_skips_duplicate_merged_expansion_event() {
-        let merged = RawWorkspaceSettings {
+    fn merged_expansion_failure_is_fatal_only_for_explicit_config() {
+        let broken = || RawWorkspaceSettings {
             search_paths: Some(vec!["$UNDEFINED_VAR/parsers".to_string()]),
             ..Default::default()
         };
-        let mut events = vec![SettingsEvent::error(
-            "Path expansion failed in explicit.toml",
-        )];
 
-        let settings = expand_merged_settings(
-            Some(merged),
+        let mut explicit_events = Vec::new();
+        let mut explicit_fatal = None;
+        let explicit = expand_merged_settings(
+            Some(broken()),
             None,
             crate::config::make_env(&[]),
-            &mut events,
+            &mut explicit_events,
+            &mut explicit_fatal,
             true,
         );
 
-        assert!(settings.is_none());
-        assert_eq!(events.len(), 1, "fatal error must be reported only once");
+        let mut implicit_events = Vec::new();
+        let mut implicit_fatal = None;
+        let implicit = expand_merged_settings(
+            Some(broken()),
+            None,
+            crate::config::make_env(&[]),
+            &mut implicit_events,
+            &mut implicit_fatal,
+            false,
+        );
+
+        assert!(explicit.is_none());
+        assert!(implicit.is_none());
+        assert!(
+            explicit_fatal
+                .as_deref()
+                .is_some_and(|message| message.contains("UNDEFINED_VAR")),
+            "explicit config must abort startup: {explicit_fatal:?}"
+        );
+        assert!(
+            implicit_fatal.is_none(),
+            "implicit config must keep falling back to defaults: {implicit_fatal:?}"
+        );
     }
 
     /// A config layer using the deprecated `rootMarkers` key sets the outcome
@@ -705,8 +745,13 @@ mod tests {
         let mut ignored_deprecation = DeprecatedKeysSeen::default();
         let result = load_toml_file(&path, &mut events, &mut ignored_deprecation);
 
-        assert!(result.is_some(), "valid TOML should parse");
-        assert_eq!(result.unwrap().auto_install, Some(false));
+        let settings = result.expect("valid TOML should parse");
+        assert_eq!(
+            settings
+                .expect("present file should yield a layer")
+                .auto_install,
+            Some(false)
+        );
         assert!(
             events
                 .iter()
@@ -716,7 +761,8 @@ mod tests {
         );
     }
 
-    /// load_toml_file: non-existent path returns None + error event (configuration-merging-strategy).
+    /// load_toml_file: an absent explicit path is an optional layer, not an
+    /// error, so a layered invocation whose overlay does not exist still starts.
     #[test]
     fn test_load_toml_file_missing() {
         let mut events = Vec::new();
@@ -727,16 +773,19 @@ mod tests {
             &mut ignored_deprecation,
         );
 
-        assert!(result.is_none(), "missing file should return None");
+        assert!(
+            matches!(result, Ok(None)),
+            "missing file should be skipped, not fatal: {result:?}"
+        );
         assert!(
             events
                 .iter()
-                .any(|e| e.kind == SettingsEventKind::Error && e.message.contains("not found")),
-            "should emit error event for missing file"
+                .any(|e| e.kind == SettingsEventKind::Warning && e.message.contains("not found")),
+            "the skip must still be visible as a warning"
         );
     }
 
-    /// load_toml_file: invalid TOML returns None + warning event.
+    /// load_toml_file: a present file with invalid TOML is fatal.
     #[test]
     fn test_load_toml_file_invalid_toml() {
         let dir = TempDir::new().unwrap();
@@ -747,12 +796,41 @@ mod tests {
         let mut ignored_deprecation = DeprecatedKeysSeen::default();
         let result = load_toml_file(&path, &mut events, &mut ignored_deprecation);
 
-        assert!(result.is_none(), "invalid TOML should return None");
+        let message = result.expect_err("invalid TOML in an explicit file must be fatal");
         assert!(
-            events.iter().any(
-                |e| e.kind == SettingsEventKind::Error && e.message.contains("Failed to parse")
-            ),
-            "should emit error for invalid TOML in explicit config file"
+            message.contains("Failed to parse") && message.contains(&path.display().to_string()),
+            "the fatal message must name the offending file: {message}"
+        );
+    }
+
+    /// load_toml_file: a file that exists but cannot be read is fatal, and is
+    /// reported differently from a file that is simply absent.
+    #[cfg(unix)]
+    #[test]
+    fn test_load_toml_file_unreadable() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("locked.toml");
+        std::fs::write(&path, "autoInstall = false\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        let mut events = Vec::new();
+        let mut ignored_deprecation = false;
+        // root ignores the permission bits, so probe before deciding to assert.
+        let permissions_enforced = std::fs::read_to_string(&path).is_err();
+        let result = load_toml_file(&path, &mut events, &mut ignored_deprecation);
+
+        // Restore before asserting so a failure cannot leave an unremovable dir.
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        if !permissions_enforced {
+            return;
+        }
+        let message = result.expect_err("an unreadable explicit file must be fatal");
+        assert!(
+            message.contains("Failed to read") && message.contains(&path.display().to_string()),
+            "the fatal message must name the offending file: {message}"
         );
     }
 
@@ -769,11 +847,11 @@ mod tests {
         let mut used_deprecated = DeprecatedKeysSeen::default();
         let result = load_toml_file(&path, &mut events, &mut used_deprecated);
 
-        assert!(result.is_some(), "valid TOML should parse");
         assert!(
-            used_deprecated.root_markers,
-            "rootMarkers should set the flag"
+            matches!(result, Ok(Some(_))),
+            "valid TOML should parse: {result:?}"
         );
+        assert!(used_deprecated.root_markers, "rootMarkers should set the flag");
     }
 
     /// load_toml_settings (the project kakehashi.toml layer) sets the flag when
