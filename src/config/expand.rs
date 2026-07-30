@@ -204,6 +204,113 @@ pub(crate) fn make_env(vars: &[(&str, &str)]) -> impl Fn(&str) -> Option<String>
 mod tests {
     use super::*;
 
+    /// Build settings whose every path-valued field carries `value`, so one
+    /// assertion covers `searchPaths`, `parser`, and `queries[].path` alike.
+    fn settings_with_path(value: &str) -> crate::config::RawWorkspaceSettings {
+        crate::config::RawWorkspaceSettings {
+            search_paths: Some(vec![value.to_string()]),
+            languages: [(
+                "lua".to_string(),
+                crate::config::LanguageSettings {
+                    parser: Some(value.to_string()),
+                    queries: Some(vec![crate::config::settings::QueryItem {
+                        path: value.to_string(),
+                        kind: None,
+                    }]),
+                    ..Default::default()
+                },
+            )]
+            .into(),
+            ..Default::default()
+        }
+    }
+
+    /// Every path field of `settings`, so a rule cannot be asserted for one
+    /// field and quietly missed for another.
+    fn all_paths(settings: &crate::config::RawWorkspaceSettings) -> Vec<String> {
+        let language = &settings.languages["lua"];
+        let mut paths = settings.search_paths.clone().unwrap_or_default();
+        paths.extend(language.parser.clone());
+        paths.extend(language.queries.iter().flatten().map(|q| q.path.clone()));
+        paths
+    }
+
+    fn anchor(value: &str, base: Option<&Path>) -> String {
+        let mut settings = settings_with_path(value);
+        anchor_settings_paths(&mut settings, base);
+        let paths = all_paths(&settings);
+        assert_eq!(paths.len(), 3, "every path field should be visited");
+        assert!(
+            paths.iter().all(|path| path == &paths[0]),
+            "every path field should follow the same rule: {paths:?}"
+        );
+        paths[0].clone()
+    }
+
+    #[test]
+    fn relative_paths_are_anchored_to_the_base() {
+        assert_eq!(
+            anchor("./queries/highlights.scm", Some(Path::new("/workspace"))),
+            "/workspace/queries/highlights.scm"
+        );
+        assert_eq!(
+            anchor("queries/highlights.scm", Some(Path::new("/workspace"))),
+            "/workspace/queries/highlights.scm"
+        );
+    }
+
+    #[test]
+    fn parent_traversal_is_normalized_away() {
+        assert_eq!(
+            anchor("../shared/parsers", Some(Path::new("/workspace/project"))),
+            "/workspace/shared/parsers"
+        );
+    }
+
+    /// Anchoring runs before expansion, so it must not disturb the syntax the
+    /// expansion pass reads — including the `$$` escape for a literal dollar.
+    #[test]
+    fn variables_survive_anchoring_unexpanded() {
+        assert_eq!(
+            anchor("./queries/$LANG.scm", Some(Path::new("/workspace"))),
+            "/workspace/queries/$LANG.scm"
+        );
+        assert_eq!(
+            anchor("./$$literal", Some(Path::new("/workspace"))),
+            "/workspace/$$literal"
+        );
+    }
+
+    /// A value that expansion turns into an absolute path is left alone: its
+    /// author already said where it lives, and joining a base onto a leading
+    /// `~` or `$` would corrupt the syntax before expansion ever sees it.
+    #[test]
+    fn absolute_and_expandable_prefixes_are_not_anchored() {
+        let base = Some(Path::new("/workspace"));
+        assert_eq!(
+            anchor("/opt/kakehashi/runtime", base),
+            "/opt/kakehashi/runtime"
+        );
+        assert_eq!(anchor("~/parsers/lua.so", base), "~/parsers/lua.so");
+        assert_eq!(anchor("$KAKEHASHI_DATA_DIR", base), "$KAKEHASHI_DATA_DIR");
+        assert_eq!(
+            anchor("${KAKEHASHI_DATA_DIR}", base),
+            "${KAKEHASHI_DATA_DIR}"
+        );
+    }
+
+    /// The programmed defaults have no source directory. Without a base every
+    /// value must survive verbatim, or `${KAKEHASHI_DATA_DIR}` would stop
+    /// reaching the expansion pass that gives it a platform default.
+    #[test]
+    fn no_base_leaves_every_path_untouched() {
+        assert_eq!(anchor("./runtime", None), "./runtime");
+        assert_eq!(
+            anchor("${KAKEHASHI_DATA_DIR}", None),
+            "${KAKEHASHI_DATA_DIR}"
+        );
+    }
+
     #[test]
     fn expand_dollar_var() {
         let env = make_env(&[("HOME", "/home/user")]);
