@@ -22,6 +22,12 @@ pub fn default_settings() -> RawWorkspaceSettings {
         search_paths: Some(vec!["${KAKEHASHI_DATA_DIR}".to_string()]),
         languages: default_languages(),
         capture_mappings: default_capture_mappings(),
+        // Safe to carry here even though the key is deprecated: this struct is
+        // also merge layer 1, and a user's own top-level value overlays THE
+        // SAME key, so it wins. `languages._.autoInstall` is the one that must
+        // stay unset in layer 1 — it outranks the top-level key in
+        // `auto_install_for`, so a defaults-supplied `_` would shadow a user's
+        // `autoInstall = false` and silently ignore it.
         auto_install: Some(true),
         diagnostics_debounce_ms: Some(DEFAULT_DEBOUNCE_MS),
         features: Some(FeatureSettings {
@@ -39,6 +45,28 @@ pub fn default_settings() -> RawWorkspaceSettings {
         }),
         language_servers: Some(default_language_servers()),
     }
+}
+
+/// The `kakehashi config init` template: [`default_settings`] plus the
+/// defaults that are resolved at lookup time rather than carried in layer 1.
+///
+/// Exists because `default_settings` is both the template source AND merge
+/// layer 1, and `autoInstall` cannot be in layer 1 (see the comment there).
+/// The template still spells the default out — per
+/// config-init-template-convention, deleting any generated line must not
+/// change behavior — but spells the CANONICAL key, `[languages._]`, so a
+/// generated file never trips the top-level deprecation notice.
+pub fn config_init_settings() -> RawWorkspaceSettings {
+    let mut settings = default_settings();
+    // Spell the default on the CANONICAL key so a generated file never trips
+    // the top-level deprecation notice, and drop the deprecated spelling for
+    // the same reason. Layer 1 still carries the top-level value, so deleting
+    // the generated line changes nothing — the convention's requirement.
+    if let Some(wildcard) = settings.languages.get_mut(WILDCARD_KEY) {
+        wildcard.auto_install = Some(true);
+    }
+    settings.auto_install = None;
+    settings
 }
 
 /// Returns the default languageServers map: a defaults-only `_` wildcard
@@ -517,15 +545,79 @@ mod tests {
     }
 
     #[test]
-    fn default_settings_has_auto_install_true() {
+    fn layer_one_leaves_the_wildcard_auto_install_unset() {
         let settings = default_settings();
 
-        // autoInstall should default to true for zero-config experience
+        // `_` outranks the top-level key, so a defaults-supplied value here
+        // would shadow a user's `autoInstall = false` and silently ignore it.
         assert_eq!(
-            settings.auto_install,
-            Some(true),
-            "autoInstall should be Some(true) by default"
+            settings
+                .languages
+                .get(WILDCARD_KEY)
+                .and_then(|wildcard| wildcard.auto_install),
+            None,
+            "layer 1 must not set languages._.autoInstall"
         );
+        // The top-level key IS safe in layer 1: a user's own top-level value
+        // overlays the same key and wins. Keeping it preserves what
+        // `effective_configuration` reports before any config is applied.
+        assert_eq!(settings.auto_install, Some(true));
+    }
+
+    #[test]
+    fn a_user_top_level_auto_install_survives_the_layer_one_default() {
+        // The regression this guards: if layer 1 supplied `languages._`, the
+        // merge would hand `auto_install_for` a wildcard `Some(true)` that
+        // outranks the user's key, silently ignoring their opt-out.
+        let user = RawWorkspaceSettings {
+            auto_install: Some(false),
+            ..Default::default()
+        };
+        let merged =
+            crate::config::merge::merge_workspace_settings(Some(default_settings()), Some(user))
+                .expect("both layers present");
+        let resolved = crate::config::WorkspaceSettings::try_from_settings(
+            &merged,
+            None,
+            crate::config::expand::with_kakehashi_defaults(|_| None),
+        )
+        .expect("merged settings expand");
+
+        assert!(!resolved.auto_install_for("python"));
+    }
+
+    #[test]
+    fn config_init_template_spells_out_the_canonical_auto_install_default() {
+        let template = config_init_settings();
+
+        // Spelled out per config-init-template-convention, and on the
+        // canonical key so a generated file never trips the deprecation
+        // notice for the top-level spelling.
+        assert_eq!(
+            template
+                .languages
+                .get(WILDCARD_KEY)
+                .and_then(|wildcard| wildcard.auto_install),
+            Some(true)
+        );
+        assert_eq!(
+            template.auto_install, None,
+            "the template must not emit the deprecated top-level key"
+        );
+
+        // Deleting the generated line must not change behavior: the resolved
+        // value with it, and without it, agree.
+        let resolved = |raw: &RawWorkspaceSettings| {
+            crate::config::WorkspaceSettings::try_from_settings(
+                raw,
+                None,
+                crate::config::expand::with_kakehashi_defaults(|_| None),
+            )
+            .expect("template expands")
+            .auto_install_for("python")
+        };
+        assert!(resolved(&template));
+        assert!(resolved(&default_settings()));
     }
 
     #[test]
@@ -599,8 +691,9 @@ mod tests {
     }
 
     #[test]
-    fn default_settings_serializes_to_valid_toml() {
-        let settings = default_settings();
+    fn config_init_template_serializes_to_valid_toml() {
+        // The template, not layer 1: this asserts what `config init` writes.
+        let settings = config_init_settings();
 
         // Should serialize to valid TOML
         let toml_string =
