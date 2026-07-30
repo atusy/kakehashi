@@ -207,6 +207,152 @@ fn assert_advertised(init_response: &Value) {
     );
 }
 
+/// Drive the reopen-order mock: an appended wire log shared by every
+/// incarnation, plus a stall (longer than the pool's 2 s `REOPEN_WAIT`) that
+/// holds the respawn re-open before any `didOpen` goes out.
+fn init_client_reopen_order(log: &std::path::Path) -> (LspClient, tempfile::TempDir) {
+    let bin = mock_formatter_bin();
+    let config_dir = tempfile::TempDir::new().expect("Failed to create config temp dir");
+    let config_path = config_dir.path().join("code_action.toml");
+    std::fs::write(&config_path, "").expect("Failed to write config");
+
+    let mut client = LspClient::builder()
+        .arg("--config-file")
+        .arg(config_path.to_str().expect("temp path should be UTF-8"))
+        // Inherited by every downstream kakehashi spawns, incl. the respawn.
+        .env(
+            "MOCK_LSP_WIRE_LOG",
+            log.to_str().expect("temp path should be UTF-8"),
+        )
+        // Longer than REOPEN_WAIT (2 s), so a command fired while the re-open
+        // is in flight can NEVER be saved by winning the race: the barrier's
+        // fail-soft is the only correct outcome, and any code path that sends
+        // anyway is caught by the wire-order assertion below.
+        .env("KAKEHASHI_E2E_STALL_REOPEN_MS", "2500")
+        .build();
+
+    client.send_request(
+        "initialize",
+        json!({
+            "processId": std::process::id(),
+            "rootUri": null,
+            "capabilities": literal_support_caps(true),
+            "workspaceFolders": null,
+            "initializationOptions": { "languageServers": {
+                "mock-codeaction": {
+                    "cmd": [bin, "code-action-reopen-order"],
+                    "languages": ["lua"]
+                }
+            }}
+        }),
+    );
+    client.send_notification("initialized", json!({}));
+    (client, config_dir)
+}
+
+/// Split the wire log into lines and return the segment belonging to the
+/// REPLACEMENT incarnation: everything from the last exact `initialize` on.
+/// Segmenting matters — the first incarnation legitimately received a didOpen
+/// before it crashed, and asserting against the whole log would let that stale
+/// didOpen satisfy the ordering check (the exact hole the first version of
+/// this test had).
+fn replacement_segment(wire: &str) -> Vec<&str> {
+    let lines: Vec<&str> = wire.lines().collect();
+    let last_init = lines
+        .iter()
+        .rposition(|l| l.split('\t').next() == Some("initialize"))
+        .unwrap_or_else(|| panic!("no initialize in the wire log:\n{wire}"));
+    lines[last_init..].to_vec()
+}
+
+/// The ordering guarantee, end to end and DETERMINISTIC: a command routed to a
+/// respawned downstream must not overtake the `didOpen` that re-opens the
+/// document its arguments reference (execute-command-routing-token).
+///
+/// The stall makes the barrier load-bearing instead of raced. While the
+/// re-open is held (2.5 s > REOPEN_WAIT), a correct kakehashi DROPS the
+/// command (fail-soft null; nothing on the wire); one that signals early,
+/// ignores the unsettled wait, or never waits sends it ahead of the didOpen —
+/// and the replacement-segment wire order catches every one of those shapes.
+/// This is the class of bug that appeared five times in review and that unit
+/// tests structurally cannot catch (they drive the completion signal by hand).
+#[test]
+fn a_command_does_not_overtake_the_reopen_of_a_respawned_downstream() {
+    let log_dir = tempfile::TempDir::new().expect("Failed to create log temp dir");
+    let log = log_dir.path().join("wire.log");
+    let (mut client, _config_dir) = init_client_reopen_order(&log);
+    open_markdown(&mut client);
+
+    // Surface the routed command; the mock then exits once (crash marker), so
+    // the connection kakehashi holds is dead and its document tracker purged.
+    let actions = code_action_with_retry(&mut client);
+    let command = actions
+        .iter()
+        .find(|a| a["command"].is_string())
+        .expect("the executable command action");
+    let routed = command["command"]
+        .as_str()
+        .expect("a routed command name")
+        .to_string();
+    let fire = json!({ "command": routed, "arguments": [] });
+
+    // First attempt: the respawn's re-open is stalled past REOPEN_WAIT, so the
+    // barrier CANNOT settle in time. The only correct outcome is a fail-soft
+    // null — a non-null result means the command executed while the document
+    // was provably not open yet.
+    let first = client.send_request("workspace/executeCommand", fire.clone());
+    assert!(
+        first["result"].is_null(),
+        "a command whose re-open is still in flight must fail soft, got: {first:?}"
+    );
+
+    // Retry until it goes through: the stall ends at ~2.5 s, the barrier
+    // settles, and a retry then waits it out and sends AFTER the didOpen.
+    let mut delivered = false;
+    for _ in 0..40 {
+        let response = client.send_request("workspace/executeCommand", fire.clone());
+        if !response["result"].is_null() {
+            delivered = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert!(
+        delivered,
+        "the command must succeed once the re-open finished"
+    );
+
+    let wire = std::fs::read_to_string(&log).expect("the mock wrote a wire log");
+    assert!(
+        std::path::Path::new(&format!("{}.died", log.to_str().expect("utf-8"))).exists(),
+        "the mock must have crashed once, else the respawn path was not exercised"
+    );
+    assert!(
+        wire.lines()
+            .filter(|l| l.split('\t').next() == Some("initialize"))
+            .count()
+            >= 2,
+        "two incarnations must have initialized:\n{wire}"
+    );
+    let segment = replacement_segment(&wire);
+    let execute = segment
+        .iter()
+        .position(|l| l.split('\t').next() == Some("workspace/executeCommand"))
+        .unwrap_or_else(|| panic!("the replacement never received the command:\n{wire}"));
+    let reopen = segment
+        .iter()
+        .position(|l| l.split('\t').next() == Some("textDocument/didOpen"))
+        .unwrap_or_else(|| {
+            panic!("no didOpen reached the replacement before the command:\n{wire}")
+        });
+    assert!(
+        reopen < execute,
+        "the replacement got the command BEFORE its re-open didOpen:\n{wire}"
+    );
+
+    shutdown(&mut client);
+}
+
 /// Markdown host: the lua fence content sits on host line 3.
 const MARKDOWN: &str = "# Test\n\n```lua\nlocal x = 1\n```\n";
 const MARKDOWN_URI: &str = "file:///test_code_action.md";

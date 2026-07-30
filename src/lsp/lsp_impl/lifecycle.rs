@@ -1173,6 +1173,24 @@ async fn forward_with_cancel(
     }
 }
 
+/// e2e-only fault injection (`KAKEHASHI_E2E_STALL_REOPEN_MS`): hold the respawn
+/// re-open before it enqueues any `didOpen`. Set LONGER than `REOPEN_WAIT` by
+/// the ordering e2e, this forces the barrier's contract to be load-bearing —
+/// the first command must be DROPPED (fail soft), never sent ahead of the
+/// didOpen — rather than won by racing. Unset (every other test, and any
+/// production use of an e2e build), this is a no-op. Not compiled into release
+/// builds at all: `cargo build --release` carries no `e2e` feature.
+#[cfg(feature = "e2e")]
+async fn e2e_stall_reopen() {
+    let Ok(ms) = std::env::var("KAKEHASHI_E2E_STALL_REOPEN_MS") else {
+        return;
+    };
+    let Ok(ms) = ms.parse::<u64>() else {
+        return;
+    };
+    tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+}
+
 fn spawn_upstream_request(
     inbound_request_registry: crate::lsp::bridge::InboundRequestRegistry,
     translators: Option<Arc<UpstreamRequestTranslators>>,
@@ -1283,6 +1301,15 @@ fn spawn_upstream_request(
                 // — the failure this barrier exists to prevent. A panic drops the
                 // sender instead, which waiters read as "can never finish".
                 let mut work = tokio::spawn(async move {
+                    // e2e-only fault injection: hold the re-open BEFORE any
+                    // didOpen goes out, so the ordering e2e can force the window
+                    // in which a command could overtake its own didOpen instead
+                    // of racing it (the race resolves correctly by accident on a
+                    // fast machine, which is what made the naive test
+                    // non-discriminating). Compiled only with the `e2e` feature;
+                    // release builds do not contain this branch.
+                    #[cfg(feature = "e2e")]
+                    e2e_stall_reopen().await;
                     for host in hosts {
                         // Await the tree first: a re-open racing an edit would
                         // otherwise resolve no injections and open nothing.

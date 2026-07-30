@@ -152,6 +152,7 @@ fn main() {
             .and_then(|m| m.as_str())
             .unwrap_or_default();
         let id = message.get("id").cloned();
+        append_wire_log(method, &message);
 
         match method {
             "initialize" => {
@@ -175,7 +176,7 @@ fn main() {
                             "textDocumentSync": 1
                         })
                     }
-                    "code-action" | "code-action-preferred" => json!({
+                    "code-action" | "code-action-preferred" | "code-action-reopen-order" => json!({
                         "codeActionProvider": true,
                         "executeCommandProvider": { "commands": ["mock.run"] },
                         "textDocumentSync": 1
@@ -619,7 +620,17 @@ fn main() {
                         }
                     })
                     .unwrap_or(Value::Null);
+                let surfaced_action = !result.is_null();
                 respond(&mut writer, id, result);
+                // `code-action-reopen-order`: die right after SURFACING the
+                // action (a null result during the cold handshake must not
+                // trigger this — the client has no routed command to fire yet),
+                // so the command the client fires next lands on a RESPAWNED
+                // connection whose document tracker was purged.
+                if mode == "code-action-reopen-order" && surfaced_action && crash_once() {
+                    let _ = writer.flush();
+                    std::process::exit(0);
+                }
             }
             "codeAction/resolve" => {
                 // Materialize the lazy action's edit, echoing the original
@@ -1282,6 +1293,47 @@ fn request_with_params<W: Write>(writer: &mut W, id: Value, method: &str, params
         json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params }).to_string();
     let _ = write!(writer, "Content-Length: {}\r\n\r\n{body}", body.len());
     let _ = writer.flush();
+}
+
+/// Append `method` (plus the document URI when there is one) to an ordered wire
+/// log shared by EVERY incarnation of this mock, so a test can assert the order
+/// in which a downstream received messages ACROSS a respawn
+/// (execute-command-routing-token). `record_mock_event` cannot express order —
+/// it writes one file per `{mode}.{event}` and overwrites. This appends, keyed
+/// only by the env var, so the replacement process kakehashi spawns after a
+/// crash keeps writing to the same log.
+fn append_wire_log(method: &str, message: &Value) {
+    let Ok(path) = std::env::var("MOCK_LSP_WIRE_LOG") else {
+        return;
+    };
+    let uri = message
+        .pointer("/params/textDocument/uri")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    else {
+        return;
+    };
+    let _ = writeln!(file, "{method}\t{uri}");
+}
+
+/// True exactly once per test run, across process incarnations: the first
+/// caller atomically creates a marker beside the wire log and gets `true`;
+/// every later incarnation sees the marker and gets `false` — the replacement
+/// must SURVIVE to receive the re-open and the command.
+fn crash_once() -> bool {
+    let Ok(path) = std::env::var("MOCK_LSP_WIRE_LOG") else {
+        return false;
+    };
+    // `create_new` is the atomic test-and-set: it fails if the marker exists.
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(format!("{path}.died"))
+        .is_ok()
 }
 
 fn record_mock_event(mode: &str, event: &str, message: &Value) {
