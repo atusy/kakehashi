@@ -204,6 +204,33 @@ fn read_explicit_layers(
                 None
             }
         };
+        // Judging a layer in isolation also resolves its language `base`
+        // chains, so a cycle an overlay later removes is still warned about
+        // once here. Accepted: the alternative is threading a "stay quiet"
+        // flag through base resolution to silence a warning that names a
+        // real cycle in a file the user wrote.
+        //
+        // Judge each layer's *paths* on its own so a later layer cannot
+        // mask an earlier one's undefined variable: path fields are
+        // replaced wholesale by the overlay, so the merged result would
+        // never mention the mistake. Cross-field invariants are excluded
+        // here (see `ExpandErrors::path_error_summary`) — their operands
+        // merge independently, so they are only meaningful once every
+        // layer has been folded together, and `expand_merged_settings`
+        // catches them there.
+        //
+        // Judged *before* anchoring, so the value the error quotes is the one
+        // the user can find in their file. The verdict is the same either way —
+        // anchoring only ever prepends literal characters, escaping any `$` in
+        // the directory name — so this costs nothing but reads better.
+        if let Some(raw_settings) = layer.as_ref()
+            && let Err(errs) = WorkspaceSettings::try_from_settings(raw_settings, home, &env_fn)
+            && let Some(details) = errs.path_error_summary()
+        {
+            let message = format!("Path expansion failed in {}: {details}", path.display());
+            events.push(SettingsEvent::error(message.clone()));
+            fatal_error.get_or_insert(message);
+        }
         // Anchor each file's relative paths to that file's own directory, so
         // `--config-file base.toml --config-file team/overrides.toml` reads
         // `./queries` as relative to whichever file wrote it.
@@ -224,28 +251,6 @@ fn read_explicit_layers(
                     fatal_error.get_or_insert(message);
                 }
             }
-        }
-        // Judging a layer in isolation also resolves its language `base`
-        // chains, so a cycle an overlay later removes is still warned about
-        // once here. Accepted: the alternative is threading a "stay quiet"
-        // flag through base resolution to silence a warning that names a
-        // real cycle in a file the user wrote.
-        //
-        // Judge each layer's *paths* on its own so a later layer cannot
-        // mask an earlier one's undefined variable: path fields are
-        // replaced wholesale by the overlay, so the merged result would
-        // never mention the mistake. Cross-field invariants are excluded
-        // here (see `ExpandErrors::path_error_summary`) — their operands
-        // merge independently, so they are only meaningful once every
-        // layer has been folded together, and `expand_merged_settings`
-        // catches them there.
-        if let Some(raw_settings) = layer.as_ref()
-            && let Err(errs) = WorkspaceSettings::try_from_settings(raw_settings, home, &env_fn)
-            && let Some(details) = errs.path_error_summary()
-        {
-            let message = format!("Path expansion failed in {}: {details}", path.display());
-            events.push(SettingsEvent::error(message.clone()));
-            fatal_error.get_or_insert(message);
         }
         layers.push(layer);
     }
@@ -712,21 +717,30 @@ mod tests {
         );
     }
 
+    /// Restores `XDG_CONFIG_HOME` when dropped, so a panic inside the test body
+    /// cannot leave the variable pointing at a deleted `TempDir` and turn one
+    /// failure into a cascade across the other `#[serial(xdg_env)]` tests.
+    struct XdgConfigHome(Option<String>);
+
+    impl Drop for XdgConfigHome {
+        fn drop(&mut self) {
+            // SAFETY: #[serial(xdg_env)] prevents concurrent modification.
+            unsafe {
+                match self.0.take() {
+                    Some(value) => std::env::set_var("XDG_CONFIG_HOME", value),
+                    None => std::env::remove_var("XDG_CONFIG_HOME"),
+                }
+            }
+        }
+    }
+
     /// Run `f` with `XDG_CONFIG_HOME` pointed at `config_home`, restoring the
     /// original afterwards. Callers must carry `#[serial(xdg_env)]`.
     fn with_xdg_config_home<T>(config_home: &Path, f: impl FnOnce() -> T) -> T {
-        let original = std::env::var("XDG_CONFIG_HOME").ok();
+        let _restore = XdgConfigHome(std::env::var("XDG_CONFIG_HOME").ok());
         // SAFETY: #[serial(xdg_env)] prevents concurrent modification.
         unsafe { std::env::set_var("XDG_CONFIG_HOME", config_home) };
-        let result = f();
-        // SAFETY: #[serial(xdg_env)] prevents concurrent modification.
-        unsafe {
-            match original {
-                Some(value) => std::env::set_var("XDG_CONFIG_HOME", value),
-                None => std::env::remove_var("XDG_CONFIG_HOME"),
-            }
-        }
-        result
+        f()
     }
 
     /// A user config file at `<config_home>/kakehashi/kakehashi.toml`, returning

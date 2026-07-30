@@ -480,6 +480,41 @@ mod tests {
         }
     }
 
+    /// One array, three rules: the relative entry moves, the two that carry
+    /// their own base do not. The single-value helper above cannot express
+    /// this, and a layer's `searchPaths` routinely mixes the forms.
+    #[test]
+    fn one_array_may_mix_anchored_and_untouched_entries() {
+        let mut settings = crate::config::RawWorkspaceSettings {
+            search_paths: Some(vec![
+                "./runtime".into(),
+                "/opt/kakehashi".into(),
+                "${KAKEHASHI_DATA_DIR}".into(),
+            ]),
+            ..Default::default()
+        };
+
+        anchor_settings_paths(&mut settings, Some(Path::new("/workspace")));
+
+        assert_eq!(
+            settings.search_paths,
+            Some(vec![
+                "/workspace/runtime".to_string(),
+                "/opt/kakehashi".to_string(),
+                "${KAKEHASHI_DATA_DIR}".to_string(),
+            ])
+        );
+    }
+
+    /// Degenerate spellings of "here". Both name the source directory, which is
+    /// what anchoring resolves them to — worth pinning because `expand_path`
+    /// leaves an empty string empty, so the two passes disagree by design.
+    #[test]
+    fn empty_and_dot_resolve_to_the_base_itself() {
+        assert_eq!(anchor("", Some(Path::new("/workspace"))), "/workspace");
+        assert_eq!(anchor(".", Some(Path::new("/workspace"))), "/workspace");
+    }
+
     /// The programmed defaults have no source directory. Without a base every
     /// value must survive verbatim, or `${KAKEHASHI_DATA_DIR}` would stop
     /// reaching the expansion pass that gives it a platform default.

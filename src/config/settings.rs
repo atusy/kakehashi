@@ -618,7 +618,9 @@ impl QueryKind {
 /// Example: `{ path = "./highlights.scm", kind = "highlights" }`
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, JsonSchema)]
 pub struct QueryItem {
-    /// Path to the query file (required)
+    /// Path to the query file (required). A relative path resolves against the
+    /// configuration source that supplied it — the containing file's directory,
+    /// or the workspace root for client-supplied settings.
     pub path: String,
     /// Query type: highlights, bindings, or injections (optional - inferred from filename if omitted)
     pub kind: Option<QueryKind>,
@@ -657,6 +659,9 @@ pub(crate) fn infer_query_kind(path: &str) -> Option<QueryKind> {
 #[serde(rename_all = "camelCase")]
 pub struct RawWorkspaceSettings {
     /// Directories to search for Tree-sitter parser libraries and query files.
+    /// A relative path resolves against the configuration source that supplied
+    /// it — the containing file's directory, or the workspace root for
+    /// client-supplied settings.
     pub search_paths: Option<Vec<String>>,
     /// Per-language configuration (parser paths, queries, bridge filters, base inheritance).
     #[serde(default)]
@@ -862,7 +867,9 @@ pub struct LanguageSettings {
     /// E.g., `base = "markdown"` on `rmd` means rmd inherits markdown's
     /// parser/queries/bridge for fields rmd does not set itself.
     pub base: Option<String>,
-    /// Path to the parser library (.so/.dylib/.dll)
+    /// Path to the parser library (.so/.dylib/.dll). A relative path resolves
+    /// against the configuration source that supplied it — the containing
+    /// file's directory, or the workspace root for client-supplied settings.
     pub parser: Option<String>,
     /// Omit to inherit from wildcard/defaults. Use an empty array `[]` to explicitly clear queries.
     pub queries: Option<Vec<QueryItem>>,
