@@ -554,6 +554,9 @@ impl DocumentTracker {
     /// The purge is the last moment that set is knowable — afterwards nothing
     /// records what the dead process had open — so the replacement connection's
     /// re-open is driven from this return value (execute-command-routing-token).
+    /// `#[must_use]`: a purge site that drops this loses the heal with no
+    /// compiler or runtime signal.
+    #[must_use]
     pub(super) async fn purge_connection(&self, connection_key: &ConnectionKey) -> Vec<Url> {
         let mut generation = self
             .connection_generations

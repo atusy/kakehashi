@@ -99,6 +99,22 @@ impl PendingReopenRegistry {
         Some((hosts, tx))
     }
 
+    /// Put a claimed host set back after a hand-off failed, and retire the
+    /// barrier it registered.
+    ///
+    /// [`take`](Self::take) DRAINS, so a handshake that claims the set and then
+    /// dies before the re-open is queued would lose it permanently: the purge
+    /// that recorded it already emptied the document tracker, so the next purge
+    /// of the same key reports nothing to re-record. Restoring leaves it for the
+    /// next replacement to claim.
+    pub(crate) fn restore(&self, key: &ConnectionKey, hosts: Vec<Url>) {
+        self.in_flight
+            .lock()
+            .recover_poison("PendingReopenRegistry::restore")
+            .remove(key);
+        self.record(key, hosts);
+    }
+
     /// Wait (bounded by [`REOPEN_WAIT`]) for an in-flight re-open on `key`.
     ///
     /// Returns immediately when none is in flight, which is the common case.
@@ -120,17 +136,26 @@ impl PendingReopenRegistry {
         let settled = tokio::time::timeout(REOPEN_WAIT, rx.wait_for(|done| *done))
             .await
             .is_ok();
-        // Retire the entry ONLY once the re-open actually settled. On timeout it
-        // is still running, and forgetting it here would let the NEXT request on
-        // this connection sail past with no wait at all — precisely when the
-        // re-open is known to be slow. Leaving it registered keeps that request
-        // bounded by the same budget, and the sender's drop retires it in the
-        // end regardless.
+        // Retire the entry only when the re-open actually SETTLED, and only when
+        // it is still the one we waited on. Two independent hazards:
+        //
+        // - On timeout the re-open is still running, so forgetting it would let
+        //   the NEXT request sail past with no wait at all — precisely when the
+        //   re-open is known to be slow. Leave it; the sender's drop retires it.
+        // - Two awaits separate the clone above from this retire, so a LATER
+        //   respawn may have claimed the key in between and registered a
+        //   genuinely outstanding re-open. Removing by key alone would evict it.
         if settled {
-            self.in_flight
+            let mut in_flight = self
+                .in_flight
                 .lock()
-                .recover_poison("PendingReopenRegistry::wait_for_reopen")
-                .remove(key);
+                .recover_poison("PendingReopenRegistry::wait_for_reopen");
+            if in_flight
+                .get(key)
+                .is_some_and(|current| current.same_channel(&rx))
+            {
+                in_flight.remove(key);
+            }
         }
     }
 }

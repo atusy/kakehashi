@@ -166,9 +166,11 @@ impl LanguageServerPool {
             // marker-less acquisition, so reconnecting with `None` would spawn a
             // client-root process instead of the shared instance and run the
             // command in the wrong workspace. A MARKER-rooted key has the same
-            // problem. Both fail soft here (the user re-fires once the origin is
-            // back); reconstructing a shared/marker root without a document is a
-            // deferred follow-up.
+            // problem here; the encoded-command path solves it with
+            // `reconnect_by_key` (which rebuilds the workspace from the root the
+            // token carries), but a palette command's registry entry is only a
+            // key, so wiring this path to the same helper is a follow-up.
+            // Shared keys cannot be re-rooted without a document either way.
             None if key.is_client_fallback() => {
                 // The palette registry is session-persistent, so an origin
                 // removed/disabled from config after registration lands here —

@@ -39,6 +39,9 @@ pub(crate) use document_tracker::OpenedVirtualDoc;
 pub(crate) use dynamic_capability_registry::DynamicCapabilityRegistry;
 pub(crate) use message_sender::{ConnectionHandleSender, MessageSender};
 use pending_reopen::PendingReopenRegistry;
+/// Re-exported so the server-side re-open handler bounds its work by the same
+/// budget requests wait on — the two must not drift apart.
+pub(crate) use pending_reopen::REOPEN_WAIT;
 pub(crate) use shutdown_timeout::GlobalShutdownTimeout;
 
 #[derive(Clone)]
@@ -1245,7 +1248,7 @@ impl LanguageServerPool {
 
     /// Resolve the exact `(server, root)` connection a document currently
     /// routes to, including shared-instance capability fallback.
-    pub(crate) async fn resolved_connection_key(
+    pub(super) async fn resolved_connection_key(
         &self,
         server_name: &str,
         server_config: &crate::config::settings::BridgeServerConfig,
@@ -2477,8 +2480,15 @@ impl LanguageServerPool {
                     // SEE that one is in flight and wait for it — registering
                     // after Ready would leave exactly the window in which a
                     // command overtakes its own didOpen.
-                    let pending_reopen_handoff = pending_reopen.take(&command_registration_key);
+                    let mut pending_reopen_handoff = pending_reopen.take(&command_registration_key);
                     if !handle_for_handshake.transition_initializing_to_ready() {
+                        // Put the claimed set back: `take` drained it, and the
+                        // purge that recorded it already emptied the document
+                        // tracker, so nothing would re-record it for the next
+                        // replacement.
+                        if let Some((hosts, _done)) = pending_reopen_handoff.take() {
+                            pending_reopen.restore(&command_registration_key, hosts);
+                        }
                         return Err(io::Error::new(
                             io::ErrorKind::Interrupted,
                             "bridge: connection was invalidated during initialization",
@@ -2523,6 +2533,12 @@ impl LanguageServerPool {
                             "Failed to queue virtual-document re-open after respawn \
                              (forwarding loop gone): {e}"
                         );
+                        // Same reasoning as the Ready-flip failure above: the
+                        // undelivered set is the only record that these documents
+                        // need re-opening.
+                        if let UpstreamRequest::ReopenDocuments { hosts, .. } = e.0 {
+                            pending_reopen.restore(&command_registration_key, hosts);
+                        }
                     }
                     Ok(())
                 }
@@ -4446,7 +4462,10 @@ mod tests {
                 .contains_key(&(connection_key.clone(), virtual_uri.to_uri_string()))
         );
 
-        pool.document_tracker
+        // Discarded deliberately: this test asserts transition-lock reclamation,
+        // not the re-open hand-off.
+        let _ = pool
+            .document_tracker
             .purge_connection(&connection_key)
             .await;
         pool.purge_open_transition_locks(&connection_key).await;
@@ -4689,7 +4708,10 @@ mod tests {
             .await;
         let stale = pool.document_tracker.host_virtual_docs(&host_uri).await[0].clone();
 
-        pool.document_tracker
+        // Discarded deliberately: this test asserts transition-lock reclamation,
+        // not the re-open hand-off.
+        let _ = pool
+            .document_tracker
             .purge_connection(&connection_key)
             .await;
         pool.register_opened_document(&host_uri, &virtual_uri, &connection_key)

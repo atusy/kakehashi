@@ -35,24 +35,43 @@ fn mock_formatter_bin() -> &'static str {
 /// Assert the origin and command without depending on which rooting mode the
 /// test's workspace happens to resolve to.
 fn is_routed_command(name: &str, origin: &str, command: &str) -> bool {
-    let Some(rest) = name.strip_prefix("kakehashi|") else {
-        return false;
-    };
-    let mut parts = rest.splitn(4, '|');
-    let tag = parts.next();
-    let server = parts.next();
-    let _root = parts.next();
-    let routed_command = parts.next();
-    matches!(tag, Some("m" | "c" | "s"))
-        && server == Some(origin)
-        && routed_command == Some(command)
+    routed_parts(name).is_some_and(|(tag, server, _root, routed_command)| {
+        matches!(tag, "m" | "c" | "s") && server == origin && routed_command == command
+    })
 }
 
-/// The routed name must NOT carry a host document any more: a per-document name
-/// is what kept the command set unbounded and unadvertisable
-/// (execute-command-routing-token).
-fn routed_command_is_document_free(name: &str, host_uri: &str) -> bool {
-    !name.contains(host_uri)
+/// Split a routed name into `(tag, server, root, command)`, or `None` if it is
+/// not bridge-minted. The command is the remainder, matching the decoder.
+fn routed_parts(name: &str) -> Option<(&str, &str, &str, &str)> {
+    let rest = name.strip_prefix("kakehashi|")?;
+    let mut parts = rest.splitn(4, '|');
+    Some((parts.next()?, parts.next()?, parts.next()?, parts.next()?))
+}
+
+/// The routed name must carry the ORIGIN CONNECTION's rooting, not the host
+/// document (execute-command-routing-token). These tests initialize with
+/// `"rootUri": null` and no workspace markers, so the origin connection is the
+/// client-root fallback: tag `c` with an empty root segment.
+///
+/// Asserting the tag and root — rather than merely "no document appears" — is
+/// what makes this discriminating: a regression to a per-document token, or one
+/// that dropped the rooting mode, changes these two segments.
+fn assert_client_fallback_rooted(name: &str) {
+    let (tag, _server, root, _command) =
+        routed_parts(name).unwrap_or_else(|| panic!("not a bridge-routed name: {name:?}"));
+    assert_eq!(
+        tag, "c",
+        "expected the client-root fallback tag in {name:?}"
+    );
+    assert_eq!(
+        root, "",
+        "the client-root fallback carries no root, got {root:?} in {name:?}"
+    );
+    // And no document identity anywhere in the token.
+    assert!(
+        !name.contains(MARKDOWN_URI) && !name.contains("test_code_action"),
+        "routed name must not embed the host document: {name:?}"
+    );
 }
 
 fn init_client(client_capabilities: Value) -> (LspClient, Value, tempfile::TempDir) {
@@ -279,12 +298,9 @@ fn code_action_edit_is_host_translated_and_suffixed() {
         ),
         "command name must encode the origin server, got: {command:?}"
     );
-    // The routing token names a connection, not a document — a per-document
-    // name is what kept the command set unbounded.
-    assert!(
-        routed_command_is_document_free(command["command"].as_str().unwrap(), "test.md"),
-        "routed name must not embed the host document, got: {command:?}"
-    );
+    assert_client_fallback_rooted(command["command"].as_str().unwrap());
+    // The routing token names a connection, not a document.
+    assert_client_fallback_rooted(command["command"].as_str().unwrap());
 
     shutdown(&mut client);
 }
@@ -475,6 +491,7 @@ fn command_action_surfaces_as_executable_with_a_routed_name() {
         ),
         "command name must encode the origin server, got: {command:?}"
     );
+    assert_client_fallback_rooted(command["command"].as_str().unwrap());
 
     shutdown(&mut client);
 }
@@ -864,6 +881,9 @@ fn lazy_action_resolving_to_command_surfaces_it_routed() {
         ),
         "the resolved command must carry a routed name, got: {resolved:?}"
     );
+    // The resolve path must encode the same connection identity as the initial
+    // path — this is the virt-layer twin of the initial-response assertion.
+    assert_client_fallback_rooted(resolved["command"]["command"].as_str().unwrap_or_default());
     assert!(
         resolved["edit"].is_null(),
         "a command-only resolve carries no edit, got: {resolved:?}"

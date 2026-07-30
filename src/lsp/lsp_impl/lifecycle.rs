@@ -390,9 +390,12 @@ impl Kakehashi {
                 // origin server by the encoded command name (#568 PR 6). Gated
                 // on the same literal-support condition as `code_action_provider`.
                 // No STATIC `commands` here: downstream servers connect lazily so
-                // their command names aren't known at initialize (and each routed
-                // name embeds a per-document host_uri, so it could never be a
-                // stable advertised entry anyway). Each server's RAW command
+                // their command names aren't known at initialize. Routed names
+                // are now per-CONNECTION rather than per-document
+                // (execute-command-routing-token), so the set IS finite — but
+                // roots are still discovered lazily, so advertising them remains
+                // a deferred follow-up (see that record's Gap section). Each
+                // server's RAW command
                 // names — those from its static initialize result; a
                 // downstream's later dynamic command registrations are not
                 // collected — are dynamically registered as it reaches Ready
@@ -401,7 +404,7 @@ impl Kakehashi {
                 // — via a session-global registry keyed by raw command id, so
                 // a name advertised by several servers/roots routes to the
                 // latest advertiser (accepted limitation).
-                // Action-embedded commands carry ENCODED per-document names that
+                // Action-embedded commands carry ENCODED per-connection names that
                 // are never registered: a client that dispatches an action's
                 // command on provider PRESENCE (Neovim's built-in client)
                 // executes them regardless; one that only dispatches command ids
@@ -1224,17 +1227,15 @@ fn spawn_upstream_request(
                 // A respawned connection has nothing open; re-open what its dead
                 // predecessor held (execute-command-routing-token).
                 //
-                // `process_injections` IS the re-open — the same call the parse
-                // path makes, which resolves the host's injections and eagerly
-                // opens their virtual documents. Reusing it (rather than driving
-                // `ensure_server_documents_open` for `server` alone) keeps one
-                // code path for opening virtual documents, and is idempotent:
-                // already-open documents are skipped by their open claims.
-                //
-                // The consequence is that it opens for every server the host
-                // bridges to, not just the respawned one. That is a superset of
-                // what is needed and harmless, so `server` is used only for
-                // logging.
+                // `ensure_server_documents_open` — NOT `process_injections`.
+                // `process_injections` reaches the open through
+                // `eager_spawn_and_open_documents`, which SPAWNS a detached task
+                // per server and returns; `done` would then be signalled before a
+                // single `didOpen` was enqueued, releasing a waiting command to
+                // overtake the very notification it is waiting for. This path
+                // awaits the open, which is the whole reason the barrier exists.
+                // It is also scoped to the server that respawned, rather than
+                // every server the host bridges to.
                 let Some(context) = delivery_context else {
                     // Unreachable in the wired server (the loop is spawned with a
                     // context), but the fallback must not silently skip a heal.
@@ -1251,20 +1252,83 @@ fn spawn_upstream_request(
                     "Re-opening {} document(s) after {server:?} respawned",
                     hosts.len()
                 );
-                for host in hosts {
-                    // Sequential, not joined: a respawn can carry a large host
-                    // set, and each re-open resolves injections and sends
-                    // didOpen on the SAME connection anyway, so fanning out
-                    // would only contend on the outbound queue.
-                    //
-                    // Await the tree first: a re-open racing an edit would
-                    // otherwise resolve no injections, open nothing, and still
-                    // report done.
-                    context.injection.ensure_document_parsed(&host).await;
-                    context.injection.process_injections(&host, false).await;
+                use crate::lsp::bridge::REOPEN_WAIT;
+                let settings = context.settings_manager.load_settings();
+                // Bound the WAIT, not the work — the shape the inline heal used.
+                // `ensure_server_documents_open` can block up to the init timeout
+                // on a cold downstream, and `done` gates every command on this
+                // connection: an unbounded loop would keep the barrier
+                // outstanding for tens of seconds, making each command pay the
+                // full wait repeatedly. On expiry the opens keep running detached
+                // and waiters are released, degrading to the pre-existing lazy
+                // heal rather than stalling.
+                let injection = context.injection.clone();
+                let reopen_server = server.clone();
+                let mut work = tokio::spawn(async move {
+                    for host in hosts {
+                        // Await the tree first: a re-open racing an edit would
+                        // otherwise resolve no injections and open nothing.
+                        injection.ensure_document_parsed(&host).await;
+                        // Incarnation BEFORE injections, matching the ordering the
+                        // inline heal used: a close+reopen landing between the two
+                        // reads then pairs a stale incarnation with fresh
+                        // injections, which the downstream sync rejects. The
+                        // reverse pairs stale injections with a fresh incarnation,
+                        // which reads as current.
+                        let Some(incarnation) = injection.document_incarnation(&host) else {
+                            continue;
+                        };
+                        let Some((host_language, injections)) = injection.bridge_injections(&host)
+                        else {
+                            continue;
+                        };
+                        if injections.is_empty() {
+                            continue;
+                        }
+                        // Sequential: each host's didOpen goes out on the SAME
+                        // connection, so fanning out would only contend on the
+                        // single-writer outbound queue.
+                        injection
+                            .bridge()
+                            .ensure_server_documents_open(
+                                &settings,
+                                &host_language,
+                                &host,
+                                incarnation,
+                                injections,
+                                &reopen_server,
+                            )
+                            .await;
+                    }
+                });
+                match tokio::time::timeout(REOPEN_WAIT, &mut work).await {
+                    Ok(Ok(())) => {}
+                    // A panic in the re-open would otherwise vanish with the
+                    // dropped JoinHandle, leaving only "the heal didn't help".
+                    Ok(Err(join_error)) => log::warn!(
+                        target: "kakehashi::bridge",
+                        "Re-open of {server:?} documents failed: {join_error}"
+                    ),
+                    Err(_) => {
+                        log::debug!(
+                            target: "kakehashi::bridge",
+                            "Re-open of {server:?} documents exceeded {REOPEN_WAIT:?}; \
+                             releasing waiters and finishing in the background"
+                        );
+                        tokio::spawn(async move {
+                            if let Err(join_error) = work.await {
+                                log::warn!(
+                                    target: "kakehashi::bridge",
+                                    "Background re-open of {server:?} documents failed: \
+                                     {join_error}"
+                                );
+                            }
+                        });
+                    }
                 }
-                // Release anything waiting to send on this connection. Send
-                // errors mean nobody is waiting, which is the common case.
+                // Release anything waiting to send on this connection. A send
+                // error means the registry entry was already superseded by a
+                // later respawn's claim — that respawn owns the barrier now.
                 let _ = done.send(true);
             }
             UpstreamRequest::ShowMessageRequest {

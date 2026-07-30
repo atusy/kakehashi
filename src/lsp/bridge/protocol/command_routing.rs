@@ -32,8 +32,8 @@
 //! The split boundaries are separator-free **by construction**: `server` and
 //! `root` are escaped on the way in and unescaped on the way out, so a config
 //! key containing the separator round-trips instead of being refused. Only `%`
-//! and the separator itself are escaped, which keeps a `file:///…` root legible
-//! in a log line.
+//! and the separator itself are escaped — a root that already contains percent
+//! escapes gets them doubled (`%20` → `%2520`), which is correct but not pretty.
 //!
 //! Decoding is total: any name that isn't a well-formed bridge command yields
 //! `None` — the handler then tries the raw palette-command registry, and only a
@@ -49,9 +49,11 @@ use crate::lsp::bridge::pool::ConnectionKey;
 
 /// Marker that identifies a bridge-minted command name.
 const COMMAND_PREFIX: &str = "kakehashi";
-/// Field separator. Printable (unlike the 0x1f this replaced) because these
-/// names are candidates for `client/registerCapability`, and escaping — not a
-/// choice of exotic character — is what keeps the boundaries unambiguous.
+/// Field separator. Printable, unlike the 0x1f control character it replaced:
+/// these names reach logs, editor UIs, and JSON (where RFC 8259 forces a
+/// `\u001f` escape for the old separator), so a legible byte is strictly easier
+/// to transport and debug. Unambiguity comes from ESCAPING the segments, not
+/// from the character being exotic.
 const SEP: char = '|';
 /// Rooting-mode tags. A tag rather than an empty-root sentinel because the two
 /// root-less modes are genuinely different connections: routing a shared

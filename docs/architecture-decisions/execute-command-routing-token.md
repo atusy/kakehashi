@@ -67,8 +67,14 @@ downstream's own id, taken as the remainder so it needs no constraint.
 makes the split boundaries separator-free **by construction**. The previous
 encoding could only *enforce* that invariant by refusing to mint a name
 (dropping the command) when a config key contained the separator; escaping
-removes that failure mode entirely. Escaping only those two characters keeps a
-`file:///…` root legible in logs.
+removes that failure mode entirely. Only those two characters are escaped, so a
+root that already carries percent escapes gets them doubled (`%20` → `%2520`) —
+correct, if not pretty.
+
+The separator itself moved from the 0x1f control character to `|`. That is not
+what makes the encoding unambiguous (escaping is), but these names reach logs,
+editor UIs, and JSON — where RFC 8259 forces a `\u001f` escape for the old
+separator — so a printable byte is easier to transport and to read.
 
 This is exactly the `(server, root)` identity the pool already keys every
 connection by, and the by-key acquisition path already exists:
@@ -94,12 +100,22 @@ That split makes the repair **asynchronous**, where the inline version was
 awaited — and being awaited was load-bearing, not incidental. The outbound
 queue to a downstream is FIFO, so a request enqueued before the re-open's
 `didOpen` reaches the server first and asks about a document that server has
-not opened. A request that depends on the repair must therefore synchronize on
-it explicitly: the connection's pending re-open is claimed *before* the
-connection is published as `Ready` (so a request unblocked by that transition
-can see it), and requests wait on it under the same bound the inline heal used.
-Dropping the completion signal releases the waiters, so a lost or failed
-re-open degrades to the old lazy behaviour instead of stalling.
+not opened. Two things restore the ordering:
+
+- The re-open itself must **await the open**, not merely start it. The eager
+  batch path spawns a detached task per server and returns, so completing it
+  proves nothing; the re-open drives the awaited per-server open instead. That
+  also scopes the work to the server that actually respawned.
+- A request that depends on the repair synchronizes on it explicitly. The
+  connection's pending re-open is claimed *before* the connection is published
+  as `Ready`, so a request unblocked by that transition can see it, and requests
+  wait on it under the same bound the inline heal used. Dropping the completion
+  signal releases the waiters, so a failed re-open degrades to the old lazy
+  behaviour instead of stalling.
+
+The claim is reversible: a handshake that dies after claiming the set restores
+it, because the purge that recorded it already emptied the tracker and no later
+purge would report those documents again.
 
 This is sound across intervening edits because region ids are position-keyed
 and shifted by edits rather than re-minted
@@ -160,7 +176,9 @@ set. Rejected in favour of the captured set.
 - The set of routable command names becomes finite and enumerable — the
   prerequisite for advertising action-embedded commands to clients that
   dispatch only registered ids.
-- Repair moves off the user-facing request and covers all request paths.
+- Repair moves off the user-facing request and covers all request paths. The
+  ordering barrier, though, is only taken by the routed `executeCommand` path;
+  other paths benefit from the repair without waiting on it.
 - The "separator in a config key drops this server's commands" failure mode is
   gone; escaping makes the invariant structural.
 - Command names no longer grow with document path length.

@@ -5,7 +5,7 @@
 //! `CodeActionEnvelope` in `CodeAction.data` (PR 4), or eagerly resolved
 //! downstream when the upstream client lacks `dataSupport`/`resolveSupport`.
 //! Command-carrying actions are executable: the command name is rewritten to
-//! encode its origin server + host document, so the bridged
+//! encode the origin CONNECTION (`(server, root)`), so the bridged
 //! `workspace/executeCommand` routes it back (PR 6, see
 //! [`command_routing`](super::super::protocol)).
 //!

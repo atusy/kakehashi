@@ -208,13 +208,11 @@ pub(crate) enum UpstreamRequest {
     ///
     /// Routed upward because re-opening needs document *content*, which only the
     /// server side can supply: it owns the document store and injection
-    /// resolution, while the pool owns the lifecycle that decides *when*. The
-    /// pool cannot resolve injections itself — which is also why
-    /// `ensure_server_documents_open` takes them from its caller.
+    /// resolution, while the pool owns the lifecycle that decides *when*.
     ///
     /// No reply channel, but NOT unsynchronized: `done` is signalled once the
-    /// documents are open, so a request that must not overtake its own
-    /// `didOpen` can wait for it (`PendingReopenRegistry::wait_for_reopen`).
+    /// re-open has finished enqueueing its `didOpen`s, so a request that must not
+    /// overtake them can wait for it (`PendingReopenRegistry::wait_for_reopen`).
     /// Dropping `done` — a handler that dies, or a message never serviced —
     /// releases those waiters rather than stranding them, and the re-open then
     /// degrades to the pre-existing lazy behaviour (the next parse's
