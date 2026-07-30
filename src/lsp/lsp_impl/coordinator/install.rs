@@ -29,11 +29,16 @@ fn updated_settings_after_install(
     if !updated_settings.search_paths.contains(&data_dir_str) {
         updated_settings.search_paths.push(data_dir_str.clone());
 
+        // Raw settings are re-expanded by everything that reads them — a
+        // `didChangeConfiguration` merges onto this snapshot and converts it
+        // again — so a literal `$` in the data directory has to be spelled with
+        // the escape on that side. The expanded copy above keeps the real name.
+        let raw_data_dir = data_dir_str.replace('$', "$$");
         let raw_search_paths = updated_raw_settings
             .search_paths
             .get_or_insert_with(Default::default);
-        if !raw_search_paths.contains(&data_dir_str) {
-            raw_search_paths.push(data_dir_str);
+        if !raw_search_paths.contains(&raw_data_dir) {
+            raw_search_paths.push(raw_data_dir);
         }
     }
 
@@ -526,6 +531,31 @@ mod tests {
                 "/installed".to_string(),
             ]
         );
+    }
+
+    /// A data directory may contain a `$`. The raw copy is re-expanded by
+    /// everything that reads it — a `didChangeConfiguration` merges onto this
+    /// snapshot and converts it again — so the literal has to carry the escape
+    /// there, while the already-expanded copy keeps the directory's real name.
+    #[test]
+    fn reload_after_install_escapes_a_dollar_in_the_data_dir_for_the_raw_copy() {
+        let raw_settings = RawWorkspaceSettings::default();
+        let settings = WorkspaceSettings::default();
+
+        let (updated_raw, updated_settings) =
+            updated_settings_after_install(&raw_settings, &settings, Path::new("/data/a$b"));
+
+        assert_eq!(
+            updated_raw.search_paths,
+            Some(vec!["/data/a$$b".to_string()])
+        );
+        assert_eq!(updated_settings.search_paths, vec!["/data/a$b".to_string()]);
+
+        // The escape must round-trip: converting the raw copy again gives the
+        // real directory back rather than failing on an undefined `$b`.
+        let reconverted = WorkspaceSettings::try_from_settings(&updated_raw, None, |_| None)
+            .expect("the escaped raw copy must still convert");
+        assert_eq!(reconverted.search_paths, vec!["/data/a$b".to_string()]);
     }
 
     #[tokio::test]
