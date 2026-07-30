@@ -186,8 +186,16 @@ fn read_explicit_layers(
     // every `try_from_settings` re-resolves language `base` chains, whose cycle
     // detector logs as it goes.
     if fatal_error.is_none() {
-        let merged = std::iter::once(Some(default_settings()))
-            .chain(layers.iter().cloned())
+        // Only the explicit layers. Programmed defaults carry
+        // `${KAKEHASHI_DATA_DIR}`, which cannot expand on a host with no
+        // discoverable data directory — blaming the user's file for that would
+        // reject a session over a valid, even empty, config. Their absence
+        // costs nothing here: `FeatureSettings::resolve` already fills an
+        // unset half of a timing pair from the same defaults, so a lone
+        // `debounceMs` is still judged against the default `maxWaitMs`.
+        let merged = layers
+            .iter()
+            .cloned()
             .reduce(merge_workspace_settings)
             .flatten();
         if let Some(raw_settings) = merged.as_ref()
@@ -358,14 +366,24 @@ fn load_toml_file(
             // misreported — a config loader does not serialize against the
             // filesystem, and the alternative (probe first) only moves the
             // window.
-            if path
-                .symlink_metadata()
-                .is_ok_and(|metadata| metadata.file_type().is_symlink())
-            {
-                return Err(format!(
-                    "Failed to read {}: broken symbolic link",
-                    path.display()
-                ));
+            match path.symlink_metadata() {
+                Ok(metadata) if metadata.file_type().is_symlink() => {
+                    return Err(format!(
+                        "Failed to read {}: broken symbolic link",
+                        path.display()
+                    ));
+                }
+                // Something appeared between the failed open and this probe.
+                // Nothing was read, so report the absence the open saw rather
+                // than guessing at what is there now.
+                Ok(_) => {}
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                // The probe itself failed — a denied parent, an I/O error.
+                // That is a path the user named and cannot use, not an absent
+                // one, and falling through would skip it silently.
+                Err(err) => {
+                    return Err(format!("Failed to read {}: {}", path.display(), err));
+                }
             }
             events.push(SettingsEvent::warning(format!(
                 "Config file not found, skipping: {}",
@@ -994,6 +1012,30 @@ mod tests {
                 .any(|event| event.message.contains(&second.display().to_string())),
             "the second file must be read: {:?}",
             explicit.events
+        );
+    }
+
+    /// A programmed default that cannot expand is not the explicit file's
+    /// fault. `${KAKEHASHI_DATA_DIR}` has no value on a host with no
+    /// discoverable data directory, and rejecting a session over that would
+    /// turn a valid — even empty — `--config-file` into a startup failure.
+    #[test]
+    fn read_explicit_layers_does_not_blame_a_file_for_the_defaults() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("empty.toml");
+        std::fs::write(&path, "").unwrap();
+
+        // An environment where the data-directory fallback is unavailable, so
+        // the default `searchPaths` entry cannot expand.
+        let explicit = read_explicit_layers(&[path], None, |var| match var {
+            "KAKEHASHI_DATA_DIR" => None,
+            _ => std::env::var(var).ok(),
+        });
+
+        assert!(
+            explicit.fatal_error.is_none(),
+            "a valid explicit file must not inherit the defaults' failure: {:?}",
+            explicit.fatal_error
         );
     }
 
