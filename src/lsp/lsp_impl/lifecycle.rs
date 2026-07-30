@@ -1382,7 +1382,11 @@ fn spawn_upstream_request(
                                 &settings,
                                 &host_language,
                                 &host,
-                                incarnation,
+                                crate::lsp::bridge::OpenExpectation {
+                                    incarnation,
+                                    // Threaded in the next commit; unchanged here.
+                                    connection: None,
+                                },
                                 injections,
                                 &reopen_server,
                             )

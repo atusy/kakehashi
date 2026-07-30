@@ -7,8 +7,27 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use super::super::pool::{ConnectionHandleSender, INIT_TIMEOUT_SECS, LanguageServerPool};
+use super::super::pool::{
+    ConnectionHandleSender, ConnectionKey, INIT_TIMEOUT_SECS, LanguageServerPool,
+};
 use super::super::protocol::VirtualDocumentUri;
+
+/// What the caller requires to STILL hold by the time an eager open actually
+/// runs. Both fields are preconditions checked inside the open, not inputs to
+/// it, which is why they travel together.
+pub(crate) struct OpenExpectation<'a> {
+    /// The document lifetime the injections were resolved under; a close+reopen
+    /// in between invalidates them.
+    pub(crate) incarnation: u64,
+    /// The connection this open is FOR, when the caller is repairing a specific
+    /// one — the respawn re-open is claimed under a key and its barrier signals
+    /// for that key. The connection is still resolved from `host_uri`, so a
+    /// config change that re-roots the host resolves a DIFFERENT one, and
+    /// opening there would satisfy nobody: the claimed connection stays empty
+    /// while its barrier reports success. `None` opens wherever the host routes
+    /// now, which is what every other caller wants.
+    pub(crate) connection: Option<&'a ConnectionKey>,
+}
 
 struct LifecycleCleanup<'a> {
     pool: &'a LanguageServerPool,
@@ -37,9 +56,13 @@ impl LanguageServerPool {
         server_config: &crate::config::settings::BridgeServerConfig,
         host_uri: &url::Url,
         host_uri_lsp: &tower_lsp_server::ls_types::Uri,
-        expected_incarnation: u64,
+        expect: OpenExpectation<'_>,
         injections: Vec<crate::lsp::bridge::coordinator::BridgeInjection>,
     ) {
+        let OpenExpectation {
+            incarnation: expected_incarnation,
+            connection: expected_key,
+        } = expect;
         // Wait for the server to be ready (handshake complete)
         let handle = match self
             .get_or_create_connection_wait_ready(
@@ -64,6 +87,20 @@ impl LanguageServerPool {
         };
 
         let connection_key = handle.key().clone();
+        // The host re-routed since the caller claimed its key: this open is not
+        // the one that was asked for. Skip rather than open on the wrong
+        // connection — the host's new connection opens it through its own
+        // request/parse path, and the caller learns nothing false.
+        if let Some(expected) = expected_key
+            && &connection_key != expected
+        {
+            log::debug!(
+                target: "kakehashi::bridge",
+                "Eager open: {host_uri} now routes to {connection_key}, not the \
+                 requested {expected}; skipping this open"
+            );
+            return;
+        }
         let mut sender = ConnectionHandleSender(&handle);
 
         let Some(lifecycle) = self.existing_host_lifecycle_lock(host_uri) else {
@@ -219,6 +256,7 @@ mod tests {
     use super::super::super::pool::test_helpers::*;
     use super::super::super::pool::{ConnectionState, LanguageServerPool};
     use super::super::super::protocol::VirtualDocumentUri;
+    use super::OpenExpectation;
 
     /// Test that eager_open_virtual_documents marks virtual documents as opened.
     ///
@@ -261,7 +299,10 @@ mod tests {
             &config,
             &host_uri,
             &host_uri_lsp,
-            1,
+            OpenExpectation {
+                incarnation: 1,
+                connection: None,
+            },
             injections,
         )
         .await;
@@ -315,7 +356,10 @@ mod tests {
             &config,
             &host_uri,
             &host_uri_lsp,
-            1,
+            OpenExpectation {
+                incarnation: 1,
+                connection: None,
+            },
             injections.clone(),
         )
         .await;
@@ -332,7 +376,10 @@ mod tests {
             &config,
             &host_uri,
             &host_uri_lsp,
-            1,
+            OpenExpectation {
+                incarnation: 1,
+                connection: None,
+            },
             injections,
         )
         .await;

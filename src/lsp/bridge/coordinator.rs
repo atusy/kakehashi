@@ -385,7 +385,7 @@ impl BridgeCoordinator {
         settings: &Arc<WorkspaceSettings>,
         host_language: &str,
         host_uri: &Url,
-        host_incarnation: u64,
+        expect: super::text_document::OpenExpectation<'_>,
         injections: Vec<BridgeInjection>,
         server_name: &str,
     ) {
@@ -403,7 +403,7 @@ impl BridgeCoordinator {
                 &config,
                 host_uri,
                 &host_uri_lsp,
-                host_incarnation,
+                expect,
                 for_server,
             )
             .await;
@@ -931,7 +931,11 @@ impl BridgeCoordinator {
                         &config,
                         &host_uri_owned,
                         &host_uri_lsp,
-                        incarnation,
+                        super::text_document::OpenExpectation {
+                            incarnation,
+                            // The eager batch opens wherever the host routes now.
+                            connection: None,
+                        },
                         group_injections,
                     ) => {}
                 }
@@ -1613,7 +1617,10 @@ mod tests {
                 &settings,
                 "markdown",
                 &host_uri,
-                1,
+                crate::lsp::bridge::OpenExpectation {
+                    incarnation: 1,
+                    connection: None,
+                },
                 injections,
                 "other-server",
             ),

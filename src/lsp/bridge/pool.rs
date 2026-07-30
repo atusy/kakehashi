@@ -4250,12 +4250,16 @@ mod tests {
 
         let handle = create_handle_with_key(ConnectionState::Ready, connection_key.clone()).await;
         pool.insert_connection(handle).await;
+        use crate::lsp::bridge::text_document::OpenExpectation;
         pool.eager_open_virtual_documents(
             "lua",
             &devnull_config(),
             &host_uri,
             &host_uri_lsp,
-            1,
+            OpenExpectation {
+                incarnation: 1,
+                connection: None,
+            },
             vec![super::super::coordinator::BridgeInjection {
                 language: "lua".to_string(),
                 region_id: TEST_ULID_LUA_0.to_string(),
@@ -4291,7 +4295,10 @@ mod tests {
             &devnull_config(),
             &host_uri,
             &host_uri_lsp,
-            1,
+            OpenExpectation {
+                incarnation: 1,
+                connection: None,
+            },
             vec![super::super::coordinator::BridgeInjection {
                 language: "lua".to_string(),
                 region_id: TEST_ULID_LUA_0.to_string(),
