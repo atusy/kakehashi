@@ -401,7 +401,7 @@ fn e2e_auto_install_deprecation_warns_once_and_spares_the_canonical_key() {
 fn e2e_auto_install_deprecation_claimed_at_initialize_suppresses_the_didchange_notice() {
     // The other autoInstall test starts from a CLEAN initialize, so it proves
     // only the didChangeConfiguration half. This one starts from a config FILE
-    // carrying the deprecated key, exercising the initialize emission path.
+    // carrying the deprecated key, exercising initialize-time DETECTION of it.
     let config_dir = tempfile::TempDir::new().expect("temp config dir");
     let config_path = config_dir.path().join("kakehashi.toml");
     std::fs::write(&config_path, "autoInstall = false\n").expect("write config");
@@ -429,10 +429,11 @@ fn e2e_auto_install_deprecation_claimed_at_initialize_suppresses_the_didchange_n
     // Pushing the same deprecated key now yields the config-updated log with no
     // popup ahead of it. Scope, precisely: this pins that initialize DETECTED
     // the file's key and claimed the slot — delete the whole `if` block at
-    // `lifecycle.rs` and the popup appears here (verified). It does not pin the
-    // `show_warning` call itself, since `initialize`'s own notifications are
-    // dropped while the client awaits the response; the sibling test covers the
-    // popup text on the didChange path.
+    // `lifecycle.rs` and the popup appears here (verified). It does NOT pin the
+    // `show_warning` call: dropping only that line leaves the claim, and this
+    // test still passes, because `initialize`'s own notifications are discarded
+    // while the client awaits the response. The sibling test pins the popup
+    // itself, on the didChange path.
     client.send_notification(
         "workspace/didChangeConfiguration",
         wrapped_didchange_config(false),
@@ -444,7 +445,7 @@ fn e2e_auto_install_deprecation_claimed_at_initialize_suppresses_the_didchange_n
         .expect("reconfig should log a config-updated message");
     assert_eq!(
         method, "window/logMessage",
-        "the initialize warning must consume the session's only slot; got: {params:?}"
+        "initialize must have claimed the session's only slot; got: {params:?}"
     );
 
     let _ = client.send_request("shutdown", json!(null));

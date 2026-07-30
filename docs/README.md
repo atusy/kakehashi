@@ -261,10 +261,12 @@ before `"_"` is consulted.
 
 **Which name to use.** The key names the language kakehashi would *install*, not
 the token in your document. A host document uses the `languageId` your editor
-sends; an injected region uses its resolved language, so a ```` ```py ```` fence
-is governed by `languages.python.autoInstall` and an `rmd` region whose own
-parser is absent is governed by whatever its `base` resolves to. Set the key on
-the resolved name.
+sends — except `plaintext`, where the language is inferred from the path and
+content instead, so a `.rs` file opened as `plaintext` is governed by
+`languages.rust.autoInstall`. An injected region uses its resolved language, so a
+```` ```py ```` fence is governed by `languages.python.autoInstall`, and an `rmd`
+region whose own parser is absent by whatever its `base` resolves to. Set the key
+on the resolved name.
 
 Enable everywhere except one language:
 
@@ -294,10 +296,13 @@ does have an entry it names the overriding key and the places the value may have
 come from, since `base`-chain and `_` inheritance are folded together by then.
 
 **Migration caveat:** moving the top-level key to `[languages._]` is
-equivalence-preserving for every language *except* one that opts out of wildcard
-inheritance with a self-referential `base` (`[languages.foo] base = "foo"`, or a
-circular chain). Such a language inherits nothing from `_` — by design, for every
-field — so it falls through to the top-level default instead. Give those
+equivalence-preserving for every language *except* one whose `base` chain
+terminates before reaching `"_"` — a self-referential `base`
+(`[languages.foo] base = "foo"`) or a cycle that never visits `"_"`. Such a
+language inherits nothing from `"_"` — by design, for every field — so it falls
+through to the top-level default instead. (A chain that *does* reach `"_"`,
+including one that gets there via an explicit `[languages._] base`, inherits
+normally.) Give those
 languages an explicit `autoInstall` when migrating.
 
 **Precedence note:** a `languages.*.autoInstall` value outranks the top-level
