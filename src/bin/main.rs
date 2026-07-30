@@ -672,9 +672,9 @@ fn write_content_to_output(
 
 /// Run the config init command
 fn run_config_init(output: Option<PathBuf>, force: bool) -> Result<(), ExitCode> {
-    use kakehashi::config::defaults::default_settings;
+    use kakehashi::config::defaults::config_init_settings;
 
-    let settings = default_settings();
+    let settings = config_init_settings();
     let config_toml = toml::to_string_pretty(&settings).map_err(|e| {
         eprintln!("Failed to serialize configuration: {}", e);
         ExitCode::FAILURE

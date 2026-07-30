@@ -119,7 +119,7 @@ impl Kakehashi {
             }
 
             if !load_result.success {
-                if self.settings_manager.is_auto_install_enabled() {
+                if self.settings_manager.is_auto_install_enabled(lang) {
                     // Language failed to load and auto-install is enabled.
                     //
                     // Move auto-install OFF the ingress writer ticket (#480
@@ -201,7 +201,9 @@ impl Kakehashi {
                     skip_parse = true;
                 } else {
                     // Notify user that parser is missing and needs manual installation
-                    let reason = self.install_coordinator().auto_install_disabled_reason();
+                    let reason = self
+                        .install_coordinator()
+                        .auto_install_disabled_reason(lang);
                     self.install_coordinator()
                         .notify_parser_missing(lang, &reason)
                         .await;

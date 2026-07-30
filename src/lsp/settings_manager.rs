@@ -33,6 +33,7 @@ pub(crate) struct SettingsManager {
     /// about, so the notice is shown at most once per session regardless of
     /// which path (initialize or didChangeConfiguration) first sees it.
     root_markers_deprecation_warned: AtomicBool,
+    auto_install_deprecation_warned: AtomicBool,
     /// Latches once an unwrapped runtime `workspace/didChangeConfiguration`
     /// payload has been warned about. Unlike `rootMarkers`, this applies only to
     /// client-pushed runtime settings, not initializationOptions or TOML files.
@@ -81,6 +82,7 @@ impl SettingsManager {
             })),
             client_capabilities: OnceLock::new(),
             root_markers_deprecation_warned: AtomicBool::new(false),
+            auto_install_deprecation_warned: AtomicBool::new(false),
             unwrapped_didchange_deprecation_warned: AtomicBool::new(false),
         }
     }
@@ -93,6 +95,15 @@ impl SettingsManager {
     pub(crate) fn claim_root_markers_deprecation_warning(&self) -> bool {
         !self
             .root_markers_deprecation_warned
+            .swap(true, Ordering::Relaxed)
+    }
+
+    /// Claim the one-per-session slot for the deprecated top-level
+    /// `autoInstall` key. Independent of the other slots: seeing one deprecated
+    /// key must not suppress the notice for another.
+    pub(crate) fn claim_auto_install_deprecation_warning(&self) -> bool {
+        !self
+            .auto_install_deprecation_warned
             .swap(true, Ordering::Relaxed)
     }
 
@@ -219,14 +230,18 @@ impl SettingsManager {
     /// Check if auto-install is enabled.
     ///
     /// Returns `false` if:
-    /// - `autoInstall` is explicitly set to `false` in settings
+    /// - auto-install is off for `language` — its resolved entry's
+    ///   `autoInstall` (which the base-chain fold may have inherited from
+    ///   `languages._`), else `languages._`'s when the language has no entry
+    ///   at all, else the deprecated top-level key
     /// - `searchPaths` doesn't include the default data directory (auto-install
     ///   would install to a location that isn't being searched)
-    pub(crate) fn is_auto_install_enabled(&self) -> bool {
+    pub(crate) fn is_auto_install_enabled(&self, language: &str) -> bool {
         let settings = self.load_settings();
 
-        // If explicitly disabled, return false
-        if !settings.auto_install {
+        // Per-language first: `[languages.<lang>] autoInstall`, else `"_"`,
+        // else the deprecated top-level key.
+        if !settings.auto_install_for(language) {
             return false;
         }
 
@@ -668,6 +683,32 @@ mod tests {
             "subsequent claims must not re-warn"
         );
         assert!(!manager.claim_root_markers_deprecation_warning());
+    }
+
+    #[test]
+    fn claim_auto_install_deprecation_warning_is_true_exactly_once() {
+        let manager = SettingsManager::new();
+        assert!(
+            manager.claim_auto_install_deprecation_warning(),
+            "first claim should win the once-per-session slot"
+        );
+        assert!(
+            !manager.claim_auto_install_deprecation_warning(),
+            "subsequent claims must not re-warn"
+        );
+    }
+
+    #[test]
+    fn deprecation_claim_slots_are_independent() {
+        // A config carrying both deprecated keys must warn about both; one
+        // shared latch would silently drop the second notice.
+        let manager = SettingsManager::new();
+        assert!(manager.claim_root_markers_deprecation_warning());
+        assert!(
+            manager.claim_auto_install_deprecation_warning(),
+            "claiming rootMarkers must not consume the autoInstall slot"
+        );
+        assert!(manager.claim_unwrapped_didchange_deprecation_warning());
     }
 
     #[test]

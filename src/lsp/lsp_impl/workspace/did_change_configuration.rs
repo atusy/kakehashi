@@ -47,8 +47,15 @@ const KNOWN_BRIDGE_SERVER_SETTING_KEYS: &[&str] = &[
 
 const KNOWN_CAPTURE_MAPPINGS_SETTING_KEYS: &[&str] = &["folds", "highlights"];
 
-const KNOWN_LANGUAGE_SETTING_KEYS: &[&str] =
-    &["aliases", "base", "bridge", "layers", "parser", "queries"];
+const KNOWN_LANGUAGE_SETTING_KEYS: &[&str] = &[
+    "aliases",
+    "autoInstall",
+    "base",
+    "bridge",
+    "layers",
+    "parser",
+    "queries",
+];
 
 const KNOWN_LAYER_AGGREGATION_SETTING_KEYS: &[&str] = &["priorities", "strategy"];
 
@@ -364,17 +371,28 @@ impl Kakehashi {
             uses_deprecated_unwrapped_didchange_shape(&params.settings);
         let (settings_value, unknown_keys) = settings_payload(params.settings);
 
-        // Nudge users off the deprecated `rootMarkers` key if this push carries
-        // it. Detect from the raw value before serde's alias erases which key
-        // was used; the claim guard shares the once-per-session slot with the
+        // Nudge users off any deprecated key this push carries. Detected from
+        // the raw value before parsing collapses the deprecated and canonical
+        // spellings; each claim guard shares its once-per-session slot with the
         // initialize path.
-        if crate::config::deprecation::json_uses_deprecated_root_markers(&settings_value)
+        let pushed_deprecated_keys =
+            crate::config::deprecation::json_deprecated_keys(&settings_value);
+        if pushed_deprecated_keys.root_markers
             && self
                 .settings_manager
                 .claim_root_markers_deprecation_warning()
         {
             self.notifier()
                 .show_warning(crate::config::deprecation::ROOT_MARKERS_DEPRECATION_NOTICE)
+                .await;
+        }
+        if pushed_deprecated_keys.auto_install
+            && self
+                .settings_manager
+                .claim_auto_install_deprecation_warning()
+        {
+            self.notifier()
+                .show_warning(crate::config::deprecation::AUTO_INSTALL_DEPRECATION_NOTICE)
                 .await;
         }
 
@@ -708,6 +726,15 @@ mod tests {
                 ..Default::default()
             },
         );
+
+        // This payload uses the deprecated top-level `autoInstall` on purpose
+        // (the merge behavior under test is about that key). Consume the notice
+        // slot first: the warning would otherwise `show_warning` into a socket
+        // this test never drains, parking the future for a reason unrelated to
+        // the settings-reload lock it is meant to park on.
+        server
+            .settings_manager
+            .claim_auto_install_deprecation_warning();
 
         let reload_guard = crate::lsp::lsp_impl::lock_settings_reload().await;
         let mut update = Box::pin(server.did_change_configuration_impl(

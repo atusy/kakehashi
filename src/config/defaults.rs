@@ -22,6 +22,12 @@ pub fn default_settings() -> RawWorkspaceSettings {
         search_paths: Some(vec!["${KAKEHASHI_DATA_DIR}".to_string()]),
         languages: default_languages(),
         capture_mappings: default_capture_mappings(),
+        // Safe to carry here even though the key is deprecated: this struct is
+        // also merge layer 1, and a user's own top-level value overlays THE
+        // SAME key, so it wins. `languages._.autoInstall` is the one that must
+        // stay unset in layer 1 — it outranks the top-level key in
+        // `auto_install_for`, so a defaults-supplied `_` would shadow a user's
+        // `autoInstall = false` and silently ignore it.
         auto_install: Some(true),
         diagnostics_debounce_ms: Some(DEFAULT_DEBOUNCE_MS),
         features: Some(FeatureSettings {
@@ -39,6 +45,32 @@ pub fn default_settings() -> RawWorkspaceSettings {
         }),
         language_servers: Some(default_language_servers()),
     }
+}
+
+/// The `kakehashi config init` template: [`default_settings`] minus the one key
+/// that cannot be spelled out inertly.
+///
+/// `autoInstall` is the sole documented exception to
+/// config-init-template-convention, which otherwise requires every built-in
+/// default to appear in the generated file. Neither spelling can be emitted
+/// safely:
+///
+/// - The top-level key is deprecated, so a generated file would trip the very
+///   migration notice we show users.
+/// - `[languages._] autoInstall` is worse than deprecated — it INVERTS layer
+///   precedence. `auto_install_for` checks `_` before the top-level key and is
+///   layer-unaware, so a `_` sitting in a generated user config (layer 2) would
+///   silently outrank a top-level `autoInstall = false` pushed by the editor at
+///   layer 4. That is not a spelled-out default; it is a behavior change.
+///   Pinned by `a_generated_template_does_not_shadow_a_higher_layer_optout`.
+///
+/// So the default lives in `auto_install_for`'s fallback and in the docs, not in
+/// the template. `default_settings` still carries the top-level value for merge
+/// layer 1, where it is safe.
+pub fn config_init_settings() -> RawWorkspaceSettings {
+    let mut settings = default_settings();
+    settings.auto_install = None;
+    settings
 }
 
 /// Returns the default languageServers map: a defaults-only `_` wildcard
@@ -517,14 +549,101 @@ mod tests {
     }
 
     #[test]
-    fn default_settings_has_auto_install_true() {
+    fn layer_one_leaves_the_wildcard_auto_install_unset() {
         let settings = default_settings();
 
-        // autoInstall should default to true for zero-config experience
+        // `_` outranks the top-level key, so a defaults-supplied value here
+        // would shadow a user's `autoInstall = false` and silently ignore it.
         assert_eq!(
-            settings.auto_install,
-            Some(true),
-            "autoInstall should be Some(true) by default"
+            settings
+                .languages
+                .get(WILDCARD_KEY)
+                .and_then(|wildcard| wildcard.auto_install),
+            None,
+            "layer 1 must not set languages._.autoInstall"
+        );
+        // The top-level key IS safe in layer 1: a user's own top-level value
+        // overlays the same key and wins. Keeping it preserves what
+        // `effective_configuration` reports before any config is applied.
+        assert_eq!(settings.auto_install, Some(true));
+    }
+
+    #[test]
+    fn a_user_top_level_auto_install_survives_the_layer_one_default() {
+        // The regression this guards: if layer 1 supplied `languages._`, the
+        // merge would hand `auto_install_for` a wildcard `Some(true)` that
+        // outranks the user's key, silently ignoring their opt-out.
+        let user = RawWorkspaceSettings {
+            auto_install: Some(false),
+            ..Default::default()
+        };
+        let merged =
+            crate::config::merge::merge_workspace_settings(Some(default_settings()), Some(user))
+                .expect("both layers present");
+        let resolved = crate::config::WorkspaceSettings::try_from_settings(
+            &merged,
+            None,
+            crate::config::expand::with_kakehashi_defaults(|_| None),
+        )
+        .expect("merged settings expand");
+
+        assert!(!resolved.auto_install_for("python"));
+    }
+
+    fn resolve(raw: &RawWorkspaceSettings) -> crate::config::WorkspaceSettings {
+        crate::config::WorkspaceSettings::try_from_settings(
+            raw,
+            None,
+            crate::config::expand::with_kakehashi_defaults(|_| None),
+        )
+        .expect("settings expand")
+    }
+
+    #[test]
+    fn config_init_template_emits_no_auto_install_at_all() {
+        let template = config_init_settings();
+
+        // The documented exception to config-init-template-convention: neither
+        // spelling is safe to generate. See `config_init_settings`.
+        assert_eq!(
+            template.auto_install, None,
+            "the template must not emit the deprecated top-level key"
+        );
+        assert_eq!(
+            template
+                .languages
+                .get(WILDCARD_KEY)
+                .and_then(|wildcard| wildcard.auto_install),
+            None,
+            "the template must not emit `languages._.autoInstall` either — it \
+             would invert layer precedence, see the regression test below"
+        );
+
+        // The generated file still resolves to the zero-config default.
+        assert!(resolve(&template).auto_install_for("python"));
+    }
+
+    #[test]
+    fn a_generated_template_does_not_shadow_a_higher_layer_optout() {
+        // The regression: `auto_install_for` checks `_` before the top-level
+        // key and is layer-unaware, so a `_` written into a generated user
+        // config (layer 2) would silently outrank the editor's top-level
+        // `autoInstall = false` at layer 4.
+        let merged = crate::config::merge::merge_workspace_settings(
+            crate::config::merge::merge_workspace_settings(
+                Some(default_settings()),
+                Some(config_init_settings()),
+            ),
+            Some(RawWorkspaceSettings {
+                auto_install: Some(false),
+                ..Default::default()
+            }),
+        )
+        .expect("layers present");
+
+        assert!(
+            !resolve(&merged).auto_install_for("python"),
+            "a higher layer's top-level opt-out must win over the template"
         );
     }
 
@@ -599,17 +718,24 @@ mod tests {
     }
 
     #[test]
-    fn default_settings_serializes_to_valid_toml() {
-        let settings = default_settings();
+    fn config_init_template_serializes_to_valid_toml() {
+        // The template, not layer 1: this asserts what `config init` writes.
+        let settings = config_init_settings();
 
         // Should serialize to valid TOML
         let toml_string =
             toml::to_string_pretty(&settings).expect("should serialize to TOML without error");
 
-        // Should contain autoInstall setting
+        // `autoInstall` is deliberately absent (see `config_init_settings`), so
+        // anchor on a key the template does spell out.
         assert!(
-            toml_string.contains("autoInstall = true"),
-            "TOML should contain 'autoInstall = true'. Got:\n{}",
+            toml_string.contains("searchPaths = "),
+            "TOML should contain 'searchPaths'. Got:\n{}",
+            toml_string
+        );
+        assert!(
+            !toml_string.contains("autoInstall"),
+            "template must emit no autoInstall at either level. Got:\n{}",
             toml_string
         );
 

@@ -321,13 +321,6 @@ impl InjectionCoordinator {
         }
         after_incarnation_check.await;
         let install = self.install_coordinator();
-        let auto_install_enabled = self.settings_manager.is_auto_install_enabled();
-
-        let reason = if auto_install_enabled {
-            String::new()
-        } else {
-            install.auto_install_disabled_reason()
-        };
 
         // Events emitted while loading an injected-language parser that was on disk
         // but not yet loaded — a one-time `Log` plus (when the language has queries)
@@ -380,7 +373,17 @@ impl InjectionCoordinator {
                 continue;
             }
 
-            if !auto_install_enabled {
+            // Resolved per language, not hoisted: `autoInstall` is now
+            // per-language (`[languages.<lang>]`, falling back to `"_"` then the
+            // deprecated top-level key), so one injected language being opted
+            // out must not decide for its siblings in the same document. Keyed
+            // on `resolved_lang` — the language actually installed — so an
+            // opt-out on the normalized name (`python`, not `py`) applies.
+            if !self
+                .settings_manager
+                .is_auto_install_enabled(&resolved_lang)
+            {
+                let reason = install.auto_install_disabled_reason(&resolved_lang);
                 install.notify_parser_missing(&resolved_lang, &reason).await;
                 continue;
             }

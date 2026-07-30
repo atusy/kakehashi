@@ -664,7 +664,10 @@ pub struct RawWorkspaceSettings {
     /// Custom mappings from Tree-sitter capture names to semantic token types.
     #[serde(default)]
     pub capture_mappings: CaptureMappings,
-    /// Whether to automatically install missing parsers and queries.
+    /// Deprecated: use `languages._.autoInstall` (and per-language
+    /// `languages.<lang>.autoInstall`) instead. Whether to automatically
+    /// install missing parsers and queries. Still honored when no per-language
+    /// value is set, but setting it shows a one-time migration notice.
     pub auto_install: Option<bool>,
     /// Debounce delay, in milliseconds, between a `didChange` and the diagnostic
     /// pull it triggers. Higher values cut refresh/pull volume during rapid typing
@@ -845,7 +848,15 @@ pub fn json_schema() -> schemars::Schema {
 // via RawWorkspaceSettings.
 
 /// Per-language Tree-sitter configuration.
+///
+/// `rename_all` is load-bearing now that a field is multi-word: the config
+/// surface is camelCase throughout, and dropping it fails
+/// `known_language_setting_keys_match_schema_properties`, which compares the
+/// camelCase `KNOWN_LANGUAGE_SETTING_KEYS` against this struct's generated
+/// schema property names. (The `snake_case leak` assertions nearby only cover
+/// `RawWorkspaceSettings`' own top-level keys, not this type's.)
 #[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
 pub struct LanguageSettings {
     /// Base language to inherit unfilled fields from (most-specific-wins).
     /// E.g., `base = "markdown"` on `rmd` means rmd inherits markdown's
@@ -865,6 +876,13 @@ pub struct LanguageSettings {
     /// Deprecated: use `base` on the derived language instead.
     /// Alternative languageId values that should use this parser.
     pub aliases: Option<Vec<String>>,
+    /// Whether missing parsers/queries for this language may be auto-installed.
+    ///
+    /// Omit to inherit from the `base` chain and ultimately the `"_"` wildcard;
+    /// when unset everywhere, the deprecated top-level `autoInstall` answers,
+    /// which itself defaults to enabled. Set `false` on `"_"` and `true` on a
+    /// language (or the reverse) to carve out per-language exceptions.
+    pub auto_install: Option<bool>,
 }
 
 impl LanguageSettings {

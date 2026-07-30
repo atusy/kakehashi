@@ -114,11 +114,17 @@ impl InstallCoordinator {
         }
     }
 
-    /// Build a human-readable reason why auto-install is disabled.
-    pub(crate) fn auto_install_disabled_reason(&self) -> String {
+    /// Build a human-readable reason why auto-install is disabled for
+    /// `language`.
+    ///
+    /// Points at the config that decided it: exactly for the wildcard and
+    /// top-level cases, hedged for a per-language entry, where the base-chain
+    /// fold makes the original spelling unknowable. See
+    /// [`crate::config::WorkspaceSettings::auto_install_disabled_reason`].
+    pub(crate) fn auto_install_disabled_reason(&self, language: &str) -> String {
         let settings = self.settings_manager.load_settings();
-        if !settings.auto_install {
-            return "autoInstall is disabled".to_string();
+        if let Some(reason) = settings.auto_install_disabled_reason(language) {
+            return reason;
         }
         if !self
             .settings_manager

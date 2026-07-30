@@ -1,3 +1,4 @@
+use crate::config::deprecation::DeprecatedKeysSeen;
 use crate::config::{
     RawWorkspaceSettings, WorkspaceSettings, defaults::default_settings, load_user_config,
     merge_workspace_settings,
@@ -61,14 +62,9 @@ pub struct SettingsLoadOutcome {
     pub settings: Option<WorkspaceSettings>,
     pub raw_settings: Option<RawWorkspaceSettings>,
     pub events: Vec<SettingsEvent>,
-    /// True if any loaded config layer used the deprecated `rootMarkers` key
-    /// (superseded by `workspaceMarkers`). Serde's alias erases which spelling
-    /// was written, so this is detected from the raw config value. The
-    /// `initialize` handler reads this field and surfaces a one-per-session
-    /// deprecation notice (gated by `SettingsManager`'s claim guard, shared
-    /// with the didChangeConfiguration path); it is intentionally kept out of
-    /// `events` so the many callers that re-load settings do not re-warn.
-    pub used_deprecated_root_markers: bool,
+    /// Which deprecated keys the loaded layers spelled — see
+    /// [`DeprecatedKeysSeen`] for why this is not an `events` entry.
+    pub(crate) deprecated_keys: DeprecatedKeysSeen,
 }
 
 pub fn load_settings(
@@ -79,7 +75,7 @@ pub fn load_settings(
 ) -> SettingsLoadOutcome {
     let env_fn = crate::config::expand::with_kakehashi_defaults(env_fn);
     let mut events = Vec::new();
-    let mut used_deprecated_root_markers = false;
+    let mut deprecated_keys = DeprecatedKeysSeen::default();
 
     // Layer 1: Programmed defaults (configuration-merging-strategy: lowest precedence)
     let defaults = Some(default_settings());
@@ -93,25 +89,20 @@ pub fn load_settings(
             )));
             files
                 .iter()
-                .map(|p| load_toml_file(p, &mut events, &mut used_deprecated_root_markers))
+                .map(|p| load_toml_file(p, &mut events, &mut deprecated_keys))
                 .collect()
         } else {
             vec![
                 // Layer 2: User config from XDG_CONFIG_HOME (~/.config/kakehashi/kakehashi.toml)
-                load_user_config_with_events(&mut events, &mut used_deprecated_root_markers),
+                load_user_config_with_events(&mut events, &mut deprecated_keys),
                 // Layer 3: Project config from root_path/kakehashi.toml
-                load_toml_settings(root_path, &mut events, &mut used_deprecated_root_markers),
+                load_toml_settings(root_path, &mut events, &mut deprecated_keys),
             ]
         };
 
     // Layer 4: Override settings from initialization options or client configuration
     let override_settings = override_settings.and_then(|(source, value)| {
-        parse_override_settings(
-            source,
-            value,
-            &mut events,
-            &mut used_deprecated_root_markers,
-        )
+        parse_override_settings(source, value, &mut events, &mut deprecated_keys)
     });
 
     // Merge all layers: defaults < config_layers < override (later layers override earlier)
@@ -142,21 +133,21 @@ pub fn load_settings(
         settings,
         raw_settings,
         events,
-        used_deprecated_root_markers,
+        deprecated_keys,
     }
 }
 
 /// Load user config and add appropriate events to the events vector.
 fn load_user_config_with_events(
     events: &mut Vec<SettingsEvent>,
-    used_deprecated_root_markers: &mut bool,
+    deprecated_keys: &mut DeprecatedKeysSeen,
 ) -> Option<RawWorkspaceSettings> {
     match load_user_config() {
         Ok(Some(config)) => {
             events.push(SettingsEvent::info(
                 "Loaded user config from XDG_CONFIG_HOME",
             ));
-            *used_deprecated_root_markers |= config.uses_deprecated_root_markers;
+            deprecated_keys.merge(config.deprecated_keys);
             Some(config.settings)
         }
         Ok(None) => {
@@ -180,7 +171,7 @@ fn load_user_config_with_events(
 fn load_toml_file(
     path: &Path,
     events: &mut Vec<SettingsEvent>,
-    used_deprecated_root_markers: &mut bool,
+    deprecated_keys: &mut DeprecatedKeysSeen,
 ) -> Option<RawWorkspaceSettings> {
     if !path.exists() {
         events.push(SettingsEvent::error(format!(
@@ -197,8 +188,7 @@ fn load_toml_file(
 
     match fs::read_to_string(path) {
         Ok(contents) => {
-            *used_deprecated_root_markers |=
-                crate::config::deprecation::toml_uses_deprecated_root_markers(&contents);
+            deprecated_keys.merge(crate::config::deprecation::toml_deprecated_keys(&contents));
             match toml::from_str::<RawWorkspaceSettings>(&contents) {
                 Ok(settings) => {
                     events.push(SettingsEvent::info(format!(
@@ -231,7 +221,7 @@ fn load_toml_file(
 fn load_toml_settings(
     root_path: Option<&Path>,
     events: &mut Vec<SettingsEvent>,
-    used_deprecated_root_markers: &mut bool,
+    deprecated_keys: &mut DeprecatedKeysSeen,
 ) -> Option<RawWorkspaceSettings> {
     let root = root_path?;
     let config_path = root.join("kakehashi.toml");
@@ -246,8 +236,7 @@ fn load_toml_settings(
 
     match fs::read_to_string(&config_path) {
         Ok(contents) => {
-            *used_deprecated_root_markers |=
-                crate::config::deprecation::toml_uses_deprecated_root_markers(&contents);
+            deprecated_keys.merge(crate::config::deprecation::toml_deprecated_keys(&contents));
             match toml::from_str::<RawWorkspaceSettings>(&contents) {
                 Ok(settings) => {
                     events.push(SettingsEvent::info("Successfully loaded kakehashi.toml"));
@@ -276,10 +265,9 @@ fn parse_override_settings(
     source: SettingsSource,
     value: Value,
     events: &mut Vec<SettingsEvent>,
-    used_deprecated_root_markers: &mut bool,
+    deprecated_keys: &mut DeprecatedKeysSeen,
 ) -> Option<RawWorkspaceSettings> {
-    *used_deprecated_root_markers |=
-        crate::config::deprecation::json_uses_deprecated_root_markers(&value);
+    deprecated_keys.merge(crate::config::deprecation::json_deprecated_keys(&value));
     match serde_json::from_value::<RawWorkspaceSettings>(value) {
         Ok(settings) => {
             events.push(SettingsEvent::info(format!(
@@ -596,7 +584,8 @@ mod tests {
             None,
             make_env(&[]),
         )
-        .used_deprecated_root_markers;
+        .deprecated_keys
+        .root_markers;
 
         let canonical = serde_json::json!({
             "languageServers": { "rust-analyzer": { "workspaceMarkers": [".git"] } }
@@ -607,7 +596,8 @@ mod tests {
             None,
             make_env(&[]),
         )
-        .used_deprecated_root_markers;
+        .deprecated_keys
+        .root_markers;
 
         // SAFETY: #[serial(xdg_env)] prevents concurrent modification.
         unsafe {
@@ -635,7 +625,7 @@ mod tests {
         std::fs::write(&path, "autoInstall = false\n").unwrap();
 
         let mut events = Vec::new();
-        let mut ignored_deprecation = false;
+        let mut ignored_deprecation = DeprecatedKeysSeen::default();
         let result = load_toml_file(&path, &mut events, &mut ignored_deprecation);
 
         assert!(result.is_some(), "valid TOML should parse");
@@ -653,7 +643,7 @@ mod tests {
     #[test]
     fn test_load_toml_file_missing() {
         let mut events = Vec::new();
-        let mut ignored_deprecation = false;
+        let mut ignored_deprecation = DeprecatedKeysSeen::default();
         let result = load_toml_file(
             Path::new("/nonexistent/config.toml"),
             &mut events,
@@ -677,7 +667,7 @@ mod tests {
         std::fs::write(&path, "this is not [valid toml").unwrap();
 
         let mut events = Vec::new();
-        let mut ignored_deprecation = false;
+        let mut ignored_deprecation = DeprecatedKeysSeen::default();
         let result = load_toml_file(&path, &mut events, &mut ignored_deprecation);
 
         assert!(result.is_none(), "invalid TOML should return None");
@@ -699,11 +689,14 @@ mod tests {
         std::fs::write(&path, "[languageServers.x]\nrootMarkers = [\".git\"]\n").unwrap();
 
         let mut events = Vec::new();
-        let mut used_deprecated = false;
+        let mut used_deprecated = DeprecatedKeysSeen::default();
         let result = load_toml_file(&path, &mut events, &mut used_deprecated);
 
         assert!(result.is_some(), "valid TOML should parse");
-        assert!(used_deprecated, "rootMarkers should set the flag");
+        assert!(
+            used_deprecated.root_markers,
+            "rootMarkers should set the flag"
+        );
     }
 
     /// load_toml_settings (the project kakehashi.toml layer) sets the flag when
@@ -718,10 +711,13 @@ mod tests {
         .unwrap();
 
         let mut events = Vec::new();
-        let mut used_deprecated = false;
+        let mut used_deprecated = DeprecatedKeysSeen::default();
         let result = load_toml_settings(Some(dir.path()), &mut events, &mut used_deprecated);
 
         assert!(result.is_some(), "valid project config should parse");
-        assert!(used_deprecated, "rootMarkers should set the flag");
+        assert!(
+            used_deprecated.root_markers,
+            "rootMarkers should set the flag"
+        );
     }
 }
