@@ -830,12 +830,13 @@ Exit codes: `0` nothing to change (or changes written without
 `2` usage error, I/O error, a configuration file given with `--config-file`
 that could not be loaded, or downstream formatter failure (a configured
 server failed to start, errored on the request, timed out, or returned a
-protocol-invalid response). Which failures count depends on the aggregation
-strategy in force: under `preferred` — the bridge-level default for formatting,
-where several servers of one target produce competing whole-document edits —
-the winner is authoritative, so a *non-winning* server's failure does not
-count; under `concatenated` every server's failure does. Same rule as
-`diagnose` below.
+protocol-invalid response). Only *request-time* failures are strategy-aware:
+under `preferred` — the bridge-level default for formatting, where several
+servers of one target produce competing whole-document edits — the winner is
+authoritative, so a non-winning server's failed request does not count, while
+`concatenated` counts every server's. A server that fails to **start** always
+counts, whichever strategy is in force and even if a fallback then formatted
+the document.
 
 A configuration failure exits `2` before anything is written, so stdout stays
 empty in `--stdin-filename` mode. A *downstream* failure does not: the content

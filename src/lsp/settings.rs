@@ -352,6 +352,12 @@ fn load_toml_file(
             // path the user named does exist, it just does not lead to a
             // config. `symlink_metadata` does not follow, so it still sees the
             // link itself.
+            //
+            // This describes the path as of the probe, which is a moment after
+            // the failed open. Something appearing there in between is
+            // misreported — a config loader does not serialize against the
+            // filesystem, and the alternative (probe first) only moves the
+            // window.
             if path
                 .symlink_metadata()
                 .is_ok_and(|metadata| metadata.file_type().is_symlink())

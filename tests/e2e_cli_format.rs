@@ -78,10 +78,11 @@ fn read(workspace: &Path, name: &str) -> String {
     std::fs::read_to_string(workspace.join(name)).expect("read workspace file")
 }
 
-/// A `--config-file` that exists but cannot be parsed aborts the run. stdout
-/// stays empty: a formatter that exits non-zero must not hand its caller
-/// content, or `kakehashi format --stdin-filename f.md < f.md > f.md` and
-/// editor filters would replace the buffer with partial output.
+/// A `--config-file` that exists but cannot be parsed aborts the run before
+/// anything is written, so stdout stays empty. This is specific to a
+/// configuration failure: a *downstream* formatter failure writes its content
+/// first and reports the failure through the exit code afterwards, so empty
+/// stdout is not a general property of exit 2.
 #[test]
 fn e2e_format_invalid_explicit_config_exits_error() {
     let ws = tempfile::tempdir().expect("create workspace tempdir");
