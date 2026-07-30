@@ -66,14 +66,9 @@ pub struct SettingsLoadOutcome {
     pub settings: Option<WorkspaceSettings>,
     pub raw_settings: Option<RawWorkspaceSettings>,
     pub events: Vec<SettingsEvent>,
-    /// True if any loaded config layer used the deprecated `rootMarkers` key
-    /// (superseded by `workspaceMarkers`). Serde's alias erases which spelling
-    /// was written, so this is detected from the raw config value. The
-    /// `initialize` handler reads this field and surfaces a one-per-session
-    /// deprecation notice (gated by `SettingsManager`'s claim guard, shared
-    /// with the didChangeConfiguration path); it is intentionally kept out of
-    /// `events` so the many callers that re-load settings do not re-warn.
-    pub deprecated_keys: DeprecatedKeysSeen,
+    /// Which deprecated keys the loaded layers spelled — see
+    /// [`DeprecatedKeysSeen`] for why this is not an `events` entry.
+    pub(crate) deprecated_keys: DeprecatedKeysSeen,
 }
 
 /// Ceiling on a single config file read.
@@ -163,7 +158,7 @@ fn read_explicit_layers(
         "Using {} explicit config file(s); default config locations skipped",
         files.len()
     ))];
-    let mut used_deprecated_root_markers = false;
+    let mut deprecated_keys = DeprecatedKeysSeen::default();
     let mut fatal_error = None;
     let mut layers = Vec::with_capacity(files.len());
 
@@ -175,7 +170,7 @@ fn read_explicit_layers(
         if fatal_error.is_some() {
             break;
         }
-        let layer = match load_toml_file(path, &mut events, &mut used_deprecated_root_markers) {
+        let layer = match load_toml_file(path, &mut events, &mut deprecated_keys) {
             Ok(layer) => layer,
             Err(message) => {
                 events.push(SettingsEvent::error(message.clone()));
@@ -233,7 +228,7 @@ fn read_explicit_layers(
     ExplicitConfig {
         layers,
         events,
-        used_deprecated_root_markers,
+        deprecated_keys,
         fatal_error,
     }
 }
@@ -255,7 +250,6 @@ pub fn load_settings(
     let env_fn = crate::config::expand::with_kakehashi_defaults(env_fn);
     let mut events = Vec::new();
     let mut deprecated_keys = DeprecatedKeysSeen::default();
-    let explicit_config_requested = crate::config::expand::config_file_override().is_some();
 
     // Layer 1: Programmed defaults (configuration-merging-strategy: lowest precedence)
     let defaults = Some(default_settings());
@@ -1012,7 +1006,7 @@ mod tests {
         std::fs::set_permissions(&locked_parent, std::fs::Permissions::from_mode(0o000)).unwrap();
 
         let mut events = Vec::new();
-        let mut ignored_deprecation = false;
+        let mut ignored_deprecation = DeprecatedKeysSeen::default();
         // root ignores the permission bits, so probe before deciding to assert.
         let permissions_enforced = std::fs::read_to_string(&path).is_err();
         let result = load_toml_file(&path, &mut events, &mut ignored_deprecation);
@@ -1076,7 +1070,7 @@ mod tests {
         std::fs::write(&path, "autoInstal = false\n").unwrap();
 
         let mut events = Vec::new();
-        let mut ignored_deprecation = false;
+        let mut ignored_deprecation = DeprecatedKeysSeen::default();
         let result = load_toml_file(&path, &mut events, &mut ignored_deprecation);
 
         assert!(
@@ -1109,7 +1103,7 @@ mod tests {
         .unwrap();
 
         let mut events = Vec::new();
-        let mut ignored_deprecation = false;
+        let mut ignored_deprecation = DeprecatedKeysSeen::default();
         let result = load_toml_file(&path, &mut events, &mut ignored_deprecation);
 
         let message = result
@@ -1132,7 +1126,7 @@ mod tests {
         .unwrap();
 
         let mut events = Vec::new();
-        let mut ignored_deprecation = false;
+        let mut ignored_deprecation = DeprecatedKeysSeen::default();
         let result = load_toml_file(&path, &mut events, &mut ignored_deprecation);
 
         assert!(matches!(result, Ok(Some(_))), "{result:?}");
@@ -1227,7 +1221,7 @@ mod tests {
         std::fs::write(&path, &oversized).unwrap();
 
         let mut events = Vec::new();
-        let mut ignored_deprecation = false;
+        let mut ignored_deprecation = DeprecatedKeysSeen::default();
         let result = load_toml_file(&path, &mut events, &mut ignored_deprecation);
 
         let message = result.expect_err("an oversized explicit file must be fatal");
@@ -1251,7 +1245,7 @@ mod tests {
         std::fs::write(&path, &oversized).unwrap();
 
         let mut events = Vec::new();
-        let mut ignored_deprecation = false;
+        let mut ignored_deprecation = DeprecatedKeysSeen::default();
         let result = load_toml_file(&path, &mut events, &mut ignored_deprecation);
 
         let message = result.expect_err("an oversized explicit file must be fatal");
@@ -1275,7 +1269,7 @@ mod tests {
         std::fs::remove_file(&target).unwrap();
 
         let mut events = Vec::new();
-        let mut ignored_deprecation = false;
+        let mut ignored_deprecation = DeprecatedKeysSeen::default();
         let result = load_toml_file(&link, &mut events, &mut ignored_deprecation);
 
         let message = result.expect_err("a dangling explicit symlink must be fatal");
@@ -1298,7 +1292,7 @@ mod tests {
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
 
         let mut events = Vec::new();
-        let mut ignored_deprecation = false;
+        let mut ignored_deprecation = DeprecatedKeysSeen::default();
         // root ignores the permission bits, so probe before deciding to assert.
         let permissions_enforced = std::fs::read_to_string(&path).is_err();
         let result = load_toml_file(&path, &mut events, &mut ignored_deprecation);
@@ -1339,7 +1333,10 @@ mod tests {
             matches!(result, Ok(Some(_))),
             "valid TOML should parse: {result:?}"
         );
-        assert!(used_deprecated.root_markers, "rootMarkers should set the flag");
+        assert!(
+            used_deprecated.root_markers,
+            "rootMarkers should set the flag"
+        );
     }
 
     /// load_toml_settings (the project kakehashi.toml layer) sets the flag when

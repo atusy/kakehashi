@@ -11,7 +11,6 @@ use crate::config::{RawWorkspaceSettings, WorkspaceSettings, merge_workspace_set
 
 use super::super::{Kakehashi, lock_settings_reload};
 
-
 fn settings_payload(settings: Value) -> (Value, Vec<String>) {
     let Value::Object(mut object) = settings else {
         return (settings, Vec::new());

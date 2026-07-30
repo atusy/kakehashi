@@ -54,8 +54,15 @@ pub(crate) const KNOWN_BRIDGE_SERVER_SETTING_KEYS: &[&str] = &[
 
 pub(crate) const KNOWN_CAPTURE_MAPPINGS_SETTING_KEYS: &[&str] = &["folds", "highlights"];
 
-pub(crate) const KNOWN_LANGUAGE_SETTING_KEYS: &[&str] =
-    &["aliases", "base", "bridge", "layers", "parser", "queries"];
+pub(crate) const KNOWN_LANGUAGE_SETTING_KEYS: &[&str] = &[
+    "aliases",
+    "autoInstall",
+    "base",
+    "bridge",
+    "layers",
+    "parser",
+    "queries",
+];
 
 pub(crate) const KNOWN_LAYER_AGGREGATION_SETTING_KEYS: &[&str] = &["priorities", "strategy"];
 
