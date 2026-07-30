@@ -109,9 +109,13 @@ not opened. Two things restore the ordering:
 - A request that depends on the repair synchronizes on it explicitly. The
   connection's pending re-open is claimed *before* the connection is published
   as `Ready`, so a request unblocked by that transition can see it, and requests
-  wait on it under the same bound the inline heal used. Dropping the completion
-  signal releases the waiters, so a failed re-open degrades to the old lazy
-  behaviour instead of stalling.
+  wait on it under the same bound the inline heal used. If that wait does NOT
+  settle, the request **fails soft rather than sending**: a bounded wait means
+  the guarantee can be unmet, and proceeding anyway is the failure the barrier
+  exists to prevent. A null the user can re-fire beats a confusing downstream
+  error. Dropping the completion signal — a re-open that can never finish —
+  counts as settled, so a dead handler degrades to the old lazy behaviour instead
+  of blocking every command.
 
 The claim is reversible: a handshake that dies after claiming the set restores
 it, because the purge that recorded it already emptied the tracker and no later

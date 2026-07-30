@@ -47,16 +47,24 @@ impl LanguageServerPool {
         settings: &WorkspaceSettings,
         upstream_id: Option<UpstreamId>,
     ) -> Option<Value> {
-        // Decode into an owned key/command first so `params.arguments` can move
-        // into the outgoing request without a partial-borrow conflict.
+        // PALETTE FIRST. A downstream's advertised command ids are arbitrary
+        // strings, so one could in principle be shaped exactly like a routed name
+        // (`kakehashi|c|srv||reload`). Decoding first would strip it to `reload`
+        // and send the wrong id. An encoded name can never be in this registry —
+        // it holds RAW advertised names — so an exact hit here is unambiguous
+        // evidence the client meant the palette command.
+        if self.command_origins().route(&params.command).is_some() {
+            return self
+                .dispatch_palette_command(params, settings, upstream_id)
+                .await;
+        }
+        // Decode into an owned key/command so `params.arguments` can move into
+        // the outgoing request without a partial-borrow conflict.
         let (key, command) = match decode_command(&params.command) {
             Some(route) => (route.key, route.command.to_string()),
             None => {
-                // Not an action-encoded command. It may still be a PALETTE
-                // command — a name a downstream advertised via
-                // `executeCommandProvider` that the client fired without an
-                // action context (#628). Route it by the command→origin registry;
-                // otherwise it's foreign and ignored.
+                // Neither a registered raw name nor an action-encoded one. The
+                // palette path re-checks and emits the "foreign command" warn.
                 return self
                     .dispatch_palette_command(params, settings, upstream_id)
                     .await;
@@ -108,7 +116,18 @@ impl LanguageServerPool {
         // enqueueing the command first would hand the downstream a command for a
         // document it has not opened yet. Bounded, and a no-op when nothing is
         // in flight (the common case).
-        self.wait_for_pending_reopen(&key).await;
+        //
+        // Drop the command if the wait did not settle. Sending anyway would
+        // waive the exact guarantee this barrier exists for and surface as a
+        // downstream error; a fail-soft null the user can re-fire is better.
+        if !self.wait_for_pending_reopen(&key).await {
+            warn!(
+                target: "kakehashi::bridge",
+                "executeCommand: {origin:?} is still re-opening its documents; \
+                 dropping {command:?} rather than sending it out of order"
+            );
+            return None;
+        }
         if !handle.has_capability(METHOD) {
             // Nearly unreachable: the bridge only mints commands from servers it
             // bridged, and the wait-ready acquisition above rules out the
@@ -238,7 +257,15 @@ impl LanguageServerPool {
         // reference a document too (a downstream is free to take a URI argument),
         // and this connection may have just respawned with its re-open still in
         // flight. Bounded, and a no-op when nothing is pending.
-        self.wait_for_pending_reopen(&key).await;
+        if !self.wait_for_pending_reopen(&key).await {
+            warn!(
+                target: "kakehashi::bridge",
+                "executeCommand: origin {origin:?} is still re-opening its documents; \
+                 dropping palette command {:?} rather than sending it out of order",
+                params.command
+            );
+            return None;
+        }
         if !handle.has_capability(METHOD) {
             // The advertising connection was Ready (capabilities set) when it
             // registered the command, but the RECONNECT path can hand back a

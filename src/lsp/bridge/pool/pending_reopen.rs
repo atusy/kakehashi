@@ -117,11 +117,17 @@ impl PendingReopenRegistry {
 
     /// Wait (bounded by [`REOPEN_WAIT`]) for an in-flight re-open on `key`.
     ///
-    /// Returns immediately when none is in flight, which is the common case.
-    /// On timeout the caller proceeds anyway: the re-open keeps running, and
-    /// letting a slow downstream block a user-facing request indefinitely would
-    /// be worse than the state it is repairing.
-    pub(crate) async fn wait_for_reopen(&self, key: &ConnectionKey) {
+    /// Returns `true` when the ordering requirement is met — either nothing was
+    /// outstanding (the common case) or the re-open finished. Returns `false` on
+    /// timeout, where the re-open is still running.
+    ///
+    /// The caller must NOT proceed on `false`. A bounded wait means the guarantee
+    /// can be unmet, and sending anyway is the failure this barrier exists to
+    /// prevent — the command would reach the downstream ahead of the `didOpen` it
+    /// depends on and fail there instead. Failing soft costs the user one
+    /// no-op action they can re-fire; sending unordered costs them a confusing
+    /// downstream error.
+    pub(crate) async fn wait_for_reopen(&self, key: &ConnectionKey) -> bool {
         let Some(mut rx) = self
             .in_flight
             .lock()
@@ -129,7 +135,8 @@ impl PendingReopenRegistry {
             .get(key)
             .cloned()
         else {
-            return;
+            // Nothing outstanding: the ordering requirement is vacuously met.
+            return true;
         };
         // `Err` (sender dropped) counts as finished: the re-open completed, or
         // its handler died and will never signal.
@@ -157,6 +164,7 @@ impl PendingReopenRegistry {
                 in_flight.remove(key);
             }
         }
+        settled
     }
 }
 
@@ -229,9 +237,12 @@ mod tests {
         // The overwhelmingly common case: nothing was purged, so a request must
         // not pay the timeout (or any wait at all).
         let registry = PendingReopenRegistry::default();
-        registry
-            .wait_for_reopen(&ConnectionKey::for_server("ruff"))
-            .await;
+        assert!(
+            registry
+                .wait_for_reopen(&ConnectionKey::for_server("ruff"))
+                .await,
+            "nothing outstanding means the ordering requirement is vacuously met"
+        );
     }
 
     #[tokio::test]
@@ -267,9 +278,13 @@ mod tests {
         drop(tx);
 
         // Would hang for REOPEN_WAIT if a dropped sender did not count as done.
-        tokio::time::timeout(Duration::from_secs(1), registry.wait_for_reopen(&key))
-            .await
-            .expect("a dropped sender releases the waiter immediately");
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), registry.wait_for_reopen(&key))
+                .await
+                .expect("a dropped sender releases the waiter immediately"),
+            "a dropped sender means the re-open will never signal, so waiting \
+             further is pointless — report settled and let the caller proceed"
+        );
     }
 
     #[tokio::test(start_paused = true)]
@@ -282,8 +297,13 @@ mod tests {
         registry.record(&key, vec![url("file:///w/a.md")]);
         let (_hosts, done) = registry.take(&key).expect("a re-open is pending");
 
-        // Auto-advances past REOPEN_WAIT without a real sleep.
-        registry.wait_for_reopen(&key).await;
+        // Auto-advances past REOPEN_WAIT without a real sleep. The wait did NOT
+        // settle, so the caller must be told to fail soft rather than send
+        // without the ordering guarantee.
+        assert!(
+            !registry.wait_for_reopen(&key).await,
+            "an unfinished re-open must report NOT settled"
+        );
 
         // Still outstanding, so a second request is bounded the same way rather
         // than sailing straight through.
@@ -293,7 +313,10 @@ mod tests {
             "a still-running re-open must keep blocking, not be forgotten"
         );
         done.send(true).expect("the registry holds the receiver");
-        registry.wait_for_reopen(&key).await;
+        assert!(
+            registry.wait_for_reopen(&key).await,
+            "a completed re-open reports settled"
+        );
     }
 
     #[tokio::test]

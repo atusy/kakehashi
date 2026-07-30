@@ -1196,11 +1196,13 @@ impl LanguageServerPool {
         }
     }
 
-    /// Wait for an in-flight virtual-document re-open on `key` before sending
-    /// on that connection (execute-command-routing-token). Bounded; a no-op
-    /// when none is in flight.
-    pub(super) async fn wait_for_pending_reopen(&self, key: &ConnectionKey) {
-        self.pending_reopen.wait_for_reopen(key).await;
+    /// Wait for an in-flight virtual-document re-open on `key` before sending on
+    /// that connection (execute-command-routing-token). Bounded; a no-op when
+    /// none is in flight.
+    /// Returns `false` when the re-open did not finish in time; the caller must
+    /// then fail soft rather than send without the ordering guarantee.
+    pub(super) async fn wait_for_pending_reopen(&self, key: &ConnectionKey) -> bool {
+        self.pending_reopen.wait_for_reopen(key).await
     }
 
     /// Reconnect to the exact `(server, root)` a routing token names, with no
