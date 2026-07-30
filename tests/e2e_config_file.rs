@@ -157,15 +157,20 @@ fn test_config_file_two_files_merge_in_order() {
     );
 }
 
-/// --config-file with non-existent path fails initialization instead of silently
-/// falling back to defaults.
+/// An absent explicit config file is an optional layer, not a startup failure:
+/// layered invocations rely on the overlay being allowed to not exist, and a
+/// relative path resolves against the editor's working directory.
 #[test]
-fn test_config_file_nonexistent_fails_initialization() {
+fn test_config_file_nonexistent_is_optional() {
     let dir = TempDir::new().unwrap();
-    let config_path = dir.path().join("missing.toml");
+    let present = dir.path().join("present.toml");
+    let missing = dir.path().join("missing.toml");
+    std::fs::write(&present, "autoInstall = false\n").unwrap();
     let mut client = LspClient::builder()
         .arg("--config-file")
-        .arg(config_path.to_str().unwrap())
+        .arg(present.to_str().unwrap())
+        .arg("--config-file")
+        .arg(missing.to_str().unwrap())
         .env_remove("KAKEHASHI_DATA_DIR")
         .build();
 
@@ -178,16 +183,18 @@ fn test_config_file_nonexistent_fails_initialization() {
         }),
     );
 
-    let error = response
-        .get("error")
-        .expect("missing explicit config file should reject initialize");
-    assert_eq!(error["code"], json!(-32803));
     assert!(
-        error["message"].as_str().is_some_and(|message| {
-            message.contains("Config file not found")
-                && message.contains(&config_path.display().to_string())
-        }),
-        "initialize error should identify the missing config file: {error}"
+        response.get("result").is_some(),
+        "a missing explicit layer must be skipped, not fatal: {response}"
+    );
+    // The surviving layer must still apply, so the skip is a skip and not a
+    // wholesale fallback to programmed defaults.
+    client.send_notification("initialized", json!({}));
+    let settings = query_effective_settings(&mut client);
+    assert_eq!(
+        settings["autoInstall"],
+        json!(false),
+        "the layer that does exist must still apply: {settings}"
     );
 }
 
@@ -291,9 +298,224 @@ fn test_config_file_masked_invalid_path_expansion_fails_initialization() {
         }),
     );
 
+    let error = response
+        .get("error")
+        .expect("a later explicit layer must not mask an earlier layer's invalid path");
+    assert_eq!(error["code"], json!(-32803));
+    assert!(
+        error["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("Path expansion failed")
+                && message.contains(invalid.to_str().unwrap())),
+        "the masked failure, not some other error, must be reported — and it must \
+         name the file the bad path came from: {error}"
+    );
+}
+
+/// Every explicit layer is validated, not just the first: a failure in the
+/// second file must be reported and must name that file.
+#[test]
+fn test_config_file_validates_every_explicit_layer() {
+    let dir = TempDir::new().unwrap();
+    let first = dir.path().join("first.toml");
+    let second = dir.path().join("second.toml");
+    std::fs::write(&first, "autoInstall = false\n").unwrap();
+    std::fs::write(&second, "searchPaths = [\"/unterminated\"\n").unwrap();
+    let mut client = LspClient::builder()
+        .arg("--config-file")
+        .arg(first.to_str().unwrap())
+        .arg("--config-file")
+        .arg(second.to_str().unwrap())
+        .env_remove("KAKEHASHI_DATA_DIR")
+        .build();
+
+    let response = client.send_request(
+        "initialize",
+        json!({
+            "processId": std::process::id(),
+            "rootUri": null,
+            "capabilities": {}
+        }),
+    );
+
+    let error = response
+        .get("error")
+        .expect("a failure in a later explicit layer must reject initialize");
+    assert!(
+        error["message"].as_str().is_some_and(|message| {
+            message.contains("Failed to parse") && message.contains(second.to_str().unwrap())
+        }),
+        "the error must name the second file, not stop at the first: {error}"
+    );
+}
+
+/// A cross-field invariant whose operands are split across two explicit layers
+/// is valid once merged, so neither layer may be rejected on its own.
+#[test]
+fn test_config_file_split_cross_field_invariant_is_not_fatal() {
+    let dir = TempDir::new().unwrap();
+    let debounce = dir.path().join("debounce.toml");
+    let max_wait = dir.path().join("max-wait.toml");
+    // 3000ms alone exceeds the default maxWaitMs of 1000ms; the overlay lifts
+    // the ceiling, so the merged configuration is valid.
+    std::fs::write(
+        &debounce,
+        "[features.\"textDocument/publishDiagnostics\"]\ndebounceMs = 3000\n",
+    )
+    .unwrap();
+    std::fs::write(
+        &max_wait,
+        "[features.\"textDocument/publishDiagnostics\"]\nmaxWaitMs = 5000\n",
+    )
+    .unwrap();
+    let mut client = LspClient::builder()
+        .arg("--config-file")
+        .arg(debounce.to_str().unwrap())
+        .arg("--config-file")
+        .arg(max_wait.to_str().unwrap())
+        .env_remove("KAKEHASHI_DATA_DIR")
+        .build();
+
+    let response = client.send_request(
+        "initialize",
+        json!({
+            "processId": std::process::id(),
+            "rootUri": null,
+            "capabilities": {}
+        }),
+    );
+
+    assert!(
+        response.get("result").is_some(),
+        "a layer must not be judged against defaults its sibling layer replaces: {response}"
+    );
+    client.send_notification("initialized", json!({}));
+    let settings = query_effective_settings(&mut client);
+    let timing = &settings["features"]["textDocument/publishDiagnostics"];
+    assert_eq!(timing["debounceMs"], json!(3000), "settings: {settings}");
+    assert_eq!(timing["maxWaitMs"], json!(5000), "settings: {settings}");
+}
+
+/// The mirror image: layers that are each valid alone but invalid once merged
+/// must still abort, rather than silently discarding the explicit configuration
+/// and starting on programmed defaults.
+#[test]
+fn test_config_file_merged_only_invalid_fails_initialization() {
+    let dir = TempDir::new().unwrap();
+    let max_wait = dir.path().join("max-wait.toml");
+    let debounce = dir.path().join("debounce.toml");
+    // Each file is valid in isolation (120 <= default 1000; 500 >= default 100),
+    // but merged they violate debounceMs <= maxWaitMs.
+    std::fs::write(
+        &max_wait,
+        "[features.\"textDocument/publishDiagnostics\"]\nmaxWaitMs = 120\n",
+    )
+    .unwrap();
+    std::fs::write(
+        &debounce,
+        "[features.\"textDocument/publishDiagnostics\"]\ndebounceMs = 500\n",
+    )
+    .unwrap();
+    let mut client = LspClient::builder()
+        .arg("--config-file")
+        .arg(max_wait.to_str().unwrap())
+        .arg("--config-file")
+        .arg(debounce.to_str().unwrap())
+        .env_remove("KAKEHASHI_DATA_DIR")
+        .build();
+
+    let response = client.send_request(
+        "initialize",
+        json!({
+            "processId": std::process::id(),
+            "rootUri": null,
+            "capabilities": {}
+        }),
+    );
+
+    let error = response
+        .get("error")
+        .expect("an explicit configuration that is invalid only once merged must abort");
+    assert_eq!(error["code"], json!(-32803));
+    assert!(
+        error["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("Invalid configuration")),
+        "initialize error should describe the invalid merged configuration: {error}"
+    );
+}
+
+/// Implicitly discovered configuration keeps its optional, warning-only policy:
+/// only paths the user named explicitly are strict. Pinning this stops a future
+/// unification of the two loaders from turning a typo in a project
+/// `kakehashi.toml` into a server that refuses to start.
+#[test]
+fn test_implicit_project_config_parse_failure_is_not_fatal() {
+    let dir = TempDir::new().unwrap();
+    std::fs::write(dir.path().join("kakehashi.toml"), "autoInstall = \n").unwrap();
+    let mut client = LspClient::builder()
+        .env_remove("KAKEHASHI_DATA_DIR")
+        .build();
+
+    let root_uri = format!("file://{}", dir.path().display());
+    let response = client.send_request(
+        "initialize",
+        json!({
+            "processId": std::process::id(),
+            "rootUri": root_uri,
+            "capabilities": {}
+        }),
+    );
+
+    assert!(
+        response.get("result").is_some(),
+        "a malformed implicit project config must not reject initialize: {response}"
+    );
+}
+
+/// The initialize error is the *only* client-facing report of a fatal config
+/// failure. Without this the early return in `initialize_impl` could drift back
+/// below `log_settings_events` and the user would get a `window/showMessage`
+/// popup on top of a failed handshake, with nothing failing in CI.
+#[test]
+fn test_config_file_fatal_error_is_not_also_shown_as_a_message() {
+    let dir = TempDir::new().unwrap();
+    let config_path = dir.path().join("invalid.toml");
+    std::fs::write(&config_path, "searchPaths = [\"/unterminated\"\n").unwrap();
+    let mut client = LspClient::builder()
+        .arg("--config-file")
+        .arg(config_path.to_str().unwrap())
+        .env_remove("KAKEHASHI_DATA_DIR")
+        .build();
+
+    let id = client.send_request_async(
+        "initialize",
+        json!({
+            "processId": std::process::id(),
+            "rootUri": null,
+            "capabilities": {}
+        }),
+    );
+    let (response, watched) = client.receive_response_for_id_watching_notifications(
+        id,
+        &["window/showMessage", "window/logMessage"],
+    );
+
     assert!(
         response.get("error").is_some(),
-        "a later explicit layer must not mask an earlier layer's invalid path: {response}"
+        "invalid explicit config file should reject initialize: {response}"
+    );
+    let duplicated: Vec<_> = watched
+        .iter()
+        .filter(|(_, params)| {
+            params["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("Failed to parse"))
+        })
+        .collect();
+    assert!(
+        duplicated.is_empty(),
+        "the initialize error must be the sole report of the failure: {duplicated:?}"
     );
 }
 
@@ -324,6 +546,21 @@ fn test_config_file_does_not_make_invalid_initialization_options_fatal() {
     assert!(
         response.get("result").is_some(),
         "initializationOptions keep their existing non-fatal policy: {response}"
+    );
+    // Prove the expansion really failed rather than quietly succeeding. The
+    // merged configuration is discarded wholesale and programmed defaults take
+    // over, so the file's `autoInstall = false` is gone too — without a failure
+    // it would have survived.
+    client.send_notification("initialized", json!({}));
+    let settings = query_effective_settings(&mut client);
+    assert_eq!(
+        settings["autoInstall"],
+        json!(true),
+        "the failed expansion should discard the merge in favour of defaults: {settings}"
+    );
+    assert!(
+        !settings.to_string().contains("KAKEHASHI_TEST_UNDEFINED"),
+        "no unexpanded value may leak into the effective configuration: {settings}"
     );
 }
 

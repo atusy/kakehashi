@@ -152,20 +152,31 @@ pub fn load_settings(
     // Merge all layers: defaults < config_layers < override (later layers override earlier)
     let mut layers = vec![defaults];
     layers.extend(config_layers);
-    layers.push(override_settings);
-    let merged = layers
+    let merged_files = layers
+        .into_iter()
+        .reduce(merge_workspace_settings)
+        .flatten();
+
+    // An explicit configuration has to be valid on its own terms, or startup
+    // would silently continue on programmed defaults. This is judged before
+    // `initializationOptions` join the merge, because those keep a non-fatal
+    // policy of their own — a client sending a bad override must not be
+    // reported as a mistake in the user's file. It is also the only place a
+    // cross-layer invariant can be judged: one file supplying `debounceMs` and
+    // another `maxWaitMs` is valid in neither file alone.
+    if explicit_files.is_some()
+        && let Some(raw_settings) = merged_files.as_ref()
+        && let Err(errs) = WorkspaceSettings::try_from_settings(raw_settings, home, &env_fn)
+    {
+        fatal_error.get_or_insert(format!("Invalid configuration from --config-file: {errs}"));
+    }
+
+    let merged = [merged_files, override_settings]
         .into_iter()
         .reduce(merge_workspace_settings)
         .flatten();
     let raw_settings = merged.clone();
-    let settings = expand_merged_settings(
-        merged,
-        home,
-        &env_fn,
-        &mut events,
-        &mut fatal_error,
-        explicit_files.is_some(),
-    );
+    let settings = expand_merged_settings(merged, home, &env_fn, &mut events);
 
     SettingsLoadOutcome {
         settings,
@@ -176,35 +187,28 @@ pub fn load_settings(
     }
 }
 
-/// Expand and validate the fully merged configuration.
+/// Expand and validate the fully merged configuration, `initializationOptions`
+/// included.
 ///
-/// `explicit_config` marks a session driven by `--config-file`. Those paths
-/// represent user intent, so a merged configuration that cannot be expanded is
-/// fatal rather than silently degrading to programmed defaults. This is also
-/// the only place a cross-layer invariant violation can be caught — one file
-/// supplying `debounceMs` and another `maxWaitMs` is valid in neither file
-/// alone, yet the pair must still be checked once merged.
+/// Failure here is never fatal on its own: it is the last, most permissive
+/// gate, and the layers that *are* strict have already been judged by the
+/// caller. Discarding the merge leaves `initialize` to start on programmed
+/// defaults, which is the documented policy for a client-supplied override.
 fn expand_merged_settings(
     merged: Option<RawWorkspaceSettings>,
     home: Option<&str>,
     env_fn: impl Fn(&str) -> Option<String>,
     events: &mut Vec<SettingsEvent>,
-    fatal_error: &mut Option<String>,
-    explicit_config: bool,
 ) -> Option<WorkspaceSettings> {
     merged.and_then(|settings| {
         match WorkspaceSettings::try_from_settings(&settings, home, env_fn) {
             Ok(settings) => Some(settings),
             Err(errs) => {
-                let message = format!(
+                events.push(SettingsEvent::error(format!(
                     "Invalid configuration: {errs}. \
                      This configuration has been discarded. \
                      Please correct the invalid settings or remove them from your config.",
-                );
-                events.push(SettingsEvent::error(message.clone()));
-                if explicit_config {
-                    fatal_error.get_or_insert(message);
-                }
+                )));
                 None
             }
         }
@@ -629,49 +633,30 @@ mod tests {
         );
     }
 
-    /// A merged configuration that fails expansion is fatal only when the user
-    /// named the files explicitly; implicit discovery keeps degrading to
-    /// defaults so the zero-config experience survives a stray config file.
+    /// The last expansion gate stays non-fatal: it also carries
+    /// `initializationOptions`, whose failures must not abort startup.
     #[test]
-    fn merged_expansion_failure_is_fatal_only_for_explicit_config() {
-        let broken = || RawWorkspaceSettings {
+    fn merged_expansion_failure_discards_settings_without_aborting() {
+        let merged = RawWorkspaceSettings {
             search_paths: Some(vec!["$UNDEFINED_VAR/parsers".to_string()]),
             ..Default::default()
         };
+        let mut events = Vec::new();
 
-        let mut explicit_events = Vec::new();
-        let mut explicit_fatal = None;
-        let explicit = expand_merged_settings(
-            Some(broken()),
+        let settings = expand_merged_settings(
+            Some(merged),
             None,
             crate::config::make_env(&[]),
-            &mut explicit_events,
-            &mut explicit_fatal,
-            true,
+            &mut events,
         );
 
-        let mut implicit_events = Vec::new();
-        let mut implicit_fatal = None;
-        let implicit = expand_merged_settings(
-            Some(broken()),
-            None,
-            crate::config::make_env(&[]),
-            &mut implicit_events,
-            &mut implicit_fatal,
-            false,
-        );
-
-        assert!(explicit.is_none());
-        assert!(implicit.is_none());
+        assert!(settings.is_none());
         assert!(
-            explicit_fatal
-                .as_deref()
-                .is_some_and(|message| message.contains("UNDEFINED_VAR")),
-            "explicit config must abort startup: {explicit_fatal:?}"
-        );
-        assert!(
-            implicit_fatal.is_none(),
-            "implicit config must keep falling back to defaults: {implicit_fatal:?}"
+            events
+                .iter()
+                .any(|event| event.kind == SettingsEventKind::Error
+                    && event.message.contains("UNDEFINED_VAR")),
+            "the discarded configuration must still be reported: {events:?}"
         );
     }
 
