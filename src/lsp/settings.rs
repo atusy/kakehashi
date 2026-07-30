@@ -117,6 +117,24 @@ pub(crate) fn load_explicit_config(
     Some(read_explicit_layers(files, home, env_fn))
 }
 
+/// The explicit layers merged with nothing beneath them — the subject of the
+/// strict gate.
+///
+/// Programmed defaults are deliberately absent. They carry
+/// `${KAKEHASHI_DATA_DIR}`, which cannot expand on a host with no discoverable
+/// data directory, and blaming the user's file for that would reject a session
+/// over a valid — even empty — config. Their absence costs the gate nothing:
+/// `FeatureSettings::resolve` already fills an unset half of a timing pair from
+/// the same defaults, so a lone `debounceMs` is still judged against the
+/// default `maxWaitMs`.
+fn merge_explicit_layers(layers: &[Option<RawWorkspaceSettings>]) -> Option<RawWorkspaceSettings> {
+    layers
+        .iter()
+        .cloned()
+        .reduce(merge_workspace_settings)
+        .flatten()
+}
+
 /// The body of [`load_explicit_config`], taking the paths directly so it can be
 /// exercised without the process-global `--config-file` override.
 fn read_explicit_layers(
@@ -186,18 +204,7 @@ fn read_explicit_layers(
     // every `try_from_settings` re-resolves language `base` chains, whose cycle
     // detector logs as it goes.
     if fatal_error.is_none() {
-        // Only the explicit layers. Programmed defaults carry
-        // `${KAKEHASHI_DATA_DIR}`, which cannot expand on a host with no
-        // discoverable data directory — blaming the user's file for that would
-        // reject a session over a valid, even empty, config. Their absence
-        // costs nothing here: `FeatureSettings::resolve` already fills an
-        // unset half of a timing pair from the same defaults, so a lone
-        // `debounceMs` is still judged against the default `maxWaitMs`.
-        let merged = layers
-            .iter()
-            .cloned()
-            .reduce(merge_workspace_settings)
-            .flatten();
+        let merged = merge_explicit_layers(&layers);
         if let Some(raw_settings) = merged.as_ref()
             && let Err(errs) = WorkspaceSettings::try_from_settings(raw_settings, home, &env_fn)
         {
@@ -1015,27 +1022,35 @@ mod tests {
         );
     }
 
-    /// A programmed default that cannot expand is not the explicit file's
-    /// fault. `${KAKEHASHI_DATA_DIR}` has no value on a host with no
-    /// discoverable data directory, and rejecting a session over that would
-    /// turn a valid — even empty — `--config-file` into a startup failure.
+    /// The strict gate judges the user's files, not the defaults beneath them.
+    /// Programmed defaults carry `${KAKEHASHI_DATA_DIR}`, which has no value on
+    /// a host with no discoverable data directory; merging them in would reject
+    /// a session over a valid — even empty — `--config-file`.
+    ///
+    /// Asserted on the merge rather than on a verdict: whether the default
+    /// expands depends on the host, so a test that ran the gate would pass on
+    /// any developer machine even with the defaults merged back in.
     #[test]
-    fn read_explicit_layers_does_not_blame_a_file_for_the_defaults() {
-        let dir = TempDir::new().unwrap();
-        let path = dir.path().join("empty.toml");
-        std::fs::write(&path, "").unwrap();
+    fn merge_explicit_layers_excludes_the_programmed_defaults() {
+        let layers = vec![
+            Some(RawWorkspaceSettings {
+                auto_install: Some(false),
+                ..Default::default()
+            }),
+            None,
+        ];
 
-        // An environment where the data-directory fallback is unavailable, so
-        // the default `searchPaths` entry cannot expand.
-        let explicit = read_explicit_layers(&[path], None, |var| match var {
-            "KAKEHASHI_DATA_DIR" => None,
-            _ => std::env::var(var).ok(),
-        });
+        let merged = merge_explicit_layers(&layers).expect("the explicit layer should survive");
 
+        assert_eq!(merged.auto_install, Some(false));
         assert!(
-            explicit.fatal_error.is_none(),
-            "a valid explicit file must not inherit the defaults' failure: {:?}",
-            explicit.fatal_error
+            merged.search_paths.is_none(),
+            "the defaults' searchPaths must not join the subject of the gate: {:?}",
+            merged.search_paths
+        );
+        assert!(
+            default_settings().search_paths.is_some(),
+            "this test is only meaningful while the defaults do carry searchPaths"
         );
     }
 
