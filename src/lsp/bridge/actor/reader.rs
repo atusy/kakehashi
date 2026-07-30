@@ -157,9 +157,9 @@ pub(crate) enum UpstreamNotification {
 /// Each *reply-bearing* variant carries a [`ForwardedRequestCancel`] so the
 /// forwarding loop can observe a downstream `$/cancelRequest` (or connection
 /// death) and forward the cancel to the editor — see [`InboundRequestRegistry`].
-/// The one exception is [`RegisterCommands`](Self::RegisterCommands), which is
-/// fire-and-forget: it advertises capability names to the editor, expects no
-/// reply, and so carries neither a `reply` sender nor a `cancel`.
+/// The exceptions are [`RegisterCommands`](Self::RegisterCommands) and
+/// [`ReopenDocuments`](Self::ReopenDocuments), which are fire-and-forget: they
+/// expect no reply and so carry neither a `reply` sender nor a `cancel`.
 ///
 /// [`InboundRequestRegistry`]: crate::lsp::bridge::InboundRequestRegistry
 pub(crate) enum UpstreamRequest {
@@ -202,6 +202,23 @@ pub(crate) enum UpstreamRequest {
     /// and fires them by raw name (#628 palette-fired commands). Fire-and-forget:
     /// no reply/cancel (the editor's ack is ignored; routing fails soft anyway).
     RegisterCommands { commands: Vec<String> },
+    /// Re-open the virtual documents of `hosts` on `server`, whose previous
+    /// connection was purged and has now been replaced by a `Ready` process
+    /// (execute-command-routing-token).
+    ///
+    /// Routed upward because re-opening needs document *content*, which only the
+    /// server side can supply: it owns the document store and injection
+    /// resolution, while the pool owns the lifecycle that decides *when*. The
+    /// pool cannot resolve injections itself — which is also why
+    /// `ensure_server_documents_open` takes them from its caller.
+    ///
+    /// Fire-and-forget: a lost re-open degrades to the pre-existing lazy
+    /// behaviour (the next parse's `process_injections` opens the documents
+    /// again), so there is nothing to report back.
+    ReopenDocuments {
+        server: String,
+        hosts: Vec<url::Url>,
+    },
 }
 
 /// Cancellation context for a forwarded request: the originating connection and

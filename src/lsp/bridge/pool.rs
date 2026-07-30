@@ -20,6 +20,7 @@ mod execute;
 mod handshake;
 mod liveness_timeout;
 mod message_sender;
+mod pending_reopen;
 mod shutdown;
 mod shutdown_timeout;
 #[cfg(test)]
@@ -37,6 +38,7 @@ use document_tracker::DocumentTracker;
 pub(crate) use document_tracker::OpenedVirtualDoc;
 pub(crate) use dynamic_capability_registry::DynamicCapabilityRegistry;
 pub(crate) use message_sender::{ConnectionHandleSender, MessageSender};
+use pending_reopen::PendingReopenRegistry;
 pub(crate) use shutdown_timeout::GlobalShutdownTimeout;
 
 #[derive(Clone)]
@@ -363,6 +365,10 @@ pub struct LanguageServerPool {
     /// servers via `bridge._self`, with their version and content
     /// fingerprint for lazy full-text re-sync.
     host_documents: Mutex<HashMap<(String, ConnectionKey), HostDocSyncState>>,
+    /// Host documents whose virtual documents a purged connection held, awaiting
+    /// re-open on the replacement connection (execute-command-routing-token).
+    /// `Arc` because the drain runs inside the spawned handshake task.
+    pending_reopen: Arc<PendingReopenRegistry>,
     /// Last full downstream pull report per exact connection/document. Region
     /// diagnostics stay virtual-local and are re-anchored with the request's
     /// current offset when a server answers `unchanged`.
@@ -494,6 +500,7 @@ impl LanguageServerPool {
             host_lifecycle_locks: DashMap::new(),
             latest_virtual_contents: DashMap::new(),
             host_documents: Mutex::new(HashMap::new()),
+            pending_reopen: Arc::new(PendingReopenRegistry::default()),
             diagnostic_pull_baselines: DashMap::new(),
             diagnostic_document_generations: DashMap::new(),
             diagnostic_pull_generations: DashMap::new(),
@@ -746,7 +753,8 @@ impl LanguageServerPool {
                 .lock()
                 .await
                 .retain(|(_, connection_key), _| connection_key != &key);
-            self.document_tracker.purge_connection(&key).await;
+            let reopen_hosts = self.document_tracker.purge_connection(&key).await;
+            self.pending_reopen.record(&key, reopen_hosts);
             self.purge_open_transition_locks(&key).await;
             if let Some(handle) = connections.remove(&key) {
                 stale_handles.push((key, handle));
@@ -2167,9 +2175,11 @@ impl LanguageServerPool {
                         .lock()
                         .await
                         .retain(|(_, key), _| key != &connection_key);
-                    self.document_tracker
+                    let reopen_hosts = self
+                        .document_tracker
                         .purge_connection(&connection_key)
                         .await;
+                    self.pending_reopen.record(&connection_key, reopen_hosts);
                     self.invalidate_diagnostic_connections(std::slice::from_ref(&connection_key));
                     self.purge_open_transition_locks(&connection_key).await;
                     // Remove only after every async purge completes. If this
@@ -2316,6 +2326,8 @@ impl LanguageServerPool {
         let command_origins = Arc::clone(&self.command_origins);
         let command_registration_key = connection_key.clone();
         let upstream_request_tx = self.upstream_request_tx.clone();
+        let pending_reopen = Arc::clone(&self.pending_reopen);
+        let reopen_server_name = server_name.to_string();
         // The editor accepts a dynamic `workspace/executeCommand` registration
         // only if it advertised `dynamicRegistration` (LSP spec). Compute once.
         let supports_dynamic_command_registration = self
@@ -2410,6 +2422,25 @@ impl LanguageServerPool {
                                  (forwarding loop gone): {e}"
                             );
                         }
+                    }
+                    // Re-open the virtual documents the PREVIOUS connection under
+                    // this key held (execute-command-routing-token). Also after
+                    // Ready, so the didOpen queues behind the settings push and
+                    // ahead of any request a waiter unblocked by the Ready
+                    // transition enqueues. Drained, so a respawn that never gets
+                    // here leaves the set for the next purge to re-record.
+                    let reopen_hosts = pending_reopen.take(&command_registration_key);
+                    if !reopen_hosts.is_empty()
+                        && let Err(e) = upstream_request_tx.send(UpstreamRequest::ReopenDocuments {
+                            server: reopen_server_name,
+                            hosts: reopen_hosts,
+                        })
+                    {
+                        log::warn!(
+                            target: "kakehashi::bridge",
+                            "Failed to queue virtual-document re-open after respawn \
+                             (forwarding loop gone): {e}"
+                        );
                     }
                     Ok(())
                 }

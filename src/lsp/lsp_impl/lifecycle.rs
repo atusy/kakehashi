@@ -525,6 +525,7 @@ impl Kakehashi {
                     crate::lsp::lsp_impl::coordinator::DiagnosticPublisher::new(self),
                 ),
                 settings_manager: Arc::clone(&self.settings_manager),
+                injection: self.injection_coordinator(),
             }));
             // LSP conditions workspace/applyEdit on the client capability;
             // resolved once here — client capabilities are fixed after
@@ -740,6 +741,11 @@ async fn forward_upstream_request(
 struct UpstreamDeliveryContext {
     diagnostic_publisher: Arc<crate::lsp::lsp_impl::coordinator::DiagnosticPublisher>,
     settings_manager: Arc<crate::lsp::settings_manager::SettingsManager>,
+    /// Re-opens a respawned connection's virtual documents
+    /// (execute-command-routing-token). Lives here because the pool cannot
+    /// resolve injections itself — the document store and injection query are
+    /// server-side — so the pool signals *when* and this supplies *what*.
+    injection: crate::lsp::lsp_impl::coordinator::InjectionCoordinator,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -832,6 +838,7 @@ async fn upstream_forwarding_loop(
                             &client,
                             request,
                             editor_supports_apply_edit,
+                            delivery_context.clone(),
                         )
                     }
                     None => break, // Channel closed
@@ -1169,6 +1176,7 @@ fn spawn_upstream_request(
     client: &Client,
     request: crate::lsp::bridge::UpstreamRequest,
     editor_supports_apply_edit: bool,
+    delivery_context: Option<Arc<UpstreamDeliveryContext>>,
 ) {
     use crate::lsp::bridge::UpstreamRequest;
     use tower_lsp_server::ls_types::{
@@ -1206,6 +1214,45 @@ fn spawn_upstream_request(
                         target: "kakehashi::bridge",
                         "Timed out registering palette commands upstream"
                     ),
+                }
+            }
+            UpstreamRequest::ReopenDocuments { server, hosts } => {
+                // A respawned connection has nothing open; re-open what its dead
+                // predecessor held (execute-command-routing-token).
+                //
+                // `process_injections` IS the re-open — the same call the parse
+                // path makes, which resolves the host's injections and eagerly
+                // opens their virtual documents. Reusing it (rather than driving
+                // `ensure_server_documents_open` for `server` alone) keeps one
+                // code path for opening virtual documents, and is idempotent:
+                // already-open documents are skipped by their open claims.
+                //
+                // The consequence is that it opens for every server the host
+                // bridges to, not just the respawned one. That is a superset of
+                // what is needed and harmless, so `server` is used only for
+                // logging.
+                let Some(context) = delivery_context else {
+                    // Unreachable in the wired server (the loop is spawned with a
+                    // context), but the fallback must not silently skip a heal.
+                    log::warn!(
+                        target: "kakehashi::bridge",
+                        "Cannot re-open {} document(s) for respawned {server:?}: \
+                         no delivery context",
+                        hosts.len()
+                    );
+                    return;
+                };
+                log::debug!(
+                    target: "kakehashi::bridge",
+                    "Re-opening {} document(s) after {server:?} respawned",
+                    hosts.len()
+                );
+                for host in hosts {
+                    // Sequential, not joined: a respawn can carry a large host
+                    // set, and each re-open resolves injections and sends
+                    // didOpen on the SAME connection anyway, so fanning out
+                    // would only contend on the outbound queue.
+                    context.injection.process_injections(&host, false).await;
                 }
             }
             UpstreamRequest::ShowMessageRequest {

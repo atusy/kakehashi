@@ -549,7 +549,12 @@ impl DocumentTracker {
     /// `(server, root)` key, so sibling connections sharing the server name (or
     /// a different root) keep their state; `opened_documents` is decremented
     /// per URI (not cleared), so a URI also open on another connection survives.
-    pub(super) async fn purge_connection(&self, connection_key: &ConnectionKey) {
+    ///
+    /// Returns the HOST documents whose virtual documents this connection held.
+    /// The purge is the last moment that set is knowable — afterwards nothing
+    /// records what the dead process had open — so the replacement connection's
+    /// re-open is driven from this return value (execute-command-routing-token).
+    pub(super) async fn purge_connection(&self, connection_key: &ConnectionKey) -> Vec<Url> {
         let mut generation = self
             .connection_generations
             .entry(connection_key.clone())
@@ -578,13 +583,23 @@ impl DocumentTracker {
         }
         // Drop this connection's host→virtual registrations so a later
         // host-close does not try to didClose documents the dead process held.
-        {
+        // The same pass collects the affected HOST documents for the caller's
+        // re-open: a host is reported only when this connection actually held
+        // one of its virtual documents, so the re-open never touches documents
+        // the dead process never opened.
+        let hosts: Vec<Url> = {
             let mut host_map = self.host_to_virtual.lock().await;
-            for docs in host_map.values_mut() {
+            let mut hosts = Vec::new();
+            for (host_uri, docs) in host_map.iter_mut() {
+                let before = docs.len();
                 docs.retain(|doc| &doc.connection_key != connection_key);
+                if docs.len() != before {
+                    hosts.push(host_uri.clone());
+                }
             }
             host_map.retain(|_, docs| !docs.is_empty());
-        }
+            hosts
+        };
         self.open_claims.retain(|(key, _), notify| {
             if key == connection_key {
                 notify.notify_waiters();
@@ -593,6 +608,7 @@ impl DocumentTracker {
                 true
             }
         });
+        hosts
     }
 
     /// Remove a single virtual document from host_to_virtual tracking.
@@ -1973,7 +1989,12 @@ mod tests {
         );
 
         // The dead connection respawns → purge its state.
-        tracker.purge_connection(&dead).await;
+        let reopen_hosts = tracker.purge_connection(&dead).await;
+        assert_eq!(
+            reopen_hosts,
+            vec![host_uri.clone()],
+            "purge reports the host whose virtual document the dead connection held"
+        );
 
         // The document is still open (sibling holds it) but re-claimable on the
         // purged connection, so its respawn will send a fresh didOpen.
@@ -1998,6 +2019,49 @@ mod tests {
             tracker.increment_document_version(&vuri, &sibling).await,
             Some(2),
             "sibling version survives the purge"
+        );
+    }
+
+    /// The purge's re-open set must be scoped to the dead connection: re-opening
+    /// a host the dead process never held would resolve injections (and send
+    /// didOpen) for documents that were never affected.
+    #[tokio::test]
+    async fn purge_reports_only_the_hosts_the_dead_connection_held() {
+        let tracker = DocumentTracker::new();
+        let held = Url::parse("file:///test/held.md").unwrap();
+        let foreign = Url::parse("file:///test/foreign.md").unwrap();
+        let dead = ConnectionKey::for_server("pyright-a");
+        let other = ConnectionKey::for_server("pyright-b");
+
+        let held_vuri = VirtualDocumentUri::new(&url_to_uri(&held), "lua", TEST_ULID_LUA_0);
+        let foreign_vuri = VirtualDocumentUri::new(&url_to_uri(&foreign), "lua", TEST_ULID_LUA_1);
+        tracker
+            .register_opened_document(&held, &held_vuri, &dead)
+            .await;
+        tracker
+            .register_opened_document(&foreign, &foreign_vuri, &other)
+            .await;
+
+        assert_eq!(
+            tracker.purge_connection(&dead).await,
+            vec![held],
+            "only the dead connection's host is reported"
+        );
+        // And the untouched connection's registration survives, so a later purge
+        // of ITS key still reports its host.
+        assert_eq!(tracker.purge_connection(&other).await, vec![foreign]);
+    }
+
+    /// A connection that never opened a virtual document has nothing to re-open,
+    /// so the respawn path must stay silent rather than queue an empty heal.
+    #[tokio::test]
+    async fn purge_reports_nothing_for_a_connection_that_held_no_documents() {
+        let tracker = DocumentTracker::new();
+        assert!(
+            tracker
+                .purge_connection(&ConnectionKey::for_server("never-bridged"))
+                .await
+                .is_empty()
         );
     }
 
