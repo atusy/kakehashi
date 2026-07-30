@@ -28,11 +28,22 @@ pub(crate) const CLOSED_INCARNATION: u64 = u64::MAX;
 /// from (the gopls immutable-snapshot property), stamped with the input
 /// version it derives from and the lifetime it belongs to.
 ///
-/// `tree: Option` makes a **resolved-but-tree-less** outcome representable —
-/// a parse that completed with no usable tree (no parser installed, install
-/// failed, quarantined crashed grammar), distinct from the pre-first-parse
-/// `None` slot: it advances `parsed_version` and releases first-parse waiters
-/// to their empty/`null`/`ContentModified` fallbacks.
+/// `tree: Option` makes a **resolved-but-tree-less** outcome representable,
+/// distinct from the pre-first-parse `None` slot: it advances
+/// `parsed_version` and releases first-parse waiters to their
+/// empty/`null`/`ContentModified` fallbacks.
+///
+/// It arises two ways, and readers must handle both:
+/// - **No usable tree reached the publish.** No parser installed, the install
+///   failed, or `ParseCoordinator::parse_with_pool` yielded nothing — a
+///   `PARSE_TIMEOUT` abort, a panicking work unit, reload/retry exhaustion, or
+///   a tree the await backstop or a stale parser generation discarded.
+/// - **A placeholder that is not a parse result at all.**
+///   `Document::invalidate_parse` publishes one on a settings/grammar reload,
+///   stamped at the bumped `content_version` so it reads as current until the
+///   replacement parse lands.
+///
+/// `language` is independently `None` when no language was detected.
 pub(crate) struct ParseSnapshot {
     pub(crate) text: Arc<str>,
     pub(crate) tree: Option<Tree>,

@@ -29,27 +29,6 @@ fn data_dir() -> &'static Path {
     .as_path()
 }
 
-/// A fresh, unique dir per spawn for the spawned server's crash-recovery state,
-/// passed via `KAKEHASHI_STATE_DIR`. `kakehashi diagnose` builds the in-process
-/// LSP service (`Kakehashi::new` -> `FailedParserRegistry`), so without this it
-/// would read/write `parsing_in_progress`/`failed_parsers` in the SHARED
-/// `data_dir()`. A per-SPAWN dir means concurrent invocations (parallel test
-/// threads here, or other test processes) never share those files, so none can
-/// poison another. All per-spawn dirs live under one base `TempDir` parked in a
-/// `static` (never dropped, so the small tree is left in the OS temp dir at
-/// process exit) — mirrors `lsp_client.rs`.
-fn state_dir() -> PathBuf {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static BASE: OnceLock<tempfile::TempDir> = OnceLock::new();
-    static SEQ: AtomicU64 = AtomicU64::new(0);
-    let base = BASE
-        .get_or_init(|| tempfile::tempdir().expect("create base KAKEHASHI_STATE_DIR"))
-        .path();
-    let dir = base.join(format!("spawn-{}", SEQ.fetch_add(1, Ordering::Relaxed)));
-    std::fs::create_dir_all(&dir).expect("create per-spawn KAKEHASHI_STATE_DIR");
-    dir
-}
-
 /// Workspace config bridging lua injections to the mock diagnostics server.
 fn config_toml() -> String {
     format!(
@@ -94,7 +73,6 @@ fn run_diagnose(workspace: &Path, args: &[&str]) -> Output {
         .args(args)
         .current_dir(workspace)
         .env("KAKEHASHI_DATA_DIR", data_dir())
-        .env("KAKEHASHI_STATE_DIR", state_dir())
         .env("RUST_LOG", "kakehashi=debug")
         .output()
         .expect("spawn kakehashi diagnose")
@@ -269,7 +247,6 @@ fn e2e_diagnose_stdin_mode_prints_diagnostics() {
         ])
         .current_dir(ws.path())
         .env("KAKEHASHI_DATA_DIR", data_dir())
-        .env("KAKEHASHI_STATE_DIR", state_dir())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

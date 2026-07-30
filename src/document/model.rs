@@ -282,7 +282,7 @@ impl Document {
     }
 
     /// Store the open-time parse result — the detected `language` and the parsed
-    /// `tree` (`None` for a parsed-to-nothing / no-language / crashed-parser open) —
+    /// `tree` (`None` for a parsed-to-nothing / no-language open) —
     /// **preserving the existing text**.
     ///
     /// For the didOpen parse, whose text was already stored when the document was

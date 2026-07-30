@@ -204,12 +204,13 @@ impl InstallCoordinator {
             return false;
         }
 
-        // Every no-reparse outcome lands here — Failed/Unsupported/NoDataDir/
-        // ParserFailed (the did_open auto-install branch never runs
-        // parse_document regardless) as well as AlreadyInstalling. None of
-        // them publishes a snapshot anywhere
-        // below, so release a parked first-parse waiter with a tree-less
-        // snapshot (bootstrap-gated inside) instead of letting every request
+        // Every no-reparse outcome lands here — Failed/Unsupported/NoDataDir as
+        // well as AlreadyInstalling. (`Abandoned` never reaches this point: it
+        // is produced by `InstallMarkerGuard::drop` into the watch channel, so
+        // it surfaces only as the `terminal` read below.) None of them publishes
+        // a snapshot anywhere below, so release a parked first-parse waiter with
+        // a tree-less snapshot (bootstrap-gated inside) instead of letting
+        // every request
         // burn the full first-parse backstop. Harmless for AlreadyInstalling:
         // its eventual reload-reparse lands the same-version tree through the
         // snapshot cell's tree-upgrade clause.
@@ -393,7 +394,6 @@ impl InstallCoordinator {
             documents: std::sync::Arc::clone(&self.documents),
             cache: std::sync::Arc::clone(&self.cache),
             settings_manager: std::sync::Arc::clone(&self.settings_manager),
-            auto_install: self.auto_install.clone(),
             bridge: std::sync::Arc::clone(&self.bridge),
         })
     }
@@ -823,16 +823,23 @@ mod tests {
         assert!(server.documents.get(&uri).unwrap().tree().is_none());
     }
 
-    #[tokio::test]
+    // `start_paused`: the healthy path returns without awaiting, so the bound
+    // below needs no wall-clock time; a regressed guard instead parks on the
+    // completion wait, the runtime goes idle, and the deadline fires at once.
+    // Without it the bound is real time and a 5s scheduling stall on a loaded
+    // CI box reads as a regression.
+    #[tokio::test(start_paused = true)]
     async fn stale_install_task_stops_before_install_events() {
         let (service, mut socket) = LspService::new(Kakehashi::new);
         let server = service.inner();
         let language = "stale-install-language";
-        server
-            .auto_install
-            .failed_parsers_handle()
-            .mark_failed(language)
-            .unwrap();
+        // Hold an install claim so a regressed staleness guard falls through to
+        // `try_install`'s `AlreadyInstalling` branch, which parks on a
+        // completion this test never resolves. That makes the regression
+        // deterministic and network-free: without the claim the fall-through
+        // reaches the metadata-backed support lookup, whose timing depends on
+        // the cache and the network.
+        let _claim = server.auto_install.begin_test_claim(language);
         let uri = Url::parse("file:///workspace/stale-install.txt").unwrap();
         let old_incarnation = server.documents.insert(
             uri.clone(),
@@ -849,17 +856,26 @@ mod tests {
         );
         assert_ne!(new_incarnation, old_incarnation);
 
-        assert!(
-            !server
-                .install_coordinator()
-                .maybe_auto_install_language(language, uri, false, Some(old_incarnation), true,)
-                .await
-        );
+        // Bounded: the held claim makes a regressed guard park on the
+        // `AlreadyInstalling` completion wait instead of returning.
+        let stale = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            server.install_coordinator().maybe_auto_install_language(
+                language,
+                uri,
+                false,
+                Some(old_incarnation),
+                true,
+            ),
+        )
+        .await
+        .expect("a stale task must return without awaiting an install");
+        assert!(!stale);
         assert!(
             tokio::time::timeout(std::time::Duration::from_millis(10), socket.next())
                 .await
                 .is_err(),
-            "a stale task must not emit parser failure or install progress events"
+            "a stale task must not emit install progress events"
         );
     }
 }

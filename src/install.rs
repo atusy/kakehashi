@@ -37,14 +37,11 @@ use std::path::PathBuf;
 /// - macOS: ~/Library/Application Support/kakehashi/
 /// - Windows: %APPDATA%/kakehashi/
 pub fn default_data_dir() -> Option<PathBuf> {
-    // In `cfg(test)`, redirect every caller (Kakehashi::new -> failed
-    // parser registry, search-path defaulting, etc.) to a project-local
-    // persistent dir under `deps/` so the developer's real
-    // `~/.local/share/kakehashi/` is never read or written. The dir is
-    // shared across the test process to keep parser/query installs
-    // cached between runs; transient crash-recovery files
-    // (`parsing_in_progress`, `failed_parsers`) are cleared once per
-    // process at first call so a prior E2E shutdown can't taint this run.
+    // In `cfg(test)`, redirect every caller (search-path defaulting, etc.)
+    // to a project-local persistent dir under `deps/` so the developer's
+    // real `~/.local/share/kakehashi/` is never read or written. The dir is
+    // shared across the test process to keep parser/query installs cached
+    // between runs.
     #[cfg(test)]
     {
         return Some(test_data_dir());
@@ -63,10 +60,8 @@ pub fn default_data_dir() -> Option<PathBuf> {
 /// Project-local persistent data directory used by unit tests.
 ///
 /// Lives under `deps/` (already gitignored). Parser/query installs persist
-/// across runs to avoid re-downloading, while crash-recovery state files
-/// are cleared once per test process so a previous test's leftovers
-/// (typically from an E2E binary that exited mid-parse) don't poison this
-/// run. Returns the same path every call within a process via `OnceLock`.
+/// across runs to avoid re-downloading. Returns the same path every call
+/// within a process via `OnceLock`.
 #[cfg(test)]
 pub(crate) fn test_data_dir() -> PathBuf {
     use std::sync::OnceLock;
@@ -74,11 +69,6 @@ pub(crate) fn test_data_dir() -> PathBuf {
     DIR.get_or_init(|| {
         let dir = test_support::test_data_dir_path();
         let _ = std::fs::create_dir_all(&dir);
-        // Crash-recovery state can be left over from a previous E2E
-        // shutdown; clear it once per test process so init() doesn't
-        // pre-mark languages as failed.
-        let _ = std::fs::remove_file(dir.join("parsing_in_progress"));
-        let _ = std::fs::remove_file(dir.join("failed_parsers"));
         // Auto-install required parsers + queries on first call per
         // process. Cached on disk via the `.installed` marker so
         // subsequent test processes are fast.

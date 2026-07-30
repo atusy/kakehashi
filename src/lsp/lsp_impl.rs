@@ -452,9 +452,7 @@ impl Kakehashi {
         let language = std::sync::Arc::new(LanguageCoordinator::new());
         let parser_pool = language.create_document_parser_pool();
 
-        // Initialize auto-install manager with crash detection
-        let failed_parsers = AutoInstallManager::init_failed_parser_registry();
-        let auto_install = AutoInstallManager::new(InstallingLanguages::new(), failed_parsers);
+        let auto_install = AutoInstallManager::new(InstallingLanguages::new());
 
         Self {
             client,
