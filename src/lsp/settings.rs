@@ -255,8 +255,10 @@ fn read_explicit_layers(
                     let unanchored = anchor_settings_paths(raw_settings, Some(&base));
                     if !unanchored.is_empty() {
                         let message = format!(
-                            "Cannot resolve {} relative to {}: the directory name is not valid \
-                             UTF-8, so {} would silently resolve against the working directory",
+                            "Cannot resolve {} in {} against that file's directory, so {} would \
+                             silently resolve against the working directory instead. Either the \
+                             directory's name is not valid UTF-8, or the path names a drive \
+                             without a root (`C:lib`); write the path in full to fix it.",
                             if unanchored.len() == 1 {
                                 "a path".to_string()
                             } else {

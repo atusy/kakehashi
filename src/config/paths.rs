@@ -97,6 +97,29 @@ fn carries_its_own_base(path: &str) -> bool {
         || path.starts_with('$')
 }
 
+/// Whether a value names a drive but no root — the Windows `C:lib` form, which
+/// means "lib, relative to that drive's own current directory".
+///
+/// It is neither self-locating nor anchorable. Not self-locating, because where
+/// it lands depends on a per-drive working directory the editor set, which is
+/// the launch-directory dependence this module exists to remove. Not
+/// anchorable, because joining leaves it untouched — `Path::push` replaces the
+/// base whenever the argument carries a prefix — so the anchor would silently
+/// do nothing.
+///
+/// Anchoring it "properly" would mean stripping the prefix and joining the
+/// remainder, which only has a meaning when the drive matches the base's, and
+/// no good answer when it does not. Reporting it as unanchorable instead lets
+/// the strict layer reject a path it cannot honour, rather than accept one that
+/// still depends on where the server started. Always false on Unix, which has
+/// no path prefixes.
+fn is_drive_relative(path: &str) -> bool {
+    matches!(
+        Path::new(path).components().next(),
+        Some(std::path::Component::Prefix(_))
+    ) && !Path::new(path).has_root()
+}
+
 /// Rewrite every relative path field in `settings` to sit under `base`.
 ///
 /// Called once per configuration layer, while the directory that layer came
@@ -115,11 +138,12 @@ fn carries_its_own_base(path: &str) -> bool {
 /// `base` is `None` for layers with no source directory (the programmed
 /// defaults), where every value is left untouched.
 ///
-/// Returns the values it could *not* anchor, which is non-empty only when the
-/// base cannot be represented as UTF-8. Layers whose contract is to degrade
-/// rather than fail may ignore it; the strict `--config-file` layer must not,
-/// since a value left as written silently resolves against the working
-/// directory — the dependence this exists to remove.
+/// Returns the values it could *not* anchor: everything, when the base cannot
+/// be represented as UTF-8, and individually any drive-relative value (see
+/// [`is_drive_relative`]). Layers whose contract is to degrade rather than fail
+/// may ignore it; the strict `--config-file` layer must not, since a value left
+/// as written silently resolves against the working directory — the dependence
+/// this exists to remove.
 #[must_use]
 pub(crate) fn anchor_settings_paths(
     settings: &mut crate::config::RawWorkspaceSettings,
@@ -160,8 +184,13 @@ pub(crate) fn anchor_settings_paths(
     // `clean` leaves it alone because it folds components, not characters.
     let base = PathBuf::from(base.replace('$', "$$"));
 
+    let mut unanchorable = Vec::new();
     for path in path_fields_mut(settings.search_paths.as_mut(), &mut settings.languages) {
         if carries_its_own_base(path) {
+            continue;
+        }
+        if is_drive_relative(path) {
+            unanchorable.push(path.clone());
             continue;
         }
         let joined = base.join(&*path);
@@ -189,7 +218,16 @@ pub(crate) fn anchor_settings_paths(
         };
     }
 
-    Vec::new()
+    if !unanchorable.is_empty() {
+        log::warn!(
+            target: "kakehashi::config",
+            "Left {} drive-relative path(s) as written; they resolve against that drive's current \
+             directory rather than the configuration they came from: {}",
+            unanchorable.len(),
+            unanchorable.join(", ")
+        );
+    }
+    unanchorable
 }
 
 #[cfg(test)]
@@ -407,6 +445,44 @@ mod tests {
     fn windows_rooted_paths_opt_out() {
         for path in [r"C:\parsers\lua.dll", r"\\server\share\lua.dll", r"\rooted"] {
             assert!(carries_its_own_base(path), "{path} should opt out");
+            assert!(
+                !is_drive_relative(path),
+                "{path} is rooted, not drive-relative"
+            );
+        }
+    }
+
+    /// `C:lib` names a drive but no root, so it resolves against that drive's
+    /// own current directory — launch-dependent, which is the whole bug. It
+    /// also cannot be anchored: joining leaves it untouched, because a prefixed
+    /// argument replaces the base. It is reported rather than silently kept.
+    #[cfg(windows)]
+    #[test]
+    fn windows_drive_relative_paths_are_reported_as_unanchorable() {
+        assert!(is_drive_relative(r"C:parsers\lua.dll"));
+        assert!(!carries_its_own_base(r"C:parsers\lua.dll"));
+
+        let mut settings = crate::config::RawWorkspaceSettings {
+            search_paths: Some(vec![r"C:parsers".into(), r"C:\absolute".into()]),
+            ..Default::default()
+        };
+        let unanchorable = anchor_settings_paths(&mut settings, Some(Path::new(r"C:\workspace")));
+
+        assert_eq!(unanchorable, [r"C:parsers"]);
+        assert_eq!(
+            settings.search_paths,
+            Some(vec![r"C:parsers".to_string(), r"C:\absolute".to_string()]),
+            "neither is rewritten: one cannot be anchored, the other needs no base"
+        );
+    }
+
+    /// Unix has no path prefixes, so nothing is ever drive-relative there — in
+    /// particular a plain relative path must not be mistaken for one.
+    #[cfg(unix)]
+    #[test]
+    fn unix_paths_are_never_drive_relative() {
+        for path in ["queries/x.scm", "./queries", "../shared", "C:parsers", ""] {
+            assert!(!is_drive_relative(path), "{path} cannot be drive-relative");
         }
     }
 
