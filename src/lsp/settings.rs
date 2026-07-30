@@ -84,6 +84,27 @@ pub struct SettingsLoadOutcome {
     pub(crate) fatal_error: Option<String>,
 }
 
+/// The reason an explicitly requested configuration is unusable, if it is.
+///
+/// `initialize` calls this *before* it latches any once-only state from the
+/// request. `tower-lsp-server` resets to `Uninitialized` after an error
+/// response, so a client may fix the file and retry — and a retry carrying
+/// different capabilities or workspace folders would otherwise be served with
+/// the failed attempt's values, since those are first-write-wins.
+///
+/// Passing no root path and no override settings is not a simplification: when
+/// `--config-file` is set the workspace-relative layer is skipped entirely, and
+/// `initializationOptions` are deliberately outside the strict gate. So this
+/// sees exactly what the gate judges, which is why it can run this early.
+/// Returns `None` when nothing was requested explicitly.
+pub(crate) fn explicit_config_fatal_error(
+    home: Option<&str>,
+    env_fn: impl Fn(&str) -> Option<String>,
+) -> Option<String> {
+    crate::config::expand::config_file_override()?;
+    load_settings(None, None, home, env_fn).fatal_error
+}
+
 pub fn load_settings(
     root_path: Option<&Path>,
     override_settings: Option<(SettingsSource, Value)>,
@@ -108,6 +129,13 @@ pub fn load_settings(
         )));
         let mut layers = Vec::with_capacity(files.len());
         for path in files {
+            // The verdict cannot change once a layer has failed, and reading on
+            // is not free: a later path could be a FIFO that blocks forever, so
+            // an already-doomed session would hang instead of reporting the
+            // failure it already knows about.
+            if fatal_error.is_some() {
+                break;
+            }
             let layer = match load_toml_file(path, &mut events, &mut deprecated_keys) {
                 Ok(layer) => layer,
                 Err(message) => {
@@ -279,6 +307,18 @@ fn load_toml_file(
     match path.try_exists() {
         Ok(true) => {}
         Ok(false) => {
+            // `try_exists` follows symlinks, so a link whose target is gone
+            // also answers "no". That is not the optional-overlay case: the
+            // path the user named does exist, it just does not lead to a
+            // config, and silently ignoring it would hide exactly the broken
+            // setup this is strict about. `symlink_metadata` does not follow,
+            // so it still sees the link itself.
+            if path.symlink_metadata().is_ok() {
+                return Err(format!(
+                    "Failed to read {}: broken symbolic link",
+                    path.display()
+                ));
+            }
             events.push(SettingsEvent::warning(format!(
                 "Config file not found, skipping: {}",
                 path.display()
@@ -835,12 +875,43 @@ mod tests {
         std::fs::set_permissions(&locked_parent, std::fs::Permissions::from_mode(0o755)).unwrap();
 
         if !permissions_enforced {
+            // Running as root (common in container CI): the bits do not apply,
+            // so there is no denial to observe. Still assert the path is not
+            // misread as absent, which is the regression this guards.
+            assert!(
+                matches!(result, Ok(Some(_))),
+                "a reachable file must load: {result:?}"
+            );
             return;
         }
         let message = result.expect_err("an unreachable explicit file must be fatal");
         assert!(
             message.contains(&path.display().to_string()) && !message.contains("not found"),
             "an unreachable path must not be reported as merely absent: {message}"
+        );
+    }
+
+    /// load_toml_file: a symlink whose target is gone is present-but-unusable,
+    /// not absent. `try_exists` follows the link and reports the *target*, so
+    /// the two cases look identical without an explicit check.
+    #[cfg(unix)]
+    #[test]
+    fn test_load_toml_file_broken_symlink() {
+        let dir = TempDir::new().unwrap();
+        let target = dir.path().join("generated.toml");
+        let link = dir.path().join("config.toml");
+        std::fs::write(&target, "autoInstall = false\n").unwrap();
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        std::fs::remove_file(&target).unwrap();
+
+        let mut events = Vec::new();
+        let mut ignored_deprecation = false;
+        let result = load_toml_file(&link, &mut events, &mut ignored_deprecation);
+
+        let message = result.expect_err("a dangling explicit symlink must be fatal");
+        assert!(
+            message.contains(&link.display().to_string()) && !message.contains("not found"),
+            "a dangling symlink must not be reported as merely absent: {message}"
         );
     }
 
@@ -866,6 +937,12 @@ mod tests {
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
 
         if !permissions_enforced {
+            // Running as root: the bits do not apply. Assert the file still
+            // loads rather than being misclassified as absent.
+            assert!(
+                matches!(result, Ok(Some(_))),
+                "a readable file must load: {result:?}"
+            );
             return;
         }
         let message = result.expect_err("an unreadable explicit file must be fatal");

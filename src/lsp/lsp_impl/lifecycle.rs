@@ -78,6 +78,25 @@ impl Kakehashi {
         &self,
         params: InitializeParams,
     ) -> Result<InitializeResult> {
+        // Reject an unusable `--config-file` before anything from `params` is
+        // latched. Several of the stores below are first-write-wins, and
+        // tower-lsp-server resets to `Uninitialized` after an error response,
+        // so a client may fix the file and retry: without this, the retry would
+        // load the corrected settings while downstream servers kept the failed
+        // attempt's capabilities, root URI, and workspace folders.
+        //
+        // Reported only through this response — the settings events carrying
+        // the same text are never sent, so the client does not also get a
+        // `window/showMessage` popup on top of a handshake it already failed.
+        // Pinned by `test_config_file_fatal_error_is_not_also_shown_as_a_message`.
+        if let Some(error) =
+            crate::lsp::settings::explicit_config_fatal_error(self.home_dir.as_deref(), |var| {
+                std::env::var(var).ok()
+            })
+        {
+            return Err(configuration_load_error(error));
+        }
+
         let position_encoding = host_position_encoding(&params.capabilities);
         // Store client capabilities for LSP compliance checks (e.g., refresh support).
         // Uses SettingsManager which wraps OnceLock for "set once, read many" semantics.
@@ -201,16 +220,10 @@ impl Kakehashi {
             |var| std::env::var(var).ok(),
         );
 
-        // Report the fatal explicit-config failure only through the initialize
-        // response. Returning before the settings events are logged keeps it
-        // from also arriving as a `window/showMessage` popup — the channel
-        // `SettingsEventKind::Error` normally uses — on top of a handshake the
-        // client already failed. Pinned by
-        // `test_config_file_fatal_error_is_not_also_shown_as_a_message`.
-        if let Some(error) = settings_outcome.fatal_error {
-            return Err(configuration_load_error(error));
-        }
-
+        // `settings_outcome.fatal_error` is deliberately not consulted here: it
+        // can only be set by the explicit layers, which the pre-flight above
+        // already judged on exactly the same inputs. Re-checking would be a
+        // guard no input can reach.
         let settings_events = settings_outcome.events;
         let mut default_settings_warning = None;
 

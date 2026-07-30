@@ -720,7 +720,10 @@ When `--config-file` is specified:
   merged explicit configuration, so splitting the two halves across two files is
   fine — but a combination that is invalid only once merged still aborts.
 - `initializationOptions` from the LSP client still apply on top, and keep their
-  ordinary non-fatal behavior: an invalid override is discarded, not fatal.
+  ordinary non-fatal behavior. Note what "non-fatal" means here: the server
+  starts, but the *whole* merged configuration is discarded in favour of
+  programmed defaults — the config files do not survive a bad override. Only
+  the abort is avoided, not the loss.
 
 Implicitly discovered configuration is deliberately laxer. A
 `~/.config/kakehashi/kakehashi.toml` or `./kakehashi.toml` that fails to parse
