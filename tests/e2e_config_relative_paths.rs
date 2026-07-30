@@ -25,7 +25,6 @@ use helpers::lsp_client::LspClient;
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
-use std::time::Duration;
 use tempfile::TempDir;
 
 /// Initialize against `root` and return the effective raw settings.
@@ -342,21 +341,26 @@ fn a_project_local_parser_and_query_are_actually_loaded() {
             }
         }),
     );
-    std::thread::sleep(Duration::from_millis(500));
-
-    let response = client.send_request(
-        "textDocument/semanticTokens/full",
-        json!({ "textDocument": { "uri": uri } }),
-    );
-    let data = response
-        .get("result")
-        .and_then(|result| result.get("data"))
-        .and_then(Value::as_array)
-        .expect("semanticTokens/full should return token data");
+    // Polled rather than slept on: this is the strongest assertion in the file,
+    // and a fixed wait would make it the flakiest. A loaded machine that is
+    // still loading the parser would fail as "anchoring never reached the
+    // filesystem", which is the one conclusion this test exists to draw.
+    let mut last = Value::Null;
+    let tokens = helpers::lsp_polling::poll_until(20, 100, || {
+        last = client.send_request(
+            "textDocument/semanticTokens/full",
+            json!({ "textDocument": { "uri": uri } }),
+        );
+        last.get("result")
+            .and_then(|result| result.get("data"))
+            .and_then(Value::as_array)
+            .filter(|data| !data.is_empty())
+            .cloned()
+    });
 
     assert!(
-        !data.is_empty(),
+        tokens.is_some(),
         "a project-local parser and query must produce tokens; an empty list \
-         means the anchored paths never reached the filesystem: {response:?}"
+         after 2s means the anchored paths never reached the filesystem: {last:?}"
     );
 }
