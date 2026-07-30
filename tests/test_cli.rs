@@ -236,9 +236,42 @@ fn test_config_init_outputs_to_stdout() {
     // Stdout should contain the config template
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
-        stdout.contains("autoInstall"),
+        stdout.contains("searchPaths"),
         "Stdout should contain config template. Got: {}",
         stdout
+    );
+}
+
+/// `config init` output must round-trip: valid TOML that emits neither spelling
+/// of `autoInstall`.
+///
+/// The deprecated top-level key would make kakehashi warn about a file it wrote
+/// itself; `[languages._] autoInstall` would silently outrank a top-level
+/// `autoInstall = false` set at a higher-precedence source. Pointing
+/// `run_config_init` back at `default_settings()` reintroduces the first, and no
+/// other assertion in this file notices.
+#[test]
+fn test_config_init_emits_no_auto_install_spelling() {
+    let output = Command::new(env!("CARGO_BIN_EXE_kakehashi"))
+        .args(["config", "init"])
+        .output()
+        .expect("Failed to run config init");
+    assert!(output.status.success());
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let parsed: toml::Value = toml::from_str(&stdout).expect("config init must emit valid TOML");
+
+    assert!(
+        parsed.get("autoInstall").is_none(),
+        "must not emit the deprecated top-level key. Got:\n{stdout}"
+    );
+    assert!(
+        parsed
+            .get("languages")
+            .and_then(|languages| languages.get("_"))
+            .and_then(|wildcard| wildcard.get("autoInstall"))
+            .is_none(),
+        "must not emit `languages._.autoInstall` either. Got:\n{stdout}"
     );
 }
 
@@ -382,7 +415,7 @@ fn test_config_init_output_creates_file() {
     // File should contain expected options
     let content = fs::read_to_string(&config_path).expect("Failed to read config");
     assert!(
-        content.contains("autoInstall"),
+        content.contains("searchPaths"),
         "Config should contain expected options. Got: {}",
         content
     );
@@ -444,7 +477,7 @@ fn test_config_init_output_force_overwrites() {
         "Content should be overwritten"
     );
     assert!(
-        content.contains("autoInstall"),
+        content.contains("searchPaths"),
         "New content should be present"
     );
 }
@@ -474,7 +507,7 @@ fn test_config_init_force_without_output_warns() {
     // Should still output to stdout
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
-        stdout.contains("autoInstall"),
+        stdout.contains("searchPaths"),
         "Should still output config to stdout. Got: {}",
         stdout
     );
@@ -498,7 +531,7 @@ fn test_config_init_output_dash_outputs_to_stdout() {
     // Stdout should contain the config template
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
-        stdout.contains("autoInstall"),
+        stdout.contains("searchPaths"),
         "Stdout should contain config template. Got: {}",
         stdout
     );

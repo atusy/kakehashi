@@ -230,7 +230,8 @@ impl SettingsManager {
     /// Check if auto-install is enabled.
     ///
     /// Returns `false` if:
-    /// - `autoInstall` is explicitly set to `false` in settings
+    /// - auto-install is off for `language` — its own `autoInstall`, else
+    ///   `languages._`'s, else the deprecated top-level key
     /// - `searchPaths` doesn't include the default data directory (auto-install
     ///   would install to a location that isn't being searched)
     pub(crate) fn is_auto_install_enabled(&self, language: &str) -> bool {

@@ -278,9 +278,18 @@ autoInstall = true
 ```
 
 When auto-install is off for a language and its parser is missing, kakehashi
-logs which key turned it off (for example ``` `languages.python.autoInstall` is
-false ```) alongside the manual `kakehashi language install` hint, so the
-setting responsible is never ambiguous.
+says so in the log alongside the manual `kakehashi language install` hint, and
+points at the config that decided it. For a language with no entry of its own it
+names the exact key (``` `languages._.autoInstall` is false ```); for one that
+does have an entry it names the overriding key and the places the value may have
+come from, since `base`-chain and `_` inheritance are folded together by then.
+
+**Precedence note:** a `languages.*.autoInstall` value outranks the top-level
+`autoInstall` even when the top-level one is set at a higher-precedence source.
+That is deliberate — the top-level key is only a fallback for an unset
+per-language value — but it means moving the key to `[languages._]` in a
+low-precedence file will shadow a top-level `autoInstall` pushed via
+`initializationOptions`. Prefer setting one or the other, not both.
 
 ##### `languages[*].base`
 
@@ -844,7 +853,7 @@ Using Neovim's built-in LSP client (0.11+):
 vim.lsp.config.kakehashi = {
   cmd = { "kakehashi" },
   init_options = {
-    autoInstall = true,
+    languages = { _ = { autoInstall = true } },
     -- LSP Bridge configuration (optional)
     languageServers = {
       pyright = {
@@ -889,7 +898,7 @@ With nvim-lspconfig:
 ```lua
 require("lspconfig").kakehashi.setup({
   init_options = {
-    autoInstall = true,
+    languages = { _ = { autoInstall = true } },
   },
 })
 ```

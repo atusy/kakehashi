@@ -99,6 +99,17 @@ final_config = [defaults, user_config, project_config, InitializationOptions]
 - Later sources completely replace earlier values (via `overlay.or(base)`)
 - Example: `autoInstall: false` in InitializationOptions overrides `autoInstall: true` from project config
 
+**Exception — key specificity can outrank source order.** The top-level
+`autoInstall` is deprecated in favour of `languages.<lang>.autoInstall` (and
+`languages._.autoInstall`), and `WorkspaceSettings::auto_install_for` consults the
+per-language keys first *regardless of which source supplied them*. So a
+`[languages._] autoInstall = true` in project config wins over an
+`autoInstall: false` from InitializationOptions — the merge above still runs
+normally per key, but the two keys are then read in specificity order, not source
+order. This is why `default_settings()` (merge layer 1) and the `config init`
+template both leave `languages._.autoInstall` unset: a built-in value there would
+silently shadow every user-supplied top-level opt-out.
+
 **Languages HashMap** (`languages`):
 - **Deep merge at language level**: Keys from later sources override same keys from earlier sources
 - **Deep merge within each language**: Individual fields (`parser`, `queries`, `bridge`, etc.) are merged

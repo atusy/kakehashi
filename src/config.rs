@@ -367,44 +367,61 @@ impl WorkspaceSettings {
         self.auto_install_decision(language).1
     }
 
-    /// The config key that turns auto-install OFF for `language`, or `None`
-    /// when it is enabled — so a user-facing message can name the key to edit
-    /// rather than just saying "disabled".
+    /// Why auto-install is OFF for `language`, or `None` when it is enabled —
+    /// so a user-facing message can point at config rather than just saying
+    /// "disabled".
+    ///
+    /// Deliberately vague on the language arm. `resolve_base_configs` copies
+    /// the whole `base` chain (and `"_"`) into every present entry, so a folded
+    /// `Some(false)` does not tell us whether the user wrote it on the language,
+    /// on its base, or on the wildcard. Naming `languages.<lang>.autoInstall`
+    /// outright would misdirect someone hunting for the global switch; the
+    /// phrasing here names the key that overrides it, which is true either way.
     ///
     /// Formats lazily: [`Self::auto_install_for`] shares the same decision
     /// without allocating, since the gate runs per `didOpen` and per injected
     /// language while this runs only on the disabled path.
-    pub(crate) fn auto_install_disabled_key(&self, language: &str) -> Option<String> {
+    pub(crate) fn auto_install_disabled_reason(&self, language: &str) -> Option<String> {
         let (source, enabled) = self.auto_install_decision(language);
         if enabled {
             return None;
         }
         Some(match source {
-            AutoInstallSource::Language => format!("languages.{language}.autoInstall"),
-            AutoInstallSource::Wildcard => format!("languages.{WILDCARD_KEY}.autoInstall"),
-            AutoInstallSource::TopLevel => "autoInstall".to_string(),
+            AutoInstallSource::Language => format!(
+                "`languages.{language}.autoInstall` resolves to false                  (set on the language, its `base` chain, or `languages._`)"
+            ),
+            AutoInstallSource::Wildcard => {
+                format!("`languages.{WILDCARD_KEY}.autoInstall` is false")
+            }
+            AutoInstallSource::TopLevel => "`autoInstall` is false".to_string(),
         })
     }
 
     /// Which level answers auto-install for `language`, and what it says.
-    /// Single source of the precedence order so the boolean and the
-    /// key-naming can never disagree.
+    /// Single source of the precedence order so the boolean and the message
+    /// can never disagree.
+    ///
+    /// A PRESENT entry owns the answer outright: `resolve_base_configs` has
+    /// already folded `"_"` and the `base` chain into it, so `None` there means
+    /// nothing in the chain set the key — including the case where the language
+    /// deliberately escaped wildcard inheritance with a self-referential `base`
+    /// (`merge::build_base_chain`), where re-consulting `"_"` here would apply a
+    /// wildcard value every other field on that language ignores.
+    ///
+    /// The `"_"` lookup is for languages with NO entry: the fold maps over
+    /// `languages.keys()`, so it never ran for them.
     fn auto_install_decision(&self, language: &str) -> (AutoInstallSource, bool) {
-        if let Some(enabled) = self
-            .languages
-            .get(language)
-            .and_then(|settings| settings.auto_install)
-        {
-            return (AutoInstallSource::Language, enabled);
-        }
-        if let Some(enabled) = self
-            .languages
-            .get(WILDCARD_KEY)
-            .and_then(|wildcard| wildcard.auto_install)
-        {
-            return (AutoInstallSource::Wildcard, enabled);
-        }
-        (AutoInstallSource::TopLevel, self.auto_install)
+        let resolved = match self.languages.get(language) {
+            Some(settings) => settings
+                .auto_install
+                .map(|enabled| (AutoInstallSource::Language, enabled)),
+            None => self
+                .languages
+                .get(WILDCARD_KEY)
+                .and_then(|wildcard| wildcard.auto_install)
+                .map(|enabled| (AutoInstallSource::Wildcard, enabled)),
+        };
+        resolved.unwrap_or((AutoInstallSource::TopLevel, self.auto_install))
     }
 
     /// True if any configured language opts into host bridging
@@ -554,6 +571,29 @@ mod tests {
     }
 
     #[test]
+    fn stripping_keeps_an_auto_install_that_differs_from_the_inherited_value() {
+        use crate::config::settings::LanguageSettings;
+        let inherited = LanguageSettings {
+            auto_install: Some(true),
+            ..Default::default()
+        };
+        // Differs → kept, so the effective-config dump shows the override.
+        let differing = LanguageSettings {
+            auto_install: Some(false),
+            ..Default::default()
+        };
+        assert_eq!(
+            strip_inherited_language_settings(&inherited, &differing).auto_install,
+            Some(false)
+        );
+        // Equal → stripped as redundant, like every neighbouring field.
+        assert_eq!(
+            strip_inherited_language_settings(&inherited, &inherited).auto_install,
+            None
+        );
+    }
+
+    #[test]
     fn auto_install_for_honors_the_language_entry() {
         let settings = settings_with_auto_install(&[("python", Some(false))], true);
         assert!(!settings.auto_install_for("python"));
@@ -562,12 +602,18 @@ mod tests {
     }
 
     #[test]
-    fn auto_install_for_falls_back_to_the_wildcard_when_the_entry_omits_it() {
-        // `resolve_base_configs` normally folds `_` into every present entry;
-        // this pins the behavior for an entry that reached us unfolded.
+    fn auto_install_for_lets_a_present_entry_own_the_answer() {
+        // A present entry has already been through `resolve_base_configs`, which
+        // folds `_` and the whole `base` chain into it. `None` there therefore
+        // means nothing in the chain set the key — notably including a language
+        // that escaped wildcard inheritance via a self-referential `base`, where
+        // re-applying `_` would contradict every other field on that language.
         let settings =
             settings_with_auto_install(&[(WILDCARD_KEY, Some(false)), ("python", None)], true);
-        assert!(!settings.auto_install_for("python"));
+        assert!(
+            settings.auto_install_for("python"),
+            "an entry the fold left unset must not pick `_` up again at lookup time"
+        );
     }
 
     #[test]
@@ -610,39 +656,130 @@ mod tests {
     }
 
     #[test]
-    fn auto_install_disabled_key_names_the_level_that_decided() {
-        let language = settings_with_auto_install(&[("python", Some(false))], true);
-        assert_eq!(
-            language.auto_install_disabled_key("python").as_deref(),
-            Some("languages.python.autoInstall")
-        );
+    fn auto_install_inherits_through_the_base_chain() {
+        // Discriminating on purpose: with NO `"_"` entry, only
+        // `merge_language_settings`'s `auto_install` arm can carry markdown's
+        // value onto `rmd`. A `"_"`-based fixture would pass even without the
+        // arm, because the lookup-time wildcard fallback answers identically.
+        let raw = crate::config::RawWorkspaceSettings {
+            languages: HashMap::from([
+                (
+                    "markdown".to_string(),
+                    LanguageSettings {
+                        auto_install: Some(false),
+                        ..Default::default()
+                    },
+                ),
+                (
+                    "rmd".to_string(),
+                    LanguageSettings {
+                        base: Some("markdown".to_string()),
+                        ..Default::default()
+                    },
+                ),
+            ]),
+            ..Default::default()
+        };
+        let settings =
+            WorkspaceSettings::try_from_settings(&raw, None, |_| None).expect("settings expand");
 
-        let wildcard = settings_with_auto_install(&[(WILDCARD_KEY, Some(false))], true);
-        assert_eq!(
-            wildcard.auto_install_disabled_key("python").as_deref(),
-            Some("languages._.autoInstall")
-        );
-
-        let top_level = settings_with_auto_install(&[], false);
-        assert_eq!(
-            top_level.auto_install_disabled_key("python").as_deref(),
-            Some("autoInstall")
+        assert!(
+            !settings.auto_install_for("rmd"),
+            "rmd must inherit markdown's autoInstall through the base chain"
         );
     }
 
     #[test]
-    fn auto_install_disabled_key_is_none_when_enabled() {
+    fn auto_install_respects_a_self_referential_base_through_the_real_fold() {
+        // Built through `try_from_settings` so `resolve_base_configs` actually
+        // runs: `base = "foo"` is the supported escape from wildcard
+        // inheritance, and `autoInstall` must honor it like every other field.
+        let raw = crate::config::RawWorkspaceSettings {
+            languages: HashMap::from([
+                (
+                    WILDCARD_KEY.to_string(),
+                    LanguageSettings {
+                        auto_install: Some(false),
+                        ..Default::default()
+                    },
+                ),
+                (
+                    "foo".to_string(),
+                    LanguageSettings {
+                        base: Some("foo".to_string()),
+                        ..Default::default()
+                    },
+                ),
+                ("bar".to_string(), LanguageSettings::default()),
+            ]),
+            ..Default::default()
+        };
+        let settings =
+            WorkspaceSettings::try_from_settings(&raw, None, |_| None).expect("settings expand");
+
+        assert!(
+            settings.auto_install_for("foo"),
+            "a self-referential base opts out of wildcard inheritance entirely"
+        );
+        assert!(
+            !settings.auto_install_for("bar"),
+            "an ordinary entry still inherits the wildcard through the fold"
+        );
+        assert!(
+            !settings.auto_install_for("unconfigured"),
+            "a language with no entry falls back to the wildcard at lookup time"
+        );
+    }
+
+    #[test]
+    fn auto_install_disabled_reason_points_at_the_config() {
+        // Language arm: the fold makes "who set it" unknowable, so the message
+        // names the overriding key and says where it may have come from rather
+        // than asserting the user wrote it on the language.
+        let language = settings_with_auto_install(&[("python", Some(false))], true);
+        let reason = language
+            .auto_install_disabled_reason("python")
+            .expect("disabled");
+        assert!(reason.contains("languages.python.autoInstall"), "{reason}");
+        assert!(reason.contains("base"), "{reason}");
+        assert!(reason.contains("languages._"), "{reason}");
+
+        // Wildcard and top-level arms ARE reliable, so they name the key flatly.
+        let wildcard = settings_with_auto_install(&[(WILDCARD_KEY, Some(false))], true);
         assert_eq!(
-            WorkspaceSettings::default().auto_install_disabled_key("python"),
+            wildcard.auto_install_disabled_reason("python").as_deref(),
+            Some("`languages._.autoInstall` is false")
+        );
+
+        let top_level = settings_with_auto_install(&[], false);
+        assert_eq!(
+            top_level.auto_install_disabled_reason("python").as_deref(),
+            Some("`autoInstall` is false")
+        );
+
+        // Discriminates the ORDER, not just each arm in isolation: with the
+        // arms swapped, the wildcard's `false` would win and this would report
+        // a reason instead of `None`.
+        let overridden = settings_with_auto_install(
+            &[(WILDCARD_KEY, Some(false)), ("python", Some(true))],
+            true,
+        );
+        assert_eq!(overridden.auto_install_disabled_reason("python"), None);
+    }
+
+    #[test]
+    fn auto_install_disabled_reason_is_none_when_enabled() {
+        assert_eq!(
+            WorkspaceSettings::default().auto_install_disabled_reason("python"),
             None
         );
         // Re-enabled per-language over a global off: nothing is disabling it,
-        // so there is no key to report even though the top level says false.
+        // so there is nothing to report even though the top level says false.
         let exception = settings_with_auto_install(&[("python", Some(true))], false);
-        assert_eq!(exception.auto_install_disabled_key("python"), None);
+        assert_eq!(exception.auto_install_disabled_reason("python"), None);
         assert_eq!(
-            exception.auto_install_disabled_key("rust").as_deref(),
-            Some("autoInstall")
+            exception.auto_install_disabled_reason("rust").as_deref(),
+            Some("`autoInstall` is false")
         );
     }
 

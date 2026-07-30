@@ -47,24 +47,28 @@ pub fn default_settings() -> RawWorkspaceSettings {
     }
 }
 
-/// The `kakehashi config init` template: [`default_settings`] plus the
-/// defaults that are resolved at lookup time rather than carried in layer 1.
+/// The `kakehashi config init` template: [`default_settings`] minus the one key
+/// that cannot be spelled out inertly.
 ///
-/// Exists because `default_settings` is both the template source AND merge
-/// layer 1, and `autoInstall` cannot be in layer 1 (see the comment there).
-/// The template still spells the default out — per
-/// config-init-template-convention, deleting any generated line must not
-/// change behavior — but spells the CANONICAL key, `[languages._]`, so a
-/// generated file never trips the top-level deprecation notice.
+/// `autoInstall` is the sole documented exception to
+/// config-init-template-convention, which otherwise requires every built-in
+/// default to appear in the generated file. Neither spelling can be emitted
+/// safely:
+///
+/// - The top-level key is deprecated, so a generated file would trip the very
+///   migration notice we show users.
+/// - `[languages._] autoInstall` is worse than deprecated — it INVERTS layer
+///   precedence. `auto_install_for` checks `_` before the top-level key and is
+///   layer-unaware, so a `_` sitting in a generated user config (layer 2) would
+///   silently outrank a top-level `autoInstall = false` pushed by the editor at
+///   layer 4. That is not a spelled-out default; it is a behavior change.
+///   Pinned by `a_generated_template_does_not_shadow_a_higher_layer_optout`.
+///
+/// So the default lives in `auto_install_for`'s fallback and in the docs, not in
+/// the template. `default_settings` still carries the top-level value for merge
+/// layer 1, where it is safe.
 pub fn config_init_settings() -> RawWorkspaceSettings {
     let mut settings = default_settings();
-    // Spell the default on the CANONICAL key so a generated file never trips
-    // the top-level deprecation notice, and drop the deprecated spelling for
-    // the same reason. Layer 1 still carries the top-level value, so deleting
-    // the generated line changes nothing — the convention's requirement.
-    if let Some(wildcard) = settings.languages.get_mut(WILDCARD_KEY) {
-        wildcard.auto_install = Some(true);
-    }
     settings.auto_install = None;
     settings
 }
@@ -586,38 +590,61 @@ mod tests {
         assert!(!resolved.auto_install_for("python"));
     }
 
+    fn resolve(raw: &RawWorkspaceSettings) -> crate::config::WorkspaceSettings {
+        crate::config::WorkspaceSettings::try_from_settings(
+            raw,
+            None,
+            crate::config::expand::with_kakehashi_defaults(|_| None),
+        )
+        .expect("settings expand")
+    }
+
     #[test]
-    fn config_init_template_spells_out_the_canonical_auto_install_default() {
+    fn config_init_template_emits_no_auto_install_at_all() {
         let template = config_init_settings();
 
-        // Spelled out per config-init-template-convention, and on the
-        // canonical key so a generated file never trips the deprecation
-        // notice for the top-level spelling.
+        // The documented exception to config-init-template-convention: neither
+        // spelling is safe to generate. See `config_init_settings`.
+        assert_eq!(
+            template.auto_install, None,
+            "the template must not emit the deprecated top-level key"
+        );
         assert_eq!(
             template
                 .languages
                 .get(WILDCARD_KEY)
                 .and_then(|wildcard| wildcard.auto_install),
-            Some(true)
-        );
-        assert_eq!(
-            template.auto_install, None,
-            "the template must not emit the deprecated top-level key"
+            None,
+            "the template must not emit `languages._.autoInstall` either — it \
+             would invert layer precedence, see the regression test below"
         );
 
-        // Deleting the generated line must not change behavior: the resolved
-        // value with it, and without it, agree.
-        let resolved = |raw: &RawWorkspaceSettings| {
-            crate::config::WorkspaceSettings::try_from_settings(
-                raw,
-                None,
-                crate::config::expand::with_kakehashi_defaults(|_| None),
-            )
-            .expect("template expands")
-            .auto_install_for("python")
-        };
-        assert!(resolved(&template));
-        assert!(resolved(&default_settings()));
+        // The generated file still resolves to the zero-config default.
+        assert!(resolve(&template).auto_install_for("python"));
+    }
+
+    #[test]
+    fn a_generated_template_does_not_shadow_a_higher_layer_optout() {
+        // The regression: `auto_install_for` checks `_` before the top-level
+        // key and is layer-unaware, so a `_` written into a generated user
+        // config (layer 2) would silently outrank the editor's top-level
+        // `autoInstall = false` at layer 4.
+        let merged = crate::config::merge::merge_workspace_settings(
+            crate::config::merge::merge_workspace_settings(
+                Some(default_settings()),
+                Some(config_init_settings()),
+            ),
+            Some(RawWorkspaceSettings {
+                auto_install: Some(false),
+                ..Default::default()
+            }),
+        )
+        .expect("layers present");
+
+        assert!(
+            !resolve(&merged).auto_install_for("python"),
+            "a higher layer's top-level opt-out must win over the template"
+        );
     }
 
     #[test]
@@ -699,10 +726,16 @@ mod tests {
         let toml_string =
             toml::to_string_pretty(&settings).expect("should serialize to TOML without error");
 
-        // Should contain autoInstall setting
+        // `autoInstall` is deliberately absent (see `config_init_settings`), so
+        // anchor on a key the template does spell out.
         assert!(
-            toml_string.contains("autoInstall = true"),
-            "TOML should contain 'autoInstall = true'. Got:\n{}",
+            toml_string.contains("searchPaths = "),
+            "TOML should contain 'searchPaths'. Got:\n{}",
+            toml_string
+        );
+        assert!(
+            !toml_string.contains("autoInstall"),
+            "template must emit no autoInstall at either level. Got:\n{}",
             toml_string
         );
 

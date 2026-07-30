@@ -110,6 +110,30 @@ mod tests {
     use super::*;
 
     #[test]
+    fn merge_ors_flags_so_a_clean_later_layer_cannot_clear_them() {
+        // The regression: `=` instead of `|=` would let a clean higher layer
+        // (e.g. `initializationOptions: {}`, which every session runs through
+        // `parse_override_settings`) clobber a flag a config FILE set, and the
+        // notice would never fire for file-config users.
+        let mut seen = DeprecatedKeysSeen {
+            root_markers: true,
+            auto_install: true,
+        };
+        seen.merge(DeprecatedKeysSeen::default());
+        assert!(seen.root_markers, "a later clean layer must not clear this");
+        assert!(seen.auto_install, "a later clean layer must not clear this");
+
+        // And it must still pick flags UP from a later layer.
+        let mut none = DeprecatedKeysSeen::default();
+        none.merge(DeprecatedKeysSeen {
+            root_markers: false,
+            auto_install: true,
+        });
+        assert!(none.auto_install);
+        assert!(!none.root_markers);
+    }
+
+    #[test]
     fn toml_detects_the_deprecated_top_level_auto_install() {
         assert!(toml_deprecated_keys("autoInstall = true").auto_install);
         assert!(toml_deprecated_keys("autoInstall = false").auto_install);

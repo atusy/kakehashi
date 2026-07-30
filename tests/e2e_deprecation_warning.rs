@@ -1,4 +1,6 @@
-//! E2E tests for the one-per-session `rootMarkers` deprecation notice.
+//! E2E tests for the one-per-session config deprecation notices
+//! (`rootMarkers`, the top-level `autoInstall`, and the unwrapped
+//! `didChangeConfiguration` shape).
 //!
 //! The notice is surfaced by `initialize` and `workspace/didChangeConfiguration`
 //! sharing a single session-scoped claim guard, so it fires at most once even

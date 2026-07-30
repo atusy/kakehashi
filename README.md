@@ -74,7 +74,6 @@ To let kakehashi auto-install the parsers it needs, make sure a **C compiler** i
 ```lua
 vim.lsp.config.kakehashi = {
     cmd = { "kakehashi" },
-    init_options = { autoInstall = true },
     on_attach = function(_, bufnr)
         -- Let kakehashi own highlighting (avoids double-highlighting)
         vim.api.nvim_create_autocmd("LspTokenUpdate", {

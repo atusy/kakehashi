@@ -121,8 +121,8 @@ impl InstallCoordinator {
     /// answer to "why is this off?" is no longer a single global setting.
     pub(crate) fn auto_install_disabled_reason(&self, language: &str) -> String {
         let settings = self.settings_manager.load_settings();
-        if let Some(key) = settings.auto_install_disabled_key(language) {
-            return format!("`{key}` is false");
+        if let Some(reason) = settings.auto_install_disabled_reason(language) {
+            return reason;
         }
         if !self
             .settings_manager
