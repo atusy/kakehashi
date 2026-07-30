@@ -6,10 +6,14 @@
 //! documented project-local `./queries/highlights.scm` resolved somewhere that
 //! depended on how the editor was started.
 //!
-//! Assertions read `kakehashi/internal/effectiveConfiguration`, which reports
-//! settings after anchoring but before variable expansion. An anchored relative
-//! path is therefore final there, while a `$`/`~` value still appears as the
-//! user wrote it — which the last test pins.
+//! Most assertions read `kakehashi/internal/effectiveConfiguration`, which
+//! reports settings after anchoring but before variable expansion. An anchored
+//! relative path is therefore final there, while a `$`/`~` value still appears
+//! as the user wrote it.
+//!
+//! Reported configuration is not proof the path is *usable*, though, so the last
+//! test drives a project-local parser and query all the way to a semantic-token
+//! response — the symptom #732 was actually reported as.
 //!
 //! Run with: `cargo test --test e2e_config_relative_paths --features e2e`
 
@@ -19,6 +23,9 @@ mod helpers;
 
 use helpers::lsp_client::LspClient;
 use serde_json::{Value, json};
+use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
+use std::time::Duration;
 use tempfile::TempDir;
 
 /// Initialize against `root` and return the effective raw settings.
@@ -224,5 +231,132 @@ fn expansion_syntax_is_left_for_the_expansion_pass() {
                 .into_owned(),
         ],
         "only the relative value is rebased; the other two reach expansion intact"
+    );
+}
+
+/// The shared data dir the rest of the e2e suite uses, with the test parsers
+/// already installed. Read-only once built, so parallel test processes share it.
+fn installed_data_dir() -> &'static Path {
+    static DIR: OnceLock<PathBuf> = OnceLock::new();
+    DIR.get_or_init(|| {
+        let dir = kakehashi::install::test_support::test_data_dir_path();
+        std::fs::create_dir_all(&dir).expect("create shared test data dir");
+        kakehashi::install::test_support::ensure_test_languages_installed(&dir)
+            .expect("install test parsers into the shared data dir");
+        dir
+    })
+    .as_path()
+}
+
+/// The installed Lua parser's filename, which is platform-specific.
+fn parser_library_name() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "lua.dylib"
+    } else if cfg!(windows) {
+        "lua.dll"
+    } else {
+        "lua.so"
+    }
+}
+
+/// The reported configuration is only half the claim. This drives a
+/// project-local parser and highlights query all the way to a semantic-token
+/// response, so the anchored path is proven to reach `dlopen` and `read` — the
+/// symptom #732 was reported as ("project-local custom parsers and queries can
+/// be reported missing even though they exist next to the project config").
+///
+/// `searchPaths` is emptied so nothing can be found by the fallback discovery
+/// route: if anchoring were wrong, there is no second way for the server to
+/// locate these files, and the token list comes back empty.
+#[test]
+fn a_project_local_parser_and_query_are_actually_loaded() {
+    let installed = installed_data_dir();
+    let project = TempDir::new().unwrap();
+    let elsewhere = TempDir::new().unwrap();
+
+    let vendor = project.path().join("vendor");
+    std::fs::create_dir_all(&vendor).unwrap();
+    std::fs::copy(
+        installed.join("parser").join(parser_library_name()),
+        vendor.join(parser_library_name()),
+    )
+    .expect("copy the installed lua parser into the project");
+    std::fs::copy(
+        installed.join("queries").join("lua").join("highlights.scm"),
+        vendor.join("highlights.scm"),
+    )
+    .expect("copy the installed lua highlights query into the project");
+
+    std::fs::write(
+        project.path().join("kakehashi.toml"),
+        format!(
+            "autoInstall = false\n\
+             searchPaths = []\n\
+             [languages.lua]\n\
+             parser = \"./vendor/{}\"\n\
+             queries = [{{ path = \"./vendor/highlights.scm\", kind = \"highlights\" }}]\n",
+            parser_library_name()
+        ),
+    )
+    .unwrap();
+
+    let source = project.path().join("main.lua");
+    std::fs::write(&source, "local x = 1\n").unwrap();
+
+    let mut client = LspClient::builder()
+        .current_dir(elsewhere.path())
+        .env("KAKEHASHI_DATA_DIR", installed.to_str().unwrap())
+        .build();
+    let init = client.send_request(
+        "initialize",
+        json!({
+            "processId": std::process::id(),
+            "rootUri": format!("file://{}", project.path().display()),
+            "capabilities": {
+                "textDocument": {
+                    "semanticTokens": {
+                        "requests": { "full": true },
+                        "tokenTypes": ["keyword", "variable", "function"],
+                        "tokenModifiers": [],
+                        "formats": ["relative"]
+                    }
+                }
+            }
+        }),
+    );
+    assert!(
+        init.get("error").is_none(),
+        "initialize should succeed: {init:?}"
+    );
+    client.send_notification("initialized", json!({}));
+
+    let uri = format!("file://{}", source.display());
+    client.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri,
+                "languageId": "lua",
+                "version": 1,
+                "text": "local x = 1\n"
+            }
+        }),
+    );
+    std::thread::sleep(Duration::from_millis(500));
+
+    let response = client.send_request(
+        "textDocument/semanticTokens/full",
+        json!({ "textDocument": { "uri": uri } }),
+    );
+    let data = response
+        .get("result")
+        .and_then(|result| result.get("data"))
+        .and_then(Value::as_array)
+        .expect("semanticTokens/full should return token data");
+
+    assert!(
+        !data.is_empty(),
+        "a project-local parser and query must produce tokens; an empty list \
+         means the anchored paths never reached the filesystem: {response:?}"
     );
 }

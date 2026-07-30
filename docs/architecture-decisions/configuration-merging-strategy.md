@@ -85,11 +85,17 @@ queries = [
 Relative path fields (`searchPaths`, `languages[*].parser`,
 `languages[*].queries[*].path`) are rewritten to sit under their source layer's
 directory *before* the layers are merged, by
-`crate::config::expand::anchor_settings_paths`. Doing it afterwards is not
+`crate::config::paths::anchor_settings_paths`. Doing it afterwards is not
 possible: the merge replaces path fields wholesale, so a surviving `./queries`
 no longer records which file asked for it, and the only base left is the server
 process's working directory — which for an editor-spawned server belongs to
 whoever launched the editor.
+
+Anchoring and expansion walk the same enumeration,
+`crate::config::paths::path_fields_mut`, which destructures `LanguageSettings`
+exhaustively. Two independent lists would drift silently: a new path field
+expanded but never anchored is this issue back for that field alone, and one
+anchored but never expanded hands a literal `~` to the filesystem.
 
 Bases per layer: a config file uses its own directory (each `--config-file`
 layer its own), `initializationOptions` and `didChangeConfiguration` use the
