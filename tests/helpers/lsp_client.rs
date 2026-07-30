@@ -139,6 +139,7 @@ pub struct LspClientBuilder {
     args: Vec<String>,
     envs: Vec<(String, String)>,
     env_removes: Vec<String>,
+    current_dir: Option<std::path::PathBuf>,
 }
 
 impl LspClientBuilder {
@@ -147,7 +148,19 @@ impl LspClientBuilder {
             args: Vec::new(),
             envs: Vec::new(),
             env_removes: Vec::new(),
+            current_dir: None,
         }
+    }
+
+    /// Spawn the server with a working directory of its own.
+    ///
+    /// An editor-spawned server inherits the editor's working directory, which
+    /// need not be the workspace it is asked to serve. Tests that care about
+    /// which directory a relative path resolves against have to be able to make
+    /// the two differ.
+    pub fn current_dir(mut self, dir: impl Into<std::path::PathBuf>) -> Self {
+        self.current_dir = Some(dir.into());
+        self
     }
 
     /// Add a CLI argument to pass to the kakehashi binary.
@@ -175,6 +188,9 @@ impl LspClientBuilder {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+        if let Some(dir) = &self.current_dir {
+            cmd.current_dir(dir);
+        }
 
         // Order matters for isolation. Apply removals to the *inherited*
         // environment first, then set the isolation default, then explicit
