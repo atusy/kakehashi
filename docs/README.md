@@ -154,8 +154,10 @@ default `info` forwards Error, Warning, and Info while suppressing LSP `Log` and
 ```json
 {
   "searchPaths": ["$HOME/.local/share/kakehashi", "/another/path"],
-  "autoInstall": true,
   "languages": {
+    "_": {
+      "autoInstall": true
+    },
     "typescript": {
       "base": "ecma",
       "queries": [
@@ -222,10 +224,15 @@ Array of base directories to search for parsers and queries. If not specified, u
 Parsers are searched as `{searchPath}/parser/{language}.{so,dylib,dll}`.
 Queries are searched as `{searchPath}/queries/{language}/{query_type}.scm`.
 
-#### `autoInstall`
+#### `autoInstall` (deprecated)
 
-- `true` (default): Automatically download and install missing parsers/queries when a file is opened
-- `false`: Require manual installation via CLI
+**Deprecated:** use [`languages[*].autoInstall`](#languagesautoinstall) instead.
+The top-level key still works — it answers whenever no per-language value is
+set — but kakehashi shows a one-time migration notice when it is present, and
+it may be removed in a future release.
+
+Move `autoInstall = true` to `[languages._] autoInstall = true` for identical
+behavior, then override per language as needed.
 
 #### `languages`
 
@@ -237,7 +244,43 @@ Per-language configuration. Usually not needed as kakehashi auto-detects languag
 | `parser` | Explicit path to the parser library (`.so`, `.dylib`, `.dll`) |
 | `queries` | Array of query configurations with `path` and `kind` (highlights, bindings, injections) |
 | `bridge` | Per-injection-language bridge filter and aggregation settings |
+| `autoInstall` | Whether missing parsers/queries for this language may be auto-installed |
 | `aliases` | Deprecated alternative language IDs. Prefer `base` on the derived language instead. |
+
+##### `languages[*].autoInstall`
+
+Whether kakehashi may download and install a missing parser/queries for this
+language when a file is opened.
+
+Resolved most-specific-wins: the language's own value, then the `"_"` wildcard's,
+then the deprecated top-level `autoInstall`, defaulting to `true`. Unset is the
+default at every level, so a language inherits `"_"` exactly like the other
+fields.
+
+Enable everywhere except one language:
+
+```toml
+[languages._]
+autoInstall = true
+
+[languages.python]
+autoInstall = false   # never auto-install the python parser
+```
+
+Or the reverse — off by default, with opt-in exceptions:
+
+```toml
+[languages._]
+autoInstall = false
+
+[languages.lua]
+autoInstall = true
+```
+
+When auto-install is off for a language and its parser is missing, kakehashi
+logs which key turned it off (for example ``` `languages.python.autoInstall` is
+false ```) alongside the manual `kakehashi language install` hint, so the
+setting responsible is never ambiguous.
 
 ##### `languages[*].base`
 
