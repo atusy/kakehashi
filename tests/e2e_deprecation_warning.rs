@@ -373,9 +373,17 @@ fn e2e_auto_install_deprecation_warns_once_and_spares_the_canonical_key() {
         Some(2),
         "deprecation notice should be MessageType::WARNING"
     );
-    client
-        .wait_for_notification_where(&["window/logMessage"], TIMEOUT, is_config_updated)
+    // Watch BOTH methods: waiting only for `logMessage` would let a second
+    // identical popup for this same update be discarded by the predicate filter.
+    let (method, params) = client
+        .wait_for_notification_where(&["window/showMessage", "window/logMessage"], TIMEOUT, |p| {
+            is_auto_install_deprecation_notice(p) || is_config_updated(p)
+        })
         .expect("first top-level reconfig should log a config-updated message");
+    assert_eq!(
+        method, "window/logMessage",
+        "one update must not emit the notice twice; got: {params:?}"
+    );
 
     // Still carrying it → the guard has latched, so no second popup precedes
     // the config-updated log.
@@ -398,7 +406,7 @@ fn e2e_auto_install_deprecation_warns_once_and_spares_the_canonical_key() {
 }
 
 #[test]
-fn e2e_auto_install_deprecation_claimed_at_initialize_suppresses_the_didchange_notice() {
+fn e2e_auto_install_deprecation_warns_at_initialize_and_not_again_on_didchange() {
     // The other autoInstall test starts from a CLEAN initialize, so it proves
     // only the didChangeConfiguration half. This one starts from a config FILE
     // carrying the deprecated key, exercising initialize-time DETECTION of it.
@@ -411,7 +419,11 @@ fn e2e_auto_install_deprecation_claimed_at_initialize_suppresses_the_didchange_n
         .arg(config_path.to_str().expect("utf-8 temp path"))
         .build();
 
-    client.send_request(
+    // Send `initialize` ASYNCHRONOUSLY and collect the notifications that arrive
+    // before its response. The synchronous helper discards them, which is why an
+    // earlier version of this test could not see the initialize-time popup at
+    // all — and therefore passed even with `show_warning` deleted.
+    let initialize_id = client.send_request_async(
         "initialize",
         json!({
             "processId": std::process::id(),
@@ -421,19 +433,28 @@ fn e2e_auto_install_deprecation_claimed_at_initialize_suppresses_the_didchange_n
             "initializationOptions": {}
         }),
     );
+    let (_response, watched) = client
+        .receive_response_for_id_watching_notifications(initialize_id, &["window/showMessage"]);
+    let notices: Vec<_> = watched
+        .iter()
+        .filter(|(_, params)| is_auto_install_deprecation_notice(params))
+        .collect();
+    assert_eq!(
+        notices.len(),
+        1,
+        "a config file carrying top-level autoInstall must warn exactly once at \
+         initialize; got: {watched:?}"
+    );
+    assert_eq!(
+        notices[0].1["type"].as_i64(),
+        Some(2),
+        "deprecation notice should be MessageType::WARNING"
+    );
     client.send_notification("initialized", json!({}));
 
-    // The initialize-time popup is not observable by this client (it is emitted
-    // inside the `initialize` request, before its response — see the module
-    // doc), so prove it by its EFFECT: it consumed the session's only slot.
-    // Pushing the same deprecated key now yields the config-updated log with no
-    // popup ahead of it. Scope, precisely: this pins that initialize DETECTED
-    // the file's key and claimed the slot — delete the whole `if` block at
-    // `lifecycle.rs` and the popup appears here (verified). It does NOT pin the
-    // `show_warning` call: dropping only that line leaves the claim, and this
-    // test still passes, because `initialize`'s own notifications are discarded
-    // while the client awaits the response. The sibling test pins the popup
-    // itself, on the didChange path.
+    // And the claim it consumed is shared with the didChange path: pushing the
+    // same deprecated key now yields the config-updated log with no popup ahead
+    // of it.
     client.send_notification(
         "workspace/didChangeConfiguration",
         wrapped_didchange_config(false),

@@ -117,6 +117,17 @@ fn inherited_language_settings<'a>(
         })
 }
 
+/// Drop fields whose value equals the one they would inherit, so a
+/// reconstructed raw config shows only genuine overrides.
+///
+/// Not behavior-preserving for a CIRCULAR `base` chain: both nodes resolve to
+/// the same folded value, so each looks inherited from the other and the
+/// cycle's single explicit value is stripped from both — re-resolving then
+/// falls through to the top-level default. Unreachable today (every production
+/// path carries the original raw settings; only the `None` arm in
+/// `apply_shared_settings` would land here, and no production caller passes
+/// `None`), and fixing it properly needs cycle-aware stripping. Recorded so a
+/// future caller of that arm knows what it inherits.
 fn strip_inherited_language_settings(
     inherited: &LanguageSettings,
     current: &LanguageSettings,
@@ -653,6 +664,62 @@ mod tests {
         );
         assert!(settings.auto_install_for("python"));
         assert!(!settings.auto_install_for("rust"));
+    }
+
+    #[test]
+    fn auto_install_precedence_holds_through_the_real_merge() {
+        // The synthetic `settings_with_auto_install` fixtures construct an
+        // ALREADY-resolved map, so they cannot catch a reversed
+        // `merge_language_settings` arm (`base.or(overlay)`): the wildcard's
+        // value would win in production while those tests stayed green. This
+        // runs the real fold with every level in conflict.
+        let raw = crate::config::RawWorkspaceSettings {
+            auto_install: Some(true),
+            languages: HashMap::from([
+                (
+                    WILDCARD_KEY.to_string(),
+                    LanguageSettings {
+                        auto_install: Some(false),
+                        ..Default::default()
+                    },
+                ),
+                (
+                    "python".to_string(),
+                    LanguageSettings {
+                        auto_install: Some(true),
+                        ..Default::default()
+                    },
+                ),
+                (
+                    "markdown".to_string(),
+                    LanguageSettings {
+                        auto_install: Some(true),
+                        ..Default::default()
+                    },
+                ),
+                (
+                    "rmd".to_string(),
+                    LanguageSettings {
+                        base: Some("markdown".to_string()),
+                        auto_install: Some(false),
+                        ..Default::default()
+                    },
+                ),
+                ("lua".to_string(), LanguageSettings::default()),
+            ]),
+            ..Default::default()
+        };
+        let settings =
+            WorkspaceSettings::try_from_settings(&raw, None, |_| None).expect("settings expand");
+
+        // Own value beats the wildcard...
+        assert!(settings.auto_install_for("python"));
+        // ...and beats an inherited base value.
+        assert!(!settings.auto_install_for("rmd"));
+        // An entry with nothing of its own takes the wildcard through the fold.
+        assert!(!settings.auto_install_for("lua"));
+        // No entry at all: the wildcard answers at lookup time.
+        assert!(!settings.auto_install_for("unconfigured"));
     }
 
     #[test]
