@@ -14,7 +14,9 @@
 //! test cannot do that, so it sends `initialize` asynchronously and keeps the
 //! notifications that precede the response.
 //!
-//! The guard and detectors are also covered in isolation by unit tests.
+//! The claim guards and the config-key detectors are also covered in isolation
+//! by unit tests; the wrapped/unwrapped shape classification is covered only
+//! here.
 
 #![cfg(feature = "e2e")]
 
