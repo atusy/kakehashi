@@ -3,8 +3,14 @@
 //! Serde ignores an unknown field silently, so a typo in a configuration file
 //! reads as "this setting was not specified" rather than as a mistake. Both the
 //! runtime `workspace/didChangeConfiguration` path and explicit `--config-file`
-//! loading walk the incoming value against these known-key sets so the user
-//! hears about it; what each does with the answer is that caller's policy.
+//! loading walk the incoming value against these known-key sets; what each does
+//! with the answer is that caller's policy — the former rejects the update, the
+//! latter warns.
+//!
+//! The walk does not cover `features`: `FeatureSettings` and its children carry
+//! `deny_unknown_fields`, so an unknown key there fails typed deserialization
+//! before any of this runs. That makes it fatal on a config file, unlike every
+//! other unknown key, which is a wrinkle worth removing rather than a design.
 
 use serde_json::Value;
 

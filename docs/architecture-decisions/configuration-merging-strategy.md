@@ -232,12 +232,18 @@ path the user typed carries intent; a path kakehashi went looking for does not.
    - Cross-field invariants (e.g. `debounceMs` ≤ `maxWaitMs`): on the merged
      explicit configuration only, because their operands merge independently —
      one file may legitimately supply just one half
-   - Unrecognised key names: reported as a warning on an explicit file, never
+   - Unrecognised key names: reported as a warning on an explicit file, not
      fatal. Serde drops an unknown field silently, so a typo otherwise reads as
      "not specified"; but a key this version does not know may be one the next
      one does, and rejecting the file would version-lock it.
      `workspace/didChangeConfiguration` rejects the whole update instead —
      a live edit is not a file shared across versions.
+   - Two known inconsistencies, both pre-existing and both worth closing
+     separately: `FeatureSettings` and its children carry
+     `deny_unknown_fields`, so an unknown key *inside* `features` fails typed
+     deserialization and is fatal before the warning walker ever sees it; and
+     CLI mode has no channel for non-fatal settings events at all, so
+     `format`/`diagnose` users never see these warnings.
    - `initializationOptions`: never fatal, and judged last. A client-supplied
      override that fails to expand does not abort — but "non-fatal" only means
      the session starts: the *whole* merged configuration is discarded in

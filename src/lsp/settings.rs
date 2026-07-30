@@ -451,6 +451,12 @@ fn load_toml_file(
     // Warn rather than reject: a key kakehashi does not recognise may be a
     // typo, but it may equally be one this version has not learned yet, and
     // refusing to start over it would make the file version-locked.
+    //
+    // Not reached for a key inside `features`: those structs carry
+    // `deny_unknown_fields`, so the parse above already failed and this file is
+    // fatal. Inconsistent with the rule stated here, pre-existing, and pinned
+    // by `test_load_toml_file_unknown_feature_key_is_fatal_today` so a future
+    // change to it is a deliberate one.
     for key in unknown_config_keys(&contents) {
         events.push(SettingsEvent::warning(format!(
             "Unknown configuration key in {}: {key}",
@@ -1075,6 +1081,33 @@ mod tests {
                     && event.message.contains("autoInstal")
                     && event.message.contains(&path.display().to_string())),
             "the typo and its file must both be named: {events:?}"
+        );
+    }
+
+    /// Records, rather than endorses, an inconsistency: `FeatureSettings` and
+    /// its children carry `deny_unknown_fields`, so an unknown key *inside*
+    /// `features` fails typed deserialization and is fatal — while the same
+    /// mistake anywhere else is a warning. Pinned so that changing it is a
+    /// deliberate act with a test to update, not a silent drift.
+    #[test]
+    fn test_load_toml_file_unknown_feature_key_is_fatal_today() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("feature-typo.toml");
+        std::fs::write(
+            &path,
+            "[features.\"textDocument/publishDiagnostics\"]\nfutureOption = 1\n",
+        )
+        .unwrap();
+
+        let mut events = Vec::new();
+        let mut ignored_deprecation = false;
+        let result = load_toml_file(&path, &mut events, &mut ignored_deprecation);
+
+        let message = result
+            .expect_err("today an unknown key under `features` is fatal, unlike anywhere else");
+        assert!(
+            message.contains("futureOption"),
+            "the rejected key must be named: {message}"
         );
     }
 
