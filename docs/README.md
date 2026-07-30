@@ -719,6 +719,13 @@ When `--config-file` is specified:
   is silent there.
 - A path whose metadata cannot be read at all — an ancestor directory denying
   traversal, say — counts as unusable, not absent.
+- A key kakehashi does not recognise is **reported but not fatal**. Serde would
+  otherwise drop `autoInstal = false` silently and leave you wondering why the
+  default applied. It stays a warning because an unrecognised key may equally be
+  one a newer kakehashi understands, and refusing to start would version-lock
+  the file. (`workspace/didChangeConfiguration` is stricter and rejects the
+  whole update — that one is a live edit, not a file you may share across
+  versions.)
 - Cross-field invariants (e.g. `debounceMs` ≤ `maxWaitMs`) are judged on the
   merged explicit configuration, so splitting the two halves across two files is
   fine — but a combination that is invalid only once merged still aborts.

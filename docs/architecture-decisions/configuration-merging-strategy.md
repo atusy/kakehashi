@@ -232,6 +232,12 @@ path the user typed carries intent; a path kakehashi went looking for does not.
    - Cross-field invariants (e.g. `debounceMs` ≤ `maxWaitMs`): on the merged
      explicit configuration only, because their operands merge independently —
      one file may legitimately supply just one half
+   - Unrecognised key names: reported as a warning on an explicit file, never
+     fatal. Serde drops an unknown field silently, so a typo otherwise reads as
+     "not specified"; but a key this version does not know may be one the next
+     one does, and rejecting the file would version-lock it.
+     `workspace/didChangeConfiguration` rejects the whole update instead —
+     a live edit is not a file shared across versions.
    - `initializationOptions`: never fatal, and judged last. A client-supplied
      override that fails to expand does not abort — but "non-fatal" only means
      the session starts: the *whole* merged configuration is discarded in

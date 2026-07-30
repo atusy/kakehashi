@@ -117,6 +117,22 @@ pub(crate) fn load_explicit_config(
     Some(read_explicit_layers(files, home, env_fn))
 }
 
+/// Keys in a TOML config file that kakehashi does not recognise.
+///
+/// Reuses the walker the `workspace/didChangeConfiguration` path uses, via a
+/// JSON round-trip, so both routes judge a key by the same schema. An empty
+/// result when the TOML cannot be re-read as a generic value is deliberate:
+/// this only ever *reports*, so a limitation of the conversion must not be
+/// louder than the settings it is describing.
+fn unknown_config_keys(contents: &str) -> Vec<String> {
+    let Ok(value) = toml::from_str::<Value>(contents) else {
+        return Vec::new();
+    };
+    let mut keys = crate::config::unknown_keys::unknown_workspace_setting_keys(&value);
+    crate::config::unknown_keys::sort_and_dedup_unknown_keys(&mut keys);
+    keys
+}
+
 /// The explicit layers merged with nothing beneath them — the subject of the
 /// strict gate.
 ///
@@ -429,6 +445,18 @@ fn load_toml_file(
     deprecated_keys.merge(crate::config::deprecation::toml_deprecated_keys(&contents));
     let settings = toml::from_str::<RawWorkspaceSettings>(&contents)
         .map_err(|err| format!("Failed to parse {}: {}", path.display(), err))?;
+
+    // Serde drops an unrecognised field silently, so `autoInstal = false` reads
+    // as "not specified" and the user gets defaults without being told why.
+    // Warn rather than reject: a key kakehashi does not recognise may be a
+    // typo, but it may equally be one this version has not learned yet, and
+    // refusing to start over it would make the file version-locked.
+    for key in unknown_config_keys(&contents) {
+        events.push(SettingsEvent::warning(format!(
+            "Unknown configuration key in {}: {key}",
+            path.display()
+        )));
+    }
 
     events.push(SettingsEvent::info(format!(
         "Successfully loaded {}",
@@ -1019,6 +1047,58 @@ mod tests {
                 .any(|event| event.message.contains(&second.display().to_string())),
             "the second file must be read: {:?}",
             explicit.events
+        );
+    }
+
+    /// A typo is reported rather than silently read as "not specified", which
+    /// is what serde does with an unrecognised field. It stays a warning: an
+    /// unrecognised key may be a mistake, or may be one a newer kakehashi
+    /// understands, and rejecting the file would version-lock it.
+    #[test]
+    fn test_load_toml_file_warns_about_unknown_keys() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("typo.toml");
+        std::fs::write(&path, "autoInstal = false\n").unwrap();
+
+        let mut events = Vec::new();
+        let mut ignored_deprecation = false;
+        let result = load_toml_file(&path, &mut events, &mut ignored_deprecation);
+
+        assert!(
+            matches!(result, Ok(Some(_))),
+            "an unknown key must not reject the file: {result:?}"
+        );
+        assert!(
+            events
+                .iter()
+                .any(|event| event.kind == SettingsEventKind::Warning
+                    && event.message.contains("autoInstal")
+                    && event.message.contains(&path.display().to_string())),
+            "the typo and its file must both be named: {events:?}"
+        );
+    }
+
+    /// The recognised spelling must stay silent, or the warning is noise.
+    #[test]
+    fn test_load_toml_file_accepts_known_keys_without_warning() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("fine.toml");
+        std::fs::write(
+            &path,
+            "autoInstall = false\n[languages.rust]\nparser = \"/p.so\"\n",
+        )
+        .unwrap();
+
+        let mut events = Vec::new();
+        let mut ignored_deprecation = false;
+        let result = load_toml_file(&path, &mut events, &mut ignored_deprecation);
+
+        assert!(matches!(result, Ok(Some(_))), "{result:?}");
+        assert!(
+            events
+                .iter()
+                .all(|event| !event.message.contains("Unknown configuration key")),
+            "a well-formed file must not warn: {events:?}"
         );
     }
 
