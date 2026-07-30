@@ -237,13 +237,38 @@ fn read_explicit_layers(
         // `--config-file base.toml --config-file team/overrides.toml` reads
         // `./queries` as relative to whichever file wrote it.
         //
-        // Failing to resolve the base is fatal rather than skipped: falling
-        // through would silently resolve the layer's paths against the working
-        // directory, which is the launch-directory dependence this anchoring
-        // exists to remove.
+        // Failing to anchor is fatal rather than skipped, both when the
+        // directory cannot be resolved and when it cannot be represented in a
+        // `String` path field: falling through would silently resolve that
+        // layer's paths against the working directory, which is the
+        // launch-directory dependence this anchoring exists to remove. The
+        // layers that degrade instead of failing are the implicit ones, whose
+        // contract has always been to fall back rather than abort.
+        //
+        // An unusable directory is only reported when the layer actually has
+        // something to anchor. A file naming only absolute paths does not care
+        // where it lives, and rejecting the session over it would be a failure
+        // the user cannot act on.
         if let Some(raw_settings) = layer.as_mut() {
             match config_file_base(path) {
-                Ok(base) => anchor_settings_paths(raw_settings, Some(&base)),
+                Ok(base) => {
+                    let unanchored = anchor_settings_paths(raw_settings, Some(&base));
+                    if !unanchored.is_empty() {
+                        let message = format!(
+                            "Cannot resolve {} relative to {}: the directory name is not valid \
+                             UTF-8, so {} would silently resolve against the working directory",
+                            if unanchored.len() == 1 {
+                                "a path".to_string()
+                            } else {
+                                format!("{} paths", unanchored.len())
+                            },
+                            path.display(),
+                            unanchored.join(", ")
+                        );
+                        events.push(SettingsEvent::error(message.clone()));
+                        fatal_error.get_or_insert(message);
+                    }
+                }
                 Err(error) => {
                     let message = format!(
                         "Failed to resolve the directory of {}: {error}",
@@ -324,9 +349,14 @@ pub fn load_settings(
     } else {
         vec![
             // Layer 2: User config from XDG_CONFIG_HOME (~/.config/kakehashi/kakehashi.toml)
+            //
+            // A base that cannot be represented leaves values as written, which
+            // is the pre-#732 meaning. Deliberately not fatal here: an implicit
+            // layer's contract is to degrade rather than take the session down,
+            // and `anchor_settings_paths` warns about what it skipped.
             load_user_config_with_events(&mut events, &mut deprecated_keys).map(
                 |(mut settings, path)| {
-                    anchor_settings_paths(&mut settings, path.parent());
+                    let _ = anchor_settings_paths(&mut settings, path.parent());
                     settings
                 },
             ),
@@ -334,7 +364,7 @@ pub fn load_settings(
             load_toml_settings(root_path, &mut events, &mut deprecated_keys).map(|mut settings| {
                 // `load_toml_settings` reads `root_path/kakehashi.toml`, so the
                 // file's directory is `root_path` itself.
-                anchor_settings_paths(&mut settings, root_path);
+                let _ = anchor_settings_paths(&mut settings, root_path);
                 settings
             }),
         ]
@@ -349,7 +379,7 @@ pub fn load_settings(
             parse_override_settings(source, value, &mut events, &mut deprecated_keys)
         })
         .map(|mut settings| {
-            anchor_settings_paths(&mut settings, root_path);
+            let _ = anchor_settings_paths(&mut settings, root_path);
             settings
         });
 
@@ -1537,6 +1567,55 @@ mod tests {
                 .all(|event| !event.message.contains(&later.display().to_string())),
             "nothing after the failure may be read: {:?}",
             explicit.events
+        );
+    }
+
+    /// A `--config-file` under a directory whose name is not valid UTF-8 cannot
+    /// have its relative paths anchored, and the strict layer must not quietly
+    /// accept that: the values would resolve against the working directory,
+    /// which is precisely the dependence anchoring removes. A file with nothing
+    /// to anchor is unaffected — it does not care where it lives.
+    ///
+    /// Runs where the filesystem allows such a name — Linux, and so CI. APFS
+    /// rejects it outright, so on macOS the setup cannot be built and the test
+    /// reports that rather than failing for an unrelated reason.
+    #[cfg(unix)]
+    #[test]
+    fn read_explicit_layers_rejects_a_base_it_cannot_represent() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+
+        let parent = TempDir::new().unwrap();
+        let dir = parent
+            .path()
+            .join(OsStr::from_bytes(b"proj-\xFF").to_os_string());
+        if std::fs::create_dir(&dir).is_err() {
+            eprintln!(
+                "skipping: this filesystem rejects non-UTF-8 directory names, so the case \
+                 under test cannot be constructed here"
+            );
+            return;
+        }
+
+        let relative = dir.join("relative.toml");
+        std::fs::write(&relative, "searchPaths = ['./runtime']\n").unwrap();
+        let rejected =
+            read_explicit_layers(&[relative.clone()], None, crate::config::make_env(&[]));
+        assert!(
+            rejected
+                .fatal_error
+                .as_deref()
+                .is_some_and(|message| message.contains("./runtime")),
+            "a path needing this base must abort and name itself: {:?}",
+            rejected.fatal_error
+        );
+
+        let absolute = dir.join("absolute.toml");
+        std::fs::write(&absolute, "searchPaths = ['/opt/kakehashi']\n").unwrap();
+        let accepted = read_explicit_layers(&[absolute], None, crate::config::make_env(&[]));
+        assert_eq!(
+            accepted.fatal_error, None,
+            "a file with nothing to anchor does not care where it lives"
         );
     }
 

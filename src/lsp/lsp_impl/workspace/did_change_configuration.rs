@@ -166,7 +166,12 @@ impl Kakehashi {
         // that arrived from a config file and was already anchored to that
         // file's directory.
         let root_path = self.settings_manager.root_path();
-        crate::config::paths::anchor_settings_paths(&mut parsed, root_path.as_ref().as_deref());
+        // A base that cannot be represented leaves the pushed values as written,
+        // which is the pre-#732 meaning; `anchor_settings_paths` warns about it.
+        // Not fatal, matching this handler's existing posture of keeping the
+        // previous settings in effect rather than taking the session down.
+        let _ =
+            crate::config::paths::anchor_settings_paths(&mut parsed, root_path.as_ref().as_deref());
 
         // Snapshot read, derivation, and publication must share the same reload
         // transaction as post-install search-path updates, or either path can

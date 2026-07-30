@@ -114,12 +114,19 @@ fn carries_its_own_base(path: &str) -> bool {
 ///
 /// `base` is `None` for layers with no source directory (the programmed
 /// defaults), where every value is left untouched.
+///
+/// Returns the values it could *not* anchor, which is non-empty only when the
+/// base cannot be represented as UTF-8. Layers whose contract is to degrade
+/// rather than fail may ignore it; the strict `--config-file` layer must not,
+/// since a value left as written silently resolves against the working
+/// directory — the dependence this exists to remove.
+#[must_use]
 pub(crate) fn anchor_settings_paths(
     settings: &mut crate::config::RawWorkspaceSettings,
     base: Option<&Path>,
-) {
+) -> Vec<String> {
     let Some(base) = base else {
-        return;
+        return Vec::new();
     };
 
     // Path fields are `String`, so a base the filesystem accepts but UTF-8 does
@@ -127,7 +134,8 @@ pub(crate) fn anchor_settings_paths(
     // U+FFFD and hand back a path that looks resolved and names a file that
     // does not exist — a silent redirection. Leaving the layer unanchored keeps
     // the pre-#732 meaning, which is at least a path the user can reason about,
-    // and says so out loud.
+    // and reports which values it applies to so a caller that cannot accept
+    // that outcome can say so.
     let Some(base) = base.to_str() else {
         log::warn!(
             target: "kakehashi::config",
@@ -135,7 +143,10 @@ pub(crate) fn anchor_settings_paths(
              and resolve against the working directory",
             base.display()
         );
-        return;
+        return path_fields_mut(settings.search_paths.as_mut(), &mut settings.languages)
+            .filter(|path| !carries_its_own_base(path))
+            .map(|path| path.clone())
+            .collect();
     };
 
     // Anchoring must not *introduce* expansion syntax either. The expansion pass
@@ -177,6 +188,8 @@ pub(crate) fn anchor_settings_paths(
             joined.clean().to_string_lossy().into_owned()
         };
     }
+
+    Vec::new()
 }
 
 #[cfg(test)]
@@ -208,7 +221,7 @@ mod tests {
 
     fn anchor(value: &str, base: Option<&Path>) -> String {
         let mut settings = settings_with_path(value);
-        anchor_settings_paths(&mut settings, base);
+        let _ = anchor_settings_paths(&mut settings, base);
         let paths: Vec<String> =
             path_fields_mut(settings.search_paths.as_mut(), &mut settings.languages)
                 .map(|path| path.clone())
@@ -399,15 +412,33 @@ mod tests {
 
     /// A base the filesystem accepts but UTF-8 does not cannot be written into
     /// a `String` path field. Anchoring lossily would name a file that does not
-    /// exist while looking resolved, so the layer is left alone instead.
+    /// exist while looking resolved, so the layer is left alone instead — and
+    /// the values that stayed relative are reported, so a caller whose contract
+    /// forbids that outcome can reject it rather than discover it later.
     #[cfg(unix)]
     #[test]
-    fn a_non_unicode_base_leaves_paths_as_written() {
+    fn a_non_unicode_base_reports_the_paths_it_left_as_written() {
         use std::ffi::OsStr;
         use std::os::unix::ffi::OsStrExt;
 
         let base = Path::new(OsStr::from_bytes(b"/tmp/proj-\xFF"));
-        assert_eq!(anchor("./queries", Some(base)), "./queries");
+        let mut settings = crate::config::RawWorkspaceSettings {
+            search_paths: Some(vec!["./runtime".into(), "/opt/kakehashi".into()]),
+            ..Default::default()
+        };
+
+        let unanchored = anchor_settings_paths(&mut settings, Some(base));
+
+        assert_eq!(
+            settings.search_paths,
+            Some(vec!["./runtime".to_string(), "/opt/kakehashi".to_string()]),
+            "nothing is rewritten when the base cannot be represented"
+        );
+        assert_eq!(
+            unanchored,
+            ["./runtime"],
+            "only the value that needed a base is reported; the absolute one is fine"
+        );
     }
 
     /// One array, three rules: the relative entry moves, the two that carry
@@ -424,7 +455,7 @@ mod tests {
             ..Default::default()
         };
 
-        anchor_settings_paths(&mut settings, Some(Path::new("/workspace")));
+        let _ = anchor_settings_paths(&mut settings, Some(Path::new("/workspace")));
 
         assert_eq!(
             settings.search_paths,
