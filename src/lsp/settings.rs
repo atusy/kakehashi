@@ -369,7 +369,11 @@ pub fn load_settings(
             // A base that cannot be represented leaves values as written, which
             // is the pre-#732 meaning. Deliberately not fatal here: an implicit
             // layer's contract is to degrade rather than take the session down,
-            // and `anchor_settings_paths` warns about what it skipped.
+            // and `anchor_settings_paths` warns about what it skipped. Same for
+            // a `parent()` of `None`, which the explicit layer treats as fatal —
+            // `user_config_path` always answers an absolute path ending
+            // `kakehashi/kakehashi.toml`, so the two rules cannot actually
+            // disagree about any real path.
             load_user_config_with_events(&mut events, &mut deprecated_keys).map(
                 |(mut settings, path)| {
                     let _ = anchor_settings_paths(&mut settings, path.parent());

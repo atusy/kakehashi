@@ -1,6 +1,15 @@
 //! `SettingsManager`: workspace settings (`ArcSwap`, hot-swappable via
-//! `apply_settings`) plus initialize-only state — `client_capabilities` and
-//! `root_path` (both `OnceLock`, set once during `initialize()`).
+//! `apply_settings`) plus initialize-only state — `client_capabilities` (a
+//! `OnceLock`) and `root_path`.
+//!
+//! `root_path` is an `ArcSwap`, not a `OnceLock`, but only `initialize()` calls
+//! [`SettingsManager::set_root_path`], and configuration now depends on that:
+//! it is the base every relative path in a client-supplied layer is resolved
+//! against (`config::paths`). A second writer — a `didChangeWorkspaceFolders`
+//! handler, say — would let a `didChangeConfiguration` read one root, the
+//! handler store another, and the merge then hold paths anchored to two
+//! different workspaces. Anything that makes it genuinely mutable has to make
+//! the read and the merge share the settings-reload transaction.
 
 use arc_swap::ArcSwap;
 use path_clean::PathClean;
