@@ -105,9 +105,17 @@ survives into the raw settings that `kakehashi/internal/effectiveConfiguration`
 reports.
 
 Because each layer is anchored while raw, a language `base` chain that spans
-layers inherits values that are *already* absolute — `resolve_base_configs`
-folds the chain later, so an inherited `parser` keeps the base of the layer that
-wrote it rather than the layer that inherits it.
+layers inherits values that have *already* been resolved against their own
+layer — `resolve_base_configs` folds the chain later, so an inherited `parser`
+keeps the base of the layer that wrote it rather than the layer that inherits
+it.
+
+Two things anchoring must not do to a value it prepends to. It escapes a `$` in
+the base as `$$`, since expansion reads `$VAR` anywhere in a value and a
+directory may legitimately be named `a$b`. And it declines to fold `..`
+lexically when the value also carries a variable, since the fold pops the
+component in front of it — which before expansion may be the variable itself,
+taking the undefined-variable error with it.
 
 ### Merge Algorithm
 
@@ -232,8 +240,11 @@ path the user typed carries intent; a path kakehashi went looking for does not.
      `kakehashi.toml` must never leave the user without a server
 
 2. **An explicit `--config-file` that is present but unusable fails startup**
-   - Unreadable, malformed TOML, larger than the 8 MiB read ceiling, or
-     carrying a path that cannot be expanded
+   - Unreadable, malformed TOML, larger than the 8 MiB read ceiling, carrying a
+     path that cannot be expanded, or sitting somewhere whose own directory
+     cannot be resolved — anchoring that layer's relative paths needs it, and
+     continuing without it would silently resolve them against the working
+     directory
    - LSP `initialize` returns `RequestFailed` (-32803) naming the first such
      file; `format` and `diagnose` print it and exit 2
    - Silently dropping the layer and continuing on defaults is what hides
@@ -341,6 +352,7 @@ fn load_settings(root, override_settings, home, env_fn, explicit) -> SettingsLoa
 - **Arrays replace, not merge**: `queries` arrays are replaced entirely, not concatenated; overriding one query type requires repeating all
 - **No "unset" mechanism**: Cannot explicitly remove a field inherited from earlier layers (would need `null` support)
 - **File I/O at startup**: Reading the config files adds latency (minimal in practice) — two implicit files, or however many `--config-file` arguments were given
+- **Relative paths changed meaning**: a relative value in an existing config file now resolves against that file's directory rather than wherever the server happened to be launched. Intended (it is the point of the change), but it silently relocates a user config written to be per-project — most visibly a `searchPaths` entry, whose misses are logged at debug level rather than as an error
 - **Infrastructure-integration gap**: Phases 1-3 (Sprints 118-120) built infrastructure (schema, merging, user config loading) but delivered ZERO user value until Sprint 124 wired APIs into application. Lesson: infrastructure sprints must be followed by integration sprints within 1-2 sprints to realize value.
 
 ### Neutral

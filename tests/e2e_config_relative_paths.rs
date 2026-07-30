@@ -7,7 +7,9 @@
 //! depended on how the editor was started.
 //!
 //! Assertions read `kakehashi/internal/effectiveConfiguration`, which reports
-//! the raw settings — the same values that later reach the filesystem.
+//! settings after anchoring but before variable expansion. An anchored relative
+//! path is therefore final there, while a `$`/`~` value still appears as the
+//! user wrote it — which the last test pins.
 //!
 //! Run with: `cargo test --test e2e_config_relative_paths --features e2e`
 

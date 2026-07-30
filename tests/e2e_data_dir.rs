@@ -65,9 +65,13 @@ fn get_effective_search_paths(client: &mut LspClient) -> Vec<String> {
         .collect()
 }
 
-/// effectiveConfiguration returns raw (pre-expansion) settings, so with no
+/// effectiveConfiguration returns pre-expansion settings, so with no
 /// `KAKEHASHI_DATA_DIR` env var and no `--data-dir` flag the raw searchPaths
 /// still contains the `${KAKEHASHI_DATA_DIR}` template.
+///
+/// Path anchoring runs before this point but cannot touch the template: a
+/// `$`-led value carries its own base. That is what keeps this assertion the
+/// guard for anchoring staying syntactic rather than expanding per layer.
 #[test]
 fn test_search_paths_returns_raw_template() {
     let tmp = TempDir::new().unwrap();
