@@ -94,6 +94,23 @@ impl ConnectionKey {
     pub(crate) fn server(&self) -> &str {
         &self.server
     }
+
+    /// The resolved marker workspace root, or `None` for the two root-less
+    /// modes (client fallback and shared instance, told apart by
+    /// [`is_client_fallback`](Self::is_client_fallback) and
+    /// [`is_shared`](Self::is_shared)).
+    ///
+    /// Exposed so the `workspace/executeCommand` routing token can carry the
+    /// root and rebuild this exact key when the command comes back
+    /// (execute-command-routing-token). Rebuilding the key is what lets that
+    /// path reach the right process with no document to re-resolve the root
+    /// from.
+    pub(crate) fn marker_root(&self) -> Option<&str> {
+        match &self.root {
+            ConnectionRoot::Marker(root) => Some(root),
+            ConnectionRoot::ClientFallback | ConnectionRoot::Shared => None,
+        }
+    }
 }
 
 impl fmt::Display for ConnectionKey {

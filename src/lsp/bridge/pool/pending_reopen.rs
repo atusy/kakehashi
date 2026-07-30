@@ -18,15 +18,31 @@
 
 use std::collections::HashMap;
 use std::sync::Mutex;
+use std::time::Duration;
 
+use tokio::sync::watch;
 use url::Url;
 
 use super::ConnectionKey;
 use crate::error::LockResultExt;
 
+/// How long a request will wait for an in-flight re-open before proceeding
+/// without it. Matches the bound the old inline pre-dispatch heal used: the
+/// happy path (nothing pending, or already open) returns immediately, and a
+/// stuck downstream must not hold a user-facing request open indefinitely.
+pub(crate) const REOPEN_WAIT: Duration = Duration::from_secs(2);
+
 #[derive(Default)]
 pub(crate) struct PendingReopenRegistry {
     hosts: Mutex<HashMap<ConnectionKey, Vec<Url>>>,
+    /// Re-opens handed off but not yet finished, so a request that must not
+    /// overtake its own `didOpen` can wait for one.
+    ///
+    /// The re-open is serviced asynchronously (the pool signals *when*, the
+    /// server side does the work), so without this a command enqueued right
+    /// after `Ready` would reach the downstream BEFORE the didOpen it depends
+    /// on — the FIFO ordering the previous inline heal guaranteed by awaiting.
+    in_flight: Mutex<HashMap<ConnectionKey, watch::Receiver<bool>>>,
 }
 
 impl PendingReopenRegistry {
@@ -51,17 +67,71 @@ impl PendingReopenRegistry {
         }
     }
 
-    /// Take the host documents awaiting re-open on `key`, leaving nothing behind.
+    /// Take the host documents awaiting re-open on `key` and mark the re-open
+    /// in flight, returning the hosts and the completion sender.
     ///
     /// Draining means one re-open attempt per respawn. That is deliberate: a
     /// retained set would re-open the same documents on every later respawn of
     /// the key, including documents the editor has since closed.
-    pub(crate) fn take(&self, key: &ConnectionKey) -> Vec<Url> {
-        self.hosts
+    ///
+    /// MUST be called before the connection is published as `Ready`. A request
+    /// unblocked by that transition checks [`wait_for_reopen`](Self::wait_for_reopen),
+    /// so registering afterwards would leave a window where the re-open is
+    /// pending but invisible — exactly the overtaking this exists to prevent.
+    ///
+    /// Dropping the returned sender completes the wait, so a handler that dies
+    /// or is never serviced releases waiters instead of stranding them until the
+    /// timeout.
+    pub(crate) fn take(&self, key: &ConnectionKey) -> Option<(Vec<Url>, watch::Sender<bool>)> {
+        let hosts = self
+            .hosts
             .lock()
             .recover_poison("PendingReopenRegistry::take")
-            .remove(key)
-            .unwrap_or_default()
+            .remove(key)?;
+        if hosts.is_empty() {
+            return None;
+        }
+        let (tx, rx) = watch::channel(false);
+        self.in_flight
+            .lock()
+            .recover_poison("PendingReopenRegistry::take")
+            .insert(key.clone(), rx);
+        Some((hosts, tx))
+    }
+
+    /// Wait (bounded by [`REOPEN_WAIT`]) for an in-flight re-open on `key`.
+    ///
+    /// Returns immediately when none is in flight, which is the common case.
+    /// On timeout the caller proceeds anyway: the re-open keeps running, and
+    /// letting a slow downstream block a user-facing request indefinitely would
+    /// be worse than the state it is repairing.
+    pub(crate) async fn wait_for_reopen(&self, key: &ConnectionKey) {
+        let Some(mut rx) = self
+            .in_flight
+            .lock()
+            .recover_poison("PendingReopenRegistry::wait_for_reopen")
+            .get(key)
+            .cloned()
+        else {
+            return;
+        };
+        // `Err` (sender dropped) counts as finished: the re-open completed, or
+        // its handler died and will never signal.
+        let settled = tokio::time::timeout(REOPEN_WAIT, rx.wait_for(|done| *done))
+            .await
+            .is_ok();
+        // Retire the entry ONLY once the re-open actually settled. On timeout it
+        // is still running, and forgetting it here would let the NEXT request on
+        // this connection sail past with no wait at all — precisely when the
+        // re-open is known to be slow. Leaving it registered keeps that request
+        // bounded by the same budget, and the sender's drop retires it in the
+        // end regardless.
+        if settled {
+            self.in_flight
+                .lock()
+                .recover_poison("PendingReopenRegistry::wait_for_reopen")
+                .remove(key);
+        }
     }
 }
 
@@ -73,16 +143,20 @@ mod tests {
         Url::parse(path).expect("valid test URL")
     }
 
+    fn hosts_of(taken: Option<(Vec<Url>, watch::Sender<bool>)>) -> Vec<Url> {
+        taken.map(|(hosts, _tx)| hosts).unwrap_or_default()
+    }
+
     #[test]
     fn take_drains_what_record_stored() {
         let registry = PendingReopenRegistry::default();
         let key = ConnectionKey::for_server("ruff");
         registry.record(&key, vec![url("file:///w/a.md")]);
 
-        assert_eq!(registry.take(&key), vec![url("file:///w/a.md")]);
+        assert_eq!(hosts_of(registry.take(&key)), vec![url("file:///w/a.md")]);
         // Drained, not retained: a later respawn must not re-open documents the
         // editor may have closed in the meantime.
-        assert!(registry.take(&key).is_empty());
+        assert!(registry.take(&key).is_none());
     }
 
     #[test]
@@ -95,7 +169,7 @@ mod tests {
         registry.record(&key, vec![url("file:///w/a.md")]);
         registry.record(&key, vec![]);
 
-        assert_eq!(registry.take(&key), vec![url("file:///w/a.md")]);
+        assert_eq!(hosts_of(registry.take(&key)), vec![url("file:///w/a.md")]);
     }
 
     #[test]
@@ -106,7 +180,7 @@ mod tests {
         registry.record(&key, vec![url("file:///w/a.md"), url("file:///w/b.md")]);
 
         assert_eq!(
-            registry.take(&key),
+            hosts_of(registry.take(&key)),
             vec![url("file:///w/a.md"), url("file:///w/b.md")]
         );
     }
@@ -121,7 +195,93 @@ mod tests {
         registry.record(&a, vec![url("file:///w/a/doc.md")]);
         registry.record(&b, vec![url("file:///w/b/doc.md")]);
 
-        assert_eq!(registry.take(&a), vec![url("file:///w/a/doc.md")]);
-        assert_eq!(registry.take(&b), vec![url("file:///w/b/doc.md")]);
+        assert_eq!(hosts_of(registry.take(&a)), vec![url("file:///w/a/doc.md")]);
+        assert_eq!(hosts_of(registry.take(&b)), vec![url("file:///w/b/doc.md")]);
+    }
+
+    #[tokio::test]
+    async fn waiting_on_a_key_with_no_reopen_returns_at_once() {
+        // The overwhelmingly common case: nothing was purged, so a request must
+        // not pay the timeout (or any wait at all).
+        let registry = PendingReopenRegistry::default();
+        registry
+            .wait_for_reopen(&ConnectionKey::for_server("ruff"))
+            .await;
+    }
+
+    #[tokio::test]
+    async fn a_request_waits_until_the_reopen_signals_completion() {
+        // The ordering guarantee: a command enqueued after Ready must not
+        // overtake the didOpen its arguments depend on.
+        let registry = std::sync::Arc::new(PendingReopenRegistry::default());
+        let key = ConnectionKey::for_server("ruff");
+        registry.record(&key, vec![url("file:///w/a.md")]);
+        let (_hosts, tx) = registry.take(&key).expect("a re-open is pending");
+
+        let waiter = {
+            let registry = std::sync::Arc::clone(&registry);
+            let key = key.clone();
+            tokio::spawn(async move { registry.wait_for_reopen(&key).await })
+        };
+        // Still in flight: the waiter must not have finished.
+        tokio::task::yield_now().await;
+        assert!(!waiter.is_finished(), "must block while the re-open runs");
+
+        tx.send(true).expect("waiter holds the receiver");
+        waiter.await.expect("waiter completes once signalled");
+    }
+
+    #[tokio::test]
+    async fn dropping_the_sender_releases_waiters() {
+        // A handler that dies (or a message never serviced) must not strand the
+        // request for the full timeout.
+        let registry = std::sync::Arc::new(PendingReopenRegistry::default());
+        let key = ConnectionKey::for_server("ruff");
+        registry.record(&key, vec![url("file:///w/a.md")]);
+        let (_hosts, tx) = registry.take(&key).expect("a re-open is pending");
+        drop(tx);
+
+        // Would hang for REOPEN_WAIT if a dropped sender did not count as done.
+        tokio::time::timeout(Duration::from_secs(1), registry.wait_for_reopen(&key))
+            .await
+            .expect("a dropped sender releases the waiter immediately");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_timed_out_wait_leaves_the_reopen_registered() {
+        // A timeout does not mean the re-open finished. Retiring the entry there
+        // would let the NEXT request skip the wait entirely — with no bound at
+        // all — exactly when the re-open is known to be slow.
+        let registry = PendingReopenRegistry::default();
+        let key = ConnectionKey::for_server("ruff");
+        registry.record(&key, vec![url("file:///w/a.md")]);
+        let (_hosts, done) = registry.take(&key).expect("a re-open is pending");
+
+        // Auto-advances past REOPEN_WAIT without a real sleep.
+        registry.wait_for_reopen(&key).await;
+
+        // Still outstanding, so a second request is bounded the same way rather
+        // than sailing straight through.
+        let second = tokio::time::timeout(REOPEN_WAIT / 2, registry.wait_for_reopen(&key)).await;
+        assert!(
+            second.is_err(),
+            "a still-running re-open must keep blocking, not be forgotten"
+        );
+        done.send(true).expect("the registry holds the receiver");
+        registry.wait_for_reopen(&key).await;
+    }
+
+    #[tokio::test]
+    async fn an_empty_pending_set_registers_no_wait() {
+        // `record` ignores an empty set, so `take` must report nothing in flight
+        // rather than register a barrier nobody will ever signal.
+        let registry = PendingReopenRegistry::default();
+        let key = ConnectionKey::for_server("ruff");
+        registry.record(&key, vec![]);
+
+        assert!(registry.take(&key).is_none());
+        tokio::time::timeout(Duration::from_secs(1), registry.wait_for_reopen(&key))
+            .await
+            .expect("nothing in flight, so no wait");
     }
 }

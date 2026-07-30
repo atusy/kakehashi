@@ -70,48 +70,7 @@ impl Kakehashi {
         uri: &Url,
         wait: std::time::Duration,
     ) -> SnapshotWait {
-        // Two deadlines: the caller's `wait` bounds the SETTLE wait (a
-        // snapshot exists but trails the input — degrading fast there is the
-        // point), while the FIRST-parse wait is generous, because it is
-        // bounded by parse completion rather than time: every open-parse
-        // resolution path publishes (tree, tree-less, or the didClose
-        // sentinel), so the receiver always wakes. A tight first-parse cap
-        // made requests racing didOpen degrade to empty on loaded machines.
-        let stale_deadline = tokio::time::Instant::now() + wait;
-        let first_parse_deadline = tokio::time::Instant::now() + FIRST_PARSE_BACKSTOP;
-        loop {
-            // Subscribe BEFORE checking (lost-wakeup guard): `subscribe` marks
-            // the current value as seen, so a publish landing between a check
-            // and a later subscribe would never trigger `changed()`.
-            let Some(mut receiver) = self.documents.subscribe_snapshots(uri) else {
-                return SnapshotWait::Gone;
-            };
-            let Some(view) = self.documents.latest_snapshot(uri) else {
-                return SnapshotWait::Gone;
-            };
-            let had_snapshot = match &view.slot.snapshot {
-                Some(snapshot) if snapshot.parsed_version == view.content_version => {
-                    return SnapshotWait::Current(Arc::clone(snapshot));
-                }
-                trailing => trailing.is_some(),
-            };
-            let deadline = if had_snapshot {
-                stale_deadline
-            } else {
-                first_parse_deadline
-            };
-            match tokio::time::timeout_at(deadline, receiver.changed()).await {
-                Ok(Ok(())) => continue,
-                Ok(Err(_closed)) => return SnapshotWait::Gone,
-                Err(_deadline) => {
-                    return if had_snapshot {
-                        SnapshotWait::Stale
-                    } else {
-                        SnapshotWait::Unparsed
-                    };
-                }
-            }
-        }
+        wait_for_current_snapshot_in(&self.documents, uri, wait).await
     }
 
     /// Resolve a **current** snapshot for the position/range readers
@@ -136,6 +95,63 @@ impl Kakehashi {
         (snapshot.incarnation == view.slot.current_incarnation
             && snapshot.parsed_version == view.content_version)
             .then_some(snapshot)
+    }
+}
+
+/// The body of [`Kakehashi::wait_for_current_snapshot`], over a bare
+/// [`DocumentStore`].
+///
+/// Free-standing because the coordinators reached from the bridge's upward
+/// request channel hold a `DocumentStore` but not a `Kakehashi`, and the
+/// respawn re-open must wait for a current tree the same way the request paths
+/// do (execute-command-routing-token) — resolving injections against a tree
+/// `didChange` just cleared would find none and open nothing.
+pub(crate) async fn wait_for_current_snapshot_in(
+    documents: &crate::document::DocumentStore,
+    uri: &Url,
+    wait: std::time::Duration,
+) -> SnapshotWait {
+    // Two deadlines: the caller's `wait` bounds the SETTLE wait (a
+    // snapshot exists but trails the input — degrading fast there is the
+    // point), while the FIRST-parse wait is generous, because it is
+    // bounded by parse completion rather than time: every open-parse
+    // resolution path publishes (tree, tree-less, or the didClose
+    // sentinel), so the receiver always wakes. A tight first-parse cap
+    // made requests racing didOpen degrade to empty on loaded machines.
+    let stale_deadline = tokio::time::Instant::now() + wait;
+    let first_parse_deadline = tokio::time::Instant::now() + FIRST_PARSE_BACKSTOP;
+    loop {
+        // Subscribe BEFORE checking (lost-wakeup guard): `subscribe` marks
+        // the current value as seen, so a publish landing between a check
+        // and a later subscribe would never trigger `changed()`.
+        let Some(mut receiver) = documents.subscribe_snapshots(uri) else {
+            return SnapshotWait::Gone;
+        };
+        let Some(view) = documents.latest_snapshot(uri) else {
+            return SnapshotWait::Gone;
+        };
+        let had_snapshot = match &view.slot.snapshot {
+            Some(snapshot) if snapshot.parsed_version == view.content_version => {
+                return SnapshotWait::Current(Arc::clone(snapshot));
+            }
+            trailing => trailing.is_some(),
+        };
+        let deadline = if had_snapshot {
+            stale_deadline
+        } else {
+            first_parse_deadline
+        };
+        match tokio::time::timeout_at(deadline, receiver.changed()).await {
+            Ok(Ok(())) => continue,
+            Ok(Err(_closed)) => return SnapshotWait::Gone,
+            Err(_deadline) => {
+                return if had_snapshot {
+                    SnapshotWait::Stale
+                } else {
+                    SnapshotWait::Unparsed
+                };
+            }
+        }
     }
 }
 

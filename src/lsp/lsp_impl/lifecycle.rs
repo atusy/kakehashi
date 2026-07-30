@@ -1216,7 +1216,11 @@ fn spawn_upstream_request(
                     ),
                 }
             }
-            UpstreamRequest::ReopenDocuments { server, hosts } => {
+            UpstreamRequest::ReopenDocuments {
+                server,
+                hosts,
+                done,
+            } => {
                 // A respawned connection has nothing open; re-open what its dead
                 // predecessor held (execute-command-routing-token).
                 //
@@ -1252,8 +1256,16 @@ fn spawn_upstream_request(
                     // set, and each re-open resolves injections and sends
                     // didOpen on the SAME connection anyway, so fanning out
                     // would only contend on the outbound queue.
+                    //
+                    // Await the tree first: a re-open racing an edit would
+                    // otherwise resolve no injections, open nothing, and still
+                    // report done.
+                    context.injection.ensure_document_parsed(&host).await;
                     context.injection.process_injections(&host, false).await;
                 }
+                // Release anything waiting to send on this connection. Send
+                // errors mean nobody is waiting, which is the common case.
+                let _ = done.send(true);
             }
             UpstreamRequest::ShowMessageRequest {
                 typ,

@@ -31,7 +31,7 @@ use tower_lsp_server::ls_types::{
 };
 use url::Url;
 
-use super::super::pool::{ConnectionHandle, LanguageServerPool, UpstreamId};
+use super::super::pool::{ConnectionHandle, ConnectionKey, LanguageServerPool, UpstreamId};
 use super::super::protocol::{
     JsonRpcRequest, RegionOffset, RequestId, VirtualDocumentUri, encode_command,
     host_position_within_region, region_host_end, response_has_jsonrpc_error,
@@ -199,11 +199,9 @@ fn re_envelope_action(action: &mut CodeAction, envelope: &CodeActionEnvelope) {
 /// `suffixed_title` is the "` — {server}`"-suffixed title to re-apply.
 ///
 /// Policy (mirrors the virt path): a disabled resolve is surfaced disabled; a
-/// materialized command is name-encoded for `executeCommand` routing (dropped
-/// if unencodable); a result with no command and no applicable edit is a no-op
-/// and is disabled (`REASON_RESOLVE` for an empty edit, or
-/// `REASON_UNROUTABLE_COMMAND` when the no-op exists only because the command
-/// was dropped above); a still-lazy result is re-enveloped for a further
+/// materialized command is name-encoded for `executeCommand` routing; a result
+/// with no command and an empty edit is a no-op and is disabled
+/// (`REASON_RESOLVE`); a still-lazy result is re-enveloped for a further
 /// resolve. Without `disabledSupport` every disable path fails soft to the
 /// unresolved action instead.
 fn finalize_host_resolved_action(
@@ -212,6 +210,7 @@ fn finalize_host_resolved_action(
     mut envelope: CodeActionEnvelope,
     suffixed_title: String,
     upstream_caps: UpstreamCodeActionCaps,
+    connection_key: &ConnectionKey,
 ) -> CodeAction {
     // Borrowed, not cloned: this `&str` view of the origin is last used
     // (title resuffixing) before the lazy path's `envelope.original_title`
@@ -242,36 +241,20 @@ fn finalize_host_resolved_action(
     // whether a command was actually DROPPED (present but unencodable) — that is
     // distinct from a resolve that never carried a command. Encode under the
     // mutable borrow, then clear afterwards so the borrow is out of scope.
-    let mut command_dropped = false;
     if let Some(command) = resolved.command.as_mut() {
-        match encode_command(server_name, &envelope.host_uri, &command.command) {
-            Some(encoded) => command.command = encoded,
-            None => command_dropped = true,
-        }
-    }
-    if command_dropped {
-        resolved.command = None;
+        command.command = encode_command(connection_key, &command.command);
     }
 
-    // A resolved action with no command and no applicable edit is a no-op —
-    // disable it rather than hand the client an enabled action that applies
-    // nothing (mirrors the virt path's empty-edit policy). Two shapes qualify,
-    // with distinct user-facing reasons: a `Some`-but-empty edit (the server
-    // resolved to nothing → `REASON_RESOLVE`), and a command-only action whose
-    // routing name couldn't be encoded above (command dropped, edit absent →
-    // `REASON_UNROUTABLE_COMMAND` — the server resolved fine; the routing name
-    // is the problem, so don't misdirect debugging at the server). A resolve
-    // that NEVER carried a command and has no edit is NOT a no-op — it is a
+    // A resolved action with no command and a `Some`-but-empty edit is a no-op
+    // — disable it rather than hand the client an enabled action that applies
+    // nothing (mirrors the virt path's empty-edit policy). A resolve that
+    // NEVER carried a command and has no edit is NOT a no-op — it is a
     // still-lazy staged resolve, re-enveloped for a further pass below.
     // Without `disabledSupport`, fail soft to the unresolved action.
-    let no_op_reason = if resolved.command.is_none() {
-        if resolved.edit.as_ref().is_some_and(workspace_edit_is_empty) {
-            Some(REASON_RESOLVE)
-        } else if command_dropped && resolved.edit.is_none() {
-            Some(REASON_UNROUTABLE_COMMAND)
-        } else {
-            None
-        }
+    let no_op_reason = if resolved.command.is_none()
+        && resolved.edit.as_ref().is_some_and(workspace_edit_is_empty)
+    {
+        Some(REASON_RESOLVE)
     } else {
         None
     };
@@ -513,7 +496,7 @@ impl LanguageServerPool {
         };
         Ok(Some(bridge_code_actions(
             actions,
-            server_name,
+            handle.key(),
             host_uri.as_str(),
             upstream_caps,
             handle.has_capability("codeAction/resolve"),
@@ -755,7 +738,14 @@ impl LanguageServerPool {
             return action;
         };
 
-        finalize_host_resolved_action(resolved, action, envelope, suffixed_title, upstream_caps)
+        finalize_host_resolved_action(
+            resolved,
+            action,
+            envelope,
+            suffixed_title,
+            upstream_caps,
+            handle.key(),
+        )
     }
 
     /// Reconnect to the origin `(server, root)`, restore the original title,
@@ -846,6 +836,7 @@ impl LanguageServerPool {
             host_uri_lsp.as_ref(),
             suffixed_title,
             upstream_caps,
+            handle.key(),
         )
     }
 }
@@ -864,6 +855,7 @@ fn finalize_virt_resolved_action(
     host_uri_lsp: Option<&Uri>,
     suffixed_title: String,
     upstream_caps: UpstreamCodeActionCaps,
+    connection_key: &ConnectionKey,
 ) -> CodeAction {
     let server_name = &envelope.origin;
     // Translate the resolved action's own diagnostics host-ward first, so
@@ -900,43 +892,12 @@ fn finalize_virt_resolved_action(
     }
 
     // A resolve that materializes a `command` (or edit+command) is now
-    // executable: rewrite the command name to encode the origin server so
-    // the bridged executeCommand routes back to it (mirrors the initial
+    // executable: rewrite the command name to encode the connection it must run
+    // on so the bridged executeCommand routes back to it (mirrors the initial
     // codeAction path). An edit+command action keeps both — the edit is
     // translated below, then the client executes the command.
-    // Drop the command if its routing name can't be encoded (unroutable);
-    // an accompanying edit is still applied. Track the drop: a
-    // command-only resolve whose command was dropped must NOT fall into
-    // the still-lazy branch below — every future resolve would
-    // re-materialize the same unroutable command, leaving the client an
-    // enabled action that can never do anything (mirrors
-    // `finalize_host_resolved_action`).
-    let mut command_dropped = false;
     if let Some(command) = resolved.command.as_mut() {
-        match encode_command(server_name, &envelope.host_uri, &command.command) {
-            Some(encoded) => command.command = encoded,
-            None => command_dropped = true,
-        }
-    }
-    if command_dropped {
-        resolved.command = None;
-    }
-    if command_dropped && resolved.edit.is_none() {
-        if !upstream_caps.disabled_support {
-            re_envelope_action(&mut action, &envelope);
-            return action;
-        }
-        resolved.title = resuffix_resolved_title(
-            std::mem::take(&mut resolved.title),
-            suffixed_title,
-            server_name,
-        );
-        resolved.data = None;
-        resolved.is_preferred = None;
-        resolved.disabled = Some(CodeActionDisabled {
-            reason: REASON_UNROUTABLE_COMMAND.to_string(),
-        });
-        return resolved;
+        command.command = encode_command(connection_key, &command.command);
     }
 
     // isPreferred is its own client capability (LSP 3.15); the downstream
@@ -1318,7 +1279,7 @@ impl UpstreamCodeActionCaps {
 /// action) or a no-op to drop.
 pub(crate) fn bridge_code_actions(
     actions: Vec<CodeActionOrCommand>,
-    server_name: &str,
+    connection_key: &ConnectionKey,
     host_uri: &str,
     upstream_caps: UpstreamCodeActionCaps,
     server_resolves: bool,
@@ -1329,7 +1290,7 @@ pub(crate) fn bridge_code_actions(
         .filter_map(|item| {
             bridge_code_action(
                 item,
-                server_name,
+                connection_key,
                 host_uri,
                 upstream_caps,
                 server_resolves,
@@ -1344,27 +1305,26 @@ const REASON_CROSS_REGION: &str = "the edit cannot be represented in the host do
 const REASON_PREFIXED_REGION: &str = "the edit would break the host document's structure \
      around the injected region (its line prefixes, e.g. a blockquote's, or the \
      closing fence)";
-const REASON_UNROUTABLE_COMMAND: &str = "the action's command cannot be routed by kakehashi";
 
 fn bridge_code_action(
     item: CodeActionOrCommand,
-    server_name: &str,
+    connection_key: &ConnectionKey,
     host_uri: &str,
     upstream_caps: UpstreamCodeActionCaps,
     server_resolves: bool,
     virt: Option<&VirtLayerContext<'_>>,
 ) -> Option<CodeActionOrCommand> {
+    // The key's server IS the config server name the envelope and titles use;
+    // deriving it here keeps one source of truth for the origin.
+    let server_name = connection_key.server();
     let mut action = match item {
         // A bare Command is executable via workspace/executeCommand once its
-        // name encodes the origin server + host document (the client sends only
+        // name encodes the connection it must run on (the client sends only
         // command+arguments on execute — no data envelope to route by).
         // Arguments stay verbatim (checklist §10); suffix the title like every
         // bridged action.
         CodeActionOrCommand::Command(mut command) => {
-            // Drop a bare command we can't mint an unambiguous routing name for
-            // (pathological: a separator in the server name) — routed back it
-            // would reach the wrong server, and un-routed it executes to nothing.
-            command.command = encode_command(server_name, host_uri, &command.command)?;
+            command.command = encode_command(connection_key, &command.command);
             command.title = suffix_title(command.title, server_name);
             return Some(CodeActionOrCommand::Command(command));
         }
@@ -1407,29 +1367,16 @@ fn bridge_code_action(
     }
 
     // A command makes the action executable via workspace/executeCommand.
-    // Rewrite the command name to encode its origin server so the bridged
-    // executeCommand routes it back (the client sends only command+arguments on
-    // execute — no data envelope). Arguments pass through verbatim (they are the
-    // downstream's own coordinate system, checklist §10). An edit+command action
-    // keeps BOTH: the client applies the (translated) edit, then executes.
-    let had_command = action.command.is_some();
-    let has_command = action
-        .command
-        .as_mut()
-        .and_then(|command| {
-            encode_command(server_name, host_uri, &command.command)
-                .map(|encoded| command.command = encoded)
-        })
-        .is_some();
-    // A command whose name couldn't be encoded (unroutable) is dropped; an
-    // accompanying edit is still applied below. Without an edit the action is
-    // DISABLED below rather than reclassified lazy — a resolve would only
-    // re-materialize the same unroutable command. Assigning None when there
-    // was no command is a harmless no-op.
-    if !has_command {
-        action.command = None;
+    // Rewrite the command name to encode the connection it must run on so the
+    // bridged executeCommand routes it back (the client sends only
+    // command+arguments on execute — no data envelope). Arguments pass through
+    // verbatim (they are the downstream's own coordinate system, checklist
+    // §10). An edit+command action keeps BOTH: the client applies the
+    // (translated) edit, then executes.
+    let has_command = action.command.is_some();
+    if let Some(command) = action.command.as_mut() {
+        command.command = encode_command(connection_key, &command.command);
     }
-    let command_dropped = had_command && !has_command;
 
     match &mut action.edit {
         Some(edit) => {
@@ -1462,17 +1409,6 @@ fn bridge_code_action(
                 action.data = None;
                 action.title = suffix_title(action.title, server_name);
                 return Some(CodeActionOrCommand::CodeAction(action));
-            }
-            // The action's ONLY payload was a command whose routing name
-            // couldn't be encoded: a permanent failure, not a lazy action —
-            // resolving it would re-materialize the same unroutable command.
-            if command_dropped {
-                return disable_action(
-                    action,
-                    REASON_UNROUTABLE_COMMAND,
-                    server_name,
-                    upstream_caps,
-                );
             }
             // No edit, no command: is this a lazy (resolve-deferred) action?
             //
@@ -1660,6 +1596,12 @@ mod tests {
 
     fn make_host_uri() -> Uri {
         crate::lsp::lsp_impl::url_to_uri(&Url::parse("file:///test.md").unwrap()).unwrap()
+    }
+
+    /// The connection these tests pretend the downstream response arrived on.
+    /// Marker-rooted so the encoded routing name exercises the root segment.
+    fn test_key() -> ConnectionKey {
+        ConnectionKey::new("ruff", Some("file:///repo".to_string()))
     }
 
     fn make_virtual_uri_string() -> String {
@@ -1965,7 +1907,7 @@ mod tests {
         };
         Some(bridge_code_actions(
             actions,
-            "ruff",
+            &test_key(),
             "file:///test.md",
             upstream_caps,
             server_resolves,
@@ -2070,11 +2012,10 @@ mod tests {
             panic!("Expected an executable Command");
         };
         assert_eq!(command.title, "Run organize imports — ruff");
-        // The command name encodes the origin server + host document so
-        // executeCommand routes back to it; arguments (none here) stay verbatim.
+        // The command name encodes the CONNECTION so executeCommand routes back
+        // to it; arguments (none here) stay verbatim.
         let route = decode_command(&command.command).expect("routed name");
-        assert_eq!(route.origin, "ruff");
-        assert_eq!(route.host_uri, "file:///test.md");
+        assert_eq!(route.key, test_key());
         assert_eq!(route.command, "ruff.organizeImports");
     }
 
@@ -2105,7 +2046,7 @@ mod tests {
         // command — both halves survive.
         assert!(action.edit.is_some(), "the translated edit is kept");
         let route = decode_command(&action.command.as_ref().unwrap().command).expect("routed name");
-        assert_eq!(route.origin, "ruff");
+        assert_eq!(route.key, test_key());
         assert_eq!(route.command, "ruff.postFix");
     }
 
@@ -2365,7 +2306,7 @@ mod tests {
 
         let bridged = bridge_code_actions(
             actions,
-            "marksman",
+            &ConnectionKey::new("marksman", None),
             "file:///test.md",
             caps(true),
             false,
@@ -2386,7 +2327,7 @@ mod tests {
         };
         assert_eq!(command.title, "Run linter — marksman");
         let route = crate::lsp::bridge::decode_command(&command.command).expect("routed name");
-        assert_eq!(route.origin, "marksman");
+        assert_eq!(route.key, ConnectionKey::new("marksman", None));
         assert_eq!(route.command, "lint.run");
     }
 
@@ -2400,7 +2341,7 @@ mod tests {
                 .unwrap();
         let bridged = bridge_code_actions(
             actions,
-            "marksman",
+            &ConnectionKey::new("marksman", None),
             "file:///test.md",
             caps_resolve(),
             true, // host server advertises codeAction/resolve
@@ -2434,7 +2375,7 @@ mod tests {
                 .unwrap();
         let bridged = bridge_code_actions(
             actions,
-            "marksman",
+            &ConnectionKey::new("marksman", None),
             "file:///test.md",
             caps_resolve(),
             false, // host server does NOT advertise resolve
@@ -2473,7 +2414,7 @@ mod tests {
             serde_json::from_value(json!([{ "title": "Fix all" }])).unwrap();
         let bridged = bridge_code_actions(
             actions,
-            "marksman",
+            &ConnectionKey::new("marksman", None),
             "file:///test.md",
             caps_resolve(),
             true,
@@ -2498,7 +2439,7 @@ mod tests {
             serde_json::from_value(json!([{ "title": "Fix all" }])).unwrap();
         let bridged = bridge_code_actions(
             actions,
-            "marksman",
+            &ConnectionKey::new("marksman", None),
             "file:///test.md",
             caps_resolve(),
             false,
@@ -2830,7 +2771,7 @@ mod tests {
 
         let bridged = bridge_code_actions(
             actions,
-            "marksman",
+            &ConnectionKey::new("marksman", None),
             "file:///test.md",
             caps(true),
             false,
@@ -2945,6 +2886,7 @@ mod tests {
             envelope,
             "Sort imports — srv".to_string(),
             caps_resolve(),
+            &ConnectionKey::new("srv", None),
         );
 
         match out.edit.as_ref().unwrap().document_changes.as_ref() {
@@ -2959,11 +2901,11 @@ mod tests {
     }
 
     #[test]
-    fn host_resolve_disables_command_only_action_when_routing_name_unencodable() {
-        // A command-only resolved action whose routing name can't be encoded
-        // (origin contains the routing separator) must NOT surface as an enabled
-        // no-op: the command is dropped and, with no edit, the action is
-        // disabled as REASON_UNROUTABLE_COMMAND (regression for the dropped-command gap).
+    fn host_resolve_routes_a_command_whose_server_name_contains_the_separator() {
+        // The predecessor encoding could not mint an unambiguous name when the
+        // server name contained the routing separator, so it DROPPED the command
+        // and disabled the action. Escaping makes such a name routable, so the
+        // command must survive — and decode back to the same connection.
         let resolved: CodeAction = serde_json::from_value(json!({
             "title": "Run fix",
             "command": { "title": "Run fix", "command": "server.fix" }
@@ -2974,7 +2916,7 @@ mod tests {
         }))
         .unwrap();
         let envelope: CodeActionEnvelope = serde_json::from_value(json!({
-            "origin": "sr\u{1f}v", // contains SEP → encode_command fails
+            "origin": "sr|v",
             "host_uri": "file:///test.md",
             "region_id": "",
             "injection_language": "",
@@ -2984,90 +2926,28 @@ mod tests {
             "host_layer": true
         }))
         .unwrap();
+        let key = ConnectionKey::new("sr|v", Some("file:///repo".to_string()));
 
         let out = finalize_host_resolved_action(
             resolved,
             action,
             envelope,
-            "Run fix — sr\u{1f}v".to_string(),
+            "Run fix — sr|v".to_string(),
             caps_resolve(),
+            &key,
         );
 
-        assert_eq!(
-            out.disabled
-                .as_ref()
-                .expect("must be disabled, not an enabled no-op")
-                .reason,
-            REASON_UNROUTABLE_COMMAND,
-            "the reason must name the routing problem, not blame the server's resolve"
-        );
-        assert!(out.command.is_none(), "unencodable command must be dropped");
-        assert!(out.edit.is_none());
+        assert!(out.disabled.is_none(), "a routable command is not disabled");
+        let command = out.command.expect("command must survive");
+        let route = crate::lsp::bridge::decode_command(&command.command).expect("routable");
+        assert_eq!(route.key, key);
+        assert_eq!(route.command, "server.fix");
     }
 
     #[test]
-    fn virt_resolve_disables_command_only_action_when_routing_name_unencodable() {
-        // The virt twin of the host case above: a resolve that materializes
-        // ONLY a command whose routing name can't be encoded must not fall
-        // into the still-lazy branch and come back ENABLED — the client would
-        // resolve it forever with the same result and applying it does
-        // nothing. Disable it (permanent failure).
-        let resolved: CodeAction = serde_json::from_value(json!({
-            "title": "Run fix",
-            "command": { "title": "Run fix", "command": "server.fix" }
-        }))
-        .unwrap();
-        let action: CodeAction = serde_json::from_value(json!({
-            "title": "Run fix — srv", "data": { "id": 1 }
-        }))
-        .unwrap();
-        let envelope: CodeActionEnvelope = serde_json::from_value(json!({
-            "origin": "sr\u{1f}v", // contains SEP → encode_command fails
-            "host_uri": "file:///test.md",
-            "region_id": "01ARZ3NDEKTSV4RRFFQ69G5FAV",
-            "injection_language": "lua",
-            "offset": { "line": 0, "column": 0 },
-            "original_title": "Run fix",
-            "inner": null,
-            "host_layer": false
-        }))
-        .unwrap();
-
-        let out = finalize_virt_resolved_action(
-            resolved,
-            action,
-            envelope,
-            &RegionOffset::new(3, 0),
-            Position {
-                line: u32::MAX,
-                character: u32::MAX,
-            },
-            Some(&make_host_uri()),
-            "Run fix — sr\u{1f}v".to_string(),
-            caps_resolve(),
-        );
-
-        assert_eq!(
-            out.disabled
-                .as_ref()
-                .expect("must be disabled, not an enabled forever-lazy action")
-                .reason,
-            REASON_UNROUTABLE_COMMAND
-        );
-        assert!(out.command.is_none(), "unencodable command must be dropped");
-        assert!(out.edit.is_none());
-        assert!(
-            out.data.is_none(),
-            "a permanently failed action must not keep a resolve envelope"
-        );
-    }
-
-    #[test]
-    fn unroutable_command_only_action_is_disabled_not_lazy_on_initial_response() {
-        // Initial surfacing twin: a command-carrying, no-edit action whose
-        // command can't be encoded must not be reclassified as lazy (each
-        // future resolve would re-materialize the same unroutable command).
-        // Disable it up front.
+    fn initial_response_routes_a_command_whose_server_name_contains_the_separator() {
+        // Initial-surfacing twin: this shape used to be disabled up front as a
+        // permanent failure. It is now an ordinary routable command-only action.
         let actions: Vec<CodeActionOrCommand> = serde_json::from_value(json!([
             {
                 "title": "Run fix",
@@ -3075,30 +2955,24 @@ mod tests {
             }
         ]))
         .unwrap();
+        let key = ConnectionKey::new("sr|v", Some("file:///repo".to_string()));
 
-        let bridged = bridge_code_actions(
-            actions,
-            "sr\u{1f}v", // SEP in the server name → encode_command fails
-            "file:///test.md",
-            caps_resolve(),
-            true, // server resolves: the old behavior enveloped this as lazy
-            None,
-        );
+        let bridged =
+            bridge_code_actions(actions, &key, "file:///test.md", caps_resolve(), true, None);
         let CodeActionOrCommand::CodeAction(action) = &bridged[0] else {
             panic!("Expected CodeAction");
         };
-        assert_eq!(
-            action
-                .disabled
-                .as_ref()
-                .expect("must be disabled, not enveloped lazy")
-                .reason,
-            REASON_UNROUTABLE_COMMAND
+        assert!(
+            action.disabled.is_none(),
+            "a routable command is not disabled"
         );
-        assert!(action.command.is_none());
+        let command = action.command.as_ref().expect("command must survive");
+        let route = crate::lsp::bridge::decode_command(&command.command).expect("routable");
+        assert_eq!(route.key, key);
+        assert_eq!(route.command, "server.fix");
         assert!(
             action.data.is_none(),
-            "no resolve envelope for a permanent failure"
+            "a materialized command-only action carries no resolve envelope"
         );
     }
 
@@ -3133,6 +3007,7 @@ mod tests {
             envelope,
             "Run fix — srv".to_string(),
             caps_resolve(),
+            &ConnectionKey::new("srv", None),
         );
 
         assert!(
@@ -3141,7 +3016,7 @@ mod tests {
         );
         let command = out.command.expect("command kept");
         let route = crate::lsp::bridge::decode_command(&command.command).expect("routed name");
-        assert_eq!(route.origin, "srv");
+        assert_eq!(route.key, ConnectionKey::new("srv", None));
         assert_eq!(route.command, "server.fix");
     }
 
@@ -3176,6 +3051,7 @@ mod tests {
             envelope,
             "Organize imports — srv".to_string(),
             caps_resolve(),
+            &ConnectionKey::new("srv", None),
         );
 
         assert!(

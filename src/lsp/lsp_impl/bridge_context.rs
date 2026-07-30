@@ -1029,6 +1029,9 @@ impl Kakehashi {
                             t.upstream_id,
                         )
                         .await
+                        // This generic raw walk relays the value verbatim; only
+                        // codeAction needs the connection the response came from.
+                        .map(|raw| raw.map(|raw| raw.value))
                 }
             },
             |opt| matches!(opt, Some(v) if !is_empty_host_layer_value(request_method, v)),

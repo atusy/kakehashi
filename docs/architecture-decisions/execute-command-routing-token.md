@@ -90,6 +90,17 @@ injection regions can supply, so the work is performed on the server side
 the existing pool→editor upward request channel. The pool decides *when*; the
 server side decides *what*.
 
+That split makes the repair **asynchronous**, where the inline version was
+awaited — and being awaited was load-bearing, not incidental. The outbound
+queue to a downstream is FIFO, so a request enqueued before the re-open's
+`didOpen` reaches the server first and asks about a document that server has
+not opened. A request that depends on the repair must therefore synchronize on
+it explicitly: the connection's pending re-open is claimed *before* the
+connection is published as `Ready` (so a request unblocked by that transition
+can see it), and requests wait on it under the same bound the inline heal used.
+Dropping the completion signal releases the waiters, so a lost or failed
+re-open degrades to the old lazy behaviour instead of stalling.
+
 This is sound across intervening edits because region ids are position-keyed
 and shifted by edits rather than re-minted
 (lazy-node-identity-tracking), so a virtual URI captured at purge
@@ -159,6 +170,10 @@ set. Rejected in favour of the captured set.
 - Two mechanisms change at once for a single user-visible behaviour, so a
   regression in repair now surfaces as a stale-virtual-document error on
   whichever path happens to run first, rather than on `executeCommand` alone.
+- Repair is asynchronous, so ordering that the inline `await` gave for free is
+  now an explicit barrier. A future request path that depends on repaired
+  document state must remember to wait on it; forgetting is silent, and shows
+  up only as a downstream error about an unopened document.
 - A respawn re-opens the dead connection's whole document set at once, where
   the previous design re-opened one document lazily. Large workspaces on a
   shared instance pay this as a burst.

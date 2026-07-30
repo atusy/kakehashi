@@ -503,10 +503,11 @@ impl Kakehashi {
                         t.upstream_id,
                     )
                     .await?;
-                let Some(value) = raw else {
+                let Some(raw) = raw else {
                     return Ok(None);
                 };
-                let Some(actions) = parse_code_actions_leniently(value) else {
+                let connection_key = raw.connection_key;
+                let Some(actions) = parse_code_actions_leniently(raw.value) else {
                     return Ok(None);
                 };
                 // Whether this host server advertises `codeAction/resolve`, so a
@@ -545,7 +546,7 @@ impl Kakehashi {
                         .await;
                 Ok(Some(bridge_code_actions(
                     actions,
-                    &t.server_name,
+                    &connection_key,
                     t.uri.as_str(),
                     upstream_caps,
                     server_resolves,

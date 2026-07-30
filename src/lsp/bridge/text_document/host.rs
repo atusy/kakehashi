@@ -50,6 +50,16 @@ pub(crate) struct HostDocument<'a> {
     pub(crate) text: &'a str,
 }
 
+/// A raw host-server response plus the connection it came from.
+///
+/// The key rides along because resolving it separately means repeating the
+/// marker filesystem walk that the request already performed — measurable on
+/// `textDocument/codeAction`, which some editors fire on cursor hold.
+pub(crate) struct HostRawResponse {
+    pub(crate) value: serde_json::Value,
+    pub(crate) connection_key: ConnectionKey,
+}
+
 fn fingerprint(text: &str) -> u64 {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     text.hash(&mut hasher);
@@ -283,7 +293,7 @@ impl LanguageServerPool {
         method: &'static str,
         mut params: serde_json::Value,
         upstream_request_id: Option<UpstreamId>,
-    ) -> io::Result<Option<serde_json::Value>> {
+    ) -> io::Result<Option<HostRawResponse>> {
         strip_progress_tokens(&mut params);
         let handle = self
             .get_or_create_connection(server_name, server_config, Some(doc.uri))
@@ -291,17 +301,27 @@ impl LanguageServerPool {
         if !handle.has_capability(method) {
             return Ok(None);
         }
-        self.execute_host_request(
-            handle,
-            doc,
-            upstream_request_id,
-            |request_id| JsonRpcRequest::new(request_id.as_i64(), method, params),
-            move |response| parse_host_raw_response(response, method),
-        )
-        // Outer `?`: transport/protocol failure from `execute_host_request`.
-        // Inner `Result` from the parser: a downstream JSON-RPC error response.
-        // Both are request failures, so flatten them into one `Err`.
-        .await?
+        // Carried out with the response so a caller that must name this exact
+        // connection (the `workspace/executeCommand` routing token) does not
+        // re-resolve it — that would repeat the marker filesystem walk on a
+        // request-frequency path (execute-command-routing-token).
+        let connection_key = handle.key().clone();
+        let value = self
+            .execute_host_request(
+                handle,
+                doc,
+                upstream_request_id,
+                |request_id| JsonRpcRequest::new(request_id.as_i64(), method, params),
+                move |response| parse_host_raw_response(response, method),
+            )
+            // Outer `?`: transport/protocol failure from `execute_host_request`.
+            // Inner `Result` from the parser: a downstream JSON-RPC error
+            // response. Both are request failures, so flatten them into one `Err`.
+            .await??;
+        Ok(value.map(|value| HostRawResponse {
+            value,
+            connection_key,
+        }))
     }
 
     /// Whether the host server for `(server_name, uri)` advertises `method`

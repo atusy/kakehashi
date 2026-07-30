@@ -1168,9 +1168,84 @@ impl LanguageServerPool {
         }
     }
 
+    /// Wait for an in-flight virtual-document re-open on `key` before sending
+    /// on that connection (execute-command-routing-token). Bounded; a no-op
+    /// when none is in flight.
+    pub(super) async fn wait_for_pending_reopen(&self, key: &ConnectionKey) {
+        self.pending_reopen.wait_for_reopen(key).await;
+    }
+
+    /// Reconnect to the exact `(server, root)` a routing token names, with no
+    /// document to re-resolve the root from (execute-command-routing-token).
+    ///
+    /// Acquiring with `document_uri: None` would NOT do: `resolve_acquire`
+    /// answers a marker-less acquisition with the client-root fallback key, so a
+    /// marker-rooted or shared connection would be replaced by a client-rooted
+    /// process and the command would run in the wrong workspace. Passing the
+    /// decoded key straight to the resolved acquisition avoids that re-resolution
+    /// entirely.
+    ///
+    /// Returns `None` (fail soft, warn-logged) for a SHARED key: it is keyed
+    /// without a root, and announcing its workspace folders needs a marker that
+    /// only a document can produce. Routing to a *live* shared connection works;
+    /// only reviving a dead one does not.
+    pub(super) async fn reconnect_by_key(
+        &self,
+        key: &ConnectionKey,
+        config: &crate::config::settings::BridgeServerConfig,
+    ) -> Option<Arc<ConnectionHandle>> {
+        let server = key.server();
+        if key.is_shared() {
+            log::warn!(
+                target: "kakehashi::bridge",
+                "executeCommand: shared-instance connection for {server:?} is gone and \
+                 cannot be re-rooted without a document; ignoring"
+            );
+            return None;
+        }
+        let marker = match key.marker_root() {
+            Some(root) => {
+                let Some(marker) = Url::parse(root)
+                    .ok()
+                    .and_then(super::root_markers::workspace_at_root)
+                else {
+                    log::warn!(
+                        target: "kakehashi::bridge",
+                        "executeCommand: routed root {root:?} for {server:?} is not a \
+                         usable workspace URI; ignoring"
+                    );
+                    return None;
+                };
+                Some(marker)
+            }
+            // Client-root fallback: no marker to restore, which is exactly the
+            // rooting this key means.
+            None => None,
+        };
+        match self
+            .acquire_resolved_wait_ready(
+                server,
+                config,
+                key.clone(),
+                marker,
+                Duration::from_secs(INIT_TIMEOUT_SECS),
+            )
+            .await
+        {
+            Ok(handle) => Some(handle),
+            Err(e) => {
+                log::warn!(
+                    target: "kakehashi::bridge",
+                    "executeCommand: failed to reconnect to {key}: {e}"
+                );
+                None
+            }
+        }
+    }
+
     /// Resolve the exact `(server, root)` connection a document currently
     /// routes to, including shared-instance capability fallback.
-    pub(super) async fn resolved_connection_key(
+    pub(crate) async fn resolved_connection_key(
         &self,
         server_name: &str,
         server_config: &crate::config::settings::BridgeServerConfig,
@@ -2395,6 +2470,14 @@ impl LanguageServerPool {
                             build_did_change_configuration_notification(payload),
                         );
                     }
+                    // Claim the previous connection's document set BEFORE
+                    // publishing Ready (execute-command-routing-token). The
+                    // re-open itself is serviced asynchronously upstream, so a
+                    // request unblocked by the Ready transition must be able to
+                    // SEE that one is in flight and wait for it — registering
+                    // after Ready would leave exactly the window in which a
+                    // command overtakes its own didOpen.
+                    let pending_reopen_handoff = pending_reopen.take(&command_registration_key);
                     if !handle_for_handshake.transition_initializing_to_ready() {
                         return Err(io::Error::new(
                             io::ErrorKind::Interrupted,
@@ -2423,17 +2506,16 @@ impl LanguageServerPool {
                             );
                         }
                     }
-                    // Re-open the virtual documents the PREVIOUS connection under
-                    // this key held (execute-command-routing-token). Also after
-                    // Ready, so the didOpen queues behind the settings push and
-                    // ahead of any request a waiter unblocked by the Ready
-                    // transition enqueues. Drained, so a respawn that never gets
-                    // here leaves the set for the next purge to re-record.
-                    let reopen_hosts = pending_reopen.take(&command_registration_key);
-                    if !reopen_hosts.is_empty()
+                    // Hand the claimed set upstream to be re-opened. Sent after
+                    // Ready so the didOpen queues behind the settings push.
+                    // `done` travels with it and releases waiters when the
+                    // re-open finishes — or when it is dropped, so a lost
+                    // message cannot strand a request for the full bound.
+                    if let Some((hosts, done)) = pending_reopen_handoff
                         && let Err(e) = upstream_request_tx.send(UpstreamRequest::ReopenDocuments {
                             server: reopen_server_name,
-                            hosts: reopen_hosts,
+                            hosts,
+                            done,
                         })
                     {
                         log::warn!(
@@ -4376,6 +4458,68 @@ mod tests {
                 .any(|entry| entry.key().0 == connection_key),
             "respawn cleanup must reclaim document transition locks"
         );
+    }
+
+    /// The purge→re-open→request seam: a purge must leave the pool able to tell
+    /// a request that a re-open is outstanding, and `wait_for_pending_reopen`
+    /// must actually block on it. Without this the ordering the routing token
+    /// depends on is only asserted inside `PendingReopenRegistry`, and the pool
+    /// wiring (which got the `take`-vs-Ready order wrong once) is untested.
+    #[tokio::test]
+    async fn a_request_waits_for_the_reopen_a_purge_scheduled() {
+        let pool = Arc::new(LanguageServerPool::new());
+        let host_uri = Url::parse("file:///test/respawned.md").unwrap();
+        let virtual_uri = VirtualDocumentUri::new(&url_to_uri(&host_uri), "lua", TEST_ULID_LUA_0);
+        let connection_key = ConnectionKey::for_server("lua");
+        let (mut sender, _rx) = tokio::sync::mpsc::channel::<OutboundMessage>(1);
+        pool.ensure_document_opened(
+            &mut sender,
+            &host_uri,
+            &virtual_uri,
+            "print('opened')",
+            &connection_key,
+        )
+        .await
+        .unwrap();
+
+        // Purge records the host; the handshake claims it before going Ready.
+        let hosts = pool
+            .document_tracker
+            .purge_connection(&connection_key)
+            .await;
+        assert_eq!(hosts, vec![host_uri.clone()], "purge reports the host");
+        pool.pending_reopen.record(&connection_key, hosts);
+        let (claimed, done) = pool
+            .pending_reopen
+            .take(&connection_key)
+            .expect("the handshake claims the pending re-open");
+        assert_eq!(claimed, vec![host_uri]);
+
+        let waiter = {
+            let pool = Arc::clone(&pool);
+            let key = connection_key.clone();
+            tokio::spawn(async move { pool.wait_for_pending_reopen(&key).await })
+        };
+        tokio::task::yield_now().await;
+        assert!(
+            !waiter.is_finished(),
+            "a request must not send while the re-open is outstanding"
+        );
+
+        done.send(true).expect("the waiter holds the receiver");
+        waiter.await.expect("the request proceeds once re-opened");
+    }
+
+    /// The overwhelmingly common case — no respawn — must not pay a wait.
+    #[tokio::test]
+    async fn a_request_on_a_connection_with_no_pending_reopen_does_not_wait() {
+        let pool = LanguageServerPool::new();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            pool.wait_for_pending_reopen(&ConnectionKey::for_server("lua")),
+        )
+        .await
+        .expect("no re-open outstanding, so no wait");
     }
 
     #[tokio::test]

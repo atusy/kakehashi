@@ -29,12 +29,30 @@ fn mock_formatter_bin() -> &'static str {
     env!("CARGO_BIN_EXE_mock-lsp-formatter")
 }
 
-/// A bridged command name encodes `kakehashi\u{1f}{origin}\u{1f}{host_uri}\u{1f}{command}`
-/// (see `bridge::protocol::command_routing`). Assert the routing key without
-/// depending on the exact host-URI field.
+/// A bridged command name encodes the CONNECTION to run on as
+/// `kakehashi|{root_tag}|{server}|{root}|{command}` (see
+/// `bridge::protocol::command_routing`, execute-command-routing-token).
+/// Assert the origin and command without depending on which rooting mode the
+/// test's workspace happens to resolve to.
 fn is_routed_command(name: &str, origin: &str, command: &str) -> bool {
-    name.starts_with(&format!("kakehashi\u{1f}{origin}\u{1f}"))
-        && name.ends_with(&format!("\u{1f}{command}"))
+    let Some(rest) = name.strip_prefix("kakehashi|") else {
+        return false;
+    };
+    let mut parts = rest.splitn(4, '|');
+    let tag = parts.next();
+    let server = parts.next();
+    let _root = parts.next();
+    let routed_command = parts.next();
+    matches!(tag, Some("m" | "c" | "s"))
+        && server == Some(origin)
+        && routed_command == Some(command)
+}
+
+/// The routed name must NOT carry a host document any more: a per-document name
+/// is what kept the command set unbounded and unadvertisable
+/// (execute-command-routing-token).
+fn routed_command_is_document_free(name: &str, host_uri: &str) -> bool {
+    !name.contains(host_uri)
 }
 
 fn init_client(client_capabilities: Value) -> (LspClient, Value, tempfile::TempDir) {
@@ -260,6 +278,12 @@ fn code_action_edit_is_host_translated_and_suffixed() {
             "mock.run"
         ),
         "command name must encode the origin server, got: {command:?}"
+    );
+    // The routing token names a connection, not a document — a per-document
+    // name is what kept the command set unbounded.
+    assert!(
+        routed_command_is_document_free(command["command"].as_str().unwrap(), "test.md"),
+        "routed name must not embed the host document, got: {command:?}"
     );
 
     shutdown(&mut client);

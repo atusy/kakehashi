@@ -440,15 +440,22 @@ impl InjectionCoordinator {
     fn get_language_for_document(&self, uri: &Url) -> Option<String> {
         detect_document_language(&self.language, &self.documents, uri)
     }
-
-    /// The host language and resolved bridge injections for `uri`, or `None`
-    /// when the document has no detectable language. Lets a caller re-derive the
-    /// injected regions on demand (executeCommand doc-sync), mirroring the
-    /// didOpen/didChange discovery.
-    pub(crate) fn bridge_injections(&self, uri: &Url) -> Option<(String, Vec<BridgeInjection>)> {
-        let host_language = self.get_language_for_document(uri)?;
-        let injections = self.resolve_injection_data(uri, &host_language);
-        Some((host_language, injections))
+    /// Wait (bounded) for `uri`'s tree to be current before its injections are
+    /// resolved.
+    ///
+    /// `didChange` clears the tree and reparses off-ingress, so a re-open
+    /// landing right after an edit would resolve ZERO injections and silently
+    /// open nothing — the same reason every request path waits for a fresh tree
+    /// (execute-command-routing-token). Without this the respawn re-open
+    /// reports success having done nothing, which is worse than not waiting at
+    /// all: a request synchronizing on it would be released early.
+    pub(crate) async fn ensure_document_parsed(&self, uri: &Url) {
+        let _ = crate::lsp::lsp_impl::snapshot_read::wait_for_current_snapshot_in(
+            &self.documents,
+            uri,
+            std::time::Duration::from_millis(200),
+        )
+        .await;
     }
 
     fn install_coordinator(&self) -> InstallCoordinator {

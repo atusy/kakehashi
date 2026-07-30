@@ -212,12 +212,17 @@ pub(crate) enum UpstreamRequest {
     /// pool cannot resolve injections itself — which is also why
     /// `ensure_server_documents_open` takes them from its caller.
     ///
-    /// Fire-and-forget: a lost re-open degrades to the pre-existing lazy
-    /// behaviour (the next parse's `process_injections` opens the documents
-    /// again), so there is nothing to report back.
+    /// No reply channel, but NOT unsynchronized: `done` is signalled once the
+    /// documents are open, so a request that must not overtake its own
+    /// `didOpen` can wait for it (`PendingReopenRegistry::wait_for_reopen`).
+    /// Dropping `done` — a handler that dies, or a message never serviced —
+    /// releases those waiters rather than stranding them, and the re-open then
+    /// degrades to the pre-existing lazy behaviour (the next parse's
+    /// `process_injections` opens the documents again).
     ReopenDocuments {
         server: String,
         hosts: Vec<url::Url>,
+        done: tokio::sync::watch::Sender<bool>,
     },
 }
 
