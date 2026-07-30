@@ -174,7 +174,7 @@ fn test_config_file_nonexistent_is_optional() {
         .env_remove("KAKEHASHI_DATA_DIR")
         .build();
 
-    let response = client.send_request(
+    let id = client.send_request_async(
         "initialize",
         json!({
             "processId": std::process::id(),
@@ -182,10 +182,35 @@ fn test_config_file_nonexistent_is_optional() {
             "capabilities": {}
         }),
     );
+    let (response, watched) = client.receive_response_for_id_watching_notifications(
+        id,
+        &["window/showMessage", "window/logMessage"],
+    );
 
     assert!(
         response.get("result").is_some(),
         "a missing explicit layer must be skipped, not fatal: {response}"
+    );
+    // The skip has to be visible, and visible as a warning rather than the
+    // error popup a genuinely unusable file gets. MessageType: 1 = Error,
+    // 2 = Warning.
+    let reports: Vec<_> = watched
+        .iter()
+        .filter(|(_, params)| {
+            params["message"]
+                .as_str()
+                .is_some_and(|message| message.contains(missing.to_str().unwrap()))
+        })
+        .collect();
+    assert!(
+        !reports.is_empty(),
+        "the skipped layer must be reported: {watched:?}"
+    );
+    assert!(
+        reports
+            .iter()
+            .all(|(method, params)| method == "window/logMessage" && params["type"] == json!(2)),
+        "a skipped optional layer is a warning, not an error popup: {reports:?}"
     );
     // The surviving layer must still apply, so the skip is a skip and not a
     // wholesale fallback to programmed defaults.

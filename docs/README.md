@@ -707,11 +707,15 @@ When `--config-file` is specified:
 - A path that expands badly is judged **per file**, so a later layer cannot mask
   an earlier layer's undefined variable — the merged result would never mention
   the mistake, because a later layer replaces path fields wholesale.
-- A file that is **absent** is skipped with a warning, not an error, so
+- A file that is **absent** is skipped rather than treated as an error, so
   `--config-file base.toml --config-file overrides.toml` works in a repository
   that has no overlay. Note that a relative path resolves against the process
   working directory, which for an editor-spawned server is the editor's rather
-  than the workspace root.
+  than the workspace root. The skip is reported to the LSP client as a warning;
+  `format` and `diagnose` report only the hard errors above, so a mistyped path
+  is silent there.
+- A path whose metadata cannot be read at all — an ancestor directory denying
+  traversal, say — counts as unusable, not absent.
 - Cross-field invariants (e.g. `debounceMs` ≤ `maxWaitMs`) are judged on the
   merged explicit configuration, so splitting the two halves across two files is
   fine — but a combination that is invalid only once merged still aborts.

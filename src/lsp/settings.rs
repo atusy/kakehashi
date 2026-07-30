@@ -158,13 +158,17 @@ pub fn load_settings(
         .flatten();
 
     // An explicit configuration has to be valid on its own terms, or startup
-    // would silently continue on programmed defaults. This is judged before
+    // would silently continue on programmed defaults. Skipped once a layer has
+    // already failed: the verdict cannot change, and every `try_from_settings`
+    // re-resolves language `base` chains, whose cycle detector logs as it goes.
+    // This is judged before
     // `initializationOptions` join the merge, because those keep a non-fatal
     // policy of their own — a client sending a bad override must not be
     // reported as a mistake in the user's file. It is also the only place a
     // cross-layer invariant can be judged: one file supplying `debounceMs` and
     // another `maxWaitMs` is valid in neither file alone.
     if explicit_files.is_some()
+        && fatal_error.is_none()
         && let Some(raw_settings) = merged_files.as_ref()
         && let Err(errs) = WorkspaceSettings::try_from_settings(raw_settings, home, &env_fn)
     {
@@ -260,12 +264,24 @@ fn load_toml_file(
     events: &mut Vec<SettingsEvent>,
     deprecated_keys: &mut DeprecatedKeysSeen,
 ) -> Result<Option<RawWorkspaceSettings>, String> {
-    if !path.exists() {
-        events.push(SettingsEvent::warning(format!(
-            "Config file not found, skipping: {}",
-            path.display()
-        )));
-        return Ok(None);
+    // `try_exists`, not `exists`: the latter answers "no" both for a path that
+    // is genuinely absent and for one whose metadata cannot be read at all
+    // (an ancestor directory denying traversal, say). Only the first is the
+    // optional-overlay case; collapsing them would let a file the user cannot
+    // reach be silently skipped, which is exactly the class this is strict
+    // about.
+    match path.try_exists() {
+        Ok(true) => {}
+        Ok(false) => {
+            events.push(SettingsEvent::warning(format!(
+                "Config file not found, skipping: {}",
+                path.display()
+            )));
+            return Ok(None);
+        }
+        Err(err) => {
+            return Err(format!("Failed to access {}: {}", path.display(), err));
+        }
     }
 
     events.push(SettingsEvent::info(format!(
@@ -785,6 +801,40 @@ mod tests {
         assert!(
             message.contains("Failed to parse") && message.contains(&path.display().to_string()),
             "the fatal message must name the offending file: {message}"
+        );
+    }
+
+    /// load_toml_file: a path whose metadata cannot even be reached is fatal,
+    /// not "absent". `Path::exists()` answers `false` for both, which would
+    /// silently skip a file the user cannot traverse to.
+    #[cfg(unix)]
+    #[test]
+    fn test_load_toml_file_unreachable_parent() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = TempDir::new().unwrap();
+        let locked_parent = dir.path().join("locked");
+        std::fs::create_dir(&locked_parent).unwrap();
+        let path = locked_parent.join("config.toml");
+        std::fs::write(&path, "autoInstall = false\n").unwrap();
+        std::fs::set_permissions(&locked_parent, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        let mut events = Vec::new();
+        let mut ignored_deprecation = false;
+        // root ignores the permission bits, so probe before deciding to assert.
+        let permissions_enforced = std::fs::read_to_string(&path).is_err();
+        let result = load_toml_file(&path, &mut events, &mut ignored_deprecation);
+
+        // Restore before asserting so a failure cannot leave an unremovable dir.
+        std::fs::set_permissions(&locked_parent, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        if !permissions_enforced {
+            return;
+        }
+        let message = result.expect_err("an unreachable explicit file must be fatal");
+        assert!(
+            message.contains(&path.display().to_string()) && !message.contains("not found"),
+            "an unreachable path must not be reported as merely absent: {message}"
         );
     }
 
