@@ -51,9 +51,13 @@ pub(crate) const UNWRAPPED_DIDCHANGE_CONFIGURATION_NOTICE: &str = "kakehashi: un
      Flat didChange settings still work for now but may be removed in a future release.";
 
 /// User-facing text for the one-per-session top-level `autoInstall` notice.
+///
+/// Dotted key paths, not TOML table syntax: this notice also fires for JSON
+/// runtime settings (`initializationOptions`, `didChangeConfiguration`), where
+/// `[languages._]` would name a shape the user cannot write.
 pub(crate) const AUTO_INSTALL_DEPRECATION_NOTICE: &str = "kakehashi: the top-level `autoInstall` config key is deprecated; move it to \
-     `[languages._] autoInstall` (and override per language with \
-     `[languages.<lang>] autoInstall`). A language with a self-referential \
+     `languages._.autoInstall` (and override per language with \
+     `languages.<lang>.autoInstall`). A language with a self-referential \
      `base` inherits nothing from `_`, so give those an explicit value. The \
      top-level key still works for now but may be removed in a future release.";
 
