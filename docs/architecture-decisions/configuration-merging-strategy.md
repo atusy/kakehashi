@@ -203,7 +203,8 @@ path the user typed carries intent; a path kakehashi went looking for does not.
      `kakehashi.toml` must never leave the user without a server
 
 2. **An explicit `--config-file` that is present but unusable fails startup**
-   - Unreadable, malformed TOML, or carrying a path that cannot be expanded
+   - Unreadable, malformed TOML, larger than the 8 MiB read ceiling, or
+     carrying a path that cannot be expanded
    - LSP `initialize` returns `RequestFailed` (-32803) naming the first such
      file; `format` and `diagnose` print it and exit 2
    - Silently dropping the layer and continuing on defaults is what hides

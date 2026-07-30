@@ -352,7 +352,10 @@ fn load_toml_file(
             // path the user named does exist, it just does not lead to a
             // config. `symlink_metadata` does not follow, so it still sees the
             // link itself.
-            if path.symlink_metadata().is_ok() {
+            if path
+                .symlink_metadata()
+                .is_ok_and(|metadata| metadata.file_type().is_symlink())
+            {
                 return Err(format!(
                     "Failed to read {}: broken symbolic link",
                     path.display()
@@ -375,19 +378,23 @@ fn load_toml_file(
     )));
 
     // Read one byte past the ceiling so hitting it is distinguishable from a
-    // file that merely ends there.
-    let mut contents = String::new();
+    // file that merely ends there. Bytes, then length, then decoding: the
+    // cutoff can land mid-character, and an oversized file should be reported
+    // as oversized rather than as invalid UTF-8 the truncation invented.
+    let mut bytes = Vec::new();
     use std::io::Read as _;
     file.take(MAX_CONFIG_FILE_BYTES + 1)
-        .read_to_string(&mut contents)
+        .read_to_end(&mut bytes)
         .map_err(|err| format!("Failed to read {}: {}", path.display(), err))?;
-    if contents.len() as u64 > MAX_CONFIG_FILE_BYTES {
+    if bytes.len() as u64 > MAX_CONFIG_FILE_BYTES {
         return Err(format!(
             "Failed to read {}: larger than the {} MiB configuration limit",
             path.display(),
             MAX_CONFIG_FILE_BYTES / (1024 * 1024)
         ));
     }
+    let contents = String::from_utf8(bytes)
+        .map_err(|err| format!("Failed to read {}: {}", path.display(), err))?;
     deprecated_keys.merge(crate::config::deprecation::toml_deprecated_keys(&contents));
     let settings = toml::from_str::<RawWorkspaceSettings>(&contents)
         .map_err(|err| format!("Failed to parse {}: {}", path.display(), err))?;
@@ -877,13 +884,13 @@ mod tests {
     /// error, so a layered invocation whose overlay does not exist still starts.
     #[test]
     fn test_load_toml_file_missing() {
+        // A child of a fresh temp dir, so "absent" cannot depend on what the
+        // host happens to have at a fixed absolute path.
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("config.toml");
         let mut events = Vec::new();
         let mut ignored_deprecation = DeprecatedKeysSeen::default();
-        let result = load_toml_file(
-            Path::new("/nonexistent/config.toml"),
-            &mut events,
-            &mut ignored_deprecation,
-        );
+        let result = load_toml_file(&path, &mut events, &mut ignored_deprecation);
 
         assert!(
             matches!(result, Ok(None)),
@@ -1043,6 +1050,29 @@ mod tests {
             message.contains("configuration limit")
                 && message.contains(&path.display().to_string()),
             "the limit must be named, and so must the file: {message}"
+        );
+    }
+
+    /// The size check runs before decoding, so a file whose oversize happens to
+    /// put a multi-byte character across the cutoff is still reported as
+    /// oversized rather than as invalid UTF-8 the truncation itself created.
+    #[test]
+    fn test_load_toml_file_over_size_limit_reports_size_not_encoding() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("huge-utf8.toml");
+        let mut oversized = String::from("# ");
+        oversized.extend(std::iter::repeat_n('a', MAX_CONFIG_FILE_BYTES as usize - 2));
+        oversized.push('é'); // straddles the ceiling
+        std::fs::write(&path, &oversized).unwrap();
+
+        let mut events = Vec::new();
+        let mut ignored_deprecation = false;
+        let result = load_toml_file(&path, &mut events, &mut ignored_deprecation);
+
+        let message = result.expect_err("an oversized explicit file must be fatal");
+        assert!(
+            message.contains("configuration limit"),
+            "size must outrank the encoding error the cutoff invented: {message}"
         );
     }
 

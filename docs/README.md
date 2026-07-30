@@ -699,7 +699,7 @@ When `--config-file` is specified:
 - Default user config (`~/.config/kakehashi/kakehashi.toml`) is **skipped**
 - Default project config (`./kakehashi.toml`) is **skipped**
 - A file that is **present but unusable** aborts startup: unreadable, malformed
-  TOML, or a path that cannot be expanded. LSP initialization returns a
+  TOML, larger than 8 MiB, or carrying a path that cannot be expanded. LSP initialization returns a
   `RequestFailed` error naming the first such file; `format` and `diagnose`
   print it to stderr and exit with status 2. Nothing is re-read while the
   session runs, so correcting the file means restarting the server
@@ -830,10 +830,12 @@ Exit codes: `0` nothing to change (or changes written without
 `2` usage error, I/O error, a configuration file given with `--config-file`
 that could not be loaded, or downstream formatter failure (a configured
 server failed to start, errored on the request, timed out, or returned a
-protocol-invalid response). Under the default `concatenated` aggregation that
-holds even when another server still produced output; under `preferred` the
-winning formatter is authoritative, so a *non-winning* server's failure does
-not count — mirroring `diagnose` below.
+protocol-invalid response). Which failures count depends on the aggregation
+strategy in force: under `preferred` — the bridge-level default for formatting,
+where several servers of one target produce competing whole-document edits —
+the winner is authoritative, so a *non-winning* server's failure does not
+count; under `concatenated` every server's failure does. Same rule as
+`diagnose` below.
 
 A configuration failure exits `2` before anything is written, so stdout stays
 empty in `--stdin-filename` mode. A *downstream* failure does not: the content
