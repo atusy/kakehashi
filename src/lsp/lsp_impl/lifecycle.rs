@@ -1280,12 +1280,11 @@ fn spawn_upstream_request(
                     ),
                 }
             }
-            UpstreamRequest::ReopenDocuments {
-                key,
-                server,
-                hosts,
-                done,
-            } => {
+            UpstreamRequest::ReopenDocuments { key, hosts, done } => {
+                // One source of truth for the server: carrying it alongside the
+                // key would be an invariant nobody checks, and a divergence
+                // would make the repair a silent no-op.
+                let server = key.server().to_string();
                 // A respawned connection has nothing open; re-open what its dead
                 // predecessor held (execute-command-routing-token).
                 //
@@ -1316,20 +1315,23 @@ fn spawn_upstream_request(
                 );
                 use crate::lsp::bridge::REOPEN_WAIT;
                 let settings = context.settings_manager.load_settings();
-                // The re-open targets the connection the purge CLAIMED. Without
-                // that, it resolves each host from the CURRENT settings, so a
-                // `workspaceMarkers` change between purge and respawn opens a
-                // newly resolved connection while the claimed one — the one
+                // The re-open targets the connection the purge CLAIMED, and the
+                // open is ACQUIRED by that key rather than resolved from the
+                // host. Resolving from the host finds whatever it routes to now,
+                // so a `workspaceMarkers` change between purge and respawn
+                // repairs a different connection while the claimed one — the one
                 // `done` signals for — stays empty.
                 //
-                // No command could reach the claimed connection in that state
-                // anyway (`workspace_markers` is part of `same_launch_config`,
-                // so both by-key routing paths reject it and the command fails
-                // soft). But that made the safety depend on a comparison in a
-                // different module continuing to include markers: drop the
-                // field there and this silently breaks. Pinning the key here
-                // makes the re-open mean what its barrier claims, without the
-                // remote coupling.
+                // A stale-rooted claimed connection IS reachable: a routed
+                // command's token carries the root, and `reconnect_by_key`
+                // rebuilds the workspace from that token rather than from
+                // current markers, spawning a fresh connection that records the
+                // current config and so passes every launch-config check. There
+                // is no guard that rejects it — the root is not a
+                // `BridgeServerConfig` field, so `same_launch_config` cannot see
+                // a stale root at all. Repairing the named connection, and
+                // reporting failure when it is gone, is what makes the barrier
+                // mean what it says.
                 // Bound the WAIT, not the work — the shape the inline heal used.
                 // `ensure_server_documents_open` can block up to the init timeout
                 // on a cold downstream, and `done` gates every command on this
@@ -1347,6 +1349,12 @@ fn spawn_upstream_request(
                 // — the failure this barrier exists to prevent. A panic drops the
                 // sender instead, which waiters read as "can never finish".
                 let mut work = tokio::spawn(async move {
+                    // Whether the CLAIMED connection actually ended up with its
+                    // documents. A skip (the host re-routed) or an unreachable
+                    // connection leaves it empty, and the barrier must say so:
+                    // releasing a command onto an empty connection is the
+                    // failure this whole mechanism exists to prevent.
+                    let mut repaired = true;
                     // e2e-only fault injection: hold the re-open BEFORE any
                     // didOpen goes out, so the ordering e2e can force the window
                     // in which a command could overtake its own didOpen instead
@@ -1379,7 +1387,7 @@ fn spawn_upstream_request(
                         // Sequential: each host's didOpen goes out on the SAME
                         // connection, so fanning out would only contend on the
                         // single-writer outbound queue.
-                        injection
+                        let outcome = injection
                             .bridge()
                             .ensure_server_documents_open(
                                 &settings,
@@ -1395,11 +1403,17 @@ fn spawn_upstream_request(
                                 &reopen_server,
                             )
                             .await;
+                        if outcome != crate::lsp::bridge::OpenOutcome::Opened {
+                            repaired = false;
+                        }
                     }
-                    // Every didOpen is now enqueued; release the waiters. A send
-                    // error means a later respawn's claim superseded this
-                    // barrier, and that respawn owns it now.
-                    let _ = done.send(true);
+                    // Report what actually happened. `true` releases waiters;
+                    // `false` leaves them to time out and fail soft, which is
+                    // correct when the claimed connection is still empty — a
+                    // command sent there would fail downstream anyway, less
+                    // legibly. A send error means a later respawn's claim
+                    // superseded this barrier, and that respawn owns it now.
+                    let _ = done.send(repaired);
                 });
                 // Bound only how long THIS task waits. The work owns the signal,
                 // so exceeding the budget stops us watching without pretending

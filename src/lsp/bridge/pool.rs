@@ -2484,7 +2484,6 @@ impl LanguageServerPool {
         let command_registration_key = connection_key.clone();
         let upstream_request_tx = self.upstream_request_tx.clone();
         let pending_reopen = Arc::clone(&self.pending_reopen);
-        let reopen_server_name = server_name.to_string();
         // The editor accepts a dynamic `workspace/executeCommand` registration
         // only if it advertised `dynamicRegistration` (LSP spec). Compute once.
         let supports_dynamic_command_registration = self
@@ -2603,7 +2602,6 @@ impl LanguageServerPool {
                     if let Some((hosts, done)) = pending_reopen_handoff
                         && let Err(e) = upstream_request_tx.send(UpstreamRequest::ReopenDocuments {
                             key: command_registration_key.clone(),
-                            server: reopen_server_name,
                             hosts,
                             done,
                         })

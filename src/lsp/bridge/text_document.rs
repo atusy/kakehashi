@@ -23,7 +23,7 @@ mod diagnostic;
 mod did_change;
 mod did_close;
 mod did_open;
-pub(crate) use did_open::OpenExpectation;
+pub(crate) use did_open::{OpenExpectation, OpenOutcome};
 mod document_color;
 mod document_highlight;
 mod document_link;

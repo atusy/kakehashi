@@ -79,13 +79,13 @@ pub(crate) use protocol::translate_virtual_range_to_host;
 pub(crate) use protocol::workspace_edit_has_effect;
 pub(crate) use protocol::workspace_edit_preserves_line_prefixes;
 pub(crate) use protocol::workspace_edit_within_region;
-pub(crate) use text_document::OpenExpectation;
 pub(crate) use text_document::host::{HostDocument, HostTextReader, normalize_host_goto_result};
 pub(crate) use text_document::{
     CodeActionEnvelope, CodeLensEnvelope, UpstreamCodeActionCaps, bridge_code_actions,
     extract_code_action_envelope, extract_code_lens_envelope, parse_code_actions_leniently,
 };
 pub(crate) use text_document::{KakehashiEnvelope, extract_envelope};
+pub(crate) use text_document::{OpenExpectation, OpenOutcome};
 pub(crate) use workspace::WorkspaceFolderSet;
 
 /// Integration tests for the bridge module.

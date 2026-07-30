@@ -388,14 +388,17 @@ impl BridgeCoordinator {
         expect: super::text_document::OpenExpectation<'_>,
         injections: Vec<BridgeInjection>,
         server_name: &str,
-    ) {
+    ) -> super::text_document::OpenOutcome {
+        use super::text_document::OpenOutcome;
         let (for_server, config) =
             self.injections_for_server(settings, host_language, injections, server_name);
         let Some(config) = config else {
-            return; // no injected region on this host bridges to `server_name`
+            // No injected region on this host bridges to `server_name`, so there
+            // is nothing for THIS server to open — not a failure to repair it.
+            return OpenOutcome::Opened;
         };
         let Ok(host_uri_lsp) = crate::lsp::lsp_impl::url_to_uri(host_uri) else {
-            return;
+            return OpenOutcome::NotOpened;
         };
         self.pool
             .eager_open_virtual_documents(
@@ -406,7 +409,7 @@ impl BridgeCoordinator {
                 expect,
                 for_server,
             )
-            .await;
+            .await
     }
 
     fn injection_open_on_connection(

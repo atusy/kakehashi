@@ -100,9 +100,17 @@ The pool also states *which connection*. The server side resolves each host
 against current settings, so a config change that re-roots the host between the
 purge and the respawn would otherwise repair a different connection than the one
 the barrier signals for — leaving the claimed one empty while reporting success.
-The claimed key travels with the request and the open is pinned to it; a
-re-routed host is skipped rather than opened elsewhere, since its new connection
-opens it through its own request path.
+The claimed key travels with the request and the open is ACQUIRED by it, not
+merely checked against it — resolving from the host would repair whichever
+connection it routes to now. A claimed connection that has since died is
+reported as unrepaired, and the barrier then withholds the commands waiting on
+it rather than releasing them onto an empty connection.
+
+A stale-rooted claimed connection is reachable rather than hypothetical: a
+routing token carries the root, and reconnection rebuilds the workspace from the
+token rather than from current markers, so it spawns a connection recording the
+current config that no launch-config check can reject. The root is not part of
+the server config, so config comparison cannot detect a stale root at all.
 
 That split makes the repair **asynchronous**, where the inline version was
 awaited — and being awaited was load-bearing, not incidental. The outbound

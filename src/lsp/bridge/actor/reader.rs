@@ -224,7 +224,6 @@ pub(crate) enum UpstreamRequest {
         /// a DIFFERENT connection while this one — the one `done` signals for,
         /// and the one a routed command names — stays empty.
         key: ConnectionKey,
-        server: String,
         hosts: Vec<url::Url>,
         done: tokio::sync::watch::Sender<bool>,
     },
