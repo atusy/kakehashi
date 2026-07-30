@@ -68,6 +68,11 @@ impl std::error::Error for UserConfigError {
 pub(crate) struct UserConfig {
     pub(crate) settings: RawWorkspaceSettings,
     pub(crate) deprecated_keys: crate::config::deprecation::DeprecatedKeysSeen,
+    /// The file these settings were read from. Reported rather than re-derived
+    /// by the caller, so a relative path inside this layer is anchored to the
+    /// directory actually read — not to whatever `user_config_path()` would
+    /// answer later, which depends on environment that can change in between.
+    pub(crate) path: PathBuf,
 }
 
 /// Loads user configuration from the XDG config directory.
@@ -94,12 +99,17 @@ pub fn load_user_config() -> UserConfigResult<Option<UserConfig>> {
     })?;
 
     let deprecated_keys = crate::config::deprecation::toml_deprecated_keys(&contents);
-    let settings = toml::from_str::<RawWorkspaceSettings>(&contents)
-        .map_err(|e| UserConfigError::ParseError { path, source: e })?;
+    let settings = toml::from_str::<RawWorkspaceSettings>(&contents).map_err(|e| {
+        UserConfigError::ParseError {
+            path: path.clone(),
+            source: e,
+        }
+    })?;
 
     Ok(Some(UserConfig {
         settings,
         deprecated_keys,
+        path,
     }))
 }
 

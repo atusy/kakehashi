@@ -1,11 +1,12 @@
 use crate::config::deprecation::DeprecatedKeysSeen;
+use crate::config::expand::anchor_settings_paths;
 use crate::config::{
     RawWorkspaceSettings, WorkspaceSettings, defaults::default_settings, load_user_config,
     merge_workspace_settings,
 };
 use serde_json::Value;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SettingsEventKind {
@@ -146,6 +147,21 @@ fn merge_explicit_layers(layers: &[Option<RawWorkspaceSettings>]) -> Option<RawW
         .flatten()
 }
 
+/// The directory a config file lives in, as an absolute path.
+///
+/// A relative `--config-file` argument is resolved against the working
+/// directory first: its *parent* would otherwise be relative too, and anchoring
+/// a layer to a relative base leaves the layer relative to the working
+/// directory — the dependence anchoring is meant to remove.
+fn absolute_parent(path: &Path) -> std::io::Result<Option<PathBuf>> {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(path)
+    };
+    Ok(absolute.parent().map(Path::to_path_buf))
+}
+
 /// The body of [`load_explicit_config`], taking the paths directly so it can be
 /// exercised without the process-global `--config-file` override.
 fn read_explicit_layers(
@@ -170,7 +186,7 @@ fn read_explicit_layers(
         if fatal_error.is_some() {
             break;
         }
-        let layer = match load_toml_file(path, &mut events, &mut deprecated_keys) {
+        let mut layer = match load_toml_file(path, &mut events, &mut deprecated_keys) {
             Ok(layer) => layer,
             Err(message) => {
                 events.push(SettingsEvent::error(message.clone()));
@@ -178,6 +194,27 @@ fn read_explicit_layers(
                 None
             }
         };
+        // Anchor each file's relative paths to that file's own directory, so
+        // `--config-file base.toml --config-file team/overrides.toml` reads
+        // `./queries` as relative to whichever file wrote it.
+        //
+        // Failing to resolve the base is fatal rather than skipped: falling
+        // through would silently resolve the layer's paths against the working
+        // directory, which is the launch-directory dependence this anchoring
+        // exists to remove.
+        if let Some(raw_settings) = layer.as_mut() {
+            match absolute_parent(path) {
+                Ok(base) => anchor_settings_paths(raw_settings, base.as_deref()),
+                Err(error) => {
+                    let message = format!(
+                        "Failed to resolve the directory of {}: {error}",
+                        path.display()
+                    );
+                    events.push(SettingsEvent::error(message.clone()));
+                    fatal_error.get_or_insert(message);
+                }
+            }
+        }
         // Judging a layer in isolation also resolves its language `base`
         // chains, so a cycle an overlay later removes is still warned about
         // once here. Accepted: the alternative is threading a "stay quiet"
@@ -252,9 +289,17 @@ pub fn load_settings(
     let mut deprecated_keys = DeprecatedKeysSeen::default();
 
     // Layer 1: Programmed defaults (configuration-merging-strategy: lowest precedence)
+    //
+    // No source directory, so nothing to anchor against: the defaults carry
+    // `${KAKEHASHI_DATA_DIR}`, which is meant to reach expansion as written.
     let defaults = Some(default_settings());
 
     // Layers 2+3: config files (either explicit --config-file or default locations)
+    //
+    // Each layer's relative paths are anchored to the directory that layer came
+    // from, while that is still known. Explicit layers were already anchored by
+    // `read_explicit_layers`, which is the only place their per-file parents are
+    // in scope.
     let config_layers: Vec<Option<RawWorkspaceSettings>> = if let Some(explicit) = explicit {
         events.extend(explicit.events);
         deprecated_keys.merge(explicit.deprecated_keys);
@@ -262,16 +307,34 @@ pub fn load_settings(
     } else {
         vec![
             // Layer 2: User config from XDG_CONFIG_HOME (~/.config/kakehashi/kakehashi.toml)
-            load_user_config_with_events(&mut events, &mut deprecated_keys),
+            load_user_config_with_events(&mut events, &mut deprecated_keys).map(
+                |(mut settings, path)| {
+                    anchor_settings_paths(&mut settings, path.parent());
+                    settings
+                },
+            ),
             // Layer 3: Project config from root_path/kakehashi.toml
-            load_toml_settings(root_path, &mut events, &mut deprecated_keys),
+            load_toml_settings(root_path, &mut events, &mut deprecated_keys).map(|mut settings| {
+                // `load_toml_settings` reads `root_path/kakehashi.toml`, so the
+                // file's directory is `root_path` itself.
+                anchor_settings_paths(&mut settings, root_path);
+                settings
+            }),
         ]
     };
 
-    // Layer 4: Override settings from initialization options or client configuration
-    let override_settings = override_settings.and_then(|(source, value)| {
-        parse_override_settings(source, value, &mut events, &mut deprecated_keys)
-    });
+    // Layer 4: Override settings from initialization options or client configuration.
+    //
+    // Client-supplied paths are workspace-local: the client knows the workspace
+    // it opened, not the directory the server was launched from.
+    let override_settings = override_settings
+        .and_then(|(source, value)| {
+            parse_override_settings(source, value, &mut events, &mut deprecated_keys)
+        })
+        .map(|mut settings| {
+            anchor_settings_paths(&mut settings, root_path);
+            settings
+        });
 
     // Merge all layers: defaults < config_layers < override (later layers override earlier)
     let mut layers = vec![defaults];
@@ -321,17 +384,20 @@ fn expand_merged_settings(
 }
 
 /// Load user config and add appropriate events to the events vector.
+///
+/// Reports the file it was read from alongside the settings, so the caller can
+/// anchor the layer's relative paths to that file's directory.
 fn load_user_config_with_events(
     events: &mut Vec<SettingsEvent>,
     deprecated_keys: &mut DeprecatedKeysSeen,
-) -> Option<RawWorkspaceSettings> {
+) -> Option<(RawWorkspaceSettings, PathBuf)> {
     match load_user_config() {
         Ok(Some(config)) => {
             events.push(SettingsEvent::info(
                 "Loaded user config from XDG_CONFIG_HOME",
             ));
             deprecated_keys.merge(config.deprecated_keys);
-            Some(config.settings)
+            Some((config.settings, config.path))
         }
         Ok(None) => {
             // No user config file exists - this is fine (zero-config experience)
@@ -633,6 +699,229 @@ mod tests {
         assert!(
             settings.auto_install,
             "Project config autoInstall=true should override user config autoInstall=false"
+        );
+    }
+
+    /// Run `f` with `XDG_CONFIG_HOME` pointed at `config_home`, restoring the
+    /// original afterwards. Callers must carry `#[serial(xdg_env)]`.
+    fn with_xdg_config_home<T>(config_home: &Path, f: impl FnOnce() -> T) -> T {
+        let original = std::env::var("XDG_CONFIG_HOME").ok();
+        // SAFETY: #[serial(xdg_env)] prevents concurrent modification.
+        unsafe { std::env::set_var("XDG_CONFIG_HOME", config_home) };
+        let result = f();
+        // SAFETY: #[serial(xdg_env)] prevents concurrent modification.
+        unsafe {
+            match original {
+                Some(value) => std::env::set_var("XDG_CONFIG_HOME", value),
+                None => std::env::remove_var("XDG_CONFIG_HOME"),
+            }
+        }
+        result
+    }
+
+    /// A user config file at `<config_home>/kakehashi/kakehashi.toml`, returning
+    /// the directory it was written to — the base its relative paths anchor to.
+    fn write_user_config(config_home: &Path, contents: &str) -> PathBuf {
+        let dir = config_home.join("kakehashi");
+        std::fs::create_dir_all(&dir).expect("failed to create user config dir");
+        std::fs::write(dir.join("kakehashi.toml"), contents).expect("failed to write user config");
+        dir
+    }
+
+    /// A project-local path resolves against the project config's directory, not
+    /// the directory the server process happens to be running in (issue #732).
+    #[test]
+    #[serial(xdg_env)]
+    fn project_relative_path_anchors_to_the_project_config() {
+        let empty_config_home = TempDir::new().expect("failed to create user config temp dir");
+        let project = TempDir::new().expect("failed to create project temp dir");
+        std::fs::write(
+            project.path().join("kakehashi.toml"),
+            "searchPaths = [\"./runtime\"]\n",
+        )
+        .expect("failed to write project config");
+
+        let outcome = with_xdg_config_home(empty_config_home.path(), || {
+            load_settings(Some(project.path()), None, None, |_| None, None)
+        });
+
+        assert_eq!(
+            outcome.settings.expect("settings should load").search_paths,
+            [project.path().join("runtime").to_string_lossy()],
+            "a project-relative searchPath belongs under the project config"
+        );
+    }
+
+    /// The point of anchoring per layer rather than after the merge: each
+    /// surviving field keeps the base of the file that wrote it, even when three
+    /// layers each contribute one.
+    #[test]
+    #[serial(xdg_env)]
+    fn merged_paths_keep_their_source_layer_base() {
+        let config_home = TempDir::new().expect("failed to create user config temp dir");
+        let user_dir = write_user_config(
+            config_home.path(),
+            "[languages.lua]\nparser = './parser/lua.so'\n",
+        );
+        let project = TempDir::new().expect("failed to create project temp dir");
+        std::fs::write(
+            project.path().join("kakehashi.toml"),
+            "[languages.lua]\nqueries = [{ path = './queries/highlights.scm' }]\n",
+        )
+        .expect("failed to write project config");
+
+        let outcome = with_xdg_config_home(config_home.path(), || {
+            load_settings(
+                Some(project.path()),
+                Some((
+                    SettingsSource::InitializationOptions,
+                    serde_json::json!({ "searchPaths": ["./runtime"] }),
+                )),
+                None,
+                |_| None,
+                None,
+            )
+        });
+
+        let settings = outcome.settings.expect("settings should load");
+        assert_eq!(
+            settings.search_paths,
+            [project.path().join("runtime").to_string_lossy()],
+            "a client-supplied path is workspace-local"
+        );
+        assert_eq!(
+            settings.languages["lua"].parser.as_deref(),
+            Some(user_dir.join("parser/lua.so").to_string_lossy().as_ref()),
+            "the parser came from the user config, so it anchors there"
+        );
+        assert_eq!(
+            settings.languages["lua"].queries.as_ref().unwrap()[0].path,
+            project
+                .path()
+                .join("queries/highlights.scm")
+                .to_string_lossy(),
+            "the query came from the project config, so it anchors there"
+        );
+    }
+
+    /// Anchoring must not consume the expansion syntax it runs ahead of.
+    /// `effectiveConfiguration` reports these raw settings verbatim, and the
+    /// programmed defaults' `${KAKEHASHI_DATA_DIR}` has to reach the expansion
+    /// pass to pick up its platform default at all.
+    #[test]
+    #[serial(xdg_env)]
+    fn expansion_syntax_reaches_expansion_unconsumed() {
+        let config_home = TempDir::new().expect("failed to create user config temp dir");
+        let project = TempDir::new().expect("failed to create project temp dir");
+
+        let outcome = with_xdg_config_home(config_home.path(), || {
+            load_settings(
+                Some(project.path()),
+                Some((
+                    SettingsSource::InitializationOptions,
+                    serde_json::json!({
+                        "languages": { "lua": { "parser": "$LUA_PARSER" } },
+                    }),
+                )),
+                None,
+                |var| (var == "LUA_PARSER").then(|| "/opt/lua.so".to_string()),
+                None,
+            )
+        });
+
+        let raw = outcome.raw_settings.expect("raw settings should load");
+        assert!(
+            raw.search_paths
+                .as_ref()
+                .is_some_and(|paths| paths.iter().any(|path| path == "${KAKEHASHI_DATA_DIR}")),
+            "the defaults' data-dir template must survive into the raw settings: {:?}",
+            raw.search_paths
+        );
+        assert_eq!(
+            raw.languages["lua"].parser.as_deref(),
+            Some("$LUA_PARSER"),
+            "a variable-led value is reported as the client wrote it"
+        );
+        assert_eq!(
+            outcome.settings.expect("settings should load").languages["lua"]
+                .parser
+                .as_deref(),
+            Some("/opt/lua.so"),
+            "and still expands to an absolute path, unanchored"
+        );
+    }
+
+    /// A `base` chain crosses layers: the inherited value is anchored by the
+    /// layer that *wrote* it, not the layer that inherits it. Anchoring runs on
+    /// each raw layer, before `resolve_base_configs` folds the chain, so every
+    /// value is already absolute by the time it is copied.
+    #[test]
+    #[serial(xdg_env)]
+    fn inherited_paths_anchor_to_the_layer_that_wrote_them() {
+        let config_home = TempDir::new().expect("failed to create user config temp dir");
+        let user_dir = write_user_config(
+            config_home.path(),
+            "[languages.shared]\nparser = './parser/shared.so'\n",
+        );
+        let project = TempDir::new().expect("failed to create project temp dir");
+        std::fs::write(
+            project.path().join("kakehashi.toml"),
+            "[languages.derived]\nbase = 'shared'\n",
+        )
+        .expect("failed to write project config");
+
+        let outcome = with_xdg_config_home(config_home.path(), || {
+            load_settings(Some(project.path()), None, None, |_| None, None)
+        });
+
+        assert_eq!(
+            outcome.settings.expect("settings should load").languages["derived"]
+                .parser
+                .as_deref(),
+            Some(user_dir.join("parser/shared.so").to_string_lossy().as_ref()),
+            "inheriting a parser must not re-base it onto the inheriting layer"
+        );
+    }
+
+    /// Each `--config-file` layer anchors to its own parent directory, so two
+    /// files that both say `./queries` mean two different directories.
+    #[test]
+    fn explicit_layers_anchor_to_their_own_directories() {
+        let first_dir = TempDir::new().expect("failed to create first temp dir");
+        let second_dir = TempDir::new().expect("failed to create second temp dir");
+        let first = first_dir.path().join("base.toml");
+        let second = second_dir.path().join("overrides.toml");
+        std::fs::write(&first, "searchPaths = ['./runtime']\n").expect("failed to write first");
+        std::fs::write(&second, "[languages.lua]\nparser = './parser/lua.so'\n")
+            .expect("failed to write second");
+
+        let explicit = read_explicit_layers(&[first, second], None, |_| None);
+        assert!(
+            explicit.fatal_error.is_none(),
+            "both layers are valid: {:?}",
+            explicit.fatal_error
+        );
+
+        let merged = merge_explicit_layers(&explicit.layers).expect("layers should merge");
+        assert_eq!(
+            merged.search_paths,
+            Some(vec![
+                first_dir
+                    .path()
+                    .join("runtime")
+                    .to_string_lossy()
+                    .into_owned()
+            ])
+        );
+        assert_eq!(
+            merged.languages["lua"].parser.as_deref(),
+            Some(
+                second_dir
+                    .path()
+                    .join("parser/lua.so")
+                    .to_string_lossy()
+                    .as_ref()
+            )
         );
     }
 

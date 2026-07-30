@@ -1,3 +1,4 @@
+use path_clean::PathClean;
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
@@ -152,6 +153,60 @@ pub(super) fn expand_path(
     match result {
         Ok(expanded) => Ok(expanded.into_owned()),
         Err(e) => Err(e.cause),
+    }
+}
+
+/// Rewrite every relative path field in `settings` to sit under `base`.
+///
+/// Called once per configuration layer, while the directory that layer came
+/// from is still known — after the layers merge, a surviving `./queries` no
+/// longer says which file asked for it, and the only base left is the server's
+/// working directory, which belongs to whoever launched the editor.
+///
+/// This runs *before* expansion and deliberately stays syntactic. A value
+/// beginning with `/`, `~`, or `$` is left exactly as written: its author has
+/// already said where it lives, and joining a base onto that syntax would
+/// corrupt it before the expansion pass ever reads it. Anchoring a
+/// variable-led value would also mean expanding here, which would consume the
+/// `${KAKEHASHI_DATA_DIR}` template that `effectiveConfiguration` reports and
+/// that the defaults layer relies on reaching expansion intact. To place a
+/// variable *under* the source directory, lead with `./` — `./$LANG/parser.so`
+/// anchors, then expands.
+///
+/// `base` is `None` for layers with no source directory (the programmed
+/// defaults), where every value is left untouched.
+pub(crate) fn anchor_settings_paths(
+    settings: &mut crate::config::RawWorkspaceSettings,
+    base: Option<&Path>,
+) {
+    let Some(base) = base else {
+        return;
+    };
+
+    let anchor = |path: &mut String| {
+        if path.starts_with('/') || path.starts_with('~') || path.starts_with('$') {
+            return;
+        }
+        // `clean` folds away the `./` and `../` segments that joining
+        // introduces. It is purely lexical, so it neither touches the
+        // filesystem nor rewrites the `$` syntax expansion still has to read.
+        *path = base.join(&*path).clean().to_string_lossy().into_owned();
+    };
+
+    if let Some(search_paths) = settings.search_paths.as_mut() {
+        for path in search_paths {
+            anchor(path);
+        }
+    }
+    for language in settings.languages.values_mut() {
+        if let Some(parser) = language.parser.as_mut() {
+            anchor(parser);
+        }
+        if let Some(queries) = language.queries.as_mut() {
+            for query in queries {
+                anchor(&mut query.path);
+            }
+        }
     }
 }
 
