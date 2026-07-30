@@ -192,16 +192,26 @@ impl Kakehashi {
         let settings_events = settings_outcome.events;
         let mut default_settings_warning = None;
 
-        // Nudge users off the deprecated `rootMarkers` config key. The claim
-        // guard latches session-wide so a later didChangeConfiguration carrying
-        // `rootMarkers` does not warn a second time (and vice versa).
-        if settings_outcome.used_deprecated_root_markers
+        // Nudge users off deprecated config keys. Each claim guard latches
+        // session-wide so a later didChangeConfiguration carrying the same key
+        // does not warn a second time (and vice versa). The two keys claim
+        // independently: seeing one must not suppress the other.
+        if settings_outcome.deprecated_keys.root_markers
             && self
                 .settings_manager
                 .claim_root_markers_deprecation_warning()
         {
             self.notifier()
                 .show_warning(crate::config::deprecation::ROOT_MARKERS_DEPRECATION_NOTICE)
+                .await;
+        }
+        if settings_outcome.deprecated_keys.auto_install
+            && self
+                .settings_manager
+                .claim_auto_install_deprecation_warning()
+        {
+            self.notifier()
+                .show_warning(crate::config::deprecation::AUTO_INSTALL_DEPRECATION_NOTICE)
                 .await;
         }
 

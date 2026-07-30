@@ -64,6 +64,24 @@ fn section_wrapped_config_with_root_markers() -> Value {
     })
 }
 
+/// The top-level-`autoInstall` notice, distinct from the `rootMarkers` one.
+fn is_auto_install_deprecation_notice(params: &Value) -> bool {
+    params["message"]
+        .as_str()
+        .is_some_and(|m| m.contains("autoInstall") && m.contains("deprecated"))
+}
+
+/// The canonical replacement spelling, which must NOT warn.
+fn canonical_per_language_auto_install(auto_install: bool) -> Value {
+    json!({
+        "settings": {
+            "kakehashi": {
+                "languages": { "_": { "autoInstall": auto_install } }
+            }
+        }
+    })
+}
+
 fn flat_didchange_config(auto_install: bool) -> Value {
     json!({ "settings": { "autoInstall": auto_install } })
 }
@@ -282,6 +300,95 @@ fn e2e_unwrapped_didchange_deprecation_warns_once_and_ignores_unrelated_settings
         query_effective_settings(&mut client)["autoInstall"],
         json!(false),
         "second flat didChange config should still update the effective runtime settings"
+    );
+
+    let _ = client.send_request("shutdown", json!(null));
+    client.send_notification("exit", json!(null));
+}
+
+#[test]
+fn e2e_auto_install_deprecation_warns_once_and_spares_the_canonical_key() {
+    let config_dir = tempfile::TempDir::new().expect("temp config dir");
+    let config_path = config_dir.path().join("kakehashi.toml");
+    std::fs::write(&config_path, "").expect("write empty config");
+
+    let mut client = LspClient::builder()
+        .arg("--config-file")
+        .arg(config_path.to_str().expect("utf-8 temp path"))
+        .build();
+
+    // Clean initialize (no `autoInstall` anywhere) leaves the slot free.
+    client.send_request(
+        "initialize",
+        json!({
+            "processId": std::process::id(),
+            "rootUri": null,
+            "capabilities": {},
+            "workspaceFolders": null,
+            "initializationOptions": {}
+        }),
+    );
+    client.send_notification("initialized", json!({}));
+
+    // The canonical per-language spelling must NOT warn — it is what the notice
+    // tells people to write, so a name-only detector would warn about its own
+    // migration target. Positive proof: the config-updated log arrives with no
+    // popup ahead of it.
+    client.send_notification(
+        "workspace/didChangeConfiguration",
+        canonical_per_language_auto_install(false),
+    );
+    let (method, params) = client
+        .wait_for_notification_where(&["window/showMessage", "window/logMessage"], TIMEOUT, |p| {
+            is_auto_install_deprecation_notice(p) || is_config_updated(p)
+        })
+        .expect("canonical reconfig should log a config-updated message");
+    assert_eq!(
+        method, "window/logMessage",
+        "`[languages._] autoInstall` must not trigger the deprecation popup; got: {params:?}"
+    );
+    assert_eq!(
+        query_effective_settings(&mut client)["languages"]["_"]["autoInstall"],
+        json!(false),
+        "canonical key should still reach the effective runtime settings"
+    );
+
+    // The deprecated top-level spelling → the popup fires.
+    client.send_notification(
+        "workspace/didChangeConfiguration",
+        wrapped_didchange_config(true),
+    );
+    let (method, params) = client
+        .wait_for_notification_where(
+            &["window/showMessage"],
+            TIMEOUT,
+            is_auto_install_deprecation_notice,
+        )
+        .expect("top-level autoInstall should surface the deprecation popup");
+    assert_eq!(method, "window/showMessage");
+    assert_eq!(
+        params["type"].as_i64(),
+        Some(2),
+        "deprecation notice should be MessageType::WARNING"
+    );
+    client
+        .wait_for_notification_where(&["window/logMessage"], TIMEOUT, is_config_updated)
+        .expect("first top-level reconfig should log a config-updated message");
+
+    // Still carrying it → the guard has latched, so no second popup precedes
+    // the config-updated log.
+    client.send_notification(
+        "workspace/didChangeConfiguration",
+        wrapped_didchange_config(false),
+    );
+    let (method, params) = client
+        .wait_for_notification_where(&["window/showMessage", "window/logMessage"], TIMEOUT, |p| {
+            is_auto_install_deprecation_notice(p) || is_config_updated(p)
+        })
+        .expect("second reconfig should log a config-updated message");
+    assert_eq!(
+        method, "window/logMessage",
+        "no second autoInstall deprecation popup should fire; got: {params:?}"
     );
 
     let _ = client.send_request("shutdown", json!(null));

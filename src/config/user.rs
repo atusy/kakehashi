@@ -60,14 +60,14 @@ impl std::error::Error for UserConfigError {
 
 /// User configuration plus metadata gathered from the same read.
 ///
-/// `uses_deprecated_root_markers` is detected from the very bytes that were
-/// parsed (not a second read), so it cannot disagree with `settings` under a
-/// concurrent file edit. Serde's alias erases which spelling was written, so
-/// this flag is the only way to know the deprecated key was used.
+/// `deprecated_keys` is detected from the very bytes that were parsed (not a
+/// second read), so it cannot disagree with `settings` under a concurrent file
+/// edit. Parsing collapses deprecated and canonical spellings, so these flags
+/// are the only way to know a deprecated key was used.
 #[derive(Debug)]
 pub(crate) struct UserConfig {
     pub(crate) settings: RawWorkspaceSettings,
-    pub(crate) uses_deprecated_root_markers: bool,
+    pub(crate) deprecated_keys: crate::config::deprecation::DeprecatedKeysSeen,
 }
 
 /// Loads user configuration from the XDG config directory.
@@ -93,14 +93,13 @@ pub fn load_user_config() -> UserConfigResult<Option<UserConfig>> {
         source: e,
     })?;
 
-    let uses_deprecated_root_markers =
-        crate::config::deprecation::toml_uses_deprecated_root_markers(&contents);
+    let deprecated_keys = crate::config::deprecation::toml_deprecated_keys(&contents);
     let settings = toml::from_str::<RawWorkspaceSettings>(&contents)
         .map_err(|e| UserConfigError::ParseError { path, source: e })?;
 
     Ok(Some(UserConfig {
         settings,
-        uses_deprecated_root_markers,
+        deprecated_keys,
     }))
 }
 
@@ -327,7 +326,7 @@ mod tests {
 
         let config = settings.unwrap();
         assert!(
-            !config.uses_deprecated_root_markers,
+            !config.deprecated_keys.root_markers,
             "no rootMarkers in this fixture"
         );
         let settings = config.settings;
@@ -374,7 +373,7 @@ mod tests {
 
         let config = result.unwrap().expect("config exists");
         assert!(
-            config.uses_deprecated_root_markers,
+            config.deprecated_keys.root_markers,
             "rootMarkers in the user config should be flagged"
         );
     }
