@@ -177,8 +177,9 @@ set. Rejected in favour of the captured set.
   prerequisite for advertising action-embedded commands to clients that
   dispatch only registered ids.
 - Repair moves off the user-facing request and covers all request paths. The
-  ordering barrier, though, is only taken by the routed `executeCommand` path;
-  other paths benefit from the repair without waiting on it.
+  ordering barrier is taken by both `workspace/executeCommand` routes (the
+  encoded one and the palette one); other request paths benefit from the repair
+  without waiting on it, since they open their own documents first.
 - The "separator in a config key drops this server's commands" failure mode is
   gone; escaping makes the invariant structural.
 - Command names no longer grow with document path length.

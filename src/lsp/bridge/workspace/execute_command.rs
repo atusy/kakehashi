@@ -234,6 +234,11 @@ impl LanguageServerPool {
                 return None;
             }
         };
+        // Same ordering requirement as the encoded path: a palette command can
+        // reference a document too (a downstream is free to take a URI argument),
+        // and this connection may have just respawned with its re-open still in
+        // flight. Bounded, and a no-op when nothing is pending.
+        self.wait_for_pending_reopen(&key).await;
         if !handle.has_capability(METHOD) {
             // The advertising connection was Ready (capabilities set) when it
             // registered the command, but the RECONNECT path can hand back a
