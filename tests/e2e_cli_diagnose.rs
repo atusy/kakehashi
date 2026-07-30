@@ -86,6 +86,53 @@ fn stderr_of(output: &Output) -> String {
     String::from_utf8_lossy(&output.stderr).into_owned()
 }
 
+/// A `--config-file` that exists but cannot be parsed aborts the run, and
+/// stdout stays empty so a caller parsing the report cannot mistake a failed
+/// run for a clean one.
+#[test]
+fn e2e_diagnose_invalid_explicit_config_exits_error() {
+    let ws = tempfile::tempdir().expect("create workspace tempdir");
+    std::fs::write(ws.path().join("doc.md"), PLAIN_MARKDOWN).expect("write document");
+    std::fs::write(ws.path().join("kakehashi.toml"), "searchPaths = [\"/x\"\n")
+        .expect("write malformed config");
+
+    let output = run_diagnose(ws.path(), &["doc.md"]);
+
+    assert_eq!(output.status.code(), Some(2));
+    assert!(
+        output.stdout.is_empty(),
+        "a failed run must not emit a report: {}",
+        stdout_of(&output)
+    );
+    let stderr = stderr_of(&output);
+    assert_eq!(
+        stderr.matches("error: failed to initialize").count(),
+        1,
+        "stderr should report the initialization failure exactly once: {stderr}"
+    );
+    assert!(
+        stderr.contains("Failed to parse"),
+        "stderr should name the failure: {stderr}"
+    );
+}
+
+/// The mirror image: an explicit config file that is merely absent is an
+/// optional layer, so the run proceeds on defaults.
+#[test]
+fn e2e_diagnose_missing_explicit_config_still_runs() {
+    let ws = tempfile::tempdir().expect("create workspace tempdir");
+    std::fs::write(ws.path().join("doc.md"), PLAIN_MARKDOWN).expect("write document");
+
+    let output = run_diagnose(ws.path(), &["doc.md"]);
+
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "a missing explicit config must be skipped, not fatal; stderr: {}",
+        stderr_of(&output)
+    );
+}
+
 #[test]
 fn e2e_diagnose_default_format_reports_transformed_position() {
     let ws = workspace_with(&config_toml(), &[("doc.md", MARKDOWN)]);

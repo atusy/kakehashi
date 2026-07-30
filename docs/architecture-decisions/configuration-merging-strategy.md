@@ -192,30 +192,100 @@ silently shadow every user-supplied top-level opt-out.
 
 ### File Loading Behavior
 
-1. **Missing files are silently ignored**
+Strictness follows *how the path was chosen*, not what went wrong with it. A
+path the user typed carries intent; a path kakehashi went looking for does not.
+
+1. **Implicitly discovered files degrade quietly**
    - User config doesn't exist: proceed with empty user config
-   - Project config doesn't exist (and `--config-file` not specified): proceed with empty project config
-   - No error, no warning—this enables zero-config startup
+   - Project config doesn't exist: proceed with empty project config
+   - Either one exists but fails to parse: warn and skip that layer
+   - This is what keeps zero-config startup working: a stray or half-edited
+     `kakehashi.toml` must never leave the user without a server
 
-2. **Invalid files cause startup failure**
-   - Parse errors in any config file should fail fast with a clear error message
-   - Users should know immediately if their config is malformed
+2. **An explicit `--config-file` that is present but unusable fails startup**
+   - Unreadable, malformed TOML, larger than the 8 MiB read ceiling, or
+     carrying a path that cannot be expanded
+   - LSP `initialize` returns `RequestFailed` (-32803) naming the first such
+     file; `format` and `diagnose` print it and exit 2
+   - Silently dropping the layer and continuing on defaults is what hides
+     configuration mistakes, and an explicit path is where the user is most
+     entitled to be told
 
-3. **`--config-file` option with missing file**
-   - If user explicitly specifies `--config-file /path/to/config.toml` and file doesn't exist: error
-   - Explicit paths should be validated; implicit defaults can be missing
+3. **An explicit `--config-file` that is absent is skipped**
+   - Layered invocations (`--config-file base.toml --config-file overrides.toml`)
+     depend on the overlay being allowed not to exist, and a relative path
+     resolves against the process working directory — for an editor-spawned
+     server, the editor's rather than the workspace root. Absence is too easily
+     accidental to be worth refusing to start over; being unusable is not.
+   - A path whose metadata cannot be read at all counts as unusable, not
+     absent: `exists()` answers "no" to both, and only one of them is the
+     optional-overlay case.
+   - The skip is a `SettingsEvent::warning`, so an editor sees it as
+     `window/logMessage`. `format` and `diagnose` show nothing: CLI mode has no
+     channel for non-fatal settings events at all (the stub client pump
+     discards them), which is a pre-existing gap rather than a decision here.
+
+4. **Where each class of failure is judged**
+   - Path expansion: per file, because a later layer replaces path fields
+     wholesale, so the merged result would never mention an earlier layer's
+     undefined variable
+   - Cross-field invariants (e.g. `debounceMs` ≤ `maxWaitMs`): on the merged
+     explicit configuration only, because their operands merge independently —
+     one file may legitimately supply just one half
+   - Unrecognised key names: reported as a warning on an explicit file, not
+     fatal. Serde drops an unknown field silently, so a typo otherwise reads as
+     "not specified"; but a key this version does not know may be one the next
+     one does, and rejecting the file would version-lock it.
+     `workspace/didChangeConfiguration` rejects the whole update instead —
+     a live edit is not a file shared across versions.
+   - Two known inconsistencies, both pre-existing and both worth closing
+     separately: `FeatureSettings` and its children carry
+     `deny_unknown_fields`, so an unknown key *inside* `features` fails typed
+     deserialization and is fatal before the warning walker ever sees it; and
+     CLI mode has no channel for non-fatal settings events at all, so
+     `format`/`diagnose` users never see these warnings.
+   - `initializationOptions`: never fatal, and judged last. A client-supplied
+     override that fails to expand does not abort — but "non-fatal" only means
+     the session starts: the *whole* merged configuration is discarded in
+     favour of programmed defaults, explicit files included. Only the abort is
+     avoided, not the loss.
+
+5. **When the strict gate runs**
+   - Before `initialize` stores anything derived from the request. Several of
+     those stores are first-write-wins and `tower-lsp-server` accepts a retry
+     after an error response, so a client that fixes the file and re-sends
+     `initialize` would otherwise get the corrected settings alongside the
+     failed attempt's capabilities and workspace folders.
+   - Each `--config-file` is read exactly once and the result carried into the
+     merge: a file swapped between two reads would slip past whichever check
+     ran first. Reads are bounded, so a path naming an endless source fails
+     instead of exhausting memory; a path naming a stream with no writer still
+     blocks, which is the failure mode of the path the user chose.
 
 ### Implementation Notes
 
 **Config loading order:**
-```rust
-fn load_configuration(cli_config_path: Option<&Path>) -> Option<RawWorkspaceSettings> {
-    let defaults = Some(default_settings());  // from src/config/defaults.rs
-    let user_config = load_optional(xdg_config_path());
-    let project_config = load_optional_project_config(cli_config_path);
-    // InitializationOptions applied later in LSP initialize handler
 
-    [defaults, user_config, project_config].into_iter().reduce(merge_workspace_settings).flatten()
+`--config-file` is not an alternative *path* for the project layer — it replaces
+the whole implicit pair, and accepts any number of files that merge in flag
+order. It is also the only layer with a verdict of its own, reached before
+`initialize` stores anything, so the files are read once and carried into the
+merge rather than re-read:
+
+```rust
+// `initialize`, before any request-derived state is stored:
+let explicit = load_explicit_config(home, env_fn);   // None when the flag is absent
+if let Some(error) = explicit.as_ref().and_then(|c| c.fatal_error.clone()) {
+    return Err(configuration_load_error(error));
+}
+
+fn load_settings(root, override_settings, home, env_fn, explicit) -> SettingsLoadOutcome {
+    let defaults = Some(default_settings());          // src/config/defaults.rs
+    let files = match explicit {
+        Some(explicit) => explicit.layers,            // --config-file, in order
+        None => vec![load_user_config(), load_project_config(root)],
+    };
+    // initializationOptions merge last, and are never fatal
 }
 ```
 
@@ -241,7 +311,7 @@ fn load_configuration(cli_config_path: Option<&Path>) -> Option<RawWorkspaceSett
 - **Complexity increase**: Four config sources to understand and debug
 - **Arrays replace, not merge**: `queries` arrays are replaced entirely, not concatenated; overriding one query type requires repeating all
 - **No "unset" mechanism**: Cannot explicitly remove a field inherited from earlier layers (would need `null` support)
-- **File I/O at startup**: Reading up to two config files adds latency (minimal in practice)
+- **File I/O at startup**: Reading the config files adds latency (minimal in practice) — two implicit files, or however many `--config-file` arguments were given
 - **Infrastructure-integration gap**: Phases 1-3 (Sprints 118-120) built infrastructure (schema, merging, user config loading) but delivered ZERO user value until Sprint 124 wired APIs into application. Lesson: infrastructure sprints must be followed by integration sprints within 1-2 sprints to realize value.
 
 ### Neutral
@@ -274,7 +344,8 @@ fn load_configuration(cli_config_path: Option<&Path>) -> Option<RawWorkspaceSett
 ### Phase 4: Project Configuration (Completed)
 - [x] Load project config from `./kakehashi.toml`
 - [x] `--config-file` CLI option for alternative path(s)
-- [x] Error on missing file when explicitly specified
+- [x] Fail startup on an explicit file that is present but unusable; skip an
+      absent one with a warning
 
 ### Phase 5: Testing
 - [ ] Unit tests for `QueryItem` parsing and type inference

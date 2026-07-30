@@ -23,7 +23,35 @@ use std::time::Duration;
 use tower_lsp_server::LspService;
 
 use crate::cli::files::collect_files;
+use crate::cli::terminal::{escape_terminal_controls, escape_terminal_controls_keeping_newlines};
 use crate::lsp::Kakehashi;
+
+/// Write one diagnostic line without turning a closed stderr pipe into panic
+/// exit 101. Format mode deliberately ignores SIGPIPE, so a consumer that
+/// stops reading (`kakehashi format … 2>&1 | head`) surfaces as a write error
+/// rather than a signal, and `std::eprintln!` panics on one.
+///
+/// The write result is dropped unconditionally, including for failures that
+/// are not `BrokenPipe`: unlike the stdout path — which distinguishes them and
+/// returns [`EXIT_ERROR`] — there is nowhere left to report a failure to
+/// report. `--check` sends its report here, so a stderr that fails for another
+/// reason (a full disk under `2>report.txt`) yields the exit code without the
+/// report.
+fn write_line_lossy(mut writer: impl std::io::Write, args: std::fmt::Arguments<'_>) {
+    let _ = writeln!(writer, "{args}");
+}
+
+/// `eprintln!` that tolerates a closed stderr pipe — see [`write_line_lossy`].
+///
+/// Deliberately *not* named `eprintln`: shadowing the std macro would silently
+/// change every call site in the module, and any future one written above the
+/// definition would quietly get the panicking version back. Mirrors
+/// `diagnose::elnln!`.
+macro_rules! elnln {
+    ($($arg:tt)*) => {
+        write_line_lossy(std::io::stderr(), format_args!($($arg)*))
+    };
+}
 
 /// Options for the `format` subcommand, mirroring its CLI flags.
 pub struct FormatOptions {
@@ -68,9 +96,9 @@ pub const EXIT_OK: u8 = 0;
 /// At least one file changed (with `--fail-on-change`) or would change
 /// (with `--check`).
 pub const EXIT_CHANGED: u8 = 1;
-/// Usage error, I/O error, or downstream formatter failure (a configured
-/// server failed to start, errored on the request, timed out, or returned a
-/// protocol-invalid response).
+/// Usage error, I/O error, an unloadable `--config-file`, or downstream
+/// formatter failure (a configured server failed to start, errored on the
+/// request, timed out, or returned a protocol-invalid response).
 pub const EXIT_ERROR: u8 = 2;
 
 /// Per-server bound for waiting on cold downstream language servers. Spawning
@@ -87,7 +115,7 @@ pub fn run(options: FormatOptions) -> u8 {
     {
         Ok(runtime) => runtime,
         Err(e) => {
-            eprintln!("error: failed to start async runtime: {e}");
+            elnln!("error: failed to start async runtime: {e}");
             return EXIT_ERROR;
         }
     };
@@ -98,7 +126,7 @@ async fn run_async(options: FormatOptions) -> u8 {
     let cwd = match std::env::current_dir() {
         Ok(dir) => dir,
         Err(e) => {
-            eprintln!("error: cannot determine current directory: {e}");
+            elnln!("error: cannot determine current directory: {e}");
             return EXIT_ERROR;
         }
     };
@@ -108,7 +136,17 @@ async fn run_async(options: FormatOptions) -> u8 {
     let (service, socket) = LspService::new(Kakehashi::new);
     crate::cli::spawn_client_pump(socket);
     let server = service.inner();
-    server.cli_initialize(&cwd).await;
+    if let Err(error) = server.cli_initialize(&cwd).await {
+        // The message quotes config-file content (a TOML parse error echoes the
+        // offending source line), so escape it before it reaches a terminal.
+        // Newlines survive: unlike `diagnose`, this output is prose, and the
+        // caret diagram is the useful part of a parse error.
+        elnln!(
+            "error: failed to initialize: {}",
+            escape_terminal_controls_keeping_newlines(&error.message)
+        );
+        return EXIT_ERROR;
+    }
 
     let code = if options.stdin_filename.is_some() {
         run_stdin(server, &cwd, &options).await
@@ -136,14 +174,14 @@ async fn run_stdin(server: &Kakehashi, cwd: &Path, options: &FormatOptions) -> u
     let stdin_paths_ok = options.paths.is_empty()
         || (options.paths.len() == 1 && options.paths[0].as_os_str() == "-");
     if !stdin_paths_ok {
-        eprintln!("error: --stdin-filename accepts no paths (optionally a single \"-\")");
+        elnln!("error: --stdin-filename accepts no paths (optionally a single \"-\")");
         return EXIT_ERROR;
     }
 
     let mut text = String::new();
     use std::io::Read as _;
     if let Err(e) = std::io::stdin().lock().read_to_string(&mut text) {
-        eprintln!("error: failed to read stdin: {e}");
+        elnln!("error: failed to read stdin: {e}");
         return EXIT_ERROR;
     }
 
@@ -161,7 +199,7 @@ async fn run_stdin(server: &Kakehashi, cwd: &Path, options: &FormatOptions) -> u
         )
         .await;
     for failure in &outcome.server_failures {
-        eprintln!("error: {failure}");
+        elnln!("error: {}", escape_terminal_controls(&failure.to_string()));
     }
     let changed = outcome.formatted.as_deref().is_some_and(|f| f != text);
 
@@ -170,7 +208,10 @@ async fn run_stdin(server: &Kakehashi, cwd: &Path, options: &FormatOptions) -> u
             return EXIT_ERROR;
         }
         if changed {
-            eprintln!("Would reformat: {}", name.display());
+            elnln!(
+                "Would reformat: {}",
+                escape_terminal_controls(&name.display().to_string())
+            );
             return EXIT_CHANGED;
         }
         return EXIT_OK;
@@ -191,7 +232,7 @@ async fn run_stdin(server: &Kakehashi, cwd: &Path, options: &FormatOptions) -> u
         .and_then(|()| stdout.flush())
         && e.kind() != std::io::ErrorKind::BrokenPipe
     {
-        eprintln!("error: failed to write stdout: {e}");
+        elnln!("error: failed to write stdout: {e}");
         return EXIT_ERROR;
     }
 
@@ -207,7 +248,7 @@ async fn run_stdin(server: &Kakehashi, cwd: &Path, options: &FormatOptions) -> u
 /// File mode: expand `paths`, format each file, and write/report per flags.
 async fn run_paths(server: &Kakehashi, cwd: &Path, options: &FormatOptions) -> u8 {
     if options.paths.is_empty() {
-        eprintln!("error: no paths given; pass files/directories or use --stdin-filename");
+        elnln!("error: no paths given; pass files/directories or use --stdin-filename");
         return EXIT_ERROR;
     }
 
@@ -216,7 +257,7 @@ async fn run_paths(server: &Kakehashi, cwd: &Path, options: &FormatOptions) -> u
     }) {
         Ok(collected) => collected,
         Err(e) => {
-            eprintln!("error: {e}");
+            elnln!("error: {}", escape_terminal_controls(&e.to_string()));
             return EXIT_ERROR;
         }
     };
@@ -231,11 +272,16 @@ async fn run_paths(server: &Kakehashi, cwd: &Path, options: &FormatOptions) -> u
     for file in &files {
         // Collected paths are absolute (normalize_path); report them
         // cwd-relative so the output stays readable in deep trees.
-        let display = file.strip_prefix(cwd).unwrap_or(file).display();
+        // Escaped once here rather than at each use: a path comes from a
+        // directory walk, so it is untrusted text on a line-oriented stream.
+        // Newlines are escaped too — unlike the initialization error, these
+        // lines are a stream the user greps, one record per file.
+        let relative = file.strip_prefix(cwd).unwrap_or(file).display().to_string();
+        let display = escape_terminal_controls(&relative);
         let text = match std::fs::read_to_string(file) {
             Ok(text) => text,
             Err(e) => {
-                eprintln!("error: cannot read '{display}': {e}");
+                elnln!("error: cannot read '{display}': {e}");
                 read_errors += 1;
                 continue;
             }
@@ -253,7 +299,10 @@ async fn run_paths(server: &Kakehashi, cwd: &Path, options: &FormatOptions) -> u
         // "unchanged" (docs: I/O errors exit 2). Any partial output another
         // server produced is still applied below.
         for failure in &outcome.server_failures {
-            eprintln!("error: {display}: {failure}");
+            elnln!(
+                "error: {display}: {}",
+                escape_terminal_controls(&failure.to_string())
+            );
         }
         let server_failed = !outcome.server_failures.is_empty();
         if server_failed {
@@ -263,12 +312,12 @@ async fn run_paths(server: &Kakehashi, cwd: &Path, options: &FormatOptions) -> u
             Some(formatted) if formatted != text => {
                 changed += 1;
                 if options.check {
-                    eprintln!("Would reformat: {display}");
+                    elnln!("Would reformat: {display}");
                 } else {
                     match write_atomically(file, &formatted) {
-                        Ok(()) => eprintln!("Reformatted: {display}"),
+                        Ok(()) => elnln!("Reformatted: {display}"),
                         Err(e) => {
-                            eprintln!("error: cannot write '{display}': {e}");
+                            elnln!("error: cannot write '{display}': {e}");
                             write_errors += 1;
                         }
                     }
@@ -288,14 +337,14 @@ async fn run_paths(server: &Kakehashi, cwd: &Path, options: &FormatOptions) -> u
         String::new()
     };
     if options.check {
-        eprintln!(
+        elnln!(
             "{changed} file(s) would be reformatted, {unchanged} already formatted{error_suffix}"
         );
     } else {
         // Write failures stay in `changed` for exit-code purposes, but the
         // summary must not claim a file was reformatted when its write failed.
         let reformatted = changed - write_errors;
-        eprintln!("{reformatted} file(s) reformatted, {unchanged} unchanged{error_suffix}");
+        elnln!("{reformatted} file(s) reformatted, {unchanged} unchanged{error_suffix}");
     }
 
     if errors > 0 {
@@ -344,4 +393,50 @@ fn write_atomically(path: &Path, content: &str) -> std::io::Result<()> {
         let _ = dir_handle.sync_all();
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct ClosedPipe;
+
+    impl std::io::Write for ClosedPipe {
+        fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe))
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn diagnostic_write_tolerates_closed_stderr() {
+        write_line_lossy(ClosedPipe, format_args!("initialization failed"));
+    }
+
+    /// Tolerating a closed pipe must not degrade into writing nothing at all —
+    /// every stderr line in this module goes through the same helper.
+    #[test]
+    fn diagnostic_write_emits_the_line_on_a_healthy_writer() {
+        let mut sink = Vec::new();
+        write_line_lossy(&mut sink, format_args!("initialization failed"));
+        assert_eq!(sink, b"initialization failed\n");
+    }
+
+    #[test]
+    fn initialization_failure_text_is_escaped_but_keeps_its_caret_diagram() {
+        let toml_error = "TOML parse error at line 1\n  |\n1 | bad = \u{1b}]0;x\u{7}\n  |       ^";
+        let escaped = escape_terminal_controls_keeping_newlines(toml_error);
+        assert!(
+            !escaped.contains('\u{1b}') && !escaped.contains('\u{7}'),
+            "terminal controls must not reach the terminal: {escaped:?}"
+        );
+        assert_eq!(
+            escaped.lines().count(),
+            4,
+            "the caret diagram must survive escaping: {escaped:?}"
+        );
+    }
 }

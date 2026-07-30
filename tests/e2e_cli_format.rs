@@ -78,6 +78,55 @@ fn read(workspace: &Path, name: &str) -> String {
     std::fs::read_to_string(workspace.join(name)).expect("read workspace file")
 }
 
+/// A `--config-file` that exists but cannot be parsed aborts the run before
+/// anything is written, so stdout stays empty. This is specific to a
+/// configuration failure: a *downstream* formatter failure writes its content
+/// first and reports the failure through the exit code afterwards, so empty
+/// stdout is not a general property of exit 2.
+#[test]
+fn e2e_format_invalid_explicit_config_exits_error() {
+    let ws = tempfile::tempdir().expect("create workspace tempdir");
+    std::fs::write(ws.path().join("doc.md"), MARKDOWN).expect("write document");
+    std::fs::write(ws.path().join("kakehashi.toml"), "searchPaths = [\"/x\"\n")
+        .expect("write malformed config");
+
+    let output = run_format(ws.path(), &["doc.md"]);
+
+    assert_eq!(output.status.code(), Some(2));
+    assert!(
+        output.stdout.is_empty(),
+        "a failed run must not emit content: {:?}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        stderr.matches("error: failed to initialize").count(),
+        1,
+        "stderr should report the initialization failure exactly once: {stderr}"
+    );
+    assert!(
+        stderr.contains("Failed to parse"),
+        "stderr should name the failure: {stderr}"
+    );
+}
+
+/// The mirror image: an explicit config file that is merely absent is an
+/// optional layer, so the run proceeds on defaults.
+#[test]
+fn e2e_format_missing_explicit_config_still_runs() {
+    let ws = tempfile::tempdir().expect("create workspace tempdir");
+    std::fs::write(ws.path().join("doc.md"), MARKDOWN).expect("write document");
+
+    let output = run_format(ws.path(), &["doc.md"]);
+
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "a missing explicit config must be skipped, not fatal; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 #[test]
 fn e2e_format_rewrites_file_in_place_and_is_idempotent() {
     let ws = workspace_with(&[("doc.md", MARKDOWN)]);

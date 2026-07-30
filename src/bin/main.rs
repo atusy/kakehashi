@@ -13,9 +13,17 @@ struct Cli {
     #[arg(long, global = true)]
     data_dir: Option<PathBuf>,
 
-    /// Config file(s) to use instead of default locations (LSP and format
-    /// modes). Can be specified multiple times; files merge in order.
-    /// Skips ~/.config/kakehashi/kakehashi.toml and ./kakehashi.toml.
+    /// Config file(s) to use instead of default locations, for the commands
+    /// that load settings (LSP server mode, format, diagnose). Can be
+    /// specified multiple times; files merge in order.
+    /// Skips both default locations: the user config under $XDG_CONFIG_HOME
+    /// (~/.config/kakehashi/kakehashi.toml when unset) and ./kakehashi.toml.
+    /// For those commands, a file that is present but unreadable, malformed,
+    /// larger than 8 MiB, or carrying an unexpandable path is a hard error:
+    /// format and diagnose exit 2, and LSP initialization is rejected with
+    /// RequestFailed. A file that is absent is skipped (warned about over LSP;
+    /// the CLI reports only hard errors). Relative paths resolve against the
+    /// working directory of the kakehashi process.
     #[arg(long, global = true)]
     config_file: Vec<PathBuf>,
 
@@ -94,8 +102,8 @@ enum Commands {
     /// Exit codes: 0 = no failing diagnostics; 1 = a failing diagnostic (any
     /// error, plus warnings with --fail-on-warning; info/hint never fail —
     /// append `|| true` to never fail); 2 = an operational error (unreadable
-    /// file, path open/enumeration failure, downstream server failure),
-    /// independent of the diagnostics.
+    /// file, path open/enumeration failure, an unloadable --config-file,
+    /// downstream server failure), independent of the diagnostics.
     Diagnose {
         /// Files or directories to diagnose ("-" for stdin with --stdin-filename)
         paths: Vec<PathBuf>,

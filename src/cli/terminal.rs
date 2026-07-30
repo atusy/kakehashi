@@ -1,5 +1,19 @@
 //! Terminal-safe rendering for untrusted CLI fields.
 
+/// Visibly escape terminal controls while keeping real line breaks intact.
+///
+/// Use this where the text is meant to be read across several lines — a TOML
+/// parse error draws a caret diagram under the offending source line, and
+/// collapsing it costs more than the escaping saves. Line-oriented output,
+/// where a stray newline would break the one-record-per-line contract, wants
+/// [`escape_terminal_controls`] instead.
+pub(crate) fn escape_terminal_controls_keeping_newlines(text: &str) -> String {
+    text.split('\n')
+        .map(|line| escape_terminal_controls(line))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 /// Visibly escape terminal, bidirectional, and Unicode line-separator
 /// characters without changing ordinary text.
 pub(crate) fn escape_terminal_controls(text: &str) -> std::borrow::Cow<'_, str> {

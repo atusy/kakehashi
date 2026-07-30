@@ -11,7 +11,11 @@ use std::path::Path;
 pub enum SettingsEventKind {
     Info,
     Warning,
-    /// Hard error surfaced via `window/showMessage` so the user cannot miss it.
+    /// Hard error normally surfaced via `window/showMessage`.
+    ///
+    /// Fatal explicit-config errors instead reject initialization before
+    /// settings events are sent, so the initialize response is their sole
+    /// client-facing report.
     Error,
 }
 
@@ -67,11 +71,181 @@ pub struct SettingsLoadOutcome {
     pub(crate) deprecated_keys: DeprecatedKeysSeen,
 }
 
+/// Ceiling on a single config file read.
+///
+/// A kakehashi configuration is a hand-written TOML file; megabytes of one is a
+/// mistake, not a use case. Without a bound, a `--config-file` naming an
+/// endless source — `/dev/zero`, most obviously — would allocate until the
+/// process died rather than reporting a bad path.
+const MAX_CONFIG_FILE_BYTES: u64 = 8 * 1024 * 1024;
+
+/// The `--config-file` inputs, read and judged exactly once.
+///
+/// Read *once* is a contract, not an optimisation. A file replaced between two
+/// reads would have its second verdict either ignored or discovered too late to
+/// matter, and a path that happens to name a stream would be found empty the
+/// second time. (Naming a stream is not a supported workflow — one with no
+/// writer will simply block initialization — but reading once is what keeps the
+/// failure mode that of the path the user chose.)
+pub(crate) struct ExplicitConfig {
+    layers: Vec<Option<RawWorkspaceSettings>>,
+    events: Vec<SettingsEvent>,
+    deprecated_keys: DeprecatedKeysSeen,
+    /// Why this configuration cannot be used, if it cannot. `initialize` must
+    /// reject the session when this is set.
+    pub(crate) fatal_error: Option<String>,
+}
+
+/// Read and judge the `--config-file` inputs, or `None` if there are none.
+///
+/// `initialize` calls this *before* it latches any once-only state from the
+/// request. `tower-lsp-server` resets to `Uninitialized` after an error
+/// response, so a client may fix the file and retry — and a retry carrying
+/// different capabilities or workspace folders would otherwise be served with
+/// the failed attempt's values, since those are first-write-wins. The result is
+/// then handed to [`load_settings`], so the files are not read again.
+pub(crate) fn load_explicit_config(
+    home: Option<&str>,
+    env_fn: impl Fn(&str) -> Option<String>,
+) -> Option<ExplicitConfig> {
+    let files = crate::config::expand::config_file_override()?;
+    Some(read_explicit_layers(files, home, env_fn))
+}
+
+/// Keys in a TOML config file that kakehashi does not recognise.
+///
+/// Reuses the walker the `workspace/didChangeConfiguration` path uses, via a
+/// JSON round-trip, so both routes judge a key by the same schema. An empty
+/// result when the TOML cannot be re-read as a generic value is deliberate:
+/// this only ever *reports*, so a limitation of the conversion must not be
+/// louder than the settings it is describing.
+fn unknown_config_keys(contents: &str) -> Vec<String> {
+    let Ok(value) = toml::from_str::<Value>(contents) else {
+        return Vec::new();
+    };
+    let mut keys = crate::config::unknown_keys::unknown_workspace_setting_keys(&value);
+    crate::config::unknown_keys::sort_and_dedup_unknown_keys(&mut keys);
+    keys
+}
+
+/// The explicit layers merged with nothing beneath them — the subject of the
+/// strict gate.
+///
+/// Programmed defaults are deliberately absent. They carry
+/// `${KAKEHASHI_DATA_DIR}`, which cannot expand on a host with no discoverable
+/// data directory, and blaming the user's file for that would reject a session
+/// over a valid — even empty — config. Their absence costs the gate nothing:
+/// `FeatureSettings::resolve` already fills an unset half of a timing pair from
+/// the same defaults, so a lone `debounceMs` is still judged against the
+/// default `maxWaitMs`.
+fn merge_explicit_layers(layers: &[Option<RawWorkspaceSettings>]) -> Option<RawWorkspaceSettings> {
+    layers
+        .iter()
+        .cloned()
+        .reduce(merge_workspace_settings)
+        .flatten()
+}
+
+/// The body of [`load_explicit_config`], taking the paths directly so it can be
+/// exercised without the process-global `--config-file` override.
+fn read_explicit_layers(
+    files: &[std::path::PathBuf],
+    home: Option<&str>,
+    env_fn: impl Fn(&str) -> Option<String>,
+) -> ExplicitConfig {
+    let env_fn = crate::config::expand::with_kakehashi_defaults(env_fn);
+    let mut events = vec![SettingsEvent::info(format!(
+        "Using {} explicit config file(s); default config locations skipped",
+        files.len()
+    ))];
+    let mut deprecated_keys = DeprecatedKeysSeen::default();
+    let mut fatal_error = None;
+    let mut layers = Vec::with_capacity(files.len());
+
+    for path in files {
+        // The verdict cannot change once a layer has failed, and reading on is
+        // not free: a later path could be a FIFO that blocks forever, so an
+        // already-doomed session would hang instead of reporting the failure it
+        // already knows about.
+        if fatal_error.is_some() {
+            break;
+        }
+        let layer = match load_toml_file(path, &mut events, &mut deprecated_keys) {
+            Ok(layer) => layer,
+            Err(message) => {
+                events.push(SettingsEvent::error(message.clone()));
+                fatal_error.get_or_insert(message);
+                None
+            }
+        };
+        // Judging a layer in isolation also resolves its language `base`
+        // chains, so a cycle an overlay later removes is still warned about
+        // once here. Accepted: the alternative is threading a "stay quiet"
+        // flag through base resolution to silence a warning that names a
+        // real cycle in a file the user wrote.
+        //
+        // Judge each layer's *paths* on its own so a later layer cannot
+        // mask an earlier one's undefined variable: path fields are
+        // replaced wholesale by the overlay, so the merged result would
+        // never mention the mistake. Cross-field invariants are excluded
+        // here (see `ExpandErrors::path_error_summary`) — their operands
+        // merge independently, so they are only meaningful once every
+        // layer has been folded together, and `expand_merged_settings`
+        // catches them there.
+        if let Some(raw_settings) = layer.as_ref()
+            && let Err(errs) = WorkspaceSettings::try_from_settings(raw_settings, home, &env_fn)
+            && let Some(details) = errs.path_error_summary()
+        {
+            let message = format!("Path expansion failed in {}: {details}", path.display());
+            events.push(SettingsEvent::error(message.clone()));
+            fatal_error.get_or_insert(message);
+        }
+        layers.push(layer);
+    }
+
+    // An explicit configuration also has to be valid *as a whole*, or startup
+    // would silently continue on programmed defaults. This is the only place a
+    // cross-layer invariant can be judged: one file supplying `debounceMs` and
+    // another `maxWaitMs` is valid in neither file alone. It is judged without
+    // `initializationOptions`, which keep a non-fatal policy of their own — a
+    // client sending a bad override must not be reported as a mistake in the
+    // user's file.
+    //
+    // Skipped once a layer has already failed: the verdict cannot change, and
+    // every `try_from_settings` re-resolves language `base` chains, whose cycle
+    // detector logs as it goes.
+    if fatal_error.is_none() {
+        let merged = merge_explicit_layers(&layers);
+        if let Some(raw_settings) = merged.as_ref()
+            && let Err(errs) = WorkspaceSettings::try_from_settings(raw_settings, home, &env_fn)
+        {
+            let message = format!("Invalid configuration from --config-file: {errs}");
+            events.push(SettingsEvent::error(message.clone()));
+            fatal_error = Some(message);
+        }
+    }
+
+    ExplicitConfig {
+        layers,
+        events,
+        deprecated_keys,
+        fatal_error,
+    }
+}
+
+/// Merge every configuration layer into the settings the session will use.
+///
+/// `explicit` carries the already-read `--config-file` inputs; when it is
+/// `Some`, the implicitly discovered user and project files are skipped and the
+/// strict gate applies. Callers must obtain it from [`load_explicit_config`]
+/// rather than reading the files themselves — passing `None` while
+/// `--config-file` is set would silently fall back to implicit discovery.
 pub fn load_settings(
     root_path: Option<&Path>,
     override_settings: Option<(SettingsSource, Value)>,
     home: Option<&str>,
     env_fn: impl Fn(&str) -> Option<String>,
+    explicit: Option<ExplicitConfig>,
 ) -> SettingsLoadOutcome {
     let env_fn = crate::config::expand::with_kakehashi_defaults(env_fn);
     let mut events = Vec::new();
@@ -81,24 +255,18 @@ pub fn load_settings(
     let defaults = Some(default_settings());
 
     // Layers 2+3: config files (either explicit --config-file or default locations)
-    let config_layers: Vec<Option<RawWorkspaceSettings>> =
-        if let Some(files) = crate::config::expand::config_file_override() {
-            events.push(SettingsEvent::info(format!(
-                "Using {} explicit config file(s); default config locations skipped",
-                files.len()
-            )));
-            files
-                .iter()
-                .map(|p| load_toml_file(p, &mut events, &mut deprecated_keys))
-                .collect()
-        } else {
-            vec![
-                // Layer 2: User config from XDG_CONFIG_HOME (~/.config/kakehashi/kakehashi.toml)
-                load_user_config_with_events(&mut events, &mut deprecated_keys),
-                // Layer 3: Project config from root_path/kakehashi.toml
-                load_toml_settings(root_path, &mut events, &mut deprecated_keys),
-            ]
-        };
+    let config_layers: Vec<Option<RawWorkspaceSettings>> = if let Some(explicit) = explicit {
+        events.extend(explicit.events);
+        deprecated_keys.merge(explicit.deprecated_keys);
+        explicit.layers
+    } else {
+        vec![
+            // Layer 2: User config from XDG_CONFIG_HOME (~/.config/kakehashi/kakehashi.toml)
+            load_user_config_with_events(&mut events, &mut deprecated_keys),
+            // Layer 3: Project config from root_path/kakehashi.toml
+            load_toml_settings(root_path, &mut events, &mut deprecated_keys),
+        ]
+    };
 
     // Layer 4: Override settings from initialization options or client configuration
     let override_settings = override_settings.and_then(|(source, value)| {
@@ -114,20 +282,7 @@ pub fn load_settings(
         .reduce(merge_workspace_settings)
         .flatten();
     let raw_settings = merged.clone();
-    let settings =
-        merged.and_then(
-            |m| match WorkspaceSettings::try_from_settings(&m, home, &env_fn) {
-                Ok(ws) => Some(ws),
-                Err(errs) => {
-                    events.push(SettingsEvent::error(format!(
-                        "Invalid configuration: {errs}. \
-                     This configuration has been discarded; previous settings remain in effect. \
-                     Please correct the invalid settings or remove them from your config.",
-                    )));
-                    None
-                }
-            },
-        );
+    let settings = expand_merged_settings(merged, home, &env_fn, &mut events);
 
     SettingsLoadOutcome {
         settings,
@@ -135,6 +290,34 @@ pub fn load_settings(
         events,
         deprecated_keys,
     }
+}
+
+/// Expand and validate the fully merged configuration, `initializationOptions`
+/// included.
+///
+/// Failure here is never fatal on its own: it is the last, most permissive
+/// gate, and the layers that *are* strict have already been judged by the
+/// caller. Discarding the merge leaves `initialize` to start on programmed
+/// defaults, which is the documented policy for a client-supplied override.
+fn expand_merged_settings(
+    merged: Option<RawWorkspaceSettings>,
+    home: Option<&str>,
+    env_fn: impl Fn(&str) -> Option<String>,
+    events: &mut Vec<SettingsEvent>,
+) -> Option<WorkspaceSettings> {
+    merged.and_then(|settings| {
+        match WorkspaceSettings::try_from_settings(&settings, home, env_fn) {
+            Ok(settings) => Some(settings),
+            Err(errs) => {
+                events.push(SettingsEvent::error(format!(
+                    "Invalid configuration: {errs}. \
+                     This configuration has been discarded. \
+                     Please correct the invalid settings or remove them from your config.",
+                )));
+                None
+            }
+        }
+    })
 }
 
 /// Load user config and add appropriate events to the events vector.
@@ -166,56 +349,129 @@ fn load_user_config_with_events(
 
 /// Load a TOML config file from an explicit path (used with `--config-file`).
 ///
-/// Unlike `load_toml_settings`, non-existent files are treated as errors
-/// because explicit paths represent user intent (configuration-merging-strategy).
+/// Every `Err` returned here is fatal to the session: unlike
+/// `load_toml_settings`, a file the user named explicitly and that is actually
+/// present must not be skipped in favour of defaults
+/// (configuration-merging-strategy).
+///
+/// An absent file is `Ok(None)`, not an error. Layered invocations
+/// (`--config-file base.toml --config-file overrides.toml`) rely on the overlay
+/// being optional, and a relative path resolves against the process working
+/// directory — for an editor-spawned server that is the editor's, not the
+/// workspace root — so absence is too easily accidental to be worth aborting
+/// over. It is still reported as a warning so the skip is visible.
 fn load_toml_file(
     path: &Path,
     events: &mut Vec<SettingsEvent>,
     deprecated_keys: &mut DeprecatedKeysSeen,
-) -> Option<RawWorkspaceSettings> {
-    if !path.exists() {
-        events.push(SettingsEvent::error(format!(
-            "Config file not found: {}",
-            path.display()
-        )));
-        return None;
-    }
+) -> Result<Option<RawWorkspaceSettings>, String> {
+    // Classify by opening, not by probing first: a separate `exists` check
+    // would answer for a different moment than the open, and would have to
+    // decide what "no" means without the kernel's reason for it. `NotFound` is
+    // the only answer that can mean the optional-overlay case; everything else
+    // — a denied ancestor directory, a path that is a directory — is a file the
+    // user named and cannot use.
+    let file = match fs::File::open(path) {
+        Ok(file) => file,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            // Opening follows symlinks, so a link whose target is gone also
+            // reports `NotFound`. That is not the optional-overlay case: the
+            // path the user named does exist, it just does not lead to a
+            // config. `symlink_metadata` does not follow, so it still sees the
+            // link itself.
+            //
+            // Only the final component is inspected. A path whose *ancestor*
+            // is a dangling link resolves to nothing at all, so nothing is
+            // there to call unusable — that is the absent case, the same as a
+            // missing directory. The line is "does the path the user named
+            // exist?", and a link does while a path beneath a broken one does
+            // not.
+            //
+            // This describes the path as of the probe, which is a moment after
+            // the failed open. Something appearing there in between is
+            // misreported — a config loader does not serialize against the
+            // filesystem, and the alternative (probe first) only moves the
+            // window.
+            match path.symlink_metadata() {
+                Ok(metadata) if metadata.file_type().is_symlink() => {
+                    return Err(format!(
+                        "Failed to read {}: broken symbolic link",
+                        path.display()
+                    ));
+                }
+                // Something appeared between the failed open and this probe.
+                // Nothing was read, so report the absence the open saw rather
+                // than guessing at what is there now.
+                Ok(_) => {}
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                // The probe itself failed — a denied parent, an I/O error.
+                // That is a path the user named and cannot use, not an absent
+                // one, and falling through would skip it silently.
+                Err(err) => {
+                    return Err(format!("Failed to read {}: {}", path.display(), err));
+                }
+            }
+            events.push(SettingsEvent::warning(format!(
+                "Config file not found, skipping: {}",
+                path.display()
+            )));
+            return Ok(None);
+        }
+        Err(err) => {
+            return Err(format!("Failed to read {}: {}", path.display(), err));
+        }
+    };
 
     events.push(SettingsEvent::info(format!(
         "Loading config file: {}",
         path.display()
     )));
 
-    match fs::read_to_string(path) {
-        Ok(contents) => {
-            deprecated_keys.merge(crate::config::deprecation::toml_deprecated_keys(&contents));
-            match toml::from_str::<RawWorkspaceSettings>(&contents) {
-                Ok(settings) => {
-                    events.push(SettingsEvent::info(format!(
-                        "Successfully loaded {}",
-                        path.display()
-                    )));
-                    Some(settings)
-                }
-                Err(err) => {
-                    events.push(SettingsEvent::error(format!(
-                        "Failed to parse {}: {}",
-                        path.display(),
-                        err
-                    )));
-                    None
-                }
-            }
-        }
-        Err(err) => {
-            events.push(SettingsEvent::error(format!(
-                "Failed to read {}: {}",
-                path.display(),
-                err
-            )));
-            None
-        }
+    // Read one byte past the ceiling so hitting it is distinguishable from a
+    // file that merely ends there. Bytes, then length, then decoding: the
+    // cutoff can land mid-character, and an oversized file should be reported
+    // as oversized rather than as invalid UTF-8 the truncation invented.
+    let mut bytes = Vec::new();
+    use std::io::Read as _;
+    file.take(MAX_CONFIG_FILE_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|err| format!("Failed to read {}: {}", path.display(), err))?;
+    if bytes.len() as u64 > MAX_CONFIG_FILE_BYTES {
+        return Err(format!(
+            "Failed to read {}: larger than the {} MiB configuration limit",
+            path.display(),
+            MAX_CONFIG_FILE_BYTES / (1024 * 1024)
+        ));
     }
+    let contents = String::from_utf8(bytes)
+        .map_err(|err| format!("Failed to read {}: {}", path.display(), err))?;
+    deprecated_keys.merge(crate::config::deprecation::toml_deprecated_keys(&contents));
+    let settings = toml::from_str::<RawWorkspaceSettings>(&contents)
+        .map_err(|err| format!("Failed to parse {}: {}", path.display(), err))?;
+
+    // Serde drops an unrecognised field silently, so `autoInstal = false` reads
+    // as "not specified" and the user gets defaults without being told why.
+    // Warn rather than reject: a key kakehashi does not recognise may be a
+    // typo, but it may equally be one this version has not learned yet, and
+    // refusing to start over it would make the file version-locked.
+    //
+    // Not reached for a key inside `features`: those structs carry
+    // `deny_unknown_fields`, so the parse above already failed and this file is
+    // fatal. Inconsistent with the rule stated here, pre-existing, and pinned
+    // by `test_load_toml_file_unknown_feature_key_is_fatal_today` so a future
+    // change to it is a deliberate one.
+    for key in unknown_config_keys(&contents) {
+        events.push(SettingsEvent::warning(format!(
+            "Unknown configuration key in {}: {key}",
+            path.display()
+        )));
+    }
+
+    events.push(SettingsEvent::info(format!(
+        "Successfully loaded {}",
+        path.display()
+    )));
+    Ok(Some(settings))
 }
 
 fn load_toml_settings(
@@ -339,9 +595,13 @@ mod tests {
 
         // Load settings with project path
         let home = dirs::home_dir().map(|p| p.to_string_lossy().into_owned());
-        let outcome = load_settings(Some(project_dir.path()), None, home.as_deref(), |var| {
-            std::env::var(var).ok()
-        });
+        let outcome = load_settings(
+            Some(project_dir.path()),
+            None,
+            home.as_deref(),
+            |var| std::env::var(var).ok(),
+            None,
+        );
 
         // Restore original XDG_CONFIG_HOME
         // SAFETY: #[serial(xdg_env)] prevents concurrent modification of XDG_CONFIG_HOME
@@ -430,6 +690,7 @@ mod tests {
             Some((SettingsSource::InitializationOptions, override_json)),
             home.as_deref(),
             |var| std::env::var(var).ok(),
+            None,
         );
 
         // Restore original XDG_CONFIG_HOME
@@ -488,7 +749,13 @@ mod tests {
 
         // Load settings (no project path, just user config)
         let home = dirs::home_dir().map(|p| p.to_string_lossy().into_owned());
-        let outcome = load_settings(None, None, home.as_deref(), |var| std::env::var(var).ok());
+        let outcome = load_settings(
+            None,
+            None,
+            home.as_deref(),
+            |var| std::env::var(var).ok(),
+            None,
+        );
 
         // Restore original XDG_CONFIG_HOME
         // SAFETY: #[serial(xdg_env)] prevents concurrent modification of XDG_CONFIG_HOME
@@ -534,6 +801,7 @@ mod tests {
             Some((SettingsSource::InitializationOptions, override_json)),
             None,
             env,
+            None,
         );
 
         assert!(
@@ -555,6 +823,40 @@ mod tests {
                 .iter()
                 .map(|e| format!("{:?}: {}", e.kind, &e.message))
                 .collect::<Vec<_>>()
+        );
+        assert!(
+            outcome
+                .events
+                .iter()
+                .all(|event| !event.message.contains("previous settings")),
+            "initialization-time errors must not claim that previous settings exist"
+        );
+    }
+
+    /// The last expansion gate stays non-fatal: it also carries
+    /// `initializationOptions`, whose failures must not abort startup.
+    #[test]
+    fn merged_expansion_failure_discards_settings_without_aborting() {
+        let merged = RawWorkspaceSettings {
+            search_paths: Some(vec!["$UNDEFINED_VAR/parsers".to_string()]),
+            ..Default::default()
+        };
+        let mut events = Vec::new();
+
+        let settings = expand_merged_settings(
+            Some(merged),
+            None,
+            crate::config::make_env(&[]),
+            &mut events,
+        );
+
+        assert!(settings.is_none());
+        assert!(
+            events
+                .iter()
+                .any(|event| event.kind == SettingsEventKind::Error
+                    && event.message.contains("UNDEFINED_VAR")),
+            "the discarded configuration must still be reported: {events:?}"
         );
     }
 
@@ -583,6 +885,7 @@ mod tests {
             Some((SettingsSource::InitializationOptions, deprecated)),
             None,
             make_env(&[]),
+            None,
         )
         .deprecated_keys
         .root_markers;
@@ -595,6 +898,7 @@ mod tests {
             Some((SettingsSource::InitializationOptions, canonical)),
             None,
             make_env(&[]),
+            None,
         )
         .deprecated_keys
         .root_markers;
@@ -628,8 +932,13 @@ mod tests {
         let mut ignored_deprecation = DeprecatedKeysSeen::default();
         let result = load_toml_file(&path, &mut events, &mut ignored_deprecation);
 
-        assert!(result.is_some(), "valid TOML should parse");
-        assert_eq!(result.unwrap().auto_install, Some(false));
+        let settings = result.expect("valid TOML should parse");
+        assert_eq!(
+            settings
+                .expect("present file should yield a layer")
+                .auto_install,
+            Some(false)
+        );
         assert!(
             events
                 .iter()
@@ -639,27 +948,31 @@ mod tests {
         );
     }
 
-    /// load_toml_file: non-existent path returns None + error event (configuration-merging-strategy).
+    /// load_toml_file: an absent explicit path is an optional layer, not an
+    /// error, so a layered invocation whose overlay does not exist still starts.
     #[test]
     fn test_load_toml_file_missing() {
+        // A child of a fresh temp dir, so "absent" cannot depend on what the
+        // host happens to have at a fixed absolute path.
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("config.toml");
         let mut events = Vec::new();
         let mut ignored_deprecation = DeprecatedKeysSeen::default();
-        let result = load_toml_file(
-            Path::new("/nonexistent/config.toml"),
-            &mut events,
-            &mut ignored_deprecation,
-        );
+        let result = load_toml_file(&path, &mut events, &mut ignored_deprecation);
 
-        assert!(result.is_none(), "missing file should return None");
+        assert!(
+            matches!(result, Ok(None)),
+            "missing file should be skipped, not fatal: {result:?}"
+        );
         assert!(
             events
                 .iter()
-                .any(|e| e.kind == SettingsEventKind::Error && e.message.contains("not found")),
-            "should emit error event for missing file"
+                .any(|e| e.kind == SettingsEventKind::Warning && e.message.contains("not found")),
+            "the skip must still be visible as a warning"
         );
     }
 
-    /// load_toml_file: invalid TOML returns None + warning event.
+    /// load_toml_file: a present file with invalid TOML is fatal.
     #[test]
     fn test_load_toml_file_invalid_toml() {
         let dir = TempDir::new().unwrap();
@@ -670,12 +983,336 @@ mod tests {
         let mut ignored_deprecation = DeprecatedKeysSeen::default();
         let result = load_toml_file(&path, &mut events, &mut ignored_deprecation);
 
-        assert!(result.is_none(), "invalid TOML should return None");
+        let message = result.expect_err("invalid TOML in an explicit file must be fatal");
         assert!(
-            events.iter().any(
-                |e| e.kind == SettingsEventKind::Error && e.message.contains("Failed to parse")
-            ),
-            "should emit error for invalid TOML in explicit config file"
+            message.contains("Failed to parse") && message.contains(&path.display().to_string()),
+            "the fatal message must name the offending file: {message}"
+        );
+    }
+
+    /// load_toml_file: a path whose metadata cannot even be reached is fatal,
+    /// not "absent". `Path::exists()` answers `false` for both, which would
+    /// silently skip a file the user cannot traverse to.
+    #[cfg(unix)]
+    #[test]
+    fn test_load_toml_file_unreachable_parent() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = TempDir::new().unwrap();
+        let locked_parent = dir.path().join("locked");
+        std::fs::create_dir(&locked_parent).unwrap();
+        let path = locked_parent.join("config.toml");
+        std::fs::write(&path, "autoInstall = false\n").unwrap();
+        std::fs::set_permissions(&locked_parent, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        let mut events = Vec::new();
+        let mut ignored_deprecation = DeprecatedKeysSeen::default();
+        // root ignores the permission bits, so probe before deciding to assert.
+        let permissions_enforced = std::fs::read_to_string(&path).is_err();
+        let result = load_toml_file(&path, &mut events, &mut ignored_deprecation);
+
+        // Restore before asserting so a failure cannot leave an unremovable dir.
+        std::fs::set_permissions(&locked_parent, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        if !permissions_enforced {
+            // Running as root (common in container CI): the bits do not apply,
+            // so there is no denial to observe. Still assert the path is not
+            // misread as absent, which is the regression this guards.
+            assert!(
+                matches!(result, Ok(Some(_))),
+                "a reachable file must load: {result:?}"
+            );
+            return;
+        }
+        let message = result.expect_err("an unreachable explicit file must be fatal");
+        assert!(
+            message.contains(&path.display().to_string()) && !message.contains("not found"),
+            "an unreachable path must not be reported as merely absent: {message}"
+        );
+    }
+
+    /// Every explicit layer is read, in order, while the configuration is
+    /// still usable.
+    #[test]
+    fn read_explicit_layers_reads_each_file_in_order() {
+        let dir = TempDir::new().unwrap();
+        let first = dir.path().join("first.toml");
+        let second = dir.path().join("second.toml");
+        std::fs::write(&first, "autoInstall = false\n").unwrap();
+        std::fs::write(&second, "autoInstall = true\n").unwrap();
+
+        let explicit = read_explicit_layers(
+            &[first.clone(), second.clone()],
+            None,
+            crate::config::make_env(&[]),
+        );
+
+        assert!(explicit.fatal_error.is_none());
+        assert_eq!(explicit.layers.len(), 2);
+        assert!(
+            explicit
+                .events
+                .iter()
+                .any(|event| event.message.contains(&second.display().to_string())),
+            "the second file must be read: {:?}",
+            explicit.events
+        );
+    }
+
+    /// A typo is reported rather than silently read as "not specified", which
+    /// is what serde does with an unrecognised field. It stays a warning: an
+    /// unrecognised key may be a mistake, or may be one a newer kakehashi
+    /// understands, and rejecting the file would version-lock it.
+    #[test]
+    fn test_load_toml_file_warns_about_unknown_keys() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("typo.toml");
+        std::fs::write(&path, "autoInstal = false\n").unwrap();
+
+        let mut events = Vec::new();
+        let mut ignored_deprecation = DeprecatedKeysSeen::default();
+        let result = load_toml_file(&path, &mut events, &mut ignored_deprecation);
+
+        assert!(
+            matches!(result, Ok(Some(_))),
+            "an unknown key must not reject the file: {result:?}"
+        );
+        assert!(
+            events
+                .iter()
+                .any(|event| event.kind == SettingsEventKind::Warning
+                    && event.message.contains("autoInstal")
+                    && event.message.contains(&path.display().to_string())),
+            "the typo and its file must both be named: {events:?}"
+        );
+    }
+
+    /// Records, rather than endorses, an inconsistency: `FeatureSettings` and
+    /// its children carry `deny_unknown_fields`, so an unknown key *inside*
+    /// `features` fails typed deserialization and is fatal — while the same
+    /// mistake anywhere else is a warning. Pinned so that changing it is a
+    /// deliberate act with a test to update, not a silent drift.
+    #[test]
+    fn test_load_toml_file_unknown_feature_key_is_fatal_today() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("feature-typo.toml");
+        std::fs::write(
+            &path,
+            "[features.\"textDocument/publishDiagnostics\"]\nfutureOption = 1\n",
+        )
+        .unwrap();
+
+        let mut events = Vec::new();
+        let mut ignored_deprecation = DeprecatedKeysSeen::default();
+        let result = load_toml_file(&path, &mut events, &mut ignored_deprecation);
+
+        let message = result
+            .expect_err("today an unknown key under `features` is fatal, unlike anywhere else");
+        assert!(
+            message.contains("futureOption"),
+            "the rejected key must be named: {message}"
+        );
+    }
+
+    /// The recognised spelling must stay silent, or the warning is noise.
+    #[test]
+    fn test_load_toml_file_accepts_known_keys_without_warning() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("fine.toml");
+        std::fs::write(
+            &path,
+            "autoInstall = false\n[languages.rust]\nparser = \"/p.so\"\n",
+        )
+        .unwrap();
+
+        let mut events = Vec::new();
+        let mut ignored_deprecation = DeprecatedKeysSeen::default();
+        let result = load_toml_file(&path, &mut events, &mut ignored_deprecation);
+
+        assert!(matches!(result, Ok(Some(_))), "{result:?}");
+        assert!(
+            events
+                .iter()
+                .all(|event| !event.message.contains("Unknown configuration key")),
+            "a well-formed file must not warn: {events:?}"
+        );
+    }
+
+    /// The strict gate judges the user's files, not the defaults beneath them.
+    /// Programmed defaults carry `${KAKEHASHI_DATA_DIR}`, which has no value on
+    /// a host with no discoverable data directory; merging them in would reject
+    /// a session over a valid — even empty — `--config-file`.
+    ///
+    /// Asserted on the merge rather than on a verdict: whether the default
+    /// expands depends on the host, so a test that ran the gate would pass on
+    /// any developer machine even with the defaults merged back in.
+    #[test]
+    fn merge_explicit_layers_excludes_the_programmed_defaults() {
+        let layers = vec![
+            Some(RawWorkspaceSettings {
+                auto_install: Some(false),
+                ..Default::default()
+            }),
+            None,
+        ];
+
+        let merged = merge_explicit_layers(&layers).expect("the explicit layer should survive");
+
+        assert_eq!(merged.auto_install, Some(false));
+        assert!(
+            merged.search_paths.is_none(),
+            "the defaults' searchPaths must not join the subject of the gate: {:?}",
+            merged.search_paths
+        );
+        assert!(
+            default_settings().search_paths.is_some(),
+            "this test is only meaningful while the defaults do carry searchPaths"
+        );
+    }
+
+    /// Once a layer has failed the verdict is settled, so later paths are not
+    /// touched at all. This is what keeps a `--config-file` naming a FIFO from
+    /// hanging a session over a failure already known — a property no
+    /// finite-file test can observe, hence the assertion on the events.
+    #[test]
+    fn read_explicit_layers_stops_at_the_first_failure() {
+        let dir = TempDir::new().unwrap();
+        let broken = dir.path().join("broken.toml");
+        let later = dir.path().join("later.toml");
+        std::fs::write(&broken, "this is not [valid toml").unwrap();
+        std::fs::write(&later, "autoInstall = true\n").unwrap();
+
+        let explicit = read_explicit_layers(
+            &[broken.clone(), later.clone()],
+            None,
+            crate::config::make_env(&[]),
+        );
+
+        assert!(
+            explicit
+                .fatal_error
+                .as_deref()
+                .is_some_and(|message| message.contains(&broken.display().to_string())),
+            "the first failure must be reported: {:?}",
+            explicit.fatal_error
+        );
+        assert!(
+            explicit
+                .events
+                .iter()
+                .all(|event| !event.message.contains(&later.display().to_string())),
+            "nothing after the failure may be read: {:?}",
+            explicit.events
+        );
+    }
+
+    /// load_toml_file: a file past the size ceiling fails instead of being read
+    /// to exhaustion. The ceiling is what keeps `--config-file /dev/zero` from
+    /// allocating until the process dies.
+    #[test]
+    fn test_load_toml_file_over_size_limit() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("huge.toml");
+        // A comment body, so the file is only rejected for its size — a valid
+        // parse would otherwise be indistinguishable from a missing check.
+        let mut oversized = String::with_capacity(MAX_CONFIG_FILE_BYTES as usize + 16);
+        oversized.push_str("# ");
+        oversized.extend(std::iter::repeat_n('a', MAX_CONFIG_FILE_BYTES as usize));
+        std::fs::write(&path, &oversized).unwrap();
+
+        let mut events = Vec::new();
+        let mut ignored_deprecation = DeprecatedKeysSeen::default();
+        let result = load_toml_file(&path, &mut events, &mut ignored_deprecation);
+
+        let message = result.expect_err("an oversized explicit file must be fatal");
+        assert!(
+            message.contains("configuration limit")
+                && message.contains(&path.display().to_string()),
+            "the limit must be named, and so must the file: {message}"
+        );
+    }
+
+    /// The size check runs before decoding, so a file whose oversize happens to
+    /// put a multi-byte character across the cutoff is still reported as
+    /// oversized rather than as invalid UTF-8 the truncation itself created.
+    #[test]
+    fn test_load_toml_file_over_size_limit_reports_size_not_encoding() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("huge-utf8.toml");
+        let mut oversized = String::from("# ");
+        oversized.extend(std::iter::repeat_n('a', MAX_CONFIG_FILE_BYTES as usize - 2));
+        oversized.push('é'); // straddles the ceiling
+        std::fs::write(&path, &oversized).unwrap();
+
+        let mut events = Vec::new();
+        let mut ignored_deprecation = DeprecatedKeysSeen::default();
+        let result = load_toml_file(&path, &mut events, &mut ignored_deprecation);
+
+        let message = result.expect_err("an oversized explicit file must be fatal");
+        assert!(
+            message.contains("configuration limit"),
+            "size must outrank the encoding error the cutoff invented: {message}"
+        );
+    }
+
+    /// load_toml_file: a symlink whose target is gone is present-but-unusable,
+    /// not absent. `try_exists` follows the link and reports the *target*, so
+    /// the two cases look identical without an explicit check.
+    #[cfg(unix)]
+    #[test]
+    fn test_load_toml_file_broken_symlink() {
+        let dir = TempDir::new().unwrap();
+        let target = dir.path().join("generated.toml");
+        let link = dir.path().join("config.toml");
+        std::fs::write(&target, "autoInstall = false\n").unwrap();
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        std::fs::remove_file(&target).unwrap();
+
+        let mut events = Vec::new();
+        let mut ignored_deprecation = DeprecatedKeysSeen::default();
+        let result = load_toml_file(&link, &mut events, &mut ignored_deprecation);
+
+        let message = result.expect_err("a dangling explicit symlink must be fatal");
+        assert!(
+            message.contains(&link.display().to_string()) && !message.contains("not found"),
+            "a dangling symlink must not be reported as merely absent: {message}"
+        );
+    }
+
+    /// load_toml_file: a file that exists but cannot be read is fatal, and is
+    /// reported differently from a file that is simply absent.
+    #[cfg(unix)]
+    #[test]
+    fn test_load_toml_file_unreadable() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("locked.toml");
+        std::fs::write(&path, "autoInstall = false\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        let mut events = Vec::new();
+        let mut ignored_deprecation = DeprecatedKeysSeen::default();
+        // root ignores the permission bits, so probe before deciding to assert.
+        let permissions_enforced = std::fs::read_to_string(&path).is_err();
+        let result = load_toml_file(&path, &mut events, &mut ignored_deprecation);
+
+        // Restore before asserting so a failure cannot leave an unremovable dir.
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        if !permissions_enforced {
+            // Running as root: the bits do not apply. Assert the file still
+            // loads rather than being misclassified as absent.
+            assert!(
+                matches!(result, Ok(Some(_))),
+                "a readable file must load: {result:?}"
+            );
+            return;
+        }
+        let message = result.expect_err("an unreadable explicit file must be fatal");
+        assert!(
+            message.contains("Failed to read") && message.contains(&path.display().to_string()),
+            "the fatal message must name the offending file: {message}"
         );
     }
 
@@ -692,7 +1329,10 @@ mod tests {
         let mut used_deprecated = DeprecatedKeysSeen::default();
         let result = load_toml_file(&path, &mut events, &mut used_deprecated);
 
-        assert!(result.is_some(), "valid TOML should parse");
+        assert!(
+            matches!(result, Ok(Some(_))),
+            "valid TOML should parse: {result:?}"
+        );
         assert!(
             used_deprecated.root_markers,
             "rootMarkers should set the flag"

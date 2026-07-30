@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use tower_lsp_server::Client;
-use tower_lsp_server::jsonrpc::Result;
+use tower_lsp_server::jsonrpc::{Error, ErrorCode, Result};
 use tower_lsp_server::ls_types::ColorProviderCapability;
 use tower_lsp_server::ls_types::{
     ClientCapabilities, CodeActionOptions, CodeActionProviderCapability, CodeLensOptions,
@@ -30,6 +30,17 @@ use crate::lsp::{SettingsSource, load_settings};
 use super::apply_edit_translation::ApplyEditTranslator;
 use super::show_document_translation::ShowDocumentTranslator;
 use super::{Kakehashi, uri_to_url};
+
+// LSP `RequestFailed`; ls-types does not currently expose this error code.
+const REQUEST_FAILED_ERROR_CODE: i64 = -32803;
+
+fn configuration_load_error(message: String) -> Error {
+    Error {
+        code: ErrorCode::ServerError(REQUEST_FAILED_ERROR_CODE),
+        message: message.into(),
+        data: None,
+    }
+}
 
 /// Translators for downstream-initiated request payloads that carry
 /// virtual-document coordinates, bundled so the forwarding loop threads one
@@ -67,6 +78,32 @@ impl Kakehashi {
         &self,
         params: InitializeParams,
     ) -> Result<InitializeResult> {
+        // Reject an unusable `--config-file` before anything from `params` is
+        // latched. Several of the stores below are first-write-wins, and
+        // tower-lsp-server resets to `Uninitialized` after an error response,
+        // so a client may fix the file and retry: without this, the retry would
+        // load the corrected settings while downstream servers kept the failed
+        // attempt's capabilities, root URI, and workspace folders.
+        //
+        // Reported only through this response — the settings events carrying
+        // the same text are never sent, so the client does not also get a
+        // `window/showMessage` popup on top of a handshake it already failed.
+        // Pinned by `test_config_file_fatal_error_is_not_also_shown_as_a_message`.
+        //
+        // The files are read here and the result carried into `load_settings`
+        // below, never re-read: a `--config-file` may name a stream, and a file
+        // swapped between two reads would slip past whichever check ran first.
+        let explicit_config =
+            crate::lsp::settings::load_explicit_config(self.home_dir.as_deref(), |var| {
+                std::env::var(var).ok()
+            });
+        if let Some(error) = explicit_config
+            .as_ref()
+            .and_then(|config| config.fatal_error.clone())
+        {
+            return Err(configuration_load_error(error));
+        }
+
         let position_encoding = host_position_encoding(&params.capabilities);
         // Store client capabilities for LSP compliance checks (e.g., refresh support).
         // Uses SettingsManager which wraps OnceLock for "set once, read many" semantics.
@@ -188,7 +225,13 @@ impl Kakehashi {
                 .map(|options| (SettingsSource::InitializationOptions, options)),
             self.home_dir.as_deref(),
             |var| std::env::var(var).ok(),
+            explicit_config,
         );
+
+        // There is deliberately no second fatal check here. Every verdict on
+        // the explicit configuration was reached above, before any of the
+        // stores in between — and the files must not be read again to reach
+        // one, since a `--config-file` may name a stream.
         let settings_events = settings_outcome.events;
         let mut default_settings_warning = None;
 

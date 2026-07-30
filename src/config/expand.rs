@@ -76,6 +76,33 @@ impl fmt::Display for ExpandError {
 #[derive(Debug)]
 pub struct ExpandErrors(pub(crate) Vec<ExpandError>);
 
+impl ExpandErrors {
+    /// Render only the errors that make a path unusable on its own.
+    ///
+    /// `InvalidSetting` is deliberately excluded: it reports a cross-field
+    /// invariant (e.g. `debounceMs <= maxWaitMs`) whose operands merge
+    /// independently across config layers, so a layer that supplies only one
+    /// side of the pair is legitimately invalid in isolation and valid once
+    /// merged. Path values, in contrast, are replaced wholesale by a later
+    /// layer, which is why they are worth judging per layer.
+    ///
+    /// Returns `None` when every error is a cross-field invariant violation.
+    pub(crate) fn path_error_summary(&self) -> Option<String> {
+        let details: Vec<String> = self
+            .0
+            .iter()
+            .filter(|error| {
+                matches!(
+                    error,
+                    ExpandError::UndefinedVar { .. } | ExpandError::NoHomeDir { .. }
+                )
+            })
+            .map(|error| error.to_string())
+            .collect();
+        (!details.is_empty()).then(|| details.join("; "))
+    }
+}
+
 impl fmt::Display for ExpandErrors {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let details: Vec<String> = self.0.iter().map(|e| e.to_string()).collect();

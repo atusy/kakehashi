@@ -3,6 +3,7 @@ pub(crate) mod deprecation;
 pub(crate) mod expand;
 pub(crate) mod merge;
 pub mod settings;
+pub(crate) mod unknown_keys;
 
 use std::collections::HashMap;
 
