@@ -13,9 +13,13 @@ struct Cli {
     #[arg(long, global = true)]
     data_dir: Option<PathBuf>,
 
-    /// Config file(s) to use instead of default locations (LSP and format
-    /// modes). Can be specified multiple times; files merge in order.
+    /// Config file(s) to use instead of default locations. Can be specified
+    /// multiple times; files merge in order.
     /// Skips ~/.config/kakehashi/kakehashi.toml and ./kakehashi.toml.
+    /// A file that is present but unreadable, malformed, or carrying an
+    /// unexpandable path is a hard error (CLI exit 2); one that is absent is
+    /// skipped with a warning. Relative paths resolve against the working
+    /// directory of the kakehashi process.
     #[arg(long, global = true)]
     config_file: Vec<PathBuf>,
 
@@ -94,8 +98,8 @@ enum Commands {
     /// Exit codes: 0 = no failing diagnostics; 1 = a failing diagnostic (any
     /// error, plus warnings with --fail-on-warning; info/hint never fail —
     /// append `|| true` to never fail); 2 = an operational error (unreadable
-    /// file, path open/enumeration failure, downstream server failure),
-    /// independent of the diagnostics.
+    /// file, path open/enumeration failure, an unloadable --config-file,
+    /// downstream server failure), independent of the diagnostics.
     Diagnose {
         /// Files or directories to diagnose ("-" for stdin with --stdin-filename)
         paths: Vec<PathBuf>,

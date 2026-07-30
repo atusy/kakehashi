@@ -22,7 +22,8 @@
 //!   `--fail-on-warning`. Info/hint never fail. To never fail on diagnostics,
 //!   append `|| true`.
 //! - `2`: an operational error (a file could not be read, a path could not be
-//!   opened or fully enumerated, or a configured downstream server failed).
+//!   opened or fully enumerated, a file given with `--config-file` could not be
+//!   loaded, or a configured downstream server failed).
 //!   Independent of the diagnostics — a tool that could not even read a file
 //!   must not look "clean" to CI, so it surfaces as `2` regardless.
 //!
@@ -100,7 +101,8 @@ pub const EXIT_OK: u8 = 0;
 /// A failing diagnostic (an error, or a warning under `--fail-on-warning`).
 pub const EXIT_DIAGNOSTICS: u8 = 1;
 /// An operational error (unreadable file, path open/enumeration failure,
-/// downstream server failure). Independent of the diagnostics.
+/// an unloadable `--config-file`, downstream server failure). Independent of
+/// the diagnostics.
 pub const EXIT_ERROR: u8 = 2;
 
 /// Per-server bound for waiting on cold downstream language servers, matching

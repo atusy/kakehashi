@@ -208,7 +208,7 @@ Path fields support environment variable expansion and tilde (`~`) expansion, ma
 - `languages[*].parser`
 - `languages[*].queries[*].path`
 
-**Behavior on undefined variables:** If a referenced environment variable is not defined during ordinary startup loading, the merged configuration is discarded and programmed defaults are used. A runtime `workspace/didChangeConfiguration` update is discarded while the previous settings remain active. Explicit `--config-file` inputs are stricter: an expansion failure rejects LSP initialization or makes the CLI command exit with status 2. The exception is `KAKEHASHI_DATA_DIR`, which automatically falls back to the platform-specific default when unset (see [Default Data Directories](#default-data-directories)).
+**Behavior on undefined variables:** If a referenced environment variable is not defined during ordinary startup loading, the merged configuration is discarded and programmed defaults are used. A runtime `workspace/didChangeConfiguration` update is discarded while the previous settings remain active. Explicit `--config-file` inputs are stricter: an expansion failure in one of them rejects LSP initialization or makes the CLI command exit with status 2, rather than falling back to defaults. `initializationOptions` sent by the client keep the ordinary non-fatal behavior even in a `--config-file` session. The exception is `KAKEHASHI_DATA_DIR`, which automatically falls back to the platform-specific default when unset (see [Default Data Directories](#default-data-directories)).
 
 ### Option Reference
 
@@ -698,11 +698,30 @@ kakehashi --config-file /path/to/empty.toml
 When `--config-file` is specified:
 - Default user config (`~/.config/kakehashi/kakehashi.toml`) is **skipped**
 - Default project config (`./kakehashi.toml`) is **skipped**
-- Every explicit file is validated before merging, so a missing or unreadable
-  file, malformed TOML, or path-expansion failure aborts startup even when a
-  later layer would override the invalid value. LSP initialization returns a
-  `RequestFailed` error; `format` and `diagnose` exit with status 2.
-- `initializationOptions` from the LSP client still apply on top
+- A file that is **present but unusable** aborts startup: unreadable, malformed
+  TOML, or a path that cannot be expanded. LSP initialization returns a
+  `RequestFailed` error naming the first such file; `format` and `diagnose`
+  print it to stderr and exit with status 2. Correcting the file requires
+  restarting the server (`:LspRestart`, or reloading the window) — kakehashi
+  does not re-read configuration after a rejected initialization.
+- A path that expands badly is judged **per file**, so a later layer cannot mask
+  an earlier layer's undefined variable — the merged result would never mention
+  the mistake, because a later layer replaces path fields wholesale.
+- A file that is **absent** is skipped with a warning, not an error, so
+  `--config-file base.toml --config-file overrides.toml` works in a repository
+  that has no overlay. Note that a relative path resolves against the process
+  working directory, which for an editor-spawned server is the editor's rather
+  than the workspace root.
+- Cross-field invariants (e.g. `debounceMs` ≤ `maxWaitMs`) are judged on the
+  merged explicit configuration, so splitting the two halves across two files is
+  fine — but a combination that is invalid only once merged still aborts.
+- `initializationOptions` from the LSP client still apply on top, and keep their
+  ordinary non-fatal behavior: an invalid override is discarded, not fatal.
+
+Implicitly discovered configuration is deliberately laxer. A
+`~/.config/kakehashi/kakehashi.toml` or `./kakehashi.toml` that fails to parse
+is reported as a warning and skipped, so a stray file cannot stop the server
+from starting. Only paths you name explicitly are strict.
 
 ## CLI Commands
 
@@ -798,10 +817,12 @@ kakehashi format . --tab-size 2 --insert-spaces false
 
 Exit codes: `0` nothing to change (or changes written without
 `--fail-on-change`), `1` changes detected under `--check`/`--fail-on-change`,
-`2` usage error, I/O error, or downstream formatter failure (a configured
+`2` usage error, I/O error, a configuration file given with `--config-file`
+that could not be loaded, or downstream formatter failure (a configured
 server failed to start, errored on the request, timed out, or returned a
 protocol-invalid response — even when a fallback server still produced
-output).
+output). On exit `2` stdout stays empty, including in `--stdin-filename` mode:
+a failed run never hands its caller content to write back.
 
 ### Diagnostics
 
@@ -851,7 +872,8 @@ Line and column are 1-based; a diagnostic with no severity is treated as an
 error (so it can never silently slip past the gate). Exit codes: `0` no failing
 diagnostic; `1` a failing diagnostic — any error always, plus warnings with
 `--fail-on-warning` (info/hint never fail); `2` an operational error (a file
-could not be read, a path could not be opened or fully enumerated, or a
+could not be read, a path could not be opened or fully enumerated, a
+configuration file given with `--config-file` could not be loaded, or a
 configured downstream server failed — including one that answered the
 `textDocument/diagnostic` pull with an error response or a
 present-but-malformed payload, matching `kakehashi format`'s strictness) —

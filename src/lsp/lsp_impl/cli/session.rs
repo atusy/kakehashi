@@ -22,6 +22,13 @@ impl Kakehashi {
     /// Run the LSP initialize/initialized lifecycle for CLI mode, loading
     /// configuration from `root` (typically the current directory) exactly
     /// like an editor session rooted there would.
+    ///
+    /// # Errors
+    ///
+    /// Returns the `initialize` error when a file given with `--config-file`
+    /// is present but cannot be loaded. Callers must surface it and exit with
+    /// their error code rather than continuing on programmed defaults;
+    /// `initialized` is deliberately not sent in that case.
     pub(crate) async fn cli_initialize(
         &self,
         root: &Path,

@@ -192,18 +192,40 @@ silently shadow every user-supplied top-level opt-out.
 
 ### File Loading Behavior
 
-1. **Missing files are silently ignored**
+Strictness follows *how the path was chosen*, not what went wrong with it. A
+path the user typed carries intent; a path kakehashi went looking for does not.
+
+1. **Implicitly discovered files degrade quietly**
    - User config doesn't exist: proceed with empty user config
-   - Project config doesn't exist (and `--config-file` not specified): proceed with empty project config
-   - No error, no warning—this enables zero-config startup
+   - Project config doesn't exist: proceed with empty project config
+   - Either one exists but fails to parse: warn and skip that layer
+   - This is what keeps zero-config startup working: a stray or half-edited
+     `kakehashi.toml` must never leave the user without a server
 
-2. **Invalid files cause startup failure**
-   - Parse errors in any config file should fail fast with a clear error message
-   - Users should know immediately if their config is malformed
+2. **An explicit `--config-file` that is present but unusable fails startup**
+   - Unreadable, malformed TOML, or carrying a path that cannot be expanded
+   - LSP `initialize` returns `RequestFailed` (-32803) naming the first such
+     file; `format` and `diagnose` print it and exit 2
+   - Silently dropping the layer and continuing on defaults is what hides
+     configuration mistakes, and an explicit path is where the user is most
+     entitled to be told
 
-3. **`--config-file` option with missing file**
-   - If user explicitly specifies `--config-file /path/to/config.toml` and file doesn't exist: error
-   - Explicit paths should be validated; implicit defaults can be missing
+3. **An explicit `--config-file` that is absent is skipped with a warning**
+   - Layered invocations (`--config-file base.toml --config-file overrides.toml`)
+     depend on the overlay being allowed not to exist, and a relative path
+     resolves against the process working directory — for an editor-spawned
+     server, the editor's rather than the workspace root. Absence is too easily
+     accidental to be worth refusing to start over; being unusable is not.
+
+4. **Where each class of failure is judged**
+   - Path expansion: per file, because a later layer replaces path fields
+     wholesale, so the merged result would never mention an earlier layer's
+     undefined variable
+   - Cross-field invariants (e.g. `debounceMs` ≤ `maxWaitMs`): on the merged
+     explicit configuration only, because their operands merge independently —
+     one file may legitimately supply just one half
+   - `initializationOptions`: never fatal. A client-supplied override that fails
+     to expand is discarded, as it is outside a `--config-file` session
 
 ### Implementation Notes
 
@@ -274,7 +296,8 @@ fn load_configuration(cli_config_path: Option<&Path>) -> Option<RawWorkspaceSett
 ### Phase 4: Project Configuration (Completed)
 - [x] Load project config from `./kakehashi.toml`
 - [x] `--config-file` CLI option for alternative path(s)
-- [x] Error on missing file when explicitly specified
+- [x] Fail startup on an explicit file that is present but unusable; skip an
+      absent one with a warning
 
 ### Phase 5: Testing
 - [ ] Unit tests for `QueryItem` parsing and type inference

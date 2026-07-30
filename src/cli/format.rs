@@ -96,9 +96,9 @@ pub const EXIT_OK: u8 = 0;
 /// At least one file changed (with `--fail-on-change`) or would change
 /// (with `--check`).
 pub const EXIT_CHANGED: u8 = 1;
-/// Usage error, I/O error, or downstream formatter failure (a configured
-/// server failed to start, errored on the request, timed out, or returned a
-/// protocol-invalid response).
+/// Usage error, I/O error, an unloadable `--config-file`, or downstream
+/// formatter failure (a configured server failed to start, errored on the
+/// request, timed out, or returned a protocol-invalid response).
 pub const EXIT_ERROR: u8 = 2;
 
 /// Per-server bound for waiting on cold downstream language servers. Spawning

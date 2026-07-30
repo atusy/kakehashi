@@ -202,8 +202,11 @@ impl Kakehashi {
         );
 
         // Report the fatal explicit-config failure only through the initialize
-        // response: returning before the settings events are logged keeps the
-        // error from also arriving as a window/logMessage duplicate.
+        // response. Returning before the settings events are logged keeps it
+        // from also arriving as a `window/showMessage` popup — the channel
+        // `SettingsEventKind::Error` normally uses — on top of a handshake the
+        // client already failed. Pinned by
+        // `test_config_file_fatal_error_is_not_also_shown_as_a_message`.
         if let Some(error) = settings_outcome.fatal_error {
             return Err(configuration_load_error(error));
         }
