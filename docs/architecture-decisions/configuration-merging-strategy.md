@@ -80,6 +80,65 @@ queries = [
    - Purpose: Per-session overrides from the editor/client configuration
    - Note: Runtime changes via `didChangeConfiguration` re-trigger the merge process
 
+### Path Anchoring Precedes the Merge
+
+Relative path fields (`searchPaths`, `languages[*].parser`,
+`languages[*].queries[*].path`) are rewritten to sit under their source layer's
+directory *before* the layers are merged, by
+`crate::config::paths::anchor_settings_paths`. Doing it afterwards is not
+possible: the merge replaces path fields wholesale, so a surviving `./queries`
+no longer records which file asked for it, and the only base left is the server
+process's working directory — which for an editor-spawned server belongs to
+whoever launched the editor.
+
+Anchoring and expansion walk the same enumeration,
+`crate::config::paths::path_fields_mut`. Two independent lists would drift
+silently: a new path field expanded but never anchored is this issue back for
+that field alone, and one anchored but never expanded hands a literal `~` to the
+filesystem. The walk destructures `LanguageSettings` and `QueryItem`
+exhaustively, so a new field on either fails to compile until it is classified;
+a new *top-level* path field is not covered, since `searchPaths` reaches the
+walk as a parameter.
+
+Bases per layer: a config file uses its own directory (each `--config-file`
+layer its own), `initializationOptions` and `didChangeConfiguration` use the
+initialized workspace root, and the programmed defaults have no base.
+
+Resolution is therefore two distinct steps, in this order:
+
+1. **Anchoring**, per raw layer, on the values as written — `searchPaths = ["./runtime"]` becomes `["<layer dir>/runtime"]`. Purely syntactic.
+2. **Expansion**, once, on the merged result, inside `WorkspaceSettings::try_from_settings` — `$VAR` and `~` are substituted.
+
+Anchoring **does not expand**, and a value beginning with `/`, `~`, or `$` skips
+anchoring but is still expanded in step 2 — the two steps opt out
+independently. Keeping expansion to a single pass is load-bearing in three ways:
+the `$$` literal-dollar escape cannot be consumed twice, the cross-field
+invariant checks that live in `try_from_settings` cannot be bypassed by a second
+conversion entry point, and the defaults' `${KAKEHASHI_DATA_DIR}` template
+survives into the raw settings that `kakehashi/internal/effectiveConfiguration`
+reports.
+
+Because step 1 writes into a string that step 2 reads, anchoring neutralises
+what it prepends: a `$` in the layer's directory name is escaped as `$$`, and a
+`..` is not folded past an unexpanded variable, which would delete the variable
+along with the error expansion owes for it. A value it cannot anchor at all — a
+directory name that is not valid UTF-8, or a drive-relative `C:lib` — is
+reported rather than silently left alone, so the strict `--config-file` layer
+can reject what it cannot honour.
+
+Because each layer is anchored while raw, a language `base` chain that spans
+layers inherits values that have *already* been resolved against their own
+layer — `resolve_base_configs` folds the chain later, so an inherited `parser`
+keeps the base of the layer that wrote it rather than the layer that inherits
+it.
+
+Two things anchoring must not do to a value it prepends to. It escapes a `$` in
+the base as `$$`, since expansion reads `$VAR` anywhere in a value and a
+directory may legitimately be named `a$b`. And it declines to fold `..`
+lexically when the value also carries a variable, since the fold pops the
+component in front of it — which before expansion may be the variable itself,
+taking the undefined-variable error with it.
+
 ### Merge Algorithm
 
 Layers are merged pairwise via `merge_workspace_settings` using `reduce` and `flatten`:
@@ -203,8 +262,11 @@ path the user typed carries intent; a path kakehashi went looking for does not.
      `kakehashi.toml` must never leave the user without a server
 
 2. **An explicit `--config-file` that is present but unusable fails startup**
-   - Unreadable, malformed TOML, larger than the 8 MiB read ceiling, or
-     carrying a path that cannot be expanded
+   - Unreadable, malformed TOML, larger than the 8 MiB read ceiling, carrying a
+     path that cannot be expanded, or sitting somewhere whose own directory
+     cannot be resolved — anchoring that layer's relative paths needs it, and
+     continuing without it would silently resolve them against the working
+     directory
    - LSP `initialize` returns `RequestFailed` (-32803) naming the first such
      file; `format` and `diagnose` print it and exit 2
    - Silently dropping the layer and continuing on defaults is what hides
@@ -312,6 +374,7 @@ fn load_settings(root, override_settings, home, env_fn, explicit) -> SettingsLoa
 - **Arrays replace, not merge**: `queries` arrays are replaced entirely, not concatenated; overriding one query type requires repeating all
 - **No "unset" mechanism**: Cannot explicitly remove a field inherited from earlier layers (would need `null` support)
 - **File I/O at startup**: Reading the config files adds latency (minimal in practice) — two implicit files, or however many `--config-file` arguments were given
+- **Relative paths changed meaning**: a relative value in an existing config file now resolves against that file's directory rather than wherever the server happened to be launched. Intended (it is the point of the change), but it silently relocates a user config written to be per-project — most visibly a `searchPaths` entry, whose misses are logged at debug level rather than as an error
 - **Infrastructure-integration gap**: Phases 1-3 (Sprints 118-120) built infrastructure (schema, merging, user config loading) but delivered ZERO user value until Sprint 124 wired APIs into application. Lesson: infrastructure sprints must be followed by integration sprints within 1-2 sprints to realize value.
 
 ### Neutral

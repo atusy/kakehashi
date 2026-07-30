@@ -149,7 +149,7 @@ impl Kakehashi {
         }
 
         // Parse the incoming settings.
-        let parsed = match serde_json::from_value::<RawWorkspaceSettings>(settings_value) {
+        let mut parsed = match serde_json::from_value::<RawWorkspaceSettings>(settings_value) {
             Ok(settings) => settings,
             Err(err) => {
                 self.notifier()
@@ -158,6 +158,20 @@ impl Kakehashi {
                 return;
             }
         };
+
+        // A pushed path is workspace-local, matching `initializationOptions`:
+        // the client knows the workspace it opened, not the directory the server
+        // was launched from. Anchored here, while this push is still a layer of
+        // its own — after the merge below it is indistinguishable from a value
+        // that arrived from a config file and was already anchored to that
+        // file's directory.
+        let root_path = self.settings_manager.root_path();
+        // A base that cannot be represented leaves the pushed values as written,
+        // which is the pre-#732 meaning; `anchor_settings_paths` warns about it.
+        // Not fatal, matching this handler's existing posture of keeping the
+        // previous settings in effect rather than taking the session down.
+        let _ =
+            crate::config::paths::anchor_settings_paths(&mut parsed, root_path.as_ref().as_deref());
 
         // Snapshot read, derivation, and publication must share the same reload
         // transaction as post-install search-path updates, or either path can
@@ -335,6 +349,67 @@ mod tests {
         }));
 
         assert_eq!(unknown_keys, ["autoInstal"]);
+    }
+
+    /// A path pushed by the client is workspace-local. Without anchoring it
+    /// would reach the filesystem relative to the server's working directory,
+    /// which for an editor-spawned server is the editor's — the same
+    /// launch-directory dependence issue #732 removed from the file layers.
+    ///
+    /// `searchPaths` stands in for every path field: which fields are anchored
+    /// is settled by `anchor_settings_paths`' own tests. Pushing a `languages`
+    /// entry here would additionally register a language and reach for its
+    /// parser, which is not what this test is about.
+    #[tokio::test]
+    async fn pushed_relative_paths_anchor_to_the_workspace_root() {
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+        server
+            .settings_manager
+            .set_root_path(Some(std::path::PathBuf::from("/workspace")));
+
+        server
+            .did_change_configuration_impl(DidChangeConfigurationParams {
+                settings: serde_json::json!({
+                    "kakehashi": { "searchPaths": ["./runtime"] }
+                }),
+            })
+            .await;
+
+        let snapshot = server.settings_manager.load_settings_pair();
+        assert_eq!(
+            snapshot.settings.search_paths,
+            vec!["/workspace/runtime".to_string()]
+        );
+        assert_eq!(
+            snapshot.raw_settings.search_paths,
+            Some(vec!["/workspace/runtime".to_string()]),
+            "the stored raw settings carry the anchored value, so a later push \
+             merging onto them does not re-base it"
+        );
+    }
+
+    /// A push arriving before `initialize` stored a root has no workspace to
+    /// anchor to. The value is left as written rather than guessed at, so it
+    /// keeps the pre-#732 meaning instead of being anchored to a wrong base.
+    #[tokio::test]
+    async fn pushed_relative_paths_survive_an_unknown_workspace_root() {
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+        server.settings_manager.set_root_path(None);
+
+        server
+            .did_change_configuration_impl(DidChangeConfigurationParams {
+                settings: serde_json::json!({
+                    "kakehashi": { "searchPaths": ["./runtime"] }
+                }),
+            })
+            .await;
+
+        assert_eq!(
+            server.settings_manager.load_settings().search_paths,
+            vec!["./runtime".to_string()]
+        );
     }
 
     #[tokio::test]

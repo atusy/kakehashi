@@ -1,11 +1,12 @@
 use crate::config::deprecation::DeprecatedKeysSeen;
+use crate::config::paths::anchor_settings_paths;
 use crate::config::{
     RawWorkspaceSettings, WorkspaceSettings, defaults::default_settings, load_user_config,
     merge_workspace_settings,
 };
 use serde_json::Value;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SettingsEventKind {
@@ -146,6 +147,45 @@ fn merge_explicit_layers(layers: &[Option<RawWorkspaceSettings>]) -> Option<RawW
         .flatten()
 }
 
+/// The directory a config file lives in, as an absolute path.
+///
+/// A relative `--config-file` argument is resolved against the working
+/// directory first: its *parent* would otherwise be relative too, and anchoring
+/// a layer to a relative base leaves the layer relative to the working
+/// directory — the dependence anchoring is meant to remove.
+///
+/// A path with no parent at all is reported as an error rather than as "no base
+/// to anchor to". Only a filesystem root lacks one, which cannot be read as a
+/// config file — so the caller never sees this — but answering `None` would make
+/// the one unanchored outcome indistinguishable from success.
+///
+/// A Windows drive-relative argument (`--config-file D:config.toml`) is refused
+/// for the same reason. Joining does not absolutize it — a prefixed argument
+/// replaces the base — so its parent would be the bare `D:`, and every path
+/// anchored to that would still resolve against drive D's own current
+/// directory. Answering that would be indistinguishable from success while
+/// preserving exactly the launch-directory dependence anchoring removes.
+fn config_file_base(path: &Path) -> std::io::Result<PathBuf> {
+    if crate::config::paths::is_drive_relative(&path.to_string_lossy()) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "path names a drive but no root, so it resolves against that drive's current \
+             directory; give the path in full",
+        ));
+    }
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(path)
+    };
+    absolute.parent().map(Path::to_path_buf).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "path has no parent directory",
+        )
+    })
+}
+
 /// The body of [`load_explicit_config`], taking the paths directly so it can be
 /// exercised without the process-global `--config-file` override.
 fn read_explicit_layers(
@@ -170,7 +210,7 @@ fn read_explicit_layers(
         if fatal_error.is_some() {
             break;
         }
-        let layer = match load_toml_file(path, &mut events, &mut deprecated_keys) {
+        let mut layer = match load_toml_file(path, &mut events, &mut deprecated_keys) {
             Ok(layer) => layer,
             Err(message) => {
                 events.push(SettingsEvent::error(message.clone()));
@@ -192,6 +232,13 @@ fn read_explicit_layers(
         // merge independently, so they are only meaningful once every
         // layer has been folded together, and `expand_merged_settings`
         // catches them there.
+        //
+        // Judged *before* anchoring, so the value the error quotes is the one
+        // the user can find in their file. The verdict is the same either way:
+        // anchoring cannot introduce an expansion error, since it prepends an
+        // absolute base whose own `$` it escapes, and cannot remove one, since
+        // it declines to fold a value carrying a variable. So this costs
+        // nothing and reads better.
         if let Some(raw_settings) = layer.as_ref()
             && let Err(errs) = WorkspaceSettings::try_from_settings(raw_settings, home, &env_fn)
             && let Some(details) = errs.path_error_summary()
@@ -199,6 +246,54 @@ fn read_explicit_layers(
             let message = format!("Path expansion failed in {}: {details}", path.display());
             events.push(SettingsEvent::error(message.clone()));
             fatal_error.get_or_insert(message);
+        }
+        // Anchor each file's relative paths to that file's own directory, so
+        // `--config-file base.toml --config-file team/overrides.toml` reads
+        // `./queries` as relative to whichever file wrote it.
+        //
+        // Failing to anchor is fatal rather than skipped, both when the
+        // directory cannot be resolved and when it cannot be represented in a
+        // `String` path field: falling through would silently resolve that
+        // layer's paths against the working directory, which is the
+        // launch-directory dependence this anchoring exists to remove. The
+        // layers that degrade instead of failing are the implicit ones, whose
+        // contract has always been to fall back rather than abort.
+        //
+        // An unusable directory is only reported when the layer actually has
+        // something to anchor. A file naming only absolute paths does not care
+        // where it lives, and rejecting the session over it would be a failure
+        // the user cannot act on.
+        if let Some(raw_settings) = layer.as_mut() {
+            match config_file_base(path) {
+                Ok(base) => {
+                    let unanchored = anchor_settings_paths(raw_settings, Some(&base));
+                    if !unanchored.is_empty() {
+                        let message = format!(
+                            "Cannot resolve {} in {} against that file's directory, so {} would \
+                             silently resolve against the working directory instead. Either the \
+                             directory's name is not valid UTF-8, or the path names a drive \
+                             without a root (`C:lib`); write the path in full to fix it.",
+                            if unanchored.len() == 1 {
+                                "a path".to_string()
+                            } else {
+                                format!("{} paths", unanchored.len())
+                            },
+                            path.display(),
+                            unanchored.join(", ")
+                        );
+                        events.push(SettingsEvent::error(message.clone()));
+                        fatal_error.get_or_insert(message);
+                    }
+                }
+                Err(error) => {
+                    let message = format!(
+                        "Failed to resolve the directory of {}: {error}",
+                        path.display()
+                    );
+                    events.push(SettingsEvent::error(message.clone()));
+                    fatal_error.get_or_insert(message);
+                }
+            }
         }
         layers.push(layer);
     }
@@ -252,9 +347,17 @@ pub fn load_settings(
     let mut deprecated_keys = DeprecatedKeysSeen::default();
 
     // Layer 1: Programmed defaults (configuration-merging-strategy: lowest precedence)
+    //
+    // No source directory, so nothing to anchor against: the defaults carry
+    // `${KAKEHASHI_DATA_DIR}`, which is meant to reach expansion as written.
     let defaults = Some(default_settings());
 
     // Layers 2+3: config files (either explicit --config-file or default locations)
+    //
+    // Each layer's relative paths are anchored to the directory that layer came
+    // from, while that is still known. Explicit layers were already anchored by
+    // `read_explicit_layers`, which is the only place their per-file parents are
+    // in scope.
     let config_layers: Vec<Option<RawWorkspaceSettings>> = if let Some(explicit) = explicit {
         events.extend(explicit.events);
         deprecated_keys.merge(explicit.deprecated_keys);
@@ -262,16 +365,43 @@ pub fn load_settings(
     } else {
         vec![
             // Layer 2: User config from XDG_CONFIG_HOME (~/.config/kakehashi/kakehashi.toml)
-            load_user_config_with_events(&mut events, &mut deprecated_keys),
+            //
+            // A base that cannot be represented leaves values as written, which
+            // is the pre-#732 meaning. Deliberately not fatal here: an implicit
+            // layer's contract is to degrade rather than take the session down,
+            // and `anchor_settings_paths` warns about what it skipped. Same for
+            // a `parent()` of `None`, which the explicit layer treats as fatal —
+            // `user_config_path` always answers an absolute path ending
+            // `kakehashi/kakehashi.toml`, so the two rules cannot actually
+            // disagree about any real path.
+            load_user_config_with_events(&mut events, &mut deprecated_keys).map(
+                |(mut settings, path)| {
+                    let _ = anchor_settings_paths(&mut settings, path.parent());
+                    settings
+                },
+            ),
             // Layer 3: Project config from root_path/kakehashi.toml
-            load_toml_settings(root_path, &mut events, &mut deprecated_keys),
+            load_toml_settings(root_path, &mut events, &mut deprecated_keys).map(|mut settings| {
+                // `load_toml_settings` reads `root_path/kakehashi.toml`, so the
+                // file's directory is `root_path` itself.
+                let _ = anchor_settings_paths(&mut settings, root_path);
+                settings
+            }),
         ]
     };
 
-    // Layer 4: Override settings from initialization options or client configuration
-    let override_settings = override_settings.and_then(|(source, value)| {
-        parse_override_settings(source, value, &mut events, &mut deprecated_keys)
-    });
+    // Layer 4: Override settings from initialization options or client configuration.
+    //
+    // Client-supplied paths are workspace-local: the client knows the workspace
+    // it opened, not the directory the server was launched from.
+    let override_settings = override_settings
+        .and_then(|(source, value)| {
+            parse_override_settings(source, value, &mut events, &mut deprecated_keys)
+        })
+        .map(|mut settings| {
+            let _ = anchor_settings_paths(&mut settings, root_path);
+            settings
+        });
 
     // Merge all layers: defaults < config_layers < override (later layers override earlier)
     let mut layers = vec![defaults];
@@ -321,17 +451,20 @@ fn expand_merged_settings(
 }
 
 /// Load user config and add appropriate events to the events vector.
+///
+/// Reports the file it was read from alongside the settings, so the caller can
+/// anchor the layer's relative paths to that file's directory.
 fn load_user_config_with_events(
     events: &mut Vec<SettingsEvent>,
     deprecated_keys: &mut DeprecatedKeysSeen,
-) -> Option<RawWorkspaceSettings> {
+) -> Option<(RawWorkspaceSettings, PathBuf)> {
     match load_user_config() {
         Ok(Some(config)) => {
             events.push(SettingsEvent::info(
                 "Loaded user config from XDG_CONFIG_HOME",
             ));
             deprecated_keys.merge(config.deprecated_keys);
-            Some(config.settings)
+            Some((config.settings, config.path))
         }
         Ok(None) => {
             // No user config file exists - this is fine (zero-config experience)
@@ -633,6 +766,276 @@ mod tests {
         assert!(
             settings.auto_install,
             "Project config autoInstall=true should override user config autoInstall=false"
+        );
+    }
+
+    /// Restores `XDG_CONFIG_HOME` when dropped, so a panic inside the test body
+    /// cannot leave the variable pointing at a deleted `TempDir` and turn one
+    /// failure into a cascade across the other `#[serial(xdg_env)]` tests.
+    struct XdgConfigHome(Option<String>);
+
+    impl Drop for XdgConfigHome {
+        fn drop(&mut self) {
+            // SAFETY: #[serial(xdg_env)] prevents concurrent modification.
+            unsafe {
+                match self.0.take() {
+                    Some(value) => std::env::set_var("XDG_CONFIG_HOME", value),
+                    None => std::env::remove_var("XDG_CONFIG_HOME"),
+                }
+            }
+        }
+    }
+
+    /// Run `f` with `XDG_CONFIG_HOME` pointed at `config_home`, restoring the
+    /// original afterwards. Callers must carry `#[serial(xdg_env)]`.
+    fn with_xdg_config_home<T>(config_home: &Path, f: impl FnOnce() -> T) -> T {
+        let _restore = XdgConfigHome(std::env::var("XDG_CONFIG_HOME").ok());
+        // SAFETY: #[serial(xdg_env)] prevents concurrent modification.
+        unsafe { std::env::set_var("XDG_CONFIG_HOME", config_home) };
+        f()
+    }
+
+    /// A user config file at `<config_home>/kakehashi/kakehashi.toml`, returning
+    /// the directory it was written to — the base its relative paths anchor to.
+    fn write_user_config(config_home: &Path, contents: &str) -> PathBuf {
+        let dir = config_home.join("kakehashi");
+        std::fs::create_dir_all(&dir).expect("failed to create user config dir");
+        std::fs::write(dir.join("kakehashi.toml"), contents).expect("failed to write user config");
+        dir
+    }
+
+    /// A `--config-file` given as a bare filename anchors to the working
+    /// directory, and one with no parent at all is an error rather than a base
+    /// of "nowhere" — otherwise an unanchored layer would be indistinguishable
+    /// from a successfully anchored one.
+    #[test]
+    fn config_file_base_resolves_a_bare_filename_and_rejects_a_parentless_path() {
+        let cwd = std::env::current_dir().expect("a working directory");
+        assert_eq!(
+            config_file_base(Path::new("kakehashi.toml")).expect("a bare filename has a parent"),
+            cwd
+        );
+        assert_eq!(
+            config_file_base(Path::new("/"))
+                .expect_err("a filesystem root has no parent")
+                .kind(),
+            std::io::ErrorKind::InvalidInput
+        );
+    }
+
+    /// `--config-file D:config.toml` cannot be absolutized by joining — a
+    /// prefixed argument replaces the base — so its parent would be the bare
+    /// `D:`, and anchoring a layer to that leaves every path resolving against
+    /// drive D's own current directory. Refused rather than answered.
+    #[cfg(windows)]
+    #[test]
+    fn config_file_base_rejects_a_drive_relative_argument() {
+        assert_eq!(
+            config_file_base(Path::new(r"D:config.toml"))
+                .expect_err("a drive-relative argument has no resolvable directory")
+                .kind(),
+            std::io::ErrorKind::InvalidInput
+        );
+        assert!(
+            config_file_base(Path::new(r"D:\configs\kakehashi.toml")).is_ok(),
+            "a rooted drive path is fine"
+        );
+    }
+
+    /// A project-local path resolves against the project config's directory, not
+    /// the directory the server process happens to be running in (issue #732).
+    #[test]
+    #[serial(xdg_env)]
+    fn project_relative_path_anchors_to_the_project_config() {
+        let empty_config_home = TempDir::new().expect("failed to create user config temp dir");
+        let project = TempDir::new().expect("failed to create project temp dir");
+        std::fs::write(
+            project.path().join("kakehashi.toml"),
+            "searchPaths = [\"./runtime\"]\n",
+        )
+        .expect("failed to write project config");
+
+        let outcome = with_xdg_config_home(empty_config_home.path(), || {
+            load_settings(Some(project.path()), None, None, |_| None, None)
+        });
+
+        assert_eq!(
+            outcome.settings.expect("settings should load").search_paths,
+            [project.path().join("runtime").to_string_lossy()],
+            "a project-relative searchPath belongs under the project config"
+        );
+    }
+
+    /// The point of anchoring per layer rather than after the merge: each
+    /// surviving field keeps the base of the file that wrote it, even when three
+    /// layers each contribute one.
+    #[test]
+    #[serial(xdg_env)]
+    fn merged_paths_keep_their_source_layer_base() {
+        let config_home = TempDir::new().expect("failed to create user config temp dir");
+        let user_dir = write_user_config(
+            config_home.path(),
+            "[languages.lua]\nparser = './parser/lua.so'\n",
+        );
+        let project = TempDir::new().expect("failed to create project temp dir");
+        std::fs::write(
+            project.path().join("kakehashi.toml"),
+            "[languages.lua]\nqueries = [{ path = './queries/highlights.scm' }]\n",
+        )
+        .expect("failed to write project config");
+
+        let outcome = with_xdg_config_home(config_home.path(), || {
+            load_settings(
+                Some(project.path()),
+                Some((
+                    SettingsSource::InitializationOptions,
+                    serde_json::json!({ "searchPaths": ["./runtime"] }),
+                )),
+                None,
+                |_| None,
+                None,
+            )
+        });
+
+        let settings = outcome.settings.expect("settings should load");
+        assert_eq!(
+            settings.search_paths,
+            [project.path().join("runtime").to_string_lossy()],
+            "a client-supplied path is workspace-local"
+        );
+        assert_eq!(
+            settings.languages["lua"].parser.as_deref(),
+            Some(user_dir.join("parser/lua.so").to_string_lossy().as_ref()),
+            "the parser came from the user config, so it anchors there"
+        );
+        assert_eq!(
+            settings.languages["lua"].queries.as_ref().unwrap()[0].path,
+            project
+                .path()
+                .join("queries/highlights.scm")
+                .to_string_lossy(),
+            "the query came from the project config, so it anchors there"
+        );
+    }
+
+    /// Anchoring must not consume the expansion syntax it runs ahead of.
+    /// `effectiveConfiguration` reports these raw settings verbatim, and the
+    /// programmed defaults' `${KAKEHASHI_DATA_DIR}` has to reach the expansion
+    /// pass to pick up its platform default at all.
+    #[test]
+    #[serial(xdg_env)]
+    fn expansion_syntax_reaches_expansion_unconsumed() {
+        let config_home = TempDir::new().expect("failed to create user config temp dir");
+        let project = TempDir::new().expect("failed to create project temp dir");
+
+        let outcome = with_xdg_config_home(config_home.path(), || {
+            load_settings(
+                Some(project.path()),
+                Some((
+                    SettingsSource::InitializationOptions,
+                    serde_json::json!({
+                        "languages": { "lua": { "parser": "$LUA_PARSER" } },
+                    }),
+                )),
+                None,
+                |var| (var == "LUA_PARSER").then(|| "/opt/lua.so".to_string()),
+                None,
+            )
+        });
+
+        let raw = outcome.raw_settings.expect("raw settings should load");
+        assert!(
+            raw.search_paths
+                .as_ref()
+                .is_some_and(|paths| paths.iter().any(|path| path == "${KAKEHASHI_DATA_DIR}")),
+            "the defaults' data-dir template must survive into the raw settings: {:?}",
+            raw.search_paths
+        );
+        assert_eq!(
+            raw.languages["lua"].parser.as_deref(),
+            Some("$LUA_PARSER"),
+            "a variable-led value is reported as the client wrote it"
+        );
+        assert_eq!(
+            outcome.settings.expect("settings should load").languages["lua"]
+                .parser
+                .as_deref(),
+            Some("/opt/lua.so"),
+            "and still expands to an absolute path, unanchored"
+        );
+    }
+
+    /// A `base` chain crosses layers: the inherited value is anchored by the
+    /// layer that *wrote* it, not the layer that inherits it. Anchoring runs on
+    /// each raw layer, before `resolve_base_configs` folds the chain, so every
+    /// value is already absolute by the time it is copied.
+    #[test]
+    #[serial(xdg_env)]
+    fn inherited_paths_anchor_to_the_layer_that_wrote_them() {
+        let config_home = TempDir::new().expect("failed to create user config temp dir");
+        let user_dir = write_user_config(
+            config_home.path(),
+            "[languages.shared]\nparser = './parser/shared.so'\n",
+        );
+        let project = TempDir::new().expect("failed to create project temp dir");
+        std::fs::write(
+            project.path().join("kakehashi.toml"),
+            "[languages.derived]\nbase = 'shared'\n",
+        )
+        .expect("failed to write project config");
+
+        let outcome = with_xdg_config_home(config_home.path(), || {
+            load_settings(Some(project.path()), None, None, |_| None, None)
+        });
+
+        assert_eq!(
+            outcome.settings.expect("settings should load").languages["derived"]
+                .parser
+                .as_deref(),
+            Some(user_dir.join("parser/shared.so").to_string_lossy().as_ref()),
+            "inheriting a parser must not re-base it onto the inheriting layer"
+        );
+    }
+
+    /// Each `--config-file` layer anchors to its own parent directory, so two
+    /// files that both say `./queries` mean two different directories.
+    #[test]
+    fn explicit_layers_anchor_to_their_own_directories() {
+        let first_dir = TempDir::new().expect("failed to create first temp dir");
+        let second_dir = TempDir::new().expect("failed to create second temp dir");
+        let first = first_dir.path().join("base.toml");
+        let second = second_dir.path().join("overrides.toml");
+        std::fs::write(&first, "searchPaths = ['./runtime']\n").expect("failed to write first");
+        std::fs::write(&second, "[languages.lua]\nparser = './parser/lua.so'\n")
+            .expect("failed to write second");
+
+        let explicit = read_explicit_layers(&[first, second], None, |_| None);
+        assert!(
+            explicit.fatal_error.is_none(),
+            "both layers are valid: {:?}",
+            explicit.fatal_error
+        );
+
+        let merged = merge_explicit_layers(&explicit.layers).expect("layers should merge");
+        assert_eq!(
+            merged.search_paths,
+            Some(vec![
+                first_dir
+                    .path()
+                    .join("runtime")
+                    .to_string_lossy()
+                    .into_owned()
+            ])
+        );
+        assert_eq!(
+            merged.languages["lua"].parser.as_deref(),
+            Some(
+                second_dir
+                    .path()
+                    .join("parser/lua.so")
+                    .to_string_lossy()
+                    .as_ref()
+            )
         );
     }
 
@@ -1203,6 +1606,55 @@ mod tests {
                 .all(|event| !event.message.contains(&later.display().to_string())),
             "nothing after the failure may be read: {:?}",
             explicit.events
+        );
+    }
+
+    /// A `--config-file` under a directory whose name is not valid UTF-8 cannot
+    /// have its relative paths anchored, and the strict layer must not quietly
+    /// accept that: the values would resolve against the working directory,
+    /// which is precisely the dependence anchoring removes. A file with nothing
+    /// to anchor is unaffected — it does not care where it lives.
+    ///
+    /// Runs where the filesystem allows such a name — Linux, and so CI. APFS
+    /// rejects it outright, so on macOS the setup cannot be built and the test
+    /// reports that rather than failing for an unrelated reason.
+    #[cfg(unix)]
+    #[test]
+    fn read_explicit_layers_rejects_a_base_it_cannot_represent() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+
+        let parent = TempDir::new().unwrap();
+        let dir = parent
+            .path()
+            .join(OsStr::from_bytes(b"proj-\xFF").to_os_string());
+        if std::fs::create_dir(&dir).is_err() {
+            eprintln!(
+                "skipping: this filesystem rejects non-UTF-8 directory names, so the case \
+                 under test cannot be constructed here"
+            );
+            return;
+        }
+
+        let relative = dir.join("relative.toml");
+        std::fs::write(&relative, "searchPaths = ['./runtime']\n").unwrap();
+        let rejected =
+            read_explicit_layers(&[relative.clone()], None, crate::config::make_env(&[]));
+        assert!(
+            rejected
+                .fatal_error
+                .as_deref()
+                .is_some_and(|message| message.contains("./runtime")),
+            "a path needing this base must abort and name itself: {:?}",
+            rejected.fatal_error
+        );
+
+        let absolute = dir.join("absolute.toml");
+        std::fs::write(&absolute, "searchPaths = ['/opt/kakehashi']\n").unwrap();
+        let accepted = read_explicit_layers(&[absolute], None, crate::config::make_env(&[]));
+        assert_eq!(
+            accepted.fatal_error, None,
+            "a file with nothing to anchor does not care where it lives"
         );
     }
 

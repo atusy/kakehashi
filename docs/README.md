@@ -208,6 +208,34 @@ Path fields support environment variable expansion and tilde (`~`) expansion, ma
 - `languages[*].parser`
 - `languages[*].queries[*].path`
 
+**Relative paths** resolve against the configuration source that supplied them, rather than against the directory the server process was launched from:
+
+| Source | Base directory |
+| --- | --- |
+| A TOML config file (user, project, or `--config-file`) | that file's own directory |
+| `initializationOptions` | the workspace root |
+| `workspace/didChangeConfiguration` | the workspace root |
+
+Each `--config-file` layer uses its own directory, so two files that both say `./queries` mean two different directories.
+
+The **workspace root** is the first `workspaceFolders` entry, or the deprecated `rootUri`, or — if the client sends neither, or sends a non-`file:` URI — the server's working directory as a last resort. In that last case a client-supplied relative path is launch-directory-dependent after all; send a workspace folder to avoid it.
+
+Resolution is two steps: a relative value is rebased onto its source directory, and then **every** value — rebased or not — goes through the variable and tilde expansion described above.
+
+A value beginning with `/`, `~`, or `$` skips the *rebasing* step only; it already says where it lives, and it is still expanded afterwards. On Windows a rooted path is likewise not rebased, whether it names a drive (`C:\parsers`) or not (`\parsers`, which means the current drive). This covers three cases worth calling out:
+
+- a variable that expands to a *relative* value: `$SHARED/queries` is expanded but never rebased, so it stays relative to the process working directory;
+- `~user`, which expansion passes through unchanged, and which rebasing would turn into a directory literally named `~user` under the base;
+- `$$queries`, the escape for a literal `$`: expansion turns it into the relative `$queries`, and rebasing would have to parse the expansion syntax to tell it apart from a variable.
+
+To place any of these underneath the configuration source, lead with `./`, as in `./$LANG/highlights.scm`. Only the built-in defaults have no base at all; their values are left as written.
+
+`..` is supported (`../shared/parsers`) but is folded **lexically**, without consulting the filesystem — so if the configuration file's own directory is a symlink, `..` means the parent of the link, not of its target. A value containing both a variable and `..` is left unfolded for the operating system to resolve.
+
+Two related fields are deliberately **not** covered, because neither is expanded either: `languageServers[*].cmd[0]` keeps `PATH` lookup semantics (so a bare `rust-analyzer` still works), and `languageServers[*].settings` / `initializationOptions` are passed through to the downstream server untouched.
+
+`kakehashi/internal/effectiveConfiguration` reports settings after anchoring but before variable expansion, so relative values appear there already resolved while `$VAR` and `~` appear as written.
+
 **Behavior on undefined variables:** If a referenced environment variable is not defined during ordinary startup loading, the merged configuration is discarded and programmed defaults are used. A runtime `workspace/didChangeConfiguration` update is discarded while the previous settings remain active. Explicit `--config-file` inputs are stricter: an expansion failure in one of them rejects LSP initialization or makes the CLI command exit with status 2, rather than falling back to defaults. `initializationOptions` sent by the client keep the ordinary non-fatal behavior even in a `--config-file` session. The exception is `KAKEHASHI_DATA_DIR`, which automatically falls back to the platform-specific default when unset (see [Default Data Directories](#default-data-directories)).
 
 ### Option Reference
@@ -682,6 +710,8 @@ queries = [
 
 Configuration files are merged with LSP initialization options (which take highest precedence).
 
+A relative path such as `./queries/highlights.scm` above resolves against the directory of the file that contains it — see [Environment Variable Expansion](#environment-variable-expansion) for the full rule.
+
 You can override the default locations with `--config-file`:
 
 ```bash
@@ -699,7 +729,8 @@ When `--config-file` is specified:
 - Default user config (`~/.config/kakehashi/kakehashi.toml`) is **skipped**
 - Default project config (`./kakehashi.toml`) is **skipped**
 - A file that is **present but unusable** aborts startup: unreadable, malformed
-  TOML, larger than 8 MiB, or carrying a path that cannot be expanded. LSP initialization returns a
+  TOML, larger than 8 MiB, carrying a path that cannot be expanded, or sitting
+  somewhere whose own directory cannot be resolved. LSP initialization returns a
   `RequestFailed` error naming the first such file; `format` and `diagnose`
   print it to stderr and exit with status 2. Nothing is re-read while the
   session runs, so correcting the file means restarting the server
