@@ -220,11 +220,13 @@ Each `--config-file` layer uses its own directory, so two files that both say `.
 
 The **workspace root** is the first `workspaceFolders` entry, or the deprecated `rootUri`, or — if the client sends neither, or sends a non-`file:` URI — the server's working directory as a last resort. In that last case a client-supplied relative path is launch-directory-dependent after all; send a workspace folder to avoid it.
 
-A value beginning with `/`, `~`, or `$` is used exactly as written and is **not** rebased — it already says where it lives. On Windows a rooted path is likewise left alone, whether it names a drive (`C:\parsers`) or not (`\parsers`, which means the current drive). This covers three cases worth calling out:
+Resolution is two steps: a relative value is rebased onto its source directory, and then **every** value — rebased or not — goes through the variable and tilde expansion described above.
 
-- a variable that expands to a *relative* value: `$SHARED/queries` stays relative to the process working directory;
-- `~user`, which is not expanded either and so would otherwise become a directory literally named `~user` under the base;
-- `$$queries`, the escape for a literal `$`, even though it expands to the relative `$queries`.
+A value beginning with `/`, `~`, or `$` skips the *rebasing* step only; it already says where it lives, and it is still expanded afterwards. On Windows a rooted path is likewise not rebased, whether it names a drive (`C:\parsers`) or not (`\parsers`, which means the current drive). This covers three cases worth calling out:
+
+- a variable that expands to a *relative* value: `$SHARED/queries` is expanded but never rebased, so it stays relative to the process working directory;
+- `~user`, which expansion passes through unchanged, and which rebasing would turn into a directory literally named `~user` under the base;
+- `$$queries`, the escape for a literal `$`: expansion turns it into the relative `$queries`, and rebasing would have to parse the expansion syntax to tell it apart from a variable.
 
 To place any of these underneath the configuration source, lead with `./`, as in `./$LANG/highlights.scm`. Only the built-in defaults have no base at all; their values are left as written.
 

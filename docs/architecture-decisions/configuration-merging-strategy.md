@@ -104,14 +104,27 @@ Bases per layer: a config file uses its own directory (each `--config-file`
 layer its own), `initializationOptions` and `didChangeConfiguration` use the
 initialized workspace root, and the programmed defaults have no base.
 
-Anchoring is **syntactic and does not expand**. A value beginning with `/`, `~`,
-or `$` is left as written, so `WorkspaceSettings::try_from_settings` remains the
-only place expansion happens. That single-pass property is load-bearing in three
-ways: the `$$` literal-dollar escape cannot be consumed twice, the cross-field
+Resolution is therefore two distinct steps, in this order:
+
+1. **Anchoring**, per raw layer, on the values as written — `searchPaths = ["./runtime"]` becomes `["<layer dir>/runtime"]`. Purely syntactic.
+2. **Expansion**, once, on the merged result, inside `WorkspaceSettings::try_from_settings` — `$VAR` and `~` are substituted.
+
+Anchoring **does not expand**, and a value beginning with `/`, `~`, or `$` skips
+anchoring but is still expanded in step 2 — the two steps opt out
+independently. Keeping expansion to a single pass is load-bearing in three ways:
+the `$$` literal-dollar escape cannot be consumed twice, the cross-field
 invariant checks that live in `try_from_settings` cannot be bypassed by a second
 conversion entry point, and the defaults' `${KAKEHASHI_DATA_DIR}` template
 survives into the raw settings that `kakehashi/internal/effectiveConfiguration`
 reports.
+
+Because step 1 writes into a string that step 2 reads, anchoring neutralises
+what it prepends: a `$` in the layer's directory name is escaped as `$$`, and a
+`..` is not folded past an unexpanded variable, which would delete the variable
+along with the error expansion owes for it. A value it cannot anchor at all — a
+directory name that is not valid UTF-8, or a drive-relative `C:lib` — is
+reported rather than silently left alone, so the strict `--config-file` layer
+can reject what it cannot honour.
 
 Because each layer is anchored while raw, a language `base` chain that spans
 layers inherits values that have *already* been resolved against their own
