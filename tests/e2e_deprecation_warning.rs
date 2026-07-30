@@ -427,9 +427,12 @@ fn e2e_auto_install_deprecation_claimed_at_initialize_suppresses_the_didchange_n
     // inside the `initialize` request, before its response — see the module
     // doc), so prove it by its EFFECT: it consumed the session's only slot.
     // Pushing the same deprecated key now yields the config-updated log with no
-    // popup ahead of it. Delete the initialize emission or its claim and the
-    // popup appears here, failing the assertion — coverage the sibling test
-    // cannot provide, since that one starts from a clean initialize.
+    // popup ahead of it. Scope, precisely: this pins that initialize DETECTED
+    // the file's key and claimed the slot — delete the whole `if` block at
+    // `lifecycle.rs` and the popup appears here (verified). It does not pin the
+    // `show_warning` call itself, since `initialize`'s own notifications are
+    // dropped while the client awaits the response; the sibling test covers the
+    // popup text on the didChange path.
     client.send_notification(
         "workspace/didChangeConfiguration",
         wrapped_didchange_config(false),

@@ -240,7 +240,7 @@ Per-language configuration. Usually not needed as kakehashi auto-detects languag
 
 | Field | Description |
 |-------|-------------|
-| `base` | Inherit parser, queries, and bridge configuration from another language |
+| `base` | Inherit parser, queries, bridge, and `autoInstall` configuration from another language |
 | `parser` | Explicit path to the parser library (`.so`, `.dylib`, `.dll`) |
 | `queries` | Array of query configurations with `path` and `kind` (highlights, bindings, injections) |
 | `bridge` | Per-injection-language bridge filter and aggregation settings |
@@ -252,10 +252,19 @@ Per-language configuration. Usually not needed as kakehashi auto-detects languag
 Whether kakehashi may download and install a missing parser/queries for this
 language when a file is opened.
 
-Resolved most-specific-wins: the language's own value, then the `"_"` wildcard's,
-then the deprecated top-level `autoInstall`, defaulting to `true`. Unset is the
-default at every level, so a language inherits `"_"` exactly like the other
-fields.
+Resolved most-specific-wins: the language's own value, then each entry in its
+`base` chain, then the `"_"` wildcard's, then the deprecated top-level
+`autoInstall`, defaulting to `true`. Unset is the default at every level, so a
+language inherits through `base` and `"_"` exactly like the other fields — for
+example `[languages.rmd] base = "markdown"` picks up markdown's `autoInstall`
+before `"_"` is consulted.
+
+**Which name to use.** The key names the language kakehashi would *install*, not
+the token in your document. A host document uses the `languageId` your editor
+sends; an injected region uses its resolved language, so a ```` ```py ```` fence
+is governed by `languages.python.autoInstall` and an `rmd` region whose own
+parser is absent is governed by whatever its `base` resolves to. Set the key on
+the resolved name.
 
 Enable everywhere except one language:
 
