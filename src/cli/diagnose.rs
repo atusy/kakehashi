@@ -138,7 +138,13 @@ async fn run_async(options: DiagnoseOptions) -> u8 {
     crate::cli::spawn_client_pump(socket);
     let server = service.inner();
     if let Err(error) = server.cli_initialize(&cwd).await {
-        elnln!("error: failed to initialize: {}", error.message);
+        // The message quotes config-file content (a TOML parse error echoes the
+        // offending source line), so it is untrusted text on a line-oriented
+        // stderr — escaped like every other field this module emits.
+        elnln!(
+            "error: failed to initialize: {}",
+            escape_terminal_controls(&error.message)
+        );
         return EXIT_ERROR;
     }
 
