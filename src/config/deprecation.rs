@@ -53,8 +53,9 @@ pub(crate) const UNWRAPPED_DIDCHANGE_CONFIGURATION_NOTICE: &str = "kakehashi: un
 /// User-facing text for the one-per-session top-level `autoInstall` notice.
 pub(crate) const AUTO_INSTALL_DEPRECATION_NOTICE: &str = "kakehashi: the top-level `autoInstall` config key is deprecated; move it to \
      `[languages._] autoInstall` (and override per language with \
-     `[languages.<lang>] autoInstall`). The top-level key still works for now \
-     but may be removed in a future release.";
+     `[languages.<lang>] autoInstall`). A language with a self-referential \
+     `base` inherits nothing from `_`, so give those an explicit value. The \
+     top-level key still works for now but may be removed in a future release.";
 
 /// Which deprecated keys the raw TOML text spells.
 ///

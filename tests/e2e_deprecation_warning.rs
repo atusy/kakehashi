@@ -396,3 +396,54 @@ fn e2e_auto_install_deprecation_warns_once_and_spares_the_canonical_key() {
     let _ = client.send_request("shutdown", json!(null));
     client.send_notification("exit", json!(null));
 }
+
+#[test]
+fn e2e_auto_install_deprecation_claimed_at_initialize_suppresses_the_didchange_notice() {
+    // The other autoInstall test starts from a CLEAN initialize, so it proves
+    // only the didChangeConfiguration half. This one starts from a config FILE
+    // carrying the deprecated key, exercising the initialize emission path.
+    let config_dir = tempfile::TempDir::new().expect("temp config dir");
+    let config_path = config_dir.path().join("kakehashi.toml");
+    std::fs::write(&config_path, "autoInstall = false\n").expect("write config");
+
+    let mut client = LspClient::builder()
+        .arg("--config-file")
+        .arg(config_path.to_str().expect("utf-8 temp path"))
+        .build();
+
+    client.send_request(
+        "initialize",
+        json!({
+            "processId": std::process::id(),
+            "rootUri": null,
+            "capabilities": {},
+            "workspaceFolders": null,
+            "initializationOptions": {}
+        }),
+    );
+    client.send_notification("initialized", json!({}));
+
+    // The initialize-time popup is not observable by this client (it is emitted
+    // inside the `initialize` request, before its response — see the module
+    // doc), so prove it by its EFFECT: it consumed the session's only slot.
+    // Pushing the same deprecated key now yields the config-updated log with no
+    // popup ahead of it. Delete the initialize emission or its claim and the
+    // popup appears here, failing the assertion — coverage the sibling test
+    // cannot provide, since that one starts from a clean initialize.
+    client.send_notification(
+        "workspace/didChangeConfiguration",
+        wrapped_didchange_config(false),
+    );
+    let (method, params) = client
+        .wait_for_notification_where(&["window/showMessage", "window/logMessage"], TIMEOUT, |p| {
+            is_auto_install_deprecation_notice(p) || is_config_updated(p)
+        })
+        .expect("reconfig should log a config-updated message");
+    assert_eq!(
+        method, "window/logMessage",
+        "the initialize warning must consume the session's only slot; got: {params:?}"
+    );
+
+    let _ = client.send_request("shutdown", json!(null));
+    client.send_notification("exit", json!(null));
+}

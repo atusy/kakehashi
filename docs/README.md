@@ -284,6 +284,13 @@ names the exact key (``` `languages._.autoInstall` is false ```); for one that
 does have an entry it names the overriding key and the places the value may have
 come from, since `base`-chain and `_` inheritance are folded together by then.
 
+**Migration caveat:** moving the top-level key to `[languages._]` is
+equivalence-preserving for every language *except* one that opts out of wildcard
+inheritance with a self-referential `base` (`[languages.foo] base = "foo"`, or a
+circular chain). Such a language inherits nothing from `_` — by design, for every
+field — so it falls through to the top-level default instead. Give those
+languages an explicit `autoInstall` when migrating.
+
 **Precedence note:** a `languages.*.autoInstall` value outranks the top-level
 `autoInstall` even when the top-level one is set at a higher-precedence source.
 That is deliberate — the top-level key is only a fallback for an unset

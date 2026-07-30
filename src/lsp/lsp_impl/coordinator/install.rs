@@ -117,8 +117,10 @@ impl InstallCoordinator {
     /// Build a human-readable reason why auto-install is disabled for
     /// `language`.
     ///
-    /// Names the exact key that turned it off — with per-language overrides the
-    /// answer to "why is this off?" is no longer a single global setting.
+    /// Points at the config that decided it: exactly for the wildcard and
+    /// top-level cases, hedged for a per-language entry, where the base-chain
+    /// fold makes the original spelling unknowable. See
+    /// [`crate::config::WorkspaceSettings::auto_install_disabled_reason`].
     pub(crate) fn auto_install_disabled_reason(&self, language: &str) -> String {
         let settings = self.settings_manager.load_settings();
         if let Some(reason) = settings.auto_install_disabled_reason(language) {

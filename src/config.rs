@@ -352,17 +352,16 @@ impl WorkspaceSettings {
             .or_else(|| self.languages.get(WILDCARD_KEY))
     }
 
-    /// Whether missing parsers/queries for `language` may be auto-installed,
-    /// most-specific-wins: the language's own `autoInstall`, else the `"_"`
-    /// wildcard's, else the deprecated top-level `autoInstall` (which itself
-    /// defaults to enabled).
+    /// Whether missing parsers/queries for `language` may be auto-installed.
     ///
-    /// The wildcard arm is not redundant with [`merge::resolve_base_configs`]:
-    /// that fold only covers languages that HAVE an entry, and an unconfigured
-    /// document has none. It also cannot be replaced by
-    /// [`Self::resolve_host_language_settings`], whose fallback is wholesale —
-    /// a language entry that sets only `parser` must still inherit the
-    /// wildcard's `autoInstall`, not shadow it with `None`.
+    /// Per-ENTRY fallback, not per-key: the language's resolved entry answers if
+    /// it has a value, else the `"_"` entry, else the deprecated top-level
+    /// `autoInstall` (which itself defaults to enabled). Because
+    /// [`merge::resolve_base_configs`] has already folded `"_"` and the whole
+    /// `base` chain into every present entry, "the entry has no value" means
+    /// nothing in that chain set one — including a language that deliberately
+    /// escaped wildcard inheritance with a self-referential `base`. See
+    /// [`Self::auto_install_decision`] for why that is the right reading.
     pub(crate) fn auto_install_for(&self, language: &str) -> bool {
         self.auto_install_decision(language).1
     }
@@ -388,7 +387,8 @@ impl WorkspaceSettings {
         }
         Some(match source {
             AutoInstallSource::Language => format!(
-                "`languages.{language}.autoInstall` resolves to false                  (set on the language, its `base` chain, or `languages._`)"
+                "`languages.{language}.autoInstall` resolves to false (set on \
+                 the language, its `base` chain, or `languages._`)"
             ),
             AutoInstallSource::Wildcard => {
                 format!("`languages.{WILDCARD_KEY}.autoInstall` is false")
@@ -657,10 +657,10 @@ mod tests {
 
     #[test]
     fn auto_install_inherits_through_the_base_chain() {
-        // Discriminating on purpose: with NO `"_"` entry, only
-        // `merge_language_settings`'s `auto_install` arm can carry markdown's
-        // value onto `rmd`. A `"_"`-based fixture would pass even without the
-        // arm, because the lookup-time wildcard fallback answers identically.
+        // Discriminating on purpose: only `merge_language_settings`'s
+        // `auto_install` arm can carry markdown's value onto `rmd`. Without it
+        // `rmd`'s entry stays unset and, since a present entry owns the answer,
+        // resolution falls straight through to the top-level default.
         let raw = crate::config::RawWorkspaceSettings {
             languages: HashMap::from([
                 (
@@ -737,12 +737,16 @@ mod tests {
         // names the overriding key and says where it may have come from rather
         // than asserting the user wrote it on the language.
         let language = settings_with_auto_install(&[("python", Some(false))], true);
-        let reason = language
-            .auto_install_disabled_reason("python")
-            .expect("disabled");
-        assert!(reason.contains("languages.python.autoInstall"), "{reason}");
-        assert!(reason.contains("base"), "{reason}");
-        assert!(reason.contains("languages._"), "{reason}");
+        // Exact, not `contains`: this string reaches the client verbatim inside
+        // `notify_parser_missing`'s sentence, and a `contains` triple let a
+        // line-continuation slip that shipped 18 literal spaces mid-message.
+        assert_eq!(
+            language.auto_install_disabled_reason("python").as_deref(),
+            Some(
+                "`languages.python.autoInstall` resolves to false \
+                 (set on the language, its `base` chain, or `languages._`)"
+            )
+        );
 
         // Wildcard and top-level arms ARE reliable, so they name the key flatly.
         let wildcard = settings_with_auto_install(&[(WILDCARD_KEY, Some(false))], true);
