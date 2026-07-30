@@ -1254,6 +1254,18 @@ fn spawn_upstream_request(
                 );
                 use crate::lsp::bridge::REOPEN_WAIT;
                 let settings = context.settings_manager.load_settings();
+                // The re-open resolves each host's connection from the CURRENT
+                // settings, so a `workspaceMarkers` change between purge and
+                // respawn can open the document on a newly resolved key rather
+                // than the one the purge recorded. That does not strand a
+                // command on the old key: `workspace_markers` is part of
+                // `same_launch_config`, so both by-key routing paths reject a
+                // connection whose config no longer matches and the command
+                // fails soft instead of executing document-less. Opening at the
+                // new location is the correct outcome for the document itself.
+                // Carrying the claimed key here would let the re-open target the
+                // dead key exactly; it buys nothing while that key is
+                // unreachable anyway.
                 // Bound the WAIT, not the work — the shape the inline heal used.
                 // `ensure_server_documents_open` can block up to the init timeout
                 // on a cold downstream, and `done` gates every command on this
@@ -1264,6 +1276,12 @@ fn spawn_upstream_request(
                 // heal rather than stalling.
                 let injection = context.injection.clone();
                 let reopen_server = server.clone();
+                // `done` moves INTO the work task, so ONLY real completion
+                // signals it. Signalling from the timeout branch below would mark
+                // the re-open complete while its didOpens were still queued, and
+                // any request still waiting would sail through and overtake them
+                // — the failure this barrier exists to prevent. A panic drops the
+                // sender instead, which waiters read as "can never finish".
                 let mut work = tokio::spawn(async move {
                     for host in hosts {
                         // Await the tree first: a re-open racing an edit would
@@ -1300,7 +1318,15 @@ fn spawn_upstream_request(
                             )
                             .await;
                     }
+                    // Every didOpen is now enqueued; release the waiters. A send
+                    // error means a later respawn's claim superseded this
+                    // barrier, and that respawn owns it now.
+                    let _ = done.send(true);
                 });
+                // Bound only how long THIS task waits. The work owns the signal,
+                // so exceeding the budget stops us watching without pretending
+                // the re-open finished: requests still waiting time out and fail
+                // soft, and a request arriving later waits on the same barrier.
                 match tokio::time::timeout(REOPEN_WAIT, &mut work).await {
                     Ok(Ok(())) => {}
                     // A panic in the re-open would otherwise vanish with the
@@ -1313,7 +1339,8 @@ fn spawn_upstream_request(
                         log::debug!(
                             target: "kakehashi::bridge",
                             "Re-open of {server:?} documents exceeded {REOPEN_WAIT:?}; \
-                             releasing waiters and finishing in the background"
+                             finishing in the background (the barrier stays \
+                             pending until it does)"
                         );
                         tokio::spawn(async move {
                             if let Err(join_error) = work.await {
@@ -1326,10 +1353,6 @@ fn spawn_upstream_request(
                         });
                     }
                 }
-                // Release anything waiting to send on this connection. A send
-                // error means the registry entry was already superseded by a
-                // later respawn's claim — that respawn owns the barrier now.
-                let _ = done.send(true);
             }
             UpstreamRequest::ShowMessageRequest {
                 typ,
