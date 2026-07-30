@@ -1242,7 +1242,27 @@ impl LanguageServerPool {
                 .wait_for_ready(Duration::from_secs(INIT_TIMEOUT_SECS))
                 .await
             {
-                Ok(()) => Some(handle),
+                // Re-check the launch config AFTER the handshake, not before it:
+                // the config is only recorded during the handshake, and a
+                // settings reload can land while we wait. Without this the
+                // Initializing branch would reintroduce exactly the staleness the
+                // Ready fast path is gated against — the handshake can finish
+                // before `propagate_settings` evicts the handle, handing the
+                // command to the superseded executable.
+                Ok(()) => {
+                    if handle
+                        .launch_config()
+                        .is_some_and(|live| !same_launch_config(live, config))
+                    {
+                        log::warn!(
+                            target: "kakehashi::bridge",
+                            "executeCommand: connection {key} finished initializing under a \
+                             superseded config; ignoring"
+                        );
+                        return None;
+                    }
+                    Some(handle)
+                }
                 Err(e) => {
                     log::warn!(
                         target: "kakehashi::bridge",

@@ -94,9 +94,15 @@ fn escape_segment(segment: &str) -> String {
     segment.replace('%', "%25").replace(SEP, "%7C")
 }
 
-/// Inverse of [`escape_segment`]. A single left-to-right pass, so the `%25`
-/// produced for a literal `%` is not re-read as the start of another escape.
-fn unescape_segment(segment: &str) -> String {
+/// Inverse of [`escape_segment`], or `None` for a segment `escape_segment` could
+/// never have produced. A single left-to-right pass, so the `%25` produced for a
+/// literal `%` is not re-read as the start of another escape.
+///
+/// Fails CLOSED on a stray `%`: `escape_segment` turns every `%` into `%25`, so
+/// any other `%` sequence means the name was not bridge-minted. Decoding it
+/// leniently would route a forged name to a real connection; rejecting sends it
+/// to the palette registry instead, which is where a non-bridge name belongs.
+fn unescape_segment(segment: &str) -> Option<String> {
     let mut out = String::with_capacity(segment.len());
     let mut rest = segment;
     while let Some(index) = rest.find('%') {
@@ -109,17 +115,11 @@ fn unescape_segment(segment: &str) -> String {
             out.push(SEP);
             rest = stripped;
         } else {
-            // Not one of our two escapes, so this token was not produced by
-            // `escape_segment` (which turns every `%` into `%25`) — a foreign or
-            // corrupt name. Copy the byte through rather than fail: the tag and
-            // key checks below decide routability, and this keeps decoding
-            // total.
-            out.push('%');
-            rest = &tail[1..];
+            return None;
         }
     }
     out.push_str(rest);
-    out
+    Some(out)
 }
 
 /// Encode `command` as a bridge-routed name carrying the connection it must run
@@ -154,20 +154,17 @@ pub(crate) fn decode_command(name: &str) -> Option<CommandRoute<'_>> {
     // a separator inside the command id rejoins into the remainder unharmed.
     let mut parts = rest.splitn(4, SEP);
     let tag = parts.next()?;
-    let server = unescape_segment(parts.next()?);
-    let root = unescape_segment(parts.next()?);
+    let server = unescape_segment(parts.next()?)?;
+    let root = unescape_segment(parts.next()?)?;
     let command = parts.next()?;
+    // Every arm rejects a root the corresponding `encode_command` branch could
+    // not have produced. A marker tag with no root would rebuild as the client
+    // fallback, and a root-less tag WITH a root is not a shape we mint at all —
+    // accepting either would let a forged name pick a rooting mode by hand.
     let key = match tag {
-        TAG_MARKER => {
-            // A marker tag with no root would rebuild as the client fallback and
-            // silently run the command in the wrong workspace. Reject instead.
-            if root.is_empty() {
-                return None;
-            }
-            ConnectionKey::new(server, Some(root))
-        }
-        TAG_CLIENT_FALLBACK => ConnectionKey::new(server, None),
-        TAG_SHARED => ConnectionKey::shared(server),
+        TAG_MARKER if !root.is_empty() => ConnectionKey::new(server, Some(root)),
+        TAG_CLIENT_FALLBACK if root.is_empty() => ConnectionKey::new(server, None),
+        TAG_SHARED if root.is_empty() => ConnectionKey::shared(server),
         _ => return None,
     };
     Some(CommandRoute { key, command })
@@ -273,6 +270,29 @@ mod tests {
         // A tag from a future (or corrupt) encoding must fail soft rather than
         // default to a rooting mode and reach the wrong process.
         assert!(decode_command("kakehashi|z|server|file:///x|cmd").is_none());
+    }
+
+    #[test]
+    fn decode_rejects_a_stray_percent_escape() {
+        // `escape_segment` emits `%` only as `%25`/`%7C`, so any other sequence
+        // means the name was not bridge-minted. Decoding it leniently would let a
+        // forged name route to a real connection.
+        assert!(decode_command("kakehashi|c|sr%v||cmd").is_none());
+        assert!(decode_command("kakehashi|c|srv%||cmd").is_none());
+        assert!(decode_command("kakehashi|m|srv|file:///a%20b|cmd").is_none());
+        // The canonical form of that last root DOES decode.
+        let key = ConnectionKey::new("srv", Some("file:///a%20b".to_string()));
+        let encoded = encode_command(&key, "cmd");
+        assert_eq!(decode_command(&encoded).expect("canonical").key, key);
+    }
+
+    #[test]
+    fn decode_rejects_a_root_less_tag_that_carries_a_root() {
+        // `encode_command` writes an empty root for both root-less modes, so a
+        // populated one is a shape we never mint — accepting it would let a
+        // forged name pick a rooting mode by hand.
+        assert!(decode_command("kakehashi|c|srv|file:///w|cmd").is_none());
+        assert!(decode_command("kakehashi|s|srv|file:///w|cmd").is_none());
     }
 
     #[test]
