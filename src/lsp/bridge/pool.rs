@@ -547,10 +547,35 @@ impl LanguageServerPool {
         &self,
         key: &ConnectionKey,
     ) -> Option<Arc<ConnectionHandle>> {
+        self.ready_connection_by_key_for_config(key, None).await
+    }
+
+    /// As [`ready_connection_by_key`](Self::ready_connection_by_key), but also
+    /// rejects a connection whose SPAWN config no longer matches `config`.
+    ///
+    /// Every acquisition through `get_or_create_connection_resolved` compares the
+    /// live handle's launch config and treats a mismatch as `Failed` (respawn).
+    /// A by-key fast path that skipped that check would hand back a process
+    /// spawned from a superseded `cmd`: the settings snapshot is published before
+    /// `propagate_settings` finishes invalidating connections, so there is a real
+    /// window in which a request reads new settings and finds the old process.
+    /// Passing `None` keeps the plain state-only filter for callers that have no
+    /// config to compare (execute-command-routing-token).
+    pub(crate) async fn ready_connection_by_key_for_config(
+        &self,
+        key: &ConnectionKey,
+        config: Option<&crate::config::settings::BridgeServerConfig>,
+    ) -> Option<Arc<ConnectionHandle>> {
         let connections = self.connections.lock().await;
         connections
             .get(key)
             .filter(|handle| handle.state() == ConnectionState::Ready)
+            .filter(|handle| match config {
+                Some(config) => handle
+                    .launch_config()
+                    .is_none_or(|live| same_launch_config(live, config)),
+                None => true,
+            })
             .map(Arc::clone)
     }
 
@@ -1198,7 +1223,39 @@ impl LanguageServerPool {
         config: &crate::config::settings::BridgeServerConfig,
     ) -> Option<Arc<ConnectionHandle>> {
         let server = key.server();
+        // A connection can exist under this key and simply not be Ready yet —
+        // `ready_connection_by_key` filters on Ready, so a respawn mid-handshake
+        // lands here. Wait it out rather than spawn a second process: this is the
+        // wait-through-initialization the previous
+        // `get_or_create_connection_wait_ready` call provided, and for a SHARED
+        // key it is the only way to reach the instance at all (the revive path
+        // below cannot re-root one). Cloned out from under the lock so the guard
+        // is not held across the await.
+        let existing = {
+            let connections = self.connections.lock().await;
+            connections.get(key).map(Arc::clone)
+        };
+        if let Some(handle) = existing
+            && handle.state() == ConnectionState::Initializing
+        {
+            return match handle
+                .wait_for_ready(Duration::from_secs(INIT_TIMEOUT_SECS))
+                .await
+            {
+                Ok(()) => Some(handle),
+                Err(e) => {
+                    log::warn!(
+                        target: "kakehashi::bridge",
+                        "executeCommand: connection {key} never reached ready: {e}"
+                    );
+                    None
+                }
+            };
+        }
         if key.is_shared() {
+            // Reviving a DEAD shared instance needs a marker to announce its
+            // workspace folders, and only a document can produce one. A live
+            // instance is reachable above and via `ready_connection_by_key`.
             log::warn!(
                 target: "kakehashi::bridge",
                 "executeCommand: shared-instance connection for {server:?} is gone and \
@@ -4527,6 +4584,95 @@ mod tests {
 
         done.send(true).expect("the waiter holds the receiver");
         waiter.await.expect("the request proceeds once re-opened");
+    }
+
+    /// A by-key fast path must not hand back a process spawned from a
+    /// superseded `cmd`. The settings snapshot is published before connection
+    /// invalidation finishes, so a request can read new settings and still find
+    /// the old process; every other acquisition path treats that as a respawn.
+    #[tokio::test]
+    async fn a_ready_connection_with_a_stale_launch_config_is_rejected() {
+        let pool = LanguageServerPool::new();
+        let key = ConnectionKey::for_server("lua");
+        let config = test_helpers::devnull_config_for_language("lua");
+        let handle =
+            test_helpers::create_handle_with_key(ConnectionState::Ready, key.clone()).await;
+        handle.record_launch_config(&config);
+        pool.connections
+            .lock()
+            .await
+            .insert(key.clone(), Arc::clone(&handle));
+
+        // Same config: the fast path reuses the live connection.
+        assert!(
+            pool.ready_connection_by_key_for_config(&key, Some(&config))
+                .await
+                .is_some(),
+            "an unchanged config must reuse the live connection"
+        );
+
+        // Changed `cmd`: the live process was spawned from a superseded config,
+        // so the fast path must miss and let the caller respawn.
+        let mut changed = config.clone();
+        changed.cmd = vec!["sh".to_string(), "-c".to_string(), "true".to_string()];
+        assert!(
+            pool.ready_connection_by_key_for_config(&key, Some(&changed))
+                .await
+                .is_none(),
+            "a superseded launch config must not be served from the fast path"
+        );
+
+        // `None` keeps the plain state-only filter for callers with no config to
+        // compare (the palette path).
+        assert!(
+            pool.ready_connection_by_key(&key).await.is_some(),
+            "the config-less variant still filters on state alone"
+        );
+    }
+
+    /// A connection mid-handshake is LIVE, and for a shared-instance key it is
+    /// the only way to reach the instance at all — the revive path cannot
+    /// re-root one without a document. Dropping it would fail soft on a
+    /// connection that is seconds from Ready.
+    #[tokio::test]
+    async fn reconnect_waits_for_an_initializing_connection_instead_of_dropping_it() {
+        let pool = LanguageServerPool::new();
+        let key = ConnectionKey::shared("tsgo");
+        let config = test_helpers::devnull_config_for_language("typescript");
+        let handle =
+            test_helpers::create_handle_with_key(ConnectionState::Initializing, key.clone()).await;
+        pool.connections
+            .lock()
+            .await
+            .insert(key.clone(), Arc::clone(&handle));
+
+        // The Ready-only fast path misses, so a request falls through to the
+        // reconnect — which must WAIT rather than take the shared-key bail.
+        assert!(
+            pool.ready_connection_by_key(&key).await.is_none(),
+            "an Initializing connection is not served by the Ready fast path"
+        );
+        let waiter = {
+            let key = key.clone();
+            let config = config.clone();
+            let pool = Arc::new(pool);
+            let pool_for_flip = Arc::clone(&pool);
+            let task = tokio::spawn(async move { pool.reconnect_by_key(&key, &config).await });
+            tokio::task::yield_now().await;
+            assert!(
+                !task.is_finished(),
+                "must wait for the handshake, not bail on the shared key"
+            );
+            // Publish Ready; the waiter should hand back THIS handle.
+            assert!(handle.transition_initializing_to_ready());
+            let _ = pool_for_flip;
+            task
+        };
+        let resolved = waiter.await.expect("waiter completes");
+        assert!(
+            resolved.is_some(),
+            "a shared connection that reached Ready must be routable"
+        );
     }
 
     /// The overwhelmingly common case — no respawn — must not pay a wait.

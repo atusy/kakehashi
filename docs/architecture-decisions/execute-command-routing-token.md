@@ -225,8 +225,9 @@ protocol text:
 Until that is settled, `executeCommandProvider.commands` stays empty and the
 vscode-languageclient limitation stands.
 
-**A shared-instance connection cannot be re-rooted from the token alone.** A
-`preferSharedInstance` connection is keyed without a root, and announcing a
-workspace folder to it requires a marker resolved from a document. Routing to
-an existing shared connection works; reconnecting to a dead one and restoring
-its folder set does not, and fails soft as before.
+**A DEAD shared-instance connection cannot be re-rooted from the token alone.**
+A `preferSharedInstance` connection is keyed without a root, and announcing a
+workspace folder to it requires a marker resolved from a document. Routing to a
+LIVE shared connection works — including one still mid-handshake, which the
+by-key path waits out rather than dropping — but reviving a dead one and
+restoring its folder set does not, and fails soft as before.

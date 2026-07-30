@@ -92,7 +92,10 @@ impl LanguageServerPool {
         // the common case; a reconnect rebuilds the same `(server, root)` key
         // rather than re-resolving a root from a document, which is what lets
         // this path work without one (execute-command-routing-token).
-        let handle = match self.ready_connection_by_key(&key).await {
+        let handle = match self
+            .ready_connection_by_key_for_config(&key, Some(&config))
+            .await
+        {
             Some(handle) => handle,
             None => match self.reconnect_by_key(&key, &config).await {
                 Some(handle) => handle,
