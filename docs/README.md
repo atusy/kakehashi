@@ -830,9 +830,16 @@ Exit codes: `0` nothing to change (or changes written without
 `2` usage error, I/O error, a configuration file given with `--config-file`
 that could not be loaded, or downstream formatter failure (a configured
 server failed to start, errored on the request, timed out, or returned a
-protocol-invalid response — even when a fallback server still produced
-output). On exit `2` stdout stays empty, including in `--stdin-filename` mode:
-a failed run never hands its caller content to write back.
+protocol-invalid response). Under the default `concatenated` aggregation that
+holds even when another server still produced output; under `preferred` the
+winning formatter is authoritative, so a *non-winning* server's failure does
+not count — mirroring `diagnose` below.
+
+A configuration failure exits `2` before anything is written, so stdout stays
+empty in `--stdin-filename` mode. A *downstream* failure does not: the content
+is written first and the exit code reports the failure afterwards, so a caller
+that pipes stdin through `format` must check the status rather than assume
+empty output means failure.
 
 ### Diagnostics
 

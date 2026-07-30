@@ -470,6 +470,62 @@ fn test_config_file_merged_only_invalid_fails_initialization() {
     );
 }
 
+/// A rejected `initialize` does not poison the session: correcting the file and
+/// sending `initialize` again is served from the corrected file. `tower-lsp`
+/// resets to `Uninitialized` after an error response, so this is a path clients
+/// can genuinely take, and it is why the configuration verdict is reached
+/// before `initialize` stores anything from the request.
+///
+/// What this cannot observe is the state that a stale latch would corrupt —
+/// downstream servers keeping the failed attempt's capabilities and workspace
+/// folders — which needs a mock downstream server to see.
+#[test]
+fn test_config_file_retry_after_repair_uses_the_corrected_file() {
+    let dir = TempDir::new().unwrap();
+    let config_path = dir.path().join("config.toml");
+    std::fs::write(&config_path, "searchPaths = [\"/unterminated\"\n").unwrap();
+    let mut client = LspClient::builder()
+        .arg("--config-file")
+        .arg(config_path.to_str().unwrap())
+        .env_remove("KAKEHASHI_DATA_DIR")
+        .build();
+
+    let rejected = client.send_request(
+        "initialize",
+        json!({
+            "processId": std::process::id(),
+            "rootUri": null,
+            "capabilities": {}
+        }),
+    );
+    assert!(
+        rejected.get("error").is_some(),
+        "the malformed file should reject the first attempt: {rejected}"
+    );
+
+    std::fs::write(&config_path, "autoInstall = false\n").unwrap();
+    let accepted = client.send_request(
+        "initialize",
+        json!({
+            "processId": std::process::id(),
+            "rootUri": null,
+            "capabilities": {}
+        }),
+    );
+    assert!(
+        accepted.get("result").is_some(),
+        "a retry after repairing the file must be accepted: {accepted}"
+    );
+
+    client.send_notification("initialized", json!({}));
+    let settings = query_effective_settings(&mut client);
+    assert_eq!(
+        settings["autoInstall"],
+        json!(false),
+        "the retry must read the corrected file, not the rejected one: {settings}"
+    );
+}
+
 /// Implicitly discovered configuration keeps its optional, warning-only policy:
 /// only paths the user named explicitly are strict. Pinning this stops a future
 /// unification of the two loaders from turning a typo in a project

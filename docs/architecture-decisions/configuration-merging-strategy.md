@@ -244,8 +244,10 @@ path the user typed carries intent; a path kakehashi went looking for does not.
      `initialize` would otherwise get the corrected settings alongside the
      failed attempt's capabilities and workspace folders.
    - Each `--config-file` is read exactly once and the result carried into the
-     merge. A path may name a stream, and a file swapped between two reads
-     would slip past whichever check ran first.
+     merge: a file swapped between two reads would slip past whichever check
+     ran first. Reads are bounded, so a path naming an endless source fails
+     instead of exhausting memory; a path naming a stream with no writer still
+     blocks, which is the failure mode of the path the user chose.
 
 ### Implementation Notes
 

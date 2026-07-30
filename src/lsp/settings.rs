@@ -76,12 +76,22 @@ pub struct SettingsLoadOutcome {
     pub deprecated_keys: DeprecatedKeysSeen,
 }
 
+/// Ceiling on a single config file read.
+///
+/// A kakehashi configuration is a hand-written TOML file; megabytes of one is a
+/// mistake, not a use case. Without a bound, a `--config-file` naming an
+/// endless source — `/dev/zero`, most obviously — would allocate until the
+/// process died rather than reporting a bad path.
+const MAX_CONFIG_FILE_BYTES: u64 = 8 * 1024 * 1024;
+
 /// The `--config-file` inputs, read and judged exactly once.
 ///
-/// Read *once* is a contract, not an optimisation. A `--config-file` may name a
-/// stream (`/dev/fd/N`), which a second read would find empty, and a file
-/// replaced between two reads would have its second verdict either ignored or
-/// discovered too late to matter.
+/// Read *once* is a contract, not an optimisation. A file replaced between two
+/// reads would have its second verdict either ignored or discovered too late to
+/// matter, and a path that happens to name a stream would be found empty the
+/// second time. (Naming a stream is not a supported workflow — one with no
+/// writer will simply block initialization — but reading once is what keeps the
+/// failure mode that of the path the user chose.)
 pub(crate) struct ExplicitConfig {
     layers: Vec<Option<RawWorkspaceSettings>>,
     events: Vec<SettingsEvent>,
@@ -328,21 +338,20 @@ fn load_toml_file(
     events: &mut Vec<SettingsEvent>,
     deprecated_keys: &mut DeprecatedKeysSeen,
 ) -> Result<Option<RawWorkspaceSettings>, String> {
-    // `try_exists`, not `exists`: the latter answers "no" both for a path that
-    // is genuinely absent and for one whose metadata cannot be read at all
-    // (an ancestor directory denying traversal, say). Only the first is the
-    // optional-overlay case; collapsing them would let a file the user cannot
-    // reach be silently skipped, which is exactly the class this is strict
-    // about.
-    match path.try_exists() {
-        Ok(true) => {}
-        Ok(false) => {
-            // `try_exists` follows symlinks, so a link whose target is gone
-            // also answers "no". That is not the optional-overlay case: the
+    // Classify by opening, not by probing first: a separate `exists` check
+    // would answer for a different moment than the open, and would have to
+    // decide what "no" means without the kernel's reason for it. `NotFound` is
+    // the only answer that can mean the optional-overlay case; everything else
+    // — a denied ancestor directory, a path that is a directory — is a file the
+    // user named and cannot use.
+    let file = match fs::File::open(path) {
+        Ok(file) => file,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            // Opening follows symlinks, so a link whose target is gone also
+            // reports `NotFound`. That is not the optional-overlay case: the
             // path the user named does exist, it just does not lead to a
-            // config, and silently ignoring it would hide exactly the broken
-            // setup this is strict about. `symlink_metadata` does not follow,
-            // so it still sees the link itself.
+            // config. `symlink_metadata` does not follow, so it still sees the
+            // link itself.
             if path.symlink_metadata().is_ok() {
                 return Err(format!(
                     "Failed to read {}: broken symbolic link",
@@ -356,17 +365,29 @@ fn load_toml_file(
             return Ok(None);
         }
         Err(err) => {
-            return Err(format!("Failed to access {}: {}", path.display(), err));
+            return Err(format!("Failed to read {}: {}", path.display(), err));
         }
-    }
+    };
 
     events.push(SettingsEvent::info(format!(
         "Loading config file: {}",
         path.display()
     )));
 
-    let contents = fs::read_to_string(path)
+    // Read one byte past the ceiling so hitting it is distinguishable from a
+    // file that merely ends there.
+    let mut contents = String::new();
+    use std::io::Read as _;
+    file.take(MAX_CONFIG_FILE_BYTES + 1)
+        .read_to_string(&mut contents)
         .map_err(|err| format!("Failed to read {}: {}", path.display(), err))?;
+    if contents.len() as u64 > MAX_CONFIG_FILE_BYTES {
+        return Err(format!(
+            "Failed to read {}: larger than the {} MiB configuration limit",
+            path.display(),
+            MAX_CONFIG_FILE_BYTES / (1024 * 1024)
+        ));
+    }
     deprecated_keys.merge(crate::config::deprecation::toml_deprecated_keys(&contents));
     let settings = toml::from_str::<RawWorkspaceSettings>(&contents)
         .map_err(|err| format!("Failed to parse {}: {}", path.display(), err))?;
@@ -996,6 +1017,32 @@ mod tests {
                 .all(|event| !event.message.contains(&later.display().to_string())),
             "nothing after the failure may be read: {:?}",
             explicit.events
+        );
+    }
+
+    /// load_toml_file: a file past the size ceiling fails instead of being read
+    /// to exhaustion. The ceiling is what keeps `--config-file /dev/zero` from
+    /// allocating until the process dies.
+    #[test]
+    fn test_load_toml_file_over_size_limit() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("huge.toml");
+        // A comment body, so the file is only rejected for its size — a valid
+        // parse would otherwise be indistinguishable from a missing check.
+        let mut oversized = String::with_capacity(MAX_CONFIG_FILE_BYTES as usize + 16);
+        oversized.push_str("# ");
+        oversized.extend(std::iter::repeat_n('a', MAX_CONFIG_FILE_BYTES as usize));
+        std::fs::write(&path, &oversized).unwrap();
+
+        let mut events = Vec::new();
+        let mut ignored_deprecation = false;
+        let result = load_toml_file(&path, &mut events, &mut ignored_deprecation);
+
+        let message = result.expect_err("an oversized explicit file must be fatal");
+        assert!(
+            message.contains("configuration limit")
+                && message.contains(&path.display().to_string()),
+            "the limit must be named, and so must the file: {message}"
         );
     }
 
