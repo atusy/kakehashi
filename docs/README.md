@@ -701,9 +701,12 @@ When `--config-file` is specified:
 - A file that is **present but unusable** aborts startup: unreadable, malformed
   TOML, or a path that cannot be expanded. LSP initialization returns a
   `RequestFailed` error naming the first such file; `format` and `diagnose`
-  print it to stderr and exit with status 2. Correcting the file requires
-  restarting the server (`:LspRestart`, or reloading the window) — kakehashi
-  does not re-read configuration after a rejected initialization.
+  print it to stderr and exit with status 2. Nothing is re-read while the
+  session runs, so correcting the file means restarting the server
+  (`:LspRestart`, or reloading the window). A client that responds to the
+  rejected handshake by sending `initialize` again is also served correctly —
+  the retry re-reads the files and is not contaminated by the failed attempt —
+  but most editors do not, so treat restart as the recovery path.
 - A path that expands badly is judged **per file**, so a later layer cannot mask
   an earlier layer's undefined variable — the merged result would never mention
   the mistake, because a later layer replaces path fields wholesale.

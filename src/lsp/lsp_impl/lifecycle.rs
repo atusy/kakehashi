@@ -89,10 +89,17 @@ impl Kakehashi {
         // the same text are never sent, so the client does not also get a
         // `window/showMessage` popup on top of a handshake it already failed.
         // Pinned by `test_config_file_fatal_error_is_not_also_shown_as_a_message`.
-        if let Some(error) =
-            crate::lsp::settings::explicit_config_fatal_error(self.home_dir.as_deref(), |var| {
+        //
+        // The files are read here and the result carried into `load_settings`
+        // below, never re-read: a `--config-file` may name a stream, and a file
+        // swapped between two reads would slip past whichever check ran first.
+        let explicit_config =
+            crate::lsp::settings::load_explicit_config(self.home_dir.as_deref(), |var| {
                 std::env::var(var).ok()
-            })
+            });
+        if let Some(error) = explicit_config
+            .as_ref()
+            .and_then(|config| config.fatal_error.clone())
         {
             return Err(configuration_load_error(error));
         }
@@ -218,6 +225,7 @@ impl Kakehashi {
                 .map(|options| (SettingsSource::InitializationOptions, options)),
             self.home_dir.as_deref(),
             |var| std::env::var(var).ok(),
+            explicit_config,
         );
 
         // `settings_outcome.fatal_error` is deliberately not consulted here: it

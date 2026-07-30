@@ -74,101 +74,154 @@ pub struct SettingsLoadOutcome {
     /// with the didChangeConfiguration path); it is intentionally kept out of
     /// `events` so the many callers that re-load settings do not re-warn.
     pub deprecated_keys: DeprecatedKeysSeen,
-    /// Fatal error from an explicitly requested configuration source.
-    ///
-    /// A `--config-file` path that is *present* but unusable — unreadable,
-    /// malformed, or carrying a path that cannot be expanded — represents a
-    /// user mistake that must not be papered over with defaults. An *absent*
-    /// explicit file stays optional (see `load_toml_file`), as do all
-    /// implicitly discovered user/project files.
+}
+
+/// The `--config-file` inputs, read and judged exactly once.
+///
+/// Read *once* is a contract, not an optimisation. A `--config-file` may name a
+/// stream (`/dev/fd/N`), which a second read would find empty, and a file
+/// replaced between two reads would have its second verdict either ignored or
+/// discovered too late to matter.
+pub(crate) struct ExplicitConfig {
+    layers: Vec<Option<RawWorkspaceSettings>>,
+    events: Vec<SettingsEvent>,
+    deprecated_keys: DeprecatedKeysSeen,
+    /// Why this configuration cannot be used, if it cannot. `initialize` must
+    /// reject the session when this is set.
     pub(crate) fatal_error: Option<String>,
 }
 
-/// The reason an explicitly requested configuration is unusable, if it is.
+/// Read and judge the `--config-file` inputs, or `None` if there are none.
 ///
 /// `initialize` calls this *before* it latches any once-only state from the
 /// request. `tower-lsp-server` resets to `Uninitialized` after an error
 /// response, so a client may fix the file and retry — and a retry carrying
 /// different capabilities or workspace folders would otherwise be served with
-/// the failed attempt's values, since those are first-write-wins.
-///
-/// Passing no root path and no override settings is not a simplification: when
-/// `--config-file` is set the workspace-relative layer is skipped entirely, and
-/// `initializationOptions` are deliberately outside the strict gate. So this
-/// sees exactly what the gate judges, which is why it can run this early.
-/// Returns `None` when nothing was requested explicitly.
-pub(crate) fn explicit_config_fatal_error(
+/// the failed attempt's values, since those are first-write-wins. The result is
+/// then handed to [`load_settings`], so the files are not read again.
+pub(crate) fn load_explicit_config(
     home: Option<&str>,
     env_fn: impl Fn(&str) -> Option<String>,
-) -> Option<String> {
-    crate::config::expand::config_file_override()?;
-    load_settings(None, None, home, env_fn).fatal_error
+) -> Option<ExplicitConfig> {
+    let files = crate::config::expand::config_file_override()?;
+    Some(read_explicit_layers(files, home, env_fn))
 }
 
+/// The body of [`load_explicit_config`], taking the paths directly so it can be
+/// exercised without the process-global `--config-file` override.
+fn read_explicit_layers(
+    files: &[std::path::PathBuf],
+    home: Option<&str>,
+    env_fn: impl Fn(&str) -> Option<String>,
+) -> ExplicitConfig {
+    let env_fn = crate::config::expand::with_kakehashi_defaults(env_fn);
+    let mut events = vec![SettingsEvent::info(format!(
+        "Using {} explicit config file(s); default config locations skipped",
+        files.len()
+    ))];
+    let mut used_deprecated_root_markers = false;
+    let mut fatal_error = None;
+    let mut layers = Vec::with_capacity(files.len());
+
+    for path in files {
+        // The verdict cannot change once a layer has failed, and reading on is
+        // not free: a later path could be a FIFO that blocks forever, so an
+        // already-doomed session would hang instead of reporting the failure it
+        // already knows about.
+        if fatal_error.is_some() {
+            break;
+        }
+        let layer = match load_toml_file(path, &mut events, &mut used_deprecated_root_markers) {
+            Ok(layer) => layer,
+            Err(message) => {
+                events.push(SettingsEvent::error(message.clone()));
+                fatal_error.get_or_insert(message);
+                None
+            }
+        };
+        // Judging a layer in isolation also resolves its language `base`
+        // chains, so a cycle an overlay later removes is still warned about
+        // once here. Accepted: the alternative is threading a "stay quiet"
+        // flag through base resolution to silence a warning that names a
+        // real cycle in a file the user wrote.
+        //
+        // Judge each layer's *paths* on its own so a later layer cannot
+        // mask an earlier one's undefined variable: path fields are
+        // replaced wholesale by the overlay, so the merged result would
+        // never mention the mistake. Cross-field invariants are excluded
+        // here (see `ExpandErrors::path_error_summary`) — their operands
+        // merge independently, so they are only meaningful once every
+        // layer has been folded together, and `expand_merged_settings`
+        // catches them there.
+        if let Some(raw_settings) = layer.as_ref()
+            && let Err(errs) = WorkspaceSettings::try_from_settings(raw_settings, home, &env_fn)
+            && let Some(details) = errs.path_error_summary()
+        {
+            let message = format!("Path expansion failed in {}: {details}", path.display());
+            events.push(SettingsEvent::error(message.clone()));
+            fatal_error.get_or_insert(message);
+        }
+        layers.push(layer);
+    }
+
+    // An explicit configuration also has to be valid *as a whole*, or startup
+    // would silently continue on programmed defaults. This is the only place a
+    // cross-layer invariant can be judged: one file supplying `debounceMs` and
+    // another `maxWaitMs` is valid in neither file alone. It is judged without
+    // `initializationOptions`, which keep a non-fatal policy of their own — a
+    // client sending a bad override must not be reported as a mistake in the
+    // user's file.
+    //
+    // Skipped once a layer has already failed: the verdict cannot change, and
+    // every `try_from_settings` re-resolves language `base` chains, whose cycle
+    // detector logs as it goes.
+    if fatal_error.is_none() {
+        let merged = std::iter::once(Some(default_settings()))
+            .chain(layers.iter().cloned())
+            .reduce(merge_workspace_settings)
+            .flatten();
+        if let Some(raw_settings) = merged.as_ref()
+            && let Err(errs) = WorkspaceSettings::try_from_settings(raw_settings, home, &env_fn)
+        {
+            fatal_error = Some(format!("Invalid configuration from --config-file: {errs}"));
+        }
+    }
+
+    ExplicitConfig {
+        layers,
+        events,
+        used_deprecated_root_markers,
+        fatal_error,
+    }
+}
+
+/// Merge every configuration layer into the settings the session will use.
+///
+/// `explicit` carries the already-read `--config-file` inputs; when it is
+/// `Some`, the implicitly discovered user and project files are skipped and the
+/// strict gate applies. Callers must obtain it from [`load_explicit_config`]
+/// rather than reading the files themselves — passing `None` while
+/// `--config-file` is set would silently fall back to implicit discovery.
 pub fn load_settings(
     root_path: Option<&Path>,
     override_settings: Option<(SettingsSource, Value)>,
     home: Option<&str>,
     env_fn: impl Fn(&str) -> Option<String>,
+    explicit: Option<ExplicitConfig>,
 ) -> SettingsLoadOutcome {
     let env_fn = crate::config::expand::with_kakehashi_defaults(env_fn);
     let mut events = Vec::new();
     let mut deprecated_keys = DeprecatedKeysSeen::default();
-    let mut fatal_error = None;
     let explicit_config_requested = crate::config::expand::config_file_override().is_some();
 
     // Layer 1: Programmed defaults (configuration-merging-strategy: lowest precedence)
     let defaults = Some(default_settings());
 
     // Layers 2+3: config files (either explicit --config-file or default locations)
-    let explicit_files = crate::config::expand::config_file_override();
-    let config_layers: Vec<Option<RawWorkspaceSettings>> = if let Some(files) = explicit_files {
-        events.push(SettingsEvent::info(format!(
-            "Using {} explicit config file(s); default config locations skipped",
-            files.len()
-        )));
-        let mut layers = Vec::with_capacity(files.len());
-        for path in files {
-            // The verdict cannot change once a layer has failed, and reading on
-            // is not free: a later path could be a FIFO that blocks forever, so
-            // an already-doomed session would hang instead of reporting the
-            // failure it already knows about.
-            if fatal_error.is_some() {
-                break;
-            }
-            let layer = match load_toml_file(path, &mut events, &mut deprecated_keys) {
-                Ok(layer) => layer,
-                Err(message) => {
-                    events.push(SettingsEvent::error(message.clone()));
-                    fatal_error.get_or_insert(message);
-                    None
-                }
-            };
-            // Judging a layer in isolation also resolves its language `base`
-            // chains, so a cycle an overlay later removes is still warned about
-            // once here. Accepted: the alternative is threading a "stay quiet"
-            // flag through base resolution to silence a warning that names a
-            // real cycle in a file the user wrote.
-            //
-            // Judge each layer's *paths* on its own so a later layer cannot
-            // mask an earlier one's undefined variable: path fields are
-            // replaced wholesale by the overlay, so the merged result would
-            // never mention the mistake. Cross-field invariants are excluded
-            // here (see `ExpandErrors::path_error_summary`) — their operands
-            // merge independently, so they are only meaningful once every
-            // layer has been folded together, and `expand_merged_settings`
-            // catches them there.
-            if let Some(raw_settings) = layer.as_ref()
-                && let Err(errs) = WorkspaceSettings::try_from_settings(raw_settings, home, &env_fn)
-                && let Some(details) = errs.path_error_summary()
-            {
-                let message = format!("Path expansion failed in {}: {details}", path.display());
-                events.push(SettingsEvent::error(message.clone()));
-                fatal_error.get_or_insert(message);
-            }
-            layers.push(layer);
-        }
-        layers
+    let config_layers: Vec<Option<RawWorkspaceSettings>> = if let Some(explicit) = explicit {
+        events.extend(explicit.events);
+        deprecated_keys.merge(explicit.deprecated_keys);
+        explicit.layers
     } else {
         vec![
             // Layer 2: User config from XDG_CONFIG_HOME (~/.config/kakehashi/kakehashi.toml)
@@ -186,30 +239,8 @@ pub fn load_settings(
     // Merge all layers: defaults < config_layers < override (later layers override earlier)
     let mut layers = vec![defaults];
     layers.extend(config_layers);
-    let merged_files = layers
-        .into_iter()
-        .reduce(merge_workspace_settings)
-        .flatten();
-
-    // An explicit configuration has to be valid on its own terms, or startup
-    // would silently continue on programmed defaults. Skipped once a layer has
-    // already failed: the verdict cannot change, and every `try_from_settings`
-    // re-resolves language `base` chains, whose cycle detector logs as it goes.
-    // This is judged before
-    // `initializationOptions` join the merge, because those keep a non-fatal
-    // policy of their own — a client sending a bad override must not be
-    // reported as a mistake in the user's file. It is also the only place a
-    // cross-layer invariant can be judged: one file supplying `debounceMs` and
-    // another `maxWaitMs` is valid in neither file alone.
-    if explicit_files.is_some()
-        && fatal_error.is_none()
-        && let Some(raw_settings) = merged_files.as_ref()
-        && let Err(errs) = WorkspaceSettings::try_from_settings(raw_settings, home, &env_fn)
-    {
-        fatal_error.get_or_insert(format!("Invalid configuration from --config-file: {errs}"));
-    }
-
-    let merged = [merged_files, override_settings]
+    layers.push(override_settings);
+    let merged = layers
         .into_iter()
         .reduce(merge_workspace_settings)
         .flatten();
@@ -221,7 +252,6 @@ pub fn load_settings(
         raw_settings,
         events,
         deprecated_keys,
-        fatal_error,
     }
 }
 
@@ -469,9 +499,13 @@ mod tests {
 
         // Load settings with project path
         let home = dirs::home_dir().map(|p| p.to_string_lossy().into_owned());
-        let outcome = load_settings(Some(project_dir.path()), None, home.as_deref(), |var| {
-            std::env::var(var).ok()
-        });
+        let outcome = load_settings(
+            Some(project_dir.path()),
+            None,
+            home.as_deref(),
+            |var| std::env::var(var).ok(),
+            None,
+        );
 
         // Restore original XDG_CONFIG_HOME
         // SAFETY: #[serial(xdg_env)] prevents concurrent modification of XDG_CONFIG_HOME
@@ -560,6 +594,7 @@ mod tests {
             Some((SettingsSource::InitializationOptions, override_json)),
             home.as_deref(),
             |var| std::env::var(var).ok(),
+            None,
         );
 
         // Restore original XDG_CONFIG_HOME
@@ -618,7 +653,13 @@ mod tests {
 
         // Load settings (no project path, just user config)
         let home = dirs::home_dir().map(|p| p.to_string_lossy().into_owned());
-        let outcome = load_settings(None, None, home.as_deref(), |var| std::env::var(var).ok());
+        let outcome = load_settings(
+            None,
+            None,
+            home.as_deref(),
+            |var| std::env::var(var).ok(),
+            None,
+        );
 
         // Restore original XDG_CONFIG_HOME
         // SAFETY: #[serial(xdg_env)] prevents concurrent modification of XDG_CONFIG_HOME
@@ -664,6 +705,7 @@ mod tests {
             Some((SettingsSource::InitializationOptions, override_json)),
             None,
             env,
+            None,
         );
 
         assert!(
@@ -747,6 +789,7 @@ mod tests {
             Some((SettingsSource::InitializationOptions, deprecated)),
             None,
             make_env(&[]),
+            None,
         )
         .deprecated_keys
         .root_markers;
@@ -759,6 +802,7 @@ mod tests {
             Some((SettingsSource::InitializationOptions, canonical)),
             None,
             make_env(&[]),
+            None,
         )
         .deprecated_keys
         .root_markers;
@@ -888,6 +932,70 @@ mod tests {
         assert!(
             message.contains(&path.display().to_string()) && !message.contains("not found"),
             "an unreachable path must not be reported as merely absent: {message}"
+        );
+    }
+
+    /// Every explicit layer is read, in order, while the configuration is
+    /// still usable.
+    #[test]
+    fn read_explicit_layers_reads_each_file_in_order() {
+        let dir = TempDir::new().unwrap();
+        let first = dir.path().join("first.toml");
+        let second = dir.path().join("second.toml");
+        std::fs::write(&first, "autoInstall = false\n").unwrap();
+        std::fs::write(&second, "autoInstall = true\n").unwrap();
+
+        let explicit = read_explicit_layers(
+            &[first.clone(), second.clone()],
+            None,
+            crate::config::make_env(&[]),
+        );
+
+        assert!(explicit.fatal_error.is_none());
+        assert_eq!(explicit.layers.len(), 2);
+        assert!(
+            explicit
+                .events
+                .iter()
+                .any(|event| event.message.contains(&second.display().to_string())),
+            "the second file must be read: {:?}",
+            explicit.events
+        );
+    }
+
+    /// Once a layer has failed the verdict is settled, so later paths are not
+    /// touched at all. This is what keeps a `--config-file` naming a FIFO from
+    /// hanging a session over a failure already known — a property no
+    /// finite-file test can observe, hence the assertion on the events.
+    #[test]
+    fn read_explicit_layers_stops_at_the_first_failure() {
+        let dir = TempDir::new().unwrap();
+        let broken = dir.path().join("broken.toml");
+        let later = dir.path().join("later.toml");
+        std::fs::write(&broken, "this is not [valid toml").unwrap();
+        std::fs::write(&later, "autoInstall = true\n").unwrap();
+
+        let explicit = read_explicit_layers(
+            &[broken.clone(), later.clone()],
+            None,
+            crate::config::make_env(&[]),
+        );
+
+        assert!(
+            explicit
+                .fatal_error
+                .as_deref()
+                .is_some_and(|message| message.contains(&broken.display().to_string())),
+            "the first failure must be reported: {:?}",
+            explicit.fatal_error
+        );
+        assert!(
+            explicit
+                .events
+                .iter()
+                .all(|event| !event.message.contains(&later.display().to_string())),
+            "nothing after the failure may be read: {:?}",
+            explicit.events
         );
     }
 

@@ -231,8 +231,21 @@ path the user typed carries intent; a path kakehashi went looking for does not.
    - Cross-field invariants (e.g. `debounceMs` ≤ `maxWaitMs`): on the merged
      explicit configuration only, because their operands merge independently —
      one file may legitimately supply just one half
-   - `initializationOptions`: never fatal. A client-supplied override that fails
-     to expand is discarded, as it is outside a `--config-file` session
+   - `initializationOptions`: never fatal, and judged last. A client-supplied
+     override that fails to expand does not abort — but "non-fatal" only means
+     the session starts: the *whole* merged configuration is discarded in
+     favour of programmed defaults, explicit files included. Only the abort is
+     avoided, not the loss.
+
+5. **When the strict gate runs**
+   - Before `initialize` stores anything derived from the request. Several of
+     those stores are first-write-wins and `tower-lsp-server` accepts a retry
+     after an error response, so a client that fixes the file and re-sends
+     `initialize` would otherwise get the corrected settings alongside the
+     failed attempt's capabilities and workspace folders.
+   - Each `--config-file` is read exactly once and the result carried into the
+     merge. A path may name a stream, and a file swapped between two reads
+     would slip past whichever check ran first.
 
 ### Implementation Notes
 
