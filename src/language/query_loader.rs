@@ -547,9 +547,63 @@ mod tests {
         fs::create_dir_all(&outside).unwrap();
         fs::write(outside.join("highlights.scm"), "(identifier) @variable").unwrap();
 
-        let result = QueryLoader::find_query_file(&[runtime], "../../outside", "highlights.scm");
+        // `runtime/queries` sits two components below the tempdir root, so the
+        // pre-fix join cleaned to exactly the file planted above.
+        let result =
+            QueryLoader::find_query_file(&[runtime.clone()], "../../outside", "highlights.scm");
 
         assert_eq!(result, None);
+
+        // An absolute name is the worse variant: `join` discards the base
+        // outright, so no `..` arithmetic is needed to escape.
+        let result = QueryLoader::find_query_file(
+            &[runtime.clone()],
+            outside.to_str().unwrap(),
+            "highlights.scm",
+        );
+
+        assert_eq!(result, None);
+
+        // Positive control on the same base: an ordinary name still resolves,
+        // so the assertions above pin the gate rather than a broken fixture.
+        let inside = runtime.join("queries").join("rust");
+        fs::create_dir_all(&inside).unwrap();
+        fs::write(inside.join("highlights.scm"), "(identifier) @variable").unwrap();
+
+        let result = QueryLoader::find_query_file(&[runtime], "rust", "highlights.scm");
+
+        assert_eq!(result, Some(inside.join("highlights.scm")));
+    }
+
+    #[test]
+    fn resolve_query_rejects_traversing_inherits_parent() {
+        // The parent language name comes from the first line of an on-disk query
+        // file, so it is the content-driven route into find_query_file -- and
+        // parse_inherits_directive, unlike its install-side twin, applies no
+        // filter of its own.
+        let dir = tempdir().unwrap();
+        let runtime = dir.path().join("runtime");
+
+        let outside = dir.path().join("outside");
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(outside.join("highlights.scm"), "(identifier) @smuggled").unwrap();
+
+        let child = runtime.join("queries").join("child");
+        fs::create_dir_all(&child).unwrap();
+        fs::write(
+            child.join("highlights.scm"),
+            "; inherits: ../../outside\n(string_literal) @string\n",
+        )
+        .unwrap();
+
+        let result = resolve_query(&[runtime], "child", "highlights.scm");
+
+        // An unresolvable parent fails the whole child query; what matters is
+        // that the smuggled content never reaches the combined output.
+        assert!(
+            result.is_err(),
+            "expected traversal to fail, got {result:?}"
+        );
     }
 
     #[test]
@@ -571,6 +625,12 @@ mod tests {
         {
             assert!(!is_single_path_component(r"C:\rust"));
             assert!(!is_single_path_component(r"\\server\share\rust"));
+            // Drive-relative: a prefix needs no following separator, so this
+            // parses as Prefix(Disk) + Normal("rust").
+            assert!(!is_single_path_component(r"C:rust"));
+            // Windows accepts `/` as a separator too, so the unix-looking case
+            // above is not redundant here.
+            assert!(!is_single_path_component("rust/query"));
         }
     }
 
