@@ -442,10 +442,10 @@ fn test_node_at_heading_returns_node_info() {
 /// alias middleware rewrites `kakehashi/node` to `kakehashi/textDocument/node`
 /// before any other layer sees it.
 ///
-/// This is the only e2e coverage of the old names — the rest of the suite
-/// moved to the canonical spellings — so it guards the whole compatibility
-/// path, including that a deprecated id-based follow-up call resolves an id
-/// minted through the deprecated entry point.
+/// Covers the deprecated path end to end — the rest of the suite moved to the
+/// canonical spellings — including that a deprecated id-based follow-up call
+/// resolves an id minted through the deprecated entry point, and that the
+/// deprecated result matches what the canonical name returns.
 #[test]
 fn test_deprecated_method_names_still_resolve() {
     let mut client = LspClient::new();
@@ -497,9 +497,139 @@ fn test_deprecated_method_names_still_resolve() {
         .and_then(|result| result.get("text"))
         .and_then(Value::as_str)
         .expect("deprecated node/text must resolve the id minted above");
+    // `contains` alone would pass for the empty string, which is exactly what a
+    // broken id resolution yields.
+    assert!(!slice.is_empty(), "deprecated node/text returned nothing");
     assert!(
         "# Hello".contains(slice),
         "expected a slice of the heading line, got {slice:?}"
+    );
+
+    // The docstring's claim, actually checked: the canonical spelling must
+    // answer identically. Ids are minted per call and may legitimately differ,
+    // so compare the observable content, not the handle.
+    let canonical_node = request_node(&mut client, uri, 0, 4);
+    assert_eq!(
+        canonical_node.get("kind"),
+        node.get("kind"),
+        "the deprecated name must resolve the same node as the canonical one"
+    );
+    let canonical_id = canonical_node
+        .get("id")
+        .and_then(Value::as_str)
+        .expect("canonical result must have a string id");
+    let canonical_text = request_node_text(&mut client, uri, canonical_id);
+    assert_eq!(
+        canonical_text.get("text").and_then(Value::as_str),
+        Some(slice),
+        "both spellings must resolve to the same text"
+    );
+}
+
+/// Every deprecated spelling must still reach a registered handler.
+///
+/// The alias table is frozen while the registration list in `main.rs` is free
+/// to change, and nothing couples them: renaming or dropping a canonical method
+/// would leave its alias rewriting into a name that no longer exists, so a
+/// client on the old spelling gets `MethodNotFound` naming a method it never
+/// sent. No unit test can catch that — the registrations live in the binary and
+/// tower-lsp's method map is private — so it has to be checked over the wire.
+///
+/// Asserts only that the method is *registered*: `-32601` (MethodNotFound) is
+/// the failure, while `-32602` (invalid params) proves the method resolved,
+/// which is what the deliberately minimal params provoke for most of the
+/// family.
+#[test]
+fn test_every_deprecated_method_name_reaches_a_handler() {
+    const METHOD_NOT_FOUND: i64 = -32601;
+
+    // The client's view of the 41 names, spelled out rather than derived from
+    // the server's table: a shared constant would make the test agree with the
+    // implementation by construction.
+    let deprecated = [
+        "kakehashi/captures/full",
+        "kakehashi/captures/full/delta",
+        "kakehashi/captures/range",
+        "kakehashi/node",
+        "kakehashi/node/text",
+        "kakehashi/node/parent",
+        "kakehashi/node/children",
+        "kakehashi/node/kind",
+        "kakehashi/node/grammarName",
+        "kakehashi/node/isNamed",
+        "kakehashi/node/isExtra",
+        "kakehashi/node/hasError",
+        "kakehashi/node/isError",
+        "kakehashi/node/isMissing",
+        "kakehashi/node/startByte",
+        "kakehashi/node/endByte",
+        "kakehashi/node/byteRange",
+        "kakehashi/node/childCount",
+        "kakehashi/node/namedChildCount",
+        "kakehashi/node/descendantCount",
+        "kakehashi/node/toSexp",
+        "kakehashi/node/child",
+        "kakehashi/node/namedChild",
+        "kakehashi/node/namedChildren",
+        "kakehashi/node/childWithDescendant",
+        "kakehashi/node/nextSibling",
+        "kakehashi/node/prevSibling",
+        "kakehashi/node/nextNamedSibling",
+        "kakehashi/node/prevNamedSibling",
+        "kakehashi/node/firstChildForByte",
+        "kakehashi/node/descendantForByteRange",
+        "kakehashi/node/namedDescendantForByteRange",
+        "kakehashi/node/range",
+        "kakehashi/node/startPosition",
+        "kakehashi/node/endPosition",
+        "kakehashi/node/descendantForPointRange",
+        "kakehashi/node/namedDescendantForPointRange",
+        "kakehashi/node/childByFieldName",
+        "kakehashi/node/childrenByFieldName",
+        "kakehashi/node/fieldNameForChild",
+        "kakehashi/node/fieldNameForNamedChild",
+    ];
+    assert_eq!(deprecated.len(), 41, "every renamed method must be listed");
+
+    let mut client = LspClient::new();
+    initialize(&mut client);
+
+    let uri = "file:///test_kakehashi_deprecated_coverage.md";
+    open_markdown(&mut client, uri, "# Hello\n\nSome paragraph text.\n");
+
+    for method in deprecated {
+        let response = client.send_request(
+            method,
+            json!({
+                "textDocument": { "uri": uri },
+                "position": { "line": 0, "character": 4 },
+                "kind": "highlights",
+            }),
+        );
+        let code = response
+            .get("error")
+            .and_then(|error| error.get("code"))
+            .and_then(Value::as_i64);
+        assert_ne!(
+            code,
+            Some(METHOD_NOT_FOUND),
+            "{method} no longer reaches a handler; its alias target is unregistered"
+        );
+    }
+
+    // The discriminating case: a name that was never registered under either
+    // spelling MUST be MethodNotFound, or the assertion above proves nothing.
+    let bogus = client.send_request(
+        "kakehashi/node/notAMethod",
+        json!({ "textDocument": { "uri": uri } }),
+    );
+    assert_eq!(
+        bogus
+            .get("error")
+            .and_then(|error| error.get("code"))
+            .and_then(Value::as_i64),
+        Some(METHOD_NOT_FOUND),
+        "an unknown method must still be MethodNotFound"
     );
 }
 
