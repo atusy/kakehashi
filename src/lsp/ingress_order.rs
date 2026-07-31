@@ -319,9 +319,9 @@ fn classify(req: &Request) -> Option<Role> {
         | "textDocument/codeAction"
         | "textDocument/diagnostic"
         | "textDocument/didSave"
-        | "kakehashi/captures/full"
-        | "kakehashi/captures/full/delta"
-        | "kakehashi/captures/range" => {
+        | "kakehashi/textDocument/captures/full"
+        | "kakehashi/textDocument/captures/full/delta"
+        | "kakehashi/textDocument/captures/range" => {
             let uri = text_document_uri(req)?;
             Some(Role::Reader { uri })
         }
@@ -331,7 +331,9 @@ fn classify(req: &Request) -> Option<Role> {
                 uri: normalize_uri(raw),
             })
         }
-        _ if method == "kakehashi/node" || method.starts_with("kakehashi/node/") => {
+        _ if method == "kakehashi/textDocument/node"
+            || method.starts_with("kakehashi/textDocument/node/") =>
+        {
             let uri = text_document_uri(req)?;
             Some(Role::Reader { uri })
         }
@@ -652,13 +654,13 @@ mod tests {
             "textDocument/codeAction",
             "textDocument/diagnostic",
             "textDocument/didSave",
-            "kakehashi/captures/full",
-            "kakehashi/captures/full/delta",
-            "kakehashi/captures/range",
-            "kakehashi/node",
-            "kakehashi/node/text",
-            "kakehashi/node/children",
-            "kakehashi/node/descendantForPointRange",
+            "kakehashi/textDocument/captures/full",
+            "kakehashi/textDocument/captures/full/delta",
+            "kakehashi/textDocument/captures/range",
+            "kakehashi/textDocument/node",
+            "kakehashi/textDocument/node/text",
+            "kakehashi/textDocument/node/children",
+            "kakehashi/textDocument/node/descendantForPointRange",
         ] {
             let reader = classify(&notification(method, URI));
             assert!(
@@ -671,6 +673,22 @@ mod tests {
             classify(&notification("textDocument/hover", URI)).is_none(),
             "unrelated methods pass through"
         );
+
+        // The gate knows ONLY the canonical scope-first spellings. Deprecated
+        // pre-rename names are rewritten by the alias middleware, which must
+        // therefore sit OUTSIDE this gate — below it, an old name would land
+        // here unrecognized, pass through ungated, and read a stale tree. This
+        // pins that layer-ordering dependency, which is otherwise invisible.
+        for deprecated in [
+            "kakehashi/node",
+            "kakehashi/node/text",
+            "kakehashi/captures/full",
+        ] {
+            assert!(
+                classify(&notification(deprecated, URI)).is_none(),
+                "{deprecated} must reach the gate already rewritten"
+            );
+        }
         assert!(
             classify(&Request::build("textDocument/didChange").finish()).is_none(),
             "missing params pass through rather than panic"
@@ -837,7 +855,7 @@ mod tests {
         });
 
         let close_fut = gate.call(notification("textDocument/didClose", URI));
-        let node_fut = gate.call(notification("kakehashi/node/text", URI));
+        let node_fut = gate.call(notification("kakehashi/textDocument/node/text", URI));
         let mut close = tokio_test::task::spawn(close_fut);
         let mut node = tokio_test::task::spawn(node_fut);
 
@@ -865,7 +883,7 @@ mod tests {
         });
 
         let change_fut = gate.call(notification("textDocument/didChange", URI));
-        let node_fut = gate.call(notification("kakehashi/node/children", URI));
+        let node_fut = gate.call(notification("kakehashi/textDocument/node/children", URI));
         let mut change = tokio_test::task::spawn(change_fut);
         let mut node = tokio_test::task::spawn(node_fut);
 

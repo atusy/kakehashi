@@ -872,8 +872,8 @@ fn run_lsp_server() {
 async fn serve_lsp() {
     use env_logger::Builder;
     use kakehashi::lsp::{
-        CancelForwarder, IngressOrderGate, Kakehashi, LanguageServerPool, RequestIdCapture,
-        repair_inbound_frames,
+        CancelForwarder, DeprecatedMethodAlias, IngressOrderGate, Kakehashi, LanguageServerPool,
+        RequestIdCapture, repair_inbound_frames,
     };
     use std::sync::Arc;
     use tokio::io::{stdin, stdout};
@@ -936,138 +936,168 @@ async fn serve_lsp() {
     // Captures (captures-protocol) — semanticTokens-style triple over a
     // server-owned query kind.
     .custom_method(
-        "kakehashi/captures/full",
+        "kakehashi/textDocument/captures/full",
         Kakehashi::kakehashi_captures_full,
     )
     .custom_method(
-        "kakehashi/captures/full/delta",
+        "kakehashi/textDocument/captures/full/delta",
         Kakehashi::kakehashi_captures_full_delta,
     )
     .custom_method(
-        "kakehashi/captures/range",
+        "kakehashi/textDocument/captures/range",
         Kakehashi::kakehashi_captures_range,
     )
-    .custom_method("kakehashi/node", Kakehashi::kakehashi_node)
-    .custom_method("kakehashi/node/text", Kakehashi::kakehashi_node_text)
-    .custom_method("kakehashi/node/parent", Kakehashi::kakehashi_node_parent)
+    .custom_method("kakehashi/textDocument/node", Kakehashi::kakehashi_node)
     .custom_method(
-        "kakehashi/node/children",
+        "kakehashi/textDocument/node/text",
+        Kakehashi::kakehashi_node_text,
+    )
+    .custom_method(
+        "kakehashi/textDocument/node/parent",
+        Kakehashi::kakehashi_node_parent,
+    )
+    .custom_method(
+        "kakehashi/textDocument/node/children",
         Kakehashi::kakehashi_node_children,
     )
     // Scalar accessors (node-reference-protocol) — mirror tree-sitter `Node`.
-    .custom_method("kakehashi/node/kind", Kakehashi::kakehashi_node_kind)
     .custom_method(
-        "kakehashi/node/grammarName",
+        "kakehashi/textDocument/node/kind",
+        Kakehashi::kakehashi_node_kind,
+    )
+    .custom_method(
+        "kakehashi/textDocument/node/grammarName",
         Kakehashi::kakehashi_node_grammar_name,
     )
-    .custom_method("kakehashi/node/isNamed", Kakehashi::kakehashi_node_is_named)
-    .custom_method("kakehashi/node/isExtra", Kakehashi::kakehashi_node_is_extra)
     .custom_method(
-        "kakehashi/node/hasError",
+        "kakehashi/textDocument/node/isNamed",
+        Kakehashi::kakehashi_node_is_named,
+    )
+    .custom_method(
+        "kakehashi/textDocument/node/isExtra",
+        Kakehashi::kakehashi_node_is_extra,
+    )
+    .custom_method(
+        "kakehashi/textDocument/node/hasError",
         Kakehashi::kakehashi_node_has_error,
     )
-    .custom_method("kakehashi/node/isError", Kakehashi::kakehashi_node_is_error)
     .custom_method(
-        "kakehashi/node/isMissing",
+        "kakehashi/textDocument/node/isError",
+        Kakehashi::kakehashi_node_is_error,
+    )
+    .custom_method(
+        "kakehashi/textDocument/node/isMissing",
         Kakehashi::kakehashi_node_is_missing,
     )
     .custom_method(
-        "kakehashi/node/startByte",
+        "kakehashi/textDocument/node/startByte",
         Kakehashi::kakehashi_node_start_byte,
     )
-    .custom_method("kakehashi/node/endByte", Kakehashi::kakehashi_node_end_byte)
     .custom_method(
-        "kakehashi/node/byteRange",
+        "kakehashi/textDocument/node/endByte",
+        Kakehashi::kakehashi_node_end_byte,
+    )
+    .custom_method(
+        "kakehashi/textDocument/node/byteRange",
         Kakehashi::kakehashi_node_byte_range,
     )
     .custom_method(
-        "kakehashi/node/childCount",
+        "kakehashi/textDocument/node/childCount",
         Kakehashi::kakehashi_node_child_count,
     )
     .custom_method(
-        "kakehashi/node/namedChildCount",
+        "kakehashi/textDocument/node/namedChildCount",
         Kakehashi::kakehashi_node_named_child_count,
     )
     .custom_method(
-        "kakehashi/node/descendantCount",
+        "kakehashi/textDocument/node/descendantCount",
         Kakehashi::kakehashi_node_descendant_count,
     )
-    .custom_method("kakehashi/node/toSexp", Kakehashi::kakehashi_node_to_sexp)
-    // Tree-walking accessors (node-reference-protocol).
-    .custom_method("kakehashi/node/child", Kakehashi::kakehashi_node_child)
     .custom_method(
-        "kakehashi/node/namedChild",
+        "kakehashi/textDocument/node/toSexp",
+        Kakehashi::kakehashi_node_to_sexp,
+    )
+    // Tree-walking accessors (node-reference-protocol).
+    .custom_method(
+        "kakehashi/textDocument/node/child",
+        Kakehashi::kakehashi_node_child,
+    )
+    .custom_method(
+        "kakehashi/textDocument/node/namedChild",
         Kakehashi::kakehashi_node_named_child,
     )
     .custom_method(
-        "kakehashi/node/namedChildren",
+        "kakehashi/textDocument/node/namedChildren",
         Kakehashi::kakehashi_node_named_children,
     )
     .custom_method(
-        "kakehashi/node/childWithDescendant",
+        "kakehashi/textDocument/node/childWithDescendant",
         Kakehashi::kakehashi_node_child_with_descendant,
     )
     .custom_method(
-        "kakehashi/node/nextSibling",
+        "kakehashi/textDocument/node/nextSibling",
         Kakehashi::kakehashi_node_next_sibling,
     )
     .custom_method(
-        "kakehashi/node/prevSibling",
+        "kakehashi/textDocument/node/prevSibling",
         Kakehashi::kakehashi_node_prev_sibling,
     )
     .custom_method(
-        "kakehashi/node/nextNamedSibling",
+        "kakehashi/textDocument/node/nextNamedSibling",
         Kakehashi::kakehashi_node_next_named_sibling,
     )
     .custom_method(
-        "kakehashi/node/prevNamedSibling",
+        "kakehashi/textDocument/node/prevNamedSibling",
         Kakehashi::kakehashi_node_prev_named_sibling,
     )
     .custom_method(
-        "kakehashi/node/firstChildForByte",
+        "kakehashi/textDocument/node/firstChildForByte",
         Kakehashi::kakehashi_node_first_child_for_byte,
     )
     .custom_method(
-        "kakehashi/node/descendantForByteRange",
+        "kakehashi/textDocument/node/descendantForByteRange",
         Kakehashi::kakehashi_node_descendant_for_byte_range,
     )
     .custom_method(
-        "kakehashi/node/namedDescendantForByteRange",
+        "kakehashi/textDocument/node/namedDescendantForByteRange",
         Kakehashi::kakehashi_node_named_descendant_for_byte_range,
     )
     // Position / range accessors (node-reference-protocol) — LSP Position (UTF-16).
-    .custom_method("kakehashi/node/range", Kakehashi::kakehashi_node_range)
     .custom_method(
-        "kakehashi/node/startPosition",
+        "kakehashi/textDocument/node/range",
+        Kakehashi::kakehashi_node_range,
+    )
+    .custom_method(
+        "kakehashi/textDocument/node/startPosition",
         Kakehashi::kakehashi_node_start_position,
     )
     .custom_method(
-        "kakehashi/node/endPosition",
+        "kakehashi/textDocument/node/endPosition",
         Kakehashi::kakehashi_node_end_position,
     )
     .custom_method(
-        "kakehashi/node/descendantForPointRange",
+        "kakehashi/textDocument/node/descendantForPointRange",
         Kakehashi::kakehashi_node_descendant_for_point_range,
     )
     .custom_method(
-        "kakehashi/node/namedDescendantForPointRange",
+        "kakehashi/textDocument/node/namedDescendantForPointRange",
         Kakehashi::kakehashi_node_named_descendant_for_point_range,
     )
     // Field-aware accessors (node-reference-protocol).
     .custom_method(
-        "kakehashi/node/childByFieldName",
+        "kakehashi/textDocument/node/childByFieldName",
         Kakehashi::kakehashi_node_child_by_field_name,
     )
     .custom_method(
-        "kakehashi/node/childrenByFieldName",
+        "kakehashi/textDocument/node/childrenByFieldName",
         Kakehashi::kakehashi_node_children_by_field_name,
     )
     .custom_method(
-        "kakehashi/node/fieldNameForChild",
+        "kakehashi/textDocument/node/fieldNameForChild",
         Kakehashi::kakehashi_node_field_name_for_child,
     )
     .custom_method(
-        "kakehashi/node/fieldNameForNamedChild",
+        "kakehashi/textDocument/node/fieldNameForNamedChild",
         Kakehashi::kakehashi_node_field_name_for_named_child,
     )
     .finish();
@@ -1088,6 +1118,12 @@ async fn serve_lsp() {
     // didChange/didClose apply strictly ordered and semanticTokens requests
     // observe every edit that preceded them on the wire (#342).
     let service = IngressOrderGate::new(service);
+
+    // Outside the gate, deliberately: the gate classifies requests by method
+    // name to assign per-document ordering tickets and knows only the
+    // canonical scope-first spellings. Rewriting below it would let a
+    // deprecated name pass through ungated and read a stale tree.
+    let service = DeprecatedMethodAlias::new(service);
 
     // Lift tower-lsp's default 4-message `buffer_unordered` cap: editors fire
     // bursts of concurrent requests per keystroke (Neovim: semanticTokens +
