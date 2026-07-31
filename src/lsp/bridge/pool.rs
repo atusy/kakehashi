@@ -652,13 +652,14 @@ impl LanguageServerPool {
     /// Apply an upstream `workspace/didChangeWorkspaceFolders` to every
     /// connection that follows the client workspace.
     ///
-    /// Four effects, ordered and all under one `connections` guard: the client
-    /// snapshot and derived root URI are updated for future spawns; the
-    /// pull-diagnostic lineage of client-fallback connections is fenced; the
-    /// event is forwarded to those that advertise support; and the rest —
-    /// mid-handshake, incapable, or unable to queue — are recycled, armed for
-    /// re-open, and shut down. Marker-rooted and shared connections derive
-    /// their folders from marker-root acquisition and are left alone.
+    /// The client snapshot and derived root URI are updated first, for future
+    /// spawns. Three effects then share one `connections` guard: the
+    /// pull-diagnostic lineage of client-fallback connections is fenced, the
+    /// event is forwarded to those that advertise support, and the rest —
+    /// mid-handshake, incapable, or unable to queue — are recycled and armed
+    /// for re-open. Their processes are shut down after the guard is released,
+    /// as `propagate_settings` does. Marker-rooted and shared connections
+    /// derive their folders from marker-root acquisition and are left alone.
     ///
     /// Answers whether the event described a change at all, so the caller can
     /// decide from one definition — this one — whether the work it owns
