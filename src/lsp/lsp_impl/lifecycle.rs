@@ -1413,14 +1413,26 @@ fn spawn_upstream_request(
                         // direction. (A `languageId` change needs
                         // didClose+didOpen, which bumps the incarnation, so the
                         // stale-reject window is narrow rather than absent.)
-                        let Some(candidate_language) = injection.document_language(&host) else {
-                            continue;
-                        };
-                        if !injection.bridge().host_language_can_reach_server(
-                            &settings,
-                            &candidate_language,
-                            &reopen_server,
-                        ) {
+                        let screened_at = injection.document_incarnation(&host);
+                        let reachable =
+                            injection
+                                .document_language(&host)
+                                .is_some_and(|candidate_language| {
+                                    injection.bridge().host_language_can_reach_server(
+                                        &settings,
+                                        &candidate_language,
+                                        &reopen_server,
+                                    )
+                                });
+                        // Only trust a REJECTION if the document did not change
+                        // lifetime underneath it. A close+reopen under a
+                        // different `languageId` between the two reads would
+                        // otherwise reject on the OLD language and skip a
+                        // document the NEW lifetime does bridge — silently,
+                        // since a skip is indistinguishable from "nothing to
+                        // repair". On a mismatch fall through and let the
+                        // authoritative path, which re-reads both, decide.
+                        if !reachable && injection.document_incarnation(&host) == screened_at {
                             continue;
                         }
                         // Await the tree first: a re-open racing an edit would
@@ -1443,7 +1455,26 @@ fn spawn_upstream_request(
                             repaired = false;
                             break;
                         }
-                        injection.ensure_document_parsed(&host, remaining).await;
+                        if !injection.ensure_document_parsed(&host, remaining).await {
+                            // The budget expired with this document's parse
+                            // still outstanding. Resolving injections now yields
+                            // ZERO — not because the host has none, but because
+                            // there is no tree to find them in — and the skip
+                            // below would then read as "nothing to repair here".
+                            // This host passed the configuration screen, so it
+                            // is a plausible member of this connection's set and
+                            // saying otherwise is the one direction that
+                            // releases a command onto a document that was never
+                            // opened. Report the connection as not caught up and
+                            // let the next parse's eager open heal it.
+                            log::debug!(
+                                target: "kakehashi::bridge",
+                                "Re-open of {key}: {host} did not settle within the \
+                                 remaining budget; reporting the connection incomplete"
+                            );
+                            repaired = false;
+                            continue;
+                        }
                         // Incarnation BEFORE injections, matching the ordering the
                         // inline heal used: a close+reopen landing between the two
                         // reads then pairs a stale incarnation with fresh

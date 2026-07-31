@@ -255,6 +255,26 @@ fn init_client_reopen_order(
     (client, config_dir)
 }
 
+/// Directory of the second fenced host, distinct from the first so its virtual
+/// documents are identifiable in the wire log (a virtual URI keeps its host's
+/// directory).
+const SECOND_HOST_DIR: &str = "second_host";
+
+/// A second markdown host with a lua fence, under its own directory.
+fn open_second_host(client: &mut LspClient) {
+    client.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": format!("file:///{SECOND_HOST_DIR}/other.md"),
+                "languageId": "markdown",
+                "version": 1,
+                "text": MARKDOWN
+            }
+        }),
+    );
+}
+
 /// Open `count` markdown documents with no injected fence, so they bridge to no
 /// downstream at all. They exist to be *considered* by a derived re-open and
 /// rejected — the workload a re-open sees on a real workspace, where the
@@ -294,7 +314,7 @@ fn dirty_bystanders(client: &mut LspClient, count: usize) {
 ///
 /// Waiting on the observable effect rather than on a duration is what keeps the
 /// caller's assertion about the barrier's RESULT instead of about the clock.
-fn await_replacement_reopen(log: &std::path::Path) {
+fn await_replacement_reopen(log: &std::path::Path, uri_marker: &str) {
     for _ in 0..300 {
         if let Ok(wire) = std::fs::read_to_string(log)
             && wire
@@ -302,16 +322,18 @@ fn await_replacement_reopen(log: &std::path::Path) {
                 .filter(|l| l.split('\t').next() == Some("initialize"))
                 .count()
                 >= 2
-            && replacement_segment(&wire)
-                .iter()
-                .any(|l| l.split('\t').next() == Some("textDocument/didOpen"))
+            && replacement_segment(&wire).iter().any(|l| {
+                let mut parts = l.split('\t');
+                parts.next() == Some("textDocument/didOpen")
+                    && parts.next().is_some_and(|uri| uri.contains(uri_marker))
+            })
         {
             return;
         }
         std::thread::sleep(Duration::from_millis(50));
     }
     let wire = std::fs::read_to_string(log).unwrap_or_default();
-    panic!("the replacement never re-opened a document:\n{wire}");
+    panic!("the replacement never re-opened a {uri_marker} document:\n{wire}");
 }
 
 /// Split the wire log into lines and return the segment belonging to the
@@ -454,6 +476,11 @@ fn a_completed_reopen_releases_the_command_it_was_holding() {
     // wait. The screen only rejects hosts whose language cannot reach the
     // server at all, and no e2e covers that direction.
     open_bystanders(&mut client, 12);
+    // A second fenced host, in its own directory so its virtual URIs are
+    // distinguishable on the wire. Nothing in this test requests anything on
+    // it after the crash, so its presence in the replacement's segment is
+    // positive evidence that the derived sweep — not a request — opened it.
+    open_second_host(&mut client);
 
     let actions = code_action_with_retry(&mut client);
     let routed = actions
@@ -475,7 +502,12 @@ fn a_completed_reopen_releases_the_command_it_was_holding() {
     // barrier, so the re-open runs and settles while nothing has waited on it —
     // and only a wait retires the entry, so its result is still there to read.
     let _ = code_action_with_retry(&mut client);
-    await_replacement_reopen(&log);
+    // Wait for the SECOND host specifically. Only the derived sweep can have
+    // opened it: the codeAction above touches the first host, so the request
+    // path's own lazy open cannot account for a virtual URI under `/second/`.
+    // Waiting on any didOpen would let a re-open that opened NOTHING satisfy
+    // this, because the request path produces one either way.
+    await_replacement_reopen(&log, SECOND_HOST_DIR);
 
     // The barrier now holds a settled result. Releasing the command is the only
     // correct response to one that reports success.

@@ -495,7 +495,15 @@ impl InjectionCoordinator {
     /// closing it: the wait is bounded, and on expiry the re-open proceeds and
     /// may still open nothing. Degrading to the pre-existing lazy heal (the next
     /// parse re-opens) is preferred over stalling the barrier.
-    pub(crate) async fn ensure_document_parsed(&self, uri: &Url, budget: std::time::Duration) {
+    /// Returns whether the tree is CURRENT. `false` means the budget expired
+    /// with the parse still outstanding, so a caller that must not silently
+    /// under-report has to treat whatever it resolves next as unreliable rather
+    /// than as "this document has nothing".
+    pub(crate) async fn ensure_document_parsed(
+        &self,
+        uri: &Url,
+        budget: std::time::Duration,
+    ) -> bool {
         // `budget` is enforced HERE rather than passed through, because
         // `wait_for_current_snapshot_in` honours its `wait` argument only for a
         // snapshot that TRAILS. A document with no snapshot at all — open, first
@@ -508,15 +516,20 @@ impl InjectionCoordinator {
         //
         // The caller passes what is LEFT of the shared budget, so a sweep cannot
         // spend it several times over.
-        let _ = tokio::time::timeout(
-            budget,
-            crate::lsp::lsp_impl::snapshot_read::wait_for_current_snapshot_in(
-                &self.documents,
-                uri,
+        matches!(
+            tokio::time::timeout(
                 budget,
-            ),
+                crate::lsp::lsp_impl::snapshot_read::wait_for_current_snapshot_in(
+                    &self.documents,
+                    uri,
+                    budget,
+                ),
+            )
+            .await,
+            Ok(crate::lsp::lsp_impl::snapshot_read::SnapshotWait::Current(
+                _
+            ))
         )
-        .await;
     }
 
     fn install_coordinator(&self) -> InstallCoordinator {
