@@ -77,11 +77,15 @@ fn host_position_encoding(capabilities: &ClientCapabilities) -> Option<PositionE
 /// defines: `workspaceFolders[0]`, then the deprecated `rootUri`, then the
 /// deprecated `rootPath`.
 ///
-/// `None` means the client opened no workspace at all. That is a state clients
-/// choose deliberately — single-file sessions, embedded clients — so neither
-/// the forwarded handshake nor config discovery may invent a root for it.
-/// The two consumers still differ in what they do with a root once found,
-/// which is why this shares the ladder and not the conversion.
+/// `None` means the client opened no workspace at all — a state clients choose
+/// deliberately (single-file sessions, embedded clients). The forwarded
+/// handshake must preserve it: inventing a root there is what #742 reported.
+/// Config discovery may still fall back to the process CWD for its own root,
+/// which the startup log names, because that root anchors Kakehashi's relative
+/// paths and never reaches a downstream server.
+///
+/// The two consumers differ in what they do with a root once found, which is
+/// why this shares the ladder and not the conversion.
 enum ClientRoot<'a> {
     /// The first entry of `workspaceFolders`.
     WorkspaceFolder(&'a Uri),
