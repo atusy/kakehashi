@@ -3540,7 +3540,7 @@ mod tests {
         fallback.set_server_capabilities(capable_workspace_folders_caps());
         let marker = create_handle_with_key(ConnectionState::Ready, marker_key.clone()).await;
         marker.set_server_capabilities(capable_workspace_folders_caps());
-        pool.insert_connection(fallback).await;
+        pool.insert_connection(Arc::clone(&fallback)).await;
         pool.insert_connection(marker).await;
         for key in [&fallback_key, &marker_key] {
             pool.diagnostic_pull_baselines.insert(
@@ -3562,6 +3562,23 @@ mod tests {
         )
         .await;
 
+        // The fence is load-bearing for exactly one shape: a connection that
+        // TOOK the notification and stayed. A recycled one is already fenced by
+        // the connection generation `purge_connection` bumps, so a fixture that
+        // silently drifted into the recycle branch would cover nothing while
+        // staying green.
+        assert!(
+            pool.connections.lock().await.contains_key(&fallback_key),
+            "the fixture must exercise a connection that took the notification"
+        );
+        assert_eq!(
+            fallback.workspace_folders().snapshot(),
+            Some(vec![tower_lsp_server::ls_types::WorkspaceFolder {
+                uri: "file:///added".parse().unwrap(),
+                name: "added".to_string(),
+            }]),
+            "and must have applied it",
+        );
         assert!(
             !pool
                 .diagnostic_pull_baselines
@@ -3576,8 +3593,12 @@ mod tests {
         );
         assert!(
             pool.diagnostic_pull_baselines
-                .contains_key(&(marker_key, "file:///v.lua".to_string())),
+                .contains_key(&(marker_key.clone(), "file:///v.lua".to_string())),
             "a marker-owned connection's project did not change"
+        );
+        assert!(
+            !pool.diagnostic_pull_generations.contains_key(&marker_key),
+            "so its fence must not move either"
         );
     }
 
