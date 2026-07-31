@@ -169,6 +169,9 @@ impl LanguageServerPool {
         // above, before the lookup.
         let connection_key = handle.key().clone();
         let mut sender = ConnectionHandleSender(&handle);
+        // Every injection's didOpen must actually be enqueued before this counts
+        // as a completed open.
+        let mut enqueued_all = true;
 
         let Some(lifecycle) = self.existing_host_lifecycle_lock(host_uri) else {
             // The host closed underneath us; nothing to open.
@@ -240,9 +243,21 @@ impl LanguageServerPool {
                     server_name,
                     e
                 );
+                // Keep opening the rest — one region failing does not make the
+                // others unopenable — but do NOT report success. A claim that
+                // did not settle, a full outbound queue, or a claim invalidated
+                // mid-enqueue each mean this connection is missing a document it
+                // should have, and a caller repairing it must hear so: that is
+                // exactly the state in which releasing a command produces the
+                // out-of-order delivery the barrier exists to prevent.
+                enqueued_all = false;
             }
         }
-        OpenOutcome::Opened
+        if enqueued_all {
+            OpenOutcome::Opened
+        } else {
+            OpenOutcome::NotOpened
+        }
     }
 
     /// Fire `didOpen` for the real host document on a `_self` host-bridge server

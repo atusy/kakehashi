@@ -485,8 +485,8 @@ impl InjectionCoordinator {
         Some((host_language, injections))
     }
 
-    /// Wait (bounded) for `uri`'s tree to be current before its injections are
-    /// resolved.
+    /// Wait (bounded by `budget`) for `uri`'s tree to be current before its
+    /// injections are resolved.
     ///
     /// `didChange` clears the tree and reparses off-ingress, so a re-open
     /// landing right after an edit would resolve ZERO injections and silently
@@ -495,11 +495,26 @@ impl InjectionCoordinator {
     /// closing it: the wait is bounded, and on expiry the re-open proceeds and
     /// may still open nothing. Degrading to the pre-existing lazy heal (the next
     /// parse re-opens) is preferred over stalling the barrier.
-    pub(crate) async fn ensure_document_parsed(&self, uri: &Url) {
-        let _ = crate::lsp::lsp_impl::snapshot_read::wait_for_current_snapshot_in(
-            &self.documents,
-            uri,
-            std::time::Duration::from_millis(200),
+    pub(crate) async fn ensure_document_parsed(&self, uri: &Url, budget: std::time::Duration) {
+        // `budget` is enforced HERE rather than passed through, because
+        // `wait_for_current_snapshot_in` honours its `wait` argument only for a
+        // snapshot that TRAILS. A document with no snapshot at all — open, first
+        // parse still queued — parks on `FIRST_PARSE_BACKSTOP` (15s) instead,
+        // which is right for a request that needs an answer and fatal for a
+        // caller sweeping documents inside a 2s barrier budget. The captured-set
+        // design never met that state (it only ever revisited documents the dead
+        // connection had already opened, hence already parsed); deriving the set
+        // means meeting every open document, including one mid-first-parse.
+        //
+        // The caller passes what is LEFT of the shared budget, so a sweep cannot
+        // spend it several times over.
+        let _ = tokio::time::timeout(
+            budget,
+            crate::lsp::lsp_impl::snapshot_read::wait_for_current_snapshot_in(
+                &self.documents,
+                uri,
+                budget,
+            ),
         )
         .await;
     }

@@ -1367,7 +1367,29 @@ fn spawn_upstream_request(
                     // release builds do not contain this branch.
                     #[cfg(feature = "e2e")]
                     e2e_stall_reopen().await;
+                    // ONE budget for the whole sweep, not one per host. Each
+                    // surviving host can park waiting for its tree, so a
+                    // per-host bound lets ten of them spend `REOPEN_WAIT` ten
+                    // times over — and the barrier promises to settle inside it
+                    // ONCE. Deriving the set is what makes that reachable: the
+                    // sweep is now sized by the workspace rather than by what
+                    // one dead connection held.
+                    let sweep_deadline = std::time::Instant::now() + REOPEN_WAIT;
                     for host in hosts {
+                        // Stop if nobody can hear the answer. `rearm` and a
+                        // later `claim` both drop the registry's receiver, so a
+                        // closed channel means this re-open has been superseded
+                        // by a newer respawn of the same key — and the sweep is
+                        // now O(open documents), so continuing would spend
+                        // marker walks and parse waits producing a result that
+                        // will be discarded.
+                        if done.is_closed() {
+                            log::debug!(
+                                target: "kakehashi::bridge",
+                                "Re-open of {key} was superseded; stopping the sweep"
+                            );
+                            return;
+                        }
                         // Cheapest question first. Deriving means asking about
                         // every open document, and for most of them the answer
                         // is "this host bridges nowhere near that server" —
@@ -1379,13 +1401,18 @@ fn spawn_upstream_request(
                         // that belongs to it, and the budget is what `done`
                         // must signal inside.
                         //
-                        // Advisory only, so reading the language before the
-                        // parse wait is safe: the authoritative language is
-                        // re-read with the injections below, keeping the
-                        // incarnation/injections ordering intact. A document
-                        // whose language changes in between is at worst
-                        // screened on its old language, and the re-read decides
-                        // what actually opens.
+                        // Reading the language before the parse wait keeps the
+                        // incarnation/injections ordering intact, because the
+                        // authoritative language is re-read with the injections
+                        // below. The screen is one-directional, though, and not
+                        // symmetric: a stale ACCEPT costs only an unnecessary
+                        // resolution, but a stale REJECT skips the document for
+                        // this round while `repaired` still reports success —
+                        // indistinguishable from "nothing to repair". Every
+                        // widening of this screen has to be weighed in that
+                        // direction. (A `languageId` change needs
+                        // didClose+didOpen, which bumps the incarnation, so the
+                        // stale-reject window is narrow rather than absent.)
                         let Some(candidate_language) = injection.document_language(&host) else {
                             continue;
                         };
@@ -1398,7 +1425,25 @@ fn spawn_upstream_request(
                         }
                         // Await the tree first: a re-open racing an edit would
                         // otherwise resolve no injections and open nothing.
-                        injection.ensure_document_parsed(&host).await;
+                        // Bounded by what is LEFT of the sweep's budget.
+                        let remaining = sweep_deadline
+                            .checked_duration_since(std::time::Instant::now())
+                            .unwrap_or_default();
+                        if remaining.is_zero() {
+                            // Out of budget with candidates still unexamined.
+                            // Report the connection as NOT caught up: the
+                            // waiters are about to time out anyway, and telling
+                            // them the sweep finished would release commands
+                            // onto documents this pass never reached.
+                            log::debug!(
+                                target: "kakehashi::bridge",
+                                "Re-open of {key} ran out of budget with candidates \
+                                 left; reporting it incomplete"
+                            );
+                            repaired = false;
+                            break;
+                        }
+                        injection.ensure_document_parsed(&host, remaining).await;
                         // Incarnation BEFORE injections, matching the ordering the
                         // inline heal used: a close+reopen landing between the two
                         // reads then pairs a stale incarnation with fresh
