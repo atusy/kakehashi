@@ -184,7 +184,7 @@ enum ConfigAction {
         #[arg(long)]
         output: Option<PathBuf>,
 
-        /// Write even if the output path already exists (only applies with --output)
+        /// Skip the refusal when the output path is already taken (only applies with --output)
         #[arg(long)]
         force: bool,
     },
@@ -197,7 +197,7 @@ enum ConfigAction {
         #[arg(long)]
         output: Option<PathBuf>,
 
-        /// Write even if the output path already exists (only applies with --output)
+        /// Skip the refusal when the output path is already taken (only applies with --output)
         #[arg(long)]
         force: bool,
     },
@@ -705,10 +705,11 @@ fn write_content_to_output(
             Ok(()) => {
                 eprintln!("Created {label} file: {}", path.display());
             }
-            // `!force` is unreachable today (a truncating write cannot report
-            // `AlreadyExists`) and stays deliberately: without it, a future
-            // force-path error of this kind would tell someone who already
-            // passed `--force` to pass `--force`.
+            // `AlreadyExists` under `--force` cannot happen today — a truncating
+            // write never reports it — so testing `!force` is redundant. It
+            // stays deliberately: without it, a future force-path error of
+            // that kind would tell someone who already passed `--force` to
+            // pass `--force`.
             Err(e) if !force && e.kind() == std::io::ErrorKind::AlreadyExists => {
                 eprintln!(
                     "Error: An entry already exists at '{}'. {}",
