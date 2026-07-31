@@ -2168,6 +2168,60 @@ mod tests {
     }
 
     #[test]
+    fn config_root_keeps_the_cwd_when_the_client_opened_no_workspace() {
+        // The asymmetry this change turns on, in one place: the handshake
+        // forwards nothing, while Kakehashi still resolves its own config
+        // against the launch directory. Deleting the surviving fallback for
+        // symmetry with the bridge would break config discovery for exactly
+        // the sessions #742 is about.
+        let params = params_with(serde_json::json!({
+            "rootUri": null,
+            "workspaceFolders": null
+        }));
+
+        assert_eq!(bridge_root_uri(&params), None, "nothing is forwarded");
+
+        let (root_path, source) = config_root_path(client_root(&params));
+        assert_eq!(root_path, std::env::current_dir().ok());
+        assert_eq!(source, "current working directory (fallback)");
+    }
+
+    #[test]
+    fn config_root_reports_the_rung_it_resolved() {
+        let root_path = std::env::current_dir()
+            .expect("current directory")
+            .join("legacy-workspace");
+        let params = params_with(serde_json::json!({
+            "rootUri": null,
+            "rootPath": root_path,
+            "workspaceFolders": null
+        }));
+
+        let (resolved, source) = config_root_path(client_root(&params));
+        assert_eq!(resolved, Some(root_path));
+        assert_eq!(
+            source, "root_path (deprecated)",
+            "the log must not call a client-named root a CWD fallback"
+        );
+    }
+
+    #[test]
+    fn config_root_falls_back_when_the_legacy_root_path_is_unanchorable() {
+        let params = params_with(serde_json::json!({
+            "rootUri": null,
+            "rootPath": "relative/workspace",
+            "workspaceFolders": null
+        }));
+
+        let (root_path, source) = config_root_path(client_root(&params));
+        assert_eq!(root_path, std::env::current_dir().ok());
+        assert_eq!(
+            source, "current working directory (fallback)",
+            "a dropped root must be reported as the fallback it became"
+        );
+    }
+
+    #[test]
     fn client_root_rejects_a_relative_legacy_root_path() {
         // A relative `rootPath` resolves against the launch directory, so it
         // cannot anchor config paths; falling through to the CWD fallback keeps
