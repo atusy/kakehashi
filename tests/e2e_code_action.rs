@@ -386,7 +386,7 @@ fn replacement_segment(wire: &str) -> Vec<&str> {
 /// document its arguments reference (execute-command-routing-token).
 ///
 /// The stall makes the barrier load-bearing instead of raced. While the
-/// re-open is held (2.5 s > REOPEN_WAIT), a correct kakehashi DROPS the
+/// re-open is held (5 s > REOPEN_WAIT), a correct kakehashi DROPS the
 /// command (fail-soft null; nothing on the wire); one that signals early,
 /// ignores the unsettled wait, or never waits sends it ahead of the didOpen —
 /// and the replacement-segment wire order catches every one of those shapes.
@@ -426,7 +426,7 @@ fn a_command_does_not_overtake_the_reopen_of_a_respawned_downstream() {
         "a command whose re-open is still in flight must fail soft, got: {first:?}"
     );
 
-    // Retry until it goes through: the stall ends at ~2.5 s, the barrier
+    // Retry until it goes through: the stall ends at ~5 s, the barrier
     // settles, and a retry then waits it out and sends AFTER the didOpen.
     let mut delivered = false;
     for _ in 0..40 {

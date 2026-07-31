@@ -219,10 +219,12 @@ anyway, incorrectly, since it cannot include documents opened since the purge.
 
 ### Known limits of `done`
 
-Two ways the sweep can report success for a connection that is not in fact
-caught up. Both are narrow, both degrade to the pre-existing lazy heal (the next
-parse's eager open), and neither is introduced here — but the barrier's contract
-is stated in terms of `done`, so they belong written down rather than implied.
+Four ways the sweep's report can be wrong — mostly by claiming success for a
+connection that is not caught up, and in the last case by claiming failure for a
+document nobody is owed. All are narrow, all degrade to the pre-existing lazy
+heal (the next parse's eager open), and none is introduced here — but the
+barrier's contract is stated in terms of `done`, so they belong written down
+rather than implied.
 
 **An invalidation placeholder reads as a current parse.** `invalidate_parse`
 publishes a tree-less snapshot whose `parsed_version` equals the content
