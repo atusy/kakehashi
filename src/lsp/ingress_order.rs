@@ -877,20 +877,19 @@ mod tests {
     /// unrecognized, fall to `Role::None`, and complete straight away —
     /// reading a tree missing the edit that preceded it on the wire.
     ///
-    /// `main.rs` wires the two in that order; this pins the consequence, so
-    /// swapping the two lines fails here instead of silently regressing into a
-    /// stale read that no assertion covers.
+    /// Drives `ingress_stack`, the same function `main.rs` calls, so this pins
+    /// the order actually shipped rather than a composition assembled here.
+    /// Both orders compile and both answer every request, so nothing else
+    /// would catch the swap.
     #[tokio::test]
     async fn a_deprecated_reader_name_is_gated_by_the_alias_layer_above() {
-        use crate::lsp::DeprecatedMethodAlias;
-
         let log = Arc::new(std::sync::Mutex::new(Vec::new()));
         let (release_tx, release_rx) = tokio::sync::oneshot::channel();
-        let mut stack = DeprecatedMethodAlias::new(IngressOrderGate::new(MockInner {
+        let mut stack = crate::lsp::ingress_stack(MockInner {
             log: Arc::clone(&log),
             stall_method: "textDocument/didChange",
             release: Some(release_rx),
-        }));
+        });
 
         let change_fut = stack.call(notification("textDocument/didChange", URI));
         // The pre-rename spelling, as a client that has not migrated sends it.

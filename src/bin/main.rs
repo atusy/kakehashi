@@ -872,8 +872,7 @@ fn run_lsp_server() {
 async fn serve_lsp() {
     use env_logger::Builder;
     use kakehashi::lsp::{
-        CancelForwarder, DeprecatedMethodAlias, IngressOrderGate, Kakehashi, LanguageServerPool,
-        RequestIdCapture, repair_inbound_frames,
+        CancelForwarder, Kakehashi, LanguageServerPool, RequestIdCapture, repair_inbound_frames,
     };
     use std::sync::Arc;
     use tokio::io::{stdin, stdout};
@@ -1114,16 +1113,13 @@ async fn serve_lsp() {
     // 2. Forward $/cancelRequest notifications to downstream servers
     let service = RequestIdCapture::with_cancel_forwarder(service, cancel_forwarder);
 
-    // Outermost: assign per-document sequence tickets in wire order so
+    // Outermost: per-document sequence tickets assigned in wire order so
     // didChange/didClose apply strictly ordered and semanticTokens requests
-    // observe every edit that preceded them on the wire (#342).
-    let service = IngressOrderGate::new(service);
-
-    // Outside the gate, deliberately: the gate classifies requests by method
-    // name to assign per-document ordering tickets and knows only the
-    // canonical scope-first spellings. Rewriting below it would let a
-    // deprecated name pass through ungated and read a stale tree.
-    let service = DeprecatedMethodAlias::new(service);
+    // observe every edit that preceded them on the wire (#342), with the
+    // deprecated-method rewrite above that. The relative order of the two is
+    // load-bearing and easy to get backwards, so it lives in `ingress_stack`
+    // where a test pins it — see that function's docs.
+    let service = kakehashi::lsp::ingress_stack(service);
 
     // Lift tower-lsp's default 4-message `buffer_unordered` cap: editors fire
     // bursts of concurrent requests per keystroke (Neovim: semanticTokens +
