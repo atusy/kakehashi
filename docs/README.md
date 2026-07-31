@@ -872,9 +872,10 @@ kakehashi format . --tab-size 2 --insert-spaces false
 
 Exit codes: `0` nothing to change (or changes written without
 `--fail-on-change`), `1` changes detected under `--check`/`--fail-on-change`,
-`2` usage error, I/O error, a configuration file given with `--config-file`
-that could not be loaded, or downstream formatter failure (a configured
-server failed to start, errored on the request, timed out, or returned a
+`2` usage error, I/O error, a refused write (see below), a configuration
+file given with `--config-file` that could not be loaded, or downstream
+formatter failure (a configured server failed to start, errored on the
+request, timed out, or returned a
 protocol-invalid response). Only *request-time* failures are strategy-aware:
 under `preferred` — the bridge-level default for formatting, where several
 servers of one target produce competing whole-document edits — the winner is
@@ -882,6 +883,17 @@ authoritative, so a non-winning server's failed request does not count, while
 `concatenated` counts every server's. A server that fails to **start** always
 counts, whichever strategy is in force and even if a fallback then formatted
 the document.
+
+In-place writes go through a temporary file and an atomic rename, so a crash
+mid-write cannot leave a truncated source file behind. Two consequences: a
+symlinked path stays a symlink (the file it resolves to is rewritten), and a
+target reachable under more than one **hard link** is *refused* rather than
+written — the rename moves only the named entry onto the new content, so the
+other names would silently keep the old. Such a file is reported per file and
+counted as a write error (exit `2`); the rest of the run continues. The
+detection is Unix-only, so on Windows a hard-linked file is still rewritten
+and its other names keep the old content. `--check` is unaffected: it answers
+whether the content would change, not whether the write would succeed.
 
 A configuration failure exits `2` before anything is written, so stdout stays
 empty in `--stdin-filename` mode. A *downstream* failure does not: the content
