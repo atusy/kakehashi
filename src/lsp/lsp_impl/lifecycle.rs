@@ -73,27 +73,80 @@ fn host_position_encoding(capabilities: &ClientCapabilities) -> Option<PositionE
         .map(|_| PositionEncodingKind::UTF16)
 }
 
-/// Derive a root URI only from workspace inputs the upstream client supplied
-/// (`workspaceFolders`, `rootUri`, or legacy `rootPath`) for downstream
-/// initialization. Kakehashi may use its process CWD internally for config
-/// discovery, but forwarding that fallback would turn a no-workspace session
-/// into an unrelated workspace for every bridged server.
+/// The workspace root the upstream client supplied, in the precedence order LSP
+/// defines: `workspaceFolders[0]`, then the deprecated `rootUri`, then the
+/// deprecated `rootPath`.
+///
+/// `None` means the client opened no workspace at all. That is a state clients
+/// choose deliberately — single-file sessions, embedded clients — so neither
+/// the forwarded handshake nor config discovery may invent a root for it.
+/// The two consumers still differ in what they do with a root once found,
+/// which is why this shares the ladder and not the conversion.
+enum ClientRoot<'a> {
+    /// The first entry of `workspaceFolders`.
+    WorkspaceFolder(&'a Uri),
+    /// The deprecated `rootUri`.
+    RootUri(&'a Uri),
+    /// The deprecated `rootPath`, which is a filesystem path and not a URI.
+    LegacyPath(&'a str),
+}
+
+impl ClientRoot<'_> {
+    /// How this root's origin reads in the startup log.
+    fn source(&self) -> &'static str {
+        match self {
+            Self::WorkspaceFolder(_) => "workspace folders",
+            Self::RootUri(_) => "root_uri (deprecated)",
+            Self::LegacyPath(_) => "root_path (deprecated)",
+        }
+    }
+
+    /// The root as a filesystem path, for Kakehashi's own config discovery.
+    fn to_file_path(&self) -> Option<std::path::PathBuf> {
+        match self {
+            Self::WorkspaceFolder(uri) | Self::RootUri(uri) => {
+                uri_to_url(uri).ok().and_then(|url| url.to_file_path().ok())
+            }
+            // Only an absolute `rootPath` can anchor relative config paths; a
+            // relative one would resolve against the launch directory, which is
+            // the dependence this handshake exists to avoid.
+            Self::LegacyPath(path) => {
+                let path = std::path::Path::new(path);
+                path.is_absolute().then(|| path.to_path_buf())
+            }
+        }
+    }
+}
+
+/// Pick the root from the workspace inputs the upstream client actually sent.
 #[allow(deprecated)]
-fn bridge_root_uri(params: &InitializeParams) -> Option<String> {
-    #[allow(deprecated)]
-    let primary_uri = params
+fn client_root(params: &InitializeParams) -> Option<ClientRoot<'_>> {
+    if let Some(folder) = params
         .workspace_folders
         .as_ref()
         .and_then(|folders| folders.first())
-        .map(|folder| &folder.uri)
-        .or(params.root_uri.as_ref());
-    primary_uri.map(|uri| uri.as_str().to_string()).or_else(|| {
-        params
-            .root_path
-            .as_ref()
-            .and_then(|path| Url::from_file_path(path).ok())
-            .map(|uri| uri.to_string())
-    })
+    {
+        return Some(ClientRoot::WorkspaceFolder(&folder.uri));
+    }
+    if let Some(uri) = params.root_uri.as_ref() {
+        return Some(ClientRoot::RootUri(uri));
+    }
+    params.root_path.as_deref().map(ClientRoot::LegacyPath)
+}
+
+/// Derive a root URI only from workspace inputs the upstream client supplied,
+/// for downstream initialization. Kakehashi may use its process CWD internally
+/// for config discovery, but forwarding that fallback would turn a
+/// no-workspace session into an unrelated workspace for every bridged server.
+fn bridge_root_uri(params: &InitializeParams) -> Option<String> {
+    match client_root(params)? {
+        ClientRoot::WorkspaceFolder(uri) | ClientRoot::RootUri(uri) => {
+            Some(uri.as_str().to_string())
+        }
+        // `Url::from_file_path` rejects a relative path, so an unanchorable
+        // `rootPath` forwards no workspace rather than one built from the CWD.
+        ClientRoot::LegacyPath(path) => Url::from_file_path(path).ok().map(|uri| uri.to_string()),
+    }
 }
 
 fn bridge_workspace_folders(
@@ -178,16 +231,14 @@ impl Kakehashi {
             "Received initialization request".to_string(),
         )];
 
-        // Extract first workspace folder for reuse
-        let first_folder = params.workspace_folders.as_ref().and_then(|f| f.first());
-
-        // Determine primary URI from workspace folders or deprecated root_uri
-        #[allow(deprecated)]
-        let primary_uri: Option<&Uri> = first_folder.map(|f| &f.uri).or(params.root_uri.as_ref());
-
         // Preserve the upstream workspace contract for downstream servers. The
-        // separate internal root-path fallback below may still use the CWD.
+        // separate internal root path below may still fall back to the CWD.
         let root_uri_for_bridge = bridge_root_uri(&params);
+
+        // Resolved here, into owned values, because `params.capabilities` is
+        // moved into the pool below and that ends any borrow of `params`.
+        let client_root_path: Option<(std::path::PathBuf, &'static str)> =
+            client_root(&params).and_then(|root| root.to_file_path().map(|p| (p, root.source())));
 
         // Forward root_uri and workspace_folders to bridge pool for downstream server initialization
         let workspace_folders_for_bridge =
@@ -213,23 +264,20 @@ impl Kakehashi {
             .pool()
             .set_client_capabilities(params.capabilities);
 
-        // Get root path from primary URI, falling back to current directory
-        let uri_to_path = |uri: &Uri| uri_to_url(uri).ok().and_then(|url| url.to_file_path().ok());
-        let root_path = primary_uri
-            .and_then(uri_to_path)
-            .or_else(|| std::env::current_dir().ok());
+        // Get root path from the client-supplied root, falling back to the
+        // current directory. Unlike the forwarded handshake, config discovery
+        // keeps that fallback: it anchors Kakehashi's own relative paths and
+        // never reaches a downstream server.
+        let (root_path, source) = match client_root_path {
+            Some((path, source)) => (Some(path), source),
+            None => (
+                std::env::current_dir().ok(),
+                "current working directory (fallback)",
+            ),
+        };
 
         // Store root path for later use and log the source
-        #[allow(deprecated)]
         if let Some(ref path) = root_path {
-            let source = if params.workspace_folders.is_some() {
-                "workspace folders"
-            } else if params.root_uri.is_some() {
-                "root_uri (deprecated)"
-            } else {
-                "current working directory (fallback)"
-            };
-
             startup_logs.push((
                 tower_lsp_server::ls_types::MessageType::INFO,
                 format!("Using workspace root from {}: {}", source, path.display()),
@@ -2056,6 +2104,88 @@ mod tests {
             host_position_encoding(&ClientCapabilities::default()),
             None,
             "omitted capability uses the protocol's UTF-16 default",
+        );
+    }
+
+    /// Initialize params carrying only the fields a test names.
+    fn params_with(workspace: serde_json::Value) -> InitializeParams {
+        let mut value = serde_json::json!({ "capabilities": {} });
+        let object = value.as_object_mut().expect("an object");
+        for (key, field) in workspace.as_object().expect("an object") {
+            object.insert(key.clone(), field.clone());
+        }
+        serde_json::from_value(value).expect("valid initialize params")
+    }
+
+    #[test]
+    fn client_root_anchors_config_discovery_to_a_legacy_root_path() {
+        // The forwarded handshake and config discovery read one ladder, so a
+        // client that names its workspace only through the deprecated
+        // `rootPath` still gets its own `kakehashi.toml` — not the launch
+        // directory's.
+        let root_path = std::env::current_dir()
+            .expect("current directory")
+            .join("legacy-workspace");
+        let params = params_with(serde_json::json!({
+            "rootUri": null,
+            "rootPath": root_path,
+            "workspaceFolders": null
+        }));
+
+        let root = client_root(&params).expect("a client-supplied root");
+        assert_eq!(root.to_file_path(), Some(root_path));
+        assert_eq!(root.source(), "root_path (deprecated)");
+    }
+
+    #[test]
+    fn client_root_rejects_a_relative_legacy_root_path() {
+        // A relative `rootPath` resolves against the launch directory, so it
+        // cannot anchor config paths; falling through to the CWD fallback keeps
+        // that dependence named in the startup log instead of hidden.
+        let params = params_with(serde_json::json!({
+            "rootUri": null,
+            "rootPath": "relative/workspace",
+            "workspaceFolders": null
+        }));
+
+        let root = client_root(&params).expect("a client-supplied root");
+        assert_eq!(root.to_file_path(), None);
+        assert_eq!(bridge_root_uri(&params), None);
+    }
+
+    #[test]
+    fn client_root_prefers_workspace_folders_over_the_deprecated_fields() {
+        let params = params_with(serde_json::json!({
+            "rootUri": "file:///from-root-uri",
+            "rootPath": "/from-root-path",
+            "workspaceFolders": [{ "uri": "file:///from-folders", "name": "folders" }]
+        }));
+
+        assert_eq!(
+            bridge_root_uri(&params).as_deref(),
+            Some("file:///from-folders")
+        );
+        assert_eq!(
+            client_root(&params).expect("a root").source(),
+            "workspace folders"
+        );
+    }
+
+    #[test]
+    fn client_root_prefers_root_uri_over_the_legacy_root_path() {
+        let params = params_with(serde_json::json!({
+            "rootUri": "file:///from-root-uri",
+            "rootPath": "/from-root-path",
+            "workspaceFolders": null
+        }));
+
+        assert_eq!(
+            bridge_root_uri(&params).as_deref(),
+            Some("file:///from-root-uri")
+        );
+        assert_eq!(
+            client_root(&params).expect("a root").source(),
+            "root_uri (deprecated)"
         );
     }
 
