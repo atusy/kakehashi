@@ -361,6 +361,10 @@ fn open_second_host_on_the_predecessor(client: &mut LspClient, log: &std::path::
             );
             return;
         }
+        // The same 50ms the sibling retry uses. Without it 300 null responses
+        // can complete faster than a cold handshake makes any progress, which
+        // would reintroduce the very race this helper replaced.
+        std::thread::sleep(Duration::from_millis(50));
     }
     let wire = std::fs::read_to_string(log).unwrap_or_default();
     panic!("the predecessor never surfaced an action for {SECOND_HOST_DIR}:\n{wire}");
