@@ -88,17 +88,23 @@ pub(crate) fn format_search_paths<P: AsRef<Path>>(paths: &[P]) -> String {
 pub(crate) struct QueryLoader;
 
 impl QueryLoader {
-    fn query_file_path(base: &Path, lang_name: &str, file_name: &str) -> Option<PathBuf> {
-        is_single_path_component(lang_name)
-            .then(|| base.join("queries").join(lang_name).join(file_name).clean())
+    /// Build `<base>/queries/<lang_name>/<file_name>`.
+    ///
+    /// Callers must reject a `lang_name` that is not a single normal path
+    /// component before calling this; `file_name` is likewise caller-validated
+    /// (see `is_single_path_component`).
+    fn query_file_path(base: &Path, lang_name: &str, file_name: &str) -> PathBuf {
+        base.join("queries").join(lang_name).join(file_name).clean()
     }
 
-    fn parser_library_path(base: &Path, language: &str, ext: &str) -> Option<PathBuf> {
-        is_single_path_component(language).then(|| {
-            base.join("parser")
-                .join(format!("{language}.{ext}"))
-                .clean()
-        })
+    /// Build `<base>/parser/<language>.<ext>`.
+    ///
+    /// Callers must reject a `language` that is not a single normal path
+    /// component before calling this.
+    fn parser_library_path(base: &Path, language: &str, ext: &str) -> PathBuf {
+        base.join("parser")
+            .join(format!("{language}.{ext}"))
+            .clean()
     }
 
     /// Resolve query inheritance and return the combined query content.
@@ -207,13 +213,21 @@ impl QueryLoader {
     /// `pub(crate)` so the captures handler can distinguish "kind file absent"
     /// (expected, debug log) from "file exists but failed to load" (asset
     /// trouble, warn) — captures-protocol §"Null vs. error semantics".
+    ///
+    /// Returns `None` without touching the filesystem when `lang_name` is not a
+    /// single normal path component, so a document-controlled injection language
+    /// cannot escape `<base>/queries/`.
     pub(crate) fn find_query_file<P: AsRef<Path>>(
         runtime_bases: &[P],
         lang_name: &str,
         file_name: &str,
     ) -> Option<PathBuf> {
+        // Name-only, so it cannot vary per base: reject once, before the search.
+        if !is_single_path_component(lang_name) {
+            return None;
+        }
         for base in runtime_bases {
-            let candidate = Self::query_file_path(base.as_ref(), lang_name, file_name)?;
+            let candidate = Self::query_file_path(base.as_ref(), lang_name, file_name);
             if candidate.exists() {
                 return Some(candidate);
             }
@@ -388,21 +402,33 @@ impl QueryLoader {
     /// because it comes from `LanguageSettings.parser: Option<String>`; `search_paths`
     /// is generic over `AsRef<Path>` to accept both `PathBuf` (from `ConfigStore`)
     /// and `String` (from `WorkspaceSettings`).
+    ///
+    /// The implicit search is skipped entirely when `language` is not a single
+    /// normal path component. An explicit `library` is exempt: it comes from
+    /// config rather than from document text.
     pub(crate) fn resolve_library_path<P: AsRef<Path>>(
         library: Option<&str>,
         language: &str,
         search_paths: &[P],
     ) -> Option<PathBuf> {
-        // If explicit library path is provided, normalize and use it
+        // If explicit library path is provided, normalize and use it.
+        // Stays ahead of the name gate: this is the documented escape hatch for
+        // assets that cannot follow the implicit layout.
         if let Some(lib) = library {
             let normalized = PathBuf::from(lib).clean();
             return Some(normalized);
         }
 
+        // Name-only, so it cannot vary per base or extension: reject once here
+        // rather than inside the search below.
+        if !is_single_path_component(language) {
+            return None;
+        }
+
         // Otherwise, search in searchPaths: <base>/parser/
         for path in search_paths {
             for ext in PARSER_EXTENSIONS {
-                let parser_path = Self::parser_library_path(path.as_ref(), language, ext)?;
+                let parser_path = Self::parser_library_path(path.as_ref(), language, ext);
                 if parser_path.exists() {
                     return Some(parser_path);
                 }
@@ -413,6 +439,26 @@ impl QueryLoader {
     }
 }
 
+/// Whether `value` names exactly one ordinary path component.
+///
+/// Gates the language half of implicit asset lookup so a document-controlled
+/// injection language cannot leave `<base>/queries` or `<base>/parser`. The
+/// query-kind half is gated separately, by `is_valid_kind` in the captures
+/// handler; every other `file_name` is a `QueryKind::filename()` constant.
+///
+/// The `name == value` comparison is load-bearing, not a formality:
+/// `Components` silently normalizes away trailing separators and interior `.`,
+/// so `"rust/"` and `"rust/."` both yield a lone `Normal("rust")`. Requiring
+/// the component to span the whole input rejects them. Every normalization
+/// `Components` performs shortens the rendered form, so equality can only hold
+/// when none occurred — which is why this cannot be reduced to a
+/// `components().count() == 1` check.
+///
+/// Deliberately laxer than `is_safe_language_name` (`[a-z0-9_]+`), which gates
+/// installs: names like `typescript-react` are legal to place by hand and must
+/// stay readable, whereas the write side may be stricter because the name also
+/// becomes a URL segment. Rejection here is a path-shape decision only; it is
+/// not a charset filter and must not be relied on as one.
 fn is_single_path_component(value: &str) -> bool {
     let mut components = Path::new(value).components();
     matches!(components.next(), Some(Component::Normal(name)) if name == value)
