@@ -135,13 +135,20 @@ impl PendingReopenRegistry {
             .state
             .lock()
             .recover_poison("PendingReopenRegistry::rearm");
-        if state
+        if !state
             .in_flight
             .get(key)
             .is_some_and(|current| current.same_channel(&probe))
         {
-            state.in_flight.remove(key);
+            // Someone else owns the barrier for this key, which can only mean a
+            // purge re-armed it and a LATER replacement claimed it. That
+            // replacement is making the repair, so there is no debt left to
+            // record — and recording one anyway would leave the key armed AND
+            // in flight at once, breaking the invariant that it is exactly one
+            // of the two, and buying a redundant sweep on the next spawn.
+            return;
         }
+        state.in_flight.remove(key);
         state.armed.insert(key.clone());
     }
 
@@ -337,6 +344,32 @@ mod tests {
         );
         live.send(true).expect("the registry holds the receiver");
         assert!(registry.wait_for_reopen(&key).await);
+    }
+
+    /// A key is armed OR in flight, never both. A stale `rearm` that finds a
+    /// later respawn's barrier must record nothing: that respawn is making the
+    /// repair, so there is no outstanding debt to remember.
+    #[tokio::test]
+    async fn a_superseded_rearm_records_no_debt() {
+        let registry = PendingReopenRegistry::default();
+        let key = ConnectionKey::for_server("ruff");
+
+        registry.arm(&key);
+        let stale = registry.claim(&key).expect("armed");
+        registry.arm(&key);
+        let live = registry.claim(&key).expect("re-armed");
+
+        registry.rearm(&key, &stale);
+        drop(stale);
+
+        // Settle the live re-open and let a waiter retire it.
+        live.send(true).expect("the registry holds the receiver");
+        assert!(registry.wait_for_reopen(&key).await);
+
+        assert!(
+            registry.claim(&key).is_none(),
+            "the superseded rearm must not have left a debt behind"
+        );
     }
 
     #[test]
