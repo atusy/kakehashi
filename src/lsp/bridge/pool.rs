@@ -3683,6 +3683,41 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn empty_workspace_folder_change_preserves_pull_diagnostic_lineage() {
+        // An event carrying neither an addition nor a removal describes no
+        // change of project, so there is nothing for the lineage to have
+        // stopped describing. Dropping the baselines anyway would cost one
+        // full downstream report per open document for nothing — the same
+        // anti-storm property `no_op_settings_reload_preserves_diagnostic_pull_baselines`
+        // pins on the settings path.
+        let key = ConnectionKey::for_server("fallback");
+        let pool = LanguageServerPool::new();
+        let handle = create_handle_with_key(ConnectionState::Ready, key.clone()).await;
+        handle.set_server_capabilities(capable_workspace_folders_caps());
+        pool.insert_connection(handle).await;
+        pool.diagnostic_pull_baselines.insert(
+            (key.clone(), "file:///v.lua".to_string()),
+            DiagnosticPullBaseline {
+                result_id: "r1".to_string(),
+                diagnostics: Arc::new(Vec::new()),
+                request_sequence: 1,
+            },
+        );
+
+        pool.apply_workspace_folder_change(Vec::new(), &[]).await;
+
+        assert!(
+            pool.diagnostic_pull_baselines
+                .contains_key(&(key.clone(), "file:///v.lua".to_string())),
+            "an event that changes no folder must not cost a full re-pull"
+        );
+        assert!(
+            !pool.diagnostic_pull_generations.contains_key(&key),
+            "and must not move the fence either"
+        );
+    }
+
     fn shared_config() -> crate::config::settings::BridgeServerConfig {
         crate::config::settings::BridgeServerConfig {
             prefer_shared_instance: Some(true),
