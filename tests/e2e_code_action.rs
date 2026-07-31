@@ -208,9 +208,18 @@ fn assert_advertised(init_response: &Value) {
 }
 
 /// Drive the reopen-order mock: an appended wire log shared by every
-/// incarnation, plus a stall (longer than the pool's 2 s `REOPEN_WAIT`) that
-/// holds the respawn re-open before any `didOpen` goes out.
-fn init_client_reopen_order(log: &std::path::Path) -> (LspClient, tempfile::TempDir) {
+/// incarnation, plus a stall that holds the respawn re-open before any
+/// `didOpen` goes out.
+///
+/// `stall_ms` selects which half of the barrier contract is under test.
+/// Longer than the pool's 2 s `REOPEN_WAIT` pins that an UNSETTLED barrier
+/// withholds the command; `0` pins that a SETTLED one releases it. Both
+/// directions are needed — a barrier that always reports failure satisfies
+/// the withhold half perfectly.
+fn init_client_reopen_order(
+    log: &std::path::Path,
+    stall_ms: u32,
+) -> (LspClient, tempfile::TempDir) {
     let bin = mock_formatter_bin();
     let config_dir = tempfile::TempDir::new().expect("Failed to create config temp dir");
     let config_path = config_dir.path().join("code_action.toml");
@@ -224,11 +233,8 @@ fn init_client_reopen_order(log: &std::path::Path) -> (LspClient, tempfile::Temp
             "MOCK_LSP_WIRE_LOG",
             log.to_str().expect("temp path should be UTF-8"),
         )
-        // Longer than REOPEN_WAIT (2 s), so a command fired while the re-open
-        // is in flight can NEVER be saved by winning the race: the barrier's
-        // fail-soft is the only correct outcome, and any code path that sends
-        // anyway is caught by the wire-order assertion below.
-        .env("KAKEHASHI_E2E_STALL_REOPEN_MS", "2500")
+        .env("KAKEHASHI_E2E_STALL_REOPEN_MS", stall_ms.to_string())
+        // (see the stall_ms doc above for why the withhold case needs slack)
         .build();
 
     client.send_request(
@@ -248,6 +254,116 @@ fn init_client_reopen_order(log: &std::path::Path) -> (LspClient, tempfile::Temp
     );
     client.send_notification("initialized", json!({}));
     (client, config_dir)
+}
+
+/// Directory of the second fenced host, distinct from the first so its virtual
+/// documents are identifiable in the wire log (a virtual URI keeps its host's
+/// directory).
+const SECOND_HOST_DIR: &str = "second_host";
+
+/// A second markdown host with a lua fence, under its own directory.
+fn open_second_host(client: &mut LspClient) {
+    client.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": format!("file:///{SECOND_HOST_DIR}/other.md"),
+                "languageId": "markdown",
+                "version": 1,
+                "text": MARKDOWN
+            }
+        }),
+    );
+}
+
+/// Open `count` markdown documents with no injected fence, so they bridge to no
+/// downstream at all. They exist to be *considered* by a derived re-open and
+/// rejected — the workload a re-open sees on a real workspace, where the
+/// documents belonging to any one connection are a small minority.
+fn open_bystanders(client: &mut LspClient, count: usize) {
+    for i in 0..count {
+        client.send_notification(
+            "textDocument/didOpen",
+            json!({
+                "textDocument": {
+                    "uri": format!("file:///bystander_{i}.md"),
+                    "languageId": "markdown",
+                    "version": 1,
+                    "text": "# Prose\n\nNo fenced code here.\n"
+                }
+            }),
+        );
+    }
+}
+
+/// Clear every bystander's tree, so the re-open meets documents whose parses are
+/// pending — the state a settings reload leaves the whole workspace in.
+fn dirty_bystanders(client: &mut LspClient, count: usize) {
+    for i in 0..count {
+        client.send_notification(
+            "textDocument/didChange",
+            json!({
+                "textDocument": { "uri": format!("file:///bystander_{i}.md"), "version": 2 },
+                "contentChanges": [{ "text": "# Prose\n\nStill no fenced code.\n" }]
+            }),
+        );
+    }
+}
+
+/// Block until the FIRST incarnation has opened `uri_marker`'s virtual
+/// document — i.e. before any respawn, so a later appearance of that host can
+/// only have come from the re-open sweep.
+fn await_initial_open(log: &std::path::Path, uri_marker: &str) {
+    for _ in 0..300 {
+        if let Ok(wire) = std::fs::read_to_string(log) {
+            let incarnations = wire
+                .lines()
+                .filter(|l| l.split('\t').next() == Some("initialize"))
+                .count();
+            assert!(
+                incarnations <= 1,
+                "the predecessor died before it opened {uri_marker}; this test \
+                 cannot then attribute a later open to the sweep:\n{wire}"
+            );
+            if wire.lines().any(|l| {
+                let mut parts = l.split('\t');
+                parts.next() == Some("textDocument/didOpen")
+                    && parts.next().is_some_and(|uri| uri.contains(uri_marker))
+            }) {
+                return;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let wire = std::fs::read_to_string(log).unwrap_or_default();
+    panic!("the first incarnation never opened a {uri_marker} document:\n{wire}");
+}
+
+/// Block until the replacement incarnation has both initialized AND received a
+/// `didOpen`, i.e. its re-open has actually run.
+///
+/// Waiting on the observable effect rather than on a duration is what keeps the
+/// caller's assertion about the barrier's RESULT instead of about the clock.
+fn await_replacement_reopen(log: &std::path::Path, uri_marker: &str) {
+    for _ in 0..300 {
+        if let Ok(wire) = std::fs::read_to_string(log)
+            && wire
+                .lines()
+                .filter(|l| l.split('\t').next() == Some("initialize"))
+                .count()
+                >= 2
+            && replacement_segment(&wire).iter().any(|l| {
+                let mut parts = l.split('\t');
+                parts.next() == Some("textDocument/didOpen")
+                    && parts.next().is_some_and(|uri| uri.contains(uri_marker))
+            })
+        {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let wire = std::fs::read_to_string(log).unwrap_or_default();
+    panic!("the replacement never re-opened a {uri_marker} document:\n{wire}");
 }
 
 /// Split the wire log into lines and return the segment belonging to the
@@ -270,7 +386,7 @@ fn replacement_segment(wire: &str) -> Vec<&str> {
 /// document its arguments reference (execute-command-routing-token).
 ///
 /// The stall makes the barrier load-bearing instead of raced. While the
-/// re-open is held (2.5 s > REOPEN_WAIT), a correct kakehashi DROPS the
+/// re-open is held (5 s > REOPEN_WAIT), a correct kakehashi DROPS the
 /// command (fail-soft null; nothing on the wire); one that signals early,
 /// ignores the unsettled wait, or never waits sends it ahead of the didOpen —
 /// and the replacement-segment wire order catches every one of those shapes.
@@ -280,7 +396,11 @@ fn replacement_segment(wire: &str) -> Vec<&str> {
 fn a_command_does_not_overtake_the_reopen_of_a_respawned_downstream() {
     let log_dir = tempfile::TempDir::new().expect("Failed to create log temp dir");
     let log = log_dir.path().join("wire.log");
-    let (mut client, _config_dir) = init_client_reopen_order(&log);
+    // 5 s, not the 2 s bound plus a hair: the stall starts when the re-open is
+    // SERVICED, while the barrier's 2 s starts when the command begins waiting,
+    // and those are independently scheduled. A 500 ms margin makes a correct
+    // barrier fail this test whenever the command is dispatched late under load.
+    let (mut client, _config_dir) = init_client_reopen_order(&log, 5000);
     open_markdown(&mut client);
 
     // Surface the routed command; the mock then exits once (crash marker), so
@@ -306,7 +426,7 @@ fn a_command_does_not_overtake_the_reopen_of_a_respawned_downstream() {
         "a command whose re-open is still in flight must fail soft, got: {first:?}"
     );
 
-    // Retry until it goes through: the stall ends at ~2.5 s, the barrier
+    // Retry until it goes through: the stall ends at ~5 s, the barrier
     // settles, and a retry then waits it out and sends AFTER the didOpen.
     let mut delivered = false;
     for _ in 0..40 {
@@ -348,6 +468,118 @@ fn a_command_does_not_overtake_the_reopen_of_a_respawned_downstream() {
     assert!(
         reopen < execute,
         "the replacement got the command BEFORE its re-open didOpen:\n{wire}"
+    );
+
+    shutdown(&mut client);
+}
+
+/// The other half of the barrier contract: a re-open that COMPLETES must
+/// release the command, on the first attempt.
+///
+/// Withholding is only half a guarantee. A barrier that reported failure
+/// unconditionally would satisfy
+/// `a_command_does_not_overtake_the_reopen_of_a_respawned_downstream`
+/// completely — its first command is null either way, and the retry loop
+/// still succeeds because a dropped completion sender retires the entry, so
+/// the second attempt sails through and the didOpen still precedes it. Nothing
+/// there distinguishes "waited and was released" from "never released, gave up
+/// waiting".
+///
+/// So this pins the positive direction. It does NOT race the barrier to do it:
+/// firing the command while the re-open is still in flight makes the assertion
+/// depend on the re-open beating `REOPEN_WAIT`, which a loaded machine breaks —
+/// and a fail-soft null is the CORRECT answer then, so the test would be
+/// failing on correct behaviour. Instead the re-open is allowed to finish
+/// first, and the command then fires against a barrier whose recorded result is
+/// already `true`. A barrier that reports failure leaves that result `false`
+/// with its sender dropped, which the wait reads as "connection may still be
+/// missing documents" and withholds the command — no timing involved.
+#[test]
+fn a_completed_reopen_releases_the_command_it_was_holding() {
+    let log_dir = tempfile::TempDir::new().expect("Failed to create log temp dir");
+    let log = log_dir.path().join("wire.log");
+    let (mut client, _config_dir) = init_client_reopen_order(&log, 0);
+    open_markdown(&mut client);
+
+    // Bystanders: markdown with no fence, so they resolve no injections and
+    // open nothing. They exist to drive the derived re-open over a realistic
+    // candidate count — every other e2e opens exactly one document.
+    //
+    // Note what they do NOT test: they share the real host's language, so the
+    // configuration screen ACCEPTS them and they still pay the bounded parse
+    // wait. The screen only rejects hosts whose language cannot reach the
+    // server at all, and no e2e covers that direction.
+    open_bystanders(&mut client, 12);
+    // A second fenced host, in its own directory so its virtual URIs are
+    // distinguishable on the wire. Nothing in this test requests anything on
+    // it after the crash, so its presence in the replacement's segment is
+    // positive evidence that the derived sweep — not a request — opened it.
+    open_second_host(&mut client);
+    // Let the FIRST incarnation open it before the crash. `didOpen` schedules
+    // parsing asynchronously and the eager open that follows uses
+    // `connection: None`, so a task still in flight when the predecessor dies
+    // could open this host on the REPLACEMENT without the sweep — which would
+    // silently make the assertion below non-discriminating again.
+    await_initial_open(&log, SECOND_HOST_DIR);
+
+    let actions = code_action_with_retry(&mut client);
+    let routed = actions
+        .iter()
+        .find(|a| a["command"].is_string())
+        .expect("the executable command action")["command"]
+        .as_str()
+        .expect("a routed command name")
+        .to_string();
+
+    // Dirty every bystander so its tree is cleared and a reparse is pending.
+    // This is the settings-reload shape: that path invalidates ALL parses and
+    // purges connections in the same pass, so "every snapshot stale AND a
+    // connection owing a re-open" is the ordinary case, not the tail.
+    dirty_bystanders(&mut client, 12);
+
+    // The mock died surfacing that action. Drive the respawn with a SECOND
+    // codeAction rather than with the command: codeAction never consults the
+    // barrier, so the re-open runs and settles while nothing has waited on it —
+    // and only a wait retires the entry, so its result is still there to read.
+    let _ = code_action_with_retry(&mut client);
+    // Wait for the SECOND host specifically. Only the derived sweep can have
+    // opened it: the codeAction above touches the first host, so the request
+    // path's own lazy open cannot account for a virtual URI under `/second/`.
+    // Waiting on any didOpen would let a re-open that opened NOTHING satisfy
+    // this, because the request path produces one either way.
+    await_replacement_reopen(&log, SECOND_HOST_DIR);
+
+    // The barrier now holds a settled result. Releasing the command is the only
+    // correct response to one that reports success.
+    let response = client.send_request(
+        "workspace/executeCommand",
+        json!({ "command": routed, "arguments": [] }),
+    );
+    assert!(
+        !response["result"].is_null(),
+        "a settled re-open must release the command it was holding, got: {response:?}"
+    );
+
+    let wire = std::fs::read_to_string(&log).expect("the mock wrote a wire log");
+    assert!(
+        std::path::Path::new(&format!("{}.died", log.to_str().expect("utf-8"))).exists(),
+        "the mock must have crashed once, else the respawn path was not exercised"
+    );
+    let segment = replacement_segment(&wire);
+    let execute = segment
+        .iter()
+        .position(|l| l.split('\t').next() == Some("workspace/executeCommand"))
+        .unwrap_or_else(|| panic!("the replacement never received the command:\n{wire}"));
+    let reopen = segment
+        .iter()
+        .position(|l| l.split('\t').next() == Some("textDocument/didOpen"))
+        .unwrap_or_else(|| {
+            panic!("no didOpen reached the replacement before the command:\n{wire}")
+        });
+    // Released, not un-awaited: being answered is not proof the wait happened.
+    assert!(
+        reopen < execute,
+        "the released command still overtook its re-open didOpen:\n{wire}"
     );
 
     shutdown(&mut client);

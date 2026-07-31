@@ -37,6 +37,17 @@ pub(crate) struct InjectionCoordinator {
     diagnostics: std::sync::Arc<DiagnosticAggregator>,
 }
 
+/// What a bounded wait for a current tree actually found.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum ParseWait {
+    /// The tree matches the document's content.
+    Current,
+    /// The document was closed; there is nothing to wait for.
+    Gone,
+    /// The budget expired with the tree still trailing or absent.
+    Unsettled,
+}
+
 impl InjectionCoordinator {
     pub(crate) fn new(server: &Kakehashi) -> Self {
         Self {
@@ -446,6 +457,27 @@ impl InjectionCoordinator {
         &self.bridge
     }
 
+    /// Every host document open right now — the candidate set the respawn
+    /// re-open derives its targets from.
+    ///
+    /// Deliberately unfiltered: which of these belong to the connection being
+    /// repaired depends on the injections each one currently resolves and on
+    /// current settings, neither of which this accessor should decide. A
+    /// snapshot, so a document closed while the re-open runs is caught by the
+    /// per-host incarnation check rather than here.
+    pub(crate) fn open_host_uris(&self) -> Vec<Url> {
+        self.documents.open_uris()
+    }
+
+    /// `uri`'s host language, without parsing or resolving anything.
+    ///
+    /// The cheap half of what [`Self::bridge_injections`] returns, so a caller
+    /// screening many candidate documents can ask the configuration question
+    /// before paying for a parse wait and an injection resolution.
+    pub(crate) fn document_language(&self, uri: &Url) -> Option<String> {
+        self.get_language_for_document(uri)
+    }
+
     /// `uri`'s reopen generation, which scopes a downstream `didOpen` to the
     /// document's current lifetime. `None` once the document is closed.
     pub(crate) fn document_incarnation(&self, uri: &Url) -> Option<u64> {
@@ -464,8 +496,8 @@ impl InjectionCoordinator {
         Some((host_language, injections))
     }
 
-    /// Wait (bounded) for `uri`'s tree to be current before its injections are
-    /// resolved.
+    /// Wait (bounded by `budget`) for `uri`'s tree to be current before its
+    /// injections are resolved.
     ///
     /// `didChange` clears the tree and reparses off-ingress, so a re-open
     /// landing right after an edit would resolve ZERO injections and silently
@@ -474,13 +506,61 @@ impl InjectionCoordinator {
     /// closing it: the wait is bounded, and on expiry the re-open proceeds and
     /// may still open nothing. Degrading to the pre-existing lazy heal (the next
     /// parse re-opens) is preferred over stalling the barrier.
-    pub(crate) async fn ensure_document_parsed(&self, uri: &Url) {
-        let _ = crate::lsp::lsp_impl::snapshot_read::wait_for_current_snapshot_in(
-            &self.documents,
-            uri,
-            std::time::Duration::from_millis(200),
+    /// Returns which of the three outcomes a caller must distinguish. They are
+    /// not interchangeable: `Gone` is nothing to do, `Unsettled` is something
+    /// this pass could not determine, and collapsing them makes a closed buffer
+    /// look like a failed repair (holding the barrier shut) or an unparsed one
+    /// look like a document with no injections (releasing commands onto it).
+    pub(crate) async fn ensure_document_parsed(
+        &self,
+        uri: &Url,
+        budget: std::time::Duration,
+    ) -> ParseWait {
+        // `budget` is enforced HERE rather than passed through, because
+        // `wait_for_current_snapshot_in` honours its `wait` argument only for a
+        // snapshot that TRAILS. A document with no snapshot at all — open, first
+        // parse still queued — parks on `FIRST_PARSE_BACKSTOP` (15s) instead,
+        // which is right for a request that needs an answer and fatal for a
+        // caller sweeping documents inside a 2s barrier budget. The captured-set
+        // design never met that state (it only ever revisited documents the dead
+        // connection had already opened, hence already parsed); deriving the set
+        // means meeting every open document, including one mid-first-parse.
+        //
+        // The caller passes what is LEFT of the shared budget, so a sweep cannot
+        // spend it several times over.
+        use crate::lsp::lsp_impl::snapshot_read::SnapshotWait;
+        match tokio::time::timeout(
+            budget,
+            crate::lsp::lsp_impl::snapshot_read::wait_for_current_snapshot_in(
+                &self.documents,
+                uri,
+                budget,
+            ),
         )
-        .await;
+        .await
+        {
+            Ok(SnapshotWait::Current(_)) => ParseWait::Current,
+            // Closed while this sweep was running. It WAS in the snapshot the
+            // sweep started from, but there is nothing left to repair, and
+            // reporting failure would hold the barrier shut over a buffer the
+            // user simply closed.
+            Ok(SnapshotWait::Gone) => ParseWait::Gone,
+            // Trailing, never parsed, or out of budget: whatever the injection
+            // resolution says next is not evidence about this document.
+            Ok(SnapshotWait::Stale | SnapshotWait::Unparsed) | Err(_) => ParseWait::Unsettled,
+        }
+    }
+
+    /// Whether `uri`'s published snapshot still matches its content — a cheap
+    /// re-check for a caller that resolved something against it and needs to
+    /// know the ground did not move underneath.
+    pub(crate) fn snapshot_is_current(&self, uri: &Url) -> bool {
+        self.documents.latest_snapshot(uri).is_some_and(|view| {
+            view.slot
+                .snapshot
+                .as_ref()
+                .is_some_and(|snapshot| snapshot.parsed_version == view.content_version)
+        })
     }
 
     fn install_coordinator(&self) -> InstallCoordinator {

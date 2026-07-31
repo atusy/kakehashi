@@ -788,7 +788,7 @@ struct UpstreamDeliveryContext {
     diagnostic_publisher: Arc<crate::lsp::lsp_impl::coordinator::DiagnosticPublisher>,
     settings_manager: Arc<crate::lsp::settings_manager::SettingsManager>,
     /// Re-opens a respawned connection's virtual documents
-    /// (execute-command-routing-token). Lives here because the pool cannot
+    /// (respawn-reopen-derives-its-targets). Lives here because the pool cannot
     /// resolve injections itself — the document store and injection query are
     /// server-side — so the pool signals *when* and this supplies *what*.
     injection: crate::lsp::lsp_impl::coordinator::InjectionCoordinator,
@@ -1280,13 +1280,13 @@ fn spawn_upstream_request(
                     ),
                 }
             }
-            UpstreamRequest::ReopenDocuments { key, hosts, done } => {
+            UpstreamRequest::ReopenDocuments { key, done } => {
                 // One source of truth for the server: carrying it alongside the
                 // key would be an invariant nobody checks, and a divergence
                 // would make the repair a silent no-op.
                 let server = key.server().to_string();
-                // A respawned connection has nothing open; re-open what its dead
-                // predecessor held (execute-command-routing-token).
+                // A respawned connection has nothing open; bring it up to date
+                // (respawn-reopen-derives-its-targets).
                 //
                 // `ensure_server_documents_open` — NOT `process_injections`.
                 // `process_injections` reaches the open through
@@ -1302,36 +1302,36 @@ fn spawn_upstream_request(
                     // context), but the fallback must not silently skip a heal.
                     log::warn!(
                         target: "kakehashi::bridge",
-                        "Cannot re-open {} document(s) for respawned {server:?}: \
-                         no delivery context",
-                        hosts.len()
+                        "Cannot re-open documents for respawned {server:?}: \
+                         no delivery context"
                     );
                     return;
                 };
+                // DERIVE the target set rather than replay one captured at purge
+                // time. Every open document is a candidate; which of them belong
+                // to this connection is decided below, per host, against current
+                // settings. A captured list answers the question as it stood
+                // before the respawn — it re-opens documents the editor has since
+                // closed, misses ones opened since, and is simply EMPTY when the
+                // dead connection never got far enough to hold anything, which is
+                // exactly when a replacement most needs the repair.
+                let hosts = context.injection.open_host_uris();
                 log::debug!(
                     target: "kakehashi::bridge",
-                    "Re-opening {} document(s) after {server:?} respawned",
+                    "Bringing {key} up to date after {server:?} respawned: \
+                     {} open document(s) to consider",
                     hosts.len()
                 );
-                use crate::lsp::bridge::REOPEN_WAIT;
+                use crate::lsp::bridge::{OpenOutcome, REOPEN_WAIT};
                 let settings = context.settings_manager.load_settings();
-                // The re-open targets the connection the purge CLAIMED, and the
-                // open is ACQUIRED by that key rather than resolved from the
-                // host. Resolving from the host finds whatever it routes to now,
-                // so a `workspaceMarkers` change between purge and respawn
-                // repairs a different connection while the claimed one — the one
-                // `done` signals for — stays empty.
-                //
-                // A stale-rooted claimed connection IS reachable: a routed
-                // command's token carries the root, and `reconnect_by_key`
-                // rebuilds the workspace from that token rather than from
-                // current markers, spawning a fresh connection that records the
-                // current config and so passes every launch-config check. There
-                // is no guard that rejects it — the root is not a
-                // `BridgeServerConfig` field, so `same_launch_config` cannot see
-                // a stale root at all. Repairing the named connection, and
-                // reporting failure when it is gone, is what makes the barrier
-                // mean what it says.
+                // Naming the connection still matters: the open is ACQUIRED by
+                // this key, never by whatever a host routes to, so the repair
+                // lands on the connection `done` signals for and a routed
+                // command names. What the key now ALSO does is filter — a host
+                // that does not route here supplies nothing for this connection,
+                // and saying so is how the derivation stays scoped to
+                // `(server, root)` instead of cross-opening one root's documents
+                // onto another root's process.
                 // Bound the WAIT, not the work — the shape the inline heal used.
                 // `ensure_server_documents_open` can block up to the init timeout
                 // on a cold downstream, and `done` gates every command on this
@@ -1349,11 +1349,14 @@ fn spawn_upstream_request(
                 // — the failure this barrier exists to prevent. A panic drops the
                 // sender instead, which waiters read as "can never finish".
                 let mut work = tokio::spawn(async move {
-                    // Whether the CLAIMED connection actually ended up with its
-                    // documents. A skip (the host re-routed) or an unreachable
-                    // connection leaves it empty, and the barrier must say so:
-                    // releasing a command onto an empty connection is the
-                    // failure this whole mechanism exists to prevent.
+                    // Whether this connection ended up holding everything current
+                    // state says it should. Only an APPLICABLE host that failed
+                    // to open clears it — a host that supplies nothing for this
+                    // connection is not a failed repair, it is not this
+                    // connection's document. Counting those would report failure
+                    // on essentially every respawn (most open documents bridge
+                    // nowhere near any one server), holding the barrier shut and
+                    // making every command pay the full wait and then fail soft.
                     let mut repaired = true;
                     // e2e-only fault injection: hold the re-open BEFORE any
                     // didOpen goes out, so the ordering e2e can force the window
@@ -1364,10 +1367,124 @@ fn spawn_upstream_request(
                     // release builds do not contain this branch.
                     #[cfg(feature = "e2e")]
                     e2e_stall_reopen().await;
+                    // ONE budget for the whole sweep, not one per host. Each
+                    // surviving host can park waiting for its tree, so a
+                    // per-host bound lets ten of them spend `REOPEN_WAIT` ten
+                    // times over — and the barrier promises to settle inside it
+                    // ONCE. Deriving the set is what makes that reachable: the
+                    // sweep is now sized by the workspace rather than by what
+                    // one dead connection held.
+                    let sweep_deadline = std::time::Instant::now() + REOPEN_WAIT;
                     for host in hosts {
+                        // Stop if nobody can hear the answer. `rearm` and a
+                        // later `claim` both drop the registry's receiver, so a
+                        // closed channel means this re-open has been superseded
+                        // by a newer respawn of the same key — and the sweep is
+                        // now O(open documents), so continuing would spend
+                        // marker walks and parse waits producing a result that
+                        // will be discarded.
+                        if done.is_closed() {
+                            log::debug!(
+                                target: "kakehashi::bridge",
+                                "Re-open of {key} was superseded; stopping the sweep"
+                            );
+                            return;
+                        }
+                        // Cheapest question first. Deriving means asking about
+                        // every open document, and for most of them the answer
+                        // is "this host bridges nowhere near that server" —
+                        // which is pure configuration, answered from a memo
+                        // with no parse, no tree and no I/O. Paying the parse
+                        // wait and the injection resolution before asking it
+                        // would spend this connection's fixed budget in
+                        // proportion to WORKSPACE SIZE rather than to the work
+                        // that belongs to it, and the budget is what `done`
+                        // must signal inside.
+                        //
+                        // Reading the language before the parse wait keeps the
+                        // incarnation/injections ordering intact, because the
+                        // authoritative language is re-read with the injections
+                        // below. The screen is one-directional, though, and not
+                        // symmetric: a stale ACCEPT costs only an unnecessary
+                        // resolution, but a stale REJECT skips the document for
+                        // this round while `repaired` still reports success —
+                        // indistinguishable from "nothing to repair". Every
+                        // widening of this screen has to be weighed in that
+                        // direction. (A `languageId` change needs
+                        // didClose+didOpen, which bumps the incarnation, so the
+                        // stale-reject window is narrow rather than absent.)
+                        let screened_at = injection.document_incarnation(&host);
+                        let reachable =
+                            injection
+                                .document_language(&host)
+                                .is_some_and(|candidate_language| {
+                                    injection.bridge().host_language_can_reach_server(
+                                        &settings,
+                                        &candidate_language,
+                                        &reopen_server,
+                                    )
+                                });
+                        // Only trust a REJECTION if the document did not change
+                        // lifetime underneath it. A close+reopen under a
+                        // different `languageId` between the two reads would
+                        // otherwise reject on the OLD language and skip a
+                        // document the NEW lifetime does bridge — silently,
+                        // since a skip is indistinguishable from "nothing to
+                        // repair". On a mismatch fall through and let the
+                        // authoritative path, which re-reads both, decide.
+                        if !reachable && injection.document_incarnation(&host) == screened_at {
+                            continue;
+                        }
                         // Await the tree first: a re-open racing an edit would
                         // otherwise resolve no injections and open nothing.
-                        injection.ensure_document_parsed(&host).await;
+                        // Bounded by what is LEFT of the sweep's budget.
+                        let remaining = sweep_deadline
+                            .checked_duration_since(std::time::Instant::now())
+                            .unwrap_or_default();
+                        if remaining.is_zero() {
+                            // Out of budget with candidates still unexamined.
+                            // Report the connection as NOT caught up: the
+                            // waiters are about to time out anyway, and telling
+                            // them the sweep finished would release commands
+                            // onto documents this pass never reached.
+                            log::debug!(
+                                target: "kakehashi::bridge",
+                                "Re-open of {key} ran out of budget with candidates \
+                                 left; reporting it incomplete"
+                            );
+                            repaired = false;
+                            break;
+                        }
+                        use crate::lsp::lsp_impl::coordinator::ParseWait;
+                        match injection.ensure_document_parsed(&host, remaining).await {
+                            ParseWait::Current => {}
+                            // Closed underneath the sweep. It was in the
+                            // snapshot this pass started from, but a buffer the
+                            // user closed is not a repair this connection is
+                            // owed, and calling it a failure would hold the
+                            // barrier shut over it.
+                            ParseWait::Gone => continue,
+                            ParseWait::Unsettled => {
+                                // The budget expired with this document's parse
+                                // still outstanding. Resolving injections now yields
+                                // ZERO — not because the host has none, but because
+                                // there is no tree to find them in — and the skip
+                                // below would then read as "nothing to repair here".
+                                // This host passed the configuration screen, so it
+                                // is a plausible member of this connection's set and
+                                // saying otherwise is the one direction that
+                                // releases a command onto a document that was never
+                                // opened. Report the connection as not caught up and
+                                // let the next parse's eager open heal it.
+                                log::debug!(
+                                    target: "kakehashi::bridge",
+                                    "Re-open of {key}: {host} did not settle within the \
+                                     remaining budget; reporting the connection incomplete"
+                                );
+                                repaired = false;
+                                continue;
+                            }
+                        }
                         // Incarnation BEFORE injections, matching the ordering the
                         // inline heal used: a close+reopen landing between the two
                         // reads then pairs a stale incarnation with fresh
@@ -1382,6 +1499,24 @@ fn spawn_upstream_request(
                             continue;
                         };
                         if injections.is_empty() {
+                            // Empty means one of two very different things: this
+                            // host genuinely has no region for this server, or
+                            // an edit cleared the tree between the currency
+                            // check above and this resolution — `didChange`
+                            // clears it WITHOUT bumping the incarnation, so
+                            // neither guard above catches that. Re-check rather
+                            // than assume the benign reading, because the benign
+                            // reading is the one that releases commands.
+                            // ...unless the host is simply gone. A buffer
+                            // closed mid-sweep is not a repair this connection
+                            // is owed, and `document_language` falls back to the
+                            // URI extension, so a closed document can reach here
+                            // and would otherwise wedge the barrier shut.
+                            if injection.document_incarnation(&host).is_some()
+                                && !injection.snapshot_is_current(&host)
+                            {
+                                repaired = false;
+                            }
                             continue;
                         }
                         // Sequential: each host's didOpen goes out on the SAME
@@ -1395,16 +1530,28 @@ fn spawn_upstream_request(
                                 &host,
                                 crate::lsp::bridge::OpenExpectation {
                                     incarnation,
-                                    // Repair the connection the purge CLAIMED,
-                                    // not whatever this host routes to now.
+                                    // Both the filter and the target: only hosts
+                                    // that route here are opened, and they are
+                                    // opened HERE.
                                     connection: Some(&key),
                                 },
                                 injections,
                                 &reopen_server,
                             )
                             .await;
-                        if outcome != crate::lsp::bridge::OpenOutcome::Opened {
-                            repaired = false;
+                        match outcome {
+                            OpenOutcome::Opened => {}
+                            // Not this connection's document. Nothing to report.
+                            OpenOutcome::NotApplicable => {}
+                            // It was this connection's and it did not open —
+                            // unless the reason is that the host closed while
+                            // the open was running, which is the same benign
+                            // case as `ParseWait::Gone` arriving one step later.
+                            OpenOutcome::NotOpened => {
+                                if injection.document_incarnation(&host).is_some() {
+                                    repaired = false;
+                                }
+                            }
                         }
                     }
                     // Report what actually happened. `true` releases waiters;

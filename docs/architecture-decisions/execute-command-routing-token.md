@@ -1,6 +1,7 @@
 # Execute Command Routing Token
 
 **Related Decisions**:
+[respawn-reopen-derives-its-targets](respawn-reopen-derives-its-targets.md),
 [language-server-bridge-request-strategies](language-server-bridge-request-strategies.md),
 [ls-bridge-server-pool-coordination](ls-bridge-server-pool-coordination.md),
 [host-document-bridge](host-document-bridge.md),
@@ -84,11 +85,14 @@ reconnect.
 
 ### 2. State repair belongs to respawn, not to the request path
 
-When a connection is purged the document tracker already computes the virtual
-URIs that connection had open, and holds a host→virtual index besides. Those
-resolve back to host documents. The re-open is therefore driven by the purge
-set and runs when the replacement connection reaches `Ready` — before any
+The re-open runs when the replacement connection reaches `Ready` — before any
 request needs it, and off the user-facing path.
+
+This decision originally also chose *which documents* to re-open, by capturing
+the set the purge dropped. That half is superseded by
+respawn-reopen-derives-its-targets: the set is derived from the documents open
+at the time the re-open runs. Everything below about *when* the repair happens,
+*who* performs it, and how requests synchronize on it still holds.
 
 Re-opening needs document *content*, which only the host document and its
 injection regions can supply, so the work is performed on the server side
@@ -96,13 +100,10 @@ injection regions can supply, so the work is performed on the server side
 the existing pool→editor upward request channel. The pool decides *when*; the
 server side decides *what*.
 
-The pool also states *which connection*. The server side resolves each host
-against current settings, so a config change that re-roots the host between the
-purge and the respawn would otherwise repair a different connection than the one
-the barrier signals for — leaving the claimed one empty while reporting success.
-The claimed key travels with the request and the open is ACQUIRED by it, not
-merely checked against it — resolving from the host would repair whichever
-connection it routes to now. A claimed connection that has since died is
+The pool also states *which connection*, and the open is ACQUIRED by that key
+rather than by whatever a host resolves to — otherwise the repair lands on
+whichever connection the host routes to now, leaving the one the barrier signals
+for empty while reporting success. A claimed connection that has since died is
 reported as unrepaired, and the barrier then withholds the commands waiting on
 it rather than releasing them onto an empty connection.
 
@@ -130,17 +131,19 @@ not opened. Two things restore the ordering:
   the guarantee can be unmet, and proceeding anyway is the failure the barrier
   exists to prevent. A null the user can re-fire beats a confusing downstream
   error. Dropping the completion signal — a re-open that can never finish —
-  counts as settled, so a dead handler degrades to the old lazy behaviour instead
-  of blocking every command.
+  does NOT count as success: the command observing it is still withheld, because
+  a re-open that died without reporting leaves the connection just as possibly
+  empty. What the dropped sender buys is that the entry is then RETIRED, so the
+  next command proceeds and a dead handler degrades to the old lazy behaviour
+  instead of blocking every command forever.
 
-The claim is reversible: a handshake that dies after claiming the set restores
-it, because the purge that recorded it already emptied the tracker and no later
-purge would report those documents again.
+The claim is reversible: a handshake that dies after claiming re-arms the key,
+so the next replacement still learns it owes a re-open.
 
 This is sound across intervening edits because region ids are position-keyed
-and shifted by edits rather than re-minted
-(lazy-node-identity-tracking), so a virtual URI captured at purge
-time still names the same region afterwards.
+and shifted by edits rather than re-minted (lazy-node-identity-tracking), so a
+region keeps its identity across the edits that happen while a connection is
+being replaced.
 
 Repair then benefits every request path, not just `workspace/executeCommand`,
 and the routing token no longer has to name a document.
@@ -183,9 +186,12 @@ a routing mechanism; it remains a legitimate fallback nowhere in this design.
 
 ### Re-open every open host document on respawn
 
-Correct but wasteful: it re-resolves injections for documents the dead
-connection never held. Unnecessary, since the purge already knows the exact
-set. Rejected in favour of the captured set.
+Rejected here as wasteful — the purge appeared to know the exact set already.
+That reasoning did not survive: the captured set is a claim about a state that
+has already stopped being true, and it is empty in exactly the case where a
+replacement most needs repairing. Superseded by
+respawn-reopen-derives-its-targets, which considers every open document and
+narrows by configuration first.
 
 ## Consequences
 
@@ -213,9 +219,9 @@ set. Rejected in favour of the captured set.
   now an explicit barrier. A future request path that depends on repaired
   document state must remember to wait on it; forgetting is silent, and shows
   up only as a downstream error about an unopened document.
-- A respawn re-opens the dead connection's whole document set at once, where
-  the previous design re-opened one document lazily. Large workspaces on a
-  shared instance pay this as a burst.
+- A respawn re-opens a connection's whole document set at once, where the
+  previous design re-opened one document lazily. Large workspaces on a shared
+  instance pay this as a burst.
 - Encoded names minted by an older build no longer decode. Harmless in
   practice — names are minted fresh in each `textDocument/codeAction` response
   and never persisted — but a client that cached an action across a kakehashi

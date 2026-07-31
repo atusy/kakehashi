@@ -368,9 +368,9 @@ pub struct LanguageServerPool {
     /// servers via `bridge._self`, with their version and content
     /// fingerprint for lazy full-text re-sync.
     host_documents: Mutex<HashMap<(String, ConnectionKey), HostDocSyncState>>,
-    /// Host documents whose virtual documents a purged connection held, awaiting
-    /// re-open on the replacement connection (execute-command-routing-token).
-    /// `Arc` because the drain runs inside the spawned handshake task.
+    /// Connections whose replacement still owes a virtual-document re-open, and
+    /// the barrier requests wait on (respawn-reopen-derives-its-targets).
+    /// `Arc` because the claim runs inside the spawned handshake task.
     pending_reopen: Arc<PendingReopenRegistry>,
     /// Last full downstream pull report per exact connection/document. Region
     /// diagnostics stay virtual-local and are re-anchored with the request's
@@ -781,8 +781,10 @@ impl LanguageServerPool {
                 .lock()
                 .await
                 .retain(|(_, connection_key), _| connection_key != &key);
-            let reopen_hosts = self.document_tracker.purge_connection(&key).await;
-            self.pending_reopen.record(&key, reopen_hosts);
+            self.document_tracker.purge_connection(&key).await;
+            // Arm before the replacement can claim: what this connection held
+            // is irrelevant, only that it owes a re-open.
+            self.pending_reopen.arm(&key);
             self.purge_open_transition_locks(&key).await;
             if let Some(handle) = connections.remove(&key) {
                 stale_handles.push((key, handle));
@@ -2024,7 +2026,7 @@ impl LanguageServerPool {
     ///
     /// Briefly locks `connections` for the capability probe; the marker is still
     /// resolved with a single filesystem walk.
-    async fn resolve_acquire(
+    pub(super) async fn resolve_acquire(
         &self,
         server_name: &str,
         server_config: &crate::config::settings::BridgeServerConfig,
@@ -2332,11 +2334,10 @@ impl LanguageServerPool {
                         .lock()
                         .await
                         .retain(|(_, key), _| key != &connection_key);
-                    let reopen_hosts = self
-                        .document_tracker
+                    self.document_tracker
                         .purge_connection(&connection_key)
                         .await;
-                    self.pending_reopen.record(&connection_key, reopen_hosts);
+                    self.pending_reopen.arm(&connection_key);
                     self.invalidate_diagnostic_connections(std::slice::from_ref(&connection_key));
                     self.purge_open_transition_locks(&connection_key).await;
                     // Remove only after every async purge completes. If this
@@ -2558,14 +2559,14 @@ impl LanguageServerPool {
                     // SEE that one is in flight and wait for it — registering
                     // after Ready would leave exactly the window in which a
                     // command overtakes its own didOpen.
-                    let mut pending_reopen_handoff = pending_reopen.take(&command_registration_key);
+                    let mut pending_reopen_handoff =
+                        pending_reopen.claim(&command_registration_key);
                     if !handle_for_handshake.transition_initializing_to_ready() {
-                        // Put the claimed set back: `take` drained it, and the
-                        // purge that recorded it already emptied the document
-                        // tracker, so nothing would re-record it for the next
-                        // replacement.
-                        if let Some((hosts, _done)) = pending_reopen_handoff.take() {
-                            pending_reopen.restore(&command_registration_key, hosts);
+                        // Re-arm: `claim` disarmed the key, and this replacement
+                        // is not going to serve anyone, so the NEXT one must
+                        // still learn that it owes a re-open.
+                        if let Some(done) = pending_reopen_handoff.take() {
+                            pending_reopen.rearm(&command_registration_key, &done);
                         }
                         return Err(io::Error::new(
                             io::ErrorKind::Interrupted,
@@ -2594,15 +2595,19 @@ impl LanguageServerPool {
                             );
                         }
                     }
-                    // Hand the claimed set upstream to be re-opened. Sent after
-                    // Ready so the didOpen queues behind the settings push.
-                    // `done` travels with it and releases waiters when the
+                    // Ask upstream to bring this connection up to date. Sent
+                    // after Ready so the didOpen queues behind the settings
+                    // push. `done` travels with it and releases waiters when the
                     // re-open finishes — or when it is dropped, so a lost
                     // message cannot strand a request for the full bound.
-                    if let Some((hosts, done)) = pending_reopen_handoff
+                    //
+                    // The request carries no document list: upstream derives
+                    // what this connection should hold from the documents open
+                    // at the time it runs, which is the only set that is still
+                    // true by then.
+                    if let Some(done) = pending_reopen_handoff
                         && let Err(e) = upstream_request_tx.send(UpstreamRequest::ReopenDocuments {
                             key: command_registration_key.clone(),
-                            hosts,
                             done,
                         })
                     {
@@ -2611,11 +2616,12 @@ impl LanguageServerPool {
                             "Failed to queue virtual-document re-open after respawn \
                              (forwarding loop gone): {e}"
                         );
-                        // Same reasoning as the Ready-flip failure above: the
-                        // undelivered set is the only record that these documents
-                        // need re-opening.
-                        if let UpstreamRequest::ReopenDocuments { hosts, .. } = e.0 {
-                            pending_reopen.restore(&command_registration_key, hosts);
+                        // Same reasoning as the Ready-flip failure above: this
+                        // connection still owes a re-open nobody is going to make.
+                        // The undelivered message carries the sender back, so the
+                        // retire stays identity-guarded.
+                        if let UpstreamRequest::ReopenDocuments { done, .. } = e.0 {
+                            pending_reopen.rearm(&command_registration_key, &done);
                         }
                     }
                     Ok(())
@@ -4598,18 +4604,15 @@ mod tests {
         .await
         .unwrap();
 
-        // Purge records the host; the handshake claims it before going Ready.
-        let hosts = pool
-            .document_tracker
+        // Purge arms the key; the handshake claims it before going Ready.
+        pool.document_tracker
             .purge_connection(&connection_key)
             .await;
-        assert_eq!(hosts, vec![host_uri.clone()], "purge reports the host");
-        pool.pending_reopen.record(&connection_key, hosts);
-        let (claimed, done) = pool
+        pool.pending_reopen.arm(&connection_key);
+        let done = pool
             .pending_reopen
-            .take(&connection_key)
+            .claim(&connection_key)
             .expect("the handshake claims the pending re-open");
-        assert_eq!(claimed, vec![host_uri]);
 
         let waiter = {
             let pool = Arc::clone(&pool);
@@ -7339,6 +7342,26 @@ mod tests {
             _ => unreachable!(),
         })
         .await;
+
+        // Every purged connection owes a re-open, and NONE of these handles ever
+        // opened a document. That is the whole point: the predecessor design
+        // armed from the host list the purge returned, so a connection holding
+        // nothing armed nothing and its replacement was never repaired by
+        // anyone. Asserting it here rather than on the registry is deliberate —
+        // the registry cannot express "held nothing", because `arm` takes no
+        // host list at all. Only the production purge site can.
+        assert!(
+            pool.pending_reopen.claim(&changed_key).is_some(),
+            "an invalidated connection owes a re-open even though it held nothing"
+        );
+        assert!(
+            pool.pending_reopen.claim(&removed_key).is_some(),
+            "a connection whose server was removed owes one too"
+        );
+        assert!(
+            pool.pending_reopen.claim(&unchanged_key).is_none(),
+            "a surviving connection must not be armed"
+        );
 
         let connections = pool.connections().await;
         assert!(!connections.contains_key(&changed_key));

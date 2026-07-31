@@ -1,5 +1,5 @@
-//! Host documents awaiting re-open on a respawned connection
-//! (execute-command-routing-token).
+//! Connections owing a virtual-document re-open after a respawn
+//! (respawn-reopen-derives-its-targets).
 //!
 //! When a stale connection is purged, the replacement process has nothing open.
 //! Nothing re-opens it on its own: `process_injections` eagerly opens virtual
@@ -7,21 +7,22 @@
 //! subsequent edit leaves the fresh process receiving requests for documents it
 //! never opened.
 //!
-//! The purge is the last moment the affected set is knowable, since it is the
-//! purge itself that forgets what the dead process held. So `purge_connection`
-//! returns the host documents it dropped and they are recorded here, then drained
-//! when the replacement reaches `Ready`.
+//! What this registry stores is a KEY, not a document set. A purge ARMS its key;
+//! the replacement's handshake CLAIMS it and the re-open then derives what the
+//! connection should hold from the documents that are open now. Remembering the
+//! dead process's set instead made the record a snapshot of a past state that
+//! kept diverging from the present — closed documents, re-rooted hosts, a second
+//! purge reporting nothing — and each divergence needed its own repair.
 //!
 //! Held in an `Arc` on the pool (like the sibling `CommandOriginRegistry`)
-//! because the drain runs inside the spawned handshake task, which cannot reach
+//! because the claim runs inside the spawned handshake task, which cannot reach
 //! `&self`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 use std::time::Duration;
 
 use tokio::sync::watch;
-use url::Url;
 
 use super::ConnectionKey;
 use crate::error::LockResultExt;
@@ -32,9 +33,19 @@ use crate::error::LockResultExt;
 /// stuck downstream must not hold a user-facing request open indefinitely.
 pub(crate) const REOPEN_WAIT: Duration = Duration::from_secs(2);
 
+/// The two halves of a key's re-open state, under ONE lock.
+///
+/// They are separate maps but a single invariant: a key is either owing a
+/// re-open, or having one made, never both and never neither-by-accident.
+/// Splitting the lock let `claim` disarm under one mutex and install under the
+/// other, so a second claim could interleave between them and have its live
+/// barrier overwritten by the first — leaving one connection Ready with an
+/// unclaimable debt and the other reporting through a channel nobody holds.
 #[derive(Default)]
-pub(crate) struct PendingReopenRegistry {
-    hosts: Mutex<HashMap<ConnectionKey, Vec<Url>>>,
+struct ReopenState {
+    /// Keys whose connection was purged and whose replacement still owes a
+    /// re-open.
+    armed: HashSet<ConnectionKey>,
     /// Re-opens handed off but not yet finished, so a request that must not
     /// overtake its own `didOpen` can wait for one.
     ///
@@ -42,37 +53,38 @@ pub(crate) struct PendingReopenRegistry {
     /// server side does the work), so without this a command enqueued right
     /// after `Ready` would reach the downstream BEFORE the didOpen it depends
     /// on — the FIFO ordering the previous inline heal guaranteed by awaiting.
-    in_flight: Mutex<HashMap<ConnectionKey, watch::Receiver<bool>>>,
+    in_flight: HashMap<ConnectionKey, watch::Receiver<bool>>,
+}
+
+#[derive(Default)]
+pub(crate) struct PendingReopenRegistry {
+    state: Mutex<ReopenState>,
 }
 
 impl PendingReopenRegistry {
-    /// Record the host documents a just-purged connection held.
+    /// Note that `key`'s connection was purged, so its replacement owes a
+    /// re-open.
     ///
-    /// Unions rather than replaces: a respawn that dies before reaching `Ready`
-    /// is purged again, and the second purge reports nothing (the first already
-    /// emptied the tracker), so replacing would forget the set entirely.
-    pub(crate) fn record(&self, key: &ConnectionKey, hosts: Vec<Url>) {
-        if hosts.is_empty() {
-            return;
-        }
-        let mut pending = self
-            .hosts
+    /// UNCONDITIONAL, and that is load-bearing. The predecessor recorded a host
+    /// list and skipped when it was empty — but a connection that dies young
+    /// holds nothing, so the purge that follows it reported nothing, armed
+    /// nothing, and its replacement was never repaired by anyone. Arming on the
+    /// purge itself has no such hole: what the dead connection happened to hold
+    /// is not what the replacement needs.
+    ///
+    /// Idempotent — a key purged twice before any replacement lands is armed
+    /// once, and one re-open brings the replacement fully up to date.
+    pub(crate) fn arm(&self, key: &ConnectionKey) {
+        self.state
             .lock()
-            .recover_poison("PendingReopenRegistry::record");
-        let entry = pending.entry(key.clone()).or_default();
-        for host in hosts {
-            if !entry.contains(&host) {
-                entry.push(host);
-            }
-        }
+            .recover_poison("PendingReopenRegistry::arm")
+            .armed
+            .insert(key.clone());
     }
 
-    /// Take the host documents awaiting re-open on `key` and mark the re-open
-    /// in flight, returning the hosts and the completion sender.
-    ///
-    /// Draining means one re-open attempt per respawn. That is deliberate: a
-    /// retained set would re-open the same documents on every later respawn of
-    /// the key, including documents the editor has since closed.
+    /// Claim `key`'s outstanding re-open and mark it in flight, returning the
+    /// completion sender. `None` when nothing was armed — a first-ever spawn,
+    /// which has no predecessor's state to restore.
     ///
     /// MUST be called before the connection is published as `Ready`. A request
     /// unblocked by that transition checks [`wait_for_reopen`](Self::wait_for_reopen),
@@ -82,37 +94,62 @@ impl PendingReopenRegistry {
     /// Dropping the returned sender completes the wait, so a handler that dies
     /// or is never serviced releases waiters instead of stranding them until the
     /// timeout.
-    pub(crate) fn take(&self, key: &ConnectionKey) -> Option<(Vec<Url>, watch::Sender<bool>)> {
-        let hosts = self
-            .hosts
+    pub(crate) fn claim(&self, key: &ConnectionKey) -> Option<watch::Sender<bool>> {
+        // Disarm and install under ONE lock. Releasing between them let a second
+        // handshake claim the same key and install its barrier, which this one
+        // would then overwrite: the second connection reaches Ready reporting
+        // through a channel the registry no longer holds, its `done` reads as
+        // closed, and the debt it was supposed to settle stays armed with
+        // nothing left to claim it.
+        let mut state = self
+            .state
             .lock()
-            .recover_poison("PendingReopenRegistry::take")
-            .remove(key)?;
-        if hosts.is_empty() {
+            .recover_poison("PendingReopenRegistry::claim");
+        if !state.armed.remove(key) {
             return None;
         }
         let (tx, rx) = watch::channel(false);
-        self.in_flight
-            .lock()
-            .recover_poison("PendingReopenRegistry::take")
-            .insert(key.clone(), rx);
-        Some((hosts, tx))
+        state.in_flight.insert(key.clone(), rx);
+        Some(tx)
     }
 
-    /// Put a claimed host set back after a hand-off failed, and retire the
-    /// barrier it registered.
+    /// Re-arm after a claimed hand-off failed, and retire the barrier THAT
+    /// claim registered.
     ///
-    /// [`take`](Self::take) DRAINS, so a handshake that claims the set and then
-    /// dies before the re-open is queued would lose it permanently: the purge
-    /// that recorded it already emptied the document tracker, so the next purge
-    /// of the same key reports nothing to re-record. Restoring leaves it for the
-    /// next replacement to claim.
-    pub(crate) fn restore(&self, key: &ConnectionKey, hosts: Vec<Url>) {
-        self.in_flight
+    /// [`claim`](Self::claim) disarms, so a handshake that claims and then dies
+    /// before the re-open is queued would leave the replacement owing a repair
+    /// nobody remembers to make.
+    ///
+    /// Takes the claim's own `done` so the retire can be identity-guarded, for
+    /// the same reason [`wait_for_reopen`](Self::wait_for_reopen) guards its
+    /// own: claim → publish-Ready → rearm is not atomic against the registry,
+    /// so a LATER respawn can claim this key in between and install a live
+    /// barrier. Removing by key alone would evict that one, and a command
+    /// arriving next finds nothing outstanding, reads the requirement as
+    /// vacuously met, and is enqueued ahead of the didOpens the live re-open
+    /// has not sent yet — the one failure mode this whole mechanism exists to
+    /// prevent, and the one case that does NOT degrade to the lazy heal.
+    pub(crate) fn rearm(&self, key: &ConnectionKey, done: &watch::Sender<bool>) {
+        let probe = done.subscribe();
+        let mut state = self
+            .state
             .lock()
-            .recover_poison("PendingReopenRegistry::restore")
-            .remove(key);
-        self.record(key, hosts);
+            .recover_poison("PendingReopenRegistry::rearm");
+        if !state
+            .in_flight
+            .get(key)
+            .is_some_and(|current| current.same_channel(&probe))
+        {
+            // Someone else owns the barrier for this key, which can only mean a
+            // purge re-armed it and a LATER replacement claimed it. That
+            // replacement is making the repair, so there is no debt left to
+            // record — and recording one anyway would leave the key armed AND
+            // in flight at once, breaking the invariant that it is exactly one
+            // of the two, and buying a redundant sweep on the next spawn.
+            return;
+        }
+        state.in_flight.remove(key);
+        state.armed.insert(key.clone());
     }
 
     /// Wait (bounded by [`REOPEN_WAIT`]) for an in-flight re-open on `key`.
@@ -134,9 +171,10 @@ impl PendingReopenRegistry {
     /// downstream error.
     pub(crate) async fn wait_for_reopen(&self, key: &ConnectionKey) -> bool {
         let Some(mut rx) = self
-            .in_flight
+            .state
             .lock()
             .recover_poison("PendingReopenRegistry::wait_for_reopen")
+            .in_flight
             .get(key)
             .cloned()
         else {
@@ -173,15 +211,16 @@ impl PendingReopenRegistry {
         // respawn may have claimed the key in between and registered a genuinely
         // outstanding re-open. Removing by key alone would evict it.
         if retire {
-            let mut in_flight = self
-                .in_flight
+            let mut state = self
+                .state
                 .lock()
                 .recover_poison("PendingReopenRegistry::wait_for_reopen");
-            if in_flight
+            if state
+                .in_flight
                 .get(key)
                 .is_some_and(|current| current.same_channel(&rx))
             {
-                in_flight.remove(key);
+                state.in_flight.remove(key);
             }
         }
         settled
@@ -192,64 +231,161 @@ impl PendingReopenRegistry {
 mod tests {
     use super::*;
 
-    fn url(path: &str) -> Url {
-        Url::parse(path).expect("valid test URL")
-    }
+    #[test]
+    fn claim_disarms_what_arm_set() {
+        let registry = PendingReopenRegistry::default();
+        let key = ConnectionKey::for_server("ruff");
+        registry.arm(&key);
 
-    fn hosts_of(taken: Option<(Vec<Url>, watch::Sender<bool>)>) -> Vec<Url> {
-        taken.map(|(hosts, _tx)| hosts).unwrap_or_default()
+        assert!(registry.claim(&key).is_some());
+        // Disarmed, not retained: one respawn owes one re-open. A retained key
+        // would make every later respawn of it re-derive for no reason.
+        assert!(registry.claim(&key).is_none());
     }
 
     #[test]
-    fn take_drains_what_record_stored() {
+    fn a_connection_that_died_holding_nothing_still_arms() {
+        // The hole the remembered-list design could not close. A connection
+        // purged before it opened anything reported an EMPTY set, which armed
+        // nothing — so its replacement was never repaired by anyone, and no
+        // amount of restoring helped because the set had never existed. Arming
+        // on the purge itself does not consult what was held.
         let registry = PendingReopenRegistry::default();
         let key = ConnectionKey::for_server("ruff");
-        registry.record(&key, vec![url("file:///w/a.md")]);
+        registry.arm(&key);
 
-        assert_eq!(hosts_of(registry.take(&key)), vec![url("file:///w/a.md")]);
-        // Drained, not retained: a later respawn must not re-open documents the
-        // editor may have closed in the meantime.
-        assert!(registry.take(&key).is_none());
-    }
-
-    #[test]
-    fn a_second_purge_before_ready_keeps_the_first_set() {
-        // A respawn that dies during the handshake is purged again, and that
-        // second purge reports nothing — the first one already emptied the
-        // tracker. Replacing instead of unioning would lose the documents.
-        let registry = PendingReopenRegistry::default();
-        let key = ConnectionKey::for_server("ruff");
-        registry.record(&key, vec![url("file:///w/a.md")]);
-        registry.record(&key, vec![]);
-
-        assert_eq!(hosts_of(registry.take(&key)), vec![url("file:///w/a.md")]);
-    }
-
-    #[test]
-    fn record_unions_without_duplicating() {
-        let registry = PendingReopenRegistry::default();
-        let key = ConnectionKey::for_server("ruff");
-        registry.record(&key, vec![url("file:///w/a.md")]);
-        registry.record(&key, vec![url("file:///w/a.md"), url("file:///w/b.md")]);
-
-        assert_eq!(
-            hosts_of(registry.take(&key)),
-            vec![url("file:///w/a.md"), url("file:///w/b.md")]
+        assert!(
+            registry.claim(&key).is_some(),
+            "a purge must arm its key regardless of what the dead connection held"
         );
     }
 
     #[test]
-    fn keys_do_not_share_a_pending_set() {
+    fn arming_twice_before_a_claim_owes_one_reopen() {
+        // A respawn that dies during its own handshake is purged again. One
+        // derivation brings the eventual replacement fully up to date, so the
+        // second purge must not queue a second one.
+        let registry = PendingReopenRegistry::default();
+        let key = ConnectionKey::for_server("ruff");
+        registry.arm(&key);
+        registry.arm(&key);
+
+        assert!(registry.claim(&key).is_some());
+        assert!(registry.claim(&key).is_none());
+    }
+
+    #[test]
+    fn rearm_puts_back_a_claim_that_could_not_be_handed_off() {
+        // A handshake that claims and then fails to publish Ready (or to queue
+        // the re-open) leaves the connection still owing one.
+        let registry = PendingReopenRegistry::default();
+        let key = ConnectionKey::for_server("ruff");
+        registry.arm(&key);
+        let done = registry.claim(&key).expect("armed");
+        registry.rearm(&key, &done);
+        drop(done);
+
+        assert!(
+            registry.claim(&key).is_some(),
+            "the next replacement must still learn it owes a re-open"
+        );
+    }
+
+    #[tokio::test]
+    async fn rearm_retires_the_barrier_the_failed_claim_registered() {
+        // The claim registered an in-flight entry; nobody will ever signal it.
+        // Leaving it would block every command on the key for the full budget.
+        let registry = PendingReopenRegistry::default();
+        let key = ConnectionKey::for_server("ruff");
+        registry.arm(&key);
+        let done = registry.claim(&key).expect("armed");
+        registry.rearm(&key, &done);
+        drop(done);
+
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), registry.wait_for_reopen(&key))
+                .await
+                .expect("a retired barrier must not make the caller wait"),
+            "a re-armed key has no re-open in flight to wait for"
+        );
+    }
+
+    /// A late `rearm` must not retire a barrier a LATER respawn registered.
+    ///
+    /// claim -> publish-Ready -> rearm is not atomic against this registry, so a
+    /// replacement can claim the same key in between and install a live barrier.
+    /// Retiring by key alone would evict it, and the next command would find
+    /// nothing outstanding, read the ordering requirement as vacuously met, and
+    /// be enqueued ahead of didOpens that have not been sent — the one failure
+    /// this mechanism exists to prevent, and the one that does NOT degrade to
+    /// the lazy heal.
+    #[tokio::test]
+    async fn a_stale_rearm_does_not_retire_a_later_respawns_barrier() {
+        let registry = PendingReopenRegistry::default();
+        let key = ConnectionKey::for_server("ruff");
+
+        // The displaced handshake claims...
+        registry.arm(&key);
+        let stale = registry.claim(&key).expect("armed");
+        // ...is displaced, so its key is armed again and a replacement claims.
+        registry.arm(&key);
+        let live = registry.claim(&key).expect("re-armed");
+
+        // Only NOW does the displaced handshake notice it lost the Ready flip.
+        registry.rearm(&key, &stale);
+        drop(stale);
+
+        // The live re-open is still outstanding, so a command must wait for it.
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), registry.wait_for_reopen(&key))
+                .await
+                .is_err(),
+            "the live respawn's barrier must survive a stale rearm"
+        );
+        live.send(true).expect("the registry holds the receiver");
+        assert!(registry.wait_for_reopen(&key).await);
+    }
+
+    /// A key is armed OR in flight, never both. A stale `rearm` that finds a
+    /// later respawn's barrier must record nothing: that respawn is making the
+    /// repair, so there is no outstanding debt to remember.
+    #[tokio::test]
+    async fn a_superseded_rearm_records_no_debt() {
+        let registry = PendingReopenRegistry::default();
+        let key = ConnectionKey::for_server("ruff");
+
+        registry.arm(&key);
+        let stale = registry.claim(&key).expect("armed");
+        registry.arm(&key);
+        let live = registry.claim(&key).expect("re-armed");
+
+        registry.rearm(&key, &stale);
+        drop(stale);
+
+        // Settle the live re-open and let a waiter retire it.
+        live.send(true).expect("the registry holds the receiver");
+        assert!(registry.wait_for_reopen(&key).await);
+
+        assert!(
+            registry.claim(&key).is_none(),
+            "the superseded rearm must not have left a debt behind"
+        );
+    }
+
+    #[test]
+    fn keys_are_armed_independently() {
         // Sibling connections (same server, different root) respawn
-        // independently; one reaching Ready must not consume the other's set.
+        // independently; one reaching Ready must not consume the other's claim.
         let registry = PendingReopenRegistry::default();
         let a = ConnectionKey::new("ruff", Some("file:///w/a".to_string()));
         let b = ConnectionKey::new("ruff", Some("file:///w/b".to_string()));
-        registry.record(&a, vec![url("file:///w/a/doc.md")]);
-        registry.record(&b, vec![url("file:///w/b/doc.md")]);
+        registry.arm(&a);
 
-        assert_eq!(hosts_of(registry.take(&a)), vec![url("file:///w/a/doc.md")]);
-        assert_eq!(hosts_of(registry.take(&b)), vec![url("file:///w/b/doc.md")]);
+        assert!(registry.claim(&a).is_some());
+        assert!(
+            registry.claim(&b).is_none(),
+            "arming one root must not arm its sibling"
+        );
     }
 
     #[tokio::test]
@@ -266,13 +402,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_armed_but_unclaimed_key_registers_no_wait() {
+        // Arming records a debt; only the claim puts a re-open in flight. A
+        // request arriving between the two must not wait for a barrier that
+        // nobody is holding.
+        let registry = PendingReopenRegistry::default();
+        let key = ConnectionKey::for_server("ruff");
+        registry.arm(&key);
+
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), registry.wait_for_reopen(&key))
+                .await
+                .expect("nothing in flight, so no wait"),
+        );
+    }
+
+    #[tokio::test]
     async fn a_request_waits_until_the_reopen_signals_completion() {
         // The ordering guarantee: a command enqueued after Ready must not
         // overtake the didOpen its arguments depend on.
         let registry = std::sync::Arc::new(PendingReopenRegistry::default());
         let key = ConnectionKey::for_server("ruff");
-        registry.record(&key, vec![url("file:///w/a.md")]);
-        let (_hosts, tx) = registry.take(&key).expect("a re-open is pending");
+        registry.arm(&key);
+        let tx = registry.claim(&key).expect("a re-open is pending");
 
         let waiter = {
             let registry = std::sync::Arc::clone(&registry);
@@ -293,8 +445,8 @@ mod tests {
         // request for the full timeout.
         let registry = std::sync::Arc::new(PendingReopenRegistry::default());
         let key = ConnectionKey::for_server("ruff");
-        registry.record(&key, vec![url("file:///w/a.md")]);
-        let (_hosts, tx) = registry.take(&key).expect("a re-open is pending");
+        registry.arm(&key);
+        let tx = registry.claim(&key).expect("a re-open is pending");
         drop(tx);
 
         // Would hang for REOPEN_WAIT if a dropped sender did not count as done.
@@ -316,14 +468,14 @@ mod tests {
 
     #[tokio::test]
     async fn a_reopen_that_reports_failure_does_not_release_the_caller() {
-        // The re-open ran but could not repair THIS connection (its host
-        // re-routed, so the opens were skipped). Releasing the caller would send
-        // a command to a connection that is still empty — the exact outcome the
-        // barrier exists to prevent.
+        // The re-open ran but could not bring THIS connection up to date (a
+        // document that belongs to it would not open). Releasing the caller
+        // would send a command to a connection still missing documents — the
+        // exact outcome the barrier exists to prevent.
         let registry = PendingReopenRegistry::default();
         let key = ConnectionKey::for_server("ruff");
-        registry.record(&key, vec![url("file:///w/a.md")]);
-        let (_hosts, done) = registry.take(&key).expect("a re-open is pending");
+        registry.arm(&key);
+        let done = registry.claim(&key).expect("a re-open is pending");
 
         done.send(false).expect("the registry holds the receiver");
         drop(done);
@@ -343,8 +495,8 @@ mod tests {
         // all — exactly when the re-open is known to be slow.
         let registry = PendingReopenRegistry::default();
         let key = ConnectionKey::for_server("ruff");
-        registry.record(&key, vec![url("file:///w/a.md")]);
-        let (_hosts, done) = registry.take(&key).expect("a re-open is pending");
+        registry.arm(&key);
+        let done = registry.claim(&key).expect("a re-open is pending");
 
         // Auto-advances past REOPEN_WAIT without a real sleep. The wait did NOT
         // settle, so the caller must be told to fail soft rather than send
@@ -366,19 +518,5 @@ mod tests {
             registry.wait_for_reopen(&key).await,
             "a completed re-open reports settled"
         );
-    }
-
-    #[tokio::test]
-    async fn an_empty_pending_set_registers_no_wait() {
-        // `record` ignores an empty set, so `take` must report nothing in flight
-        // rather than register a barrier nobody will ever signal.
-        let registry = PendingReopenRegistry::default();
-        let key = ConnectionKey::for_server("ruff");
-        registry.record(&key, vec![]);
-
-        assert!(registry.take(&key).is_none());
-        tokio::time::timeout(Duration::from_secs(1), registry.wait_for_reopen(&key))
-            .await
-            .expect("nothing in flight, so no wait");
     }
 }

@@ -26,11 +26,18 @@ pub(crate) enum OpenOutcome {
     /// The open ran on the connection the caller expected (or the caller named
     /// none). Documents it could open are enqueued.
     Opened,
-    /// The host resolved to a DIFFERENT connection than the caller named, so
-    /// nothing was opened. A caller repairing the named connection must report
-    /// failure rather than success: the connection is still empty.
-    WrongConnection,
-    /// The connection could not be reached at all, so nothing was opened.
+    /// This host supplies nothing for the named connection — it routes to a
+    /// different one, or none of its injections bridge to that server.
+    ///
+    /// NOT a failure. The respawn re-open asks this of every open document, and
+    /// for most of them the answer is "not mine": a markdown file with no lua
+    /// fence, or one under a different workspace root. Counting those as failed
+    /// repairs would hold the barrier shut on every respawn.
+    NotApplicable,
+    /// The open was applicable — this host does belong to the named connection
+    /// — but did not happen: the connection is gone, the document moved to a
+    /// new lifetime, or the handle was replaced mid-loop. The caller repairing
+    /// that connection must report failure; it is still missing documents.
     NotOpened,
 }
 
@@ -40,11 +47,17 @@ pub(crate) struct OpenExpectation<'a> {
     pub(crate) incarnation: u64,
     /// The connection this open is FOR, when the caller is repairing a specific
     /// one — the respawn re-open is claimed under a key and its barrier signals
-    /// for that key. The connection is still resolved from `host_uri`, so a
-    /// config change that re-roots the host resolves a DIFFERENT one, and
-    /// opening there would satisfy nobody: the claimed connection stays empty
-    /// while its barrier reports success. `None` opens wherever the host routes
-    /// now, which is what every other caller wants.
+    /// for that key.
+    ///
+    /// Naming it does two things the `None` case does not: the open is ACQUIRED
+    /// by that key rather than by whatever the host routes to (a config change
+    /// that re-roots the host would otherwise repair a different connection
+    /// while the claimed one stays empty and its barrier reports success), and
+    /// the host is first checked to actually belong there, so a caller may ask
+    /// about a host without risking an open on the wrong connection.
+    ///
+    /// `None` opens wherever the host routes now, spawning if needed, which is
+    /// what every other caller wants.
     pub(crate) connection: Option<&'a ConnectionKey>,
 }
 
@@ -90,21 +103,42 @@ impl LanguageServerPool {
         // and never spawning: this repairs a connection that exists, and a named
         // connection that has since died has nothing to restore.
         let handle = match expected_key {
-            Some(key) => match self
-                .ready_connection_by_key_for_config(key, Some(server_config))
-                .await
-            {
-                Some(handle) => handle,
-                None => {
+            Some(key) => {
+                // Does this host belong to the connection being repaired?
+                // Acquiring by key cannot answer that: the lookup succeeds for
+                // the key no matter which host asked, so a caller sweeping
+                // several hosts would open documents rooted elsewhere onto this
+                // connection. Resolve where the host actually routes and
+                // compare. Read-only — unlike the `None` arm below it never
+                // spawns, so asking about a host that belongs to some other
+                // root cannot bring that root's server up.
+                let (_marker, routes_to) = self
+                    .resolve_acquire(server_name, server_config, Some(host_uri))
+                    .await;
+                if &routes_to != key {
                     log::debug!(
                         target: "kakehashi::bridge",
-                        "Eager open: connection {key} is gone; nothing to repair for \
-                         {} injections",
-                        injections.len()
+                        "Eager open: {host_uri} routes to {routes_to}, not the \
+                         requested {key}; it supplies nothing for that connection"
                     );
-                    return OpenOutcome::NotOpened;
+                    return OpenOutcome::NotApplicable;
                 }
-            },
+                match self
+                    .ready_connection_by_key_for_config(key, Some(server_config))
+                    .await
+                {
+                    Some(handle) => handle,
+                    None => {
+                        log::debug!(
+                            target: "kakehashi::bridge",
+                            "Eager open: connection {key} is gone; nothing to repair for \
+                             {} injections",
+                            injections.len()
+                        );
+                        return OpenOutcome::NotOpened;
+                    }
+                }
+            }
             // Open wherever this host routes now, spawning if needed.
             None => match self
                 .get_or_create_connection_wait_ready(
@@ -129,21 +163,15 @@ impl LanguageServerPool {
             },
         };
 
+        // The by-key lookup returns the connection stored under that key, so
+        // comparing `handle.key()` to `expected_key` again could never fail —
+        // the question that CAN fail ("does this host route here?") is asked
+        // above, before the lookup.
         let connection_key = handle.key().clone();
-        // Belt-and-braces: the by-key lookup above already returns the named
-        // connection, so this only fires if that ever stops holding. Report it
-        // rather than open on a connection nobody asked for.
-        if let Some(expected) = expected_key
-            && &connection_key != expected
-        {
-            log::debug!(
-                target: "kakehashi::bridge",
-                "Eager open: resolved {connection_key}, not the requested \
-                 {expected}; skipping this open"
-            );
-            return OpenOutcome::WrongConnection;
-        }
         let mut sender = ConnectionHandleSender(&handle);
+        // Every injection's didOpen must actually be enqueued before this counts
+        // as a completed open.
+        let mut enqueued_all = true;
 
         let Some(lifecycle) = self.existing_host_lifecycle_lock(host_uri) else {
             // The host closed underneath us; nothing to open.
@@ -215,9 +243,21 @@ impl LanguageServerPool {
                     server_name,
                     e
                 );
+                // Keep opening the rest — one region failing does not make the
+                // others unopenable — but do NOT report success. A claim that
+                // did not settle, a full outbound queue, or a claim invalidated
+                // mid-enqueue each mean this connection is missing a document it
+                // should have, and a caller repairing it must hear so: that is
+                // exactly the state in which releasing a command produces the
+                // out-of-order delivery the barrier exists to prevent.
+                enqueued_all = false;
             }
         }
-        OpenOutcome::Opened
+        if enqueued_all {
+            OpenOutcome::Opened
+        } else {
+            OpenOutcome::NotOpened
+        }
     }
 
     /// Fire `didOpen` for the real host document on a `_self` host-bridge server
@@ -371,19 +411,27 @@ mod tests {
         );
     }
 
-    /// A named connection is repaired BY KEY, not by re-resolving the host.
-    /// When a config change re-roots the host between purge and respawn,
-    /// resolving from the host would repair a different connection and leave the
-    /// named one — the one the barrier signals for, and the one a routed command
-    /// carries — empty.
+    /// A host that has been re-rooted away from the connection being repaired
+    /// supplies nothing for it — and the connection is left EMPTY rather than
+    /// propped up with a document that no longer belongs to it.
+    ///
+    /// This is a deliberate consequence of deriving. The remembered-list design
+    /// re-opened such a host on the claimed connection anyway, because the list
+    /// asserted the host had been its document. Derived, current settings are
+    /// the authority: the host now routes elsewhere, so this connection's
+    /// correct contents are nothing, and `done` reporting success for an empty
+    /// connection is accurate rather than a lie. A command still in flight
+    /// against the old root fails downstream instead — the same outcome the
+    /// routing ADR already accepts for a token naming a root no open document
+    /// sits under.
     #[tokio::test]
-    async fn eager_open_repairs_the_named_connection_not_the_hosts_current_one() {
+    async fn a_rerooted_host_is_not_reopened_on_the_connection_it_left() {
         let pool = LanguageServerPool::new();
         let server_name = "lua_ls";
         let config = crate::lsp::bridge::pool::test_helpers::devnull_config_for_language("lua");
 
-        // The connection the purge claimed: rooted somewhere the host no longer
-        // resolves to. Nothing else would ever pick it.
+        // The connection the purge claimed, rooted where the host no longer
+        // resolves to. It is present and Ready, so only routing refuses it.
         let claimed = crate::lsp::bridge::ConnectionKey::new(
             server_name,
             Some("file:///claimed".to_string()),
@@ -396,12 +444,6 @@ mod tests {
         pool.open_host_incarnation(&host_uri, 1).await;
 
         use super::super::super::coordinator::BridgeInjection;
-        let injections = vec![BridgeInjection {
-            language: "lua".to_string(),
-            region_id: TEST_ULID_LUA_0.to_string(),
-            content: "print('hello')".to_string(),
-        }];
-
         let outcome = pool
             .eager_open_virtual_documents(
                 server_name,
@@ -412,18 +454,19 @@ mod tests {
                     incarnation: 1,
                     connection: Some(&claimed),
                 },
-                injections,
+                vec![BridgeInjection {
+                    language: "lua".to_string(),
+                    region_id: TEST_ULID_LUA_0.to_string(),
+                    content: "print('hello')".to_string(),
+                }],
             )
             .await;
 
-        assert_eq!(outcome, OpenOutcome::Opened);
+        assert_eq!(outcome, OpenOutcome::NotApplicable);
         let vuri = VirtualDocumentUri::new(&host_uri_lsp, "lua", TEST_ULID_LUA_0);
-        // The claimed connection is the one that got the document — resolving
-        // from the host would have produced the client-root fallback key, which
-        // is NOT `claimed`.
         assert!(
-            pool.is_document_opened_on_connection(&vuri, &claimed),
-            "the named connection must be the one repaired"
+            !pool.is_document_opened_on_connection(&vuri, &claimed),
+            "a host that routes elsewhere must not be opened here"
         );
     }
 
@@ -446,9 +489,11 @@ mod tests {
             content: "print('hello')".to_string(),
         }];
 
-        // No connection under this key at all.
-        let gone =
-            crate::lsp::bridge::ConnectionKey::new(server_name, Some("file:///gone".to_string()));
+        // The key this host routes to (client-root fallback, no marker above
+        // `/test`), with NO connection under it. Naming a key the host does not
+        // route to would be refused by the routing filter first and never reach
+        // the acquisition this test is about.
+        let gone = crate::lsp::bridge::ConnectionKey::for_server(server_name);
         let outcome = pool
             .eager_open_virtual_documents(
                 server_name,
@@ -473,6 +518,106 @@ mod tests {
             !pool.is_document_opened(&vuri),
             "and must not have opened anything anywhere"
         );
+    }
+
+    /// A named connection is not enough on its own: the host must actually
+    /// route there.
+    ///
+    /// Acquiring by key always succeeds for a key the pool holds, whichever
+    /// host asked — so without this check a caller sweeping candidate hosts
+    /// would open documents belonging to one root onto a connection serving
+    /// another. The connection here is present and `Ready`, so the by-key
+    /// acquisition WOULD hand it over; only the routing question refuses.
+    #[tokio::test]
+    async fn an_open_is_refused_for_a_connection_the_host_does_not_route_to() {
+        let pool = LanguageServerPool::new();
+        let config = devnull_config();
+        let server_name = "test-server";
+
+        // The host sits under no marker root, so it routes to the client
+        // fallback — never to this marker-rooted key.
+        let elsewhere = crate::lsp::bridge::ConnectionKey::new(
+            server_name,
+            Some("file:///elsewhere".to_string()),
+        );
+        let handle = create_handle_with_key(ConnectionState::Ready, elsewhere.clone()).await;
+        pool.insert_connection(handle).await;
+
+        let host_uri = test_host_uri("routes_elsewhere");
+        let host_uri_lsp = url_to_uri(&host_uri);
+        pool.open_host_incarnation(&host_uri, 1).await;
+
+        use super::super::super::coordinator::BridgeInjection;
+        let outcome = pool
+            .eager_open_virtual_documents(
+                server_name,
+                &config,
+                &host_uri,
+                &host_uri_lsp,
+                OpenExpectation {
+                    incarnation: 1,
+                    connection: Some(&elsewhere),
+                },
+                vec![BridgeInjection {
+                    language: "lua".to_string(),
+                    region_id: TEST_ULID_LUA_0.to_string(),
+                    content: "print('hello')".to_string(),
+                }],
+            )
+            .await;
+
+        assert_eq!(outcome, OpenOutcome::NotApplicable);
+        assert!(
+            !pool.is_document_opened(&VirtualDocumentUri::new(
+                &host_uri_lsp,
+                "lua",
+                TEST_ULID_LUA_0
+            )),
+            "nothing may be opened on a connection this host does not route to"
+        );
+    }
+
+    /// The mirror of the above: when the host DOES route to the named
+    /// connection, naming it opens exactly as an unnamed open would.
+    #[tokio::test]
+    async fn an_open_for_the_connection_the_host_routes_to_proceeds() {
+        let pool = LanguageServerPool::new();
+        let config = devnull_config();
+        let server_name = "test-server";
+
+        let routed_key = crate::lsp::bridge::ConnectionKey::for_server(server_name);
+        let handle = create_handle_with_key(ConnectionState::Ready, routed_key.clone()).await;
+        pool.insert_connection(handle).await;
+
+        let host_uri = test_host_uri("routes_here");
+        let host_uri_lsp = url_to_uri(&host_uri);
+        pool.open_host_incarnation(&host_uri, 1).await;
+
+        use super::super::super::coordinator::BridgeInjection;
+        let outcome = pool
+            .eager_open_virtual_documents(
+                server_name,
+                &config,
+                &host_uri,
+                &host_uri_lsp,
+                OpenExpectation {
+                    incarnation: 1,
+                    connection: Some(&routed_key),
+                },
+                vec![BridgeInjection {
+                    language: "lua".to_string(),
+                    region_id: TEST_ULID_LUA_0.to_string(),
+                    content: "print('hello')".to_string(),
+                }],
+            )
+            .await;
+
+        assert_eq!(outcome, OpenOutcome::Opened);
+        assert!(pool.is_document_opened(&VirtualDocumentUri::new(
+            &host_uri_lsp,
+            "lua",
+            TEST_ULID_LUA_0
+        )));
     }
 
     /// Test that eager_open_virtual_documents is idempotent.
