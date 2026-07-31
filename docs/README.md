@@ -892,7 +892,7 @@ written — the rename moves only the named entry onto the new content, so the
 other names would silently keep the old. Such a file is reported per file and
 counted as a write error (exit `2`); the rest of the run continues. Detection
 depends on the filesystem reporting a true link count, and is Unix-only — on
-Windows, and on mounts that report link counts inaccurately (some FUSE
+Windows, and on mounts that under-report link counts (some FUSE
 backends, `cifs` without UNIX extensions), a hard-linked file is still
 rewritten and its other names keep the old content. `--check` is unaffected: it answers
 whether the content would change, not whether the write would succeed.
