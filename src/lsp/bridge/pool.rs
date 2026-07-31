@@ -705,6 +705,11 @@ impl LanguageServerPool {
                 .await
                 .retain(|(_, connection_key), _| connection_key != &key);
             self.document_tracker.purge_connection(&key).await;
+            // Arm before the replacement can claim: what this connection held
+            // is irrelevant, only that it owes a re-open. A connection dropped
+            // mid-handshake held nothing at all, which is exactly the case a
+            // host-list-shaped record would have skipped.
+            self.pending_reopen.arm(&key);
             self.purge_open_transition_locks(&key).await;
             if let Some(handle) = connections.remove(&key) {
                 stale_handles.push((key, handle));
