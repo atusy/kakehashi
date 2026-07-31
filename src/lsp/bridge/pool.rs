@@ -718,13 +718,22 @@ impl LanguageServerPool {
             return false;
         }
 
+        // The snapshot is mutated UNDER the connections guard, not before it.
+        // `didChangeWorkspaceFolders` has no ingress ordering gate and tower-lsp
+        // polls handlers concurrently, so two events could otherwise apply to
+        // the snapshot in one order and reach the forwarding loop in the other
+        // — leaving the pool's set and a downstream's disagreeing about which
+        // folder is current. Under the guard the snapshot, the derived root,
+        // the fence, and the forwarding are one transaction per event. The
+        // spawn path reads both while holding the same guard, so a connection
+        // cannot be created from a half-applied change either.
+        let mut connections = self.connections.lock().await;
+
         self.workspace_folders.apply_change(added.clone(), removed);
         self.set_root_uri(
             self.workspace_folders()
                 .and_then(|folders| folders.first().map(|folder| folder.uri.to_string())),
         );
-
-        let mut connections = self.connections.lock().await;
         // Every connection that follows the client workspace has just had the
         // project its diagnostics describe replaced, so no previousResultId
         // lineage survives the change — the same reasoning `propagate_settings`

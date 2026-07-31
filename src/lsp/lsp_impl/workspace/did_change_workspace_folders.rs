@@ -48,28 +48,6 @@ impl Kakehashi {
             return;
         }
 
-        // The change moved the project every client-fallback downstream
-        // analyses, so what they report can differ while no document — and no
-        // document version — did. A pull-namespace editor has no event of its
-        // own for that, and the lineage the call above just dropped means an
-        // answer crossing the change resolves to an empty layer rather than the
-        // baseline. Both are repaired by the same nudge.
-        //
-        // FORCED because the coverage gate suppresses an unforced refresh when
-        // nothing is dirty by version — the exact shape of a change that moves
-        // the project rather than the documents. Requested here rather than
-        // after the reload because the `--config-file` branch returns before
-        // it, never reaching a later call site. Capability-gated and
-        // single-flighted inside; `forced` bypasses neither.
-        //
-        // The request is fire-and-forget, so the editor's re-pull can land
-        // while the reload below still holds the pre-reload settings. That is
-        // benign — the root path is read only where settings are loaded, never
-        // at spawn — and a reload that does change something recycles through
-        // `propagate_settings` and nudges again on its own.
-        super::super::coordinator::DiagnosticPublisher::new(self)
-            .request_pull_diagnostic_refresh(true);
-
         // An emptied folder list does not leave the session rootless when the
         // client named another root: the rungs below `workspaceFolders` answer,
         // as they did at initialize. A client that named none gets no project
@@ -90,9 +68,11 @@ impl Kakehashi {
         // exactly once by contract, which leaves this reload nothing to read
         // and only initialize's settings events to re-emit. Refreshing the root
         // — which still anchors relative paths — and stopping there is the whole
-        // of it.
+        // of it. This branch returns before any reload below, so it is the only
+        // chance the pull-namespace nudge gets on this path.
         if crate::config::expand::config_file_override().is_some() {
             self.settings_manager.set_root_path(root_path);
+            self.request_folder_change_repull();
             return;
         }
 
@@ -138,6 +118,33 @@ impl Kakehashi {
                     .await;
             }
         }
+        // After the reload, not before it. The editor answers a refresh by
+        // pulling immediately, and a pull served from the previous project's
+        // settings is not merely stale: if the new project drops the server
+        // that produced a layer, the reparse that follows yields
+        // `PullLayerOutcome::Skip`, which neither clears the layer nor asks for
+        // another refresh — so the editor would keep diagnostics from a server
+        // the new workspace does not configure. Requested on the error path
+        // too: the previous settings remain in effect there, but the folder set
+        // and the fence moved regardless, so the editor still owes itself a
+        // pull.
+        self.request_folder_change_repull();
+    }
+
+    /// Ask a pull-namespace editor to re-pull after a workspace-folder change.
+    ///
+    /// FORCED because the coverage gate suppresses an unforced refresh when
+    /// nothing is dirty by version — the exact shape of a change that moves the
+    /// project rather than the documents. Capability-gated and single-flighted
+    /// inside; `forced` bypasses neither.
+    ///
+    /// Without it the editor has no event of its own telling it the project
+    /// moved, and the lineage the pool just fenced means an answer crossing the
+    /// change resolves to an empty layer rather than the baseline. One nudge
+    /// repairs both.
+    fn request_folder_change_repull(&self) {
+        super::super::coordinator::DiagnosticPublisher::new(self)
+            .request_pull_diagnostic_refresh(true);
     }
 }
 
@@ -183,7 +190,10 @@ mod tests {
         // parks in this harness on a socket the test never drains — verified by
         // mutating the guard away, where an unbounded await hung instead of
         // reporting the count it had already moved.
-        let _ = tokio::time::timeout(
+        // The result is asserted, not discarded: a handler that stalls BEFORE
+        // requesting the refresh would otherwise leave the counter at zero and
+        // pass after simply waiting out the bound.
+        tokio::time::timeout(
             std::time::Duration::from_secs(5),
             server.did_change_workspace_folders_impl(DidChangeWorkspaceFoldersParams {
                 event: WorkspaceFoldersChangeEvent {
@@ -192,7 +202,8 @@ mod tests {
                 },
             }),
         )
-        .await;
+        .await
+        .expect("an event that names no folder must return without a reload");
 
         assert_eq!(
             server.diagnostics.metrics_snapshot().refreshes_requested,
