@@ -13,7 +13,6 @@
 //! `kakehashi/internal/effectiveConfiguration` takes empty params and keeps
 //! its name.
 
-use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use dashmap::DashSet;
@@ -90,12 +89,14 @@ const VENDOR_PREFIX: &str = "kakehashi/";
 /// Returns `&'static str` rather than `String` so the result doubles as the
 /// dedup key for the once-per-method deprecation warning; the wire method name
 /// is owned and would otherwise have to be cloned into the seen-set.
-pub(crate) fn canonical_method(method: &str) -> Option<&'static str> {
+fn canonical_method(method: &str) -> Option<&'static str> {
     let feature = method.strip_prefix(VENDOR_PREFIX)?;
-    // Already canonical. Checked before the lookup so the mapping is
-    // idempotent: without this, `kakehashi/textDocument/node` would fail the
-    // lookup anyway, but a future `kakehashi/textDocument/…` method that
-    // happens to share a suffix would not.
+    // Short-circuit the canonical spellings. This is a HOT-PATH guard, not a
+    // correctness one: the lookup below would also miss, because stripping
+    // `CANONICAL_PREFIX` from an entry can never leave a suffix that starts
+    // with `textDocument/`. Without it, every canonical call — and clients
+    // walking a tree fire these in bursts — would scan all 41 entries to
+    // conclude nothing matches.
     if method.starts_with(CANONICAL_PREFIX) {
         return None;
     }
@@ -108,50 +109,30 @@ pub(crate) fn canonical_method(method: &str) -> Option<&'static str> {
 /// Tower middleware rewriting deprecated custom method names to their
 /// canonical spelling, warning once per distinct old name.
 ///
-/// **Must be the OUTERMOST layer** — above [`IngressOrderGate`]. That gate
-/// classifies requests by method name to assign per-document wire-order
-/// tickets, and knows only the canonical spellings. Placed below the gate,
-/// this layer would let an old name arrive unrecognized, pass through ungated,
-/// and read a tree that is missing edits which preceded it on the wire.
+/// **Must wrap the ordering gate**, never the reverse — see [`ingress_stack`],
+/// which is the only place the two are composed and where the reasoning lives.
 ///
-/// [`IngressOrderGate`]: crate::lsp::IngressOrderGate
-pub struct DeprecatedMethodAlias<S> {
+/// [`ingress_stack`]: crate::lsp::ingress_stack
+pub(crate) struct DeprecatedMethodAlias<S> {
     inner: S,
-    /// Old names already warned about. Shared behind an `Arc` because tower
-    /// clones services, and the warning is once per *session*, not per clone.
-    warned: Arc<DashSet<&'static str>>,
+    /// Old names already warned about, so a client that never migrates gets one
+    /// line per name rather than one per keystroke.
+    ///
+    /// Bounded at 41 entries — the keys are `&'static str` drawn from the frozen
+    /// table, not from the wire. Interior mutability rather than `&mut self`
+    /// because `Service::call` hands out `&mut self` but `rewrite` is shared
+    /// through it.
+    warned: DashSet<&'static str>,
 }
 
 impl<S> DeprecatedMethodAlias<S> {
-    pub fn new(inner: S) -> Self {
+    pub(crate) fn new(inner: S) -> Self {
         Self {
             inner,
-            warned: Arc::new(DashSet::new()),
+            warned: DashSet::new(),
         }
     }
-}
 
-impl<S> Service<Request> for DeprecatedMethodAlias<S>
-where
-    S: Service<Request>,
-{
-    type Response = S::Response;
-    type Error = S::Error;
-    type Future = S::Future;
-
-    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        self.inner.poll_ready(cx)
-    }
-
-    fn call(&mut self, req: Request) -> Self::Future {
-        // Stays synchronous through to the delegate: every layer below relies
-        // on `call` being invoked in wire order, so this must not await, spawn,
-        // or reorder.
-        self.inner.call(self.rewrite(req))
-    }
-}
-
-impl<S> DeprecatedMethodAlias<S> {
     /// Rewrite a deprecated method name in place, leaving `id` and `params`
     /// untouched. Non-deprecated requests are returned unchanged.
     fn rewrite(&self, req: Request) -> Request {
@@ -180,6 +161,26 @@ impl<S> DeprecatedMethodAlias<S> {
             builder = builder.id(id);
         }
         builder.finish()
+    }
+}
+
+impl<S> Service<Request> for DeprecatedMethodAlias<S>
+where
+    S: Service<Request>,
+{
+    type Response = S::Response;
+    type Error = S::Error;
+    type Future = S::Future;
+
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        self.inner.poll_ready(cx)
+    }
+
+    fn call(&mut self, req: Request) -> Self::Future {
+        // Stays synchronous through to the delegate: every layer below relies
+        // on `call` being invoked in wire order, so this must not await, spawn,
+        // or reorder.
+        self.inner.call(self.rewrite(req))
     }
 }
 
@@ -269,6 +270,35 @@ mod tests {
     /// through a middleware wrapping the unit type rather than a stub service.
     fn alias() -> DeprecatedMethodAlias<()> {
         DeprecatedMethodAlias::new(())
+    }
+
+    #[test]
+    fn the_warning_fires_once_per_name_not_once_per_call() {
+        // The regression this guards is silent and unbounded: inverting the
+        // `insert` condition warns on every call, so a client that never
+        // migrates floods the log at keystroke rate. Nothing else would fail.
+        let alias = alias();
+        let deprecated = || Request::build("kakehashi/node/parent").id(1).finish();
+
+        alias.rewrite(deprecated());
+        alias.rewrite(deprecated());
+        alias.rewrite(deprecated());
+        assert_eq!(alias.warned.len(), 1, "one entry for three calls");
+
+        alias.rewrite(Request::build("kakehashi/captures/full").id(2).finish());
+        assert_eq!(alias.warned.len(), 2, "a distinct name warns separately");
+
+        // A canonical name is not a deprecation and must not be recorded.
+        alias.rewrite(
+            Request::build("kakehashi/textDocument/node/parent")
+                .id(3)
+                .finish(),
+        );
+        assert_eq!(
+            alias.warned.len(),
+            2,
+            "canonical names are not warned about"
+        );
     }
 
     #[test]

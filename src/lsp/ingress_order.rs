@@ -363,8 +363,11 @@ pub(crate) fn normalize_uri(raw: &str) -> String {
 }
 
 /// Tower middleware applying [`DocumentSequencer`] ordering to the LSP
-/// request stream. Wraps the outermost service handed to `Server::serve` so
-/// ticket assignment happens in wire order.
+/// request stream. Composed by [`ingress_stack`] directly beneath the
+/// deprecated-method alias layer, so ticket assignment still happens in wire
+/// order — every layer above it must delegate synchronously.
+///
+/// [`ingress_stack`]: crate::lsp::ingress_stack
 pub struct IngressOrderGate<S> {
     inner: S,
     sequencer: Arc<DocumentSequencer>,
