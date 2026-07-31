@@ -1379,10 +1379,29 @@ impl DiagnosticAggregator {
             .recover_poison("DiagnosticAggregator::degraded_pulls");
         // A repeat debt from a NEWER lifetime must overwrite the epoch, or the
         // clear below would key on a lifetime that no longer owes anything.
-        if let Some(recorded) = degraded.get_mut(host) {
-            *recorded = epoch;
-        } else {
-            degraded.insert(host.clone(), epoch);
+        // But it must never REWIND: a stale degraded pull landing after the
+        // reopened one would otherwise re-key the debt to the closed lifetime,
+        // and a stale covering pull from that same lifetime could then clear
+        // it — losing the reopened host's recovery refresh, which is the whole
+        // failure this scoping exists to prevent. Epochs are minted by a
+        // monotonic counter, so `>=` is genuinely "not older".
+        match degraded.get_mut(host) {
+            Some(recorded) => {
+                let replace = match (*recorded, epoch) {
+                    (Some(stored), Some(new)) => new >= stored,
+                    // An identified lifetime is strictly better than none.
+                    (None, Some(_)) => true,
+                    // ...and going back to unidentified is not an improvement.
+                    (Some(_), None) => false,
+                    (None, None) => true,
+                };
+                if replace {
+                    *recorded = epoch;
+                }
+            }
+            None => {
+                degraded.insert(host.clone(), epoch);
+            }
         }
     }
 
@@ -1415,19 +1434,28 @@ impl DiagnosticAggregator {
     /// to recover and the editor would keep the region-less answer. A mismatch
     /// leaves the debt, costing at most one extra forced refresh, which is the
     /// direction that cannot lose a needed one.
+    ///
+    /// A stampless pull clears NOTHING. Coverage entries are created lazily, so
+    /// a pull can observe none and still answer degraded once a push creates
+    /// slots during its awaits — meaning an old covering pull and a reopened
+    /// degraded pull can both carry `None`. Treating those as the same lifetime
+    /// would delete the reopened debt on exactly the evidence that proves
+    /// nothing: absence of an identity is not a matching identity.
     pub(crate) fn forget_degraded_pull_from(
         &self,
         host: &Url,
         stamp: Option<DiagnosticCoverageStamp>,
     ) {
-        let epoch = stamp.map(|stamp| stamp.epoch);
+        let Some(stamp) = stamp else {
+            return;
+        };
         let mut degraded = self
             .degraded_pulls
             .lock()
             .recover_poison("DiagnosticAggregator::degraded_pulls");
         if degraded
             .get(host)
-            .is_some_and(|recorded| *recorded == epoch)
+            .is_some_and(|recorded| *recorded == Some(stamp.epoch))
         {
             degraded.remove(host);
         }
@@ -4007,6 +4035,56 @@ mod tests {
             !agg.take_degraded_pull(&h),
             "a covering pull from the recording lifetime clears the debt"
         );
+    }
+
+    /// A degraded pull from the CLOSED lifetime landing after the reopened one
+    /// must not re-key the debt backwards, or a covering pull from that same
+    /// closed lifetime could then clear it.
+    #[test]
+    fn a_stale_degraded_pull_does_not_rewind_the_debts_lifetime() {
+        let agg = DiagnosticAggregator::new();
+        let h = host();
+        agg.bump_current(&h);
+        let stale = agg.coverage_stamp(&h).expect("coverage before close");
+
+        agg.forget_coverage(&h);
+        agg.bump_current(&h);
+        let reopened = agg.coverage_stamp(&h).expect("reopened coverage");
+
+        // The reopened lifetime owes a recovery...
+        agg.record_degraded_pull(&h, Some(reopened));
+        // ...then a degraded pull from the closed lifetime finally lands.
+        agg.record_degraded_pull(&h, Some(stale));
+        // A covering pull from the closed lifetime must still not settle it.
+        agg.forget_degraded_pull_from(&h, Some(stale));
+
+        assert!(
+            agg.take_degraded_pull(&h),
+            "a stale degraded pull must not re-key the debt to its own lifetime"
+        );
+    }
+
+    /// Coverage entries are lazy, so two pulls from DIFFERENT lifetimes can
+    /// both observe none. Absence of an identity is not a matching identity.
+    #[test]
+    fn a_stampless_covering_pull_clears_nothing() {
+        let agg = DiagnosticAggregator::new();
+        let h = host();
+
+        // A degraded pull that saw no coverage entry.
+        agg.record_degraded_pull(&h, None);
+        agg.forget_degraded_pull_from(&h, None);
+        assert!(
+            agg.take_degraded_pull(&h),
+            "a pull with no lifetime cannot prove it owns the debt"
+        );
+
+        // And it cannot clear an identified lifetime's debt either.
+        agg.bump_current(&h);
+        let stamp = agg.coverage_stamp(&h).expect("coverage exists");
+        agg.record_degraded_pull(&h, Some(stamp));
+        agg.forget_degraded_pull_from(&h, None);
+        assert!(agg.take_degraded_pull(&h));
     }
 
     #[test]
