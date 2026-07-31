@@ -219,7 +219,7 @@ anyway, incorrectly, since it cannot include documents opened since the purge.
 
 ### Known limits of `done`
 
-Four ways the sweep's report can be wrong — mostly by claiming success for a
+Tracked as issue #929. Four ways the sweep's report can be wrong — mostly by claiming success for a
 connection that is not caught up, and in the last case by claiming failure for a
 document nobody is owed. All are narrow, all degrade to the pre-existing lazy
 heal (the next parse's eager open), and none is introduced here — but the
@@ -235,8 +235,8 @@ settings-reload path, which invalidates every parse and purges connections in
 the same pass. Distinguishing a placeholder from a legitimately tree-less parse
 (no parser loaded, parse produced nothing) needs a discriminator the snapshot
 does not currently carry, and rejecting every tree-less snapshot instead would
-wedge the barrier shut while a parser is still being installed. Tracked as the
-same class as the reload-placeholder issue in the parse-snapshot work.
+wedge the barrier shut while a parser is still being installed. Same root cause
+as the reload-placeholder issue (#923).
 
 **An empty resolution can be confirmed against a NEWER version.** If a
 `didChange` clears the tree and its reparse publishes before the currency
