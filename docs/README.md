@@ -837,11 +837,12 @@ kakehashi config init --output ./kakehashi.toml --force
 
 `--force` only applies when `--output` is used.
 
-Without `--force`, the output path is never touched: the file is created
-exclusively, so *any* existing entry there — a regular file, a directory, or a
-symlink, including a dangling one — makes the command report an error and exit
-non-zero rather than write. With `--force`, a symlink at the output path is
-followed and its target is written; the link itself stays.
+Without `--force`, an entry already at the output path is never touched: the
+file is created exclusively, so *anything* there — a regular file, a
+directory, or a symlink, including a dangling one — makes the command report
+an error and exit non-zero rather than write. With `--force`, a symlink is
+followed rather than replaced, so the write lands on its target when that
+target can be opened as a file.
 
 ### Formatting
 
