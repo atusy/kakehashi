@@ -448,6 +448,38 @@ fn test_config_init_output_no_overwrite_without_force() {
     assert_eq!(content, "existing", "Original content should be preserved");
 }
 
+/// Test that config init --output refuses a dangling symlink instead of
+/// creating whatever it points at. `Path::exists()` follows symlinks, so the
+/// old precheck read a dangling link as absent and wrote through it (#763).
+#[cfg(unix)]
+#[test]
+fn test_config_init_output_rejects_dangling_symlink() {
+    let test_dir = tempfile::tempdir().expect("Failed to create temp dir");
+    let redirected = test_dir.path().join("redirected.toml");
+    std::os::unix::fs::symlink(&redirected, test_dir.path().join("kakehashi.toml"))
+        .expect("Failed to create dangling symlink");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_kakehashi"))
+        .args(["config", "init", "--output", "kakehashi.toml"])
+        .current_dir(test_dir.path())
+        .output()
+        .expect("Failed to execute command");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success(),
+        "A dangling symlink is an existing entry and must be refused; stderr: {stderr}"
+    );
+    assert!(
+        !redirected.exists(),
+        "The link's target must not be created; stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("symbolic link"),
+        "The refusal must not promise that --force replaces the link; stderr: {stderr}"
+    );
+}
+
 /// Test that config init --output --force overwrites existing file
 #[test]
 fn test_config_init_output_force_overwrites() {

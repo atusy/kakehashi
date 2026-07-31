@@ -184,7 +184,7 @@ enum ConfigAction {
         #[arg(long)]
         output: Option<PathBuf>,
 
-        /// Overwrite existing file (only applies with --output)
+        /// Overwrite whatever is at the output path (only applies with --output)
         #[arg(long)]
         force: bool,
     },
@@ -197,7 +197,7 @@ enum ConfigAction {
         #[arg(long)]
         output: Option<PathBuf>,
 
-        /// Overwrite existing file (only applies with --output)
+        /// Overwrite whatever is at the output path (only applies with --output)
         #[arg(long)]
         force: bool,
     },
@@ -641,6 +641,24 @@ fn find_parser_file(parser_dir: &std::path::Path, lang: &str) -> Option<PathBuf>
     if path.exists() { Some(path) } else { None }
 }
 
+/// What to tell someone whose `--output` path is already taken. Blanket
+/// "use --force to overwrite" advice is wrong for two of the three cases:
+/// `--force` writes *through* a symlink to whatever it points at, and it
+/// cannot write to a directory at all.
+///
+/// The entry is inspected only to word the message — the refusal itself was
+/// already decided atomically by `create_new`, so a path that changes between
+/// the two costs at worst a misleading sentence, never a wrong action.
+fn overwrite_advice(path: &Path) -> &'static str {
+    match path.symlink_metadata() {
+        Ok(metadata) if metadata.is_dir() => "It is a directory; --force cannot overwrite it.",
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            "It is a symbolic link; --force would write through to its target rather than replace the link."
+        }
+        _ => "Use --force to overwrite.",
+    }
+}
+
 /// Write content to stdout or a file, with --force / --output semantics.
 fn write_content_to_output(
     content: &str,
@@ -654,6 +672,13 @@ fn write_content_to_output(
     }
 
     if let Some(path) = output.as_ref().filter(|p| p.as_os_str() != "-") {
+        // `create_new` (O_CREAT|O_EXCL), not an `exists()` check followed by a
+        // write: check-then-write has two holes that one syscall closes.
+        // `exists()` follows symlinks, so a dangling symlink reads as absent
+        // and the write lands on its target instead of refusing; and anything
+        // created between the check and the write is silently truncated
+        // (#763). `--force` keeps the plain truncating write — replacing what
+        // is already there is exactly what it asks for.
         let write_result = if force {
             std::fs::write(path, content)
         } else {
@@ -670,10 +695,15 @@ fn write_content_to_output(
             Ok(()) => {
                 eprintln!("Created {label} file: {}", path.display());
             }
+            // `!force` is unreachable today (a truncating write cannot report
+            // `AlreadyExists`) and stays deliberately: without it, a future
+            // force-path error of this kind would tell someone who already
+            // passed `--force` to pass `--force`.
             Err(e) if !force && e.kind() == std::io::ErrorKind::AlreadyExists => {
                 eprintln!(
-                    "Error: An entry already exists at '{}'. Use --force to overwrite.",
-                    path.display()
+                    "Error: An entry already exists at '{}'. {}",
+                    path.display(),
+                    overwrite_advice(path)
                 );
                 return Err(ExitCode::FAILURE);
             }
@@ -1153,6 +1183,9 @@ mod tests {
         assert_eq!(installed_query_language_name(&hidden), None);
     }
 
+    /// `Path::exists()` follows symlinks, so the old precheck read a dangling
+    /// link as absent and the write clobbered the link's target (#763). The
+    /// entry at the output path must survive as the link it is.
     #[cfg(unix)]
     #[test]
     fn output_without_force_rejects_dangling_symlink() {
@@ -1169,8 +1202,38 @@ mod tests {
         assert!(result.is_err());
         assert!(output.symlink_metadata().unwrap().file_type().is_symlink());
         assert!(!redirected.exists());
+
+        // Positive control: this directory is writable, so the refusal above
+        // came from the dangling link and not from an unwritable fixture.
+        let fresh = temp.path().join("fresh.toml");
+        write_content_to_output("generated", Some(fresh.clone()), false, "configuration")
+            .expect("a free path in the same directory must still be created");
+        assert_eq!(std::fs::read_to_string(fresh).unwrap(), "generated");
     }
 
+    /// `--force` opts out of the no-clobber guard, and that means writing
+    /// *through* a symlink rather than replacing it — the reason the refusal
+    /// message stops advertising `--force` for a link. Pinned so the behavior
+    /// cannot drift silently while #800 decides whether to keep it.
+    #[cfg(unix)]
+    #[test]
+    fn output_with_force_follows_a_symlink_to_its_target() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::TempDir::new().unwrap();
+        let redirected = temp.path().join("redirected.toml");
+        let output = temp.path().join("config.toml");
+        symlink(&redirected, &output).unwrap();
+
+        write_content_to_output("generated", Some(output.clone()), true, "configuration")
+            .expect("--force must not be blocked by the link");
+
+        assert!(output.symlink_metadata().unwrap().file_type().is_symlink());
+        assert_eq!(std::fs::read_to_string(&redirected).unwrap(), "generated");
+    }
+
+    /// Guards the `AlreadyExists` mapping rather than the #763 fix itself:
+    /// the old `exists()` precheck already refused a plain file.
     #[test]
     fn output_without_force_preserves_existing_file() {
         let temp = tempfile::TempDir::new().unwrap();
