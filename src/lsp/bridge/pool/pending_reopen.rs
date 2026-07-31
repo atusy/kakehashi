@@ -33,11 +33,19 @@ use crate::error::LockResultExt;
 /// stuck downstream must not hold a user-facing request open indefinitely.
 pub(crate) const REOPEN_WAIT: Duration = Duration::from_secs(2);
 
+/// The two halves of a key's re-open state, under ONE lock.
+///
+/// They are separate maps but a single invariant: a key is either owing a
+/// re-open, or having one made, never both and never neither-by-accident.
+/// Splitting the lock let `claim` disarm under one mutex and install under the
+/// other, so a second claim could interleave between them and have its live
+/// barrier overwritten by the first — leaving one connection Ready with an
+/// unclaimable debt and the other reporting through a channel nobody holds.
 #[derive(Default)]
-pub(crate) struct PendingReopenRegistry {
+struct ReopenState {
     /// Keys whose connection was purged and whose replacement still owes a
     /// re-open.
-    armed: Mutex<HashSet<ConnectionKey>>,
+    armed: HashSet<ConnectionKey>,
     /// Re-opens handed off but not yet finished, so a request that must not
     /// overtake its own `didOpen` can wait for one.
     ///
@@ -45,7 +53,12 @@ pub(crate) struct PendingReopenRegistry {
     /// server side does the work), so without this a command enqueued right
     /// after `Ready` would reach the downstream BEFORE the didOpen it depends
     /// on — the FIFO ordering the previous inline heal guaranteed by awaiting.
-    in_flight: Mutex<HashMap<ConnectionKey, watch::Receiver<bool>>>,
+    in_flight: HashMap<ConnectionKey, watch::Receiver<bool>>,
+}
+
+#[derive(Default)]
+pub(crate) struct PendingReopenRegistry {
+    state: Mutex<ReopenState>,
 }
 
 impl PendingReopenRegistry {
@@ -62,9 +75,10 @@ impl PendingReopenRegistry {
     /// Idempotent — a key purged twice before any replacement lands is armed
     /// once, and one re-open brings the replacement fully up to date.
     pub(crate) fn arm(&self, key: &ConnectionKey) {
-        self.armed
+        self.state
             .lock()
             .recover_poison("PendingReopenRegistry::arm")
+            .armed
             .insert(key.clone());
     }
 
@@ -81,19 +95,21 @@ impl PendingReopenRegistry {
     /// or is never serviced releases waiters instead of stranding them until the
     /// timeout.
     pub(crate) fn claim(&self, key: &ConnectionKey) -> Option<watch::Sender<bool>> {
-        if !self
-            .armed
+        // Disarm and install under ONE lock. Releasing between them let a second
+        // handshake claim the same key and install its barrier, which this one
+        // would then overwrite: the second connection reaches Ready reporting
+        // through a channel the registry no longer holds, its `done` reads as
+        // closed, and the debt it was supposed to settle stays armed with
+        // nothing left to claim it.
+        let mut state = self
+            .state
             .lock()
-            .recover_poison("PendingReopenRegistry::claim")
-            .remove(key)
-        {
+            .recover_poison("PendingReopenRegistry::claim");
+        if !state.armed.remove(key) {
             return None;
         }
         let (tx, rx) = watch::channel(false);
-        self.in_flight
-            .lock()
-            .recover_poison("PendingReopenRegistry::claim")
-            .insert(key.clone(), rx);
+        state.in_flight.insert(key.clone(), rx);
         Some(tx)
     }
 
@@ -115,19 +131,18 @@ impl PendingReopenRegistry {
     /// prevent, and the one case that does NOT degrade to the lazy heal.
     pub(crate) fn rearm(&self, key: &ConnectionKey, done: &watch::Sender<bool>) {
         let probe = done.subscribe();
+        let mut state = self
+            .state
+            .lock()
+            .recover_poison("PendingReopenRegistry::rearm");
+        if state
+            .in_flight
+            .get(key)
+            .is_some_and(|current| current.same_channel(&probe))
         {
-            let mut in_flight = self
-                .in_flight
-                .lock()
-                .recover_poison("PendingReopenRegistry::rearm");
-            if in_flight
-                .get(key)
-                .is_some_and(|current| current.same_channel(&probe))
-            {
-                in_flight.remove(key);
-            }
+            state.in_flight.remove(key);
         }
-        self.arm(key);
+        state.armed.insert(key.clone());
     }
 
     /// Wait (bounded by [`REOPEN_WAIT`]) for an in-flight re-open on `key`.
@@ -149,9 +164,10 @@ impl PendingReopenRegistry {
     /// downstream error.
     pub(crate) async fn wait_for_reopen(&self, key: &ConnectionKey) -> bool {
         let Some(mut rx) = self
-            .in_flight
+            .state
             .lock()
             .recover_poison("PendingReopenRegistry::wait_for_reopen")
+            .in_flight
             .get(key)
             .cloned()
         else {
@@ -188,15 +204,16 @@ impl PendingReopenRegistry {
         // respawn may have claimed the key in between and registered a genuinely
         // outstanding re-open. Removing by key alone would evict it.
         if retire {
-            let mut in_flight = self
-                .in_flight
+            let mut state = self
+                .state
                 .lock()
                 .recover_poison("PendingReopenRegistry::wait_for_reopen");
-            if in_flight
+            if state
+                .in_flight
                 .get(key)
                 .is_some_and(|current| current.same_channel(&rx))
             {
-                in_flight.remove(key);
+                state.in_flight.remove(key);
             }
         }
         settled
