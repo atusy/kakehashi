@@ -373,7 +373,7 @@ impl Kakehashi {
         if degraded_virt {
             // The debt drives the post-parse recovery refresh (see
             // `DiagnosticAggregator::degraded_pulls`).
-            self.diagnostics.record_degraded_pull(&uri);
+            self.diagnostics.record_degraded_pull(&uri, coverage_stamp);
             // TOCTOU guard: `snapshot` was captured before the fan-out/fold
             // awaits above, so the parse may have landed — and the post-parse
             // debt consumer already run — in between, leaving this
@@ -421,10 +421,17 @@ impl Kakehashi {
     /// A pull answered with a covering (non-degraded) report: advance the
     /// coverage `served` marker and clear any earlier degraded-pull debt —
     /// every covering exit must do both, or a stale debt would later fire an
-    /// unnecessary (though coverage-gated) recovery refresh.
+    /// unnecessary recovery refresh. Not coverage-gated: both recovery paths
+    /// pass `forced`, so the debt is the only thing standing between a stale
+    /// entry and a refresh.
+    ///
+    /// Both halves are scoped to the coverage lifetime this pull observed. A
+    /// pull that started before a close+reopen may neither mark the reopened
+    /// lifetime served nor clear a debt recorded within it (#745).
     fn mark_pull_covered(&self, uri: &Url, coverage_stamp: Option<DiagnosticCoverageStamp>) {
         self.diagnostics.mark_served(uri, coverage_stamp);
-        self.diagnostics.forget_degraded_pull(uri);
+        self.diagnostics
+            .forget_degraded_pull_from(uri, coverage_stamp);
     }
 
     /// pushFallback fold (Path B, #425): append push-driven servers' cached
