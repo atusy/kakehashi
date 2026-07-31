@@ -123,6 +123,17 @@ impl ClientRoot<'_> {
 }
 
 /// Pick the root from the workspace inputs the upstream client actually sent.
+///
+/// An empty `workspaceFolders` does not suppress the deprecated fields, so
+/// `{workspaceFolders: [], rootUri: X}` still roots at `X`. Reviewers read that
+/// pair as contradictory and propose making the empty list authoritative;
+/// it costs more than it looks. LSP gives `[]` no meaning distinct from `null`
+/// ("supports folders, none configured"), while `rootUri` is documented as null
+/// when no folder is open — so a client that meant "no workspace" left the field
+/// that says it unused. And because this ladder also feeds config discovery,
+/// suppressing `X` would not leave that root empty: it would fall through to the
+/// process CWD, trading a location the client named for the launch directory
+/// #742 exists to stop depending on.
 #[allow(deprecated)]
 fn client_root(params: &InitializeParams) -> Option<ClientRoot<'_>> {
     if let Some(folder) = params
