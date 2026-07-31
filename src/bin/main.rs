@@ -642,12 +642,15 @@ fn find_parser_file(parser_dir: &std::path::Path, lang: &str) -> Option<PathBuf>
 }
 
 /// What to tell someone whose `--output` path is already taken. A regular
-/// file is the only entry `--force` actually replaces: it writes *through* a
-/// symlink to whatever that points at, and cannot write to a directory at
-/// all. Nor to the rest: it would write *into* a FIFO or device node —
-/// blocking until a reader appears, in the FIFO case — while a socket path
-/// cannot be opened as a file at all. None of those is a replacement, so the
-/// advice is only offered where it holds.
+/// file is the only entry `--force` overwrites — in place, truncating that
+/// inode rather than replacing the directory entry, so any hard link to it
+/// sees the new content too. Everything else it cannot overwrite at all: it
+/// writes *through* a symlink to whatever that points at, cannot write to a
+/// directory, would write *into* a FIFO or device node (blocking until a
+/// reader appears, in the FIFO case), and cannot open a socket path as a file
+/// at all. So the advice is offered only where `--force` acts on the entry
+/// named — not as a promise that the write then succeeds, which permissions
+/// still decide.
 ///
 /// The entry is inspected only to word the message — the refusal itself was
 /// already decided atomically by `create_new`, so a path that changes between
@@ -1243,11 +1246,11 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&redirected).unwrap(), "generated");
     }
 
-    /// Only a regular file may be told to retry with `--force`; every other
-    /// entry kind would get a promise the flag cannot keep.
+    /// Only a regular file may be told to retry with `--force`; for every
+    /// other entry kind the flag does not act on the entry named at all.
     #[cfg(unix)]
     #[test]
-    fn overwrite_advice_offers_force_only_where_it_replaces_the_entry() {
+    fn overwrite_advice_offers_force_only_where_it_overwrites_the_entry() {
         let temp = tempfile::TempDir::new().unwrap();
 
         let file = temp.path().join("plain.toml");
