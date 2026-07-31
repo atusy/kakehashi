@@ -3611,6 +3611,63 @@ mod tests {
         assert_eq!(handle.workspace_folders().snapshot(), Some(vec![marker]));
     }
 
+    #[tokio::test]
+    async fn workspace_folder_change_drops_pull_diagnostic_lineage_of_client_fallbacks() {
+        // A pull already in flight when the folder set changes was answered
+        // against the previous project, and every generation in the lineage
+        // gate is unchanged for a connection that merely took the
+        // notification — so without a bump here that stale answer is accepted
+        // as current and its resultId seeds the next request. Scoped to the
+        // connections that follow the client workspace: a marker-owned one is
+        // rooted on disk and its lineage stays valid.
+        let fallback_key = ConnectionKey::for_server("fallback");
+        let marker_key = ConnectionKey::new("marker", Some("file:///marker".to_string()));
+        let pool = LanguageServerPool::new();
+        let fallback = create_handle_with_key(ConnectionState::Ready, fallback_key.clone()).await;
+        fallback.set_server_capabilities(capable_workspace_folders_caps());
+        let marker = create_handle_with_key(ConnectionState::Ready, marker_key.clone()).await;
+        marker.set_server_capabilities(capable_workspace_folders_caps());
+        pool.insert_connection(fallback).await;
+        pool.insert_connection(marker).await;
+        for key in [&fallback_key, &marker_key] {
+            pool.diagnostic_pull_baselines.insert(
+                (key.clone(), "file:///v.lua".to_string()),
+                DiagnosticPullBaseline {
+                    result_id: "r1".to_string(),
+                    diagnostics: Arc::new(Vec::new()),
+                    request_sequence: 1,
+                },
+            );
+        }
+
+        pool.apply_workspace_folder_change(
+            vec![tower_lsp_server::ls_types::WorkspaceFolder {
+                uri: "file:///added".parse().unwrap(),
+                name: "added".to_string(),
+            }],
+            &[],
+        )
+        .await;
+
+        assert!(
+            !pool
+                .diagnostic_pull_baselines
+                .contains_key(&(fallback_key.clone(), "file:///v.lua".to_string())),
+            "no previousResultId may cross a change of the project it described"
+        );
+        assert!(
+            pool.diagnostic_pull_generations
+                .get(&fallback_key)
+                .is_some_and(|generation| *generation > 0),
+            "a pull in flight across the change must lose to the generation"
+        );
+        assert!(
+            pool.diagnostic_pull_baselines
+                .contains_key(&(marker_key, "file:///v.lua".to_string())),
+            "a marker-owned connection's project did not change"
+        );
+    }
+
     fn shared_config() -> crate::config::settings::BridgeServerConfig {
         crate::config::settings::BridgeServerConfig {
             prefer_shared_instance: Some(true),
