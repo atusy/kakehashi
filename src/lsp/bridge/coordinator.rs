@@ -1620,7 +1620,7 @@ mod tests {
         }];
 
         // `python` bridges to "ruff", not "other-server" → no match → no-op.
-        tokio::time::timeout(
+        let outcome = tokio::time::timeout(
             std::time::Duration::from_secs(2),
             coordinator.ensure_server_documents_open(
                 &settings,
@@ -1636,6 +1636,12 @@ mod tests {
         )
         .await
         .expect("a non-matching server must short-circuit, not attempt a spawn");
+        assert_eq!(
+            outcome,
+            crate::lsp::bridge::OpenOutcome::Opened,
+            "a caller that named no connection has nothing to repair, so \
+             'this host bridges nowhere' is success, not failure"
+        );
     }
 
     #[tokio::test]

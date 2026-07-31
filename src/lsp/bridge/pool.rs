@@ -4249,23 +4249,29 @@ mod tests {
 
         let handle = create_handle_with_key(ConnectionState::Ready, connection_key.clone()).await;
         pool.insert_connection(handle).await;
-        use crate::lsp::bridge::text_document::OpenExpectation;
-        pool.eager_open_virtual_documents(
-            "lua",
-            &devnull_config(),
-            &host_uri,
-            &host_uri_lsp,
-            OpenExpectation {
-                incarnation: 1,
-                connection: None,
-            },
-            vec![super::super::coordinator::BridgeInjection {
-                language: "lua".to_string(),
-                region_id: TEST_ULID_LUA_0.to_string(),
-                content: "print('old lifetime')".to_string(),
-            }],
-        )
-        .await;
+        use crate::lsp::bridge::text_document::{OpenExpectation, OpenOutcome};
+        let outcome = pool
+            .eager_open_virtual_documents(
+                "lua",
+                &devnull_config(),
+                &host_uri,
+                &host_uri_lsp,
+                OpenExpectation {
+                    incarnation: 1,
+                    connection: None,
+                },
+                vec![super::super::coordinator::BridgeInjection {
+                    language: "lua".to_string(),
+                    region_id: TEST_ULID_LUA_0.to_string(),
+                    content: "print('old lifetime')".to_string(),
+                }],
+            )
+            .await;
+        assert_eq!(
+            outcome,
+            OpenOutcome::NotOpened,
+            "the host moved to incarnation 2, so a stale batch opens nothing"
+        );
         assert!(!pool.is_document_opened(&virtual_uri));
         assert!(pool.host_lifecycle_locks.contains_key(&host_uri));
 
@@ -4289,22 +4295,28 @@ mod tests {
         );
 
         pool.close_host_incarnation(&host_uri, 2).await;
-        pool.eager_open_virtual_documents(
-            "lua",
-            &devnull_config(),
-            &host_uri,
-            &host_uri_lsp,
-            OpenExpectation {
-                incarnation: 1,
-                connection: None,
-            },
-            vec![super::super::coordinator::BridgeInjection {
-                language: "lua".to_string(),
-                region_id: TEST_ULID_LUA_0.to_string(),
-                content: "print('old lifetime')".to_string(),
-            }],
-        )
-        .await;
+        let outcome = pool
+            .eager_open_virtual_documents(
+                "lua",
+                &devnull_config(),
+                &host_uri,
+                &host_uri_lsp,
+                OpenExpectation {
+                    incarnation: 1,
+                    connection: None,
+                },
+                vec![super::super::coordinator::BridgeInjection {
+                    language: "lua".to_string(),
+                    region_id: TEST_ULID_LUA_0.to_string(),
+                    content: "print('old lifetime')".to_string(),
+                }],
+            )
+            .await;
+        assert_eq!(
+            outcome,
+            OpenOutcome::NotOpened,
+            "the host is closed, so there is no lifetime to open under"
+        );
         assert!(pool.host_lifecycle_locks.is_empty());
     }
 

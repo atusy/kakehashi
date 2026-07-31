@@ -310,10 +310,6 @@ mod tests {
     ///
     /// Given a ready server and injection data, calling eager_open_virtual_documents
     /// should result in each virtual document being marked as opened in DocumentTracker.
-    /// Test that eager_open_virtual_documents marks virtual documents as opened.
-    ///
-    /// Given a ready server and injection data, calling eager_open_virtual_documents
-    /// should result in each virtual document being marked as opened in DocumentTracker.
     #[tokio::test]
     async fn eager_open_marks_documents_as_opened() {
         let pool = LanguageServerPool::new();
@@ -346,18 +342,20 @@ mod tests {
             },
         ];
 
-        pool.eager_open_virtual_documents(
-            server_name,
-            &config,
-            &host_uri,
-            &host_uri_lsp,
-            OpenExpectation {
-                incarnation: 1,
-                connection: None,
-            },
-            injections,
-        )
-        .await;
+        let outcome = pool
+            .eager_open_virtual_documents(
+                server_name,
+                &config,
+                &host_uri,
+                &host_uri_lsp,
+                OpenExpectation {
+                    incarnation: 1,
+                    connection: None,
+                },
+                injections,
+            )
+            .await;
+        assert_eq!(outcome, OpenOutcome::Opened);
 
         // Verify both virtual documents are marked as opened
         let vuri_0 = VirtualDocumentUri::new(&host_uri_lsp, "lua", TEST_ULID_LUA_0);
@@ -507,18 +505,20 @@ mod tests {
         }];
 
         // First call - should open the document
-        pool.eager_open_virtual_documents(
-            server_name,
-            &config,
-            &host_uri,
-            &host_uri_lsp,
-            OpenExpectation {
-                incarnation: 1,
-                connection: None,
-            },
-            injections.clone(),
-        )
-        .await;
+        let outcome = pool
+            .eager_open_virtual_documents(
+                server_name,
+                &config,
+                &host_uri,
+                &host_uri_lsp,
+                OpenExpectation {
+                    incarnation: 1,
+                    connection: None,
+                },
+                injections.clone(),
+            )
+            .await;
+        assert_eq!(outcome, OpenOutcome::Opened);
 
         let vuri = VirtualDocumentUri::new(&host_uri_lsp, "lua", TEST_ULID_LUA_0);
         assert!(
@@ -527,18 +527,24 @@ mod tests {
         );
 
         // Second call - should be a no-op (idempotent)
-        pool.eager_open_virtual_documents(
-            server_name,
-            &config,
-            &host_uri,
-            &host_uri_lsp,
-            OpenExpectation {
-                incarnation: 1,
-                connection: None,
-            },
-            injections,
-        )
-        .await;
+        let outcome = pool
+            .eager_open_virtual_documents(
+                server_name,
+                &config,
+                &host_uri,
+                &host_uri_lsp,
+                OpenExpectation {
+                    incarnation: 1,
+                    connection: None,
+                },
+                injections,
+            )
+            .await;
+        assert_eq!(
+            outcome,
+            OpenOutcome::Opened,
+            "an idempotent re-open still reports the connection as open"
+        );
 
         assert!(
             pool.is_document_opened(&vuri),
