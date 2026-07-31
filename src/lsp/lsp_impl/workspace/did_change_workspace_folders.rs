@@ -120,3 +120,74 @@ impl Kakehashi {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use tower_lsp_server::LspService;
+    use tower_lsp_server::ls_types::{
+        ClientCapabilities, DiagnosticWorkspaceClientCapabilities, WorkspaceClientCapabilities,
+        WorkspaceFoldersChangeEvent,
+    };
+
+    /// A client that advertises `workspace.diagnostics.refreshSupport`, which is
+    /// the gate every refresh request passes before it is even counted.
+    fn refresh_capable() -> ClientCapabilities {
+        ClientCapabilities {
+            workspace: Some(WorkspaceClientCapabilities {
+                diagnostics: Some(DiagnosticWorkspaceClientCapabilities {
+                    refresh_support: Some(true),
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn an_empty_folder_event_requests_no_pull_refresh() {
+        // Asserted in-process rather than over the wire. tower-lsp runs ingress
+        // handlers concurrently, so a request sent after this notification can
+        // be handled before it finishes — and `shutdown` in particular cancels
+        // the token that suppresses an already-admitted refresh. A wire-level
+        // "no refresh arrived" is therefore satisfiable by a regression.
+        // `refreshes_requested` is recorded synchronously ahead of every
+        // admission gate and cannot be hidden that way.
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+        server.settings_manager.set_capabilities(refresh_capable());
+
+        // Bounded so a regression fails on the assertion rather than hanging.
+        // Without the guard the handler runs on into the settings reload, which
+        // parks in this harness on a socket the test never drains — verified by
+        // mutating the guard away, where an unbounded await hung instead of
+        // reporting the count it had already moved.
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            server.did_change_workspace_folders_impl(DidChangeWorkspaceFoldersParams {
+                event: WorkspaceFoldersChangeEvent {
+                    added: Vec::new(),
+                    removed: Vec::new(),
+                },
+            }),
+        )
+        .await;
+
+        assert_eq!(
+            server.diagnostics.metrics_snapshot().refreshes_requested,
+            0,
+            "an event that names no folder must not force a workspace-wide re-pull"
+        );
+
+        // Proves the zero above is the guard and not a fixture whose capability
+        // gate was shut all along — the same request, made directly, counts.
+        super::super::super::coordinator::DiagnosticPublisher::new(server)
+            .request_pull_diagnostic_refresh(true);
+        assert_eq!(
+            server.diagnostics.metrics_snapshot().refreshes_requested,
+            1,
+            "the capability gate must be open for the assertion above to mean anything"
+        );
+    }
+}
