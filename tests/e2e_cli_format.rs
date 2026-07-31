@@ -707,9 +707,13 @@ fn e2e_format_preserves_file_permissions() {
 #[cfg(unix)]
 #[test]
 fn e2e_hard_linked_file_is_refused_and_counted_as_an_error() {
+    use std::os::unix::fs::MetadataExt as _;
+
     let ws = workspace_with(&[("doc.md", MARKDOWN)]);
-    std::fs::hard_link(ws.path().join("doc.md"), ws.path().join("alias.md"))
-        .expect("hard link the document");
+    let target = ws.path().join("doc.md");
+    let alias = ws.path().join("alias.md");
+    std::fs::hard_link(&target, &alias).expect("hard link the document");
+    let inode = std::fs::metadata(&target).expect("stat target").ino();
 
     let output = run_format(ws.path(), &["doc.md"]);
 
@@ -736,6 +740,18 @@ fn e2e_hard_linked_file_is_refused_and_counted_as_an_error() {
         read(ws.path(), "alias.md"),
         MARKDOWN,
         "the alias must not be left on stale content"
+    );
+    // Equal bytes are not equal files: the split this guards against produces
+    // two inodes that happen to agree until the next edit. Pin the identity.
+    assert_eq!(
+        std::fs::metadata(&target).expect("stat target").ino(),
+        inode,
+        "the target must keep its inode"
+    );
+    assert_eq!(
+        std::fs::metadata(&alias).expect("stat alias").ino(),
+        inode,
+        "both names must still resolve to the one inode"
     );
 }
 
