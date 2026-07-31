@@ -72,10 +72,29 @@ Three properties of that middleware are load-bearing:
    `internal/effectiveConfiguration`, and would invent deprecated spellings for
    methods that never had one. The list is frozen at the rename: methods added
    afterwards never had an old name to alias.
-3. **The warning is log-only.** The natural alternative,
-   `window/showMessage` as the config-key deprecations use, would mean up to 41
-   popups in a session; the middleware also has no `Client` handle, sitting
-   above the service that owns one. A client author reads the LSP log.
+
+   Freezing it opens one hazard the list cannot close by itself. Nothing
+   couples it to the registrations in `main.rs`, so renaming or removing a
+   canonical method would leave its alias rewriting into a name that no longer
+   exists — and the client would get `MethodNotFound` naming a method it never
+   sent, which is worse than the error it would have got without the alias. No
+   unit test can see both sides: the registrations live in the binary and
+   tower-lsp's method map is private. An e2e test therefore walks all 41 old
+   spellings over the wire and asserts none answers `-32601`.
+
+3. **The notice goes to `window/logMessage`, not just the server log.** An
+   earlier revision emitted `log::warn!` only, which is invisible in a default
+   run: env_logger takes its level from `RUST_LOG` and filters at `Error` when
+   it is unset, and it writes to the server's stderr rather than the editor's
+   LSP output. The audience is client authors reading that output.
+
+   `window/showMessage`, which the config-key deprecations use, is the wrong
+   instrument here — up to 41 popups in a session. `logMessage` is the LSP log
+   itself and carries no popup. The `Client` reaches the layer through a
+   `OnceLock` filled inside `LspService::build`'s factory closure, since that
+   closure is the only place the handle exists; the notification is spawned
+   rather than awaited so the request path stays synchronous into the ordering
+   gate.
 
 ## Considered Options
 
@@ -136,4 +155,9 @@ saves.
   structural one — even though no client breaks, the wire surface changed.
 - The frozen alias list is deliberately not derived from the live registration
   list in `src/bin/main.rs`. They will diverge as methods are added; that
-  divergence is correct.
+  divergence is correct, and it is one-directional — registered-but-not-aliased
+  is the intended state, aliased-but-not-registered is the bug the e2e sweep
+  catches. (Deriving it is also not cheap: `custom_method` takes a distinct
+  closure type per call, so the registrations cannot be a loop over a shared
+  table without a macro, and the table would then live in the binary where no
+  lib test can read it.)

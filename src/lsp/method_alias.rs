@@ -30,6 +30,12 @@ use tower_lsp_server::ls_types::MessageType;
 /// after the rename never had an old spelling to alias, and adding it here
 /// would invent a deprecated name nobody ever called. It shrinks only when a
 /// deprecation window closes.
+///
+/// It therefore duplicates part of the registration chain in `src/bin/main.rs`
+/// on purpose; see custom-method-namespace for why deriving one from the other
+/// would be wrong. Every entry must nonetheless stay registered there —
+/// `tests/e2e_kakehashi_node.rs` walks all of them asserting none has become
+/// `MethodNotFound`.
 const ALIASED_METHODS: &[&str] = &[
     "kakehashi/textDocument/captures/full",
     "kakehashi/textDocument/captures/full/delta",
