@@ -2075,7 +2075,14 @@ mod tests {
 
     #[test]
     fn bridge_root_uri_preserves_legacy_root_path() {
-        let root_path = std::env::current_dir().expect("current directory");
+        // A directory the process is NOT running in: the removed fallback
+        // forwarded the CWD, so a CWD-valued fixture would pass under both the
+        // old and the new derivation and pin nothing. Built from the CWD rather
+        // than a literal so the path stays absolute on Windows too.
+        let root_path = std::env::current_dir()
+            .expect("current directory")
+            .join("legacy-workspace");
+        let expected = Url::from_file_path(&root_path).expect("an absolute root path");
         let params: InitializeParams = serde_json::from_value(serde_json::json!({
             "capabilities": {},
             "rootUri": null,
@@ -2084,13 +2091,7 @@ mod tests {
         }))
         .expect("valid initialize params");
 
-        assert_eq!(
-            bridge_root_uri(&params).as_deref(),
-            Url::from_file_path(&root_path)
-                .ok()
-                .as_ref()
-                .map(Url::as_str)
-        );
+        assert_eq!(bridge_root_uri(&params).as_deref(), Some(expected.as_str()));
     }
 
     /// A throwaway cancel context for tests that don't exercise cancellation.
