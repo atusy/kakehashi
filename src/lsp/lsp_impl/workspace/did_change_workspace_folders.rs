@@ -14,6 +14,9 @@ impl Kakehashi {
     ) {
         let added = params.event.added;
         let removed = params.event.removed;
+        // Read before the move below; an event naming no folder changes no
+        // project, and the pool ignores it for the same reason.
+        let folders_changed = !added.is_empty() || !removed.is_empty();
         self.bridge
             .pool()
             .apply_workspace_folder_change(added, &removed)
@@ -30,9 +33,13 @@ impl Kakehashi {
         // coverage gate suppresses an unforced refresh when nothing is dirty by
         // version, which is exactly this change's shape, and the `--config-file`
         // branch returns before the reload without ever reaching a later call
-        // site. Capability-gated and single-flighted inside.
-        super::super::coordinator::DiagnosticPublisher::new(self)
-            .request_pull_diagnostic_refresh(true);
+        // site. Capability-gated and single-flighted inside — but `forced` is
+        // what bypasses that coverage gate, so the emptiness check is this
+        // call's own responsibility rather than something the gate absorbs.
+        if folders_changed {
+            super::super::coordinator::DiagnosticPublisher::new(self)
+                .request_pull_diagnostic_refresh(true);
+        }
 
         // Reading the settings in effect, merging the reloaded root onto them,
         // and publishing the result share the one reload transaction
