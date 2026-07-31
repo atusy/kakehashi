@@ -701,6 +701,44 @@ fn e2e_format_preserves_file_permissions() {
     );
 }
 
+/// A refused write must be reported and counted like any other write error,
+/// not swallowed — and the summary must not claim the file was reformatted.
+/// This is the cheapest deterministic way to reach that branch at all.
+#[cfg(unix)]
+#[test]
+fn e2e_hard_linked_file_is_refused_and_counted_as_an_error() {
+    let ws = workspace_with(&[("doc.md", MARKDOWN)]);
+    std::fs::hard_link(ws.path().join("doc.md"), ws.path().join("alias.md"))
+        .expect("hard link the document");
+
+    let output = run_format(ws.path(), &["doc.md"]);
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "a refused write exits 2; stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("cannot write") && stderr.contains("hard link"),
+        "the refusal must name its cause; stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("0 file(s) reformatted"),
+        "a refused write must not be summarised as reformatted; stderr: {stderr}"
+    );
+    assert_eq!(
+        read(ws.path(), "doc.md"),
+        MARKDOWN,
+        "the target must be untouched"
+    );
+    assert_eq!(
+        read(ws.path(), "alias.md"),
+        MARKDOWN,
+        "the alias must not be left on stale content"
+    );
+}
+
 #[test]
 fn e2e_excludes_filters_directory_walk() {
     let ws = workspace_with(&[("kept.md", MARKDOWN), ("vendor/dep.md", MARKDOWN)]);
