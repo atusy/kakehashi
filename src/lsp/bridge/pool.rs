@@ -703,12 +703,20 @@ impl LanguageServerPool {
         // folder set, loses to the generation instead of being accepted as
         // current: for a connection that merely takes the notification, no
         // other generation in the lineage gate moves at all.
-        let following_client_workspace: Vec<ConnectionKey> = connections
-            .keys()
-            .filter(|key| key.is_client_fallback())
-            .cloned()
-            .collect();
-        self.invalidate_diagnostic_connections(&following_client_workspace);
+        // Skipped for an event that names neither an addition nor a removal:
+        // the lineage still describes the project the downstream will report
+        // on, and dropping it would cost a full report per open document for
+        // nothing. Deliberately not a full before/after comparison — a
+        // duplicate add or an absent removal is a no-op for *our* snapshot but
+        // is still forwarded downstream, whose own view we cannot diff.
+        if !added.is_empty() || !removed.is_empty() {
+            let following_client_workspace: Vec<ConnectionKey> = connections
+                .keys()
+                .filter(|key| key.is_client_fallback())
+                .cloned()
+                .collect();
+            self.invalidate_diagnostic_connections(&following_client_workspace);
+        }
 
         let mut invalidated = Vec::new();
         for (key, handle) in connections.iter() {
