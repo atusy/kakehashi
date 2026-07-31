@@ -403,6 +403,14 @@ pub(crate) struct DiagnosticAggregator {
     /// captures this epoch and the current version in [`Self::coverage_stamp`];
     /// after `didClose` removes the entry, its completion must not advance a
     /// later reopened lifetime's `served` value.
+    ///
+    /// Deliberately separate from [`Self::next_cache_revision`], which solves
+    /// the structurally similar "a reopened URI must not be confused with its
+    /// predecessor" problem one map over. They are not interchangeable: a cache
+    /// revision advances on every mutation and orders wire snapshots, while
+    /// this is minted once per coverage lifetime and only ever compared for
+    /// equality. Sharing one counter would tie the coverage gate's correctness
+    /// to the cadence of cache writes.
     next_coverage_epoch: AtomicU64,
     /// Hosts whose LAST pull was answered degraded — the bounded parse wait
     /// lapsed while the aggregator held live region pushes, so the response
