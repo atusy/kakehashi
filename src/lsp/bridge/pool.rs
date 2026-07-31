@@ -697,6 +697,22 @@ impl LanguageServerPool {
         added: Vec<tower_lsp_server::ls_types::WorkspaceFolder>,
         removed: &[tower_lsp_server::ls_types::WorkspaceFolder],
     ) {
+        // An event naming neither an addition nor a removal describes no
+        // change: `WorkspaceFolderSet::apply_change` is a no-op for it, so the
+        // derived root cannot move, the forwarded notification would say
+        // nothing, and no connection's lineage stopped describing its project.
+        //
+        // Returning here rather than guarding only the fence below is
+        // deliberate. The recycle loop is not conditional on the event saying
+        // anything, and the fence is the ONLY thing that drops a connection's
+        // baselines — the respawn path's own invalidation is gated on finding
+        // an existing connection, which this function has already removed. A
+        // guard that skipped the fence alone would therefore hand a dead
+        // process's resultId to its replacement.
+        if added.is_empty() && removed.is_empty() {
+            return;
+        }
+
         self.workspace_folders.apply_change(added.clone(), removed);
         self.set_root_uri(
             self.workspace_folders()
@@ -717,27 +733,25 @@ impl LanguageServerPool {
         // current and its resultId kept as the next baseline.
         //
         // What closes that window is the guard, not the statement order: a pull
-        // enqueues its request while holding `connections` (`execute.rs`, which
-        // spans the liveness check, the didOpen, and `send_request`), so none
+        // enqueues its request while holding `connections` (`execute.rs` for a
+        // virtual region, `host.rs` for a host document — both span the
+        // liveness check, the didOpen/sync, and `send_request`), so none
         // can be enqueued between this bump and the notification below. A pull
         // that snapshotted before this guard was taken carries the old
         // generation and loses; one that snapshots after cannot overtake the
         // notification on the outbound FIFO. Moving this call after the loop
         // would be equivalent — it stays here to match `propagate_settings`.
-        // Skipped for an event that names neither an addition nor a removal:
-        // the lineage still describes the project the downstream will report
-        // on, and dropping it would cost a full report per open document for
-        // nothing. Deliberately not a full before/after comparison — a
-        // duplicate add or an absent removal is a no-op for *our* snapshot but
-        // is still forwarded downstream, whose own view we cannot diff.
-        if !added.is_empty() || !removed.is_empty() {
-            let following_client_workspace: Vec<ConnectionKey> = connections
-                .keys()
-                .filter(|key| key.is_client_fallback())
-                .cloned()
-                .collect();
-            self.invalidate_diagnostic_connections(&following_client_workspace);
-        }
+        // Deliberately not narrowed by a before/after comparison of our own
+        // snapshot: a duplicate add or a removal of a folder we never held
+        // leaves that snapshot untouched, but the notification is forwarded
+        // downstream regardless and its view is not ours to diff. The empty
+        // event — the only one that provably says nothing — returned above.
+        let following_client_workspace: Vec<ConnectionKey> = connections
+            .keys()
+            .filter(|key| key.is_client_fallback())
+            .cloned()
+            .collect();
+        self.invalidate_diagnostic_connections(&following_client_workspace);
 
         let mut invalidated = Vec::new();
         for (key, handle) in connections.iter() {
@@ -3741,10 +3755,16 @@ mod tests {
         // full downstream report per open document for nothing — the same
         // anti-storm property `no_op_settings_reload_preserves_diagnostic_pull_baselines`
         // pins on the settings path.
+        //
+        // The fixture is deliberately a connection the recycle branch WOULD
+        // claim (Ready, no folder-change capability): skipping only the fence
+        // while still recycling would leave its replacement inheriting this
+        // baseline, since the respawn path's own invalidation is gated on an
+        // existing connection that the recycle already removed.
         let key = ConnectionKey::for_server("fallback");
         let pool = LanguageServerPool::new();
         let handle = create_handle_with_key(ConnectionState::Ready, key.clone()).await;
-        handle.set_server_capabilities(capable_workspace_folders_caps());
+        handle.set_server_capabilities(Default::default());
         pool.insert_connection(handle).await;
         pool.diagnostic_pull_baselines.insert(
             (key.clone(), "file:///v.lua".to_string()),
@@ -3765,6 +3785,10 @@ mod tests {
         assert!(
             !pool.diagnostic_pull_generations.contains_key(&key),
             "and must not move the fence either"
+        );
+        assert!(
+            pool.connections.lock().await.contains_key(&key),
+            "nor recycle a process over an event that named no folder"
         );
     }
 
