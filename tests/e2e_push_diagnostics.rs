@@ -1478,24 +1478,16 @@ fn e2e_workspace_folder_change_refreshes_pull_clients() {
 #[test]
 fn e2e_empty_workspace_folder_change_does_not_refresh_pull_clients() {
     // An event naming neither an addition nor a removal changes no project, so
-    // forcing every open document to be re-pulled buys nothing. Self-validating:
-    // the same client then sends a real change and MUST be refreshed, so a
-    // negative result here is the guard working rather than the harness failing
-    // to emit.
+    // forcing every open document to be re-pulled buys nothing.
+    //
+    // Ordered so the absence is provable rather than merely un-observed: a real
+    // change first, which must refresh (so a later silence cannot be the harness
+    // failing to emit), then the empty event, then a `shutdown` request as a
+    // FIFO barrier. The pipe is ordered, so the empty event is fully handled
+    // before the barrier is answered — an empty watch list when the response
+    // arrives is a proof, not a timeout that got lucky.
     let (mut client, _config_dir) =
         init_client_with_mode_caps("workspace-folders", refresh_capable_caps());
-
-    client.send_notification(
-        "workspace/didChangeWorkspaceFolders",
-        json!({ "event": { "added": [], "removed": [] } }),
-    );
-
-    assert!(
-        client
-            .wait_for_server_request("workspace/diagnostic/refresh", Duration::from_secs(3))
-            .is_none(),
-        "an event that names no folder must not force a workspace-wide re-pull"
-    );
 
     client.send_notification(
         "workspace/didChangeWorkspaceFolders",
@@ -1506,12 +1498,26 @@ fn e2e_empty_workspace_folder_change_does_not_refresh_pull_clients() {
             }
         }),
     );
-
     let (refresh_id, _) = client
         .wait_for_server_request("workspace/diagnostic/refresh", Duration::from_secs(15))
-        .expect("a real change on the same client must still refresh");
+        .expect("a real change must refresh, or the silence below proves nothing");
+    // Acked so the single-flight guard cannot be what suppresses the next one.
     client.send_response(refresh_id, json!(null));
 
-    client.send_request("shutdown", json!(null));
+    client.send_notification(
+        "workspace/didChangeWorkspaceFolders",
+        json!({ "event": { "added": [], "removed": [] } }),
+    );
+
+    let barrier_id = client.send_request_async("shutdown", json!(null));
+    let (_, refreshes) = client.receive_response_for_id_watching_server_requests(
+        barrier_id,
+        "workspace/diagnostic/refresh",
+    );
+    assert!(
+        refreshes.is_empty(),
+        "an event that names no folder must not force a workspace-wide re-pull: {refreshes:?}"
+    );
+
     client.send_notification("exit", json!(null));
 }
