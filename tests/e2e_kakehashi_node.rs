@@ -1,5 +1,5 @@
-//! End-to-end tests for `kakehashi/node`, `kakehashi/node/text`,
-//! `kakehashi/node/parent`, and `kakehashi/node/children` (node-reference-protocol PR-1 + PR-2 + PR-3).
+//! End-to-end tests for `kakehashi/textDocument/node`, `kakehashi/textDocument/node/text`,
+//! `kakehashi/textDocument/node/parent`, and `kakehashi/textDocument/node/children` (node-reference-protocol PR-1 + PR-2 + PR-3).
 //!
 //! Covers the entry-point method (position → NodeInfo), the text resolution
 //! method (id → current node text), the parent navigation method
@@ -9,10 +9,10 @@
 //! - smallest-at-cursor lookup for named-or-anonymous nodes (host language only)
 //! - end-of-document exception (`b == L && L > 0 && e == L`)
 //! - empty document and out-of-bounds returning `null`
-//! - `kakehashi/node/text` returning the live slice for a tracked node
-//! - `kakehashi/node/parent` walking one step toward the root
+//! - `kakehashi/textDocument/node/text` returning the live slice for a tracked node
+//! - `kakehashi/textDocument/node/parent` walking one step toward the root
 //! - parent returning null at the root and for unknown ids
-//! - `kakehashi/node/children` returning siblings in document order
+//! - `kakehashi/textDocument/node/children` returning siblings in document order
 //! - children returning `[]` (NOT `null`) for a leaf node
 //! - children returning `null` for unknown ids
 //! - ULID survival across position-adjusting edits
@@ -55,10 +55,10 @@ fn open_markdown(client: &mut LspClient, uri: &str, text: &str) {
     );
 }
 
-/// Send `kakehashi/node/text` for an id and unwrap the `result` field.
+/// Send `kakehashi/textDocument/node/text` for an id and unwrap the `result` field.
 fn request_node_text(client: &mut LspClient, uri: &str, id: &str) -> Value {
     let response = client.send_request(
-        "kakehashi/node/text",
+        "kakehashi/textDocument/node/text",
         json!({
             "textDocument": { "uri": uri },
             "id": id
@@ -66,7 +66,7 @@ fn request_node_text(client: &mut LspClient, uri: &str, id: &str) -> Value {
     );
     assert!(
         response.get("error").is_none(),
-        "kakehashi/node/text returned an error: {:?}",
+        "kakehashi/textDocument/node/text returned an error: {:?}",
         response.get("error")
     );
     response
@@ -75,11 +75,11 @@ fn request_node_text(client: &mut LspClient, uri: &str, id: &str) -> Value {
         .expect("response must contain a result field")
 }
 
-/// Send `kakehashi/node/parent` for an id and unwrap the `result` field
+/// Send `kakehashi/textDocument/node/parent` for an id and unwrap the `result` field
 /// (which may be `null`).
 fn request_node_parent(client: &mut LspClient, uri: &str, id: &str) -> Value {
     let response = client.send_request(
-        "kakehashi/node/parent",
+        "kakehashi/textDocument/node/parent",
         json!({
             "textDocument": { "uri": uri },
             "id": id
@@ -87,7 +87,7 @@ fn request_node_parent(client: &mut LspClient, uri: &str, id: &str) -> Value {
     );
     assert!(
         response.get("error").is_none(),
-        "kakehashi/node/parent returned an error: {:?}",
+        "kakehashi/textDocument/node/parent returned an error: {:?}",
         response.get("error")
     );
     response
@@ -96,11 +96,11 @@ fn request_node_parent(client: &mut LspClient, uri: &str, id: &str) -> Value {
         .expect("response must contain a result field")
 }
 
-/// Send `kakehashi/node/children` for an id and unwrap the `result` field
+/// Send `kakehashi/textDocument/node/children` for an id and unwrap the `result` field
 /// (which may be `null`, an empty array, or a non-empty array).
 fn request_node_children(client: &mut LspClient, uri: &str, id: &str) -> Value {
     let response = client.send_request(
-        "kakehashi/node/children",
+        "kakehashi/textDocument/node/children",
         json!({
             "textDocument": { "uri": uri },
             "id": id
@@ -108,7 +108,7 @@ fn request_node_children(client: &mut LspClient, uri: &str, id: &str) -> Value {
     );
     assert!(
         response.get("error").is_none(),
-        "kakehashi/node/children returned an error: {:?}",
+        "kakehashi/textDocument/node/children returned an error: {:?}",
         response.get("error")
     );
     response
@@ -117,10 +117,10 @@ fn request_node_children(client: &mut LspClient, uri: &str, id: &str) -> Value {
         .expect("response must contain a result field")
 }
 
-/// Send `kakehashi/node` and unwrap the `result` field (which may be `null`).
+/// Send `kakehashi/textDocument/node` and unwrap the `result` field (which may be `null`).
 fn request_node(client: &mut LspClient, uri: &str, line: u32, character: u32) -> Value {
     let response = client.send_request(
-        "kakehashi/node",
+        "kakehashi/textDocument/node",
         json!({
             "textDocument": { "uri": uri },
             "position": { "line": line, "character": character }
@@ -128,7 +128,7 @@ fn request_node(client: &mut LspClient, uri: &str, line: u32, character: u32) ->
     );
     assert!(
         response.get("error").is_none(),
-        "kakehashi/node returned an error: {:?}",
+        "kakehashi/textDocument/node returned an error: {:?}",
         response.get("error")
     );
     response
@@ -137,7 +137,7 @@ fn request_node(client: &mut LspClient, uri: &str, line: u32, character: u32) ->
         .expect("response must contain a result field")
 }
 
-/// Send `kakehashi/node` with an explicit `injection` parameter (node-reference-protocol PR-4).
+/// Send `kakehashi/textDocument/node` with an explicit `injection` parameter (node-reference-protocol PR-4).
 /// `injection` is a `bool | number`; we accept any JSON value so the test
 /// fixtures can exercise the full parameter surface, including out-of-bounds
 /// indices and saturating `true`.
@@ -149,7 +149,7 @@ fn request_node_with_injection(
     injection: Value,
 ) -> Value {
     let response = client.send_request(
-        "kakehashi/node",
+        "kakehashi/textDocument/node",
         json!({
             "textDocument": { "uri": uri },
             "position": { "line": line, "character": character },
@@ -158,7 +158,7 @@ fn request_node_with_injection(
     );
     assert!(
         response.get("error").is_none(),
-        "kakehashi/node returned an error: {:?}",
+        "kakehashi/textDocument/node returned an error: {:?}",
         response.get("error")
     );
     response
@@ -192,7 +192,7 @@ fn full_text_change(client: &mut LspClient, uri: &str, new_version: i64, new_tex
 }
 
 /// Edit survival: acquire an id for a node, send a `didChange` that does NOT
-/// touch the node's START byte, and verify `kakehashi/node/text` reflects the
+/// touch the node's START byte, and verify `kakehashi/textDocument/node/text` reflects the
 /// post-edit content. The lazy-node-identity-tracking decision's START-priority rule keeps the ULID alive,
 /// and the node-reference-protocol decision's text endpoint must always slice from the *current* document.
 #[test]
@@ -254,7 +254,7 @@ fn test_node_text_survives_edit_that_does_not_touch_start() {
 /// Invalidation: an edit whose range covers the node's START byte must drop the
 /// ULID per the lazy-node-identity-tracking decision's START-priority rule. The node-reference-protocol decision collapses
 /// invalidated / never-issued / mismatched-URI cases into a single null
-/// response, so `kakehashi/node/text` must return null after the edit.
+/// response, so `kakehashi/textDocument/node/text` must return null after the edit.
 #[test]
 fn test_node_text_returns_null_after_invalidating_edit() {
     let mut client = LspClient::new();
@@ -293,8 +293,8 @@ fn test_node_text_returns_null_after_invalidating_edit() {
     );
 }
 
-/// Round-trip: acquire an id via `kakehashi/node`, then ask
-/// `kakehashi/node/text` for it and verify the returned slice matches the
+/// Round-trip: acquire an id via `kakehashi/textDocument/node`, then ask
+/// `kakehashi/textDocument/node/text` for it and verify the returned slice matches the
 /// expected substring of the document.
 #[test]
 fn test_node_text_round_trips_for_known_id() {
@@ -316,7 +316,7 @@ fn test_node_text_round_trips_for_known_id() {
     let text_response = request_node_text(&mut client, uri, id);
     assert!(
         !text_response.is_null(),
-        "kakehashi/node/text must return a NodeText for a freshly issued id"
+        "kakehashi/textDocument/node/text must return a NodeText for a freshly issued id"
     );
 
     let returned_text = text_response
@@ -402,7 +402,7 @@ fn test_node_position_past_eof_returns_null() {
     );
 }
 
-/// `kakehashi/node` on a markdown heading returns a NodeInfo with the heading
+/// `kakehashi/textDocument/node` on a markdown heading returns a NodeInfo with the heading
 /// node's tree-sitter type and a ULID-shaped id.
 #[test]
 fn test_node_at_heading_returns_node_info() {
@@ -418,7 +418,7 @@ fn test_node_at_heading_returns_node_info() {
 
     assert!(
         !result.is_null(),
-        "kakehashi/node should return a NodeInfo for a position inside the heading, got null"
+        "kakehashi/textDocument/node should return a NodeInfo for a position inside the heading, got null"
     );
 
     let id = result.get("id").expect("result must have id field");
@@ -438,7 +438,72 @@ fn test_node_at_heading_returns_node_info() {
     );
 }
 
-/// `kakehashi/node/parent` walks one step toward the root of the same language
+/// The pre-scope-first spellings stay callable for a deprecation window: the
+/// alias middleware rewrites `kakehashi/node` to `kakehashi/textDocument/node`
+/// before any other layer sees it.
+///
+/// This is the only e2e coverage of the old names — the rest of the suite
+/// moved to the canonical spellings — so it guards the whole compatibility
+/// path, including that a deprecated id-based follow-up call resolves an id
+/// minted through the deprecated entry point.
+#[test]
+fn test_deprecated_method_names_still_resolve() {
+    let mut client = LspClient::new();
+    initialize(&mut client);
+
+    let uri = "file:///test_kakehashi_deprecated_alias.md";
+    open_markdown(&mut client, uri, "# Hello\n\nSome paragraph text.\n");
+
+    let response = client.send_request(
+        "kakehashi/node",
+        json!({
+            "textDocument": { "uri": uri },
+            "position": { "line": 0, "character": 4 }
+        }),
+    );
+    assert!(
+        response.get("error").is_none(),
+        "the deprecated `kakehashi/node` must not be MethodNotFound: {:?}",
+        response.get("error")
+    );
+    let node = response
+        .get("result")
+        .cloned()
+        .expect("response must contain a result field");
+    assert!(
+        !node.is_null(),
+        "the deprecated name must return the same NodeInfo as the canonical one"
+    );
+    let id = node
+        .get("id")
+        .and_then(Value::as_str)
+        .expect("result must have a string id field")
+        .to_string();
+
+    // An id minted through the deprecated entry point must resolve through a
+    // deprecated accessor too — the rewrite must not split the two calls
+    // across different tracker state.
+    let text = client.send_request(
+        "kakehashi/node/text",
+        json!({ "textDocument": { "uri": uri }, "id": id }),
+    );
+    assert!(
+        text.get("error").is_none(),
+        "the deprecated `kakehashi/node/text` must not be MethodNotFound: {:?}",
+        text.get("error")
+    );
+    let slice = text
+        .get("result")
+        .and_then(|result| result.get("text"))
+        .and_then(Value::as_str)
+        .expect("deprecated node/text must resolve the id minted above");
+    assert!(
+        "# Hello".contains(slice),
+        "expected a slice of the heading line, got {slice:?}"
+    );
+}
+
+/// `kakehashi/textDocument/node/parent` walks one step toward the root of the same language
 /// tree (node-reference-protocol §"Navigation Methods"). Acquiring an id deep inside a nested
 /// markdown structure and asking for its parent must yield a NodeInfo whose id
 /// is distinct from the child's and whose kind is that of the immediate
@@ -505,7 +570,7 @@ fn test_node_parent_returns_immediate_parent_for_nested_node() {
     );
 }
 
-/// Walking `kakehashi/node/parent` repeatedly from any in-document node must
+/// Walking `kakehashi/textDocument/node/parent` repeatedly from any in-document node must
 /// eventually surface the root, at which point one more `parent` call returns
 /// null (node-reference-protocol §"Navigation Methods" — "id refers to a root node").
 #[test]
@@ -571,7 +636,7 @@ fn test_node_parent_returns_null_for_unknown_id() {
     );
 }
 
-/// `kakehashi/node/children` returns the immediate children of a tracked node
+/// `kakehashi/textDocument/node/children` returns the immediate children of a tracked node
 /// in **document order** (node-reference-protocol §"Navigation Methods" — Ordering). The
 /// response includes BOTH named and anonymous children. The order invariant is
 /// expressed as a non-decreasing `start_byte` across the returned sequence —
@@ -608,7 +673,7 @@ fn test_node_children_returns_siblings_in_document_order() {
         let response = request_node_children(&mut client, uri, &current_id);
         assert!(
             !response.is_null(),
-            "kakehashi/node/children must return an array (possibly empty) for a known id, got null at hop {}",
+            "kakehashi/textDocument/node/children must return an array (possibly empty) for a known id, got null at hop {}",
             hops
         );
         let arr = response
@@ -746,7 +811,7 @@ fn test_node_children_returns_empty_array_for_leaf_node() {
 }
 
 /// A ULID that was never issued by this server must resolve to null for
-/// `kakehashi/node/children` (node-reference-protocol §"Navigation Methods" — `null` cases).
+/// `kakehashi/textDocument/node/children` (node-reference-protocol §"Navigation Methods" — `null` cases).
 #[test]
 fn test_node_children_returns_null_for_unknown_id() {
     let mut client = LspClient::new();
@@ -1224,7 +1289,7 @@ fn test_node_injection_unsupported_shape_returns_null() {
     );
 }
 
-/// `kakehashi/node/parent` on an id minted from an injected layer must keep
+/// `kakehashi/textDocument/node/parent` on an id minted from an injected layer must keep
 /// navigating *inside that injected tree* (node-reference-protocol §"Navigation Methods" —
 /// Scope rule), never crossing back into the markdown host. Walk the parent
 /// chain from a python node up to the python root; every hop must stay a
@@ -1295,7 +1360,7 @@ fn test_node_parent_on_injected_id_stays_in_injected_tree() {
     );
 }
 
-/// `kakehashi/node/children` on an id minted from an injected layer must list
+/// `kakehashi/textDocument/node/children` on an id minted from an injected layer must list
 /// children from the injected tree, not the markdown host. Mint the python
 /// root via the deepest-saturating walk, then assert its children are python.
 #[test]

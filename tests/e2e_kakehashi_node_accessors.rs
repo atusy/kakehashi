@@ -39,7 +39,7 @@ fn open_markdown(client: &mut LspClient, uri: &str, text: &str) {
     );
 }
 
-/// Send a custom `kakehashi/node*` request and unwrap its `result` field.
+/// Send a custom `kakehashi/textDocument/node*` request and unwrap its `result` field.
 fn call(client: &mut LspClient, method: &str, params: Value) -> Value {
     let response = client.send_request(method, params);
     assert!(
@@ -59,11 +59,11 @@ fn id_params(uri: &str, id: &str) -> Value {
     json!({ "textDocument": { "uri": uri }, "id": id })
 }
 
-/// Resolve a position to a node id via `kakehashi/node`.
+/// Resolve a position to a node id via `kakehashi/textDocument/node`.
 fn node_at(client: &mut LspClient, uri: &str, line: u32, character: u32) -> Value {
     call(
         client,
-        "kakehashi/node",
+        "kakehashi/textDocument/node",
         json!({ "textDocument": { "uri": uri }, "position": { "line": line, "character": character } }),
     )
 }
@@ -83,7 +83,11 @@ fn root_id(client: &mut LspClient, uri: &str) -> String {
     assert!(!start.is_null(), "expected a node at document start");
     let mut current = id_of(&start);
     for _ in 0..64 {
-        let parent = call(client, "kakehashi/node/parent", id_params(uri, &current));
+        let parent = call(
+            client,
+            "kakehashi/textDocument/node/parent",
+            id_params(uri, &current),
+        );
         if parent.is_null() {
             return current;
         }
@@ -101,7 +105,11 @@ const DOC: &str = "# Heading\n\nplain **bold** more text.\n";
 fn multi_child_node(client: &mut LspClient, uri: &str) -> String {
     let mut current = root_id(client, uri);
     for _ in 0..32 {
-        let children = call(client, "kakehashi/node/children", id_params(uri, &current));
+        let children = call(
+            client,
+            "kakehashi/textDocument/node/children",
+            id_params(uri, &current),
+        );
         let arr = children.as_array().expect("children must be an array");
         if arr.len() >= 2 {
             return current;
@@ -125,7 +133,11 @@ fn test_scalar_accessors_report_intrinsic_properties() {
     let root = root_id(&mut client, uri);
 
     // kind / grammarName are non-empty strings.
-    let kind = call(&mut client, "kakehashi/node/kind", id_params(uri, &root));
+    let kind = call(
+        &mut client,
+        "kakehashi/textDocument/node/kind",
+        id_params(uri, &root),
+    );
     assert!(
         kind.get("kind")
             .and_then(Value::as_str)
@@ -135,7 +147,7 @@ fn test_scalar_accessors_report_intrinsic_properties() {
     );
     let grammar = call(
         &mut client,
-        "kakehashi/node/grammarName",
+        "kakehashi/textDocument/node/grammarName",
         id_params(uri, &root),
     );
     assert!(
@@ -145,14 +157,18 @@ fn test_scalar_accessors_report_intrinsic_properties() {
     );
 
     // The document root is a named node spanning the whole document.
-    let is_named = call(&mut client, "kakehashi/node/isNamed", id_params(uri, &root));
+    let is_named = call(
+        &mut client,
+        "kakehashi/textDocument/node/isNamed",
+        id_params(uri, &root),
+    );
     assert_eq!(is_named.get("isNamed"), Some(&Value::Bool(true)));
 
     for (method, field) in [
-        ("kakehashi/node/isExtra", "isExtra"),
-        ("kakehashi/node/hasError", "hasError"),
-        ("kakehashi/node/isError", "isError"),
-        ("kakehashi/node/isMissing", "isMissing"),
+        ("kakehashi/textDocument/node/isExtra", "isExtra"),
+        ("kakehashi/textDocument/node/hasError", "hasError"),
+        ("kakehashi/textDocument/node/isError", "isError"),
+        ("kakehashi/textDocument/node/isMissing", "isMissing"),
     ] {
         let v = call(&mut client, method, id_params(uri, &root));
         assert!(
@@ -167,11 +183,15 @@ fn test_scalar_accessors_report_intrinsic_properties() {
     // Byte span: root starts at 0 and ends at the document length.
     let start_byte = call(
         &mut client,
-        "kakehashi/node/startByte",
+        "kakehashi/textDocument/node/startByte",
         id_params(uri, &root),
     );
     assert_eq!(start_byte.get("startByte"), Some(&json!(0)));
-    let end_byte = call(&mut client, "kakehashi/node/endByte", id_params(uri, &root));
+    let end_byte = call(
+        &mut client,
+        "kakehashi/textDocument/node/endByte",
+        id_params(uri, &root),
+    );
     assert_eq!(
         end_byte.get("endByte").and_then(Value::as_u64),
         Some(DOC.len() as u64),
@@ -179,7 +199,7 @@ fn test_scalar_accessors_report_intrinsic_properties() {
     );
     let byte_range = call(
         &mut client,
-        "kakehashi/node/byteRange",
+        "kakehashi/textDocument/node/byteRange",
         id_params(uri, &root),
     );
     assert_eq!(byte_range.get("startByte"), Some(&json!(0)));
@@ -191,7 +211,7 @@ fn test_scalar_accessors_report_intrinsic_properties() {
     // Counts: the root has children, and named ≤ total.
     let child_count = call(
         &mut client,
-        "kakehashi/node/childCount",
+        "kakehashi/textDocument/node/childCount",
         id_params(uri, &root),
     )
     .get("childCount")
@@ -199,7 +219,7 @@ fn test_scalar_accessors_report_intrinsic_properties() {
     .expect("childCount");
     let named_count = call(
         &mut client,
-        "kakehashi/node/namedChildCount",
+        "kakehashi/textDocument/node/namedChildCount",
         id_params(uri, &root),
     )
     .get("namedChildCount")
@@ -213,7 +233,7 @@ fn test_scalar_accessors_report_intrinsic_properties() {
 
     let descendant_count = call(
         &mut client,
-        "kakehashi/node/descendantCount",
+        "kakehashi/textDocument/node/descendantCount",
         id_params(uri, &root),
     )
     .get("descendantCount")
@@ -225,7 +245,11 @@ fn test_scalar_accessors_report_intrinsic_properties() {
     );
 
     // s-expression is a non-empty parenthesized form.
-    let sexp = call(&mut client, "kakehashi/node/toSexp", id_params(uri, &root));
+    let sexp = call(
+        &mut client,
+        "kakehashi/textDocument/node/toSexp",
+        id_params(uri, &root),
+    );
     assert!(
         sexp.get("sexp")
             .and_then(Value::as_str)
@@ -245,7 +269,7 @@ fn test_child_and_named_child_indexing() {
 
     let child0 = call(
         &mut client,
-        "kakehashi/node/child",
+        "kakehashi/textDocument/node/child",
         json!({ "textDocument": { "uri": uri }, "id": root, "index": 0 }),
     );
     assert!(!child0.is_null(), "child(0) of a non-leaf must resolve");
@@ -254,20 +278,20 @@ fn test_child_and_named_child_indexing() {
     // Out-of-range and negative indices collapse to null.
     let out = call(
         &mut client,
-        "kakehashi/node/child",
+        "kakehashi/textDocument/node/child",
         json!({ "textDocument": { "uri": uri }, "id": root, "index": 100000 }),
     );
     assert!(out.is_null(), "out-of-range child index must be null");
     let neg = call(
         &mut client,
-        "kakehashi/node/child",
+        "kakehashi/textDocument/node/child",
         json!({ "textDocument": { "uri": uri }, "id": root, "index": -1 }),
     );
     assert!(neg.is_null(), "negative child index must be null");
 
     let named0 = call(
         &mut client,
-        "kakehashi/node/namedChild",
+        "kakehashi/textDocument/node/namedChild",
         json!({ "textDocument": { "uri": uri }, "id": root, "index": 0 }),
     );
     assert!(
@@ -286,12 +310,12 @@ fn test_named_children_are_a_subset_in_order() {
 
     let all = call(
         &mut client,
-        "kakehashi/node/children",
+        "kakehashi/textDocument/node/children",
         id_params(uri, &root),
     );
     let named = call(
         &mut client,
-        "kakehashi/node/namedChildren",
+        "kakehashi/textDocument/node/namedChildren",
         id_params(uri, &root),
     );
 
@@ -318,7 +342,7 @@ fn test_sibling_navigation_round_trips() {
     // child(0) of a multi-child node is followed by at least one more sibling.
     let first = call(
         &mut client,
-        "kakehashi/node/child",
+        "kakehashi/textDocument/node/child",
         json!({ "textDocument": { "uri": uri }, "id": container, "index": 0 }),
     );
     assert!(!first.is_null());
@@ -326,7 +350,7 @@ fn test_sibling_navigation_round_trips() {
 
     let next = call(
         &mut client,
-        "kakehashi/node/nextSibling",
+        "kakehashi/textDocument/node/nextSibling",
         id_params(uri, &first_id),
     );
     assert!(!next.is_null(), "first child must have a next sibling");
@@ -336,7 +360,7 @@ fn test_sibling_navigation_round_trips() {
     // Walking back must return to the original node.
     let back = call(
         &mut client,
-        "kakehashi/node/prevSibling",
+        "kakehashi/textDocument/node/prevSibling",
         id_params(uri, &next_id),
     );
     assert_eq!(
@@ -348,7 +372,7 @@ fn test_sibling_navigation_round_trips() {
     // The first child has no previous sibling.
     let none = call(
         &mut client,
-        "kakehashi/node/prevSibling",
+        "kakehashi/textDocument/node/prevSibling",
         id_params(uri, &first_id),
     );
     assert!(none.is_null(), "first child must have no previous sibling");
@@ -356,12 +380,12 @@ fn test_sibling_navigation_round_trips() {
     // Named-sibling variants resolve (value depends on grammar; just exercise).
     let _ = call(
         &mut client,
-        "kakehashi/node/nextNamedSibling",
+        "kakehashi/textDocument/node/nextNamedSibling",
         id_params(uri, &first_id),
     );
     let _ = call(
         &mut client,
-        "kakehashi/node/prevNamedSibling",
+        "kakehashi/textDocument/node/prevNamedSibling",
         id_params(uri, &next_id),
     );
 }
@@ -377,7 +401,7 @@ fn test_byte_based_descendant_lookups() {
     // descendantForByteRange at [0, 1) lands inside the first heading.
     let desc = call(
         &mut client,
-        "kakehashi/node/descendantForByteRange",
+        "kakehashi/textDocument/node/descendantForByteRange",
         json!({ "textDocument": { "uri": uri }, "id": root, "startByte": 0, "endByte": 1 }),
     );
     assert!(
@@ -388,7 +412,7 @@ fn test_byte_based_descendant_lookups() {
 
     let named_desc = call(
         &mut client,
-        "kakehashi/node/namedDescendantForByteRange",
+        "kakehashi/textDocument/node/namedDescendantForByteRange",
         json!({ "textDocument": { "uri": uri }, "id": root, "startByte": 0, "endByte": 1 }),
     );
     assert!(
@@ -399,7 +423,7 @@ fn test_byte_based_descendant_lookups() {
     // firstChildForByte(0) returns the root's first child past byte 0.
     let first_child = call(
         &mut client,
-        "kakehashi/node/firstChildForByte",
+        "kakehashi/textDocument/node/firstChildForByte",
         json!({ "textDocument": { "uri": uri }, "id": root, "byte": 0 }),
     );
     assert!(!first_child.is_null(), "firstChildForByte(0) must resolve");
@@ -407,7 +431,7 @@ fn test_byte_based_descendant_lookups() {
     // Negative byte → null.
     let neg = call(
         &mut client,
-        "kakehashi/node/firstChildForByte",
+        "kakehashi/textDocument/node/firstChildForByte",
         json!({ "textDocument": { "uri": uri }, "id": root, "byte": -5 }),
     );
     assert!(neg.is_null(), "negative byte must collapse to null");
@@ -417,7 +441,7 @@ fn test_byte_based_descendant_lookups() {
     // unspecified range.
     let inverted = call(
         &mut client,
-        "kakehashi/node/descendantForByteRange",
+        "kakehashi/textDocument/node/descendantForByteRange",
         json!({ "textDocument": { "uri": uri }, "id": root, "startByte": 5, "endByte": 1 }),
     );
     assert!(
@@ -426,7 +450,7 @@ fn test_byte_based_descendant_lookups() {
     );
     let inverted_named = call(
         &mut client,
-        "kakehashi/node/namedDescendantForByteRange",
+        "kakehashi/textDocument/node/namedDescendantForByteRange",
         json!({ "textDocument": { "uri": uri }, "id": root, "startByte": 5, "endByte": 1 }),
     );
     assert!(
@@ -442,7 +466,7 @@ fn test_byte_based_descendant_lookups() {
 
     let oob_first_child = call(
         &mut client,
-        "kakehashi/node/firstChildForByte",
+        "kakehashi/textDocument/node/firstChildForByte",
         json!({ "textDocument": { "uri": uri }, "id": root, "byte": oob }),
     );
     assert!(
@@ -453,7 +477,7 @@ fn test_byte_based_descendant_lookups() {
 
     let oob_desc = call(
         &mut client,
-        "kakehashi/node/descendantForByteRange",
+        "kakehashi/textDocument/node/descendantForByteRange",
         json!({ "textDocument": { "uri": uri }, "id": root, "startByte": 0, "endByte": oob }),
     );
     assert!(
@@ -464,7 +488,7 @@ fn test_byte_based_descendant_lookups() {
 
     let oob_named_desc = call(
         &mut client,
-        "kakehashi/node/namedDescendantForByteRange",
+        "kakehashi/textDocument/node/namedDescendantForByteRange",
         json!({ "textDocument": { "uri": uri }, "id": root, "startByte": 0, "endByte": oob }),
     );
     assert!(
@@ -488,16 +512,20 @@ fn test_byte_lookups_before_node_start_are_null() {
     let node = node_at(&mut client, uri, 2, 2);
     assert!(!node.is_null(), "expected a node on line 2");
     let id = id_of(&node);
-    let start_byte = call(&mut client, "kakehashi/node/startByte", id_params(uri, &id))
-        .get("startByte")
-        .and_then(Value::as_u64)
-        .expect("startByte");
+    let start_byte = call(
+        &mut client,
+        "kakehashi/textDocument/node/startByte",
+        id_params(uri, &id),
+    )
+    .get("startByte")
+    .and_then(Value::as_u64)
+    .expect("startByte");
     assert!(start_byte > 0, "fixture node must start after byte 0");
 
     // firstChildForByte at byte 0 is before this node → null.
     let before = call(
         &mut client,
-        "kakehashi/node/firstChildForByte",
+        "kakehashi/textDocument/node/firstChildForByte",
         json!({ "textDocument": { "uri": uri }, "id": id, "byte": 0 }),
     );
     assert!(
@@ -508,8 +536,8 @@ fn test_byte_lookups_before_node_start_are_null() {
 
     // A range whose start is before this node → null (both variants).
     for method in [
-        "kakehashi/node/descendantForByteRange",
-        "kakehashi/node/namedDescendantForByteRange",
+        "kakehashi/textDocument/node/descendantForByteRange",
+        "kakehashi/textDocument/node/namedDescendantForByteRange",
     ] {
         let v = call(
             &mut client,
@@ -538,7 +566,7 @@ fn test_field_name_for_child_reports_or_nulls() {
     // fields). The point is that a resolvable node never yields top-level null.
     let resp = call(
         &mut client,
-        "kakehashi/node/fieldNameForChild",
+        "kakehashi/textDocument/node/fieldNameForChild",
         json!({ "textDocument": { "uri": uri }, "id": root, "index": 0 }),
     );
     assert!(
@@ -549,7 +577,7 @@ fn test_field_name_for_child_reports_or_nulls() {
 
     let named = call(
         &mut client,
-        "kakehashi/node/fieldNameForNamedChild",
+        "kakehashi/textDocument/node/fieldNameForNamedChild",
         json!({ "textDocument": { "uri": uri }, "id": root, "index": 0 }),
     );
     assert!(
@@ -575,7 +603,7 @@ fn test_field_name_lookups_on_python_assignment() {
     // is the `1`, which is unambiguously within the python tree).
     let py = call(
         &mut client,
-        "kakehashi/node",
+        "kakehashi/textDocument/node",
         json!({ "textDocument": { "uri": uri }, "position": { "line": 3, "character": 4 }, "injection": true }),
     );
     if py.is_null() {
@@ -587,14 +615,18 @@ fn test_field_name_lookups_on_python_assignment() {
     let mut current = id_of(&py);
     let mut assignment: Option<String> = None;
     for _ in 0..16 {
-        let kind = call(&mut client, "kakehashi/node/kind", id_params(uri, &current));
+        let kind = call(
+            &mut client,
+            "kakehashi/textDocument/node/kind",
+            id_params(uri, &current),
+        );
         if kind.get("kind").and_then(Value::as_str) == Some("assignment") {
             assignment = Some(current.clone());
             break;
         }
         let parent = call(
             &mut client,
-            "kakehashi/node/parent",
+            "kakehashi/textDocument/node/parent",
             id_params(uri, &current),
         );
         if parent.is_null() {
@@ -610,7 +642,7 @@ fn test_field_name_lookups_on_python_assignment() {
     // child_by_field_name("left") → the `y` identifier.
     let left = call(
         &mut client,
-        "kakehashi/node/childByFieldName",
+        "kakehashi/textDocument/node/childByFieldName",
         json!({ "textDocument": { "uri": uri }, "id": assignment, "name": "left" }),
     );
     assert!(!left.is_null(), "assignment must have a `left` field");
@@ -623,7 +655,7 @@ fn test_field_name_lookups_on_python_assignment() {
     // childrenByFieldName("left") → exactly one node, same as the singular lookup.
     let lefts = call(
         &mut client,
-        "kakehashi/node/childrenByFieldName",
+        "kakehashi/textDocument/node/childrenByFieldName",
         json!({ "textDocument": { "uri": uri }, "id": assignment, "name": "left" }),
     );
     let lefts_arr = lefts
@@ -634,7 +666,7 @@ fn test_field_name_lookups_on_python_assignment() {
     // An absent field name yields an empty array, not null.
     let nope = call(
         &mut client,
-        "kakehashi/node/childrenByFieldName",
+        "kakehashi/textDocument/node/childrenByFieldName",
         json!({ "textDocument": { "uri": uri }, "id": assignment, "name": "no_such_field" }),
     );
     assert_eq!(
@@ -655,16 +687,16 @@ fn test_accessors_return_null_for_unknown_id() {
     let stray = "01HXXXXXXXXXXXXXXXXXXXXXXX";
 
     for method in [
-        "kakehashi/node/kind",
-        "kakehashi/node/grammarName",
-        "kakehashi/node/isNamed",
-        "kakehashi/node/startByte",
-        "kakehashi/node/byteRange",
-        "kakehashi/node/childCount",
-        "kakehashi/node/descendantCount",
-        "kakehashi/node/toSexp",
-        "kakehashi/node/namedChildren",
-        "kakehashi/node/nextSibling",
+        "kakehashi/textDocument/node/kind",
+        "kakehashi/textDocument/node/grammarName",
+        "kakehashi/textDocument/node/isNamed",
+        "kakehashi/textDocument/node/startByte",
+        "kakehashi/textDocument/node/byteRange",
+        "kakehashi/textDocument/node/childCount",
+        "kakehashi/textDocument/node/descendantCount",
+        "kakehashi/textDocument/node/toSexp",
+        "kakehashi/textDocument/node/namedChildren",
+        "kakehashi/textDocument/node/nextSibling",
     ] {
         let v = call(&mut client, method, id_params(uri, stray));
         assert!(v.is_null(), "{} must return null for an unknown id", method);
@@ -673,19 +705,19 @@ fn test_accessors_return_null_for_unknown_id() {
     // Index / byte / field variants likewise collapse to null.
     let v = call(
         &mut client,
-        "kakehashi/node/child",
+        "kakehashi/textDocument/node/child",
         json!({ "textDocument": { "uri": uri }, "id": stray, "index": 0 }),
     );
     assert!(v.is_null(), "child on unknown id must be null");
     let v = call(
         &mut client,
-        "kakehashi/node/fieldNameForChild",
+        "kakehashi/textDocument/node/fieldNameForChild",
         json!({ "textDocument": { "uri": uri }, "id": stray, "index": 0 }),
     );
     assert!(v.is_null(), "fieldNameForChild on unknown id must be null");
     let v = call(
         &mut client,
-        "kakehashi/node/childByFieldName",
+        "kakehashi/textDocument/node/childByFieldName",
         json!({ "textDocument": { "uri": uri }, "id": stray, "name": "left" }),
     );
     assert!(v.is_null(), "childByFieldName on unknown id must be null");
@@ -714,7 +746,7 @@ fn test_position_accessors_return_lsp_positions() {
     // The document root starts at the very beginning.
     let start_pos = call(
         &mut client,
-        "kakehashi/node/startPosition",
+        "kakehashi/textDocument/node/startPosition",
         id_params(uri, &root),
     );
     assert_eq!(
@@ -725,14 +757,18 @@ fn test_position_accessors_return_lsp_positions() {
 
     let end_pos = call(
         &mut client,
-        "kakehashi/node/endPosition",
+        "kakehashi/textDocument/node/endPosition",
         id_params(uri, &root),
     );
     let end = lsp_pos(end_pos.get("endPosition").expect("endPosition field"));
 
     // range bundles the two into { start, end } and must agree with the singular
     // accessors.
-    let range = call(&mut client, "kakehashi/node/range", id_params(uri, &root));
+    let range = call(
+        &mut client,
+        "kakehashi/textDocument/node/range",
+        id_params(uri, &root),
+    );
     assert_eq!(
         lsp_pos(range.get("start").expect("range.start")),
         (0, 0),
@@ -762,13 +798,17 @@ fn test_positions_are_utf16_not_byte_columns() {
     assert!(!node.is_null(), "expected a node at the CJK line start");
     let id = id_of(&node);
 
-    let end_byte = call(&mut client, "kakehashi/node/endByte", id_params(uri, &id))
-        .get("endByte")
-        .and_then(Value::as_u64)
-        .expect("endByte");
+    let end_byte = call(
+        &mut client,
+        "kakehashi/textDocument/node/endByte",
+        id_params(uri, &id),
+    )
+    .get("endByte")
+    .and_then(Value::as_u64)
+    .expect("endByte");
     let end_pos = call(
         &mut client,
-        "kakehashi/node/endPosition",
+        "kakehashi/textDocument/node/endPosition",
         id_params(uri, &id),
     );
     let (line, character) = lsp_pos(end_pos.get("endPosition").expect("endPosition field"));
@@ -803,7 +843,7 @@ fn test_descendant_for_point_range_takes_lsp_positions() {
     // A Position range covering the first byte resolves a descendant.
     let desc = call(
         &mut client,
-        "kakehashi/node/descendantForPointRange",
+        "kakehashi/textDocument/node/descendantForPointRange",
         json!({ "textDocument": { "uri": uri }, "id": root,
                 "start": { "line": 0, "character": 0 },
                 "end":   { "line": 0, "character": 1 } }),
@@ -816,7 +856,7 @@ fn test_descendant_for_point_range_takes_lsp_positions() {
 
     let named = call(
         &mut client,
-        "kakehashi/node/namedDescendantForPointRange",
+        "kakehashi/textDocument/node/namedDescendantForPointRange",
         json!({ "textDocument": { "uri": uri }, "id": root,
                 "start": { "line": 0, "character": 0 },
                 "end":   { "line": 0, "character": 1 } }),
@@ -829,7 +869,7 @@ fn test_descendant_for_point_range_takes_lsp_positions() {
     // Inverted Position range collapses to null.
     let inverted = call(
         &mut client,
-        "kakehashi/node/descendantForPointRange",
+        "kakehashi/textDocument/node/descendantForPointRange",
         json!({ "textDocument": { "uri": uri }, "id": root,
                 "start": { "line": 0, "character": 5 },
                 "end":   { "line": 0, "character": 1 } }),
@@ -841,7 +881,7 @@ fn test_descendant_for_point_range_takes_lsp_positions() {
     // descendant resolved elsewhere in the document.
     let overlong = call(
         &mut client,
-        "kakehashi/node/descendantForPointRange",
+        "kakehashi/textDocument/node/descendantForPointRange",
         json!({ "textDocument": { "uri": uri }, "id": root,
                 "start": { "line": 0, "character": 0 },
                 "end":   { "line": 0, "character": 999 } }),
@@ -862,16 +902,16 @@ fn test_position_accessors_return_null_for_unknown_id() {
     let stray = "01HXXXXXXXXXXXXXXXXXXXXXXX";
 
     for method in [
-        "kakehashi/node/range",
-        "kakehashi/node/startPosition",
-        "kakehashi/node/endPosition",
+        "kakehashi/textDocument/node/range",
+        "kakehashi/textDocument/node/startPosition",
+        "kakehashi/textDocument/node/endPosition",
     ] {
         let v = call(&mut client, method, id_params(uri, stray));
         assert!(v.is_null(), "{} must return null for an unknown id", method);
     }
     let v = call(
         &mut client,
-        "kakehashi/node/descendantForPointRange",
+        "kakehashi/textDocument/node/descendantForPointRange",
         json!({ "textDocument": { "uri": uri }, "id": stray,
                 "start": { "line": 0, "character": 0 },
                 "end":   { "line": 0, "character": 1 } }),
@@ -890,7 +930,7 @@ fn test_position_accessors_return_null_for_unknown_id() {
 // non-contiguous included ranges: each line's code is included, the `> `
 // prefixes are excluded gaps. A coordinate landing in a gap is not real
 // injected content, so the coordinate accessors must return null — matching
-// the entry point (`kakehashi/node`), which never pushes an injection layer
+// the entry point (`kakehashi/textDocument/node`), which never pushes an injection layer
 // for a gap byte.
 //
 // Byte map of the fixture (every line starts with a 2-byte `> ` prefix):
@@ -907,7 +947,7 @@ const BLOCKQUOTED_PYTHON: &str = "> ```python\n> x = 1\n> y = 2\n> ```\n";
 fn python_layer_root(client: &mut LspClient, uri: &str) -> String {
     let node = call(
         client,
-        "kakehashi/node",
+        "kakehashi/textDocument/node",
         json!({
             "textDocument": { "uri": uri },
             "position": { "line": 1, "character": 4 },
@@ -920,7 +960,11 @@ fn python_layer_root(client: &mut LspClient, uri: &str) -> String {
     );
     let mut current = id_of(&node);
     for _ in 0..32 {
-        let parent = call(client, "kakehashi/node/parent", id_params(uri, &current));
+        let parent = call(
+            client,
+            "kakehashi/textDocument/node/parent",
+            id_params(uri, &current),
+        );
         if parent.is_null() {
             return current;
         }
@@ -933,7 +977,11 @@ fn python_layer_root(client: &mut LspClient, uri: &str) -> String {
 /// excluded gap), so this asserts the test premise: the gap bytes pass the
 /// node-span bound and only the included-ranges check can reject them.
 fn assert_gap_inside_root_span(client: &mut LspClient, uri: &str, root: &str) {
-    let range = call(client, "kakehashi/node/byteRange", id_params(uri, root));
+    let range = call(
+        client,
+        "kakehashi/textDocument/node/byteRange",
+        id_params(uri, root),
+    );
     let start = range
         .get("startByte")
         .and_then(Value::as_u64)
@@ -962,7 +1010,7 @@ fn test_byte_lookups_in_excluded_gap_are_null() {
     // Control: a code byte (the `y` at byte 22) resolves normally.
     let on_code = call(
         &mut client,
-        "kakehashi/node/descendantForByteRange",
+        "kakehashi/textDocument/node/descendantForByteRange",
         json!({ "textDocument": { "uri": uri }, "id": root,
                 "startByte": 22, "endByte": 23 }),
     );
@@ -976,7 +1024,7 @@ fn test_byte_lookups_in_excluded_gap_are_null() {
     // the `y` at 22.
     let spanning = call(
         &mut client,
-        "kakehashi/node/descendantForByteRange",
+        "kakehashi/textDocument/node/descendantForByteRange",
         json!({ "textDocument": { "uri": uri }, "id": root,
                 "startByte": 14, "endByte": 23 }),
     );
@@ -991,8 +1039,8 @@ fn test_byte_lookups_in_excluded_gap_are_null() {
     // content even though 22 itself starts an included range.
     for (start, end) in [(20, 21), (14, 22)] {
         for method in [
-            "kakehashi/node/descendantForByteRange",
-            "kakehashi/node/namedDescendantForByteRange",
+            "kakehashi/textDocument/node/descendantForByteRange",
+            "kakehashi/textDocument/node/namedDescendantForByteRange",
         ] {
             let v = call(
                 &mut client,
@@ -1011,7 +1059,7 @@ fn test_byte_lookups_in_excluded_gap_are_null() {
 
     let v = call(
         &mut client,
-        "kakehashi/node/firstChildForByte",
+        "kakehashi/textDocument/node/firstChildForByte",
         json!({ "textDocument": { "uri": uri }, "id": root, "byte": 20 }),
     );
     assert!(
@@ -1034,7 +1082,7 @@ fn test_point_lookups_in_excluded_gap_are_null() {
     // Control: positions on the code (`y` at line 2, characters 2..3) resolve.
     let on_code = call(
         &mut client,
-        "kakehashi/node/descendantForPointRange",
+        "kakehashi/textDocument/node/descendantForPointRange",
         json!({ "textDocument": { "uri": uri }, "id": root,
                 "start": { "line": 2, "character": 2 },
                 "end":   { "line": 2, "character": 3 } }),
@@ -1046,8 +1094,8 @@ fn test_point_lookups_in_excluded_gap_are_null() {
 
     // Positions on the line-2 `> ` prefix are an excluded gap → null.
     for method in [
-        "kakehashi/node/descendantForPointRange",
-        "kakehashi/node/namedDescendantForPointRange",
+        "kakehashi/textDocument/node/descendantForPointRange",
+        "kakehashi/textDocument/node/namedDescendantForPointRange",
     ] {
         let v = call(
             &mut client,
@@ -1089,14 +1137,14 @@ fn test_child_with_descendant_returns_child_on_path() {
     // Walk two levels down: child = children(root)[0], grandchild = children(child)[0].
     let children = call(
         &mut client,
-        "kakehashi/node/children",
+        "kakehashi/textDocument/node/children",
         id_params(uri, &root),
     );
     let child = &children.as_array().expect("children array")[0];
     let child_id = id_of(child);
     let grandchildren = call(
         &mut client,
-        "kakehashi/node/children",
+        "kakehashi/textDocument/node/children",
         id_params(uri, &child_id),
     );
     let grandchild_id = id_of(&grandchildren.as_array().expect("grandchildren array")[0]);
@@ -1104,7 +1152,7 @@ fn test_child_with_descendant_returns_child_on_path() {
     // Grandchild: the immediate child on the path is `child` (same minted id).
     let via_grandchild = call(
         &mut client,
-        "kakehashi/node/childWithDescendant",
+        "kakehashi/textDocument/node/childWithDescendant",
         descendant_params(uri, &root, &grandchild_id),
     );
     assert!(
@@ -1120,7 +1168,7 @@ fn test_child_with_descendant_returns_child_on_path() {
     // Immediate child: returns the child itself.
     let via_child = call(
         &mut client,
-        "kakehashi/node/childWithDescendant",
+        "kakehashi/textDocument/node/childWithDescendant",
         descendant_params(uri, &root, &child_id),
     );
     assert!(!via_child.is_null());
@@ -1140,21 +1188,21 @@ fn test_child_with_descendant_null_for_non_descendants() {
 
     let children = call(
         &mut client,
-        "kakehashi/node/children",
+        "kakehashi/textDocument/node/children",
         id_params(uri, &root),
     );
     let child_id = id_of(&children.as_array().expect("children array")[0]);
 
     let self_pair = call(
         &mut client,
-        "kakehashi/node/childWithDescendant",
+        "kakehashi/textDocument/node/childWithDescendant",
         descendant_params(uri, &root, &root),
     );
     assert!(self_pair.is_null(), "descendant == self must be null");
 
     let inverted = call(
         &mut client,
-        "kakehashi/node/childWithDescendant",
+        "kakehashi/textDocument/node/childWithDescendant",
         descendant_params(uri, &child_id, &root),
     );
     assert!(
@@ -1164,7 +1212,7 @@ fn test_child_with_descendant_null_for_non_descendants() {
 
     let malformed = call(
         &mut client,
-        "kakehashi/node/childWithDescendant",
+        "kakehashi/textDocument/node/childWithDescendant",
         descendant_params(uri, &root, "not-a-ulid"),
     );
     assert!(malformed.is_null(), "malformed descendantId must be null");
@@ -1185,7 +1233,7 @@ fn test_child_with_descendant_rejects_cross_layer_pair() {
 
     let cross = call(
         &mut client,
-        "kakehashi/node/childWithDescendant",
+        "kakehashi/textDocument/node/childWithDescendant",
         descendant_params(uri, &host_root, &python_root),
     );
     assert!(
@@ -1209,14 +1257,14 @@ fn test_child_with_descendant_in_injection_layer() {
     let python_root = python_layer_root(&mut client, uri);
     let children = call(
         &mut client,
-        "kakehashi/node/children",
+        "kakehashi/textDocument/node/children",
         id_params(uri, &python_root),
     );
     let child = &children.as_array().expect("python children array")[0];
     let child_id = id_of(child);
     let grandchildren = call(
         &mut client,
-        "kakehashi/node/children",
+        "kakehashi/textDocument/node/children",
         id_params(uri, &child_id),
     );
     let grandchild_id = id_of(
@@ -1227,7 +1275,7 @@ fn test_child_with_descendant_in_injection_layer() {
 
     let via_grandchild = call(
         &mut client,
-        "kakehashi/node/childWithDescendant",
+        "kakehashi/textDocument/node/childWithDescendant",
         descendant_params(uri, &python_root, &grandchild_id),
     );
     assert!(
@@ -1242,7 +1290,7 @@ fn test_child_with_descendant_in_injection_layer() {
 
     let self_pair = call(
         &mut client,
-        "kakehashi/node/childWithDescendant",
+        "kakehashi/textDocument/node/childWithDescendant",
         descendant_params(uri, &python_root, &python_root),
     );
     assert!(

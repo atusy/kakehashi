@@ -1,4 +1,4 @@
-//! End-to-end tests for `kakehashi/captures/{full, full/delta, range}`
+//! End-to-end tests for `kakehashi/textDocument/captures/{full, full/delta, range}`
 //! (captures-protocol).
 //!
 //! Exercises the full LSP round-trip a treesitter-context-style client makes:
@@ -105,7 +105,7 @@ fn request(client: &mut LspClient, method: &str, params: Value) -> Value {
 fn full(client: &mut LspClient, uri: &str, kind: &str) -> Value {
     request(
         client,
-        "kakehashi/captures/full",
+        "kakehashi/textDocument/captures/full",
         json!({ "textDocument": { "uri": uri }, "kind": kind }),
     )
 }
@@ -113,7 +113,7 @@ fn full(client: &mut LspClient, uri: &str, kind: &str) -> Value {
 fn full_with_injection(client: &mut LspClient, uri: &str, kind: &str) -> Value {
     request(
         client,
-        "kakehashi/captures/full",
+        "kakehashi/textDocument/captures/full",
         json!({ "textDocument": { "uri": uri }, "kind": kind, "injection": true }),
     )
 }
@@ -137,7 +137,7 @@ fn match_languages(result: &Value) -> Vec<String> {
 fn delta(client: &mut LspClient, uri: &str, kind: &str, previous_result_id: &str) -> Value {
     request(
         client,
-        "kakehashi/captures/full/delta",
+        "kakehashi/textDocument/captures/full/delta",
         json!({
             "textDocument": { "uri": uri },
             "kind": kind,
@@ -421,7 +421,7 @@ fn range_returns_only_intersecting_matches() {
 
     let result = request(
         &mut client,
-        "kakehashi/captures/range",
+        "kakehashi/textDocument/captures/range",
         json!({
             "textDocument": { "uri": uri },
             "kind": "context",
@@ -475,7 +475,7 @@ fn malformed_kind_returns_error() {
     open_markdown(&mut client, uri, DOC);
 
     let response = client.send_request(
-        "kakehashi/captures/full",
+        "kakehashi/textDocument/captures/full",
         json!({ "textDocument": { "uri": uri }, "kind": "../evil" }),
     );
     assert!(
@@ -512,7 +512,7 @@ fn full_with_injection_collects_all_layers() {
     assert_eq!(langs.first().map(String::as_str), Some("markdown"));
 
     // The python match's node is minted in its layer and composes with
-    // kakehashi/node/*: feeding the id back resolves to the python node kind.
+    // kakehashi/textDocument/node/*: feeding the id back resolves to the python node kind.
     let matches = result.get("matches").and_then(Value::as_array).unwrap();
     let py = matches
         .iter()
@@ -523,7 +523,7 @@ fn full_with_injection_collects_all_layers() {
         .and_then(Value::as_str)
         .expect("python capture has a node id");
     let response = client.send_request(
-        "kakehashi/node/kind",
+        "kakehashi/textDocument/node/kind",
         json!({ "textDocument": { "uri": uri }, "id": id }),
     );
     assert_eq!(
@@ -655,7 +655,7 @@ fn range_with_injection_prunes_to_intersecting_layers() {
     // Lines 3-4 cover only the python function body, not the heading.
     let result = request(
         &mut client,
-        "kakehashi/captures/range",
+        "kakehashi/textDocument/captures/range",
         json!({
             "textDocument": { "uri": uri },
             "kind": "context",
