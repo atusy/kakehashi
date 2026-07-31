@@ -13,11 +13,14 @@
 //! `kakehashi/internal/effectiveConfiguration` takes empty params and keeps
 //! its name.
 
+use std::sync::{Arc, OnceLock};
 use std::task::{Context, Poll};
 
 use dashmap::DashSet;
 use tower::Service;
+use tower_lsp_server::Client;
 use tower_lsp_server::jsonrpc::Request;
+use tower_lsp_server::ls_types::MessageType;
 
 /// The document-scoped custom methods that existed when the `textDocument/`
 /// scope segment was introduced, in their canonical spelling.
@@ -123,13 +126,21 @@ pub(crate) struct DeprecatedMethodAlias<S> {
     /// because `Service::call` hands out `&mut self` but `rewrite` is shared
     /// through it.
     warned: DashSet<&'static str>,
+    /// The handle used to put the deprecation notice in the editor's LSP log.
+    ///
+    /// A `OnceLock` because the `Client` does not exist until `LspService::build`
+    /// runs its factory closure, which is also where the service this layer
+    /// wraps is created. Empty in unit tests, where the notice is `log::warn!`
+    /// only and nothing is spawned.
+    client: Arc<OnceLock<Client>>,
 }
 
 impl<S> DeprecatedMethodAlias<S> {
-    pub(crate) fn new(inner: S) -> Self {
+    pub(crate) fn new(inner: S, client: Arc<OnceLock<Client>>) -> Self {
         Self {
             inner,
             warned: DashSet::new(),
+            client,
         }
     }
 
@@ -144,13 +155,7 @@ impl<S> DeprecatedMethodAlias<S> {
         // a client on an old name would otherwise flood the log on every
         // keystroke.
         if self.warned.insert(canonical) {
-            log::warn!(
-                target: "kakehashi::deprecated",
-                "custom method `{}` is deprecated; use `{}`. The old name still \
-                 works for now but may be removed in a future release.",
-                req.method(),
-                canonical
-            );
+            self.warn_deprecated(req.method(), canonical);
         }
         let (_, id, params) = req.into_parts();
         let mut builder = Request::build(canonical);
@@ -161,6 +166,34 @@ impl<S> DeprecatedMethodAlias<S> {
             builder = builder.id(id);
         }
         builder.finish()
+    }
+
+    /// Announce a deprecated spelling once, to both the server log and the
+    /// editor's LSP log.
+    ///
+    /// `window/logMessage` is what actually reaches the audience. The server's
+    /// own `log::warn!` goes to stderr and, with `RUST_LOG` unset, env_logger
+    /// filters at `Error` — so a log-only notice is invisible in a default run,
+    /// to precisely the client authors who need to see it. `showMessage` is
+    /// wrong in the other direction: up to 41 popups in a session.
+    ///
+    /// Detached rather than awaited. `call` must reach the ordering gate
+    /// synchronously, so the request path stays straight-line and only this
+    /// once-per-name notification is spawned; it carries no ordering
+    /// obligation of its own.
+    fn warn_deprecated(&self, deprecated: &str, canonical: &'static str) {
+        let notice = format!(
+            "kakehashi: custom method `{deprecated}` is deprecated; use \
+             `{canonical}`. The old name still works for now but may be removed \
+             in a future release."
+        );
+        log::warn!(target: "kakehashi::deprecated", "{notice}");
+        if let Some(client) = self.client.get() {
+            let client = client.clone();
+            tokio::spawn(async move {
+                client.log_message(MessageType::WARNING, notice).await;
+            });
+        }
     }
 }
 
@@ -269,7 +302,9 @@ mod tests {
     /// The rewrite is independent of the inner service, so tests drive it
     /// through a middleware wrapping the unit type rather than a stub service.
     fn alias() -> DeprecatedMethodAlias<()> {
-        DeprecatedMethodAlias::new(())
+        // No client: the notice is `log::warn!` only, so `rewrite` spawns
+        // nothing and these stay plain `#[test]`s with no runtime.
+        DeprecatedMethodAlias::new((), Arc::new(OnceLock::new()))
     }
 
     #[test]

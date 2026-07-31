@@ -888,11 +888,14 @@ mod tests {
     async fn a_deprecated_reader_name_is_gated_by_the_alias_layer_above() {
         let log = Arc::new(std::sync::Mutex::new(Vec::new()));
         let (release_tx, release_rx) = tokio::sync::oneshot::channel();
-        let mut stack = crate::lsp::ingress_stack(MockInner {
-            log: Arc::clone(&log),
-            stall_method: "textDocument/didChange",
-            release: Some(release_rx),
-        });
+        let mut stack = crate::lsp::ingress_stack(
+            MockInner {
+                log: Arc::clone(&log),
+                stall_method: "textDocument/didChange",
+                release: Some(release_rx),
+            },
+            Arc::new(std::sync::OnceLock::new()),
+        );
 
         let change_fut = stack.call(notification("textDocument/didChange", URI));
         // The pre-rename spelling, as a client that has not migrated sends it.

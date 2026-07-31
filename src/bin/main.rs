@@ -918,10 +918,17 @@ async fn serve_lsp() {
     let pool = Arc::new(LanguageServerPool::new());
     let cancel_forwarder = CancelForwarder::new(Arc::clone(&pool));
 
-    // Create Kakehashi with the shared pool and cancel forwarder
+    // Create Kakehashi with the shared pool and cancel forwarder.
+    //
+    // The factory closure is the only place the `Client` is handed out, and the
+    // deprecated-method alias layer — built after this, from the outside — needs
+    // one to put its notice in the editor's LSP log. Stash a clone here.
     let pool_for_service = Arc::clone(&pool);
     let forwarder_for_service = cancel_forwarder.clone();
+    let deprecation_client = Arc::new(std::sync::OnceLock::new());
+    let client_slot = Arc::clone(&deprecation_client);
     let (service, socket) = LspService::build(move |client| {
+        let _ = client_slot.set(client.clone());
         Kakehashi::with_cancel_forwarder(
             client,
             Arc::clone(&pool_for_service),
@@ -1119,7 +1126,7 @@ async fn serve_lsp() {
     // deprecated-method rewrite above that. The relative order of the two is
     // load-bearing and easy to get backwards, so it lives in `ingress_stack`
     // where a test pins it — see that function's docs.
-    let service = kakehashi::lsp::ingress_stack(service);
+    let service = kakehashi::lsp::ingress_stack(service, deprecation_client);
 
     // Lift tower-lsp's default 4-message `buffer_unordered` cap: editors fire
     // bursts of concurrent requests per keystroke (Neovim: semanticTokens +

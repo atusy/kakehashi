@@ -45,8 +45,14 @@ use method_alias::DeprecatedMethodAlias;
 /// The `Future: Send` bound must be restated on the return type: `Server::serve`
 /// requires it, and an opaque `impl Trait` would otherwise hide that the
 /// composed future is `Send`.
+///
+/// `client` carries the deprecation notice to the editor's LSP log. It is a
+/// `OnceLock` because `LspService::build` only hands out the `Client` inside
+/// the factory closure that also builds `inner`, so the caller fills the slot
+/// there and passes it here.
 pub fn ingress_stack<S>(
     inner: S,
+    client: std::sync::Arc<std::sync::OnceLock<tower_lsp_server::Client>>,
 ) -> impl tower::Service<
     tower_lsp_server::jsonrpc::Request,
     Response = S::Response,
@@ -61,7 +67,7 @@ where
     S::Future: Send + 'static,
     S::Error: Send + 'static,
 {
-    DeprecatedMethodAlias::new(IngressOrderGate::new(inner))
+    DeprecatedMethodAlias::new(IngressOrderGate::new(inner), client)
 }
 pub(crate) use request_id::current_upstream_id;
 pub use request_id::{CancelForwarder, RequestIdCapture};

@@ -59,9 +59,14 @@ Three properties of that middleware are load-bearing:
    per-document wire-order tickets by matching on the method name and knows
    only the canonical spellings. Below the gate, a deprecated call would arrive
    unrecognized, fall through ungated, and read a tree missing edits that
-   preceded it on the wire. An `ingress_order` test pins that old names reach
-   the gate already rewritten, so the ordering dependency is not merely a
-   comment.
+   preceded it on the wire.
+
+   Both orders compile and both leave every request answerable, so the mistake
+   is invisible at the call site. The composition therefore lives in one
+   library function, `lsp::ingress_stack`, which `main.rs` calls and a unit
+   test drives — the shipped order is the one under assertion. A test that
+   assembled its own stack would have pinned the property while leaving the
+   wiring free to regress.
 2. **The mapping is an explicit allowlist, not a prefix rule.** A blanket
    `kakehashi/` → `kakehashi/textDocument/` rewrite would corrupt
    `internal/effectiveConfiguration`, and would invent deprecated spellings for
