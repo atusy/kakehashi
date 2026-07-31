@@ -255,6 +255,31 @@ fn init_client_reopen_order(
     (client, config_dir)
 }
 
+/// Block until the replacement incarnation has both initialized AND received a
+/// `didOpen`, i.e. its re-open has actually run.
+///
+/// Waiting on the observable effect rather than on a duration is what keeps the
+/// caller's assertion about the barrier's RESULT instead of about the clock.
+fn await_replacement_reopen(log: &std::path::Path) {
+    for _ in 0..300 {
+        if let Ok(wire) = std::fs::read_to_string(log)
+            && wire
+                .lines()
+                .filter(|l| l.split('\t').next() == Some("initialize"))
+                .count()
+                >= 2
+            && replacement_segment(&wire)
+                .iter()
+                .any(|l| l.split('\t').next() == Some("textDocument/didOpen"))
+        {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let wire = std::fs::read_to_string(log).unwrap_or_default();
+    panic!("the replacement never re-opened a document:\n{wire}");
+}
+
 /// Split the wire log into lines and return the segment belonging to the
 /// REPLACEMENT incarnation: everything from the last exact `initialize` on.
 /// Segmenting matters — the first incarnation legitimately received a didOpen
@@ -370,9 +395,15 @@ fn a_command_does_not_overtake_the_reopen_of_a_respawned_downstream() {
 /// there distinguishes "waited and was released" from "never released, gave up
 /// waiting".
 ///
-/// So this pins the positive direction: with no stall, the re-open finishes
-/// well inside `REOPEN_WAIT`, and the FIRST command must come back non-null —
-/// having waited, not having skipped the wait, which the wire order proves.
+/// So this pins the positive direction. It does NOT race the barrier to do it:
+/// firing the command while the re-open is still in flight makes the assertion
+/// depend on the re-open beating `REOPEN_WAIT`, which a loaded machine breaks —
+/// and a fail-soft null is the CORRECT answer then, so the test would be
+/// failing on correct behaviour. Instead the re-open is allowed to finish
+/// first, and the command then fires against a barrier whose recorded result is
+/// already `true`. A barrier that reports failure leaves that result `false`
+/// with its sender dropped, which the wait reads as "connection may still be
+/// missing documents" and withholds the command — no timing involved.
 #[test]
 fn a_completed_reopen_releases_the_command_it_was_holding() {
     let log_dir = tempfile::TempDir::new().expect("Failed to create log temp dir");
@@ -389,12 +420,15 @@ fn a_completed_reopen_releases_the_command_it_was_holding() {
         .expect("a routed command name")
         .to_string();
 
-    // The mock died surfacing that action, so this command is the request that
-    // drives the respawn. Its connection is acquired BEFORE the barrier wait,
-    // and the barrier is claimed BEFORE the replacement flips to Ready — so the
-    // wait always observes the in-flight re-open rather than racing it. With no
-    // stall the re-open settles, and a released command is the only correct
-    // outcome.
+    // The mock died surfacing that action. Drive the respawn with a SECOND
+    // codeAction rather than with the command: codeAction never consults the
+    // barrier, so the re-open runs and settles while nothing has waited on it —
+    // and only a wait retires the entry, so its result is still there to read.
+    let _ = code_action_with_retry(&mut client);
+    await_replacement_reopen(&log);
+
+    // The barrier now holds a settled result. Releasing the command is the only
+    // correct response to one that reports success.
     let response = client.send_request(
         "workspace/executeCommand",
         json!({ "command": routed, "arguments": [] }),
