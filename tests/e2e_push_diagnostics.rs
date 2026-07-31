@@ -1474,3 +1474,44 @@ fn e2e_workspace_folder_change_refreshes_pull_clients() {
     client.send_request("shutdown", json!(null));
     client.send_notification("exit", json!(null));
 }
+
+#[test]
+fn e2e_empty_workspace_folder_change_does_not_refresh_pull_clients() {
+    // An event naming neither an addition nor a removal changes no project, so
+    // forcing every open document to be re-pulled buys nothing. Self-validating:
+    // the same client then sends a real change and MUST be refreshed, so a
+    // negative result here is the guard working rather than the harness failing
+    // to emit.
+    let (mut client, _config_dir) =
+        init_client_with_mode_caps("workspace-folders", refresh_capable_caps());
+
+    client.send_notification(
+        "workspace/didChangeWorkspaceFolders",
+        json!({ "event": { "added": [], "removed": [] } }),
+    );
+
+    assert!(
+        client
+            .wait_for_server_request("workspace/diagnostic/refresh", Duration::from_secs(3))
+            .is_none(),
+        "an event that names no folder must not force a workspace-wide re-pull"
+    );
+
+    client.send_notification(
+        "workspace/didChangeWorkspaceFolders",
+        json!({
+            "event": {
+                "added": [{ "uri": "file:///added-workspace", "name": "added" }],
+                "removed": []
+            }
+        }),
+    );
+
+    let (refresh_id, _) = client
+        .wait_for_server_request("workspace/diagnostic/refresh", Duration::from_secs(15))
+        .expect("a real change on the same client must still refresh");
+    client.send_response(refresh_id, json!(null));
+
+    client.send_request("shutdown", json!(null));
+    client.send_notification("exit", json!(null));
+}
