@@ -131,8 +131,11 @@ not opened. Two things restore the ordering:
   the guarantee can be unmet, and proceeding anyway is the failure the barrier
   exists to prevent. A null the user can re-fire beats a confusing downstream
   error. Dropping the completion signal — a re-open that can never finish —
-  counts as settled, so a dead handler degrades to the old lazy behaviour instead
-  of blocking every command.
+  does NOT count as success: the command observing it is still withheld, because
+  a re-open that died without reporting leaves the connection just as possibly
+  empty. What the dropped sender buys is that the entry is then RETIRED, so the
+  next command proceeds and a dead handler degrades to the old lazy behaviour
+  instead of blocking every command forever.
 
 The claim is reversible: a handshake that dies after claiming re-arms the key,
 so the next replacement still learns it owes a re-open.

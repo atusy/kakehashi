@@ -1507,7 +1507,14 @@ fn spawn_upstream_request(
                             // neither guard above catches that. Re-check rather
                             // than assume the benign reading, because the benign
                             // reading is the one that releases commands.
-                            if !injection.snapshot_is_current(&host) {
+                            // ...unless the host is simply gone. A buffer
+                            // closed mid-sweep is not a repair this connection
+                            // is owed, and `document_language` falls back to the
+                            // URI extension, so a closed document can reach here
+                            // and would otherwise wedge the barrier shut.
+                            if injection.document_incarnation(&host).is_some()
+                                && !injection.snapshot_is_current(&host)
+                            {
                                 repaired = false;
                             }
                             continue;
@@ -1536,8 +1543,15 @@ fn spawn_upstream_request(
                             OpenOutcome::Opened => {}
                             // Not this connection's document. Nothing to report.
                             OpenOutcome::NotApplicable => {}
-                            // It was this connection's and it did not open.
-                            OpenOutcome::NotOpened => repaired = false,
+                            // It was this connection's and it did not open —
+                            // unless the reason is that the host closed while
+                            // the open was running, which is the same benign
+                            // case as `ParseWait::Gone` arriving one step later.
+                            OpenOutcome::NotOpened => {
+                                if injection.document_incarnation(&host).is_some() {
+                                    repaired = false;
+                                }
+                            }
                         }
                     }
                     // Report what actually happened. `true` releases waiters;

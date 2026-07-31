@@ -136,11 +136,13 @@ whether N remembered hosts had been restored: a per-host property forced into a
 per-connection signal, which is why its granularity never quite fit.
 
 It is a report on the sweep, not a proof of completeness. A host whose tree does
-not settle inside the parse budget resolves no injections and is skipped, and a
-host misjudged as not-applicable is skipped silently by construction — both
-leave `done` reporting success, degrading to the pre-existing lazy heal. That
-asymmetry is the price of the three-way outcome: it buys a barrier that is not
-permanently shut, and it makes every future misclassification invisible.
+not settle inside the budget IS reported — it marks the connection not caught
+up, because an empty resolution from a document with no tree says nothing about
+that document. What stays invisible is a host misjudged as not-applicable:
+skipping is indistinguishable from having nothing to do, by construction. That
+asymmetry is the price of the three-way outcome — it buys a barrier that is not
+permanently shut, and it makes every future misclassification silent. See
+"Known limits of `done`" below for the cases that remain.
 
 ## Considered Options
 
@@ -214,6 +216,48 @@ anyway, incorrectly, since it cannot include documents opened since the purge.
   respawned server. The pre-existing eager path already resolves markers per
   open, so this is not a new kind of work, but it is work the captured-list
   design skipped.
+
+### Known limits of `done`
+
+Two ways the sweep can report success for a connection that is not in fact
+caught up. Both are narrow, both degrade to the pre-existing lazy heal (the next
+parse's eager open), and neither is introduced here — but the barrier's contract
+is stated in terms of `done`, so they belong written down rather than implied.
+
+**An invalidation placeholder reads as a current parse.** `invalidate_parse`
+publishes a tree-less snapshot whose `parsed_version` equals the content
+version, so both the parse wait and the currency re-check classify it as
+settled. The sweep then resolves no injections — because there is no tree, not
+because the host has no regions — and reports success. This matters most on the
+settings-reload path, which invalidates every parse and purges connections in
+the same pass. Distinguishing a placeholder from a legitimately tree-less parse
+(no parser loaded, parse produced nothing) needs a discriminator the snapshot
+does not currently carry, and rejecting every tree-less snapshot instead would
+wedge the barrier shut while a parser is still being installed. Tracked as the
+same class as the reload-placeholder issue in the parse-snapshot work.
+
+**An empty resolution can be confirmed against a NEWER version.** If a
+`didChange` clears the tree and its reparse publishes before the currency
+re-check runs, the check passes on version N+1 while the emptiness came from N.
+The new version's own `process_injections` opens the documents, so the
+connection is repaired — just not by this sweep, and possibly after the barrier
+released.
+
+**A `didOpen` can carry superseded content.** `ensure_document_opened` re-reads
+the latest virtual content immediately before enqueue, but that cache is
+refreshed when a `didChange` is FORWARDED, which happens after the reparse the
+edit scheduled. A sweep that claims the document in between reads the older
+content and enqueues it. The open claim does order the eventual
+`didChange` after this `didOpen`, so the downstream converges — but it does not
+order either of them against the command the barrier is about to release, so a
+command can arrive between them.
+
+**The incarnation checks are not atomic with what they guard.** A close landing
+between the liveness check and the currency re-check still reports failure, and
+a close+reopen can validate an empty result from one lifetime against a snapshot
+from the next. Same shape as the version case above: a two-step check over a
+value that can move between the steps. Closing it properly needs one lookup
+returning gone / exactly-current / changed rather than two booleans.
 
 ### Neutral
 
