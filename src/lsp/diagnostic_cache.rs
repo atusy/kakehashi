@@ -699,6 +699,30 @@ impl DiagnosticMetricsSnapshot {
     }
 }
 
+/// Fold a newly-recorded debt lifetime into the one already stored.
+///
+/// Two rules, and the second is the one that is easy to get wrong.
+///
+/// Between two KNOWN lifetimes, keep the newer: epochs come from a monotonic
+/// counter, so a stale degraded pull landing after a reopened one must not
+/// re-key the debt to the closed lifetime, where a stale covering pull could
+/// then clear it.
+///
+/// An UNKNOWN lifetime (`None`) is ABSORBING, not merely inferior. A pull
+/// captures its stamp before its awaited work, and coverage entries are created
+/// lazily, so a reopened lifetime's degraded pull can genuinely carry `None`.
+/// Ordering `None` against `Some` either way loses that debt: preferring the
+/// stored `Some` lets a stale covering pull clear the newer unidentified debt,
+/// and preferring the incoming `Some` re-keys it to the stale lifetime so the
+/// same clear succeeds. Once any part of the debt is unidentified, only
+/// `take_degraded_pull` or the close path may remove it.
+fn merge_debt_lifetime(stored: Option<u64>, incoming: Option<u64>) -> Option<u64> {
+    match (stored, incoming) {
+        (Some(stored), Some(incoming)) => Some(stored.max(incoming)),
+        _ => None,
+    }
+}
+
 impl DiagnosticAggregator {
     /// Record downstream refresh activity and claim the single debounce task.
     /// The returned generation is the activity snapshot that task should wait
@@ -1377,27 +1401,9 @@ impl DiagnosticAggregator {
             .degraded_pulls
             .lock()
             .recover_poison("DiagnosticAggregator::degraded_pulls");
-        // A repeat debt from a NEWER lifetime must overwrite the epoch, or the
-        // clear below would key on a lifetime that no longer owes anything.
-        // But it must never REWIND: a stale degraded pull landing after the
-        // reopened one would otherwise re-key the debt to the closed lifetime,
-        // and a stale covering pull from that same lifetime could then clear
-        // it — losing the reopened host's recovery refresh, which is the whole
-        // failure this scoping exists to prevent. Epochs are minted by a
-        // monotonic counter, so `>=` is genuinely "not older".
         match degraded.get_mut(host) {
             Some(recorded) => {
-                let replace = match (*recorded, epoch) {
-                    (Some(stored), Some(new)) => new >= stored,
-                    // An identified lifetime is strictly better than none.
-                    (None, Some(_)) => true,
-                    // ...and going back to unidentified is not an improvement.
-                    (Some(_), None) => false,
-                    (None, None) => true,
-                };
-                if replace {
-                    *recorded = epoch;
-                }
+                *recorded = merge_debt_lifetime(*recorded, epoch);
             }
             None => {
                 degraded.insert(host.clone(), epoch);
@@ -4085,6 +4091,40 @@ mod tests {
         agg.record_degraded_pull(&h, Some(stamp));
         agg.forget_degraded_pull_from(&h, None);
         assert!(agg.take_degraded_pull(&h));
+    }
+
+    /// Mixed identities, both orderings. An unknown lifetime must ABSORB, not
+    /// lose to a known one — either direction of preference lets a stale
+    /// covering pull clear a debt the reopened lifetime recorded.
+    #[test]
+    fn an_unknown_debt_lifetime_absorbs_a_known_one() {
+        // record(Some(old)) -> record(None) -> clear(Some(old))
+        let agg = DiagnosticAggregator::new();
+        let h = host();
+        agg.bump_current(&h);
+        let old = agg.coverage_stamp(&h).expect("coverage exists");
+        agg.record_degraded_pull(&h, Some(old));
+        agg.record_degraded_pull(&h, None);
+        agg.forget_degraded_pull_from(&h, Some(old));
+        assert!(
+            agg.take_degraded_pull(&h),
+            "an unidentified debt recorded later must not be clearable by the \
+             lifetime it replaced"
+        );
+
+        // record(None) -> record(Some(old)) -> clear(Some(old))
+        let agg = DiagnosticAggregator::new();
+        let h = host();
+        agg.bump_current(&h);
+        let old = agg.coverage_stamp(&h).expect("coverage exists");
+        agg.record_degraded_pull(&h, None);
+        agg.record_degraded_pull(&h, Some(old));
+        agg.forget_degraded_pull_from(&h, Some(old));
+        assert!(
+            agg.take_degraded_pull(&h),
+            "a known lifetime must not re-key an unidentified debt into being \
+             clearable"
+        );
     }
 
     #[test]
