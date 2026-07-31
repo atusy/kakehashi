@@ -698,11 +698,23 @@ impl LanguageServerPool {
         // Every connection that follows the client workspace has just had the
         // project its diagnostics describe replaced, so no previousResultId
         // lineage survives the change — the same reasoning `propagate_settings`
-        // applies to a settings replacement. Bumped BEFORE the notification is
-        // queued so a pull already in flight, answered against the previous
-        // folder set, loses to the generation instead of being accepted as
-        // current: for a connection that merely takes the notification, no
-        // other generation in the lineage gate moves at all.
+        // applies to a settings replacement.
+        //
+        // This is the only fence such a connection gets. One that is recycled
+        // below at least moves its connection generation when the purge bumps
+        // it; one that merely takes the notification moves nothing else in
+        // `diagnostic_pull_lineage_is_current`, so without this its answer to a
+        // pull issued against the previous folder set would be accepted as
+        // current and its resultId kept as the next baseline.
+        //
+        // What closes that window is the guard, not the statement order: a pull
+        // enqueues its request while holding `connections` (`execute.rs`, which
+        // spans the liveness check, the didOpen, and `send_request`), so none
+        // can be enqueued between this bump and the notification below. A pull
+        // that snapshotted before this guard was taken carries the old
+        // generation and loses; one that snapshots after cannot overtake the
+        // notification on the outbound FIFO. Moving this call after the loop
+        // would be equivalent — it stays here to match `propagate_settings`.
         // Skipped for an event that names neither an addition nor a removal:
         // the lineage still describes the project the downstream will report
         // on, and dropping it would cost a full report per open document for
