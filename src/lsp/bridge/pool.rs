@@ -662,6 +662,21 @@ impl LanguageServerPool {
         );
 
         let mut connections = self.connections.lock().await;
+        // Every connection that follows the client workspace has just had the
+        // project its diagnostics describe replaced, so no previousResultId
+        // lineage survives the change — the same reasoning `propagate_settings`
+        // applies to a settings replacement. Bumped BEFORE the notification is
+        // queued so a pull already in flight, answered against the previous
+        // folder set, loses to the generation instead of being accepted as
+        // current: for a connection that merely takes the notification, no
+        // other generation in the lineage gate moves at all.
+        let following_client_workspace: Vec<ConnectionKey> = connections
+            .keys()
+            .filter(|key| key.is_client_fallback())
+            .cloned()
+            .collect();
+        self.invalidate_diagnostic_connections(&following_client_workspace);
+
         let mut invalidated = Vec::new();
         for (key, handle) in connections.iter() {
             let follows_client_workspace = key.is_client_fallback();
