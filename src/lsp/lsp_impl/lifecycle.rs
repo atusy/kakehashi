@@ -149,6 +149,23 @@ fn client_root(params: &InitializeParams) -> Option<ClientRoot<'_>> {
     params.root_path.as_deref().map(ClientRoot::LegacyPath)
 }
 
+/// Kakehashi's own root, paired with the origin the startup log reports: the
+/// client's root when it named an anchorable one, else the process CWD.
+///
+/// This is the fallback the bridge side deliberately does not have. It anchors
+/// relative config paths and `kakehashi.toml` discovery and never reaches a
+/// downstream server, so a no-workspace session forwards nothing while still
+/// resolving Kakehashi's own configuration.
+fn config_root_path(root: Option<ClientRoot<'_>>) -> (Option<std::path::PathBuf>, &'static str) {
+    match root.and_then(|root| root.to_file_path().map(|path| (path, root.source()))) {
+        Some((path, source)) => (Some(path), source),
+        None => (
+            std::env::current_dir().ok(),
+            "current working directory (fallback)",
+        ),
+    }
+}
+
 /// Derive a root URI only from workspace inputs the upstream client supplied,
 /// for downstream initialization. Kakehashi may use its process CWD internally
 /// for config discovery, but forwarding that fallback would turn a
@@ -263,8 +280,7 @@ impl Kakehashi {
 
         // Resolved here, into owned values, because `params.capabilities` is
         // moved into the pool below and that ends any borrow of `params`.
-        let client_root_path: Option<(std::path::PathBuf, &'static str)> =
-            client_root(&params).and_then(|root| root.to_file_path().map(|p| (p, root.source())));
+        let (root_path, source) = config_root_path(client_root(&params));
 
         // Forward root_uri and workspace_folders to bridge pool for downstream server initialization
         let workspace_folders_for_bridge =
@@ -289,18 +305,6 @@ impl Kakehashi {
         self.bridge
             .pool()
             .set_client_capabilities(params.capabilities);
-
-        // Get root path from the client-supplied root, falling back to the
-        // current directory. Unlike the forwarded handshake, config discovery
-        // keeps that fallback: it anchors Kakehashi's own relative paths and
-        // never reaches a downstream server.
-        let (root_path, source) = match client_root_path {
-            Some((path, source)) => (Some(path), source),
-            None => (
-                std::env::current_dir().ok(),
-                "current working directory (fallback)",
-            ),
-        };
 
         // Store root path for later use and log the source
         if let Some(ref path) = root_path {
