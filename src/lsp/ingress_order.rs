@@ -872,6 +872,50 @@ mod tests {
         );
     }
 
+    /// Stacking the alias middleware ABOVE this gate is what keeps deprecated
+    /// method names gated. Below it, the old name would reach `classify`
+    /// unrecognized, fall to `Role::None`, and complete straight away —
+    /// reading a tree missing the edit that preceded it on the wire.
+    ///
+    /// `main.rs` wires the two in that order; this pins the consequence, so
+    /// swapping the two lines fails here instead of silently regressing into a
+    /// stale read that no assertion covers.
+    #[tokio::test]
+    async fn a_deprecated_reader_name_is_gated_by_the_alias_layer_above() {
+        use crate::lsp::DeprecatedMethodAlias;
+
+        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let mut stack = DeprecatedMethodAlias::new(IngressOrderGate::new(MockInner {
+            log: Arc::clone(&log),
+            stall_method: "textDocument/didChange",
+            release: Some(release_rx),
+        }));
+
+        let change_fut = stack.call(notification("textDocument/didChange", URI));
+        // The pre-rename spelling, as a client that has not migrated sends it.
+        let node_fut = stack.call(notification("kakehashi/node/text", URI));
+        let mut change = tokio_test::task::spawn(change_fut);
+        let mut node = tokio_test::task::spawn(node_fut);
+
+        assert!(
+            node.poll().is_pending(),
+            "a deprecated reader must be gated exactly like its canonical name"
+        );
+        assert!(
+            change.poll().is_pending(),
+            "didChange stalls on the oneshot"
+        );
+        release_tx.send(()).expect("didChange is waiting");
+        assert!(change.poll().is_ready());
+        assert!(node.is_woken());
+        assert!(node.poll().is_ready());
+        assert_eq!(
+            *log.lock().recover_poison("ingress_order::tests"),
+            vec!["change", "reader"]
+        );
+    }
+
     #[tokio::test]
     async fn gate_runs_node_navigation_only_after_preceding_change() {
         let log = Arc::new(std::sync::Mutex::new(Vec::new()));
