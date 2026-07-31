@@ -200,7 +200,14 @@ host coordinates and use the same cache without transformation.
 
 The baseline is discarded on downstream `null`/full-without-resultId, virtual
 or host `didClose`, region identity/language replacement, connection respawn,
-and a settings replacement affecting that exact connection. A mere geometry shift of the same stable region id
+a settings replacement affecting that exact connection, and a workspace-folder
+change for connections rooted at the client fallback — a folder change replaces
+the project those servers analyse, so what they report can move while no
+document does. Marker-rooted and shared connections are exempt: their root comes
+from an on-disk marker walk, which an upstream folder change does not touch. The
+fence is advanced before the triggering notification is queued, under the same
+`connections` guard a pull holds to enqueue its request, so no pull can slip
+between the two. A mere geometry shift of the same stable region id
 does not discard it: virtual-local storage plus lazy re-anchor is precisely what
 makes that reuse correct. Concurrent pulls carry a bridge-local monotonically
 increasing request sequence: the later-started request owns the final lineage

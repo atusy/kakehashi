@@ -380,7 +380,8 @@ pub struct LanguageServerPool {
     /// this advances on close so an old response cannot attach to a reopen of
     /// the same URI on the same process.
     pub(crate) diagnostic_document_generations: DashMap<(ConnectionKey, String), u64>,
-    /// Per-connection settings/respawn fence for in-flight baseline reads.
+    /// Per-connection settings/respawn/workspace-folder fence for in-flight
+    /// baseline reads.
     pub(crate) diagnostic_pull_generations: DashMap<ConnectionKey, u64>,
     /// Serializes baseline snapshots/mutations with every invalidation fence.
     pub(crate) diagnostic_pull_lock: std::sync::Mutex<()>,
@@ -681,8 +682,16 @@ impl LanguageServerPool {
         self.workspace_folders.snapshot()
     }
 
-    /// Update the upstream client workspace snapshot used by future
-    /// client-fallback downstream connections.
+    /// Apply an upstream `workspace/didChangeWorkspaceFolders` to every
+    /// connection that follows the client workspace.
+    ///
+    /// Four effects, ordered and all under one `connections` guard: the client
+    /// snapshot and derived root URI are updated for future spawns; the
+    /// pull-diagnostic lineage of client-fallback connections is fenced; the
+    /// event is forwarded to those that advertise support; and the rest —
+    /// mid-handshake, incapable, or unable to queue — are recycled, armed for
+    /// re-open, and shut down. Marker-rooted and shared connections derive
+    /// their folders from marker-root acquisition and are left alone.
     pub(crate) async fn apply_workspace_folder_change(
         &self,
         added: Vec<tower_lsp_server::ls_types::WorkspaceFolder>,
