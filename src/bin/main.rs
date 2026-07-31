@@ -643,10 +643,11 @@ fn find_parser_file(parser_dir: &std::path::Path, lang: &str) -> Option<PathBuf>
 
 /// What to tell someone whose `--output` path is already taken. A regular
 /// file is the only entry `--force` actually replaces: it writes *through* a
-/// symlink to whatever that points at, cannot write to a directory at all,
-/// and would write *into* a FIFO, socket, or device node — blocking on a
-/// reader, in the FIFO case — rather than replace it. So the advice is only
-/// offered where it holds.
+/// symlink to whatever that points at, and cannot write to a directory at
+/// all. Nor to the rest: it would write *into* a FIFO or device node —
+/// blocking until a reader appears, in the FIFO case — while a socket path
+/// cannot be opened as a file at all. None of those is a replacement, so the
+/// advice is only offered where it holds.
 ///
 /// The entry is inspected only to word the message — the refusal itself was
 /// already decided atomically by `create_new`, so a path that changes between
@@ -663,7 +664,7 @@ fn overwrite_advice(path: &Path) -> &'static str {
     } else if metadata.file_type().is_symlink() {
         "It is a symbolic link; --force would write through to its target rather than replace the link."
     } else {
-        "It is not a regular file; --force would write into it rather than replace it."
+        "It is not a regular file; --force would not replace it."
     }
 }
 
@@ -686,7 +687,7 @@ fn write_content_to_output(
         // and the write lands on its target instead of refusing; and anything
         // created between the check and the write is silently truncated
         // (#763). `--force` keeps the plain truncating write: it asks to
-        // write whatever is already there out of the way, which for a symlink
+        // write regardless of whatever is already there, which for a symlink
         // means following it — see `overwrite_advice`.
         let write_result = if force {
             std::fs::write(path, content)
@@ -1261,7 +1262,8 @@ mod tests {
         assert!(overwrite_advice(&link).contains("symbolic link"));
 
         // A socket stands in for the whole special-file family (FIFOs, device
-        // nodes): `--force` would write *into* it, not replace it.
+        // nodes). Only the classification is pinned here: what --force does to
+        // each kind differs, and none of it is a replacement.
         let socket = temp.path().join("sock");
         let _listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
         assert!(overwrite_advice(&socket).contains("not a regular file"));
