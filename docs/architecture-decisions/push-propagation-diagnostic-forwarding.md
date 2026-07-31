@@ -204,10 +204,16 @@ a settings replacement affecting that exact connection, and a workspace-folder
 change for connections rooted at the client fallback — a folder change replaces
 the project those servers analyse, so what they report can move while no
 document does. Marker-rooted and shared connections are exempt: their root comes
-from an on-disk marker walk, which an upstream folder change does not touch. The
-fence is advanced before the triggering notification is queued, under the same
-`connections` guard a pull holds to enqueue its request, so no pull can slip
-between the two. A mere geometry shift of the same stable region id
+from an on-disk marker walk, which an upstream folder change does not touch. An
+event naming neither an addition nor a removal is not a change at all and is
+ignored whole — no fence, no forwarded notification, no recycling — because a
+fence skipped on its own would still let the recycling below strand a baseline
+on a key whose process has been replaced. The fence is advanced before the
+triggering notification is queued, under the same `connections` guard a pull
+holds to enqueue its request, so no pull can slip between the two. Because the
+change moves no document version, the coverage gate would suppress the client
+re-pull it warrants, so the accompanying `workspace/diagnostic/refresh` is
+forced. A mere geometry shift of the same stable region id
 does not discard it: virtual-local storage plus lazy re-anchor is precisely what
 makes that reuse correct. Concurrent pulls carry a bridge-local monotonically
 increasing request sequence: the later-started request owns the final lineage
