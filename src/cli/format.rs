@@ -504,6 +504,9 @@ mod tests {
         );
     }
 
+    /// Before #760 this write *succeeded*: the target took `"new\n"` on a
+    /// fresh inode and the alias silently stayed behind on the old one. Both
+    /// names, and the inode that carries them, must survive the refusal.
     #[cfg(unix)]
     #[test]
     fn write_atomically_rejects_multiply_linked_target_without_changes() {
@@ -515,19 +518,124 @@ mod tests {
         std::fs::write(&target, "old\n").unwrap();
         std::fs::hard_link(&target, &alias).unwrap();
         let inode = std::fs::metadata(&target).unwrap().ino();
-        let entries_before = std::fs::read_dir(dir.path()).unwrap().count();
 
         let error = write_atomically(&target, "new\n").unwrap_err();
 
-        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
-        assert!(error.to_string().contains("hard link"));
-        assert_eq!(std::fs::read_to_string(&target).unwrap(), "old\n");
-        assert_eq!(std::fs::read_to_string(&alias).unwrap(), "old\n");
-        assert_eq!(std::fs::metadata(&target).unwrap().ino(), inode);
-        assert_eq!(std::fs::metadata(&alias).unwrap().ino(), inode);
         assert_eq!(
-            std::fs::read_dir(dir.path()).unwrap().count(),
-            entries_before
+            error.kind(),
+            std::io::ErrorKind::InvalidInput,
+            "a policy refusal, not an I/O failure: {error}"
         );
+        assert!(
+            error.to_string().contains("hard link"),
+            "the refusal must name its cause: {error}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&target).unwrap(),
+            "old\n",
+            "the target must not be rewritten"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&alias).unwrap(),
+            "old\n",
+            "the alias must not be left on stale content"
+        );
+        assert_eq!(
+            std::fs::metadata(&target).unwrap().ino(),
+            inode,
+            "the target must keep its inode, or the link is already split"
+        );
+        assert_eq!(
+            std::fs::metadata(&alias).unwrap().ino(),
+            inode,
+            "both names must still resolve to the one inode"
+        );
+        assert_eq!(
+            sorted_entry_names(dir.path()),
+            ["alias.lua", "source.lua"],
+            "the refusal must leave no temp file behind"
+        );
+    }
+
+    /// The refusal must not cost the normal case. This is the only test of a
+    /// *successful* `write_atomically` that CI compiles — `tests/` is gated
+    /// behind the `e2e` feature — so without it, inverting the guard to
+    /// `links >= 1` would refuse every write and still pass the gate.
+    #[cfg(unix)]
+    #[test]
+    fn write_atomically_replaces_a_single_link_file_keeping_its_mode() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("source.lua");
+        std::fs::write(&target, "old\n").unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o754)).unwrap();
+
+        write_atomically(&target, "new\n").expect("a singly linked file must stay writable");
+
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "new\n");
+        assert_eq!(
+            std::fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+            0o754,
+            "the rename must carry the target's own mode over"
+        );
+        assert_eq!(
+            sorted_entry_names(dir.path()),
+            ["source.lua"],
+            "the temp file must not survive the write"
+        );
+    }
+
+    /// Canonicalization writes *through* a symlink instead of replacing it,
+    /// and the link count that decides the refusal is therefore the resolved
+    /// file's — a symlink does not count as a hard link to it.
+    #[cfg(unix)]
+    #[test]
+    fn write_atomically_writes_through_a_symlink() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real.lua");
+        let link = dir.path().join("link.lua");
+        std::fs::write(&real, "old\n").unwrap();
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        write_atomically(&link, "new\n").expect("writing through a symlink must succeed");
+
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "the symlink must survive the replacement"
+        );
+        assert_eq!(std::fs::read_to_string(&real).unwrap(), "new\n");
+    }
+
+    /// Pins the predicate both call sites rest on. The pre-persist one is
+    /// only reachable by racing a concurrent `link(2)`, so this is the only
+    /// coverage it can get.
+    #[cfg(unix)]
+    #[test]
+    fn reject_multiple_hard_links_only_rejects_aliased_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let lone = dir.path().join("lone.lua");
+        let aliased = dir.path().join("aliased.lua");
+        std::fs::write(&lone, "x").unwrap();
+        std::fs::write(&aliased, "x").unwrap();
+        std::fs::hard_link(&aliased, dir.path().join("alias.lua")).unwrap();
+
+        reject_multiple_hard_links(&lone).expect("a single name is not an alias");
+        let error = reject_multiple_hard_links(&aliased).unwrap_err();
+
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+    }
+
+    #[cfg(unix)]
+    fn sorted_entry_names(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
     }
 }
