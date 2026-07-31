@@ -368,9 +368,9 @@ pub struct LanguageServerPool {
     /// servers via `bridge._self`, with their version and content
     /// fingerprint for lazy full-text re-sync.
     host_documents: Mutex<HashMap<(String, ConnectionKey), HostDocSyncState>>,
-    /// Host documents whose virtual documents a purged connection held, awaiting
-    /// re-open on the replacement connection (execute-command-routing-token).
-    /// `Arc` because the drain runs inside the spawned handshake task.
+    /// Connections whose replacement still owes a virtual-document re-open, and
+    /// the barrier requests wait on (respawn-reopen-derives-its-targets).
+    /// `Arc` because the claim runs inside the spawned handshake task.
     pending_reopen: Arc<PendingReopenRegistry>,
     /// Last full downstream pull report per exact connection/document. Region
     /// diagnostics stay virtual-local and are re-anchored with the request's

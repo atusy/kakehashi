@@ -788,7 +788,7 @@ struct UpstreamDeliveryContext {
     diagnostic_publisher: Arc<crate::lsp::lsp_impl::coordinator::DiagnosticPublisher>,
     settings_manager: Arc<crate::lsp::settings_manager::SettingsManager>,
     /// Re-opens a respawned connection's virtual documents
-    /// (execute-command-routing-token). Lives here because the pool cannot
+    /// (respawn-reopen-derives-its-targets). Lives here because the pool cannot
     /// resolve injections itself — the document store and injection query are
     /// server-side — so the pool signals *when* and this supplies *what*.
     injection: crate::lsp::lsp_impl::coordinator::InjectionCoordinator,
@@ -1285,8 +1285,8 @@ fn spawn_upstream_request(
                 // key would be an invariant nobody checks, and a divergence
                 // would make the repair a silent no-op.
                 let server = key.server().to_string();
-                // A respawned connection has nothing open; re-open what its dead
-                // predecessor held (execute-command-routing-token).
+                // A respawned connection has nothing open; bring it up to date
+                // (respawn-reopen-derives-its-targets).
                 //
                 // `ensure_server_documents_open` — NOT `process_injections`.
                 // `process_injections` reaches the open through

@@ -1,0 +1,184 @@
+# Respawn Re-open Derives Its Targets
+
+**Related Decisions**:
+[execute-command-routing-token](execute-command-routing-token.md),
+[ls-bridge-server-pool-coordination](ls-bridge-server-pool-coordination.md),
+[language-server-bridge-virtual-document-model](language-server-bridge-virtual-document-model.md),
+[host-document-bridge](host-document-bridge.md)
+
+## Context
+
+When a bridged downstream is replaced, the fresh process has nothing open. The
+replacement must be told about the virtual documents it is expected to serve,
+or it answers requests about documents it has never seen.
+
+execute-command-routing-token established *when* that happens (at respawn,
+signalled by a barrier) and *who* does it (the server side, which owns document
+content). It answered *which documents* by capturing them: the purge returned
+the host documents the dead connection had held, and the replacement replayed
+that list.
+
+Capturing seemed forced by the situation — the purge is the moment the
+information is destroyed, so it looked like the last moment it was knowable.
+But a captured list is a claim about a state that has already stopped being
+true, and every way it could drift from the present needed its own repair:
+
+| Drift | Repair it needed |
+|-------|------------------|
+| a document closed after the purge | the claim DRAINS the list |
+| a second purge before any replacement lands | the record UNIONS instead of replacing |
+| the handshake dies after claiming | restore the claimed list |
+| the hand-off send fails | restore the claimed list again |
+| a config change re-roots a host | carry the claimed key and acquire by it |
+
+Four restore-shaped repairs against one cause. And one divergence had no repair
+available at all: a connection that died before opening anything held nothing,
+so its purge captured an empty list, which was skipped — nothing was recorded
+and nothing was scheduled. Its replacement was never repaired by anyone.
+Restoring could not help, because the list had never existed. That case is not
+exotic: it is precisely a connection that fails during startup and is replaced,
+which is when a replacement most needs the repair.
+
+The pattern points at the premise. The question "what did the dead process
+hold?" is not the question that needs answering. The question is "what should
+this connection hold?" — and that has an answer that is true now.
+
+## Decision
+
+**Derive the re-open set from current state; remember only that a connection
+owes one.**
+
+A purge ARMS its key. The replacement's handshake CLAIMS it. The re-open then
+asks, of every currently open document, whether it belongs to this connection,
+and opens the ones that do.
+
+Nothing is remembered about documents, so nothing about them can go stale.
+
+### Arming is unconditional, and that is the load-bearing part
+
+The previous design armed only when the captured list was non-empty, which is
+what left a young connection's replacement unrepaired. Arming records that a
+connection was replaced — a fact about the connection, not about its contents —
+so there is nothing to be empty. A first-ever spawn is still free: no prior
+purge, no armed key, no re-open.
+
+Symmetrically, a handshake that finds an armed key always emits the re-open
+request. Both halves must be unconditional; leaving either gated on a captured
+set would preserve the hole while appearing to fix it.
+
+### Belonging is decided per host, against current settings
+
+Which documents are a connection's is not a property of language alone. A
+connection is a `(server, root)` pair, so a document that bridges to the right
+server but sits under a different root is not its document.
+
+So each candidate host is asked twice, cheap question first:
+
+1. Do any of its injections bridge to this server? Pure configuration, answered
+   from the per-snapshot memo, with no pool lookup and no filesystem access.
+   This rejects the great majority of open documents — most bridge nowhere near
+   any one server — before anything expensive runs.
+2. Does it route to *this* connection? A marker resolution, paid only by hosts
+   that survived the first question. Read-only: it never spawns, so asking
+   about a document belonging to another root cannot bring that root's server
+   up.
+
+Only then is the connection acquired, and acquired BY KEY rather than by what
+the host resolves to. Both are needed and they are not the same check. The
+routing question decides whether this host belongs here; acquiring by key
+decides that the open lands on the connection the barrier signals for. A by-key
+lookup succeeds whichever host asked, so without the routing question a sweep
+over every open document would cross-open one root's documents onto another
+root's process.
+
+### The third outcome is "not applicable", not "wrong"
+
+An open reports one of three things: it happened; it was not this connection's
+document; or it was and it failed.
+
+The middle case is the common one under derivation, and it is not a failure.
+Only an applicable host that failed to open may mark the connection as not
+caught up. Conflating them would report failure on essentially every respawn,
+holding the barrier shut so that every command pays the full wait and then
+fails soft — a correctness mechanism turned into a latency tax that also
+withholds correct results.
+
+### What the barrier now means
+
+`done` reports whether this connection matches current state, which is a
+per-connection property — matching what the barrier is keyed by and what a
+routing token names. Under the captured-list design it reported whether N
+remembered hosts had been restored: a per-host property forced into a
+per-connection signal, which is why its granularity never quite fit.
+
+## Considered Options
+
+### Keep the captured list and add a bounded wait for the Initializing case
+
+The unrepaired-replacement hole can be closed by having the re-open wait for a
+still-initializing replacement instead of giving up on it. It works, and it
+would have been a fifth repair against the same cause — arriving after four
+others, in a mechanism where each one had made the next harder to see. Rejected
+in favour of removing the cause. Under derivation the case dissolves rather
+than being handled: nothing is lost when a re-open gives up, because the next
+one re-derives.
+
+### Derive by language only, without the root check
+
+Simpler, and wrong. Two roots each running the same server would repair each
+other: a respawn under root A would open root B's documents onto A's process.
+
+### Derive, but resolve each host's connection instead of acquiring by key
+
+Resolving from the host is how the pre-#927 design worked and it re-introduces
+that bug: it finds whichever connection the host routes to now, which after a
+re-rooting is not the one the barrier signals for. It also spawns, so a sweep
+would start servers for roots nobody asked about.
+
+### Keep remembering, but recompute the list at claim time
+
+A middle path: capture at purge, then filter against current state before
+replaying. This is derivation with a redundant input — the filter is doing all
+the work, and the captured list only narrows what the filter would have found
+anyway, incorrectly, since it cannot include documents opened since the purge.
+
+## Consequences
+
+### Positive
+
+- A replacement of a connection that died before opening anything is now
+  repaired. Previously it never was, silently.
+- `purge_connection`'s return value, the remembered host map, and the
+  record/take/restore lifecycle are gone, along with the class of bug where a
+  claimed set is dropped on a failure path.
+- The barrier's signal is per-connection in meaning as well as in keying.
+- Documents opened *since* the purge are now included; the captured list could
+  only ever shrink.
+- The re-open no longer touches documents the editor has closed, without
+  needing a drain to arrange it.
+
+### Negative
+
+- A host re-rooted away from the connection being repaired is no longer
+  re-opened onto it. Current settings are the authority, so that connection's
+  correct contents are nothing — but a command already in flight against the
+  old root now fails downstream rather than being served. This is the outcome
+  execute-command-routing-token already accepts for a token naming a root no
+  open document sits under, and it requires a configuration change between the
+  action and its command.
+- The re-open considers every open document rather than a pre-narrowed set. The
+  configuration question is answered first and from a memo, so the cost is a
+  map lookup per open document, but it does scale with the workspace rather
+  than with what one connection held.
+- Marker resolution now runs during the re-open for hosts that bridge to the
+  respawned server. The pre-existing eager path already resolves markers per
+  open, so this is not a new kind of work, but it is work the captured-list
+  design skipped.
+
+### Neutral
+
+- The barrier itself is unchanged: same claim-before-Ready ordering, same
+  bound, same fail-soft-on-unsettled rule. Only what it is a barrier *for*
+  changed.
+- Arming a key whose connection is never replaced leaves one entry until the
+  key is next claimed. Bounded by the number of distinct `(server, root)` pairs.
