@@ -1280,7 +1280,7 @@ fn spawn_upstream_request(
                     ),
                 }
             }
-            UpstreamRequest::ReopenDocuments { key, hosts, done } => {
+            UpstreamRequest::ReopenDocuments { key, done } => {
                 // One source of truth for the server: carrying it alongside the
                 // key would be an invariant nobody checks, and a divergence
                 // would make the repair a silent no-op.
@@ -1302,36 +1302,36 @@ fn spawn_upstream_request(
                     // context), but the fallback must not silently skip a heal.
                     log::warn!(
                         target: "kakehashi::bridge",
-                        "Cannot re-open {} document(s) for respawned {server:?}: \
-                         no delivery context",
-                        hosts.len()
+                        "Cannot re-open documents for respawned {server:?}: \
+                         no delivery context"
                     );
                     return;
                 };
+                // DERIVE the target set rather than replay one captured at purge
+                // time. Every open document is a candidate; which of them belong
+                // to this connection is decided below, per host, against current
+                // settings. A captured list answers the question as it stood
+                // before the respawn — it re-opens documents the editor has since
+                // closed, misses ones opened since, and is simply EMPTY when the
+                // dead connection never got far enough to hold anything, which is
+                // exactly when a replacement most needs the repair.
+                let hosts = context.injection.open_host_uris();
                 log::debug!(
                     target: "kakehashi::bridge",
-                    "Re-opening {} document(s) after {server:?} respawned",
+                    "Bringing {key} up to date after {server:?} respawned: \
+                     {} open document(s) to consider",
                     hosts.len()
                 );
-                use crate::lsp::bridge::REOPEN_WAIT;
+                use crate::lsp::bridge::{OpenOutcome, REOPEN_WAIT};
                 let settings = context.settings_manager.load_settings();
-                // The re-open targets the connection the purge CLAIMED, and the
-                // open is ACQUIRED by that key rather than resolved from the
-                // host. Resolving from the host finds whatever it routes to now,
-                // so a `workspaceMarkers` change between purge and respawn
-                // repairs a different connection while the claimed one — the one
-                // `done` signals for — stays empty.
-                //
-                // A stale-rooted claimed connection IS reachable: a routed
-                // command's token carries the root, and `reconnect_by_key`
-                // rebuilds the workspace from that token rather than from
-                // current markers, spawning a fresh connection that records the
-                // current config and so passes every launch-config check. There
-                // is no guard that rejects it — the root is not a
-                // `BridgeServerConfig` field, so `same_launch_config` cannot see
-                // a stale root at all. Repairing the named connection, and
-                // reporting failure when it is gone, is what makes the barrier
-                // mean what it says.
+                // Naming the connection still matters: the open is ACQUIRED by
+                // this key, never by whatever a host routes to, so the repair
+                // lands on the connection `done` signals for and a routed
+                // command names. What the key now ALSO does is filter — a host
+                // that does not route here supplies nothing for this connection,
+                // and saying so is how the derivation stays scoped to
+                // `(server, root)` instead of cross-opening one root's documents
+                // onto another root's process.
                 // Bound the WAIT, not the work — the shape the inline heal used.
                 // `ensure_server_documents_open` can block up to the init timeout
                 // on a cold downstream, and `done` gates every command on this
@@ -1349,11 +1349,14 @@ fn spawn_upstream_request(
                 // — the failure this barrier exists to prevent. A panic drops the
                 // sender instead, which waiters read as "can never finish".
                 let mut work = tokio::spawn(async move {
-                    // Whether the CLAIMED connection actually ended up with its
-                    // documents. A skip (the host re-routed) or an unreachable
-                    // connection leaves it empty, and the barrier must say so:
-                    // releasing a command onto an empty connection is the
-                    // failure this whole mechanism exists to prevent.
+                    // Whether this connection ended up holding everything current
+                    // state says it should. Only an APPLICABLE host that failed
+                    // to open clears it — a host that supplies nothing for this
+                    // connection is not a failed repair, it is not this
+                    // connection's document. Counting those would report failure
+                    // on essentially every respawn (most open documents bridge
+                    // nowhere near any one server), holding the barrier shut and
+                    // making every command pay the full wait and then fail soft.
                     let mut repaired = true;
                     // e2e-only fault injection: hold the re-open BEFORE any
                     // didOpen goes out, so the ordering e2e can force the window
@@ -1395,16 +1398,21 @@ fn spawn_upstream_request(
                                 &host,
                                 crate::lsp::bridge::OpenExpectation {
                                     incarnation,
-                                    // Repair the connection the purge CLAIMED,
-                                    // not whatever this host routes to now.
+                                    // Both the filter and the target: only hosts
+                                    // that route here are opened, and they are
+                                    // opened HERE.
                                     connection: Some(&key),
                                 },
                                 injections,
                                 &reopen_server,
                             )
                             .await;
-                        if outcome != crate::lsp::bridge::OpenOutcome::Opened {
-                            repaired = false;
+                        match outcome {
+                            OpenOutcome::Opened => {}
+                            // Not this connection's document. Nothing to report.
+                            OpenOutcome::NotApplicable => {}
+                            // It was this connection's and it did not open.
+                            OpenOutcome::NotOpened => repaired = false,
                         }
                     }
                     // Report what actually happened. `true` releases waiters;

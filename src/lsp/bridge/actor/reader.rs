@@ -202,9 +202,9 @@ pub(crate) enum UpstreamRequest {
     /// and fires them by raw name (#628 palette-fired commands). Fire-and-forget:
     /// no reply/cancel (the editor's ack is ignored; routing fails soft anyway).
     RegisterCommands { commands: Vec<String> },
-    /// Re-open the virtual documents of `hosts` on `server`, whose previous
-    /// connection was purged and has now been replaced by a `Ready` process
-    /// (execute-command-routing-token).
+    /// Bring `key`'s virtual documents up to date: its previous connection was
+    /// purged and has now been replaced by a `Ready` process
+    /// (respawn-reopen-derives-its-targets).
     ///
     /// Routed upward because re-opening needs document *content*, which only the
     /// server side can supply: it owns the document store and injection
@@ -218,13 +218,13 @@ pub(crate) enum UpstreamRequest {
     /// degrades to the pre-existing lazy behaviour (the next parse's
     /// `process_injections` opens the documents again).
     ReopenDocuments {
-        /// The connection the purge recorded this set under. The re-open
-        /// resolves each host's connection from the CURRENT settings, so a
-        /// config change that re-roots the host in between would otherwise open
-        /// a DIFFERENT connection while this one — the one `done` signals for,
-        /// and the one a routed command names — stays empty.
+        /// The connection to bring up to date, and the ONLY input the re-open
+        /// needs: which documents belong to it is derived from the documents
+        /// open when this runs, not from what its dead predecessor held. A list
+        /// captured at purge time is a snapshot of a state that has already
+        /// stopped being true — documents close, hosts re-root, and a
+        /// connection that died young held nothing to capture at all.
         key: ConnectionKey,
-        hosts: Vec<url::Url>,
         done: tokio::sync::watch::Sender<bool>,
     },
 }

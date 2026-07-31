@@ -393,15 +393,12 @@ impl BridgeCoordinator {
         let (for_server, config) =
             self.injections_for_server(settings, host_language, injections, server_name);
         let Some(config) = config else {
-            // No injected region on this host bridges to `server_name`.
-            // With no named connection this is simply nothing to do; but a
-            // caller repairing a NAMED connection asked for documents this host
-            // can no longer supply (server removed from config, or the host's
-            // injections changed), so its repair did NOT happen.
-            return match expect.connection {
-                Some(_) => OpenOutcome::NotOpened,
-                None => OpenOutcome::Opened,
-            };
+            // No injected region on this host bridges to `server_name`, so this
+            // host supplies nothing for that server on any connection. Pure
+            // config — resolved from the memo, before any pool lookup or marker
+            // walk, so the hosts that bridge nowhere near this server cost
+            // nothing to reject.
+            return OpenOutcome::NotApplicable;
         };
         let Ok(host_uri_lsp) = crate::lsp::lsp_impl::url_to_uri(host_uri) else {
             return OpenOutcome::NotOpened;
@@ -1638,9 +1635,9 @@ mod tests {
         .expect("a non-matching server must short-circuit, not attempt a spawn");
         assert_eq!(
             outcome,
-            crate::lsp::bridge::OpenOutcome::Opened,
-            "a caller that named no connection has nothing to repair, so \
-             'this host bridges nowhere' is success, not failure"
+            crate::lsp::bridge::OpenOutcome::NotApplicable,
+            "a host that bridges to no such server supplies nothing for it — \
+             the answer the respawn re-open gets for most open documents"
         );
     }
 

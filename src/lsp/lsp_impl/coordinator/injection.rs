@@ -446,6 +446,18 @@ impl InjectionCoordinator {
         &self.bridge
     }
 
+    /// Every host document open right now — the candidate set the respawn
+    /// re-open derives its targets from.
+    ///
+    /// Deliberately unfiltered: which of these belong to the connection being
+    /// repaired depends on the injections each one currently resolves and on
+    /// current settings, neither of which this accessor should decide. A
+    /// snapshot, so a document closed while the re-open runs is caught by the
+    /// per-host incarnation check rather than here.
+    pub(crate) fn open_host_uris(&self) -> Vec<Url> {
+        self.documents.open_uris()
+    }
+
     /// `uri`'s reopen generation, which scopes a downstream `didOpen` to the
     /// document's current lifetime. `None` once the document is closed.
     pub(crate) fn document_incarnation(&self, uri: &Url) -> Option<u64> {
