@@ -3,7 +3,7 @@ use log::warn;
 use path_clean::PathClean;
 use std::fmt::Write;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use tree_sitter::{Language, Query};
 
 /// Parser library file extensions for different platforms
@@ -88,10 +88,19 @@ pub(crate) fn format_search_paths<P: AsRef<Path>>(paths: &[P]) -> String {
 pub(crate) struct QueryLoader;
 
 impl QueryLoader {
+    /// Build `<base>/queries/<lang_name>/<file_name>`.
+    ///
+    /// Callers must reject a `lang_name` that is not a single normal path
+    /// component before calling this; `file_name` is likewise caller-validated
+    /// (see `is_single_path_component`).
     fn query_file_path(base: &Path, lang_name: &str, file_name: &str) -> PathBuf {
         base.join("queries").join(lang_name).join(file_name).clean()
     }
 
+    /// Build `<base>/parser/<language>.<ext>`.
+    ///
+    /// Callers must reject a `language` that is not a single normal path
+    /// component before calling this.
     fn parser_library_path(base: &Path, language: &str, ext: &str) -> PathBuf {
         base.join("parser")
             .join(format!("{language}.{ext}"))
@@ -204,11 +213,19 @@ impl QueryLoader {
     /// `pub(crate)` so the captures handler can distinguish "kind file absent"
     /// (expected, debug log) from "file exists but failed to load" (asset
     /// trouble, warn) — captures-protocol §"Null vs. error semantics".
+    ///
+    /// Returns `None` without touching the filesystem when `lang_name` is not a
+    /// single normal path component, so a document-controlled injection language
+    /// cannot escape `<base>/queries/`.
     pub(crate) fn find_query_file<P: AsRef<Path>>(
         runtime_bases: &[P],
         lang_name: &str,
         file_name: &str,
     ) -> Option<PathBuf> {
+        // Name-only, so it cannot vary per base: reject once, before the search.
+        if !is_single_path_component(lang_name) {
+            return None;
+        }
         for base in runtime_bases {
             let candidate = Self::query_file_path(base.as_ref(), lang_name, file_name);
             if candidate.exists() {
@@ -385,15 +402,27 @@ impl QueryLoader {
     /// because it comes from `LanguageSettings.parser: Option<String>`; `search_paths`
     /// is generic over `AsRef<Path>` to accept both `PathBuf` (from `ConfigStore`)
     /// and `String` (from `WorkspaceSettings`).
+    ///
+    /// The implicit search is skipped entirely when `language` is not a single
+    /// normal path component. An explicit `library` is exempt: it comes from
+    /// config rather than from document text.
     pub(crate) fn resolve_library_path<P: AsRef<Path>>(
         library: Option<&str>,
         language: &str,
         search_paths: &[P],
     ) -> Option<PathBuf> {
-        // If explicit library path is provided, normalize and use it
+        // If explicit library path is provided, normalize and use it.
+        // Stays ahead of the name gate: this is the documented escape hatch for
+        // assets that cannot follow the implicit layout.
         if let Some(lib) = library {
             let normalized = PathBuf::from(lib).clean();
             return Some(normalized);
+        }
+
+        // Name-only, so it cannot vary per base or extension: reject once here
+        // rather than inside the search below.
+        if !is_single_path_component(language) {
+            return None;
         }
 
         // Otherwise, search in searchPaths: <base>/parser/
@@ -408,6 +437,32 @@ impl QueryLoader {
 
         None
     }
+}
+
+/// Whether `value` names exactly one ordinary path component.
+///
+/// Gates the language half of implicit asset lookup so a document-controlled
+/// injection language cannot leave `<base>/queries` or `<base>/parser`. The
+/// query-kind half is gated separately, by `is_valid_kind` in the captures
+/// handler; every other `file_name` is a `QueryKind::filename()` constant.
+///
+/// The `name == value` comparison is load-bearing, not a formality:
+/// `Components` silently normalizes away trailing separators and interior `.`,
+/// so `"rust/"` and `"rust/."` both yield a lone `Normal("rust")`. Requiring
+/// the component to span the whole input rejects them. Every normalization
+/// `Components` performs shortens the rendered form, so equality can only hold
+/// when none occurred — which is why this cannot be reduced to a
+/// `components().count() == 1` check.
+///
+/// Deliberately laxer than `is_safe_language_name` (`[a-z0-9_]+`), which gates
+/// installs: names like `typescript-react` are legal to place by hand and must
+/// stay readable, whereas the write side may be stricter because the name also
+/// becomes a URL segment. Rejection here is a path-shape decision only; it is
+/// not a charset filter and must not be relied on as one.
+fn is_single_path_component(value: &str) -> bool {
+    let mut components = Path::new(value).components();
+    matches!(components.next(), Some(Component::Normal(name)) if name == value)
+        && components.next().is_none()
 }
 
 fn normalize_inherited_language_name(name: &str) -> String {
@@ -482,6 +537,133 @@ mod tests {
         // Test not finding a non-existent file
         let result = QueryLoader::find_query_file(NO_SEARCH_PATHS, "rust", "highlights.scm");
         assert!(result.is_none());
+    }
+
+    #[test]
+    fn find_query_file_rejects_language_path_traversal() {
+        let dir = tempdir().unwrap();
+        let runtime = dir.path().join("runtime");
+        let outside = dir.path().join("outside");
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(outside.join("highlights.scm"), "(identifier) @variable").unwrap();
+
+        // `runtime/queries` sits two components below the tempdir root, so the
+        // pre-fix join cleaned to exactly the file planted above.
+        let result =
+            QueryLoader::find_query_file(&[runtime.clone()], "../../outside", "highlights.scm");
+
+        assert_eq!(result, None);
+
+        // An absolute name is the worse variant: `join` discards the base
+        // outright, so no `..` arithmetic is needed to escape.
+        let result = QueryLoader::find_query_file(
+            &[runtime.clone()],
+            outside.to_str().unwrap(),
+            "highlights.scm",
+        );
+
+        assert_eq!(result, None);
+
+        // Positive control on the same base: an ordinary name still resolves,
+        // so the assertions above pin the gate rather than a broken fixture.
+        let inside = runtime.join("queries").join("rust");
+        fs::create_dir_all(&inside).unwrap();
+        fs::write(inside.join("highlights.scm"), "(identifier) @variable").unwrap();
+
+        let result = QueryLoader::find_query_file(&[runtime], "rust", "highlights.scm");
+
+        assert_eq!(result, Some(inside.join("highlights.scm")));
+    }
+
+    #[test]
+    fn resolve_query_rejects_traversing_inherits_parent() {
+        // The parent language name comes from the first line of an on-disk query
+        // file, so it is the content-driven route into find_query_file -- and
+        // parse_inherits_directive, unlike its install-side twin, applies no
+        // filter of its own.
+        let dir = tempdir().unwrap();
+        let runtime = dir.path().join("runtime");
+
+        let outside = dir.path().join("outside");
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(outside.join("highlights.scm"), "(identifier) @smuggled").unwrap();
+
+        let child = runtime.join("queries").join("child");
+        fs::create_dir_all(&child).unwrap();
+        fs::write(
+            child.join("highlights.scm"),
+            "; inherits: ../../outside\n(string_literal) @string\n",
+        )
+        .unwrap();
+
+        let result = resolve_query(&[runtime], "child", "highlights.scm");
+
+        // An unresolvable parent fails the whole child query; what matters is
+        // that the smuggled content never reaches the combined output.
+        assert!(
+            result.is_err(),
+            "expected traversal to fail, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn implicit_asset_language_must_be_one_normal_component() {
+        assert!(is_single_path_component("typescript-react"));
+        assert!(!is_single_path_component(""));
+        assert!(!is_single_path_component("."));
+        assert!(!is_single_path_component(".."));
+        assert!(!is_single_path_component("../rust"));
+        assert!(!is_single_path_component("rust/query"));
+        assert!(!is_single_path_component("rust/"));
+        assert!(!is_single_path_component("rust/."));
+        assert!(!is_single_path_component("/rust"));
+        assert!(!is_single_path_component(&format!(
+            "rust{}query",
+            std::path::MAIN_SEPARATOR
+        )));
+        #[cfg(windows)]
+        {
+            assert!(!is_single_path_component(r"C:\rust"));
+            assert!(!is_single_path_component(r"\\server\share\rust"));
+            // Drive-relative: a prefix needs no following separator, so this
+            // parses as Prefix(Disk) + Normal("rust").
+            assert!(!is_single_path_component(r"C:rust"));
+            // Windows accepts `/` as a separator too, so the unix-looking case
+            // above is not redundant here.
+            assert!(!is_single_path_component("rust/query"));
+        }
+    }
+
+    #[test]
+    fn resolve_library_path_rejects_language_path_traversal() {
+        let dir = tempdir().unwrap();
+        let runtime = dir.path().join("runtime");
+        fs::create_dir_all(&runtime).unwrap();
+        for ext in PARSER_EXTENSIONS {
+            fs::write(dir.path().join(format!("outside.{ext}")), "not a parser").unwrap();
+        }
+
+        let result = QueryLoader::resolve_library_path(None, "../../outside", &[runtime]);
+
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn resolve_library_path_honors_explicit_path_for_rejected_language() {
+        // The name gate guards implicit `<base>/parser/<language>.<ext>` lookup only.
+        // An explicit `languages[*].parser` comes from config, not from a document,
+        // and is the documented escape hatch for assets that cannot follow the
+        // implicit layout -- so it must resolve even for a name the gate rejects.
+        let dir = tempdir().unwrap();
+        let runtime = dir.path().join("runtime");
+
+        let result = QueryLoader::resolve_library_path(
+            Some("explicit/path.so"),
+            "../../outside",
+            &[runtime],
+        );
+
+        assert_eq!(result, Some(PathBuf::from("explicit/path.so")));
     }
 
     #[test]
