@@ -255,7 +255,7 @@ Out-of-range / negative `index` or `byte` values collapse to `null` rather than 
 
 **Why LSP `Position`, not tree-sitter `Point`**: tree-sitter's `Point.column` is a **UTF-8 byte** offset within the line, whereas the protocol speaks LSP `Position` (UTF-16 code units) everywhere else (§"Position Encoding"). Returning native points would diverge from every other LSP coordinate around non-ASCII (emoji, CJK) and force clients to special-case these accessors. Instead the server converts each end via `PositionMapper`: byte → `Position` on output, `Position` → byte on input (reusing the byte-range search and its inverted / out-of-bounds guards). Clients that genuinely want byte-native spans use `startByte` / `endByte` / `byteRange` and `descendant*ForByteRange`, which are unambiguous. A `Position` that cannot be mapped into the current document collapses to `null`.
 
-This supersedes the earlier deferral of range reporting (Alternative C): rather than a single bulk `kakehashi/textDocument/node/range` endpoint, each tree-sitter method is exposed individually for 1:1 parity with the `Node` API; bulk range retrieval (e.g. `childrenWithRange`) remains a possible future addition if profiling shows the N+1 cost dominates.
+This supersedes the earlier deferral of range reporting (Alternative C): rather than one endpoint reporting ranges in bulk, each tree-sitter method is exposed individually for 1:1 parity with the `Node` API. The `kakehashi/textDocument/node/range` that shipped is therefore the **per-node** accessor in the table above, not that rejected bulk endpoint, which the name would otherwise suggest. Bulk range retrieval (e.g. `childrenWithRange`) remains a possible future addition if profiling shows the N+1 cost dominates.
 
 **Field accessors** expose the name-keyed half of tree-sitter's field API:
 
@@ -299,7 +299,7 @@ All three collapse to `null`. This is a deliberate consequence of the no-tombsto
 
 ## Example Flow
 
-```
+```text
 1. Client: kakehashi/textDocument/node { textDocument, position, injection: true }
 2. Server: { id: "01HX-A", type: "call" }
 
