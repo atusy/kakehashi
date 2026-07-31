@@ -118,8 +118,13 @@ impl PendingReopenRegistry {
     /// Wait (bounded by [`REOPEN_WAIT`]) for an in-flight re-open on `key`.
     ///
     /// Returns `true` when the ordering requirement is met — either nothing was
-    /// outstanding (the common case) or the re-open finished. Returns `false` on
-    /// timeout, where the re-open is still running.
+    /// outstanding (the common case) or the re-open reported that it repaired
+    /// this connection.
+    ///
+    /// Returns `false` in three cases, all meaning "this connection may still be
+    /// missing documents": the wait timed out and the re-open is still running;
+    /// the re-open reported it could not repair this connection; or its sender
+    /// was dropped before reporting success (a handler that died).
     ///
     /// The caller must NOT proceed on `false`. A bounded wait means the guarantee
     /// can be unmet, and sending anyway is the failure this barrier exists to
@@ -138,21 +143,36 @@ impl PendingReopenRegistry {
             // Nothing outstanding: the ordering requirement is vacuously met.
             return true;
         };
-        // `Err` (sender dropped) counts as finished: the re-open completed, or
-        // its handler died and will never signal.
-        let settled = tokio::time::timeout(REOPEN_WAIT, rx.wait_for(|done| *done))
-            .await
-            .is_ok();
-        // Retire the entry only when the re-open actually SETTLED, and only when
-        // it is still the one we waited on. Two independent hazards:
-        //
-        // - On timeout the re-open is still running, so forgetting it would let
-        //   the NEXT request sail past with no wait at all — precisely when the
-        //   re-open is known to be slow. Leave it; the sender's drop retires it.
-        // - Two awaits separate the clone above from this retire, so a LATER
-        //   respawn may have claimed the key in between and registered a
-        //   genuinely outstanding re-open. Removing by key alone would evict it.
-        if settled {
+        // Three outcomes, and they are not the same thing:
+        // - observed `true`  → the re-open repaired this connection; go ahead.
+        // - sender dropped   → no further news will come. Trust the last value:
+        //   a re-open that reported failure (or died before reporting) leaves
+        //   the connection empty, so the caller must NOT send. Retire the entry
+        //   regardless — nothing will ever settle it, and keeping it would fail
+        //   every later command on this key forever.
+        // - timed out        → still running. Keep the entry so the next
+        //   command is bounded by the same budget rather than sailing past.
+        // Collapse to a plain discriminant first: `wait_for`'s `Ok` holds a
+        // `Ref` borrowing `rx`, and the sender-gone arm needs to read `rx` again.
+        enum Waited {
+            Repaired,
+            SenderGone,
+            TimedOut,
+        }
+        let waited = match tokio::time::timeout(REOPEN_WAIT, rx.wait_for(|done| *done)).await {
+            Ok(Ok(_)) => Waited::Repaired,
+            Ok(Err(_)) => Waited::SenderGone,
+            Err(_) => Waited::TimedOut,
+        };
+        let (settled, retire) = match waited {
+            Waited::Repaired => (true, true),
+            Waited::SenderGone => (*rx.borrow(), true),
+            Waited::TimedOut => (false, false),
+        };
+        // Two awaits separate the clone above from this retire, so a LATER
+        // respawn may have claimed the key in between and registered a genuinely
+        // outstanding re-open. Removing by key alone would evict it.
+        if retire {
             let mut in_flight = self
                 .in_flight
                 .lock()
@@ -279,11 +299,40 @@ mod tests {
 
         // Would hang for REOPEN_WAIT if a dropped sender did not count as done.
         assert!(
-            tokio::time::timeout(Duration::from_secs(1), registry.wait_for_reopen(&key))
+            !tokio::time::timeout(Duration::from_secs(1), registry.wait_for_reopen(&key))
                 .await
                 .expect("a dropped sender releases the waiter immediately"),
-            "a dropped sender means the re-open will never signal, so waiting \
-             further is pointless — report settled and let the caller proceed"
+            "a re-open that died without reporting success leaves the connection \
+             empty, so the caller must NOT send"
+        );
+        // ...but the entry is retired, so it cannot block every later command.
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), registry.wait_for_reopen(&key))
+                .await
+                .expect("no wait"),
+            "a settled-by-drop entry must be retired, not left blocking forever"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_reopen_that_reports_failure_does_not_release_the_caller() {
+        // The re-open ran but could not repair THIS connection (its host
+        // re-routed, so the opens were skipped). Releasing the caller would send
+        // a command to a connection that is still empty — the exact outcome the
+        // barrier exists to prevent.
+        let registry = PendingReopenRegistry::default();
+        let key = ConnectionKey::for_server("ruff");
+        registry.record(&key, vec![url("file:///w/a.md")]);
+        let (_hosts, done) = registry.take(&key).expect("a re-open is pending");
+
+        done.send(false).expect("the registry holds the receiver");
+        drop(done);
+
+        assert!(
+            !tokio::time::timeout(Duration::from_secs(1), registry.wait_for_reopen(&key))
+                .await
+                .expect("a reported failure must not make the caller wait out the budget"),
+            "a re-open that reported failure must not release the caller"
         );
     }
 

@@ -385,17 +385,26 @@ impl BridgeCoordinator {
         settings: &Arc<WorkspaceSettings>,
         host_language: &str,
         host_uri: &Url,
-        host_incarnation: u64,
+        expect: super::text_document::OpenExpectation<'_>,
         injections: Vec<BridgeInjection>,
         server_name: &str,
-    ) {
+    ) -> super::text_document::OpenOutcome {
+        use super::text_document::OpenOutcome;
         let (for_server, config) =
             self.injections_for_server(settings, host_language, injections, server_name);
         let Some(config) = config else {
-            return; // no injected region on this host bridges to `server_name`
+            // No injected region on this host bridges to `server_name`.
+            // With no named connection this is simply nothing to do; but a
+            // caller repairing a NAMED connection asked for documents this host
+            // can no longer supply (server removed from config, or the host's
+            // injections changed), so its repair did NOT happen.
+            return match expect.connection {
+                Some(_) => OpenOutcome::NotOpened,
+                None => OpenOutcome::Opened,
+            };
         };
         let Ok(host_uri_lsp) = crate::lsp::lsp_impl::url_to_uri(host_uri) else {
-            return;
+            return OpenOutcome::NotOpened;
         };
         self.pool
             .eager_open_virtual_documents(
@@ -403,10 +412,10 @@ impl BridgeCoordinator {
                 &config,
                 host_uri,
                 &host_uri_lsp,
-                host_incarnation,
+                expect,
                 for_server,
             )
-            .await;
+            .await
     }
 
     fn injection_open_on_connection(
@@ -931,7 +940,11 @@ impl BridgeCoordinator {
                         &config,
                         &host_uri_owned,
                         &host_uri_lsp,
-                        incarnation,
+                        super::text_document::OpenExpectation {
+                            incarnation,
+                            // The eager batch opens wherever the host routes now.
+                            connection: None,
+                        },
                         group_injections,
                     ) => {}
                 }
@@ -1607,19 +1620,28 @@ mod tests {
         }];
 
         // `python` bridges to "ruff", not "other-server" → no match → no-op.
-        tokio::time::timeout(
+        let outcome = tokio::time::timeout(
             std::time::Duration::from_secs(2),
             coordinator.ensure_server_documents_open(
                 &settings,
                 "markdown",
                 &host_uri,
-                1,
+                crate::lsp::bridge::OpenExpectation {
+                    incarnation: 1,
+                    connection: None,
+                },
                 injections,
                 "other-server",
             ),
         )
         .await
         .expect("a non-matching server must short-circuit, not attempt a spawn");
+        assert_eq!(
+            outcome,
+            crate::lsp::bridge::OpenOutcome::Opened,
+            "a caller that named no connection has nothing to repair, so \
+             'this host bridges nowhere' is success, not failure"
+        );
     }
 
     #[tokio::test]

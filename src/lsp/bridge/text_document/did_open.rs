@@ -7,8 +7,46 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use super::super::pool::{ConnectionHandleSender, INIT_TIMEOUT_SECS, LanguageServerPool};
+use super::super::pool::{
+    ConnectionHandleSender, ConnectionKey, INIT_TIMEOUT_SECS, LanguageServerPool,
+};
 use super::super::protocol::VirtualDocumentUri;
+
+/// What the caller requires to STILL hold by the time an eager open actually
+/// runs. Both fields are preconditions checked inside the open, not inputs to
+/// it, which is why they travel together.
+/// Whether an eager open did what the caller asked for.
+///
+/// Only a caller that named a `connection` can act on the difference, but the
+/// value is returned unconditionally so the compiler forces every caller to
+/// decide (`let _ =` is an explicit "I open wherever it lands").
+#[derive(Debug, PartialEq, Eq)]
+#[must_use]
+pub(crate) enum OpenOutcome {
+    /// The open ran on the connection the caller expected (or the caller named
+    /// none). Documents it could open are enqueued.
+    Opened,
+    /// The host resolved to a DIFFERENT connection than the caller named, so
+    /// nothing was opened. A caller repairing the named connection must report
+    /// failure rather than success: the connection is still empty.
+    WrongConnection,
+    /// The connection could not be reached at all, so nothing was opened.
+    NotOpened,
+}
+
+pub(crate) struct OpenExpectation<'a> {
+    /// The document lifetime the injections were resolved under; a close+reopen
+    /// in between invalidates them.
+    pub(crate) incarnation: u64,
+    /// The connection this open is FOR, when the caller is repairing a specific
+    /// one — the respawn re-open is claimed under a key and its barrier signals
+    /// for that key. The connection is still resolved from `host_uri`, so a
+    /// config change that re-roots the host resolves a DIFFERENT one, and
+    /// opening there would satisfy nobody: the claimed connection stays empty
+    /// while its barrier reports success. `None` opens wherever the host routes
+    /// now, which is what every other caller wants.
+    pub(crate) connection: Option<&'a ConnectionKey>,
+}
 
 struct LifecycleCleanup<'a> {
     pool: &'a LanguageServerPool,
@@ -37,37 +75,79 @@ impl LanguageServerPool {
         server_config: &crate::config::settings::BridgeServerConfig,
         host_uri: &url::Url,
         host_uri_lsp: &tower_lsp_server::ls_types::Uri,
-        expected_incarnation: u64,
+        expect: OpenExpectation<'_>,
         injections: Vec<crate::lsp::bridge::coordinator::BridgeInjection>,
-    ) {
-        // Wait for the server to be ready (handshake complete)
-        let handle = match self
-            .get_or_create_connection_wait_ready(
-                server_name,
-                server_config,
-                Some(host_uri),
-                Duration::from_secs(INIT_TIMEOUT_SECS),
-            )
-            .await
-        {
-            Ok(h) => h,
-            Err(e) => {
-                log::debug!(
-                    target: "kakehashi::bridge",
-                    "Eager open: server {} not ready, skipping didOpen for {} injections: {}",
+    ) -> OpenOutcome {
+        let OpenExpectation {
+            incarnation: expected_incarnation,
+            connection: expected_key,
+        } = expect;
+        // A caller repairing a NAMED connection is acquired BY KEY. Resolving
+        // from `host_uri` would find whatever that host routes to *now*, which
+        // after a re-rooting config change is a different connection — and then
+        // the named one, the one whose barrier is about to be signalled and whose
+        // token a routed command carries, is never repaired at all. Ready-only
+        // and never spawning: this repairs a connection that exists, and a named
+        // connection that has since died has nothing to restore.
+        let handle = match expected_key {
+            Some(key) => match self
+                .ready_connection_by_key_for_config(key, Some(server_config))
+                .await
+            {
+                Some(handle) => handle,
+                None => {
+                    log::debug!(
+                        target: "kakehashi::bridge",
+                        "Eager open: connection {key} is gone; nothing to repair for \
+                         {} injections",
+                        injections.len()
+                    );
+                    return OpenOutcome::NotOpened;
+                }
+            },
+            // Open wherever this host routes now, spawning if needed.
+            None => match self
+                .get_or_create_connection_wait_ready(
                     server_name,
-                    injections.len(),
-                    e
-                );
-                return;
-            }
+                    server_config,
+                    Some(host_uri),
+                    Duration::from_secs(INIT_TIMEOUT_SECS),
+                )
+                .await
+            {
+                Ok(h) => h,
+                Err(e) => {
+                    log::debug!(
+                        target: "kakehashi::bridge",
+                        "Eager open: server {} not ready, skipping didOpen for {} injections: {}",
+                        server_name,
+                        injections.len(),
+                        e
+                    );
+                    return OpenOutcome::NotOpened;
+                }
+            },
         };
 
         let connection_key = handle.key().clone();
+        // Belt-and-braces: the by-key lookup above already returns the named
+        // connection, so this only fires if that ever stops holding. Report it
+        // rather than open on a connection nobody asked for.
+        if let Some(expected) = expected_key
+            && &connection_key != expected
+        {
+            log::debug!(
+                target: "kakehashi::bridge",
+                "Eager open: resolved {connection_key}, not the requested \
+                 {expected}; skipping this open"
+            );
+            return OpenOutcome::WrongConnection;
+        }
         let mut sender = ConnectionHandleSender(&handle);
 
         let Some(lifecycle) = self.existing_host_lifecycle_lock(host_uri) else {
-            return;
+            // The host closed underneath us; nothing to open.
+            return OpenOutcome::NotOpened;
         };
         let _lifecycle_cleanup = LifecycleCleanup {
             pool: self,
@@ -83,7 +163,9 @@ impl LanguageServerPool {
             let current_incarnation = self.current_host_incarnation(host_uri);
             if current_incarnation != Some(expected_incarnation) {
                 drop(lifecycle_guard);
-                return;
+                // The document was reopened under a new lifetime; these
+                // injections are stale. Nothing further is opened.
+                return OpenOutcome::NotOpened;
             }
             let virtual_uri =
                 VirtualDocumentUri::new(host_uri_lsp, &injection.language, &injection.region_id);
@@ -111,7 +193,9 @@ impl LanguageServerPool {
                     "Eager open: connection {} replaced mid-loop; stopping",
                     connection_key
                 );
-                return;
+                // A respawn replaced the handle; the purge lets the next real
+                // request re-open cleanly, but THIS open did not finish.
+                return OpenOutcome::NotOpened;
             }
 
             if let Err(e) = self
@@ -133,6 +217,7 @@ impl LanguageServerPool {
                 );
             }
         }
+        OpenOutcome::Opened
     }
 
     /// Fire `didOpen` for the real host document on a `_self` host-bridge server
@@ -219,6 +304,7 @@ mod tests {
     use super::super::super::pool::test_helpers::*;
     use super::super::super::pool::{ConnectionState, LanguageServerPool};
     use super::super::super::protocol::VirtualDocumentUri;
+    use super::{OpenExpectation, OpenOutcome};
 
     /// Test that eager_open_virtual_documents marks virtual documents as opened.
     ///
@@ -256,15 +342,20 @@ mod tests {
             },
         ];
 
-        pool.eager_open_virtual_documents(
-            server_name,
-            &config,
-            &host_uri,
-            &host_uri_lsp,
-            1,
-            injections,
-        )
-        .await;
+        let outcome = pool
+            .eager_open_virtual_documents(
+                server_name,
+                &config,
+                &host_uri,
+                &host_uri_lsp,
+                OpenExpectation {
+                    incarnation: 1,
+                    connection: None,
+                },
+                injections,
+            )
+            .await;
+        assert_eq!(outcome, OpenOutcome::Opened);
 
         // Verify both virtual documents are marked as opened
         let vuri_0 = VirtualDocumentUri::new(&host_uri_lsp, "lua", TEST_ULID_LUA_0);
@@ -277,6 +368,110 @@ mod tests {
         assert!(
             pool.is_document_opened(&vuri_1),
             "Second virtual document should be marked as opened"
+        );
+    }
+
+    /// A named connection is repaired BY KEY, not by re-resolving the host.
+    /// When a config change re-roots the host between purge and respawn,
+    /// resolving from the host would repair a different connection and leave the
+    /// named one — the one the barrier signals for, and the one a routed command
+    /// carries — empty.
+    #[tokio::test]
+    async fn eager_open_repairs_the_named_connection_not_the_hosts_current_one() {
+        let pool = LanguageServerPool::new();
+        let server_name = "lua_ls";
+        let config = crate::lsp::bridge::pool::test_helpers::devnull_config_for_language("lua");
+
+        // The connection the purge claimed: rooted somewhere the host no longer
+        // resolves to. Nothing else would ever pick it.
+        let claimed = crate::lsp::bridge::ConnectionKey::new(
+            server_name,
+            Some("file:///claimed".to_string()),
+        );
+        let handle = create_handle_with_key(ConnectionState::Ready, claimed.clone()).await;
+        pool.insert_connection(handle).await;
+
+        let host_uri = test_host_uri("eager_open_named_connection");
+        let host_uri_lsp = url_to_uri(&host_uri);
+        pool.open_host_incarnation(&host_uri, 1).await;
+
+        use super::super::super::coordinator::BridgeInjection;
+        let injections = vec![BridgeInjection {
+            language: "lua".to_string(),
+            region_id: TEST_ULID_LUA_0.to_string(),
+            content: "print('hello')".to_string(),
+        }];
+
+        let outcome = pool
+            .eager_open_virtual_documents(
+                server_name,
+                &config,
+                &host_uri,
+                &host_uri_lsp,
+                OpenExpectation {
+                    incarnation: 1,
+                    connection: Some(&claimed),
+                },
+                injections,
+            )
+            .await;
+
+        assert_eq!(outcome, OpenOutcome::Opened);
+        let vuri = VirtualDocumentUri::new(&host_uri_lsp, "lua", TEST_ULID_LUA_0);
+        // The claimed connection is the one that got the document — resolving
+        // from the host would have produced the client-root fallback key, which
+        // is NOT `claimed`.
+        assert!(
+            pool.is_document_opened_on_connection(&vuri, &claimed),
+            "the named connection must be the one repaired"
+        );
+    }
+
+    /// A named connection that has since died has nothing to restore, and the
+    /// caller must learn that: releasing a command onto it would hit an empty
+    /// process.
+    #[tokio::test]
+    async fn eager_open_reports_not_opened_when_the_named_connection_is_gone() {
+        let pool = LanguageServerPool::new();
+        let server_name = "lua_ls";
+        let config = crate::lsp::bridge::pool::test_helpers::devnull_config_for_language("lua");
+        let host_uri = test_host_uri("eager_open_named_gone");
+        let host_uri_lsp = url_to_uri(&host_uri);
+        pool.open_host_incarnation(&host_uri, 1).await;
+
+        use super::super::super::coordinator::BridgeInjection;
+        let injections = vec![BridgeInjection {
+            language: "lua".to_string(),
+            region_id: TEST_ULID_LUA_0.to_string(),
+            content: "print('hello')".to_string(),
+        }];
+
+        // No connection under this key at all.
+        let gone =
+            crate::lsp::bridge::ConnectionKey::new(server_name, Some("file:///gone".to_string()));
+        let outcome = pool
+            .eager_open_virtual_documents(
+                server_name,
+                &config,
+                &host_uri,
+                &host_uri_lsp,
+                OpenExpectation {
+                    incarnation: 1,
+                    connection: Some(&gone),
+                },
+                injections,
+            )
+            .await;
+
+        assert_eq!(
+            outcome,
+            OpenOutcome::NotOpened,
+            "a gone connection must report failure, not success"
+        );
+        let vuri = VirtualDocumentUri::new(&host_uri_lsp, "lua", TEST_ULID_LUA_0);
+        assert!(
+            !pool.is_document_opened(&vuri),
+            "and must not have opened anything anywhere"
         );
     }
 
@@ -310,15 +505,20 @@ mod tests {
         }];
 
         // First call - should open the document
-        pool.eager_open_virtual_documents(
-            server_name,
-            &config,
-            &host_uri,
-            &host_uri_lsp,
-            1,
-            injections.clone(),
-        )
-        .await;
+        let outcome = pool
+            .eager_open_virtual_documents(
+                server_name,
+                &config,
+                &host_uri,
+                &host_uri_lsp,
+                OpenExpectation {
+                    incarnation: 1,
+                    connection: None,
+                },
+                injections.clone(),
+            )
+            .await;
+        assert_eq!(outcome, OpenOutcome::Opened);
 
         let vuri = VirtualDocumentUri::new(&host_uri_lsp, "lua", TEST_ULID_LUA_0);
         assert!(
@@ -327,15 +527,24 @@ mod tests {
         );
 
         // Second call - should be a no-op (idempotent)
-        pool.eager_open_virtual_documents(
-            server_name,
-            &config,
-            &host_uri,
-            &host_uri_lsp,
-            1,
-            injections,
-        )
-        .await;
+        let outcome = pool
+            .eager_open_virtual_documents(
+                server_name,
+                &config,
+                &host_uri,
+                &host_uri_lsp,
+                OpenExpectation {
+                    incarnation: 1,
+                    connection: None,
+                },
+                injections,
+            )
+            .await;
+        assert_eq!(
+            outcome,
+            OpenOutcome::Opened,
+            "an idempotent re-open still reports the connection as open"
+        );
 
         assert!(
             pool.is_document_opened(&vuri),

@@ -96,6 +96,22 @@ injection regions can supply, so the work is performed on the server side
 the existing pool→editor upward request channel. The pool decides *when*; the
 server side decides *what*.
 
+The pool also states *which connection*. The server side resolves each host
+against current settings, so a config change that re-roots the host between the
+purge and the respawn would otherwise repair a different connection than the one
+the barrier signals for — leaving the claimed one empty while reporting success.
+The claimed key travels with the request and the open is ACQUIRED by it, not
+merely checked against it — resolving from the host would repair whichever
+connection it routes to now. A claimed connection that has since died is
+reported as unrepaired, and the barrier then withholds the commands waiting on
+it rather than releasing them onto an empty connection.
+
+A stale-rooted claimed connection is reachable rather than hypothetical: a
+routing token carries the root, and reconnection rebuilds the workspace from the
+token rather than from current markers, so it spawns a connection recording the
+current config that no launch-config check can reject. The root is not part of
+the server config, so config comparison cannot detect a stale root at all.
+
 That split makes the repair **asynchronous**, where the inline version was
 awaited — and being awaited was load-bearing, not incidental. The outbound
 queue to a downstream is FIFO, so a request enqueued before the re-open's
