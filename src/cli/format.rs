@@ -312,6 +312,12 @@ async fn run_paths(server: &Kakehashi, cwd: &Path, options: &FormatOptions) -> u
             Some(formatted) if formatted != text => {
                 changed += 1;
                 if options.check {
+                    // Deliberately not mirroring `write_atomically`'s
+                    // refusals (hard links) here: `--check` answers "would
+                    // the content change", not "would the write succeed",
+                    // and it resolves no paths at all today. A read-only
+                    // target has always passed `--check` and failed the
+                    // apply run the same way.
                     elnln!("Would reformat: {display}");
                 } else {
                     match write_atomically(file, &formatted) {
@@ -364,6 +370,12 @@ async fn run_paths(server: &Kakehashi, cwd: &Path, options: &FormatOptions) -> u
 /// The path is canonicalized first so a symlinked source file keeps being a
 /// symlink — renaming over the link itself would silently replace it with a
 /// regular file and leave the link's target stale (chezmoi/stow setups).
+///
+/// Not every target can be served this way: a file with more than one hard
+/// link is *refused* (`InvalidInput`) rather than written, because the rename
+/// moves only the named directory entry onto the new inode and every other
+/// name would silently keep the old content. That is a policy refusal, not an
+/// I/O failure, and it is Unix-only — see [`reject_multiple_hard_links`].
 fn write_atomically(path: &Path, content: &str) -> std::io::Result<()> {
     use std::io::Write as _;
 
@@ -383,8 +395,13 @@ fn write_atomically(path: &Path, content: &str) -> std::io::Result<()> {
     // over — after writing, so a read-only target mode can't block the write.
     tmp.as_file()
         .set_permissions(std::fs::metadata(&target)?.permissions())?;
-    // A link can be added while the replacement is prepared. Check again
-    // immediately before persist, which would otherwise split the new alias.
+    // A link can be added while the replacement is prepared, so check again
+    // here. This *narrows* the race, it does not close it: a link created
+    // between this check and the `rename(2)` inside `persist` is still split.
+    // Nothing closes it — no stable API renames conditionally on a link
+    // count, `RENAME_EXCHANGE` only reshapes the split, and the one true fix
+    // (truncate-and-write in place) forfeits the crash safety this function
+    // exists to provide.
     reject_multiple_hard_links(&target)?;
     tmp.persist(&target).map_err(|e| e.error)?;
     // Best-effort directory fsync: on some filesystems the rename's
@@ -399,6 +416,14 @@ fn write_atomically(path: &Path, content: &str) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Refuse a target that is reachable under more than one name, because
+/// [`write_atomically`]'s rename can only move one of them onto the new
+/// content (#760).
+///
+/// A false negative is the safe direction, and there are two: mounts that do
+/// not report real link counts (some FUSE backends, `cifs` without UNIX
+/// extensions) and non-Unix platforms. Both degrade to the pre-#760 behavior
+/// rather than to a wrong refusal.
 #[cfg(unix)]
 fn reject_multiple_hard_links(target: &Path) -> std::io::Result<()> {
     use std::os::unix::fs::MetadataExt as _;
@@ -424,8 +449,13 @@ fn reject_multiple_hard_links(target: &Path) -> std::io::Result<()> {
 
 #[cfg(not(unix))]
 fn reject_multiple_hard_links(_target: &Path) -> std::io::Result<()> {
-    // Stable std currently exposes link counts only on Unix. In particular,
-    // Windows MetadataExt::number_of_links is still a nightly-only API.
+    // Not implemented rather than impossible, and NTFS does have hard links,
+    // so #760 stays live on Windows. Stable std cannot express the check —
+    // `windows::fs::MetadataExt::number_of_links` is unstable behind
+    // `windows_by_handle` — but `winapi-util` and `windows-sys` are both
+    // already in the lockfile on Windows and expose
+    // `GetFileInformationByHandle`. Tracked in #933, together with the CI
+    // gap that leaves this arm uncompiled until a release build.
     Ok(())
 }
 
