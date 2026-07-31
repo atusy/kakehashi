@@ -414,17 +414,23 @@ pub(crate) struct DiagnosticAggregator {
     /// the cache REVISIONS themselves as lifetime identity would be wrong,
     /// since a revision changes repeatedly within one coverage lifetime.
     next_coverage_epoch: AtomicU64,
-    /// Hosts whose LAST pull was answered degraded — the bounded parse wait
-    /// lapsed while the aggregator held live region pushes, so the response
-    /// was missing the region fold and deliberately did not `mark_served`.
+    /// Hosts with OUTSTANDING degraded-pull recovery debt — some pull's bounded
+    /// parse wait lapsed while the aggregator held live region pushes, so that
+    /// response was missing the region fold and deliberately did not
+    /// `mark_served`.
+    ///
+    /// Deliberately not "hosts whose LAST pull was degraded": unknown-lifetime
+    /// debt survives a later covering pull (see the absorbing rule below), so
+    /// an entry can outlive the answer that would otherwise have settled it.
+    ///
     /// The reparse loop's post-parse backstop consumes an entry
     /// ([`Self::take_degraded_pull`]) to request the recovery
     /// `workspace/diagnostic/refresh` for exactly the hosts that owe one —
     /// keying the recovery on this instead of the workspace-wide coverage
     /// dirtiness keeps unrelated stale hosts from turning every edit's parse
-    /// pass into a refresh trigger. A later non-degraded pull FROM THE SAME
-    /// coverage lifetime clears the debt (it marks served); `didClose` forgets
-    /// it outright.
+    /// pass into a refresh trigger. A non-degraded pull carrying a stamp whose
+    /// epoch MATCHES clears known debt (it marks served); unknown debt waits for
+    /// `take_degraded_pull`; `didClose` forgets either outright.
     ///
     /// The stored value is the coverage epoch the debt was recorded under, for
     /// the same reason `served` carries one: a pull that started before a
