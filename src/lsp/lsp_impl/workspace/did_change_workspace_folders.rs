@@ -15,6 +15,21 @@ impl Kakehashi {
         let added = params.event.added;
         let removed = params.event.removed;
 
+        // The change moved the project every client-fallback downstream
+        // analyses, so what they report can differ while no document — and no
+        // document version — did. A pull-namespace editor has no event of its
+        // own for that, and the lineage the call above just dropped means an
+        // answer crossing the change resolves to an empty layer rather than the
+        // baseline. Both are repaired by the same nudge.
+        //
+        // FORCED, and requested here rather than after the reload below: the
+        // coverage gate suppresses an unforced refresh when nothing is dirty by
+        // version, which is exactly this change's shape, and the `--config-file`
+        // branch returns before the reload without ever reaching a later call
+        // site. Capability-gated and single-flighted inside.
+        super::super::coordinator::DiagnosticPublisher::new(self)
+            .request_pull_diagnostic_refresh(true);
+
         // Reading the settings in effect, merging the reloaded root onto them,
         // and publishing the result share the one reload transaction
         // `workspace/didChangeConfiguration` uses. Without it a configuration
