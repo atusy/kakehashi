@@ -445,14 +445,14 @@ fn a_completed_reopen_releases_the_command_it_was_holding() {
     let (mut client, _config_dir) = init_client_reopen_order(&log, 0);
     open_markdown(&mut client);
 
-    // Bystanders: markdown with no fence, so they bridge to nothing. The
-    // re-open derives its targets from the OPEN DOCUMENTS, so these are all
-    // candidates it must reject — and rejecting them must be cheap. When the
-    // per-host parse wait (200 ms each) ran before the configuration question,
-    // a handful of them exhausted the 2 s budget on documents that supply
-    // nothing, `done` never signalled in time, and the command below failed
-    // soft. Every other e2e opens exactly one document, so nothing else in the
-    // suite can see that.
+    // Bystanders: markdown with no fence, so they resolve no injections and
+    // open nothing. They exist to drive the derived re-open over a realistic
+    // candidate count — every other e2e opens exactly one document.
+    //
+    // Note what they do NOT test: they share the real host's language, so the
+    // configuration screen ACCEPTS them and they still pay the bounded parse
+    // wait. The screen only rejects hosts whose language cannot reach the
+    // server at all, and no e2e covers that direction.
     open_bystanders(&mut client, 12);
 
     let actions = code_action_with_retry(&mut client);

@@ -81,8 +81,12 @@ with the work that belongs to the connection.
 
 1. Could a document in this HOST language bridge to this server at all? Pure
    configuration, answered from the per-snapshot memo — no parse, no tree, no
-   pool lookup, no filesystem access. This rejects the great majority of open
-   documents, and it must run before the parse wait and the injection
+   pool lookup, no filesystem access. It rejects hosts whose configured `bridge`
+   filter blocks every language the server declares, and servers no longer
+   configured. How much that narrows depends entirely on the configuration: on
+   the shipped defaults the bridge filter allows everything, so a workspace of
+   same-host-language documents is barely thinned, and the later stages carry
+   the load. It must still run before the parse wait and the injection
    resolution, not merely before the open.
 2. Do its resolved injections actually bridge to this server? Also pure
    configuration, but it needs the injections, so it is paid only by hosts that
@@ -92,10 +96,16 @@ with the work that belongs to the connection.
    belonging to another root cannot bring that root's server up.
 
 Stage 1 is deliberately conservative — a server declaring the `*` wildcard is
-never pre-rejected — and advisory, in that it reads the host language before the
-parse wait while the authoritative language is re-read with the injections.
-Screening on a stale language can only cost an unnecessary stage 2; it cannot
-open anything.
+never pre-rejected, and inheritance from the `_` template is resolved before the
+list is read, because a server that omits `languages` reads as declaring nothing
+until the template is merged in.
+
+It is also advisory, in that it reads the host language before the parse wait
+while the authoritative language is re-read with the injections. That asymmetry
+runs one way only, and the safe direction is the ACCEPTING one: a wrong accept
+costs an unnecessary stage 2, while a wrong reject skips the document and still
+reports success. Any future narrowing of stage 1 has to be judged against the
+reject direction, which no test can observe from the outside.
 
 Only then is the connection acquired, and acquired BY KEY rather than by what
 the host resolves to. Both are needed and they are not the same check. The
@@ -119,11 +129,18 @@ withholds correct results.
 
 ### What the barrier now means
 
-`done` reports whether this connection matches current state, which is a
-per-connection property — matching what the barrier is keyed by and what a
-routing token names. Under the captured-list design it reported whether N
-remembered hosts had been restored: a per-host property forced into a
+`done` reports whether every host this re-open judged applicable was opened on
+this connection — a per-connection property, matching what the barrier is keyed
+by and what a routing token names. Under the captured-list design it reported
+whether N remembered hosts had been restored: a per-host property forced into a
 per-connection signal, which is why its granularity never quite fit.
+
+It is a report on the sweep, not a proof of completeness. A host whose tree does
+not settle inside the parse budget resolves no injections and is skipped, and a
+host misjudged as not-applicable is skipped silently by construction — both
+leave `done` reporting success, degrading to the pre-existing lazy heal. That
+asymmetry is the price of the three-way outcome: it buys a barrier that is not
+permanently shut, and it makes every future misclassification invisible.
 
 ## Considered Options
 
@@ -174,12 +191,18 @@ anyway, incorrectly, since it cannot include documents opened since the purge.
 ### Negative
 
 - A host re-rooted away from the connection being repaired is no longer
-  re-opened onto it. Current settings are the authority, so that connection's
-  correct contents are nothing — but a command already in flight against the
-  old root now fails downstream rather than being served. This is the outcome
-  execute-command-routing-token already accepts for a token naming a root no
-  open document sits under, and it requires a configuration change between the
-  action and its command.
+  re-opened onto it. This is a real regression against what
+  execute-command-routing-token's follow-up deliberately built: it made the
+  re-open acquire the CLAIMED connection precisely so a re-rooted host would
+  still be restored there. Current settings are the authority now, so that
+  connection's correct contents are nothing — but a command already in flight
+  against the
+  old root now fails downstream rather than being served. It needs BOTH a
+  respawn and a re-rooting — a live connection already holds its documents, and
+  the barrier is a no-op for it. Re-rooting is not only a configuration change:
+  marker resolution walks the live filesystem uncached, so creating a marker
+  (`git init` in a subdirectory, a submodule checkout, scaffolding a nested
+  project) re-roots a host with settings untouched.
 - The re-open considers every open document rather than a pre-narrowed set. The
   configuration question is answered first and from a memo, so the cost is a
   map lookup per open document, but it does scale with the workspace rather

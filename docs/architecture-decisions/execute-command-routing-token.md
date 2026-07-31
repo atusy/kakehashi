@@ -1,6 +1,7 @@
 # Execute Command Routing Token
 
 **Related Decisions**:
+[respawn-reopen-derives-its-targets](respawn-reopen-derives-its-targets.md),
 [language-server-bridge-request-strategies](language-server-bridge-request-strategies.md),
 [ls-bridge-server-pool-coordination](ls-bridge-server-pool-coordination.md),
 [host-document-bridge](host-document-bridge.md),
