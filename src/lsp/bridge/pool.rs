@@ -3391,6 +3391,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn workspace_folder_change_arms_every_recycled_connection_for_reopen() {
+        // Dropping the connection is only half the repair: its replacement
+        // starts with nothing open, and only an armed key gets a re-open
+        // dispatched when that replacement goes Ready. Arming unconditionally
+        // is what the settings-reload purge does, and for the same reason — a
+        // connection recycled mid-handshake holds no documents to report, yet
+        // its replacement still has to be brought up to date.
+        let pool = LanguageServerPool::new();
+        let capable_key = ConnectionKey::for_server("capable");
+        let incapable_key = ConnectionKey::for_server("incapable");
+        let initializing_key = ConnectionKey::for_server("initializing");
+        let capable = create_handle_with_key(ConnectionState::Ready, capable_key.clone()).await;
+        capable.set_server_capabilities(capable_workspace_folders_caps());
+        let incapable = create_handle_with_key(ConnectionState::Ready, incapable_key.clone()).await;
+        incapable.set_server_capabilities(Default::default());
+        let initializing =
+            create_handle_with_key(ConnectionState::Initializing, initializing_key.clone()).await;
+        pool.insert_connection(capable).await;
+        pool.insert_connection(incapable).await;
+        pool.insert_connection(initializing).await;
+        let added = tower_lsp_server::ls_types::WorkspaceFolder {
+            uri: "file:///added".parse().unwrap(),
+            name: "added".to_string(),
+        };
+
+        pool.apply_workspace_folder_change(vec![added], &[]).await;
+
+        assert!(
+            pool.pending_reopen.claim(&incapable_key).is_some(),
+            "a fallback recycled for lacking the capability owes a re-open"
+        );
+        assert!(
+            pool.pending_reopen.claim(&initializing_key).is_some(),
+            "a connection recycled mid-handshake owes one even though it held nothing"
+        );
+        assert!(
+            pool.pending_reopen.claim(&capable_key).is_none(),
+            "a connection that took the notification keeps its documents open"
+        );
+    }
+
+    #[tokio::test]
     async fn workspace_folder_change_does_not_touch_marker_owned_connection() {
         let pool = LanguageServerPool::new();
         let key = ConnectionKey::new("marker", Some("file:///marker".to_string()));
