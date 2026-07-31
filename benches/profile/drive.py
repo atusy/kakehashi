@@ -175,7 +175,7 @@ def main() -> None:
                                    "extension, falling back to --lang)")
     ap.add_argument(
         "--captures", action="store_true",
-        help="warm kakehashi/captures/full once, then send a real injection-mode "
+        help="warm kakehashi/textDocument/captures/full once, then send a real injection-mode "
              "captures delta per cycle")
     ap.add_argument(
         "--concurrent-captures", action="store_true",
@@ -409,7 +409,7 @@ def main() -> None:
         captures_result_id = None
         if args.captures:
             seed, _ = request(
-                "kakehashi/captures/full",
+                "kakehashi/textDocument/captures/full",
                 {
                     "textDocument": {"uri": uri},
                     "kind": "highlights",
@@ -459,7 +459,7 @@ def main() -> None:
                 {"textDocument": {"uri": uri}},
             )
             captures_requests = [
-                ("kakehashi/captures/full/delta",
+                ("kakehashi/textDocument/captures/full/delta",
                  {"textDocument": {"uri": uri}, "kind": "highlights",
                   "previousResultId": captures_result_id}),
             ]

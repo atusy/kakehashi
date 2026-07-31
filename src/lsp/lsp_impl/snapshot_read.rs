@@ -74,7 +74,7 @@ impl Kakehashi {
     }
 
     /// Resolve a **current** snapshot for the position/range readers
-    /// (`kakehashi/node/*`, the bridge-context requests): a trailing snapshot
+    /// (`kakehashi/textDocument/node/*`, the bridge-context requests): a trailing snapshot
     /// rejects **immediately** — these are implicit/background requests, the
     /// client's next natural request heals — while a not-yet-parsed document
     /// gets only the bounded first-parse wait (`snapshot_for_tokens` waits

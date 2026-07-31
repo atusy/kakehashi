@@ -352,13 +352,20 @@ type NodeInfo = {
 Every method takes a `textDocument`. The `id`-based methods are tied to the document
 they came from; querying with an `id` from a different document returns `null`.
 
+> **Renamed.** These methods used to be spelled without the `textDocument/`
+> segment — `kakehashi/node`, `kakehashi/node/parent`, `kakehashi/captures/full`,
+> and so on. The old names still work, and the server logs a warning naming the
+> replacement the first time each one is called. They may be removed in a future
+> release, so migrate by inserting `textDocument/` after `kakehashi/`.
+> `kakehashi/internal/effectiveConfiguration` is unchanged.
+
 | Method | Input | Output | Purpose |
 |--------|-------|--------|---------|
-| `kakehashi/node` | `{ textDocument, position, injection? }` | `NodeInfo \| null` | The smallest node at a position (on the chosen embedding layer) |
-| `kakehashi/node/parent` | `{ textDocument, id }` | `NodeInfo \| null` | The node's parent (within the same language tree) |
-| `kakehashi/node/children` | `{ textDocument, id }` | `NodeInfo[] \| null` | The node's immediate children (named + anonymous), in document order |
-| `kakehashi/node/namedChildren` | `{ textDocument, id }` | `NodeInfo[] \| null` | The node's immediate **named** children, in document order |
-| `kakehashi/node/text` | `{ textDocument, id }` | `{ text: string } \| null` | The node's current text |
+| `kakehashi/textDocument/node` | `{ textDocument, position, injection? }` | `NodeInfo \| null` | The smallest node at a position (on the chosen embedding layer) |
+| `kakehashi/textDocument/node/parent` | `{ textDocument, id }` | `NodeInfo \| null` | The node's parent (within the same language tree) |
+| `kakehashi/textDocument/node/children` | `{ textDocument, id }` | `NodeInfo[] \| null` | The node's immediate children (named + anonymous), in document order |
+| `kakehashi/textDocument/node/namedChildren` | `{ textDocument, id }` | `NodeInfo[] \| null` | The node's immediate **named** children, in document order |
+| `kakehashi/textDocument/node/text` | `{ textDocument, id }` | `{ text: string } \| null` | The node's current text |
 
 Positions always use UTF-16 code units. When the client advertises
 `general.positionEncodings`, kakehashi explicitly selects `utf-16`; otherwise
@@ -366,7 +373,7 @@ both sides use the LSP default of UTF-16.
 
 ### The `injection` parameter
 
-`kakehashi/node` accepts an optional `injection` (`boolean | number`, default
+`kakehashi/textDocument/node` accepts an optional `injection` (`boolean | number`, default
 `false`) selecting which embedding layer to resolve the position in. Picture the
 layers under the cursor as `[host, layer 1, layer 2, …, deepest]`:
 
@@ -395,69 +402,69 @@ any unresolvable `id` — or out-of-range argument — returns `null`.
 
 | Method | Output |
 |--------|--------|
-| `kakehashi/node/kind` | `{ kind: string }` — the node's grammar symbol |
-| `kakehashi/node/grammarName` | `{ grammarName: string }` — grammar name (differs from `kind` for aliased nodes) |
-| `kakehashi/node/isNamed` · `isExtra` | `{ isNamed: bool }` · `{ isExtra: bool }` |
-| `kakehashi/node/hasError` · `isError` · `isMissing` | `{ hasError: bool }` … (error-recovery flags) |
-| `kakehashi/node/startByte` · `endByte` | `{ startByte: int }` · `{ endByte: int }` |
-| `kakehashi/node/byteRange` | `{ startByte: int, endByte: int }` |
-| `kakehashi/node/childCount` · `namedChildCount` · `descendantCount` | `{ childCount: int }` … |
-| `kakehashi/node/toSexp` | `{ sexp: string }` — the subtree as an s-expression |
+| `kakehashi/textDocument/node/kind` | `{ kind: string }` — the node's grammar symbol |
+| `kakehashi/textDocument/node/grammarName` | `{ grammarName: string }` — grammar name (differs from `kind` for aliased nodes) |
+| `kakehashi/textDocument/node/isNamed` · `isExtra` | `{ isNamed: bool }` · `{ isExtra: bool }` |
+| `kakehashi/textDocument/node/hasError` · `isError` · `isMissing` | `{ hasError: bool }` … (error-recovery flags) |
+| `kakehashi/textDocument/node/startByte` · `endByte` | `{ startByte: int }` · `{ endByte: int }` |
+| `kakehashi/textDocument/node/byteRange` | `{ startByte: int, endByte: int }` |
+| `kakehashi/textDocument/node/childCount` · `namedChildCount` · `descendantCount` | `{ childCount: int }` … |
+| `kakehashi/textDocument/node/toSexp` | `{ sexp: string }` — the subtree as an s-expression |
 
 **Navigation** — returns `NodeInfo | null` (or `NodeInfo[] | null`), minted in the
 same embedding layer as the input:
 
 | Method | Extra input | Output |
 |--------|-------------|--------|
-| `kakehashi/node/child` · `namedChild` | `index` | `NodeInfo \| null` |
-| `kakehashi/node/nextSibling` · `prevSibling` | — | `NodeInfo \| null` |
-| `kakehashi/node/nextNamedSibling` · `prevNamedSibling` | — | `NodeInfo \| null` |
-| `kakehashi/node/firstChildForByte` | `byte` | `NodeInfo \| null` |
-| `kakehashi/node/descendantForByteRange` · `namedDescendantForByteRange` | `startByte`, `endByte` | `NodeInfo \| null` |
+| `kakehashi/textDocument/node/child` · `namedChild` | `index` | `NodeInfo \| null` |
+| `kakehashi/textDocument/node/nextSibling` · `prevSibling` | — | `NodeInfo \| null` |
+| `kakehashi/textDocument/node/nextNamedSibling` · `prevNamedSibling` | — | `NodeInfo \| null` |
+| `kakehashi/textDocument/node/firstChildForByte` | `byte` | `NodeInfo \| null` |
+| `kakehashi/textDocument/node/descendantForByteRange` · `namedDescendantForByteRange` | `startByte`, `endByte` | `NodeInfo \| null` |
 
 **Fields** — children labelled by the grammar (e.g. a function's `name` / `body`):
 
 | Method | Extra input | Output |
 |--------|-------------|--------|
-| `kakehashi/node/childByFieldName` | `name` | `NodeInfo \| null` |
-| `kakehashi/node/childrenByFieldName` | `name` | `NodeInfo[] \| null` |
-| `kakehashi/node/fieldNameForChild` · `fieldNameForNamedChild` | `index` | `{ fieldName: string \| null } \| null` |
+| `kakehashi/textDocument/node/childByFieldName` | `name` | `NodeInfo \| null` |
+| `kakehashi/textDocument/node/childrenByFieldName` | `name` | `NodeInfo[] \| null` |
+| `kakehashi/textDocument/node/fieldNameForChild` · `fieldNameForNamedChild` | `index` | `{ fieldName: string \| null } \| null` |
 
 **Position / range** — line/column as LSP `Position` (`{ line, character }`, UTF-16):
 
 | Method | Extra input | Output |
 |--------|-------------|--------|
-| `kakehashi/node/startPosition` · `endPosition` | — | `{ startPosition: Position }` · `{ endPosition: Position }` |
-| `kakehashi/node/range` | — | `{ start: Position, end: Position }` |
-| `kakehashi/node/descendantForPointRange` · `namedDescendantForPointRange` | `start`, `end` (Positions) | `NodeInfo \| null` |
+| `kakehashi/textDocument/node/startPosition` · `endPosition` | — | `{ startPosition: Position }` · `{ endPosition: Position }` |
+| `kakehashi/textDocument/node/range` | — | `{ start: Position, end: Position }` |
+| `kakehashi/textDocument/node/descendantForPointRange` · `namedDescendantForPointRange` | `start`, `end` (Positions) | `NodeInfo \| null` |
 
 > **Two coordinate systems.** Byte accessors (`startByte`, `byteRange`,
 > `descendantForByteRange`, `firstChildForByte`, …) use **UTF-8 byte offsets** —
-> Tree-sitter's native space, matching `kakehashi/node/text`. Position accessors use
-> **LSP `Position` (UTF-16)**, matching `kakehashi/node` and every other LSP request.
+> Tree-sitter's native space, matching `kakehashi/textDocument/node/text`. Position accessors use
+> **LSP `Position` (UTF-16)**, matching `kakehashi/textDocument/node` and every other LSP request.
 > Pick whichever your client already works in; they address the same nodes.
 
 ### Result semantics
 
 - **`null` means "not currently resolvable."** Whether the `id` was invalidated by
   an edit, never existed, or the document isn't open, the answer is the same. Treat
-  `null` as a signal to re-acquire the node via `kakehashi/node`.
+  `null` as a signal to re-acquire the node via `kakehashi/textDocument/node`.
 - **A cursor exactly at a node's end is outside it.** For example, a cursor on the
   closing fence of a code block resolves to the surrounding document, not the block.
 - **A cursor at the very end of the document** still resolves (so syntax-aware
   commands work at end-of-file). An empty document returns `null`.
 - **Navigation stays inside one language tree.** Asking for the parent of an
   embedded block's root returns `null`, not the host node containing it — to cross
-  that boundary, call `kakehashi/node` again at the position.
+  that boundary, call `kakehashi/textDocument/node` again at the position.
 
-> A `namedOnly` option on `kakehashi/node` (resolving the smallest *named* node at
+> A `namedOnly` option on `kakehashi/textDocument/node` (resolving the smallest *named* node at
 > a position) is planned but **not yet available**. For named-only navigation today,
-> use `kakehashi/node/namedChildren` and the `named*` accessors.
+> use `kakehashi/textDocument/node/namedChildren` and the `named*` accessors.
 
 ### Captures
 
 The node accessors above walk the tree one step at a time. The
-`kakehashi/captures/*` methods run a whole Tree-sitter
+`kakehashi/textDocument/captures/*` methods run a whole Tree-sitter
 [query](https://tree-sitter.github.io/tree-sitter/using-parsers/queries/) over the
 document in a single request — so a client can do structural search, symbol
 extraction, fold-range computation, or a
@@ -476,9 +483,9 @@ re-request cheaply on every cursor move or edit:
 
 | Method | Input | Output |
 |--------|-------|--------|
-| `kakehashi/captures/full` | `{ textDocument, kind, injection? }` | `CapturesResult \| null` |
-| `kakehashi/captures/full/delta` | `{ textDocument, kind, previousResultId }` | `CapturesResult \| CapturesDelta \| null` |
-| `kakehashi/captures/range` | `{ textDocument, kind, range, injection? }` | `{ matches, skipped } \| null` |
+| `kakehashi/textDocument/captures/full` | `{ textDocument, kind, injection? }` | `CapturesResult \| null` |
+| `kakehashi/textDocument/captures/full/delta` | `{ textDocument, kind, previousResultId }` | `CapturesResult \| CapturesDelta \| null` |
+| `kakehashi/textDocument/captures/range` | `{ textDocument, kind, range, injection? }` | `{ matches, skipped } \| null` |
 
 ```typescript
 type CapturesResult = {
@@ -525,7 +532,7 @@ type CapturesDelta = {
   the Markdown heading *and* the Python function in one response; a language
   without the kind file simply contributes nothing. `language` is present on every
   match either way, and captured node ids resolve in their own layer when handed
-  to `kakehashi/node/*`.
+  to `kakehashi/textDocument/node/*`.
 - **`full` → `full/delta` loop**: call `full` once, keep its `resultId`, then send
   `full/delta` on subsequent ticks. The delta carries **no `injection` parameter**
   — your `previousResultId` identifies the lineage and with it the mode; switch

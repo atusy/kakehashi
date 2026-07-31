@@ -33,7 +33,7 @@ use crate::lsp::lsp_impl::kakehashi::node::navigation::range_bounds_in_ranges;
 use crate::text::PositionMapper;
 
 impl Kakehashi {
-    /// `kakehashi/node/range` — the node's span as a pair of LSP `Position`s,
+    /// `kakehashi/textDocument/node/range` — the node's span as a pair of LSP `Position`s,
     /// per `Node::range`. Returns `{ "start": Position, "end": Position }` or
     /// `null`.
     pub async fn kakehashi_node_range(&self, params: NodeIdParams) -> Result<Value> {
@@ -52,7 +52,7 @@ impl Kakehashi {
         Ok(value)
     }
 
-    /// `kakehashi/node/startPosition` — the node's start as an LSP `Position`,
+    /// `kakehashi/textDocument/node/startPosition` — the node's start as an LSP `Position`,
     /// per `Node::start_position`. Returns `{ "startPosition": Position }` or
     /// `null`.
     pub async fn kakehashi_node_start_position(&self, params: NodeIdParams) -> Result<Value> {
@@ -67,7 +67,7 @@ impl Kakehashi {
         Ok(value)
     }
 
-    /// `kakehashi/node/endPosition` — the node's end as an LSP `Position`, per
+    /// `kakehashi/textDocument/node/endPosition` — the node's end as an LSP `Position`, per
     /// `Node::end_position`. Returns `{ "endPosition": Position }` or `null`.
     pub async fn kakehashi_node_end_position(&self, params: NodeIdParams) -> Result<Value> {
         let value = self
@@ -81,7 +81,7 @@ impl Kakehashi {
         Ok(value)
     }
 
-    /// `kakehashi/node/descendantForPointRange` — the smallest descendant
+    /// `kakehashi/textDocument/node/descendantForPointRange` — the smallest descendant
     /// (named + anonymous) spanning `[start, end)` within this node's subtree,
     /// per `Node::descendant_for_point_range`, with the bounds given as LSP
     /// `Position`s. `null` for an unresolvable id, an unmappable `Position`, or an
@@ -93,7 +93,7 @@ impl Kakehashi {
         self.point_range_descendant(params, false).await
     }
 
-    /// `kakehashi/node/namedDescendantForPointRange` — the smallest *named*
+    /// `kakehashi/textDocument/node/namedDescendantForPointRange` — the smallest *named*
     /// descendant spanning `[start, end)` within this node's subtree, per
     /// `Node::named_descendant_for_point_range`. Same `Position` handling as the
     /// anonymous-inclusive variant.

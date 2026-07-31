@@ -32,7 +32,7 @@
 //!   later same-URI readers/writers. Moving auto-install to a spawned task
 //!   (#480) is therefore a liveness fix, not just a latency one; until then
 //!   the exposure is one-time, first open of an uninstalled parser.
-//! - **Readers** (the `semanticTokens` family, the `kakehashi/captures`
+//! - **Readers** (the `semanticTokens` family, the `kakehashi/textDocument/captures`
 //!   triple, the edit-producing formatting/rename requests, pull
 //!   diagnostics, and `didSave`'s diagnostic snapshot) snapshot the current
 //!   tail ticket at `call` time and run only once that ticket is done, so a
@@ -282,7 +282,7 @@ enum Role {
 ///
 /// Readers are the document-snapshotting request families: `semanticTokens`
 /// (including `range`, which never had the in-handler `edit_lock` settle),
-/// the `kakehashi/captures` triple, which mirrors it, the edit-producing
+/// the `kakehashi/textDocument/captures` triple, which mirrors it, the edit-producing
 /// requests (formatting, rename — their edits are applied by the client to
 /// its current text, so edits computed against a stale snapshot corrupt the
 /// document), pull diagnostics, and `didSave` (its synthetic-diagnostic task
@@ -295,7 +295,7 @@ enum Role {
 /// wire — but their params carry no `textDocument`, so the URI comes from the
 /// routing envelope in `params.data.kakehashi.host_uri` (unenveloped items
 /// pass through ungated; their handlers return them unchanged anyway). The
-/// full `kakehashi/node` family is gated too (#698). Its tracker and
+/// full `kakehashi/textDocument/node` family is gated too (#698). Its tracker and
 /// incarnation checks catch staleness only after a lifecycle writer has run;
 /// without this barrier a following node request can overtake a wire-order
 /// `didChange`/`didClose` and observe the pre-writer document.

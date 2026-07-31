@@ -1,4 +1,4 @@
-//! `kakehashi/captures/{full, full/delta, range}` — run a server-owned query
+//! `kakehashi/textDocument/captures/{full, full/delta, range}` — run a server-owned query
 //! kind over a document (captures-protocol).
 //!
 //! The triple mirrors `textDocument/semanticTokens`: `full` computes every
@@ -21,7 +21,7 @@
 //! With `injection: true` the kind query runs across **every** layer — the
 //! host, then each injection region in document-order DFS — each layer
 //! resolving its own language's kind file, with result nodes minted in their
-//! layer's depth so they compose with `kakehashi/node/*` under the per-layer
+//! layer's depth so they compose with `kakehashi/textDocument/node/*` under the per-layer
 //! Scope rule. Every match carries the producing layer's `language`. Deltas
 //! carry no `injection` parameter: the mode is **lineage state**, inherited
 //! from the most recent `full` for that `(uri, kind)`.
@@ -54,11 +54,11 @@ use crate::lsp::lsp_impl::kakehashi::node::injection_stack::walk_document_layers
 use crate::lsp::lsp_impl::{Kakehashi, uri_to_url};
 use crate::text::PositionMapper;
 
-/// Request parameters for `kakehashi/captures/full`.
+/// Request parameters for `kakehashi/textDocument/captures/full`.
 ///
 /// There is deliberately no result cap: a truncated `full` would silently
 /// poison the delta lineage (edits computed over a clipped array), and the
-/// scoping tool for "too much data" is `kakehashi/captures/range` —
+/// scoping tool for "too much data" is `kakehashi/textDocument/captures/range` —
 /// matching semanticTokens, which has no limit parameter either
 /// (captures-protocol §"Considered Options").
 ///
@@ -71,14 +71,14 @@ pub struct CapturesFullParams {
     /// Query kind, resolved as `queries/<lang>/<kind>.scm` on the search paths.
     pub kind: String,
     /// `true` runs the kind query across every injection layer; absent/`false`
-    /// stays on the host layer. A plain boolean — unlike `kakehashi/node`,
+    /// stays on the host layer. A plain boolean — unlike `kakehashi/textDocument/node`,
     /// captures have no cursor position to anchor a layer stack, so there is
     /// nothing for an integer index to select.
     #[serde(default)]
     pub injection: bool,
 }
 
-/// Request parameters for `kakehashi/captures/full/delta`.
+/// Request parameters for `kakehashi/textDocument/captures/full/delta`.
 ///
 /// No `injection` field: the mode is inherited from the `(uri, kind)` lineage
 /// established by `full` (captures-protocol §"Delta semantics").
@@ -93,7 +93,7 @@ pub struct CapturesDeltaParams {
     pub previous_result_id: String,
 }
 
-/// Request parameters for `kakehashi/captures/range`.
+/// Request parameters for `kakehashi/textDocument/captures/range`.
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CapturesRangeParams {
@@ -481,8 +481,8 @@ fn serialize_arc_vec<S: Serializer>(
     v.as_slice().serialize(s)
 }
 
-/// Wire shape for `kakehashi/captures/full` and the full-fallback branch of
-/// `kakehashi/captures/full/delta`.
+/// Wire shape for `kakehashi/textDocument/captures/full` and the full-fallback branch of
+/// `kakehashi/textDocument/captures/full/delta`.
 ///
 /// Holds `Arc` clones (a refcount bump, not a deep copy) of the memoized
 /// match/skip arrays so the handler can move the originals into the lineage
@@ -502,7 +502,7 @@ pub struct CapturesFullResponse {
     skipped: Arc<Vec<Value>>,
 }
 
-/// Wire shape for `kakehashi/captures/range` (no `resultId`: range results
+/// Wire shape for `kakehashi/textDocument/captures/range` (no `resultId`: range results
 /// have no stable lineage to diff against).
 #[derive(Debug, Serialize)]
 pub struct CapturesRangeResponse {
@@ -512,7 +512,7 @@ pub struct CapturesRangeResponse {
     skipped: Arc<Vec<Value>>,
 }
 
-/// A single positional edit in a `kakehashi/captures/full/delta` response:
+/// A single positional edit in a `kakehashi/textDocument/captures/full/delta` response:
 /// replace `deleteCount` matches starting at `start` with `data`. Typed
 /// (rather than `json!`-built) for the same reason as `CapturesFullResponse` —
 /// `data` is already a `Vec<Value>` from `matches_delta_edit`, so this avoids
@@ -526,7 +526,7 @@ pub struct CapturesDeltaEdit {
     data: Vec<Value>,
 }
 
-/// Wire shape for `kakehashi/captures/full/delta`: either a positional edit
+/// Wire shape for `kakehashi/textDocument/captures/full/delta`: either a positional edit
 /// over the previous matches, or a full result (stale `previousResultId`,
 /// or lineage advanced during the await — LSP convention lets a server
 /// always answer a delta request with a full one).
@@ -573,7 +573,7 @@ impl Kakehashi {
         });
     }
 
-    /// Handler for `kakehashi/captures/full`.
+    /// Handler for `kakehashi/textDocument/captures/full`.
     pub async fn kakehashi_captures_full(
         &self,
         params: CapturesFullParams,
@@ -661,7 +661,7 @@ impl Kakehashi {
         still_current
     }
 
-    /// Handler for `kakehashi/captures/full/delta`.
+    /// Handler for `kakehashi/textDocument/captures/full/delta`.
     ///
     /// `previousResultId` selects its lineage **and so its injection mode** by
     /// matching one of the per-mode slots; the current matches are then
@@ -797,7 +797,7 @@ impl Kakehashi {
         Ok(Some(response))
     }
 
-    /// Handler for `kakehashi/captures/range`.
+    /// Handler for `kakehashi/textDocument/captures/range`.
     ///
     /// No `resultId` — range results depend on the viewport, so there is no
     /// stable lineage to diff against (matching semanticTokens/range, which
@@ -1381,7 +1381,7 @@ fn execute_captures_walk(
     // goes READ-ONLY on the tracker: a position the intervening edits did
     // not shift reuses its live id (so the delta lineage stays a minimal
     // diff), and an unknown position gets an unregistered id — resolving
-    // one via `kakehashi/node/*` yields `null`, the protocol's re-sync
+    // one via `kakehashi/textDocument/node/*` yields `null`, the protocol's re-sync
     // signal, and the client's next current-snapshot request mints real
     // ones. An edit landing AFTER the caller's gate — during the pool-queue
     // wait or the walk itself — fails the per-layer batch latch instead
@@ -1521,7 +1521,7 @@ fn execute_captures_walk(
         // capture's ULID in ONE tracker entry-lock acquisition instead of
         // one per capture (~20k on an injection-heavy document). Minted in
         // the layer's depth, so the id resolves in its minting layer via
-        // kakehashi/node/* (per-layer Scope rule). The batch is keyed on the
+        // kakehashi/textDocument/node/* (per-layer Scope rule). The batch is keyed on the
         // walk's entry latch: a mid-walk edit refuses it wholesale (nothing
         // minted — no wrong-space entries, no purge), and the layer degrades
         // to the stale serve's read-only resolution below. Ids are minted

@@ -1,5 +1,5 @@
 //! Cross-snapshot, content-addressed cache of per-layer captures query
-//! matches (`kakehashi/captures/*`).
+//! matches (`kakehashi/textDocument/captures/*`).
 //!
 //! The captures walk re-executes every layer's kind query on every new
 //! snapshot, but a keystroke leaves most layers' *content* untouched — an

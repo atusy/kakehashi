@@ -124,7 +124,7 @@ pub(crate) struct DiscoveredBridgeRegion {
 /// the owned product of the captures/node layer walk
 /// (`walk_document_layers`), built LAZILY by the first walking request on a
 /// snapshot (never on the parse critical path) and carried on the
-/// `ParseSnapshot` so the per-keystroke `kakehashi/captures` requests (full
+/// `ParseSnapshot` so the per-keystroke `kakehashi/textDocument/captures` requests (full
 /// AND delta both walk) iterate these instead of re-running the injection
 /// query, re-resolving every region's language, and re-parsing every
 /// injected region per request.

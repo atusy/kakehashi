@@ -29,7 +29,7 @@ fn triple(node: tree_sitter::Node<'_>) -> (usize, usize, &'static str) {
 }
 
 impl Kakehashi {
-    /// `kakehashi/node/child` — the child at `index` (named + anonymous), per
+    /// `kakehashi/textDocument/node/child` — the child at `index` (named + anonymous), per
     /// `Node::child`. Out-of-range / negative indices resolve to `null`.
     pub async fn kakehashi_node_child(&self, params: NodeIndexParams) -> Result<Value> {
         // tree-sitter child indices are u32; anything outside that range can
@@ -42,7 +42,7 @@ impl Kakehashi {
             .await)
     }
 
-    /// `kakehashi/node/namedChild` — the *named* child at `index`, per
+    /// `kakehashi/textDocument/node/namedChild` — the *named* child at `index`, per
     /// `Node::named_child`. Out-of-range / negative indices resolve to `null`.
     pub async fn kakehashi_node_named_child(&self, params: NodeIndexParams) -> Result<Value> {
         let index = u32::try_from(params.index).ok();
@@ -53,8 +53,8 @@ impl Kakehashi {
             .await)
     }
 
-    /// `kakehashi/node/namedChildren` — all *named* children in document order,
-    /// per `Node::named_children`. Complements `kakehashi/node/children`
+    /// `kakehashi/textDocument/node/namedChildren` — all *named* children in document order,
+    /// per `Node::named_children`. Complements `kakehashi/textDocument/node/children`
     /// (named + anonymous) and mints IDs only for named nodes.
     pub async fn kakehashi_node_named_children(&self, params: NodeIdParams) -> Result<Value> {
         Ok(self
@@ -65,7 +65,7 @@ impl Kakehashi {
             .await)
     }
 
-    /// `kakehashi/node/childWithDescendant` — the immediate child of `id` that
+    /// `kakehashi/textDocument/node/childWithDescendant` — the immediate child of `id` that
     /// contains `descendantId`, per `Node::child_with_descendant` (issue #335).
     ///
     /// The only two-id accessor: both ids must have been minted in the
@@ -101,7 +101,7 @@ impl Kakehashi {
             .await)
     }
 
-    /// `kakehashi/node/nextSibling` — the next sibling (named + anonymous), per
+    /// `kakehashi/textDocument/node/nextSibling` — the next sibling (named + anonymous), per
     /// `Node::next_sibling`. `null` for the last child or an unresolvable id.
     pub async fn kakehashi_node_next_sibling(&self, params: NodeIdParams) -> Result<Value> {
         Ok(self
@@ -111,7 +111,7 @@ impl Kakehashi {
             .await)
     }
 
-    /// `kakehashi/node/prevSibling` — the previous sibling (named + anonymous),
+    /// `kakehashi/textDocument/node/prevSibling` — the previous sibling (named + anonymous),
     /// per `Node::prev_sibling`. `null` for the first child or an unresolvable id.
     pub async fn kakehashi_node_prev_sibling(&self, params: NodeIdParams) -> Result<Value> {
         Ok(self
@@ -121,7 +121,7 @@ impl Kakehashi {
             .await)
     }
 
-    /// `kakehashi/node/nextNamedSibling` — the next *named* sibling, per
+    /// `kakehashi/textDocument/node/nextNamedSibling` — the next *named* sibling, per
     /// `Node::next_named_sibling`.
     pub async fn kakehashi_node_next_named_sibling(&self, params: NodeIdParams) -> Result<Value> {
         Ok(self
@@ -131,7 +131,7 @@ impl Kakehashi {
             .await)
     }
 
-    /// `kakehashi/node/prevNamedSibling` — the previous *named* sibling, per
+    /// `kakehashi/textDocument/node/prevNamedSibling` — the previous *named* sibling, per
     /// `Node::prev_named_sibling`.
     pub async fn kakehashi_node_prev_named_sibling(&self, params: NodeIdParams) -> Result<Value> {
         Ok(self
@@ -141,7 +141,7 @@ impl Kakehashi {
             .await)
     }
 
-    /// `kakehashi/node/firstChildForByte` — the node's first child extending
+    /// `kakehashi/textDocument/node/firstChildForByte` — the node's first child extending
     /// beyond `byte` (UTF-8, host coords), per `Node::first_child_for_byte`.
     /// `byte` is rejected (→ `null`) unless `node.start_byte <= byte <=
     /// node.end_byte` — i.e. negative, before the node, or past its end — and,
@@ -170,7 +170,7 @@ impl Kakehashi {
             .await)
     }
 
-    /// `kakehashi/node/descendantForByteRange` — the smallest descendant
+    /// `kakehashi/textDocument/node/descendantForByteRange` — the smallest descendant
     /// (named + anonymous) spanning `[startByte, endByte)` within this node's
     /// subtree, per `Node::descendant_for_byte_range`. The range is rejected
     /// (→ `null`) unless `node.start_byte <= startByte <= endByte <=
@@ -196,7 +196,7 @@ impl Kakehashi {
             .await)
     }
 
-    /// `kakehashi/node/namedDescendantForByteRange` — the smallest *named*
+    /// `kakehashi/textDocument/node/namedDescendantForByteRange` — the smallest *named*
     /// descendant spanning `[startByte, endByte)` within this node's subtree, per
     /// `Node::named_descendant_for_byte_range`. The range is rejected (→ `null`)
     /// unless `node.start_byte <= startByte <= endByte <= node.end_byte` — i.e.

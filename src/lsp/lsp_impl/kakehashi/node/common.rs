@@ -1,5 +1,5 @@
 //! Shared request shapes and the id-resolution helper for the id-based
-//! `kakehashi/node/*` accessor methods (node-reference-protocol).
+//! `kakehashi/textDocument/node/*` accessor methods (node-reference-protocol).
 //!
 //! Every accessor (`kind`, `childCount`, `child`, `nextSibling`, …) repeats the
 //! same prelude: convert the URI, parse the ULID, look the tracked

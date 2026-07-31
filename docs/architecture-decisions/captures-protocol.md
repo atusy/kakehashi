@@ -1,8 +1,9 @@
 # Captures Protocol
 
 **Related Decisions**:
-- [node-reference-protocol](node-reference-protocol.md) — Node identity, `NodeInfo`, and the `kakehashi/node/*` accessor family the capture results compose with
+- [node-reference-protocol](node-reference-protocol.md) — Node identity, `NodeInfo`, and the `kakehashi/textDocument/node/*` accessor family the capture results compose with
 - [lazy-node-identity-tracking](lazy-node-identity-tracking.md) — ULID identity tracking reused to make captured nodes addressable across edits
+- [custom-method-namespace](custom-method-namespace.md) — Why these methods are scoped under `textDocument/`, and the deprecation window for the old `kakehashi/captures/*` names
 
 ## Context and Problem Statement
 
@@ -28,9 +29,9 @@ A first iteration shipped `kakehashi/query`: a one-shot method taking a **client
 
 | Method | Input | Output |
 |---|---|---|
-| `kakehashi/captures/full` | `{ textDocument, kind, injection? }` | `CapturesResult \| null` |
-| `kakehashi/captures/full/delta` | `{ textDocument, kind, previousResultId }` | `CapturesResult \| CapturesDelta \| null` |
-| `kakehashi/captures/range` | `{ textDocument, kind, range, injection? }` | `CapturesRangeResult \| null` |
+| `kakehashi/textDocument/captures/full` | `{ textDocument, kind, injection? }` | `CapturesResult \| null` |
+| `kakehashi/textDocument/captures/full/delta` | `{ textDocument, kind, previousResultId }` | `CapturesResult \| CapturesDelta \| null` |
+| `kakehashi/textDocument/captures/range` | `{ textDocument, kind, range, injection? }` | `CapturesRangeResult \| null` |
 
 ### Result shapes
 
@@ -48,7 +49,7 @@ type Match = {
   metadata?: Metadata;         // match-level `#set!` directives
   captures: {
     name: string;              // capture name without '@', e.g. "context"
-    node: NodeInfo;            // { id, kind } — trackable via kakehashi/node/*
+    node: NodeInfo;            // { id, kind } — trackable via kakehashi/textDocument/node/*
     range: Range;              // LSP Range (UTF-16), inline to avoid N+1
     metadata?: Metadata;       // capture-scoped `#set! @cap` directives
   }[];
@@ -93,16 +94,16 @@ static, so it falls out of tree-sitter's own `property_settings` parsing.
 
 ### Kind resolution
 
-`kind` names a query file: the server resolves `queries/<language>/<kind>.scm` across its configured `searchPaths` (first hit wins), honoring `; inherits:` directives and tolerant per-pattern compilation — the identical pipeline used for highlights/bindings/injections. `kind` is validated as `[A-Za-z0-9_-]+`; anything else (path separators, dots) is rejected as `InvalidParams` before touching the filesystem. The fixed `QueryKind` enum remains an internal detail of config-time loading; this protocol deliberately does **not** extend it, so available kinds are defined purely by what files exist — enabling a future `kakehashi/captures/kinds` discovery method with no protocol change.
+`kind` names a query file: the server resolves `queries/<language>/<kind>.scm` across its configured `searchPaths` (first hit wins), honoring `; inherits:` directives and tolerant per-pattern compilation — the identical pipeline used for highlights/bindings/injections. `kind` is validated as `[A-Za-z0-9_-]+`; anything else (path separators, dots) is rejected as `InvalidParams` before touching the filesystem. The fixed `QueryKind` enum remains an internal detail of config-time loading; this protocol deliberately does **not** extend it, so available kinds are defined purely by what files exist — enabling a future `captures/kinds` discovery method with no protocol change. Its scope segment is left open deliberately (see custom-method-namespace): a global answer — every kind on `searchPaths` — is server-scoped and belongs under `kakehashi/workspace/`, while an answer restricted to a document's own language and its injections belongs under `kakehashi/textDocument/`. The two are different questions and could both exist.
 
 ### The `injection` parameter
 
 `injection` is a plain boolean (default `false`) on `full` and `range`:
 
 - `false` / absent — run the kind query against the **host** tree only (all result nodes minted in layer 0);
-- `true` — run it across **every** layer: the host first, then each injection region in document order, recursing into nested injections up to the same depth cap as the cursor-path injection stack (`MAX_INJECTION_DEPTH` injected layers — the convention that matters, because minted ids resolve through that stack's depth indexing). Each layer resolves **its own language's** `queries/<lang>/<kind>.scm`; a layer whose language has no kind file simply contributes nothing. Result nodes are minted in their layer's depth, so they compose with `kakehashi/node/*` under the node-reference-protocol per-layer Scope rule (with the same depth-index caveats lazy-node-identity-tracking documents; ids minted from *overlapping* same-depth regions may re-resolve in the wrong same-depth region or collapse to `null` — issue #350).
+- `true` — run it across **every** layer: the host first, then each injection region in document order, recursing into nested injections up to the same depth cap as the cursor-path injection stack (`MAX_INJECTION_DEPTH` injected layers — the convention that matters, because minted ids resolve through that stack's depth indexing). Each layer resolves **its own language's** `queries/<lang>/<kind>.scm`; a layer whose language has no kind file simply contributes nothing. Result nodes are minted in their layer's depth, so they compose with `kakehashi/textDocument/node/*` under the node-reference-protocol per-layer Scope rule (with the same depth-index caveats lazy-node-identity-tracking documents; ids minted from *overlapping* same-depth regions may re-resolve in the wrong same-depth region or collapse to `null` — issue #350).
 
-Unlike `kakehashi/node`'s `boolean | number` selector, there is no layer *indexing*: captures have no cursor position to anchor a layer stack, so the only meaningful modes are "host only" and "everything". The kind is considered available when **at least one** visited layer's language has the kind file — e.g. a host language without a `context.scm` still yields the embedded layers' contexts; only "no visited language has the file" collapses to `null`.
+Unlike `kakehashi/textDocument/node`'s `boolean | number` selector, there is no layer *indexing*: captures have no cursor position to anchor a layer stack, so the only meaningful modes are "host only" and "everything". The kind is considered available when **at least one** visited layer's language has the kind file — e.g. a host language without a `context.scm` still yields the embedded layers' contexts; only "no visited language has the file" collapses to `null`.
 
 **Match ordering** is document-order DFS — the host layer's matches in query order, then each injection region by ascending start byte, each region's matches (and its nested regions) before the next sibling region. The order is deterministic, which the positional delta diff requires.
 
@@ -145,9 +146,9 @@ Matches existing config-time loading, but every new kind becomes a code change, 
 
 Deferred, not rejected: v1 reloads and recompiles the kind query per request. The files are small (a `context.scm` is ~1 KB) and execution over the tree dominates; a compiled-query cache keyed by `(language, kind)` with config-reload invalidation is a contained optimization if profiling warrants it.
 
-### F. Richer `injection` selector (`boolean | number`, as on `kakehashi/node`)
+### F. Richer `injection` selector (`boolean | number`, as on `kakehashi/textDocument/node`)
 
-`kakehashi/node` indexes a layer *stack at a cursor position*; captures run over the whole document, where injection regions are siblings, not a stack — an integer index has nothing well-defined to select. The two meaningful modes are "host only" and "all layers", which a boolean expresses exactly. Rejected as YAGNI; a future filter (e.g. by language name) would be a new parameter, not an integer.
+`kakehashi/textDocument/node` indexes a layer *stack at a cursor position*; captures run over the whole document, where injection regions are siblings, not a stack — an integer index has nothing well-defined to select. The two meaningful modes are "host only" and "all layers", which a boolean expresses exactly. Rejected as YAGNI; a future filter (e.g. by language name) would be a new parameter, not an integer.
 
 ### G. Per-capture `language`, or matches grouped by layer
 
@@ -168,7 +169,7 @@ The first iteration carried an optional per-request cap (plus a server default).
 * The sticky-context loop becomes wire-efficient: unchanged documents answer with an empty-edits delta; small edits ship only the changed matches.
 * Query assets live where the ecosystem already puts them (`queries/<lang>/<kind>.scm` in runtime paths); nvim-treesitter-context's own query files work unmodified once on a search path.
 * Kinds are open-ended without protocol or code changes; folds, textobjects, or custom plugin kinds ride the same three methods.
-* Captured nodes remain trackable `NodeInfo`s, composing with the entire `kakehashi/node/*` family.
+* Captured nodes remain trackable `NodeInfo`s, composing with the entire `kakehashi/textDocument/node/*` family.
 * `injection: true` makes the cross-language sticky-context case (Markdown heading **and** the Python function inside the block) a single request, with each layer's own ecosystem query assets.
 
 ### Negative

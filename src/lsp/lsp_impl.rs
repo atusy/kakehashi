@@ -345,7 +345,7 @@ pub struct Kakehashi {
     /// Computed once at construction — `dirs::home_dir()` is stable for the
     /// process lifetime.
     home_dir: Option<String>,
-    /// Previous full results per `(uri, kind)` for `kakehashi/captures/full/delta`
+    /// Previous full results per `(uri, kind)` for `kakehashi/textDocument/captures/full/delta`
     /// (captures-protocol §"Delta semantics"). One lineage slot **per
     /// injection mode** — index `0` host-only, index `1` injection — each
     /// holding `(resultId, matches as wire JSON)`. Deltas carry no `injection`

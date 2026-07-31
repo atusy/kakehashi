@@ -16,7 +16,7 @@ as a user-visible regression against v0.7.0 (which parsed inline on `didChange`)
 1. **Per-keystroke read latency on large documents.** `Document::apply_edit_and_seed`
    does `self.tree.take()`: after an edit there is **no servable tree** until the
    off-ingress reparse republishes one. So every tree reader —
-   `textDocument/semanticTokens`, `kakehashi/captures`, `kakehashi/node/*`,
+   `textDocument/semanticTokens`, `kakehashi/textDocument/captures`, `kakehashi/textDocument/node/*`,
    `documentSymbol`, selection ranges — must **block** waiting for the reparse
    (`get_tree_with_wait` on the parse **watermark** via `wait_for_epoch`;
    `ensure_document_parsed` for the captures / node readers).
@@ -29,7 +29,7 @@ as a user-visible regression against v0.7.0 (which parsed inline on `didChange`)
    `populate_injections` (the injection-cache build from injection-token-cache-reuse,
    O(regions): a per-region node-tracker ULID mint + content hash, hundreds of ms
    for ~900 regions) runs inline in the off-ingress parse loop, and
-   `compute_captures` / the `kakehashi/node/*` layer walks run inline in their
+   `compute_captures` / the `kakehashi/textDocument/node/*` layer walks run inline in their
    async handlers. On the default `num_cpus`-worker runtime those bursts saturate
    the worker pool, so the tokio timer wheel and `watch` notifications that back
    the 200 ms caps cannot fire, and unrelated documents' handlers cannot be polled.
@@ -241,7 +241,7 @@ observed by the *next* request, not by half of this one.
 
 Region identity is the load-bearing subtlety, and it forces a clean split. The
 shared `NodeTracker` (lazy-node-identity-tracking) is a **mutable, edit-shifted**
-index: it is adjusted synchronously on `didChange` to keep `kakehashi/node/*`
+index: it is adjusted synchronously on `didChange` to keep `kakehashi/textDocument/node/*`
 references stable across edits, so it tracks `content_version`. A snapshot's tree
 tracks `parsed_version`. Minting region ids by mutating that shared tracker from a
 parse pass — at `parsed_version`, into an index the live document has already
@@ -373,7 +373,7 @@ Any reader that must resolve against **live** positions is position-critical
   non-visual-jarring; this is the deliberate, user-sanctioned relaxation.
 - **Staleness-reject** — every **position/range** reader, because its
   coordinates are authored against the **live** text: `semanticTokens/range`,
-  `kakehashi/node/*`, `selectionRange`, `formatting`, `rangeFormatting`,
+  `kakehashi/textDocument/node/*`, `selectionRange`, `formatting`, `rangeFormatting`,
   `captures/range`, **and the ~16 position/range bridge-context requests** that
   resolve an injection region before forwarding to a downstream server (hover,
   definition, references, declaration, typeDefinition, implementation, rename /
@@ -394,7 +394,7 @@ Any reader that must resolve against **live** positions is position-critical
     `ContentModified` — because a silent no-op on an action the user consciously
     triggered is jarring, and the wait is affordable exactly because these are not
     per-keystroke.
-  - `kakehashi/captures/range` uses `null` where the LSP requests use
+  - `kakehashi/textDocument/captures/range` uses `null` where the LSP requests use
     `ContentModified` — `null` is the re-sync signal captures-protocol already
     defines ("on null, call full again"), and a JSON-RPC *error* would violate that
     contract. `captures/full` and `full/delta` take the **serve-current parked
@@ -426,7 +426,7 @@ the **explicit-action wait** above (`formatting`/`rename`), and the
 polling; bounded by parse completion and released early by supersede/cancel).
 No other *per-keystroke* read ever waits.
 
-*(`kakehashi/node/*` stays staleness-reject: a node request resolves to a
+*(`kakehashi/textDocument/node/*` stays staleness-reject: a node request resolves to a
 specific live-position node, so a stale-position answer is wrong, not merely
 late — and it has no per-keystroke re-request to heal it. Serving it stale
 would need a per-snapshot tracker view, which this decision does not commit
@@ -632,7 +632,7 @@ inside the existing safety contracts at each step:
   re-sync signal) past the backstop; `documentSymbol`/`documentColor`
   self-correct only on the client's next natural request (no active refresh
   added).
-- Staleness-reject requests (`kakehashi/node/*`, range requests, formatting) return
+- Staleness-reject requests (`kakehashi/textDocument/node/*`, range requests, formatting) return
   `ContentModified` during the reparse window (`captures/range` returns `null`, its
   protocol re-sync signal). The LSP spec does not mandate retry on `ContentModified`,
   so on a client that does not re-request (e.g. Neovim's built-in client for

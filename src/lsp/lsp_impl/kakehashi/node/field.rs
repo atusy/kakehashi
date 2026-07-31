@@ -18,7 +18,7 @@ use crate::lsp::lsp_impl::Kakehashi;
 use crate::lsp::lsp_impl::kakehashi::node::common::{NodeFieldNameParams, NodeIndexParams};
 
 impl Kakehashi {
-    /// `kakehashi/node/childByFieldName` — the child labelled `name`, per
+    /// `kakehashi/textDocument/node/childByFieldName` — the child labelled `name`, per
     /// `Node::child_by_field_name`. `null` when no child carries that field (or
     /// the id is unresolvable).
     pub async fn kakehashi_node_child_by_field_name(
@@ -34,7 +34,7 @@ impl Kakehashi {
             .await)
     }
 
-    /// `kakehashi/node/childrenByFieldName` — all children labelled `name` in
+    /// `kakehashi/textDocument/node/childrenByFieldName` — all children labelled `name` in
     /// document order, per `Node::children_by_field_name`. A resolvable node with
     /// no such children yields `[]`; an unresolvable id yields `null`.
     pub async fn kakehashi_node_children_by_field_name(
@@ -52,7 +52,7 @@ impl Kakehashi {
             .await)
     }
 
-    /// `kakehashi/node/fieldNameForChild` — the field name of the child at
+    /// `kakehashi/textDocument/node/fieldNameForChild` — the field name of the child at
     /// `index` (named + anonymous), per `Node::field_name_for_child`.
     ///
     /// Returns `{ "fieldName": string | null }` when the node resolves —
@@ -73,7 +73,7 @@ impl Kakehashi {
         Ok(value)
     }
 
-    /// `kakehashi/node/fieldNameForNamedChild` — the field name of the *named*
+    /// `kakehashi/textDocument/node/fieldNameForNamedChild` — the field name of the *named*
     /// child at `index`, per `Node::field_name_for_named_child`. Same response
     /// shape as `fieldNameForChild`.
     pub async fn kakehashi_node_field_name_for_named_child(

@@ -599,7 +599,7 @@ impl InjectionResolver {
     /// Region IDs use a reserved tracker-layer namespace plus the deterministic
     /// same-range identity slot. This keeps alternate language/query layers at
     /// identical host coordinates distinct without colliding with real parse
-    /// injection depths used by `kakehashi/node`.
+    /// injection depths used by `kakehashi/textDocument/node`.
     pub(crate) fn calculate_region_id(
         tracker: &NodeTracker,
         uri: &Url,

@@ -1,4 +1,4 @@
-//! `kakehashi/node` — position → NodeInfo entry point (node-reference-protocol).
+//! `kakehashi/textDocument/node` — position → NodeInfo entry point (node-reference-protocol).
 //!
 //! Resolves a `Position` to the smallest tree-sitter node (named or anonymous)
 //! containing that byte at the layer selected by the `injection` parameter
@@ -29,7 +29,7 @@ use crate::lsp::lsp_impl::kakehashi::node::injection_stack::injection_stack_at;
 use crate::lsp::lsp_impl::{Kakehashi, uri_to_url};
 use crate::text::PositionMapper;
 
-/// Request parameters for `kakehashi/node`.
+/// Request parameters for `kakehashi/textDocument/node`.
 ///
 /// The `injection` field is a `boolean | number` per node-reference-protocol PR-4. We
 /// deserialize it as a raw `Value` and dispatch on the JSON shape ourselves
@@ -140,7 +140,7 @@ fn resolve_index(n: i64, stack_len: usize) -> Option<usize> {
 }
 
 impl Kakehashi {
-    /// Handler for `kakehashi/node`.
+    /// Handler for `kakehashi/textDocument/node`.
     pub async fn kakehashi_node(&self, params: NodeParams) -> Result<Value> {
         self.kakehashi_node_after_injection_load(params, std::future::ready(()))
             .await
@@ -368,7 +368,7 @@ impl Kakehashi {
 
     /// Ensure parsers for every injection language **along the cursor's
     /// injection path** are loaded. `didOpen` triggers a first-level load via
-    /// `process_injections`, but a client may call `kakehashi/node` quickly
+    /// `process_injections`, but a client may call `kakehashi/textDocument/node` quickly
     /// enough to race it, and nested grammars (Markdown → Python → Regex) are
     /// never first-level. Re-run defensively here so PR-4's injection-aware
     /// path has parsers for the whole chain at `byte`.

@@ -33,8 +33,8 @@ tiers by their dependence on kakehashi's own tree-sitter parse:
   forwarded request itself does not use the tree. Region location is an
   intrinsic tree dependency — you cannot know where the embedded Python is
   without parsing the Markdown.
-- **Native tier** — `semanticTokens`, `selectionRange`, and the `kakehashi/node`
-  / `kakehashi/captures` protocols. These are tree-derived and need a parsed
+- **Native tier** — `semanticTokens`, `selectionRange`, and the `kakehashi/textDocument/node`
+  / `kakehashi/textDocument/captures` protocols. These are tree-derived and need a parsed
   tree fully.
 
 **The coupling is incidental, not essential.** In `did_open_impl`

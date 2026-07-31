@@ -1,7 +1,7 @@
 //! Execute a precompiled tree-sitter query over a parsed tree and collect its
 //! matches as plain byte-range data (captures-protocol).
 //!
-//! This is the grammar-level core behind the `kakehashi/captures/*` LSP
+//! This is the grammar-level core behind the `kakehashi/textDocument/captures/*` LSP
 //! methods. It is kept free of LSP / `Kakehashi` concerns (no URI, no ULID
 //! minting, no coordinate conversion) so it can be unit-tested with a bare
 //! grammar and so the handlers stay thin adapters: execute here, then map

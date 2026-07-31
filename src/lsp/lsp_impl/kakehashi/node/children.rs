@@ -1,4 +1,4 @@
-//! `kakehashi/node/children` — id → immediate-children NodeInfo array (node-reference-protocol).
+//! `kakehashi/textDocument/node/children` — id → immediate-children NodeInfo array (node-reference-protocol).
 //!
 //! Resolves a previously-issued ULID to its tracked `(start_byte, end_byte, kind, layer)`
 //! key, locates the matching tree-sitter node in the current parse tree, and
@@ -32,7 +32,7 @@ use ulid::Ulid;
 use crate::lsp::lsp_impl::kakehashi::node::injection_stack::with_resolved_node;
 use crate::lsp::lsp_impl::{Kakehashi, uri_to_url};
 
-/// Request parameters for `kakehashi/node/children`.
+/// Request parameters for `kakehashi/textDocument/node/children`.
 ///
 /// `pub` because the handler is registered as a custom LSP method in the
 /// `kakehashi` binary (see `src/bin/main.rs`).
@@ -44,7 +44,7 @@ pub struct NodeChildrenParams {
 }
 
 impl Kakehashi {
-    /// Handler for `kakehashi/node/children`.
+    /// Handler for `kakehashi/textDocument/node/children`.
     pub async fn kakehashi_node_children(&self, params: NodeChildrenParams) -> Result<Value> {
         let lsp_uri = params.text_document.uri;
         let Ok(uri) = uri_to_url(&lsp_uri) else {
@@ -68,7 +68,7 @@ impl Kakehashi {
         };
 
         // Ensure the document is parsed before snapshotting — same race as in
-        // `kakehashi/node` and `kakehashi/node/parent`: didOpen schedules an
+        // `kakehashi/textDocument/node` and `kakehashi/textDocument/node/parent`: didOpen schedules an
         // async parse, and a `didChange` mid-flight can briefly leave
         // `Document::tree()` populated with a stale tree while NodeTracker has
         // already been adjusted. The helper waits on the parse-state watch

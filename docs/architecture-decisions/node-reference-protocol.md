@@ -3,6 +3,7 @@
 **Related Decisions**:
 - [lazy-node-identity-tracking](lazy-node-identity-tracking.md) — Underlying identity tracking algorithm
 - [language-server-bridge-virtual-document-model](language-server-bridge-virtual-document-model.md) — Virtual document model for injection regions
+- [custom-method-namespace](custom-method-namespace.md) — Why these methods are scoped under `textDocument/`, and the deprecation window for the old `kakehashi/node/*` names
 
 ## Context and Problem Statement
 
@@ -29,17 +30,17 @@ These reduce to a small set of primitives: **identify a node at a position**, **
 
 ## Decision Outcome
 
-**Chosen approach**: Introduce five custom LSP methods (`kakehashi/node`, `kakehashi/node/parent`, `kakehashi/node/children`, `kakehashi/node/namedChildren`, `kakehashi/node/text`) returning a minimal `NodeInfo` type and propagating `null` for any unresolvable reference. Injection layer selection is controlled by an explicit `injection` parameter on the entry-point method. Named-vs-anonymous selection follows tree-sitter's own API surface: a `namedOnly` parameter on the entry point (mirroring `named_descendant_for_byte_range`) and a dedicated `namedChildren` navigation method (mirroring `named_children()`).
+**Chosen approach**: Introduce five custom LSP methods (`kakehashi/textDocument/node`, `kakehashi/textDocument/node/parent`, `kakehashi/textDocument/node/children`, `kakehashi/textDocument/node/namedChildren`, `kakehashi/textDocument/node/text`) returning a minimal `NodeInfo` type and propagating `null` for any unresolvable reference. Injection layer selection is controlled by an explicit `injection` parameter on the entry-point method. Named-vs-anonymous selection follows tree-sitter's own API surface: a `namedOnly` parameter on the entry point (mirroring `named_descendant_for_byte_range`) and a dedicated `namedChildren` navigation method (mirroring `named_children()`).
 
 ### Method Catalog
 
 | Method | Input | Output | Purpose |
 |---|---|---|---|
-| `kakehashi/node` | `{ textDocument, position, injection?, namedOnly? }` | `NodeInfo \| null` | Entry point: position → node identity |
-| `kakehashi/node/parent` | `{ textDocument, id }` | `NodeInfo \| null` | Walk one step toward the root |
-| `kakehashi/node/children` | `{ textDocument, id }` | `NodeInfo[] \| null` | List immediate children (named + anonymous) |
-| `kakehashi/node/namedChildren` | `{ textDocument, id }` | `NodeInfo[] \| null` | List immediate **named** children only |
-| `kakehashi/node/text` | `{ textDocument, id }` | `{ text: string } \| null` | Resolve current text content |
+| `kakehashi/textDocument/node` | `{ textDocument, position, injection?, namedOnly? }` | `NodeInfo \| null` | Entry point: position → node identity |
+| `kakehashi/textDocument/node/parent` | `{ textDocument, id }` | `NodeInfo \| null` | Walk one step toward the root |
+| `kakehashi/textDocument/node/children` | `{ textDocument, id }` | `NodeInfo[] \| null` | List immediate children (named + anonymous) |
+| `kakehashi/textDocument/node/namedChildren` | `{ textDocument, id }` | `NodeInfo[] \| null` | List immediate **named** children only |
+| `kakehashi/textDocument/node/text` | `{ textDocument, id }` | `{ text: string } \| null` | Resolve current text content |
 
 All methods carry a `TextDocumentIdentifier` even when an `id` (ULID) is provided. While ULIDs are globally unique by construction, the `textDocument` field keeps the protocol aligned with LSP conventions, allows the server to route directly to the correct per-URI tracker, and lets the server reject mismatched (`uri`, `id`) pairs as `null` instead of silently querying another document.
 
@@ -65,7 +66,7 @@ The cost is N+1 round trips for clients that need ranges of every child, accepte
 
 Namedness (`is_named()`) is likewise **not** a field on `NodeInfo`. Named-vs-anonymous is expressed through *selection* — the `namedOnly` parameter and the `namedChildren` method below — rather than reported per node, because the round-trip-sensitive use cases all want to *select* named nodes, not to *introspect* one already in hand. A `named: boolean` field remains available as a future addition: unlike `range` it is intrinsic, immutable, and one byte, so it would belong inline alongside `kind` rather than behind its own endpoint. It is deferred until a concrete consumer needs to label nodes it already holds (e.g. a nearest-named-ancestor `parent` walk) — see Alternatives.
 
-### Entry-Point Method: `kakehashi/node`
+### Entry-Point Method: `kakehashi/textDocument/node`
 
 ```jsonc
 // Request
@@ -179,17 +180,17 @@ Edge cases:
 ### Navigation Methods
 
 ```jsonc
-// kakehashi/node/parent
+// kakehashi/textDocument/node/parent
 { "textDocument": { "uri": "..." }, "id": "01HX..." }    →    NodeInfo | null
 
-// kakehashi/node/children        — named + anonymous
+// kakehashi/textDocument/node/children        — named + anonymous
 { "textDocument": { "uri": "..." }, "id": "01HX..." }    →    NodeInfo[] | null
 
-// kakehashi/node/namedChildren   — named only
+// kakehashi/textDocument/node/namedChildren   — named only
 { "textDocument": { "uri": "..." }, "id": "01HX..." }    →    NodeInfo[] | null
 ```
 
-**Scope rule**: Navigation stays within a single language tree. Calling `parent` on the root of an injected tree returns `null`, **not** the host node that contains the injection. Crossing injection boundaries requires a fresh `kakehashi/node` call.
+**Scope rule**: Navigation stays within a single language tree. Calling `parent` on the root of an injected tree returns `null`, **not** the host node that contains the injection. Crossing injection boundaries requires a fresh `kakehashi/textDocument/node` call.
 
 This holds even when a host node and an injected node share an identical span **and** kind (e.g. recursive same-language injection such as markdown-in-markdown). The identity key carries an injection-`layer` discriminator (lazy-node-identity-tracking § Node Uniqueness Key), so the two are distinct ULIDs and `parent`/`children` resolve each in the tree that minted it.
 
@@ -254,7 +255,7 @@ Out-of-range / negative `index` or `byte` values collapse to `null` rather than 
 
 **Why LSP `Position`, not tree-sitter `Point`**: tree-sitter's `Point.column` is a **UTF-8 byte** offset within the line, whereas the protocol speaks LSP `Position` (UTF-16 code units) everywhere else (§"Position Encoding"). Returning native points would diverge from every other LSP coordinate around non-ASCII (emoji, CJK) and force clients to special-case these accessors. Instead the server converts each end via `PositionMapper`: byte → `Position` on output, `Position` → byte on input (reusing the byte-range search and its inverted / out-of-bounds guards). Clients that genuinely want byte-native spans use `startByte` / `endByte` / `byteRange` and `descendant*ForByteRange`, which are unambiguous. A `Position` that cannot be mapped into the current document collapses to `null`.
 
-This supersedes the earlier deferral of range reporting (Alternative C): rather than a single bulk `kakehashi/node/range` endpoint, each tree-sitter method is exposed individually for 1:1 parity with the `Node` API; bulk range retrieval (e.g. `childrenWithRange`) remains a possible future addition if profiling shows the N+1 cost dominates.
+This supersedes the earlier deferral of range reporting (Alternative C): rather than a single bulk `kakehashi/textDocument/node/range` endpoint, each tree-sitter method is exposed individually for 1:1 parity with the `Node` API; bulk range retrieval (e.g. `childrenWithRange`) remains a possible future addition if profiling shows the N+1 cost dominates.
 
 **Field accessors** expose the name-keyed half of tree-sitter's field API:
 
@@ -267,7 +268,7 @@ This supersedes the earlier deferral of range reporting (Alternative C): rather 
 
 For `fieldNameFor*`, top-level `null` means the *id* is unresolvable, while `{ "fieldName": null }` means the node resolved but that child carries no field — the two are deliberately distinguished.
 
-### Text Resolution: `kakehashi/node/text`
+### Text Resolution: `kakehashi/textDocument/node/text`
 
 ```jsonc
 // Request
@@ -288,29 +289,29 @@ Clients **cannot distinguish** between:
 - An ID that was never issued by this server for the supplied `textDocument`
 - A `textDocument` that has no tracker entries (e.g., never opened, already closed)
 
-All three collapse to `null`. This is a deliberate consequence of the no-tombstone, no-LRU design (lazy-node-identity-tracking). Clients that need to refresh a node should treat `null` as "re-acquire via `kakehashi/node`".
+All three collapse to `null`. This is a deliberate consequence of the no-tombstone, no-LRU design (lazy-node-identity-tracking). Clients that need to refresh a node should treat `null` as "re-acquire via `kakehashi/textDocument/node`".
 
 ### Lifecycle
 
-- `didOpen`: no eager work — IDs are issued lazily on first `kakehashi/node*` request
+- `didOpen`: no eager work — IDs are issued lazily on first `kakehashi/textDocument/node*` request
 - `didChange`: existing IDs are repositioned or invalidated per lazy-node-identity-tracking
 - `didClose`: all IDs for the URI are dropped
 
 ## Example Flow
 
 ```
-1. Client: kakehashi/node { textDocument, position, injection: true }
+1. Client: kakehashi/textDocument/node { textDocument, position, injection: true }
 2. Server: { id: "01HX-A", type: "call" }
 
 3. ... user edits, didChange fires ...
 
-4. Client: kakehashi/node/text { textDocument, id: "01HX-A" }
+4. Client: kakehashi/textDocument/node/text { textDocument, id: "01HX-A" }
 5. Server: { text: "foo(updated_arg)" }     // ID survived, text reflects edit
 
-6. Client: kakehashi/node/parent { textDocument, id: "01HX-A" }
+6. Client: kakehashi/textDocument/node/parent { textDocument, id: "01HX-A" }
 7. Server: { id: "01HX-B", type: "expression_statement" }
 
-8. Client: kakehashi/node/children { textDocument, id: "01HX-B" }
+8. Client: kakehashi/textDocument/node/children { textDocument, id: "01HX-B" }
 9. Server: [ { id: "01HX-A", type: "call" } ]
 ```
 
@@ -387,7 +388,7 @@ Return both children always, add `named: boolean` to `NodeInfo`, and let clients
 * Bad, because **larger payloads** and per-client filtering logic for a distinction the server can make natively via `named_children()`
 * The `named` field itself is not rejected outright — it is deferred until a *holding-a-node* consumer (e.g. a nearest-named-ancestor `parent` walk) needs it, at which point it would live inline on `NodeInfo`
 
-### Alternative G: Separate `kakehashi/node/named` Entry Method
+### Alternative G: Separate `kakehashi/textDocument/node/named` Entry Method
 
 Split the entry point into anonymous-inclusive and named-only methods instead of a `namedOnly` parameter.
 
@@ -397,7 +398,7 @@ Split the entry point into anonymous-inclusive and named-only methods instead of
 ## Implementation Notes
 
 - Methods are registered via `LspService::build().custom_method(...)` in `src/bin/main.rs`, following the existing `kakehashi/internal/effectiveConfiguration` pattern
-- Handlers live under `src/lsp/lsp_impl/kakehashi/node/`. The core methods keep one file each (`entry`, `text`, `parent`, `children`); the accessor family is grouped by category (`metadata`, `navigation`, `field`) since each method shrinks to a few lines over the shared `common` prelude (`with_node_by_id` / `navigate_to_node` / `navigate_to_nodes`), which centralises URI/ULID resolution, parse-readiness, snapshotting, and per-layer node resolution
+- Handlers live under `src/lsp/lsp_impl/kakehashi/textDocument/node/`. The core methods keep one file each (`entry`, `text`, `parent`, `children`); the accessor family is grouped by category (`metadata`, `navigation`, `field`) since each method shrinks to a few lines over the shared `common` prelude (`with_node_by_id` / `navigate_to_node` / `navigate_to_nodes`), which centralises URI/ULID resolution, parse-readiness, snapshotting, and per-layer node resolution
 - The entry point resolves `namedOnly` by switching `descendant_for_byte_range` → `named_descendant_for_byte_range` at the selected layer's tree; the end-of-document exception walks the right spine to the deepest node ending at `L`, restricted to named nodes when `namedOnly` is set
 - `namedChildren` reuses the `children` handler's tracker-minting path over `Node::named_children` instead of `Node::children`
 - `NodeTracker` (`src/language/node_tracker.rs`) backs all four id-based methods via a per-URI bidirectional index — forward (`PositionKey → Ulid`) for minting/dedup, reverse (`Ulid → PositionKey`) for resolving a held ULID back to a node range; see lazy-node-identity-tracking
@@ -407,7 +408,7 @@ Split the entry point into anonymous-inclusive and named-only methods instead of
 
 | Aspect | Decision |
 |--------|----------|
-| **Methods** | `kakehashi/node`, `/parent`, `/children`, `/namedChildren`, `/text` |
+| **Methods** | `kakehashi/textDocument/node`, `/parent`, `/children`, `/namedChildren`, `/text` |
 | **Common params** | All methods carry `TextDocumentIdentifier` |
 | **`NodeInfo` shape** | `{ id, kind }` (range via separate `range`/`startPosition`/`endPosition` accessors, not inline; `named` deferred) |
 | **Entry resolution** | Smallest containing node at selected injection layer |

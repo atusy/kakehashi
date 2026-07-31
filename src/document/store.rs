@@ -358,7 +358,7 @@ impl DocumentStore {
     /// still equals `expected_text`. Returns `true` iff the tree was stored.
     ///
     /// This is the safe persistence path for an **on-demand reader parse** (e.g.
-    /// `kakehashi/node`'s parse fallback). Unlike [`update_document`] it is
+    /// `kakehashi/textDocument/node`'s parse fallback). Unlike [`update_document`] it is
     /// **non-inserting**: a `Vacant` entry — the document was closed while the
     /// parse ran — is left untouched, so a parse completing after a `didClose`
     /// cannot **resurrect** the document. Folding the text-equality check into the

@@ -1,4 +1,4 @@
-//! `kakehashi/node/text` — id → current node text (node-reference-protocol).
+//! `kakehashi/textDocument/node/text` — id → current node text (node-reference-protocol).
 //!
 //! Resolves a previously-issued ULID back to its tracked byte range via
 //! [`NodeTracker::lookup_position`] and slices the current document text at
@@ -19,7 +19,7 @@ use ulid::Ulid;
 
 use crate::lsp::lsp_impl::{Kakehashi, uri_to_url};
 
-/// Request parameters for `kakehashi/node/text`.
+/// Request parameters for `kakehashi/textDocument/node/text`.
 ///
 /// `pub` because the handler is registered as a custom LSP method in the
 /// `kakehashi` binary (see `src/bin/main.rs`).
@@ -31,7 +31,7 @@ pub struct NodeTextParams {
 }
 
 impl Kakehashi {
-    /// Handler for `kakehashi/node/text`.
+    /// Handler for `kakehashi/textDocument/node/text`.
     pub async fn kakehashi_node_text(&self, params: NodeTextParams) -> Result<Value> {
         let lsp_uri = params.text_document.uri;
         let Ok(uri) = uri_to_url(&lsp_uri) else {

@@ -11,7 +11,7 @@
 This decision covers the **virt and native tiers** — the work that
 intrinsically needs kakehashi's tree-sitter parse (region location for injected
 languages, and the tree-derived `semanticTokens` / `selectionRange` /
-`kakehashi/node` / `kakehashi/captures` features). The host tier needs no tree
+`kakehashi/textDocument/node` / `kakehashi/textDocument/captures` features). The host tier needs no tree
 and is decoupled separately; see parse-decoupled-document-lifecycle. With the host
 tier hoisted ahead of the parse, what remains is to get the parse itself off the
 latency-critical ingress path and give a document's parse lifecycle a single

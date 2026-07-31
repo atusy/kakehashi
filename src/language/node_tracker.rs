@@ -22,7 +22,7 @@ use url::Url;
 /// Maintains a bidirectional index per URI:
 /// - forward (`PositionKey -> (Ulid, incarnation)`) for assignment / dedup
 /// - reverse (`Ulid -> (PositionKey, incarnation)`) for resolving a held ULID back to a node
-///   range (used by `kakehashi/node/text` and future navigation methods).
+///   range (used by `kakehashi/textDocument/node/text` and future navigation methods).
 ///
 /// Both directions are kept in sync across `get_or_create`, `adjust_for_edits`,
 /// and `cleanup` so an invalidated ULID becomes indistinguishable from a never-issued

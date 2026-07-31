@@ -1,4 +1,4 @@
-//! `kakehashi/node/parent` — id → immediate-parent NodeInfo (node-reference-protocol).
+//! `kakehashi/textDocument/node/parent` — id → immediate-parent NodeInfo (node-reference-protocol).
 //!
 //! Resolves a previously-issued ULID to its tracked `(start_byte, end_byte, kind, layer)`
 //! key, locates the matching tree-sitter node in the current parse tree, and
@@ -11,7 +11,7 @@
 //! the correct tree we resolve it **only** in the layer that minted it —
 //! `stack[layer]` for the tracked `layer` (see
 //! [`with_resolved_node`](super::injection_stack::with_resolved_node)) — so a
-//! node minted by `kakehashi/node` against an injected layer is never re-matched
+//! node minted by `kakehashi/textDocument/node` against an injected layer is never re-matched
 //! against a different layer's tree.
 //!
 //! Returns `null` (serialized as JSON `null`) when:
@@ -32,7 +32,7 @@ use ulid::Ulid;
 use crate::lsp::lsp_impl::kakehashi::node::injection_stack::with_resolved_node;
 use crate::lsp::lsp_impl::{Kakehashi, uri_to_url};
 
-/// Request parameters for `kakehashi/node/parent`.
+/// Request parameters for `kakehashi/textDocument/node/parent`.
 ///
 /// `pub` because the handler is registered as a custom LSP method in the
 /// `kakehashi` binary (see `src/bin/main.rs`).
@@ -44,7 +44,7 @@ pub struct NodeParentParams {
 }
 
 impl Kakehashi {
-    /// Handler for `kakehashi/node/parent`.
+    /// Handler for `kakehashi/textDocument/node/parent`.
     pub async fn kakehashi_node_parent(&self, params: NodeParentParams) -> Result<Value> {
         let lsp_uri = params.text_document.uri;
         let Ok(uri) = uri_to_url(&lsp_uri) else {
@@ -69,7 +69,7 @@ impl Kakehashi {
         };
 
         // Ensure the document is parsed before snapshotting — same race as in
-        // `kakehashi/node`: didOpen schedules an async parse, a client that
+        // `kakehashi/textDocument/node`: didOpen schedules an async parse, a client that
         // immediately follows up with `parent` must not see `tree: None`.
         // Resolve a CURRENT parse snapshot (parse-snapshot ADR §3): a node id
         // names a live-position node, so a trailing snapshot rejects

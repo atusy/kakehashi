@@ -3,10 +3,10 @@
 //! See [node-reference-protocol](../../../../docs/architecture-decisions/node-reference-protocol.md) for the
 //! protocol specification. Each method has its own file under `node/`:
 //!
-//! - [`entry`]: `kakehashi/node` — position → NodeInfo entry point
-//! - [`text`]: `kakehashi/node/text` — id → current node text
-//! - [`parent`]: `kakehashi/node/parent` — id → immediate-parent NodeInfo
-//! - [`children`]: `kakehashi/node/children` — id → immediate-children NodeInfo[]
+//! - [`entry`]: `kakehashi/textDocument/node` — position → NodeInfo entry point
+//! - [`text`]: `kakehashi/textDocument/node/text` — id → current node text
+//! - [`parent`]: `kakehashi/textDocument/node/parent` — id → immediate-parent NodeInfo
+//! - [`children`]: `kakehashi/textDocument/node/children` — id → immediate-children NodeInfo[]
 
 mod children;
 mod common;
