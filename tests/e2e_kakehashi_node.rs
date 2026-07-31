@@ -526,6 +526,73 @@ fn test_deprecated_method_names_still_resolve() {
     );
 }
 
+/// The deprecation notice must reach the editor's LSP log, not only the
+/// server's stderr.
+///
+/// This is the whole point of the notice: `log::warn!` alone is invisible in a
+/// default run, because env_logger takes its level from `RUST_LOG` and filters
+/// at `Error` when unset — so the client authors who need to migrate would
+/// never see it. Nothing else covers the `window/logMessage` path.
+#[test]
+fn test_deprecated_method_notice_reaches_the_client_log() {
+    let mut client = LspClient::new();
+    initialize(&mut client);
+
+    let uri = "file:///test_kakehashi_deprecation_notice.md";
+    open_markdown(&mut client, uri, "# Hello\n");
+
+    // `send_request` is unusable here: its response helper discards
+    // notifications, and the notice is dispatched during `Service::call` — so
+    // it usually arrives BEFORE the response and would be swallowed.
+    let request_id = client.send_request_async(
+        "kakehashi/node",
+        json!({
+            "textDocument": { "uri": uri },
+            "position": { "line": 0, "character": 4 }
+        }),
+    );
+
+    let mentions_the_old_name = |params: &Value| {
+        params
+            .get("message")
+            .and_then(Value::as_str)
+            .is_some_and(|message| message.contains("kakehashi/node"))
+    };
+
+    // The notice is detached, so it is unordered against the response. Retain
+    // it if it precedes the response, and fall back to a bounded wait if it
+    // follows — neither ordering may fail the test.
+    let (_, watched) =
+        client.receive_response_for_id_watching_notifications(request_id, &["window/logMessage"]);
+    let params = watched
+        .into_iter()
+        .map(|(_, params)| params)
+        .find(|params| mentions_the_old_name(params))
+        .or_else(|| {
+            client
+                .wait_for_notification_where(
+                    &["window/logMessage"],
+                    std::time::Duration::from_secs(5),
+                    mentions_the_old_name,
+                )
+                .map(|(_, params)| params)
+        })
+        .expect("the deprecation notice must reach window/logMessage");
+    assert_eq!(
+        params.get("type").and_then(Value::as_i64),
+        Some(2),
+        "the notice must be MessageType::WARNING"
+    );
+    let message = params
+        .get("message")
+        .and_then(Value::as_str)
+        .expect("logMessage carries a string message");
+    assert!(
+        message.contains("kakehashi/textDocument/node"),
+        "the notice must name the replacement, got {message:?}"
+    );
+}
+
 /// Every deprecated spelling must still reach a registered handler.
 ///
 /// The alias table is frozen while the registration list in `main.rs` is free
