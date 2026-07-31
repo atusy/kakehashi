@@ -403,7 +403,14 @@ fn write_atomically(path: &Path, content: &str) -> std::io::Result<()> {
 fn reject_multiple_hard_links(target: &Path) -> std::io::Result<()> {
     use std::os::unix::fs::MetadataExt as _;
 
-    let links = std::fs::metadata(target)?.nlink();
+    // `symlink_metadata`, not `metadata`: `rename(2)` never follows a final
+    // symlink, so the count has to come from the same inode the rename will
+    // unlink. On the pre-create call the two are identical — `target` is
+    // canonical, so its last component cannot be a symlink — but the
+    // pre-persist call re-reads a path that may have changed underneath, and
+    // there a symlink (which can itself carry links on Linux) must be judged
+    // by its own count rather than its pointee's.
+    let links = std::fs::symlink_metadata(target)?.nlink();
     if links > 1 {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
