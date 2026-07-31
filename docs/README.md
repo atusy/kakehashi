@@ -875,27 +875,31 @@ Exit codes: `0` nothing to change (or changes written without
 `2` usage error, I/O error, a refused write (see below), a configuration
 file given with `--config-file` that could not be loaded, or downstream
 formatter failure (a configured server failed to start, errored on the
-request, timed out, or returned a
-protocol-invalid response). Only *request-time* failures are strategy-aware:
-under `preferred` — the bridge-level default for formatting, where several
-servers of one target produce competing whole-document edits — the winner is
-authoritative, so a non-winning server's failed request does not count, while
-`concatenated` counts every server's. A server that fails to **start** always
-counts, whichever strategy is in force and even if a fallback then formatted
-the document.
+request, timed out, or returned a protocol-invalid response). Only
+*request-time* failures are strategy-aware: under `preferred` — the
+bridge-level default for formatting, where several servers of one target
+produce competing whole-document edits — the winner is authoritative, so a
+non-winning server's failed request does not count, while `concatenated`
+counts every server's. A server that fails to **start** always counts,
+whichever strategy is in force and even if a fallback then formatted the
+document.
 
 In-place writes go through a temporary file and an atomic rename, so a crash
 mid-write cannot leave a truncated source file behind. Two consequences: a
 symlinked path stays a symlink (the file it resolves to is rewritten), and a
 target reachable under more than one **hard link** is *refused* rather than
 written — the rename moves only the named entry onto the new content, so the
-other names would silently keep the old. Such a file is reported per file and
-counted as a write error (exit `2`); the rest of the run continues. Detection
-depends on the filesystem reporting a true link count, and is Unix-only — on
-Windows, and on mounts that under-report link counts (some FUSE
-backends, `cifs` without UNIX extensions), a hard-linked file is still
-rewritten and its other names keep the old content. `--check` is unaffected: it answers
-whether the content would change, not whether the write would succeed.
+other names would silently keep the old. Such a file is reported per file
+and counted as a write error (exit `2`); the rest of the run continues.
+
+That refusal is a best-effort guard, not a guarantee. It rests on the
+link count the filesystem reports, so a mount that under-reports (some
+FUSE backends, `cifs` without UNIX extensions) still splits the file
+silently, as does Windows, where the count is not read at all. The count
+is also checked immediately before the rename rather than atomically with
+it, so a link created in that window is still split. `--check` is
+unaffected either way: it answers whether the content would change, not
+whether the write would succeed.
 
 A configuration failure exits `2` before anything is written, so stdout stays
 empty in `--stdin-filename` mode. A *downstream* failure does not: the content
