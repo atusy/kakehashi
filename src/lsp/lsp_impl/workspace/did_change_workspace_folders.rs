@@ -14,9 +14,6 @@ impl Kakehashi {
     ) {
         let added = params.event.added;
         let removed = params.event.removed;
-        // Read before the move below; an event naming no folder changes no
-        // project, and the pool ignores it for the same reason.
-        let folders_changed = !added.is_empty() || !removed.is_empty();
 
         // Reading the settings in effect, merging the reloaded root onto them,
         // and publishing the result share the one reload transaction
@@ -29,13 +26,27 @@ impl Kakehashi {
         // let a push anchor against the old root after the workspace has
         // already moved. The lock order is reload-then-connections on every
         // path that takes both, since the settings reload also reaches the
-        // bridge.
+        // bridge. Taken even for an event that may turn out to name no folder:
+        // the pool's own emptiness check below returns before it ever reaches
+        // `connections`, so nothing is held across that check.
         let reload = lock_settings_reload().await;
 
-        self.bridge
+        // The pool owns the definition of "this event changed something" and
+        // reports it, so the reload and the re-pull below cannot drift from the
+        // fence's notion of it. An event that named no folder moved no project:
+        // re-deriving the settings root from it would drop the project config
+        // layer for a session whose folder list is empty, and reparsing every
+        // open document plus a semantic-tokens refresh is a high price for a
+        // notification that said nothing.
+        if !self
+            .bridge
             .pool()
             .apply_workspace_folder_change(added, &removed)
-            .await;
+            .await
+        {
+            drop(reload);
+            return;
+        }
 
         // The change moved the project every client-fallback downstream
         // analyses, so what they report can differ while no document — and no
@@ -44,15 +55,20 @@ impl Kakehashi {
         // answer crossing the change resolves to an empty layer rather than the
         // baseline. Both are repaired by the same nudge.
         //
-        // FORCED: the coverage gate suppresses an unforced refresh when nothing
-        // is dirty by version, which is exactly this change's shape — but
-        // `forced` is also what bypasses that gate, so the emptiness check is
-        // this call site's own responsibility rather than something the gate
-        // absorbs.
-        if folders_changed {
-            super::super::coordinator::DiagnosticPublisher::new(self)
-                .request_pull_diagnostic_refresh(true);
-        }
+        // FORCED because the coverage gate suppresses an unforced refresh when
+        // nothing is dirty by version — the exact shape of a change that moves
+        // the project rather than the documents. Requested here rather than
+        // after the reload because the `--config-file` branch returns before
+        // it, never reaching a later call site. Capability-gated and
+        // single-flighted inside; `forced` bypasses neither.
+        //
+        // The request is fire-and-forget, so the editor's re-pull can land
+        // while the reload below still holds the pre-reload settings. That is
+        // benign — the root path is read only where settings are loaded, never
+        // at spawn — and a reload that does change something recycles through
+        // `propagate_settings` and nudges again on its own.
+        super::super::coordinator::DiagnosticPublisher::new(self)
+            .request_pull_diagnostic_refresh(true);
 
         // An emptied folder list does not leave the session rootless when the
         // client named another root: the rungs below `workspaceFolders` answer,
