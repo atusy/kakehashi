@@ -312,6 +312,12 @@ async fn run_paths(server: &Kakehashi, cwd: &Path, options: &FormatOptions) -> u
             Some(formatted) if formatted != text => {
                 changed += 1;
                 if options.check {
+                    // Deliberately not mirroring `write_atomically`'s
+                    // refusals (hard links) here: `--check` answers "would
+                    // the content change", not "would the write succeed",
+                    // and it resolves no paths at all today. A target in a
+                    // read-only directory has always passed `--check` and
+                    // failed the apply run the same way.
                     elnln!("Would reformat: {display}");
                 } else {
                     match write_atomically(file, &formatted) {
@@ -364,10 +370,17 @@ async fn run_paths(server: &Kakehashi, cwd: &Path, options: &FormatOptions) -> u
 /// The path is canonicalized first so a symlinked source file keeps being a
 /// symlink — renaming over the link itself would silently replace it with a
 /// regular file and leave the link's target stale (chezmoi/stow setups).
+///
+/// Not every target can be served this way: a file with more than one hard
+/// link is *refused* (`InvalidInput`) rather than written, because the rename
+/// moves only the named directory entry onto the new inode and every other
+/// name would silently keep the old content. That is a policy refusal, not an
+/// I/O failure, and it is Unix-only — see [`reject_multiple_hard_links`].
 fn write_atomically(path: &Path, content: &str) -> std::io::Result<()> {
     use std::io::Write as _;
 
     let target = std::fs::canonicalize(path)?;
+    reject_multiple_hard_links(&target)?;
     let dir = target.parent().filter(|p| !p.as_os_str().is_empty());
     let mut tmp = tempfile::NamedTempFile::new_in(dir.unwrap_or(Path::new(".")))?;
     tmp.write_all(content.as_bytes())?;
@@ -382,6 +395,14 @@ fn write_atomically(path: &Path, content: &str) -> std::io::Result<()> {
     // over — after writing, so a read-only target mode can't block the write.
     tmp.as_file()
         .set_permissions(std::fs::metadata(&target)?.permissions())?;
+    // A link can be added while the replacement is prepared, so check again
+    // here. This *narrows* the race, it does not close it: a link created
+    // between this check and the `rename(2)` inside `persist` is still split.
+    // Nothing closes it — no stable API renames conditionally on a link
+    // count, `RENAME_EXCHANGE` only reshapes the split, and the one true fix
+    // (truncate-and-write in place) forfeits the crash safety this function
+    // exists to provide.
+    reject_multiple_hard_links(&target)?;
     tmp.persist(&target).map_err(|e| e.error)?;
     // Best-effort directory fsync: on some filesystems the rename's
     // directory-entry update is itself buffered, so without this a power
@@ -392,6 +413,55 @@ fn write_atomically(path: &Path, content: &str) -> std::io::Result<()> {
     {
         let _ = dir_handle.sync_all();
     }
+    Ok(())
+}
+
+/// Refuse a target that is reachable under more than one name, because
+/// [`write_atomically`]'s rename can only move one of them onto the new
+/// content (#760).
+///
+/// The verdict is only as good as the filesystem's `st_nlink`, and it can be
+/// wrong in either direction — neither of which is "safe":
+/// - A false negative (some FUSE backends hardcode 1; `cifs` without UNIX
+///   extensions) silently restores the pre-#760 split, i.e. the data loss
+///   this guard exists to prevent. Non-Unix platforms sit here too (#933).
+/// - A false positive costs a spurious refusal, which at least says so and
+///   leaves the file intact.
+///
+/// Neither is detectable from here, so the guard reports what it is told.
+#[cfg(unix)]
+fn reject_multiple_hard_links(target: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    // `symlink_metadata`, not `metadata`: `rename(2)` never follows a final
+    // symlink, so the count has to come from the same inode the rename will
+    // unlink. On the pre-create call the two are identical — `target` is
+    // canonical, so its last component cannot be a symlink — but the
+    // pre-persist call re-reads a path that may have changed underneath, and
+    // there a symlink (which can itself carry links on Linux) must be judged
+    // by its own count rather than its pointee's.
+    let links = std::fs::symlink_metadata(target)?.nlink();
+    if links > 1 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "target has {links} hard links; an atomic replacement updates only this name and would leave every other name on the old content (`find -samefile` lists them)"
+            ),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn reject_multiple_hard_links(_target: &Path) -> std::io::Result<()> {
+    // Not implemented rather than impossible, and NTFS does have hard links,
+    // so #760 stays live on Windows. Stable std cannot express the check —
+    // `windows::fs::MetadataExt::number_of_links` is unstable behind
+    // `windows_by_handle` — but `winapi-util` and `windows-sys` both reach
+    // Windows builds transitively already and expose
+    // `GetFileInformationByHandle`, so the implementation costs a direct
+    // dependency entry rather than a new crate. Tracked in #933, together
+    // with the CI gap that leaves this arm uncompiled until a release build.
     Ok(())
 }
 
@@ -438,5 +508,159 @@ mod tests {
             4,
             "the caret diagram must survive escaping: {escaped:?}"
         );
+    }
+
+    /// Before #760 this write *succeeded*: the target took `"new\n"` on a
+    /// fresh inode and the alias silently stayed behind on the old one. Both
+    /// names, and the inode that carries them, must survive the refusal.
+    #[cfg(unix)]
+    #[test]
+    fn write_atomically_rejects_multiply_linked_target_without_changes() {
+        use std::os::unix::fs::MetadataExt as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("source.lua");
+        let alias = dir.path().join("alias.lua");
+        std::fs::write(&target, "old\n").unwrap();
+        std::fs::hard_link(&target, &alias).unwrap();
+        let inode = std::fs::metadata(&target).unwrap().ino();
+
+        let error = write_atomically(&target, "new\n").unwrap_err();
+
+        assert_eq!(
+            error.kind(),
+            std::io::ErrorKind::InvalidInput,
+            "a policy refusal, not an I/O failure: {error}"
+        );
+        assert!(
+            error.to_string().contains("hard link"),
+            "the refusal must name its cause: {error}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&target).unwrap(),
+            "old\n",
+            "the target must not be rewritten"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&alias).unwrap(),
+            "old\n",
+            "the alias must not be left on stale content"
+        );
+        assert_eq!(
+            std::fs::metadata(&target).unwrap().ino(),
+            inode,
+            "the target must keep its inode, or the link is already split"
+        );
+        assert_eq!(
+            std::fs::metadata(&alias).unwrap().ino(),
+            inode,
+            "both names must still resolve to the one inode"
+        );
+        assert_eq!(
+            sorted_entry_names(dir.path()),
+            ["alias.lua", "source.lua"],
+            "the refusal must land before a temp file is even created"
+        );
+    }
+
+    /// The refusal must not cost the normal case. Every *successful*
+    /// `write_atomically` test used to live in `tests/`, which is gated
+    /// behind the `e2e` feature that CI does not enable — so inverting the
+    /// guard to `links >= 1`, refusing every write, passed the whole gate.
+    #[cfg(unix)]
+    #[test]
+    fn write_atomically_replaces_a_single_link_file_keeping_its_mode() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("source.lua");
+        std::fs::write(&target, "old\n").unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o754)).unwrap();
+
+        write_atomically(&target, "new\n").expect("a singly linked file must stay writable");
+
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "new\n");
+        assert_eq!(
+            std::fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+            0o754,
+            "the rename must carry the target's own mode over"
+        );
+        assert_eq!(
+            sorted_entry_names(dir.path()),
+            ["source.lua"],
+            "the temp file must not survive the write"
+        );
+    }
+
+    /// Canonicalization writes *through* a symlink instead of replacing it,
+    /// and the link count that decides the refusal is therefore the resolved
+    /// file's — a symlink does not count as a hard link to it.
+    #[cfg(unix)]
+    #[test]
+    fn write_atomically_writes_through_a_symlink() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real.lua");
+        let link = dir.path().join("link.lua");
+        std::fs::write(&real, "old\n").unwrap();
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        write_atomically(&link, "new\n").expect("writing through a symlink must succeed");
+
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "the symlink must survive the replacement"
+        );
+        assert_eq!(std::fs::read_to_string(&real).unwrap(), "new\n");
+    }
+
+    /// Pins the predicate both call sites rest on. The pre-persist one is
+    /// only reachable by racing a concurrent `link(2)`, so this is the only
+    /// coverage it can get.
+    #[cfg(unix)]
+    #[test]
+    fn reject_multiple_hard_links_only_rejects_aliased_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let lone = dir.path().join("lone.lua");
+        let aliased = dir.path().join("aliased.lua");
+        std::fs::write(&lone, "x").unwrap();
+        std::fs::write(&aliased, "x").unwrap();
+        std::fs::hard_link(&aliased, dir.path().join("alias.lua")).unwrap();
+
+        reject_multiple_hard_links(&lone).expect("a single name is not an alias");
+        let error = reject_multiple_hard_links(&aliased).unwrap_err();
+
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+    }
+
+    /// The count must come from the link itself, not from what it points at,
+    /// because `rename(2)` replaces the link rather than following it.
+    /// `write_atomically` canonicalizes before it ever gets here, so only the
+    /// pre-persist re-check can be handed a symlink — and only after the path
+    /// changed underneath it. Reverting to `metadata` refuses this case.
+    #[cfg(unix)]
+    #[test]
+    fn reject_multiple_hard_links_judges_a_symlink_by_its_own_count() {
+        let dir = tempfile::tempdir().unwrap();
+        let aliased = dir.path().join("aliased.lua");
+        let link = dir.path().join("link.lua");
+        std::fs::write(&aliased, "x").unwrap();
+        std::fs::hard_link(&aliased, dir.path().join("alias.lua")).unwrap();
+        std::os::unix::fs::symlink(&aliased, &link).unwrap();
+
+        reject_multiple_hard_links(&link)
+            .expect("a symlink carries one name, whatever its target carries");
+    }
+
+    #[cfg(unix)]
+    fn sorted_entry_names(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
     }
 }
