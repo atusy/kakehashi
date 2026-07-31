@@ -415,7 +415,7 @@ fn reject_multiple_hard_links(target: &Path) -> std::io::Result<()> {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             format!(
-                "refusing atomic replacement of a file with {links} hard links; remove the aliases first"
+                "target has {links} hard links; an atomic replacement updates only this name and would leave the other names on the old content (list them with `find . -samefile <path>`)"
             ),
         ));
     }
