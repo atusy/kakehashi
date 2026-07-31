@@ -2200,6 +2200,88 @@ mod tests {
         );
     }
 
+    /// The folder `bridge_workspace_folders` forwards for `params`, as
+    /// `(uri, name)` — the shape a downstream server receives.
+    fn forwarded_folders(params: &InitializeParams) -> Option<Vec<(String, String)>> {
+        let root_uri = bridge_root_uri(params);
+        bridge_workspace_folders(params, root_uri.as_deref()).map(|folders| {
+            folders
+                .into_iter()
+                .map(|folder| (folder.uri.as_str().to_string(), folder.name))
+                .collect()
+        })
+    }
+
+    #[test]
+    fn bridge_workspace_folders_names_a_synthesized_folder_after_the_root() {
+        let params = params_with(serde_json::json!({
+            "rootUri": "file:///home/dev/my-project",
+            "workspaceFolders": null
+        }));
+
+        assert_eq!(
+            forwarded_folders(&params),
+            Some(vec![(
+                "file:///home/dev/my-project".to_string(),
+                "my-project".to_string()
+            )])
+        );
+    }
+
+    #[test]
+    fn bridge_workspace_folders_synthesizes_from_a_legacy_root_path() {
+        let root_path = std::env::current_dir()
+            .expect("current directory")
+            .join("legacy-workspace");
+        let expected_uri = Url::from_file_path(&root_path).expect("an absolute root path");
+        let params = params_with(serde_json::json!({
+            "rootUri": null,
+            "rootPath": root_path,
+            "workspaceFolders": null
+        }));
+
+        assert_eq!(
+            forwarded_folders(&params),
+            Some(vec![(
+                expected_uri.as_str().to_string(),
+                "legacy-workspace".to_string()
+            )])
+        );
+    }
+
+    #[test]
+    fn bridge_workspace_folders_falls_back_to_a_fixed_name_without_a_segment() {
+        // A root with no last segment to name: `path_segments` yields the empty
+        // string, which must not become the folder name.
+        let params = params_with(serde_json::json!({
+            "rootUri": "file:///",
+            "workspaceFolders": null
+        }));
+
+        assert_eq!(
+            forwarded_folders(&params),
+            Some(vec![("file:///".to_string(), "workspace".to_string())])
+        );
+    }
+
+    #[test]
+    fn bridge_workspace_folders_forwards_an_empty_list_verbatim() {
+        // `[]` is the client saying it has no folders. Synthesizing one from
+        // `rootUri` here would invent the workspace #742 is about, so the empty
+        // list is forwarded as sent.
+        let params = params_with(serde_json::json!({
+            "rootUri": "file:///home/dev/my-project",
+            "workspaceFolders": []
+        }));
+
+        assert_eq!(forwarded_folders(&params), Some(vec![]));
+        assert_eq!(
+            bridge_root_uri(&params).as_deref(),
+            Some("file:///home/dev/my-project"),
+            "an empty folder list leaves the client's own rootUri untouched"
+        );
+    }
+
     #[test]
     fn bridge_root_uri_preserves_no_workspace_initialize() {
         let params: InitializeParams = serde_json::from_value(serde_json::json!({
