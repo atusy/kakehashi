@@ -37,6 +37,17 @@ pub(crate) struct InjectionCoordinator {
     diagnostics: std::sync::Arc<DiagnosticAggregator>,
 }
 
+/// What a bounded wait for a current tree actually found.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum ParseWait {
+    /// The tree matches the document's content.
+    Current,
+    /// The document was closed; there is nothing to wait for.
+    Gone,
+    /// The budget expired with the tree still trailing or absent.
+    Unsettled,
+}
+
 impl InjectionCoordinator {
     pub(crate) fn new(server: &Kakehashi) -> Self {
         Self {
@@ -495,15 +506,16 @@ impl InjectionCoordinator {
     /// closing it: the wait is bounded, and on expiry the re-open proceeds and
     /// may still open nothing. Degrading to the pre-existing lazy heal (the next
     /// parse re-opens) is preferred over stalling the barrier.
-    /// Returns whether the tree is CURRENT. `false` means the budget expired
-    /// with the parse still outstanding, so a caller that must not silently
-    /// under-report has to treat whatever it resolves next as unreliable rather
-    /// than as "this document has nothing".
+    /// Returns which of the three outcomes a caller must distinguish. They are
+    /// not interchangeable: `Gone` is nothing to do, `Unsettled` is something
+    /// this pass could not determine, and collapsing them makes a closed buffer
+    /// look like a failed repair (holding the barrier shut) or an unparsed one
+    /// look like a document with no injections (releasing commands onto it).
     pub(crate) async fn ensure_document_parsed(
         &self,
         uri: &Url,
         budget: std::time::Duration,
-    ) -> bool {
+    ) -> ParseWait {
         // `budget` is enforced HERE rather than passed through, because
         // `wait_for_current_snapshot_in` honours its `wait` argument only for a
         // snapshot that TRAILS. A document with no snapshot at all — open, first
@@ -516,20 +528,39 @@ impl InjectionCoordinator {
         //
         // The caller passes what is LEFT of the shared budget, so a sweep cannot
         // spend it several times over.
-        matches!(
-            tokio::time::timeout(
+        use crate::lsp::lsp_impl::snapshot_read::SnapshotWait;
+        match tokio::time::timeout(
+            budget,
+            crate::lsp::lsp_impl::snapshot_read::wait_for_current_snapshot_in(
+                &self.documents,
+                uri,
                 budget,
-                crate::lsp::lsp_impl::snapshot_read::wait_for_current_snapshot_in(
-                    &self.documents,
-                    uri,
-                    budget,
-                ),
-            )
-            .await,
-            Ok(crate::lsp::lsp_impl::snapshot_read::SnapshotWait::Current(
-                _
-            ))
+            ),
         )
+        .await
+        {
+            Ok(SnapshotWait::Current(_)) => ParseWait::Current,
+            // Closed while this sweep was running. It WAS in the snapshot the
+            // sweep started from, but there is nothing left to repair, and
+            // reporting failure would hold the barrier shut over a buffer the
+            // user simply closed.
+            Ok(SnapshotWait::Gone) => ParseWait::Gone,
+            // Trailing, never parsed, or out of budget: whatever the injection
+            // resolution says next is not evidence about this document.
+            Ok(SnapshotWait::Stale | SnapshotWait::Unparsed) | Err(_) => ParseWait::Unsettled,
+        }
+    }
+
+    /// Whether `uri`'s published snapshot still matches its content — a cheap
+    /// re-check for a caller that resolved something against it and needs to
+    /// know the ground did not move underneath.
+    pub(crate) fn snapshot_is_current(&self, uri: &Url) -> bool {
+        self.documents.latest_snapshot(uri).is_some_and(|view| {
+            view.slot
+                .snapshot
+                .as_ref()
+                .is_some_and(|snapshot| snapshot.parsed_version == view.content_version)
+        })
     }
 
     fn install_coordinator(&self) -> InstallCoordinator {

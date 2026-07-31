@@ -1455,25 +1455,35 @@ fn spawn_upstream_request(
                             repaired = false;
                             break;
                         }
-                        if !injection.ensure_document_parsed(&host, remaining).await {
-                            // The budget expired with this document's parse
-                            // still outstanding. Resolving injections now yields
-                            // ZERO — not because the host has none, but because
-                            // there is no tree to find them in — and the skip
-                            // below would then read as "nothing to repair here".
-                            // This host passed the configuration screen, so it
-                            // is a plausible member of this connection's set and
-                            // saying otherwise is the one direction that
-                            // releases a command onto a document that was never
-                            // opened. Report the connection as not caught up and
-                            // let the next parse's eager open heal it.
-                            log::debug!(
-                                target: "kakehashi::bridge",
-                                "Re-open of {key}: {host} did not settle within the \
-                                 remaining budget; reporting the connection incomplete"
-                            );
-                            repaired = false;
-                            continue;
+                        use crate::lsp::lsp_impl::coordinator::ParseWait;
+                        match injection.ensure_document_parsed(&host, remaining).await {
+                            ParseWait::Current => {}
+                            // Closed underneath the sweep. It was in the
+                            // snapshot this pass started from, but a buffer the
+                            // user closed is not a repair this connection is
+                            // owed, and calling it a failure would hold the
+                            // barrier shut over it.
+                            ParseWait::Gone => continue,
+                            ParseWait::Unsettled => {
+                                // The budget expired with this document's parse
+                                // still outstanding. Resolving injections now yields
+                                // ZERO — not because the host has none, but because
+                                // there is no tree to find them in — and the skip
+                                // below would then read as "nothing to repair here".
+                                // This host passed the configuration screen, so it
+                                // is a plausible member of this connection's set and
+                                // saying otherwise is the one direction that
+                                // releases a command onto a document that was never
+                                // opened. Report the connection as not caught up and
+                                // let the next parse's eager open heal it.
+                                log::debug!(
+                                    target: "kakehashi::bridge",
+                                    "Re-open of {key}: {host} did not settle within the \
+                                     remaining budget; reporting the connection incomplete"
+                                );
+                                repaired = false;
+                                continue;
+                            }
                         }
                         // Incarnation BEFORE injections, matching the ordering the
                         // inline heal used: a close+reopen landing between the two
@@ -1489,6 +1499,17 @@ fn spawn_upstream_request(
                             continue;
                         };
                         if injections.is_empty() {
+                            // Empty means one of two very different things: this
+                            // host genuinely has no region for this server, or
+                            // an edit cleared the tree between the currency
+                            // check above and this resolution — `didChange`
+                            // clears it WITHOUT bumping the incarnation, so
+                            // neither guard above catches that. Re-check rather
+                            // than assume the benign reading, because the benign
+                            // reading is the one that releases commands.
+                            if !injection.snapshot_is_current(&host) {
+                                repaired = false;
+                            }
                             continue;
                         }
                         // Sequential: each host's didOpen goes out on the SAME

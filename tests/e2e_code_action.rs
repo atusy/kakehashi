@@ -234,6 +234,7 @@ fn init_client_reopen_order(
             log.to_str().expect("temp path should be UTF-8"),
         )
         .env("KAKEHASHI_E2E_STALL_REOPEN_MS", stall_ms.to_string())
+        // (see the stall_ms doc above for why the withhold case needs slack)
         .build();
 
     client.send_request(
@@ -309,6 +310,35 @@ fn dirty_bystanders(client: &mut LspClient, count: usize) {
     }
 }
 
+/// Block until the FIRST incarnation has opened `uri_marker`'s virtual
+/// document — i.e. before any respawn, so a later appearance of that host can
+/// only have come from the re-open sweep.
+fn await_initial_open(log: &std::path::Path, uri_marker: &str) {
+    for _ in 0..300 {
+        if let Ok(wire) = std::fs::read_to_string(log) {
+            let incarnations = wire
+                .lines()
+                .filter(|l| l.split('\t').next() == Some("initialize"))
+                .count();
+            assert!(
+                incarnations <= 1,
+                "the predecessor died before it opened {uri_marker}; this test \
+                 cannot then attribute a later open to the sweep:\n{wire}"
+            );
+            if wire.lines().any(|l| {
+                let mut parts = l.split('\t');
+                parts.next() == Some("textDocument/didOpen")
+                    && parts.next().is_some_and(|uri| uri.contains(uri_marker))
+            }) {
+                return;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let wire = std::fs::read_to_string(log).unwrap_or_default();
+    panic!("the first incarnation never opened a {uri_marker} document:\n{wire}");
+}
+
 /// Block until the replacement incarnation has both initialized AND received a
 /// `didOpen`, i.e. its re-open has actually run.
 ///
@@ -366,7 +396,11 @@ fn replacement_segment(wire: &str) -> Vec<&str> {
 fn a_command_does_not_overtake_the_reopen_of_a_respawned_downstream() {
     let log_dir = tempfile::TempDir::new().expect("Failed to create log temp dir");
     let log = log_dir.path().join("wire.log");
-    let (mut client, _config_dir) = init_client_reopen_order(&log, 2500);
+    // 5 s, not the 2 s bound plus a hair: the stall starts when the re-open is
+    // SERVICED, while the barrier's 2 s starts when the command begins waiting,
+    // and those are independently scheduled. A 500 ms margin makes a correct
+    // barrier fail this test whenever the command is dispatched late under load.
+    let (mut client, _config_dir) = init_client_reopen_order(&log, 5000);
     open_markdown(&mut client);
 
     // Surface the routed command; the mock then exits once (crash marker), so
@@ -481,6 +515,12 @@ fn a_completed_reopen_releases_the_command_it_was_holding() {
     // it after the crash, so its presence in the replacement's segment is
     // positive evidence that the derived sweep — not a request — opened it.
     open_second_host(&mut client);
+    // Let the FIRST incarnation open it before the crash. `didOpen` schedules
+    // parsing asynchronously and the eager open that follows uses
+    // `connection: None`, so a task still in flight when the predecessor dies
+    // could open this host on the REPLACEMENT without the sweep — which would
+    // silently make the assertion below non-discriminating again.
+    await_initial_open(&log, SECOND_HOST_DIR);
 
     let actions = code_action_with_retry(&mut client);
     let routed = actions
