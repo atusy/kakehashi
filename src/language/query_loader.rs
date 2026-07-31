@@ -543,6 +543,24 @@ mod tests {
     }
 
     #[test]
+    fn resolve_library_path_honors_explicit_path_for_rejected_language() {
+        // The name gate guards implicit `<base>/parser/<language>.<ext>` lookup only.
+        // An explicit `languages[*].parser` comes from config, not from a document,
+        // and is the documented escape hatch for assets that cannot follow the
+        // implicit layout -- so it must resolve even for a name the gate rejects.
+        let dir = tempdir().unwrap();
+        let runtime = dir.path().join("runtime");
+
+        let result = QueryLoader::resolve_library_path(
+            Some("explicit/path.so"),
+            "../../outside",
+            &[runtime],
+        );
+
+        assert_eq!(result, Some(PathBuf::from("explicit/path.so")));
+    }
+
+    #[test]
     fn test_resolve_library_path() {
         // Test explicit library path
         let explicit = Some("explicit/path.so");
