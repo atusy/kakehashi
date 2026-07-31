@@ -420,10 +420,15 @@ fn write_atomically(path: &Path, content: &str) -> std::io::Result<()> {
 /// [`write_atomically`]'s rename can only move one of them onto the new
 /// content (#760).
 ///
-/// A false negative is the safe direction, and there are two: mounts that do
-/// not report real link counts (some FUSE backends, `cifs` without UNIX
-/// extensions) and non-Unix platforms. Both degrade to the pre-#760 behavior
-/// rather than to a wrong refusal.
+/// The verdict is only as good as the filesystem's `st_nlink`, and it can be
+/// wrong in either direction — neither of which is "safe":
+/// - A false negative (some FUSE backends hardcode 1; `cifs` without UNIX
+///   extensions) silently restores the pre-#760 split, i.e. the data loss
+///   this guard exists to prevent. Non-Unix platforms sit here too (#933).
+/// - A false positive costs a spurious refusal, which at least says so and
+///   leaves the file intact.
+///
+/// Neither is detectable from here, so the guard reports what it is told.
 #[cfg(unix)]
 fn reject_multiple_hard_links(target: &Path) -> std::io::Result<()> {
     use std::os::unix::fs::MetadataExt as _;
