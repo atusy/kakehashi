@@ -14,21 +14,9 @@ impl Kakehashi {
     ) {
         let added = params.event.added;
         let removed = params.event.removed;
-
-        // The change moved the project every client-fallback downstream
-        // analyses, so what they report can differ while no document — and no
-        // document version — did. A pull-namespace editor has no event of its
-        // own for that, and the lineage the call above just dropped means an
-        // answer crossing the change resolves to an empty layer rather than the
-        // baseline. Both are repaired by the same nudge.
-        //
-        // FORCED, and requested here rather than after the reload below: the
-        // coverage gate suppresses an unforced refresh when nothing is dirty by
-        // version, which is exactly this change's shape, and the `--config-file`
-        // branch returns before the reload without ever reaching a later call
-        // site. Capability-gated and single-flighted inside.
-        super::super::coordinator::DiagnosticPublisher::new(self)
-            .request_pull_diagnostic_refresh(true);
+        // Read before the move below; an event naming no folder changes no
+        // project, and the pool ignores it for the same reason.
+        let folders_changed = !added.is_empty() || !removed.is_empty();
 
         // Reading the settings in effect, merging the reloaded root onto them,
         // and publishing the result share the one reload transaction
@@ -48,6 +36,23 @@ impl Kakehashi {
             .pool()
             .apply_workspace_folder_change(added, &removed)
             .await;
+
+        // The change moved the project every client-fallback downstream
+        // analyses, so what they report can differ while no document — and no
+        // document version — did. A pull-namespace editor has no event of its
+        // own for that, and the lineage the call above just dropped means an
+        // answer crossing the change resolves to an empty layer rather than the
+        // baseline. Both are repaired by the same nudge.
+        //
+        // FORCED: the coverage gate suppresses an unforced refresh when nothing
+        // is dirty by version, which is exactly this change's shape — but
+        // `forced` is also what bypasses that gate, so the emptiness check is
+        // this call site's own responsibility rather than something the gate
+        // absorbs.
+        if folders_changed {
+            super::super::coordinator::DiagnosticPublisher::new(self)
+                .request_pull_diagnostic_refresh(true);
+        }
 
         // An emptied folder list does not leave the session rootless when the
         // client named another root: the rungs below `workspaceFolders` answer,
