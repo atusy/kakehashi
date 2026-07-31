@@ -580,8 +580,18 @@ impl BridgeCoordinator {
         let Some(config) = settings.language_servers.get(server_name) else {
             return false;
         };
-        config.languages.iter().any(|injection_language| {
-            injection_language == "*"
+        // Resolve `_` inheritance: `languages` is `#[serde(default)]`, so a
+        // server that omits it reads as declaring NOTHING until the wildcard
+        // template is merged in — and the authoritative resolver merges before
+        // matching. Reading the raw list here would answer "reaches nothing"
+        // for a server that reaches everything, and because this screen only
+        // ever SKIPS, that false negative is silent: no didOpen, no failure
+        // reported, and the barrier releases commands onto an empty connection.
+        let effective_languages = config.effective_languages_with_wildcard(
+            settings.language_servers.get(crate::config::WILDCARD_KEY),
+        );
+        effective_languages.iter().any(|injection_language| {
+            injection_language == crate::config::settings::LANGUAGES_WILDCARD
                 || self
                     .cached_configs_for_injection_language(
                         settings,
@@ -1575,6 +1585,69 @@ mod tests {
             coordinator.host_language_can_reach_server(&settings, "markdown", "anything"),
             "a wildcard server could serve any injection language, so it must \
              never be pre-rejected"
+        );
+    }
+
+    /// A server that INHERITS its `languages` from the `_` template must not be
+    /// screened out.
+    ///
+    /// `languages` is `#[serde(default)]`, so omitting the key leaves the raw
+    /// entry's list empty and the authoritative resolver merges the template in
+    /// before matching. A screen that read the raw list would answer "reaches
+    /// nothing" for a server that reaches everything — and because this screen
+    /// only ever SKIPS, the failure is silent: no didOpen is sent, nothing is
+    /// reported as failed, and the barrier releases commands onto a connection
+    /// that holds no documents.
+    #[test]
+    fn host_language_can_reach_server_resolves_inherited_languages() {
+        let coordinator = BridgeCoordinator::new();
+        let mut servers = HashMap::new();
+        servers.insert(
+            crate::config::WILDCARD_KEY.to_string(),
+            BridgeServerConfig {
+                cmd: Vec::new(),
+                languages: vec!["*".to_string()],
+                initialization_options: None,
+                workspace_markers: None,
+                on_type_formatting_triggers: None,
+                prefer_shared_instance: None,
+                enabled: None,
+                settings: None,
+            },
+        );
+        servers.insert(
+            "harper-ls".to_string(),
+            BridgeServerConfig {
+                cmd: vec!["harper-ls".to_string()],
+                // Deliberately omitted in TOML → empty here, inherited from `_`.
+                languages: Vec::new(),
+                initialization_options: None,
+                workspace_markers: None,
+                on_type_formatting_triggers: None,
+                prefer_shared_instance: None,
+                enabled: None,
+                settings: None,
+            },
+        );
+        let settings = Arc::new(WorkspaceSettings {
+            languages: HashMap::new(),
+            auto_install: false,
+            language_servers: servers,
+            ..Default::default()
+        });
+
+        // The authority says this server bridges the language...
+        assert!(
+            coordinator
+                .get_all_configs_for_language(&settings, "markdown", "python")
+                .iter()
+                .any(|r| r.server_name == "harper-ls"),
+            "precondition: the merged config makes harper-ls a candidate"
+        );
+        // ...so the screen must not disagree.
+        assert!(
+            coordinator.host_language_can_reach_server(&settings, "markdown", "harper-ls"),
+            "a server inheriting `languages` from `_` must not be pre-rejected"
         );
     }
 

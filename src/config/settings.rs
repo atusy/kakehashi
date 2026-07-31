@@ -496,6 +496,31 @@ impl BridgeServerConfig {
         !self.cmd.is_empty() && self.is_enabled()
     }
 
+    /// The `languages` list that actually applies, resolving `_` inheritance
+    /// against an already-looked-up `wildcard`.
+    ///
+    /// `languages` is `#[serde(default)]`, so a server that omits the key
+    /// inherits the `_` template's list (wildcard-config-inheritance) — its own
+    /// list reads as EMPTY until that merge happens. A caller that reads
+    /// `languages` directly to decide "which languages can this server serve"
+    /// therefore sees nothing for a server that may serve everything.
+    /// Merging the whole config to find out costs a clone per server, so this
+    /// mirrors [`Self::is_spawnable_with_wildcard`]: resolve just this field,
+    /// and let a loop hoist the `_` lookup.
+    ///
+    /// Replace-not-union, matching `merge_bridge_server_configs`: a server that
+    /// declares its own list has overridden the template.
+    pub(crate) fn effective_languages_with_wildcard<'a>(
+        &'a self,
+        wildcard: Option<&'a Self>,
+    ) -> &'a [String] {
+        if self.languages.is_empty() {
+            wildcard.map(|w| w.languages.as_slice()).unwrap_or_default()
+        } else {
+            self.languages.as_slice()
+        }
+    }
+
     /// Same as [`Self::is_spawnable`], but resolves `cmd`/`enabled`
     /// inheritance against an already-looked-up `wildcard` instead of doing
     /// its own `_` lookup — for callers (like [`crate::config::is_server_spawnable`]
