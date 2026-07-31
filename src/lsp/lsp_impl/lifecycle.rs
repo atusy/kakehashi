@@ -149,6 +149,17 @@ fn bridge_root_uri(params: &InitializeParams) -> Option<String> {
     }
 }
 
+/// Forward the client's `workspaceFolders` verbatim — including an empty list,
+/// which says "no folders" as deliberately as a missing one — and otherwise
+/// synthesize the single folder that folder-only downstream servers expect from
+/// `root_uri`. Synthesizing translates a root the client did supply; it never
+/// invents one, so a no-workspace session still forwards nothing.
+///
+/// `root_uri` must be [`bridge_root_uri`]'s result for the same `params`.
+///
+/// The folder name mirrors `root_markers::workspace_at_root`, except that this
+/// falls back to a fixed name where that one falls back to the whole URI: the
+/// name here is only ever shown to a downstream server.
 fn bridge_workspace_folders(
     params: &InitializeParams,
     root_uri: Option<&str>,
