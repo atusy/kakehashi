@@ -458,6 +458,15 @@ impl InjectionCoordinator {
         self.documents.open_uris()
     }
 
+    /// `uri`'s host language, without parsing or resolving anything.
+    ///
+    /// The cheap half of what [`Self::bridge_injections`] returns, so a caller
+    /// screening many candidate documents can ask the configuration question
+    /// before paying for a parse wait and an injection resolution.
+    pub(crate) fn document_language(&self, uri: &Url) -> Option<String> {
+        self.get_language_for_document(uri)
+    }
+
     /// `uri`'s reopen generation, which scopes a downstream `didOpen` to the
     /// document's current lifetime. `None` once the document is closed.
     pub(crate) fn document_incarnation(&self, uri: &Url) -> Option<u64> {

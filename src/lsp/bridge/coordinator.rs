@@ -557,6 +557,42 @@ impl BridgeCoordinator {
         self.cached_configs(settings, host_language, Some(injection_language))
     }
 
+    /// Whether a document whose HOST language is `host_language` could bridge
+    /// any injection to `server_name` at all, under current settings.
+    ///
+    /// Pure configuration, answered from the same per-snapshot memo the open
+    /// path uses: no pool lookup, no marker walk, no tree. It exists so the
+    /// respawn re-open can reject a candidate host before paying for one —
+    /// deriving the target set means asking about EVERY open document, and the
+    /// answer is "no" for most of them. Without this the per-host parse wait
+    /// and injection resolution run first, so the barrier's fixed budget is
+    /// spent in proportion to workspace size rather than to the work that
+    /// belongs to the connection (respawn-reopen-derives-its-targets).
+    ///
+    /// Conservative in the safe direction: a server declaring the `*` wildcard
+    /// could serve any injection language, so it is never pre-rejected.
+    pub(crate) fn host_language_can_reach_server(
+        &self,
+        settings: &Arc<WorkspaceSettings>,
+        host_language: &str,
+        server_name: &str,
+    ) -> bool {
+        let Some(config) = settings.language_servers.get(server_name) else {
+            return false;
+        };
+        config.languages.iter().any(|injection_language| {
+            injection_language == "*"
+                || self
+                    .cached_configs_for_injection_language(
+                        settings,
+                        host_language,
+                        injection_language,
+                    )
+                    .iter()
+                    .any(|resolved| resolved.server_name == server_name)
+        })
+    }
+
     /// Memoized [`Self::get_host_configs_for_language`] for the current
     /// settings snapshot.
     pub(crate) fn cached_host_configs_for_language(
@@ -1499,6 +1535,95 @@ mod tests {
         assert!(
             result.is_empty(),
             "rust should be blocked by markdown's bridge filter"
+        );
+    }
+
+    /// The screen the respawn re-open applies to every open document before
+    /// paying for a parse wait or an injection resolution.
+    #[test]
+    fn host_language_can_reach_server_screens_on_configuration_alone() {
+        let coordinator = BridgeCoordinator::new();
+        let server = |language: &str| BridgeServerConfig {
+            cmd: vec!["x".to_string()],
+            languages: vec![language.to_string()],
+            initialization_options: None,
+            workspace_markers: None,
+            on_type_formatting_triggers: None,
+            prefer_shared_instance: None,
+            enabled: None,
+            settings: None,
+        };
+        let mut servers = HashMap::new();
+        servers.insert("ruff".to_string(), server("python"));
+        servers.insert("anything".to_string(), server("*"));
+        let settings = Arc::new(WorkspaceSettings {
+            languages: HashMap::new(),
+            auto_install: false,
+            language_servers: servers,
+            ..Default::default()
+        });
+
+        assert!(
+            coordinator.host_language_can_reach_server(&settings, "markdown", "ruff"),
+            "markdown can host a python injection, so ruff is reachable"
+        );
+        assert!(
+            !coordinator.host_language_can_reach_server(&settings, "markdown", "gone"),
+            "a server that is not configured at all is unreachable"
+        );
+        assert!(
+            coordinator.host_language_can_reach_server(&settings, "markdown", "anything"),
+            "a wildcard server could serve any injection language, so it must \
+             never be pre-rejected"
+        );
+    }
+
+    /// A host language whose bridge filter blocks the server's only language
+    /// must be screened out — otherwise the re-open pays full price for a
+    /// document that can supply nothing.
+    #[test]
+    fn host_language_can_reach_server_respects_the_hosts_bridge_filter() {
+        let coordinator = BridgeCoordinator::new();
+        let mut bridge_filter = HashMap::new();
+        bridge_filter.insert(
+            "python".to_string(),
+            BridgeLanguageConfig {
+                enabled: Some(false),
+                ..Default::default()
+            },
+        );
+        let mut languages = HashMap::new();
+        languages.insert(
+            "markdown".to_string(),
+            LanguageSettings {
+                bridge: Some(bridge_filter),
+                ..Default::default()
+            },
+        );
+        let mut servers = HashMap::new();
+        servers.insert(
+            "ruff".to_string(),
+            BridgeServerConfig {
+                cmd: vec!["ruff".to_string()],
+                languages: vec!["python".to_string()],
+                initialization_options: None,
+                workspace_markers: None,
+                on_type_formatting_triggers: None,
+                prefer_shared_instance: None,
+                enabled: None,
+                settings: None,
+            },
+        );
+        let settings = Arc::new(WorkspaceSettings {
+            languages,
+            auto_install: false,
+            language_servers: servers,
+            ..Default::default()
+        });
+
+        assert!(
+            !coordinator.host_language_can_reach_server(&settings, "markdown", "ruff"),
+            "markdown blocks python, so ruff can receive nothing from it"
         );
     }
 

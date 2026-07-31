@@ -72,16 +72,30 @@ Which documents are a connection's is not a property of language alone. A
 connection is a `(server, root)` pair, so a document that bridges to the right
 server but sits under a different root is not its document.
 
-So each candidate host is asked twice, cheap question first:
+So each candidate host is screened in stages, cheapest first, and the ordering
+is a correctness property rather than a micro-optimization: the re-open runs
+inside a fixed budget that `done` must signal within, so work done per candidate
+is work charged against every command on that connection. Screening after the
+expensive steps would make that budget scale with workspace size instead of
+with the work that belongs to the connection.
 
-1. Do any of its injections bridge to this server? Pure configuration, answered
-   from the per-snapshot memo, with no pool lookup and no filesystem access.
-   This rejects the great majority of open documents — most bridge nowhere near
-   any one server — before anything expensive runs.
-2. Does it route to *this* connection? A marker resolution, paid only by hosts
-   that survived the first question. Read-only: it never spawns, so asking
-   about a document belonging to another root cannot bring that root's server
-   up.
+1. Could a document in this HOST language bridge to this server at all? Pure
+   configuration, answered from the per-snapshot memo — no parse, no tree, no
+   pool lookup, no filesystem access. This rejects the great majority of open
+   documents, and it must run before the parse wait and the injection
+   resolution, not merely before the open.
+2. Do its resolved injections actually bridge to this server? Also pure
+   configuration, but it needs the injections, so it is paid only by hosts that
+   survived (1).
+3. Does it route to *this* connection? A marker resolution, paid only by hosts
+   that survived (2). Read-only: it never spawns, so asking about a document
+   belonging to another root cannot bring that root's server up.
+
+Stage 1 is deliberately conservative — a server declaring the `*` wildcard is
+never pre-rejected — and advisory, in that it reads the host language before the
+parse wait while the authoritative language is re-read with the injections.
+Screening on a stale language can only cost an unnecessary stage 2; it cannot
+open anything.
 
 Only then is the connection acquired, and acquired BY KEY rather than by what
 the host resolves to. Both are needed and they are not the same check. The
@@ -169,7 +183,10 @@ anyway, incorrectly, since it cannot include documents opened since the purge.
 - The re-open considers every open document rather than a pre-narrowed set. The
   configuration question is answered first and from a memo, so the cost is a
   map lookup per open document, but it does scale with the workspace rather
-  than with what one connection held.
+  than with what one connection held. The ordering above is what keeps that
+  cost off the barrier's budget; a future change that moves work ahead of the
+  stage-1 screen re-couples them, and the symptom is every command on a
+  respawned connection failing soft on a large workspace.
 - Marker resolution now runs during the re-open for hosts that bridge to the
   respawned server. The pre-existing eager path already resolves markers per
   open, so this is not a new kind of work, but it is work the captured-list

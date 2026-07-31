@@ -1368,6 +1368,34 @@ fn spawn_upstream_request(
                     #[cfg(feature = "e2e")]
                     e2e_stall_reopen().await;
                     for host in hosts {
+                        // Cheapest question first. Deriving means asking about
+                        // every open document, and for most of them the answer
+                        // is "this host bridges nowhere near that server" —
+                        // which is pure configuration, answered from a memo
+                        // with no parse, no tree and no I/O. Paying the parse
+                        // wait and the injection resolution before asking it
+                        // would spend this connection's fixed budget in
+                        // proportion to WORKSPACE SIZE rather than to the work
+                        // that belongs to it, and the budget is what `done`
+                        // must signal inside.
+                        //
+                        // Advisory only, so reading the language before the
+                        // parse wait is safe: the authoritative language is
+                        // re-read with the injections below, keeping the
+                        // incarnation/injections ordering intact. A document
+                        // whose language changes in between is at worst
+                        // screened on its old language, and the re-read decides
+                        // what actually opens.
+                        let Some(candidate_language) = injection.document_language(&host) else {
+                            continue;
+                        };
+                        if !injection.bridge().host_language_can_reach_server(
+                            &settings,
+                            &candidate_language,
+                            &reopen_server,
+                        ) {
+                            continue;
+                        }
                         // Await the tree first: a re-open racing an edit would
                         // otherwise resolve no injections and open nothing.
                         injection.ensure_document_parsed(&host).await;

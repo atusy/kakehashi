@@ -255,6 +255,40 @@ fn init_client_reopen_order(
     (client, config_dir)
 }
 
+/// Open `count` markdown documents with no injected fence, so they bridge to no
+/// downstream at all. They exist to be *considered* by a derived re-open and
+/// rejected — the workload a re-open sees on a real workspace, where the
+/// documents belonging to any one connection are a small minority.
+fn open_bystanders(client: &mut LspClient, count: usize) {
+    for i in 0..count {
+        client.send_notification(
+            "textDocument/didOpen",
+            json!({
+                "textDocument": {
+                    "uri": format!("file:///bystander_{i}.md"),
+                    "languageId": "markdown",
+                    "version": 1,
+                    "text": "# Prose\n\nNo fenced code here.\n"
+                }
+            }),
+        );
+    }
+}
+
+/// Clear every bystander's tree, so the re-open meets documents whose parses are
+/// pending — the state a settings reload leaves the whole workspace in.
+fn dirty_bystanders(client: &mut LspClient, count: usize) {
+    for i in 0..count {
+        client.send_notification(
+            "textDocument/didChange",
+            json!({
+                "textDocument": { "uri": format!("file:///bystander_{i}.md"), "version": 2 },
+                "contentChanges": [{ "text": "# Prose\n\nStill no fenced code.\n" }]
+            }),
+        );
+    }
+}
+
 /// Block until the replacement incarnation has both initialized AND received a
 /// `didOpen`, i.e. its re-open has actually run.
 ///
@@ -411,6 +445,16 @@ fn a_completed_reopen_releases_the_command_it_was_holding() {
     let (mut client, _config_dir) = init_client_reopen_order(&log, 0);
     open_markdown(&mut client);
 
+    // Bystanders: markdown with no fence, so they bridge to nothing. The
+    // re-open derives its targets from the OPEN DOCUMENTS, so these are all
+    // candidates it must reject — and rejecting them must be cheap. When the
+    // per-host parse wait (200 ms each) ran before the configuration question,
+    // a handful of them exhausted the 2 s budget on documents that supply
+    // nothing, `done` never signalled in time, and the command below failed
+    // soft. Every other e2e opens exactly one document, so nothing else in the
+    // suite can see that.
+    open_bystanders(&mut client, 12);
+
     let actions = code_action_with_retry(&mut client);
     let routed = actions
         .iter()
@@ -419,6 +463,12 @@ fn a_completed_reopen_releases_the_command_it_was_holding() {
         .as_str()
         .expect("a routed command name")
         .to_string();
+
+    // Dirty every bystander so its tree is cleared and a reparse is pending.
+    // This is the settings-reload shape: that path invalidates ALL parses and
+    // purges connections in the same pass, so "every snapshot stale AND a
+    // connection owing a re-open" is the ordinary case, not the tail.
+    dirty_bystanders(&mut client, 12);
 
     // The mock died surfacing that action. Drive the respawn with a SECOND
     // codeAction rather than with the command: codeAction never consults the
