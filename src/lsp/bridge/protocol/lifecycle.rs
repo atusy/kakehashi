@@ -105,12 +105,10 @@ pub(crate) fn build_didclose_notification(
 /// separate follow-up.
 pub(crate) fn build_did_change_workspace_folders_notification(
     added: Vec<WorkspaceFolder>,
+    removed: Vec<WorkspaceFolder>,
 ) -> JsonRpcNotification<DidChangeWorkspaceFoldersParams> {
     let params = DidChangeWorkspaceFoldersParams {
-        event: WorkspaceFoldersChangeEvent {
-            added,
-            removed: Vec::new(),
-        },
+        event: WorkspaceFoldersChangeEvent { added, removed },
     };
     JsonRpcNotification::new("workspace/didChangeWorkspaceFolders", params)
 }
