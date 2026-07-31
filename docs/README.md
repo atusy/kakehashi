@@ -251,12 +251,24 @@ Array of base directories to search for parsers and queries. If not specified, u
 
 Parsers are searched as `{searchPath}/parser/{language}.{so,dylib,dll}`.
 Queries are searched as `{searchPath}/queries/{language}/{query_type}.scm`.
-For implicit lookup, `{language}` must be one normal path component; values
-containing path separators, `.`/`..` components, or platform path prefixes do
-not resolve. Use an explicit `languages[*].parser` or `languages[*].queries`
-path for the configured parser and query kinds when an asset cannot follow this
-layout. Runtime-named queries (including capture kinds and inherited parents)
-must use the implicit layout.
+For implicit lookup, `{language}` must be one normal path component: values
+containing a path separator or a `.`/`..` component do not resolve, and on
+Windows neither do drive (`C:\…`) or UNC (`\\server\share\…`) prefixes. This
+keeps a language name taken from document text — an injected code fence, say —
+from reaching outside `parser/` and `queries/`. It is a check on the name only;
+a component that is a symlink still leads wherever it points.
+
+For an asset that cannot follow this layout, set
+[`languages[*].parser`](#languages) to an explicit path. That is required, not
+merely an alternative: no queries are loaded for a language whose parser fails
+to load. Then list each kind you need under `languages[*].queries[*].path` —
+supplying `queries` at all disables the implicit lookup for the kinds you leave
+out, and only `highlights`, `injections`, and `bindings` can be given an
+explicit path.
+
+A `; inherits:` parent is resolved by language name at runtime and cannot be
+given an explicit path, so a parent query must always follow the implicit
+layout.
 
 #### `autoInstall` (deprecated)
 
