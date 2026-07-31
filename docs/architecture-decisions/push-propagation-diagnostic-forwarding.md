@@ -201,25 +201,39 @@ host coordinates and use the same cache without transformation.
 The baseline is discarded on downstream `null`/full-without-resultId, virtual
 or host `didClose`, region identity/language replacement, connection respawn,
 a settings replacement affecting that exact connection, and a workspace-folder
-change for connections rooted at the client fallback — a folder change replaces
-the project those servers analyse, so what they report can move while no
-document does. Marker-rooted and shared connections are exempt: their root comes
-from an on-disk marker walk, which an upstream folder change does not touch. An
-event naming neither an addition nor a removal is not a change at all and is
-ignored whole — no fence, no forwarded notification, no recycling — because a
-fence skipped on its own would still let the recycling below strand a baseline
-on a key whose process has been replaced. The fence is advanced before the
-triggering notification is queued, under the same `connections` guard a pull
-holds to enqueue its request, so no pull can slip between the two. Because the
-change moves no document version, the coverage gate would suppress the client
-re-pull it warrants, so the accompanying `workspace/diagnostic/refresh` is
-forced. A mere geometry shift of the same stable region id
+change for connections rooted at the client fallback. A mere geometry shift of the same stable region id
 does not discard it: virtual-local storage plus lazy re-anchor is precisely what
 makes that reuse correct. Concurrent pulls carry a bridge-local monotonically
 increasing request sequence: the later-started request owns the final lineage
 regardless of response completion order, so a late older response cannot
 overwrite or clear its baseline even when an opaque downstream `resultId`
 repeats.
+
+### Workspace-folder changes
+
+A folder change replaces the project a downstream analyses, so what it reports
+can move while no document — and no document version — does. Four rules follow
+from that:
+
+- **Scope.** Only connections rooted at the client fallback are fenced.
+  Marker-rooted and shared connections take their root from an on-disk marker
+  walk, which an upstream folder change does not touch.
+- **Empty events.** An event naming neither an addition nor a removal is not a
+  change at all and is ignored whole — no fence, no forwarded notification, no
+  recycling, and no project-config reload. Skipping the fence alone would not
+  be enough: the recycle loop in `apply_workspace_folder_change` is not
+  conditional on the event saying anything, and the respawn path's own
+  invalidation is gated on finding an existing connection that the recycle has
+  already removed, so the replacement would inherit a dead process's
+  `previousResultId`.
+- **Ordering.** The fence is advanced before the triggering notification is
+  queued, under the same `connections` guard a pull holds to enqueue its
+  request, so no pull can slip between the two.
+- **The client re-pull.** Because the change moves no document version, the
+  coverage gate would suppress the `workspace/diagnostic/refresh` the editor
+  needs, so it is forced. Without it a pull-namespace editor keeps rendering the
+  pre-change set, and an answer crossing the fence resolves to an empty layer
+  with nothing scheduled to repopulate it.
 
 ### Per-server source and fallback
 

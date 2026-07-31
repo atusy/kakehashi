@@ -659,11 +659,15 @@ impl LanguageServerPool {
     /// mid-handshake, incapable, or unable to queue — are recycled, armed for
     /// re-open, and shut down. Marker-rooted and shared connections derive
     /// their folders from marker-root acquisition and are left alone.
+    ///
+    /// Answers whether the event described a change at all, so the caller can
+    /// decide from one definition — this one — whether the work it owns
+    /// (the client re-pull, the project-config reload) is warranted.
     pub(crate) async fn apply_workspace_folder_change(
         &self,
         added: Vec<tower_lsp_server::ls_types::WorkspaceFolder>,
         removed: &[tower_lsp_server::ls_types::WorkspaceFolder],
-    ) {
+    ) -> bool {
         // An event naming neither an addition nor a removal describes no
         // change: `WorkspaceFolderSet::apply_change` is a no-op for it, so the
         // derived root cannot move, the forwarded notification would say
@@ -677,7 +681,7 @@ impl LanguageServerPool {
         // guard that skipped the fence alone would therefore hand a dead
         // process's resultId to its replacement.
         if added.is_empty() && removed.is_empty() {
-            return;
+            return false;
         }
 
         self.workspace_folders.apply_change(added.clone(), removed);
@@ -777,6 +781,7 @@ impl LanguageServerPool {
         for (key, handle) in stale_handles {
             shutdown_invalidated_connection(key, handle);
         }
+        true
     }
 
     /// Set the upstream client capabilities.
