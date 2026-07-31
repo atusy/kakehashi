@@ -2565,8 +2565,8 @@ impl LanguageServerPool {
                         // Re-arm: `claim` disarmed the key, and this replacement
                         // is not going to serve anyone, so the NEXT one must
                         // still learn that it owes a re-open.
-                        if pending_reopen_handoff.take().is_some() {
-                            pending_reopen.rearm(&command_registration_key);
+                        if let Some(done) = pending_reopen_handoff.take() {
+                            pending_reopen.rearm(&command_registration_key, &done);
                         }
                         return Err(io::Error::new(
                             io::ErrorKind::Interrupted,
@@ -2618,7 +2618,11 @@ impl LanguageServerPool {
                         );
                         // Same reasoning as the Ready-flip failure above: this
                         // connection still owes a re-open nobody is going to make.
-                        pending_reopen.rearm(&command_registration_key);
+                        // The undelivered message carries the sender back, so the
+                        // retire stays identity-guarded.
+                        if let UpstreamRequest::ReopenDocuments { done, .. } = e.0 {
+                            pending_reopen.rearm(&command_registration_key, &done);
+                        }
                     }
                     Ok(())
                 }
@@ -7338,6 +7342,26 @@ mod tests {
             _ => unreachable!(),
         })
         .await;
+
+        // Every purged connection owes a re-open, and NONE of these handles ever
+        // opened a document. That is the whole point: the predecessor design
+        // armed from the host list the purge returned, so a connection holding
+        // nothing armed nothing and its replacement was never repaired by
+        // anyone. Asserting it here rather than on the registry is deliberate —
+        // the registry cannot express "held nothing", because `arm` takes no
+        // host list at all. Only the production purge site can.
+        assert!(
+            pool.pending_reopen.claim(&changed_key).is_some(),
+            "an invalidated connection owes a re-open even though it held nothing"
+        );
+        assert!(
+            pool.pending_reopen.claim(&removed_key).is_some(),
+            "a connection whose server was removed owes one too"
+        );
+        assert!(
+            pool.pending_reopen.claim(&unchanged_key).is_none(),
+            "a surviving connection must not be armed"
+        );
 
         let connections = pool.connections().await;
         assert!(!connections.contains_key(&changed_key));

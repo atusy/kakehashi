@@ -97,17 +97,36 @@ impl PendingReopenRegistry {
         Some(tx)
     }
 
-    /// Re-arm after a claimed hand-off failed, and retire the barrier it
-    /// registered.
+    /// Re-arm after a claimed hand-off failed, and retire the barrier THAT
+    /// claim registered.
     ///
     /// [`claim`](Self::claim) disarms, so a handshake that claims and then dies
     /// before the re-open is queued would leave the replacement owing a repair
     /// nobody remembers to make.
-    pub(crate) fn rearm(&self, key: &ConnectionKey) {
-        self.in_flight
-            .lock()
-            .recover_poison("PendingReopenRegistry::rearm")
-            .remove(key);
+    ///
+    /// Takes the claim's own `done` so the retire can be identity-guarded, for
+    /// the same reason [`wait_for_reopen`](Self::wait_for_reopen) guards its
+    /// own: claim → publish-Ready → rearm is not atomic against the registry,
+    /// so a LATER respawn can claim this key in between and install a live
+    /// barrier. Removing by key alone would evict that one, and a command
+    /// arriving next finds nothing outstanding, reads the requirement as
+    /// vacuously met, and is enqueued ahead of the didOpens the live re-open
+    /// has not sent yet — the one failure mode this whole mechanism exists to
+    /// prevent, and the one case that does NOT degrade to the lazy heal.
+    pub(crate) fn rearm(&self, key: &ConnectionKey, done: &watch::Sender<bool>) {
+        let probe = done.subscribe();
+        {
+            let mut in_flight = self
+                .in_flight
+                .lock()
+                .recover_poison("PendingReopenRegistry::rearm");
+            if in_flight
+                .get(key)
+                .is_some_and(|current| current.same_channel(&probe))
+            {
+                in_flight.remove(key);
+            }
+        }
         self.arm(key);
     }
 
@@ -239,8 +258,8 @@ mod tests {
         let key = ConnectionKey::for_server("ruff");
         registry.arm(&key);
         let done = registry.claim(&key).expect("armed");
+        registry.rearm(&key, &done);
         drop(done);
-        registry.rearm(&key);
 
         assert!(
             registry.claim(&key).is_some(),
@@ -256,7 +275,7 @@ mod tests {
         let key = ConnectionKey::for_server("ruff");
         registry.arm(&key);
         let done = registry.claim(&key).expect("armed");
-        registry.rearm(&key);
+        registry.rearm(&key, &done);
         drop(done);
 
         assert!(
@@ -265,6 +284,42 @@ mod tests {
                 .expect("a retired barrier must not make the caller wait"),
             "a re-armed key has no re-open in flight to wait for"
         );
+    }
+
+    /// A late `rearm` must not retire a barrier a LATER respawn registered.
+    ///
+    /// claim -> publish-Ready -> rearm is not atomic against this registry, so a
+    /// replacement can claim the same key in between and install a live barrier.
+    /// Retiring by key alone would evict it, and the next command would find
+    /// nothing outstanding, read the ordering requirement as vacuously met, and
+    /// be enqueued ahead of didOpens that have not been sent — the one failure
+    /// this mechanism exists to prevent, and the one that does NOT degrade to
+    /// the lazy heal.
+    #[tokio::test]
+    async fn a_stale_rearm_does_not_retire_a_later_respawns_barrier() {
+        let registry = PendingReopenRegistry::default();
+        let key = ConnectionKey::for_server("ruff");
+
+        // The displaced handshake claims...
+        registry.arm(&key);
+        let stale = registry.claim(&key).expect("armed");
+        // ...is displaced, so its key is armed again and a replacement claims.
+        registry.arm(&key);
+        let live = registry.claim(&key).expect("re-armed");
+
+        // Only NOW does the displaced handshake notice it lost the Ready flip.
+        registry.rearm(&key, &stale);
+        drop(stale);
+
+        // The live re-open is still outstanding, so a command must wait for it.
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), registry.wait_for_reopen(&key))
+                .await
+                .is_err(),
+            "the live respawn's barrier must survive a stale rearm"
+        );
+        live.send(true).expect("the registry holds the receiver");
+        assert!(registry.wait_for_reopen(&key).await);
     }
 
     #[test]
