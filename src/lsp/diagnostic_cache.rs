@@ -47,7 +47,7 @@
 //! version gate was evaluated and rejected (it converts a self-healing stale-overwrite
 //! into a reopen-resurrection hide); the stale-overwrite is left self-healing.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -392,23 +392,54 @@ pub(crate) struct DiagnosticAggregator {
     forwarded_refresh_debounce: Mutex<ForwardedRefreshDebounce>,
     /// Per-host coverage versions for the refresh **coverage gate** (#497, commit 2).
     /// `current` bumps on every set-changing republish (the editor's pulled view is
-    /// now stale); `served` records the `current` a pull was answered against. A
+    /// now stale); a pull captures the epoch plus `current` version through
+    /// [`Self::coverage_stamp`], and `served` records that version. A
     /// gated refresh fires only when some host has `current > served` ("dirty") — so
     /// a change the editor already re-pulled (its own `didChange` pull advances
     /// `served`) sends no redundant nudge. Drives [`Self::bump_current`],
     /// [`Self::mark_served`], [`Self::is_dirty`]; forgotten on `didClose`.
     coverage: Mutex<HashMap<Url, HostCoverage>>,
-    /// Hosts whose LAST pull was answered degraded — the bounded parse wait
-    /// lapsed while the aggregator held live region pushes, so the response
-    /// was missing the region fold and deliberately did not `mark_served`.
+    /// Mints a distinct lifetime for each newly-created coverage entry. A pull
+    /// captures this epoch and the current version in [`Self::coverage_stamp`];
+    /// after `didClose` removes the entry, its completion must not advance a
+    /// later reopened lifetime's `served` value.
+    ///
+    /// Deliberately separate from [`Self::next_cache_revision`], which solves
+    /// the structurally similar "a reopened URI must not be confused with its
+    /// predecessor" problem one map over. They are not interchangeable: a cache
+    /// revision advances on every mutation and orders wire snapshots, while
+    /// this is minted once per coverage lifetime and only ever compared for
+    /// equality. A shared allocator would work, but it would couple two
+    /// unrelated concepts and their allocation cadences for nothing; reusing
+    /// the cache REVISIONS themselves as lifetime identity would be wrong,
+    /// since a revision changes repeatedly within one coverage lifetime.
+    next_coverage_epoch: AtomicU64,
+    /// Hosts with OUTSTANDING degraded-pull recovery debt — some pull's bounded
+    /// parse wait lapsed while the aggregator held live region pushes, so that
+    /// response was missing the region fold and deliberately did not
+    /// `mark_served`.
+    ///
+    /// Deliberately not "hosts whose LAST pull was degraded": unknown-lifetime
+    /// debt survives a later covering pull (see the absorbing rule below), so
+    /// an entry can outlive the answer that would otherwise have settled it.
+    ///
     /// The reparse loop's post-parse backstop consumes an entry
     /// ([`Self::take_degraded_pull`]) to request the recovery
     /// `workspace/diagnostic/refresh` for exactly the hosts that owe one —
     /// keying the recovery on this instead of the workspace-wide coverage
     /// dirtiness keeps unrelated stale hosts from turning every edit's parse
-    /// pass into a refresh trigger. A later non-degraded pull clears the debt
-    /// (it marks served); `didClose` forgets it.
-    degraded_pulls: Mutex<HashSet<Url>>,
+    /// pass into a refresh trigger. A non-degraded pull carrying a stamp whose
+    /// epoch MATCHES clears known debt (it marks served); unknown debt waits for
+    /// `take_degraded_pull`; `didClose` forgets either outright.
+    ///
+    /// The stored value is the coverage epoch the debt was recorded under, for
+    /// the same reason `served` carries one: a pull that started before a
+    /// close+reopen must not settle the reopened lifetime's state. Without it
+    /// such a pull would be correctly refused by `mark_served` and still erase
+    /// a debt a NEWER degraded pull had just recorded, so the post-parse
+    /// backstop would find nothing and the editor would keep a region-less
+    /// answer (#745).
+    degraded_pulls: Mutex<HashMap<Url, Option<u64>>>,
     /// Per-host coalescing state for the editor-facing `publishDiagnostics`
     /// wire sends (the quiet window): see [`WireGate`] and
     /// [`Self::wire_gate_admit`]. Mutated under the host's republish lock
@@ -580,13 +611,21 @@ impl PartialEq for WireAdmit {
 impl Eq for WireAdmit {}
 
 /// Per-host coverage versions for the refresh gate (#497, commit 2).
-#[derive(Default, Clone, Copy)]
+#[derive(Clone, Copy)]
 struct HostCoverage {
+    epoch: u64,
     /// Bumped on each set-changing republish for this host.
     current: u64,
     /// The `current` value a pull was last answered against (a lower bound — read
     /// before the pull's fold, so never ahead of what the editor actually received).
     served: u64,
+}
+
+/// The diagnostic coverage observed when a pull begins.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DiagnosticCoverageStamp {
+    epoch: u64,
+    version: u64,
 }
 
 /// Always-on diagnostic-path counters (#533). The four counts trace the refresh
@@ -663,6 +702,30 @@ impl DiagnosticMetricsSnapshot {
         self.pull_micros_total
             .checked_div(self.pulls_answered)
             .unwrap_or(0)
+    }
+}
+
+/// Fold a newly-recorded debt lifetime into the one already stored.
+///
+/// Two rules, and the second is the one that is easy to get wrong.
+///
+/// Between two KNOWN lifetimes, keep the newer: epochs come from a monotonic
+/// counter, so a stale degraded pull landing after a reopened one must not
+/// re-key the debt to the closed lifetime, where a stale covering pull could
+/// then clear it.
+///
+/// An UNKNOWN lifetime (`None`) is ABSORBING, not merely inferior. A pull
+/// captures its stamp before its awaited work, and coverage entries are created
+/// lazily, so a reopened lifetime's degraded pull can genuinely carry `None`.
+/// Ordering `None` against `Some` either way loses that debt: preferring the
+/// stored `Some` lets a stale covering pull clear the newer unidentified debt,
+/// and preferring the incoming `Some` re-keys it to the stale lifetime so the
+/// same clear succeeds. Once any part of the debt is unidentified, only
+/// `take_degraded_pull` or the close path may remove it.
+fn merge_debt_lifetime(stored: Option<u64>, incoming: Option<u64>) -> Option<u64> {
+    match (stored, incoming) {
+        (Some(stored), Some(incoming)) => Some(stored.max(incoming)),
+        _ => None,
     }
 }
 
@@ -1259,6 +1322,7 @@ impl DiagnosticAggregator {
             coverage.insert(
                 host.clone(),
                 HostCoverage {
+                    epoch: self.next_coverage_epoch.fetch_add(1, Ordering::Relaxed),
                     current: 1,
                     served: 0,
                 },
@@ -1266,9 +1330,10 @@ impl DiagnosticAggregator {
         }
     }
 
-    /// Read a host's current coverage version (`0` if it has never changed). A pull
-    /// captures this *before* its fold and later passes it to [`Self::mark_served`],
-    /// so `served` is a lower bound (never ahead of the set the editor received).
+    /// Read a host's current coverage version (`0` if it has never changed).
+    /// Test-only numeric view; production pulls use [`Self::coverage_stamp`] so
+    /// close/reopen lifetimes cannot be confused (#745).
+    #[cfg(test)]
     pub(crate) fn current_version(&self, host: &Url) -> u64 {
         self.coverage
             .lock()
@@ -1277,21 +1342,39 @@ impl DiagnosticAggregator {
             .map_or(0, |c| c.current)
     }
 
+    /// Capture both the current version and the coverage-entry lifetime.
+    /// Returns `None` when the host has no active coverage entry, including
+    /// after `didClose`; passing that through to [`Self::mark_served`] is a no-op.
+    pub(crate) fn coverage_stamp(&self, host: &Url) -> Option<DiagnosticCoverageStamp> {
+        self.coverage
+            .lock()
+            .recover_poison("DiagnosticAggregator::coverage")
+            .get(host)
+            .map(|coverage| DiagnosticCoverageStamp {
+                epoch: coverage.epoch,
+                version: coverage.current,
+            })
+    }
+
     /// Record that a pull was answered for `host` against coverage version
-    /// `version` (#497): the editor now has the set as of `version`, so it is no
+    /// `stamp` (#497): the editor now has the set as of its version, so it is no
     /// longer dirty up to there. Pure bookkeeping — it must **never** bump `current`
     /// or republish, so a refresh→pull→`mark_served` cannot beget another refresh
     /// (keeps #496/#499 loop-safety). Monotonic via `max`, so a slower concurrent
-    /// pull can't regress `served`. No-op for a host with no coverage entry (nothing
-    /// was ever pushed → nothing to be dirty about).
-    pub(crate) fn mark_served(&self, host: &Url, version: u64) {
+    /// pull can't regress `served`. A missing stamp or one from a closed document
+    /// lifetime is a no-op (#745).
+    pub(crate) fn mark_served(&self, host: &Url, stamp: Option<DiagnosticCoverageStamp>) {
+        let Some(stamp) = stamp else {
+            return;
+        };
         if let Some(cov) = self
             .coverage
             .lock()
             .recover_poison("DiagnosticAggregator::coverage")
             .get_mut(host)
+            && cov.epoch == stamp.epoch
         {
-            cov.served = cov.served.max(version);
+            cov.served = cov.served.max(stamp.version);
         }
     }
 
@@ -1316,14 +1399,21 @@ impl DiagnosticAggregator {
     }
 
     /// Record that a pull for `host` was answered degraded (see the
-    /// `degraded_pulls` field doc). Clones the key only on first insert.
-    pub(crate) fn record_degraded_pull(&self, host: &Url) {
+    /// `degraded_pulls` field doc), under the coverage lifetime the answering
+    /// pull observed. Clones the key only on first insert.
+    pub(crate) fn record_degraded_pull(&self, host: &Url, stamp: Option<DiagnosticCoverageStamp>) {
+        let epoch = stamp.map(|stamp| stamp.epoch);
         let mut degraded = self
             .degraded_pulls
             .lock()
             .recover_poison("DiagnosticAggregator::degraded_pulls");
-        if !degraded.contains(host) {
-            degraded.insert(host.clone());
+        match degraded.get_mut(host) {
+            Some(recorded) => {
+                *recorded = merge_debt_lifetime(*recorded, epoch);
+            }
+            None => {
+                degraded.insert(host.clone(), epoch);
+            }
         }
     }
 
@@ -1334,16 +1424,53 @@ impl DiagnosticAggregator {
             .lock()
             .recover_poison("DiagnosticAggregator::degraded_pulls")
             .remove(host)
+            .is_some()
     }
 
-    /// Forget `host`'s degraded-pull debt without acting on it: a later
-    /// non-degraded pull covered the host (it marked served), or the host
-    /// closed.
+    /// Forget `host`'s degraded-pull debt outright — the host CLOSED, so it
+    /// owes no recovery refresh whichever lifetime recorded the debt.
     pub(crate) fn forget_degraded_pull(&self, host: &Url) {
         self.degraded_pulls
             .lock()
             .recover_poison("DiagnosticAggregator::degraded_pulls")
             .remove(host);
+    }
+
+    /// Forget `host`'s degraded-pull debt because a covering pull answered it —
+    /// but only if that pull belongs to the lifetime that recorded it.
+    ///
+    /// The lifetime check is what keeps this in step with [`Self::mark_served`].
+    /// A pull that started before a close+reopen is refused there, and clearing
+    /// the debt unconditionally would still let it erase a debt a newer
+    /// degraded pull recorded — the post-parse backstop would then find nothing
+    /// to recover and the editor would keep the region-less answer. A mismatch
+    /// leaves the debt, costing at most one extra forced refresh, which is the
+    /// direction that cannot lose a needed one.
+    ///
+    /// A stampless pull clears NOTHING. Coverage entries are created lazily, so
+    /// a pull can observe none and still answer degraded once a push creates
+    /// slots during its awaits — meaning an old covering pull and a reopened
+    /// degraded pull can both carry `None`. Treating those as the same lifetime
+    /// would delete the reopened debt on exactly the evidence that proves
+    /// nothing: absence of an identity is not a matching identity.
+    pub(crate) fn forget_degraded_pull_from(
+        &self,
+        host: &Url,
+        stamp: Option<DiagnosticCoverageStamp>,
+    ) {
+        let Some(stamp) = stamp else {
+            return;
+        };
+        let mut degraded = self
+            .degraded_pulls
+            .lock()
+            .recover_poison("DiagnosticAggregator::degraded_pulls");
+        if degraded
+            .get(host)
+            .is_some_and(|recorded| *recorded == Some(stamp.epoch))
+        {
+            degraded.remove(host);
+        }
     }
 
     /// Decide whether a wire `publishDiagnostics` for `host` may be written
@@ -3771,7 +3898,8 @@ mod tests {
         agg.bump_current(&h); // current=2
         assert!(!agg.try_begin_refresh(false), "in-flight → pending");
         // The editor pulls and is answered against the latest version → not dirty.
-        agg.mark_served(&h, 2);
+        let stamp = agg.coverage_stamp(&h);
+        agg.mark_served(&h, stamp);
         assert!(!agg.is_dirty(), "the pull covered both changes");
         // Completion: pending was set, but nothing is dirty and it wasn't forced →
         // the trailing is suppressed.
@@ -3829,8 +3957,15 @@ mod tests {
         agg.bump_current(&h);
         assert_eq!(agg.current_version(&h), 2);
         // `served` is monotonic: a stale (lower) mark can't regress it.
-        agg.mark_served(&h, 2);
-        agg.mark_served(&h, 1);
+        let current = agg.coverage_stamp(&h).expect("coverage exists");
+        agg.mark_served(&h, Some(current));
+        agg.mark_served(
+            &h,
+            Some(DiagnosticCoverageStamp {
+                version: 1,
+                ..current
+            }),
+        );
         assert!(
             !agg.is_dirty(),
             "served caught up and a stale mark didn't regress it"
@@ -3844,6 +3979,158 @@ mod tests {
             "a closed host no longer keeps the workspace dirty"
         );
         assert_eq!(agg.current_version(&h), 0, "re-open starts fresh");
+    }
+
+    #[test]
+    fn stale_pull_does_not_mark_reopened_coverage_served() {
+        let agg = DiagnosticAggregator::new();
+        let h = host();
+        agg.bump_current(&h);
+        agg.bump_current(&h);
+        let stale = agg
+            .coverage_stamp(&h)
+            .expect("coverage exists before close");
+
+        agg.forget_coverage(&h);
+        agg.bump_current(&h);
+        agg.mark_served(&h, Some(stale));
+
+        assert!(
+            agg.is_dirty(),
+            "a pull from the closed lifetime must not cover the reopened host"
+        );
+    }
+
+    /// The debt half of the lifetime guard. A pull that started before a
+    /// close+reopen is refused by `mark_served`, but if it could still clear
+    /// the debt a NEWER degraded pull recorded, the post-parse backstop would
+    /// find nothing to recover and the editor would keep a region-less answer.
+    #[test]
+    fn a_stale_covering_pull_does_not_clear_a_reopened_lifetimes_debt() {
+        let agg = DiagnosticAggregator::new();
+        let h = host();
+        agg.bump_current(&h);
+        let stale = agg
+            .coverage_stamp(&h)
+            .expect("coverage exists before close");
+
+        // Close and reopen, then a degraded pull in the NEW lifetime owes a
+        // recovery refresh.
+        agg.forget_coverage(&h);
+        agg.bump_current(&h);
+        let reopened = agg.coverage_stamp(&h).expect("reopened coverage");
+        agg.record_degraded_pull(&h, Some(reopened));
+
+        // The pull from the closed lifetime finally answers.
+        agg.forget_degraded_pull_from(&h, Some(stale));
+
+        assert!(
+            agg.take_degraded_pull(&h),
+            "a pull from the closed lifetime must not settle the reopened one's debt"
+        );
+    }
+
+    /// The other direction: the lifetime that recorded the debt does clear it,
+    /// or every covering pull would leave a debt behind and fire a needless
+    /// forced refresh on the next parse.
+    #[test]
+    fn a_covering_pull_clears_its_own_lifetimes_debt() {
+        let agg = DiagnosticAggregator::new();
+        let h = host();
+        agg.bump_current(&h);
+        let stamp = agg.coverage_stamp(&h).expect("coverage exists");
+        agg.record_degraded_pull(&h, Some(stamp));
+
+        agg.forget_degraded_pull_from(&h, Some(stamp));
+
+        assert!(
+            !agg.take_degraded_pull(&h),
+            "a covering pull from the recording lifetime clears the debt"
+        );
+    }
+
+    /// A degraded pull from the CLOSED lifetime landing after the reopened one
+    /// must not re-key the debt backwards, or a covering pull from that same
+    /// closed lifetime could then clear it.
+    #[test]
+    fn a_stale_degraded_pull_does_not_rewind_the_debts_lifetime() {
+        let agg = DiagnosticAggregator::new();
+        let h = host();
+        agg.bump_current(&h);
+        let stale = agg.coverage_stamp(&h).expect("coverage before close");
+
+        agg.forget_coverage(&h);
+        agg.bump_current(&h);
+        let reopened = agg.coverage_stamp(&h).expect("reopened coverage");
+
+        // The reopened lifetime owes a recovery...
+        agg.record_degraded_pull(&h, Some(reopened));
+        // ...then a degraded pull from the closed lifetime finally lands.
+        agg.record_degraded_pull(&h, Some(stale));
+        // A covering pull from the closed lifetime must still not settle it.
+        agg.forget_degraded_pull_from(&h, Some(stale));
+
+        assert!(
+            agg.take_degraded_pull(&h),
+            "a stale degraded pull must not re-key the debt to its own lifetime"
+        );
+    }
+
+    /// Coverage entries are lazy, so two pulls from DIFFERENT lifetimes can
+    /// both observe none. Absence of an identity is not a matching identity.
+    #[test]
+    fn a_stampless_covering_pull_clears_nothing() {
+        let agg = DiagnosticAggregator::new();
+        let h = host();
+
+        // A degraded pull that saw no coverage entry.
+        agg.record_degraded_pull(&h, None);
+        agg.forget_degraded_pull_from(&h, None);
+        assert!(
+            agg.take_degraded_pull(&h),
+            "a pull with no lifetime cannot prove it owns the debt"
+        );
+
+        // And it cannot clear an identified lifetime's debt either.
+        agg.bump_current(&h);
+        let stamp = agg.coverage_stamp(&h).expect("coverage exists");
+        agg.record_degraded_pull(&h, Some(stamp));
+        agg.forget_degraded_pull_from(&h, None);
+        assert!(agg.take_degraded_pull(&h));
+    }
+
+    /// Mixed identities, both orderings. An unknown lifetime must ABSORB, not
+    /// lose to a known one — either direction of preference lets a stale
+    /// covering pull clear a debt the reopened lifetime recorded.
+    #[test]
+    fn an_unknown_debt_lifetime_absorbs_a_known_one() {
+        // record(Some(old)) -> record(None) -> clear(Some(old))
+        let agg = DiagnosticAggregator::new();
+        let h = host();
+        agg.bump_current(&h);
+        let old = agg.coverage_stamp(&h).expect("coverage exists");
+        agg.record_degraded_pull(&h, Some(old));
+        agg.record_degraded_pull(&h, None);
+        agg.forget_degraded_pull_from(&h, Some(old));
+        assert!(
+            agg.take_degraded_pull(&h),
+            "an unidentified debt recorded later must not be clearable by the \
+             lifetime it replaced"
+        );
+
+        // record(None) -> record(Some(old)) -> clear(Some(old))
+        let agg = DiagnosticAggregator::new();
+        let h = host();
+        agg.bump_current(&h);
+        let old = agg.coverage_stamp(&h).expect("coverage exists");
+        agg.record_degraded_pull(&h, None);
+        agg.record_degraded_pull(&h, Some(old));
+        agg.forget_degraded_pull_from(&h, Some(old));
+        assert!(
+            agg.take_degraded_pull(&h),
+            "a known lifetime must not re-key an unidentified debt into being \
+             clearable"
+        );
     }
 
     #[test]
