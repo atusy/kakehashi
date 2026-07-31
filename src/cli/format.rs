@@ -315,9 +315,9 @@ async fn run_paths(server: &Kakehashi, cwd: &Path, options: &FormatOptions) -> u
                     // Deliberately not mirroring `write_atomically`'s
                     // refusals (hard links) here: `--check` answers "would
                     // the content change", not "would the write succeed",
-                    // and it resolves no paths at all today. A read-only
-                    // target has always passed `--check` and failed the
-                    // apply run the same way.
+                    // and it resolves no paths at all today. A target in a
+                    // read-only directory has always passed `--check` and
+                    // failed the apply run the same way.
                     elnln!("Would reformat: {display}");
                 } else {
                     match write_atomically(file, &formatted) {
@@ -445,7 +445,7 @@ fn reject_multiple_hard_links(target: &Path) -> std::io::Result<()> {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             format!(
-                "target has {links} hard links; an atomic replacement updates only this name and would leave the other names on the old content (list them with `find . -samefile <path>`)"
+                "target has {links} hard links; an atomic replacement updates only this name and would leave every other name on the old content (`find -samefile` lists them)"
             ),
         ));
     }
@@ -457,10 +457,11 @@ fn reject_multiple_hard_links(_target: &Path) -> std::io::Result<()> {
     // Not implemented rather than impossible, and NTFS does have hard links,
     // so #760 stays live on Windows. Stable std cannot express the check —
     // `windows::fs::MetadataExt::number_of_links` is unstable behind
-    // `windows_by_handle` — but `winapi-util` and `windows-sys` are both
-    // already in the lockfile on Windows and expose
-    // `GetFileInformationByHandle`. Tracked in #933, together with the CI
-    // gap that leaves this arm uncompiled until a release build.
+    // `windows_by_handle` — but `winapi-util` and `windows-sys` both reach
+    // Windows builds transitively already and expose
+    // `GetFileInformationByHandle`, so the implementation costs a direct
+    // dependency entry rather than a new crate. Tracked in #933, together
+    // with the CI gap that leaves this arm uncompiled until a release build.
     Ok(())
 }
 
@@ -558,14 +559,14 @@ mod tests {
         assert_eq!(
             sorted_entry_names(dir.path()),
             ["alias.lua", "source.lua"],
-            "the refusal must leave no temp file behind"
+            "the refusal must land before a temp file is even created"
         );
     }
 
-    /// The refusal must not cost the normal case. This is the only test of a
-    /// *successful* `write_atomically` that CI compiles — `tests/` is gated
-    /// behind the `e2e` feature — so without it, inverting the guard to
-    /// `links >= 1` would refuse every write and still pass the gate.
+    /// The refusal must not cost the normal case. Every *successful*
+    /// `write_atomically` test used to live in `tests/`, which is gated
+    /// behind the `e2e` feature that CI does not enable — so inverting the
+    /// guard to `links >= 1`, refusing every write, passed the whole gate.
     #[cfg(unix)]
     #[test]
     fn write_atomically_replaces_a_single_link_file_keeping_its_mode() {
@@ -632,6 +633,25 @@ mod tests {
         let error = reject_multiple_hard_links(&aliased).unwrap_err();
 
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+    }
+
+    /// The count must come from the link itself, not from what it points at,
+    /// because `rename(2)` replaces the link rather than following it.
+    /// `write_atomically` canonicalizes before it ever gets here, so only the
+    /// pre-persist re-check can be handed a symlink — and only after the path
+    /// changed underneath it. Reverting to `metadata` refuses this case.
+    #[cfg(unix)]
+    #[test]
+    fn reject_multiple_hard_links_judges_a_symlink_by_its_own_count() {
+        let dir = tempfile::tempdir().unwrap();
+        let aliased = dir.path().join("aliased.lua");
+        let link = dir.path().join("link.lua");
+        std::fs::write(&aliased, "x").unwrap();
+        std::fs::hard_link(&aliased, dir.path().join("alias.lua")).unwrap();
+        std::os::unix::fs::symlink(&aliased, &link).unwrap();
+
+        reject_multiple_hard_links(&link)
+            .expect("a symlink carries one name, whatever its target carries");
     }
 
     #[cfg(unix)]
