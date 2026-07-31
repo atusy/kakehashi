@@ -208,9 +208,18 @@ fn assert_advertised(init_response: &Value) {
 }
 
 /// Drive the reopen-order mock: an appended wire log shared by every
-/// incarnation, plus a stall (longer than the pool's 2 s `REOPEN_WAIT`) that
-/// holds the respawn re-open before any `didOpen` goes out.
-fn init_client_reopen_order(log: &std::path::Path) -> (LspClient, tempfile::TempDir) {
+/// incarnation, plus a stall that holds the respawn re-open before any
+/// `didOpen` goes out.
+///
+/// `stall_ms` selects which half of the barrier contract is under test.
+/// Longer than the pool's 2 s `REOPEN_WAIT` pins that an UNSETTLED barrier
+/// withholds the command; `0` pins that a SETTLED one releases it. Both
+/// directions are needed — a barrier that always reports failure satisfies
+/// the withhold half perfectly.
+fn init_client_reopen_order(
+    log: &std::path::Path,
+    stall_ms: u32,
+) -> (LspClient, tempfile::TempDir) {
     let bin = mock_formatter_bin();
     let config_dir = tempfile::TempDir::new().expect("Failed to create config temp dir");
     let config_path = config_dir.path().join("code_action.toml");
@@ -224,11 +233,7 @@ fn init_client_reopen_order(log: &std::path::Path) -> (LspClient, tempfile::Temp
             "MOCK_LSP_WIRE_LOG",
             log.to_str().expect("temp path should be UTF-8"),
         )
-        // Longer than REOPEN_WAIT (2 s), so a command fired while the re-open
-        // is in flight can NEVER be saved by winning the race: the barrier's
-        // fail-soft is the only correct outcome, and any code path that sends
-        // anyway is caught by the wire-order assertion below.
-        .env("KAKEHASHI_E2E_STALL_REOPEN_MS", "2500")
+        .env("KAKEHASHI_E2E_STALL_REOPEN_MS", stall_ms.to_string())
         .build();
 
     client.send_request(
@@ -280,7 +285,7 @@ fn replacement_segment(wire: &str) -> Vec<&str> {
 fn a_command_does_not_overtake_the_reopen_of_a_respawned_downstream() {
     let log_dir = tempfile::TempDir::new().expect("Failed to create log temp dir");
     let log = log_dir.path().join("wire.log");
-    let (mut client, _config_dir) = init_client_reopen_order(&log);
+    let (mut client, _config_dir) = init_client_reopen_order(&log, 2500);
     open_markdown(&mut client);
 
     // Surface the routed command; the mock then exits once (crash marker), so
@@ -348,6 +353,77 @@ fn a_command_does_not_overtake_the_reopen_of_a_respawned_downstream() {
     assert!(
         reopen < execute,
         "the replacement got the command BEFORE its re-open didOpen:\n{wire}"
+    );
+
+    shutdown(&mut client);
+}
+
+/// The other half of the barrier contract: a re-open that COMPLETES must
+/// release the command, on the first attempt.
+///
+/// Withholding is only half a guarantee. A barrier that reported failure
+/// unconditionally would satisfy
+/// `a_command_does_not_overtake_the_reopen_of_a_respawned_downstream`
+/// completely — its first command is null either way, and the retry loop
+/// still succeeds because a dropped completion sender retires the entry, so
+/// the second attempt sails through and the didOpen still precedes it. Nothing
+/// there distinguishes "waited and was released" from "never released, gave up
+/// waiting".
+///
+/// So this pins the positive direction: with no stall, the re-open finishes
+/// well inside `REOPEN_WAIT`, and the FIRST command must come back non-null —
+/// having waited, not having skipped the wait, which the wire order proves.
+#[test]
+fn a_completed_reopen_releases_the_command_it_was_holding() {
+    let log_dir = tempfile::TempDir::new().expect("Failed to create log temp dir");
+    let log = log_dir.path().join("wire.log");
+    let (mut client, _config_dir) = init_client_reopen_order(&log, 0);
+    open_markdown(&mut client);
+
+    let actions = code_action_with_retry(&mut client);
+    let routed = actions
+        .iter()
+        .find(|a| a["command"].is_string())
+        .expect("the executable command action")["command"]
+        .as_str()
+        .expect("a routed command name")
+        .to_string();
+
+    // The mock died surfacing that action, so this command is the request that
+    // drives the respawn. Its connection is acquired BEFORE the barrier wait,
+    // and the barrier is claimed BEFORE the replacement flips to Ready — so the
+    // wait always observes the in-flight re-open rather than racing it. With no
+    // stall the re-open settles, and a released command is the only correct
+    // outcome.
+    let response = client.send_request(
+        "workspace/executeCommand",
+        json!({ "command": routed, "arguments": [] }),
+    );
+    assert!(
+        !response["result"].is_null(),
+        "a settled re-open must release the command it was holding, got: {response:?}"
+    );
+
+    let wire = std::fs::read_to_string(&log).expect("the mock wrote a wire log");
+    assert!(
+        std::path::Path::new(&format!("{}.died", log.to_str().expect("utf-8"))).exists(),
+        "the mock must have crashed once, else the respawn path was not exercised"
+    );
+    let segment = replacement_segment(&wire);
+    let execute = segment
+        .iter()
+        .position(|l| l.split('\t').next() == Some("workspace/executeCommand"))
+        .unwrap_or_else(|| panic!("the replacement never received the command:\n{wire}"));
+    let reopen = segment
+        .iter()
+        .position(|l| l.split('\t').next() == Some("textDocument/didOpen"))
+        .unwrap_or_else(|| {
+            panic!("no didOpen reached the replacement before the command:\n{wire}")
+        });
+    // Released, not un-awaited: being answered is not proof the wait happened.
+    assert!(
+        reopen < execute,
+        "the released command still overtook its re-open didOpen:\n{wire}"
     );
 
     shutdown(&mut client);
