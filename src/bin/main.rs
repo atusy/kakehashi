@@ -778,13 +778,13 @@ fn find_parser_file(parser_dir: &std::path::Path, lang: &str) -> Option<PathBuf>
 /// What to tell someone whose `--output` path is already taken. A regular
 /// file is the only entry `--force` overwrites — in place, truncating that
 /// inode rather than replacing the directory entry, so any hard link to it
-/// sees the new content too. Everything else it cannot overwrite at all: it
-/// writes *through* a symlink to whatever that points at, cannot write to a
-/// directory, would write *into* a FIFO or device node (blocking until a
-/// reader appears, in the FIFO case), and cannot open a socket path as a file
-/// at all. So the advice is offered only where `--force` acts on the entry
-/// named — not as a promise that the write then succeeds, which permissions
-/// still decide.
+/// sees the new content too. Everything else it cannot overwrite at all:
+/// `--force` refuses a symlink or reparse point rather than following it (see
+/// `write_forced_output`), cannot write to a directory, would write *into* a
+/// FIFO or device node (blocking until a reader appears, in the FIFO case),
+/// and cannot open a socket path as a file at all. So the advice is offered
+/// only where `--force` acts on the entry named — not as a promise that the
+/// write then succeeds, which permissions still decide.
 ///
 /// The entry is inspected only to word the message — the refusal itself was
 /// already decided atomically by `create_new`, so a path that changes between
@@ -799,7 +799,7 @@ fn overwrite_advice(path: &Path) -> &'static str {
     } else if metadata.is_dir() {
         "It is a directory; --force cannot write to it."
     } else if metadata.file_type().is_symlink() {
-        "It is a symbolic link; --force would write through to its target rather than replace the link."
+        "It is a symbolic link; --force refuses to follow it and will not replace it."
     } else {
         "It is not a regular file; --force would not replace it."
     }
@@ -825,19 +825,17 @@ fn write_content_to_output(
         // target instead of refusing; and anything created between the check
         // and the write is silently truncated (#763). Staging in a temp file
         // also means a failed write (e.g. disk full) never leaves partial
-        // content at the destination (#799). `--force` keeps the plain
-        // truncating write: it asks to write regardless of whatever is
-        // already there, which for a symlink means following it — see
-        // `overwrite_advice`.
+        // content at the destination (#799). `--force` also refuses a
+        // symlinked or reparse-point output rather than writing through it
+        // (#800) — see `overwrite_advice` and `write_forced_output`.
         let write_result = if force {
-            std::fs::write(path, content)
+            write_forced_output(path, content)
         } else {
             write_new_output_with(path, |file| {
                 use std::io::Write as _;
                 file.write_all(content.as_bytes())
             })
         };
-
         match write_result {
             Ok(()) => {
                 eprintln!("Created {label} file: {}", path.display());
@@ -887,6 +885,45 @@ fn write_new_output_with(
     temp.persist_noclobber(path)
         .map(|_| ())
         .map_err(|e| e.error)
+}
+
+fn write_forced_output(path: &std::path::Path, content: &str) -> std::io::Result<()> {
+    if std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_symlink()) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("refusing to follow output symlink '{}'", path.display()),
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::io::Write as _;
+        use std::os::unix::fs::OpenOptionsExt as _;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .custom_flags(nix::libc::O_NOFOLLOW)
+            .open(path)?;
+        file.write_all(content.as_bytes())
+    }
+    #[cfg(not(unix))]
+    {
+        #[cfg(windows)]
+        {
+            use std::io::Write as _;
+            use std::os::windows::fs::OpenOptionsExt as _;
+            const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+                .open(path)?;
+            file.write_all(content.as_bytes())
+        }
+        #[cfg(not(windows))]
+        std::fs::write(path, content)
+    }
 }
 
 /// Run the config init command
@@ -1381,27 +1418,6 @@ mod tests {
         assert_eq!(std::fs::read_to_string(fresh).unwrap(), "generated");
     }
 
-    /// `--force` opts out of the no-clobber guard, and that means writing
-    /// *through* a symlink rather than replacing it — the reason the refusal
-    /// message stops advertising `--force` for a link. Pinned so the behavior
-    /// cannot drift silently while #800 decides whether to keep it.
-    #[cfg(unix)]
-    #[test]
-    fn output_with_force_follows_a_symlink_to_its_target() {
-        use std::os::unix::fs::symlink;
-
-        let temp = tempfile::TempDir::new().unwrap();
-        let redirected = temp.path().join("redirected.toml");
-        let output = temp.path().join("config.toml");
-        symlink(&redirected, &output).unwrap();
-
-        write_content_to_output("generated", Some(output.clone()), true, "configuration")
-            .expect("--force must not be blocked by the link");
-
-        assert!(output.symlink_metadata().unwrap().file_type().is_symlink());
-        assert_eq!(std::fs::read_to_string(&redirected).unwrap(), "generated");
-    }
-
     /// Only a regular file may be told to retry with `--force`; for every
     /// other entry kind the flag does not act on the entry named at all.
     #[cfg(unix)]
@@ -1478,5 +1494,63 @@ mod tests {
             output.metadata().unwrap().permissions().mode() & 0o777,
             ordinary.metadata().unwrap().permissions().mode() & 0o777
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn force_output_rejects_symlink_without_touching_target() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::TempDir::new().unwrap();
+        let target = temp.path().join("shared.toml");
+        let output = temp.path().join("config.toml");
+        std::fs::write(&target, "shared").unwrap();
+        symlink(&target, &output).unwrap();
+
+        let error = write_forced_output(&output, "generated").unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(
+            error
+                .to_string()
+                .contains("refusing to follow output symlink")
+        );
+
+        let result =
+            write_content_to_output("generated", Some(output.clone()), true, "configuration");
+
+        assert!(result.is_err());
+        assert!(output.symlink_metadata().unwrap().file_type().is_symlink());
+        assert_eq!(std::fs::read_to_string(target).unwrap(), "shared");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn force_output_rejects_windows_symlink_without_touching_target() {
+        use std::os::windows::fs::symlink_file;
+
+        let temp = tempfile::TempDir::new().unwrap();
+        let target = temp.path().join("shared.toml");
+        let output = temp.path().join("config.toml");
+        std::fs::write(&target, "shared").unwrap();
+        if let Err(error) = symlink_file(&target, &output) {
+            if error.kind() == std::io::ErrorKind::PermissionDenied {
+                return;
+            }
+            panic!("create test symlink: {error}");
+        }
+
+        let error = write_forced_output(&output, "generated").unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(
+            error
+                .to_string()
+                .contains("refusing to follow output symlink")
+        );
+
+        let result =
+            write_content_to_output("generated", Some(output.clone()), true, "configuration");
+        assert!(result.is_err());
+        assert!(output.symlink_metadata().unwrap().file_type().is_symlink());
+        assert_eq!(std::fs::read_to_string(target).unwrap(), "shared");
     }
 }
