@@ -818,24 +818,24 @@ fn write_content_to_output(
     }
 
     if let Some(path) = output.as_ref().filter(|p| p.as_os_str() != "-") {
-        // `create_new` (O_CREAT|O_EXCL), not an `exists()` check followed by a
-        // write: check-then-write has two holes that one syscall closes.
-        // `exists()` follows symlinks, so a dangling symlink reads as absent
-        // and the write lands on its target instead of refusing; and anything
-        // created between the check and the write is silently truncated
-        // (#763). `--force` keeps the plain truncating write: it asks to
-        // write regardless of whatever is already there, which for a symlink
-        // means following it — see `overwrite_advice`.
+        // A same-directory temp file plus an atomic no-clobber persist, not an
+        // `exists()` check followed by a write: check-then-write has two holes
+        // that the final atomic persist closes. `exists()` follows symlinks,
+        // so a dangling symlink reads as absent and the write lands on its
+        // target instead of refusing; and anything created between the check
+        // and the write is silently truncated (#763). Staging in a temp file
+        // also means a failed write (e.g. disk full) never leaves partial
+        // content at the destination (#799). `--force` keeps the plain
+        // truncating write: it asks to write regardless of whatever is
+        // already there, which for a symlink means following it — see
+        // `overwrite_advice`.
         let write_result = if force {
             std::fs::write(path, content)
         } else {
-            use std::io::Write as _;
-
-            std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(path)
-                .and_then(|mut file| file.write_all(content.as_bytes()))
+            write_new_output_with(path, |file| {
+                use std::io::Write as _;
+                file.write_all(content.as_bytes())
+            })
         };
 
         match write_result {
@@ -865,6 +865,28 @@ fn write_content_to_output(
     }
 
     Ok(())
+}
+
+fn write_new_output_with(
+    path: &std::path::Path,
+    write: impl FnOnce(&mut std::fs::File) -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| std::path::Path::new("."));
+    let mut builder = tempfile::Builder::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        builder.permissions(std::fs::Permissions::from_mode(0o666));
+    }
+    let mut temp = builder.tempfile_in(parent)?;
+    write(temp.as_file_mut())?;
+    temp.as_file().sync_all()?;
+    temp.persist_noclobber(path)
+        .map(|_| ())
+        .map_err(|e| e.error)
 }
 
 /// Run the config init command
@@ -1420,5 +1442,41 @@ mod tests {
 
         assert!(result.is_err());
         assert_eq!(std::fs::read_to_string(output).unwrap(), "existing");
+    }
+
+    #[test]
+    fn failed_no_clobber_write_leaves_no_partial_output() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let output = temp.path().join("config.toml");
+
+        let result = write_new_output_with(&output, |file| {
+            use std::io::Write as _;
+            file.write_all(b"partial")?;
+            Err(std::io::Error::other("injected write failure"))
+        });
+
+        assert!(result.is_err());
+        assert!(!output.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn no_clobber_output_uses_normal_umask_permissions() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let temp = tempfile::TempDir::new().unwrap();
+        let output = temp.path().join("atomic.toml");
+        let ordinary = temp.path().join("ordinary.toml");
+        write_new_output_with(&output, |file| {
+            use std::io::Write as _;
+            file.write_all(b"generated")
+        })
+        .unwrap();
+        std::fs::write(&ordinary, "generated").unwrap();
+
+        assert_eq!(
+            output.metadata().unwrap().permissions().mode() & 0o777,
+            ordinary.metadata().unwrap().permissions().mode() & 0o777
+        );
     }
 }
