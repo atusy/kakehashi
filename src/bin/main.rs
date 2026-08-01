@@ -820,14 +820,15 @@ fn write_content_to_output(
     if let Some(path) = output.as_ref().filter(|p| p.as_os_str() != "-") {
         // A same-directory temp file plus an atomic no-clobber persist, not an
         // `exists()` check followed by a write: check-then-write has two holes
-        // that one syscall closes. `exists()` follows symlinks, so a dangling
-        // symlink reads as absent and the write lands on its target instead of
-        // refusing; and anything created between the check and the write is
-        // silently truncated (#763). Staging in a temp file also means a
-        // failed write (e.g. disk full) never leaves partial content at the
-        // destination (#799). `--force` keeps the plain truncating write: it
-        // asks to write regardless of whatever is already there, which for a
-        // symlink means following it — see `overwrite_advice`.
+        // that the final atomic persist closes. `exists()` follows symlinks,
+        // so a dangling symlink reads as absent and the write lands on its
+        // target instead of refusing; and anything created between the check
+        // and the write is silently truncated (#763). Staging in a temp file
+        // also means a failed write (e.g. disk full) never leaves partial
+        // content at the destination (#799). `--force` keeps the plain
+        // truncating write: it asks to write regardless of whatever is
+        // already there, which for a symlink means following it — see
+        // `overwrite_advice`.
         let write_result = if force {
             std::fs::write(path, content)
         } else {
