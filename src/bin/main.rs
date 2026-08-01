@@ -778,13 +778,13 @@ fn find_parser_file(parser_dir: &std::path::Path, lang: &str) -> Option<PathBuf>
 /// What to tell someone whose `--output` path is already taken. A regular
 /// file is the only entry `--force` overwrites — in place, truncating that
 /// inode rather than replacing the directory entry, so any hard link to it
-/// sees the new content too. Everything else it cannot overwrite at all: it
-/// writes *through* a symlink to whatever that points at, cannot write to a
-/// directory, would write *into* a FIFO or device node (blocking until a
-/// reader appears, in the FIFO case), and cannot open a socket path as a file
-/// at all. So the advice is offered only where `--force` acts on the entry
-/// named — not as a promise that the write then succeeds, which permissions
-/// still decide.
+/// sees the new content too. Everything else it cannot overwrite at all:
+/// `--force` refuses a symlink or reparse point rather than following it (see
+/// `write_forced_output`), cannot write to a directory, would write *into* a
+/// FIFO or device node (blocking until a reader appears, in the FIFO case),
+/// and cannot open a socket path as a file at all. So the advice is offered
+/// only where `--force` acts on the entry named — not as a promise that the
+/// write then succeeds, which permissions still decide.
 ///
 /// The entry is inspected only to word the message — the refusal itself was
 /// already decided atomically by `create_new`, so a path that changes between
@@ -799,7 +799,7 @@ fn overwrite_advice(path: &Path) -> &'static str {
     } else if metadata.is_dir() {
         "It is a directory; --force cannot write to it."
     } else if metadata.file_type().is_symlink() {
-        "It is a symbolic link; --force would write through to its target rather than replace the link."
+        "It is a symbolic link; --force refuses to follow it and will not replace it."
     } else {
         "It is not a regular file; --force would not replace it."
     }
