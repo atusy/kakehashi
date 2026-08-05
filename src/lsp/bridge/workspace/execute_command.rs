@@ -29,6 +29,7 @@ use serde_json::Value;
 
 use crate::config::settings::WorkspaceSettings;
 use crate::config::{merge_bridge_server_configs, resolve_with_wildcard};
+use crate::lsp::bridge::ConnectionKey;
 use crate::lsp::bridge::actor::RouterCleanupGuard;
 use crate::lsp::bridge::decode_command;
 use crate::lsp::bridge::pool::{ConnectionHandle, ConnectionState, LanguageServerPool, UpstreamId};
@@ -37,25 +38,23 @@ use tower_lsp_server::ls_types::ExecuteCommandParams;
 
 const METHOD: &str = "workspace/executeCommand";
 
+/// How many live connections advertise a raw palette command name — the whole
+/// routing decision, because the name carries no other identity.
 #[derive(Debug, PartialEq, Eq)]
 enum ReadyPaletteOrigin {
     None,
-    Unique(crate::lsp::bridge::ConnectionKey),
+    Unique(ConnectionKey),
     Ambiguous,
 }
 
-fn select_ready_palette_origin(
-    origins: &[crate::lsp::bridge::ConnectionKey],
-    mut is_ready: impl FnMut(&crate::lsp::bridge::ConnectionKey) -> bool,
-) -> ReadyPaletteOrigin {
-    let mut ready = origins.iter().filter(|key| is_ready(key));
-    let Some(first) = ready.next() else {
-        return ReadyPaletteOrigin::None;
-    };
-    if ready.next().is_some() {
-        ReadyPaletteOrigin::Ambiguous
-    } else {
-        ReadyPaletteOrigin::Unique(first.clone())
+/// Classify an already-filtered set of live advertisers. Kept separate from the
+/// scan that produces it so the "one is safe, several are not" rule is stated
+/// once and tested without a pool.
+fn select_ready_palette_origin(ready: &[ConnectionKey]) -> ReadyPaletteOrigin {
+    match ready {
+        [] => ReadyPaletteOrigin::None,
+        [only] => ReadyPaletteOrigin::Unique(only.clone()),
+        _ => ReadyPaletteOrigin::Ambiguous,
     }
 }
 
@@ -182,6 +181,27 @@ impl LanguageServerPool {
     /// the raw request carries no workspace identity (#823). Forwards the command
     /// name and arguments verbatim; other failures remain fail-soft like the
     /// encoded-command path.
+    /// Every live connection whose EXACT advertised command list contains
+    /// `command`, read from one connections-map snapshot.
+    ///
+    /// Scanning the handles rather than the origin registry is what closes the
+    /// handshake window: a connection publishes its capabilities and its `Ready`
+    /// state before its palette metadata reaches the registry, so a
+    /// registry-only check can miss a live colliding advertiser and conclude
+    /// "unique" about a set it cannot yet see (#823). The routing decision
+    /// linearizes at this snapshot.
+    async fn ready_palette_origins(&self, command: &str) -> Vec<ConnectionKey> {
+        let connections = self.connections().await;
+        connections
+            .iter()
+            .filter(|(_, handle)| {
+                handle.state() == ConnectionState::Ready
+                    && handle.advertises_execute_command(command)
+            })
+            .map(|(key, _)| key.clone())
+            .collect()
+    }
+
     async fn dispatch_palette_command(
         &self,
         params: ExecuteCommandParams,
@@ -198,26 +218,9 @@ impl LanguageServerPool {
             return None;
         }
 
-        // Resolve liveness from one connections-map snapshot, scanning the
-        // handles' actual advertised command lists rather than only the origin
-        // registry. A handshake publishes its capabilities + Ready state before
-        // recording dynamic palette metadata; consulting only the registry in
-        // that window would miss a live colliding advertiser (#823). The command
-        // linearizes at this snapshot: exactly one Ready advertiser is safe;
-        // several are inherently ambiguous because the raw name carries no
-        // document/workspace identity.
-        let ready_origins: Vec<_> = {
-            let connections = self.connections().await;
-            connections
-                .iter()
-                .filter(|(_, handle)| {
-                    handle.state() == ConnectionState::Ready
-                        && handle.advertises_execute_command(&params.command)
-                })
-                .map(|(key, _)| key.clone())
-                .collect()
-        };
-        let key = match select_ready_palette_origin(&ready_origins, |_| true) {
+        let key = match select_ready_palette_origin(
+            &self.ready_palette_origins(&params.command).await,
+        ) {
             ReadyPaletteOrigin::Unique(key) => key,
             ReadyPaletteOrigin::Ambiguous => {
                 warn!(
@@ -457,37 +460,88 @@ fn parse_execute_command_response(mut response: Value) -> Option<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::lsp::bridge::pool::test_helpers::create_handle_advertising_commands;
     use serde_json::json;
-    use std::collections::HashSet;
 
-    #[test]
-    fn collision_routes_when_exactly_one_advertiser_is_live() {
-        let ruff =
-            crate::lsp::bridge::ConnectionKey::new("ruff", Some("file:///workspace/a".to_string()));
-        let eslint = crate::lsp::bridge::ConnectionKey::new(
-            "eslint",
-            Some("file:///workspace/b".to_string()),
-        );
-        let ready = HashSet::from([eslint.clone()]);
+    fn key(server: &str, root: &str) -> ConnectionKey {
+        ConnectionKey::new(server, Some(root.to_string()))
+    }
 
-        assert_eq!(
-            select_ready_palette_origin(&[ruff, eslint.clone()], |key| ready.contains(key)),
-            ReadyPaletteOrigin::Unique(eslint),
-        );
+    /// Seed a connection in `state` advertising exactly `commands`.
+    async fn seed(
+        pool: &LanguageServerPool,
+        key: &ConnectionKey,
+        state: ConnectionState,
+        commands: &[&str],
+    ) {
+        pool.insert_connection(
+            create_handle_advertising_commands(state, key.clone(), commands).await,
+        )
+        .await;
     }
 
     #[test]
-    fn collision_refuses_to_choose_between_live_advertisers() {
-        let ruff =
-            crate::lsp::bridge::ConnectionKey::new("ruff", Some("file:///workspace/a".to_string()));
-        let eslint = crate::lsp::bridge::ConnectionKey::new(
-            "eslint",
-            Some("file:///workspace/b".to_string()),
+    fn one_live_advertiser_is_the_only_safe_case() {
+        let ruff = key("ruff", "file:///workspace/a");
+        assert_eq!(
+            select_ready_palette_origin(std::slice::from_ref(&ruff)),
+            ReadyPaletteOrigin::Unique(ruff),
         );
+        assert_eq!(select_ready_palette_origin(&[]), ReadyPaletteOrigin::None);
+        assert_eq!(
+            select_ready_palette_origin(&[
+                key("ruff", "file:///workspace/a"),
+                key("eslint", "file:///workspace/b"),
+            ]),
+            ReadyPaletteOrigin::Ambiguous,
+            "a raw name carries no workspace identity, so two advertisers cannot be told apart"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_scan_sees_every_live_advertiser_of_the_exact_name() {
+        let pool = LanguageServerPool::new();
+        let ruff = key("ruff", "file:///workspace/a");
+        let eslint = key("eslint", "file:///workspace/b");
+        seed(&pool, &ruff, ConnectionState::Ready, &["source.fixAll"]).await;
+        seed(&pool, &eslint, ConnectionState::Ready, &["source.fixAll"]).await;
+
+        let mut found = pool.ready_palette_origins("source.fixAll").await;
+        found.sort_by_key(|k| k.server().to_string());
 
         assert_eq!(
-            select_ready_palette_origin(&[ruff, eslint], |_| true),
-            ReadyPaletteOrigin::Ambiguous,
+            found,
+            vec![eslint, ruff],
+            "missing either advertiser would make an ambiguous command look unique"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_scan_ignores_a_connection_that_cannot_serve_the_name() {
+        let pool = LanguageServerPool::new();
+        let ready = key("ruff", "file:///workspace/a");
+        seed(&pool, &ready, ConnectionState::Ready, &["source.fixAll"]).await;
+        // Advertises the name but is still handshaking: not routable yet.
+        seed(
+            &pool,
+            &key("eslint", "file:///workspace/b"),
+            ConnectionState::Initializing,
+            &["source.fixAll"],
+        )
+        .await;
+        // Ready, but this exact name is not in its list — `has_capability` would
+        // have accepted it on mere provider presence.
+        seed(
+            &pool,
+            &key("biome", "file:///workspace/c"),
+            ConnectionState::Ready,
+            &["source.organizeImports"],
+        )
+        .await;
+
+        assert_eq!(
+            pool.ready_palette_origins("source.fixAll").await,
+            vec![ready],
         );
     }
 

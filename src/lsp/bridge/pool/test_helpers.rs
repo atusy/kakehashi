@@ -137,6 +137,27 @@ pub(in crate::lsp::bridge) async fn create_handle_with_key(
     create_handle_with_state_and_pid_keyed(state, key).await.0
 }
 
+/// Like [`create_handle_with_key`], but also advertises `commands` as the
+/// connection's static `executeCommandProvider.commands`.
+///
+/// Lives here rather than in the caller's test module because
+/// `set_server_capabilities` is `pub(super)` to the pool.
+pub(in crate::lsp::bridge) async fn create_handle_advertising_commands(
+    state: ConnectionState,
+    key: ConnectionKey,
+    commands: &[&str],
+) -> Arc<ConnectionHandle> {
+    let handle = create_handle_with_key(state, key).await;
+    handle.set_server_capabilities(tower_lsp_server::ls_types::ServerCapabilities {
+        execute_command_provider: Some(tower_lsp_server::ls_types::ExecuteCommandOptions {
+            commands: commands.iter().map(|c| (*c).to_string()).collect(),
+            work_done_progress_options: Default::default(),
+        }),
+        ..Default::default()
+    });
+    handle
+}
+
 /// Like [`create_handle_with_state`], but also returns the sink child's pid
 /// so tests can assert the process actually dies (e.g. kill-on-timeout paths).
 pub async fn create_handle_with_state_and_pid(
