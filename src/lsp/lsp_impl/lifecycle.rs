@@ -701,6 +701,12 @@ impl Kakehashi {
     pub(crate) async fn initialized_impl(&self, _: InitializedParams) {
         self.notifier().log_info("server is ready").await;
 
+        // Now that the handshake is complete, ask a pull-capable client for its
+        // configuration. Editors that send `didChangeConfiguration` with no
+        // usable `settings` have no other way to configure kakehashi past
+        // `initializationOptions`.
+        self.pull_client_configuration().await;
+
         // Forward downstream-initiated messages to the upstream editor
         // (workspace/applyEdit is answered locally instead when the editor
         // never declared the capability). The reader tasks feed three
