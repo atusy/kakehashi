@@ -533,8 +533,14 @@ impl LanguageServerPool {
         }
     }
 
-    /// Registry mapping a downstream server's advertised palette command names to
-    /// the connection that advertised them (#628 palette-fired executeCommand).
+    /// What is known about the raw palette command names downstream servers have
+    /// advertised (#628 palette-fired executeCommand).
+    ///
+    /// Two questions, not one: whether a name is one the editor was told about
+    /// (the decode gate), and which of its origins could be RECONNECTED if none
+    /// is live. It does not say which connection should run a live command —
+    /// that is decided by scanning the connections map, the only view that
+    /// cannot lag a handshake.
     pub(crate) fn command_origins(&self) -> &CommandOriginRegistry {
         &self.command_origins
     }
