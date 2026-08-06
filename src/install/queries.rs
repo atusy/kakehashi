@@ -526,7 +526,17 @@ fn discard_backup_locked(published: &PublishedQueryDir) {
     let _replace_lock = published
         .queries_dir
         .parent()
-        .map(|parent| QueryReplaceLockGuard::acquire(parent, &published.language));
+        .map(|parent| QueryReplaceLockGuard::acquire(parent, &published.language))
+        .transpose()
+        .inspect_err(|e| {
+            // Still discard: an uncollected backup is worse than an unlocked
+            // removal, and the lock only avoids making a concurrent uninstall
+            // report a failure for work that did happen.
+            eprintln!(
+                "Warning: could not lock '{}' before dropping its query backup: {}",
+                published.language, e
+            )
+        });
     discard_backup(published);
 }
 
@@ -539,8 +549,28 @@ fn discard_backup(published: &PublishedQueryDir) {
     let Some(backup) = &published.backup else {
         return;
     };
-    let _ = fs::remove_dir_all(backup);
-    let _ = fs::remove_file(backup_ownership_sidecar(backup));
+    discard_backup_dir(backup);
+}
+
+/// Remove a backup directory and, once it is confirmed gone, the sidecar that
+/// marks it as ours.
+///
+/// The sidecar outlives a removal that *failed*: every collector — uninstall,
+/// the recovery sweep, `newest_complete_backup_dir` — gates on it, so dropping
+/// it while the directory survives would make that directory unreachable by all
+/// of them. It is dropped when the directory is confirmed absent, which is how
+/// a concurrent uninstall's collection stops leaving sidecars behind.
+fn discard_backup_dir(backup: &Path) {
+    match remove_dir_all_tolerating_vanished(backup) {
+        Ok(_) => {
+            let _ = fs::remove_file(backup_ownership_sidecar(backup));
+        }
+        Err(e) => eprintln!(
+            "Warning: failed to remove the superseded query backup at {}: {}",
+            backup.display(),
+            e
+        ),
+    }
 }
 
 /// What staging found for one language.
@@ -1084,14 +1114,21 @@ fn collect_superseded_backups(
     language: &str,
 ) -> Result<(), QueryInstallError> {
     validate_safe_language_name(language)?;
-    if !queries_parent.join(language).exists() {
+    // "Superseded" means a *complete* directory took the backup's place. A live
+    // directory that is merely present is not enough: an interrupted uninstall
+    // can leave a partially emptied one, and then the backup is the only intact
+    // copy — the same reason `newest_complete_backup_dir` refuses to restore an
+    // incomplete backup, applied in the other direction. A publish always
+    // produces a complete directory, so this still covers the case the sweep
+    // exists for.
+    if !query_install_is_complete(&queries_parent.join(language)) {
         return Ok(());
     }
 
     let _replace_lock = QueryReplaceLockGuard::acquire(queries_parent, language)?;
     // Re-check under the lock: a concurrent uninstall may have removed the
     // directory, which makes these backups restore candidates again.
-    if !queries_parent.join(language).exists() {
+    if !query_install_is_complete(&queries_parent.join(language)) {
         return Ok(());
     }
 
@@ -1114,8 +1151,7 @@ fn collect_superseded_backups(
         if backup_language != language || process_is_running(pid) {
             continue;
         }
-        let _ = fs::remove_dir_all(&path);
-        let _ = fs::remove_file(backup_ownership_sidecar(&path));
+        discard_backup_dir(&path);
     }
     Ok(())
 }
@@ -1812,6 +1848,35 @@ mod tests {
             fs::read_to_string(live.join("highlights.scm")).unwrap(),
             "published",
             "collecting a backup must not disturb the live queries"
+        );
+    }
+
+    /// A live directory that is merely present is not proof the backup is
+    /// superseded: an interrupted uninstall leaves a partially emptied one, and
+    /// then the backup is the only intact copy.
+    #[test]
+    #[cfg(unix)]
+    fn recover_interrupted_query_installs_keeps_a_backup_over_an_incomplete_dir() {
+        let temp = TempDir::new().unwrap();
+        let queries_parent = temp.path().join("queries");
+        let live = queries_parent.join("lua");
+        fs::create_dir_all(&live).unwrap();
+        fs::write(live.join("bindings.scm"), "user managed query").unwrap();
+        let backup = queries_parent.join(format!(".lua.{}.0.backup", dead_test_pid()));
+        fs::create_dir_all(&backup).unwrap();
+        fs::write(backup.join("highlights.scm"), "(comment) @comment\n").unwrap();
+        write_install_marker(&backup).unwrap();
+        write_backup_ownership_marker(&backup).unwrap();
+
+        recover_interrupted_query_installs(&queries_parent).unwrap();
+
+        assert!(
+            backup.join("highlights.scm").exists(),
+            "the only complete copy must survive an incomplete live directory"
+        );
+        assert!(
+            backup_ownership_sidecar(&backup).is_file(),
+            "and stay owned, so it is still a restore candidate"
         );
     }
 
