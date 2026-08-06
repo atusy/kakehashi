@@ -1759,6 +1759,53 @@ mod tests {
         );
     }
 
+    /// Re-running an install is how a user repairs a language whose inherited
+    /// queries went missing (the documented fix for TypeScript/JavaScript), so
+    /// an already-complete language must still pull in the parents it is
+    /// missing — without `--force`, and without touching its own files.
+    #[test]
+    fn installing_a_complete_language_still_repairs_a_missing_parent() {
+        let temp_dir = TempDir::new().unwrap();
+        let data_dir = temp_dir.path().to_path_buf();
+        let child_dir = data_dir.join("queries").join("complete_child");
+        fs::create_dir_all(&child_dir).unwrap();
+        fs::write(
+            child_dir.join("highlights.scm"),
+            "; inherits: absent_parent\n(identifier) @variable\n",
+        )
+        .unwrap();
+        write_install_marker(&child_dir).unwrap();
+        let base_url = spawn_query_file_server(vec![(
+            "/absent_parent/highlights.scm",
+            "(comment) @comment\n",
+        )]);
+
+        let result = install_queries_with_dependencies_from_allowing_http_for_tests(
+            &base_url,
+            "complete_child",
+            &data_dir,
+            false,
+        );
+
+        assert!(
+            matches!(result, Err(QueryInstallError::AlreadyExists(path)) if path == child_dir),
+            "the requested language was already installed"
+        );
+        assert!(
+            data_dir
+                .join("queries")
+                .join("absent_parent")
+                .join("highlights.scm")
+                .exists(),
+            "the missing parent must be installed by the re-run"
+        );
+        assert_eq!(
+            fs::read_to_string(child_dir.join("highlights.scm")).unwrap(),
+            "; inherits: absent_parent\n(identifier) @variable\n",
+            "repairing a parent must not rewrite the language's own queries"
+        );
+    }
+
     #[test]
     fn install_preserves_legacy_non_marker_query_dir_without_force() {
         let temp_dir = TempDir::new().unwrap();
