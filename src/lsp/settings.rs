@@ -412,6 +412,9 @@ pub fn load_settings(
         .reduce(merge_workspace_settings)
         .flatten();
     let raw_settings = merged.clone();
+    if let Some(message) = emptied_bridge_list_notice(raw_settings.as_ref()) {
+        events.push(SettingsEvent::warning(message));
+    }
     let settings = expand_merged_settings(merged, home, &env_fn, &mut events);
 
     SettingsLoadOutcome {
@@ -420,6 +423,34 @@ pub fn load_settings(
         events,
         deprecated_keys,
     }
+}
+
+/// Report `languageServers` entries whose `cmd` or `languages` is written as an
+/// empty list.
+///
+/// An empty list used to mean "inherit the `_` wildcard's"; it now means "this
+/// server has none", and omitting the key is what inherits. A configuration
+/// written against the old rule keeps parsing and silently changes meaning, so
+/// say so once per load rather than leaving the server mysteriously unused.
+fn emptied_bridge_list_notice(settings: Option<&RawWorkspaceSettings>) -> Option<String> {
+    let servers = settings?.language_servers.as_ref()?;
+    let mut named: Vec<&str> = servers
+        .iter()
+        .filter(|(_, config)| {
+            config.cmd.as_ref().is_some_and(Vec::is_empty)
+                || config.languages.as_ref().is_some_and(Vec::is_empty)
+        })
+        .map(|(name, _)| name.as_str())
+        .collect();
+    if named.is_empty() {
+        return None;
+    }
+    named.sort_unstable();
+    Some(format!(
+        "kakehashi: an empty `cmd` or `languages` list now means the server has none, \
+         not that it inherits the `_` wildcard's — omit the key to inherit. Affected: {}",
+        named.join(", ")
+    ))
 }
 
 /// Expand and validate the fully merged configuration, `initializationOptions`
@@ -837,6 +868,40 @@ mod tests {
     /// directory, and one with no parent at all is an error rather than a base
     /// of "nowhere" — otherwise an unanchored layer would be indistinguishable
     /// from a successfully anchored one.
+    #[test]
+    fn emptied_bridge_lists_are_reported_once_per_load() {
+        let settings: RawWorkspaceSettings = toml::from_str(
+            r#"
+            [languageServers.declines]
+            cmd = []
+
+            [languageServers.silent]
+            languages = []
+
+            [languageServers.fine]
+            cmd = ["real-server"]
+        "#,
+        )
+        .expect("should parse");
+
+        let message = emptied_bridge_list_notice(Some(&settings)).expect("a notice");
+        assert!(message.contains("declines"), "{message}");
+        assert!(message.contains("silent"), "{message}");
+        assert!(!message.contains("fine"), "{message}");
+
+        let inheriting: RawWorkspaceSettings = toml::from_str(
+            r#"
+            [languageServers.inherits]
+            enabled = true
+        "#,
+        )
+        .expect("should parse");
+        assert!(
+            emptied_bridge_list_notice(Some(&inheriting)).is_none(),
+            "omitting the keys is the inheriting spelling and must stay quiet"
+        );
+    }
+
     #[test]
     fn config_file_base_resolves_a_bare_filename_and_rejects_a_parentless_path() {
         let cwd = std::env::current_dir().expect("a working directory");
