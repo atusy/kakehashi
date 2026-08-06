@@ -284,14 +284,31 @@ impl StagedParser {
     ///
     /// On unix `rename` atomically replaces an existing parser. Windows
     /// `rename` instead fails if the destination exists, which would make a
-    /// `force` reinstall fail after a good compile — remove the old file
-    /// first there (a small non-atomic window, acceptable on the
-    /// non-primary platform).
+    /// `force` reinstall fail after a good compile — so there the previous
+    /// parser is moved aside first, and moved back if the rename then fails.
+    /// Deleting it instead would leave a `force` reinstall that failed at the
+    /// rename with no parser at all, while the caller reports that nothing was
+    /// published.
     pub(crate) fn publish(mut self) -> Result<ParserInstallResult, ParserInstallError> {
-        #[cfg(windows)]
-        let _ = fs::remove_file(&self.parser_file);
+        // `cfg!` rather than `#[cfg]` so this compiles everywhere it is read,
+        // not only where it runs.
+        let displaced = if cfg!(windows) && self.parser_file.exists() {
+            let aside = self
+                .parser_file
+                .with_file_name(format!("{}.displaced", staging_file_name(&self.language)));
+            fs::rename(&self.parser_file, &aside)?;
+            Some(aside)
+        } else {
+            None
+        };
         if let Err(e) = fs::rename(&self.tmp_file, &self.parser_file) {
+            if let Some(aside) = &displaced {
+                let _ = fs::rename(aside, &self.parser_file);
+            }
             return Err(ParserInstallError::IoError(e));
+        }
+        if let Some(aside) = &displaced {
+            let _ = fs::remove_file(aside);
         }
         // The rename consumed the staging file; anything the drop guard would
         // remove now belongs to the data dir.
@@ -1537,6 +1554,37 @@ mod tests {
         assert!(
             !tmp_file.exists(),
             "publishing must consume the staging file"
+        );
+    }
+
+    /// The previous parser is displaced, not deleted, so a publish that fails
+    /// at the rename leaves the language exactly as it was. (The displacement
+    /// only happens on Windows, where rename cannot replace; elsewhere the
+    /// rename is atomic and there is nothing to displace.)
+    #[test]
+    fn publishing_over_an_existing_parser_replaces_it() {
+        let temp = tempdir().expect("temp dir");
+        let ext = std::env::consts::DLL_EXTENSION;
+        let parser_file = temp.path().join("parser").join(format!("lua.{}", ext));
+        let staged = fake_staged_parser(temp.path(), "lua");
+        fs::write(&parser_file, b"previous parser").expect("write previous parser");
+
+        let result = staged.publish().expect("publish should succeed");
+
+        assert_eq!(
+            fs::read(&result.install_path).expect("read published parser"),
+            b"staged parser"
+        );
+        let leftovers: Vec<_> = fs::read_dir(temp.path().join("parser"))
+            .expect("read parser dir")
+            .flatten()
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name != &format!("lua.{}", ext))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "replacing a parser must not strand the one it displaced, found {:?}",
+            leftovers
         );
     }
 
