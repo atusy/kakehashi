@@ -188,9 +188,13 @@ fn resolve_data_dir(env_fn: impl Fn(&str) -> Option<String>) -> Option<PathBuf> 
 /// Result of installing a language (both parser and queries).
 ///
 /// A language is installed as a unit: every failure path returns before
-/// publishing either half, or undoes the one it published. A `None` path with
-/// no matching error means that half was not left published — either it was
-/// never published, or it was undone when the other half failed.
+/// publishing either half, or undoes the one it published.
+///
+/// The paths describe what this run *settled on*, not what is on disk. They are
+/// populated together on success — including when a half was already installed
+/// and left alone — and a `None` path with no matching error means this run
+/// neither published that half nor left one it had published, which says
+/// nothing about a copy an earlier install put there. Read the disk for that.
 #[derive(Debug)]
 pub struct InstallResult {
     /// Path where the parser was installed, if successful.
