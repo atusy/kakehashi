@@ -614,8 +614,10 @@ neither the query's requests nor its connections. That is a real divergence from
 its documented promise to "cap the number of concurrent server requests", and
 the fix is documentation, not a mechanism: the setting's description must say so
 (point 8). What actually bounds the total is the live-connection set (point 7).
-A workspace-level ceiling, if one is ever wanted, belongs in a separate setting
-with its own name and semantics rather than smuggled into this one.
+A workspace-level ceiling belongs in a separate setting with its own name and
+semantics rather than smuggled into this one, and is listed as deferred work in
+point 9 rather than left as a vague possibility — this method is the widest
+fan-out kakehashi has, and it is the one the existing guard does not bound.
 
 ```
   open host docs × their open virtual docs    ← concrete languages only,
@@ -1067,15 +1069,22 @@ a per-document snapshot across the whole fan-in and translating against the
 pinned text — which would answer with coordinates into text the client has
 already replaced. Dropping is the safer failure.
 
-The response to the client is always an **array**, never `null`, so "no server
-was running", "everything was dropped", and "every target errored or timed out"
-are not distinguished — the spec assigns no distinct meaning to `null` here, and
-an array keeps the empty case uniform. This last case needs stating because the
-existing fan-in outcomes are mapped inconsistently elsewhere (the diagnostics
-path turns a total failure into an empty vector, formatting and code actions
-into `None`); here it is the empty array, so a downstream outage degrades to
-"no matches" rather than to a protocol-level nothing. A target that errors or
-hits the 30-second timeout contributes nothing and does not fail the query.
+The response is an **array**, never `null`: the spec assigns no distinct meaning
+to `null` here, so "no server was selected" and "servers answered nothing" both
+come back empty.
+
+**Total failure is the exception.** If every dispatched target errored or timed
+out, the query answers with a **request error**, not `[]`. An empty array is a
+claim — "these servers searched and found nothing" — and making it while every
+server was unreachable is confidently wrong at exactly the moment the user is
+least able to tell. A client shown "no matches" during an outage concludes the
+symbol does not exist. The existing concatenated fan-in already draws this line,
+distinguishing zero successes with errors from an empty target set, and this
+method keeps it.
+
+Partial failure stays soft: a target that errors or times out while others
+answer contributes nothing and does not fail the query. The distinction is
+between *some* evidence and *none*.
 
 Entries are emitted as `WorkspaceSymbol[]` — `WorkspaceSymbolResponse::Nested`
 in `ls-types`, whose variant names are a misnomer: **both** variants are flat
@@ -1193,9 +1202,22 @@ requests.
 ### 7. Coverage is what is live, and a query never cold-starts a server
 
 A candidate with no live connection is **skipped**, not spawned. Coverage is
-"the servers that are running because of what the client has opened", and it
-grows as the client opens more files — opening a host document spawns its
-servers and opens its virtual documents.
+therefore bounded by what the client has opened, and grows as it opens more.
+
+Stated precisely, it is **the servers currently holding an open document for
+this workspace** — not "every running server". The two differ, and the gap is
+user-visible: `didClose` removes kakehashi's document tracking but deliberately
+leaves the downstream connection running, so closing the last buffer for a
+language drops that server from selection even though it is still `Ready` and
+still holds a complete real-file index it could have answered from. Symbol
+search goes empty with no failure anywhere.
+
+That follows from deriving the candidate axes from open documents, which is what
+makes them concrete (point 3) — the alternative derivations lose `_` handling or
+`["*"]` servers entirely. Closing it properly means retaining each connection's
+admitting policy independently of document tracking, so a connection can outlive
+the document that justified it. That is a change to what the pool remembers, not
+to this method, and is left as a follow-up rather than smuggled in here.
 
 This is not merely a cost trade. Cold-starting cannot deliver the coverage it
 appears to promise:
@@ -1291,6 +1313,12 @@ documenting only two values.
   `workspaceSymbolProvider`. The existing client-progress aggregator is keyed by
   region and has no meaning for a request that has no region. Both tokens are
   optional in LSP 3.18.
+- **A request-wide fan-out ceiling.** `max_fan_out` bounds a pair's name
+  selection, not the query (point 3), so nothing caps how many connections one
+  query touches except how many are live. That is a real gap in a generic load
+  control, and this is the method most able to expose it. The fix is a
+  separately named workspace-level limit — a new user-facing setting, which is
+  why it is deferred rather than decided here.
 - **Request coalescing.** A symbol picker typically fires one request per
   keystroke, and this design has no single-flight, debounce, or supersession —
   each keystroke fans out to every live connection. The repo has prior art for
@@ -1393,7 +1421,10 @@ Including it would defeat dedup on a field carrying no identity.
 ### Negative
 
 - Results depend on what is open, and coverage can shrink (close, respawn,
-  silent connection death). The same query answers differently at different
+  silent connection death). Closing the last buffer for a language removes its
+  server from search even though the process is still running and still
+  indexed — the sharpest form of this, and a follow-up rather than a fix here
+  (point 7). The same query answers differently at different
   points in a session. LSP permits partial `workspace/symbol` results, but a
   user expecting an indexed whole-project search will find this surprising.
 - Latency is max-over-live-targets, and every *wait* is bounded: the pool's 30s
@@ -1472,12 +1503,16 @@ Including it would defeat dedup on a field carrying no identity.
   never reaches the cross-layer walk.
 - Exposing `union` in the serialized config and the generated schema is a
   **one-way door**: it is public API from the first release that ships it, yet
-  it offers no choice anywhere — it is mandatory where it applies and inert
-  where it does not. Keeping the merge internal to this method would have left
-  that door open. It is exposed because a named, inspectable strategy value was
-  the maintainer's explicit preference over a hidden merge rule; the cost is
-  recorded here so a later reversal is a deliberate deprecation rather than a
-  surprise.
+  it offers no choice anywhere — mandatory where it applies, inert everywhere
+  else, including every document-scoped method and every layer entry that will
+  now schema-accept it as a no-op. Keeping the merge internal would have left
+  that door open.
+
+  This was weighed and **settled**: a named, inspectable strategy value is the
+  maintainer's explicit preference over a hidden merge rule, on the grounds that
+  a user reading the config should be able to see what this method does. The
+  cost is recorded here so that a later reversal is a deliberate deprecation
+  rather than a surprise — and so that it is not re-litigated as an oversight.
 - Result ordering is deterministic but not relevance-ranked. LSP delegates
   scoring to the client ("editors will apply their own highlighting and scoring
   on the results"), so a client that re-sorts sees no change and one that does
