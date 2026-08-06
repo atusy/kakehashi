@@ -4,8 +4,9 @@
 //! The handler picks kakehashi's own configuration root from the current folder
 //! list, so a folder change re-reads the project `kakehashi.toml` at the new
 //! root. These tests pin which root it picks — including when the client removes
-//! the last folder, where the root has to come from the same ladder
-//! `initialize` uses.
+//! the last folder, where the root comes from the rungs `initialize` resolved
+//! below `workspaceFolders`, and where the ladder deliberately stops before the
+//! process working directory.
 //!
 //! Run with: `cargo test --test e2e_workspace_folder_config --features e2e`
 
@@ -14,23 +15,35 @@
 mod helpers;
 
 use helpers::lsp_client::LspClient;
+use helpers::lsp_polling::poll_until;
 use serde_json::json;
-use std::time::Duration;
 use tempfile::TempDir;
 
 /// A directory holding a project config whose `searchPaths` names it.
 fn project_dir(marker: &str) -> TempDir {
     let dir = TempDir::new().unwrap();
+    write_marker(&dir, marker);
+    dir
+}
+
+/// Repoint a project config at a new marker, so the only way to observe it is a
+/// reload that reads that directory again.
+fn write_marker(dir: &TempDir, marker: &str) {
     std::fs::write(
         dir.path().join("kakehashi.toml"),
         format!("searchPaths = [\"/{marker}\"]\n"),
     )
     .unwrap();
-    dir
 }
 
+/// A canonical `file://` URI. Built via `Url::from_file_path` rather than string
+/// formatting so the URI is RFC-canonical and percent-encoded — a `TMPDIR`
+/// containing a space would otherwise produce something kakehashi's
+/// `url::Url::parse` rejects.
 fn uri_of(dir: &TempDir) -> String {
-    format!("file://{}", dir.path().display())
+    url::Url::from_file_path(dir.path())
+        .expect("valid file URI")
+        .to_string()
 }
 
 fn folder(dir: &TempDir, name: &str) -> serde_json::Value {
@@ -47,31 +60,31 @@ fn query_effective_settings(client: &mut LspClient) -> serde_json::Value {
         .clone()
 }
 
-/// Poll until `searchPaths` matches `expected`, then return the settings.
-fn poll_search_paths(client: &mut LspClient, expected: &str, msg: &str) -> serde_json::Value {
-    for _ in 0..20 {
+/// Poll until `searchPaths` equals `expected`.
+///
+/// Every caller polls for a value that differs from the one in effect when the
+/// notification was sent, so this is a barrier on the reload rather than a
+/// sample that can pass before the handler has run.
+fn poll_search_paths(client: &mut LspClient, expected: serde_json::Value, msg: &str) {
+    let settled = poll_until(20, 100, || {
         let settings = query_effective_settings(client);
-        if settings["searchPaths"] == json!([expected]) {
-            return settings;
-        }
-        std::thread::sleep(Duration::from_millis(100));
-    }
-    let settings = query_effective_settings(client);
-    assert_eq!(
-        settings["searchPaths"],
-        json!([expected]),
-        "{msg}: {settings}"
+        (settings["searchPaths"] == expected).then_some(settings)
+    });
+    assert!(
+        settled.is_some(),
+        "{msg}; last seen: {}",
+        query_effective_settings(client)["searchPaths"]
     );
-    settings
 }
 
-/// Removing the last workspace folder must not leave the session rootless.
+/// Removing the last workspace folder must not leave the session rootless when
+/// the client named another root.
 ///
-/// `initialize` walks `workspaceFolders` → `rootUri` → `rootPath` → process CWD
-/// to choose the configuration root. Emptying the folder list puts the session
-/// in exactly the state a client that never sent a folder starts in, so the same
-/// ladder has to answer — otherwise the project layer silently disappears and
-/// relative paths in the client layers lose the base they were anchored to.
+/// `initialize` walks `workspaceFolders` → `rootUri` → `rootPath`, and an empty
+/// folder list deliberately does not suppress those deprecated fields
+/// (`client_root`). Emptying the list through a notification reaches the same
+/// state, so the same rungs answer — otherwise the project layer silently
+/// disappears and relative paths in the client layers lose their base.
 #[test]
 fn test_removing_the_last_folder_falls_back_to_root_uri() {
     let folder_dir = project_dir("from-folder");
@@ -110,8 +123,111 @@ fn test_removing_the_last_folder_falls_back_to_root_uri() {
 
     poll_search_paths(
         &mut client,
-        "/from-root-uri",
+        json!(["/from-root-uri"]),
         "removing the last folder should fall back to the rootUri project config",
+    );
+}
+
+/// The common client shape: `rootUri` names the same directory as the only
+/// workspace folder (Neovim and single-folder VS Code both send this).
+///
+/// Removing that folder restores the root to the directory the client just
+/// closed, so its `kakehashi.toml` stays in effect. That follows from the rung
+/// order rather than being chosen for this case, and it matches `client_root`'s
+/// existing refusal to let an empty folder list suppress `rootUri` — pinned here
+/// because this shape is the one real clients produce.
+#[test]
+fn test_removing_the_last_folder_keeps_a_root_uri_that_names_it() {
+    let dir = project_dir("from-shared-root");
+
+    let mut client = LspClient::builder()
+        .env_remove("KAKEHASHI_DATA_DIR")
+        .build();
+    client.send_request(
+        "initialize",
+        json!({
+            "processId": std::process::id(),
+            "rootUri": uri_of(&dir),
+            "workspaceFolders": [folder(&dir, "root")],
+            "capabilities": {}
+        }),
+    );
+    client.send_notification("initialized", json!({}));
+    assert_eq!(
+        query_effective_settings(&mut client)["searchPaths"],
+        json!(["/from-shared-root"]),
+        "precondition"
+    );
+
+    // Repoint the config so the assertion below can only be satisfied by a
+    // reload that read this directory again, not by the settings already in
+    // effect.
+    write_marker(&dir, "from-shared-root-reloaded");
+    client.send_notification(
+        "workspace/didChangeWorkspaceFolders",
+        json!({
+            "event": {
+                "added": [],
+                "removed": [folder(&dir, "root")],
+            }
+        }),
+    );
+
+    poll_search_paths(
+        &mut client,
+        json!(["/from-shared-root-reloaded"]),
+        "a rootUri naming the removed folder keeps that directory as the root",
+    );
+}
+
+/// A client that named no root besides its folders gets no project layer when
+/// the last one goes — never the directory the server was launched from.
+///
+/// The working directory is `initialize`'s last resort so a session opened with
+/// no workspace can still find a configuration. Reaching it from a folder change
+/// would migrate an established session to whatever `kakehashi.toml` sits in the
+/// launch directory, which may name parser libraries to load.
+#[test]
+fn test_removing_the_last_folder_without_a_named_root_drops_the_project_layer() {
+    let folder_dir = project_dir("from-folder");
+    let launch_dir = project_dir("from-launch-dir");
+
+    let mut client = LspClient::builder()
+        .current_dir(launch_dir.path())
+        .env_remove("KAKEHASHI_DATA_DIR")
+        .build();
+    client.send_request(
+        "initialize",
+        json!({
+            "processId": std::process::id(),
+            "rootUri": null,
+            "workspaceFolders": [folder(&folder_dir, "folder")],
+            "capabilities": {}
+        }),
+    );
+    client.send_notification("initialized", json!({}));
+    assert_eq!(
+        query_effective_settings(&mut client)["searchPaths"],
+        json!(["/from-folder"]),
+        "precondition: the folder outranks the launch directory"
+    );
+
+    client.send_notification(
+        "workspace/didChangeWorkspaceFolders",
+        json!({
+            "event": {
+                "added": [],
+                "removed": [folder(&folder_dir, "folder")],
+            }
+        }),
+    );
+
+    // Back to the programmed default, which the launch directory's config would
+    // have replaced had the ladder reached it.
+    poll_search_paths(
+        &mut client,
+        json!(["${KAKEHASHI_DATA_DIR}"]),
+        "an unrooted session must not adopt the launch directory's config",
     );
 }
 
@@ -146,6 +262,11 @@ fn test_removing_a_non_primary_folder_keeps_the_root() {
         "precondition: the first folder is the configuration root: {settings}"
     );
 
+    // Repoint the primary's config before the change. Polling for the value
+    // already in effect would return on the first sample — passing even if the
+    // notification were dropped — so the reload has to produce a value that did
+    // not exist when it was sent.
+    write_marker(&primary, "from-primary-reloaded");
     client.send_notification(
         "workspace/didChangeWorkspaceFolders",
         json!({
@@ -156,15 +277,11 @@ fn test_removing_a_non_primary_folder_keeps_the_root() {
         }),
     );
 
-    // Nothing should change, so poll for the *stable* value rather than a
-    // transition: a wrong root would show up as `/from-secondary` or the
-    // programmed defaults.
-    let settings = poll_search_paths(
+    poll_search_paths(
         &mut client,
-        "/from-primary",
-        "removing a non-primary folder must not move the configuration root",
+        json!(["/from-primary-reloaded"]),
+        "removing a non-primary folder must reload from the unchanged primary root",
     );
-    assert_eq!(settings["searchPaths"], json!(["/from-primary"]));
 }
 
 /// Removing the primary folder promotes the next one in client order.
@@ -189,9 +306,8 @@ fn test_removing_the_primary_folder_promotes_the_next() {
         }),
     );
     client.send_notification("initialized", json!({}));
-    let settings = query_effective_settings(&mut client);
     assert_eq!(
-        settings["searchPaths"],
+        query_effective_settings(&mut client)["searchPaths"],
         json!(["/from-primary"]),
         "precondition"
     );
@@ -208,7 +324,7 @@ fn test_removing_the_primary_folder_promotes_the_next() {
 
     poll_search_paths(
         &mut client,
-        "/from-secondary",
+        json!(["/from-secondary"]),
         "removing the primary folder should promote the next one",
     );
 }
@@ -243,17 +359,13 @@ fn test_folder_change_preserves_client_layers() {
         "workspace/didChangeConfiguration",
         json!({ "settings": { "kakehashi": { "diagnosticsDebounceMs": 222 } } }),
     );
-    for _ in 0..20 {
-        if query_effective_settings(&mut client)["diagnosticsDebounceMs"] == json!(222) {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(100));
-    }
-    let settings = query_effective_settings(&mut client);
-    assert_eq!(
-        settings["diagnosticsDebounceMs"],
-        json!(222),
-        "precondition: the runtime layer outranks initializationOptions: {settings}"
+    let pushed = poll_until(20, 100, || {
+        let settings = query_effective_settings(&mut client);
+        (settings["diagnosticsDebounceMs"] == json!(222)).then_some(settings)
+    });
+    assert!(
+        pushed.is_some(),
+        "precondition: the runtime layer outranks initializationOptions"
     );
 
     client.send_notification(
@@ -266,11 +378,12 @@ fn test_folder_change_preserves_client_layers() {
         }),
     );
 
-    let settings = poll_search_paths(
+    poll_search_paths(
         &mut client,
-        "/from-secondary",
+        json!(["/from-secondary"]),
         "the project layer should follow the new root",
     );
+    let settings = query_effective_settings(&mut client);
     assert_eq!(
         settings["diagnosticsDebounceMs"],
         json!(222),
