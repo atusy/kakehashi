@@ -1011,70 +1011,50 @@ fn run_install(language: &str, force: bool, verbose: bool, no_cache: bool) -> Re
         ExitCode::FAILURE
     })?;
 
-    // Track success/failure for exit code
-    let mut parser_success = true;
-    let mut queries_success = true;
+    eprintln!("Installing '{}' to {:?}...", language, data_dir);
 
-    if let Err(e) = queries::clear_uninstall_tombstone_for_install(&data_dir, language) {
-        eprintln!("✗ Failed to prepare query installation: {}", e);
-        queries_success = false;
+    let result = kakehashi::install::install_language(
+        language,
+        &kakehashi::install::LanguageInstallOptions {
+            data_dir,
+            force,
+            verbose,
+            no_cache,
+            // The CLI runs from the kakehashi binary, so the killable subprocess path
+            // is available and a hung cc is deadline-bounded.
+            compile: parser::ParserCompile::KillableSubprocess,
+        },
+    );
+
+    if let Some(e) = &result.parser_error {
+        eprintln!("✗ Parser installation failed: {}", e);
+    }
+    if let Some(e) = &result.queries_error {
+        eprintln!("✗ Query installation failed: {}", e);
     }
 
-    // Install parser
-    eprintln!("Installing parser for '{}' to {:?}...", language, data_dir);
-
-    let options = parser::InstallOptions {
-        data_dir: data_dir.clone(),
-        force,
-        verbose,
-        no_cache,
-        // The CLI runs from the kakehashi binary, so the killable subprocess path
-        // is available and a hung cc is deadline-bounded.
-        compile: parser::ParserCompile::KillableSubprocess,
-    };
-
-    match parser::install_parser(language, &options) {
-        Ok(result) => {
-            eprintln!("✓ Parser installed: {}", result.install_path.display());
-            if verbose {
-                eprintln!("  Revision: {}", result.revision);
-            }
-        }
-        Err(e) => {
-            eprintln!("✗ Parser installation failed: {}", e);
-            parser_success = false;
-        }
+    if !result.is_success() {
+        // Both halves are staged before either is published, so a failure
+        // installed nothing — say so, rather than leaving the user to guess
+        // which half survived and whether a retry needs --force.
+        eprintln!(
+            "\nFailed to install '{}' language support. Nothing was installed; \
+             run the command again to retry.",
+            language
+        );
+        return Err(ExitCode::FAILURE);
     }
 
-    // Install queries (with inherited dependencies)
-    eprintln!("Installing queries for '{}' to {:?}...", language, data_dir);
-
-    match queries::install_queries_with_dependencies_after_install_started(
-        language, &data_dir, force,
-    ) {
-        Ok(result) => {
-            eprintln!("✓ Queries installed: {}", result.install_path.display());
-            if verbose {
-                eprintln!("  Files: {}", result.files_downloaded.join(", "));
-            }
-        }
-        Err(e) => {
-            eprintln!("✗ Query installation failed: {}", e);
-            queries_success = false;
-        }
+    // Paths are reported rather than "installed": either half may have already
+    // been present, in which case this run left it alone.
+    if let Some(path) = &result.parser_path {
+        eprintln!("✓ Parser: {}", path.display());
     }
-
-    // Summary
-    if parser_success && queries_success {
-        eprintln!("\nSuccessfully installed '{}' language support.", language);
-        Ok(())
-    } else if !parser_success && !queries_success {
-        eprintln!("\nFailed to install '{}' language support.", language);
-        Err(ExitCode::FAILURE)
-    } else {
-        eprintln!("\nPartially installed '{}' language support.", language);
-        Err(ExitCode::FAILURE)
+    if let Some(path) = &result.queries_path {
+        eprintln!("✓ Queries: {}", path.display());
     }
+    eprintln!("\nSuccessfully installed '{}' language support.", language);
+    Ok(())
 }
 
 /// Run the hidden `__compile-parser` subprocess entry: compile one grammar
