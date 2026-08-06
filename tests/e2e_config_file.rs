@@ -802,17 +802,15 @@ fn test_config_file_language_servers_with_init_options_partial_override() {
         .env_remove("KAKEHASHI_DATA_DIR")
         .build();
 
-    // Note: BridgeServerConfig requires that both `cmd` and `languages` be present in the
-    // JSON for deserialization (they are not `Option` and have no `#[serde(default)]`).
-    // We pass `languages: []` so deserialization succeeds; the merge logic then keeps the
-    // config file's non-empty `languages` because the overlay's is empty.
+    // Omitting `languages` is what inherits the config file's list. Writing
+    // `[]` would say this server handles nothing, which the sibling test below
+    // pins.
     let settings = get_effective_settings_with_init_options(
         &mut client,
         json!({
             "languageServers": {
                 "myserver": {
-                    "cmd": ["new-cmd"],
-                    "languages": []
+                    "cmd": ["new-cmd"]
                 }
             }
         }),
@@ -828,7 +826,44 @@ fn test_config_file_language_servers_with_init_options_partial_override() {
     assert_eq!(
         myserver["languages"],
         json!(["rust"]),
-        "languages should be inherited from config file (overlay was empty)"
+        "languages should be inherited from the config file (the overlay omitted it)"
+    );
+}
+
+/// The other half of the rule the test above relies on: an overlay that writes
+/// an empty `languages` has said the server handles nothing, so the config
+/// file's list is replaced rather than inherited.
+#[test]
+fn test_config_file_language_servers_empty_languages_overrides_rather_than_inherits() {
+    let dir = TempDir::new().unwrap();
+    let config = dir.path().join("kakehashi.toml");
+    std::fs::write(
+        &config,
+        "[languageServers.myserver]\ncmd = [\"old-cmd\"]\nlanguages = [\"rust\"]\n",
+    )
+    .unwrap();
+
+    let mut client = LspClient::builder()
+        .arg("--config-file")
+        .arg(config.to_str().unwrap())
+        .env_remove("KAKEHASHI_DATA_DIR")
+        .build();
+
+    let settings = get_effective_settings_with_init_options(
+        &mut client,
+        json!({
+            "languageServers": {
+                "myserver": {
+                    "languages": []
+                }
+            }
+        }),
+    );
+
+    assert_eq!(
+        settings["languageServers"]["myserver"]["languages"],
+        json!([]),
+        "an explicitly empty languages list must not fall back to the config file's"
     );
 }
 

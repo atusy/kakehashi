@@ -1927,8 +1927,8 @@ mod tests {
         ResolvedServerConfig {
             server_name: name.to_string(),
             config: Arc::new(crate::config::settings::BridgeServerConfig {
-                cmd: vec![name.to_string()],
-                languages: vec![],
+                cmd: Some(vec![name.to_string()]),
+                languages: None,
                 initialization_options: None,
                 workspace_markers: None,
                 on_type_formatting_triggers: None,

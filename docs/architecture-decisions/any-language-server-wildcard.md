@@ -31,19 +31,22 @@ appears in a document.
 
 The obvious spellings for "any" are already taken:
 
-- **`languages = []`** — `merge_bridge_server_configs`
-  (`src/config/merge.rs`) treats an empty overlay list as "not specified here",
-  which resolves to the same server's entry in a lower config layer, or failing
-  that to the `_` entry (wildcard-config-inheritance).
-- **`languages` omitted** — `#[serde(default)]` on `Vec<String>` produces that
-  same empty vec, so it lands on the identical inherit path. (`null` is not a
-  third spelling: TOML has no `null`, and an explicit JSON `null` from
-  `initializationOptions` fails to deserialize into `Vec<String>` rather than
-  defaulting — the field is neither `Option` nor `default_on_null`.)
+- **`languages` omitted** — resolves to the same server's entry in a lower
+  config layer, or failing that to the `_` entry
+  (wildcard-config-inheritance). (`null` is a synonym for omission: the field is
+  `Option`, so an explicit JSON `null` from `initializationOptions`
+  deserializes to `None`. TOML has no `null`.)
+- **`languages = []`** — states that the server handles nothing, and defers to
+  no one.
 
-Both therefore mean *defer*. A concrete server has no way to **widen** past an
-inherited narrow list — only to accept it. That is precisely the gap a
-language-agnostic server needs to fill.
+Neither can *widen*: omitting accepts whatever was inherited, and an empty list
+narrows to nothing. A concrete server has no way to widen past an inherited
+narrow list. That is precisely the gap a language-agnostic server needs to fill.
+
+> Originally both spellings meant *defer*, because the field was a bare `Vec`
+> that could not distinguish them. Splitting them (#949) did not change this
+> decision — it removed one of the two candidate spellings for "any" rather
+> than freeing it.
 
 ## Decision Drivers
 
@@ -74,15 +77,20 @@ languages = ["*"]
 | `["rust"]` | matches rust only |
 | `["*"]` | matches every language |
 | `["rust", "*"]` | matches every language — membership has no ordering, so the named entry is redundant, not restrictive |
-| `[]` / omitted | **not specified at this layer** (unchanged) — see below |
+| omitted | **not specified at this layer** (unchanged) — see below |
+| `[]` | **handles nothing** — states it, does not defer |
 
-An empty or omitted `languages` is more precisely "absent at this layer" than
+An *omitted* `languages` is more precisely "absent at this layer" than
 "inherit from `_`". Config layers (defaults < user < project <
 `initializationOptions`) collapse *before* the `_` entry is resolved, and the
-same emptiness rule drives both steps — so `checker.languages = []` in a
+same rule drives both steps — so a `checker` entry that omits `languages` in a
 project config first takes the user config's `checker.languages`, and only
 falls through to `languageServers._` when no layer specified it. A lower
 layer's concrete list therefore beats a higher layer's `_` wildcard.
+
+An *empty* one is absent at no layer: `checker.languages = []` in the project
+config states that the server handles nothing, and neither the user config nor
+`_` is consulted.
 
 - Resolved at **match time** (`handles_language`), not expanded during config
   merging. "Every language" is an open set with no static enumeration.
@@ -191,11 +199,12 @@ the other is harder to document than the `_self` gate that already exists.
   resolved at match time, so a `_` wildcard in the user config also widens
   servers declared in a project's config. Documented with a recommendation to
   declare `"*"` on concrete servers instead.
-- **Opting a single server back out is not spellable in `languages`.** `[]`
-  means "not specified here", so it lands on the same server's list from a
-  lower config layer, or on the `_` wildcard when no layer supplied one —
-  either way not "nothing". The escape hatch is `enabled = false` (which the
-  selection sites check first, via `is_spawnable`). Narrowing to a real language list does work — a concrete
+- **Opting a single server back out is `enabled = false` or `languages = []`.**
+  Both say "nothing"; the first also stops the server from being spawned at all,
+  and the selection sites check it first via `is_spawnable`. Omitting
+  `languages` is the one spelling that does *not* opt out — it lands on the same
+  server's list from a lower config layer, or on the `_` wildcard when no layer
+  supplied one. Narrowing to a real language list works too: a concrete
   non-empty `languages` overrides the wildcard.
 - **Cost scales with injection *regions*, not with languages — and that is a
   much bigger number than it sounds.** The process count does not grow at all:
@@ -266,12 +275,10 @@ the other is harder to document than the `_self` gate that already exists.
 
 ### A. `languages = []` means "any"
 
-**Rejected because**: already means "not specified at this layer"
-(`merge_bridge_server_configs`), which resolves to a lower layer's list for the
-same server, or to the `_` entry. Redefining it would silently convert every
-server that currently defers — to either source — into an attach-to-everything
-server. Secondary: a multi-line list whose entries are all commented out
-collapses to `[]`, so the intent would be unrecoverable from the text.
+**Rejected because**: a multi-line list whose entries are all commented out
+collapses to `[]`, so "any" would be unrecoverable from the text — the reading
+most likely to be reached by accident would be the widest one. `[]` has since
+been given the opposite meaning ("handles nothing", #949), which settles it.
 
 ### B. `languages` omitted means "any"
 

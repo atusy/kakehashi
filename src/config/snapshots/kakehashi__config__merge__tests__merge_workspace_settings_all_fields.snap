@@ -1,5 +1,6 @@
 ---
 source: src/config/merge.rs
+assertion_line: 871
 expression: result
 ---
 {
@@ -62,14 +63,12 @@ expression: result
     "lua": {
       "highlights": {
         "keyword": "base.keyword"
-      },
-      "folds": {}
+      }
     },
     "rust": {
       "highlights": {
         "type.builtin": "rust.type"
-      },
-      "folds": {}
+      }
     }
   },
   "autoInstall": false,

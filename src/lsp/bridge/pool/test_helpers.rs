@@ -48,8 +48,8 @@ pub(in crate::lsp::bridge) fn is_lua_ls_available() -> bool {
 /// Create a BridgeServerConfig for lua-language-server.
 pub(in crate::lsp::bridge) fn lua_ls_config() -> BridgeServerConfig {
     BridgeServerConfig {
-        cmd: vec!["lua-language-server".to_string()],
-        languages: vec!["lua".to_string()],
+        cmd: Some(vec!["lua-language-server".to_string()]),
+        languages: Some(vec!["lua".to_string()]),
         initialization_options: None,
         workspace_markers: None,
         on_type_formatting_triggers: None,
@@ -68,12 +68,12 @@ pub(in crate::lsp::bridge) fn devnull_config() -> BridgeServerConfig {
 /// Create a BridgeServerConfig for a mock server with a specific language.
 pub(in crate::lsp::bridge) fn devnull_config_for_language(language: &str) -> BridgeServerConfig {
     BridgeServerConfig {
-        cmd: vec![
+        cmd: Some(vec![
             "sh".to_string(),
             "-c".to_string(),
             "cat > /dev/null".to_string(),
-        ],
-        languages: vec![language.to_string()],
+        ]),
+        languages: Some(vec![language.to_string()]),
         initialization_options: None,
         workspace_markers: None,
         on_type_formatting_triggers: None,

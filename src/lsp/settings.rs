@@ -422,6 +422,67 @@ pub fn load_settings(
     }
 }
 
+/// Report settings written as an explicitly empty container, where that used to
+/// mean something else.
+///
+/// Two spellings changed meaning at once:
+///
+/// - an empty `cmd` or `languages` used to defer to the `_` wildcard's list;
+///   it now says the entry has none, and omitting the key is what inherits;
+/// - an empty `captureMappings`, `highlights`, or `folds` used to be a no-op —
+///   the merge only extended — and now clears the layer below, which for a
+///   top-level `captureMappings = {}` means every built-in mapping.
+///
+/// A configuration written against either old rule still parses and silently
+/// changes behavior, so name what is affected rather than leaving the user to
+/// discover it through missing highlights or an unused server.
+///
+/// The `_` entry is reported like any other: an empty list there clears a lower
+/// layer's wildcard, which is exactly the kind of change worth naming.
+///
+/// Callers pass the layer the user just wrote, not the merged result — an
+/// inherited `[]` would otherwise be re-announced on every configuration push.
+/// The notice is shown once per session (see
+/// `SettingsManager::claim_empty_container_migration_warning`), because the
+/// spelling it names is also the one the documentation now recommends for
+/// "this entry has none": worth explaining once, not worth nagging about.
+pub(crate) fn emptied_container_notice(settings: Option<&RawWorkspaceSettings>) -> Option<String> {
+    let settings = settings?;
+    let mut named: Vec<String> = Vec::new();
+
+    if let Some(servers) = settings.language_servers.as_ref() {
+        named.extend(
+            servers
+                .iter()
+                .filter(|(_, config)| {
+                    config.cmd.as_ref().is_some_and(Vec::is_empty)
+                        || config.languages.as_ref().is_some_and(Vec::is_empty)
+                })
+                .map(|(name, _)| format!("languageServers.{name}")),
+        );
+    }
+
+    match settings.capture_mappings.as_ref() {
+        Some(mappings) if mappings.is_empty() => named.push("captureMappings".to_string()),
+        Some(mappings) => named.extend(mappings.iter().filter_map(|(lang, entry)| {
+            let cleared = entry.highlights.as_ref().is_some_and(|m| m.is_empty())
+                || entry.folds.as_ref().is_some_and(|m| m.is_empty());
+            cleared.then(|| format!("captureMappings.{lang}"))
+        })),
+        None => {}
+    }
+
+    if named.is_empty() {
+        return None;
+    }
+    named.sort_unstable();
+    Some(format!(
+        "kakehashi: an empty list or map now clears the layer below rather than \
+         deferring to it — omit the key to inherit. Affected: {}",
+        named.join(", ")
+    ))
+}
+
 /// Expand and validate the fully merged configuration, `initializationOptions`
 /// included.
 ///
@@ -837,6 +898,40 @@ mod tests {
     /// directory, and one with no parent at all is an error rather than a base
     /// of "nowhere" — otherwise an unanchored layer would be indistinguishable
     /// from a successfully anchored one.
+    #[test]
+    fn emptied_containers_are_named_in_the_migration_notice() {
+        let settings: RawWorkspaceSettings = toml::from_str(
+            r#"
+            [languageServers.declines]
+            cmd = []
+
+            [languageServers.silent]
+            languages = []
+
+            [languageServers.fine]
+            cmd = ["real-server"]
+        "#,
+        )
+        .expect("should parse");
+
+        let message = emptied_container_notice(Some(&settings)).expect("a notice");
+        assert!(message.contains("declines"), "{message}");
+        assert!(message.contains("silent"), "{message}");
+        assert!(!message.contains("fine"), "{message}");
+
+        let inheriting: RawWorkspaceSettings = toml::from_str(
+            r#"
+            [languageServers.inherits]
+            enabled = true
+        "#,
+        )
+        .expect("should parse");
+        assert!(
+            emptied_container_notice(Some(&inheriting)).is_none(),
+            "omitting the keys is the inheriting spelling and must stay quiet"
+        );
+    }
+
     #[test]
     fn config_file_base_resolves_a_bare_filename_and_rejects_a_parentless_path() {
         let cwd = std::env::current_dir().expect("a working directory");

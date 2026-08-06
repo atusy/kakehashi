@@ -551,12 +551,12 @@ mod tests {
         language_servers.insert(
             "rust-bridge".to_string(),
             BridgeServerConfig {
-                cmd: vec![
+                cmd: Some(vec![
                     "sh".to_string(),
                     "-c".to_string(),
                     "cat > /dev/null".to_string(),
-                ],
-                languages: vec!["rust".to_string()],
+                ]),
+                languages: Some(vec!["rust".to_string()]),
                 initialization_options: None,
                 workspace_markers: None,
                 on_type_formatting_triggers: None,
@@ -645,12 +645,12 @@ print("hello")
             BridgeServerConfig {
                 // Inert: the caller pre-inserts a Ready handle via
                 // `insert_ready_test_connection`, so this cmd is never spawned.
-                cmd: vec![
+                cmd: Some(vec![
                     "sh".to_string(),
                     "-c".to_string(),
                     "cat > /dev/null".to_string(),
-                ],
-                languages: vec!["rust".to_string()],
+                ]),
+                languages: Some(vec!["rust".to_string()]),
                 initialization_options: None,
                 workspace_markers: None,
                 on_type_formatting_triggers: None,

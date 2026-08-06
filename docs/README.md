@@ -394,6 +394,30 @@ Use `base` when one language should reuse another language's parser, queries, an
 }
 ```
 
+### Omitted, empty, and non-empty
+
+Every map- or list-**valued** setting reads the same three ways, whichever layer
+it comes from:
+
+| | omitted | empty (`{}` / `[]`) | non-empty |
+|---|---|---|---|
+| map | inherit the layer below | **clear** it | merge per key |
+| list | inherit the layer below | **clear** it | replace wholesale |
+
+So `queries = []`, `bridge = {}`, `languageServers = {}`, `cmd = []`, and
+`captureMappings = {}` all mean "none", while leaving the key out means "I have
+nothing to say about this — keep what the layer below decided". Removing a key
+never removes a value: to override one, write the value you want (see the
+`workspace/didChangeConfiguration` notes above).
+
+An *entry* is not a container: `[captureMappings.rust]` or `[languageServers.foo]`
+with no keys under it sets no field, so it inherits rather than clears. Clear a
+field, not the table — `[captureMappings.rust] highlights = {}`.
+
+Two settings stand outside this: the top-level `languages` map still ignores
+`{}` (it has no clear spelling yet), and `captureMappings` is additive per
+capture name rather than per language — see below.
+
 For `rmd`, kakehashi will try `rmd`-specific parser/query settings first and fall back through `markdown` and then `_`. Fields set on the derived language override inherited fields. Omitted fields inherit from the base chain; `queries: []` and `bridge: {}` explicitly clear inherited query and bridge settings.
 
 Set `base` to the same language name to make a self-contained language that does not inherit from `_`:
@@ -512,11 +536,11 @@ languages = ["*"]
 ```
 
 `"*"` is a list element for the same reason `priorities` uses one: `_` keys
-carry field-level inheritance, list elements do not. Note that an **empty or
-omitted** `languages` does *not* mean "any" — it means "not specified here", so
-it falls through to the same server's entry in a lower config layer and, only
-if no layer specified one, to the `_` entry (wildcard-config-inheritance).
-Either way it can only ever *defer*, which is why widening needs its own
+carry field-level inheritance, list elements do not. Note that neither spelling
+of "nothing" means "any": an **omitted** `languages` falls through to the same
+server's entry in a lower config layer and, only if no layer specified one, to
+the `_` entry (wildcard-config-inheritance), while an **empty** one says the
+server handles nothing and defers to no one. Widening therefore needs its own
 marker. Keeping it in the list also leaves room for future set algebra such as
 an `"!markdown"` exclusion.
 
@@ -557,12 +581,15 @@ config *files*: layers collapse before the `_` entry is resolved, so a `_`
 wildcard in your user config widens servers declared in any project's config
 too — servers you never saw when you wrote it.
 
-Opting a single server back out is `enabled = false`, not an empty
-`languages`: `[]` means "not specified here", so it resolves to whatever the
-next source supplies — that same server's list from a lower config layer if it
-has one, and otherwise the `_` wildcard, i.e. right back to `["*"]`. A concrete
-server's own non-empty `languages` does override the wildcard, so listing real
-languages narrows it as expected.
+Opting a single server back out is `enabled = false` or an empty `languages`:
+`[]` says the server handles nothing, and — unlike omitting the key, which
+inherits the next source's list and ultimately the `_` wildcard's `["*"]` — it
+does not fall back. A concrete server's own non-empty `languages` overrides the
+wildcard, so listing real languages narrows it as expected.
+
+> **Changed:** `[]` used to mean "not specified here" and inherited. Configs
+> written against that rule still parse, so kakehashi names the affected
+> servers in a warning when it loads them.
 
 **Bridge Language Configuration:**
 

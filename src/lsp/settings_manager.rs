@@ -70,6 +70,10 @@ pub(crate) struct SettingsManager {
     /// payload has been warned about. Unlike `rootMarkers`, this applies only to
     /// client-pushed runtime settings, not initializationOptions or TOML files.
     unwrapped_didchange_deprecation_warned: AtomicBool,
+    /// Latches once the empty-container migration notice has been shown. The
+    /// spelling it explains is legitimate under the current rule, so it is
+    /// announced once and then left alone.
+    empty_container_migration_warned: AtomicBool,
 }
 
 impl std::fmt::Debug for SettingsManager {
@@ -118,6 +122,7 @@ impl SettingsManager {
             root_markers_deprecation_warned: AtomicBool::new(false),
             auto_install_deprecation_warned: AtomicBool::new(false),
             unwrapped_didchange_deprecation_warned: AtomicBool::new(false),
+            empty_container_migration_warned: AtomicBool::new(false),
         }
     }
 
@@ -146,6 +151,13 @@ impl SettingsManager {
     pub(crate) fn claim_unwrapped_didchange_deprecation_warning(&self) -> bool {
         !self
             .unwrapped_didchange_deprecation_warned
+            .swap(true, Ordering::Relaxed)
+    }
+
+    /// Claim the one-per-session slot for the empty-container migration notice.
+    pub(crate) fn claim_empty_container_migration_warning(&self) -> bool {
+        !self
+            .empty_container_migration_warned
             .swap(true, Ordering::Relaxed)
     }
 

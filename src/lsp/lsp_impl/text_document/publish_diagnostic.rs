@@ -249,8 +249,8 @@ mod tests {
             configs: vec![ResolvedServerConfig {
                 server_name: server.to_string(),
                 config: Arc::new(BridgeServerConfig {
-                    cmd: vec![server.to_string()],
-                    languages: vec![],
+                    cmd: Some(vec![server.to_string()]),
+                    languages: None,
                     initialization_options: None,
                     workspace_markers: None,
                     on_type_formatting_triggers: None,

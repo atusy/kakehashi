@@ -687,8 +687,8 @@ mod tests {
         cmd: &str,
     ) {
         let config = crate::config::settings::BridgeServerConfig {
-            cmd: vec![cmd.to_string()],
-            languages: vec!["*".to_string()],
+            cmd: Some(vec![cmd.to_string()]),
+            languages: Some(vec!["*".to_string()]),
             ..Default::default()
         };
         pool.insert_connection(
@@ -957,8 +957,8 @@ mod tests {
             settings.language_servers.insert(
                 (*name).to_string(),
                 crate::config::settings::BridgeServerConfig {
-                    cmd: vec!["true".to_string()],
-                    languages: vec!["*".to_string()],
+                    cmd: Some(vec!["true".to_string()]),
+                    languages: Some(vec!["*".to_string()]),
                     ..Default::default()
                 },
             );

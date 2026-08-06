@@ -100,6 +100,24 @@ exhaustively, so a new field on either fails to compile until it is classified;
 a new *top-level* path field is not covered, since `searchPaths` reaches the
 walk as a parameter.
 
+Omitted, empty, and non-empty are three distinct statements for a map- or
+list-valued setting: omitted inherits the layer below, an explicit empty
+container clears it, and a non-empty one merges per key (maps) or replaces
+wholesale (lists). Expressing that requires the field to be `Option`-typed —
+`#[serde(default)]` on a bare `HashMap`/`Vec` cannot tell an omitted key from an
+empty one.
+
+Two consequences worth stating. A *serializing* field also needs
+`skip_serializing_if`, so a config written back out does not gain an empty
+container that reads as a clear when it is loaded again — the template `config
+init` emits is the case that matters. And an *entry* is not a container: a table
+with no fields set inherits field by field, so clearing means writing an empty
+value for the field, not an empty table.
+
+The top-level `languages` map is the one map-valued setting still outside this;
+it has no clear spelling, which is bound up with the separate question of
+disabling a language outright.
+
 Bases per layer: a config file uses its own directory (each `--config-file`
 layer its own), `initializationOptions` and `didChangeConfiguration` use the
 workspace root, and the programmed defaults have no base. That root is not
@@ -376,7 +394,7 @@ fn load_settings(root, override_settings, home, env_fn, explicit) -> SettingsLoa
 
 - **Complexity increase**: Four config sources to understand and debug
 - **Arrays replace, not merge**: `queries` arrays are replaced entirely, not concatenated; overriding one query type requires repeating all
-- **No "unset" mechanism**: Cannot explicitly remove a field inherited from earlier layers (would need `null` support)
+- **No "unset" mechanism for scalars**: a later layer can override a scalar but not return it to unset. Map- and list-valued settings do have one — an explicit empty container clears the layer below (see the merge algorithm above).
 - **File I/O at startup**: Reading the config files adds latency (minimal in practice) — two implicit files, or however many `--config-file` arguments were given
 - **Relative paths changed meaning**: a relative value in an existing config file now resolves against that file's directory rather than wherever the server happened to be launched. Intended (it is the point of the change), but it silently relocates a user config written to be per-project — most visibly a `searchPaths` entry, whose misses are logged at debug level rather than as an error
 - **Infrastructure-integration gap**: Phases 1-3 (Sprints 118-120) built infrastructure (schema, merging, user config loading) but delivered ZERO user value until Sprint 124 wired APIs into application. Lesson: infrastructure sprints must be followed by integration sprints within 1-2 sprints to realize value.

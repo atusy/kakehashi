@@ -183,6 +183,17 @@ impl Kakehashi {
         let _ =
             crate::config::paths::anchor_settings_paths(&mut parsed, root_path.as_ref().as_deref());
 
+        // Checked on the pushed layer, not the merge below: an empty container
+        // inherited from a file layer would otherwise be re-announced on every
+        // push. Latched session-wide, like the deprecated-key notices.
+        if let Some(notice) = crate::lsp::settings::emptied_container_notice(Some(&parsed))
+            && self
+                .settings_manager
+                .claim_empty_container_migration_warning()
+        {
+            self.notifier().show_warning(notice).await;
+        }
+
         // Merge onto current effective settings (not from scratch).
         // The current settings already reflect defaults < user < project < initializationOptions,
         // so merging preserves languages and other fields set during initialize.

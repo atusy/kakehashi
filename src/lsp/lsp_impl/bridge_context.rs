@@ -549,12 +549,22 @@ pub(crate) fn concatenated_formatting_pairs(settings: &WorkspaceSettings) -> Vec
 ///
 /// A server that resolves to `enabled: false` is excluded even if its `cmd`
 /// is also empty: disabling a server is a deliberate choice, not the
-/// misconfiguration this warning exists to surface.
+/// misconfiguration this warning exists to surface. A server that WRITES
+/// `cmd = []` is excluded for the same reason — that spelling now says the
+/// entry has none, so it is a statement rather than an omission. What remains
+/// worth naming is a server that said nothing about `cmd` and found nothing to
+/// inherit.
 pub(crate) fn unspawnable_language_servers(settings: &WorkspaceSettings) -> Vec<String> {
     let servers = &settings.language_servers;
     let mut names: Vec<String> = servers
-        .keys()
-        .filter(|name| *name != crate::config::WILDCARD_KEY)
+        .iter()
+        .filter(|(name, _)| name.as_str() != crate::config::WILDCARD_KEY)
+        .filter(|(_, config)| {
+            // Written as `cmd = []`: the entry says it has none, which is a
+            // statement, not the omission this warning exists to surface.
+            !config.cmd.as_ref().is_some_and(Vec::is_empty)
+        })
+        .map(|(name, _)| name)
         .filter(|name| {
             crate::config::resolve_with_wildcard(
                 servers,
@@ -563,7 +573,7 @@ pub(crate) fn unspawnable_language_servers(settings: &WorkspaceSettings) -> Vec<
             )
             // A deliberately disabled server is not a misconfiguration —
             // don't warn about its missing cmd.
-            .is_none_or(|config| config.cmd.is_empty() && config.is_enabled())
+            .is_none_or(|config| config.cmd().is_empty() && config.is_enabled())
         })
         .cloned()
         .collect();
@@ -1621,10 +1631,21 @@ mod tests {
         }
     }
 
+    /// A server that says nothing about `cmd` — the spelling that inherits, and
+    /// the only one this warning is about.
+    fn cmd_unspecified() -> crate::config::settings::BridgeServerConfig {
+        crate::config::settings::BridgeServerConfig {
+            cmd: None,
+            ..server(&[])
+        }
+    }
+
+    /// A server that writes `cmd` explicitly — an empty slice means "this
+    /// server has no command", which no longer inherits the wildcard's.
     fn server(cmd: &[&str]) -> crate::config::settings::BridgeServerConfig {
         crate::config::settings::BridgeServerConfig {
-            cmd: cmd.iter().map(|s| s.to_string()).collect(),
-            languages: vec!["lua".to_string()],
+            cmd: Some(cmd.iter().map(|s| s.to_string()).collect()),
+            languages: Some(vec!["lua".to_string()]),
             initialization_options: None,
             workspace_markers: None,
             on_type_formatting_triggers: None,
@@ -1638,10 +1659,10 @@ mod tests {
     fn unspawnable_language_servers_flags_empty_cmd_but_not_wildcard() {
         let mut settings = settings_with(HashMap::new());
         settings.language_servers = HashMap::from([
-            ("_".to_string(), server(&[])), // defaults-only entry: never flagged
+            ("_".to_string(), cmd_unspecified()), // defaults-only entry: never flagged
             ("good".to_string(), server(&["lua-language-server"])),
-            ("broken".to_string(), server(&[])),
-            ("also-broken".to_string(), server(&[])),
+            ("broken".to_string(), cmd_unspecified()),
+            ("also-broken".to_string(), cmd_unspecified()),
         ]);
 
         assert_eq!(
@@ -1653,14 +1674,32 @@ mod tests {
     #[test]
     fn unspawnable_language_servers_honors_cmd_inherited_from_wildcard() {
         let mut settings = settings_with(HashMap::new());
+        let mut inherits_cmd = server(&[]);
+        // Omitted, not empty: that is what inherits.
+        inherits_cmd.cmd = None;
         settings.language_servers = HashMap::from([
             ("_".to_string(), server(&["shared-ls", "--stdio"])),
-            ("inherits-cmd".to_string(), server(&[])),
+            ("inherits-cmd".to_string(), inherits_cmd),
         ]);
 
         assert!(
             unspawnable_language_servers(&settings).is_empty(),
             "cmd supplied by the '_' wildcard makes the entry spawnable"
+        );
+    }
+
+    #[test]
+    fn unspawnable_language_servers_excludes_an_explicitly_empty_cmd() {
+        let mut settings = settings_with(HashMap::new());
+        settings.language_servers = HashMap::from([
+            ("_".to_string(), server(&["shared-ls", "--stdio"])),
+            ("declines".to_string(), server(&[])),
+        ]);
+
+        assert!(
+            unspawnable_language_servers(&settings).is_empty(),
+            "`cmd = []` states that the entry has none — a deliberate choice, \
+             like `enabled = false`, not the omission this warning surfaces"
         );
     }
 
@@ -1673,9 +1712,9 @@ mod tests {
         let mut disabled = server(&["lua-language-server"]);
         disabled.enabled = Some(false);
         settings.language_servers = HashMap::from([
-            ("_".to_string(), server(&[])),
+            ("_".to_string(), cmd_unspecified()),
             ("disabled".to_string(), disabled),
-            ("broken".to_string(), server(&[])),
+            ("broken".to_string(), cmd_unspecified()),
         ]);
 
         assert_eq!(
@@ -1691,12 +1730,12 @@ mod tests {
         // a placeholder entry the user hasn't filled in yet, or one they
         // turned off without deleting). Must not be flagged either.
         let mut settings = settings_with(HashMap::new());
-        let mut disabled = server(&[]);
+        let mut disabled = cmd_unspecified();
         disabled.enabled = Some(false);
         settings.language_servers = HashMap::from([
-            ("_".to_string(), server(&[])),
+            ("_".to_string(), cmd_unspecified()),
             ("disabled".to_string(), disabled),
-            ("broken".to_string(), server(&[])),
+            ("broken".to_string(), cmd_unspecified()),
         ]);
 
         assert_eq!(

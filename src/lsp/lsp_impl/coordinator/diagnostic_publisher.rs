@@ -1637,8 +1637,8 @@ mod tests {
         (
             "rust_ls".to_string(),
             BridgeServerConfig {
-                cmd: vec!["true".to_string()],
-                languages: vec!["rust".to_string()],
+                cmd: Some(vec!["true".to_string()]),
+                languages: Some(vec!["rust".to_string()]),
                 initialization_options: None,
                 workspace_markers: None,
                 on_type_formatting_triggers: None,
@@ -1748,7 +1748,7 @@ mod tests {
         settings.language_servers.insert(
             "sql_ls".to_string(),
             BridgeServerConfig {
-                cmd: vec!["sql-ls".to_string()],
+                cmd: Some(vec!["sql-ls".to_string()]),
                 enabled: Some(false),
                 ..Default::default()
             },
@@ -2479,7 +2479,7 @@ mod tests {
         settings.language_servers.insert(
             "lua_ls".to_string(),
             BridgeServerConfig {
-                cmd: vec!["lua-language-server".to_string()],
+                cmd: Some(vec!["lua-language-server".to_string()]),
                 ..Default::default()
             },
         );

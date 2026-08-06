@@ -1412,7 +1412,7 @@ mod tests {
         settings.language_servers.insert(
             crate::config::WILDCARD_KEY.to_string(),
             BridgeServerConfig {
-                cmd: vec!["shared-server".into()],
+                cmd: Some(vec!["shared-server".into()]),
                 ..Default::default()
             },
         );
@@ -1522,8 +1522,8 @@ mod tests {
         servers.insert(
             "rust-analyzer".to_string(),
             BridgeServerConfig {
-                cmd: vec!["rust-analyzer".to_string()],
-                languages: vec!["rust".to_string()],
+                cmd: Some(vec!["rust-analyzer".to_string()]),
+                languages: Some(vec!["rust".to_string()]),
                 initialization_options: None,
                 workspace_markers: None,
                 on_type_formatting_triggers: None,
@@ -1554,8 +1554,8 @@ mod tests {
     fn host_language_can_reach_server_screens_on_configuration_alone() {
         let coordinator = BridgeCoordinator::new();
         let server = |language: &str| BridgeServerConfig {
-            cmd: vec!["x".to_string()],
-            languages: vec![language.to_string()],
+            cmd: Some(vec!["x".to_string()]),
+            languages: Some(vec![language.to_string()]),
             initialization_options: None,
             workspace_markers: None,
             on_type_formatting_triggers: None,
@@ -1605,8 +1605,8 @@ mod tests {
         servers.insert(
             crate::config::WILDCARD_KEY.to_string(),
             BridgeServerConfig {
-                cmd: Vec::new(),
-                languages: vec!["*".to_string()],
+                cmd: None,
+                languages: Some(vec!["*".to_string()]),
                 initialization_options: None,
                 workspace_markers: None,
                 on_type_formatting_triggers: None,
@@ -1618,9 +1618,9 @@ mod tests {
         servers.insert(
             "harper-ls".to_string(),
             BridgeServerConfig {
-                cmd: vec!["harper-ls".to_string()],
+                cmd: Some(vec!["harper-ls".to_string()]),
                 // Deliberately omitted in TOML → empty here, inherited from `_`.
-                languages: Vec::new(),
+                languages: None,
                 initialization_options: None,
                 workspace_markers: None,
                 on_type_formatting_triggers: None,
@@ -1677,8 +1677,8 @@ mod tests {
         servers.insert(
             "ruff".to_string(),
             BridgeServerConfig {
-                cmd: vec!["ruff".to_string()],
-                languages: vec!["python".to_string()],
+                cmd: Some(vec!["ruff".to_string()]),
+                languages: Some(vec!["python".to_string()]),
                 initialization_options: None,
                 workspace_markers: None,
                 on_type_formatting_triggers: None,
@@ -1725,8 +1725,8 @@ mod tests {
             },
         );
         let server = |cmd: &str| BridgeServerConfig {
-            cmd: vec![cmd.to_string()],
-            languages: vec!["python".to_string()],
+            cmd: Some(vec![cmd.to_string()]),
+            languages: Some(vec!["python".to_string()]),
             initialization_options: None,
             workspace_markers: None,
             on_type_formatting_triggers: None,
@@ -1756,7 +1756,7 @@ mod tests {
             assert_eq!(kept.len(), 1, "{name} must self-heal its python injection");
             assert_eq!(
                 config.expect("config for matched server").cmd,
-                vec![cmd.to_string()]
+                Some(vec![cmd.to_string()])
             );
         }
 
@@ -1890,8 +1890,8 @@ mod tests {
         servers.insert(
             "rust-analyzer".to_string(),
             BridgeServerConfig {
-                cmd: vec!["rust-analyzer".to_string()],
-                languages: vec!["rust".to_string()],
+                cmd: Some(vec!["rust-analyzer".to_string()]),
+                languages: Some(vec!["rust".to_string()]),
                 initialization_options: None,
                 workspace_markers: None,
                 on_type_formatting_triggers: None,
@@ -1916,7 +1916,7 @@ mod tests {
             "rust should be allowed when no filter is set"
         );
         assert_eq!(result[0].server_name, "rust-analyzer");
-        assert_eq!(result[0].config.cmd, vec!["rust-analyzer".to_string()]);
+        assert_eq!(result[0].config.cmd(), ["rust-analyzer".to_string()]);
     }
 
     #[test]
@@ -1930,8 +1930,8 @@ mod tests {
         servers.insert(
             "_".to_string(),
             BridgeServerConfig {
-                cmd: vec![],
-                languages: vec!["rust".to_string()],
+                cmd: None,
+                languages: Some(vec!["rust".to_string()]),
                 initialization_options: None,
                 workspace_markers: Some(vec![crate::config::settings::RootMarker::Single(
                     ".git".to_string(),
@@ -1945,8 +1945,8 @@ mod tests {
         servers.insert(
             "broken".to_string(),
             BridgeServerConfig {
-                cmd: vec![],
-                languages: vec!["rust".to_string()],
+                cmd: None,
+                languages: Some(vec!["rust".to_string()]),
                 initialization_options: None,
                 workspace_markers: None,
                 on_type_formatting_triggers: None,
@@ -2005,8 +2005,8 @@ mod tests {
         servers.insert(
             "_".to_string(),
             BridgeServerConfig {
-                cmd: vec![],
-                languages: vec![],
+                cmd: None,
+                languages: None,
                 initialization_options: None,
                 workspace_markers: None,
                 on_type_formatting_triggers: None,
@@ -2018,8 +2018,8 @@ mod tests {
         servers.insert(
             "rust-analyzer".to_string(),
             BridgeServerConfig {
-                cmd: vec!["rust-analyzer".to_string()],
-                languages: vec!["rust".to_string()],
+                cmd: Some(vec!["rust-analyzer".to_string()]),
+                languages: Some(vec!["rust".to_string()]),
                 initialization_options: None,
                 workspace_markers: None,
                 on_type_formatting_triggers: None,
@@ -2075,8 +2075,8 @@ mod tests {
         servers.insert(
             "_".to_string(),
             BridgeServerConfig {
-                cmd: vec![],
-                languages: vec![],
+                cmd: None,
+                languages: None,
                 initialization_options: None,
                 workspace_markers: None,
                 on_type_formatting_triggers: None,
@@ -2088,8 +2088,8 @@ mod tests {
         servers.insert(
             "rust-analyzer".to_string(),
             BridgeServerConfig {
-                cmd: vec!["rust-analyzer".to_string()],
-                languages: vec!["rust".to_string()],
+                cmd: Some(vec!["rust-analyzer".to_string()]),
+                languages: Some(vec!["rust".to_string()]),
                 initialization_options: None,
                 workspace_markers: None,
                 on_type_formatting_triggers: None,
@@ -2125,8 +2125,8 @@ mod tests {
         servers.insert(
             "pyright".to_string(),
             BridgeServerConfig {
-                cmd: vec!["pyright-langserver".to_string()],
-                languages: vec!["python".to_string()],
+                cmd: Some(vec!["pyright-langserver".to_string()]),
+                languages: Some(vec!["python".to_string()]),
                 initialization_options: None,
                 workspace_markers: None,
                 on_type_formatting_triggers: None,
@@ -2138,8 +2138,8 @@ mod tests {
         servers.insert(
             "ruff".to_string(),
             BridgeServerConfig {
-                cmd: vec!["ruff".to_string(), "server".to_string()],
-                languages: vec!["python".to_string()],
+                cmd: Some(vec!["ruff".to_string(), "server".to_string()]),
+                languages: Some(vec!["python".to_string()]),
                 initialization_options: None,
                 workspace_markers: None,
                 on_type_formatting_triggers: None,
@@ -2172,16 +2172,16 @@ mod tests {
             (
                 "harper-ls".to_string(),
                 BridgeServerConfig {
-                    cmd: vec!["harper-ls".to_string()],
-                    languages: vec![LANGUAGES_WILDCARD.to_string()],
+                    cmd: Some(vec!["harper-ls".to_string()]),
+                    languages: Some(vec![LANGUAGES_WILDCARD.to_string()]),
                     ..Default::default()
                 },
             ),
             (
                 "rust-analyzer".to_string(),
                 BridgeServerConfig {
-                    cmd: vec!["rust-analyzer".to_string()],
-                    languages: vec!["rust".to_string()],
+                    cmd: Some(vec!["rust-analyzer".to_string()]),
+                    languages: Some(vec!["rust".to_string()]),
                     ..Default::default()
                 },
             ),
@@ -2272,7 +2272,7 @@ mod tests {
         let coordinator = BridgeCoordinator::new();
         let mut settings = settings_with_any_language_server();
         for config in settings.language_servers.values_mut() {
-            config.cmd = vec!["/nonexistent/kakehashi-test-server".to_string()];
+            config.cmd = Some(vec!["/nonexistent/kakehashi-test-server".to_string()]);
         }
         let host_uri = Url::parse("file:///test.md").unwrap();
 
@@ -2432,14 +2432,14 @@ mod tests {
             (
                 "_".to_string(),
                 BridgeServerConfig {
-                    languages: vec![LANGUAGES_WILDCARD.to_string()],
+                    languages: Some(vec![LANGUAGES_WILDCARD.to_string()]),
                     ..Default::default()
                 },
             ),
             (
                 "harper-ls".to_string(),
                 BridgeServerConfig {
-                    cmd: vec!["harper-ls".to_string()],
+                    cmd: Some(vec!["harper-ls".to_string()]),
                     ..Default::default()
                 },
             ),
@@ -2451,8 +2451,8 @@ mod tests {
             (
                 "rust-analyzer".to_string(),
                 BridgeServerConfig {
-                    cmd: vec!["rust-analyzer".to_string()],
-                    languages: vec!["rust".to_string()],
+                    cmd: Some(vec!["rust-analyzer".to_string()]),
+                    languages: Some(vec!["rust".to_string()]),
                     ..Default::default()
                 },
             ),
@@ -2513,8 +2513,8 @@ mod tests {
         servers.insert(
             "rust-analyzer".to_string(),
             BridgeServerConfig {
-                cmd: vec!["rust-analyzer".to_string()],
-                languages: vec!["rust".to_string()],
+                cmd: Some(vec!["rust-analyzer".to_string()]),
+                languages: Some(vec!["rust".to_string()]),
                 initialization_options: None,
                 workspace_markers: None,
                 on_type_formatting_triggers: None,
@@ -2551,8 +2551,8 @@ mod tests {
         servers.insert(
             "rust-analyzer".to_string(),
             BridgeServerConfig {
-                cmd: vec!["rust-analyzer".to_string()],
-                languages: vec!["rust".to_string()],
+                cmd: Some(vec!["rust-analyzer".to_string()]),
+                languages: Some(vec!["rust".to_string()]),
                 initialization_options: None,
                 workspace_markers: None,
                 on_type_formatting_triggers: None,
@@ -2670,8 +2670,8 @@ mod tests {
         servers.insert(
             "rust-analyzer".to_string(),
             BridgeServerConfig {
-                cmd: vec!["rust-analyzer".to_string()],
-                languages: vec!["rust".to_string()],
+                cmd: Some(vec!["rust-analyzer".to_string()]),
+                languages: Some(vec!["rust".to_string()]),
                 initialization_options: None,
                 workspace_markers: None,
                 on_type_formatting_triggers: None,
@@ -2896,8 +2896,8 @@ mod tests {
         servers.insert(
             "lua-language-server".to_string(),
             BridgeServerConfig {
-                cmd: vec!["lua-language-server".to_string()],
-                languages: vec!["lua".to_string()],
+                cmd: Some(vec!["lua-language-server".to_string()]),
+                languages: Some(vec!["lua".to_string()]),
                 initialization_options: None,
                 workspace_markers: None,
                 on_type_formatting_triggers: None,

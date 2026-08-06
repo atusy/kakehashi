@@ -80,14 +80,14 @@ pub(super) fn resolve_capture(
         // Try filetype-specific mapping first
         if let Some(ft) = filetype
             && let Some(lang_mappings) = mappings.get(ft)
-            && let Some(mapped) = lang_mappings.highlights.get(capture_name)
+            && let Some(mapped) = lang_mappings.highlights().get(capture_name)
         {
             return resolve_user_mapping(mapped);
         }
 
         // Try wildcard mapping
         if let Some(wildcard_mappings) = mappings.get(WILDCARD_KEY)
-            && let Some(mapped) = wildcard_mappings.highlights.get(capture_name)
+            && let Some(mapped) = wildcard_mappings.highlights().get(capture_name)
         {
             return resolve_user_mapping(mapped);
         }
@@ -193,8 +193,8 @@ mod tests {
         mappings.insert(
             WILDCARD_KEY.to_string(),
             QueryTypeMappings {
-                highlights: wildcard_highlights,
-                folds: HashMap::new(),
+                highlights: Some(wildcard_highlights),
+                folds: None,
             },
         );
 
@@ -208,8 +208,8 @@ mod tests {
         mappings.insert(
             "rust".to_string(),
             QueryTypeMappings {
-                highlights: rust_highlights,
-                folds: HashMap::new(),
+                highlights: Some(rust_highlights),
+                folds: None,
             },
         );
 
@@ -247,8 +247,8 @@ mod tests {
         mappings.insert(
             "rust".to_string(),
             QueryTypeMappings {
-                highlights,
-                folds: HashMap::new(),
+                highlights: Some(highlights),
+                folds: None,
             },
         );
         assert_eq!(

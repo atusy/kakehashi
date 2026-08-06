@@ -123,29 +123,27 @@ enabled = false
 # "comment" = ""  # overridden (empty string suppresses the token)
 ```
 
-### Bare `Vec` fields: empty means "inherit", so it cannot mean anything else
+### List fields: omitted inherits, empty states
 
-For the **bare** `Vec` fields of `languageServers` (`cmd`, `languages`),
-`merge_bridge_server_configs` treats an **empty overlay list as absent** and
-takes the base value. That is what lets a concrete server omit `cmd` or
-`languages` and pick them up from the wildcard entry.
+For the list fields of `languageServers` (`cmd`, `languages`, `workspaceMarkers`,
+`onTypeFormattingTriggers`), `merge_bridge_server_configs` takes the overlay's
+list whenever the overlay wrote one — empty or not — and the base's only when
+the overlay omitted the key. The same rule resolves the `_` wildcard at read
+time (`is_spawnable_with_wildcard`, `effective_languages_with_wildcard`), so a
+concrete server that omits `cmd` picks the wildcard's up, and one that writes
+`cmd = []` states that it has none and does not.
 
 Note that "the base" is not always `_`. The same function also merges a
 same-named server across config *layers*, which happens before wildcard
-resolution — so an empty list means "not specified at this layer" and reaches
+resolution — so an omitted list means "not specified at this layer" and reaches
 `_` only when no layer specified one. A lower layer's concrete list beats a
 higher layer's `_` wildcard.
 
-The consequence is that a concrete server can only ever *defer* on those fields
-— to a lower layer's value for the same server, or to `_`. It can narrow by
-listing fewer entries, but it has no spelling for "wider than what I
-inherited", because the widest spelling (`[]`) is the defer sentinel. Where widening must be expressible, it needs a marker
-*inside* the list: see any-language-server-wildcard for `languages = ["*"]`.
-
-The `Option<Vec>` fields (`workspaceMarkers`, `onTypeFormattingTriggers`) do
-**not** follow this rule — overlay wins whenever it is `Some`, so an explicit
-`[]` there is preserved and carries its own meaning ("disable the marker
-search"), while `None` is the inherit sentinel.
+A concrete server can therefore narrow (list fewer entries), clear (`[]`), or
+defer (omit the key) — but it still has no spelling for "wider than what I
+inherited", because clearing is not widening. Where widening must be
+expressible, it needs a marker *inside* the list: see
+any-language-server-wildcard for `languages = ["*"]`.
 
 ## Consequences
 
