@@ -1026,20 +1026,29 @@ fn run_install(language: &str, force: bool, verbose: bool, no_cache: bool) -> Re
         },
     );
 
-    if let Some(e) = &result.parser_error {
-        eprintln!("✗ Parser installation failed: {}", e);
-    }
-    if let Some(e) = &result.queries_error {
-        eprintln!("✗ Query installation failed: {}", e);
+    // The name guard reports the same reason for both halves; printing it once
+    // is the whole message.
+    if result.parser_error == result.queries_error {
+        if let Some(e) = &result.parser_error {
+            eprintln!("✗ Installation failed: {}", e);
+        }
+    } else {
+        if let Some(e) = &result.parser_error {
+            eprintln!("✗ Parser installation failed: {}", e);
+        }
+        if let Some(e) = &result.queries_error {
+            eprintln!("✗ Query installation failed: {}", e);
+        }
     }
 
     if !result.is_success() {
         // Both halves are staged before either is published, so a failure
-        // installed nothing — say so, rather than leaving the user to guess
-        // which half survived and whether a retry needs --force.
+        // published neither — say so, rather than leaving the user to guess
+        // which half survived and whether a retry needs --force. Scoped to what
+        // is published: a failed install can still have written the metadata
+        // cache or created the data directories.
         eprintln!(
-            "\nFailed to install '{}' language support. Nothing was installed; \
-             run the command again to retry.",
+            "\nFailed to install '{}' language support. No parser or query files were published.",
             language
         );
         return Err(ExitCode::FAILURE);

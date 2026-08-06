@@ -199,9 +199,10 @@ fn resolve_data_dir(env_fn: impl Fn(&str) -> Option<String>) -> Option<PathBuf> 
 
 /// Result of installing a language (both parser and queries).
 ///
-/// A language is installed as a unit, so a result carries either both paths or
-/// neither: a `None` path with no matching error means that half was never
-/// published because the other half failed.
+/// A language is installed as a unit: every failure path returns before
+/// publishing either half, or undoes the one it published. A `None` path with
+/// no matching error means that half was never published because the other half
+/// failed.
 #[derive(Debug)]
 pub struct InstallResult {
     /// Path where the parser was installed, if successful.
@@ -237,9 +238,11 @@ pub struct LanguageInstallOptions {
 
 /// Install a language's parser and queries as a unit.
 ///
-/// Both halves are prepared before either is published, so a failure leaves the
-/// data directory exactly as it was rather than installing one half and
-/// reporting the other as an error.
+/// Both halves are prepared before either is published, so a failure publishes
+/// neither, rather than installing one half and reporting the other as an
+/// error. Bookkeeping a failed install may still leave behind: the parser
+/// metadata cache, the `parser/` and `queries/` directories, the per-language
+/// lock files, and the removal of an uninstall tombstone for the language.
 pub fn install_language(language: &str, options: &LanguageInstallOptions) -> InstallResult {
     install_language_with_query_stager(
         language,
@@ -298,9 +301,13 @@ fn install_language_with_query_stager(
 
     // The queries installer re-checks names itself, but the parser
     // installer also builds paths from the name (`parser/<name>.<ext>`),
-    // so reject traversal-capable names before touching either.
+    // so reject traversal-capable names before touching either. Report the
+    // queries installer's wording, which names the allowed characters — the
+    // user's next move is to correct the name.
     if !queries::is_safe_language_name(language) {
-        let reason = format!("Language name '{}' is unsafe", language.escape_default());
+        let reason =
+            queries::QueryInstallError::InvalidLanguageName(language.escape_default().to_string())
+                .to_string();
         result.parser_error = Some(reason.clone());
         result.queries_error = Some(reason);
         return result;
@@ -313,7 +320,7 @@ fn install_language_with_query_stager(
 
     // Stage both halves before publishing either, so a language is never left
     // half-installed: whichever half fails, every staging artifact is dropped
-    // and the data directory is exactly as it was.
+    // and no parser or query files are published.
     //
     // Queries first because they are the cheap half — a language whose queries
     // cannot be fetched is rejected in seconds instead of after a parser
@@ -668,7 +675,7 @@ mod tests {
             result
                 .parser_error
                 .as_deref()
-                .is_some_and(|e| e.contains("unsafe")),
+                .is_some_and(|e| e.contains("Invalid language name")),
             "parser side must be blocked by the name guard, got {:?}",
             result.parser_error
         );
@@ -676,7 +683,7 @@ mod tests {
             result
                 .queries_error
                 .as_deref()
-                .is_some_and(|e| e.contains("unsafe")),
+                .is_some_and(|e| e.contains("Invalid language name")),
             "queries side must be blocked by the name guard, got {:?}",
             result.queries_error
         );
