@@ -242,10 +242,10 @@ of a response a given pair "asked for". Concretely, given
 
 ```toml
 [languages.LANG_1.bridge._self.aggregation]
-workspace/symbol = { priorities = ["B"] }
+"workspace/symbol" = { priorities = ["B"] }
 
 [languages.LANG_2.bridge._self.aggregation]
-workspace/symbol = { priorities = ["C"] }
+"workspace/symbol" = { priorities = ["C"] }
 ```
 
 B's LANG_2-related symbols are **kept**. Dropping them because LANG_2 nominates
@@ -1014,6 +1014,17 @@ waits. None of those carries a deadline, and cancel forwarding acquires the same
 mutex before it can notify a subscribed handler, so early subscription cannot
 interrupt a stall behind it.
 
+That last part has a consequence **accepted rather than solved**: a cancellation
+issued while selection is queued behind the mutex may not reach the handler
+before selection's budget expires, because local notification happens only after
+cancel forwarding has itself acquired the mutex and captured its downstream
+targets. The handler can therefore answer a partial success for a request the
+client already cancelled. Fixing it properly means a local wake-up path
+independent of target capture — worth doing, but a change to the cancellation
+machinery rather than to this method. The observable cost is small: the client
+discards an answer it no longer wants, and the alternative failure — holding the
+query open behind an unrelated stall — is worse.
+
 Every phase that can block on that mutex therefore carries **its own budget**,
 and there are two — because the mutex is taken twice, not once. Selection takes
 it to read the connection map; then each send **re-acquires** it for the
@@ -1021,7 +1032,11 @@ stale-handle check before enqueueing, which is the precedent's own discipline
 and can stall behind exactly the same holders, after selection's budget has
 already been spent.
 
-- **Selection**: three seconds to acquire and filter.
+- **Selection's lock acquisition**: three seconds. The budget covers
+  *acquiring* the mutex, not the filtering that follows — that walk is
+  synchronous with no await, so a timeout could not preempt it anyway, and
+  bounding what cannot be interrupted would be a promise the runtime does not
+  keep. The walk is over in-memory maps and is not where a query stalls.
 - **Each send's pre-enqueue re-acquisition**: three seconds, per target,
   independently. A target that cannot get the lock in time is dropped like any
   other unreachable one.
@@ -1262,7 +1277,12 @@ Including it would defeat dedup on a field carrying no identity.
   a search in the seconds after opening a file can miss it (point 3).
 - Selection and each send carry their own budgets, because both must take the
   pool's `connections` mutex and other paths hold that across unbounded async
-  work (point 6). Expiring either answers from a partial target set.
+  work (point 6). Expiring either answers from a partial target set — and a
+  cancellation queued behind that same mutex may arrive too late to stop it, so
+  a cancelled request can still be answered.
+- The content-identity check proves a `didChange` was *enqueued*, not delivered:
+  notifications carry no acknowledgement and a failed write does not fail the
+  connection. The stale-result window is narrowed, not closed (point 5).
 - `max_fan_out` does not bound this method's total fan-out. It selects names
   per pair, and one name still queries every `Ready`, capable root while a
   connection excluded by one pair re-enters through another. Its documented
@@ -1270,7 +1290,9 @@ Including it would defeat dedup on a field carrying no identity.
   the documentation must say so.
 - The `kakehashi-virtual-uri-*` filename space is reserved: a real workspace
   file named into it is invisible to symbol search (point 5).
-- `strategy` becomes a knob that this one method ignores (with a warning). Users
+- `strategy` becomes a knob that this one method ignores. A **method-specific**
+  entry warns; a `_` wildcard that happens to reach the method is overridden
+  silently, by design (point 2). Users
   who reach for `preferred` to suppress a noisy server must instead leave it out
   of `priorities` — in every pair that names it.
 - Dedup is exact-match, so two servers that disagree on a symbol's range both
