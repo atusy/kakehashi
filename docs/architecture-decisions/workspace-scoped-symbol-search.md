@@ -272,17 +272,30 @@ configuration would contribute **no candidates at all**. Treating `_` instead as
 `bridge.python.enabled = false` or `priorities = []` excluded, and union has no
 way to subtract that contribution.
 
-So the axes are:
+Both axes therefore come from **what is actually open**, which is also the set
+the live-only rule already commits to:
 
-- **Host languages**: the languages of the **currently open documents**. This is
-  concrete by construction (it comes from language detection, never from a map
-  key), and it is the right set for the same reason the whole method is
-  live-only — virtual documents, and therefore downstream connections, exist
-  only for documents the client has opened.
-- **Injection languages**: the concrete (non-`_`) bridge keys under those host
-  languages, plus `_self`, plus the languages configured servers declare in
-  `languages = [...]`. A `languages = ["*"]` server needs no entry of its own:
-  it is admitted for every concrete language by the normal routing check.
+- **Host languages**: the languages of the currently open documents
+  (`DocumentStore::open_uris()` + language detection). Concrete by
+  construction — it never comes from a map key.
+- **Injection languages**: the languages of the currently **open virtual
+  documents**, read from `VirtualDocumentUri::language()` on the pool's tracked
+  `OpenedVirtualDoc` entries, plus `_self` for the host tier.
+
+Deriving the injection axis from configuration instead — concrete bridge keys
+plus the languages servers declare — looks equivalent and is not. It loses every
+`languages = ["*"]` server, which is the whole point of the any-language-server
+wildcard: an open Markdown document with Python fences, the default `bridge._`,
+and only a `["*"]` server configured yields no non-`_` bridge key and no
+declared concrete language, so no injection language would be generated and the
+server would never be asked. Normal routing avoids this because it starts from
+the region's actual `"python"` and lets `handles_language` recognize `"*"`.
+Starting from open virtual documents restores exactly that: the language is the
+region's real one.
+
+`OpenedVirtualDoc` also carries the `connection_key` the document was opened on,
+so the walk can pair each open virtual document with its host document's
+language directly rather than taking a cross product of the two axes.
 
 Candidates for each `(host, injection)` pair then come from the **existing
 routing entry point**, `get_all_configs_for_language`, rather than from a
@@ -341,8 +354,8 @@ a cost bound; here it is only a per-pair selection rule. What actually bounds
 the total is the live-connection set (point 7).
 
 ```
-  settings.languages × bridge_map.keys()      ← candidate walk only,
-        │  (each key via resolve_with_wildcard) no arbitration
+  open host docs × their open virtual docs    ← concrete languages only,
+        │  (never a raw `_` map key)             no arbitration
         ▼
   ┌──────────────────────┐   ┌──────────────────────┐
   │ (LANG_1, _self)      │   │ (LANG_2, _self)      │  ... every pair
@@ -483,15 +496,25 @@ this classifier would silently turn into "no embedded symbols". The
 whole-document handlers avoid this by calling `ensure_document_parsed` first;
 this method has no target document to name.
 
-It therefore ensures **lazily, at translation time**: as entries are classified,
-each distinct `host_url` they resolve to is ensured once, immediately before its
-entries are translated. Doing this up front instead — a sweep over every open
-document, issued alongside the fan-out — was the first shape considered and is
-worse on both axes. It does work for documents no result mentions, and, more
-importantly, it completes up to 30 seconds before the value is used (a target
-may take the full response timeout), so an edit arriving in between re-clears
-the tree and the sweep guarantees nothing. Ensuring next to the use closes that
-gap to the width of one classification step.
+Fan-in therefore runs in **three passes**, not one:
+
+1. Classify every entry and resolve its virtual URI to a `host_url`, **grouping
+   entries by host**. This pass needs no parse — `resolve_virtual_uri` is a map
+   lookup — so nothing waits here.
+2. Ensure the distinct hosts that actually appear, **concurrently**.
+3. Resolve each entry's offset and translate, per group.
+
+Ensuring one host at a time while translating would make the cost additive:
+`distinct_hosts × 200ms` in series, which for a query touching many stale hosts
+would dwarf the fan-out it follows and contradict point 6's max-over-targets
+account. Grouping first makes the whole pass cost about one 200ms wait.
+
+Sweeping every open document up front instead — alongside the fan-out — was the
+first shape considered and is worse on both axes. It does work for documents no
+result mentions, and it completes up to 30 seconds before the value is used (a
+target may take the full response timeout), so an edit arriving in between
+re-clears the tree and the sweep guarantees nothing. Ensuring between resolution
+and translation closes that gap to the width of one pass.
 
 Only documents that **already have a snapshot** are ensured. `ensure_document_parsed`
 asks for a 200ms wait, but `wait_for_current_snapshot` escalates to the
@@ -718,8 +741,9 @@ Including it would defeat dedup on a field carrying no identity.
   request timeout and liveness timeout; forwarded cancellation is best-effort
   because a downstream may ignore it.
 - One request per keystroke, un-coalesced (point 9).
-- Fan-in can wait on a parse: each distinct host document a result addresses is
-  ensured before translation, up to 200ms each (point 5).
+- Fan-in can wait on a parse: the distinct host documents a result addresses are
+  ensured before translation. Because they are ensured concurrently the pass
+  costs about one 200ms wait rather than one per document (point 5).
 - An edit landing between that ensure and the offset resolution still drops the
   affected entries. The window is small but not closed, and the failure is
   silent — the symbols simply are not there.
@@ -745,7 +769,8 @@ Including it would defeat dedup on a field carrying no identity.
 ### Neutral
 
 - `Union` is a named strategy but is meaningful only for this method; elsewhere
-  it behaves as `Concatenated`.
+  it is normalized to that method's existing default before any handler runs, so
+  configuring it there changes nothing.
 - Result ordering is deterministic but not relevance-ranked. LSP delegates
   scoring to the client ("editors will apply their own highlighting and scoring
   on the results"), so a client that re-sorts sees no change and one that does
