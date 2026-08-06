@@ -5,7 +5,7 @@ use crate::config::unknown_keys::{
     unknown_workspace_setting_keys,
 };
 use serde_json::Value;
-use tower_lsp_server::ls_types::DidChangeConfigurationParams;
+use tower_lsp_server::ls_types::{ConfigurationItem, DidChangeConfigurationParams};
 
 use crate::config::{RawWorkspaceSettings, WorkspaceSettings, merge_workspace_settings};
 
@@ -90,6 +90,56 @@ fn is_kakehashi_workspace_entry(key: &str, value: &Value) -> bool {
 }
 
 impl Kakehashi {
+    /// Ask the client for its `kakehashi` section and apply what comes back.
+    ///
+    /// Editors that send `didChangeConfiguration` with no usable `settings`
+    /// (VS Code most prominently) expect the server to pull instead. The
+    /// answer is not a delta and not a snapshot of kakehashi's own state — it
+    /// is the client's configuration, which is one layer among the rest, so it
+    /// is applied exactly as a push of the same section would be. Nothing
+    /// supersedes anything: the layer is appended in arrival order like any
+    /// other (#734).
+    ///
+    /// `scopeUri` is deliberately null. kakehashi resolves one effective
+    /// settings snapshot for the whole process, so asking with a scope and
+    /// applying the answer process-wide would silently promote one folder's
+    /// configuration to global. Asking unscoped asks for exactly what the
+    /// single layer means; scoped pull is the separate half of #952.
+    pub(crate) async fn pull_client_configuration(&self) {
+        if !self.settings_manager.supports_configuration_pull() {
+            return;
+        }
+
+        let items = vec![ConfigurationItem {
+            scope_uri: None,
+            section: Some("kakehashi".to_string()),
+        }];
+        let answered = match self.client.configuration(items).await {
+            Ok(values) => values,
+            Err(error) => {
+                // Leave the settings in effect alone: a failed pull is no
+                // answer, not an empty one.
+                self.notifier()
+                    .log_warning(format!(
+                        "Could not read configuration from the client: {error}"
+                    ))
+                    .await;
+                return;
+            }
+        };
+
+        // `null` means the client cannot provide a value for this item — also
+        // no answer. An object, empty or not, is one.
+        let Some(section @ Value::Object(_)) = answered.into_iter().next() else {
+            return;
+        };
+
+        self.did_change_configuration_impl(DidChangeConfigurationParams {
+            settings: serde_json::json!({ "kakehashi": section }),
+        })
+        .await;
+    }
+
     /// Handle workspace/didChangeConfiguration notification.
     pub(crate) async fn did_change_configuration_impl(&self, params: DidChangeConfigurationParams) {
         let uses_deprecated_unwrapped_shape =
