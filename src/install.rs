@@ -91,7 +91,7 @@ pub(crate) fn test_data_dir() -> PathBuf {
 /// in-tree test harness.
 #[cfg(any(test, feature = "e2e"))]
 pub mod test_support {
-    use super::{parser, queries};
+    use super::parser;
     use std::path::{Path, PathBuf};
 
     /// Languages whose parsers and queries every kakehashi test relies on.
@@ -126,11 +126,10 @@ pub mod test_support {
     /// the `.installed` marker is missing, writing the marker only when
     /// every required install succeeded.
     ///
-    /// Mirrors the install loop in `make deps/tree-sitter/.installed`.
-    /// Both the parser and queries installs short-circuit when a
-    /// language is up-to-date; any genuine failure is logged so tests
-    /// depending on that language fail with a clearer error rather than
-    /// the whole suite panicking in setup.
+    /// Covers the same languages as `make deps/tree-sitter/.installed`.
+    /// The install short-circuits when a language is up-to-date; any
+    /// genuine failure is logged so tests depending on that language fail
+    /// with a clearer error rather than the whole suite panicking in setup.
     ///
     /// A transient failure (network, file lock, compile error) must not
     /// leave the marker behind: a marker over a half-populated data dir
@@ -142,7 +141,7 @@ pub mod test_support {
         if marker.exists() {
             return Ok(());
         }
-        let parser_options = parser::InstallOptions {
+        let options = super::LanguageInstallOptions {
             data_dir: data_dir.to_path_buf(),
             force: false,
             verbose: false,
@@ -153,28 +152,17 @@ pub mod test_support {
         };
         let mut all_ok = true;
         for lang in TEST_LANGUAGES {
-            // `AlreadyExists` means the artifact is present from an earlier
-            // run — success for setup purposes, not a failure. Treating it as
-            // failure would make a partial prior run unrecoverable: if parsers
-            // installed but a query failed (so the marker was never written),
-            // every later run would see `AlreadyExists` for the parser and
-            // could never write the marker without deleting files by hand.
-            match parser::install_parser(lang, &parser_options) {
-                Ok(_) | Err(parser::ParserInstallError::AlreadyExists(_)) => {}
-                Err(e) => {
-                    eprintln!("[test setup] install_parser({}) failed: {}", lang, e);
-                    all_ok = false;
+            // Artifacts already present from an earlier run are a success for
+            // setup purposes, and `install_language` reports them as such.
+            let result = super::install_language(lang, &options);
+            if !result.is_success() {
+                for error in [result.parser_error, result.queries_error]
+                    .into_iter()
+                    .flatten()
+                {
+                    eprintln!("[test setup] install_language({}) failed: {}", lang, error);
                 }
-            }
-            match queries::install_queries_with_dependencies(lang, data_dir, false) {
-                Ok(_) | Err(queries::QueryInstallError::AlreadyExists(_)) => {}
-                Err(e) => {
-                    eprintln!(
-                        "[test setup] install_queries_with_dependencies({}) failed: {}",
-                        lang, e
-                    );
-                    all_ok = false;
-                }
+                all_ok = false;
             }
         }
         if all_ok {

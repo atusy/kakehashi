@@ -728,7 +728,7 @@ pub fn query_install_is_complete(queries_dir: &Path) -> bool {
 
 /// RAII cleanup for a staging directory: removes it on drop so every error
 /// path (including `?` propagation added later) leaves nothing stranded. On
-/// the success path `replace_query_dir` renames the directory away, making
+/// the success path `publish_query_dir` renames the directory away, making
 /// the drop-time removal a harmless no-op.
 struct TempQueryDirGuard {
     path: PathBuf,
