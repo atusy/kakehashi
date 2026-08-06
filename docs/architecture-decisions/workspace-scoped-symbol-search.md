@@ -1266,9 +1266,18 @@ those rather than from whole responses:
   even though both surface as no current geometry.
 
 An answer is **informative** when it produced at least one translated entry, or
-when every one of its entries was semantically rejected — including a
-legitimately empty response, which is a server saying it searched and found
-nothing.
+when every one of its entries was semantically rejected — including an empty
+response, which is a server saying it searched and found nothing.
+
+With one exception, and it is the reason identity is checked **per target** and
+not only per entry: if any virtual document that target was dispatched against
+changed between dispatch and translation, its answer is **uninformative
+regardless of content**, empty included. An empty answer over stale text says
+nothing about the current text — the match it omitted may have been added or
+shifted by the very edit that invalidated it — and there is no returned entry to
+mark, so a purely entry-level rollup would quietly count it as evidence of
+absence. The per-target identity snapshot already exists for this; it just has
+to be consulted even when the response carried nothing.
 
 Granularity matters here: `edit_lock` expiry is per *host*, while one response
 can carry real-file entries and virtual entries from several hosts. One
@@ -1677,7 +1686,9 @@ Including it would defeat dedup on a field carrying no identity.
 
 - A file opened from outside the client's workspace no longer contributes its
   project's symbols here, though the connection it spawned still serves that
-  file's own bridged requests (point 3).
+  file's own bridged requests. One exception survives: a `preferSharedInstance`
+  server that took on both an in-workspace root and an external one is
+  indivisible, so admitting it for the former also admits the latter (point 3).
 - Results depend on what is open, and coverage can shrink (close, respawn,
   silent connection death). Closing the last buffer for a language removes its
   server from search even though the process is still running and may still be
