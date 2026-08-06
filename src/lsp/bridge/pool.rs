@@ -589,12 +589,7 @@ impl LanguageServerPool {
         connections
             .get(key)
             .filter(|handle| handle.state() == ConnectionState::Ready)
-            .filter(|handle| match config {
-                Some(config) => handle
-                    .launch_config()
-                    .is_none_or(|live| same_launch_config(live, config)),
-                None => true,
-            })
+            .filter(|handle| config.is_none_or(|config| handle.matches_launch_config(config)))
             .map(Arc::clone)
     }
 

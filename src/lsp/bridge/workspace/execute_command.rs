@@ -240,20 +240,65 @@ impl LanguageServerPool {
     /// registry-only check can miss a live colliding advertiser and conclude
     /// "unique" about a set it cannot yet see (#823).
     ///
+    /// A candidate must also be one the CURRENT settings would still produce.
+    /// The settings snapshot is published before `propagate_settings` finishes
+    /// invalidating connections, so this window contains processes spawned from
+    /// a config that no longer exists — a deleted server, or one whose `cmd`
+    /// moved. They have to be excluded HERE rather than at acquisition: the
+    /// acquisition would reject them anyway, but by then the candidate count has
+    /// already been used, so a stale process standing beside the current one
+    /// turns a routable command into a refused "ambiguous" one.
+    ///
+    /// In production this filter is never vacuous: `record_launch_config` runs
+    /// on the one spawn path before the `Ready` transition, so every connection
+    /// the state filter admits has a snapshot to compare.
+    ///
     /// It does not make the decision globally atomic, and nothing downstream
     /// re-checks it: an advertiser that reaches `Ready` after this snapshot is
     /// not counted, so the command goes to what was the sole live advertiser
     /// when it was decided. Re-checking later would only move that window, and
     /// the target was never the *wrong* one — just not the only one.
-    async fn ready_palette_origins(&self, command: &str) -> Vec<ConnectionKey> {
-        let connections = self.connections().await;
-        connections
-            .iter()
-            .filter(|(_, handle)| {
-                handle.state() == ConnectionState::Ready
-                    && handle.advertises_execute_command(command)
+    async fn ready_palette_origins(
+        &self,
+        command: &str,
+        settings: &WorkspaceSettings,
+    ) -> Vec<ConnectionKey> {
+        // Take the cheap, lock-scoped half first. Resolving a config allocates
+        // an owned `BridgeServerConfig` — cloning `cmd`, `languages`, and
+        // arbitrary `initialization_options` JSON — and merging it is real work;
+        // none of that belongs under the pool-wide connections guard.
+        let advertisers: Vec<_> = {
+            let connections = self.connections().await;
+            connections
+                .iter()
+                .filter(|(_, handle)| {
+                    handle.state() == ConnectionState::Ready
+                        && handle.advertises_execute_command(command)
+                })
+                .map(|(key, handle)| (key.clone(), Arc::clone(handle)))
+                .collect()
+        };
+        // Resolve once per distinct server: a collision is usually the SAME
+        // server under several roots, which is the case that would otherwise
+        // merge the same config repeatedly.
+        let mut resolved: std::collections::HashMap<String, Option<_>> =
+            std::collections::HashMap::new();
+        advertisers
+            .into_iter()
+            .filter(|(key, handle)| {
+                resolved
+                    .entry(key.server().to_string())
+                    .or_insert_with(|| {
+                        resolve_with_wildcard(
+                            &settings.language_servers,
+                            key.server(),
+                            merge_bridge_server_configs,
+                        )
+                    })
+                    .as_ref()
+                    .is_some_and(|config| handle.matches_launch_config(config))
             })
-            .map(|(key, _)| key.clone())
+            .map(|(key, _)| key)
             .collect()
     }
 
@@ -282,20 +327,16 @@ impl LanguageServerPool {
             );
             return None;
         }
-        // Both candidate sets are filtered by the CURRENT config, and for the
-        // same reason on each side.
+        // Both candidate sets are filtered by the CURRENT config before anything
+        // counts them, because a candidate the acquisition would reject must not
+        // get a vote on whether the command is ambiguous.
         //
         // A recorded origin whose server was removed from config cannot be
         // revived, so counting it would let a deleted server permanently veto
-        // the origin that is still spawnable.
-        //
-        // A LIVE connection for a removed server is the sharper case: the
-        // settings snapshot is published before `propagate_settings` finishes
-        // invalidating connections, so a request landing in that window finds a
-        // process spawned from a config that no longer exists, still `Ready`.
-        // Left unfiltered it could win the route outright — running a
-        // possibly workspace-mutating command on a superseded server — or make
-        // an otherwise-unambiguous command look ambiguous and refuse it.
+        // the origin that is still spawnable. `ready_palette_origins` applies
+        // the launch-config half of the same rule; this adds the half it cannot
+        // express, since a server can be present in config yet disabled or
+        // command-less.
         let spawnable = |key: &ConnectionKey| {
             crate::config::is_server_spawnable(&settings.language_servers, key.server())
         };
@@ -306,7 +347,7 @@ impl LanguageServerPool {
             .filter(&spawnable)
             .collect();
         let ready: Vec<_> = self
-            .ready_palette_origins(&params.command)
+            .ready_palette_origins(&params.command, settings)
             .await
             .into_iter()
             .filter(&spawnable)
@@ -333,18 +374,30 @@ impl LanguageServerPool {
         };
         let origin = key.server();
         // Resolved once, and BEFORE the live lookup rather than only inside the
-        // reconnect branch: the by-key fast path must reject a handle spawned
-        // from a superseded `cmd`, which is the check every other acquisition in
-        // the pool performs. Without it the scan's spawnability filter still
-        // lets an edited-but-not-yet-invalidated process through, because the
-        // server name is unchanged — only its command line moved.
-        let config = resolve_with_wildcard(
+        // reconnect branch, so the by-key fast path performs the same
+        // launch-config check every other acquisition in the pool does.
+        //
+        // Bound fail-closed rather than passed as an `Option`. A chosen key has
+        // already passed `is_server_spawnable` on this same immutable snapshot,
+        // which requires a concrete entry — so `None` here is unreachable today.
+        // Encoding it as a refusal costs nothing and means a future change that
+        // makes it reachable lands on a drop rather than on a lookup that
+        // silently skips the config check.
+        let Some(config) = resolve_with_wildcard(
             &settings.language_servers,
             origin,
             merge_bridge_server_configs,
-        );
+        ) else {
+            warn!(
+                target: "kakehashi::bridge",
+                "executeCommand: palette origin {origin:?} has no resolvable config; \
+                 dropping {:?}",
+                params.command
+            );
+            return None;
+        };
         let handle = match self
-            .ready_connection_by_key_for_config(&key, config.as_ref())
+            .ready_connection_by_key_for_config(&key, Some(&config))
             .await
         {
             // The connection that advertised the command is still Ready — route
@@ -364,27 +417,10 @@ impl LanguageServerPool {
             // key, so wiring this path to the same helper is a follow-up.
             // Shared keys cannot be re-rooted without a document either way.
             None if key.is_client_fallback() => {
-                // The palette registry is session-persistent, so an origin
-                // removed/disabled from config after registration lands here —
-                // warn like the encoded-command path (user-invoked).
-                if !crate::config::is_server_spawnable(&settings.language_servers, origin) {
-                    warn!(
-                        target: "kakehashi::bridge",
-                        "executeCommand: palette origin {origin:?} is no longer spawnable; \
-                         dropping {:?}",
-                        params.command
-                    );
-                    return None;
-                }
-                let Some(config) = config else {
-                    warn!(
-                        target: "kakehashi::bridge",
-                        "executeCommand: palette origin {origin:?} has no resolvable config; \
-                         dropping {:?}",
-                        params.command
-                    );
-                    return None;
-                };
+                // No spawnability re-check here: the chosen key passed the
+                // identical predicate against this same borrowed snapshot a few
+                // lines up, and nothing between can change it. A second one
+                // would read as a live guard against a race that does not exist.
                 // Wait through initialization (bounded by the standard init
                 // budget) rather than take a possibly-`Initializing` handle: the
                 // pool returns an existing not-yet-Ready connection here, whose
@@ -680,7 +716,12 @@ mod tests {
         seed(&pool, &ruff, ConnectionState::Ready, &["source.fixAll"]).await;
         seed(&pool, &eslint, ConnectionState::Ready, &["source.fixAll"]).await;
 
-        let mut found = pool.ready_palette_origins("source.fixAll").await;
+        let mut found = pool
+            .ready_palette_origins(
+                "source.fixAll",
+                &settings_with_servers(&["ruff", "eslint", "biome"]),
+            )
+            .await;
         found.sort_by_key(|k| k.server().to_string());
 
         assert_eq!(
@@ -714,7 +755,11 @@ mod tests {
         .await;
 
         assert_eq!(
-            pool.ready_palette_origins("source.fixAll").await,
+            pool.ready_palette_origins(
+                "source.fixAll",
+                &settings_with_servers(&["ruff", "eslint", "biome"])
+            )
+            .await,
             vec![ready],
         );
     }
@@ -731,7 +776,12 @@ mod tests {
         .await;
 
         assert!(
-            pool.ready_palette_origins("source.fixAll").await.is_empty(),
+            pool.ready_palette_origins(
+                "source.fixAll",
+                &settings_with_servers(&["ruff", "eslint", "biome"])
+            )
+            .await
+            .is_empty(),
             "a longer name that merely starts with the query is a different command"
         );
     }
@@ -824,6 +874,31 @@ mod tests {
 
         // A dead collision must not cost the one advertiser that can serve it.
         let settings = settings_with_servers(&["ruff", "eslint"]);
+        assert_reached_downstream(dispatch(&pool, &settings, "source.fixAll")).await;
+    }
+
+    #[tokio::test]
+    async fn a_superseded_process_beside_the_current_one_does_not_make_it_ambiguous() {
+        // The window's real shape: during settings propagation the OLD process
+        // is still Ready while the new one is already up. Both advertise the
+        // name and both name a configured server, so a spawnability-only filter
+        // counts two and refuses — losing a command that has exactly one valid
+        // target. The launch-config check has to run before anything counts.
+        let pool = LanguageServerPool::new();
+        let current = key("ruff", "file:///w/a");
+        let superseded = key("ruff", "file:///w/b");
+        pool.command_origins()
+            .register(&current, vec!["source.fixAll".to_string()]);
+        seed_spawned_from(&pool, &current, &["source.fixAll"], "true").await;
+        seed_spawned_from(&pool, &superseded, &["source.fixAll"], "old-ruff").await;
+
+        // `settings_with_servers` spawns `true`, so only `current` matches.
+        let settings = settings_with_servers(&["ruff"]);
+        assert_eq!(
+            pool.ready_palette_origins("source.fixAll", &settings).await,
+            vec![current],
+            "a process the acquisition would reject must not get a vote"
+        );
         assert_reached_downstream(dispatch(&pool, &settings, "source.fixAll")).await;
     }
 

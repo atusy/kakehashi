@@ -236,6 +236,24 @@ impl ConnectionHandle {
         self.launch_config.get()
     }
 
+    /// Whether this connection's process is one `config` would still produce.
+    ///
+    /// A handle with no recorded snapshot passes: test-built handles have none,
+    /// and a connection mid-handshake has not recorded one yet — treating either
+    /// as superseded would reject connections that are fine.
+    ///
+    /// Exposed beyond the pool so a caller ENUMERATING live connections can
+    /// apply the same rule the by-key acquisition applies. Deciding anything
+    /// from a candidate count before this runs counts processes the acquisition
+    /// would then reject.
+    pub(crate) fn matches_launch_config(
+        &self,
+        config: &crate::config::settings::BridgeServerConfig,
+    ) -> bool {
+        self.launch_config()
+            .is_none_or(|live| super::same_launch_config(live, config))
+    }
+
     /// This connection's current workspace settings, if any
     /// (downstream-settings-propagation). Read by the propagation diff to decide
     /// whether a merge change needs a `workspace/didChangeConfiguration` push.
