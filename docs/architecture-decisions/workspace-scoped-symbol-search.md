@@ -476,6 +476,23 @@ final barrier.** The order is fixed:
       boundary to enforce, so nothing is filtered — the alternative would be to
       answer nothing.
 
+      A `preferSharedInstance` connection needs its own rule, because `Shared`
+      exposes **no** marker root: the roots it actually serves live in the
+      handle's mutable **workspace-folder set**, which grows as capable servers
+      take on later roots. So a `Shared` connection is admitted if **any folder
+      in that set** is inside the client workspace, and dropped only if none is.
+      Reading the folder set rather than the key is the whole of the rule;
+      testing the key would either drop every shared target or treat it as
+      rootless.
+
+      That admission is all-or-nothing, and it leaks: an instance that took on
+      both an in-workspace root and a stray external one brings the external
+      project's symbols with it. One connection cannot be half-admitted, and
+      filtering the external *candidate* does not help, because an in-workspace
+      candidate selects the same connection. The durable fix is to keep external
+      roots out of shared instances in the first place, which belongs to the
+      routing change rather than to this query.
+
    c. Then keep only `Ready` handles (`connections()` returns the raw map, and
       `ConnectionState` also has `Initializing`, `Failed`, `Closing`, `Closed`),
       drop handles lacking `workspace/symbol`, and drop handles whose recorded
@@ -943,9 +960,12 @@ Two things about *when* and *per what* are load-bearing:
   a document is being edited. Closing it needs an enqueue-coupled identity
   primitive or synchronization with the per-document transition state, and both
   are changes to the bridge's write path rather than to this method.
-- **Per connection, not per URI.** Both tracker values are keyed by
+- **Per connection, and covering `_self`.** Both tracker values are keyed by
   `ConnectionKey`, and one virtual URI can be open on several connections with
-  different confirmed content. An identity snapshot is therefore taken per
+  different confirmed content. A `_self` target's identity is its host
+  document's own downstream version and fingerprint from `host_documents`, not a
+  virtual one — captured and compared the same way, so a host edit after
+  dispatch voids that target's negative evidence exactly as a region edit does. An identity snapshot is therefore taken per
   target, and travels **with that target's response** — the bridge module hands
   back the source connection key and its URI→identity map alongside the
   `Vec<WorkspaceSymbol>`, rather than a bare vector. Fan-in validates each
@@ -1269,15 +1289,25 @@ An answer is **informative** when it produced at least one translated entry, or
 when every one of its entries was semantically rejected — including an empty
 response, which is a server saying it searched and found nothing.
 
-With one exception, and it is the reason identity is checked **per target** and
-not only per entry: if any virtual document that target was dispatched against
-changed between dispatch and translation, its answer is **uninformative
-regardless of content**, empty included. An empty answer over stale text says
-nothing about the current text — the match it omitted may have been added or
-shifted by the very edit that invalidated it — and there is no returned entry to
-mark, so a purely entry-level rollup would quietly count it as evidence of
-absence. The per-target identity snapshot already exists for this; it just has
-to be consulted even when the response carried nothing.
+With one qualification, and it is the reason identity is checked **per target**
+and not only per entry. If any document that target was dispatched against
+changed between dispatch and translation — a virtual document, or the **host**
+document for a `_self` target, whose sync state carries its own downstream
+version and fingerprint — then that target's **negative** evidence is void: an
+empty answer, or one whose entries were all semantically rejected, stops
+counting as informative. An empty answer over stale text says nothing about the
+current text, since the match it omitted may have been added or shifted by the
+very edit that invalidated it, and there is no returned entry for an
+entry-level rollup to mark.
+
+Its **positive** evidence survives. A drifted target can still have translated a
+real-file symbol, or one from a region nothing touched, and those entries are as
+good as any — drift on one document is no reason to discard a correct result
+from another, and identity is tracked per connection across documents that
+change independently. So a drifted target with at least one translated entry
+remains informative; only a drifted target that produced none loses its vote.
+Anything stronger would let an unrelated keystroke turn a working search into a
+request error.
 
 Granularity matters here: `edit_lock` expiry is per *host*, while one response
 can carry real-file entries and virtual entries from several hosts. One
