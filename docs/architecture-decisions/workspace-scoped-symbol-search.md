@@ -460,7 +460,23 @@ final barrier.** The order is fixed:
       A candidate that fails this is **stale, not failed**: it is discarded
       silently, before any accounting.
 
-   b. Then keep only `Ready` handles (`connections()` returns the raw map, and
+   b. **Drop connections rooted outside the client's workspace.** `open_uris()`
+      returns every document opened in the session, `didOpen` accepts any URI
+      the client sends, and marker discovery walks a stray file's ancestors with
+      no workspace boundary — so opening one file from another project spawns a
+      connection rooted there, and its real-file symbols would flow into this
+      workspace's search unchanged. A connection whose root lies outside every
+      declared workspace folder is not a candidate for a *workspace* query.
+
+      The filter is on the **connection's root**, not on result URIs: a server
+      legitimately rooted inside the workspace may return symbols from a
+      dependency outside it, and that is its own call, not pollution.
+      `ClientFallback`-rooted connections sit at the client root and always
+      pass. A session that declared **no** root or folders at all has no
+      boundary to enforce, so nothing is filtered — the alternative would be to
+      answer nothing.
+
+   c. Then keep only `Ready` handles (`connections()` returns the raw map, and
       `ConnectionState` also has `Initializing`, `Failed`, `Closing`, `Closed`),
       drop handles lacking `workspace/symbol`, and drop handles whose recorded
       launch configuration no longer matches the `BridgeServerConfig` that
@@ -469,7 +485,7 @@ final barrier.** The order is fixed:
       failure** (point 5) rather than as an absent candidate — but only if
       policy would have admitted it; see below.
 
-   Step (a) must precede (b), and this is the subtle part. A purge removes the
+   Step (a) must precede (c), and this is the subtle part. A purge removes the
    document state and then installs a replacement under the **same**
    `ConnectionKey`; if that replacement fails its handshake, a cloned snapshot
    entry from before the purge resolves to a brand-new `Failed` handle with no
@@ -739,7 +755,8 @@ fix. Nothing in this design bounds the query at all, which point 9 names as a
         │ pool-owned batch validator, one lock:│
         │ (a) confirm still current — else it  │
         │     is STALE, not failed             │
-        │ (b) Ready only, drop incapable, drop │
+        │ (b) drop roots outside the workspace │
+        │ (c) Ready only, drop incapable, drop │
         │     stale-config                     │
         │ then: allowlist + per-pair maxFanOut │
         │ NEVER spawns a connection            │
@@ -1228,10 +1245,15 @@ those rather than from whole responses:
 - **Translated** — it reached the client.
 - **Semantically rejected** — examined, and found not to describe a place in
   this workspace: the region is *gone*, its language changed, the indexed URI is
-  retired, the range escaped its region, or the content identity moved. The
-  answer was processed; it yielded fewer symbols. These are the silent drops
-  points 5 and 7 already accept.
-- **Infrastructure-failed** — never examined at all, so nothing was learned. A
+  retired, or the range escaped its region. The answer was processed; it yielded
+  fewer symbols. These are the silent drops points 5 and 7 already accept.
+- **Infrastructure-failed** — nothing was learned. This covers entries never
+  examined, and also entries whose **content identity moved**: an edit during
+  the request means the downstream answered about text that no longer exists, so
+  a symbol it did not mention may simply have shifted. The bridge learned
+  neither that the workspace has no match nor where the match now is, which is
+  the definition of uninformative — and it is why the same paragraph calls this a
+  false-negative window rather than a filter. A
   candidate **that policy admitted and is known to be capable**, whose connection
   was already `Failed`, `Closing`, or `Closed` at selection (point 3), starts
   here rather than never existing; one the allowlist, the cap, or a recorded
@@ -1653,6 +1675,9 @@ Including it would defeat dedup on a field carrying no identity.
 
 ### Negative
 
+- A file opened from outside the client's workspace no longer contributes its
+  project's symbols here, though the connection it spawned still serves that
+  file's own bridged requests (point 3).
 - Results depend on what is open, and coverage can shrink (close, respawn,
   silent connection death). Closing the last buffer for a language removes its
   server from search even though the process is still running and may still be
