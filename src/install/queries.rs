@@ -176,7 +176,50 @@ pub fn install_queries_with_dependencies_after_install_started(
     )
 }
 
+/// Stage the queries for `language` and its `; inherits:` chain from
+/// `base_url`, leaving publication to the caller.
+///
+/// Used by the language installer, which stages both halves of a language
+/// before publishing either.
+pub(crate) fn stage_queries_with_dependencies_from(
+    base_url: &str,
+    language: &str,
+    data_dir: &Path,
+    force: bool,
+) -> Result<StagedQueryInstall, QueryInstallError> {
+    stage_queries_with_dependencies(
+        base_url,
+        language,
+        data_dir,
+        force,
+        QueryHttpPolicy::HttpsOnly,
+    )
+}
+
+/// Like [`stage_queries_with_dependencies_from`] but disables the HTTPS-only
+/// policy for tests that serve fixture query files over local plain HTTP.
+#[cfg(test)]
+pub(crate) fn stage_queries_with_dependencies_from_allowing_http_for_tests(
+    base_url: &str,
+    language: &str,
+    data_dir: &Path,
+    force: bool,
+) -> Result<StagedQueryInstall, QueryInstallError> {
+    stage_queries_with_dependencies(
+        base_url,
+        language,
+        data_dir,
+        force,
+        QueryHttpPolicy::AllowHttpForTests,
+    )
+}
+
 /// Like [`install_queries_with_dependencies`] but downloading from `base_url`.
+///
+/// Production installs stage and publish in separate steps (see
+/// [`stage_queries_with_dependencies_from`]); this one-shot form is what the
+/// tests that only exercise the queries half use.
+#[cfg(test)]
 pub(crate) fn install_queries_with_dependencies_from(
     base_url: &str,
     language: &str,
