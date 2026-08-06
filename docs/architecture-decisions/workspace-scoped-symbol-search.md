@@ -1307,13 +1307,17 @@ those rather than from whole responses:
 
 - **Translated** — it reached the client.
 - **Semantically rejected** — examined, and found not to describe a place in
-  this workspace: the region is *gone*, its language changed, the indexed URI is
-  retired, or the range escaped its region. The answer was processed; it yielded
-  fewer symbols. These are the silent drops points 5 and 7 already accept.
+  this workspace: the region is *gone*, its language changed, or the indexed URI
+  is retired. The answer was processed; it yielded fewer symbols. These are the
+  silent drops points 5 and 7 already accept. The common thread is that the
+  *place* no longer exists — kakehashi looked and there was nothing there.
 - **Infrastructure-failed** — nothing was learned. This covers entries never
-  examined — including an entry a downstream returned **without a range**, which
-  it reported as a match and kakehashi could not place — and also entries whose
-  **content identity moved**: an edit during
+  examined — including entries a downstream returned **without a range**, or
+  with a range that is reversed or escapes its region once content identity has
+  already passed. Those are matches the server reported and kakehashi could not
+  place: unusable output, not an absent place, which is the line between this
+  state and the one above. Also entries whose **content identity moved**: an
+  edit during
   the request means the downstream answered about text that no longer exists, so
   a symbol it did not mention may simply have shifted. The bridge learned
   neither that the workspace has no match nor where the match now is, which is
