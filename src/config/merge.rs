@@ -1929,6 +1929,78 @@ mod tests {
         );
     }
 
+    /// An explicit empty map clears the layer below, the same spelling
+    /// `languageServers`, `bridge`, and `layers.aggregation` already answer to.
+    /// Omitting the key still inherits.
+    #[test]
+    fn capture_mappings_empty_map_clears_the_lower_layer() {
+        use crate::config::defaults::default_settings;
+
+        let cleared: RawWorkspaceSettings = toml::from_str(
+            r#"
+            [captureMappings._]
+            highlights = {}
+        "#,
+        )
+        .expect("should parse");
+
+        let merged = merge_workspace_settings(Some(default_settings()), Some(cleared))
+            .expect("two settings merge");
+
+        assert!(
+            merged.capture_mappings[WILDCARD_KEY].highlights.is_empty(),
+            "an explicit empty highlights map should clear the defaults"
+        );
+    }
+
+    /// Clearing one query kind must not disturb the other: `folds` is
+    /// `#[serde(default)]`, so a layer that writes only `highlights` says
+    /// nothing about folds and must leave them alone.
+    #[test]
+    fn capture_mappings_written_highlights_leave_folds_alone() {
+        let base: RawWorkspaceSettings = toml::from_str(
+            r#"
+            [captureMappings._.folds]
+            "comment" = "comment"
+        "#,
+        )
+        .expect("should parse");
+        let overlay: RawWorkspaceSettings = toml::from_str(
+            r#"
+            [captureMappings._.highlights]
+            "keyword" = "keyword"
+        "#,
+        )
+        .expect("should parse");
+
+        let merged =
+            merge_workspace_settings(Some(base), Some(overlay)).expect("two settings merge");
+        let wildcard = &merged.capture_mappings[WILDCARD_KEY];
+
+        assert_eq!(
+            wildcard.folds["comment"], "comment",
+            "writing highlights must not clear folds"
+        );
+        assert_eq!(wildcard.highlights["keyword"], "keyword");
+    }
+
+    /// The whole map clears too, so a layer can drop every language's mappings.
+    #[test]
+    fn capture_mappings_empty_root_clears_every_language() {
+        use crate::config::defaults::default_settings;
+
+        let cleared: RawWorkspaceSettings =
+            toml::from_str("captureMappings = {}\n").expect("should parse");
+
+        let merged = merge_workspace_settings(Some(default_settings()), Some(cleared))
+            .expect("two settings merge");
+
+        assert!(
+            merged.capture_mappings.is_empty(),
+            "an explicit empty captureMappings should clear every language entry"
+        );
+    }
+
     #[test]
     fn test_resolve_with_wildcard_bridge_language_merges_fields() {
         // Wildcard provides aggregation defaults; specific provides enabled override
