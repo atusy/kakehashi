@@ -1061,6 +1061,9 @@ fn run_install(language: &str, force: bool, verbose: bool, no_cache: bool) -> Re
     }
     if let Some(path) = &result.queries_path {
         eprintln!("✓ Queries: {}", path.display());
+        if verbose && !result.files_downloaded.is_empty() {
+            eprintln!("  Files: {}", result.files_downloaded.join(", "));
+        }
     }
     eprintln!("\nSuccessfully installed '{}' language support.", language);
     Ok(())

@@ -389,20 +389,11 @@ pub(crate) fn stage_parser(
     // previously-working parser (e.g. a `force` reinstall that fails) and concurrent
     // readers never observe a half-written file.
     //
-    // The temp name combines the pid with a process-local counter so two installs
-    // in the same process never collide on it, independent of the per-language
-    // install dedup. (Windows caveat: replacing a parser that is *currently loaded*
-    // by this process still fails at the rename — a loaded DLL can't be removed — a
+    // (Windows caveat: replacing a parser that is *currently loaded* by this
+    // process still fails at the rename — a loaded DLL can't be removed — a
     // pre-existing platform limitation this scheme doesn't change.)
     fs::create_dir_all(&parser_dir)?;
-    static TMP_COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-    let tmp_file = parser_dir.join(format!(
-        ".{}.{}.{}.{}.tmp",
-        language,
-        std::process::id(),
-        TMP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
-        std::env::consts::DLL_EXTENSION
-    ));
+    let tmp_file = parser_dir.join(staging_file_name(language));
     let staged = StagedParser {
         language: language.to_string(),
         revision: metadata.revision,
@@ -416,10 +407,26 @@ pub(crate) fn stage_parser(
     }?;
 
     if options.verbose {
-        eprintln!("Compiled to: {}", staged.tmp_file.display());
+        eprintln!("Compiled parser for '{}'", language);
     }
 
     Ok(StagedParserOutcome::Staged(staged))
+}
+
+/// Name of the staging file a parser compiles into, inside `parser/`.
+///
+/// Dot-prefixed and `.tmp`-suffixed so parser discovery walks past it, and
+/// combining the pid with a process-local counter so two installs in the same
+/// process never collide on it, independent of the per-language install dedup.
+fn staging_file_name(language: &str) -> String {
+    static TMP_COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    format!(
+        ".{}.{}.{}.{}.tmp",
+        language,
+        std::process::id(),
+        TMP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+        std::env::consts::DLL_EXTENSION
+    )
 }
 
 /// Install a Tree-sitter parser for a language, publishing it immediately.
@@ -1450,11 +1457,15 @@ mod tests {
 
     /// Build a staged parser over a hand-written temp file, so the staging
     /// contract can be tested without metadata, a clone, or a `cc` run.
+    ///
+    /// The temp path is built the same way `stage_parser` builds it, so a
+    /// change to that shape cannot silently leave these tests pinning a name
+    /// production no longer produces.
     fn fake_staged_parser(data_dir: &Path, language: &str) -> StagedParser {
         let parser_dir = data_dir.join("parser");
         fs::create_dir_all(&parser_dir).expect("create parser dir");
         let ext = std::env::consts::DLL_EXTENSION;
-        let tmp_file = parser_dir.join(format!(".{}.staged.{}.tmp", language, ext));
+        let tmp_file = parser_dir.join(staging_file_name(language));
         fs::write(&tmp_file, b"staged parser").expect("write staged parser");
         StagedParser {
             language: language.to_string(),
@@ -1529,18 +1540,30 @@ mod tests {
         );
     }
 
-    /// A published parser is owned by the data dir, not by the (now dropped)
-    /// staging handle — the drop guard must not delete what it just handed over.
+    /// A publish that cannot complete must still reclaim its staging file:
+    /// the install is over, and a leftover temp file is exactly what the
+    /// staging design exists to avoid.
     #[test]
-    fn publishing_disarms_the_staging_cleanup() {
+    fn a_failed_publish_removes_the_staging_file() {
         let temp = tempdir().expect("temp dir");
+        let ext = std::env::consts::DLL_EXTENSION;
         let staged = fake_staged_parser(temp.path(), "lua");
+        let tmp_file = staged.tmp_file.clone();
+        // A non-empty directory where the parser file belongs: the rename
+        // cannot replace it.
+        let blocker = temp.path().join("parser").join(format!("lua.{}", ext));
+        fs::create_dir_all(blocker.join("occupied")).expect("create blocking dir");
 
-        let result = staged.publish().expect("publish should succeed");
+        let error = staged.publish().expect_err("publish must fail");
 
+        assert!(matches!(error, ParserInstallError::IoError(_)));
         assert!(
-            result.install_path.exists(),
-            "the published parser must survive the staging handle's drop"
+            !tmp_file.exists(),
+            "a failed publish must not leave its staging file behind"
+        );
+        assert!(
+            blocker.join("occupied").exists(),
+            "a failed publish must not disturb what was already there"
         );
     }
 

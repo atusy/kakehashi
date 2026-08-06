@@ -201,6 +201,9 @@ pub struct InstallResult {
     pub parser_error: Option<String>,
     /// Error message if queries install failed.
     pub queries_error: Option<String>,
+    /// Query files this install downloaded, for the requested language.
+    /// Empty when its queries were already present.
+    pub files_downloaded: Vec<String>,
 }
 
 impl InstallResult {
@@ -285,6 +288,7 @@ fn install_language_with_query_stager(
         queries_path: None,
         parser_error: None,
         queries_error: None,
+        files_downloaded: Vec::new(),
     };
 
     // The queries installer re-checks names itself, but the parser
@@ -372,6 +376,7 @@ fn install_language_with_query_stager(
     match published_queries.commit() {
         Ok(query_result) => {
             result.queries_path = Some(query_result.install_path);
+            result.files_downloaded = query_result.files_downloaded;
         }
         Err(queries::QueryInstallError::AlreadyExists(path)) => {
             result.queries_path = Some(path);
@@ -415,6 +420,7 @@ pub(crate) async fn install_language_async(
         queries_path: None,
         parser_error: Some(format!("Task panicked: {}", e)),
         queries_error: None,
+        files_downloaded: Vec::new(),
     })
 }
 
@@ -732,6 +738,7 @@ mod tests {
             queries_path: Some(PathBuf::from("/tmp/queries")),
             parser_error: None,
             queries_error: None,
+            files_downloaded: Vec::new(),
         };
         assert!(success.is_success());
 
@@ -740,6 +747,7 @@ mod tests {
             queries_path: None,
             parser_error: Some("Parser failed".to_string()),
             queries_error: Some("Queries failed".to_string()),
+            files_downloaded: Vec::new(),
         };
         assert!(!failure.is_success());
     }
@@ -749,6 +757,12 @@ mod tests {
         let temp = tempfile::TempDir::new().unwrap();
         let data_dir = temp.path();
 
+        // An already-installed parser, so "no parser was published" is a claim
+        // about this run rather than about an empty data dir.
+        let parser_dir = data_dir.join("parser");
+        std::fs::create_dir_all(&parser_dir).unwrap();
+        let parser_file = parser_dir.join(format!("lua.{}", std::env::consts::DLL_EXTENSION));
+        std::fs::write(&parser_file, "").unwrap();
         // A file where the queries directory belongs makes tombstone cleanup
         // fail; the base URL points nowhere so a download would fail loudly.
         std::fs::write(data_dir.join("queries"), "not a directory").unwrap();
@@ -775,7 +789,12 @@ mod tests {
         );
         assert!(
             result.parser_path.is_none(),
-            "a failure before staging must not report a parser as installed"
+            "a failure before staging must not report the already-installed parser as this \
+             run's work"
+        );
+        assert!(
+            parser_file.exists(),
+            "a failed install must not disturb an already-installed parser"
         );
     }
 
@@ -787,6 +806,16 @@ mod tests {
     fn failed_queries_publish_no_parser() {
         let temp = tempfile::TempDir::new().unwrap();
         let data_dir = temp.path();
+        // A parser is already on disk: the old installer reported it as this
+        // run's `parser_path`, which is exactly what must not happen when the
+        // queries half fails.
+        let parser_dir = data_dir.join("parser");
+        std::fs::create_dir_all(&parser_dir).unwrap();
+        let parser_file = parser_dir.join(format!(
+            "unsupported_lang.{}",
+            std::env::consts::DLL_EXTENSION
+        ));
+        std::fs::write(&parser_file, "").unwrap();
         // No routes: highlights.scm 404s, so the language is unsupported.
         let base_url = spawn_query_file_server(vec![]);
 
@@ -804,8 +833,8 @@ mod tests {
             "a failed install must not report an installed parser"
         );
         assert!(
-            parser_file_exists("unsupported_lang", data_dir).is_none(),
-            "a failed install must not leave a parser on disk"
+            parser_file.exists(),
+            "a failed install must leave the parser that was already there alone"
         );
         assert!(
             !data_dir.join("queries").join("unsupported_lang").exists(),
@@ -844,6 +873,10 @@ mod tests {
         assert!(
             !result.is_success(),
             "a missing parent must fail the install"
+        );
+        assert!(
+            result.parser_path.is_none(),
+            "a failed install must not report the pre-existing parser as installed"
         );
         assert!(
             !data_dir.join("queries").join("orphan_child").exists(),
