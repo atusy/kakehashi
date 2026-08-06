@@ -805,18 +805,29 @@ Two things about *when* and *per what* are load-bearing:
   later comparison sees B and agrees. Capturing first makes the recorded
   identity the one the request actually raced.
 
-  **Atomically with the enqueue**, moreover — not merely before it. The
-  revisions live behind their own Tokio mutex, so the snapshot is taken with
-  `try_lock` inside the same `connections` critical section that performs the
-  stale-handle check and the enqueue, never awaited beside it. Contention drops
-  that target, counted as a failure like any other.
+  **In the same `connections` critical section as the enqueue**, not merely
+  before it. The revisions live behind their own Tokio mutex, so the snapshot is
+  taken with `try_lock` inside the section that performs the stale-handle check
+  and the enqueue, never awaited beside it. Contention drops that target,
+  counted as a failure like any other.
 
-  Taking it *outside* that section would leave a gap: eager `didOpen` holds
-  `connections` while opening, so a virtual document can be opened between the
-  snapshot and the enqueue. The request would then see that document and the
-  late URI index would contain it, while the target's identity map would not —
-  and its symbols would be dropped, silently, for a document that was legitimately
-  open when the request ran. Capturing inside the section closes it.
+  This closes the `didOpen` gap: eager open holds `connections` while opening,
+  so taking the snapshot outside the section would let a virtual document be
+  opened between snapshot and enqueue — the request would see it and the late
+  URI index would contain it, while the target's identity map would not, and its
+  symbols would be dropped for a document legitimately open when the request
+  ran.
+
+  It does **not** make the pair atomic against `didChange`, and the ADR does not
+  claim it does. `didChange` releases `connections` *before* it increments the
+  revision, enqueues, and records the fingerprint, so an already-admitted change
+  can land in that window or expose an intermediate revision/fingerprint pair
+  that no snapshot matches. The checks fail safe — the entries are dropped, not
+  mistranslated — so this is a **false-negative window**, not a correctness
+  hole: symbols that were legitimately valid can go missing from one query while
+  a document is being edited. Closing it needs an enqueue-coupled identity
+  primitive or synchronization with the per-document transition state, and both
+  are changes to the bridge's write path rather than to this method.
 - **Per connection, not per URI.** Both tracker values are keyed by
   `ConnectionKey`, and one virtual URI can be open on several connections with
   different confirmed content. An identity snapshot is therefore taken per
@@ -950,9 +961,9 @@ acceptable". Calling it once per returned symbol destroys exactly that premise:
 an interactive endpoint returning thousands of symbols would pay
 `symbols × open_virtual_docs`, serialized through repeated acquisition of the
 tracker's async mutex. Snapshotting once makes it one scan plus O(1) per entry.
-It is a *separate* snapshot from the one point 3 takes to validate candidates —
-that one is taken at selection time under the `connections` lock and answers a
-different question.
+It is a *separate* snapshot from the one point 3 takes to enumerate candidates —
+that one is taken at selection time, before `connections` is acquired, and
+answers a different question.
 
 The index also becomes the **identity test**. `is_virtual_uri` is only a
 basename pattern — it accepts any URI ending in
@@ -1112,18 +1123,26 @@ re-check, or the enqueue fails. Counting only "dispatched targets that errored"
 would let a query whose every target died pre-dispatch report a confident empty
 answer, since zero dispatches looks the same as zero results.
 
+The unit is a **successfully processed answer**: a target that answered *and*
+whose entries fan-in could classify and translate. Anything short of that is
+"we could not find out", not "there is nothing".
+
 - Selection **completed** and found no candidates → `[]`. Nothing failed; there
   was nothing to ask.
-- **At least one** target answered → `[]` or its results, as they came. Partial
-  failure stays soft.
-- Candidates existed and **none answered** — for any reason, at any phase →
-  **request error**.
-- Selection **did not complete** and nothing answered → **request error**. Its
-  tracker or `connections` acquisition can expire, and `_self` discovery is
-  incomplete whenever `host_documents` was contended, so "no candidates" and
-  "we could not find out" are different states. Only the first may claim `[]`;
-  reporting the second as an empty search would be the same confident falsehood
-  as reporting an outage that way.
+- **At least one** successfully processed answer → its results, or `[]` if they
+  genuinely contained nothing. Partial failure stays soft.
+- Candidates existed and **no answer was successfully processed** — for any
+  reason, at any phase → **request error**.
+- Selection **did not complete** and nothing was processed → **request error**.
+
+The last two cases are why the unit is processing rather than response. Selection
+can expire its tracker or `connections` acquisition, and `_self` discovery is
+incomplete whenever `host_documents` was contended, so "no candidates" and "we
+could not find out" are different states. Just as importantly, a fan-in failure
+counts: if servers returned symbols and every entry was dropped because the
+late host→virtual snapshot or the identity re-read could not be acquired, the
+client would otherwise be told the search found nothing — the same confident
+falsehood as reporting an outage that way, arrived at from the other end.
 
 A downstream `null` is an answer, not a failure. The method's result type is
 `Option<WorkspaceSymbolResponse>` precisely because `null` is valid, so it
@@ -1233,7 +1252,8 @@ arriving mid-processing would otherwise wait on unrelated work with no bound.
   identity re-read — three seconds each. These come *after* every downstream
   response, so they are easy to overlook, and unbudgeted they would reintroduce
   an unbounded wait at the very end of the query. Expiry drops the affected
-  entries.
+  entries **and counts against the outcome rule** (point 5): entries lost to a
+  fan-in failure are not evidence that the search found nothing.
 - **Translation's `edit_lock`** per host: three seconds. A host whose lock
   cannot be taken in time loses that query's entries, exactly like a host whose
   geometry was stale.
@@ -1526,6 +1546,10 @@ Including it would defeat dedup on a field carrying no identity.
 - The content-identity check proves a `didChange` was *enqueued*, not delivered:
   notifications carry no acknowledgement and a failed write does not fail the
   connection. The stale-result window is narrowed, not closed (point 5).
+- It also has a false-negative window in the other direction: `didChange`
+  releases `connections` before bumping its revision and recording its
+  fingerprint, so a change landing beside a dispatch can expose a pair no
+  snapshot matches, and those symbols are dropped from that query (point 4).
 - `max_fan_out` does not bound this method's total fan-out. It selects names
   per pair, and a connection one pair excluded re-enters through another pair
   that legitimately opened it. Its documented promise to cap concurrent server
