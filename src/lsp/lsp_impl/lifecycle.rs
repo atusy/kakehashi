@@ -414,6 +414,16 @@ impl Kakehashi {
                 .show_warning(crate::config::deprecation::AUTO_INSTALL_DEPRECATION_NOTICE)
                 .await;
         }
+        // Same shape for the empty-container rule change: what the layers said
+        // still parses, and now means something else.
+        if let Some(notice) =
+            crate::lsp::settings::emptied_container_notice(settings_outcome.raw_settings.as_ref())
+            && self
+                .settings_manager
+                .claim_empty_container_migration_warning()
+        {
+            self.notifier().show_warning(notice).await;
+        }
 
         // Always apply settings (use defaults if none were loaded)
         // This ensures auto_install=true, default capture_mappings, and other defaults are active
