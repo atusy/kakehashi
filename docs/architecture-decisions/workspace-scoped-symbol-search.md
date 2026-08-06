@@ -255,7 +255,7 @@ from an empty response — which is the distinction that makes it acceptable her
 and `preferred` not. It does cost the user an edit in **every** pair that names
 the unwanted server, because fan-out unions candidates across all pairs.
 
-### 3. Fan-out: live connections first, then the configuration filter
+### 3. Fan-out: select synchronously, then wait per target
 
 A request has no document, so it cannot pick one `(host_language, bridge_key)`
 pair — it walks **all** of them, purely to collect candidates. Both axes must be
@@ -331,21 +331,36 @@ the opt-out, wildcard-resolved gate beside it.
 set only on `bridge._` still apply to a concrete pair — the property that keeps
 existing configuration from becoming a silent no-op here.
 
-**Order matters, and it is liveness first:**
+**Order matters. Everything synchronous happens first; only then does any
+target wait:**
 
 1. Take the pool's connection map and keep only `Ready` and `Initializing`
    entries. `connections()` returns the raw map, and `ConnectionState` also has
    `Failed`, `Closing`, and `Closed`, which linger until lazily evicted — none
-   of them is a valid target.
-2. Wait for the surviving `Initializing` entries to reach Ready.
-3. **Then** check `has_capability("workspace/symbol")` (see point 4 for why this
-   order is forced, and what `has_capability` needs first).
-4. **Then** apply the per-pair `priorities` allowlist and `max_fan_out` cap.
-5. Dedup the survivors by **connection key** `(server, root)`.
+   of them is a valid target. This is a map read, not a wait.
+2. Apply the per-pair `priorities` allowlist and `max_fan_out` cap to what
+   survived. Also synchronous.
+3. Dedup the survivors by **connection key** `(server, root)`.
+4. **Per target, independently**: wait for `Ready`, then check
+   `has_capability("workspace/symbol")` (point 4 explains why the capability
+   check cannot precede the wait), then send.
 
-Applying the cap before the liveness filter would let dead or absent servers
-consume cap slots and silently exclude a live server ranked below the cutoff —
-which would contradict this decision's own "coverage is what is live" contract.
+The cap sits between the two: after the liveness filter, before any waiting.
+Both halves of that placement are load-bearing.
+
+Putting the cap *before* the liveness filter would let dead or absent servers
+consume cap slots and silently exclude a live server ranked below the cutoff,
+contradicting this decision's own coverage contract. Putting it *after* the
+Ready wait would make the cap a global barrier: with `max_fan_out = 1` and
+priorities `[initializing_A, ready_B]`, nothing could dispatch until A's wait
+resolved — up to the full 30 seconds — even though B was ready immediately.
+Deciding membership synchronously and waiting per target removes the
+interaction entirely.
+
+The residual cost is stated rather than engineered away: a target that is
+`Initializing` at selection time consumes a cap slot even if it later turns out
+to lack the capability. Selecting on a fact that is not yet knowable is the
+alternative, and it is worse.
 
 `priorities` is an allowlist: listed servers are candidates, `"*"` stands for
 the rest, and an explicit `[]` remains the per-method kill switch. Its **order**
@@ -367,11 +382,20 @@ connection's own indexed workspace, so a connection named by several pairs is
 asked **once**, while the same server name under two roots is genuinely two
 connections and two requests.
 
-`max_fan_out` therefore bounds a **pair's** contribution, not the query's total
-fan-out. A connection dropped by one pair's cap still enters through another
-pair that names it, and no global cap exists. Under `preferred` the cap was also
-a cost bound; here it is only a per-pair selection rule. What actually bounds
-the total is the live-connection set (point 7).
+`max_fan_out` counts **server names**, not connections — `truncate_entries`
+truncates a flattened name list in walk order. A surviving name then contributes
+**every** live connection it has, so a server live under two roots sends two
+requests against one cap slot. No root is dropped and no root-ordering policy is
+needed, which is the point: this method queries every live root of a selected
+server by design.
+
+The setting's documented promise ("cap the number of concurrent server
+requests") is therefore not what happens here, and could not be — a cap on names
+cannot bound requests once one name means several connections. Combined with the
+fact that a connection dropped by one pair's cap still enters through another
+pair that names it, `max_fan_out` is a **per-pair name-selection rule** for this
+method and nothing more. What actually bounds the total is the live-connection
+set (point 7).
 
 ```
   open host docs × their open virtual docs    ← concrete languages only,
@@ -495,7 +519,19 @@ may not: the goto filter exists because only one region's offset is in hand.
      TRANSLATE
        uri   := host_url
        range := translate_virtual_range_to_host(range, offset)
+       └─ reject if the translated range escapes the region's current
+          bounds — see below
 ```
+
+Translation **validates the region bounds**; it does not translate blindly.
+Region ids deliberately survive edits, so an in-flight response can carry a
+range measured against an older, larger region while offset resolution against
+the current parse still succeeds — and plain range translation performs no
+boundary check, so the result could point into the closing fence or the host
+text after it. `resolve_region_offset` already returns the region's current
+`region_end` alongside the offset; that bound is retained and a translated range
+falling outside it is rejected, the same discipline workspace-edit translation
+already applies.
 
 The range check comes first because `WorkspaceSymbol.location` is
 `OneOf<Location, WorkspaceLocation>` and the `WorkspaceLocation` form carries a
@@ -516,13 +552,38 @@ this classifier would silently turn into "no embedded symbols". The
 whole-document handlers avoid this by calling `ensure_document_parsed` first;
 this method has no target document to name.
 
-Fan-in therefore runs in **three passes**, not one:
+Fan-in therefore runs in **three passes**, not one, over a **request-local
+index** built once up front:
 
-1. Classify every entry and resolve its virtual URI to a `host_url`, **grouping
-   entries by host**. This pass needs no parse — `resolve_virtual_uri` is a map
-   lookup — so nothing waits here.
+0. Snapshot the tracker's host→virtual map once and build a
+   `virtual_uri_string → (host_url, region_id)` map for this request.
+1. Classify every entry against that index, **grouping entries by host**. No
+   parse and no lock is involved, so nothing waits here.
 2. Ensure the distinct hosts that actually appear, **concurrently**.
 3. Resolve each entry's offset and translate, per group.
+
+Pass 0 is not an optimization. `BridgeCoordinator::resolve_virtual_uri` is
+**not** a map lookup: its own doc comment records that it is "O(N) over open
+virtual docs" — the virtual URI encodes the host *directory* and region id but
+not the host filename, so the host cannot be derived without a scan — and
+justifies that cost with "`window/showDocument` is rare, so the scan is
+acceptable". Calling it once per returned symbol destroys exactly that premise:
+an interactive endpoint returning thousands of symbols would pay
+`symbols × open_virtual_docs`, serialized through repeated acquisition of the
+tracker's async mutex. Snapshotting once makes it one scan plus O(1) per entry,
+and the snapshot is the same data point 3's validation already takes.
+
+The index also becomes the **identity test**. `is_virtual_uri` is only a
+basename pattern — it accepts any URI ending in
+`kakehashi-virtual-uri-<id>.<ext>` — so pattern-matching alone would let a real
+file that happens to be named that way be treated as virtual. Membership in the
+index is the real answer for the entries that matter. What the pattern still
+decides is the *drop* case: a pattern match that is absent from the index is
+either a region that has since died or a real file with that name, and the two
+are indistinguishable. Dropping is chosen, because letting a dead region's
+virtual URI reach the editor is the worse failure. **The
+`kakehashi-virtual-uri-*` filename space is reserved**; a real file named into
+it is not visible to workspace symbol search.
 
 Ensuring one host at a time while translating would make the cost additive:
 `distinct_hosts × 200ms` in series, which for a query touching many stale hosts
@@ -542,6 +603,12 @@ asks for a 200ms wait, but `wait_for_current_snapshot` escalates to the
 the caller's wait. Skipping them loses nothing: a never-parsed document has no
 resolved injection regions, hence no virtual documents downstream, hence no
 result can address it.
+
+The precheck alone does not make the 200ms hold: a close/reopen between the
+check and the ensure moves the URI into a fresh, snapshot-less lifetime and the
+15-second deadline applies after all. Each ensure therefore carries its **own
+outer 200ms timeout**, so the phase's bound is a property of this call site
+rather than an inference about the callee's internal state.
 
 A residual race remains and is **accepted**: a `didChange` landing between the
 ensure and the offset resolution clears the tree again, and that entry is
@@ -566,7 +633,16 @@ in `ls-types`, whose variant names are a misnomer: **both** variants are flat
 arrays, and the choice is the element type, not hierarchy (there is no nested
 form for this method; `containerName` is spec-documented as unusable for
 re-inferring one). `SymbolInformation[]` is the deprecated alternative and is
-not emitted. No client capability governs the choice, so none is consulted.
+not emitted.
+
+One client capability *does* govern the payload, though not the element type:
+`workspace.symbol.tagSupport` declares which `SymbolTag`s the client accepts.
+kakehashi already stores the upstream capabilities, so tags are filtered to the
+declared set and omitted entirely for a client that declares none. This matters
+because the `SymbolInformation` normalization in point 4 *creates* a tag —
+folding the legacy `deprecated` flag into `SymbolTag::DEPRECATED` — so without
+the filter kakehashi would hand a tag-less client a tag it never asked for, and
+the legacy `deprecated` field that client could have understood is gone.
 
 ### 6. Latency is bounded by the pool's timeouts, not by cancellation
 
@@ -772,6 +848,14 @@ Including it would defeat dedup on a field carrying no identity.
   touches is how many are live.
 - Adding the `Union` variant forces a `Union` arm at 7 exhaustive `match` sites
   in methods that have no use for it.
+- A target that is `Initializing` when the candidate set is fixed consumes a
+  `max_fan_out` slot even if it later proves incapable — the cost of deciding
+  membership synchronously (point 3).
+- `max_fan_out` does not mean here what its own documentation promises. It caps
+  server *names*, and one selected name still queries every live root, so it
+  bounds neither requests nor connections.
+- The `kakehashi-virtual-uri-*` filename space is reserved: a real workspace
+  file named into it is invisible to symbol search (point 5).
 - `strategy` becomes a knob that this one method ignores (with a warning). Users
   who reach for `preferred` to suppress a noisy server must instead leave it out
   of `priorities` — in every pair that names it.
@@ -790,7 +874,17 @@ Including it would defeat dedup on a field carrying no identity.
 
 - `Union` is a named strategy but is meaningful only for this method; elsewhere
   it is normalized to that method's existing default before any handler runs, so
-  configuring it there changes nothing.
+  configuring it there changes nothing. `layers.aggregation["workspace/symbol"]
+  .strategy = "union"` is schema-valid and inert for the same reason this method
+  never reaches the cross-layer walk.
+- Exposing `union` in the serialized config and the generated schema is a
+  **one-way door**: it is public API from the first release that ships it, yet
+  it offers no choice anywhere — it is mandatory where it applies and inert
+  where it does not. Keeping the merge internal to this method would have left
+  that door open. It is exposed because a named, inspectable strategy value was
+  the maintainer's explicit preference over a hidden merge rule; the cost is
+  recorded here so a later reversal is a deliberate deprecation rather than a
+  surprise.
 - Result ordering is deterministic but not relevance-ranked. LSP delegates
   scoring to the client ("editors will apply their own highlighting and scoring
   on the results"), so a client that re-sorts sees no change and one that does
