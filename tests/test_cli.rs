@@ -844,6 +844,84 @@ fn test_language_status_shows_installed() {
     );
 }
 
+/// Parser-shaped directories are not loadable shared libraries and must not
+/// be reported as installed parsers.
+#[test]
+fn test_language_status_ignores_parser_shaped_directories() {
+    use std::fs;
+
+    let test_dir = tempfile::tempdir().expect("Failed to create temp dir");
+    let ext = std::env::consts::DLL_EXTENSION;
+    fs::create_dir_all(test_dir.path().join(format!("parser/fakeparser.{ext}")))
+        .expect("Failed to create parser-shaped directory");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_kakehashi"))
+        .args([
+            "language",
+            "status",
+            "--data-dir",
+            test_dir.path().to_str().unwrap(),
+        ])
+        .output()
+        .expect("Failed to execute command");
+
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !combined.contains("fakeparser"),
+        "a directory named like a parser must not be reported as installed. Got: {combined}"
+    );
+}
+
+/// The other half of the same bug: when QUERIES make status list a language,
+/// `find_parser_file` decides whether it prints a parser as present — and a
+/// directory named like one is not a parser.
+#[test]
+fn test_language_status_marks_a_parser_shaped_directory_as_missing() {
+    use std::fs;
+
+    let test_dir = tempfile::tempdir().expect("Failed to create temp dir");
+    let ext = std::env::consts::DLL_EXTENSION;
+    fs::create_dir_all(test_dir.path().join(format!("parser/fakeparser.{ext}")))
+        .expect("Failed to create parser-shaped directory");
+    // Queries are what put the language in the listing at all, so the row exists
+    // and its parser column is the thing under test.
+    fs::create_dir_all(test_dir.path().join("queries/fakeparser"))
+        .expect("Failed to create queries directory");
+    fs::write(
+        test_dir.path().join("queries/fakeparser/highlights.scm"),
+        "; test\n",
+    )
+    .expect("Failed to write query file");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_kakehashi"))
+        .args([
+            "language",
+            "status",
+            "--data-dir",
+            test_dir.path().to_str().unwrap(),
+        ])
+        .output()
+        .expect("Failed to execute command");
+
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        combined.contains("fakeparser"),
+        "the queries should still list the language. Got: {combined}"
+    );
+    assert!(
+        combined.contains("✗ parser"),
+        "a parser-shaped DIRECTORY must not count as an installed parser. Got: {combined}"
+    );
+}
+
 /// Status must not report an install as empty when it could not inspect it.
 #[test]
 fn test_language_status_fails_when_install_directory_is_not_a_directory() {
@@ -1585,6 +1663,84 @@ fn test_language_uninstall_all() {
         })
         .unwrap_or_default();
     assert!(queries.is_empty(), "All queries should be removed");
+}
+
+/// Bulk uninstall discovery must ignore parser-shaped directories instead of
+/// treating them as installed languages that subsequently cannot be removed.
+#[test]
+fn test_language_uninstall_all_ignores_parser_shaped_directories() {
+    use std::fs;
+
+    let test_dir = tempfile::tempdir().expect("Failed to create temp dir");
+    let ext = std::env::consts::DLL_EXTENSION;
+    let parser_dir = test_dir.path().join(format!("parser/fakeparser.{ext}"));
+    fs::create_dir_all(&parser_dir).expect("Failed to create parser-shaped directory");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_kakehashi"))
+        .args([
+            "language",
+            "uninstall",
+            "--all",
+            "--force",
+            "--data-dir",
+            test_dir.path().to_str().unwrap(),
+        ])
+        .output()
+        .expect("Failed to execute command");
+
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.status.success(), "uninstall failed: {combined}");
+    assert!(
+        combined.contains("No languages installed to uninstall"),
+        "parser-shaped directories must not enter uninstall discovery: {combined}"
+    );
+    assert!(
+        parser_dir.is_dir(),
+        "unrelated directory must remain intact"
+    );
+}
+
+/// Explicit uninstall must use the same regular-file check as discovery, so a
+/// parser-shaped directory is reported as absent and never passed to removal.
+#[test]
+fn test_language_uninstall_ignores_parser_shaped_directory() {
+    use std::fs;
+
+    let test_dir = tempfile::tempdir().expect("Failed to create temp dir");
+    let ext = std::env::consts::DLL_EXTENSION;
+    let parser_dir = test_dir.path().join(format!("parser/fakeparser.{ext}"));
+    fs::create_dir_all(&parser_dir).expect("Failed to create parser-shaped directory");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_kakehashi"))
+        .args([
+            "language",
+            "uninstall",
+            "fakeparser",
+            "--force",
+            "--data-dir",
+            test_dir.path().to_str().unwrap(),
+        ])
+        .output()
+        .expect("Failed to execute command");
+
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.status.success(), "uninstall failed: {combined}");
+    assert!(
+        combined.contains("Language 'fakeparser' is not installed"),
+        "parser-shaped directory must not count as an installed parser: {combined}"
+    );
+    assert!(
+        parser_dir.is_dir(),
+        "unrelated directory must remain intact"
+    );
 }
 
 /// Test that language uninstall --all ignores internal query staging directories
