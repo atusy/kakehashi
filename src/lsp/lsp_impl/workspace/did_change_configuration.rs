@@ -101,6 +101,22 @@ fn is_kakehashi_workspace_entry(key: &str, value: &Value) -> bool {
     is_workspace_setting_key_or_typo(key)
 }
 
+/// Holds the single-flight claim for the duration of one pull, releasing it on
+/// every exit path including the timeout and shutdown arms.
+struct SingleFlightPull<'a>(&'a std::sync::atomic::AtomicBool);
+
+impl<'a> SingleFlightPull<'a> {
+    fn claim(flag: &'a std::sync::atomic::AtomicBool) -> Option<Self> {
+        (!flag.swap(true, std::sync::atomic::Ordering::AcqRel)).then_some(Self(flag))
+    }
+}
+
+impl Drop for SingleFlightPull<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, std::sync::atomic::Ordering::Release);
+    }
+}
+
 /// How long to wait for the client to answer `workspace/configuration`.
 ///
 /// The await lives in a service future the server joins on, so an answer that
@@ -174,6 +190,16 @@ impl Kakehashi {
             return;
         }
 
+        // One pull at a time. Startup pulls, and so does every no-payload
+        // notification, so two can be in flight at once — and since the reload
+        // lock is only taken once an answer arrives, the older answer could
+        // apply last and merge its snapshot over the newer one. A pull already
+        // running will read the client's current state, which is what a second
+        // one would have asked for.
+        let Some(_in_flight) = SingleFlightPull::claim(&self.configuration_pull_in_flight) else {
+            return;
+        };
+
         let items = vec![ConfigurationItem {
             scope_uri: None,
             section: Some("kakehashi".to_string()),
@@ -183,6 +209,10 @@ impl Kakehashi {
         // would keep `serve` from returning after `exit`. The SIGTERM handler
         // rescues that on Unix and nothing does on Windows.
         let answered = match tokio::select! {
+            // Biased, response first: `select!` is unbiased by default, so an
+            // answer that arrives in the same poll as the deadline could be
+            // thrown away. An answer that came is an answer.
+            biased;
             result = self.client.configuration(items) => result,
             () = self.shutdown_token.cancelled() => return,
             () = tokio::time::sleep(CONFIGURATION_PULL_TIMEOUT) => {
@@ -423,6 +453,26 @@ impl Kakehashi {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn single_flight_pull_admits_one_claim_at_a_time() {
+        use std::sync::atomic::AtomicBool;
+
+        let in_flight = AtomicBool::new(false);
+        let first = SingleFlightPull::claim(&in_flight).expect("the first pull runs");
+        assert!(
+            SingleFlightPull::claim(&in_flight).is_none(),
+            "a second pull must stand down: the one already running reads the \
+             same client state it would have asked for"
+        );
+
+        drop(first);
+        assert!(
+            SingleFlightPull::claim(&in_flight).is_some(),
+            "the claim is released on every exit path, including the timeout \
+             and shutdown arms"
+        );
+    }
+
     use super::*;
 
     use std::future::Future;

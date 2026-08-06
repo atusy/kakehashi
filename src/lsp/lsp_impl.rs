@@ -341,6 +341,9 @@ pub struct Kakehashi {
     /// dropped. Cancelling the token gives deterministic shutdown: `shutdown()`
     /// cancels → task exits immediately → no waiting for channel drainage.
     shutdown_token: tokio_util::sync::CancellationToken,
+    /// Whether a `workspace/configuration` pull is already in flight; see
+    /// `pull_client_configuration`.
+    configuration_pull_in_flight: std::sync::atomic::AtomicBool,
     /// Pre-computed home directory for tilde expansion in config paths.
     /// Computed once at construction — `dirs::home_dir()` is stable for the
     /// process lifetime.
@@ -424,6 +427,7 @@ impl std::fmt::Debug for Kakehashi {
             .field("synthetic_diagnostics", &"SyntheticDiagnosticsManager")
             .field("debounced_diagnostics", &"DebouncedDiagnosticsManager")
             .field("shutdown_token", &"CancellationToken")
+            .field("configuration_pull_in_flight", &"AtomicBool")
             .field("home_dir", &self.home_dir)
             .finish_non_exhaustive()
     }
@@ -475,6 +479,7 @@ impl Kakehashi {
                 crate::lsp::diagnostic_cache::DiagnosticAggregator::new(),
             ),
             shutdown_token: tokio_util::sync::CancellationToken::new(),
+            configuration_pull_in_flight: std::sync::atomic::AtomicBool::new(false),
             home_dir: dirs::home_dir().map(|p| p.to_string_lossy().into_owned()),
             captures_cache: dashmap::DashMap::new(),
             captures_walk_cache: dashmap::DashMap::new(),
