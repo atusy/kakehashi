@@ -302,13 +302,29 @@ impl StagedParser {
             None
         };
         if let Err(e) = fs::rename(&self.tmp_file, &self.parser_file) {
-            if let Some(aside) = &displaced {
-                let _ = fs::rename(aside, &self.parser_file);
+            if let Some(aside) = &displaced
+                && let Err(restore) = fs::rename(aside, &self.parser_file)
+            {
+                // Both halves of the swap failed: say where the previous parser
+                // is, because nothing else will move it back.
+                return Err(ParserInstallError::IoError(std::io::Error::other(format!(
+                    "failed to publish the compiled parser: {e}; failed to restore the previous \
+                     one from {}: {restore}",
+                    aside.display()
+                ))));
             }
             return Err(ParserInstallError::IoError(e));
         }
-        if let Some(aside) = &displaced {
-            let _ = fs::remove_file(aside);
+        if let Some(aside) = &displaced
+            && let Err(e) = fs::remove_file(aside)
+            && e.kind() != std::io::ErrorKind::NotFound
+        {
+            eprintln!(
+                "Warning: the parser replaced for '{}' could not be removed from {}: {}",
+                self.language,
+                aside.display(),
+                e
+            );
         }
         // The rename consumed the staging file; anything the drop guard would
         // remove now belongs to the data dir.

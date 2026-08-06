@@ -746,6 +746,18 @@ fn run_language_uninstall(
 
         let mut removed_something = false;
 
+        // Hold the language's install lock across both removals, so a
+        // concurrent install cannot publish one artifact between them and leave
+        // the language half-removed after this command reports success.
+        let _transaction = match queries::lock_language(&data_dir, lang) {
+            Ok(lock) => Some(lock),
+            Err(e) => {
+                eprintln!("✗ Failed to lock '{}' for uninstall: {}", lang, e);
+                any_failed = true;
+                continue;
+            }
+        };
+
         // Remove queries directory and any kakehashi-created backups under the
         // same lock used by install replacement, so uninstall cannot race a
         // concurrent install into resurrecting queries after reporting success.
