@@ -439,8 +439,9 @@ final barrier.** The order is fixed:
    only `Ready` handles (`connections()` returns the raw map, and
    `ConnectionState` also has `Initializing`, `Failed`, `Closing`, `Closed`).
    A candidate dropped because its connection is `Failed`, `Closing`, or
-   `Closed` is recorded as an **infrastructure failure** (point 5), not as an
-   absent candidate — see below;
+   `Closed` is recorded as an **infrastructure failure** (point 5) rather than
+   as an absent candidate — but only if policy would have admitted it; see
+   below;
    drops handles lacking `workspace/symbol`; drops handles whose recorded launch
    configuration no longer matches the `BridgeServerConfig` that admitted them;
    and confirms current membership — the live reverse index for a virtual
@@ -476,11 +477,15 @@ The resulting order is `connections` → {tracker, `host_documents`}, which is t
 pool's own nesting and the one the respawn purge takes.
 
 Every filter in step 2 precedes the cap in step 3, and that ordering is
-load-bearing for each of them: with `priorities = [A, B]` and
-`max_fan_out = 1`, an A that is incapable, stale-configured, or no longer
-holding its documents would otherwise take the only slot and then be dropped,
-leaving the query to consult nobody. Filtering on what is already knowable
-before allocating slots costs nothing and removes all three cases at once.
+load-bearing: with `priorities = [A, B]` and `max_fan_out = 1`, an A that is
+incapable or stale-configured would otherwise take the only slot and then be
+dropped, leaving the query to consult nobody. Filtering on what is already
+knowable before allocating slots costs nothing.
+
+Failure *bookkeeping*, though, runs the other way round — a candidate must clear
+the allowlist and cap before its death counts against the query, per the rule
+above. Filtering and accounting are separate questions: the first asks who to
+ask, the second asks whether silence means anything.
 
 Step 5 exists because a connection reaches `Ready` *before* its virtual
 documents are replayed after a respawn, so a query landing in that window would
@@ -510,6 +515,22 @@ single outer deadline would let a slow `connections` acquisition eat into the
 barrier's two seconds and cancel it early — and that cancellation is not the
 barrier returning `false`, so the drop policy above would not even cover it.
 Each phase that can block on the pool gets its own budget instead.
+
+**Only a candidate the request would actually have used counts as a failure.**
+The dead-connection bookkeeping is applied to what survives current
+configuration and the `priorities` allowlist and cap — not to every dead handle
+the admissions name. A server the user removed from `priorities`, or excluded
+with the `[]` kill switch, or capped out, is not part of this query; whether its
+process is alive is none of the query's business, and letting its death produce
+an error would make a deliberate exclusion behave like an outage. `priorities =
+[]` and `max_fan_out = 0` admit **no** candidates, so there is nothing for them
+to fail.
+
+Capability is deliberately not part of that test, because it cannot be: a dead
+handle's `server_capabilities()` is whatever it was, and for one that never
+reached `Ready` there is nothing to read. A server the user configured and
+allowed, now unreachable, is an outage whether or not we can confirm what it
+could have done.
 
 Recording a dead connection as a failure rather than as a non-candidate is what
 keeps the outcome rule honest. A liveness timeout marks a handle `Failed` in
@@ -1154,8 +1175,10 @@ those rather than from whole responses:
   answer was processed; it yielded fewer symbols. These are the silent drops
   points 5 and 7 already accept.
 - **Infrastructure-failed** — never examined at all, so nothing was learned. A
-  candidate whose connection was already `Failed`, `Closing`, or `Closed` at
-  selection (point 3) starts here rather than never existing. Also: the
+  candidate **that policy admitted** whose connection was already `Failed`,
+  `Closing`, or `Closed` at selection (point 3) starts here rather than never
+  existing; one the allowlist or cap excluded is simply not a candidate. Also:
+  the
   pass-0 host→virtual snapshot, the translation-time identity re-read, or a
   host's `edit_lock` expiring; and, importantly, geometry that is *unsettled*
   rather than gone — a host still parsing, a pass whose 200ms ensure timed out,
