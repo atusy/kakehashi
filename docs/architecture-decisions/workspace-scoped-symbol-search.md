@@ -519,7 +519,7 @@ with its own name and semantics rather than smuggled into this one.
              └────────────┬─────────────┘
                           ▼
         ┌──────────────────────────────────────┐
-        │ SELECTION (own 3s budget, §6)        │
+        │ SELECTION (3s to ACQUIRE lock, §6)   │
         │ 1. keep Ready ONLY (not Initializing,│
         │    Failed, Closing, Closed)          │
         │ 2. drop handles lacking capability   │
@@ -672,7 +672,7 @@ downstream was looking at.
 
 Each virtual document's **content identity at dispatch** is therefore captured
 and re-checked before its entries are translated, using the per-connection
-revision and the fingerprint of the content last *confirmed sent* that the
+revision and the fingerprint of the content last *confirmed enqueued* that the
 tracker already maintains.
 
 Two things about *when* and *per what* are load-bearing:
@@ -693,17 +693,28 @@ Two things about *when* and *per what* are load-bearing:
 
 Comparing those two values across dispatch and translation is not enough on its
 own. The revision advances before the `didChange` is enqueued and stays advanced
-when the enqueue fails, while the confirmed-sent fingerprint deliberately does
+when the enqueue fails, while the recorded fingerprint deliberately does
 not move — so after an `A → B` edit whose notification was dropped, both
 readings agree at `(revision 2, fingerprint A)` while the current geometry
 describes B and the server is still answering about A. Stability across the
 request proves nothing when both halves were already wrong.
 
-The confirmed-sent fingerprint must therefore also **equal the current region's
-content identity**. That is the check that ties what the server saw to what the
-geometry describes; the dispatch/translation comparison only catches movement
-during the request. Entries failing either are dropped, exactly like entries
-whose region moved.
+The recorded fingerprint must therefore also **equal the current region's
+content identity**. That is the check relating what the downstream was told to
+what the geometry describes; the dispatch/translation comparison only catches
+movement *during* the request. Entries failing either are dropped, exactly like
+entries whose region moved.
+
+The fingerprint is content **confirmed enqueued**, not confirmed delivered, and
+this decision claims no more than that. It is recorded once the `didChange`
+enters the writer queue; notifications carry no acknowledgement, and the writer
+continues after a write error rather than failing the connection. So a
+notification that was queued and then failed to write leaves a fingerprint
+naming content the server never received, and these checks narrow the
+stale-result window sharply without closing it. Closing it needs either writer
+acknowledgement, or a rule that a failed notification write makes the connection
+terminal before any later request on it can succeed — both broader than this
+decision, and both better fixed once for every bridged request than here.
 
 With that in place, translation **validates the region bounds** too; it does not
 translate blindly.
@@ -1254,9 +1265,9 @@ Including it would defeat dedup on a field carrying no identity.
   points in a session. LSP permits partial `workspace/symbol` results, but a
   user expecting an indexed whole-project search will find this surprising.
 - Latency is max-over-live-targets, bounded by the pool's existing 30s request
-  timeout and liveness timeout, plus a three-second budget on selection, three
-  seconds on each send's pre-enqueue lock acquisition, and the reopen barrier's
-  two seconds; forwarded cancellation is best-effort because a downstream may
+  timeout and liveness timeout, plus three-second budgets on selection's and
+  each send's `connections` **lock acquisition** — the synchronous filtering
+  that follows is outside them — and the reopen barrier's two seconds; forwarded cancellation is best-effort because a downstream may
   ignore it.
 - One request per keystroke, un-coalesced (point 9).
 - Fan-in can wait on a parse: the distinct host documents a result addresses are
@@ -1275,9 +1286,11 @@ Including it would defeat dedup on a field carrying no identity.
   in methods that have no use for it.
 - A server still `Initializing` when the query arrives is skipped entirely, so
   a search in the seconds after opening a file can miss it (point 3).
-- Selection and each send carry their own budgets, because both must take the
-  pool's `connections` mutex and other paths hold that across unbounded async
-  work (point 6). Expiring either answers from a partial target set — and a
+- Selection and each send bound only their `connections` **lock acquisition**,
+  because other paths hold that mutex across unbounded async work (point 6);
+  the filtering that follows is synchronous and cannot be preempted, so neither
+  total selection time nor cancellation blocking is capped. Expiring either
+  budget answers from a partial target set — and a
   cancellation queued behind that same mutex may arrive too late to stop it, so
   a cancelled request can still be answered.
 - The content-identity check proves a `didChange` was *enqueued*, not delivered:
