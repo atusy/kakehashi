@@ -26,13 +26,18 @@ impl Kakehashi {
         // snapshot the other has already replaced.
         let reload = lock_settings_reload().await;
 
-        let root_path = self
+        // An emptied folder list does not leave the session rootless: it puts it
+        // exactly where a client that never sent a folder starts, so the rungs
+        // below `workspaceFolders` answer, as they did at initialize.
+        let first_folder = self
             .bridge
             .pool()
             .workspace_folders()
-            .and_then(|folders| folders.first().cloned())
-            .and_then(|folder| super::super::uri_to_url(&folder.uri).ok())
-            .and_then(|url| url.to_file_path().ok());
+            .and_then(|folders| folders.first().cloned());
+        let root_path = super::super::lifecycle::config_root_for_first_folder(
+            first_folder.as_ref().map(|folder| &folder.uri),
+            self.settings_manager.folderless_root_path(),
+        );
         self.settings_manager.set_root_path(root_path);
 
         // An explicit `--config-file` replaces the whole config-file stack, so
@@ -41,8 +46,7 @@ impl Kakehashi {
         // exactly once by contract, which leaves this reload nothing to read
         // and only initialize's settings events to re-emit. Refreshing the root
         // — which still anchors relative paths — and stopping there is the whole
-        // of it; #746 covers reloading the project layer for the sessions that
-        // do have one.
+        // of it.
         if crate::config::expand::config_file_override().is_some() {
             return;
         }

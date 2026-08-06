@@ -177,6 +177,23 @@ fn config_root_path(root: Option<ClientRoot<'_>>) -> (Option<std::path::PathBuf>
     }
 }
 
+/// Kakehashi's root for a session whose first workspace folder is now `folder`,
+/// where `folderless` is [`SettingsManager::folderless_root_path`].
+///
+/// This is [`config_root_path`] with the top rung supplied by the *current*
+/// folder list rather than the one `initialize` received, so a folder change
+/// resolves the root the same way the handshake did — including the process-CWD
+/// fallback for a folder URI that names no file path.
+pub(super) fn config_root_for_first_folder(
+    folder: Option<&Uri>,
+    folderless: Option<std::path::PathBuf>,
+) -> Option<std::path::PathBuf> {
+    match folder {
+        Some(uri) => config_root_path(Some(ClientRoot::WorkspaceFolder(uri))).0,
+        None => folderless,
+    }
+}
+
 /// Derive a root URI only from workspace inputs the upstream client supplied,
 /// for downstream initialization. Kakehashi may use its process CWD internally
 /// for config discovery, but forwarding that fallback would turn a
@@ -302,6 +319,12 @@ impl Kakehashi {
         // Resolved here, into owned values, because `params.capabilities` is
         // moved into the pool below and that ends any borrow of `params`.
         let (root_path, source) = config_root_path(client_root(&params));
+        // The root a later `didChangeWorkspaceFolders` falls back to once it
+        // empties the folder list: the same ladder minus its top rung, since a
+        // session that loses its last folder ends up where a session that never
+        // had one starts.
+        self.settings_manager
+            .set_folderless_root_path(config_root_path(client_root_without_folders(&params)).0);
 
         // Forward root_uri and workspace_folders to bridge pool for downstream server initialization
         let workspace_folders_for_bridge =

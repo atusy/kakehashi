@@ -2,14 +2,16 @@
 //! `apply_settings`) plus initialize-only state — `client_capabilities` (a
 //! `OnceLock`) and `root_path`.
 //!
-//! `root_path` is an `ArcSwap`, not a `OnceLock`, but only `initialize()` calls
-//! [`SettingsManager::set_root_path`], and configuration now depends on that:
-//! it is the base every relative path in a client-supplied layer is resolved
-//! against (`config::paths`). A second writer — a `didChangeWorkspaceFolders`
-//! handler, say — would let a `didChangeConfiguration` read one root, the
-//! handler store another, and the merge then hold paths anchored to two
-//! different workspaces. Anything that makes it genuinely mutable has to make
-//! the read and the merge share the settings-reload transaction.
+//! `root_path` is an `ArcSwap`, not a `OnceLock`, because `initialize()` is not
+//! its only writer: `didChangeWorkspaceFolders` restores it when the client's
+//! folder list changes. Configuration depends on that value — it is the base
+//! every relative path in a client-supplied layer is resolved against
+//! (`config::paths`) — so two writers would otherwise let a
+//! `didChangeConfiguration` read one root, the handler store another, and the
+//! merge then hold paths anchored to two different workspaces. What keeps that
+//! sound is that the second writer stores the root and re-derives the settings
+//! inside the same settings-reload transaction; any further writer has to do
+//! the same.
 
 use arc_swap::ArcSwap;
 use path_clean::PathClean;
@@ -34,6 +36,14 @@ pub(crate) struct SettingsSnapshot {
 
 pub(crate) struct SettingsManager {
     root_path: ArcSwap<Option<PathBuf>>,
+    /// The root to fall back to once the client's workspace-folder list is
+    /// empty: `initialize`'s ladder below `workspaceFolders` (`rootUri`, then
+    /// the deprecated `rootPath`, then the process CWD), resolved during
+    /// `initialize` because the params it reads do not outlive that request.
+    ///
+    /// A `OnceLock` because no rung below `workspaceFolders` can change after
+    /// the handshake — only the folder list does.
+    folderless_root_path: OnceLock<Option<PathBuf>>,
     settings_snapshot: ArcSwap<SettingsSnapshot>,
     /// Client capabilities from initialize() - immutable after initialization.
     /// Uses OnceLock to enforce "set once, read many" semantics per LSP protocol.
@@ -85,6 +95,7 @@ impl SettingsManager {
 
         Self {
             root_path: ArcSwap::new(Arc::new(None)),
+            folderless_root_path: OnceLock::new(),
             settings_snapshot: ArcSwap::new(Arc::new(SettingsSnapshot {
                 raw_settings: Arc::new(raw_settings),
                 settings: Arc::new(settings),
@@ -162,6 +173,18 @@ impl SettingsManager {
     /// Get the current workspace root path.
     pub(crate) fn root_path(&self) -> Arc<Option<PathBuf>> {
         self.root_path.load_full()
+    }
+
+    /// Record the root a later folder change falls back to once the client's
+    /// folder list is empty. Set once, during `initialize`.
+    pub(crate) fn set_folderless_root_path(&self, path: Option<PathBuf>) {
+        let _ = self.folderless_root_path.set(path);
+    }
+
+    /// The root for a session with no workspace folders — `None` before
+    /// `initialize` resolves one, and also when no rung of its ladder answered.
+    pub(crate) fn folderless_root_path(&self) -> Option<PathBuf> {
+        self.folderless_root_path.get().cloned().flatten()
     }
 
     /// Load the current workspace settings.
