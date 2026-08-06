@@ -107,7 +107,10 @@ struct SingleFlightPull<'a>(&'a std::sync::atomic::AtomicBool);
 
 impl<'a> SingleFlightPull<'a> {
     fn claim(flag: &'a std::sync::atomic::AtomicBool) -> Option<Self> {
-        (!flag.swap(true, std::sync::atomic::Ordering::AcqRel)).then_some(Self(flag))
+        // `then`, not `then_some`: the latter builds its argument eagerly, so a
+        // failed claim would construct a guard, drop it, and release the flag
+        // it never held — leaving no single-flight at all.
+        (!flag.swap(true, std::sync::atomic::Ordering::AcqRel)).then(|| Self(flag))
     }
 }
 
@@ -190,16 +193,42 @@ impl Kakehashi {
             return;
         }
 
-        // One pull at a time. Startup pulls, and so does every no-payload
-        // notification, so two can be in flight at once — and since the reload
-        // lock is only taken once an answer arrives, the older answer could
-        // apply last and merge its snapshot over the newer one. A pull already
-        // running will read the client's current state, which is what a second
-        // one would have asked for.
-        let Some(_in_flight) = SingleFlightPull::claim(&self.configuration_pull_in_flight) else {
-            return;
-        };
+        // One pull at a time, with a burst collapsed into at most one trailing
+        // pull. Startup pulls, and so does every no-payload notification, so
+        // two can be in flight at once — and since the reload lock is only
+        // taken once an answer arrives, the older answer could apply last and
+        // merge its snapshot over the newer one.
+        //
+        // Standing down is not enough on its own: the running pull may already
+        // have its answer when the user changes something, and dropping that
+        // trigger would lose the change until the next one. A rejected trigger
+        // is recorded instead, and whoever holds the claim runs one more pull
+        // before letting go.
+        loop {
+            {
+                let Some(_in_flight) = SingleFlightPull::claim(&self.configuration_pull_in_flight)
+                else {
+                    self.configuration_pull_pending
+                        .store(true, std::sync::atomic::Ordering::Release);
+                    return;
+                };
+                // Cleared inside the claim, so a trigger arriving during the
+                // request below is still seen by the trailing check.
+                self.configuration_pull_pending
+                    .store(false, std::sync::atomic::Ordering::Release);
+                self.pull_client_configuration_once().await;
+            }
+            if !self
+                .configuration_pull_pending
+                .swap(false, std::sync::atomic::Ordering::AcqRel)
+            {
+                return;
+            }
+        }
+    }
 
+    /// One round trip: ask, and apply whatever comes back.
+    async fn pull_client_configuration_once(&self) {
         let items = vec![ConfigurationItem {
             scope_uri: None,
             section: Some("kakehashi".to_string()),
@@ -471,6 +500,38 @@ mod tests {
             "the claim is released on every exit path, including the timeout \
              and shutdown arms"
         );
+    }
+
+    /// The trailing-pull handshake: a trigger rejected while a pull is running
+    /// is recorded, and the running pull sees it after releasing — so a burst
+    /// collapses into one follow-up rather than being dropped.
+    #[test]
+    fn a_rejected_trigger_survives_as_one_trailing_pull() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let in_flight = AtomicBool::new(false);
+        let pending = AtomicBool::new(false);
+
+        let claim = SingleFlightPull::claim(&in_flight).expect("the first pull runs");
+        pending.store(false, Ordering::Release);
+
+        // Two triggers arrive while it is running; both stand down, both leave
+        // the same mark.
+        for _ in 0..2 {
+            assert!(SingleFlightPull::claim(&in_flight).is_none());
+            pending.store(true, Ordering::Release);
+        }
+
+        drop(claim);
+        assert!(
+            pending.swap(false, Ordering::AcqRel),
+            "the burst must leave exactly one follow-up behind"
+        );
+        assert!(
+            !pending.swap(false, Ordering::AcqRel),
+            "and only one — the trailing pull is not run per trigger"
+        );
+        assert!(SingleFlightPull::claim(&in_flight).is_some());
     }
 
     use super::*;
