@@ -95,12 +95,11 @@ pub(crate) enum InstallOutcome {
         /// Directory where parser and queries were installed
         data_dir: PathBuf,
     },
-    /// The install failed, but a parser for the language was published by
-    /// another install while this one ran, so the language is still loadable —
-    /// with whatever queries that install left, which may be none.
+    /// This install failed, but another one completed the language while it
+    /// ran, so both halves are on disk and it is still loadable.
     SuccessWithWarnings {
-        /// Directory the language loads from. The parser there is another
-        /// install's, not this one's.
+        /// Directory the language loads from. What is there is another
+        /// install's work, not this one's.
         data_dir: PathBuf,
     },
     /// Parser already exists, just needs reload (no installation performed)
@@ -537,17 +536,16 @@ impl AutoInstallManager {
             // kakehashi binary — so the killable subprocess (re-exec
             // `__compile-parser`) is valid and bounds a hung `cc`.
             let result = install_executor(task_lang.clone(), task_data_dir.clone()).await;
-            let parser_exists =
-                crate::install::parser_file_exists(&task_lang, &task_data_dir).is_some();
-            let terminal = classify_install_outcome(&result, parser_exists, &task_data_dir);
+            let complete = language_is_complete(&task_lang, &task_data_dir);
+            let terminal = classify_install_outcome(&result, complete, &task_data_dir);
             let mut install_marker = install_marker;
             // If the caller awaiting this task is cancelled, the task output is
             // dropped. Keep the real install result on the guard so waiters see
             // success rather than the guard's fail-closed fallback.
             install_marker.preserve_terminal(terminal);
-            (result, parser_exists, install_marker)
+            (result, complete, install_marker)
         });
-        let (result, parser_exists, install_marker) = match install_task.await {
+        let (result, complete, install_marker) = match install_task.await {
             Ok(result) => result,
             Err(join_error) => {
                 events.push(InstallEvent::ProgressEnd { success: false });
@@ -564,7 +562,7 @@ impl AutoInstallManager {
             }
         };
 
-        let outcome = classify_install_outcome(&result, parser_exists, &data_dir);
+        let outcome = classify_install_outcome(&result, complete, &data_dir);
         if result.is_success() {
             events.push(InstallEvent::ProgressEnd { success: true });
             events.push(InstallEvent::Log {
@@ -573,22 +571,22 @@ impl AutoInstallManager {
             });
             InstallResult::with_claim(outcome, events, install_marker)
         } else if matches!(outcome, InstallOutcome::SuccessWithWarnings { .. }) {
-            // The install published nothing, but a concurrent install put a
-            // parser on disk, so the language still loads. Only
-            // when the parser half itself did not fail: a parser that failed to
-            // publish leaves a file whose provenance is somebody else's install,
-            // and reporting that as a near-success would hide a real error.
+            // This install published nothing, but the language is complete on
+            // disk because another one finished it while this ran, so it loads.
             events.push(InstallEvent::ProgressEnd { success: true });
 
             let mut warnings = Vec::new();
-            if let Some(e) = &result.queries_error {
-                warnings.push(format!("queries: {}", e));
+            for error in [&result.parser_error, &result.queries_error]
+                .into_iter()
+                .flatten()
+            {
+                warnings.push(error.clone());
             }
             events.push(InstallEvent::Log {
                 level: MessageType::WARNING,
                 message: format!(
-                    "Language '{}' was not installed ({}), but a parser is already present. \
-                     Reloading...",
+                    "Language '{}' was not installed by this attempt ({}), but another install \
+                     completed it. Reloading...",
                     lang,
                     warnings.join("; ")
                 ),
@@ -620,28 +618,34 @@ impl AutoInstallManager {
     }
 }
 
+/// Whether both halves of a language are on disk and usable.
+///
+/// Read from disk rather than from an `InstallResult`, so it answers for
+/// whatever another process published while this install ran.
+fn language_is_complete(language: &str, data_dir: &std::path::Path) -> bool {
+    crate::install::parser_file_exists(language, data_dir).is_some()
+        && crate::install::queries::query_install_is_complete(
+            &data_dir.join("queries").join(language),
+        )
+}
+
 /// Decide what an install attempt means for the client.
 ///
-/// `parser_exists` is read from disk rather than from `result`, because a
-/// parser can be present without this install having published it: an install
-/// that already had one short-circuits before reaching here, so what this
-/// catches is another process publishing one while this install ran. That is
-/// the only way a failed install is still worth reloading for.
-///
-/// It is not enough on its own: an install whose *parser* half failed leaves a
-/// file whose provenance is somebody else's, and reporting that as a
-/// near-success would swallow a real error, so the parser half must be the one
-/// that did not fail.
+/// A failed install is still worth reloading for in exactly one case: another
+/// process published the language while this one ran. That takes BOTH halves —
+/// a parser on its own is what the failed install was trying to complete, and
+/// reloading it registers a language with no highlighting while reporting
+/// success.
 fn classify_install_outcome(
     result: &crate::install::InstallResult,
-    parser_exists: bool,
+    language_is_complete: bool,
     data_dir: &std::path::Path,
 ) -> InstallOutcome {
     if result.is_success() {
         InstallOutcome::Success {
             data_dir: data_dir.to_path_buf(),
         }
-    } else if parser_exists && result.parser_error.is_none() {
+    } else if language_is_complete {
         InstallOutcome::SuccessWithWarnings {
             data_dir: data_dir.to_path_buf(),
         }
@@ -654,11 +658,31 @@ fn classify_install_outcome(
 mod tests {
     use super::*;
 
-    /// A failed install whose parser half is the half that failed must not be
-    /// dressed up as a near-success just because a parser file is on disk: the
-    /// file is another install's, and the error would be swallowed.
+    /// A failed install must not be dressed up as a near-success by a parser
+    /// that is on disk without its queries — that is the half-installed
+    /// language the attempt was trying to repair, and reloading it registers a
+    /// language with no highlighting while reporting success.
     #[test]
-    fn a_failed_parser_half_is_never_reported_as_warnings() {
+    fn a_failed_install_over_an_incomplete_language_stays_failed() {
+        let data_dir = PathBuf::from("/data");
+        let result = crate::install::InstallResult {
+            parser_path: None,
+            queries_path: None,
+            parser_error: None,
+            queries_error: Some("network unreachable".to_string()),
+            files_downloaded: Vec::new(),
+        };
+
+        assert_eq!(
+            classify_install_outcome(&result, false, &data_dir),
+            InstallOutcome::Failed
+        );
+    }
+
+    /// Another install finished the language while this one was failing, so
+    /// both halves are there and it loads.
+    #[test]
+    fn a_failed_install_over_a_complete_language_still_reloads() {
         let data_dir = PathBuf::from("/data");
         let result = crate::install::InstallResult {
             parser_path: None,
@@ -670,33 +694,9 @@ mod tests {
 
         assert_eq!(
             classify_install_outcome(&result, true, &data_dir),
-            InstallOutcome::Failed
-        );
-    }
-
-    /// The install published nothing, but a parser from an earlier or
-    /// concurrent install is present, so the language is still loadable.
-    #[test]
-    fn a_failed_queries_half_over_an_existing_parser_still_reloads() {
-        let data_dir = PathBuf::from("/data");
-        let result = crate::install::InstallResult {
-            parser_path: None,
-            queries_path: None,
-            parser_error: None,
-            queries_error: Some("network unreachable".to_string()),
-            files_downloaded: Vec::new(),
-        };
-
-        assert_eq!(
-            classify_install_outcome(&result, true, &data_dir),
             InstallOutcome::SuccessWithWarnings {
                 data_dir: data_dir.clone()
             }
-        );
-        assert_eq!(
-            classify_install_outcome(&result, false, &data_dir),
-            InstallOutcome::Failed,
-            "with no parser on disk there is nothing to reload"
         );
     }
 
