@@ -38,9 +38,11 @@ Partially implemented:
   merge host-server pulls (real URI) with the virt regions' results per the
   layer strategy. Not covered: semantic tokens (native-only) and the experimental
   documentColor/colorPresentation pair. `completionItem/resolve` routes by
-  the envelope the virt fan-out stamps into `CompletionItem.data`; host
-  completion items carry no envelope and resolve falls back gracefully
-  (item returned unresolved). Formatting additionally supports the cross-layer
+  the envelope stamped into `CompletionItem.data`; the host layer stamps one
+  too (marked `host_layer`, so the resolve forwards VERBATIM — no coordinate
+  translation and no injection-region edit guard), but only for a server that
+  advertises `completionItem/resolve`. Without that capability the items stay
+  bare and a resolve falls back gracefully (item returned unresolved). Formatting additionally supports the cross-layer
   `concatenated` pipeline: virt region edits apply first, the host
   formatter formats the intermediate text, and the chain collapses into one
   whole-document replacement edit. During that pipeline the host server's
