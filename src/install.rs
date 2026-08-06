@@ -308,7 +308,14 @@ fn install_language_with_query_stager(
         return result;
     }
 
-    if let Err(e) = queries::clear_uninstall_tombstone_for_install(data_dir, language) {
+    // Clearing the tombstone is what makes this install override an earlier
+    // uninstall, so it has to wait for any uninstall in flight: clearing it
+    // between that uninstall's two removals would leave this install staging
+    // against a parser the uninstall was about to delete. The lock is released
+    // again immediately — the expensive staging below must not block anyone.
+    let cleared = queries::lock_language(data_dir, language)
+        .and_then(|_lock| queries::clear_uninstall_tombstone_for_install(data_dir, language));
+    if let Err(e) = cleared {
         result.queries_error = Some(e.to_string());
         return result;
     }
@@ -392,7 +399,21 @@ fn install_language_with_query_stager(
                 return result;
             }
         },
-        parser::StagedParserOutcome::AlreadyInstalled(path) => result.parser_path = Some(path),
+        parser::StagedParserOutcome::AlreadyInstalled(path) => {
+            // Staging saw this parser before the transaction lock was taken, so
+            // re-check it: publishing queries against a parser an uninstall has
+            // since removed is the queries-only state this lock exists to
+            // prevent, and nothing was staged that could replace it.
+            if !path.exists() {
+                published_queries.rollback();
+                result.parser_error = Some(format!(
+                    "the installed parser for '{}' was removed while it was being installed",
+                    language
+                ));
+                return result;
+            }
+            result.parser_path = Some(path);
+        }
     }
 
     let committed = published_queries.commit();
@@ -773,6 +794,9 @@ mod tests {
         assert!(!failure.is_success());
     }
 
+    /// Preparing the query side — taking the language lock and clearing any
+    /// uninstall tombstone — happens before either half is staged, so its
+    /// failure is a query error and nothing else.
     #[test]
     fn install_language_reports_tombstone_cleanup_as_query_error_only() {
         let temp = tempfile::TempDir::new().unwrap();
@@ -787,10 +811,12 @@ mod tests {
         // A file where the queries directory belongs makes tombstone cleanup
         // fail; the base URL points nowhere so a download would fail loudly.
         std::fs::write(data_dir.join("queries"), "not a directory").unwrap();
-        let expected_queries_error =
-            queries::clear_uninstall_tombstone_for_install(data_dir, "lua")
-                .unwrap_err()
-                .to_string();
+        // Derived the same way the installer does, so the assertion follows the
+        // code rather than a copy of its message.
+        let expected_queries_error = queries::lock_language(data_dir, "lua")
+            .and_then(|_lock| queries::clear_uninstall_tombstone_for_install(data_dir, "lua"))
+            .unwrap_err()
+            .to_string();
 
         let result = install_language_blocking(
             "lua",
