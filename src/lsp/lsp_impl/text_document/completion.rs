@@ -59,6 +59,12 @@ impl Kakehashi {
     /// `completionItem/resolve`: for one that does not, it would be pure wire
     /// weight on every item of every completion, and the resolve would fail
     /// soft back to the unresolved item anyway.
+    ///
+    /// Minting also happens only for the server that WINS the fan-in. Each
+    /// fanned-out server carries its identity back beside its response
+    /// ([`HostCompletion`]) instead of enveloping in its own task, so a
+    /// multi-server `bridge._self` does not pay a per-item pass in every
+    /// losing task on every keystroke only to discard it.
     async fn completion_host_layer(
         &self,
         lsp_uri: &Uri,
@@ -90,17 +96,17 @@ impl Kakehashi {
                 let Some(raw) = raw else {
                     return Ok(None);
                 };
-                let Some(mut response) = parse_host_verbatim::<CompletionResponse>(raw.value)
-                else {
+                let Some(response) = parse_host_verbatim::<CompletionResponse>(raw.value) else {
                     return Ok(None);
                 };
-                bridge_host_completion_items(
-                    &mut response,
-                    &t.server_name,
-                    t.uri.as_str(),
-                    raw.handle.has_capability("completionItem/resolve"),
-                );
-                Ok(Some(response))
+                Ok(Some(HostCompletion {
+                    response,
+                    // Two allocations per SERVER, versus an envelope per item
+                    // in a task whose result the fan-in may well discard.
+                    server_resolves: raw.handle.has_capability("completionItem/resolve"),
+                    server_name: t.server_name,
+                    host_uri: t.uri.into(),
+                }))
             }
         };
         // No layer-level `unregister_all` here: the virt layer runs
@@ -111,14 +117,14 @@ impl Kakehashi {
             &ctx,
             pool.clone(),
             f,
-            |opt| matches!(opt, Some(v) if completion_response_has_result(v)),
+            |opt| matches!(opt, Some(v) if completion_response_has_result(&v.response)),
             cancel_rx,
         )
         .await;
         // Quieter than `FanInResult::handle`: an all-empty host layer is the
         // normal outcome whenever virt answers, so only real failures surface.
         match fan_in {
-            FanInResult::Done(value) => Ok(value),
+            FanInResult::Done(won) => Ok(won.map(HostCompletion::into_enveloped_response)),
             FanInResult::NoResult { errors } => {
                 if errors > 0 {
                     self.notifier()
@@ -182,6 +188,30 @@ impl Kakehashi {
                 Ok(v.map(CompletionResponse::List))
             })
             .await
+    }
+}
+
+/// One host server's completion response plus the identity the resolve
+/// envelope needs, carried through the fan-in so only the WINNER is enveloped.
+struct HostCompletion {
+    response: CompletionResponse,
+    /// The server that answered — the `origin` a later resolve routes to.
+    server_name: String,
+    /// The real host document URI the resolve reconnects on.
+    host_uri: String,
+    /// Whether that server advertises `completionItem/resolve`.
+    server_resolves: bool,
+}
+
+impl HostCompletion {
+    fn into_enveloped_response(mut self) -> CompletionResponse {
+        bridge_host_completion_items(
+            &mut self.response,
+            &self.server_name,
+            &self.host_uri,
+            self.server_resolves,
+        );
+        self.response
     }
 }
 

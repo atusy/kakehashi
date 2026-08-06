@@ -401,6 +401,9 @@ pub(crate) struct KakehashiEnvelope {
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub region_id: String,
     /// The downstream server's original `data` value (preserved verbatim).
+    /// Absent — not `null` — when the server sent none, which is most items
+    /// on most responses; `wrap_envelope` moves the value in afterwards.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub inner: Option<Value>,
     /// Region offset snapshot for coordinate transformation of the resolved response.
     pub offset: EnvelopeOffset,
@@ -505,12 +508,38 @@ pub(crate) fn envelope_item_data(item: &mut CompletionItem, ctx: &EnvelopeContex
         origin: ctx.server_name.to_string(),
         host_uri: ctx.host_uri.to_string(),
         region_id: ctx.region_id.to_string(),
-        inner,
+        inner: None,
         offset: EnvelopeOffset::from(ctx.offset),
         region_end: ctx.region_end.map(|end| (end.line, end.character)),
         host_layer: ctx.host_layer,
     };
-    item.data = Some(serde_json::json!({ ENVELOPE_KEY: envelope }));
+    item.data = Some(wrap_envelope(envelope, inner));
+}
+
+/// Serialize an envelope into `{"kakehashi": {…}}`, MOVING the downstream's
+/// own `data` into `inner`.
+///
+/// The obvious `json!({ ENVELOPE_KEY: envelope })` would serialize `inner`
+/// through `Serialize`, i.e. deep-copy the downstream's `data` — once per
+/// item, on a response the client re-requests on every keystroke. Serializing
+/// the envelope with `inner: None` (skipped on the wire) and inserting the
+/// moved value afterwards costs one map insert instead.
+fn wrap_envelope(envelope: KakehashiEnvelope, inner: Option<Value>) -> Value {
+    debug_assert!(
+        envelope.inner.is_none(),
+        "inner must be moved in, not serialized"
+    );
+    let mut wrapped = serde_json::to_value(envelope).unwrap_or(Value::Null);
+    if let Some(inner) = inner
+        && let Some(fields) = wrapped.as_object_mut()
+    {
+        fields.insert("inner".to_string(), inner);
+    }
+    // Built by hand rather than `json!`, which would deep-copy `wrapped`
+    // (including the `inner` we just moved in) back out through `Serialize`.
+    let mut outer = serde_json::Map::with_capacity(1);
+    outer.insert(ENVELOPE_KEY.to_string(), wrapped);
+    Value::Object(outer)
 }
 
 /// Apply the HOST-layer completion policy to a host response (#958): envelope
@@ -567,7 +596,7 @@ pub(super) fn envelope_host_item(item: &mut CompletionItem, server_name: &str, h
         origin: server_name.to_string(),
         host_uri: host_uri.to_string(),
         region_id: String::new(),
-        inner,
+        inner: None,
         // Unused on the host path (resolve forwards verbatim); a zero offset.
         offset: EnvelopeOffset {
             line: 0,
@@ -577,7 +606,7 @@ pub(super) fn envelope_host_item(item: &mut CompletionItem, server_name: &str, h
         region_end: None,
         host_layer: true,
     };
-    item.data = Some(serde_json::json!({ ENVELOPE_KEY: envelope }));
+    item.data = Some(wrap_envelope(envelope, inner));
 }
 
 /// Extract the envelope from a completion item's `data` without modifying the item.
@@ -1367,10 +1396,58 @@ mod tests {
 
         let envelope = extract_envelope(&item).expect("should extract envelope");
         assert_eq!(envelope.inner, None);
+        assert!(
+            item.data.as_ref().expect("enveloped")["kakehashi"]
+                .get("inner")
+                .is_none(),
+            "an item whose server sent no data must not carry `inner: null`"
+        );
 
         let stripped = strip_envelope(&mut item).expect("should strip");
         assert_eq!(stripped.inner, None);
         assert_eq!(item.data, None);
+    }
+
+    /// `wrap_envelope` moves the downstream's `data` in rather than
+    /// re-serializing it (which would deep-copy every item's data on every
+    /// keystroke). Nested structure must survive the move byte for byte.
+    #[test]
+    fn envelope_moves_nested_downstream_data_in_unchanged() {
+        let original = json!({
+            "resolve_id": 42,
+            "nested": { "deep": ["a", 1, null, {"k": true}] }
+        });
+        let mut item = CompletionItem {
+            label: "print".to_string(),
+            data: Some(original.clone()),
+            ..Default::default()
+        };
+        let offset = RegionOffset::new(3, 4);
+        envelope_item_data(
+            &mut item,
+            &EnvelopeContext {
+                server_name: "lua-ls",
+                host_uri: "file:///test/doc.md",
+                region_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+                offset: &offset,
+                region_end: Some(TEST_REGION_END),
+                host_layer: false,
+            },
+        );
+
+        assert_eq!(
+            item.data.as_ref().expect("enveloped")["kakehashi"]["inner"],
+            original,
+            "the moved-in data must be identical to what the server sent"
+        );
+        assert_eq!(
+            extract_envelope(&item).expect("enveloped").inner,
+            Some(original.clone()),
+            "and must deserialize back to that same value"
+        );
+        // `strip_envelope` moves `inner` back out into the item's own data.
+        strip_envelope(&mut item).expect("should strip");
+        assert_eq!(item.data, Some(original));
     }
 
     #[test]
