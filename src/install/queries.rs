@@ -170,6 +170,20 @@ pub fn query_install_chain_is_complete(queries_parent: &Path, language: &str) ->
     walk(queries_parent, language, &mut Vec::new())
 }
 
+/// Strip the parentheses nvim-treesitter puts around some inherited names.
+///
+/// Must match what the query loader does with the same line
+/// (`language::query_loader::normalize_inherited_language_name`): the loader
+/// resolves `(cpp)` as `cpp`, so an installer that dropped it as an unsafe name
+/// would report success and leave the loader looking for a language nothing
+/// fetched.
+fn normalize_inherited_language_name(name: &str) -> String {
+    name.trim_start_matches('(')
+        .trim_end_matches(')')
+        .trim()
+        .to_string()
+}
+
 /// Parse the `; inherits: lang1,lang2` directive from query content.
 /// Returns the list of parent languages, dropping unsafe names
 /// (see [`is_safe_language_name`]).
@@ -177,7 +191,7 @@ fn parse_inherits_directive(content: &str) -> Vec<String> {
     let first_line = content.lines().next().unwrap_or("");
     if let Some(rest) = first_line.strip_prefix("; inherits:") {
         rest.split(',')
-            .map(|s| s.trim().to_string())
+            .map(|s| normalize_inherited_language_name(s.trim()))
             .filter(|s| !s.is_empty())
             .filter(|s| {
                 let safe = is_safe_language_name(s);
@@ -458,11 +472,12 @@ impl StagedQueryInstall {
             language: requested_language.clone(),
             published: Vec::new(),
         };
-        // Deepest first: entries are collected requested-language-first, so
-        // reversing publishes every base language before the one that inherits
-        // it. A reader that catches the install mid-publish then sees a
-        // language whose chain is already there, never a dangling `; inherits:`.
-        for entry in entries.into_iter().rev() {
+        // Staging appends a language only once every language it inherits is
+        // already in the list, so publishing in order puts each base language
+        // in place before the one that needs it. A reader that catches the
+        // install mid-publish then sees a language whose chain is already
+        // there, never a dangling `; inherits:`.
+        for entry in entries {
             let requested = entry.language == requested_language;
             // Each entry publishes with the `force` it was staged with, so an
             // inherited parent never overwrites a copy that appeared while this
@@ -593,7 +608,7 @@ impl PublishedQueryInstall {
                      retrying.",
                     published.language, e, published.language
                 );
-                outcome = RollbackOutcome::LeftPublished;
+                outcome = RollbackOutcome::NewQueriesRemain;
                 continue;
             }
             let Some(backup) = &published.backup else {
@@ -617,7 +632,7 @@ impl PublishedQueryInstall {
                         e,
                         backup.display()
                     );
-                    outcome = RollbackOutcome::LeftPublished;
+                    outcome = RollbackOutcome::PreviousQueriesStranded;
                 }
             }
         }
@@ -625,15 +640,19 @@ impl PublishedQueryInstall {
     }
 }
 
-/// Whether a rollback actually put everything back.
+/// What a rollback managed to put back.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RollbackOutcome {
-    /// Nothing this install published is still published.
+    /// Nothing this install published is still published, and whatever it
+    /// displaced is back.
     Undone,
-    /// A removal or restore failed, so the data directory still holds queries
-    /// this install wrote — the warnings say which. The caller must not tell
-    /// the user that nothing was published.
-    LeftPublished,
+    /// The queries this install published are still live: they could not be
+    /// removed, or the lock needed to remove them could not be taken.
+    NewQueriesRemain,
+    /// The new queries are gone but the ones they displaced could not be put
+    /// back, so the language has no queries and the previous ones are in a
+    /// backup directory. The warnings name it.
+    PreviousQueriesStranded,
 }
 
 impl Drop for PublishedQueryInstall {
@@ -882,8 +901,10 @@ fn stage_queries_recursive(
 
     write_install_marker(&tmp_queries_dir)?;
 
+    // Marked as staged before recursing, so an inheritance cycle terminates;
+    // the entry itself is appended after, so `entries` comes out in dependency
+    // order and can be published base-language-first.
     staged.insert(language.to_string());
-    entries.push(staged_dir);
 
     // Stage parent dependencies. A parent that cannot be downloaded fails the
     // whole install: propagating the error here drops every staging directory
@@ -902,6 +923,7 @@ fn stage_queries_recursive(
             http_policy,
         )?;
     }
+    entries.push(staged_dir);
 
     Ok(StageOutcome::Staged { files_downloaded })
 }
@@ -2454,6 +2476,18 @@ mod tests {
     /// URL segments, so anything outside nvim-treesitter's `[a-z0-9_]+`
     /// naming must be dropped — `; inherits: ../../x` from a compromised or
     /// custom query source must not escape the data dir.
+    /// nvim-treesitter parenthesizes some inherited names, and the query loader
+    /// resolves `(cpp)` as `cpp`. An installer that read it any other way would
+    /// report success and leave the loader looking for a language nothing
+    /// fetched.
+    #[test]
+    fn parse_inherits_directive_strips_parentheses_like_the_loader() {
+        assert_eq!(
+            parse_inherits_directive("; inherits: c, (cpp), (cuda)\n"),
+            vec!["c".to_string(), "cpp".to_string(), "cuda".to_string()]
+        );
+    }
+
     #[test]
     fn parse_inherits_directive_drops_unsafe_language_names() {
         let parents = parse_inherits_directive(
@@ -2642,6 +2676,12 @@ mod tests {
                 "; inherits: inj_parent\n(comment) @injection.content\n",
             ),
             ("/inj_parent/highlights.scm", "(comment) @comment\n"),
+            // The kind that inherited it, too: loading the child's injections
+            // resolves the parent's injections, not its highlights.
+            (
+                "/inj_parent/injections.scm",
+                "(string) @injection.content\n",
+            ),
         ]);
 
         install_queries_with_dependencies_from_allowing_http_for_tests(
@@ -2656,9 +2696,9 @@ mod tests {
             data_dir
                 .join("queries")
                 .join("inj_parent")
-                .join("highlights.scm")
+                .join("injections.scm")
                 .exists(),
-            "a parent named by injections.scm must be installed"
+            "a parent named by injections.scm must be installed, with the kind that named it"
         );
     }
 

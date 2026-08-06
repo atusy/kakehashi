@@ -901,6 +901,19 @@ accepts them — reinstall with `--force` to line them up again. A kill that
 leaves the parser itself missing needs no `--force`: a plain re-run sees the
 missing half and fetches it.
 
+Two more limits worth knowing:
+
+- Publication is atomic per file, not to readers. A running server that loads a
+  language *while* a `--force` reinstall is publishing can see the new queries
+  against the parser still being replaced, and keep that pairing until it
+  reloads. Installing while nothing is using the language avoids it.
+- A base language is fetched with the same query kinds as the language that
+  inherits it, but only the ones upstream publishes for it. If upstream names a
+  base language in, say, `injections.scm` without shipping that base language's
+  `injections.scm`, the install still succeeds and the query fails to load —
+  the missing file is upstream's, and installing the base language by name will
+  not conjure it either.
+
 ### Configuration Management
 
 ```bash
