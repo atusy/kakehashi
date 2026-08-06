@@ -120,7 +120,11 @@ pub fn parser_file_exists(language: &str, data_dir: &Path) -> Option<PathBuf> {
         data_dir
             .join("parser")
             .join(format!("{}.{}", language, std::env::consts::DLL_EXTENSION));
-    if parser_file.exists() {
+    // A file, not merely an entry: a directory with a parser's name is not a
+    // parser, and reading it as one made an install report success over
+    // something it never wrote — while `language status`, which does check for
+    // a file, called the same language missing.
+    if parser_file.is_file() {
         Some(parser_file)
     } else {
         None
@@ -377,17 +381,7 @@ pub(crate) fn stage_parser(
     language: &str,
     options: &InstallOptions,
 ) -> Result<StagedParserOutcome, ParserInstallError> {
-    // `language` becomes path segments (`parser/<language>.<ext>` and the temp
-    // file) and a URL/metadata key, so reject traversal-capable names before
-    // touching the filesystem. Higher-level callers (auto-install) already gate
-    // this, but `install_parser` is a public entry point and must be safe on its
-    // own — a name like `../../evil` would otherwise write outside the data dir.
-    if !super::queries::is_safe_language_name(language) {
-        return Err(ParserInstallError::IoError(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            format!("unsafe language name '{}'", language.escape_default()),
-        )));
-    }
+    reject_unsafe_language_name(language)?;
 
     let parser_dir = options.data_dir.join("parser");
     let parser_file = parser_dir.join(format!("{}.{}", language, std::env::consts::DLL_EXTENSION));
@@ -462,6 +456,87 @@ pub(crate) fn stage_parser(
     Ok(StagedParserOutcome::Staged(staged))
 }
 
+/// Reject a language name that cannot be used to build a path.
+///
+/// `language` becomes path segments (`parser/<language>.<ext>` and the temp
+/// file) and a URL/metadata key. Higher-level callers (auto-install) already
+/// gate this, but the entry points below are public and must be safe on their
+/// own — a name like `../../evil` would otherwise write outside the data dir.
+fn reject_unsafe_language_name(language: &str) -> Result<(), ParserInstallError> {
+    if super::queries::is_safe_language_name(language) {
+        Ok(())
+    } else {
+        Err(ParserInstallError::IoError(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("unsafe language name '{}'", language.escape_default()),
+        )))
+    }
+}
+
+/// Collect parser staging files whose owning process is gone.
+///
+/// Publication renames the staging file away, and the drop guard reclaims it on
+/// every error path — but a killed process runs neither, and nothing else knows
+/// the name. The query side has had this since staging directories were
+/// introduced; this is its parser counterpart. Dot-prefixed staging files are
+/// already invisible to parser discovery, so this only reclaims disk.
+///
+/// Names carry the owning pid, and a live owner's file is left alone. Off unix
+/// there is no portable liveness test, so nothing is collected — the same
+/// conservative stance the query sweep takes.
+pub fn recover_interrupted_parser_installs(parser_dir: &Path) -> std::io::Result<()> {
+    let entries = match fs::read_dir(parser_dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e),
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !entry.file_type().is_ok_and(|kind| kind.is_file()) {
+            continue;
+        }
+        let Some(pid) = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .and_then(staging_file_owner)
+        else {
+            continue;
+        };
+        if super::queries::process_is_running(pid) {
+            continue;
+        }
+        let _ = fs::remove_file(&path);
+    }
+    Ok(())
+}
+
+/// The pid embedded in a generated staging file name, if it is one.
+///
+/// Shape: `.{language}.{pid}.{counter}.{ext}.tmp`, plus the `.displaced` copy a
+/// Windows publish moves the previous parser to. A user's own dot-file is left
+/// alone because it will not parse into these parts.
+fn staging_file_owner(name: &str) -> Option<&str> {
+    let rest = name
+        .strip_prefix('.')?
+        .strip_suffix(".displaced")
+        .unwrap_or(name.strip_prefix('.')?)
+        .strip_suffix(".tmp")?;
+    let mut parts = rest.split('.');
+    let language = parts.next()?;
+    let pid = parts.next()?;
+    let counter = parts.next()?;
+    let _extension = parts.next()?;
+    if parts.next().is_none()
+        && super::queries::is_safe_language_name(language)
+        && pid.bytes().all(|b| b.is_ascii_digit())
+        && counter.bytes().all(|b| b.is_ascii_digit())
+    {
+        Some(pid)
+    } else {
+        None
+    }
+}
+
 /// Name of the staging file a parser compiles into, inside `parser/`.
 ///
 /// Dot-prefixed and `.tmp`-suffixed so parser discovery walks past it, and
@@ -483,6 +558,14 @@ pub fn install_parser(
     language: &str,
     options: &InstallOptions,
 ) -> Result<ParserInstallResult, ParserInstallError> {
+    // Half of a language on its own, but still inside the transaction protocol:
+    // a parser published without this lock can land after an uninstall removed
+    // the other half, recreating the parser-only state that uninstall reported
+    // as gone. Checked before the lock so an unusable name keeps reporting
+    // itself rather than a lock failure.
+    reject_unsafe_language_name(language)?;
+    let _transaction = super::queries::lock_language(&options.data_dir, language)
+        .map_err(|e| ParserInstallError::IoError(std::io::Error::other(e.to_string())))?;
     match stage_parser(language, options)? {
         StagedParserOutcome::Staged(staged) => {
             let result = staged.publish()?;
@@ -1479,6 +1562,59 @@ mod tests {
         let status = run_with_timeout(cmd, Duration::from_secs(10), "test exit")
             .expect("fast command should complete within the deadline");
         assert!(status.success());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn interrupted_parser_staging_files_are_collected() {
+        let temp = tempdir().expect("temp dir");
+        let parser_dir = temp.path().join("parser");
+        fs::create_dir_all(&parser_dir).expect("create parser dir");
+        let ext = std::env::consts::DLL_EXTENSION;
+        let dead = parser_dir.join(format!(".lua.{}.0.{}.tmp", dead_pid(), ext));
+        let live = parser_dir.join(format!(".lua.{}.0.{}.tmp", std::process::id(), ext));
+        let installed = parser_dir.join(format!("lua.{}", ext));
+        let unmanaged = parser_dir.join(".notes.txt");
+        for path in [&dead, &live, &installed, &unmanaged] {
+            fs::write(path, b"x").expect("write file");
+        }
+
+        recover_interrupted_parser_installs(&parser_dir).expect("sweep should succeed");
+
+        assert!(!dead.exists(), "a dead owner's staging file is reclaimed");
+        assert!(
+            live.exists(),
+            "a live owner is still compiling into its file"
+        );
+        assert!(installed.exists(), "the installed parser is untouched");
+        assert!(
+            unmanaged.exists(),
+            "files this module did not name are left alone"
+        );
+    }
+
+    /// A pid no live process can have, found the same way the query sweep's
+    /// test finds one.
+    #[cfg(unix)]
+    fn dead_pid() -> u32 {
+        let mut pid = std::process::id().saturating_add(100_000);
+        while super::super::queries::process_is_running(&pid.to_string()) {
+            pid = pid.saturating_add(1);
+        }
+        pid
+    }
+
+    /// A directory that happens to carry a parser's name is not a parser —
+    /// `language status` already says so, and an install that disagreed
+    /// reported success over something it never wrote.
+    #[test]
+    fn a_parser_shaped_directory_is_not_an_installed_parser() {
+        let temp = tempdir().expect("temp dir");
+        let ext = std::env::consts::DLL_EXTENSION;
+        fs::create_dir_all(temp.path().join("parser").join(format!("lua.{}", ext)))
+            .expect("create parser-shaped directory");
+
+        assert!(parser_file_exists("lua", temp.path()).is_none());
     }
 
     #[test]

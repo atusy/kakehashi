@@ -416,6 +416,9 @@ fn run_language_status(verbose: bool) -> Result<(), ExitCode> {
         eprintln!("Error: failed to recover interrupted query installs: {e}");
         ExitCode::FAILURE
     })?;
+    if let Err(e) = parser::recover_interrupted_parser_installs(&parser_dir) {
+        eprintln!("Warning: failed to collect interrupted parser installs: {e}");
+    }
 
     // Collect all installed languages from both parser and queries directories
     let mut languages = BTreeSet::new();
@@ -1064,11 +1067,19 @@ fn run_install(language: &str, force: bool, verbose: bool, no_cache: bool) -> Re
         // which half survived and whether a retry needs --force. Scoped to the
         // requested language: queries for a base language it inherits stay
         // published (they are shared), and bookkeeping is written either way.
-        eprintln!(
-            "\nFailed to install '{}' language support. Neither its parser nor its queries were \
-             published.",
-            language
-        );
+        if result.left_published_queries {
+            eprintln!(
+                "\nFailed to install '{}' language support, and the queries it had already \
+                 published could not be withdrawn — see the warnings above.",
+                language
+            );
+        } else {
+            eprintln!(
+                "\nFailed to install '{}' language support. Neither its parser nor its queries \
+                 were published.",
+                language
+            );
+        }
         return Err(ExitCode::FAILURE);
     }
 
