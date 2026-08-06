@@ -302,18 +302,21 @@ selected it always merges B, and with `priorities` naming only A there is no B
 to fall back to. So a user gets *either* B's duplicates always, *or* no backup;
 not "A normally, B when A has nothing".
 
-The trade is accepted because the conditional's remaining half is the one this
-method should not have. Falling back on **failure** is not really needed: a
-failed A contributes nothing and B, if selected, is in the answer regardless.
-Falling back on **empty** is the case `preferred` uniquely provides, and it is
-wrong here — for a search, empty means "no matches", so consulting B on it
-answers a query A already said had none. What is genuinely lost is the
-combination: suppressing B's duplicates while keeping it as a failure backup.
+The trade is accepted as **uniformity**, not because fallback-on-empty is
+invalid. It would be easy to over-argue this, so: an empty answer from A
+establishes only that A's index has no match, and says nothing about B's — which
+is exactly why `union` returns B's matches when A is empty, and why treating
+empty as a reason to consult B is a defensible policy rather than a semantic
+error. `preferred` already treats empty as failed for priority purposes.
 
-If that combination turns out to matter, it belongs in a mode of its own with a
-name that says what it does, not in `preferred` — whose empty-means-retry
-semantics are the part that must not apply. Until then the lever is
-`priorities`, an allowlist: name only the server you want. That is a
+What this decision chooses instead is that **every selected server's view
+appears, unconditionally**, because kakehashi cannot attribute a response to a
+pair (point 2's central argument) and so cannot justify suppressing one server's
+results on the strength of another's. Accepting that means accepting its
+corollary: no configuration expresses "suppress B's duplicates but keep B as a
+backup". If that combination turns out to matter, it belongs in a mode of its
+own with a name that says what it does. Until then the lever is `priorities`, an
+allowlist: name only the server you want. That is a
 static, deliberate exclusion the user writes, not an inference kakehashi draws
 from an empty response — which is the distinction that makes it acceptable here
 and `preferred` not. It does cost the user an edit in **every** pair that names
@@ -417,7 +420,9 @@ existing configuration from becoming a silent no-op here.
 2. Drop handles that lack `workspace/symbol`. This is knowable now, because
    every candidate is `Ready` — `server_capabilities()` is populated during the
    handshake.
-3. Apply the per-pair `priorities` allowlist and `max_fan_out` cap.
+3. Apply the per-pair `priorities` allowlist and `max_fan_out` cap, and drop
+   any handle whose recorded launch configuration no longer matches the
+   `BridgeServerConfig` that admitted it.
 4. Dedup the survivors by **connection key** `(server, root)`.
 5. Await `wait_for_pending_reopen` for the survivors, **concurrently**, then
    send.
@@ -477,6 +482,15 @@ design this placement had a second failure mode too — the cap became a global
 barrier — but with `Initializing` excluded there is nothing left to wait for,
 so only the coverage argument applies.)
 Deciding membership synchronously removes the interaction entirely.
+
+Step 3's config check exists because settings are published before the pool
+finishes propagating them, so a reload leaves a window in which a live handle
+was spawned from a configuration the current settings have already superseded.
+Being `Ready`, capable, and holding the right documents does not make it the
+process the current config describes; the pool's own by-key acquisition compares
+launch configurations for exactly this reason. The resolved config is therefore
+carried into selection and re-compared at the pre-enqueue check, and a mismatched
+handle is dropped rather than queried.
 
 Step 2 must precede step 3: capping first would let a **known-incapable**
 server take a slot from a capable one — with `priorities = [A, B]`,
@@ -563,7 +577,8 @@ with its own name and semantics rather than smuggled into this one.
         │ 1. keep Ready ONLY (not Initializing,│
         │    Failed, Closing, Closed)          │
         │ 2. drop handles lacking capability   │
-        │ 3. allowlist + per-pair max_fan_out  │
+        │ 3. allowlist + per-pair max_fan_out, │
+        │    drop stale-config handles         │
         │    NEVER spawns a connection         │
         └──────────────────┬───────────────────┘
                            ▼
@@ -1082,14 +1097,26 @@ stale-handle check before enqueueing, which is the precedent's own discipline
 and can stall behind exactly the same holders, after selection's budget has
 already been spent.
 
-- **Selection's lock acquisition**: three seconds. The budget covers
-  *acquiring* the mutex, not the filtering that follows — that walk is
-  synchronous with no await, so a timeout could not preempt it anyway, and
-  bounding what cannot be interrupted would be a promise the runtime does not
-  keep. The walk is over in-memory maps and is not where a query stalls.
-- **Each send's pre-enqueue re-acquisition**: three seconds, per target,
-  independently. A target that cannot get the lock in time is dropped like any
-  other unreachable one.
+The rule is uniform: **every lock this path acquires carries a three-second
+budget, and failing to acquire it drops the affected target or host** rather
+than blocking the query. That is more than the `connections` mutex — selection
+also takes `host_documents` (for `_self` targets) and the tracker snapshot, each
+send re-acquires `connections` before enqueue, and translation takes each host's
+`edit_lock`. None of these is safe to assume fast: injection processing holds
+`edit_lock` across downstream close, change, and eager-spawn awaits, so a query
+arriving mid-processing would otherwise wait on unrelated work with no bound.
+
+- **Selection** (`connections`, then `host_documents`, then the tracker
+  snapshot, in that order): three seconds each. The budget covers *acquiring*
+  each lock, not the filtering between them — that walk is synchronous with no
+  await, so a timeout could not preempt it anyway, and bounding what cannot be
+  interrupted would promise something the runtime does not deliver.
+- **Each send's pre-enqueue re-acquisition** of `connections`: three seconds,
+  per target, independently. A target that cannot get the lock in time is
+  dropped like any other unreachable one.
+- **Translation's `edit_lock`** per host: three seconds. A host whose lock
+  cannot be taken in time loses that query's entries, exactly like a host whose
+  geometry was stale.
 
 Separate budgets rather than one deadline spanning the whole dispatch, because a
 single outer deadline would silently consume the reopen barrier's two seconds
@@ -1296,9 +1323,11 @@ Including it would defeat dedup on a field carrying no identity.
 - No result is discarded on a basis kakehashi cannot compute. A server
   configured under one language may return another language's symbols, and they
   survive.
-- Because nothing arbitrates, there is no per-target response buffer to hold and
-  no ordering dependency between targets — the handler is a flat
-  fan-out/translate/merge.
+- Because nothing arbitrates, there is no ordering dependency between targets —
+  the handler is a flat fan-out/translate/merge. This removes ordering state,
+  **not** storage: fan-in waits for every target before classifying anything
+  (point 5), so peak memory is the sum of all targets' complete responses, held
+  while the slowest target runs out its 30-second budget.
 - A query never spawns a process, so `Ctrl-T` in a fresh session cannot stampede
   every configured language server.
 
@@ -1309,10 +1338,11 @@ Including it would defeat dedup on a field carrying no identity.
   points in a session. LSP permits partial `workspace/symbol` results, but a
   user expecting an indexed whole-project search will find this surprising.
 - Latency is max-over-live-targets, and every *wait* is bounded: the pool's 30s
-  request timeout and liveness timeout, three-second budgets on selection's and
-  each send's `connections` lock **acquisition**, and the reopen barrier's two
-  seconds. Total latency is not bounded, because the synchronous filtering
-  between those waits cannot be preempted. Forwarded cancellation is
+  request timeout and liveness timeout, a three-second budget on **every** lock
+  this path acquires (`connections`, `host_documents`, the tracker snapshot,
+  each send's re-acquisition, and each host's `edit_lock`), and the reopen
+  barrier's two seconds. Total latency is not bounded, because the synchronous
+  filtering between those waits cannot be preempted. Forwarded cancellation is
   best-effort, since a downstream may ignore it.
 - One request per keystroke, un-coalesced (point 9).
 - Fan-in can wait on a parse: the distinct host documents a result addresses are
