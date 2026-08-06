@@ -254,7 +254,15 @@ fn install_queries_with_dependencies_from_with_http_policy(
     http_policy: QueryHttpPolicy,
 ) -> Result<QueryInstallResult, QueryInstallError> {
     let staged = stage_queries_with_dependencies(base_url, language, data_dir, force, http_policy)?;
-    staged.publish()?.commit()
+    match staged.publish()?.commit() {
+        CommittedQueryInstall::Installed(result) => Ok(result),
+        // The `install_queries_*` entry points predate staging and report an
+        // untouched language as `AlreadyExists`; their callers read it as a
+        // successful no-op.
+        CommittedQueryInstall::AlreadyInstalled(path) => {
+            Err(QueryInstallError::AlreadyExists(path))
+        }
+    }
 }
 
 fn validate_url_http_policy(
@@ -386,22 +394,30 @@ impl StagedQueryInstall {
     }
 }
 
+/// What committing a publish left in place.
+pub(crate) enum CommittedQueryInstall {
+    /// This install published the requested language's queries.
+    Installed(QueryInstallResult),
+    /// The requested language's queries were already there, so only the
+    /// parents it was missing (if any) were published.
+    AlreadyInstalled(PathBuf),
+}
+
 impl PublishedQueryInstall {
     /// Make the publish final by discarding the displaced directories.
     ///
-    /// Reports `AlreadyExists` when the requested language needed nothing —
-    /// callers treat that as a successful no-op, and it keeps the pre-staging
-    /// contract of the `install_queries_*` entry points.
-    pub(crate) fn commit(mut self) -> Result<QueryInstallResult, QueryInstallError> {
+    /// Infallible on purpose. It runs after the parser has been published, so
+    /// there is no half-installed state left to report — and a fallible commit
+    /// would give callers an error arm whose only honest handling is to undo
+    /// work that already succeeded.
+    pub(crate) fn commit(mut self) -> CommittedQueryInstall {
         for published in std::mem::take(&mut self.published) {
             discard_backup_locked(&published);
         }
         if self.requested_already_complete {
-            return Err(QueryInstallError::AlreadyExists(std::mem::take(
-                &mut self.install_path,
-            )));
+            return CommittedQueryInstall::AlreadyInstalled(std::mem::take(&mut self.install_path));
         }
-        Ok(QueryInstallResult {
+        CommittedQueryInstall::Installed(QueryInstallResult {
             language: std::mem::take(&mut self.language),
             install_path: std::mem::take(&mut self.install_path),
             files_downloaded: std::mem::take(&mut self.files_downloaded),
@@ -794,6 +810,7 @@ pub fn recover_interrupted_query_installs(queries_parent: &Path) -> Result<(), Q
         if let Some(language) = backup_language_name(&path) {
             if recovered_languages.insert(language.clone()) {
                 recover_interrupted_query_install(queries_parent, &language)?;
+                collect_superseded_backups(queries_parent, &language)?;
             }
         } else if let Some((language, _)) = temp_language_name_and_pid(&path) {
             remove_interrupted_temp_query_install(queries_parent, &language, &path)?;
@@ -1045,6 +1062,61 @@ fn recover_interrupted_query_install(
         Err(e) => return Err(QueryInstallError::IoError(e)),
     }
     let _ = fs::remove_file(ownership);
+    Ok(())
+}
+
+/// Drop backups left behind by an install that died after publishing a query
+/// directory but before committing.
+///
+/// [`recover_interrupted_query_install`] restores a backup only when the live
+/// directory is missing. Once the publish landed, the directory it displaced is
+/// superseded — and invisible to that recovery for exactly that reason — so
+/// without this it would sit under `queries/` until the user uninstalled the
+/// language by name. An install publishes one such backup per language in the
+/// `; inherits:` chain, so the leak is per-chain, not per-install.
+///
+/// Only backups whose owning process is gone are collected, mirroring
+/// [`remove_interrupted_temp_query_install`]; a live install's backup is still
+/// its rollback target. As there, `process_is_running` is conservative off
+/// unix, so nothing is collected there.
+fn collect_superseded_backups(
+    queries_parent: &Path,
+    language: &str,
+) -> Result<(), QueryInstallError> {
+    validate_safe_language_name(language)?;
+    if !queries_parent.join(language).exists() {
+        return Ok(());
+    }
+
+    let _replace_lock = QueryReplaceLockGuard::acquire(queries_parent, language)?;
+    // Re-check under the lock: a concurrent uninstall may have removed the
+    // directory, which makes these backups restore candidates again.
+    if !queries_parent.join(language).exists() {
+        return Ok(());
+    }
+
+    let entries = match fs::read_dir(queries_parent) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(QueryInstallError::IoError(e)),
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_dir() || !backup_is_owned(&path) {
+            continue;
+        }
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        let Some((backup_language, pid, _)) = generated_backup_parts(name) else {
+            continue;
+        };
+        if backup_language != language || process_is_running(pid) {
+            continue;
+        }
+        let _ = fs::remove_dir_all(&path);
+        let _ = fs::remove_file(backup_ownership_sidecar(&path));
+    }
     Ok(())
 }
 
@@ -1708,6 +1780,62 @@ mod tests {
         assert!(
             !queries_parent.exists(),
             "unsafe cleanup must not even create the queries directory"
+        );
+    }
+
+    /// An install killed between publishing a query directory and committing
+    /// leaves the directory it displaced behind, and the restore path skips it
+    /// because the live directory is present again. Something has to collect it.
+    #[test]
+    #[cfg(unix)]
+    fn recover_interrupted_query_installs_collects_superseded_backups() {
+        let temp = TempDir::new().unwrap();
+        let queries_parent = temp.path().join("queries");
+        let live = queries_parent.join("lua");
+        fs::create_dir_all(&live).unwrap();
+        fs::write(live.join("highlights.scm"), "published").unwrap();
+        write_install_marker(&live).unwrap();
+        let backup = queries_parent.join(format!(".lua.{}.0.backup", dead_test_pid()));
+        fs::create_dir_all(&backup).unwrap();
+        fs::write(backup.join("highlights.scm"), "displaced").unwrap();
+        write_install_marker(&backup).unwrap();
+        write_backup_ownership_marker(&backup).unwrap();
+
+        recover_interrupted_query_installs(&queries_parent).unwrap();
+
+        assert!(!backup.exists(), "a superseded backup must be collected");
+        assert!(
+            !backup_ownership_sidecar(&backup).exists(),
+            "its ownership sidecar must go with it"
+        );
+        assert_eq!(
+            fs::read_to_string(live.join("highlights.scm")).unwrap(),
+            "published",
+            "collecting a backup must not disturb the live queries"
+        );
+    }
+
+    /// A backup whose install is still running is that install's rollback
+    /// target, not garbage.
+    #[test]
+    fn recover_interrupted_query_installs_keeps_a_live_installs_backup() {
+        let temp = TempDir::new().unwrap();
+        let queries_parent = temp.path().join("queries");
+        let live = queries_parent.join("lua");
+        fs::create_dir_all(&live).unwrap();
+        fs::write(live.join("highlights.scm"), "published").unwrap();
+        write_install_marker(&live).unwrap();
+        let backup = queries_parent.join(format!(".lua.{}.0.backup", std::process::id()));
+        fs::create_dir_all(&backup).unwrap();
+        fs::write(backup.join("highlights.scm"), "displaced").unwrap();
+        write_install_marker(&backup).unwrap();
+        write_backup_ownership_marker(&backup).unwrap();
+
+        recover_interrupted_query_installs(&queries_parent).unwrap();
+
+        assert!(
+            backup.exists(),
+            "a running install's backup must not be collected"
         );
     }
 

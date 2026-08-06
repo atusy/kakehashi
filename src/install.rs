@@ -374,15 +374,12 @@ fn install_language_with_query_stager(
     }
 
     match published_queries.commit() {
-        Ok(query_result) => {
+        queries::CommittedQueryInstall::Installed(query_result) => {
             result.queries_path = Some(query_result.install_path);
             result.files_downloaded = query_result.files_downloaded;
         }
-        Err(queries::QueryInstallError::AlreadyExists(path)) => {
+        queries::CommittedQueryInstall::AlreadyInstalled(path) => {
             result.queries_path = Some(path);
-        }
-        Err(e) => {
-            result.queries_error = Some(e.to_string());
         }
     }
 
