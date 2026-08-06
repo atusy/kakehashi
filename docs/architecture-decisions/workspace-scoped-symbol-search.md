@@ -373,10 +373,23 @@ name across roots, recreating the leak point 3 exists to prevent. The
 `(host_language, _self, ConnectionKey)` triples come from `host_documents`
 directly.
 
-That is a second async map, so selection acquires two: the lock order is
-`connections` → `host_documents`, matching the pool's own, and both acquisitions
-fall under point 6's budget rather than the "one acquisition then synchronous
-work" shape the earlier draft assumed.
+That is a second async map, so selection acquires three locks in all — the
+tracker snapshot, `host_documents`, then `connections` — and each falls under
+point 6's budget rather than the "one acquisition then synchronous work" shape
+an earlier draft assumed. The first two are snapshots taken and released before
+`connections` is held, so the only nesting is `connections` → tracker, which is
+the pool's own order.
+
+The two snapshots also have to be **joined safely**. Host language comes from
+the document store, while the exact keys come from pool tracking read later, and
+neither `OpenedVirtualDoc` nor the host-document sync state records the host
+language or its incarnation. A close/reopen — or a language change — between the
+two reads would therefore apply the *new* lifetime's policy to the *old*
+lifetime's downstream opens: precisely the policy-boundary leak this point
+exists to prevent, in transient form. So before a pair contributes, the host
+document's current language and incarnation are re-read and must match what the
+walk assumed; a mismatch drops that pair's contribution rather than guessing
+which lifetime it belonged to.
 
 An entry must be **validated before it contributes**, because the tracker's
 host→virtual map is not an "already open downstream" set: `register_pending_document`
@@ -386,11 +399,10 @@ cloned entry can also outlive a connection purge. Taken at face value, the walk
 would derive a pair from a `didOpen` the downstream has not seen, or from a
 replaced connection whose documents were never replayed.
 
-The save path already establishes the discipline this needs, and the reasoning
-there applies unchanged: snapshot the tracker, then take `connections` **once**
-and hold it across the checks with no `.await` inside, require the handle to be
-the current `Ready` one, and only then consult
-`is_virtual_doc_open_on_connection`. Holding `connections` is what makes it
+The save path already establishes the discipline this needs, and the ordering
+below follows it: snapshot the tracker, then take `connections` **once** and
+hold it across the checks with no `.await` inside, require the handle to be the
+current `Ready` one, and only then consult `is_virtual_doc_open_on_connection`. Holding `connections` is what makes it
 sound — a reverse-index check alone would not, since a purge could swap in a
 fresh `Ready` handle that never opened the document. The lock order is
 `connections` → tracker, matching the respawn purge. This composes with the
@@ -412,22 +424,36 @@ the opt-out, wildcard-resolved gate beside it.
 set only on `bridge._` still apply to a concrete pair — the property that keeps
 existing configuration from becoming a silent no-op here.
 
-**Selection is entirely synchronous. No candidate is waited for:**
+**No candidate is waited for; the only waits are lock acquisitions and the
+final barrier.** The order is fixed:
 
-1. Take the pool's connection map and keep only `Ready` entries.
-   `connections()` returns the raw map, and `ConnectionState` also has
-   `Initializing`, `Failed`, `Closing`, and `Closed`.
-2. Drop handles that lack `workspace/symbol`. This is knowable now, because
-   every candidate is `Ready` — `server_capabilities()` is populated during the
-   handshake.
-3. Apply the per-pair `priorities` allowlist and `max_fan_out` cap, and drop
-   any handle whose recorded launch configuration no longer matches the
-   `BridgeServerConfig` that admitted it.
-4. Dedup the survivors by **connection key** `(server, root)`.
-5. Await `wait_for_pending_reopen` for the survivors, **concurrently**, then
+1. **Snapshot the tracker's host→virtual map, then `host_documents`**, each
+   under its own lock and each **released before the next**. Nothing is held
+   across them, so no ordering question arises between the two.
+2. **Take `connections` once** and hold it across every per-handle check below,
+   with no `.await` inside. Consulting the tracker's live reverse index while
+   holding it is the pool's own `connections` → tracker order, which the
+   respawn purge also takes.
+3. Under that lock, per candidate: keep only `Ready` handles (`connections()`
+   returns the raw map, and `ConnectionState` also has `Initializing`,
+   `Failed`, `Closing`, `Closed`); drop handles lacking `workspace/symbol`;
+   drop handles whose recorded launch configuration no longer matches the
+   `BridgeServerConfig` that admitted them; and confirm the
+   `(virtual_uri, connection)` pair is still in the live reverse index.
+4. Release the lock, then apply the per-pair `priorities` allowlist and
+   `max_fan_out` cap — pure computation over what survived.
+5. Dedup the survivors by **connection key** `(server, root)`.
+6. Await `wait_for_pending_reopen` for the survivors, **concurrently**, then
    send.
 
-Step 5 exists because a connection reaches `Ready` *before* its virtual
+Every filter in step 3 precedes the cap in step 4, and that ordering is
+load-bearing for each of them: with `priorities = [A, B]` and
+`max_fan_out = 1`, an A that is incapable, stale-configured, or no longer
+holding its documents would otherwise take the only slot and then be dropped,
+leaving the query to consult nobody. Filtering on what is already knowable
+before allocating slots costs nothing and removes all three cases at once.
+
+Step 6 exists because a connection reaches `Ready` *before* its virtual
 documents are replayed after a respawn, so a query landing in that window would
 under-report that server's embedded symbols indistinguishably from "no matches".
 The barrier is **bounded to two seconds** and enforced with a timeout, and
@@ -573,13 +599,13 @@ with its own name and semantics rather than smuggled into this one.
              └────────────┬─────────────┘
                           ▼
         ┌──────────────────────────────────────┐
-        │ SELECTION (3s to ACQUIRE lock, §6)   │
-        │ 1. keep Ready ONLY (not Initializing,│
-        │    Failed, Closing, Closed)          │
-        │ 2. drop handles lacking capability   │
-        │ 3. allowlist + per-pair max_fan_out, │
-        │    drop stale-config handles         │
-        │    NEVER spawns a connection         │
+        │ SELECTION (3s per lock ACQUIRE, §6)  │
+        │ under `connections`, all before the  │
+        │ cap: keep Ready only, drop incapable,│
+        │ drop stale-config, confirm still     │
+        │ open on that connection              │
+        │ then: allowlist + per-pair maxFanOut │
+        │ NEVER spawns a connection            │
         └──────────────────┬───────────────────┘
                            ▼
         ┌──────────────────────────────────────┐
@@ -1361,10 +1387,12 @@ Including it would defeat dedup on a field carrying no identity.
   in methods that have no use for it.
 - A server still `Initializing` when the query arrives is skipped entirely, so
   a search in the seconds after opening a file can miss it (point 3).
-- Selection and each send bound only their `connections` **lock acquisition**,
-  because other paths hold that mutex across unbounded async work (point 6);
-  the filtering that follows is synchronous and cannot be preempted, so neither
-  total selection time nor cancellation blocking is capped. Expiring either
+- Every lock this path takes — the tracker snapshot, `host_documents`,
+  `connections`, each send's re-acquisition, each host's `edit_lock` — is
+  bounded only in its **acquisition**, because other paths hold these across
+  unbounded async work (point 6); the filtering between them is synchronous and
+  cannot be preempted, so neither total selection time nor cancellation blocking
+  is capped. Expiring either
   budget answers from a partial target set — and a
   cancellation queued behind that same mutex may arrive too late to stop it, so
   a cancelled request can still be answered.
