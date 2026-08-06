@@ -1167,6 +1167,47 @@ fn collect_superseded_backups(
     Ok(())
 }
 
+/// Hold the language's replace lock and report whether an uninstall claimed it.
+///
+/// The parser half has no lock of its own, so an install that published its
+/// queries and then took minutes to compile could publish a parser for a
+/// language `language uninstall` had removed in the meantime — leaving the
+/// parser-only state the uninstall reported as gone. Checking the tombstone
+/// under this lock, and keeping the lock until the parser rename is done,
+/// serializes the two: uninstall removes the queries and writes the tombstone
+/// under the same lock, and removes the parser after.
+pub(crate) fn hold_against_uninstall(
+    data_dir: &Path,
+    language: &str,
+) -> Result<UninstallClaim, QueryInstallError> {
+    validate_safe_language_name(language)?;
+    let queries_parent = data_dir.join("queries");
+    // The lock lives beside the query directories, so the directory has to
+    // exist to take it. Staging already created it; this only covers a caller
+    // that skipped straight here.
+    fs::create_dir_all(&queries_parent)?;
+    let guard = QueryReplaceLockGuard::acquire(&queries_parent, language)?;
+    if uninstall_tombstone_path(&queries_parent, language).is_file() {
+        return Ok(UninstallClaim::Uninstalled);
+    }
+    Ok(UninstallClaim::Clear(UninstallGuard { _lock: guard }))
+}
+
+/// Whether an uninstall has claimed a language.
+pub(crate) enum UninstallClaim {
+    /// It has not, and will not while the guard is held.
+    Clear(UninstallGuard),
+    /// An uninstall removed this language; publishing anything for it now would
+    /// resurrect half of what the user removed.
+    Uninstalled,
+}
+
+/// Proof that no uninstall has claimed the language, held for as long as the
+/// caller needs the answer to stay true.
+pub(crate) struct UninstallGuard {
+    _lock: QueryReplaceLockGuard,
+}
+
 fn uninstall_tombstone_path(queries_parent: &Path, language: &str) -> PathBuf {
     queries_parent.join(format!(".{language}{QUERY_UNINSTALL_TOMBSTONE_SUFFIX}"))
 }
@@ -1903,6 +1944,38 @@ mod tests {
             "published",
             "collecting a backup must not disturb the live queries"
         );
+    }
+
+    /// The parser half has no lock of its own, so this is what keeps an
+    /// install from publishing a parser for a language the user just removed.
+    #[test]
+    fn a_tombstoned_language_is_reported_as_uninstalled() {
+        let temp = TempDir::new().unwrap();
+        let data_dir = temp.path();
+        let queries_parent = data_dir.join("queries");
+        fs::create_dir_all(&queries_parent).unwrap();
+        write_uninstall_tombstone(&queries_parent, "lua").unwrap();
+
+        assert!(matches!(
+            hold_against_uninstall(data_dir, "lua").unwrap(),
+            UninstallClaim::Uninstalled
+        ));
+    }
+
+    #[test]
+    fn an_untouched_language_is_held_clear_of_uninstall() {
+        let temp = TempDir::new().unwrap();
+
+        let claim = hold_against_uninstall(temp.path(), "lua").unwrap();
+
+        assert!(matches!(claim, UninstallClaim::Clear(_)));
+        drop(claim);
+        // The guard is released, so a second caller can take it in turn — a
+        // guard that outlived its scope would hang here instead.
+        assert!(matches!(
+            hold_against_uninstall(temp.path(), "lua").unwrap(),
+            UninstallClaim::Clear(_)
+        ));
     }
 
     /// A live directory that is merely present is not proof the backup is
