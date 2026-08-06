@@ -1273,6 +1273,45 @@ pub fn lock_language(data_dir: &Path, language: &str) -> Result<LanguageLock, Qu
     })
 }
 
+/// Whether another install is between publishing this language's queries and
+/// committing them.
+///
+/// Non-blocking, unlike [`lock_language`]: this answers on the LSP's async path,
+/// where waiting on another process is not acceptable. A language someone is
+/// mid-publish on reads as unsettled — its queries can still be rolled back —
+/// so a caller that would otherwise treat it as installed falls through to a
+/// real install instead, and that install queues on the same lock properly.
+///
+/// A language nobody is publishing, and any error taking the probe, read as
+/// settled: this only withholds a shortcut, and failing to take a lock is not
+/// evidence of an install in flight.
+pub fn language_publish_in_flight(data_dir: &Path, language: &str) -> bool {
+    if !is_safe_language_name(language) {
+        return false;
+    }
+    let path = data_dir
+        .join("queries")
+        .join(format!(".{}{}", language, LANGUAGE_LOCK_SUFFIX));
+    if !path.is_file() {
+        return false;
+    }
+    let Ok(file) = fs::OpenOptions::new()
+        .create(false)
+        .write(true)
+        .truncate(false)
+        .open(path)
+    else {
+        return false;
+    };
+    match file.try_lock() {
+        Ok(()) => {
+            let _ = file.unlock();
+            false
+        }
+        Err(_) => true,
+    }
+}
+
 /// Take [`lock_language`] for every language an install depends on.
 ///
 /// `languages` must be sorted: two installs whose dependency sets overlap
@@ -1725,6 +1764,30 @@ mod staging_tests {
             residue(&queries_parent),
             vec!["child".to_string()],
             "the displaced directory and its sidecar must not be stranded"
+        );
+    }
+
+    /// A language nobody is publishing is settled; one whose lock is held is
+    /// not, because that install can still roll its queries back.
+    #[test]
+    fn a_publish_in_flight_is_visible_without_waiting_for_it() {
+        let temp = TempDir::new().unwrap();
+        let data_dir = temp.path();
+
+        assert!(
+            !language_publish_in_flight(data_dir, "lua"),
+            "a language nobody has touched is settled"
+        );
+
+        let lock = lock_language(data_dir, "lua").unwrap();
+        assert!(
+            language_publish_in_flight(data_dir, "lua"),
+            "a held lock means an install is between publishing and committing"
+        );
+        drop(lock);
+        assert!(
+            !language_publish_in_flight(data_dir, "lua"),
+            "and it is settled again once that install is done"
         );
     }
 

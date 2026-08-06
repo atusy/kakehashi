@@ -497,11 +497,7 @@ impl AutoInstallManager {
         // arrived, and skipping on the parser meant that language could never
         // repair itself. Falling through costs a stat per half when everything
         // is there, since staging short-circuits on both.
-        if crate::install::parser_file_exists(language, &data_dir).is_some()
-            && crate::install::queries::query_install_is_complete(
-                &data_dir.join("queries").join(language),
-            )
-        {
+        if language_is_complete(language, &data_dir) {
             events.push(InstallEvent::Log {
                 level: MessageType::INFO,
                 message: format!(
@@ -623,7 +619,12 @@ impl AutoInstallManager {
 /// Read from disk rather than from an `InstallResult`, so it answers for
 /// whatever another process published while this install ran.
 fn language_is_complete(language: &str, data_dir: &std::path::Path) -> bool {
-    crate::install::parser_file_exists(language, data_dir).is_some()
+    // An install that is mid-publish can still roll its queries back, so what
+    // is on disk right now is not yet an answer. Treating it as one would let
+    // the editor load a language that is about to lose half of itself. The
+    // probe is non-blocking — this runs on the async path.
+    !crate::install::queries::language_publish_in_flight(data_dir, language)
+        && crate::install::parser_file_exists(language, data_dir).is_some()
         && crate::install::queries::query_install_is_complete(
             &data_dir.join("queries").join(language),
         )
