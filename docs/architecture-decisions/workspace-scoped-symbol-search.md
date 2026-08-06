@@ -256,9 +256,14 @@ An explicit non-`union` strategy for this method is therefore overridden to
 `union`, with one warning at settings-apply time, following the existing
 misconfiguration path (`misconfigured_settings_warnings`, which already warns
 about `concatenated`-without-`priorities` for formatting). The same walk warns
-in the **other** direction too: `strategy = "union"` on any method other than
-`workspace/symbol` is equally inert (point 1), and warning on only one of the
-two would leave the more likely user mistake silent.
+in the **other** direction too: a `union` that cannot take effect is worth
+saying so about, and warning on only one direction would leave the more likely
+user mistake silent. "Cannot take effect" is broader than "another method",
+though — at the **bridge** level `union` is inert for every method but this one,
+and at the **layer** level it is inert for *every* method including this one,
+since a document-less request never reaches the cross-layer walk. So
+`layers.aggregation["workspace/symbol"].strategy = "union"` warns too, rather
+than looking correct because the method name matches.
 
 The override and the warning ask **different questions**, and conflating them
 would make the warning fire for everyone.
@@ -397,10 +402,11 @@ be missing its documents, which is the failure step 5 exists to prevent. Losing
 that one target is the same coverage cost point 7 already describes, now with a
 bound on how long the query waits to find out.
 
-Selection's outer deadline (point 6) must exceed this two-second budget, or it
-would cancel the barrier it is waiting for; **five seconds** leaves room for the
-`connections` acquisition ahead of it without letting an unrelated stall hold
-the query indefinitely.
+The bounds here are **per phase, not one budget spanning them** (point 6). A
+single outer deadline would let a slow `connections` acquisition eat into the
+barrier's two seconds and cancel it early — and that cancellation is not the
+barrier returning `false`, so the drop policy above would not even cover it.
+Each phase that can block on the pool gets its own budget instead.
 
 **`Initializing` connections are excluded.** Including them, and waiting for
 Ready before dispatch, was tried and abandoned — it looked like it removed a
@@ -464,8 +470,7 @@ connection's own indexed workspace, so a connection named by several pairs is
 asked **once**, while the same server name under two roots is genuinely two
 connections and two requests.
 
-`max_fan_out` is applied **twice**, and the second application is what makes it
-mean what it says.
+`max_fan_out` applies **per pair only**, and that is the whole of it here.
 
 Within a pair it works as everywhere else: `truncate_entries` truncates a
 flattened name list in walk order, keeping the highest-priority N names. A
@@ -514,7 +519,7 @@ with its own name and semantics rather than smuggled into this one.
              └────────────┬─────────────┘
                           ▼
         ┌──────────────────────────────────────┐
-        │ SELECTION (own outer deadline, §6)   │
+        │ SELECTION (own 3s budget, §6)        │
         │ 1. keep Ready ONLY (not Initializing,│
         │    Failed, Closing, Closed)          │
         │ 2. drop handles lacking capability   │
@@ -595,7 +600,10 @@ fan-out's placement in point 4, which is a real visibility constraint.
 The value crossing that boundary is **typed, not raw JSON**: the bridge module
 owns deserialization for every other bridged request, and this one keeps that
 property. Each target's response is parsed into `Vec<WorkspaceSymbol>` there,
-normalizing a `SymbolInformation[]` answer into the same shape. That works for
+normalizing a `SymbolInformation[]` answer into the same shape, and is handed
+back **with its source connection key and that connection's URI→content-identity
+snapshot** — fan-in cannot validate a symbol without knowing which connection
+produced it (point 5). That works for
 `location` because `WorkspaceSymbol.location` is a `OneOf` that models the
 range-less form rather than rejecting it, but it is not field-for-field:
 `SymbolInformation` carries a (itself deprecated) `deprecated: Option<bool>`
@@ -666,6 +674,22 @@ Each virtual document's **content identity at dispatch** is therefore captured
 and re-checked before its entries are translated, using the per-connection
 revision and the fingerprint of the content last *confirmed sent* that the
 tracker already maintains.
+
+Two things about *when* and *per what* are load-bearing:
+
+- **Captured before the request is enqueued**, not after. Requests and
+  `didChange` notifications share one writer FIFO, so capturing afterwards
+  inverts the check: enqueue R against content A, let a `didChange(B)` follow,
+  then read identity as B — R still executes first, against A, while every
+  later comparison sees B and agrees. Capturing first makes the recorded
+  identity the one the request actually raced.
+- **Per connection, not per URI.** Both tracker values are keyed by
+  `ConnectionKey`, and one virtual URI can be open on several connections with
+  different confirmed content. An identity snapshot is therefore taken per
+  target, and travels **with that target's response** — the bridge module hands
+  back the source connection key and its URI→identity map alongside the
+  `Vec<WorkspaceSymbol>`, rather than a bare vector. Fan-in validates each
+  entry against the identity of the connection that produced it.
 
 Comparing those two values across dispatch and translation is not enough on its
 own. The revision advances before the `didChange` is enqueued and stays advanced
@@ -970,7 +994,7 @@ normalization**: set `deprecated = Some(true)` when the normalized tags contain
 it was meant to preserve. It is bounded: the modern type is used everywhere
 else.
 
-### 6. Latency is bounded by the pool's timeouts and one deadline of our own
+### 6. Latency is bounded by the pool's timeouts and our own phase budgets
 
 Every target is awaited, so latency is max-over-targets. The bounds are:
 
@@ -990,13 +1014,25 @@ waits. None of those carries a deadline, and cancel forwarding acquires the same
 mutex before it can notify a subscribed handler, so early subscription cannot
 interrupt a stall behind it.
 
-Selection therefore runs under its own **outer deadline** — five seconds,
-chosen in point 3 to sit above the reopen barrier's two-second budget. Expiring
-it answers from whatever was already selectable rather than blocking the query
-behind unrelated pool work. This is the one deadline the design imposes; every
-other bound it relies on already existed.
+Every phase that can block on that mutex therefore carries **its own budget**,
+and there are two — because the mutex is taken twice, not once. Selection takes
+it to read the connection map; then each send **re-acquires** it for the
+stale-handle check before enqueueing, which is the precedent's own discipline
+and can stall behind exactly the same holders, after selection's budget has
+already been spent.
 
-Beyond that one deadline, nothing new is introduced: every target is already
+- **Selection**: three seconds to acquire and filter.
+- **Each send's pre-enqueue re-acquisition**: three seconds, per target,
+  independently. A target that cannot get the lock in time is dropped like any
+  other unreachable one.
+
+Separate budgets rather than one deadline spanning the whole dispatch, because a
+single outer deadline would silently consume the reopen barrier's two seconds
+(point 3) and cancel it in a way its own timeout never reports. These are the
+only deadlines the design imposes; every other bound it relies on already
+existed.
+
+Beyond those budgets, nothing new is introduced: every target is already
 `Ready` when chosen (point 3), so nothing waits for a handshake before the
 request goes out, and the reopen barrier in step 5 is itself bounded to two
 seconds. Because no target is ever cold-started (point 7), the practical case is
@@ -1066,9 +1102,13 @@ assert that every other method dispatches `preferred` regardless:
   table and its lead-in ("one of two strategies").
 - `docs/README.md` — the `strategy` row of the aggregation table.
 
-And `maxFanOut`'s own description in `docs/README.md` must record that for
-`workspace/symbol` it selects names per pair and does **not** cap the query's
-total requests or connections.
+And `maxFanOut`'s description must record, in **all three** places that state
+its contract, that for `workspace/symbol` it selects names per pair and does
+**not** cap the query's total requests or connections:
+`docs/README.md`'s aggregation table, `docs/language-features.md`'s
+"`maxFanOut` limits how many servers are queried", and the doc-comment on the
+field in `src/config/settings.rs` — which is the source of the generated schema,
+and so the one users are most likely to read.
 
 *And the feature must move* out of `docs/language-features.md`'s "Not currently
 provided" list into a section of its own, and into `docs/README.md`'s
@@ -1199,9 +1239,10 @@ Including it would defeat dedup on a field carrying no identity.
   points in a session. LSP permits partial `workspace/symbol` results, but a
   user expecting an indexed whole-project search will find this surprising.
 - Latency is max-over-live-targets, bounded by the pool's existing 30s request
-  timeout and liveness timeout, plus selection's own five-second deadline and
-  the reopen barrier's two seconds; forwarded cancellation is best-effort
-  because a downstream may ignore it.
+  timeout and liveness timeout, plus a three-second budget on selection, three
+  seconds on each send's pre-enqueue lock acquisition, and the reopen barrier's
+  two seconds; forwarded cancellation is best-effort because a downstream may
+  ignore it.
 - One request per keystroke, un-coalesced (point 9).
 - Fan-in can wait on a parse: the distinct host documents a result addresses are
   ensured before translation. Because they are ensured concurrently the pass
@@ -1219,9 +1260,9 @@ Including it would defeat dedup on a field carrying no identity.
   in methods that have no use for it.
 - A server still `Initializing` when the query arrives is skipped entirely, so
   a search in the seconds after opening a file can miss it (point 3).
-- Selection carries its own deadline, because it must take the pool's
-  `connections` mutex and other paths hold that across unbounded async work
-  (point 6). Expiring it answers from a partial target set.
+- Selection and each send carry their own budgets, because both must take the
+  pool's `connections` mutex and other paths hold that across unbounded async
+  work (point 6). Expiring either answers from a partial target set.
 - `max_fan_out` does not bound this method's total fan-out. It selects names
   per pair, and one name still queries every `Ready`, capable root while a
   connection excluded by one pair re-enters through another. Its documented
