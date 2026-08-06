@@ -569,18 +569,8 @@ impl LanguageServerPool {
         }
     }
 
-    /// The existing `Ready` connection for `key`, if one is live. Used to route a
-    /// palette command back to the exact connection that advertised it (right
-    /// workspace root/context) rather than spawning a fresh client-root one.
-    pub(crate) async fn ready_connection_by_key(
-        &self,
-        key: &ConnectionKey,
-    ) -> Option<Arc<ConnectionHandle>> {
-        self.ready_connection_by_key_for_config(key, None).await
-    }
-
-    /// As [`ready_connection_by_key`](Self::ready_connection_by_key), but also
-    /// rejects a connection whose SPAWN config no longer matches `config`.
+    /// The existing `Ready` connection for `key`, if one is live — and, when
+    /// `config` is given, only if its SPAWN config still matches.
     ///
     /// Every acquisition through `get_or_create_connection_resolved` compares the
     /// live handle's launch config and treats a mismatch as `Failed` (respawn).
@@ -1330,7 +1320,7 @@ impl LanguageServerPool {
     ) -> Option<Arc<ConnectionHandle>> {
         let server = key.server();
         // A connection can exist under this key and simply not be Ready yet —
-        // `ready_connection_by_key` filters on Ready, so a respawn mid-handshake
+        // `ready_connection_by_key_for_config` filters on Ready, so a respawn mid-handshake
         // lands here. Wait it out rather than spawn a second process: this is the
         // wait-through-initialization the previous
         // `get_or_create_connection_wait_ready` call provided, and for a SHARED
@@ -1381,7 +1371,7 @@ impl LanguageServerPool {
         if key.is_shared() {
             // Reviving a DEAD shared instance needs a marker to announce its
             // workspace folders, and only a document can produce one. A live
-            // instance is reachable above and via `ready_connection_by_key`.
+            // instance is reachable above and via `ready_connection_by_key_for_config`.
             log::warn!(
                 target: "kakehashi::bridge",
                 "executeCommand: shared-instance connection for {server:?} is gone and \
@@ -4934,7 +4924,9 @@ mod tests {
         // `None` keeps the plain state-only filter for callers with no config to
         // compare (the palette path).
         assert!(
-            pool.ready_connection_by_key(&key).await.is_some(),
+            pool.ready_connection_by_key_for_config(&key, None)
+                .await
+                .is_some(),
             "the config-less variant still filters on state alone"
         );
     }
@@ -4958,7 +4950,9 @@ mod tests {
         // The Ready-only fast path misses, so a request falls through to the
         // reconnect — which must WAIT rather than take the shared-key bail.
         assert!(
-            pool.ready_connection_by_key(&key).await.is_none(),
+            pool.ready_connection_by_key_for_config(&key, None)
+                .await
+                .is_none(),
             "an Initializing connection is not served by the Ready fast path"
         );
         let waiter = {

@@ -282,19 +282,35 @@ impl LanguageServerPool {
             );
             return None;
         }
-        // A recorded origin whose server has since been removed from config
-        // cannot be revived, so it must not be counted when deciding whether the
-        // revivable set is unambiguous — otherwise a deleted server permanently
-        // vetoes the one origin that is still spawnable.
+        // Both candidate sets are filtered by the CURRENT config, and for the
+        // same reason on each side.
+        //
+        // A recorded origin whose server was removed from config cannot be
+        // revived, so counting it would let a deleted server permanently veto
+        // the origin that is still spawnable.
+        //
+        // A LIVE connection for a removed server is the sharper case: the
+        // settings snapshot is published before `propagate_settings` finishes
+        // invalidating connections, so a request landing in that window finds a
+        // process spawned from a config that no longer exists, still `Ready`.
+        // Left unfiltered it could win the route outright — running a
+        // possibly workspace-mutating command on a superseded server — or make
+        // an otherwise-unambiguous command look ambiguous and refuse it.
+        let spawnable = |key: &ConnectionKey| {
+            crate::config::is_server_spawnable(&settings.language_servers, key.server())
+        };
         let reconnectable: Vec<_> = self
             .command_origins()
             .reconnectable_origins(&params.command)
             .into_iter()
-            .filter(|key| {
-                crate::config::is_server_spawnable(&settings.language_servers, key.server())
-            })
+            .filter(&spawnable)
             .collect();
-        let ready = self.ready_palette_origins(&params.command).await;
+        let ready: Vec<_> = self
+            .ready_palette_origins(&params.command)
+            .await
+            .into_iter()
+            .filter(&spawnable)
+            .collect();
 
         let key = match select_palette_route(&ready, &reconnectable) {
             PaletteRoute::Route(key) | PaletteRoute::Reconnect(key) => key,
@@ -316,7 +332,21 @@ impl LanguageServerPool {
             }
         };
         let origin = key.server();
-        let handle = match self.ready_connection_by_key(&key).await {
+        // Resolved once, and BEFORE the live lookup rather than only inside the
+        // reconnect branch: the by-key fast path must reject a handle spawned
+        // from a superseded `cmd`, which is the check every other acquisition in
+        // the pool performs. Without it the scan's spawnability filter still
+        // lets an edited-but-not-yet-invalidated process through, because the
+        // server name is unchanged — only its command line moved.
+        let config = resolve_with_wildcard(
+            &settings.language_servers,
+            origin,
+            merge_bridge_server_configs,
+        );
+        let handle = match self
+            .ready_connection_by_key_for_config(&key, config.as_ref())
+            .await
+        {
             // The connection that advertised the command is still Ready — route
             // there, preserving its workspace root/context.
             Some(handle) => handle,
@@ -346,11 +376,7 @@ impl LanguageServerPool {
                     );
                     return None;
                 }
-                let Some(config) = resolve_with_wildcard(
-                    &settings.language_servers,
-                    origin,
-                    merge_bridge_server_configs,
-                ) else {
+                let Some(config) = config else {
                     warn!(
                         target: "kakehashi::bridge",
                         "executeCommand: palette origin {origin:?} has no resolvable config; \
@@ -550,7 +576,8 @@ mod tests {
         ConnectionKey::new(server, Some(root.to_string()))
     }
 
-    /// Seed a connection in `state` advertising exactly `commands`.
+    /// Seed a connection in `state` advertising exactly `commands`, with no
+    /// recorded launch config (so config checks pass).
     async fn seed(
         pool: &LanguageServerPool,
         key: &ConnectionKey,
@@ -558,7 +585,31 @@ mod tests {
         commands: &[&str],
     ) {
         pool.insert_connection(
-            create_handle_advertising_commands(state, key.clone(), commands).await,
+            create_handle_advertising_commands(state, key.clone(), commands, None).await,
+        )
+        .await;
+    }
+
+    /// As [`seed`], but the connection remembers the config it was spawned from.
+    async fn seed_spawned_from(
+        pool: &LanguageServerPool,
+        key: &ConnectionKey,
+        commands: &[&str],
+        cmd: &str,
+    ) {
+        let config = crate::config::settings::BridgeServerConfig {
+            cmd: vec![cmd.to_string()],
+            languages: vec!["*".to_string()],
+            ..Default::default()
+        };
+        pool.insert_connection(
+            create_handle_advertising_commands(
+                ConnectionState::Ready,
+                key.clone(),
+                commands,
+                Some(&config),
+            )
+            .await,
         )
         .await;
     }
@@ -696,8 +747,18 @@ mod tests {
     /// Drive the dispatcher itself. `select_palette_route` returning the right
     /// verdict is not the property that matters — acting on it is, and that
     /// wiring is what a classification-only test leaves unpinned.
-    async fn dispatch(pool: &LanguageServerPool, command: &str) -> Option<Value> {
-        pool.dispatch_palette_command(params(command), &WorkspaceSettings::default(), None)
+    ///
+    /// `settings` is never `default()` when a connection is meant to be usable:
+    /// both candidate sets are filtered against the current config, so a server
+    /// absent from `languageServers` is correctly treated as deleted — and a
+    /// test that forgot to configure it would pass by refusing for the wrong
+    /// reason.
+    async fn dispatch(
+        pool: &LanguageServerPool,
+        settings: &WorkspaceSettings,
+        command: &str,
+    ) -> Option<Value> {
+        pool.dispatch_palette_command(params(command), settings, None)
             .await
     }
 
@@ -745,7 +806,8 @@ mod tests {
         seed(&pool, &eslint, ConnectionState::Ready, &["source.fixAll"]).await;
 
         // Picking either of two live advertisers is the #823 defect itself.
-        assert_refused(dispatch(&pool, "source.fixAll")).await;
+        let settings = settings_with_servers(&["ruff", "eslint"]);
+        assert_refused(dispatch(&pool, &settings, "source.fixAll")).await;
     }
 
     #[tokio::test]
@@ -761,7 +823,47 @@ mod tests {
         seed(&pool, &ruff, ConnectionState::Ready, &["source.fixAll"]).await;
 
         // A dead collision must not cost the one advertiser that can serve it.
-        assert_reached_downstream(dispatch(&pool, "source.fixAll")).await;
+        let settings = settings_with_servers(&["ruff", "eslint"]);
+        assert_reached_downstream(dispatch(&pool, &settings, "source.fixAll")).await;
+    }
+
+    #[tokio::test]
+    async fn a_live_connection_spawned_from_a_superseded_cmd_is_not_routed_to() {
+        // Same publication window as the deleted-server case, but the server is
+        // still configured — only its command line moved. The name-level
+        // spawnability filter cannot see that, so the by-key acquisition must do
+        // what every other acquisition in the pool does and compare the launch
+        // config, or the command runs on the process the user just replaced.
+        let pool = LanguageServerPool::new();
+        let ruff = key("ruff", "file:///w/a");
+        pool.command_origins()
+            .register(&ruff, vec!["source.fixAll".to_string()]);
+        seed_spawned_from(&pool, &ruff, &["source.fixAll"], "old-ruff").await;
+
+        // `settings_with_servers` spawns `true`, which is not `old-ruff`.
+        let settings = settings_with_servers(&["ruff"]);
+        assert_refused(dispatch(&pool, &settings, "source.fixAll")).await;
+    }
+
+    #[tokio::test]
+    async fn a_live_connection_for_a_deleted_server_does_not_create_ambiguity() {
+        // The settings snapshot is published before `propagate_settings` finishes
+        // invalidating connections, so a request can find a still-Ready process
+        // spawned from a config that no longer exists. Counting it would either
+        // route a workspace-mutating command to a superseded server or refuse a
+        // command that has exactly one valid target.
+        let pool = LanguageServerPool::new();
+        let ruff = key("ruff", "file:///w/a");
+        let deleted = key("deleted", "file:///w/b");
+        pool.command_origins()
+            .register(&ruff, vec!["source.fixAll".to_string()]);
+        pool.command_origins()
+            .register(&deleted, vec!["source.fixAll".to_string()]);
+        seed(&pool, &ruff, ConnectionState::Ready, &["source.fixAll"]).await;
+        seed(&pool, &deleted, ConnectionState::Ready, &["source.fixAll"]).await;
+
+        let settings = settings_with_servers(&["ruff"]);
+        assert_reached_downstream(dispatch(&pool, &settings, "source.fixAll")).await;
     }
 
     #[tokio::test]
@@ -789,7 +891,7 @@ mod tests {
         // — so the dispatch would settle instead of parking.
         assert_reached_downstream(pool.dispatch_execute_command(
             params(shaped),
-            &WorkspaceSettings::default(),
+            &settings_with_servers(&["ruff"]),
             None,
         ))
         .await;
@@ -853,8 +955,9 @@ mod tests {
         )
         .await;
 
+        let settings = settings_with_servers(&["ruff"]);
         assert!(
-            dispatch(&pool, "source.fixAll").await.is_none(),
+            dispatch(&pool, &settings, "source.fixAll").await.is_none(),
             "a live advertiser the editor was never told about is not a palette command"
         );
     }
@@ -872,7 +975,8 @@ mod tests {
             vec!["source.fixAll".to_string()],
         );
 
-        assert!(dispatch(&pool, "source.fixAll").await.is_none());
+        let settings = settings_with_servers(&["ruff", "eslint"]);
+        assert!(dispatch(&pool, &settings, "source.fixAll").await.is_none());
         assert!(
             pool.connections().await.is_empty(),
             "refusing must not spawn one of the candidates"
