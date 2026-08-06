@@ -545,6 +545,18 @@ impl LanguageServerPool {
         &self.command_origins
     }
 
+    /// Whether the editor will accept a dynamic `workspace/executeCommand`
+    /// registration — it does only if it advertised `dynamicRegistration` (LSP
+    /// spec). Both registering and RETIRING a palette command must ask, or a
+    /// retirement names ids the editor was never given.
+    fn client_supports_dynamic_command_registration(&self) -> bool {
+        self.client_capabilities()
+            .and_then(|caps| caps.workspace)
+            .and_then(|ws| ws.execute_command)
+            .and_then(|ec| ec.dynamic_registration)
+            .unwrap_or(false)
+    }
+
     /// Tell the USER, not just the log, that a request they invoked could not be
     /// served — as a `window/logMessage` at WARNING.
     ///
@@ -924,6 +936,37 @@ impl LanguageServerPool {
         drop(connections);
         for (key, handle) in stale_handles {
             shutdown_invalidated_connection(key, handle);
+        }
+        // A settings change is the ONLY event that can retire a palette command
+        // name. Connection removal cannot: every removal site above arms a
+        // re-open for the same key, so the connection is expected back, and
+        // retiring there would churn the editor's palette on each respawn.
+        //
+        // "Gone" is SPAWNABILITY, not mere presence in the config. A server left
+        // in `languageServers` with `enabled = false` or an empty `cmd` will
+        // never advertise anything again, so its commands are exactly as dead as
+        // a deleted server's — and asking only whether the entry resolves would
+        // leave them registered and inert for the rest of the session.
+        //
+        // Deliberately a different question from the invalidation loop above,
+        // which asks whether a LIVE process still matches its config. This one
+        // asks whether a process could ever exist.
+        let retired = self.command_origins.retire_unadvertisable(|server| {
+            resolve(server).is_some_and(|config| config.is_spawnable_with_wildcard(None))
+        });
+        // Gated exactly like registration: a client that cannot accept a dynamic
+        // registration was never sent one, so unregistering would name ids it
+        // never held.
+        if !retired.is_empty()
+            && self.client_supports_dynamic_command_registration()
+            && let Err(e) = self
+                .upstream_request_tx
+                .send(UpstreamRequest::UnregisterCommands { commands: retired })
+        {
+            log::warn!(
+                target: "kakehashi::bridge",
+                "Failed to queue palette-command retirement (forwarding loop gone): {e}"
+            );
         }
         pushed
     }
@@ -2582,12 +2625,8 @@ impl LanguageServerPool {
         let pending_reopen = Arc::clone(&self.pending_reopen);
         // The editor accepts a dynamic `workspace/executeCommand` registration
         // only if it advertised `dynamicRegistration` (LSP spec). Compute once.
-        let supports_dynamic_command_registration = self
-            .client_capabilities()
-            .and_then(|caps| caps.workspace)
-            .and_then(|ws| ws.execute_command)
-            .and_then(|ec| ec.dynamic_registration)
-            .unwrap_or(false);
+        let supports_dynamic_command_registration =
+            self.client_supports_dynamic_command_registration();
         let handshake_task = tokio::spawn(async move {
             let init_result = tokio::time::timeout(
                 timeout,
@@ -2673,22 +2712,61 @@ impl LanguageServerPool {
                     // back to a Ready connection (#628). Dedup is by name across
                     // the whole session, so a respawn / second root re-registers
                     // nothing new.
-                    if let Some(commands) = palette_commands {
-                        let added = command_origins.register(&command_registration_key, commands);
-                        // Advertise the NEWLY-added names upstream so the editor's
-                        // palette lists them. Fire-and-forget; skipped when the
-                        // client can't accept a dynamic registration.
-                        if !added.is_empty()
-                            && supports_dynamic_command_registration
-                            && let Err(e) = upstream_request_tx
-                                .send(UpstreamRequest::RegisterCommands { commands: added })
-                        {
-                            log::warn!(
-                                target: "kakehashi::bridge",
-                                "Failed to queue palette-command registration \
-                                 (forwarding loop gone): {e}"
-                            );
+                    //
+                    // ALWAYS with the list this handshake actually advertised —
+                    // including the empty list when the server has no
+                    // `executeCommandProvider` at all. That is the shape a
+                    // server takes after an upgrade that dropped the feature,
+                    // and skipping it would leave the previous incarnation's
+                    // entries standing as candidates nothing can serve.
+                    let outcome = command_origins.register(
+                        &command_registration_key,
+                        palette_commands.unwrap_or_default(),
+                    );
+                    // Advertise the NEWLY-added names upstream so the editor's
+                    // palette lists them. Fire-and-forget; skipped when the
+                    // client can't accept a dynamic registration — in which case
+                    // the registry is told, so it never believes the editor holds
+                    // something that was never sent.
+                    if !outcome.newly_advertised.is_empty() {
+                        if supports_dynamic_command_registration {
+                            if let Err(e) =
+                                upstream_request_tx.send(UpstreamRequest::RegisterCommands {
+                                    commands: outcome.newly_advertised.clone(),
+                                })
+                            {
+                                log::warn!(
+                                    target: "kakehashi::bridge",
+                                    "Failed to queue palette-command registration \
+                                     (forwarding loop gone): {e}"
+                                );
+                                command_origins.forget_registration(&outcome.newly_advertised);
+                            }
+                        } else {
+                            command_origins.forget_registration(&outcome.newly_advertised);
                         }
+                    }
+                    // A name whose every advertiser has stopped offering it is
+                    // dead even though its server is still configured — the
+                    // in-place-upgrade shape, which the config-driven sweep
+                    // cannot see.
+                    // Gated like every other send on this path. It is currently
+                    // redundant — with no capability nothing was announced, so
+                    // nothing can be orphaned — but that is an invariant two
+                    // steps away, and a retirement that stops asking would name
+                    // ids the editor never held.
+                    if !outcome.orphaned.is_empty()
+                        && supports_dynamic_command_registration
+                        && let Err(e) =
+                            upstream_request_tx.send(UpstreamRequest::UnregisterCommands {
+                                commands: outcome.orphaned,
+                            })
+                    {
+                        log::warn!(
+                            target: "kakehashi::bridge",
+                            "Failed to queue palette-command retirement \
+                             (forwarding loop gone): {e}"
+                        );
                     }
                     // Ask upstream to bring this connection up to date. Sent
                     // after Ready so the didOpen queues behind the settings
@@ -7555,6 +7633,106 @@ mod tests {
             ..Default::default()
         };
         assert!(same_launch_config(&inherited, &explicit));
+    }
+
+    #[tokio::test]
+    async fn removing_the_last_advertiser_retires_its_palette_commands() {
+        let pool = pool_with_dynamic_command_registration();
+        let mut rx = pool.take_upstream_request_rx().expect("receiver");
+        pool.command_origins().register(
+            &ConnectionKey::for_server("ruff"),
+            vec!["ruff.fix".to_string()],
+        );
+
+        // A reload in which `ruff` no longer resolves: it is gone from config,
+        // so nothing can ever advertise `ruff.fix` again.
+        pool.propagate_settings(|_| None).await;
+
+        match rx.try_recv() {
+            Ok(super::UpstreamRequest::UnregisterCommands { commands }) => {
+                assert_eq!(commands, vec!["ruff.fix".to_string()]);
+            }
+            Ok(_) => panic!("expected an UnregisterCommands request"),
+            Err(e) => panic!("expected an UnregisterCommands request, got {e:?}"),
+        }
+    }
+
+    /// A pool whose editor accepts dynamic `workspace/executeCommand`
+    /// registrations. Without this the palette paths are correctly inert, so a
+    /// test that forgets it observes nothing and passes for the wrong reason.
+    fn pool_with_dynamic_command_registration() -> LanguageServerPool {
+        let pool = LanguageServerPool::new();
+        pool.set_client_capabilities(tower_lsp_server::ls_types::ClientCapabilities {
+            workspace: Some(tower_lsp_server::ls_types::WorkspaceClientCapabilities {
+                execute_command: Some(
+                    tower_lsp_server::ls_types::DynamicRegistrationClientCapabilities {
+                        dynamic_registration: Some(true),
+                    },
+                ),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        pool
+    }
+
+    #[tokio::test]
+    async fn disabling_the_last_advertiser_retires_its_commands() {
+        // A server left in `languageServers` with `enabled = false` will never
+        // advertise anything again, so its commands are as dead as a deleted
+        // server's — asking only whether the entry resolves leaves them
+        // registered and inert for the rest of the session.
+        let pool = pool_with_dynamic_command_registration();
+        let mut rx = pool.take_upstream_request_rx().expect("receiver");
+        pool.command_origins().register(
+            &ConnectionKey::for_server("ruff"),
+            vec!["ruff.fix".to_string()],
+        );
+
+        pool.propagate_settings(|_| {
+            Some(crate::config::settings::BridgeServerConfig {
+                cmd: vec!["ruff".to_string()],
+                languages: vec!["*".to_string()],
+                enabled: Some(false),
+                ..Default::default()
+            })
+        })
+        .await;
+
+        match rx.try_recv() {
+            Ok(super::UpstreamRequest::UnregisterCommands { commands }) => {
+                assert_eq!(commands, vec!["ruff.fix".to_string()]);
+            }
+            Ok(_) => panic!("expected an UnregisterCommands request"),
+            Err(e) => panic!("expected an UnregisterCommands request, got {e:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_reload_that_keeps_the_server_retires_nothing() {
+        let pool = pool_with_dynamic_command_registration();
+        let mut rx = pool.take_upstream_request_rx().expect("receiver");
+        pool.command_origins().register(
+            &ConnectionKey::for_server("ruff"),
+            vec!["ruff.fix".to_string()],
+        );
+
+        // A SPAWNABLE config: `BridgeServerConfig::default()` has an empty `cmd`,
+        // which is a server that can never advertise again — so it would
+        // correctly retire, and the test would pass for the wrong reason.
+        pool.propagate_settings(|_| {
+            Some(crate::config::settings::BridgeServerConfig {
+                cmd: vec!["ruff".to_string()],
+                languages: vec!["*".to_string()],
+                ..Default::default()
+            })
+        })
+        .await;
+
+        assert!(
+            rx.try_recv().is_err(),
+            "an ordinary reload must not churn the editor's palette"
+        );
     }
 
     #[tokio::test]

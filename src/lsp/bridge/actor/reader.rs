@@ -202,6 +202,13 @@ pub(crate) enum UpstreamRequest {
     /// and fires them by raw name (#628 palette-fired commands). Fire-and-forget:
     /// no reply/cancel (the editor's ack is ignored; routing fails soft anyway).
     RegisterCommands { commands: Vec<String> },
+    /// Retire palette command names the editor should stop offering, via
+    /// `client/unregisterCapability` (#823 follow-up). Sent only when a settings
+    /// change leaves a name with no configured server that could advertise it —
+    /// NOT when a connection dies, since every removal site expects the same key
+    /// back and retiring there would churn the palette on each respawn.
+    /// Fire-and-forget for the same reason as its sibling.
+    UnregisterCommands { commands: Vec<String> },
     /// Bring `key`'s virtual documents up to date: its previous connection was
     /// purged and has now been replaced by a `Ready` process
     /// (respawn-reopen-derives-its-targets).

@@ -1357,6 +1357,31 @@ async fn e2e_stall_reopen() {
     tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
 }
 
+/// The `client/registerCapability` id kakehashi uses for one palette command.
+///
+/// Derived from the name rather than allocated and stored: one registration per
+/// name means the id can be recomputed when the name is retired, so the mapping
+/// needs no state to survive between the two events. Ids only have to be unique
+/// among ACTIVE registrations, and a name is registered at most once at a time.
+fn palette_registration_id(command: &str) -> String {
+    format!("kakehashi/executeCommand/{command}")
+}
+
+/// Serializes palette registration against palette RETIREMENT.
+///
+/// The two carry the same derived id — that is the point of deriving it — so
+/// their order is load-bearing: a settings reload that removes a server and a
+/// handshake that re-adds it produce an unregister and a register for the same
+/// id, and the wrong order leaves the editor either holding a dead entry or
+/// missing a live one.
+///
+/// The channel delivers them in order, but each message is dispatched into its
+/// own task, so nothing downstream of the channel preserves it. One lock held
+/// across the round trip does. Only these two message kinds contend for it, and
+/// only at handshake and settings-reload rate.
+static PALETTE_REGISTRATION_ORDER: std::sync::LazyLock<tokio::sync::Mutex<()>> =
+    std::sync::LazyLock::new(|| tokio::sync::Mutex::new(()));
+
 fn spawn_upstream_request(
     inbound_request_registry: crate::lsp::bridge::InboundRequestRegistry,
     translators: Option<Arc<UpstreamRequestTranslators>>,
@@ -1374,21 +1399,25 @@ fn spawn_upstream_request(
         match request {
             UpstreamRequest::RegisterCommands { commands } => {
                 use tower_lsp_server::ls_types::Registration;
-                // Fire-and-forget dynamic registration of palette command names.
-                // A unique registration id (we never unregister — a disconnected
-                // server's command simply routes fail-soft). Register-options
-                // carry the `commands` for `workspace/executeCommand`.
-                let id = format!("kakehashi/executeCommand/{}", client.next_request_id());
-                let registration = Registration {
-                    id,
-                    method: "workspace/executeCommand".to_string(),
-                    register_options: Some(serde_json::json!({ "commands": commands })),
-                };
+                let _order = PALETTE_REGISTRATION_ORDER.lock().await;
+                // ONE registration per command name, batched into one request.
+                // Batching them under a single id would be fewer objects but
+                // would make the set un-retirable: `client/unregisterCapability`
+                // names a registration, so dropping one command from a shared id
+                // means unregistering the batch and re-registering the rest.
+                let registrations: Vec<_> = commands
+                    .iter()
+                    .map(|command| Registration {
+                        id: palette_registration_id(command),
+                        method: "workspace/executeCommand".to_string(),
+                        register_options: Some(serde_json::json!({ "commands": [command] })),
+                    })
+                    .collect();
                 // Bound the await: a non-responsive editor must not leak a task
                 // pending forever on the registration request.
                 match tokio::time::timeout(
                     std::time::Duration::from_secs(10),
-                    client.register_capability(vec![registration]),
+                    client.register_capability(registrations),
                 )
                 .await
                 {
@@ -1400,6 +1429,35 @@ fn spawn_upstream_request(
                     Err(_) => log::warn!(
                         target: "kakehashi::bridge",
                         "Timed out registering palette commands upstream"
+                    ),
+                }
+            }
+            UpstreamRequest::UnregisterCommands { commands } => {
+                use tower_lsp_server::ls_types::Unregistration;
+                let _order = PALETTE_REGISTRATION_ORDER.lock().await;
+                // The id is DERIVED from the name, so nothing has to be
+                // remembered between registering and retiring it.
+                let unregistrations: Vec<_> = commands
+                    .iter()
+                    .map(|command| Unregistration {
+                        id: palette_registration_id(command),
+                        method: "workspace/executeCommand".to_string(),
+                    })
+                    .collect();
+                match tokio::time::timeout(
+                    std::time::Duration::from_secs(10),
+                    client.unregister_capability(unregistrations),
+                )
+                .await
+                {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => log::warn!(
+                        target: "kakehashi::bridge",
+                        "Failed to unregister palette commands upstream: {e}"
+                    ),
+                    Err(_) => log::warn!(
+                        target: "kakehashi::bridge",
+                        "Timed out unregistering palette commands upstream"
                     ),
                 }
             }
