@@ -625,7 +625,7 @@ this classifier would silently turn into "no embedded symbols". The
 whole-document handlers avoid this by calling `ensure_document_parsed` first;
 this method has no target document to name.
 
-Fan-in therefore runs in **three passes**, not one, over a **request-local
+Fan-in therefore runs in **four passes**, not one, over a **request-local
 index** built once up front:
 
 0. **After every target's result is collected**, and not before, snapshot the
@@ -670,10 +670,9 @@ Both that check and the range validation below need data the current helper
 throws away rather than data the system lacks: `ResolvedInjection` already
 carries `injection_language` and `virtual_content`, and
 `resolved_region_geometry` discards both, returning only offset, region end, and
-contiguity. The fan-in path needs a resolution variant that **retains** them.
-No second parse is involved either way: the preferred path reads an
-already-resolved snapshot, and the fallback runs the one resolution that path
-would have read.
+contiguity. The fan-in path needs a snapshot accessor that **retains** them.
+No parse and no resolution is involved: fan-in only reads what the store has
+already resolved.
 
 Pass 0 is also not an optimization. `BridgeCoordinator::resolve_virtual_uri` is
 **not** a map lookup: its own doc comment records that it is "O(N) over open
@@ -709,8 +708,8 @@ Sweeping every open document up front instead — alongside the fan-out — was 
 first shape considered and is worse on both axes. It does work for documents no
 result mentions, and it completes up to 30 seconds before the value is used (a
 target may take the full response timeout), so an edit arriving in between
-re-clears the tree and the sweep guarantees nothing. Ensuring between resolution
-and translation closes that gap to the width of one pass.
+re-clears the tree and the sweep guarantees nothing. Ensuring immediately before
+resolution and translation closes that gap to the width of one pass.
 
 Only documents that **already have a snapshot** are ensured. `ensure_document_parsed`
 asks for a 200ms wait, but `wait_for_current_snapshot` escalates to the
@@ -741,18 +740,36 @@ this: the first lookup for each distinct region still walks, so the worst case
 stays quadratic.
 
 Each host is therefore resolved **once** into a request-local
-`region_id → (offset, region_end, virtual_content, injection_language)` map, and
-every entry for that host is translated against it. The preferred source is the
-**generation-stamped resolved-region snapshot** the document store already
-keeps; only when that is unavailable does fan-in run one full resolution for the
-host and build the map from it.
+`region_id → (offset, region_end, virtual_content, injection_language)` map,
+built from the **generation-stamped resolved-region snapshot** the document
+store already keeps. When a host has no current snapshot, its entries are
+**dropped** — fan-in never resolves inline.
 
-Preferring the cached snapshot is not only about cost. `resolve_by_region_id`
-**mutates** the tracker — it reaches the named-layer allocator and then
-`calculate_region_id`, which can mint a ULID — so an inline resolution that
-loses a race mints a **ghost id at coordinates that no longer exist**, and no
-post-check can undo that. Reading an already-resolved snapshot has no such side
-effect.
+That refusal is the load-bearing part, not a shortcut. Resolving inline would
+mean calling `resolve_by_region_id`, which **mutates** the tracker: it reaches
+the named-layer allocator and then `calculate_region_id`, which can mint a ULID.
+Every attempt to make that safe produced a worse problem than it solved:
+
+- Guarding it with the edit lock and a generation check does not help on
+  cancellation. The walk must run on the compute pool (it is documented as
+  taking hundreds of milliseconds and having starved Tokio before), and the pool
+  **detaches** its work behind a oneshot — dropping the awaiting future does not
+  stop the closure. A cancelled query would therefore release both guards while
+  `resolve_all` kept mutating the tracker, reopening exactly the ghost-id and
+  mixed-generation races the guards existed to close.
+- The pool has no queue or execution deadline, so the wait is unbounded — while
+  holding that host's edit lock *and* the process-wide settings-reload guard.
+  One symbol search could stall edits for a document and configuration reload
+  for the whole server.
+- Timing out the awaiter does not rescue it; that is precisely the detached-work
+  case above.
+
+Dropping instead costs one query's entries for one host, in a state that is
+transient by construction: the pre-warm in pass 2 exists to make the snapshot
+current, and anything still missing self-corrects on the next query. This is the
+same failure kakehashi already accepts for a region invalidated mid-flight, and
+it keeps the whole fan-in **read-only** — no minting, no detached work, no
+unbounded wait, and no global guard held across one.
 
 Two identities must hold, not one:
 
@@ -765,32 +782,22 @@ Two identities must hold, not one:
   the design notices.
 - **Query generation.** A settings reload replaces the injection queries and
   bumps the settings generation *before* invalidating parses, and takes no
-  document edit lock — so a resolution can straddle a reload, use
-  mixed-generation query state, and still pass the document-version check. The
-  generation is captured and re-checked, as the other query-sensitive paths
-  already do. Because an inline resolution mutates the tracker, detecting a
-  mismatch afterwards cannot undo it; this is the second reason the
-  generation-stamped snapshot is the preferred source, and the reason the inline
-  fallback must be serialized against reload.
+  document edit lock — so a document-version check alone would accept geometry
+  produced under queries that no longer apply. The generation is captured and
+  re-checked, as the other query-sensitive paths already do. Because the
+  snapshot is generation-stamped, this is a comparison rather than a repair:
+  a mismatch drops the entries, and nothing has been mutated to undo.
 
-**Both** paths take the host's document edit lock before the final freshness
-comparison and hold it through translation. The cached snapshot is not exempt:
-it validates freshness only while handing out its `Arc`, so a `didChange`
-landing afterwards invalidates the geometry before the translation uses it, and
-an unlocked post-check races the same way. The lock is what makes "validated"
-and "used" the same instant.
+Translation takes the host's document edit lock before the final freshness
+comparison and holds it through translation. The cached snapshot is not exempt
+from needing this: it validates freshness only while handing out its `Arc`, so a
+`didChange` landing afterwards invalidates the geometry before the translation
+uses it, and an unlocked post-check races the same way. The lock is what makes
+"validated" and "used" the same instant.
 
-The inline fallback needs the lock **earlier still** — before its resolution
-snapshot is taken, not merely around the comparison — because there the lock has
-to cover a side effect rather than observe a value. (A genuinely read-only
-resolver, reusing the requested id and never reaching a minting helper, would
-remove that requirement; it does not exist today.)
-
-The fallback also must not run the injection walk on the async runtime. That
-walk is documented as taking hundreds of milliseconds and having starved Tokio
-before, which is why production parsing hands it to the compute pool; the
-fallback does the same, with the caller holding the edit and generation guards
-across it. A once-per-host cost is acceptable, a stalled runtime is not.
+Because the path is read-only, that lock is held only across a map lookup, a
+version comparison, and arithmetic — no parse, no walk, no await on another
+runtime. That is the whole reason it is safe to hold at all.
 
 Taking that lock carries an obligation the happy path hides. `edit_lock`
 **creates** an entry unconditionally, so a host that closed between indexing and
@@ -1075,8 +1082,9 @@ Including it would defeat dedup on a field carrying no identity.
 - Fan-in can wait on a parse: the distinct host documents a result addresses are
   ensured before translation. Because they are ensured concurrently the pass
   costs about one 200ms wait rather than one per document (point 5).
-- An edit landing between that ensure and the offset resolution still drops the
-  affected entries. The window is small but not closed, and the failure is
+- An edit landing between that ensure and the freshness check still drops the
+  affected entries, as does a host whose resolved-region snapshot is not current
+  when fan-in reaches it. The window is small but not closed, and the failure is
   silent — the symbols simply are not there.
 - `max_fan_out` no longer bounds a query's total fan-out — only each pair's
   contribution — so the only real bound on how many connections one query
