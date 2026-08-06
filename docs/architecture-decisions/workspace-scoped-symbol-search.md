@@ -384,6 +384,13 @@ highest-priority candidate not yet selected takes it. Backfill runs only on that
 failure path, so the common case stays a single synchronous selection, and the
 pathological case degrades to "slower" instead of "empty".
 
+Backfill is deterministic and terminates: the replacement is always the
+highest-priority candidate not yet selected, which is a total order fixed before
+any waiting, and each backfill consumes one candidate from a finite list. A
+chain of failures therefore walks the priority order once and stops, and the
+resulting target set does not depend on the order failures happened to occur
+in.
+
 `priorities` is an allowlist: listed servers are candidates, `"*"` stands for
 the rest, and an explicit `[]` remains the per-method kill switch. Its **order**
 still decides which N survive a `max_fan_out` cap (`truncate_entries` keeps the
@@ -557,11 +564,11 @@ virtual position like `(0, 1000)` inside a region ending on line 5 compares as
 before the end while carrying a column that never existed, and the workspace-edit
 precedent checks only per-line floors and a global endpoint.
 
-Validation therefore runs against the region's **current `virtual_content`**:
-both endpoints must be real positions in that text and the range must be
-correctly ordered — using the existing strict position machinery rather than a
-new comparison — and only then is the range translated and checked against the
-host-side region bound. Validating in virtual coordinates before translating is
+Validation therefore runs against the region's **current `virtual_content`** —
+the same field the language check above needs retained: both endpoints must be
+real positions in that text and the range must be correctly ordered, using the
+existing strict position machinery rather than a new comparison, and only then
+is the range translated and checked against the host-side region bound. Validating in virtual coordinates before translating is
 what catches the column case; the host bound catches what survives it.
 
 The range check comes first because `WorkspaceSymbol.location` is
@@ -611,6 +618,13 @@ naming the *old* URI would still resolve, and a Python result would be
 translated into a region that is now Rust. So the indexed URI must **match the
 URI reconstructed from the region's current injection language**; a mismatch is
 a retired document and the entry is dropped.
+
+Both that check and the range validation below need data the current helper
+throws away rather than data the system lacks: `ResolvedInjection` already
+carries `injection_language` and `virtual_content`, and
+`resolved_region_geometry` discards both, returning only offset, region end, and
+contiguity. The fan-in path needs a resolution variant that **retains** them.
+That is the whole mechanism — no new resolution, no second parse.
 
 Pass 0 is also not an optimization. `BridgeCoordinator::resolve_virtual_uri` is
 **not** a map lookup: its own doc comment records that it is "O(N) over open
