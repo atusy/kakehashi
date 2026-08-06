@@ -557,15 +557,14 @@ pub(crate) fn concatenated_formatting_pairs(settings: &WorkspaceSettings) -> Vec
 pub(crate) fn unspawnable_language_servers(settings: &WorkspaceSettings) -> Vec<String> {
     let servers = &settings.language_servers;
     let mut names: Vec<String> = servers
-        .keys()
-        .filter(|name| *name != crate::config::WILDCARD_KEY)
-        .filter(|name| {
+        .iter()
+        .filter(|(name, _)| name.as_str() != crate::config::WILDCARD_KEY)
+        .filter(|(_, config)| {
             // Written as `cmd = []`: the entry says it has none, which is a
             // statement, not the omission this warning exists to surface.
-            !servers
-                .get(*name)
-                .is_some_and(|config| config.cmd.as_ref().is_some_and(Vec::is_empty))
+            !config.cmd.as_ref().is_some_and(Vec::is_empty)
         })
+        .map(|(name, _)| name)
         .filter(|name| {
             crate::config::resolve_with_wildcard(
                 servers,

@@ -85,7 +85,8 @@ pub(crate) fn merge_bridge_language_configs(
 }
 
 /// Field-level merge of two BridgeServerConfig values.
-/// Vec fields: the overlay's list wins when it wrote one, empty or not.
+/// List fields (`Option<Vec<_>>`): the overlay's list wins when it wrote one,
+/// empty or not; omitting the key is what inherits.
 /// JSON Option fields: deep merge (configuration-merging-strategy).
 /// Option fields: overlay wins when present.
 pub(crate) fn merge_bridge_server_configs(

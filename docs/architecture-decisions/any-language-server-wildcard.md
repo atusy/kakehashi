@@ -80,13 +80,17 @@ languages = ["*"]
 | omitted | **not specified at this layer** (unchanged) — see below |
 | `[]` | **handles nothing** — states it, does not defer |
 
-An empty or omitted `languages` is more precisely "absent at this layer" than
+An *omitted* `languages` is more precisely "absent at this layer" than
 "inherit from `_`". Config layers (defaults < user < project <
 `initializationOptions`) collapse *before* the `_` entry is resolved, and the
-same emptiness rule drives both steps — so `checker.languages = []` in a
+same rule drives both steps — so a `checker` entry that omits `languages` in a
 project config first takes the user config's `checker.languages`, and only
 falls through to `languageServers._` when no layer specified it. A lower
 layer's concrete list therefore beats a higher layer's `_` wildcard.
+
+An *empty* one is absent at no layer: `checker.languages = []` in the project
+config states that the server handles nothing, and neither the user config nor
+`_` is consulted.
 
 - Resolved at **match time** (`handles_language`), not expanded during config
   merging. "Every language" is an open set with no static enumeration.
