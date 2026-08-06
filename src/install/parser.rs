@@ -495,9 +495,13 @@ pub fn recover_interrupted_parser_installs(parser_dir: &Path) -> std::io::Result
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(e) => return Err(e),
     };
-    for entry in entries.flatten() {
+    for entry in entries {
+        // An entry this pass cannot read is reported, not skipped: a sweep that
+        // returns success while residue remains is how the residue becomes
+        // permanent.
+        let entry = entry?;
         let path = entry.path();
-        if !entry.file_type().is_ok_and(|kind| kind.is_file()) {
+        if !entry.file_type()?.is_file() {
             continue;
         }
         let Some(pid) = path

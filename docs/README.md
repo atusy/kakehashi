@@ -878,8 +878,10 @@ Installing a language is all-or-nothing. The parser, the language's query
 files, and every query file it pulls in through `; inherits:` are prepared
 first, and only made visible once all of them are ready. A failed install — no
 network, an unsupported language, a compile error, or a base language that
-cannot be downloaded — never leaves the language you asked for half-installed:
-its parser and its queries are published together or not at all.
+cannot be downloaded — does not leave the language you asked for
+half-installed: its parser and its queries are published together or not at
+all. (If undoing a publish itself fails — a permission error, a file held open
+— the command says so instead, and names what is left where.)
 
 Two things a failed install can still leave behind. Queries for a *base*
 language it had to fetch stay installed: they are shared with every language
@@ -901,18 +903,28 @@ accepts them — reinstall with `--force` to line them up again. A kill that
 leaves the parser itself missing needs no `--force`: a plain re-run sees the
 missing half and fetches it.
 
-Two more limits worth knowing:
+Three more limits worth knowing, all of them about a language being *loaded*
+while it is being installed, or about files upstream does not provide:
 
 - Publication is atomic per file, not to readers. A running server that loads a
   language *while* a `--force` reinstall is publishing can see the new queries
   against the parser still being replaced, and keep that pairing until it
-  reloads. Installing while nothing is using the language avoids it.
-- A base language is fetched with the same query kinds as the language that
-  inherits it, but only the ones upstream publishes for it. If upstream names a
-  base language in, say, `injections.scm` without shipping that base language's
-  `injections.scm`, the install still succeeds and the query fails to load —
-  the missing file is upstream's, and installing the base language by name will
-  not conjure it either.
+  reloads. Worse, a server that loads a language whose base language is being
+  removed at that moment registers it with the query error as a warning and
+  caches that verdict, so later opens do not retry the install. Both are fixed
+  by restarting the server or installing the language explicitly; installing
+  while nothing is using the language avoids them.
+- Base languages are tracked by name, not by which query kind needed them. A
+  base language is fetched with whatever kinds upstream publishes for it, and
+  the optional kinds are best-effort: if upstream does not ship the base
+  language's `injections.scm`, or that one download fails, a language whose own
+  `injections.scm` inherits it installs successfully and fails to load its
+  injections. A plain re-run skips the base language as complete —
+  `kakehashi language install <base> --force` is what re-fetches it.
+- Staging files left behind by a process that was killed are collected by
+  `kakehashi language status` on Linux and macOS. On Windows there is no
+  portable way to tell whether the owning process is still running, so they are
+  left alone; they are inert, and safe to delete by hand.
 
 ### Configuration Management
 
