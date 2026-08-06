@@ -15,12 +15,12 @@
 
 use tower_lsp_server::jsonrpc::Result;
 use tower_lsp_server::ls_types::{
-    CompletionList, CompletionParams, CompletionResponse, MessageType, Position, Uri,
+    CompletionList, CompletionParams, CompletionResponse, Position, Uri,
 };
 
 use super::super::Kakehashi;
 use crate::lsp::aggregation::server::{
-    FanInResult, HostFanOutTask, dispatch_host_preferred, dispatch_preferred,
+    HostFanOutTask, dispatch_host_preferred, dispatch_preferred,
 };
 use crate::lsp::bridge::{HostDocument, bridge_host_completion_items};
 use crate::lsp::lsp_impl::bridge_context::parse_host_verbatim;
@@ -121,23 +121,11 @@ impl Kakehashi {
             cancel_rx,
         )
         .await;
-        // Quieter than `FanInResult::handle`: an all-empty host layer is the
-        // normal outcome whenever virt answers, so only real failures surface.
-        match fan_in {
-            FanInResult::Done(won) => Ok(won.map(HostCompletion::into_enveloped_response)),
-            FanInResult::NoResult { errors } => {
-                if errors > 0 {
-                    self.notifier()
-                        .log(
-                            MessageType::WARNING,
-                            format!("No {METHOD} response from any host bridge server"),
-                        )
-                        .await;
-                }
-                Ok(None)
-            }
-            FanInResult::Cancelled => Err(tower_lsp_server::jsonrpc::Error::request_cancelled()),
-        }
+        // The envelope pass rides in `on_done`, so only the WINNER pays it.
+        self.host_layer_result(fan_in, METHOD, |won| {
+            won.map(HostCompletion::into_enveloped_response)
+        })
+        .await
     }
 
     /// Virt layer: bridge the injection region under the cursor.

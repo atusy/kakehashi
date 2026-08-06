@@ -1054,12 +1054,32 @@ impl Kakehashi {
         // registry on this arm's completion would drop a live sibling's
         // cancel registrations. The one non-walk caller
         // (`will_save_wait_until`) sweeps for itself.
-        // Quieter than `FanInResult::handle`: an all-empty host layer is the
-        // normal outcome whenever virt answers, and the virt arm already
-        // emits the client-visible "no response" LOG — only real host
-        // failures get surfaced here.
+        self.host_layer_result(result, request_method, |value| value)
+            .await
+    }
+
+    /// Fold a host-layer fan-in result into a handler's return.
+    ///
+    /// Quieter than [`FanInResult::handle`](crate::lsp::aggregation::server::FanInResult::handle):
+    /// an all-empty host layer is the normal outcome whenever virt answers,
+    /// and the virt arm already emits the client-visible "no response" LOG —
+    /// only real host failures get surfaced here. That deviation is exactly
+    /// why this is shared rather than written per handler: every host arm
+    /// (the verbatim raw walk above, codeAction, completion) must quiet the
+    /// same way, and three hand-copies would drift the moment the policy moves.
+    ///
+    /// `on_done` maps the winning fan-in payload to the handler's response —
+    /// identity for the arms whose payload already IS the response, and the
+    /// hook where a handler post-processes the winner (completion mints its
+    /// resolve envelopes there, so only the winner pays for them).
+    pub(crate) async fn host_layer_result<T, R>(
+        &self,
+        result: crate::lsp::aggregation::server::FanInResult<T>,
+        request_method: &str,
+        on_done: impl FnOnce(T) -> Option<R>,
+    ) -> tower_lsp_server::jsonrpc::Result<Option<R>> {
         match result {
-            crate::lsp::aggregation::server::FanInResult::Done(value) => Ok(value),
+            crate::lsp::aggregation::server::FanInResult::Done(value) => Ok(on_done(value)),
             crate::lsp::aggregation::server::FanInResult::NoResult { errors } => {
                 if errors > 0 {
                     self.notifier()

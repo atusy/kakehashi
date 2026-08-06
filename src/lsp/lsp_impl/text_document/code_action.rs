@@ -21,7 +21,7 @@
 use tower_lsp_server::jsonrpc::Result;
 use tower_lsp_server::ls_types::{
     CodeAction, CodeActionContext, CodeActionOrCommand, CodeActionParams, CodeActionResponse,
-    MessageType, NumberOrString, Position, Range, Uri,
+    NumberOrString, Position, Range, Uri,
 };
 use ulid::Ulid;
 use url::Url;
@@ -31,7 +31,7 @@ use super::super::{Kakehashi, detect_document_language};
 use crate::config::settings::AggregationStrategy;
 use crate::language::InjectionResolver;
 use crate::lsp::aggregation::server::{
-    FanInResult, FanOutTask, HostFanOutTask, dispatch_concatenated, dispatch_host_concatenated,
+    FanOutTask, HostFanOutTask, dispatch_concatenated, dispatch_host_concatenated,
     dispatch_host_preferred, dispatch_preferred,
 };
 use crate::lsp::bridge::{
@@ -568,39 +568,13 @@ impl Kakehashi {
                     cancel_rx,
                 )
                 .await;
-                self.host_code_action_result(fan_in, |v| v).await
+                self.host_layer_result(fan_in, METHOD, |v| v).await
             }
             AggregationStrategy::Concatenated => {
                 let fan_in =
                     dispatch_host_concatenated(&ctx, pool.clone(), f, cancel_rx, None, None).await;
-                self.host_code_action_result(fan_in, concat_merge).await
+                self.host_layer_result(fan_in, METHOD, concat_merge).await
             }
-        }
-    }
-
-    /// Fold a host-layer fan-in result into the handler's return, with the
-    /// host-arm quieting: an all-empty host layer is the normal outcome
-    /// whenever virt answers, so it stays SILENT (unlike [`FanInResult::handle`],
-    /// which logs a LOG-level message) and warns only on real failures.
-    async fn host_code_action_result<T>(
-        &self,
-        result: FanInResult<T>,
-        on_done: impl FnOnce(T) -> Option<CodeActionResponse>,
-    ) -> Result<Option<CodeActionResponse>> {
-        match result {
-            FanInResult::Done(value) => Ok(on_done(value)),
-            FanInResult::NoResult { errors } => {
-                if errors > 0 {
-                    self.notifier()
-                        .log(
-                            MessageType::WARNING,
-                            format!("No {METHOD} response from any host bridge server"),
-                        )
-                        .await;
-                }
-                Ok(None)
-            }
-            FanInResult::Cancelled => Err(tower_lsp_server::jsonrpc::Error::request_cancelled()),
         }
     }
 }
