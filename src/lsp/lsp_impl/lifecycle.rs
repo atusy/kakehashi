@@ -135,7 +135,6 @@ impl ClientRoot<'_> {
 /// suppressing `X` would not leave that root empty: it would fall through to the
 /// process CWD, trading a location the client named for the launch directory
 /// #742 exists to stop depending on.
-#[allow(deprecated)]
 fn client_root(params: &InitializeParams) -> Option<ClientRoot<'_>> {
     if let Some(folder) = params
         .workspace_folders
@@ -144,6 +143,17 @@ fn client_root(params: &InitializeParams) -> Option<ClientRoot<'_>> {
     {
         return Some(ClientRoot::WorkspaceFolder(&folder.uri));
     }
+    client_root_without_folders(params)
+}
+
+/// The rungs of [`client_root`]'s ladder below `workspaceFolders`.
+///
+/// Split out because the folder list is the one input that changes after
+/// `initialize`: when `workspace/didChangeWorkspaceFolders` empties it, the
+/// session's root is whatever it would have been had the client never sent a
+/// folder, and that is exactly this ladder.
+#[allow(deprecated)]
+fn client_root_without_folders(params: &InitializeParams) -> Option<ClientRoot<'_>> {
     if let Some(uri) = params.root_uri.as_ref() {
         return Some(ClientRoot::RootUri(uri));
     }
