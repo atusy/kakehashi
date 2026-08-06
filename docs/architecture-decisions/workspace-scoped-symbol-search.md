@@ -567,21 +567,25 @@ hand. "Its own offset" does not mean "its own resolution", though; see pass 3.
      └─────────┬─────────┘             no place in any host file)
                │ no
                ▼
-     resolve_virtual_uri(uri)
+     look up in the REQUEST-LOCAL URI index (pass 0)
                │
-               ├── None ─────────▶ DROP  (no host mapping for this URI)
+               ├── absent ───────▶ DROP  (retired region, or a real file in
+               │                          the reserved virtual-URI namespace)
+               ▼ (host_url, region_id, language)
+     look up region_id in that HOST's region map (pass 3, resolved once)
                │
-               ▼ Some((host_url, region_id))
-     resolve_region_offset(host_url, region_id)
-               │
-               ├── None ─────────▶ DROP  (region invalidated by edits, or
+               ├── absent ───────▶ DROP  (region invalidated by edits, or
                │                          host document closed)
-               ▼ Some(offset)
+               ├── language ≠ ────▶ DROP  (region now hosts another language)
+               │   current
+               ▼ (offset, region_end, virtual_content)
      TRANSLATE
        uri   := host_url
        range := translate_virtual_range_to_host(range, offset)
-       └─ reject if the translated range escapes the region's current
-          bounds — see below
+       └─ validate against virtual_content and region_end — see below
+
+  Neither lookup rescans: the URI index is built once per request and the
+  region map once per host.
 ```
 
 Translation **validates the region bounds**; it does not translate blindly.
@@ -667,7 +671,9 @@ throws away rather than data the system lacks: `ResolvedInjection` already
 carries `injection_language` and `virtual_content`, and
 `resolved_region_geometry` discards both, returning only offset, region end, and
 contiguity. The fan-in path needs a resolution variant that **retains** them.
-That is the whole mechanism — no new resolution, no second parse.
+No second parse is involved either way: the preferred path reads an
+already-resolved snapshot, and the fallback runs the one resolution that path
+would have read.
 
 Pass 0 is also not an optimization. `BridgeCoordinator::resolve_virtual_uri` is
 **not** a map lookup: its own doc comment records that it is "O(N) over open
@@ -767,11 +773,24 @@ Two identities must hold, not one:
   generation-stamped snapshot is the preferred source, and the reason the inline
   fallback must be serialized against reload.
 
-The inline fallback additionally requires the document edit lock **before its
-resolution snapshot is taken**, not merely around the comparison, and held
-through translation — the lock has to cover the side effect, not merely observe
-it. (A genuinely read-only resolver, reusing the requested id and never reaching
-a minting helper, would remove that requirement; it does not exist today.)
+**Both** paths take the host's document edit lock before the final freshness
+comparison and hold it through translation. The cached snapshot is not exempt:
+it validates freshness only while handing out its `Arc`, so a `didChange`
+landing afterwards invalidates the geometry before the translation uses it, and
+an unlocked post-check races the same way. The lock is what makes "validated"
+and "used" the same instant.
+
+The inline fallback needs the lock **earlier still** — before its resolution
+snapshot is taken, not merely around the comparison — because there the lock has
+to cover a side effect rather than observe a value. (A genuinely read-only
+resolver, reusing the requested id and never reaching a minting helper, would
+remove that requirement; it does not exist today.)
+
+The fallback also must not run the injection walk on the async runtime. That
+walk is documented as taking hundreds of milliseconds and having starved Tokio
+before, which is why production parsing hands it to the compute pool; the
+fallback does the same, with the caller holding the edit and generation guards
+across it. A once-per-host cost is acceptable, a stalled runtime is not.
 
 Taking that lock carries an obligation the happy path hides. `edit_lock`
 **creates** an entry unconditionally, so a host that closed between indexing and
