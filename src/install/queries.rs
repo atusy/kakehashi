@@ -224,15 +224,8 @@ fn install_queries_with_dependencies_from_with_http_policy(
     force: bool,
     http_policy: QueryHttpPolicy,
 ) -> Result<QueryInstallResult, QueryInstallError> {
-    let mut installed = std::collections::HashSet::new();
-    install_queries_recursive(
-        base_url,
-        language,
-        data_dir,
-        force,
-        &mut installed,
-        http_policy,
-    )
+    let staged = stage_queries_with_dependencies(base_url, language, data_dir, force, http_policy)?;
+    staged.publish(force)?.commit()
 }
 
 fn validate_url_http_policy(
@@ -249,28 +242,212 @@ fn validate_url_http_policy(
     }
 }
 
-/// Internal recursive helper for installing queries with dependencies.
-fn install_queries_recursive(
+/// One language's query files downloaded into a staging directory, waiting to
+/// be renamed into `queries/<language>`.
+struct StagedQueryDir {
+    language: String,
+    queries_dir: PathBuf,
+    tmp: TempQueryDirGuard,
+}
+
+/// Everything one install needs to publish: the requested language plus every
+/// language it reaches through `; inherits:`.
+///
+/// Staging the whole dependency chain before publishing any of it is what makes
+/// an install all-or-nothing — a parent that fails to download aborts the
+/// install with the data directory untouched, instead of leaving a language
+/// whose inherited queries are missing.
+pub(crate) struct StagedQueryInstall {
+    language: String,
+    /// Where the requested language's queries live once published.
+    install_path: PathBuf,
+    files_downloaded: Vec<String>,
+    /// True when the requested language was already installed and only its
+    /// missing parents (if any) were staged.
+    requested_already_complete: bool,
+    entries: Vec<StagedQueryDir>,
+}
+
+/// A query directory that has been renamed into place, with the directory it
+/// displaced kept aside until the install as a whole is committed.
+struct PublishedQueryDir {
+    queries_dir: PathBuf,
+    backup: Option<PathBuf>,
+}
+
+/// The outcome of publishing a [`StagedQueryInstall`], still undoable.
+pub(crate) struct PublishedQueryInstall {
+    language: String,
+    install_path: PathBuf,
+    files_downloaded: Vec<String>,
+    requested_already_complete: bool,
+    published: Vec<PublishedQueryDir>,
+}
+
+impl StagedQueryInstall {
+    /// Rename every staged directory into place, keeping the displaced
+    /// directories so the whole install can still be undone.
+    pub(crate) fn publish(
+        mut self,
+        force: bool,
+    ) -> Result<PublishedQueryInstall, QueryInstallError> {
+        let requested_language = std::mem::take(&mut self.language);
+        let mut publish = PublishedQueryInstall {
+            install_path: std::mem::take(&mut self.install_path),
+            files_downloaded: std::mem::take(&mut self.files_downloaded),
+            requested_already_complete: self.requested_already_complete,
+            language: requested_language.clone(),
+            published: Vec::new(),
+        };
+        for entry in self.entries.drain(..) {
+            let requested = entry.language == requested_language;
+            match publish_query_dir(&entry.tmp.path, &entry.queries_dir, &entry.language, force) {
+                Ok(PublishQueryDirOutcome::Published { backup }) => {
+                    publish.published.push(PublishedQueryDir {
+                        queries_dir: entry.queries_dir,
+                        backup,
+                    });
+                }
+                // A concurrent installer completed this language while we were
+                // downloading. Its files are as good as ours, so keep them.
+                Ok(PublishQueryDirOutcome::AlreadyComplete) => {
+                    if requested {
+                        publish.requested_already_complete = true;
+                    }
+                }
+                Ok(PublishQueryDirOutcome::Uninstalled) => {
+                    publish.rollback();
+                    return Err(QueryInstallError::IoError(std::io::Error::new(
+                        std::io::ErrorKind::Interrupted,
+                        format!(
+                            "Query install for {} was superseded by uninstall",
+                            entry.language
+                        ),
+                    )));
+                }
+                Err(e) => {
+                    publish.rollback();
+                    return Err(e);
+                }
+            }
+        }
+        Ok(publish)
+    }
+}
+
+impl PublishedQueryInstall {
+    /// Make the publish final by discarding the displaced directories.
+    ///
+    /// Reports `AlreadyExists` when the requested language needed nothing —
+    /// callers treat that as a successful no-op, and it keeps the pre-staging
+    /// contract of the `install_queries_*` entry points.
+    pub(crate) fn commit(self) -> Result<QueryInstallResult, QueryInstallError> {
+        for published in &self.published {
+            let Some(backup) = &published.backup else {
+                continue;
+            };
+            if fs::remove_dir_all(backup).is_ok() {
+                let _ = fs::remove_file(backup_ownership_sidecar(backup));
+            }
+        }
+        if self.requested_already_complete {
+            return Err(QueryInstallError::AlreadyExists(self.install_path));
+        }
+        Ok(QueryInstallResult {
+            language: self.language,
+            install_path: self.install_path,
+            files_downloaded: self.files_downloaded,
+        })
+    }
+
+    /// Undo the publish, restoring each displaced directory.
+    ///
+    /// Best-effort by construction: every step is a rename or removal that
+    /// already succeeded once in the other direction, and there is nothing
+    /// better to do with a failure here than leave the backup in place for
+    /// `language uninstall` to collect.
+    pub(crate) fn rollback(self) {
+        for published in self.published.into_iter().rev() {
+            match published.backup {
+                Some(backup) => {
+                    let _ = fs::remove_dir_all(&published.queries_dir);
+                    if fs::rename(&backup, &published.queries_dir).is_ok() {
+                        let _ = fs::remove_file(backup_ownership_sidecar(&backup));
+                    }
+                }
+                None => {
+                    let _ = fs::remove_dir_all(&published.queries_dir);
+                }
+            }
+        }
+    }
+}
+
+/// What staging found for one language.
+enum StageOutcome {
+    /// Query files were downloaded and are waiting to be published.
+    Staged { files_downloaded: Vec<String> },
+    /// The language's queries are already installed; nothing was downloaded.
+    NothingToDo,
+}
+
+/// Stage the queries for `language` and everything it inherits from.
+fn stage_queries_with_dependencies(
     base_url: &str,
     language: &str,
     data_dir: &Path,
     force: bool,
-    installed: &mut std::collections::HashSet<String>,
     http_policy: QueryHttpPolicy,
-) -> Result<QueryInstallResult, QueryInstallError> {
+) -> Result<StagedQueryInstall, QueryInstallError> {
+    let mut entries = Vec::new();
+    let mut staged = std::collections::HashSet::new();
+    // On any error the entries collected so far are dropped here, and with them
+    // every staging directory: a failed install publishes nothing.
+    let outcome = stage_queries_recursive(
+        base_url,
+        language,
+        data_dir,
+        force,
+        &mut staged,
+        &mut entries,
+        http_policy,
+    )?;
+    let (files_downloaded, requested_already_complete) = match outcome {
+        StageOutcome::Staged { files_downloaded } => (files_downloaded, false),
+        StageOutcome::NothingToDo => (Vec::new(), true),
+    };
+    Ok(StagedQueryInstall {
+        language: language.to_string(),
+        install_path: data_dir.join("queries").join(language),
+        files_downloaded,
+        requested_already_complete,
+        entries,
+    })
+}
+
+/// Internal recursive helper for staging queries with dependencies.
+///
+/// Appends the requested language's staging directory to `entries` before
+/// recursing, so publication order matches the old install order: a language
+/// becomes visible before the parents it inherits from.
+fn stage_queries_recursive(
+    base_url: &str,
+    language: &str,
+    data_dir: &Path,
+    force: bool,
+    staged: &mut std::collections::HashSet<String>,
+    entries: &mut Vec<StagedQueryDir>,
+    http_policy: QueryHttpPolicy,
+) -> Result<StageOutcome, QueryInstallError> {
     // The name becomes a path and URL segment below; reject anything that
     // could escape the data dir (e.g. a caller-provided `../../x`).
     // Escape the untrusted name: the error's Display is printed raw by
     // the CLI, so control characters must not reach the terminal.
     validate_safe_language_name(language)?;
 
-    // Skip if already installed in this session
-    if installed.contains(language) {
-        return Ok(QueryInstallResult {
-            language: language.to_string(),
-            install_path: data_dir.join("queries").join(language),
-            files_downloaded: vec![],
-        });
+    // Skip if already staged (or found complete) in this session
+    if staged.contains(language) {
+        return Ok(StageOutcome::NothingToDo);
     }
 
     let queries_dir = data_dir.join("queries").join(language);
@@ -282,11 +459,11 @@ fn install_queries_recursive(
     // leave a directory without the required highlights.scm; that is treated
     // as incomplete so a later install can repair it without --force.
     if query_install_is_complete(&queries_dir) && !force {
-        // Mark as installed BEFORE recursing into parents: an inheritance
+        // Mark as staged BEFORE recursing into parents: an inheritance
         // cycle among on-disk query files (self-inherit typo, A↔B) would
         // otherwise recurse forever and overflow the stack. The download
         // branch below already inserts before its parent loop.
-        installed.insert(language.to_string());
+        staged.insert(language.to_string());
 
         // Even if skipping, we need to check for inherited dependencies
         let highlights_path = queries_dir.join("highlights.scm");
@@ -295,32 +472,29 @@ fn install_queries_recursive(
         {
             let parents = parse_inherits_directive(&content);
             for parent in parents {
-                // Install parent dependencies (don't force, just ensure they exist)
+                // Stage parent dependencies (don't force, just ensure they exist)
                 clear_uninstall_tombstone(&queries_parent, &parent)?;
-                match install_queries_recursive(
+                stage_queries_recursive(
                     base_url,
                     &parent,
                     data_dir,
                     false,
-                    installed,
+                    staged,
+                    entries,
                     http_policy,
-                ) {
-                    Ok(_) | Err(QueryInstallError::AlreadyExists(_)) => {}
-                    Err(e) => {
-                        eprintln!(
-                            "Warning: Failed to install inherited queries '{}': {}",
-                            parent, e
-                        );
-                    }
-                }
+                )?;
             }
         }
-        return Err(QueryInstallError::AlreadyExists(queries_dir));
+        return Ok(StageOutcome::NothingToDo);
     }
 
     let tmp_queries_dir = create_unique_temp_query_dir(&queries_parent, language)?;
-    let _tmp_guard = TempQueryDirGuard {
-        path: tmp_queries_dir.clone(),
+    let staged_dir = StagedQueryDir {
+        language: language.to_string(),
+        queries_dir,
+        tmp: TempQueryDirGuard {
+            path: tmp_queries_dir.clone(),
+        },
     };
 
     let mut files_downloaded = Vec::new();
@@ -370,46 +544,28 @@ fn install_queries_recursive(
 
     write_install_marker(&tmp_queries_dir)?;
 
-    match replace_query_dir(&tmp_queries_dir, &queries_dir, language, force) {
-        Ok(ReplaceQueryDirResult::Replaced) => {}
-        Ok(ReplaceQueryDirResult::AlreadyComplete) => {
-            return Err(QueryInstallError::AlreadyExists(queries_dir));
-        }
-        Ok(ReplaceQueryDirResult::Uninstalled) => {
-            return Err(QueryInstallError::IoError(std::io::Error::new(
-                std::io::ErrorKind::Interrupted,
-                format!("Query install for {language} was superseded by uninstall"),
-            )));
-        }
-        Err(e) => {
-            return Err(e);
-        }
-    }
+    staged.insert(language.to_string());
+    entries.push(staged_dir);
 
-    installed.insert(language.to_string());
-
-    // Install parent dependencies
+    // Stage parent dependencies. A parent that cannot be downloaded fails the
+    // whole install: propagating the error here drops every staging directory
+    // collected so far, so a language is never published without the queries it
+    // inherits.
     for parent in parents_to_install {
-        eprintln!("Installing inherited queries: {}", parent);
-        // Don't fail if parent already exists
+        eprintln!("Staging inherited queries: {}", parent);
         clear_uninstall_tombstone(&queries_parent, &parent)?;
-        match install_queries_recursive(base_url, &parent, data_dir, false, installed, http_policy)
-        {
-            Ok(_) | Err(QueryInstallError::AlreadyExists(_)) => {}
-            Err(e) => {
-                eprintln!(
-                    "Warning: Failed to install inherited queries '{}': {}",
-                    parent, e
-                );
-            }
-        }
+        stage_queries_recursive(
+            base_url,
+            &parent,
+            data_dir,
+            false,
+            staged,
+            entries,
+            http_policy,
+        )?;
     }
 
-    Ok(QueryInstallResult {
-        language: language.to_string(),
-        install_path: queries_dir,
-        files_downloaded,
-    })
+    Ok(StageOutcome::Staged { files_downloaded })
 }
 
 pub fn query_install_is_complete(queries_dir: &Path) -> bool {
@@ -860,18 +1016,23 @@ pub(crate) fn write_install_marker_for_tests(queries_dir: &Path) -> Result<(), Q
     write_install_marker(queries_dir)
 }
 
-enum ReplaceQueryDirResult {
-    Replaced,
+enum PublishQueryDirOutcome {
+    /// The staged directory is now the live one. `backup` holds the directory
+    /// it displaced, kept until the install commits so a later failure can put
+    /// it back.
+    Published {
+        backup: Option<PathBuf>,
+    },
     AlreadyComplete,
     Uninstalled,
 }
 
-fn replace_query_dir(
+fn publish_query_dir(
     tmp_queries_dir: &Path,
     queries_dir: &Path,
     language: &str,
     force: bool,
-) -> Result<ReplaceQueryDirResult, QueryInstallError> {
+) -> Result<PublishQueryDirOutcome, QueryInstallError> {
     let _replace_lock = QueryReplaceLockGuard::acquire(
         queries_dir
             .parent()
@@ -880,7 +1041,7 @@ fn replace_query_dir(
     )?;
 
     if !force && query_install_is_complete(queries_dir) {
-        return Ok(ReplaceQueryDirResult::AlreadyComplete);
+        return Ok(PublishQueryDirOutcome::AlreadyComplete);
     }
     if uninstall_tombstone_path(
         queries_dir
@@ -890,12 +1051,12 @@ fn replace_query_dir(
     )
     .is_file()
     {
-        return Ok(ReplaceQueryDirResult::Uninstalled);
+        return Ok(PublishQueryDirOutcome::Uninstalled);
     }
 
     if !queries_dir.exists() {
         fs::rename(tmp_queries_dir, queries_dir)?;
-        return Ok(ReplaceQueryDirResult::Replaced);
+        return Ok(PublishQueryDirOutcome::Published { backup: None });
     }
 
     let backup_dir = unique_backup_query_dir(queries_dir, language);
@@ -908,7 +1069,7 @@ fn replace_query_dir(
         // of aborting the install.
         if e.kind() == std::io::ErrorKind::NotFound {
             fs::rename(tmp_queries_dir, queries_dir)?;
-            return Ok(ReplaceQueryDirResult::Replaced);
+            return Ok(PublishQueryDirOutcome::Published { backup: None });
         }
         return Err(QueryInstallError::IoError(e));
     }
@@ -927,10 +1088,14 @@ fn replace_query_dir(
         return Err(QueryInstallError::IoError(e));
     }
 
-    if fs::remove_dir_all(&backup_dir).is_ok() {
-        let _ = fs::remove_file(backup_ownership_sidecar(&backup_dir));
-    }
-    Ok(ReplaceQueryDirResult::Replaced)
+    // The backup outlives this function: it is dropped by
+    // `PublishedQueryInstall::commit` once every language in the install has
+    // been published. Until then `recover_interrupted_query_install` will not
+    // collect it — `queries_dir` exists again, so it returns early — which is
+    // the pre-existing orphan-backup window that `language uninstall` cleans up.
+    Ok(PublishQueryDirOutcome::Published {
+        backup: Some(backup_dir),
+    })
 }
 
 struct QueryReplaceLockGuard {
@@ -975,6 +1140,140 @@ fn download_file(url: &str, http_policy: QueryHttpPolicy) -> Result<String, Quer
         .body_mut()
         .read_to_string()
         .map_err(|e| QueryInstallError::HttpError(e.to_string()))
+}
+
+#[cfg(test)]
+mod staging_tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    /// Entries under `queries/` that an install is expected to leave behind.
+    ///
+    /// The per-language replace locks are long-lived by design: they serialize
+    /// concurrent installers and are reused, so they are not install residue.
+    fn residue(queries_parent: &Path) -> Vec<String> {
+        fs::read_dir(queries_parent)
+            .expect("read queries parent")
+            .flatten()
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| !name.ends_with(".replace.lock"))
+            .collect()
+    }
+
+    /// Stage a query directory by hand, without touching the network.
+    fn stage(queries_parent: &Path, language: &str, contents: &str) -> StagedQueryDir {
+        fs::create_dir_all(queries_parent).expect("create queries parent");
+        let tmp_dir = create_unique_temp_query_dir(queries_parent, language).expect("stage dir");
+        fs::write(tmp_dir.join("highlights.scm"), contents).expect("write staged highlights");
+        write_install_marker(&tmp_dir).expect("write staged marker");
+        StagedQueryDir {
+            language: language.to_string(),
+            queries_dir: queries_parent.join(language),
+            tmp: TempQueryDirGuard { path: tmp_dir },
+        }
+    }
+
+    /// An install abandoned before publication must leave `queries/` exactly as
+    /// it was — including for the inherited parents staged alongside the
+    /// requested language.
+    #[test]
+    fn dropping_a_staged_install_publishes_nothing() {
+        let temp = TempDir::new().unwrap();
+        let queries_parent = temp.path().join("queries");
+        let staged = StagedQueryInstall {
+            language: "child".to_string(),
+            install_path: queries_parent.join("child"),
+            files_downloaded: vec!["highlights.scm".to_string()],
+            requested_already_complete: false,
+            entries: vec![
+                stage(&queries_parent, "child", "; inherits: parent\n"),
+                stage(&queries_parent, "parent", "(comment) @comment\n"),
+            ],
+        };
+
+        drop(staged);
+
+        let leftovers = residue(&queries_parent);
+        assert!(
+            leftovers.is_empty(),
+            "an unpublished staged install must leave nothing behind, found {:?}",
+            leftovers
+        );
+    }
+
+    /// Rolling back an install that replaced existing queries must put the
+    /// previous directory back and drop the ownership sidecar, so the next run
+    /// sees a clean data dir rather than an orphaned backup.
+    #[test]
+    fn rolling_back_a_publish_restores_the_previous_queries() {
+        let temp = TempDir::new().unwrap();
+        let queries_parent = temp.path().join("queries");
+        let queries_dir = queries_parent.join("child");
+        fs::create_dir_all(&queries_dir).unwrap();
+        fs::write(queries_dir.join("highlights.scm"), "previous").unwrap();
+        write_install_marker(&queries_dir).unwrap();
+        let staged = StagedQueryInstall {
+            language: "child".to_string(),
+            install_path: queries_parent.join("child"),
+            files_downloaded: vec!["highlights.scm".to_string()],
+            requested_already_complete: false,
+            entries: vec![stage(&queries_parent, "child", "replacement")],
+        };
+
+        let published = staged.publish(true).expect("publish should succeed");
+        assert_eq!(
+            fs::read_to_string(queries_dir.join("highlights.scm")).unwrap(),
+            "replacement",
+            "publish must make the staged queries visible"
+        );
+        published.rollback();
+
+        assert_eq!(
+            fs::read_to_string(queries_dir.join("highlights.scm")).unwrap(),
+            "previous",
+            "rollback must restore the queries that were there before"
+        );
+        let leftovers: Vec<_> = residue(&queries_parent)
+            .into_iter()
+            .filter(|name| name != "child")
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "rollback must not strand a backup or its sidecar, found {:?}",
+            leftovers
+        );
+    }
+
+    /// A language that had no queries before must be removed again on rollback:
+    /// leaving it behind is exactly the half-installed state staging exists to
+    /// prevent.
+    #[test]
+    fn rolling_back_a_first_install_removes_the_published_queries() {
+        let temp = TempDir::new().unwrap();
+        let queries_parent = temp.path().join("queries");
+        let staged = StagedQueryInstall {
+            language: "child".to_string(),
+            install_path: queries_parent.join("child"),
+            files_downloaded: vec!["highlights.scm".to_string()],
+            requested_already_complete: false,
+            entries: vec![
+                stage(&queries_parent, "child", "; inherits: parent\n"),
+                stage(&queries_parent, "parent", "(comment) @comment\n"),
+            ],
+        };
+
+        staged
+            .publish(false)
+            .expect("publish should succeed")
+            .rollback();
+
+        let leftovers = residue(&queries_parent);
+        assert!(
+            leftovers.is_empty(),
+            "rollback must remove every directory this install published, found {:?}",
+            leftovers
+        );
+    }
 }
 
 #[cfg(test)]
@@ -1391,6 +1690,46 @@ mod tests {
         );
     }
 
+    /// Queries a language inherits are part of what makes it usable, so a
+    /// parent that cannot be downloaded fails the whole install — and, because
+    /// nothing is published until every dependency is staged, the data dir is
+    /// left untouched rather than holding a language whose `; inherits:` chain
+    /// is broken.
+    #[test]
+    fn a_failing_inherited_parent_publishes_nothing() {
+        let temp_dir = TempDir::new().unwrap();
+        let data_dir = temp_dir.path().to_path_buf();
+        let base_url = spawn_query_file_server(vec![(
+            "/orphan_child/highlights.scm",
+            "; inherits: missing_parent\n(identifier) @variable\n",
+        )]);
+
+        let result = install_queries_with_dependencies_from_allowing_http_for_tests(
+            &base_url,
+            "orphan_child",
+            &data_dir,
+            false,
+        );
+
+        assert!(
+            matches!(result, Err(QueryInstallError::LanguageNotSupported(lang)) if lang == "missing_parent"),
+            "an unavailable inherited parent must fail the install"
+        );
+        let leftovers: Vec<_> = fs::read_dir(data_dir.join("queries"))
+            .expect("read queries parent")
+            .flatten()
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            // The per-language replace locks are reused infrastructure, not
+            // install residue.
+            .filter(|name| !name.ends_with(".replace.lock"))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "a failed dependency must leave no queries behind, found {:?}",
+            leftovers
+        );
+    }
+
     #[test]
     fn install_preserves_legacy_non_marker_query_dir_without_force() {
         let temp_dir = TempDir::new().unwrap();
@@ -1452,7 +1791,7 @@ mod tests {
     }
 
     #[test]
-    fn replace_query_dir_aborts_when_uninstall_tombstone_exists() {
+    fn publish_query_dir_aborts_when_uninstall_tombstone_exists() {
         let temp_dir = TempDir::new().unwrap();
         let queries_parent = temp_dir.path().join("queries");
         fs::create_dir_all(&queries_parent).unwrap();
@@ -1465,7 +1804,7 @@ mod tests {
         write_install_marker_for_tests(&tmp_queries_dir).unwrap();
         write_uninstall_tombstone(&queries_parent, "raced_lang").unwrap();
 
-        let result = replace_query_dir(
+        let result = publish_query_dir(
             &tmp_queries_dir,
             &queries_parent.join("raced_lang"),
             "raced_lang",
@@ -1473,7 +1812,7 @@ mod tests {
         );
 
         assert!(
-            matches!(result, Ok(ReplaceQueryDirResult::Uninstalled)),
+            matches!(result, Ok(PublishQueryDirOutcome::Uninstalled)),
             "replacement should observe uninstall tombstone under the lock"
         );
         assert!(
