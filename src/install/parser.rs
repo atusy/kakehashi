@@ -354,6 +354,22 @@ pub(crate) enum StagedParserOutcome {
     AlreadyInstalled(PathBuf),
 }
 
+impl StagedParserOutcome {
+    /// Give way to a parser that appeared while this one was being compiled.
+    ///
+    /// Staging decides whether to compile from the state it sees, but the
+    /// compile takes long enough for a concurrent install of the same language
+    /// to finish. Without `force`, that install's parser is as good as ours and
+    /// is already paired with its queries, so replacing it would split the
+    /// pair. Dropping the staged parser here reclaims the compiled file.
+    pub(crate) fn yield_to_existing(self, force: bool, existing: Option<PathBuf>) -> Self {
+        match (self, existing) {
+            (Self::Staged(_), Some(path)) if !force => Self::AlreadyInstalled(path),
+            (outcome, _) => outcome,
+        }
+    }
+}
+
 /// Compile a Tree-sitter parser into a staging file without publishing it.
 ///
 /// See [`StagedParser`] for why publication is deferred.
@@ -1570,6 +1586,45 @@ mod tests {
         assert!(
             !tmp_file.exists(),
             "publishing must consume the staging file"
+        );
+    }
+
+    #[test]
+    fn a_staged_parser_yields_to_one_that_appeared_while_it_compiled() {
+        let temp = tempdir().expect("temp dir");
+        let ext = std::env::consts::DLL_EXTENSION;
+        let staged = fake_staged_parser(temp.path(), "lua");
+        let tmp_file = staged.tmp_file.clone();
+        let winner = temp.path().join("parser").join(format!("lua.{}", ext));
+
+        let outcome =
+            StagedParserOutcome::Staged(staged).yield_to_existing(false, Some(winner.clone()));
+
+        assert!(matches!(outcome, StagedParserOutcome::AlreadyInstalled(path) if path == winner));
+        assert!(
+            !tmp_file.exists(),
+            "yielding must reclaim the parser it compiled"
+        );
+    }
+
+    #[test]
+    fn a_staged_parser_keeps_its_place_when_forced_or_unopposed() {
+        let temp = tempdir().expect("temp dir");
+        let ext = std::env::consts::DLL_EXTENSION;
+        let winner = temp.path().join("parser").join(format!("lua.{}", ext));
+
+        let forced = StagedParserOutcome::Staged(fake_staged_parser(temp.path(), "lua"))
+            .yield_to_existing(true, Some(winner));
+        assert!(
+            matches!(forced, StagedParserOutcome::Staged(_)),
+            "--force replaces whatever is there"
+        );
+
+        let unopposed = StagedParserOutcome::Staged(fake_staged_parser(temp.path(), "lua"))
+            .yield_to_existing(false, None);
+        assert!(
+            matches!(unopposed, StagedParserOutcome::Staged(_)),
+            "with nothing to yield to, the staged parser is published"
         );
     }
 

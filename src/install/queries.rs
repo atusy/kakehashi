@@ -334,6 +334,23 @@ pub(crate) struct PublishedQueryInstall {
 }
 
 impl StagedQueryInstall {
+    /// Publish the requested language's queries even if a copy appeared since
+    /// staging.
+    ///
+    /// Yielding to a concurrent winner is right when this install is not
+    /// publishing a parser either — the whole language stays that install's.
+    /// But when this one publishes the parser, its queries have to come with
+    /// it: an install of a *different* language that inherits this one can
+    /// publish these queries without holding this language's lock, and the pair
+    /// would then be one install's grammar beside another's queries.
+    pub(crate) fn claim_requested_language(&mut self) {
+        for entry in &mut self.entries {
+            if entry.language == self.language {
+                entry.force = true;
+            }
+        }
+    }
+
     /// Whether the requested language's queries are still where staging left
     /// them.
     ///
@@ -888,10 +905,17 @@ impl QueryRemoval {
     }
 }
 
+/// Remove a language's queries and every backup kakehashi made of them.
+///
+/// Takes the [`LanguageLock`] rather than a path and a name so the transaction
+/// protocol is enforced by the signature: removing one half while an install is
+/// between its two publishes is exactly how a language ends up parser-only, and
+/// the lock is what an install waits on.
 pub fn remove_query_install_and_backups(
-    queries_parent: &Path,
-    language: &str,
+    lock: &LanguageLock,
 ) -> Result<QueryRemoval, QueryInstallError> {
+    let queries_parent = lock.queries_parent.as_path();
+    let language = lock.language.as_str();
     validate_safe_language_name(language)?;
     fs::create_dir_all(queries_parent)?;
     let _replace_lock = QueryReplaceLockGuard::acquire(queries_parent, language)?;
@@ -1971,7 +1995,9 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let queries_parent = temp.path().join("queries");
 
-        let result = remove_query_install_and_backups(&queries_parent, "a/../../victim");
+        let result = lock_language(temp.path(), "a/../../victim")
+            .map(|lock| remove_query_install_and_backups(&lock))
+            .and_then(|result| result);
 
         assert!(
             matches!(result, Err(QueryInstallError::InvalidLanguageName(_))),
