@@ -437,7 +437,10 @@ final barrier.** The order is fixed:
 2. Hand the candidate set to a **pool-owned batch validator**, which takes
    `connections` **once** and, without awaiting inside, per candidate: keeps
    only `Ready` handles (`connections()` returns the raw map, and
-   `ConnectionState` also has `Initializing`, `Failed`, `Closing`, `Closed`);
+   `ConnectionState` also has `Initializing`, `Failed`, `Closing`, `Closed`).
+   A candidate dropped because its connection is `Failed`, `Closing`, or
+   `Closed` is recorded as an **infrastructure failure** (point 5), not as an
+   absent candidate — see below;
    drops handles lacking `workspace/symbol`; drops handles whose recorded launch
    configuration no longer matches the `BridgeServerConfig` that admitted them;
    and confirms current membership — the live reverse index for a virtual
@@ -507,6 +510,20 @@ single outer deadline would let a slow `connections` acquisition eat into the
 barrier's two seconds and cancel it early — and that cancellation is not the
 barrier returning `false`, so the drop policy above would not even cover it.
 Each phase that can block on the pool gets its own budget instead.
+
+Recording a dead connection as a failure rather than as a non-candidate is what
+keeps the outcome rule honest. A liveness timeout marks a handle `Failed` in
+place, and the pool only replaces it when a later acquisition happens to
+encounter it — so a workspace whose servers have all died sits with every
+connection `Failed` indefinitely. Treating those as "no candidates" would answer
+`[]`, telling the user the workspace contains no matching symbols at the exact
+moment nothing is running. They were routable; they are unreachable; that is an
+outage.
+
+`Initializing` is different and keeps its own behavior: those connections are
+skipped as a deliberate coverage choice below, not because they failed, so a
+query that finds only initializing candidates legitimately answers `[]` — the
+servers are starting, not dead.
 
 **`Initializing` connections are excluded.** Including them, and waiting for
 Ready before dispatch, was tried and abandoned — it looked like it removed a
@@ -1136,7 +1153,9 @@ those rather than from whole responses:
   retired, the range escaped its region, or the content identity moved. The
   answer was processed; it yielded fewer symbols. These are the silent drops
   points 5 and 7 already accept.
-- **Infrastructure-failed** — never examined at all, so nothing was learned. The
+- **Infrastructure-failed** — never examined at all, so nothing was learned. A
+  candidate whose connection was already `Failed`, `Closing`, or `Closed` at
+  selection (point 3) starts here rather than never existing. Also: the
   pass-0 host→virtual snapshot, the translation-time identity re-read, or a
   host's `edit_lock` expiring; and, importantly, geometry that is *unsettled*
   rather than gone — a host still parsing, a pass whose 200ms ensure timed out,
@@ -1156,7 +1175,9 @@ a request error, so poisoning is decided per entry and rolled up, never per
 response.
 
 - Selection **completed** and found no candidates → `[]`. Nothing failed; there
-  was nothing to ask.
+  was nothing to ask. "No candidates" means the admissions named none, or only
+  ones that are still `Initializing` — **not** ones whose connections had died,
+  which are infrastructure failures and fall to the error case below (point 3).
 - **At least one informative** answer → its results, or `[]` if they genuinely
   contained nothing. Partial failure stays soft.
 - Candidates existed and **no answer was informative** — for any reason, at any
