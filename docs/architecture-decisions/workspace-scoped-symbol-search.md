@@ -98,6 +98,15 @@ mirroring the upstream client's `symbolKind` and `tagSupport` while keeping
 `resolveSupport` absent. Mirroring rather than asserting is deliberate:
 kakehashi must not accept a kind or tag it cannot pass on.
 
+Exact mirroring has one exception, and it is the legacy spelling again. An
+upstream `tagSupport: true` deserializes to an empty `value_set`, and mirroring
+that verbatim would advertise `{ valueSet: [] }` downstream — telling a
+conformant server to send neither a `DEPRECATED` tag *nor* the legacy
+`deprecated` field, leaving the fallback below nothing to preserve. For that
+representation kakehashi advertises `DEPRECATED` downstream instead, because it
+can convert a tag back into the legacy boolean but cannot invent information a
+server was told not to send.
+
 Nothing currently advertises the provider: `workspace_symbol_provider` is never
 set in the initialize result, and `LanguageServer::symbol` is never overridden,
 so the request today reaches tower-lsp-server's default and is unimplemented.
@@ -265,7 +274,7 @@ from an empty response — which is the distinction that makes it acceptable her
 and `preferred` not. It does cost the user an edit in **every** pair that names
 the unwanted server, because fan-out unions candidates across all pairs.
 
-### 3. Fan-out: select synchronously, then wait per target
+### 3. Fan-out: select synchronously, and never wait to select
 
 A request has no document, so it cannot pick one `(host_language, bridge_key)`
 pair — it walks **all** of them, purely to collect candidates. Both axes must be
@@ -390,10 +399,11 @@ resolved — up to the full 30 seconds — even though B was ready immediately.
 Deciding membership synchronously and waiting per target removes the
 interaction entirely.
 
-Step 2 must precede step 3, for the reason the abandoned design could not
-honour: capping first would let a **known-incapable** server take a slot from a
-capable one — with `priorities = [A, B]`, `max_fan_out = 1`, and A incapable,
-the query would consult nobody.
+Step 2 must precede step 3: capping first would let a **known-incapable**
+server take a slot from a capable one — with `priorities = [A, B]`,
+`max_fan_out = 1`, and A incapable, the query would consult nobody. Keeping only
+`Ready` candidates is what makes that ordering possible at all, since capability
+is unknowable before the handshake.
 
 `priorities` is an allowlist: listed servers are candidates, `"*"` stands for
 the rest, and an explicit `[]` remains the per-method kill switch. Its **order**
@@ -417,8 +427,11 @@ connections and two requests.
 
 `max_fan_out` counts **server names**, not connections — `truncate_entries`
 truncates a flattened name list in walk order. A surviving name then contributes
-**every** live connection it has, so a server live under two roots sends two
-requests against one cap slot. No root is dropped and no root-ordering policy is
+every connection **that survived steps 1 and 2** — every `Ready`, capable handle
+in the selection snapshot — so a server live under two roots sends two requests
+against one cap slot. It contributes those, not "every live connection": if
+`A/root1` advertises `workspace/symbol` and `A/root2` does not, selecting the
+name A must not smuggle root2 back past the capability filter. No root is dropped and no root-ordering policy is
 needed, which is the point: this method queries every live root of a selected
 server by design.
 
@@ -488,8 +501,8 @@ return is part of the pattern.
 - **To be called after the Ready wait.** It falls back to
   `server_capabilities()`, which is `None` until `set_server_capabilities` runs
   during the handshake. Point 3 keeps only `Ready` candidates precisely so this
-  is knowable at selection time; an `Initializing` handle would report every
-  server incapable.
+  is knowable at selection time — an `Initializing` handle reports every server
+  incapable, which is why it cannot be a candidate.
 
 Cancellation needs nothing new **downstream**: `register_upstream_request`
 already holds many `(server, root)` keys per upstream id,
@@ -497,13 +510,16 @@ already holds many `(server, root)` keys per upstream id,
 `UpstreamRegistrySweepGuard` unregisters the whole entry. Multi-target
 cancellation falls out of using the pattern.
 
-It does need something **upstream**. Registration happens inside the per-target
-send, and cancel forwarding records nothing for an id that is not yet
-registered — so a cancel arriving before the sends would be dropped and the
-query would run to completion regardless. The handler therefore subscribes to
+It does need something **upstream**. Downstream registration happens inside the
+per-target send, so it can only cancel work that has already been dispatched —
+it does nothing for the selection and index-building the handler does first, nor
+for the handler's own future. The handler therefore subscribes to
 `$/cancelRequest` **before its first await** and selects against the whole
-dispatch, exactly as the existing document-free handler does, rather than
-relying on per-target registration alone.
+dispatch, exactly as the existing document-free handler does. Not because the
+signal would otherwise be lost — the request registry latches a cancel that
+arrives between request acceptance and subscription and delivers it on
+subscribe — but because selecting on it is what makes the handler abandon
+promptly rather than only at its next dispatch boundary.
 
 Fan-in cannot live in the `bridge` module, because `resolve_region_offset` is
 `pub(super)` to `lsp_impl`. So unlike every `transform_*_response_to_host`
@@ -699,15 +715,23 @@ check and the ensure moves the URI into a fresh, snapshot-less lifetime and the
 outer 200ms timeout**, so the phase's bound is a property of this call site
 rather than an inference about the callee's internal state.
 
-Resolution also **post-checks the snapshot incarnation**. `resolve_region_offset`
+Resolution also **post-checks the snapshot's freshness**. `resolve_region_offset`
 takes an owned snapshot before it consults the tracker and walks the tree, while
 `didChange` updates tracker positions *before* it clears the visible tree — so a
 resolution that reads the tracker just ahead of that update finishes against its
 own stale snapshot and passes both the language and range checks with old
-coordinates. Re-reading the incarnation after resolution and discarding the
-entry when it moved closes that, following the same discipline the semantic
-token path already uses. Without it, "the tree is gone" is the only edit race
-the design would notice, and it is not the only one that exists.
+coordinates.
+
+The check must be on **incarnation *and* content version**, not incarnation
+alone. An ordinary edit preserves the incarnation and only bumps the content
+version, and `DocumentSnapshot` does not carry that version — so an
+incarnation-only comparison would miss precisely the race described above.
+The resolution variant therefore retains the snapshot's content/parsed version
+alongside the language and virtual content, compares both fields against a
+single live `SnapshotView`, and holds the document edit lock through validation
+so the comparison cannot itself be raced. This is the discipline the semantic
+token path already uses, and only the whole of it works; the incarnation half
+alone would leave "the tree is gone" as the only edit race the design notices.
 
 A residual race remains and is **accepted**: a `didChange` landing between the
 ensure and the offset resolution clears the tree again, and that entry is
@@ -731,8 +755,8 @@ Entries are emitted as `WorkspaceSymbol[]` — `WorkspaceSymbolResponse::Nested`
 in `ls-types`, whose variant names are a misnomer: **both** variants are flat
 arrays, and the choice is the element type, not hierarchy (there is no nested
 form for this method; `containerName` is spec-documented as unusable for
-re-inferring one). `SymbolInformation[]` is the deprecated alternative and is
-not emitted.
+re-inferring one). `SymbolInformation[]` is the deprecated alternative, emitted only in the
+compatibility case below.
 
 One client capability *does* govern the payload, and it turns out to govern the
 element type too: `workspace.symbol.tagSupport` declares which `SymbolTag`s the
@@ -752,12 +776,17 @@ that actually matters.
 
 The second case is why the element type cannot simply be "always the modern
 one". Point 4 *creates* a tag during normalization, folding the legacy
-`deprecated` flag into `SymbolTag::DEPRECATED`. Emitting `WorkspaceSymbol[]`
-with tags stripped would therefore destroy deprecation outright for exactly the
-clients too old to read tags — while `SymbolInformation.deprecated` is a field
-those clients do understand and that the deprecated element type still carries.
-Emitting the deprecated type for a client that declared no tag support is the
-lesser evil, and it is bounded: the modern type is used everywhere else.
+`deprecated` flag into `SymbolTag::DEPRECATED` and discarding the original
+field. Emitting `WorkspaceSymbol[]` with tags stripped would therefore destroy
+deprecation outright for exactly the clients too old to read tags.
+
+Choosing the legacy element type is not by itself enough to undo that, because
+the information now lives in a tag. The legacy path must **reverse the
+normalization**: set `deprecated = Some(true)` when the normalized tags contain
+`DEPRECATED`, and drop tags the client cannot represent. Selecting
+`SymbolInformation[]` without that conversion would lose exactly what selecting
+it was meant to preserve. It is bounded: the modern type is used everywhere
+else.
 
 ### 6. Latency is bounded by the pool's timeouts, not by cancellation
 
@@ -817,22 +846,43 @@ one region's offset is known. Workspace symbol search resolves each result's
 region independently, so the offset is always the right one for the entry being
 translated.
 
-Two user-facing docs state the no-cross-block rule as a blanket claim and must
-be amended, not merely appended to — the wrong part is the framing sentence in
-each: `docs/language-features.md` ("Bridged features are also limited to
-embedded code blocks in one respect: navigation and edits do not cross between
-blocks", and separately "features that need to see across blocks do not work
-between them") and `docs/README.md` ("**No cross-region results within the host
-document**"). Both files' itemized bodies are already correctly scoped to the
-goto/references/rename transforms and stay true. The
-language-server-bridge-request-strategies per-method table gains no row for this
-method and is left incomplete rather than wrong.
+Shipping this obliges edits in **both** user-facing docs, in three separate
+respects each. They are listed here because more than one review round found the
+inventory incomplete.
+
+*The no-cross-block rule is stated as a blanket claim and must be amended, not
+appended to* — the wrong part is the framing sentence, while both files'
+itemized bodies are already correctly scoped to the goto/references/rename
+transforms and stay true:
+
+- `docs/language-features.md` — "Bridged features are also limited to embedded
+  code blocks in one respect: navigation and edits do not cross between blocks",
+  and separately "features that need to see across blocks do not work between
+  them".
+- `docs/README.md` — "**No cross-region results within the host document**".
+
+*The strategy set is described as closed* in two more places, both of which
+enumerate exactly `preferred`/`concatenated` and both of which additionally
+assert that every other method dispatches `preferred` regardless:
+
+- `docs/language-features.md` — the "When several servers handle one language"
+  table and its lead-in ("one of two strategies").
+- `docs/README.md` — the `strategy` row of the aggregation table.
+
+*And the feature must move* out of `docs/language-features.md`'s "Not currently
+provided" list into a section of its own, and into `docs/README.md`'s
+bridge-backed request list — carrying the live-only coverage contract and the
+fact that coverage can shrink.
+
+The language-server-bridge-request-strategies per-method table gains no row for
+this method and is left incomplete rather than wrong.
 
 ### 9. Deferred in this decision
 
 - `workspaceSymbol/resolve` — `resolveProvider` is advertised as `false`. Because
-  kakehashi declares no `workspace.symbol` capability downstream, an entry
-  arriving without a range is a downstream conformance bug; §5 drops it.
+  kakehashi keeps `resolveSupport` absent from the `workspace.symbol` capability
+  it declares downstream (point 5), an entry arriving without a range is a
+  downstream conformance bug; point 5 drops it.
 - `workDoneToken` / `partialResultToken` — neither is forwarded downstream, and
   `workDoneProgress` is left unset on the advertised
   `workspaceSymbolProvider`. The existing client-progress aggregator is keyed by
