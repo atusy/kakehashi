@@ -76,6 +76,35 @@ fn select_palette_route(ready: &[ConnectionKey], reconnectable: &[ConnectionKey]
     }
 }
 
+/// Why a palette command was refused. The two cases are genuinely different
+/// sentences, not one sentence with a different noun: "several of these claim
+/// it" and "none of these can be reached" share no clause, and gluing a common
+/// tail onto both produced "[none] advertise it".
+enum PaletteRefusal {
+    /// Several live connections advertise the name.
+    SeveralLive(Vec<ConnectionKey>),
+    /// Nothing live advertises it, and the recorded origins do not resolve to a
+    /// single revivable one. The list is often empty, which is the honest answer
+    /// for a name whose advertisers have all gone away.
+    NothingReachable(Vec<ConnectionKey>),
+}
+
+/// The whole reason, as one sentence the user can act on.
+fn describe_refusal(refusal: &PaletteRefusal) -> String {
+    match refusal {
+        PaletteRefusal::SeveralLive(candidates) => format!(
+            "several live connections [{}] advertise it, and the request carries no workspace \
+             context, so kakehashi will not guess which to use",
+            describe_candidates(candidates)
+        ),
+        PaletteRefusal::NothingReachable(candidates) => format!(
+            "no live connection advertises it, and its recorded origins [{}] do not resolve to \
+             a single one that can be reconnected",
+            describe_candidates(candidates)
+        ),
+    }
+}
+
 /// Render the connections a refused command could have meant, e.g.
 /// `ruff@file:///w/a, ruff@file:///w/b`. Empty renders as `none`, which is the
 /// honest answer for a name whose advertisers have all gone away.
@@ -219,16 +248,13 @@ impl LanguageServerPool {
     /// Naming them is the point: the user knows which command they picked, not
     /// which servers claim it, and `ConnectionKey`'s `Display` is exactly the
     /// server-and-root pair they would have to change to disambiguate.
-    fn refuse_palette_command(&self, command: &str, reason: &str, candidates: &[ConnectionKey]) {
-        let candidates = describe_candidates(candidates);
+    fn refuse_palette_command(&self, command: &str, refusal: PaletteRefusal) {
+        let reason = describe_refusal(&refusal);
         warn!(
             target: "kakehashi::bridge",
-            "executeCommand: refusing palette command {command:?}: {reason} [{candidates}]"
+            "executeCommand: refusing palette command {command:?}: {reason}"
         );
-        self.warn_to_editor(format!(
-            "command {command:?} was not run: {reason} [{candidates}] advertise it, and the \
-             request carries no workspace context, so kakehashi will not guess which to use"
-        ));
+        self.warn_to_editor(format!("command {command:?} was not run: {reason}"));
     }
 
     /// Every live connection whose EXACT advertised command list contains
@@ -358,16 +384,14 @@ impl LanguageServerPool {
             PaletteRoute::AmbiguousLive(candidates) => {
                 self.refuse_palette_command(
                     &params.command,
-                    "several live connections",
-                    &candidates,
+                    PaletteRefusal::SeveralLive(candidates),
                 );
                 return None;
             }
             PaletteRoute::Unreachable(candidates) => {
                 self.refuse_palette_command(
                     &params.command,
-                    "no live connection, and no single revivable origin among",
-                    &candidates,
+                    PaletteRefusal::NothingReachable(candidates),
                 );
                 return None;
             }
@@ -706,6 +730,26 @@ mod tests {
             "ruff@file:///w/a, ruff@file:///w/b",
             "server AND root: the root is the axis a same-server collision turns on"
         );
+    }
+
+    #[test]
+    fn each_refusal_reads_as_a_sentence_about_its_own_case() {
+        let several = describe_refusal(&PaletteRefusal::SeveralLive(vec![
+            key("ruff", "file:///w/a"),
+            key("eslint", "file:///w/b"),
+        ]));
+        assert!(several.contains("ruff@file:///w/a, eslint@file:///w/b"));
+        assert!(several.contains("will not guess which to use"));
+
+        // The case a shared sentence tail broke: no candidates at all, where
+        // "[none] advertise it" was both ungrammatical and untrue.
+        let nothing = describe_refusal(&PaletteRefusal::NothingReachable(vec![]));
+        assert!(
+            !nothing.contains("advertise it"),
+            "an empty candidate list must not be described as advertising anything: {nothing}"
+        );
+        assert!(nothing.contains("no live connection advertises it"));
+        assert!(nothing.contains("[none]"));
     }
 
     #[tokio::test]
