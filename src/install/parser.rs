@@ -295,8 +295,11 @@ impl StagedParser {
     /// published.
     pub(crate) fn publish(mut self) -> Result<ParserInstallResult, ParserInstallError> {
         // `cfg!` rather than `#[cfg]` so this compiles everywhere it is read,
-        // not only where it runs.
-        let displaced = if cfg!(windows) && self.parser_file.exists() {
+        // not only where it runs. `is_file`, so a directory sitting where the
+        // parser belongs is not moved aside and then left stranded by a
+        // `remove_file` that cannot remove it — the rename below fails instead,
+        // which is the error the user needs to see.
+        let displaced = if cfg!(windows) && self.parser_file.is_file() {
             let aside = self
                 .parser_file
                 .with_file_name(format!("{}.displaced", staging_file_name(&self.language)));
