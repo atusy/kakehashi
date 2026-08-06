@@ -78,11 +78,17 @@ pub struct SettingsLoadOutcome {
 /// Extracted rather than inlined because the order is load-bearing beyond
 /// "later wins": [`merge_workspace_settings`] is **not associative** once an
 /// empty container clears the layer below — `merge(merge({x}, {}), {y})` is
-/// `{y}`, while `merge({x}, merge({}, {y}))` is `{x, y}`. Any future caller
-/// that recomposes from retained layers has to fold them strictly
-/// left-to-right, in the order they were received, and must not fold a suffix
-/// on its own and replay it over a rebuilt base.
-pub(crate) fn fold_layers(
+/// `{y}`, while `merge({x}, merge({}, {y}))` is `{x, y}`.
+///
+/// Precisely: because this is a left fold, any *prefix* may be collapsed into
+/// one value and resumed from — that is what a checkpoint is — but no proper
+/// *suffix* may be folded on its own and replayed over a rebuilt base, since
+/// the clear it carried would be lost.
+///
+/// The sibling hazard for anything retaining layers: a layer whose only
+/// content is an empty container looks contentless and is not. It must not be
+/// pruned or deduplicated away.
+fn fold_layers(
     layers: impl IntoIterator<Item = Option<RawWorkspaceSettings>>,
 ) -> Option<RawWorkspaceSettings> {
     layers
@@ -159,11 +165,7 @@ fn unknown_config_keys(contents: &str) -> Vec<String> {
 /// the same defaults, so a lone `debounceMs` is still judged against the
 /// default `maxWaitMs`.
 fn merge_explicit_layers(layers: &[Option<RawWorkspaceSettings>]) -> Option<RawWorkspaceSettings> {
-    layers
-        .iter()
-        .cloned()
-        .reduce(merge_workspace_settings)
-        .flatten()
+    fold_layers(layers.iter().cloned())
 }
 
 /// The directory a config file lives in, as an absolute path.
@@ -1000,8 +1002,40 @@ mod tests {
         assert_eq!(
             names(&replayed),
             ["a", "b"],
-            "folding the suffix on its own loses the clear — this is why the \
-             order and the whole prefix have to be kept"
+            "folding the suffix on its own loses the clear — this characterizes \
+             today's hazard, and is why the order and the whole prefix have to \
+             be kept"
+        );
+    }
+
+    /// An absent layer and a layer that clears are not the same thing, and the
+    /// fold has to keep them apart: `None` contributes nothing, while
+    /// `Some({})` says "none of this". Every future caller that recomposes
+    /// from retained layers depends on the distinction.
+    #[test]
+    fn fold_layers_keeps_an_absent_layer_distinct_from_a_clearing_one() {
+        let with_server: RawWorkspaceSettings =
+            toml::from_str("[languageServers.a]\ncmd = [\"a\"]\n").expect("parses");
+        let cleared: RawWorkspaceSettings =
+            toml::from_str("languageServers = {}\n").expect("parses");
+
+        let absent = fold_layers([None, Some(with_server.clone()), None]).expect("one real layer");
+        assert!(
+            absent
+                .language_servers
+                .as_ref()
+                .is_some_and(|servers| servers.contains_key("a")),
+            "an absent layer must contribute nothing, not clear"
+        );
+
+        let clearing = fold_layers([Some(with_server), Some(cleared)]).expect("two layers fold");
+        assert_eq!(
+            clearing
+                .language_servers
+                .as_ref()
+                .map(std::collections::HashMap::len),
+            Some(0),
+            "a clearing layer must empty what the layer below supplied"
         );
     }
 
