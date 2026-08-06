@@ -438,11 +438,22 @@ final barrier.** The order is fixed:
    `connections` **once** and, without awaiting inside, per candidate — **in
    this order**:
 
-   a. **Confirm the candidate is still current** — the live reverse index for a
-      virtual candidate, `host_documents` for a `_self` one, and in both cases
-      the stored connection generation matching the handle's. A candidate that
-      fails this is **stale, not failed**: it is discarded silently, before any
-      accounting.
+   a. **Confirm the candidate is still current.** The check differs by kind,
+      because the available evidence does:
+
+      - *Virtual* — the live reverse index, **and**
+        `OpenedVirtualDoc.connection_generation` equal to the tracker's current
+        generation for that key. The generation lives on the tracked document
+        and the tracker, not on the handle: `ConnectionHandle` has no such
+        field, so "matches the handle's generation" would be unimplementable.
+      - *`_self`* — fresh `host_documents` membership, read while `connections`
+        is held. No generation is needed or available (`HostDocSyncState`
+        carries only a version and a fingerprint); holding `connections` across
+        the read is itself what prevents a purge and replacement from
+        interleaving.
+
+      A candidate that fails this is **stale, not failed**: it is discarded
+      silently, before any accounting.
 
    b. Then keep only `Ready` handles (`connections()` returns the raw map, and
       `ConnectionState` also has `Initializing`, `Failed`, `Closing`, `Closed`),
