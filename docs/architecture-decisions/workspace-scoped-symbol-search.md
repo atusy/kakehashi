@@ -805,12 +805,18 @@ Two things about *when* and *per what* are load-bearing:
   later comparison sees B and agrees. Capturing first makes the recorded
   identity the one the request actually raced.
 
-  Reading it is a **third awaited lock** on the send path, not a free lookup:
-  the revisions live behind their own Tokio mutex (the fingerprints behind a
-  separate synchronous one), so the snapshot is taken per target before the
-  `connections` re-acquisition, under the same three-second budget as every
-  other awaited lock, and a target whose snapshot cannot be taken in time is
-  dropped and counted as a failure like any other.
+  **Atomically with the enqueue**, moreover — not merely before it. The
+  revisions live behind their own Tokio mutex, so the snapshot is taken with
+  `try_lock` inside the same `connections` critical section that performs the
+  stale-handle check and the enqueue, never awaited beside it. Contention drops
+  that target, counted as a failure like any other.
+
+  Taking it *outside* that section would leave a gap: eager `didOpen` holds
+  `connections` while opening, so a virtual document can be opened between the
+  snapshot and the enqueue. The request would then see that document and the
+  late URI index would contain it, while the target's identity map would not —
+  and its symbols would be dropped, silently, for a document that was legitimately
+  open when the request ran. Capturing inside the section closes it.
 - **Per connection, not per URI.** Both tracker values are keyed by
   `ConnectionKey`, and one virtual URI can be open on several connections with
   different confirmed content. An identity snapshot is therefore taken per
@@ -905,7 +911,10 @@ then be dropped for being absent from a map that predates it. Waiting for the
 *first* response is not enough either — other targets can stay in flight for
 another 30 seconds and answer with documents opened in the meantime. The index
 is therefore built once all results are in hand, immediately before
-classification.
+classification. It covers documents opened up to the enqueue of each request,
+which is as far as it can: a per-target identity map fixes what that target
+could legitimately have seen, and it is captured atomically with that target's
+enqueue (point 4).
 
 Staleness in the other direction is worse and survives any snapshot time, so it
 is closed by a check rather than by timing. A region keeps its ULID across
@@ -1103,12 +1112,18 @@ re-check, or the enqueue fails. Counting only "dispatched targets that errored"
 would let a query whose every target died pre-dispatch report a confident empty
 answer, since zero dispatches looks the same as zero results.
 
-- Selection found **no candidates at all** → `[]`. Nothing failed; there was
-  nothing to ask.
+- Selection **completed** and found no candidates → `[]`. Nothing failed; there
+  was nothing to ask.
 - **At least one** target answered → `[]` or its results, as they came. Partial
   failure stays soft.
 - Candidates existed and **none answered** — for any reason, at any phase →
   **request error**.
+- Selection **did not complete** and nothing answered → **request error**. Its
+  tracker or `connections` acquisition can expire, and `_self` discovery is
+  incomplete whenever `host_documents` was contended, so "no candidates" and
+  "we could not find out" are different states. Only the first may claim `[]`;
+  reporting the second as an empty search would be the same confident falsehood
+  as reporting an outage that way.
 
 A downstream `null` is an answer, not a failure. The method's result type is
 `Option<WorkspaceSymbolResponse>` precisely because `null` is valid, so it
@@ -1209,10 +1224,16 @@ arriving mid-processing would otherwise wait on unrelated work with no bound.
   covers *acquiring* each lock, not the filtering between them — that walk is synchronous with no
   await, so a timeout could not preempt it anyway, and bounding what cannot be
   interrupted would promise something the runtime does not deliver.
-- **Each send**: the content-identity snapshot's tracker mutex, then the
-  pre-enqueue re-acquisition of `connections` — three seconds each, per target,
-  independently. A target that cannot get either in time is dropped, and counts
-  as a failed target for the outcome rule in point 5.
+- **Each send**: the pre-enqueue re-acquisition of `connections` — three
+  seconds, per target, independently. The content-identity snapshot is
+  `try_lock`ed *inside* that section rather than awaited, so it adds no wait;
+  contention drops the target. Either failure counts as a failed target for the
+  outcome rule in point 5.
+- **Fan-in**: the pass-0 host→virtual snapshot, and the translation-time
+  identity re-read — three seconds each. These come *after* every downstream
+  response, so they are easy to overlook, and unbudgeted they would reintroduce
+  an unbounded wait at the very end of the query. Expiry drops the affected
+  entries.
 - **Translation's `edit_lock`** per host: three seconds. A host whose lock
   cannot be taken in time loses that query's entries, exactly like a host whose
   geometry was stale.
@@ -1465,8 +1486,9 @@ Including it would defeat dedup on a field carrying no identity.
 - Latency is max-over-live-targets, and every *wait* is bounded: the pool's 30s
   request timeout and liveness timeout, a three-second budget on **every** lock
   this path awaits (the candidate tracker snapshot, `connections`, each send's
-  identity snapshot and `connections` re-acquisition, and each host's
-  `edit_lock`), and the reopen barrier's two seconds. Total latency is not bounded, because the synchronous
+  `connections` re-acquisition, the pass-0 host→virtual snapshot, the
+  translation-time identity re-read, and each host's `edit_lock`), and the
+  reopen barrier's two seconds. Total latency is not bounded, because the synchronous
   filtering between those waits cannot be preempted. Forwarded cancellation is
   best-effort, since a downstream may ignore it.
 - One request per keystroke, un-coalesced (point 9).
@@ -1490,10 +1512,11 @@ Including it would defeat dedup on a field carrying no identity.
   time, since it is `try_lock`ed rather than awaited (point 3). Host-bridged
   symbols can therefore be absent from one query for a reason the user cannot
   see.
-- Every lock this path *awaits* — the tracker snapshot, `connections`, each
-  send's re-acquisition, each host's `edit_lock` — is bounded only in its
-  **acquisition** (`host_documents` is never awaited; it is `try_lock`ed under
-  `connections`, and contention drops that query's `_self` candidates), because
+- Every lock this path *awaits* — the candidate tracker snapshot, `connections`,
+  each send's re-acquisition, the two fan-in tracker reads, each host's
+  `edit_lock` — is bounded only in its **acquisition** (`host_documents` and the
+  per-send identity snapshot are never awaited; they are `try_lock`ed under
+  `connections`, and contention drops the affected candidates), because
   other paths hold these across unbounded async work (point 6); the filtering
   between them is synchronous and cannot be preempted, so neither total
   selection time nor cancellation blocking is capped. Expiring any of those
