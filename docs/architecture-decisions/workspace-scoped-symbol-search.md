@@ -103,10 +103,10 @@ per-entry global fan-in translator, and a single deduplicating union. Defer
  client                    kakehashi                    downstream servers
    │
    │ workspace/symbol   ┌───────────────┐
-   │  { query }    ────▶│ candidate set │─── request ──▶  lua_ls   @ rootA
-   │                    │ ∩ live conns  │─── request ──▶  tsgo     @ rootA
-   │                    │ dedup by conn │─── request ──▶  tsgo     @ rootB
-   │                    │ (fan-out, §3) │
+   │  { query }    ────▶│ fan-out (§3): │─── request ──▶  lua_ls   @ rootA
+   │                    │ pairs ∩ live, │─── request ──▶  tsgo     @ rootA
+   │                    │ capped, then  │─── request ──▶  tsgo     @ rootB
+   │                    │ deduped       │
    │                    └───────────────┘                         │
    │                                                              │
    │                    ┌───────────────┐                         │
@@ -214,6 +214,13 @@ The same walk warns in the **other** direction too: `strategy = "union"` on any
 method other than `workspace/symbol` is equally inert (point 1), and warning on
 only one of the two would leave the more likely user mistake silent.
 
+Both directions must decide "which method is this?" by **resolving** the
+aggregation entry, not by comparing map keys. A method-level `"_"` wildcard
+entry legitimately supplies a strategy to `workspace/symbol` through the same
+`resolve_with_wildcard` fallback used everywhere else, so a walk that only
+inspects literal key names would both miss the override it should apply and warn
+about a `union` that is in fact reaching this method.
+
 Two servers indexing the *identical* root — say two TypeScript servers — are
 genuinely competing rather than complementary, and this decision does make their
 near-duplicate entries survive when their ranges differ. The lever for that case
@@ -264,6 +271,13 @@ dropped. A `_self` pair contributes candidates only when
 a **direct** lookup with no wildcard fallback, unlike the aggregation fields
 beside it, so a `bridge._self.aggregation` block without `enabled` contributes
 nothing at all.
+
+Every **other** bridge key needs the sibling gate, `is_language_bridgeable`,
+which resolves `enabled` through the wildcard and defaults to `true`. The two
+gates are deliberately asymmetric — host bridging is opt-in, injection bridging
+is opt-out — and the walk must apply the right one per key, or a pair the user
+switched off with `bridge.<key>.enabled = false` would still contribute
+candidates here while contributing to no other bridged method.
 
 Dedup is by connection key, not server name: the response depends on the
 connection's own indexed workspace, so a connection named by several pairs is
@@ -351,9 +365,12 @@ translator resolves a different offset per entry and must sit where the
 The value crossing that boundary is **typed, not raw JSON**: the bridge module
 owns deserialization for every other bridged request, and this one keeps that
 property. Each target's response is parsed into `Vec<WorkspaceSymbol>` there,
-normalizing a `SymbolInformation[]` answer into the same shape, which is
-possible precisely because `WorkspaceSymbol.location` is a `OneOf` that models
-the range-less form rather than rejecting it. `lsp_impl` then classifies and
+normalizing a `SymbolInformation[]` answer into the same shape. That works for
+`location` because `WorkspaceSymbol.location` is a `OneOf` that models the
+range-less form rather than rejecting it, but it is not field-for-field:
+`SymbolInformation` carries a (itself deprecated) `deprecated: Option<bool>`
+that `WorkspaceSymbol` has no counterpart for, so the normalization must fold
+`Some(true)` into `tags` as `SymbolTag::DEPRECATED` or silently lose it. `lsp_impl` then classifies and
 translates typed values, and its classification is unit-testable as a pure
 function once the offset resolver is injected.
 
@@ -421,16 +438,28 @@ scratch documents are not in the set.
 
 The sweep is **concurrent**, one `JoinSet` task per document, matching the
 diagnostic publisher's shape rather than the serial shared-budget sweep in
-`lifecycle.rs`. Each call carries `ensure_document_parsed`'s own 200ms bound, so
-the sweep costs roughly one such wait in wall time rather than one per document,
-and it is issued alongside the fan-out requests so it overlaps them. No
-additional total budget is imposed: the set is bounded by what the client has
-open, and every task's own bound is the existing one.
+`lifecycle.rs`, and it is issued alongside the fan-out requests so it overlaps
+them.
+
+It pre-warms only documents that **already have a snapshot**. That is not an
+optimization but a correctness-preserving bound: `ensure_document_parsed` asks
+for a 200ms wait, but `wait_for_current_snapshot` escalates to the 15-second
+`FIRST_PARSE_BACKSTOP` when no snapshot exists at all, regardless of the
+caller's wait — so a sweep that included never-parsed documents could block a
+query for 15 seconds. Skipping them loses nothing: a document that has never
+been parsed has no resolved injection regions, hence no virtual documents opened
+downstream, hence no result can address it. The reparse window this pre-warm
+exists for is by definition a document that has a snapshot and a cleared tree.
 
 The response to the client is always an **array**, never `null`, so "no server
-was running" and "everything was dropped" are not distinguished — the spec
-assigns no distinct meaning to `null` here, and an array keeps the empty case
-uniform.
+was running", "everything was dropped", and "every target errored or timed out"
+are not distinguished — the spec assigns no distinct meaning to `null` here, and
+an array keeps the empty case uniform. This last case needs stating because the
+existing fan-in outcomes are mapped inconsistently elsewhere (the diagnostics
+path turns a total failure into an empty vector, formatting and code actions
+into `None`); here it is the empty array, so a downstream outage degrades to
+"no matches" rather than to a protocol-level nothing. A target that errors or
+hits the 30-second timeout contributes nothing and does not fail the query.
 
 Entries are emitted as `WorkspaceSymbol[]` — `WorkspaceSymbolResponse::Nested`
 in `ls-types`, whose variant names are a misnomer: **both** variants are flat
