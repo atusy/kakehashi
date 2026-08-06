@@ -101,8 +101,10 @@ kakehashi must not accept a kind or tag it cannot pass on.
 Exact mirroring has one exception, and it is the legacy spelling again. An
 upstream `tagSupport: true` deserializes to an empty `value_set`, and mirroring
 that verbatim would advertise `{ valueSet: [] }` downstream — telling a
-conformant server to send neither a `DEPRECATED` tag *nor* the legacy
-`deprecated` field, leaving the fallback below nothing to preserve. For that
+conformant server that no tag is supported. The legacy `deprecated` field is
+modelled independently and is not forbidden by that, but neither is it
+guaranteed: a server may reasonably send neither form, leaving the fallback
+below nothing to preserve. For that
 representation kakehashi advertises `DEPRECATED` downstream instead, because it
 can convert a tag back into the legacy boolean but cannot invent information a
 server was told not to send.
@@ -387,8 +389,8 @@ coverage already grows and shrinks under the client's own actions (point 7). It
 buys a selection that is synchronous, deterministic, capability-exact, and free
 of every failure mode above.
 
-The cap sits between the two: after the liveness filter, before any waiting.
-Both halves of that placement are load-bearing.
+The cap sits after the liveness and capability filters, and that placement is
+load-bearing.
 
 Putting the cap *before* the liveness filter would let dead or absent servers
 consume cap slots and silently exclude a live server ranked below the cutoff,
@@ -431,9 +433,9 @@ every connection **that survived steps 1 and 2** — every `Ready`, capable hand
 in the selection snapshot — so a server live under two roots sends two requests
 against one cap slot. It contributes those, not "every live connection": if
 `A/root1` advertises `workspace/symbol` and `A/root2` does not, selecting the
-name A must not smuggle root2 back past the capability filter. No root is dropped and no root-ordering policy is
-needed, which is the point: this method queries every live root of a selected
-server by design.
+name A must not smuggle root2 back past the capability filter. Beyond that
+filter no root is dropped and no root-ordering policy is needed: this method
+queries every `Ready`, capable root of a selected server by design.
 
 The setting's documented promise ("cap the number of concurrent server
 requests") is therefore not what happens here, and could not be — a cap on names
@@ -498,7 +500,7 @@ return is part of the pattern.
   method reports every server incapable. The arm reads
   `workspace_symbol_provider: Option<OneOf<bool, WorkspaceSymbolOptions>>` in the
   same shape as the existing `textDocument/definition` arm.
-- **To be called after the Ready wait.** It falls back to
+- **A `Ready` handle to read.** It falls back to
   `server_capabilities()`, which is `None` until `set_server_capabilities` runs
   during the handshake. Point 3 keeps only `Ready` candidates precisely so this
   is knowable at selection time — an `Initializing` handle reports every server
@@ -631,7 +633,8 @@ index** built once up front:
 3. Resolve each entry's offset and translate, per group.
 
 Pass 0 is built **late, and verified late**, because a single early snapshot
-is wrong in both directions across a wait that can reach a minute.
+is wrong in both directions across a collection phase that runs concurrently and
+can reach the 30-second response bound.
 
 Too-early **under-reports**: a virtual document opened after the snapshot but
 before a downstream request can legitimately appear in that response, and would
@@ -732,6 +735,14 @@ single live `SnapshotView`, and holds the document edit lock through validation
 so the comparison cannot itself be raced. This is the discipline the semantic
 token path already uses, and only the whole of it works; the incarnation half
 alone would leave "the tree is gone" as the only edit race the design notices.
+
+Taking that lock carries an obligation the happy path hides. `edit_lock`
+**creates** an entry unconditionally, so a host that closed between indexing and
+fan-in yields no live `SnapshotView` — and simply dropping the symbol would
+leave the lock entry behind forever. The miss path must call
+`remove_edit_lock_if_unshared`, exactly as the semantic token path does. Fan-in
+reaches this case routinely, because the index is built from documents that may
+close while other targets are still answering.
 
 A residual race remains and is **accepted**: a `didChange` landing between the
 ensure and the offset resolution clears the tree again, and that entry is
@@ -874,8 +885,15 @@ provided" list into a section of its own, and into `docs/README.md`'s
 bridge-backed request list — carrying the live-only coverage contract and the
 fact that coverage can shrink.
 
-The language-server-bridge-request-strategies per-method table gains no row for
-this method and is left incomplete rather than wrong.
+One more site is a **related ADR**, and it is wrong rather than merely
+incomplete: language-server-bridge-request-strategies states universally that
+every other method dispatches `preferred`, and `workspace/symbol` is now a
+counterexample. Its per-method table gains no row — that part is only an
+omission — but the universal sentence must be corrected.
+
+`docs/README.md`'s cross-layer `layers.aggregation` `strategy` row belongs to
+the closed-set list above too: it will schema-accept an inert `union` while
+documenting only two values.
 
 ### 9. Deferred in this decision
 
@@ -1012,8 +1030,8 @@ Including it would defeat dedup on a field carrying no identity.
 - A server still `Initializing` when the query arrives is skipped entirely, so
   a search in the seconds after opening a file can miss it (point 3).
 - `max_fan_out` does not mean here what its own documentation promises. It caps
-  server *names*, and one selected name still queries every live root, so it
-  bounds neither requests nor connections.
+  server *names*, and one selected name still queries every `Ready`, capable
+  root, so it bounds neither requests nor connections.
 - The `kakehashi-virtual-uri-*` filename space is reserved: a real workspace
   file named into it is invisible to symbol search (point 5).
 - `strategy` becomes a knob that this one method ignores (with a warning). Users
@@ -1026,9 +1044,10 @@ Including it would defeat dedup on a field carrying no identity.
   index is server-specific — the virtual files do not exist on disk, and servers
   that index only on-disk workspace contents will contribute real-file symbols
   only.
-- Shipping this obliges a documentation change, not just an addition: two
-  user-facing files state the no-cross-block rule as a blanket claim and one
-  states the strategy set as a closed pair (point 8).
+- Shipping this obliges documentation changes, not just additions: both
+  user-facing files state the no-cross-block rule as a blanket claim, both
+  describe the strategy set as a closed pair, and a related ADR states the
+  same closure as a universal rule (point 8).
 
 ### Neutral
 
