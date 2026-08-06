@@ -534,9 +534,18 @@ finishes propagating them, so a reload leaves a window in which a live handle
 was spawned from a configuration the current settings have already superseded.
 Being `Ready`, capable, and holding the right documents does not make it the
 process the current config describes; the pool's own by-key acquisition compares
-launch configurations for exactly this reason. The resolved config is therefore
-carried into selection and re-compared at the pre-enqueue check, and a mismatched
-handle is dropped rather than queried.
+launch configurations for exactly this reason. The resolved config is therefore compared inside the batch validator, which is
+also where it is reachable at all.
+
+The pre-enqueue check does **not** repeat that comparison, and does not need to.
+It checks pointer identity — that this handle is still the pool's current one
+for its key — which is the precedent's own discipline and is sufficient here: a
+settings reload removes and shuts down a connection whose spawn-time config
+changed rather than mutating it in place, so a config change necessarily
+installs a different handle and fails the identity check. Pointer identity after
+batch validation therefore implies config validity, and re-comparing would need
+either a pool-owned check-and-enqueue primitive or wider visibility for a
+guarantee already in hand.
 
 Step 2 must precede step 3: capping first would let a **known-incapable**
 server take a slot from a capable one — with `priorities = [A, B]`,
@@ -1143,12 +1152,14 @@ stale-handle check before enqueueing, which is the precedent's own discipline
 and can stall behind exactly the same holders, after selection's budget has
 already been spent.
 
-The rule is uniform: **every lock this path acquires carries a three-second
+The rule is uniform: **every lock this path *awaits* carries a three-second
 budget, and failing to acquire it drops the affected target or host** rather
 than blocking the query. That is more than the `connections` mutex — selection
-also takes `host_documents` (for `_self` targets) and the tracker snapshot, each
-send re-acquires `connections` before enqueue, and translation takes each host's
-`edit_lock`. None of these is safe to assume fast: injection processing holds
+also awaits the tracker snapshot, each send re-acquires `connections` before
+enqueue, and translation takes each host's `edit_lock`. (`host_documents` is not
+in that list: it is `try_lock`ed under `connections` and never awaited, so
+contention drops the `_self` candidates immediately rather than consuming a
+budget.) None of these is safe to assume fast: injection processing holds
 `edit_lock` across downstream close, change, and eager-spawn awaits, so a query
 arriving mid-processing would otherwise wait on unrelated work with no bound.
 
