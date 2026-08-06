@@ -526,11 +526,21 @@ an error would make a deliberate exclusion behave like an outage. `priorities =
 []` and `max_fan_out = 0` admit **no** candidates, so there is nothing for them
 to fail.
 
-Capability is deliberately not part of that test, because it cannot be: a dead
-handle's `server_capabilities()` is whatever it was, and for one that never
-reached `Ready` there is nothing to read. A server the user configured and
-allowed, now unreachable, is an outage whether or not we can confirm what it
-could have done.
+Capability **is** part of that test, wherever it can be read. A handle's
+initialize capabilities live in a `OnceLock` that outlives its state, and
+`has_capability` does not require `Ready` — so a server that was once up and is
+known not to support `workspace/symbol` is still known not to. Its death removes
+no symbol-search coverage, and counting it would turn a legitimate "no matches"
+into an outage on the strength of a server that was never going to answer.
+
+That leaves three cases for a dead candidate, and only the first is silent:
+
+- **Known incapable** — excluded, exactly as it would be while alive. Not a
+  failure.
+- **Known capable** — an infrastructure failure. It would have answered.
+- **Never initialized**, so nothing was ever recorded — an infrastructure
+  failure too. Whether it would have contributed is unknowable, and the whole
+  point of this accounting is that unknown must not read as absent.
 
 Recording a dead connection as a failure rather than as a non-candidate is what
 keeps the outcome rule honest. A liveness timeout marks a handle `Failed` in
@@ -1175,10 +1185,10 @@ those rather than from whole responses:
   answer was processed; it yielded fewer symbols. These are the silent drops
   points 5 and 7 already accept.
 - **Infrastructure-failed** — never examined at all, so nothing was learned. A
-  candidate **that policy admitted** whose connection was already `Failed`,
-  `Closing`, or `Closed` at selection (point 3) starts here rather than never
-  existing; one the allowlist or cap excluded is simply not a candidate. Also:
-  the
+  candidate **that policy admitted and is not known to be incapable**, whose
+  connection was already `Failed`, `Closing`, or `Closed` at selection (point 3),
+  starts here rather than never existing; one the allowlist, the cap, or a
+  recorded lack of the capability excluded is simply not a candidate. Also: the
   pass-0 host→virtual snapshot, the translation-time identity re-read, or a
   host's `edit_lock` expiring; and, importantly, geometry that is *unsettled*
   rather than gone — a host still parsing, a pass whose 200ms ensure timed out,
