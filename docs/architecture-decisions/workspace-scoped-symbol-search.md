@@ -476,6 +476,15 @@ before allocating slots costs nothing and removes all three cases at once.
 Step 5 exists because a connection reaches `Ready` *before* its virtual
 documents are replayed after a respawn, so a query landing in that window would
 under-report that server's embedded symbols indistinguishably from "no matches".
+
+It closes **part** of that window, not all of it. Selection admits a candidate
+only if the tracker still records the document on that connection, and a respawn
+purge removes exactly those records — so a query arriving between the purge and
+the first replayed `didOpen` discovers no candidate at all and never reaches the
+barrier. The barrier helps once a target is discoverable but not yet replayed;
+before that, the connection is invisible to selection. Both halves have the same
+root cause and the same fix — retaining a connection's admitting policy
+independently of document tracking (point 7) — so neither is patched here.
 The barrier is **bounded to two seconds** and enforced with a timeout, and
 awaiting the survivors concurrently costs that bound once for the whole query —
 not once per target.
@@ -710,7 +719,8 @@ fan-out's placement in point 4, which is a real visibility constraint.
 
 The value crossing that boundary is **typed, not raw JSON**: the bridge module
 owns deserialization for every other bridged request, and this one keeps that
-property. Each target's response is parsed into `Vec<WorkspaceSymbol>` there,
+property. A `null` result normalizes to an empty vector first (point 5);
+otherwise each target's response is parsed into `Vec<WorkspaceSymbol>` there,
 normalizing a `SymbolInformation[]` answer into the same shape, and is handed
 back **with its source connection key and that connection's URI→content-identity
 snapshot** — fan-in cannot validate a symbol without knowing which connection
@@ -794,6 +804,13 @@ Two things about *when* and *per what* are load-bearing:
   then read identity as B — R still executes first, against A, while every
   later comparison sees B and agrees. Capturing first makes the recorded
   identity the one the request actually raced.
+
+  Reading it is a **third awaited lock** on the send path, not a free lookup:
+  the revisions live behind their own Tokio mutex (the fingerprints behind a
+  separate synchronous one), so the snapshot is taken per target before the
+  `connections` re-acquisition, under the same three-second budget as every
+  other awaited lock, and a target whose snapshot cannot be taken in time is
+  dropped and counted as a failure like any other.
 - **Per connection, not per URI.** Both tracker values are keyed by
   `ConnectionKey`, and one virtual URI can be open on several connections with
   different confirmed content. An identity snapshot is therefore taken per
@@ -1073,18 +1090,31 @@ The response is an **array**, never `null`: the spec assigns no distinct meaning
 to `null` here, so "no server was selected" and "servers answered nothing" both
 come back empty.
 
-**Total failure is the exception.** If every dispatched target errored or timed
-out, the query answers with a **request error**, not `[]`. An empty array is a
-claim — "these servers searched and found nothing" — and making it while every
-server was unreachable is confidently wrong at exactly the moment the user is
-least able to tell. A client shown "no matches" during an outage concludes the
-symbol does not exist. The existing concatenated fan-in already draws this line,
-distinguishing zero successes with errors from an empty target set, and this
-method keeps it.
+**Total failure is the exception.** An empty array is a claim — "these servers
+searched and found nothing" — and making it while every server was unreachable
+is confidently wrong at exactly the moment the user is least able to tell. A
+client shown "no matches" during an outage concludes the symbol does not exist.
 
-Partial failure stays soft: a target that errors or times out while others
-answer contributes nothing and does not fail the query. The distinction is
-between *some* evidence and *none*.
+So the outcome is decided on whether *any* server actually answered, tracked
+**across every phase**, not just the response phase. A target can be lost after
+selection and before dispatch too: its reopen barrier fails, its send cannot
+re-acquire `connections` within budget, or registration, the stale-handle
+re-check, or the enqueue fails. Counting only "dispatched targets that errored"
+would let a query whose every target died pre-dispatch report a confident empty
+answer, since zero dispatches looks the same as zero results.
+
+- Selection found **no candidates at all** → `[]`. Nothing failed; there was
+  nothing to ask.
+- **At least one** target answered → `[]` or its results, as they came. Partial
+  failure stays soft.
+- Candidates existed and **none answered** — for any reason, at any phase →
+  **request error**.
+
+A downstream `null` is an answer, not a failure. The method's result type is
+`Option<WorkspaceSymbolResponse>` precisely because `null` is valid, so it
+normalizes to a successful empty vector **before** either array form is parsed.
+Treating it as a parse failure would let a conformant "I found nothing" trip the
+total-failure rule — the exact inversion this rule exists to prevent.
 
 Entries are emitted as `WorkspaceSymbol[]` — `WorkspaceSymbolResponse::Nested`
 in `ls-types`, whose variant names are a misnomer: **both** variants are flat
@@ -1179,9 +1209,10 @@ arriving mid-processing would otherwise wait on unrelated work with no bound.
   covers *acquiring* each lock, not the filtering between them — that walk is synchronous with no
   await, so a timeout could not preempt it anyway, and bounding what cannot be
   interrupted would promise something the runtime does not deliver.
-- **Each send's pre-enqueue re-acquisition** of `connections`: three seconds,
-  per target, independently. A target that cannot get the lock in time is
-  dropped like any other unreachable one.
+- **Each send**: the content-identity snapshot's tracker mutex, then the
+  pre-enqueue re-acquisition of `connections` — three seconds each, per target,
+  independently. A target that cannot get either in time is dropped, and counts
+  as a failed target for the outcome rule in point 5.
 - **Translation's `edit_lock`** per host: three seconds. A host whose lock
   cannot be taken in time loses that query's entries, exactly like a host whose
   geometry was stale.
@@ -1208,9 +1239,12 @@ Stated precisely, it is **the servers currently holding an open document for
 this workspace** — not "every running server". The two differ, and the gap is
 user-visible: `didClose` removes kakehashi's document tracking but deliberately
 leaves the downstream connection running, so closing the last buffer for a
-language drops that server from selection even though it is still `Ready` and
-still holds a complete real-file index it could have answered from. Symbol
-search goes empty with no failure anywhere.
+language drops that server from selection even though it is still `Ready`. What
+that costs depends on the server: whether a downstream retains a usable
+workspace index after `didClose` is server-specific and not something kakehashi
+can know. Where it does, a query that would have been answered comes back
+empty — and if that server was the only one selected, the whole search does,
+with no failure anywhere.
 
 That follows from deriving the candidate axes from open documents, which is what
 makes them concrete (point 3) — the alternative derivations lose `_` handling or
@@ -1422,16 +1456,17 @@ Including it would defeat dedup on a field carrying no identity.
 
 - Results depend on what is open, and coverage can shrink (close, respawn,
   silent connection death). Closing the last buffer for a language removes its
-  server from search even though the process is still running and still
-  indexed — the sharpest form of this, and a follow-up rather than a fix here
-  (point 7). The same query answers differently at different
+  server from search even though the process is still running and may still be
+  usefully indexed — the sharpest form of this, and a follow-up rather than a
+  fix here (point 7). The respawn window has the same cause: a purged
+  connection is invisible to selection until its documents are replayed. The same query answers differently at different
   points in a session. LSP permits partial `workspace/symbol` results, but a
   user expecting an indexed whole-project search will find this surprising.
 - Latency is max-over-live-targets, and every *wait* is bounded: the pool's 30s
   request timeout and liveness timeout, a three-second budget on **every** lock
-  this path awaits (the tracker snapshot, `connections`, each send's
-  re-acquisition, and each host's `edit_lock`), and the reopen barrier's two
-  seconds. Total latency is not bounded, because the synchronous
+  this path awaits (the candidate tracker snapshot, `connections`, each send's
+  identity snapshot and `connections` re-acquisition, and each host's
+  `edit_lock`), and the reopen barrier's two seconds. Total latency is not bounded, because the synchronous
   filtering between those waits cannot be preempted. Forwarded cancellation is
   best-effort, since a downstream may ignore it.
 - One request per keystroke, un-coalesced (point 9).
