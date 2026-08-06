@@ -523,12 +523,13 @@ arrives between request acceptance and subscription and delivers it on
 subscribe — but because selecting on it is what makes the handler abandon
 promptly rather than only at its next dispatch boundary.
 
-Fan-in cannot live in the `bridge` module: it reads the document store's
-resolved-region snapshots, which `lsp_impl` owns. So unlike every
-`transform_*_response_to_host` function — pure because the caller already handed
-it *the* offset — this translator selects a different region's geometry per
-entry and must sit where the `DocumentStore` / `LanguageCoordinator` /
-`BridgeCoordinator` handles are, as `ShowDocumentTranslator` does.
+Fan-in lives in `lsp_impl`. Not because it must — the store's snapshot
+accessor is `pub(crate)`, so a `bridge` module handed the store could call it —
+but because that is where the `DocumentStore` / `LanguageCoordinator` /
+`BridgeCoordinator` handles already sit together, as they do for
+`ShowDocumentTranslator`. Putting it in `bridge` would mean threading the store
+into a module whose job is wire protocol. This is a coupling choice, unlike the
+fan-out's placement in point 4, which is a real visibility constraint.
 
 The value crossing that boundary is **typed, not raw JSON**: the bridge module
 owns deserialization for every other bridged request, and this one keeps that
@@ -538,9 +539,12 @@ normalizing a `SymbolInformation[]` answer into the same shape. That works for
 range-less form rather than rejecting it, but it is not field-for-field:
 `SymbolInformation` carries a (itself deprecated) `deprecated: Option<bool>`
 that `WorkspaceSymbol` has no counterpart for, so the normalization must fold
-`Some(true)` into `tags` as `SymbolTag::DEPRECATED` or silently lose it. `lsp_impl` then classifies and
-translates typed values, and its classification is unit-testable as a pure
-function once the offset resolver is injected.
+`Some(true)` into `tags` as `SymbolTag::DEPRECATED` or silently lose it.
+
+`lsp_impl` then classifies and translates those typed values. Its classification
+is unit-testable as a pure function once the URI index and the per-host geometry
+map are injected — both are plain data, which is a side benefit of fan-in
+resolving nothing.
 
 ### 5. Fan-in: a global virtual→host translator
 
@@ -573,7 +577,7 @@ hand. "Its own offset" does not mean "its own resolution", though; see pass 3.
                ├── absent ───────▶ DROP  (retired region, or a real file in
                │                          the reserved virtual-URI namespace)
                ▼ (host_url, region_id, language)
-     look up region_id in that HOST's region map (pass 3, resolved once)
+     look up region_id in that HOST's geometry map (pass 3, read once)
                │
                ├── absent ───────▶ DROP  (region invalidated by edits, or
                │                          host document closed)
@@ -636,8 +640,8 @@ index** built once up front:
 1. Classify every entry against that index, **grouping entries by host**. No
    parse and no lock is involved, so nothing waits here.
 2. Ensure the distinct hosts that actually appear, **concurrently**.
-3. Resolve each host's regions **once**, then translate its entries against
-   that one resolution.
+3. Read each host's region geometry **once** from its snapshot, then translate
+   that host's entries against it.
 
 Pass 0 is built **late, and verified late**, because a single early snapshot
 is wrong in both directions across a collection phase that runs concurrently and
@@ -931,9 +935,9 @@ shrinks coverage with no signal to the user.
 
 Every other bridged navigation path filters out results addressed to a region
 other than the request's own, because a cross-region offset is unsafe when only
-one region's offset is known. Workspace symbol search resolves each result's
-region independently, so the offset is always the right one for the entry being
-translated.
+one region's offset is known. Workspace symbol search holds every region's
+geometry for the hosts it touches, so each entry is translated by its own
+region's offset rather than by a single borrowed one.
 
 Shipping this obliges edits in **both** user-facing docs, in three separate
 respects each. They are listed here because more than one review round found the
