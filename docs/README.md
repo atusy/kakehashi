@@ -897,7 +897,9 @@ languages are never replaced, so install one by name to refresh it.
 One gap `--force` is the only fix for: a `--force` reinstall that is killed
 between publishing the new queries and publishing the new parser leaves new
 queries against the old parser. Both halves look installed, so a plain re-run
-accepts them — reinstall with `--force` to line them up again.
+accepts them — reinstall with `--force` to line them up again. A kill that
+leaves the parser itself missing needs no `--force`: a plain re-run sees the
+missing half and fetches it.
 
 ### Configuration Management
 
