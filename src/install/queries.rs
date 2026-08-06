@@ -334,6 +334,19 @@ pub(crate) struct PublishedQueryInstall {
 }
 
 impl StagedQueryInstall {
+    /// Whether the requested language's queries are still where staging left
+    /// them.
+    ///
+    /// Staging skips a language whose queries are already complete, so there is
+    /// no staged copy to publish and nothing that would notice them
+    /// disappearing. An uninstall between staging and publication would
+    /// otherwise leave the install publishing a parser and reporting success
+    /// over queries that are gone. Callers check this once they hold the lock
+    /// that keeps the answer true.
+    pub(crate) fn requested_queries_still_complete(&self) -> bool {
+        !self.requested_already_complete || query_install_is_complete(&self.install_path)
+    }
+
     /// Rename every staged directory into place, keeping the displaced
     /// directories so the whole install can still be undone.
     pub(crate) fn publish(self) -> Result<PublishedQueryInstall, QueryInstallError> {
@@ -1628,6 +1641,49 @@ mod staging_tests {
             vec!["child".to_string()],
             "the displaced directory and its sidecar must not be stranded"
         );
+    }
+
+    /// Staging does not copy queries it found complete, so nothing else would
+    /// notice an uninstall removing them before the publish.
+    #[test]
+    fn a_skipped_requested_language_is_rechecked() {
+        let temp = TempDir::new().unwrap();
+        let queries_parent = temp.path().join("queries");
+        let queries_dir = queries_parent.join("child");
+        fs::create_dir_all(&queries_dir).unwrap();
+        fs::write(queries_dir.join("highlights.scm"), "complete").unwrap();
+        write_install_marker(&queries_dir).unwrap();
+        let staged = StagedQueryInstall {
+            language: "child".to_string(),
+            install_path: queries_dir.clone(),
+            files_downloaded: Vec::new(),
+            requested_already_complete: true,
+            entries: Vec::new(),
+        };
+
+        assert!(staged.requested_queries_still_complete());
+        fs::remove_dir_all(&queries_dir).unwrap();
+        assert!(
+            !staged.requested_queries_still_complete(),
+            "queries removed after staging must not pass as already installed"
+        );
+    }
+
+    /// A language this install staged for itself needs no such check — its
+    /// publish re-checks the directory under the lock.
+    #[test]
+    fn a_staged_requested_language_needs_no_recheck() {
+        let temp = TempDir::new().unwrap();
+        let queries_parent = temp.path().join("queries");
+        let staged = StagedQueryInstall {
+            language: "child".to_string(),
+            install_path: queries_parent.join("child"),
+            files_downloaded: vec!["highlights.scm".to_string()],
+            requested_already_complete: false,
+            entries: vec![stage(&queries_parent, "child", "staged", false)],
+        };
+
+        assert!(staged.requested_queries_still_complete());
     }
 
     /// `--force` replaces the requested language, not the base languages it
