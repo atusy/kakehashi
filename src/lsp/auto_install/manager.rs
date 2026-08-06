@@ -619,12 +619,15 @@ impl AutoInstallManager {
 /// Read from disk rather than from an `InstallResult`, so it answers for
 /// whatever another process published while this install ran.
 fn language_is_complete(language: &str, data_dir: &std::path::Path) -> bool {
-    // An install that is mid-publish can still roll its queries back, so what
-    // is on disk right now is not yet an answer. Treating it as one would let
-    // the editor load a language that is about to lose half of itself. The
-    // probe is non-blocking — this runs on the async path.
-    !crate::install::queries::language_publish_in_flight(data_dir, language)
-        && crate::install::parser_file_exists(language, data_dir).is_some()
+    // An install that is mid-publish can still roll its queries back, so what is
+    // on disk right now is not yet an answer. Hold the language's lock across
+    // both reads — releasing it first would leave room for an entire publish and
+    // rollback between the probe and the reads. Non-blocking: this runs on the
+    // async path, and "busy" is as useful an answer as waiting for one.
+    let Some(_settled) = crate::install::queries::try_lock_language(data_dir, language) else {
+        return false;
+    };
+    crate::install::parser_file_exists(language, data_dir).is_some()
         && crate::install::queries::query_install_is_complete(
             &data_dir.join("queries").join(language),
         )
