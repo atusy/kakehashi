@@ -132,10 +132,39 @@ impl LanguageServerPool {
         // PALETTE FIRST. A downstream's advertised command ids are arbitrary
         // strings, so one could in principle be shaped exactly like a routed name
         // (`kakehashi|c|srv||reload`). Decoding first would strip it to `reload`
-        // and send the wrong id. An encoded name can never be in this registry —
-        // it holds RAW advertised names — so an exact hit here is unambiguous
-        // evidence the client meant the palette command.
-        if self.command_origins().is_registered(&params.command) {
+        // and send the wrong id, so a raw-registry hit wins.
+        //
+        // That rule was safe while encoded names were minted per code-action
+        // response and never registered: the client could not be holding one as
+        // a palette entry, so a hit meant the palette command and nothing else.
+        // Registering encoded names breaks the premise. A downstream can now
+        // advertise a raw id byte-identical to an entry kakehashi minted for a
+        // DIFFERENT connection, and the two readings point at different
+        // processes with no way to tell which the user picked. Refuse — the same
+        // answer #823 gives every other unresolvable name.
+        // The test is whether a routed entry of this exact text EXISTS, not
+        // whether the string happens to decode. A downstream is free to
+        // advertise a raw id shaped like a routed name with nothing on the other
+        // side of it; that has one reading and routes fine, as it did before
+        // these entries were registered.
+        let is_raw_name = self.command_origins().is_registered(&params.command);
+        let collides_with_routed_entry = self.command_origins().holds_encoded(&params.command);
+        if collides_with_routed_entry && is_raw_name {
+            warn!(
+                target: "kakehashi::bridge",
+                "executeCommand: {:?} is both a routed name kakehashi minted and a raw id a \
+                 downstream advertised; refusing rather than guessing which was picked",
+                params.command
+            );
+            self.warn_to_editor(format!(
+                "command {:?} was not run: it is both a routed entry kakehashi created and a \
+                 raw command a downstream server advertised, so which one you picked cannot \
+                 be told apart",
+                params.command
+            ));
+            return None;
+        }
+        if is_raw_name {
             return self
                 .dispatch_palette_command(params, settings, upstream_id)
                 .await;
@@ -921,6 +950,22 @@ mod tests {
         assert_reached_downstream(dispatch(&pool, &settings, "source.fixAll")).await;
     }
 
+    /// Settings in which exactly the named servers can be spawned.
+    fn settings_with_servers(names: &[&str]) -> WorkspaceSettings {
+        let mut settings = WorkspaceSettings::default();
+        for name in names {
+            settings.language_servers.insert(
+                (*name).to_string(),
+                crate::config::settings::BridgeServerConfig {
+                    cmd: vec!["true".to_string()],
+                    languages: vec!["*".to_string()],
+                    ..Default::default()
+                },
+            );
+        }
+        settings
+    }
+
     #[tokio::test]
     async fn a_superseded_process_beside_the_current_one_does_not_make_it_ambiguous() {
         // The window's real shape: during settings propagation the OLD process
@@ -986,50 +1031,70 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_registered_raw_name_shaped_like_a_routing_token_stays_a_palette_command() {
-        // Why the palette-first gate exists: a downstream's advertised ids are
-        // arbitrary strings, so one can be shaped exactly like a minted routing
-        // token. Decoding first would strip it to its last segment and send
-        // `reload` to whatever the token's key names.
+    async fn a_raw_name_that_collides_with_a_real_routed_entry_is_refused() {
+        // The genuine collision: `srv` advertises `reload`, so kakehashi minted
+        // and registered `kakehashi|c|srv||reload` for it — and `ruff`
+        // separately advertises that exact text as a raw id of its own. The two
+        // readings name different processes with nothing to separate them.
         let pool = LanguageServerPool::new();
+        let srv = ConnectionKey::new("srv", None);
+        let ruff = ConnectionKey::new("ruff", None);
         let shaped = "kakehashi|c|srv||reload";
         assert!(
-            decode_command(shaped).is_some(),
-            "this test is only meaningful while the name really does decode"
+            pool.command_origins()
+                .register(&srv, vec!["reload".to_string()])
+                .newly_encoded
+                .contains(&shaped.to_string()),
+            "the routed entry this collides with must really have been minted"
         );
-        // `ruff` advertises the awkward name and is its sole live advertiser, so
-        // the palette path has a target. The decode path's target would be
-        // `srv`, which nothing serves — so which path ran is observable.
-        let ruff = ConnectionKey::new("ruff", None);
         pool.command_origins()
             .register(&ruff, vec![shaped.to_string()]);
         seed(&pool, &ruff, ConnectionState::Ready, &[shaped]).await;
 
-        // Treated as the raw palette command it is. Decoding it first would
-        // have stripped it to `reload` and aimed at `srv`, which nothing serves
-        // — so the dispatch would settle instead of parking.
-        assert_reached_downstream(pool.dispatch_execute_command(
+        assert_refused(pool.dispatch_execute_command(
             params(shaped),
-            &settings_with_servers(&["ruff"]),
+            &settings_with_servers(&["ruff", "srv"]),
             None,
         ))
         .await;
     }
 
-    /// Settings in which exactly the named servers can be spawned.
-    fn settings_with_servers(names: &[&str]) -> WorkspaceSettings {
-        let mut settings = WorkspaceSettings::default();
-        for name in names {
-            settings.language_servers.insert(
-                (*name).to_string(),
-                crate::config::settings::BridgeServerConfig {
-                    cmd: vec!["true".to_string()],
-                    languages: vec!["*".to_string()],
-                    ..Default::default()
-                },
-            );
-        }
-        settings
+    #[tokio::test]
+    async fn a_routed_shaped_raw_name_with_no_routed_twin_still_routes() {
+        // Decodability alone is not a collision. Nothing ever minted
+        // `kakehashi|c|srv||reload`, so there is exactly one reading of it and
+        // refusing would break a command that works.
+        let pool = LanguageServerPool::new();
+        let ruff = ConnectionKey::new("ruff", None);
+        let shaped = "kakehashi|c|srv||reload";
+        pool.command_origins()
+            .register(&ruff, vec![shaped.to_string()]);
+        seed(&pool, &ruff, ConnectionState::Ready, &[shaped]).await;
+
+        assert_reached_downstream(pool.dispatch_execute_command(
+            params(shaped),
+            &settings_with_servers(&["ruff", "srv"]),
+            None,
+        ))
+        .await;
+    }
+
+    #[tokio::test]
+    async fn an_ordinary_raw_name_still_takes_the_palette_path() {
+        // The guard must fire only on the genuine collision. A raw name that
+        // does not decode is not ambiguous with anything.
+        let pool = LanguageServerPool::new();
+        let ruff = ConnectionKey::new("ruff", None);
+        pool.command_origins()
+            .register(&ruff, vec!["ruff.fix".to_string()]);
+        seed(&pool, &ruff, ConnectionState::Ready, &["ruff.fix"]).await;
+
+        assert_reached_downstream(pool.dispatch_execute_command(
+            params("ruff.fix"),
+            &settings_with_servers(&["ruff"]),
+            None,
+        ))
+        .await;
     }
 
     #[tokio::test]

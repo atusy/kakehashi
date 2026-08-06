@@ -25,11 +25,12 @@
 //! dispatcher scans the connections map for handles whose exact advertised list
 //! contains the name, which is the only view that cannot lag a handshake.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Mutex;
 
 use super::ConnectionKey;
 use crate::error::LockResultExt;
+use crate::lsp::bridge::protocol::encode_command;
 
 /// What is known about one advertised raw command name.
 #[derive(Default)]
@@ -42,6 +43,17 @@ struct CommandOrigins {
     /// The client-fallback connections that advertised it, in first-advertisement
     /// order. Only these, because only these can be revived from the name alone.
     reconnectable: Vec<ConnectionKey>,
+    /// The connections whose ENCODED form of this name the editor was asked to
+    /// hold. Per connection, unlike `registered_upstream`: an encoded entry
+    /// names one connection, so each gets its own palette row and its own
+    /// retirement.
+    ///
+    /// "Asked to hold", not "advertises": a connection is added when its
+    /// handshake advertises the name AND the routed entry goes out, removed
+    /// when it stops advertising it, when its server leaves the config, or when
+    /// the request could not be sent at all. So it tracks the editor's side, not
+    /// the downstream's.
+    encoded_registered: HashSet<ConnectionKey>,
     /// Whether the editor currently holds a registration for this name.
     ///
     /// Distinct from the entry existing. The entry outlives the registration:
@@ -59,11 +71,16 @@ pub(crate) struct CommandOriginRegistry {
 /// What a handshake's advertisement changed.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub(crate) struct RegistrationOutcome {
-    /// Names the editor should now be told about.
+    /// Raw names the editor should now be told about.
     pub(crate) newly_advertised: Vec<String>,
-    /// Names this handshake left with no advertiser at all, so the editor should
-    /// stop offering them.
+    /// Raw names this handshake left with no advertiser at all, so the editor
+    /// should stop offering them.
     pub(crate) orphaned: Vec<String>,
+    /// Encoded, connection-specific names the editor should now be told about —
+    /// the unambiguous sibling of every raw entry this connection contributes.
+    pub(crate) newly_encoded: Vec<String>,
+    /// Encoded names this connection no longer backs.
+    pub(crate) retired_encoded: Vec<String>,
 }
 
 impl CommandOriginRegistry {
@@ -90,9 +107,28 @@ impl CommandOriginRegistry {
             .recover_poison("CommandOriginRegistry::register");
         // Reconcile BEFORE recording: this handshake is the current truth about
         // what `key` serves.
-        let orphaned = Self::reconcile(&mut origins, key, &commands);
+        let (orphaned, retired_encoded) = Self::reconcile(&mut origins, key, &commands);
         let mut newly_advertised = Vec::new();
+        let mut newly_encoded = Vec::new();
         for command in commands {
+            // Never ANNOUNCE a name whose text is already claimed by the other
+            // kind — checked against the WHOLE registry, because the two owners
+            // need not come from the same connection or the same handshake.
+            //
+            // The registration id is derived from the final text, so two owners
+            // of one string share one id, and either retiring would unregister
+            // what the other still needs. Nothing usable is lost by withholding:
+            // dispatch refuses that exact text anyway, since it cannot tell which
+            // of the two readings the user picked.
+            let encoded = encode_command(key, &command);
+            let routed_text_is_a_known_raw_name = origins.contains_key(&encoded);
+            let raw_text_is_a_held_routed_name =
+                crate::lsp::bridge::protocol::decode_command(&command).is_some_and(|route| {
+                    origins
+                        .get(route.command)
+                        .is_some_and(|entry| entry.encoded_registered.contains(&route.key))
+                });
+
             let entry = origins.entry(command.clone()).or_default();
             entry.servers.insert(key.server().to_string());
             // Recording a non-reconnectable key would only ever subtract: it
@@ -101,7 +137,10 @@ impl CommandOriginRegistry {
             if key.is_client_fallback() && !entry.reconnectable.contains(key) {
                 entry.reconnectable.push(key.clone());
             }
-            if !entry.registered_upstream {
+            if entry.encoded_registered.insert(key.clone()) && !routed_text_is_a_known_raw_name {
+                newly_encoded.push(encoded);
+            }
+            if !entry.registered_upstream && !raw_text_is_a_held_routed_name {
                 entry.registered_upstream = true;
                 newly_advertised.push(command);
             }
@@ -109,6 +148,8 @@ impl CommandOriginRegistry {
         RegistrationOutcome {
             newly_advertised,
             orphaned,
+            newly_encoded,
+            retired_encoded,
         }
     }
 
@@ -119,14 +160,34 @@ impl CommandOriginRegistry {
     /// or a forwarding loop that has gone away. Otherwise the registry would
     /// later try to retire an id the editor never held, and would refuse to
     /// re-offer the name if the client's capability arrived by another route.
-    pub(crate) fn forget_registration(&self, commands: &[String]) {
+    /// Take back the bookkeeping for an announcement that never reached the
+    /// editor — an unsendable request, or a client that cannot accept one.
+    ///
+    /// The two halves are taken back SEPARATELY because they are independent.
+    /// A second connection advertising a name the first already announced
+    /// contributes a routed entry and NO raw one, so keying the rollback off the
+    /// raw list would silently retain a routed row the editor never received —
+    /// and nothing would ever re-offer it. Conversely a raw name may be shared,
+    /// so clearing it from this connection's failure must not be inferred from a
+    /// routed rollback either.
+    pub(crate) fn forget_registration(&self, outcome: &RegistrationOutcome) {
         let mut origins = self
             .origins
             .lock()
             .recover_poison("CommandOriginRegistry::forget_registration");
-        for command in commands {
+        for command in &outcome.newly_advertised {
             if let Some(entry) = origins.get_mut(command) {
                 entry.registered_upstream = false;
+            }
+        }
+        for encoded in &outcome.newly_encoded {
+            // The routed name carries its own owner, so it needs no separate
+            // key argument: decoding gives back exactly the (connection, command)
+            // pair that minted it.
+            if let Some(route) = crate::lsp::bridge::protocol::decode_command(encoded)
+                && let Some(entry) = origins.get_mut(route.command)
+            {
+                entry.encoded_registered.remove(&route.key);
             }
         }
     }
@@ -149,24 +210,39 @@ impl CommandOriginRegistry {
         origins: &mut HashMap<String, CommandOrigins>,
         key: &ConnectionKey,
         commands: &[String],
-    ) -> Vec<String> {
+    ) -> (Vec<String>, Vec<String>) {
         // One set, not a linear scan per known name: this runs under the lock on
         // every handshake, against a map that keeps every name for the session.
         let advertised: std::collections::HashSet<&str> =
             commands.iter().map(String::as_str).collect();
         let mut orphaned = Vec::new();
+        let mut retired_encoded = Vec::new();
         for (command, entry) in origins.iter_mut() {
             if advertised.contains(command.as_str()) {
                 continue;
             }
             entry.reconnectable.retain(|recorded| recorded != key);
-            entry.servers.remove(key.server());
+            if entry.encoded_registered.remove(key) {
+                retired_encoded.push(encode_command(key, command));
+            }
+            // Drop the SERVER only once none of its connections advertise the
+            // name any more. One connection's handshake speaks for itself, not
+            // for its siblings: the same server rooted at two workspace folders
+            // is two connections, and the first to drop a command must not
+            // retire an entry the second still backs.
+            if !entry
+                .encoded_registered
+                .iter()
+                .any(|live| live.server() == key.server())
+            {
+                entry.servers.remove(key.server());
+            }
             if entry.registered_upstream && entry.servers.is_empty() {
                 entry.registered_upstream = false;
                 orphaned.push(command.clone());
             }
         }
-        orphaned
+        (orphaned, retired_encoded)
     }
 
     /// The names whose every advertiser is gone from `is_spawnable`, marking them
@@ -189,29 +265,45 @@ impl CommandOriginRegistry {
         // caller answers from a full wildcard merge of the config, and one
         // server typically advertises many commands — asking per (name, server)
         // pair would pay for that merge once per command on every reload.
-        let mut spawnable: HashMap<&str, bool> = HashMap::new();
+        let mut spawnable: HashMap<String, bool> = HashMap::new();
         for entry in origins.values() {
-            for server in &entry.servers {
-                if !spawnable.contains_key(server.as_str()) {
-                    spawnable.insert(server.as_str(), is_spawnable(server));
+            let servers = entry
+                .servers
+                .iter()
+                .map(String::as_str)
+                .chain(entry.encoded_registered.iter().map(ConnectionKey::server));
+            for server in servers {
+                if !spawnable.contains_key(server) {
+                    spawnable.insert(server.to_string(), is_spawnable(server));
                 }
             }
         }
-        let retired: Vec<String> = origins
-            .iter()
-            .filter(|(_, entry)| {
-                entry.registered_upstream
-                    && !entry.servers.is_empty()
-                    && !entry
-                        .servers
-                        .iter()
-                        .any(|server| spawnable[server.as_str()])
-            })
-            .map(|(command, _)| command.clone())
-            .collect();
-        for command in &retired {
-            if let Some(entry) = origins.get_mut(command) {
+        let mut retired = Vec::new();
+        for (command, entry) in origins.iter_mut() {
+            // Routed entries name a connection, so each dies with ITS OWN
+            // server. They are retired independently of the raw name, which
+            // survives as long as any advertiser does — otherwise a removed
+            // server's routed row would be left visible and broken whenever a
+            // second server kept the raw name alive.
+            let dead_keys: Vec<_> = entry
+                .encoded_registered
+                .iter()
+                .filter(|key| !spawnable.get(key.server()).copied().unwrap_or(false))
+                .cloned()
+                .collect();
+            for key in dead_keys {
+                entry.encoded_registered.remove(&key);
+                retired.push(encode_command(&key, command));
+            }
+            if entry.registered_upstream
+                && !entry.servers.is_empty()
+                && !entry
+                    .servers
+                    .iter()
+                    .any(|server| spawnable.get(server.as_str()).copied().unwrap_or(false))
+            {
                 entry.registered_upstream = false;
+                retired.push(command.clone());
             }
         }
         retired
@@ -230,6 +322,24 @@ impl CommandOriginRegistry {
             .get(command)
             .map(|entry| entry.reconnectable.clone())
             .unwrap_or_default()
+    }
+
+    /// Whether `name` is a ROUTED entry kakehashi minted and the editor still
+    /// holds — the exact question, not "does this string happen to decode".
+    ///
+    /// A downstream is free to advertise a raw id shaped like a routed name.
+    /// That is only a collision if a routed entry of the same text actually
+    /// exists; otherwise there is one reading and it routes fine, which is what
+    /// happened before these entries were registered.
+    pub(crate) fn holds_encoded(&self, name: &str) -> bool {
+        let Some(route) = crate::lsp::bridge::protocol::decode_command(name) else {
+            return false;
+        };
+        self.origins
+            .lock()
+            .recover_poison("CommandOriginRegistry::holds_encoded")
+            .get(route.command)
+            .is_some_and(|entry| entry.encoded_registered.contains(&route.key))
     }
 
     /// Whether `command` is a raw name some downstream advertised.
@@ -346,8 +456,17 @@ mod tests {
                 .is_empty()
         );
 
-        // Config drops ruff: nothing can advertise the name any more.
-        assert_eq!(reg.retire_unadvertisable(|_| false), vec!["ruff.fix"]);
+        // Config drops ruff: nothing can advertise the name any more, so BOTH
+        // the raw entry and ruff's routed one die.
+        let mut retired = reg.retire_unadvertisable(|_| false);
+        retired.sort();
+        assert_eq!(
+            retired,
+            vec![
+                "kakehashi|c|ruff||ruff.fix".to_string(),
+                "ruff.fix".to_string()
+            ]
+        );
         assert!(
             reg.is_registered("ruff.fix"),
             "the decode gate must keep recognising a retired name — a client can \
@@ -364,6 +483,123 @@ mod tests {
                 .newly_advertised,
             vec!["ruff.fix"],
             "a retired name must be re-registered, not skipped as already known"
+        );
+    }
+
+    #[test]
+    fn every_connection_gets_its_own_encoded_entry() {
+        // The escape hatch a refusal leaves the user without: a raw name shared
+        // by two roots is unresolvable, but each root's encoded entry names its
+        // own connection, so picking one IS the disambiguation.
+        let reg = CommandOriginRegistry::default();
+        let a = marker("ruff", "file:///repo-a");
+        let b = marker("ruff", "file:///repo-b");
+
+        let first = reg.register(&a, vec!["ruff.fix".to_string()]);
+        let second = reg.register(&b, vec!["ruff.fix".to_string()]);
+
+        assert_eq!(first.newly_advertised, vec!["ruff.fix".to_string()]);
+        assert!(
+            second.newly_advertised.is_empty(),
+            "the raw name is still announced exactly once"
+        );
+        assert_eq!(first.newly_encoded.len(), 1);
+        assert_eq!(second.newly_encoded.len(), 1);
+        assert_ne!(
+            first.newly_encoded, second.newly_encoded,
+            "two roots must get two distinguishable entries"
+        );
+        for encoded in first.newly_encoded.iter().chain(&second.newly_encoded) {
+            assert!(encoded.contains("ruff.fix"), "{encoded}");
+        }
+    }
+
+    #[test]
+    fn a_routed_only_announcement_that_was_never_sent_is_taken_back() {
+        // The rollback shape that keying off the RAW list misses entirely: the
+        // second connection contributes a routed entry and no raw one, because
+        // the first already announced the raw name.
+        let reg = CommandOriginRegistry::default();
+        let a = marker("ruff", "file:///repo-a");
+        let b = marker("ruff", "file:///repo-b");
+        reg.register(&a, vec!["ruff.fix".to_string()]);
+
+        let second = reg.register(&b, vec!["ruff.fix".to_string()]);
+        assert!(
+            second.newly_advertised.is_empty(),
+            "the raw name was already announced by repo-a"
+        );
+        assert_eq!(second.newly_encoded.len(), 1);
+
+        reg.forget_registration(&second);
+
+        assert_eq!(
+            reg.register(&b, vec!["ruff.fix".to_string()]).newly_encoded,
+            second.newly_encoded,
+            "a routed entry the editor never received must be offered again"
+        );
+    }
+
+    #[test]
+    fn a_text_two_owners_could_claim_is_announced_by_at_most_one() {
+        // One registration id is derived from the final text, so two owners of
+        // one string would share it and either retiring would unregister what
+        // the other still needs. At most one owner is the property that matters;
+        // WHICH one depends on advertisement order and does not.
+        //
+        // The survivor is unusable either way — dispatch refuses that exact text,
+        // since it cannot tell the two readings apart — so nothing the user could
+        // have run is lost.
+        let reg = CommandOriginRegistry::default();
+        let srv = fallback("srv");
+        let collide = encode_command(&srv, "foo");
+
+        let outcome = reg.register(&srv, vec!["foo".to_string(), collide.clone()]);
+
+        let owners = outcome
+            .newly_advertised
+            .iter()
+            .chain(&outcome.newly_encoded)
+            .filter(|name| **name == collide)
+            .count();
+        assert_eq!(
+            owners, 1,
+            "two owners would share one registration id: {outcome:?}"
+        );
+        assert!(
+            reg.is_registered(&collide),
+            "it is still a name the decode gate has to recognise"
+        );
+    }
+
+    #[test]
+    fn re_advertising_from_the_same_connection_adds_no_second_encoded_entry() {
+        let reg = CommandOriginRegistry::default();
+        let a = marker("ruff", "file:///repo-a");
+        reg.register(&a, vec!["ruff.fix".to_string()]);
+
+        assert!(
+            reg.register(&a, vec!["ruff.fix".to_string()])
+                .newly_encoded
+                .is_empty(),
+            "a respawn under the same key must not duplicate its palette row"
+        );
+    }
+
+    #[test]
+    fn one_connection_dropping_a_command_retires_only_its_own_encoded_entry() {
+        let reg = CommandOriginRegistry::default();
+        let a = marker("ruff", "file:///repo-a");
+        let b = marker("ruff", "file:///repo-b");
+        reg.register(&a, vec!["ruff.fix".to_string()]);
+        let b_entry = reg.register(&b, vec!["ruff.fix".to_string()]).newly_encoded;
+
+        let outcome = reg.register(&b, Vec::new());
+
+        assert_eq!(outcome.retired_encoded, b_entry);
+        assert!(
+            outcome.orphaned.is_empty(),
+            "the raw name survives — repo-a still advertises it"
         );
     }
 
@@ -438,13 +674,17 @@ mod tests {
         let outcome = reg.register(&ruff, vec!["ruff.fix".to_string()]);
         assert_eq!(outcome.newly_advertised, vec!["ruff.fix".to_string()]);
 
-        reg.forget_registration(&outcome.newly_advertised);
+        reg.forget_registration(&outcome);
 
+        let again = reg.register(&ruff, vec!["ruff.fix".to_string()]);
         assert_eq!(
-            reg.register(&ruff, vec!["ruff.fix".to_string()])
-                .newly_advertised,
+            again.newly_advertised,
             vec!["ruff.fix".to_string()],
             "a name that was never announced must be announceable again"
+        );
+        assert_eq!(
+            again.newly_encoded, outcome.newly_encoded,
+            "the routed entry rode the same unsent request, so it must come back too"
         );
     }
 
@@ -481,10 +721,12 @@ mod tests {
         reg.register(&fallback("ruff"), vec!["source.fixAll".to_string()]);
         reg.register(&fallback("eslint"), vec!["source.fixAll".to_string()]);
 
-        assert!(
-            reg.retire_unadvertisable(|server| server == "eslint")
-                .is_empty(),
-            "deleting one of two advertisers leaves the name real"
+        // Deleting ruff leaves the RAW name real — eslint still advertises it —
+        // but ruff's routed entry names a connection that is gone, so it must
+        // not be left visible and broken.
+        assert_eq!(
+            reg.retire_unadvertisable(|server| server == "eslint"),
+            vec!["kakehashi|c|ruff||source.fixAll".to_string()],
         );
         assert!(
             reg.retire_unadvertisable(|_| false)
