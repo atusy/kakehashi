@@ -38,24 +38,56 @@ use tower_lsp_server::ls_types::ExecuteCommandParams;
 
 const METHOD: &str = "workspace/executeCommand";
 
-/// How many live connections advertise a raw palette command name — the whole
-/// routing decision, because the name carries no other identity.
+/// What to do with a raw palette command name.
 #[derive(Debug, PartialEq, Eq)]
-enum ReadyPaletteOrigin {
-    None,
-    Unique(ConnectionKey),
-    Ambiguous,
+enum PaletteRoute {
+    /// Exactly one live connection advertises it.
+    Route(ConnectionKey),
+    /// Nothing live, but exactly one recorded origin can be revived.
+    Reconnect(ConnectionKey),
+    /// Several live connections advertise it; the request cannot say which.
+    AmbiguousLive(Vec<ConnectionKey>),
+    /// Nothing live, and zero or several revivable origins.
+    Unreachable(Vec<ConnectionKey>),
 }
 
-/// Classify an already-filtered set of live advertisers. Kept separate from the
-/// scan that produces it so the "one is safe, several are not" rule is stated
-/// once and tested without a pool.
-fn select_ready_palette_origin(ready: &[ConnectionKey]) -> ReadyPaletteOrigin {
+/// The entire palette routing decision, as a pure function of the two sets the
+/// dispatcher gathers.
+///
+/// Whole rather than in pieces on purpose: the property that matters is not that
+/// "two live advertisers" classifies as ambiguous, it is that the dispatcher
+/// then refuses. Splitting the classification from the action left the action
+/// pinned by nothing, and mutations that dropped the refusal outright survived
+/// the entire suite.
+///
+/// `ready` wins over `reconnectable` whenever it is non-empty: a live connection
+/// is the one thing that can actually serve the command, and reviving a
+/// recorded origin while another is live would spawn a second process for a
+/// workspace that already has one.
+fn select_palette_route(ready: &[ConnectionKey], reconnectable: &[ConnectionKey]) -> PaletteRoute {
     match ready {
-        [] => ReadyPaletteOrigin::None,
-        [only] => ReadyPaletteOrigin::Unique(only.clone()),
-        _ => ReadyPaletteOrigin::Ambiguous,
+        [only] => return PaletteRoute::Route(only.clone()),
+        [_, _, ..] => return PaletteRoute::AmbiguousLive(ready.to_vec()),
+        [] => {}
     }
+    match reconnectable {
+        [only] => PaletteRoute::Reconnect(only.clone()),
+        _ => PaletteRoute::Unreachable(reconnectable.to_vec()),
+    }
+}
+
+/// Render the connections a refused command could have meant, e.g.
+/// `ruff@file:///w/a, ruff@file:///w/b`. Empty renders as `none`, which is the
+/// honest answer for a name whose advertisers have all gone away.
+fn describe_candidates(candidates: &[ConnectionKey]) -> String {
+    if candidates.is_empty() {
+        return "none".to_string();
+    }
+    candidates
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 impl LanguageServerPool {
@@ -155,6 +187,13 @@ impl LanguageServerPool {
             // still-Initializing false negative. Reaching it means the server
             // genuinely dropped the capability across a respawn — a log entry
             // beats a silent drop (every other failure branch here warns).
+            //
+            // Deliberately the LOOSE check, unlike the palette path's
+            // `advertises_execute_command`: an action-minted command is a name
+            // the bridge chose from a `Command` the server surfaced, and servers
+            // routinely surface code-action commands whose ids are absent from
+            // `executeCommandProvider.commands`. Requiring the exact name here
+            // would fail soft on working setups.
             warn!(
                 target: "kakehashi::bridge",
                 "executeCommand: {origin:?} does not advertise executeCommandProvider; ignoring {command:?}"
@@ -174,22 +213,38 @@ impl LanguageServerPool {
             .await
     }
 
-    /// Route a PALETTE-fired command (a raw downstream command name, no action
-    /// envelope) to the sole live connection advertising that exact name. If no
-    /// advertiser is live, the handshake registry can reconnect one unambiguous
-    /// client-root origin. Multiple live or historical origins fail soft because
-    /// the raw request carries no workspace identity (#823). Forwards the command
-    /// name and arguments verbatim; other failures remain fail-soft like the
-    /// encoded-command path.
+    /// Log AND tell the editor that a palette command was refused, naming the
+    /// connections it could have meant.
+    ///
+    /// Naming them is the point: the user knows which command they picked, not
+    /// which servers claim it, and `ConnectionKey`'s `Display` is exactly the
+    /// server-and-root pair they would have to change to disambiguate.
+    fn refuse_palette_command(&self, command: &str, reason: &str, candidates: &[ConnectionKey]) {
+        let candidates = describe_candidates(candidates);
+        warn!(
+            target: "kakehashi::bridge",
+            "executeCommand: refusing palette command {command:?}: {reason} [{candidates}]"
+        );
+        self.warn_to_editor(format!(
+            "command {command:?} was not run: {reason} [{candidates}] advertise it, and the \
+             request carries no workspace context, so kakehashi will not guess which to use"
+        ));
+    }
+
     /// Every live connection whose EXACT advertised command list contains
     /// `command`, read from one connections-map snapshot.
     ///
     /// Scanning the handles rather than the origin registry is what closes the
-    /// handshake window: a connection publishes its capabilities and its `Ready`
-    /// state before its palette metadata reaches the registry, so a
+    /// REGISTRY-LAG window: a connection publishes its capabilities and flips to
+    /// `Ready` before its palette metadata reaches the registry, so a
     /// registry-only check can miss a live colliding advertiser and conclude
-    /// "unique" about a set it cannot yet see (#823). The routing decision
-    /// linearizes at this snapshot.
+    /// "unique" about a set it cannot yet see (#823).
+    ///
+    /// It does not make the decision globally atomic, and nothing downstream
+    /// re-checks it: an advertiser that reaches `Ready` after this snapshot is
+    /// not counted, so the command goes to what was the sole live advertiser
+    /// when it was decided. Re-checking later would only move that window, and
+    /// the target was never the *wrong* one — just not the only one.
     async fn ready_palette_origins(&self, command: &str) -> Vec<ConnectionKey> {
         let connections = self.connections().await;
         connections
@@ -202,14 +257,24 @@ impl LanguageServerPool {
             .collect()
     }
 
+    /// Route a PALETTE-fired command (a raw downstream command name, no action
+    /// envelope) to the sole live connection advertising that exact name. If no
+    /// advertiser is live, one unambiguous client-root origin can be reconnected.
+    /// Several live advertisers fail soft because the raw request carries no
+    /// workspace identity (#823). Forwards the command name and arguments
+    /// verbatim; other failures remain fail-soft like the encoded-command path.
+    ///
+    /// Refusals are reported to the EDITOR as well as the log: this is the one
+    /// branch where the user positively picked the action and there is no
+    /// correct target, so a silent null would be indistinguishable from "nothing
+    /// to do".
     async fn dispatch_palette_command(
         &self,
         params: ExecuteCommandParams,
         settings: &WorkspaceSettings,
         upstream_id: Option<UpstreamId>,
     ) -> Option<Value> {
-        let origins = self.command_origins().origins(&params.command);
-        if origins.is_empty() {
+        if !self.command_origins().is_registered(&params.command) {
             warn!(
                 target: "kakehashi::bridge",
                 "executeCommand: {:?} is neither a bridged nor a registered command; ignoring",
@@ -217,25 +282,35 @@ impl LanguageServerPool {
             );
             return None;
         }
+        // A recorded origin whose server has since been removed from config
+        // cannot be revived, so it must not be counted when deciding whether the
+        // revivable set is unambiguous — otherwise a deleted server permanently
+        // vetoes the one origin that is still spawnable.
+        let reconnectable: Vec<_> = self
+            .command_origins()
+            .reconnectable_origins(&params.command)
+            .into_iter()
+            .filter(|key| {
+                crate::config::is_server_spawnable(&settings.language_servers, key.server())
+            })
+            .collect();
+        let ready = self.ready_palette_origins(&params.command).await;
 
-        let key = match select_ready_palette_origin(
-            &self.ready_palette_origins(&params.command).await,
-        ) {
-            ReadyPaletteOrigin::Unique(key) => key,
-            ReadyPaletteOrigin::Ambiguous => {
-                warn!(
-                    target: "kakehashi::bridge",
-                    "executeCommand: palette command {:?} has multiple live origins; ignoring",
-                    params.command
+        let key = match select_palette_route(&ready, &reconnectable) {
+            PaletteRoute::Route(key) | PaletteRoute::Reconnect(key) => key,
+            PaletteRoute::AmbiguousLive(candidates) => {
+                self.refuse_palette_command(
+                    &params.command,
+                    "several live connections",
+                    &candidates,
                 );
                 return None;
             }
-            ReadyPaletteOrigin::None if origins.len() == 1 => origins[0].clone(),
-            ReadyPaletteOrigin::None => {
-                warn!(
-                    target: "kakehashi::bridge",
-                    "executeCommand: palette command {:?} has multiple registered origins and none is live; ignoring",
-                    params.command
+            PaletteRoute::Unreachable(candidates) => {
+                self.refuse_palette_command(
+                    &params.command,
+                    "no live connection, and no single revivable origin among",
+                    &candidates,
                 );
                 return None;
             }
@@ -332,12 +407,20 @@ impl LanguageServerPool {
             return None;
         }
         if !handle.advertises_execute_command(&params.command) {
-            // Revalidate the exact command on the handle fetched after the live
-            // snapshot. A no-live fallback may reconnect to an upgraded server,
-            // or the snapshotted handle may be replaced under the same key; mere
-            // provider presence must not forward a historical command the new
-            // process removed (#823). The re-open wait above can also span a
-            // replacement, so this must be read AFTER it, not before.
+            // Revalidate the EXACT name on the handle we are about to send on.
+            // The scan proved something advertised it; this handle is whatever
+            // acquisition returned, which on the reconnect path can be a freshly
+            // spawned — possibly upgraded — server that dropped the name. Mere
+            // `executeCommandProvider` presence must not forward a command the
+            // process no longer has (#823).
+            //
+            // This is NOT what protects against a replacement during the re-open
+            // wait: `server_capabilities` is a `OnceLock` written before Ready,
+            // so THIS `Arc`'s answer cannot change once read, and a replacement
+            // is a different `Arc` entirely. That case is covered by the
+            // `Arc::ptr_eq` re-check taken with the enqueue in
+            // `send_execute_command_on_handle` — do not weaken it on the
+            // strength of this check.
             warn!(
                 target: "kakehashi::bridge",
                 "executeCommand: origin {origin:?} no longer advertises palette command {:?}; ignoring",
@@ -480,21 +563,61 @@ mod tests {
         .await;
     }
 
+    /// The whole routing decision, as a table. Every row is a mutation that
+    /// would otherwise pass: dropping the ambiguity refusal, letting the no-live
+    /// path pick an arbitrary origin, or preferring a revivable origin over a
+    /// live one all change a cell here.
     #[test]
-    fn one_live_advertiser_is_the_only_safe_case() {
-        let ruff = key("ruff", "file:///workspace/a");
+    fn the_palette_route_table() {
+        let a = key("ruff", "file:///w/a");
+        let b = key("eslint", "file:///w/b");
+        let fallback = ConnectionKey::new("ruff", None);
+
+        // Live wins, and one live advertiser is the only routable shape.
         assert_eq!(
-            select_ready_palette_origin(std::slice::from_ref(&ruff)),
-            ReadyPaletteOrigin::Unique(ruff),
+            select_palette_route(std::slice::from_ref(&a), &[]),
+            PaletteRoute::Route(a.clone()),
         );
-        assert_eq!(select_ready_palette_origin(&[]), ReadyPaletteOrigin::None);
         assert_eq!(
-            select_ready_palette_origin(&[
-                key("ruff", "file:///workspace/a"),
-                key("eslint", "file:///workspace/b"),
-            ]),
-            ReadyPaletteOrigin::Ambiguous,
-            "a raw name carries no workspace identity, so two advertisers cannot be told apart"
+            select_palette_route(std::slice::from_ref(&a), std::slice::from_ref(&fallback)),
+            PaletteRoute::Route(a.clone()),
+            "a live connection must not be passed over to spawn a second one",
+        );
+
+        // Several live advertisers: the request cannot say which, so neither can we.
+        assert_eq!(
+            select_palette_route(&[a.clone(), b.clone()], &[]),
+            PaletteRoute::AmbiguousLive(vec![a.clone(), b.clone()]),
+        );
+        assert_eq!(
+            select_palette_route(&[a.clone(), b.clone()], std::slice::from_ref(&fallback)),
+            PaletteRoute::AmbiguousLive(vec![a.clone(), b.clone()]),
+            "a revivable origin must not break a live tie",
+        );
+
+        // Nothing live: exactly one revivable origin may be reconnected.
+        assert_eq!(
+            select_palette_route(&[], std::slice::from_ref(&fallback)),
+            PaletteRoute::Reconnect(fallback.clone()),
+        );
+        assert_eq!(
+            select_palette_route(&[], &[]),
+            PaletteRoute::Unreachable(vec![]),
+        );
+        assert_eq!(
+            select_palette_route(&[], &[fallback.clone(), b.clone()]),
+            PaletteRoute::Unreachable(vec![fallback, b]),
+            "two revivable origins are as unresolvable as two live ones",
+        );
+    }
+
+    #[test]
+    fn refusals_name_the_connections_the_user_would_have_to_change() {
+        assert_eq!(describe_candidates(&[]), "none");
+        assert_eq!(
+            describe_candidates(&[key("ruff", "file:///w/a"), key("ruff", "file:///w/b")]),
+            "ruff@file:///w/a, ruff@file:///w/b",
+            "server AND root: the root is the axis a same-server collision turns on"
         );
     }
 
@@ -542,6 +665,231 @@ mod tests {
         assert_eq!(
             pool.ready_palette_origins("source.fixAll").await,
             vec![ready],
+        );
+    }
+
+    #[tokio::test]
+    async fn the_scan_matches_the_name_exactly_not_by_prefix() {
+        let pool = LanguageServerPool::new();
+        seed(
+            &pool,
+            &key("eslint", "file:///w/a"),
+            ConnectionState::Ready,
+            &["source.fixAll.eslint"],
+        )
+        .await;
+
+        assert!(
+            pool.ready_palette_origins("source.fixAll").await.is_empty(),
+            "a longer name that merely starts with the query is a different command"
+        );
+    }
+
+    fn params(command: &str) -> ExecuteCommandParams {
+        ExecuteCommandParams {
+            command: command.to_string(),
+            arguments: vec![],
+            work_done_progress_params: Default::default(),
+        }
+    }
+
+    /// Drive the dispatcher itself. `select_palette_route` returning the right
+    /// verdict is not the property that matters — acting on it is, and that
+    /// wiring is what a classification-only test leaves unpinned.
+    async fn dispatch(pool: &LanguageServerPool, command: &str) -> Option<Value> {
+        pool.dispatch_palette_command(params(command), &WorkspaceSettings::default(), None)
+            .await
+    }
+
+    /// Whether a dispatch actually reached a downstream.
+    ///
+    /// The distinction the refusal tests need, and the one a bare `is_none()`
+    /// cannot make: every branch in this file fails soft to `None`, so "returned
+    /// null" says nothing about whether the command was sent. A forwarded
+    /// command parks waiting for a reply the sink process never writes; a
+    /// refusal returns before that.
+    async fn reached_a_downstream(fut: impl std::future::Future<Output = Option<Value>>) -> bool {
+        tokio::time::timeout(std::time::Duration::from_millis(300), fut)
+            .await
+            .is_err()
+    }
+
+    #[tokio::test]
+    async fn dispatch_refuses_a_command_two_live_connections_advertise() {
+        let pool = LanguageServerPool::new();
+        let ruff = key("ruff", "file:///w/a");
+        let eslint = key("eslint", "file:///w/b");
+        pool.command_origins()
+            .register(&ruff, vec!["source.fixAll".to_string()]);
+        pool.command_origins()
+            .register(&eslint, vec!["source.fixAll".to_string()]);
+        seed(&pool, &ruff, ConnectionState::Ready, &["source.fixAll"]).await;
+        seed(&pool, &eslint, ConnectionState::Ready, &["source.fixAll"]).await;
+
+        assert!(
+            !reached_a_downstream(dispatch(&pool, "source.fixAll")).await,
+            "picking either of two live advertisers is the #823 defect itself"
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_routes_when_only_one_of_the_advertisers_is_live() {
+        let pool = LanguageServerPool::new();
+        let ruff = key("ruff", "file:///w/a");
+        let eslint = key("eslint", "file:///w/b");
+        pool.command_origins()
+            .register(&ruff, vec!["source.fixAll".to_string()]);
+        pool.command_origins()
+            .register(&eslint, vec!["source.fixAll".to_string()]);
+        // Only ruff is live; eslint is a registered-but-dead collision.
+        seed(&pool, &ruff, ConnectionState::Ready, &["source.fixAll"]).await;
+
+        assert!(
+            reached_a_downstream(dispatch(&pool, "source.fixAll")).await,
+            "a dead collision must not cost the one advertiser that can serve it"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_registered_raw_name_shaped_like_a_routing_token_stays_a_palette_command() {
+        // Why the palette-first gate exists: a downstream's advertised ids are
+        // arbitrary strings, so one can be shaped exactly like a minted routing
+        // token. Decoding first would strip it to its last segment and send
+        // `reload` to whatever the token's key names.
+        let pool = LanguageServerPool::new();
+        let shaped = "kakehashi|c|srv||reload";
+        assert!(
+            decode_command(shaped).is_some(),
+            "this test is only meaningful while the name really does decode"
+        );
+        // `ruff` advertises the awkward name and is its sole live advertiser, so
+        // the palette path has a target. The decode path's target would be
+        // `srv`, which nothing serves — so which path ran is observable.
+        let ruff = ConnectionKey::new("ruff", None);
+        pool.command_origins()
+            .register(&ruff, vec![shaped.to_string()]);
+        seed(&pool, &ruff, ConnectionState::Ready, &[shaped]).await;
+
+        assert!(
+            reached_a_downstream(pool.dispatch_execute_command(
+                params(shaped),
+                &WorkspaceSettings::default(),
+                None,
+            ))
+            .await,
+            "the name must be treated as the raw palette command it is; decoding \
+             it first would have stripped it to `reload` and aimed at `srv`, \
+             which nothing here serves"
+        );
+    }
+
+    /// Settings in which exactly the named servers can be spawned.
+    fn settings_with_servers(names: &[&str]) -> WorkspaceSettings {
+        let mut settings = WorkspaceSettings::default();
+        for name in names {
+            settings.language_servers.insert(
+                (*name).to_string(),
+                crate::config::settings::BridgeServerConfig {
+                    cmd: vec!["true".to_string()],
+                    languages: vec!["*".to_string()],
+                    ..Default::default()
+                },
+            );
+        }
+        settings
+    }
+
+    #[tokio::test]
+    async fn a_deleted_server_does_not_veto_the_origin_that_survives_it() {
+        // Both origins are revivable in shape, but only one names a server the
+        // current config can still spawn — so the set is not really ambiguous.
+        // Counting the deleted one would refuse the command permanently, since
+        // nothing ever removes it from the registry.
+        let pool = LanguageServerPool::new();
+        let ruff = ConnectionKey::new("ruff", None);
+        pool.command_origins()
+            .register(&ruff, vec!["source.fixAll".to_string()]);
+        pool.command_origins().register(
+            &ConnectionKey::new("deleted", None),
+            vec!["source.fixAll".to_string()],
+        );
+
+        let settings = settings_with_servers(&["ruff"]);
+        let reached = reached_a_downstream(pool.dispatch_palette_command(
+            params("source.fixAll"),
+            &settings,
+            None,
+        ))
+        .await;
+
+        // The spawn of `true` exits immediately, so the command cannot complete
+        // either way; what this pins is that the dispatcher got as far as trying
+        // to revive `ruff` rather than refusing on a phantom collision.
+        assert!(
+            reached || !pool.connections().await.is_empty(),
+            "a server removed from config must not out-vote the one still configured"
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_refuses_an_unknown_name_without_scanning() {
+        let pool = LanguageServerPool::new();
+        seed(
+            &pool,
+            &key("ruff", "file:///w/a"),
+            ConnectionState::Ready,
+            &["source.fixAll"],
+        )
+        .await;
+
+        assert!(
+            dispatch(&pool, "source.fixAll").await.is_none(),
+            "a live advertiser the editor was never told about is not a palette command"
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_refuses_when_nothing_is_live_and_several_origins_are_recorded() {
+        let pool = LanguageServerPool::new();
+        // Two client-fallback origins: both revivable, so neither is the answer.
+        pool.command_origins().register(
+            &ConnectionKey::new("ruff", None),
+            vec!["source.fixAll".to_string()],
+        );
+        pool.command_origins().register(
+            &ConnectionKey::new("eslint", None),
+            vec!["source.fixAll".to_string()],
+        );
+
+        assert!(dispatch(&pool, "source.fixAll").await.is_none());
+        assert!(
+            pool.connections().await.is_empty(),
+            "refusing must not spawn one of the candidates"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_marker_rooted_origin_does_not_veto_the_revivable_one() {
+        // The #628 regression: a key the reconnect branch can never revive used
+        // to count toward the cardinality test and refuse the key that works.
+        let pool = LanguageServerPool::new();
+        let registry = pool.command_origins();
+        registry.register(
+            &key("ruff", "file:///w/a"),
+            vec!["source.fixAll".to_string()],
+        );
+        registry.register(
+            &ConnectionKey::new("ruff", None),
+            vec!["source.fixAll".to_string()],
+        );
+
+        assert_eq!(
+            registry.reconnectable_origins("source.fixAll"),
+            vec![ConnectionKey::new("ruff", None)],
+        );
+        assert_eq!(
+            select_palette_route(&[], &registry.reconnectable_origins("source.fixAll")),
+            PaletteRoute::Reconnect(ConnectionKey::new("ruff", None)),
         );
     }
 
