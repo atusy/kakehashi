@@ -201,6 +201,9 @@ pub struct InstallResult {
     pub parser_error: Option<String>,
     /// Error message if queries install failed.
     pub queries_error: Option<String>,
+    /// True when a failed install could not withdraw queries it had already
+    /// published, so the data directory still holds them. The errors say which.
+    pub left_published_queries: bool,
     /// Query files this install downloaded, for the requested language.
     /// Empty when its queries were already present.
     pub files_downloaded: Vec<String>,
@@ -291,6 +294,7 @@ fn install_language_with_query_stager(
         queries_path: None,
         parser_error: None,
         queries_error: None,
+        left_published_queries: false,
         files_downloaded: Vec::new(),
     };
 
@@ -424,7 +428,8 @@ fn install_language_with_query_stager(
         parser::StagedParserOutcome::Staged(staged) => match staged.publish() {
             Ok(parser_result) => result.parser_path = Some(parser_result.install_path),
             Err(e) => {
-                published_queries.rollback();
+                result.left_published_queries =
+                    published_queries.rollback() == queries::RollbackOutcome::LeftPublished;
                 result.parser_error = Some(e.to_string());
                 return result;
             }
@@ -435,7 +440,8 @@ fn install_language_with_query_stager(
             // since removed is the queries-only state this lock exists to
             // prevent, and nothing was staged that could replace it.
             if !path.exists() {
-                published_queries.rollback();
+                result.left_published_queries =
+                    published_queries.rollback() == queries::RollbackOutcome::LeftPublished;
                 result.parser_error = Some(format!(
                     "the installed parser for '{}' was removed while it was being installed",
                     language
@@ -492,6 +498,7 @@ pub(crate) async fn install_language_async(
         queries_path: None,
         parser_error: Some(format!("Task panicked: {}", e)),
         queries_error: None,
+        left_published_queries: false,
         files_downloaded: Vec::new(),
     })
 }
@@ -810,6 +817,7 @@ mod tests {
             queries_path: Some(PathBuf::from("/tmp/queries")),
             parser_error: None,
             queries_error: None,
+            left_published_queries: false,
             files_downloaded: Vec::new(),
         };
         assert!(success.is_success());
@@ -819,6 +827,7 @@ mod tests {
             queries_path: None,
             parser_error: Some("Parser failed".to_string()),
             queries_error: Some("Queries failed".to_string()),
+            left_published_queries: false,
             files_downloaded: Vec::new(),
         };
         assert!(!failure.is_success());

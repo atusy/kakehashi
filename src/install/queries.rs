@@ -202,6 +202,10 @@ pub fn install_queries_with_dependencies(
     data_dir: &Path,
     force: bool,
 ) -> Result<QueryInstallResult, QueryInstallError> {
+    // Half of a language on its own, but still inside the transaction protocol:
+    // an unlocked publish here could land between the two halves of an install
+    // or an uninstall running in another process.
+    let _transaction = lock_language(data_dir, language)?;
     clear_uninstall_tombstone_for_install(data_dir, language)?;
     install_queries_with_dependencies_from_with_http_policy(
         NVIM_TREESITTER_QUERIES_URL,
@@ -454,7 +458,11 @@ impl StagedQueryInstall {
             language: requested_language.clone(),
             published: Vec::new(),
         };
-        for entry in entries {
+        // Deepest first: entries are collected requested-language-first, so
+        // reversing publishes every base language before the one that inherits
+        // it. A reader that catches the install mid-publish then sees a
+        // language whose chain is already there, never a dangling `; inherits:`.
+        for entry in entries.into_iter().rev() {
             let requested = entry.language == requested_language;
             // Each entry publishes with the `force` it was staged with, so an
             // inherited parent never overwrites a copy that appeared while this
@@ -481,7 +489,7 @@ impl StagedQueryInstall {
                     }
                 }
                 Ok(PublishQueryDirOutcome::Uninstalled) => {
-                    publish.rollback();
+                    let _ = publish.rollback();
                     return Err(QueryInstallError::IoError(std::io::Error::new(
                         std::io::ErrorKind::Interrupted,
                         format!(
@@ -491,7 +499,7 @@ impl StagedQueryInstall {
                     )));
                 }
                 Err(e) => {
-                    publish.rollback();
+                    let _ = publish.rollback();
                     return Err(e);
                 }
             }
@@ -551,7 +559,9 @@ impl PublishedQueryInstall {
     /// one was compiling would have its work undone here. Closing that needs
     /// provenance in the install marker; same-language cross-process installs
     /// are rare enough that the marker format has not been changed for it.
-    pub(crate) fn rollback(mut self) {
+    #[must_use = "a rollback that could not finish leaves published queries behind"]
+    pub(crate) fn rollback(mut self) -> RollbackOutcome {
+        let mut outcome = RollbackOutcome::Undone;
         for published in std::mem::take(&mut self.published) {
             if !published.requested {
                 discard_backup_locked(&published);
@@ -583,6 +593,7 @@ impl PublishedQueryInstall {
                      retrying.",
                     published.language, e, published.language
                 );
+                outcome = RollbackOutcome::LeftPublished;
                 continue;
             }
             let Some(backup) = &published.backup else {
@@ -598,16 +609,31 @@ impl PublishedQueryInstall {
                 Ok(()) => {
                     let _ = fs::remove_file(backup_ownership_sidecar(backup));
                 }
-                Err(e) => eprintln!(
-                    "Warning: failed to restore the previous queries for '{}': {}. They are kept \
-                     at {}.",
-                    published.language,
-                    e,
-                    backup.display()
-                ),
+                Err(e) => {
+                    eprintln!(
+                        "Warning: failed to restore the previous queries for '{}': {}. They are \
+                         kept at {}.",
+                        published.language,
+                        e,
+                        backup.display()
+                    );
+                    outcome = RollbackOutcome::LeftPublished;
+                }
             }
         }
+        outcome
     }
+}
+
+/// Whether a rollback actually put everything back.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RollbackOutcome {
+    /// Nothing this install published is still published.
+    Undone,
+    /// A removal or restore failed, so the data directory still holds queries
+    /// this install wrote — the warnings say which. The caller must not tell
+    /// the user that nothing was published.
+    LeftPublished,
 }
 
 impl Drop for PublishedQueryInstall {
@@ -1156,7 +1182,7 @@ fn remove_interrupted_temp_query_install(
 }
 
 #[cfg(unix)]
-fn process_is_running(pid: &str) -> bool {
+pub(crate) fn process_is_running(pid: &str) -> bool {
     let Ok(pid) = pid.parse::<i32>() else {
         return false;
     };
@@ -1171,7 +1197,7 @@ fn process_is_running(pid: &str) -> bool {
 }
 
 #[cfg(not(unix))]
-fn process_is_running(pid: &str) -> bool {
+pub(crate) fn process_is_running(pid: &str) -> bool {
     // No portable std API can test another process's liveness. Be
     // conservative: generated temp names contain numeric PIDs, so treat them
     // as possibly live and leave cleanup to a future platform-specific pass.
@@ -1714,7 +1740,7 @@ mod staging_tests {
             "replacement",
             "publish must make the staged queries visible"
         );
-        published.rollback();
+        assert_eq!(published.rollback(), RollbackOutcome::Undone);
 
         assert_eq!(
             fs::read_to_string(queries_dir.join("highlights.scm")).unwrap(),
@@ -1753,7 +1779,7 @@ mod staging_tests {
             queries_parent: queries_parent.clone(),
         };
 
-        staged.publish().expect("publish should succeed").rollback();
+        let _ = staged.publish().expect("publish should succeed").rollback();
 
         assert!(
             !queries_parent.join("child").exists(),
