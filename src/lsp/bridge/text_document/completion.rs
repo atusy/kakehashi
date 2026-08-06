@@ -395,8 +395,10 @@ pub(crate) struct KakehashiEnvelope {
     #[serde(default)]
     pub host_uri: String,
     /// Stable injection region identity for live resolve-time geometry checks.
-    /// Empty for envelopes minted before this field existed.
-    #[serde(default)]
+    /// Empty for envelopes minted before this field existed, and for every
+    /// host-layer envelope (which has no region) — skipped on the wire in
+    /// that case, since this rides in EVERY item of every completion response.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub region_id: String,
     /// The downstream server's original `data` value (preserved verbatim).
     pub inner: Option<Value>,
@@ -413,9 +415,16 @@ pub(crate) struct KakehashiEnvelope {
     /// coordinates, so `completionItem/resolve` routes to the host server
     /// VERBATIM — no virtual URI, region, or offset translation.
     /// `region_id`/`offset`/`region_end` are unused for these. Defaults to
-    /// `false` (virt layer) so existing enveloped items deserialize unchanged.
-    #[serde(default)]
+    /// `false` (virt layer) so existing enveloped items deserialize unchanged
+    /// — and is skipped on the wire in that case, so the far more numerous
+    /// virt items pay nothing for a marker only host items use.
+    #[serde(default, skip_serializing_if = "is_false")]
     pub host_layer: bool,
+}
+
+/// `skip_serializing_if` predicate for a `bool` that defaults to `false`.
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 impl KakehashiEnvelope {
@@ -1142,6 +1151,18 @@ mod tests {
         };
         envelope_host_item(&mut item, "tsudoi-ls", "file:///test/doc.txt");
 
+        // The two fields a host envelope leaves at their defaults must not
+        // ride the wire — this rides in every item of every response.
+        let wire = item.data.clone().expect("enveloped");
+        assert!(
+            wire["kakehashi"].get("region_id").is_none(),
+            "an empty region_id must be skipped on the wire: {wire}"
+        );
+        assert_eq!(
+            wire["kakehashi"]["host_layer"], true,
+            "the host marker is the one flag that must be serialized: {wire}"
+        );
+
         let envelope = extract_envelope(&item).expect("should extract envelope");
         assert!(envelope.is_host_layer());
         assert_eq!(envelope.origin, "tsudoi-ls");
@@ -1178,6 +1199,26 @@ mod tests {
         assert!(
             !envelope.is_host_layer(),
             "a region-carrying envelope stays on the virt resolve path"
+        );
+
+        // The virt envelope — minted for every item of every completion —
+        // must not carry the host marker on the wire at all.
+        let mut virt = CompletionItem::default();
+        envelope_item_data(
+            &mut virt,
+            &EnvelopeContext {
+                server_name: "lua-ls",
+                host_uri: "file:///test/doc.md",
+                region_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+                offset: &offset,
+                region_end: Some(TEST_REGION_END),
+                host_layer: false,
+            },
+        );
+        let wire = virt.data.expect("enveloped");
+        assert!(
+            wire["kakehashi"].get("host_layer").is_none(),
+            "a virt envelope must not pay for the host marker: {wire}"
         );
     }
 
