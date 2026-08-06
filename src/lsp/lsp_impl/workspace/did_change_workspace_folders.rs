@@ -14,17 +14,25 @@ impl Kakehashi {
     ) {
         let added = params.event.added;
         let removed = params.event.removed;
-        self.bridge
-            .pool()
-            .apply_workspace_folder_change(added, &removed)
-            .await;
 
         // Reading the settings in effect, merging the reloaded root onto them,
         // and publishing the result share the one reload transaction
         // `workspace/didChangeConfiguration` uses. Without it a configuration
         // push racing this notification can publish a merge derived from the
         // snapshot the other has already replaced.
+        //
+        // The pool's folder set moves inside that transaction too: it is what
+        // the configuration root is derived from, so committing it first would
+        // let a push anchor against the old root after the workspace has
+        // already moved. The lock order is reload-then-connections on every
+        // path that takes both, since the settings reload also reaches the
+        // bridge.
         let reload = lock_settings_reload().await;
+
+        self.bridge
+            .pool()
+            .apply_workspace_folder_change(added, &removed)
+            .await;
 
         // An emptied folder list does not leave the session rootless when the
         // client named another root: the rungs below `workspaceFolders` answer,
