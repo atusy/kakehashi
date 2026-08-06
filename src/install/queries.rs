@@ -1576,6 +1576,49 @@ mod staging_tests {
         );
     }
 
+    /// `--force` replaces the requested language, not the base languages it
+    /// inherits: staging decided a parent was missing, and by publish time a
+    /// concurrent install may have filled it in. Forcing over that would
+    /// destroy a copy this install never intended to touch.
+    #[test]
+    fn forcing_the_requested_language_leaves_an_inherited_parent_alone() {
+        let temp = TempDir::new().unwrap();
+        let queries_parent = temp.path().join("queries");
+        let parent_dir = queries_parent.join("parent");
+        let staged = StagedQueryInstall {
+            language: "child".to_string(),
+            install_path: queries_parent.join("child"),
+            files_downloaded: vec!["highlights.scm".to_string()],
+            requested_already_complete: false,
+            entries: vec![
+                stage(&queries_parent, "child", "; inherits: parent\n", true),
+                stage(&queries_parent, "parent", "ours", false),
+            ],
+        };
+        // The parent appears while this install is busy with the parser.
+        fs::create_dir_all(&parent_dir).unwrap();
+        fs::write(parent_dir.join("highlights.scm"), "theirs").unwrap();
+        write_install_marker(&parent_dir).unwrap();
+
+        staged.publish().expect("publish should succeed").commit();
+
+        assert_eq!(
+            fs::read_to_string(parent_dir.join("highlights.scm")).unwrap(),
+            "theirs",
+            "forcing the requested language must not overwrite an inherited parent"
+        );
+        assert_eq!(
+            fs::read_to_string(queries_parent.join("child").join("highlights.scm")).unwrap(),
+            "; inherits: parent\n",
+            "the requested language is still published"
+        );
+        assert_eq!(
+            residue(&queries_parent),
+            vec!["child".to_string(), "parent".to_string()],
+            "yielding to the parent must not leave a backup behind"
+        );
+    }
+
     /// Publishing stops at the first entry it cannot publish and undoes the
     /// requested language it had already made visible.
     #[test]
