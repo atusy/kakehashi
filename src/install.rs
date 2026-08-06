@@ -365,14 +365,31 @@ fn install_language_with_query_stager(
     // failure; treating it as an error made the auto-install manager degrade a
     // fully-installed language to a warning about its own success.
     match staged_parser {
-        parser::StagedParserOutcome::Staged(staged) => match staged.publish() {
-            Ok(parser_result) => result.parser_path = Some(parser_result.install_path),
-            Err(e) => {
-                published_queries.rollback();
-                result.parser_error = Some(e.to_string());
-                return result;
+        parser::StagedParserOutcome::Staged(staged) => {
+            // Publishing a parser for a language `language uninstall` removed
+            // while this install was compiling would leave exactly the
+            // parser-only state that uninstall just reported as gone.
+            let published = match queries::hold_against_uninstall(data_dir, language) {
+                Ok(queries::UninstallClaim::Uninstalled) => Err(format!(
+                    "'{}' was uninstalled while it was being installed",
+                    language
+                )),
+                // The guard is arm-scoped, so the lock is released before the
+                // rollback below reaches for the same one.
+                Ok(queries::UninstallClaim::Clear(_guard)) => {
+                    staged.publish().map_err(|e| e.to_string())
+                }
+                Err(e) => Err(e.to_string()),
+            };
+            match published {
+                Ok(parser_result) => result.parser_path = Some(parser_result.install_path),
+                Err(reason) => {
+                    published_queries.rollback();
+                    result.parser_error = Some(reason);
+                    return result;
+                }
             }
-        },
+        }
         parser::StagedParserOutcome::AlreadyInstalled(path) => result.parser_path = Some(path),
     }
 

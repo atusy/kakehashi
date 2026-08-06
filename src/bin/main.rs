@@ -746,23 +746,14 @@ fn run_language_uninstall(
 
         let mut removed_something = false;
 
-        // Remove parser file
-        if let Some(parser_path) = find_parser_file(&parser_dir, lang) {
-            match fs::remove_file(&parser_path) {
-                Ok(()) => {
-                    eprintln!("✓ Removed parser: {}", parser_path.display());
-                    removed_something = true;
-                }
-                Err(e) => {
-                    eprintln!("✗ Failed to remove parser {}: {}", parser_path.display(), e);
-                    any_failed = true;
-                }
-            }
-        }
-
         // Remove queries directory and any kakehashi-created backups under the
         // same lock used by install replacement, so uninstall cannot race a
         // concurrent install into resurrecting queries after reporting success.
+        //
+        // Before the parser, so the tombstone this writes is already visible to
+        // an install that is about to publish its parser: that install checks
+        // for it under this same lock and gives up instead of leaving a parser
+        // behind for a language the user just removed.
         match queries::remove_query_install_and_backups(&queries_dir, lang) {
             Ok(removal) => {
                 if removal.removed_queries {
@@ -776,6 +767,20 @@ fn run_language_uninstall(
             Err(e) => {
                 eprintln!("✗ Failed to remove queries for '{}': {}", lang, e);
                 any_failed = true;
+            }
+        }
+
+        // Remove parser file
+        if let Some(parser_path) = find_parser_file(&parser_dir, lang) {
+            match fs::remove_file(&parser_path) {
+                Ok(()) => {
+                    eprintln!("✓ Removed parser: {}", parser_path.display());
+                    removed_something = true;
+                }
+                Err(e) => {
+                    eprintln!("✗ Failed to remove parser {}: {}", parser_path.display(), e);
+                    any_failed = true;
+                }
             }
         }
 
