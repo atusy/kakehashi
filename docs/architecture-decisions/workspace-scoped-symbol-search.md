@@ -465,8 +465,23 @@ final barrier.** The order is fixed:
       the client sends, and marker discovery walks a stray file's ancestors with
       no workspace boundary — so opening one file from another project spawns a
       connection rooted there, and its real-file symbols would flow into this
-      workspace's search unchanged. A connection whose root lies outside every
-      declared workspace folder is not a candidate for a *workspace* query.
+      workspace's search unchanged.
+
+      The test is **overlap**, not containment in one direction: a connection is
+      admitted if its root either lies inside a declared workspace folder **or
+      encloses one**. Requiring the root to be inside the workspace would be
+      wrong for the most ordinary layout there is — open `/repo/pkg` as the
+      workspace with `.git` at `/repo`, and marker discovery roots the server at
+      `/repo`, which is outside `/repo/pkg`. That test would drop the only
+      server serving the workspace's own documents.
+
+      Admitting an enclosing root has an unavoidable cost, stated rather than
+      hidden: such a server indexes `/repo` entire, so a search of `/repo/pkg`
+      also returns symbols from sibling packages. That is inherent to the
+      server's rooting, not something this query can filter without also
+      discarding legitimate in-workspace results, and it is the better error —
+      too many symbols is recoverable, none is not. Only roots that neither
+      contain nor are contained by any declared folder are dropped.
 
       The filter is on the **connection's root**, not on result URIs: a server
       legitimately rooted inside the workspace may return symbols from a
@@ -480,7 +495,8 @@ final barrier.** The order is fixed:
       exposes **no** marker root: the roots it actually serves live in the
       handle's mutable **workspace-folder set**, which grows as capable servers
       take on later roots. So a `Shared` connection is admitted if **any folder
-      in that set** is inside the client workspace, and dropped only if none is.
+      in that set** overlaps the client workspace by the same test, and dropped
+      only if none does.
       Reading the folder set rather than the key is the whole of the rule;
       testing the key would either drop every shared target or treat it as
       rootless.
@@ -885,9 +901,9 @@ hand. "Its own offset" does not mean "its own resolution", though; see pass 3.
                │ yes
                ▼
      ┌───────────────────┐  no
-     │ is_virtual_uri ?  ├─────▶ REAL FILE ─▶ pass through untouched
-     └─────────┬─────────┘
-               │ yes
+     │ is_virtual_uri ?  ├─────▶ REAL FILE ─▶ pass through untouched,
+     └─────────┬─────────┘                     unless it names a drifted
+               │ yes                            `_self` host (§5)
                ▼
      ┌───────────────────┐  yes
      │ is_scratch_uri ?  ├─────▶ DROP  (a formatting scratch document; names
@@ -964,8 +980,17 @@ Two things about *when* and *per what* are load-bearing:
   `ConnectionKey`, and one virtual URI can be open on several connections with
   different confirmed content. A `_self` target's identity is its host
   document's own downstream version and fingerprint from `host_documents`, not a
-  virtual one — captured and compared the same way, so a host edit after
-  dispatch voids that target's negative evidence exactly as a region edit does. An identity snapshot is therefore taken per
+  virtual one.
+
+  Comparing that recorded pair across the request is **not enough on its own**,
+  and for a sharper reason than in the virtual case. Downstream host
+  synchronization is deferred to the diagnostic debounce and then launched
+  asynchronously, so an edit can update the `DocumentStore` and leave
+  `HostDocSyncState` untouched for some time — both readings equal, both stale.
+  The recorded fingerprint must therefore also be compared against the host's
+  **current `DocumentStore` text**, exactly as the virtual path compares against
+  the region's current content. Only that catches an edit the downstream has not
+  been told about yet. An identity snapshot is therefore taken per
   target, and travels **with that target's response** — the bridge module hands
   back the source connection key and its URI→identity map alongside the
   `Vec<WorkspaceSymbol>`, rather than a bare vector. Fan-in validates each
@@ -1300,14 +1325,23 @@ current text, since the match it omitted may have been added or shifted by the
 very edit that invalidated it, and there is no returned entry for an
 entry-level rollup to mark.
 
-Its **positive** evidence survives. A drifted target can still have translated a
-real-file symbol, or one from a region nothing touched, and those entries are as
-good as any — drift on one document is no reason to discard a correct result
-from another, and identity is tracked per connection across documents that
-change independently. So a drifted target with at least one translated entry
-remains informative; only a drifted target that produced none loses its vote.
-Anything stronger would let an unrelated keystroke turn a working search into a
-request error.
+Its **positive** evidence survives, with one exclusion. A drifted target can
+still have translated a symbol from an unrelated real file, or from a region
+nothing touched, and those entries are as good as any — drift on one document is
+no reason to discard a correct result from another, and identity is tracked per
+connection across documents that change independently.
+
+The exclusion is the drifted document's **own** entries. A `_self` server is
+handed the host under its real URI, so its results come back as real-file
+entries and pass through untranslated — which means a symbol it reported for a
+host that has since drifted carries a range measured against text that no longer
+exists, and nothing downstream of here would catch it. Real-file entries whose
+URI names a drifted `_self` host are therefore rejected, while entries naming
+any other file survive.
+
+So a drifted target with at least one surviving translated entry remains
+informative; only one that produced none loses its vote. Anything stronger would
+let an unrelated keystroke turn a working search into a request error.
 
 Granularity matters here: `edit_lock` expiry is per *host*, while one response
 can carry real-file entries and virtual entries from several hosts. One
@@ -1716,9 +1750,11 @@ Including it would defeat dedup on a field carrying no identity.
 
 - A file opened from outside the client's workspace no longer contributes its
   project's symbols here, though the connection it spawned still serves that
-  file's own bridged requests. One exception survives: a `preferSharedInstance`
-  server that took on both an in-workspace root and an external one is
-  indivisible, so admitting it for the former also admits the latter (point 3).
+  file's own bridged requests. Two leaks remain by design (point 3): a
+  `preferSharedInstance` server holding both an in-workspace and an external
+  root is indivisible, and a server rooted *above* the workspace — the ordinary
+  case when `.git` sits above the opened folder — indexes its whole tree, so a
+  search returns sibling packages too.
 - Results depend on what is open, and coverage can shrink (close, respawn,
   silent connection death). Closing the last buffer for a language removes its
   server from search even though the process is still running and may still be
