@@ -82,11 +82,12 @@ Three facts in the existing code make the feature tractable anyway:
   existing precedent for sending a request on a connection **without** a virtual
   document, and it shows exactly what that costs (see point 4).
 
-kakehashi sends downstream no `workspace.symbol` client capability at all
+kakehashi today sends downstream no `workspace.symbol` client capability at all
 (`bridge/protocol/client_capabilities.rs` sets no `symbol` field on
 `WorkspaceClientCapabilities`), so in particular no `resolveSupport`. Per LSP
 3.18, a conformant downstream must therefore return a full `Location` rather
-than the location-without-range form.
+than the location-without-range form. Point 5 keeps that property for
+`resolveSupport` while declaring the rest of the capability.
 
 Absence is the right answer only for `resolveSupport`. `symbolKind` and
 `tagSupport` are independent of it, and leaving the whole capability absent
@@ -133,8 +134,8 @@ per-entry global fan-in translator, and a single deduplicating union. Defer
    │             │  3. sort   (uri, start, end,   │
    │             │             name, kind)        │
    │             └───────────────┬────────────────┘
-   │◀── WorkspaceSymbol[] ───────┘
-   │    (always an array, never null)
+   │◀── Symbol array ────────────┘
+   │    (element type per client, §5; never null)
    │
    │ $/cancelRequest ─▶ forwarded to every in-flight target, best effort:
    │                    a downstream may ignore it (LSP allows this). The
@@ -340,22 +341,42 @@ the opt-out, wildcard-resolved gate beside it.
 set only on `bridge._` still apply to a concrete pair — the property that keeps
 existing configuration from becoming a silent no-op here.
 
-**Order matters. Everything synchronous happens first; only then does any
-target wait:**
+**Selection is entirely synchronous. No candidate is waited for:**
 
-1. Take the pool's connection map and keep only `Ready` and `Initializing`
-   entries. `connections()` returns the raw map, and `ConnectionState` also has
-   `Failed`, `Closing`, and `Closed`, which linger until lazily evicted — none
-   of them is a valid target. This is a map read, not a wait.
-2. Drop `Ready` handles already known to lack `workspace/symbol`. Capability is
-   synchronously knowable for a `Ready` handle; only an `Initializing` one is
-   genuinely unknown, and those are carried forward as unknown.
-3. Apply the per-pair `priorities` allowlist and `max_fan_out` cap to what
-   survived. Also synchronous.
+1. Take the pool's connection map and keep only `Ready` entries.
+   `connections()` returns the raw map, and `ConnectionState` also has
+   `Initializing`, `Failed`, `Closing`, and `Closed`.
+2. Drop handles that lack `workspace/symbol`. This is knowable now, because
+   every candidate is `Ready` — `server_capabilities()` is populated during the
+   handshake.
+3. Apply the per-pair `priorities` allowlist and `max_fan_out` cap.
 4. Dedup the survivors by **connection key** `(server, root)`.
-5. **Per target, independently**: wait for `Ready`, re-check
-   `has_capability("workspace/symbol")` — now knowable for the ones that were
-   `Initializing` — then send.
+5. Send to each survivor.
+
+**`Initializing` connections are excluded.** Including them, and waiting for
+Ready before dispatch, was tried and abandoned — it looked like it removed a
+timing dependence and instead produced a cascade:
+
+- Capability is unknowable for an `Initializing` handle, so the cap either ran
+  before the capability check (letting a known-incapable server take the last
+  slot and answer nobody) or after the wait (making the cap a global barrier
+  that delayed a ready target by another target's 30-second `wait_for_ready`).
+- A reserved slot could die four ways — timeout, failure, close, handle
+  replacement — turning `max_fan_out = 1` with a slow high-priority candidate
+  from "slower" into "empty".
+- Backfilling the dead slot has no well-defined unit: the cap selects server
+  *names* per pair, while failure happens per `(server, root)` *connection*, and
+  a deduplicated connection can carry several pairs' priority lists, so there is
+  no single "next candidate". Sequential backfill also gives each replacement a
+  fresh 30-second wait, so three slow candidates cost 90 seconds before any
+  response wait — breaking the latency account outright.
+
+Excluding them costs one thing: a query issued in the seconds after opening a
+file may miss a server still starting for it. That is not a new class of
+surprise — this method's contract is already "coverage is what is live", and
+coverage already grows and shrinks under the client's own actions (point 7). It
+buys a selection that is synchronous, deterministic, capability-exact, and free
+of every failure mode above.
 
 The cap sits between the two: after the liveness filter, before any waiting.
 Both halves of that placement are load-bearing.
@@ -369,27 +390,10 @@ resolved — up to the full 30 seconds — even though B was ready immediately.
 Deciding membership synchronously and waiting per target removes the
 interaction entirely.
 
-Step 2 exists because capping first would let a **known-incapable** server take
-a slot from a capable one: with `priorities = [A, B]`, `max_fan_out = 1`, both
-`Ready`, and A incapable, the query would consult nobody. Filtering on what is
-already knowable costs nothing and removes that case entirely.
-
-What remains unknowable is an `Initializing` target, and reserving its slot has
-teeth: `wait_for_ready` can end in timeout, failure, close, or handle
-replacement, and the target may also turn out to lack the capability. With
-`max_fan_out = 1` and `priorities = [initializing_A, ready_B]`, a naive
-reservation would not merely delay B — it would exclude B for the whole query
-and answer empty. So a reserved slot that **dies** is **backfilled**: the
-highest-priority candidate not yet selected takes it. Backfill runs only on that
-failure path, so the common case stays a single synchronous selection, and the
-pathological case degrades to "slower" instead of "empty".
-
-Backfill is deterministic and terminates: the replacement is always the
-highest-priority candidate not yet selected, which is a total order fixed before
-any waiting, and each backfill consumes one candidate from a finite list. A
-chain of failures therefore walks the priority order once and stops, and the
-resulting target set does not depend on the order failures happened to occur
-in.
+Step 2 must precede step 3, for the reason the abandoned design could not
+honour: capping first would let a **known-incapable** server take a slot from a
+capable one — with `priorities = [A, B]`, `max_fan_out = 1`, and A incapable,
+the query would consult nobody.
 
 `priorities` is an allowlist: listed servers are candidates, `"*"` stands for
 the rest, and an explicit `[]` remains the per-method kill switch. Its **order**
@@ -437,10 +441,10 @@ set (point 7).
              └────────────┬─────────────┘
                           ▼
         ┌──────────────────────────────────────┐
-        │ SYNCHRONOUS selection — no waiting:  │
-        │ 1. keep Ready + Initializing only    │
-        │    (NOT Failed/Closing/Closed)       │
-        │ 2. drop known-incapable Ready handles│
+        │ SYNCHRONOUS selection — nothing waits│
+        │ 1. keep Ready ONLY (not Initializing,│
+        │    Failed, Closing, Closed)          │
+        │ 2. drop handles lacking capability   │
         │ 3. allowlist + max_fan_out           │
         │    NEVER spawns a connection         │
         └──────────────────┬───────────────────┘
@@ -453,8 +457,7 @@ set (point 7).
         │   (C, rootA)  ← named by LANG_2      │
         └──────────────────┬───────────────────┘
                            ▼
-              THEN per target, independently:
-              wait Ready → re-check capability → send (§4),
+              then send to each survivor (§4),
               then per-entry fan-in (§5),
               then UNION → dedup → sort (§1)
 ```
@@ -484,13 +487,23 @@ return is part of the pattern.
   same shape as the existing `textDocument/definition` arm.
 - **To be called after the Ready wait.** It falls back to
   `server_capabilities()`, which is `None` until `set_server_capabilities` runs
-  during the handshake — so prefiltering an `Initializing` connection drops
-  exactly the connections point 3 decided to keep.
+  during the handshake. Point 3 keeps only `Ready` candidates precisely so this
+  is knowable at selection time; an `Initializing` handle would report every
+  server incapable.
 
-Cancellation needs nothing new: `register_upstream_request` already holds many
-`(server, root)` keys per upstream id, `forward_cancel_by_upstream_id_if_current`
-already iterates all of them, and `UpstreamRegistrySweepGuard` unregisters the
-whole entry. Multi-target cancellation falls out of using the pattern.
+Cancellation needs nothing new **downstream**: `register_upstream_request`
+already holds many `(server, root)` keys per upstream id,
+`forward_cancel_by_upstream_id_if_current` already iterates all of them, and
+`UpstreamRegistrySweepGuard` unregisters the whole entry. Multi-target
+cancellation falls out of using the pattern.
+
+It does need something **upstream**. Registration happens inside the per-target
+send, and cancel forwarding records nothing for an id that is not yet
+registered — so a cancel arriving before the sends would be dropped and the
+query would run to completion regardless. The handler therefore subscribes to
+`$/cancelRequest` **before its first await** and selects against the whole
+dispatch, exactly as the existing document-free handler does, rather than
+relying on per-target registration alone.
 
 Fan-in cannot live in the `bridge` module, because `resolve_region_offset` is
 `pub(super)` to `lsp_impl`. So unlike every `transform_*_response_to_host`
@@ -593,9 +606,9 @@ this method has no target document to name.
 Fan-in therefore runs in **three passes**, not one, over a **request-local
 index** built once up front:
 
-0. **When fan-in begins** — not at fan-out time — snapshot the tracker's
-   host→virtual map once and build a
-   `virtual_uri_string → (host_url, region_id)` map for this request.
+0. **After every target's result is collected**, and not before, snapshot the
+   tracker's host→virtual map once and build a
+   `virtual_uri_string → (host_url, region_id, language)` map for this request.
 1. Classify every entry against that index, **grouping entries by host**. No
    parse and no lock is involved, so nothing waits here.
 2. Ensure the distinct hosts that actually appear, **concurrently**.
@@ -605,9 +618,12 @@ Pass 0 is built **late, and verified late**, because a single early snapshot
 is wrong in both directions across a wait that can reach a minute.
 
 Too-early **under-reports**: a virtual document opened after the snapshot but
-before the downstream request can legitimately appear in that response, and
-would then be dropped for being absent from a map that predates it. Building the
-index when the first response is in hand removes that whole class.
+before a downstream request can legitimately appear in that response, and would
+then be dropped for being absent from a map that predates it. Waiting for the
+*first* response is not enough either — other targets can stay in flight for
+another 30 seconds and answer with documents opened in the meantime. The index
+is therefore built once all results are in hand, immediately before
+classification.
 
 Staleness in the other direction is worse and survives any snapshot time, so it
 is closed by a check rather than by timing. A region keeps its ULID across
@@ -615,9 +631,16 @@ edits, but its **injection language can change** — the close path removes the 
 virtual URI and a new one is opened for the new language. `resolve_region_offset`
 resolves by host and region id alone and discards the language, so a stale entry
 naming the *old* URI would still resolve, and a Python result would be
-translated into a region that is now Rust. So the indexed URI must **match the
-URI reconstructed from the region's current injection language**; a mismatch is
-a retired document and the entry is dropped.
+translated into a region that is now Rust. So the index must carry each entry's
+**language**, taken from `OpenedVirtualDoc.virtual_uri.language()`, and that
+language must equal the region's current `injection_language`; a mismatch is a
+retired document and the entry is dropped.
+
+Comparing *reconstructed URIs* instead would not work. A virtual URI renders the
+language only as a file extension, and that mapping is not injective —
+`python` and a literal `py` both render `.py`, as do `rust`/`rs` and
+`javascript`/`js` — so exactly the language changes most likely to occur would
+compare equal. The tracked language string is the identity; the URI is not.
 
 Both that check and the range validation below need data the current helper
 throws away rather than data the system lacks: `ResolvedInjection` already
@@ -634,8 +657,10 @@ justifies that cost with "`window/showDocument` is rare, so the scan is
 acceptable". Calling it once per returned symbol destroys exactly that premise:
 an interactive endpoint returning thousands of symbols would pay
 `symbols × open_virtual_docs`, serialized through repeated acquisition of the
-tracker's async mutex. Snapshotting once makes it one scan plus O(1) per entry,
-and the snapshot is the same data point 3's validation already takes.
+tracker's async mutex. Snapshotting once makes it one scan plus O(1) per entry.
+It is a *separate* snapshot from the one point 3 takes to validate candidates —
+that one is taken at selection time under the `connections` lock and answers a
+different question.
 
 The index also becomes the **identity test**. `is_virtual_uri` is only a
 basename pattern — it accepts any URI ending in
@@ -674,6 +699,16 @@ check and the ensure moves the URI into a fresh, snapshot-less lifetime and the
 outer 200ms timeout**, so the phase's bound is a property of this call site
 rather than an inference about the callee's internal state.
 
+Resolution also **post-checks the snapshot incarnation**. `resolve_region_offset`
+takes an owned snapshot before it consults the tracker and walks the tree, while
+`didChange` updates tracker positions *before* it clears the visible tree — so a
+resolution that reads the tracker just ahead of that update finishes against its
+own stale snapshot and passes both the language and range checks with old
+coordinates. Re-reading the incarnation after resolution and discarding the
+entry when it moved closes that, following the same discipline the semantic
+token path already uses. Without it, "the tree is gone" is the only edit race
+the design would notice, and it is not the only one that exists.
+
 A residual race remains and is **accepted**: a `didChange` landing between the
 ensure and the offset resolution clears the tree again, and that entry is
 dropped like any other unresolvable one. Closing it entirely would mean pinning
@@ -703,9 +738,17 @@ One client capability *does* govern the payload, and it turns out to govern the
 element type too: `workspace.symbol.tagSupport` declares which `SymbolTag`s the
 client accepts, and kakehashi already stores the upstream capabilities.
 
-- A client **with** `tagSupport` gets `WorkspaceSymbol[]`, tags filtered to the
-  set it declared.
-- A client **without** it gets `SymbolInformation[]`.
+- A client that can represent `SymbolTag::DEPRECATED` gets `WorkspaceSymbol[]`,
+  tags filtered to the set it declared.
+- Every other client gets `SymbolInformation[]`.
+
+The discriminator is **representability, not presence**. `tagSupport` cannot be
+tested for existence: the legacy boolean form `tagSupport: true` deserializes to
+`Some(TagSupport { value_set: [] })`, so a client that declares tag support in
+the old spelling would pass a presence check, have every tag filtered away
+against its empty set, and lose deprecation exactly as if it had declared
+nothing. Asking whether `DEPRECATED` survives the filter answers the question
+that actually matters.
 
 The second case is why the element type cannot simply be "always the modern
 one". Point 4 *creates* a tag during normalization, folding the legacy
@@ -720,10 +763,6 @@ lesser evil, and it is bounded: the modern type is used everywhere else.
 
 Every target is awaited, so latency is max-over-targets. The bounds are:
 
-- The Ready wait in point 3 is bounded by `wait_for_ready`'s
-  `INIT_TIMEOUT_SECS`, also **30 seconds**, and it happens *before* the target's
-  request is sent. Each target waits independently: a slow `Initializing`
-  connection must not delay dispatch to connections that are already `Ready`.
 - `wait_for_response` wraps each request in a hardcoded **30-second** timeout and
   removes the router entry when it fires.
 - The reader's **liveness timeout** can independently fail a connection that has
@@ -732,11 +771,11 @@ Every target is awaited, so latency is max-over-targets. The bounds are:
   permits a downstream to ignore `$/` notifications, so it is best-effort and
   cannot be the guarantee.
 
-So a single target's worst case is the two 30-second bounds in series, not one.
-No *additional* deadline is introduced. Because no target is ever cold-started
-(point 7), the practical case is bounded by servers that are already running and
-already answering other requests — a target that is still `Initializing` at
-query time is one the client's own file-open just started.
+No *additional* deadline is introduced, and selection adds none: every target is
+already `Ready` when it is chosen (point 3), so nothing waits before the request
+goes out. Because no target is ever cold-started (point 7), the practical case is
+bounded by servers that are already running and already answering other
+requests.
 
 ### 7. Coverage is what is live, and a query never cold-starts a server
 
@@ -920,9 +959,8 @@ Including it would defeat dedup on a field carrying no identity.
   touches is how many are live.
 - Adding the `Union` variant forces a `Union` arm at 7 exhaustive `match` sites
   in methods that have no use for it.
-- A target that is `Initializing` when the candidate set is fixed consumes a
-  `max_fan_out` slot even if it later proves incapable — the cost of deciding
-  membership synchronously (point 3).
+- A server still `Initializing` when the query arrives is skipped entirely, so
+  a search in the seconds after opening a file can miss it (point 3).
 - `max_fan_out` does not mean here what its own documentation promises. It caps
   server *names*, and one selected name still queries every live root, so it
   bounds neither requests nor connections.
