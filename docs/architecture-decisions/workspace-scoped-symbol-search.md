@@ -924,8 +924,9 @@ another 30 seconds and answer with documents opened in the meantime. The index
 is therefore built once all results are in hand, immediately before
 classification. It covers documents opened up to the enqueue of each request,
 which is as far as it can: a per-target identity map fixes what that target
-could legitimately have seen, and it is captured atomically with that target's
-enqueue (point 4).
+could legitimately have seen, captured in the same `connections` section as that
+target's enqueue — which excludes a concurrent `didOpen`, though not a
+concurrent `didChange` (point 4).
 
 Staleness in the other direction is worse and survives any snapshot time, so it
 is closed by a check rather than by timing. A region keeps its ULID across
@@ -1115,17 +1116,30 @@ searched and found nothing" — and making it while every server was unreachable
 is confidently wrong at exactly the moment the user is least able to tell. A
 client shown "no matches" during an outage concludes the symbol does not exist.
 
-So the outcome is decided on whether *any* server actually answered, tracked
-**across every phase**, not just the response phase. A target can be lost after
+So the outcome is decided on whether any server's answer was **successfully
+processed**, tracked **across every phase**, not just the response phase. A target can be lost after
 selection and before dispatch too: its reopen barrier fails, its send cannot
 re-acquire `connections` within budget, or registration, the stale-handle
 re-check, or the enqueue fails. Counting only "dispatched targets that errored"
 would let a query whose every target died pre-dispatch report a confident empty
 answer, since zero dispatches looks the same as zero results.
 
-The unit is a **successfully processed answer**: a target that answered *and*
-whose entries fan-in could classify and translate. Anything short of that is
-"we could not find out", not "there is nothing".
+The unit is a **successfully processed answer**, and the line that defines it is
+between *semantic* rejection and *infrastructure* failure:
+
+- **Semantic rejection is successful processing.** An entry dropped because its
+  region died, its language changed, its range escaped the region, its host has
+  no current geometry, or its content identity moved was examined and found not
+  to describe a place in this workspace. The answer was processed; it yielded
+  fewer symbols. These are the silent drops points 5 and 7 already accept, and
+  they do not poison anything.
+- **Infrastructure failure poisons the answer.** The pass-0 host→virtual
+  snapshot, the translation-time identity re-read, or a host's `edit_lock`
+  expiring means the entries were never examined at all. Nothing was learned
+  about them, so they are not evidence of absence.
+
+Anything short of one processed answer is "we could not find out", not "there
+is nothing".
 
 - Selection **completed** and found no candidates → `[]`. Nothing failed; there
   was nothing to ask.
@@ -1252,8 +1266,9 @@ arriving mid-processing would otherwise wait on unrelated work with no bound.
   identity re-read — three seconds each. These come *after* every downstream
   response, so they are easy to overlook, and unbudgeted they would reintroduce
   an unbounded wait at the very end of the query. Expiry drops the affected
-  entries **and counts against the outcome rule** (point 5): entries lost to a
-  fan-in failure are not evidence that the search found nothing.
+  entries **and counts against the outcome rule** (point 5) as infrastructure
+  failure, not semantic rejection: entries never examined are not evidence that
+  the search found nothing.
 - **Translation's `edit_lock`** per host: three seconds. A host whose lock
   cannot be taken in time loses that query's entries, exactly like a host whose
   geometry was stale.
