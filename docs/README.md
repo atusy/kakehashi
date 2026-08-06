@@ -911,20 +911,25 @@ while it is being installed, or about files upstream does not provide:
   against the parser still being replaced, and keep that pairing until it
   reloads. Worse, a server that loads a language whose base language is being
   removed at that moment registers it with the query error as a warning and
-  caches that verdict, so later opens do not retry the install. Both are fixed
-  by restarting the server or installing the language explicitly; installing
-  while nothing is using the language avoids them.
+  caches that verdict, so later opens do not retry the install. Fixing that
+  takes both steps: install the missing language, then restart or reload the
+  server, since the install repairs the disk and the reload clears the cached
+  verdict. Installing while nothing is using the language avoids the whole
+  situation.
 - Base languages are tracked by name, not by which query kind needed them. A
   base language is fetched with whatever kinds upstream publishes for it, and
   the optional kinds are best-effort: if upstream does not ship the base
   language's `injections.scm`, or that one download fails, a language whose own
   `injections.scm` inherits it installs successfully and fails to load its
   injections. A plain re-run skips the base language as complete —
-  `kakehashi language install <base> --force` is what re-fetches it.
+  `kakehashi language install <base> --force` is what re-fetches it, followed by
+  a server reload if it has already cached the failure.
 - Staging files left behind by a process that was killed are collected by
   `kakehashi language status` on Linux and macOS. On Windows there is no
   portable way to tell whether the owning process is still running, so they are
-  left alone; they are inert, and safe to delete by hand.
+  left alone. They are inert, and safe to delete by hand once no kakehashi
+  server or install is running — while one is, a staging file may be the one it
+  is compiling into.
 
 ### Configuration Management
 
