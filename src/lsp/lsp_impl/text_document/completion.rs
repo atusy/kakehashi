@@ -10,7 +10,8 @@
 //! The host layer cannot use the generic verbatim raw-value walk: its items
 //! need the routing envelope that makes `completionItem/resolve` reach the host
 //! server that produced them (#958), so it dispatches typed per server to keep
-//! the server name and its advertised capabilities.
+//! the server name and its advertised capabilities, and hands both to the
+//! bridge's `bridge_host_completion_items` policy.
 
 use tower_lsp_server::jsonrpc::Result;
 use tower_lsp_server::ls_types::{
@@ -21,7 +22,7 @@ use super::super::Kakehashi;
 use crate::lsp::aggregation::server::{
     FanInResult, HostFanOutTask, dispatch_host_preferred, dispatch_preferred,
 };
-use crate::lsp::bridge::{HostDocument, envelope_host_item};
+use crate::lsp::bridge::{HostDocument, bridge_host_completion_items};
 use crate::lsp::lsp_impl::bridge_context::parse_host_verbatim;
 
 const METHOD: &str = "textDocument/completion";
@@ -93,9 +94,12 @@ impl Kakehashi {
                 else {
                     return Ok(None);
                 };
-                if raw.handle.has_capability("completionItem/resolve") {
-                    envelope_host_completion_items(&mut response, &t.server_name, t.uri.as_str());
-                }
+                bridge_host_completion_items(
+                    &mut response,
+                    &t.server_name,
+                    t.uri.as_str(),
+                    raw.handle.has_capability("completionItem/resolve"),
+                );
                 Ok(Some(response))
             }
         };
@@ -178,24 +182,6 @@ impl Kakehashi {
                 Ok(v.map(CompletionResponse::List))
             })
             .await
-    }
-}
-
-/// Envelope every item of a host-layer response for `completionItem/resolve`
-/// routing. Both response shapes are enveloped: host servers answer with a bare
-/// array as often as with a `CompletionList`, and a List-only loop would leave
-/// array responses unresolvable — the very bug this fixes.
-fn envelope_host_completion_items(
-    response: &mut CompletionResponse,
-    server_name: &str,
-    host_uri: &str,
-) {
-    let items = match response {
-        CompletionResponse::Array(items) => items,
-        CompletionResponse::List(list) => &mut list.items,
-    };
-    for item in items.iter_mut() {
-        envelope_host_item(item, server_name, host_uri);
     }
 }
 

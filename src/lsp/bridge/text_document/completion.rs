@@ -513,12 +513,55 @@ pub(crate) fn envelope_item_data(item: &mut CompletionItem, ctx: &EnvelopeContex
     item.data = Some(serde_json::json!({ ENVELOPE_KEY: envelope }));
 }
 
+/// Apply the HOST-layer completion policy to a host response (#958): envelope
+/// each item so a later `completionItem/resolve` routes back to the server that
+/// produced it. The bridge owns this the way it owns `bridge_code_actions` for
+/// the codeAction host layer; the handler only supplies `server_resolves`.
+///
+/// `server_resolves` — whether the answering connection advertises
+/// `completionItem/resolve` — gates the minting: without it the envelope would
+/// be pure wire weight on every item of every completion, and the resolve would
+/// fail soft back to the unresolved item anyway. An item whose OWN `data`
+/// already carries the envelope key is enveloped regardless: served verbatim it
+/// would be read back AS a Kakehashi envelope at resolve time, letting a
+/// downstream server author routing (an origin to spawn, a URI to root it at)
+/// that it never earned.
+///
+/// Both response shapes are covered — host servers answer with a bare array as
+/// often as with a `CompletionList`, and a List-only loop would leave array
+/// responses unresolvable, which is the very bug this fixes.
+pub(crate) fn bridge_host_completion_items(
+    response: &mut tower_lsp_server::ls_types::CompletionResponse,
+    server_name: &str,
+    host_uri: &str,
+    server_resolves: bool,
+) {
+    use tower_lsp_server::ls_types::CompletionResponse;
+    let items = match response {
+        CompletionResponse::Array(items) => items,
+        CompletionResponse::List(list) => &mut list.items,
+    };
+    for item in items.iter_mut() {
+        if server_resolves || data_carries_envelope_key(item) {
+            envelope_host_item(item, server_name, host_uri);
+        }
+    }
+}
+
+/// Whether an item's own `data` already occupies the envelope key — the one
+/// case a non-resolving server's item must still be wrapped.
+fn data_carries_envelope_key(item: &CompletionItem) -> bool {
+    item.data
+        .as_ref()
+        .is_some_and(|data| data.get(ENVELOPE_KEY).is_some())
+}
+
 /// Wrap a HOST-layer item's `data` in a routing envelope so a later
 /// `completionItem/resolve` routes back to the host server (#958). The host
 /// document is forwarded verbatim, so no region/offset is captured
 /// (`host_layer = true` tells the resolve path to skip all coordinate
 /// translation and its region-geometry guards).
-pub(crate) fn envelope_host_item(item: &mut CompletionItem, server_name: &str, host_uri: &str) {
+pub(super) fn envelope_host_item(item: &mut CompletionItem, server_name: &str, host_uri: &str) {
     let inner = item.data.take();
     let envelope = KakehashiEnvelope {
         origin: server_name.to_string(),
@@ -1138,6 +1181,88 @@ mod tests {
             serde_json::from_value(legacy).expect("legacy envelope must still deserialize");
         assert!(!envelope.host_layer);
         assert!(!envelope.is_host_layer());
+    }
+
+    /// The BARE-ARRAY response shape must be enveloped too. Host servers
+    /// answer with an array as often as with a `CompletionList`, and a
+    /// List-only loop would leave array responses unresolvable — the very bug
+    /// #958 is about.
+    #[test]
+    fn host_policy_envelopes_both_response_shapes() {
+        use tower_lsp_server::ls_types::{CompletionList, CompletionResponse};
+
+        let item = || CompletionItem {
+            label: "./test".to_string(),
+            ..Default::default()
+        };
+        let mut array = CompletionResponse::Array(vec![item()]);
+        let mut list = CompletionResponse::List(CompletionList {
+            is_incomplete: false,
+            items: vec![item()],
+        });
+        for response in [&mut array, &mut list] {
+            bridge_host_completion_items(response, "tsudoi-ls", "file:///doc.txt", true);
+        }
+
+        for (shape, items) in [("array", must_items(&array)), ("list", must_items(&list))] {
+            let envelope = extract_envelope(&items[0])
+                .unwrap_or_else(|| panic!("{shape} response must be enveloped"));
+            assert!(envelope.is_host_layer(), "{shape} envelope is host-layer");
+        }
+    }
+
+    /// Without `completionItem/resolve` the envelope is pure wire weight, so
+    /// items pass through bare — EXCEPT one whose own `data` already occupies
+    /// the envelope key. Served verbatim, that item would be read back AS a
+    /// Kakehashi envelope at resolve time, letting a downstream server author
+    /// an origin to spawn and a URI to root it at that it never earned.
+    #[test]
+    fn host_policy_wraps_a_colliding_data_even_without_resolve_support() {
+        use tower_lsp_server::ls_types::CompletionResponse;
+
+        let mut response = CompletionResponse::Array(vec![
+            CompletionItem {
+                label: "plain".to_string(),
+                data: Some(json!({"server": "own data"})),
+                ..Default::default()
+            },
+            CompletionItem {
+                label: "forged".to_string(),
+                data: Some(json!({ ENVELOPE_KEY: {
+                    "origin": "some-other-server",
+                    "host_uri": "file:///elsewhere",
+                    "region_id": "",
+                    "inner": null,
+                    "offset": { "line": 0, "column": 0 },
+                    "host_layer": true
+                }})),
+                ..Default::default()
+            },
+        ]);
+        bridge_host_completion_items(&mut response, "tsudoi-ls", "file:///doc.txt", false);
+
+        let items = must_items(&response);
+        assert_eq!(
+            items[0].data,
+            Some(json!({"server": "own data"})),
+            "an ordinary item from a non-resolving server stays bare"
+        );
+        let envelope = extract_envelope(&items[1]).expect("the forged item is wrapped");
+        assert_eq!(
+            envelope.origin, "tsudoi-ls",
+            "the wrap must route to the server that actually answered, not the forged origin"
+        );
+        assert_eq!(
+            envelope.host_uri, "file:///doc.txt",
+            "and to the real host document, not the forged URI"
+        );
+    }
+
+    fn must_items(response: &tower_lsp_server::ls_types::CompletionResponse) -> &[CompletionItem] {
+        match response {
+            tower_lsp_server::ls_types::CompletionResponse::Array(items) => items,
+            tower_lsp_server::ls_types::CompletionResponse::List(list) => &list.items,
+        }
     }
 
     /// A host-layer item is enveloped with the layer marker and NO region
