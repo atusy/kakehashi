@@ -255,18 +255,29 @@ is false.
 An explicit non-`union` strategy for this method is therefore overridden to
 `union`, with one warning at settings-apply time, following the existing
 misconfiguration path (`misconfigured_settings_warnings`, which already warns
-about `concatenated`-without-`priorities` for formatting).
+about `concatenated`-without-`priorities` for formatting). The same walk warns
+in the **other** direction too: `strategy = "union"` on any method other than
+`workspace/symbol` is equally inert (point 1), and warning on only one of the
+two would leave the more likely user mistake silent.
 
-The same walk warns in the **other** direction too: `strategy = "union"` on any
-method other than `workspace/symbol` is equally inert (point 1), and warning on
-only one of the two would leave the more likely user mistake silent.
+The word doing the work is **explicit**, and the existing hook cannot see it.
+`misconfigured_settings_warnings` receives effective `WorkspaceSettings`, and
+the built-in defaults themselves install a wildcard `preferred`. After wildcard
+resolution an untouched session is indistinguishable from a user who wrote that
+wildcard by hand — so a warning driven off effective settings would fire for
+**everyone**, which is worse than not warning at all.
 
-Both directions must decide "which method is this?" by **resolving** the
-aggregation entry, not by comparing map keys. A method-level `"_"` wildcard
-entry legitimately supplies a strategy to `workspace/symbol` through the same
-`resolve_with_wildcard` fallback used everywhere else, so a walk that only
-inspects literal key names would both miss the override it should apply and warn
-about a `union` that is in fact reaching this method.
+The warning therefore needs **provenance**: it is driven off the raw
+user-supplied layers, not the merged result, and fires only where a non-`union`
+strategy for this method was actually written. The override itself still applies
+to the effective settings unconditionally; only the diagnostic is provenance-
+gated.
+
+Whichever settings it reads, the walk must decide "which method is this?" by
+**resolving** the aggregation entry rather than comparing map keys: a
+method-level `"_"` wildcard legitimately supplies a strategy to
+`workspace/symbol` through the same `resolve_with_wildcard` fallback used
+everywhere else.
 
 Two servers indexing the *identical* root — say two TypeScript servers — are
 genuinely competing rather than complementary, and this decision does make their
@@ -363,7 +374,16 @@ existing configuration from becoming a silent no-op here.
    handshake.
 3. Apply the per-pair `priorities` allowlist and `max_fan_out` cap.
 4. Dedup the survivors by **connection key** `(server, root)`.
-5. Send to each survivor.
+5. Await `wait_for_pending_reopen` for the survivors, **concurrently**, then
+   send.
+
+Step 5 exists because a connection reaches `Ready` *before* its virtual
+documents are replayed after a respawn, so a query landing in that window would
+under-report that server's embedded symbols indistinguishably from "no matches".
+The barrier is **bounded to two seconds** and enforced with a timeout, and
+awaiting the survivors concurrently costs that bound once for the whole query —
+not once per target. That is a cheap price for not silently losing a server's
+regions, and it is the only wait in selection.
 
 **`Initializing` connections are excluded.** Including them, and waiting for
 Ready before dispatch, was tried and abandoned — it looked like it removed a
@@ -427,23 +447,29 @@ connection's own indexed workspace, so a connection named by several pairs is
 asked **once**, while the same server name under two roots is genuinely two
 connections and two requests.
 
-`max_fan_out` counts **server names**, not connections — `truncate_entries`
-truncates a flattened name list in walk order. A surviving name then contributes
-every connection **that survived steps 1 and 2** — every `Ready`, capable handle
-in the selection snapshot — so a server live under two roots sends two requests
-against one cap slot. It contributes those, not "every live connection": if
-`A/root1` advertises `workspace/symbol` and `A/root2` does not, selecting the
-name A must not smuggle root2 back past the capability filter. Beyond that
-filter no root is dropped and no root-ordering policy is needed: this method
-queries every `Ready`, capable root of a selected server by design.
+`max_fan_out` is applied **twice**, and the second application is what makes it
+mean what it says.
 
-The setting's documented promise ("cap the number of concurrent server
-requests") is therefore not what happens here, and could not be — a cap on names
-cannot bound requests once one name means several connections. Combined with the
-fact that a connection dropped by one pair's cap still enters through another
-pair that names it, `max_fan_out` is a **per-pair name-selection rule** for this
-method and nothing more. What actually bounds the total is the live-connection
-set (point 7).
+Within a pair it works as everywhere else: `truncate_entries` truncates a
+flattened name list in walk order, keeping the highest-priority N names. A
+surviving name contributes every connection that survived steps 1 and 2 — every
+`Ready`, capable handle in the selection snapshot — so if `A/root1` advertises
+`workspace/symbol` and `A/root2` does not, selecting the name A must not smuggle
+root2 back past the capability filter.
+
+But a per-pair name cap bounds neither requests nor connections here: one name
+can mean several roots, and a connection one pair's cap excluded re-enters
+through another pair that names it. Left there, `max_fan_out = 1` could produce
+arbitrarily many requests, contradicting the setting's documented promise to
+"cap the number of concurrent server requests" — a generic load control quietly
+losing its load-controlling property in exactly the method most able to fan out.
+
+So after dedup, the **largest `max_fan_out` among the contributing pairs** is
+applied once more, as a final cap on the number of connections queried, in
+priority order. Taking the largest rather than the smallest keeps a restrictive
+setting on one pair from silently throttling unrelated languages, while still
+giving the setting a real ceiling. A pair that set no cap contributes none, and
+if no pair caps, nothing is capped.
 
 ```
   open host docs × their open virtual docs    ← concrete languages only,
@@ -456,11 +482,11 @@ set (point 7).
              └────────────┬─────────────┘
                           ▼
         ┌──────────────────────────────────────┐
-        │ SYNCHRONOUS selection — nothing waits│
+        │ SELECTION (own outer deadline, §6)   │
         │ 1. keep Ready ONLY (not Initializing,│
         │    Failed, Closing, Closed)          │
         │ 2. drop handles lacking capability   │
-        │ 3. allowlist + max_fan_out           │
+        │ 3. allowlist + per-pair max_fan_out  │
         │    NEVER spawns a connection         │
         └──────────────────┬───────────────────┘
                            ▼
@@ -470,8 +496,10 @@ set (point 7).
         │   (B, rootB)  ← same server, another │
         │                 root: 2 connections  │
         │   (C, rootA)  ← named by LANG_2      │
+        │ then ONE global max_fan_out cap      │
         └──────────────────┬───────────────────┘
                            ▼
+              await the bounded reopen barrier,
               then send to each survivor (§4),
               then per-entry fan-in (§5),
               then UNION → dedup → sort (§1)
@@ -593,7 +621,23 @@ hand. "Its own offset" does not mean "its own resolution", though; see pass 3.
   region map once per host.
 ```
 
-Translation **validates the region bounds**; it does not translate blindly.
+Bounds validation is necessary but **not sufficient**, so translation also
+pins the content the result was computed from. A range measured against an older
+version of a region can remain perfectly in-bounds in the current one — insert a
+line above a symbol while the request is in flight and its old range still
+validates, then translates onto unrelated text. No amount of geometry checking
+catches that, because the geometry is fine; what changed is the text the
+downstream was looking at.
+
+Each virtual document's **content identity at dispatch** is therefore captured
+and re-checked before its entries are translated. The tracker already maintains
+what this needs — per-connection virtual-document revisions and the fingerprint
+of the content last confirmed sent — so the check is a comparison, not new
+bookkeeping. Entries from a virtual document whose content moved between
+dispatch and translation are dropped, exactly like entries whose region moved.
+
+With that in place, translation **validates the region bounds** too; it does not
+translate blindly.
 Region ids deliberately survive edits, so an in-flight response can carry a
 range measured against an older, larger region while offset resolution against
 the current parse still succeeds — and plain range translation performs no
@@ -893,9 +937,24 @@ Every target is awaited, so latency is max-over-targets. The bounds are:
   permits a downstream to ignore `$/` notifications, so it is best-effort and
   cannot be the guarantee.
 
-No *additional* deadline is introduced, and selection adds none: every target is
-already `Ready` when it is chosen (point 3), so nothing waits before the request
-goes out. Because no target is ever cold-started (point 7), the practical case is
+Selection is not quite free, and the earlier claim that it "adds no wait" was
+too strong. It must take the pool's `connections` mutex, and other paths hold
+that mutex across `.await`s — eager `didOpen` holds it while opening documents,
+and respawn and config invalidation hold it across purges and transition-lock
+waits. None of those carries a deadline, and cancel forwarding acquires the same
+mutex before it can notify a subscribed handler, so early subscription cannot
+interrupt a stall behind it.
+
+Selection therefore runs under its own **outer deadline**; expiring it answers
+from whatever was already selectable rather than blocking the query behind
+unrelated pool work. This is the one place the design imposes a deadline of its
+own, and it exists because the lock's holders make no promise it could otherwise
+rely on.
+
+Beyond that, no *additional* deadline is introduced: every target is already
+`Ready` when chosen (point 3), so nothing waits for a handshake before the
+request goes out, and the reopen barrier in step 5 is itself bounded to two
+seconds. Because no target is ever cold-started (point 7), the practical case is
 bounded by servers that are already running and already answering other
 requests.
 
@@ -962,6 +1021,11 @@ assert that every other method dispatches `preferred` regardless:
   table and its lead-in ("one of two strategies").
 - `docs/README.md` — the `strategy` row of the aggregation table.
 
+And `maxFanOut`'s own description in `docs/README.md` needs the second,
+post-dedup application spelled out: its promise to cap concurrent server
+requests holds here only because of that final cap, and the per-pair half alone
+would not deliver it.
+
 *And the feature must move* out of `docs/language-features.md`'s "Not currently
 provided" list into a section of its own, and into `docs/README.md`'s
 bridge-backed request list — carrying the live-only coverage contract and the
@@ -994,13 +1058,9 @@ documenting only two values.
   exactly this failure mode in the semantic-token and diagnostic wire floods.
   Nothing here prevents it; it is left for a follow-up once real traffic exists
   to measure, and is the most likely first regression.
-- **The respawn re-open window.** A connection reaches `Ready` *before* its
-  virtual documents are replayed; the barrier that signals replay completion
-  (`wait_for_pending_reopen`) is today awaited only by `workspace/executeCommand`.
-  A query landing in that window under-reports a respawned server's
-  embedded-block symbols, indistinguishably from "no matches". Awaiting the
-  barrier per target would add unbounded latency to every query, so this is
-  accepted rather than fixed.
+- ~~**The respawn re-open window.**~~ Not deferred — see point 3. A connection
+  reaches `Ready` before its virtual documents are replayed, and the barrier is
+  awaited rather than skipped.
 
 ## Considered Options
 
@@ -1114,9 +1174,12 @@ Including it would defeat dedup on a field carrying no identity.
   in methods that have no use for it.
 - A server still `Initializing` when the query arrives is skipped entirely, so
   a search in the seconds after opening a file can miss it (point 3).
-- `max_fan_out` does not mean here what its own documentation promises. It caps
-  server *names*, and one selected name still queries every `Ready`, capable
-  root, so it bounds neither requests nor connections.
+- Selection carries its own deadline, because it must take the pool's
+  `connections` mutex and other paths hold that across unbounded async work
+  (point 6). Expiring it answers from a partial target set.
+- `max_fan_out` is applied twice — per pair by name, then once globally after
+  dedup — so it keeps its documented ceiling, but its per-pair half no longer
+  predicts how many connections a query touches.
 - The `kakehashi-virtual-uri-*` filename space is reserved: a real workspace
   file named into it is invisible to symbol search (point 5).
 - `strategy` becomes a knob that this one method ignores (with a warning). Users
