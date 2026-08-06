@@ -32,8 +32,9 @@ The arbitration problem is subtler than "no document", and it is the one that
 shapes this decision: a `workspace/symbol` response is **not attributable to a
 language**. A server answers "here are the workspace's symbols matching
 `query`", and what it indexes is its workspace root, not a language — so a
-server reached through one configured pair routinely returns symbols belonging
-to another pair's language. Nothing in the response says which configured pair
+server reached through one configured **pair** (throughout this decision, a
+`(host_language, bridge_key)` entry in `languages.<lang>.bridge.<key>`)
+routinely returns symbols belonging to another pair's language. Nothing in the response says which configured pair
 "owns" an entry, so no arbitration between pairs can be principled.
 
 ```
@@ -75,11 +76,11 @@ Three facts in the existing code make the feature tractable anyway:
 - `BridgeCoordinator::resolve_virtual_uri(uri) -> Option<(host_url, region_id)>`
   is a **global** virtual→host reverse map (it is what `window/showDocument`
   translation already uses), and `resolve_region_offset` rebuilds the
-  `RegionOffset` from the live parse for any `(host_url, region_id)` pair.
+  `RegionOffset` from the live parse for any given `host_url` and `region_id`.
 - `LanguageServerPool::connections()` enumerates the pool's connection map.
 - `send_execute_command_on_handle` (`bridge/workspace/execute_command.rs`) is an
   existing precedent for sending a request on a connection **without** a virtual
-  document, and it shows exactly what that costs (see point 3).
+  document, and it shows exactly what that costs (see point 4).
 
 kakehashi sends downstream no `workspace.symbol` client capability at all
 (`bridge/protocol/client_capabilities.rs` sets no `symbol` field on
@@ -104,7 +105,7 @@ per-entry global fan-in translator, and a single deduplicating union. Defer
    │ workspace/symbol   ┌───────────────┐
    │  { query }    ────▶│ candidate set │─── request ──▶  lua_ls   @ rootA
    │                    │ ∩ live conns  │─── request ──▶  tsgo     @ rootA
-   │                    │ dedup by key  │─── request ──▶  tsgo     @ rootB
+   │                    │ dedup by conn │─── request ──▶  tsgo     @ rootB
    │                    │ (fan-out, §3) │
    │                    └───────────────┘                         │
    │                                                              │
@@ -169,7 +170,7 @@ survive. That is a real limit of the mechanism, not something the strategy
 promises away.
 
 Adding the variant is not free: `AggregationStrategy` is matched exhaustively,
-with no wildcard arm, at 14 sites across `lsp_impl/bridge_context.rs`,
+with no wildcard arm, at 7 `match` sites across `lsp_impl/bridge_context.rs`,
 `text_document/formatting.rs`, `text_document/code_action.rs`, and
 `text_document/diagnostic.rs`. Each must gain a `Union` arm, and none of those
 methods has a response shape `Union`'s key tuple applies to. Those arms
@@ -208,6 +209,10 @@ An explicit non-`union` strategy for this method is therefore overridden to
 `union`, with one warning at settings-apply time, following the existing
 misconfiguration path (`misconfigured_settings_warnings`, which already warns
 about `concatenated`-without-`priorities` for formatting).
+
+The same walk warns in the **other** direction too: `strategy = "union"` on any
+method other than `workspace/symbol` is equally inert (point 1), and warning on
+only one of the two would leave the more likely user mistake silent.
 
 Two servers indexing the *identical* root — say two TypeScript servers — are
 genuinely competing rather than complementary, and this decision does make their
@@ -265,6 +270,12 @@ connection's own indexed workspace, so a connection named by several pairs is
 asked **once**, while the same server name under two roots is genuinely two
 connections and two requests.
 
+`max_fan_out` therefore bounds a **pair's** contribution, not the query's total
+fan-out. A connection dropped by one pair's cap still enters through another
+pair that names it, and no global cap exists. Under `preferred` the cap was also
+a cost bound; here it is only a per-pair selection rule. What actually bounds
+the total is the live-connection set (point 7).
+
 ```
   settings.languages × bridge_map.keys()      ← candidate walk only,
         │  (each key via resolve_with_wildcard) no arbitration
@@ -297,7 +308,7 @@ connections and two requests.
               then UNION → dedup → sort (§1)
 ```
 
-### 4. The send lives in the bridge layer; the translation does not
+### 4. The send lives in the `bridge` module; the translation does not
 
 `connections()` is `pub(super)` to `crate::lsp::bridge`, and `lsp_impl` is a
 sibling module, not a descendant — so the fan-out **cannot** live beside the
@@ -330,14 +341,21 @@ Cancellation needs nothing new: `register_upstream_request` already holds many
 already iterates all of them, and `UpstreamRegistrySweepGuard` unregisters the
 whole entry. Multi-target cancellation falls out of using the pattern.
 
-Fan-in cannot live in the bridge layer, because `resolve_region_offset` is
+Fan-in cannot live in the `bridge` module, because `resolve_region_offset` is
 `pub(super)` to `lsp_impl`. So unlike every `transform_*_response_to_host`
 function — which is pure because the caller already resolved *the* offset — this
 translator resolves a different offset per entry and must sit where the
 `DocumentStore` / `LanguageCoordinator` / `BridgeCoordinator` handles are, as
-`ShowDocumentTranslator` does. The bridge layer returns each target's raw
-result; `lsp_impl` classifies and translates. The classification is testable as
-a pure function only if the resolver is injected.
+`ShowDocumentTranslator` does.
+
+The value crossing that boundary is **typed, not raw JSON**: the bridge module
+owns deserialization for every other bridged request, and this one keeps that
+property. Each target's response is parsed into `Vec<WorkspaceSymbol>` there,
+normalizing a `SymbolInformation[]` answer into the same shape, which is
+possible precisely because `WorkspaceSymbol.location` is a `OneOf` that models
+the range-less form rather than rejecting it. `lsp_impl` then classifies and
+translates typed values, and its classification is unit-testable as a pure
+function once the offset resolver is injected.
 
 ### 5. Fan-in: a global virtual→host translator
 
@@ -396,11 +414,18 @@ parse, and `didChange` clears the tree and reparses off-ingress, so during the
 reparse window it returns `None` for every region of the edited document — which
 this classifier would silently turn into "no embedded symbols". The
 whole-document handlers avoid this by calling `ensure_document_parsed` first;
-this method has no target document to name. It therefore calls
-`ensure_document_parsed` for **every open host document** before consuming
-responses. That set is bounded by what the client has open (virtual documents
-exist only for open hosts), and the pre-warm is issued concurrently with the
-fan-out requests, so it costs latency only when a parse is genuinely in flight.
+this method has no target document to name. It therefore pre-warms **every open
+host document** before consuming responses, enumerated via
+`DocumentStore::open_uris()` — which holds host URIs only, so formatting's
+scratch documents are not in the set.
+
+The sweep is **concurrent**, one `JoinSet` task per document, matching the
+diagnostic publisher's shape rather than the serial shared-budget sweep in
+`lifecycle.rs`. Each call carries `ensure_document_parsed`'s own 200ms bound, so
+the sweep costs roughly one such wait in wall time rather than one per document,
+and it is issued alongside the fan-out requests so it overlaps them. No
+additional total budget is imposed: the set is bounded by what the client has
+open, and every task's own bound is the existing one.
 
 The response to the client is always an **array**, never `null`, so "no server
 was running" and "everything was dropped" are not distinguished — the spec
@@ -601,7 +626,14 @@ Including it would defeat dedup on a field carrying no identity.
   request timeout and liveness timeout; forwarded cancellation is best-effort
   because a downstream may ignore it.
 - One request per keystroke, un-coalesced (point 9).
-- Adding the `Union` variant forces a `Union` arm at 14 exhaustive match sites
+- Every query pre-warms the parse of every open host document (point 5). The
+  sweep is concurrent and each task carries the existing 200ms bound, but it is
+  per-query work that scales with the number of open documents, and it compounds
+  with the un-coalesced fan-out above.
+- `max_fan_out` no longer bounds a query's total fan-out — only each pair's
+  contribution — so the only real bound on how many connections one query
+  touches is how many are live.
+- Adding the `Union` variant forces a `Union` arm at 7 exhaustive `match` sites
   in methods that have no use for it.
 - `strategy` becomes a knob that this one method ignores (with a warning). Users
   who reach for `preferred` to suppress a noisy server must instead leave it out
@@ -613,6 +645,9 @@ Including it would defeat dedup on a field carrying no identity.
   index is server-specific — the virtual files do not exist on disk, and servers
   that index only on-disk workspace contents will contribute real-file symbols
   only.
+- Shipping this obliges a documentation change, not just an addition: two
+  user-facing files state the no-cross-block rule as a blanket claim and one
+  states the strategy set as a closed pair (point 8).
 
 ### Neutral
 
