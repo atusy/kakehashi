@@ -387,6 +387,21 @@ fn install_language_with_query_stager(
         return result;
     }
 
+    // A parser that appeared since staging belongs to a concurrent install of
+    // the same language. Without `force`, the query side already yields to such
+    // a winner (`PublishQueryDirOutcome::AlreadyComplete`); yield the parser the
+    // same way, or the two halves can end up published by different installs —
+    // one's queries beside the other's grammar. Dropping the staged parser here
+    // reclaims the compiled file.
+    let staged_parser = match staged_parser {
+        parser::StagedParserOutcome::Staged(_)
+            if !force && let Some(path) = parser_file_exists(language, data_dir) =>
+        {
+            parser::StagedParserOutcome::AlreadyInstalled(path)
+        }
+        outcome => outcome,
+    };
+
     let published_queries = match staged_queries.publish() {
         Ok(published) => published,
         Err(e) => {
