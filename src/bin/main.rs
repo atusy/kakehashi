@@ -446,8 +446,11 @@ fn run_language_status(verbose: bool) -> Result<(), ExitCode> {
             }
             Err(error) => return Err(error),
         };
-        if is_file && let Some(stem) = path.file_stem() {
-            languages.insert(stem.to_string_lossy().to_string());
+        if is_file
+            && let Some(stem) = path.file_stem()
+            && let Some(language) = safe_parser_language_name(&stem.to_string_lossy())
+        {
+            languages.insert(language);
         }
         Ok(())
     })
@@ -589,6 +592,21 @@ fn visit_install_directory(
     Ok(())
 }
 
+/// The language a parser FILENAME stem names, or `None` when the stem is not one
+/// this CLI can safely manage.
+///
+/// Parser discovery is where a name enters from the FILESYSTEM rather than from
+/// config, so it is where the safe-name contract has to be applied; the queries
+/// side already applies it in `installed_query_language_name_checked`.
+///
+/// Shared by `status` and `uninstall --all` so they agree on which NAMES count —
+/// a name one lists and the other refuses to touch is what made `uninstall --all`
+/// fail partway. They still differ on I/O errors (status propagates, uninstall
+/// swallows); that divergence predates this and is tracked separately.
+fn safe_parser_language_name(stem: &str) -> Option<String> {
+    queries::is_safe_language_name(stem).then(|| stem.to_string())
+}
+
 fn installed_query_language_name(path: &Path) -> Option<String> {
     installed_query_language_name_checked(path).ok().flatten()
 }
@@ -643,6 +661,11 @@ fn run_language_uninstall(
         eprintln!("Warning: failed to recover interrupted query installs: {e}");
     }
 
+    // Parser files discovery walked past because their names are not ones this
+    // CLI manages. Kept so the summary cannot claim it removed everything while
+    // one of them is still on disk.
+    let mut unmanaged: Vec<PathBuf> = Vec::new();
+
     // Determine which languages to uninstall
     let languages_to_uninstall: Vec<String> = if all {
         // Collect all installed languages
@@ -656,7 +679,16 @@ fn run_language_uninstall(
                         .extension()
                         .is_some_and(|ext| ext == std::env::consts::DLL_EXTENSION);
                 if is_parser && let Some(stem) = path.file_stem() {
-                    languages.insert(stem.to_string_lossy().to_string());
+                    let stem = stem.to_string_lossy();
+                    match safe_parser_language_name(&stem) {
+                        Some(language) => {
+                            languages.insert(language);
+                        }
+                        // Remembered, not just skipped: this command goes on to
+                        // say it uninstalled everything, and a parser file left
+                        // on disk makes that false.
+                        None => unmanaged.push(path.clone()),
+                    }
                 }
             }
         }
@@ -758,9 +790,26 @@ fn run_language_uninstall(
         return Err(ExitCode::FAILURE);
     }
 
+    if !unmanaged.is_empty() {
+        eprintln!();
+        for path in &unmanaged {
+            eprintln!(
+                "Note: left '{}' in place — its name is not one this CLI manages.",
+                path.display()
+            );
+        }
+    }
+
     if any_removed {
         if all {
-            eprintln!("\nUninstalled all languages.");
+            // Not "all" when discovery deliberately walked past something that
+            // is still on disk; saying so would be the command reporting a
+            // completeness it knows it does not have.
+            if unmanaged.is_empty() {
+                eprintln!("\nUninstalled all languages.");
+            } else {
+                eprintln!("\nUninstalled all managed languages.");
+            }
         } else {
             eprintln!("\nUninstalled '{}'.", languages_to_uninstall[0]);
         }

@@ -922,6 +922,49 @@ fn test_language_status_marks_a_parser_shaped_directory_as_missing() {
     );
 }
 
+/// A parser artifact whose STEM is outside the installer's language-name
+/// contract is an unmanaged file, not an install. Distinct from the
+/// directory cases above: this one is a real file with a real extension, and
+/// only its name disqualifies it.
+#[test]
+fn test_language_status_ignores_invalid_parser_language_names() {
+    use std::fs;
+
+    let test_dir = tempfile::tempdir().expect("Failed to create temp dir");
+    let ext = std::env::consts::DLL_EXTENSION;
+    fs::create_dir_all(test_dir.path().join("parser")).expect("Failed to create parser dir");
+    fs::write(
+        test_dir.path().join(format!("parser/not-a-language.{ext}")),
+        "unmanaged",
+    )
+    .expect("Failed to create invalid parser artifact");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_kakehashi"))
+        .args([
+            "language",
+            "status",
+            "--data-dir",
+            test_dir.path().to_str().unwrap(),
+        ])
+        .output()
+        .expect("Failed to execute command");
+
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.status.success(), "status failed: {combined}");
+    assert!(
+        combined.contains("No languages installed"),
+        "invalid parser stems must be ignored: {combined}"
+    );
+    assert!(
+        !combined.contains("not-a-language"),
+        "invalid parser stem became a status row: {combined}"
+    );
+}
+
 /// Status must not report an install as empty when it could not inspect it.
 #[test]
 fn test_language_status_fails_when_install_directory_is_not_a_directory() {
@@ -1701,6 +1744,94 @@ fn test_language_uninstall_all_ignores_parser_shaped_directories() {
     assert!(
         parser_dir.is_dir(),
         "unrelated directory must remain intact"
+    );
+}
+
+/// Bulk uninstall must ignore an unmanaged parser artifact whose filename stem
+/// is outside the safe language-name contract. Distinct from the directory case
+/// above: this is a real file, and only its name disqualifies it.
+#[test]
+fn test_language_uninstall_all_ignores_invalid_parser_language_names() {
+    use std::fs;
+
+    let test_dir = tempfile::tempdir().expect("Failed to create temp dir");
+    let ext = std::env::consts::DLL_EXTENSION;
+    fs::create_dir_all(test_dir.path().join("parser")).expect("Failed to create parser dir");
+    let artifact = test_dir.path().join(format!("parser/not-a-language.{ext}"));
+    fs::write(&artifact, "unmanaged").expect("Failed to create invalid parser artifact");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_kakehashi"))
+        .args([
+            "language",
+            "uninstall",
+            "--all",
+            "--force",
+            "--data-dir",
+            test_dir.path().to_str().unwrap(),
+        ])
+        .output()
+        .expect("Failed to execute command");
+
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.status.success(), "uninstall failed: {combined}");
+    assert!(
+        combined.contains("No languages installed to uninstall"),
+        "invalid parser stems must not enter uninstall discovery: {combined}"
+    );
+    assert!(artifact.is_file(), "unmanaged artifact must remain intact");
+}
+
+/// Issue #833's actual shape: an unmanaged artifact BESIDE a real install. Both
+/// of the single-artifact tests above stop at the "nothing installed" guard and
+/// never reach removal, so this is the one that reaches it — and the one that
+/// catches the command calling the result "all" while a parser file it walked
+/// past is still on disk.
+#[test]
+fn test_language_uninstall_all_leaves_unmanaged_artifacts_and_says_so() {
+    use std::fs;
+
+    let test_dir = tempfile::tempdir().expect("Failed to create temp dir");
+    let ext = std::env::consts::DLL_EXTENSION;
+    fs::create_dir_all(test_dir.path().join("parser")).expect("Failed to create parser dir");
+    let managed = test_dir.path().join(format!("parser/rust.{ext}"));
+    fs::write(&managed, "parser").expect("Failed to create managed parser");
+    let unmanaged = test_dir.path().join(format!("parser/not-a-language.{ext}"));
+    fs::write(&unmanaged, "unmanaged").expect("Failed to create unmanaged artifact");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_kakehashi"))
+        .args([
+            "language",
+            "uninstall",
+            "--all",
+            "--force",
+            "--data-dir",
+            test_dir.path().to_str().unwrap(),
+        ])
+        .output()
+        .expect("Failed to execute command");
+
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.status.success(), "uninstall failed: {combined}");
+    assert!(!managed.exists(), "the managed parser must be removed");
+    assert!(
+        unmanaged.is_file(),
+        "the unmanaged artifact must be left alone: {combined}"
+    );
+    assert!(
+        combined.contains("not-a-language"),
+        "the user must be told what was left behind: {combined}"
+    );
+    assert!(
+        !combined.contains("Uninstalled all languages."),
+        "'all' is false while a parser file it walked past is still there: {combined}"
     );
 }
 
