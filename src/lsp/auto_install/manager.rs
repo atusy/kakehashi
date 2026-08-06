@@ -491,12 +491,22 @@ impl AutoInstallManager {
             }
         };
 
-        // Check if parser already exists - skip installation and just signal reload
-        if crate::install::parser_file_exists(language, &data_dir).is_some() {
+        // Both halves already present — skip installation and just signal reload.
+        //
+        // The parser alone is not enough: a data directory written before
+        // installs became all-or-nothing can hold a parser whose queries never
+        // arrived, and skipping on the parser meant that language could never
+        // repair itself. Falling through costs a stat per half when everything
+        // is there, since staging short-circuits on both.
+        if crate::install::parser_file_exists(language, &data_dir).is_some()
+            && crate::install::queries::query_install_is_complete(
+                &data_dir.join("queries").join(language),
+            )
+        {
             events.push(InstallEvent::Log {
                 level: MessageType::INFO,
                 message: format!(
-                    "Parser for '{}' already exists. Loading without reinstall...",
+                    "Parser and queries for '{}' already exist. Loading without reinstall...",
                     language
                 ),
             });
