@@ -95,8 +95,14 @@ Absence is the right answer only for `resolveSupport`. `symbolKind` and
 tells a conformant server to omit tags and to restrict itself to the legacy
 `File`–`Array` kind set — silently degrading results kakehashi's own client
 could have used. So this decision **declares `workspace.symbol` downstream**,
-mirroring the upstream client's `symbolKind` and `tagSupport` while keeping
-`resolveSupport` absent. Mirroring rather than asserting is deliberate:
+mirroring the upstream client's `symbolKind` and `tagSupport`, setting
+`dynamicRegistration: true`, and keeping `resolveSupport` absent.
+
+`dynamicRegistration` is an independent field and needs its own answer, not
+silence. The bridge already records downstream registrations and consults them
+*before* static capabilities, so a server that registers `workspace/symbol`
+dynamically would be usable — but only if it was told it could. Leaving the
+field absent would tell it otherwise and lose those servers entirely. Mirroring rather than asserting is deliberate:
 kakehashi must not accept a kind or tag it cannot pass on.
 
 Exact mirroring has one exception, and it is the legacy spelling again. An
@@ -146,8 +152,8 @@ per-entry global fan-in translator, and a single deduplicating union. Defer
    │             │  3. sort   (uri, start, end,   │
    │             │             name, kind)        │
    │             └───────────────┬────────────────┘
-   │◀── Symbol array ────────────┘
-   │    (element type per client, §5; never null)
+   │◀── SymbolInformation[] ─────┘
+   │    (always; never null — §5)
    │
    │ $/cancelRequest ─▶ forwarded to every in-flight target, best effort:
    │                    a downstream may ignore it (LSP allows this). The
@@ -483,8 +489,8 @@ purge removes exactly those records — so a query arriving between the purge an
 the first replayed `didOpen` discovers no candidate at all and never reaches the
 barrier. The barrier helps once a target is discoverable but not yet replayed;
 before that, the connection is invisible to selection. Both halves have the same
-root cause and the same fix — retaining a connection's admitting policy
-independently of document tracking (point 7) — so neither is patched here.
+root cause, and point 9 names it as a **shipping blocker** rather than
+something this decision patches.
 The barrier is **bounded to two seconds** and enforced with a timeout, and
 awaiting the survivors concurrently costs that bound once for the whole query —
 not once per target.
@@ -619,14 +625,11 @@ coherent semantics:
   which connections survived would vary run to run.
 
 So `max_fan_out` stays a **per-pair name-selection rule** here and bounds
-neither the query's requests nor its connections. That is a real divergence from
-its documented promise to "cap the number of concurrent server requests", and
-the fix is documentation, not a mechanism: the setting's description must say so
-(point 8). What actually bounds the total is the live-connection set (point 7).
-A workspace-level ceiling belongs in a separate setting with its own name and
-semantics rather than smuggled into this one, and is listed as deferred work in
-point 9 rather than left as a vague possibility — this method is the widest
-fan-out kakehashi has, and it is the one the existing guard does not bound.
+neither the query's requests nor its connections. Its documented promise to
+"cap the number of concurrent server requests" therefore does not hold, and the
+setting's description must record that (point 8) — but recording it is not the
+fix. Nothing in this design bounds the query at all, which point 9 names as a
+**shipping blocker**; what closes it is left to the change that implements it.
 
 ```
   open host docs × their open virtual docs    ← concrete languages only,
@@ -1176,42 +1179,32 @@ normalizes to a successful empty vector **before** either array form is parsed.
 Treating it as a parse failure would let a conformant "I found nothing" trip the
 total-failure rule — the exact inversion this rule exists to prevent.
 
-Entries are emitted as `WorkspaceSymbol[]` — `WorkspaceSymbolResponse::Nested`
-in `ls-types`, whose variant names are a misnomer: **both** variants are flat
-arrays, and the choice is the element type, not hierarchy (there is no nested
-form for this method; `containerName` is spec-documented as unusable for
-re-inferring one). `SymbolInformation[]` is the deprecated alternative, emitted only in the
-compatibility case below.
+Entries are emitted as **`SymbolInformation[]`, always** —
+`WorkspaceSymbolResponse::Flat` in `ls-types`, whose variant names are a
+misnomer: **both** variants are flat arrays, and the choice is the element type,
+not hierarchy (there is no nested form for this method, and `containerName` is
+spec-documented as unusable for re-inferring one). No client capability is
+consulted to decide it.
 
-One client capability *does* govern the payload, and it turns out to govern the
-element type too: `workspace.symbol.tagSupport` declares which `SymbolTag`s the
-client accepts, and kakehashi already stores the upstream capabilities.
+`WorkspaceSymbol` earns nothing here. Its one advantage over the older type is
+the location-without-range form, which this design cannot use — every entry must
+carry a full `Location` (point 5) — and its `data` field, which is dropped
+because `workspaceSymbol/resolve` is not supported. What it costs is a shape
+risk: LSP gates the `WorkspaceSymbol[]` result form on
+`workspace.symbol.resolveSupport`, not on tag support, so a client that declares
+tags but not `resolveSupport` could be handed a form it does not accept.
 
-- A client that can represent `SymbolTag::DEPRECATED` gets `WorkspaceSymbol[]`,
-  tags filtered to the set it declared.
-- Every other client gets `SymbolInformation[]`.
+Gating on `tagSupport` instead was drafted and is wrong for exactly that reason.
+It also solved a problem `SymbolInformation` does not have: that type carries
+**both** `tags` and the legacy `deprecated` flag, so a modern client reads the
+tag and an older one reads the field, from one payload, with no branch and
+nothing to reverse. The normalization in point 4 folds an incoming `deprecated`
+into `SymbolTag::DEPRECATED`; on the way out both are populated, and tags are
+filtered to what the client declared.
 
-The discriminator is **representability, not presence**. `tagSupport` cannot be
-tested for existence: the legacy boolean form `tagSupport: true` deserializes to
-`Some(TagSupport { value_set: [] })`, so a client that declares tag support in
-the old spelling would pass a presence check, have every tag filtered away
-against its empty set, and lose deprecation exactly as if it had declared
-nothing. Asking whether `DEPRECATED` survives the filter answers the question
-that actually matters.
-
-The second case is why the element type cannot simply be "always the modern
-one". Point 4 *creates* a tag during normalization, folding the legacy
-`deprecated` flag into `SymbolTag::DEPRECATED` and discarding the original
-field. Emitting `WorkspaceSymbol[]` with tags stripped would therefore destroy
-deprecation outright for exactly the clients too old to read tags.
-
-Choosing the legacy element type is not by itself enough to undo that, because
-the information now lives in a tag. The legacy path must **reverse the
-normalization**: set `deprecated = Some(true)` when the normalized tags contain
-`DEPRECATED`, and drop tags the client cannot represent. Selecting
-`SymbolInformation[]` without that conversion would lose exactly what selecting
-it was meant to preserve. It is bounded: the modern type is used everywhere
-else.
+The cost is using a type the spec marks deprecated. That is the honest trade:
+the deprecated type is the one that is universally accepted and loses no
+information this design produces.
 
 ### 6. Every wait is bounded; the synchronous work between them is not
 
@@ -1437,21 +1430,12 @@ do is specify their mechanisms, for a reason given in Considered Options.
   `workspaceSymbolProvider`. The existing client-progress aggregator is keyed by
   region and has no meaning for a request that has no region. Both tokens are
   optional in LSP 3.18.
-- **A request-wide fan-out ceiling.** `max_fan_out` bounds a pair's name
-  selection, not the query (point 3), so nothing caps how many connections one
-  query touches except how many are live. That is a real gap in a generic load
-  control, and this is the method most able to expose it. The fix is a
-  separately named workspace-level limit — a new user-facing setting, which is
-  why it is deferred rather than decided here.
 - **Request coalescing.** A symbol picker typically fires one request per
   keystroke, and this design has no single-flight, debounce, or supersession —
   each keystroke fans out to every live connection. The repo has prior art for
   exactly this failure mode in the semantic-token and diagnostic wire floods.
   Nothing here prevents it; it is left for a follow-up once real traffic exists
   to measure, and is the most likely first regression.
-- ~~**The respawn re-open window.**~~ Not deferred — see point 3. A connection
-  reaches `Ready` before its virtual documents are replayed, and the barrier is
-  awaited rather than skipped.
 
 ## Considered Options
 
@@ -1566,9 +1550,9 @@ Including it would defeat dedup on a field carrying no identity.
 - Results depend on what is open, and coverage can shrink (close, respawn,
   silent connection death). Closing the last buffer for a language removes its
   server from search even though the process is still running and may still be
-  usefully indexed — the sharpest form of this, and a follow-up rather than a
-  fix here (point 7). The respawn window has the same cause: a purged
-  connection is invisible to selection until its documents are replayed. The same query answers differently at different
+  usefully indexed; the respawn window has the same cause, since a purged
+  connection is invisible to selection until its documents are replayed. Both
+  are **shipping blockers** (point 9), not costs this decision accepts. The same query answers differently at different
   points in a session. LSP permits partial `workspace/symbol` results, but a
   user expecting an indexed whole-project search will find this surprising.
 - Latency is max-over-live-targets, and every *wait* is bounded: the pool's 30s
