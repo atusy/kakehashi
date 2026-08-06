@@ -135,7 +135,6 @@ impl ClientRoot<'_> {
 /// suppressing `X` would not leave that root empty: it would fall through to the
 /// process CWD, trading a location the client named for the launch directory
 /// #742 exists to stop depending on.
-#[allow(deprecated)]
 fn client_root(params: &InitializeParams) -> Option<ClientRoot<'_>> {
     if let Some(folder) = params
         .workspace_folders
@@ -144,6 +143,17 @@ fn client_root(params: &InitializeParams) -> Option<ClientRoot<'_>> {
     {
         return Some(ClientRoot::WorkspaceFolder(&folder.uri));
     }
+    client_root_without_folders(params)
+}
+
+/// The rungs of [`client_root`]'s ladder below `workspaceFolders`.
+///
+/// Split out because the folder list is the one input that changes after
+/// `initialize`: when `workspace/didChangeWorkspaceFolders` empties it, the
+/// session's root is whatever it would have been had the client never sent a
+/// folder, and that is exactly this ladder.
+#[allow(deprecated)]
+fn client_root_without_folders(params: &InitializeParams) -> Option<ClientRoot<'_>> {
     if let Some(uri) = params.root_uri.as_ref() {
         return Some(ClientRoot::RootUri(uri));
     }
@@ -164,6 +174,28 @@ fn config_root_path(root: Option<ClientRoot<'_>>) -> (Option<std::path::PathBuf>
             std::env::current_dir().ok(),
             "current working directory (fallback)",
         ),
+    }
+}
+
+/// Kakehashi's root once the client's folder list has changed: the current first
+/// folder, else `folderless` — the rungs `initialize` resolved below
+/// `workspaceFolders`.
+///
+/// Deliberately **not** [`config_root_path`]: this ladder stops at roots the
+/// client named and never reaches the process CWD. That last rung exists so a
+/// session opened with no workspace at all can still find a configuration; it is
+/// a property of how the server was launched, not of the workspace. Migrating an
+/// established session to the launch directory — where an unrelated
+/// `kakehashi.toml` may name parser libraries to load — is not something closing
+/// a folder should do. A client that named no other root gets no project layer,
+/// which is what it had before it opened the folder.
+pub(super) fn config_root_after_folder_change(
+    folder: Option<&Uri>,
+    folderless: Option<std::path::PathBuf>,
+) -> Option<std::path::PathBuf> {
+    match folder {
+        Some(uri) => ClientRoot::WorkspaceFolder(uri).to_file_path(),
+        None => folderless,
     }
 }
 
@@ -240,7 +272,8 @@ impl Kakehashi {
         params: InitializeParams,
     ) -> Result<InitializeResult> {
         // Reject an unusable `--config-file` before anything from `params` is
-        // latched. Several of the stores below are first-write-wins, and
+        // latched. Several of the stores below are first-write-wins
+        // (`set_capabilities`, `set_folderless_root_path`), and
         // tower-lsp-server resets to `Uninitialized` after an error response,
         // so a client may fix the file and retry: without this, the retry would
         // load the corrected settings while downstream servers kept the failed
@@ -292,6 +325,15 @@ impl Kakehashi {
         // Resolved here, into owned values, because `params.capabilities` is
         // moved into the pool below and that ends any borrow of `params`.
         let (root_path, source) = config_root_path(client_root(&params));
+        // The root a later `didChangeWorkspaceFolders` falls back to once it
+        // empties the folder list. Resolved here because `params` does not
+        // outlive this request, and deliberately without `config_root_path`'s
+        // process-CWD rung: a session that started folderless may load the
+        // launch directory's config, while one that lost its last folder gets
+        // no project layer — see `config_root_after_folder_change`.
+        self.settings_manager.set_folderless_root_path(
+            client_root_without_folders(&params).and_then(|root| root.to_file_path()),
+        );
 
         // Forward root_uri and workspace_folders to bridge pool for downstream server initialization
         let workspace_folders_for_bridge =
@@ -2223,6 +2265,57 @@ mod tests {
             object.insert(key.clone(), field.clone());
         }
         serde_json::from_value(value).expect("valid initialize params")
+    }
+
+    /// The folder-change ladder resolves the current first folder, exactly as
+    /// the handshake resolves `workspaceFolders[0]`.
+    #[test]
+    fn config_root_after_folder_change_uses_the_current_first_folder() {
+        use std::path::PathBuf;
+        use std::str::FromStr as _;
+        let uri = Uri::from_str("file:///current").expect("a file URI");
+
+        assert_eq!(
+            config_root_after_folder_change(Some(&uri), Some(PathBuf::from("/folderless"))),
+            Some(PathBuf::from("/current")),
+            "a folder outranks the folderless fallback",
+        );
+    }
+
+    /// An emptied folder list falls back to the rungs `initialize` resolved
+    /// below `workspaceFolders`, and to nothing when the client named none.
+    #[test]
+    fn config_root_after_folder_change_falls_back_when_no_folder_remains() {
+        use std::path::PathBuf;
+
+        assert_eq!(
+            config_root_after_folder_change(None, Some(PathBuf::from("/folderless"))),
+            Some(PathBuf::from("/folderless")),
+        );
+        assert_eq!(
+            config_root_after_folder_change(None, None),
+            None,
+            "a client that named no other root gets no project layer",
+        );
+    }
+
+    /// The launch directory is a handshake-time last resort, not somewhere a
+    /// folder change may migrate an established session: a folder URI naming no
+    /// file path leaves the session rootless rather than reaching the CWD rung
+    /// that `config_root_path` ends with.
+    #[test]
+    fn config_root_after_folder_change_never_reaches_the_process_cwd() {
+        use std::path::PathBuf;
+        use std::str::FromStr as _;
+        let uri = Uri::from_str("untitled:Untitled-1").expect("a non-file URI");
+
+        assert_eq!(config_root_after_folder_change(Some(&uri), None), None);
+        assert_eq!(
+            config_root_after_folder_change(Some(&uri), Some(PathBuf::from("/folderless"))),
+            None,
+            "an unresolvable folder does not fall through to the folderless rungs \
+             either — the handshake ladder stops at its top rung too",
+        );
     }
 
     #[test]

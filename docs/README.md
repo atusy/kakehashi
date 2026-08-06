@@ -220,6 +220,8 @@ Each `--config-file` layer uses its own directory, so two files that both say `.
 
 The **workspace root** is the first `workspaceFolders` entry, or the deprecated `rootUri`, or — if the client sends neither, or sends a non-`file:` URI — the server's working directory as a last resort. In that last case a client-supplied relative path is launch-directory-dependent after all; send a workspace folder to avoid it.
 
+The root is re-selected the same way whenever the client sends `workspace/didChangeWorkspaceFolders`, and the project `kakehashi.toml` is re-read at the new root. One rung differs there: a folder change never falls back to the working directory. Removing the last folder falls back to `rootUri`, then the deprecated `rootPath`, and otherwise leaves the session with no project layer — closing a folder must not silently adopt the configuration of whichever directory the server happens to have been launched from. A `--config-file` session keeps its config-file stack regardless, since those files are read exactly once.
+
 Resolution is two steps: a relative value is rebased onto its source directory, and then **every** value — rebased or not — goes through the variable and tilde expansion described above.
 
 A value beginning with `/`, `~`, or `$` skips the *rebasing* step only; it already says where it lives, and it is still expanded afterwards. On Windows a rooted path is likewise not rebased, whether it names a drive (`C:\parsers`) or not (`\parsers`, which means the current drive). This covers three cases worth calling out:

@@ -159,6 +159,16 @@ impl Kakehashi {
             }
         };
 
+        // Snapshot read, derivation, and publication must share the same reload
+        // transaction as post-install search-path updates, or either path can
+        // overwrite a concurrent update derived from a stale snapshot. The root
+        // read below is part of that: `didChangeWorkspaceFolders` stores a new
+        // root inside this same transaction, and anchoring against a root read
+        // outside it pins this push to a workspace the session may already have
+        // left — permanently, since anchoring yields absolute paths that no
+        // later reload re-bases.
+        let reload = lock_settings_reload().await;
+
         // A pushed path is workspace-local, matching `initializationOptions`:
         // the client knows the workspace it opened, not the directory the server
         // was launched from. Anchored here, while this push is still a layer of
@@ -172,11 +182,6 @@ impl Kakehashi {
         // previous settings in effect rather than taking the session down.
         let _ =
             crate::config::paths::anchor_settings_paths(&mut parsed, root_path.as_ref().as_deref());
-
-        // Snapshot read, derivation, and publication must share the same reload
-        // transaction as post-install search-path updates, or either path can
-        // overwrite a concurrent update derived from a stale snapshot.
-        let reload = lock_settings_reload().await;
 
         // Merge onto current effective settings (not from scratch).
         // The current settings already reflect defaults < user < project < initializationOptions,
