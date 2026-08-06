@@ -88,6 +88,15 @@ kakehashi sends downstream no `workspace.symbol` client capability at all
 3.18, a conformant downstream must therefore return a full `Location` rather
 than the location-without-range form.
 
+Absence is the right answer only for `resolveSupport`. `symbolKind` and
+`tagSupport` are independent of it, and leaving the whole capability absent
+tells a conformant server to omit tags and to restrict itself to the legacy
+`File`–`Array` kind set — silently degrading results kakehashi's own client
+could have used. So this decision **declares `workspace.symbol` downstream**,
+mirroring the upstream client's `symbolKind` and `tagSupport` while keeping
+`resolveSupport` absent. Mirroring rather than asserting is deliberate:
+kakehashi must not accept a kind or tag it cannot pass on.
+
 Nothing currently advertises the provider: `workspace_symbol_provider` is never
 set in the initialize result, and `LanguageServer::symbol` is never overridden,
 so the request today reaches tower-lsp-server's default and is unimplemented.
@@ -338,12 +347,15 @@ target wait:**
    entries. `connections()` returns the raw map, and `ConnectionState` also has
    `Failed`, `Closing`, and `Closed`, which linger until lazily evicted — none
    of them is a valid target. This is a map read, not a wait.
-2. Apply the per-pair `priorities` allowlist and `max_fan_out` cap to what
+2. Drop `Ready` handles already known to lack `workspace/symbol`. Capability is
+   synchronously knowable for a `Ready` handle; only an `Initializing` one is
+   genuinely unknown, and those are carried forward as unknown.
+3. Apply the per-pair `priorities` allowlist and `max_fan_out` cap to what
    survived. Also synchronous.
-3. Dedup the survivors by **connection key** `(server, root)`.
-4. **Per target, independently**: wait for `Ready`, then check
-   `has_capability("workspace/symbol")` (point 4 explains why the capability
-   check cannot precede the wait), then send.
+4. Dedup the survivors by **connection key** `(server, root)`.
+5. **Per target, independently**: wait for `Ready`, re-check
+   `has_capability("workspace/symbol")` — now knowable for the ones that were
+   `Initializing` — then send.
 
 The cap sits between the two: after the liveness filter, before any waiting.
 Both halves of that placement are load-bearing.
@@ -357,10 +369,20 @@ resolved — up to the full 30 seconds — even though B was ready immediately.
 Deciding membership synchronously and waiting per target removes the
 interaction entirely.
 
-The residual cost is stated rather than engineered away: a target that is
-`Initializing` at selection time consumes a cap slot even if it later turns out
-to lack the capability. Selecting on a fact that is not yet knowable is the
-alternative, and it is worse.
+Step 2 exists because capping first would let a **known-incapable** server take
+a slot from a capable one: with `priorities = [A, B]`, `max_fan_out = 1`, both
+`Ready`, and A incapable, the query would consult nobody. Filtering on what is
+already knowable costs nothing and removes that case entirely.
+
+What remains unknowable is an `Initializing` target, and reserving its slot has
+teeth: `wait_for_ready` can end in timeout, failure, close, or handle
+replacement, and the target may also turn out to lack the capability. With
+`max_fan_out = 1` and `priorities = [initializing_A, ready_B]`, a naive
+reservation would not merely delay B — it would exclude B for the whole query
+and answer empty. So a reserved slot that **dies** is **backfilled**: the
+highest-priority candidate not yet selected takes it. Backfill runs only on that
+failure path, so the common case stays a single synchronous selection, and the
+pathological case degrades to "slower" instead of "empty".
 
 `priorities` is an allowlist: listed servers are candidates, `"*"` stands for
 the rest, and an explicit `[]` remains the per-method kill switch. Its **order**
@@ -408,11 +430,11 @@ set (point 7).
              └────────────┬─────────────┘
                           ▼
         ┌──────────────────────────────────────┐
+        │ SYNCHRONOUS selection — no waiting:  │
         │ 1. keep Ready + Initializing only    │
         │    (NOT Failed/Closing/Closed)       │
-        │ 2. wait for Ready                    │
-        │ 3. THEN has_capability               │
-        │ 4. THEN allowlist + max_fan_out      │
+        │ 2. drop known-incapable Ready handles│
+        │ 3. allowlist + max_fan_out           │
         │    NEVER spawns a connection         │
         └──────────────────┬───────────────────┘
                            ▼
@@ -424,7 +446,8 @@ set (point 7).
         │   (C, rootA)  ← named by LANG_2      │
         └──────────────────┬───────────────────┘
                            ▼
-              one request per connection (§4),
+              THEN per target, independently:
+              wait Ready → re-check capability → send (§4),
               then per-entry fan-in (§5),
               then UNION → dedup → sort (§1)
 ```
@@ -529,9 +552,17 @@ range measured against an older, larger region while offset resolution against
 the current parse still succeeds — and plain range translation performs no
 boundary check, so the result could point into the closing fence or the host
 text after it. `resolve_region_offset` already returns the region's current
-`region_end` alongside the offset; that bound is retained and a translated range
-falling outside it is rejected, the same discipline workspace-edit translation
-already applies.
+`region_end` alongside the offset, but that bound alone is not enough: a stale
+virtual position like `(0, 1000)` inside a region ending on line 5 compares as
+before the end while carrying a column that never existed, and the workspace-edit
+precedent checks only per-line floors and a global endpoint.
+
+Validation therefore runs against the region's **current `virtual_content`**:
+both endpoints must be real positions in that text and the range must be
+correctly ordered — using the existing strict position machinery rather than a
+new comparison — and only then is the range translated and checked against the
+host-side region bound. Validating in virtual coordinates before translating is
+what catches the column case; the host bound catches what survives it.
 
 The range check comes first because `WorkspaceSymbol.location` is
 `OneOf<Location, WorkspaceLocation>` and the `WorkspaceLocation` form carries a
@@ -555,14 +586,33 @@ this method has no target document to name.
 Fan-in therefore runs in **three passes**, not one, over a **request-local
 index** built once up front:
 
-0. Snapshot the tracker's host→virtual map once and build a
+0. **When fan-in begins** — not at fan-out time — snapshot the tracker's
+   host→virtual map once and build a
    `virtual_uri_string → (host_url, region_id)` map for this request.
 1. Classify every entry against that index, **grouping entries by host**. No
    parse and no lock is involved, so nothing waits here.
 2. Ensure the distinct hosts that actually appear, **concurrently**.
 3. Resolve each entry's offset and translate, per group.
 
-Pass 0 is not an optimization. `BridgeCoordinator::resolve_virtual_uri` is
+Pass 0 is built **late, and verified late**, because a single early snapshot
+is wrong in both directions across a wait that can reach a minute.
+
+Too-early **under-reports**: a virtual document opened after the snapshot but
+before the downstream request can legitimately appear in that response, and
+would then be dropped for being absent from a map that predates it. Building the
+index when the first response is in hand removes that whole class.
+
+Staleness in the other direction is worse and survives any snapshot time, so it
+is closed by a check rather than by timing. A region keeps its ULID across
+edits, but its **injection language can change** — the close path removes the old
+virtual URI and a new one is opened for the new language. `resolve_region_offset`
+resolves by host and region id alone and discards the language, so a stale entry
+naming the *old* URI would still resolve, and a Python result would be
+translated into a region that is now Rust. So the indexed URI must **match the
+URI reconstructed from the region's current injection language**; a mismatch is
+a retired document and the entry is dropped.
+
+Pass 0 is also not an optimization. `BridgeCoordinator::resolve_virtual_uri` is
 **not** a map lookup: its own doc comment records that it is "O(N) over open
 virtual docs" — the virtual URI encodes the host *directory* and region id but
 not the host filename, so the host cannot be derived without a scan — and
@@ -635,14 +685,22 @@ form for this method; `containerName` is spec-documented as unusable for
 re-inferring one). `SymbolInformation[]` is the deprecated alternative and is
 not emitted.
 
-One client capability *does* govern the payload, though not the element type:
-`workspace.symbol.tagSupport` declares which `SymbolTag`s the client accepts.
-kakehashi already stores the upstream capabilities, so tags are filtered to the
-declared set and omitted entirely for a client that declares none. This matters
-because the `SymbolInformation` normalization in point 4 *creates* a tag —
-folding the legacy `deprecated` flag into `SymbolTag::DEPRECATED` — so without
-the filter kakehashi would hand a tag-less client a tag it never asked for, and
-the legacy `deprecated` field that client could have understood is gone.
+One client capability *does* govern the payload, and it turns out to govern the
+element type too: `workspace.symbol.tagSupport` declares which `SymbolTag`s the
+client accepts, and kakehashi already stores the upstream capabilities.
+
+- A client **with** `tagSupport` gets `WorkspaceSymbol[]`, tags filtered to the
+  set it declared.
+- A client **without** it gets `SymbolInformation[]`.
+
+The second case is why the element type cannot simply be "always the modern
+one". Point 4 *creates* a tag during normalization, folding the legacy
+`deprecated` flag into `SymbolTag::DEPRECATED`. Emitting `WorkspaceSymbol[]`
+with tags stripped would therefore destroy deprecation outright for exactly the
+clients too old to read tags — while `SymbolInformation.deprecated` is a field
+those clients do understand and that the deprecated element type still carries.
+Emitting the deprecated type for a client that declared no tag support is the
+lesser evil, and it is bounded: the modern type is used everywhere else.
 
 ### 6. Latency is bounded by the pool's timeouts, not by cancellation
 
