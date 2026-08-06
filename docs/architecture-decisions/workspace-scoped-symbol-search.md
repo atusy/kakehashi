@@ -533,14 +533,25 @@ known not to support `workspace/symbol` is still known not to. Its death removes
 no symbol-search coverage, and counting it would turn a legitimate "no matches"
 into an outage on the strength of a server that was never going to answer.
 
-That leaves three cases for a dead candidate, and only the first is silent:
+That leaves two cases for a dead candidate, and only the first is silent:
 
 - **Known incapable** — excluded, exactly as it would be while alive. Not a
   failure.
 - **Known capable** — an infrastructure failure. It would have answered.
-- **Never initialized**, so nothing was ever recorded — an infrastructure
-  failure too. Whether it would have contributed is unknowable, and the whole
-  point of this accounting is that unknown must not read as absent.
+
+There is no third, "never initialized" case, and it is worth saying why rather
+than leaving a reader to wonder. A candidate exists only because a document was
+successfully opened on that connection, and both eager-open paths wait for
+`Ready` and bail on initialization failure *before* recording any document
+state. A handle that never completed its handshake is therefore named by no
+candidate at all — selection cannot see it, so it cannot classify it.
+
+The consequence is a real one and belongs to point 9's first blocker rather than
+to this rule: a workspace whose servers **all failed to start** answers `[]`,
+because coverage is derived from successful document opens and there were none.
+That is the same defect as a connection not outliving its documents, seen from
+the other end — coverage tied to document lifecycle — and it is fixed by
+whatever fixes that.
 
 Recording a dead connection as a failure rather than as a non-candidate is what
 keeps the outcome rule honest. A liveness timeout marks a handle `Failed` in
@@ -737,11 +748,12 @@ return is part of the pattern.
   method reports every server incapable. The arm reads
   `workspace_symbol_provider: Option<OneOf<bool, WorkspaceSymbolOptions>>` in the
   same shape as the existing `textDocument/definition` arm.
-- **A `Ready` handle to read.** It falls back to
-  `server_capabilities()`, which is `None` until `set_server_capabilities` runs
-  during the handshake. Point 3 keeps only `Ready` candidates precisely so this
-  is knowable at selection time — an `Initializing` handle reports every server
-  incapable, which is why it cannot be a candidate.
+- **A completed handshake to read.** It falls back to `server_capabilities()`,
+  which is `None` until `set_server_capabilities` runs — but that is a
+  `OnceLock`, so it stays readable afterwards regardless of state. `Ready` is
+  what *dispatch* requires; capability classification only requires that the
+  handshake happened, which is why point 3 can classify a dead handle and cannot
+  classify an `Initializing` one, where every server would report incapable.
 
 Cancellation needs nothing new **downstream**: `register_upstream_request`
 already holds many `(server, root)` keys per upstream id,
@@ -1185,10 +1197,10 @@ those rather than from whole responses:
   answer was processed; it yielded fewer symbols. These are the silent drops
   points 5 and 7 already accept.
 - **Infrastructure-failed** — never examined at all, so nothing was learned. A
-  candidate **that policy admitted and is not known to be incapable**, whose
-  connection was already `Failed`, `Closing`, or `Closed` at selection (point 3),
-  starts here rather than never existing; one the allowlist, the cap, or a
-  recorded lack of the capability excluded is simply not a candidate. Also: the
+  candidate **that policy admitted and is known to be capable**, whose connection
+  was already `Failed`, `Closing`, or `Closed` at selection (point 3), starts
+  here rather than never existing; one the allowlist, the cap, or a recorded
+  lack of the capability excluded is simply not a candidate. Also: the
   pass-0 host→virtual snapshot, the translation-time identity re-read, or a
   host's `edit_lock` expiring; and, importantly, geometry that is *unsettled*
   rather than gone — a host still parsing, a pass whose 200ms ensure timed out,
@@ -1208,9 +1220,10 @@ a request error, so poisoning is decided per entry and rolled up, never per
 response.
 
 - Selection **completed** and found no candidates → `[]`. Nothing failed; there
-  was nothing to ask. "No candidates" means the admissions named none, or only
-  ones that are still `Initializing` — **not** ones whose connections had died,
-  which are infrastructure failures and fall to the error case below (point 3).
+  was nothing to ask. "No candidates" covers admissions that named none, ones
+  still `Initializing`, and dead ones **known to be incapable** — but not dead
+  ones known to be capable, which are infrastructure failures and fall to the
+  error case below (point 3).
 - **At least one informative** answer → its results, or `[]` if they genuinely
   contained nothing. Partial failure stays soft.
 - Candidates existed and **no answer was informative** — for any reason, at any
@@ -1463,8 +1476,12 @@ do is specify their mechanisms, for a reason given in Considered Options.
   stops being asked, and if it was the only one selected the search goes empty
   with no failure anywhere. The respawn purge window is the same defect seen
   twice: a purged connection is invisible to selection until its documents are
-  replayed. A workspace search that silently narrows when you close a file is
-  not one; whatever mechanism is chosen, this must behave correctly at ship.
+  replayed. The same derivation has a third face: a workspace whose servers
+  **all failed to start** answers `[]` rather than reporting an outage, because
+  coverage comes from successful document opens and there were none. A workspace
+  search that silently narrows when you close a file — or that reports "no
+  matches" when nothing ever started — is not one; whatever mechanism is chosen,
+  this must behave correctly at ship.
 - **`max_fan_out` does not bound this query.** It selects server *names* per
   pair, one name reaches every root it is live on, and a connection one pair
   excluded re-enters through another — so `max_fan_out = 1` can issue many
