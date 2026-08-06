@@ -874,6 +874,14 @@ kakehashi language uninstall lua --force
 kakehashi language uninstall --all --force
 ```
 
+Installing a language is all-or-nothing. The parser, the language's query
+files, and every query file it pulls in through `; inherits:` are prepared
+first, and only made visible once all of them are ready — so a failed install
+(no network, an unsupported language, a compile error) leaves the data
+directory exactly as it was. Re-running the command is always safe and never
+needs `--force`: whatever is already installed is left alone, and only the
+missing pieces are fetched.
+
 ### Configuration Management
 
 ```bash
@@ -1173,9 +1181,10 @@ RUST_LOG=kakehashi::lock_recovery=warn kakehashi
 
 ### Queries not working for TypeScript/JavaScript
 
-These languages use query inheritance. Ensure base queries are installed:
+These languages use query inheritance. Re-run the install to fetch any base
+queries that are missing:
 
 ```bash
-kakehashi language install typescript --force
-# This automatically installs 'ecma' queries
+kakehashi language install typescript
+# This also installs the 'ecma' queries typescript inherits from
 ```
