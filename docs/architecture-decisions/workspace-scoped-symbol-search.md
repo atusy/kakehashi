@@ -294,18 +294,26 @@ Two servers indexing the *identical* root — say two TypeScript servers — are
 genuinely competing rather than complementary, and this decision does make their
 near-duplicate entries survive when their ranges differ.
 
-Overriding `preferred` costs less than it appears to here, because `union`
-already provides the half of it that matters. `preferred`'s value is "use A,
-fall back to B" — and it distinguishes two cases the ADR must not conflate. When
-A **fails or times out**, union covers it: A contributes nothing and B's results
-are in the answer anyway, without anyone having to declare a fallback. What is
-lost is only fallback when A returns **empty**, and that is precisely the
-semantics rejected above: for a search, empty means "no matches", so consulting
-B on it produces results for a query A said had none. The case `preferred` can
-express and `union` cannot is the case it should not express.
+Overriding `preferred` does cost something real, and it should be stated
+plainly rather than argued away: **`union` cannot express conditional fallback
+at all.** `preferred` suppresses B when A answers non-empty and consults B when
+A fails or comes back empty. `union` has no such conditional — with both
+selected it always merges B, and with `priorities` naming only A there is no B
+to fall back to. So a user gets *either* B's duplicates always, *or* no backup;
+not "A normally, B when A has nothing".
 
-What remains is suppressing a redundant server's near-duplicates, and the lever
-for that is `priorities`, which is an allowlist: name only the server you want. That is a
+The trade is accepted because the conditional's remaining half is the one this
+method should not have. Falling back on **failure** is not really needed: a
+failed A contributes nothing and B, if selected, is in the answer regardless.
+Falling back on **empty** is the case `preferred` uniquely provides, and it is
+wrong here — for a search, empty means "no matches", so consulting B on it
+answers a query A already said had none. What is genuinely lost is the
+combination: suppressing B's duplicates while keeping it as a failure backup.
+
+If that combination turns out to matter, it belongs in a mode of its own with a
+name that says what it does, not in `preferred` — whose empty-means-retry
+semantics are the part that must not apply. Until then the lever is
+`priorities`, an allowlist: name only the server you want. That is a
 static, deliberate exclusion the user writes, not an inference kakehashi draws
 from an empty response — which is the distinction that makes it acceptable here
 and `preferred` not. It does cost the user an edit in **every** pair that names
@@ -352,6 +360,20 @@ region's real one.
 `OpenedVirtualDoc` also carries the `connection_key` the document was opened on,
 so the walk can pair each open virtual document with its host document's
 language directly rather than taking a cross product of the two axes.
+
+`_self` needs its **own** source. Host-bridge opens are not `OpenedVirtualDoc`s
+— they live in the pool's `host_documents`, keyed by `(uri, ConnectionKey)` — so
+a host-only document can have a perfectly valid `_self` connection that no
+virtual document names. Deriving `_self` targets from virtual documents would
+therefore either omit host bridging entirely or fall back to expanding a server
+name across roots, recreating the leak point 3 exists to prevent. The
+`(host_language, _self, ConnectionKey)` triples come from `host_documents`
+directly.
+
+That is a second async map, so selection acquires two: the lock order is
+`connections` → `host_documents`, matching the pool's own, and both acquisitions
+fall under point 6's budget rather than the "one acquisition then synchronous
+work" shape the earlier draft assumed.
 
 An entry must be **validated before it contributes**, because the tracker's
 host→virtual map is not an "already open downstream" set: `register_pending_document`
@@ -1220,8 +1242,9 @@ conditional on the method.
 
 **Cold-start every configured server so a query covers languages no open file
 uses.** Rejected, per point 7. It reads like the thorough option, but it buys no
-embedded-block coverage at all, and the real-file coverage it does buy lands on
-the `ClientFallback` root alone. It also cannot answer "does this language even
+embedded-block coverage at all, and the real-file coverage it does buy comes
+from a single fallback connection that receives the client's declared folders
+but none of the marker-derived subroots normal routing would have produced. It also cannot answer "does this language even
 occur in the workspace?" without a workspace file walk the LSP server does not
 have.
 
@@ -1319,12 +1342,14 @@ Including it would defeat dedup on a field carrying no identity.
   notifications carry no acknowledgement and a failed write does not fail the
   connection. The stale-result window is narrowed, not closed (point 5).
 - `max_fan_out` does not bound this method's total fan-out. It selects names
-  per pair, and one name still queries every `Ready`, capable root while a
-  connection excluded by one pair re-enters through another. Its documented
-  promise to cap concurrent server requests does not hold here, which is why
-  the documentation must say so.
+  per pair, and a connection one pair excluded re-enters through another pair
+  that legitimately opened it. Its documented promise to cap concurrent server
+  requests does not hold here, which is why the documentation must say so.
 - The `kakehashi-virtual-uri-*` filename space is reserved: a real workspace
   file named into it is invisible to symbol search (point 5).
+- No configuration can express "suppress B's duplicates, but fall back to B when
+  A fails" — `union` has no conditional and `priorities` is unconditional, so
+  users pick one or the other (point 2).
 - `strategy` becomes a knob that this one method ignores. A **method-specific**
   entry warns; a `_` wildcard that happens to reach the method is overridden
   silently, by design (point 2). Users
