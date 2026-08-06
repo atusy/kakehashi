@@ -225,6 +225,15 @@ The following are **deferred** and intentionally out of scope:
   identically to a push of the same section (see the accumulate contract in
   configuration-merging-strategy), so nothing about the merge is special-cased
   for having been pulled.
+
+  One consequence worth stating for anyone writing an editor integration: a
+  field the client answers with an empty container **clears** the layer below,
+  exactly as the same spelling would in a config file. LSP carries no
+  provenance that distinguishes a value the user authored from a default the
+  extension registered, so an extension that registers `{}` as the default for
+  a setting would clear it for users who configured nothing. Special-casing it
+  is not an option — it would make an intentional clear unspellable through a
+  pull-model editor — so register defaults as absent rather than empty.
 - **`scopeUri` / multi-root resolution**: on the downstream side
   `ConfigurationItem.scopeUri` is ignored — a single per-server `settings`
   value answers all scopes. Upstream, kakehashi asks without a scope on
