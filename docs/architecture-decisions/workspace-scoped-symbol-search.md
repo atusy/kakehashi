@@ -385,40 +385,20 @@ name across roots, recreating the leak point 3 exists to prevent. The
 `(host_language, _self, ConnectionKey)` admission records are therefore written
 at host-open time from `host_documents`' own key, alongside the virtual ones.
 
-That is a second async map, read **under** `connections` by the batch validator
-below rather than snapshotted separately, so selection's acquisitions are the
-tracker snapshot and then `connections`, each falling under point 6's budget —
-not the "one acquisition then synchronous work" shape an earlier draft assumed.
+`host_documents` is read only at *open* time, to write that record — never
+during a query, which is why selection takes `connections` alone.
 
-The two snapshots also have to be **joined safely**. Host language comes from
-the document store, while the exact keys come from pool tracking read later, and
-neither `OpenedVirtualDoc` nor the host-document sync state records the host
-language or its incarnation. A close/reopen — or a language change — between the
-two reads would therefore apply the *new* lifetime's policy to the *old*
-lifetime's downstream opens: precisely the policy-boundary leak this point
-exists to prevent, in transient form. So before a pair contributes, the host
-document's current language and incarnation are re-read and must match what the
-walk assumed; a mismatch drops that pair's contribution rather than guessing
-which lifetime it belonged to.
+Both fields of a record are captured at open time, from the same event, so the
+lifetime-join problem an earlier draft had does not arise: there is no later
+read to disagree with. A `didClose` followed by a reopen under a different
+language simply writes a second record; the first stays until its key does, and
+names a pair the connection genuinely served.
 
-An entry must be **validated before it contributes**, because the tracker's
-host→virtual map is not an "already open downstream" set: `register_pending_document`
-inserts an entry to own its close-cleanup *before* `didOpen` reaches the writer
-FIFO, and only `mark_open_sent` promotes it into the live reverse index. A
-cloned entry can also outlive a connection purge. Taken at face value, the walk
-would derive a pair from a `didOpen` the downstream has not seen, or from a
-replaced connection whose documents were never replayed.
-
-The save path already establishes the discipline this needs, and the ordering
-below follows it: snapshot the tracker, then take `connections` **once** and
-hold it across the checks with no `.await` inside, require the handle to be the
-current `Ready` one, and only then consult `is_virtual_doc_open_on_connection`. Holding `connections` is what makes it
-sound — a reverse-index check alone would not, since a purge could swap in a
-fresh `Ready` handle that never opened the document. The lock order is
-`connections` → tracker, matching the respawn purge. This composes with the
-stale-handle re-check the send already performs (point 4): the enqueue is
-non-blocking, so both happen under the same lock and only the response is
-awaited outside it.
+A record is written **once the `didOpen` is confirmed enqueued**, not when it is
+merely intended. The tracker's own `register_pending_document` /
+`mark_open_sent` split exists for exactly that distinction, and a record written
+on the pending half would claim an admission the downstream may never have
+received.
 
 Candidates for each `(host, injection)` pair then come from the **existing
 routing entry point**, `get_all_configs_for_language`, rather than from a
@@ -459,8 +439,16 @@ final barrier.** The order is fixed:
 3. Apply the per-pair `priorities` allowlist and `max_fan_out` cap to the
    survivors — pure computation, after the lock is released.
 4. Dedup by **connection key** `(server, root)`.
-5. Await `wait_for_pending_reopen` for the survivors, **concurrently**, then
-   send.
+5. Await `wait_for_pending_reopen` for the survivors, **concurrently**, dropping
+   any whose barrier fails.
+6. Apply `workspaceSymbolMaxFanOut` to what is left, then send.
+
+The ceiling comes **after** the barrier, not before, because a cap allocated to
+connections that then fail their barrier wastes its slots: with a ceiling of one
+and a first-ordered connection whose repair fails, the healthy connections below
+it would already have been truncated away and the query would error despite
+having had a sendable target. Capping what is actually sendable avoids needing a
+backfill rule at all.
 
 The validator is **pool-owned** for two reasons. It is the only way to do all of
 this under one acquisition — `launch_config` and its comparator are private to
@@ -644,16 +632,29 @@ per-pair priority list to merge.
 
 As a configuration surface it is `workspaceSymbolMaxFanOut`, a top-level
 `Option<i64>` alongside the existing top-level settings, mirroring
-`max_fan_out`'s own conventions so users meet no new ones: absent or `null` =
-no limit, `0` = disable the method entirely, positive = cap, negative = treated
-as no limit. It merges like every other scalar — a later layer's value replaces
-an earlier one — which means it needs the same raw/resolved field pair, the same
-layered-merge entry, the same default, and the same schema and documentation
-coverage as its neighbours. Naming it here without that inventory would leave an
-implementer unable to expose or reload it consistently.
+`max_fan_out`'s value conventions so users meet no new ones: `0` = disable the
+method entirely, positive = cap, negative = treated as no limit, **absent =
+inherit, defaulting to no limit**.
 
-It applies **after dedup**, to the connection set, and truncates in a **stable
-documented order** rather than by priority — per-pair priorities conflict, and
+"Absent" is deliberately not spelled "`null` clears it". Scalar layers merge
+with `overlay.or(base)`, and serde collapses an absent key and an explicit
+`null` to the same `None`, so a higher layer writing `null` would inherit a
+lower layer's cap rather than remove it. Rather than introduce a presence-aware
+`Option<Option<i64>>` for one setting, `null` is documented as inheritance —
+matching what the merge actually does. Clearing a cap means setting it to a
+negative value.
+
+Adding a top-level key is more than a struct field. It needs the raw/resolved
+field pair, the layered-merge entry, the default, the schema, the user
+documentation — **and registration in `KNOWN_WORKSPACE_SETTING_KEYS`**, which is
+the one an implementer is most likely to miss: `didChangeConfiguration` rejects
+an update containing an unregistered top-level key *before* deserialization, so
+without it the setting would work from a config file and be rejected on live
+reload.
+
+It applies **after dedup and after the reopen barrier**, to the connections that
+are actually sendable, and truncates in a **stable documented order** rather
+than by priority — per-pair priorities conflict, and
 walk order varies run to run. The order is `(server name, root discriminator,
 root path)`: the discriminator is required because `ClientFallback` and `Shared`
 both report no marker root and can coexist for one server, so comparing only the
@@ -685,12 +686,12 @@ iteration order — the nondeterminism this ordering exists to remove.
         │   each pair admits ONLY the conns it │
         │   actually opened — never a name     │
         │   expanded across roots              │
-        │ then workspaceSymbolMaxFanOut, in    │
-        │ (name, root-kind, root) order        │
         └──────────────────┬───────────────────┘
                            ▼
               await the 2s reopen barrier concurrently,
               dropping targets whose repair failed,
+              THEN workspaceSymbolMaxFanOut in
+              (name, root-kind, root) order,
               then send to each survivor (§4),
               then per-entry fan-in (§5),
               then UNION → dedup → sort (§1)
@@ -1185,8 +1186,10 @@ contended host must not turn an answer whose other entries translated fine into
 a request error, so poisoning is decided per entry and rolled up, never per
 response.
 
-- Selection **completed** and found no candidates → `[]`. Nothing failed; there
-  was nothing to ask.
+- Selection **completed** and found no candidates, or the method is **disabled**
+  (`workspaceSymbolMaxFanOut = 0`, or every pair's `priorities` is `[]`) → `[]`.
+  Nothing failed; there was nothing to ask, or the user asked for nothing. A
+  deliberate disable must not surface as an error.
 - **At least one informative** answer → its results, or `[]` if they genuinely
   contained nothing. Partial failure stays soft.
 - Candidates existed and **no answer was informative** — for any reason, at any
@@ -1354,20 +1357,34 @@ removed only when the key itself goes away. Candidates come from these records
 instead of from live document tracking, and the tracker is consulted only for
 things that genuinely are about documents.
 
-Keying on `ConnectionKey` rather than on a handle is what makes them survive
-both events that motivated this. A `didClose` does not touch them. Neither does
-a respawn: the replacement serves the same `(server, root)` under the same
-configuration, so the pairs that admitted its predecessor admit it too — that
-is not stale inheritance but the correct answer. An earlier draft stamped
-records with the connection generation to prevent exactly that inheritance,
-which was solving a problem that does not exist; the reopen barrier, not a
-generation check, is what handles a replacement whose documents are not yet
-replayed.
+Keying on `ConnectionKey` rather than on a handle is what makes them survive a
+`didClose`, which does not touch them, and a **failure respawn**, where the
+replacement serves the same `(server, root)` under the same configuration and
+so is admitted by the pairs that admitted its predecessor. That is not stale
+inheritance but the correct answer, and an earlier draft's generation stamp —
+added to prevent exactly that inheritance — was solving a problem that does not
+exist. The reopen barrier, not a generation check, handles a replacement whose
+documents are not yet replayed.
+
+Survival must be **reason-aware**, though, because the pool removes the same key
+for three different reasons and only one of them preserves meaning:
+
+- **Failure respawn** — the process died and is being replaced with an
+  equivalent one. Records survive; this is the case the whole mechanism exists
+  for.
+- **Configuration change or removal** — the server's spawn-time config changed,
+  or it left the config entirely. Records are **cleared**: the pairs that
+  admitted the old executable say nothing about a differently-configured one.
+- **Client workspace invalidation, or a changed client root under
+  `ClientFallback`** — that key is reused across workspaces, so retaining
+  records would transfer one workspace's admissions into another. **Cleared.**
+
+Clearing on every removal would break respawn survival; retaining on every
+removal would leak admissions into a reconfigured server or a different
+workspace. Neither is safe, so the removal reason has to reach the records.
 
 The records stay concrete because each was created from a real open document
-(point 3's requirement). They are removed when their `ConnectionKey` is — a
-server dropped from configuration, or a root that no longer resolves — so a
-long-lived session does not accumulate keys for servers it no longer has.
+(point 3's requirement).
 
 Their size is bounded by **distinct `(host_language, injection_language)` pairs
 per key**, not by session history. That is small for ordinary configurations,
