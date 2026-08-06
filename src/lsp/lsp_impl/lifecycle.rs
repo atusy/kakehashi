@@ -272,7 +272,8 @@ impl Kakehashi {
         params: InitializeParams,
     ) -> Result<InitializeResult> {
         // Reject an unusable `--config-file` before anything from `params` is
-        // latched. Several of the stores below are first-write-wins, and
+        // latched. Several of the stores below are first-write-wins
+        // (`set_capabilities`, `set_folderless_root_path`), and
         // tower-lsp-server resets to `Uninitialized` after an error response,
         // so a client may fix the file and retry: without this, the retry would
         // load the corrected settings while downstream servers kept the failed

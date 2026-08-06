@@ -102,7 +102,11 @@ walk as a parameter.
 
 Bases per layer: a config file uses its own directory (each `--config-file`
 layer its own), `initializationOptions` and `didChangeConfiguration` use the
-initialized workspace root, and the programmed defaults have no base.
+workspace root, and the programmed defaults have no base. That root is not
+fixed at initialize: `workspace/didChangeWorkspaceFolders` re-selects it from
+the current folder list. A layer anchored earlier keeps the root it was
+anchored to, because anchoring yields absolute paths and is idempotent — see
+#948.
 
 Resolution is therefore two distinct steps, in this order:
 
