@@ -175,14 +175,33 @@ a full-declaration span versus a name-only span — produce two entries that bot
 survive. That is a real limit of the mechanism, not something the strategy
 promises away.
 
-Adding the variant is not free: `AggregationStrategy` is matched exhaustively,
-with no wildcard arm, at 7 `match` sites across `lsp_impl/bridge_context.rs`,
-`text_document/formatting.rs`, `text_document/code_action.rs`, and
-`text_document/diagnostic.rs`. Each must gain a `Union` arm, and none of those
-methods has a response shape `Union`'s key tuple applies to. Those arms
-therefore fall back to each site's existing `Concatenated` behavior: `Union` is
-meaningful for `workspace/symbol` and for nothing else. It is a named strategy,
-not a generally useful one.
+When two entries *do* collide, the survivor's non-key fields are **merged by
+rule**, not taken from whichever arrived first — otherwise the payload would
+still vary with `JoinSet` completion order even though its ordering does not.
+`tags` are unioned and sorted; `container_name` takes the lexicographically
+smallest `Some`, or `None` if no entry carried one; `data` is **dropped
+entirely**, since it is server-private state whose only purpose is
+`workspaceSymbol/resolve`, which this decision does not support.
+
+`Union` is **normalized away at resolution time** for every other method:
+`resolve_aggregation` yields `Union` only for `workspace/symbol`, and a `Union`
+configured anywhere else resolves to that method's existing default before any
+handler sees it. The same normalization applies to `LayerAggregationConfig`,
+which shares this enum.
+
+Normalizing at the single resolution point — rather than adding behavior at each
+consumer — is not a style preference. `AggregationStrategy` is matched
+exhaustively at 7 sites, but `plan_region_format` does **not** match: it tests
+`strategy != Concatenated` and treats everything else as `Preferred`. So a
+`Union` that reached the handlers would mean `Concatenated` at the exhaustive
+sites and `Preferred` inside formatting — one configured value with two
+behaviors in the same method. And because a method-level `"_"` entry resolves
+into every method, `_ = union` is a configuration a user can plausibly write,
+so this is reachable, not hypothetical.
+
+The exhaustive sites still need a `Union` arm to compile; with normalization in
+front of them it is unreachable, and each site should say so rather than invent
+a behavior. `Union` is meaningful for `workspace/symbol` and nothing else.
 
 `workspace/symbol` does not go through the cross-layer walk at all — there are
 no layers without a document — so only the bridge-level default matters.
@@ -239,18 +258,45 @@ the unwanted server, because fan-out unions candidates across all pairs.
 ### 3. Fan-out: live connections first, then the configuration filter
 
 A request has no document, so it cannot pick one `(host_language, bridge_key)`
-pair — it walks **all** of them, purely to collect candidates.
+pair — it walks **all** of them, purely to collect candidates. Both axes must be
+**concrete**, and neither is the config map's raw key set.
 
-The walk mirrors `concatenated_formatting_pairs`, including the part that is
-easy to miss: each bridge key must be resolved through
-`resolve_with_wildcard(bridge_map, key, merge_bridge_language_configs)` before
-`resolve_aggregation(method)`, so that `priorities` / `strategy` /
-`max_fan_out` set only on the `bridge._` wildcard still apply to a concrete
-pair. Without that step the "no existing configuration becomes a silent no-op"
-property this decision claims would not hold. The literal `"_"` key is itself
-present in `bridge_map` for essentially every deployment (the shipped defaults
-populate `languages._.bridge._`); it is walked like any other key, which is
-idempotent under the self-merge and contributes the wildcard's own candidates.
+`"_"` is a configuration **template**, never a target. Everywhere else in
+kakehashi it is resolved *against an actual language*:
+`is_language_bridgeable("python")` merges `_` into `python`, and servers are
+then selected by whether they handle `python`. Walking `bridge_map.keys()`
+literally would ask for the servers that handle a language named `_` — and
+because the shipped defaults populate only `languages._.bridge._`, the default
+configuration would contribute **no candidates at all**. Treating `_` instead as
+"every server" is worse: it would re-admit servers that a concrete
+`bridge.python.enabled = false` or `priorities = []` excluded, and union has no
+way to subtract that contribution.
+
+So the axes are:
+
+- **Host languages**: the languages of the **currently open documents**. This is
+  concrete by construction (it comes from language detection, never from a map
+  key), and it is the right set for the same reason the whole method is
+  live-only — virtual documents, and therefore downstream connections, exist
+  only for documents the client has opened.
+- **Injection languages**: the concrete (non-`_`) bridge keys under those host
+  languages, plus `_self`, plus the languages configured servers declare in
+  `languages = [...]`. A `languages = ["*"]` server needs no entry of its own:
+  it is admitted for every concrete language by the normal routing check.
+
+Candidates for each `(host, injection)` pair then come from the **existing
+routing entry point**, `get_all_configs_for_language`, rather than from a
+hand-rolled lookup. That function already applies the `is_language_bridgeable`
+gate — with `_` inheritance — and already selects servers by whether they handle
+the injection language, so reusing it is what keeps this method's routing
+identical to every other method's. `_self` goes through the host tier's own
+gate instead (`is_host_bridging_enabled`), which is opt-in and direct, unlike
+the opt-out, wildcard-resolved gate beside it.
+
+`priorities` / `strategy` / `max_fan_out` are read with
+`resolve_aggregation(method)` on the wildcard-resolved bridge config, so values
+set only on `bridge._` still apply to a concrete pair — the property that keeps
+existing configuration from becoming a silent no-op here.
 
 **Order matters, and it is liveness first:**
 
@@ -278,12 +324,10 @@ a **direct** lookup with no wildcard fallback, unlike the aggregation fields
 beside it, so a `bridge._self.aggregation` block without `enabled` contributes
 nothing at all.
 
-Every **other** bridge key needs the sibling gate, `is_language_bridgeable`,
-which resolves `enabled` through the wildcard and defaults to `true`. The two
-gates are deliberately asymmetric — host bridging is opt-in, injection bridging
-is opt-out — and the walk must apply the right one per key, or a pair the user
-switched off with `bridge.<key>.enabled = false` would still contribute
-candidates here while contributing to no other bridged method.
+Every **other** bridge key is gated by `is_language_bridgeable`, which resolves
+`enabled` through the wildcard and defaults to `true` — and which
+`get_all_configs_for_language` already applies, which is the main reason to
+route through it rather than re-deriving the gates.
 
 Dedup is by connection key, not server name: the response depends on the
 connection's own indexed workspace, so a connection named by several pairs is
@@ -437,25 +481,32 @@ parse, and `didChange` clears the tree and reparses off-ingress, so during the
 reparse window it returns `None` for every region of the edited document — which
 this classifier would silently turn into "no embedded symbols". The
 whole-document handlers avoid this by calling `ensure_document_parsed` first;
-this method has no target document to name. It therefore pre-warms **every open
-host document** before consuming responses, enumerated via
-`DocumentStore::open_uris()` — which holds host URIs only, so formatting's
-scratch documents are not in the set.
+this method has no target document to name.
 
-The sweep is **concurrent**, one `JoinSet` task per document, matching the
-diagnostic publisher's shape rather than the serial shared-budget sweep in
-`lifecycle.rs`, and it is issued alongside the fan-out requests so it overlaps
-them.
+It therefore ensures **lazily, at translation time**: as entries are classified,
+each distinct `host_url` they resolve to is ensured once, immediately before its
+entries are translated. Doing this up front instead — a sweep over every open
+document, issued alongside the fan-out — was the first shape considered and is
+worse on both axes. It does work for documents no result mentions, and, more
+importantly, it completes up to 30 seconds before the value is used (a target
+may take the full response timeout), so an edit arriving in between re-clears
+the tree and the sweep guarantees nothing. Ensuring next to the use closes that
+gap to the width of one classification step.
 
-It pre-warms only documents that **already have a snapshot**. That is not an
-optimization but a correctness-preserving bound: `ensure_document_parsed` asks
-for a 200ms wait, but `wait_for_current_snapshot` escalates to the 15-second
-`FIRST_PARSE_BACKSTOP` when no snapshot exists at all, regardless of the
-caller's wait — so a sweep that included never-parsed documents could block a
-query for 15 seconds. Skipping them loses nothing: a document that has never
-been parsed has no resolved injection regions, hence no virtual documents opened
-downstream, hence no result can address it. The reparse window this pre-warm
-exists for is by definition a document that has a snapshot and a cleared tree.
+Only documents that **already have a snapshot** are ensured. `ensure_document_parsed`
+asks for a 200ms wait, but `wait_for_current_snapshot` escalates to the
+15-second `FIRST_PARSE_BACKSTOP` when no snapshot exists at all, regardless of
+the caller's wait. Skipping them loses nothing: a never-parsed document has no
+resolved injection regions, hence no virtual documents downstream, hence no
+result can address it.
+
+A residual race remains and is **accepted**: a `didChange` landing between the
+ensure and the offset resolution clears the tree again, and that entry is
+dropped like any other unresolvable one. Closing it entirely would mean pinning
+a per-document snapshot generation across the whole fan-in and resolving against
+the pinned tree — which would translate results against text the client has
+already replaced. Dropping is the safer failure, and it self-corrects on the
+next query.
 
 The response to the client is always an **array**, never `null`, so "no server
 was running", "everything was dropped", and "every target errored or timed out"
@@ -667,10 +718,11 @@ Including it would defeat dedup on a field carrying no identity.
   request timeout and liveness timeout; forwarded cancellation is best-effort
   because a downstream may ignore it.
 - One request per keystroke, un-coalesced (point 9).
-- Every query pre-warms the parse of every open host document (point 5). The
-  sweep is concurrent and each task carries the existing 200ms bound, but it is
-  per-query work that scales with the number of open documents, and it compounds
-  with the un-coalesced fan-out above.
+- Fan-in can wait on a parse: each distinct host document a result addresses is
+  ensured before translation, up to 200ms each (point 5).
+- An edit landing between that ensure and the offset resolution still drops the
+  affected entries. The window is small but not closed, and the failure is
+  silent — the symbols simply are not there.
 - `max_fan_out` no longer bounds a query's total fan-out — only each pair's
   contribution — so the only real bound on how many connections one query
   touches is how many are live.
