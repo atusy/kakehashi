@@ -2491,7 +2491,7 @@ impl LanguageServerPool {
         }
 
         // Spawn new connection (while holding lock to prevent concurrent spawns)
-        let mut conn = AsyncBridgeConnection::spawn(server_config.cmd.clone()).await?;
+        let mut conn = AsyncBridgeConnection::spawn(server_config.cmd().to_vec()).await?;
 
         // Split connection immediately
         let (writer, reader) = conn.split();
@@ -4213,12 +4213,12 @@ mod tests {
 
         // First attempt with unresponsive server - should timeout
         let unresponsive_config = BridgeServerConfig {
-            cmd: vec![
+            cmd: Some(vec![
                 "sh".to_string(),
                 "-c".to_string(),
                 "cat > /dev/null".to_string(),
-            ],
-            languages: vec!["lua".to_string()],
+            ]),
+            languages: Some(vec!["lua".to_string()]),
             initialization_options: None,
             workspace_markers: None,
             on_type_formatting_triggers: None,
@@ -5015,7 +5015,7 @@ mod tests {
         // Changed `cmd`: the live process was spawned from a superseded config,
         // so the fast path must miss and let the caller respawn.
         let mut changed = config.clone();
-        changed.cmd = vec!["sh".to_string(), "-c".to_string(), "true".to_string()];
+        changed.cmd = Some(vec!["sh".to_string(), "-c".to_string(), "true".to_string()]);
         assert!(
             pool.ready_connection_by_key_for_config(&key, Some(&changed))
                 .await
@@ -7722,8 +7722,8 @@ mod tests {
 
         pool.propagate_settings(|_| {
             Some(crate::config::settings::BridgeServerConfig {
-                cmd: vec!["ruff".to_string()],
-                languages: vec!["*".to_string()],
+                cmd: Some(vec!["ruff".to_string()]),
+                languages: Some(vec!["*".to_string()]),
                 enabled: Some(false),
                 ..Default::default()
             })
@@ -7761,8 +7761,8 @@ mod tests {
         // correctly retire, and the test would pass for the wrong reason.
         pool.propagate_settings(|_| {
             Some(crate::config::settings::BridgeServerConfig {
-                cmd: vec!["ruff".to_string()],
-                languages: vec!["*".to_string()],
+                cmd: Some(vec!["ruff".to_string()]),
+                languages: Some(vec!["*".to_string()]),
                 ..Default::default()
             })
         })
@@ -7788,15 +7788,15 @@ mod tests {
         let unchanged = create_handle_with_key(ConnectionState::Ready, unchanged_key.clone()).await;
 
         let old_changed = BridgeServerConfig {
-            cmd: vec!["old-server".into()],
+            cmd: Some(vec!["old-server".into()]),
             ..Default::default()
         };
         let old_removed = BridgeServerConfig {
-            cmd: vec!["removed-server".into()],
+            cmd: Some(vec!["removed-server".into()]),
             ..Default::default()
         };
         let stable = BridgeServerConfig {
-            cmd: vec!["stable-server".into()],
+            cmd: Some(vec!["stable-server".into()]),
             ..Default::default()
         };
         changed.record_launch_config(&old_changed);
@@ -7812,7 +7812,7 @@ mod tests {
         let stable_for_resolve = stable.clone();
         pool.propagate_settings(move |name| match name {
             "changed" => Some(BridgeServerConfig {
-                cmd: vec!["new-server".into()],
+                cmd: Some(vec!["new-server".into()]),
                 ..Default::default()
             }),
             "removed" => None,

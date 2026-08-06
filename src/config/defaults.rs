@@ -83,8 +83,8 @@ fn default_language_servers() -> HashMap<String, BridgeServerConfig> {
     HashMap::from([(
         WILDCARD_KEY.to_string(),
         BridgeServerConfig {
-            cmd: vec![],
-            languages: vec![],
+            cmd: None,
+            languages: None,
             initialization_options: None,
             workspace_markers: Some(vec![RootMarker::Single(".git".to_string())]),
             on_type_formatting_triggers: None,
@@ -502,7 +502,7 @@ mod tests {
             Some(vec![RootMarker::Single(".git".to_string())])
         );
         assert!(
-            wildcard.cmd.is_empty() && wildcard.languages.is_empty(),
+            wildcard.cmd().is_empty() && wildcard.languages().is_empty(),
             "the wildcard entry is defaults-only, not a spawnable server"
         );
 

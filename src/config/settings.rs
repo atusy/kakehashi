@@ -369,21 +369,21 @@ impl RootMarker {
 pub struct BridgeServerConfig {
     /// Command array: first element is the program, rest are arguments
     /// e.g., ["rust-analyzer"] or ["pyright-langserver", "--stdio"].
-    /// Optional so a wildcard `_` entry can carry defaults only; a concrete
-    /// server whose resolved cmd is still empty is skipped at lookup.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub cmd: Vec<String>,
+    /// Omit to inherit the `_` wildcard's command; write `[]` to say this
+    /// server has none, which skips it at lookup.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cmd: Option<Vec<String>>,
     /// Languages this server handles (e.g., ["rust"], ["python"]). The element
     /// `"*"` matches every language, for servers not tied to one.
-    /// Optional for the same wildcard-defaults reason as `cmd`; a server
-    /// with no languages never matches a lookup.
+    /// Omit to inherit the `_` wildcard's list; write `[]` to say this server
+    /// handles none, which never matches a lookup.
     // Doc comments on this struct are user-facing: they become the `config
     // schema` output an editor shows on hover. Keep them free of rustdoc
     // intra-doc links and implementor notes — match through
     // `handles_language`, never by comparing elements directly, so that `"*"`
     // is honored everywhere.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub languages: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub languages: Option<Vec<String>>,
     /// Optional initialization options to pass to the server during initialize
     pub initialization_options: Option<Value>,
     /// Optional workspace settings for the server, propagated *after*
@@ -483,9 +483,22 @@ impl BridgeServerConfig {
     /// candidates. On the host axis a candidate is still not consent — that
     /// path stays gated on the explicit `bridge._self.enabled = true` opt-in.
     pub(crate) fn handles_language(&self, language: &str) -> bool {
-        self.languages
+        self.languages()
             .iter()
             .any(|l| l == language || l == LANGUAGES_WILDCARD)
+    }
+
+    /// The command this config names — empty when it names none, whether by
+    /// omitting the key or by writing `[]`. Callers that need to tell those
+    /// apart resolve wildcard inheritance first; see
+    /// [`Self::is_spawnable_with_wildcard`].
+    pub(crate) fn cmd(&self) -> &[String] {
+        self.cmd.as_deref().unwrap_or_default()
+    }
+
+    /// The languages this config names, on the same terms as [`Self::cmd`].
+    pub(crate) fn languages(&self) -> &[String] {
+        self.languages.as_deref().unwrap_or_default()
     }
 
     /// A resolved config is a real, usable server: it has a command to run
@@ -493,20 +506,22 @@ impl BridgeServerConfig {
     /// (spawn-resolution, capability advertisement, resolve-dispatch) should
     /// share this single predicate rather than re-deriving it.
     pub(crate) fn is_spawnable(&self) -> bool {
-        !self.cmd.is_empty() && self.is_enabled()
+        !self.cmd().is_empty() && self.is_enabled()
     }
 
     /// The `languages` list that actually applies, resolving `_` inheritance
     /// against an already-looked-up `wildcard`.
     ///
-    /// `languages` is `#[serde(default)]`, so a server that omits the key
-    /// inherits the `_` template's list (wildcard-config-inheritance) — its own
-    /// list reads as EMPTY until that merge happens. A caller that reads
-    /// `languages` directly to decide "which languages can this server serve"
-    /// therefore sees nothing for a server that may serve everything.
-    /// Merging the whole config to find out costs a clone per server, so this
-    /// mirrors [`Self::is_spawnable_with_wildcard`]: resolve just this field,
-    /// and let a loop hoist the `_` lookup.
+    /// A server that OMITS `languages` inherits the `_` template's list
+    /// (wildcard-config-inheritance) — its own list reads as absent until that
+    /// merge happens. A caller that reads the field directly to decide "which
+    /// languages can this server serve" therefore sees nothing for a server
+    /// that may serve everything. Merging the whole config to find out costs a
+    /// clone per server, so this mirrors [`Self::is_spawnable_with_wildcard`]:
+    /// resolve just this field, and let a loop hoist the `_` lookup.
+    ///
+    /// A server that WRITES an empty list has said it handles nothing, and
+    /// does not inherit — the same empty-means-clear rule the merge applies.
     ///
     /// Replace-not-union, matching `merge_bridge_server_configs`: a server that
     /// declares its own list has overridden the template.
@@ -514,10 +529,9 @@ impl BridgeServerConfig {
         &'a self,
         wildcard: Option<&'a Self>,
     ) -> &'a [String] {
-        if self.languages.is_empty() {
-            wildcard.map(|w| w.languages.as_slice()).unwrap_or_default()
-        } else {
-            self.languages.as_slice()
+        match self.languages.as_deref() {
+            Some(languages) => languages,
+            None => wildcard.map(Self::languages).unwrap_or_default(),
         }
     }
 
@@ -527,7 +541,12 @@ impl BridgeServerConfig {
     /// and loops over every configured server) that can hoist the wildcard
     /// lookup out of a loop instead of repeating it per server.
     pub(crate) fn is_spawnable_with_wildcard(&self, wildcard: Option<&Self>) -> bool {
-        let cmd_non_empty = !self.cmd.is_empty() || wildcard.is_some_and(|w| !w.cmd.is_empty());
+        // An omitted cmd inherits the wildcard's; an explicitly empty one does
+        // not, so the server stays unspawnable however the template is set.
+        let cmd_non_empty = match self.cmd.as_deref() {
+            Some(cmd) => !cmd.is_empty(),
+            None => wildcard.is_some_and(|w| !w.cmd().is_empty()),
+        };
         let enabled = self
             .enabled
             .or(wildcard.and_then(|w| w.enabled))
@@ -1597,8 +1616,8 @@ mod tests {
         // Empty is already spoken for ("inherit from `_`"), so the wildcard
         // element is the only shape that can *widen* an inherited list.
         let server = BridgeServerConfig {
-            cmd: vec!["harper-ls".to_string()],
-            languages: vec![LANGUAGES_WILDCARD.to_string()],
+            cmd: Some(vec!["harper-ls".to_string()]),
+            languages: Some(vec![LANGUAGES_WILDCARD.to_string()]),
             ..Default::default()
         };
 
@@ -1612,8 +1631,8 @@ mod tests {
         // Membership has no ordering, so a named entry alongside `"*"` is
         // redundant rather than restrictive.
         let server = BridgeServerConfig {
-            cmd: vec!["harper-ls".to_string()],
-            languages: vec!["rust".to_string(), LANGUAGES_WILDCARD.to_string()],
+            cmd: Some(vec!["harper-ls".to_string()]),
+            languages: Some(vec!["rust".to_string(), LANGUAGES_WILDCARD.to_string()]),
             ..Default::default()
         };
 
@@ -1624,8 +1643,8 @@ mod tests {
     #[test]
     fn explicit_languages_list_matches_only_listed_languages() {
         let server = BridgeServerConfig {
-            cmd: vec!["rust-analyzer".to_string()],
-            languages: vec!["rust".to_string()],
+            cmd: Some(vec!["rust-analyzer".to_string()]),
+            languages: Some(vec!["rust".to_string()]),
             ..Default::default()
         };
 
@@ -1639,8 +1658,8 @@ mod tests {
         // A `.contains('*')`-style implementation would pass every other test
         // in this file, so pin the narrower contract explicitly.
         let server = BridgeServerConfig {
-            cmd: vec!["tsgo".to_string()],
-            languages: vec!["ts*".to_string()],
+            cmd: Some(vec!["tsgo".to_string()]),
+            languages: Some(vec!["ts*".to_string()]),
             ..Default::default()
         };
 
@@ -1656,8 +1675,8 @@ mod tests {
     fn empty_languages_matches_nothing() {
         // An unresolved (still-inheriting) config must not become "any".
         let server = BridgeServerConfig {
-            cmd: vec!["rust-analyzer".to_string()],
-            languages: vec![],
+            cmd: Some(vec!["rust-analyzer".to_string()]),
+            languages: None,
             ..Default::default()
         };
 
@@ -1679,14 +1698,14 @@ mod tests {
         let config: BridgeServerConfig = serde_json::from_str(config_json).unwrap();
 
         assert_eq!(
-            config.cmd,
-            vec![
+            config.cmd(),
+            [
                 "rust-analyzer".to_string(),
                 "--log-file".to_string(),
                 "/tmp/ra.log".to_string()
             ]
         );
-        assert_eq!(config.languages, vec!["rust".to_string()]);
+        assert_eq!(config.languages(), ["rust".to_string()]);
         assert!(config.initialization_options.is_some());
         let init_opts = config.initialization_options.unwrap();
         assert!(init_opts.get("linkedProjects").is_some());
@@ -1702,8 +1721,8 @@ mod tests {
 
         let config: BridgeServerConfig = serde_json::from_str(config_json).unwrap();
 
-        assert_eq!(config.cmd, vec!["pyright".to_string()]);
-        assert_eq!(config.languages, vec!["python".to_string()]);
+        assert_eq!(config.cmd(), ["pyright".to_string()]);
+        assert_eq!(config.languages(), ["python".to_string()]);
         assert!(config.initialization_options.is_none());
     }
 
@@ -1866,9 +1885,9 @@ mod tests {
 
     #[test]
     fn is_spawnable_with_wildcard_resolves_cmd_and_enabled_inheritance() {
-        let server = |cmd: Vec<&str>, enabled: Option<bool>| BridgeServerConfig {
-            cmd: cmd.into_iter().map(String::from).collect(),
-            languages: vec![],
+        let server = |cmd: Option<Vec<&str>>, enabled: Option<bool>| BridgeServerConfig {
+            cmd: cmd.map(|cmd| cmd.into_iter().map(String::from).collect()),
+            languages: None,
             initialization_options: None,
             workspace_markers: None,
             on_type_formatting_triggers: None,
@@ -1878,19 +1897,26 @@ mod tests {
         };
 
         // Own cmd and enabled, no wildcard needed.
-        assert!(server(vec!["x"], Some(true)).is_spawnable_with_wildcard(None));
+        assert!(server(Some(vec!["x"]), Some(true)).is_spawnable_with_wildcard(None));
 
-        // cmd inherited from the wildcard.
-        let wildcard = server(vec!["shared-ls"], None);
-        assert!(server(vec![], None).is_spawnable_with_wildcard(Some(&wildcard)));
+        // cmd inherited from the wildcard by OMITTING it.
+        let wildcard = server(Some(vec!["shared-ls"]), None);
+        assert!(server(None, None).is_spawnable_with_wildcard(Some(&wildcard)));
+
+        // An explicitly empty cmd is a statement, not an omission: it does not
+        // inherit, so the wildcard's command cannot make the server spawnable.
+        assert!(!server(Some(vec![]), None).is_spawnable_with_wildcard(Some(&wildcard)));
 
         // enabled inherited (disabled) from the wildcard.
-        let disabling_wildcard = server(vec![], Some(false));
-        assert!(!server(vec!["x"], None).is_spawnable_with_wildcard(Some(&disabling_wildcard)));
+        let disabling_wildcard = server(None, Some(false));
+        assert!(
+            !server(Some(vec!["x"]), None).is_spawnable_with_wildcard(Some(&disabling_wildcard))
+        );
 
         // Own enabled: true overrides a disabling wildcard.
         assert!(
-            server(vec!["x"], Some(true)).is_spawnable_with_wildcard(Some(&disabling_wildcard))
+            server(Some(vec!["x"]), Some(true))
+                .is_spawnable_with_wildcard(Some(&disabling_wildcard))
         );
     }
 
@@ -1984,8 +2010,8 @@ mod tests {
     #[test]
     fn on_type_formatting_trigger_union_is_sorted_and_deduped() {
         let server = |triggers: Option<Vec<&str>>| BridgeServerConfig {
-            cmd: vec!["x".to_string()],
-            languages: vec![],
+            cmd: Some(vec!["x".to_string()]),
+            languages: None,
             initialization_options: None,
             workspace_markers: None,
             on_type_formatting_triggers: triggers
@@ -2023,8 +2049,8 @@ mod tests {
     #[test]
     fn on_type_formatting_trigger_union_excludes_disabled_server() {
         let server = |triggers: Option<Vec<&str>>, enabled: Option<bool>| BridgeServerConfig {
-            cmd: vec!["x".to_string()],
-            languages: vec![],
+            cmd: Some(vec!["x".to_string()]),
+            languages: None,
             initialization_options: None,
             workspace_markers: None,
             on_type_formatting_triggers: triggers
@@ -2108,8 +2134,8 @@ mod tests {
         let servers = HashMap::from([(
             "tsgo".to_string(),
             BridgeServerConfig {
-                cmd: vec![],
-                languages: vec![],
+                cmd: None,
+                languages: None,
                 initialization_options: None,
                 workspace_markers: None,
                 on_type_formatting_triggers: Some(vec![";".to_string()]),
@@ -2131,8 +2157,8 @@ mod tests {
         let servers = HashMap::from([(
             "a".to_string(),
             BridgeServerConfig {
-                cmd: vec!["x".to_string()],
-                languages: vec![],
+                cmd: Some(vec!["x".to_string()]),
+                languages: None,
                 initialization_options: None,
                 workspace_markers: None,
                 on_type_formatting_triggers: Some(vec![String::new()]),
@@ -2174,8 +2200,8 @@ mod tests {
         let settings: RawWorkspaceSettings = toml::from_str(toml_str).unwrap();
         let servers = settings.language_servers.unwrap();
         let wildcard = &servers["_"];
-        assert!(wildcard.cmd.is_empty());
-        assert!(wildcard.languages.is_empty());
+        assert!(wildcard.cmd().is_empty());
+        assert!(wildcard.languages().is_empty());
         assert_eq!(
             wildcard.workspace_markers,
             Some(vec![RootMarker::Single(".git".to_string())])
@@ -2306,8 +2332,8 @@ mod tests {
         // via serde_json, so a Group must round-trip: array for a group, bare
         // string for a single, with entry order preserved.
         let config = BridgeServerConfig {
-            cmd: vec![],
-            languages: vec![],
+            cmd: None,
+            languages: None,
             initialization_options: None,
             workspace_markers: Some(vec![
                 RootMarker::Group(vec!["stylua.toml".to_string(), ".luarc.json".to_string()]),

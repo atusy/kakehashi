@@ -731,7 +731,7 @@ mod tests {
         settings.language_servers.insert(
             "lua-ls".to_string(),
             BridgeServerConfig {
-                cmd: vec!["lua-language-server".to_string()],
+                cmd: Some(vec!["lua-language-server".to_string()]),
                 enabled: Some(false),
                 ..Default::default()
             },
@@ -771,7 +771,7 @@ mod tests {
         settings.language_servers.insert(
             "lua-ls".to_string(),
             BridgeServerConfig {
-                cmd: vec!["lua-language-server".to_string()],
+                cmd: Some(vec!["lua-language-server".to_string()]),
                 ..Default::default()
             },
         );

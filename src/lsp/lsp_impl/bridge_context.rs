@@ -563,7 +563,7 @@ pub(crate) fn unspawnable_language_servers(settings: &WorkspaceSettings) -> Vec<
             )
             // A deliberately disabled server is not a misconfiguration —
             // don't warn about its missing cmd.
-            .is_none_or(|config| config.cmd.is_empty() && config.is_enabled())
+            .is_none_or(|config| config.cmd().is_empty() && config.is_enabled())
         })
         .cloned()
         .collect();
@@ -1621,10 +1621,12 @@ mod tests {
         }
     }
 
+    /// A server that writes `cmd` explicitly — an empty slice means "this
+    /// server has no command", which no longer inherits the wildcard's.
     fn server(cmd: &[&str]) -> crate::config::settings::BridgeServerConfig {
         crate::config::settings::BridgeServerConfig {
-            cmd: cmd.iter().map(|s| s.to_string()).collect(),
-            languages: vec!["lua".to_string()],
+            cmd: Some(cmd.iter().map(|s| s.to_string()).collect()),
+            languages: Some(vec!["lua".to_string()]),
             initialization_options: None,
             workspace_markers: None,
             on_type_formatting_triggers: None,
@@ -1653,14 +1655,32 @@ mod tests {
     #[test]
     fn unspawnable_language_servers_honors_cmd_inherited_from_wildcard() {
         let mut settings = settings_with(HashMap::new());
+        let mut inherits_cmd = server(&[]);
+        // Omitted, not empty: that is what inherits.
+        inherits_cmd.cmd = None;
         settings.language_servers = HashMap::from([
             ("_".to_string(), server(&["shared-ls", "--stdio"])),
-            ("inherits-cmd".to_string(), server(&[])),
+            ("inherits-cmd".to_string(), inherits_cmd),
         ]);
 
         assert!(
             unspawnable_language_servers(&settings).is_empty(),
             "cmd supplied by the '_' wildcard makes the entry spawnable"
+        );
+    }
+
+    #[test]
+    fn unspawnable_language_servers_flags_an_explicitly_empty_cmd() {
+        let mut settings = settings_with(HashMap::new());
+        settings.language_servers = HashMap::from([
+            ("_".to_string(), server(&["shared-ls", "--stdio"])),
+            ("declines".to_string(), server(&[])),
+        ]);
+
+        assert_eq!(
+            unspawnable_language_servers(&settings),
+            vec!["declines".to_string()],
+            "an explicitly empty cmd must not inherit the wildcard's"
         );
     }
 

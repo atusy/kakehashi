@@ -853,8 +853,8 @@ mod tests {
         use crate::config::settings::BridgeServerConfig;
 
         let server = |cmd: Vec<&str>| BridgeServerConfig {
-            cmd: cmd.into_iter().map(String::from).collect(),
-            languages: vec![],
+            cmd: Some(cmd.into_iter().map(String::from).collect()),
+            languages: None,
             initialization_options: None,
             workspace_markers: None,
             on_type_formatting_triggers: None,
@@ -889,8 +889,8 @@ mod tests {
         use crate::config::settings::BridgeServerConfig;
 
         let server = |cmd: Vec<&str>, enabled: Option<bool>| BridgeServerConfig {
-            cmd: cmd.into_iter().map(String::from).collect(),
-            languages: vec![],
+            cmd: Some(cmd.into_iter().map(String::from).collect()),
+            languages: None,
             initialization_options: None,
             workspace_markers: None,
             on_type_formatting_triggers: None,

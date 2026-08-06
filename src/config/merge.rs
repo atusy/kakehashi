@@ -85,7 +85,7 @@ pub(crate) fn merge_bridge_language_configs(
 }
 
 /// Field-level merge of two BridgeServerConfig values.
-/// Vec fields: use overlay if non-empty, else base.
+/// Vec fields: the overlay's list wins when it wrote one, empty or not.
 /// JSON Option fields: deep merge (configuration-merging-strategy).
 /// Option fields: overlay wins when present.
 pub(crate) fn merge_bridge_server_configs(
@@ -93,16 +93,10 @@ pub(crate) fn merge_bridge_server_configs(
     overlay: &BridgeServerConfig,
 ) -> BridgeServerConfig {
     BridgeServerConfig {
-        cmd: if overlay.cmd.is_empty() {
-            base.cmd.clone()
-        } else {
-            overlay.cmd.clone()
-        },
-        languages: if overlay.languages.is_empty() {
-            base.languages.clone()
-        } else {
-            overlay.languages.clone()
-        },
+        // Omitted inherits, written wins — including when what it wrote is
+        // empty, which is how a server says it has none of these.
+        cmd: overlay.cmd.clone().or_else(|| base.cmd.clone()),
+        languages: overlay.languages.clone().or_else(|| base.languages.clone()),
         initialization_options: match (
             &base.initialization_options,
             &overlay.initialization_options,
@@ -722,8 +716,8 @@ mod tests {
                 (
                     "rust-analyzer".to_string(),
                     BridgeServerConfig {
-                        cmd: vec!["rust-analyzer".to_string()],
-                        languages: vec!["rust".to_string()],
+                        cmd: Some(vec!["rust-analyzer".to_string()]),
+                        languages: Some(vec!["rust".to_string()]),
                         initialization_options: Some(json!({"checkOnSave": true})),
                         workspace_markers: None,
                         on_type_formatting_triggers: None,
@@ -735,8 +729,8 @@ mod tests {
                 (
                     "lua-language-server".to_string(),
                     BridgeServerConfig {
-                        cmd: vec!["lua-language-server".to_string()],
-                        languages: vec!["lua".to_string()],
+                        cmd: Some(vec!["lua-language-server".to_string()]),
+                        languages: Some(vec!["lua".to_string()]),
                         initialization_options: None,
                         workspace_markers: None,
                         on_type_formatting_triggers: None,
@@ -805,8 +799,8 @@ mod tests {
                     // shared key: rust-analyzer — overlay adds initOptions, inherits cmd/languages
                     "rust-analyzer".to_string(),
                     BridgeServerConfig {
-                        cmd: vec![],
-                        languages: vec![],
+                        cmd: None,
+                        languages: None,
                         initialization_options: Some(json!({"linkedProjects": ["./Cargo.toml"]})),
                         workspace_markers: None,
                         on_type_formatting_triggers: None,
@@ -819,8 +813,11 @@ mod tests {
                     // new key: pyright — added by overlay
                     "pyright".to_string(),
                     BridgeServerConfig {
-                        cmd: vec!["pyright-langserver".to_string(), "--stdio".to_string()],
-                        languages: vec!["python".to_string()],
+                        cmd: Some(vec![
+                            "pyright-langserver".to_string(),
+                            "--stdio".to_string(),
+                        ]),
+                        languages: Some(vec!["python".to_string()]),
                         initialization_options: None,
                         workspace_markers: None,
                         on_type_formatting_triggers: None,
@@ -884,8 +881,8 @@ mod tests {
             language_servers: Some(HashMap::from([(
                 "rust-analyzer".to_string(),
                 BridgeServerConfig {
-                    cmd: vec!["rust-analyzer".to_string()],
-                    languages: vec!["rust".to_string()],
+                    cmd: Some(vec!["rust-analyzer".to_string()]),
+                    languages: Some(vec!["rust".to_string()]),
                     initialization_options: None,
                     workspace_markers: None,
                     on_type_formatting_triggers: None,
@@ -1275,8 +1272,8 @@ mod tests {
         let servers = HashMap::from([(
             "_".to_string(),
             BridgeServerConfig {
-                cmd: vec!["default-lsp".to_string()],
-                languages: vec!["any".to_string()],
+                cmd: Some(vec!["default-lsp".to_string()]),
+                languages: Some(vec!["any".to_string()]),
                 initialization_options: None,
                 workspace_markers: None,
                 on_type_formatting_triggers: None,
@@ -1286,15 +1283,15 @@ mod tests {
             },
         )]);
         let resolved = resolve_with_wildcard(&servers, "ra", merge_bridge_server_configs).unwrap();
-        assert_eq!(resolved.cmd, vec!["default-lsp".to_string()]);
-        assert_eq!(resolved.languages, vec!["any".to_string()]);
+        assert_eq!(resolved.cmd(), ["default-lsp".to_string()]);
+        assert_eq!(resolved.languages(), ["any".to_string()]);
 
         // Specific only → cloned
         let servers = HashMap::from([(
             "ra".to_string(),
             BridgeServerConfig {
-                cmd: vec!["rust-analyzer".to_string()],
-                languages: vec!["rust".to_string()],
+                cmd: Some(vec!["rust-analyzer".to_string()]),
+                languages: Some(vec!["rust".to_string()]),
                 initialization_options: None,
                 workspace_markers: None,
                 on_type_formatting_triggers: None,
@@ -1304,16 +1301,16 @@ mod tests {
             },
         )]);
         let resolved = resolve_with_wildcard(&servers, "ra", merge_bridge_server_configs).unwrap();
-        assert_eq!(resolved.cmd, vec!["rust-analyzer".to_string()]);
-        assert_eq!(resolved.languages, vec!["rust".to_string()]);
+        assert_eq!(resolved.cmd(), ["rust-analyzer".to_string()]);
+        assert_eq!(resolved.languages(), ["rust".to_string()]);
 
         // Both → merged (specific cmd wins, empty languages inherits, initOptions deep-merged)
         let servers = HashMap::from([
             (
                 "_".to_string(),
                 BridgeServerConfig {
-                    cmd: vec!["default-lsp".to_string()],
-                    languages: vec!["any".to_string()],
+                    cmd: Some(vec!["default-lsp".to_string()]),
+                    languages: Some(vec!["any".to_string()]),
                     initialization_options: Some(json!({"defaultOption": true})),
                     workspace_markers: None,
                     on_type_formatting_triggers: None,
@@ -1325,8 +1322,8 @@ mod tests {
             (
                 "ra".to_string(),
                 BridgeServerConfig {
-                    cmd: vec!["rust-analyzer".to_string()],
-                    languages: vec![],
+                    cmd: Some(vec!["rust-analyzer".to_string()]),
+                    languages: None,
                     initialization_options: Some(json!({"linkedProjects": ["./Cargo.toml"]})),
                     workspace_markers: None,
                     on_type_formatting_triggers: None,
@@ -1337,8 +1334,8 @@ mod tests {
             ),
         ]);
         let resolved = resolve_with_wildcard(&servers, "ra", merge_bridge_server_configs).unwrap();
-        assert_eq!(resolved.cmd, vec!["rust-analyzer".to_string()]);
-        assert_eq!(resolved.languages, vec!["any".to_string()]);
+        assert_eq!(resolved.cmd(), ["rust-analyzer".to_string()]);
+        assert_eq!(resolved.languages(), ["any".to_string()]);
         let init_opts = resolved.initialization_options.unwrap();
         assert_eq!(init_opts.get("defaultOption"), Some(&json!(true)));
         assert_eq!(
@@ -1356,8 +1353,8 @@ mod tests {
         use settings::{BridgeServerConfig, RootMarker};
 
         let base = BridgeServerConfig {
-            cmd: vec![],
-            languages: vec![],
+            cmd: None,
+            languages: None,
             initialization_options: None,
             workspace_markers: Some(vec![RootMarker::Single(".git".to_string())]),
             on_type_formatting_triggers: None,
@@ -1368,8 +1365,8 @@ mod tests {
 
         // Unset overlay inherits from base (wildcard default applies)
         let inheriting = BridgeServerConfig {
-            cmd: vec!["rust-analyzer".to_string()],
-            languages: vec!["rust".to_string()],
+            cmd: Some(vec!["rust-analyzer".to_string()]),
+            languages: Some(vec!["rust".to_string()]),
             initialization_options: None,
             workspace_markers: None,
             on_type_formatting_triggers: None,
@@ -1413,8 +1410,8 @@ mod tests {
         use settings::BridgeServerConfig;
 
         let server = |prefer: Option<bool>| BridgeServerConfig {
-            cmd: vec![],
-            languages: vec![],
+            cmd: None,
+            languages: None,
             initialization_options: None,
             workspace_markers: None,
             on_type_formatting_triggers: None,
@@ -1455,8 +1452,8 @@ mod tests {
         use settings::BridgeServerConfig;
 
         let server = |enabled: Option<bool>| BridgeServerConfig {
-            cmd: vec![],
-            languages: vec![],
+            cmd: None,
+            languages: None,
             initialization_options: None,
             workspace_markers: None,
             on_type_formatting_triggers: None,
@@ -1500,8 +1497,8 @@ mod tests {
         use settings::BridgeServerConfig;
 
         let base = BridgeServerConfig {
-            cmd: vec!["default-lsp".to_string()],
-            languages: vec![],
+            cmd: Some(vec!["default-lsp".to_string()]),
+            languages: None,
             initialization_options: Some(json!({
                 "feature1": true,
                 "shared_opt": "base",
@@ -1514,8 +1511,8 @@ mod tests {
             settings: None,
         };
         let overlay = BridgeServerConfig {
-            cmd: vec!["rust-analyzer".to_string()],
-            languages: vec!["rust".to_string()],
+            cmd: Some(vec!["rust-analyzer".to_string()]),
+            languages: Some(vec!["rust".to_string()]),
             initialization_options: Some(json!({
                 "feature2": true,
                 "shared_opt": "overlay",
@@ -1607,8 +1604,8 @@ mod tests {
         use settings::BridgeServerConfig;
 
         let server = |triggers: Option<Vec<&str>>| BridgeServerConfig {
-            cmd: vec![],
-            languages: vec![],
+            cmd: None,
+            languages: None,
             initialization_options: None,
             workspace_markers: None,
             on_type_formatting_triggers: triggers
@@ -1761,8 +1758,8 @@ mod tests {
             (
                 "_".to_string(),
                 BridgeServerConfig {
-                    cmd: vec![],
-                    languages: vec![],
+                    cmd: None,
+                    languages: None,
                     initialization_options: Some(json!({ "checkOnSave": true })),
                     workspace_markers: None,
                     on_type_formatting_triggers: None,
@@ -1775,8 +1772,8 @@ mod tests {
             (
                 "rust-analyzer".to_string(),
                 BridgeServerConfig {
-                    cmd: vec!["rust-analyzer".to_string()],
-                    languages: vec!["rust".to_string()],
+                    cmd: Some(vec!["rust-analyzer".to_string()]),
+                    languages: Some(vec!["rust".to_string()]),
                     initialization_options: None, // Should inherit from wildcard
                     workspace_markers: None,
                     on_type_formatting_triggers: None,
@@ -1792,9 +1789,9 @@ mod tests {
             resolve_with_wildcard(&servers, "rust-analyzer", merge_bridge_server_configs).unwrap();
 
         // cmd from specific
-        assert_eq!(ra.cmd, vec!["rust-analyzer".to_string()]);
+        assert_eq!(ra.cmd(), ["rust-analyzer".to_string()]);
         // languages from specific
-        assert_eq!(ra.languages, vec!["rust".to_string()]);
+        assert_eq!(ra.languages(), ["rust".to_string()]);
         // initialization_options inherited from wildcard
         assert!(ra.initialization_options.is_some());
         let opts = ra.initialization_options.as_ref().unwrap();
@@ -1816,8 +1813,8 @@ mod tests {
             (
                 "_".to_string(),
                 BridgeServerConfig {
-                    cmd: vec!["default-lsp".to_string()],
-                    languages: vec!["rust".to_string(), "python".to_string()],
+                    cmd: Some(vec!["default-lsp".to_string()]),
+                    languages: Some(vec!["rust".to_string(), "python".to_string()]),
                     initialization_options: None,
                     workspace_markers: None,
                     on_type_formatting_triggers: None,
@@ -1830,8 +1827,8 @@ mod tests {
             (
                 "rust-analyzer".to_string(),
                 BridgeServerConfig {
-                    cmd: vec!["rust-analyzer".to_string()],
-                    languages: vec![], // Empty - should inherit from wildcard
+                    cmd: Some(vec!["rust-analyzer".to_string()]),
+                    languages: None, // Empty - should inherit from wildcard
                     initialization_options: None,
                     workspace_markers: None,
                     on_type_formatting_triggers: None,
@@ -1869,11 +1866,11 @@ mod tests {
         let server = found_server.unwrap();
         assert_eq!(
             server.cmd,
-            vec!["rust-analyzer".to_string()],
+            Some(vec!["rust-analyzer".to_string()]),
             "Should find rust-analyzer server"
         );
         assert!(
-            server.languages.contains(&"rust".to_string()),
+            server.languages().contains(&"rust".to_string()),
             "Resolved server should have 'rust' in languages (inherited from wildcard)"
         );
     }
@@ -2173,9 +2170,9 @@ mod tests {
     /// independently), not just the trivial no-inheritance case.
     #[test]
     fn test_is_server_spawnable_matches_full_resolution() {
-        let server = |cmd: Vec<&str>, enabled: Option<bool>| settings::BridgeServerConfig {
-            cmd: cmd.into_iter().map(String::from).collect(),
-            languages: vec![],
+        let server = |cmd: Option<Vec<&str>>, enabled: Option<bool>| settings::BridgeServerConfig {
+            cmd: cmd.map(|cmd| cmd.into_iter().map(String::from).collect()),
+            languages: None,
             initialization_options: None,
             workspace_markers: None,
             on_type_formatting_triggers: None,
@@ -2191,17 +2188,17 @@ mod tests {
         };
 
         // Case 1: server has its own cmd and enabled — no inheritance needed.
-        let servers = HashMap::from([("a".to_string(), server(vec!["x"], Some(true)))]);
+        let servers = HashMap::from([("a".to_string(), server(Some(vec!["x"]), Some(true)))]);
         assert!(is_server_spawnable(&servers, "a"));
         assert_eq!(
             is_server_spawnable(&servers, "a"),
             full_resolution(&servers, "a")
         );
 
-        // Case 2: server's own cmd is empty, inherits a non-empty cmd from `_`.
+        // Case 2: server omits its own cmd, inheriting a non-empty one from `_`.
         let servers = HashMap::from([
-            ("_".to_string(), server(vec!["shared-ls"], None)),
-            ("a".to_string(), server(vec![], None)),
+            ("_".to_string(), server(Some(vec!["shared-ls"]), None)),
+            ("a".to_string(), server(None, None)),
         ]);
         assert!(
             is_server_spawnable(&servers, "a"),
@@ -2215,8 +2212,8 @@ mod tests {
         // Case 3: server has its own cmd but the wildcard disables everything
         // by default; server doesn't override enabled — inherits disabled.
         let servers = HashMap::from([
-            ("_".to_string(), server(vec![], Some(false))),
-            ("a".to_string(), server(vec!["x"], None)),
+            ("_".to_string(), server(None, Some(false))),
+            ("a".to_string(), server(Some(vec!["x"]), None)),
         ]);
         assert!(!is_server_spawnable(&servers, "a"));
         assert_eq!(
@@ -2226,8 +2223,8 @@ mod tests {
 
         // Case 4: server re-enables itself over a disabled wildcard.
         let servers = HashMap::from([
-            ("_".to_string(), server(vec![], Some(false))),
-            ("a".to_string(), server(vec!["x"], Some(true))),
+            ("_".to_string(), server(None, Some(false))),
+            ("a".to_string(), server(Some(vec!["x"]), Some(true))),
         ]);
         assert!(is_server_spawnable(&servers, "a"));
         assert_eq!(
@@ -2237,13 +2234,13 @@ mod tests {
 
         // Case 5: name not present in the map at all — false, not a fallback
         // to the wildcard's own config.
-        let servers = HashMap::from([("_".to_string(), server(vec!["x"], Some(true)))]);
+        let servers = HashMap::from([("_".to_string(), server(Some(vec!["x"]), Some(true)))]);
         assert!(!is_server_spawnable(&servers, "missing"));
 
         // Case 6: called with the wildcard key itself — false, per the
         // documented contract (the wildcard is a template, never a server in
         // its own right), even when it has a non-empty cmd and enabled: true.
-        let servers = HashMap::from([("_".to_string(), server(vec!["x"], Some(true)))]);
+        let servers = HashMap::from([("_".to_string(), server(Some(vec!["x"]), Some(true)))]);
         assert!(
             !is_server_spawnable(&servers, WILDCARD_KEY),
             "the wildcard key itself must never report as spawnable"
