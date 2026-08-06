@@ -292,8 +292,20 @@ everything else than to be an opinion about workspace symbols.
 
 Two servers indexing the *identical* root — say two TypeScript servers — are
 genuinely competing rather than complementary, and this decision does make their
-near-duplicate entries survive when their ranges differ. The lever for that case
-is `priorities`, which is an allowlist: name only the server you want. That is a
+near-duplicate entries survive when their ranges differ.
+
+Overriding `preferred` costs less than it appears to here, because `union`
+already provides the half of it that matters. `preferred`'s value is "use A,
+fall back to B" — and it distinguishes two cases the ADR must not conflate. When
+A **fails or times out**, union covers it: A contributes nothing and B's results
+are in the answer anyway, without anyone having to declare a fallback. What is
+lost is only fallback when A returns **empty**, and that is precisely the
+semantics rejected above: for a search, empty means "no matches", so consulting
+B on it produces results for a query A said had none. The case `preferred` can
+express and `union` cannot is the case it should not express.
+
+What remains is suppressing a redundant server's near-duplicates, and the lever
+for that is `priorities`, which is an allowlist: name only the server you want. That is a
 static, deliberate exclusion the user writes, not an inference kakehashi draws
 from an empty response — which is the distinction that makes it acceptable here
 and `preferred` not. It does cost the user an edit in **every** pair that names
@@ -473,18 +485,24 @@ connections and two requests.
 `max_fan_out` applies **per pair only**, and that is the whole of it here.
 
 Within a pair it works as everywhere else: `truncate_entries` truncates a
-flattened name list in walk order, keeping the highest-priority N names. A
-surviving name contributes every connection that survived steps 1 and 2 — every
-`Ready`, capable handle in the selection snapshot — so if `A/root1` advertises
-`workspace/symbol` and `A/root2` does not, selecting the name A must not smuggle
-root2 back past the capability filter.
+flattened name list in walk order, keeping the highest-priority N names.
 
-But a per-pair name cap bounds neither requests nor connections here: one name
-can mean several roots, and a connection one pair's cap excluded re-enters
-through another pair that names it. Left there, `max_fan_out = 1` could produce
-arbitrarily many requests, contradicting the setting's documented promise to
-"cap the number of concurrent server requests" — a generic load control quietly
-losing its load-controlling property in exactly the method most able to fan out.
+A surviving name admits **only the connections that pair actually opened**, not
+every live connection of that server. The tracker records each open virtual
+document's `ConnectionKey` next to its language, so a pair's targets are known
+exactly and never derived by expanding a name across roots. That distinction is
+load-bearing: expanding would let a Python pair that admits A reach `A/root2`
+even when the pair that actually opened A on root2 excluded it with
+`priorities = []` — turning `priorities` from a policy boundary into a hint, and
+leaking one language's configuration into another's connections. The exact keys
+are already there; deriving them would be both more work and wrong.
+
+A per-pair name cap still bounds neither requests nor connections overall,
+because a connection one pair's cap excluded re-enters through another pair that
+legitimately opened it. So `max_fan_out = 1` can still produce more than one
+request, contradicting the setting's documented promise to "cap the number of
+concurrent server requests" — a generic load control quietly losing its
+load-controlling property in exactly the method most able to fan out.
 
 A second, global cap after dedup was tried and **rejected**. It cannot be given
 coherent semantics:
@@ -529,10 +547,9 @@ with its own name and semantics rather than smuggled into this one.
                            ▼
         ┌──────────────────────────────────────┐
         │ dedup by CONNECTION KEY (server,root)│
-        │   (B, rootA)  ← named by LANG_1      │
-        │   (B, rootB)  ← same server, another │
-        │                 root: 2 connections  │
-        │   (C, rootA)  ← named by LANG_2      │
+        │   each pair admits ONLY the conns it │
+        │   actually opened — never a name     │
+        │   expanded across roots              │
         │ (no global cap — see §3)             │
         └──────────────────┬───────────────────┘
                            ▼
@@ -1081,10 +1098,14 @@ appears to promise:
   *client* has opened. Reaching embedded code in unopened files would mean
   parsing every candidate host file in the workspace and opening every region —
   precisely the unbounded work this method must not do.
-- **Real-file symbols would be reached, but at one root only.** A server spawned
-  without a document hint resolves to the `ClientFallback` key, so a multi-root
-  workspace gets the client root and none of the marker-derived per-root
-  connections.
+- **Real-file coverage would be partial and hard to predict.** A server spawned
+  without a document hint lands on the single `ClientFallback` connection key.
+  That is not as limiting as one root, since the pool hands such a connection
+  the client root *and* the full upstream `workspaceFolders` snapshot, which
+  initialization forwards verbatim — a multi-root-capable server can index every
+  folder the client declared. What it misses is everything derived from root
+  markers: a monorepo's per-package roots become one undifferentiated workspace
+  instead of the per-root connections normal routing would have produced.
 - **Scoping by "does this language occur in the workspace?" would need a
   mechanism that does not exist.** The LSP server is document-driven and holds
   no workspace index; nothing walks the filesystem on the server path. Under the
