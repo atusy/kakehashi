@@ -481,8 +481,8 @@ mutex.
 
 Every filter in step 2 precedes the cap in step 3, and that ordering is
 load-bearing for each of them: with `priorities = [A, B]` and
-`max_fan_out = 1`, an A that is incapable, stale-configured, or no longer
-holding its documents would otherwise take the only slot and then be dropped,
+`max_fan_out = 1`, an A that is incapable or stale-configured would otherwise
+take the only slot and then be dropped,
 leaving the query to consult nobody. Filtering on what is already knowable
 before allocating slots costs nothing and removes all three cases at once.
 
@@ -1205,8 +1205,8 @@ response.
   error**.
 
 The last two cases are why the unit is the entry rather than the response.
-Selection can expire its tracker or `connections` acquisition, so "no
-candidates" and "we could not find out" are different states. And a fan-in
+Selection can expire its `connections` acquisition, so "no candidates" and "we
+could not find out" are different states. And a fan-in
 failure counts: if servers returned symbols and every entry was lost to a lock
 that could not be acquired or a parse that had not settled, the client would
 otherwise be told the search found nothing — the same confident falsehood as
@@ -1646,8 +1646,7 @@ Including it would defeat dedup on a field carrying no identity.
   one query (point 5). This is the one accepted failure here that is not
   self-correcting, and it has no signal to the user.
 - `max_fan_out` no longer bounds a query's total fan-out — only each pair's
-  contribution — so the only real bound on how many connections one query
-  touches is how many are live.
+  contribution. `workspaceSymbolMaxFanOut` is what bounds the query.
 - Adding the `Union` variant forces a `Union` arm at 7 exhaustive `match` sites
   in methods that have no use for it.
 - A server still `Initializing` when the query arrives is skipped entirely, so
