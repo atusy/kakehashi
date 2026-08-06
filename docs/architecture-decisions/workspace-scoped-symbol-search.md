@@ -435,17 +435,32 @@ final barrier.** The order is fixed:
    it. This only *enumerates* candidates; every entry is re-validated in step 2
    before it can contribute.
 2. Hand the candidate set to a **pool-owned batch validator**, which takes
-   `connections` **once** and, without awaiting inside, per candidate: keeps
-   only `Ready` handles (`connections()` returns the raw map, and
-   `ConnectionState` also has `Initializing`, `Failed`, `Closing`, `Closed`).
-   A candidate dropped because its connection is `Failed`, `Closing`, or
-   `Closed` is recorded as an **infrastructure failure** (point 5) rather than
-   as an absent candidate — but only if policy would have admitted it; see
-   below;
-   drops handles lacking `workspace/symbol`; drops handles whose recorded launch
-   configuration no longer matches the `BridgeServerConfig` that admitted them;
-   and confirms current membership — the live reverse index for a virtual
-   candidate, `host_documents` for a `_self` one.
+   `connections` **once** and, without awaiting inside, per candidate — **in
+   this order**:
+
+   a. **Confirm the candidate is still current** — the live reverse index for a
+      virtual candidate, `host_documents` for a `_self` one, and in both cases
+      the stored connection generation matching the handle's. A candidate that
+      fails this is **stale, not failed**: it is discarded silently, before any
+      accounting.
+
+   b. Then keep only `Ready` handles (`connections()` returns the raw map, and
+      `ConnectionState` also has `Initializing`, `Failed`, `Closing`, `Closed`),
+      drop handles lacking `workspace/symbol`, and drop handles whose recorded
+      launch configuration no longer matches the `BridgeServerConfig` that
+      admitted them. A candidate dropped here because its connection is
+      `Failed`, `Closing`, or `Closed` is recorded as an **infrastructure
+      failure** (point 5) rather than as an absent candidate — but only if
+      policy would have admitted it; see below.
+
+   Step (a) must precede (b), and this is the subtle part. A purge removes the
+   document state and then installs a replacement under the **same**
+   `ConnectionKey`; if that replacement fails its handshake, a cloned snapshot
+   entry from before the purge resolves to a brand-new `Failed` handle with no
+   capabilities recorded. Accounting first would file that as an infrastructure
+   failure — reintroducing the "never initialized" case this decision withdrew
+   as unreachable, through a door the ordering closes. The stale entry never
+   named a live document on that connection, so it is not evidence of anything.
 
    The reverse index is a sharded map and answers synchronously. `host_documents`
    is a separate Tokio mutex, so it is taken with **`try_lock`**, never awaited:
@@ -544,7 +559,10 @@ than leaving a reader to wonder. A candidate exists only because a document was
 successfully opened on that connection, and both eager-open paths wait for
 `Ready` and bail on initialization failure *before* recording any document
 state. A handle that never completed its handshake is therefore named by no
-candidate at all — selection cannot see it, so it cannot classify it.
+candidate at all — selection cannot see it, so it cannot classify it. The one
+way it could have been seen is a stale snapshot entry resolving to a failed
+replacement under the same key, which step 2(a) discards before any accounting
+runs.
 
 The consequence is a real one and belongs to point 9's first blocker rather than
 to this rule: a workspace whose servers **all failed to start** answers `[]`,
