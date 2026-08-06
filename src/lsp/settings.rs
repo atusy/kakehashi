@@ -72,6 +72,25 @@ pub struct SettingsLoadOutcome {
     pub(crate) deprecated_keys: DeprecatedKeysSeen,
 }
 
+/// Fold configuration layers into the settings they describe, lowest
+/// precedence first.
+///
+/// Extracted rather than inlined because the order is load-bearing beyond
+/// "later wins": [`merge_workspace_settings`] is **not associative** once an
+/// empty container clears the layer below — `merge(merge({x}, {}), {y})` is
+/// `{y}`, while `merge({x}, merge({}, {y}))` is `{x, y}`. Any future caller
+/// that recomposes from retained layers has to fold them strictly
+/// left-to-right, in the order they were received, and must not fold a suffix
+/// on its own and replay it over a rebuilt base.
+pub(crate) fn fold_layers(
+    layers: impl IntoIterator<Item = Option<RawWorkspaceSettings>>,
+) -> Option<RawWorkspaceSettings> {
+    layers
+        .into_iter()
+        .reduce(merge_workspace_settings)
+        .flatten()
+}
+
 /// Ceiling on a single config file read.
 ///
 /// A kakehashi configuration is a hand-written TOML file; megabytes of one is a
@@ -407,10 +426,7 @@ pub fn load_settings(
     let mut layers = vec![defaults];
     layers.extend(config_layers);
     layers.push(override_settings);
-    let merged = layers
-        .into_iter()
-        .reduce(merge_workspace_settings)
-        .flatten();
+    let merged = fold_layers(layers);
     let raw_settings = merged.clone();
     let settings = expand_merged_settings(merged, home, &env_fn, &mut events);
 
@@ -944,6 +960,48 @@ mod tests {
                 .expect_err("a filesystem root has no parent")
                 .kind(),
             std::io::ErrorKind::InvalidInput
+        );
+    }
+
+    /// Folding is left-to-right over the layers as received, and that is not a
+    /// stylistic choice: an empty container clears the layer below, so folding
+    /// a suffix on its own loses the clear and replaying it over a rebuilt base
+    /// resurrects what it was meant to remove.
+    #[test]
+    fn fold_layers_is_left_to_right_because_a_clear_is_not_associative() {
+        let with_server: RawWorkspaceSettings =
+            toml::from_str("[languageServers.a]\ncmd = [\"a\"]\n").expect("parses");
+        let cleared: RawWorkspaceSettings =
+            toml::from_str("languageServers = {}\n").expect("parses");
+        let other_server: RawWorkspaceSettings =
+            toml::from_str("[languageServers.b]\ncmd = [\"b\"]\n").expect("parses");
+
+        let sequential = fold_layers([
+            Some(with_server.clone()),
+            Some(cleared.clone()),
+            Some(other_server.clone()),
+        ])
+        .expect("three layers fold");
+        let names = |settings: &RawWorkspaceSettings| {
+            let mut names: Vec<String> = settings
+                .language_servers
+                .as_ref()
+                .expect("servers")
+                .keys()
+                .cloned()
+                .collect();
+            names.sort();
+            names
+        };
+        assert_eq!(names(&sequential), ["b"], "the clear must survive the fold");
+
+        let suffix = fold_layers([Some(cleared), Some(other_server)]).expect("two layers fold");
+        let replayed = fold_layers([Some(with_server), Some(suffix)]).expect("two layers fold");
+        assert_eq!(
+            names(&replayed),
+            ["a", "b"],
+            "folding the suffix on its own loses the clear — this is why the \
+             order and the whole prefix have to be kept"
         );
     }
 
