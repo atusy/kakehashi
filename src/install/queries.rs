@@ -254,7 +254,7 @@ fn install_queries_with_dependencies_from_with_http_policy(
     http_policy: QueryHttpPolicy,
 ) -> Result<QueryInstallResult, QueryInstallError> {
     let staged = stage_queries_with_dependencies(base_url, language, data_dir, force, http_policy)?;
-    staged.publish(force)?.commit()
+    staged.publish()?.commit()
 }
 
 fn validate_url_http_policy(
@@ -276,6 +276,10 @@ fn validate_url_http_policy(
 struct StagedQueryDir {
     language: String,
     queries_dir: PathBuf,
+    /// The `force` this language was staged with — the install's flag for the
+    /// requested language, and always `false` for an inherited parent, which is
+    /// only ever fetched when it is missing.
+    force: bool,
     tmp: TempQueryDirGuard,
 }
 
@@ -300,8 +304,13 @@ pub(crate) struct StagedQueryInstall {
 /// A query directory that has been renamed into place, with the directory it
 /// displaced kept aside until the install as a whole is committed.
 struct PublishedQueryDir {
+    language: String,
     queries_dir: PathBuf,
     backup: Option<PathBuf>,
+    /// Whether this is the language the install was asked for, as opposed to
+    /// one it pulled in through `; inherits:`. Only the requested language is
+    /// un-published on rollback (see [`PublishedQueryInstall::rollback`]).
+    requested: bool,
 }
 
 /// The outcome of publishing a [`StagedQueryInstall`], still undoable.
@@ -316,25 +325,38 @@ pub(crate) struct PublishedQueryInstall {
 impl StagedQueryInstall {
     /// Rename every staged directory into place, keeping the displaced
     /// directories so the whole install can still be undone.
-    pub(crate) fn publish(
-        mut self,
-        force: bool,
-    ) -> Result<PublishedQueryInstall, QueryInstallError> {
-        let requested_language = std::mem::take(&mut self.language);
+    pub(crate) fn publish(self) -> Result<PublishedQueryInstall, QueryInstallError> {
+        let Self {
+            language: requested_language,
+            install_path,
+            files_downloaded,
+            requested_already_complete,
+            entries,
+        } = self;
         let mut publish = PublishedQueryInstall {
-            install_path: std::mem::take(&mut self.install_path),
-            files_downloaded: std::mem::take(&mut self.files_downloaded),
-            requested_already_complete: self.requested_already_complete,
+            install_path,
+            files_downloaded,
+            requested_already_complete,
             language: requested_language.clone(),
             published: Vec::new(),
         };
-        for entry in self.entries.drain(..) {
+        for entry in entries {
             let requested = entry.language == requested_language;
-            match publish_query_dir(&entry.tmp.path, &entry.queries_dir, &entry.language, force) {
+            // Each entry publishes with the `force` it was staged with, so an
+            // inherited parent never overwrites a copy that appeared while this
+            // install was busy compiling the parser.
+            match publish_query_dir(
+                &entry.tmp.path,
+                &entry.queries_dir,
+                &entry.language,
+                entry.force,
+            ) {
                 Ok(PublishQueryDirOutcome::Published { backup }) => {
                     publish.published.push(PublishedQueryDir {
+                        language: entry.language,
                         queries_dir: entry.queries_dir,
                         backup,
+                        requested,
                     });
                 }
                 // A concurrent installer completed this language while we were
@@ -370,46 +392,139 @@ impl PublishedQueryInstall {
     /// Reports `AlreadyExists` when the requested language needed nothing —
     /// callers treat that as a successful no-op, and it keeps the pre-staging
     /// contract of the `install_queries_*` entry points.
-    pub(crate) fn commit(self) -> Result<QueryInstallResult, QueryInstallError> {
-        for published in &self.published {
-            let Some(backup) = &published.backup else {
-                continue;
-            };
-            if fs::remove_dir_all(backup).is_ok() {
-                let _ = fs::remove_file(backup_ownership_sidecar(backup));
-            }
+    pub(crate) fn commit(mut self) -> Result<QueryInstallResult, QueryInstallError> {
+        for published in std::mem::take(&mut self.published) {
+            discard_backup_locked(&published);
         }
         if self.requested_already_complete {
-            return Err(QueryInstallError::AlreadyExists(self.install_path));
+            return Err(QueryInstallError::AlreadyExists(std::mem::take(
+                &mut self.install_path,
+            )));
         }
         Ok(QueryInstallResult {
-            language: self.language,
-            install_path: self.install_path,
-            files_downloaded: self.files_downloaded,
+            language: std::mem::take(&mut self.language),
+            install_path: std::mem::take(&mut self.install_path),
+            files_downloaded: std::mem::take(&mut self.files_downloaded),
         })
     }
 
-    /// Undo the publish, restoring each displaced directory.
+    /// Un-publish the requested language, restoring the directory it displaced.
     ///
-    /// Best-effort by construction: every step is a rename or removal that
-    /// already succeeded once in the other direction, and there is nothing
-    /// better to do with a failure here than leave the backup in place for
-    /// `language uninstall` to collect.
-    pub(crate) fn rollback(self) {
-        for published in self.published.into_iter().rev() {
-            match published.backup {
-                Some(backup) => {
-                    let _ = fs::remove_dir_all(&published.queries_dir);
-                    if fs::rename(&backup, &published.queries_dir).is_ok() {
-                        let _ = fs::remove_file(backup_ownership_sidecar(&backup));
+    /// Only the requested language is un-published. Query files for the base
+    /// languages it inherits are shared: another install running concurrently
+    /// may already have seen ours and skipped staging its own, so removing them
+    /// would break *its* language rather than undo ours. A base language whose
+    /// queries are present but unused is inert — no parser is registered for it
+    /// — so keeping them is the safe direction, and their backups are simply
+    /// discarded.
+    ///
+    /// Best-effort: every step is the inverse of a rename that already
+    /// succeeded, and a failure here is reported rather than retried, because
+    /// the alternative — leaving a half-restored directory — is worse than
+    /// telling the user what state they are in.
+    pub(crate) fn rollback(mut self) {
+        for published in std::mem::take(&mut self.published) {
+            if !published.requested {
+                discard_backup_locked(&published);
+                continue;
+            }
+            // Take the same lock the publish held, so the un-publish cannot
+            // land inside another installer's or the uninstaller's critical
+            // section.
+            let Some(queries_parent) = published.queries_dir.parent() else {
+                continue;
+            };
+            let _replace_lock =
+                match QueryReplaceLockGuard::acquire(queries_parent, &published.language) {
+                    Ok(guard) => guard,
+                    Err(e) => {
+                        eprintln!(
+                            "Warning: could not lock '{}' to undo its query install: {}",
+                            published.language, e
+                        );
+                        continue;
                     }
+                };
+            if let Err(e) = fs::remove_dir_all(&published.queries_dir)
+                && e.kind() != std::io::ErrorKind::NotFound
+            {
+                eprintln!(
+                    "Warning: failed to remove the queries published for '{}': {}. The data \
+                     directory still holds them; run `kakehashi language uninstall {}` before \
+                     retrying.",
+                    published.language, e, published.language
+                );
+                continue;
+            }
+            let Some(backup) = &published.backup else {
+                continue;
+            };
+            // An uninstall that landed while this install ran wants the
+            // language gone; restoring the backup would resurrect it.
+            if uninstall_tombstone_path(queries_parent, &published.language).is_file() {
+                discard_backup(&published);
+                continue;
+            }
+            match fs::rename(backup, &published.queries_dir) {
+                Ok(()) => {
+                    let _ = fs::remove_file(backup_ownership_sidecar(backup));
                 }
-                None => {
-                    let _ = fs::remove_dir_all(&published.queries_dir);
-                }
+                Err(e) => eprintln!(
+                    "Warning: failed to restore the previous queries for '{}': {}. They are kept \
+                     at {}.",
+                    published.language,
+                    e,
+                    backup.display()
+                ),
             }
         }
     }
+}
+
+impl Drop for PublishedQueryInstall {
+    /// Backstop for an install abandoned without committing or rolling back —
+    /// today only a panic between the two.
+    ///
+    /// Keep the publish and drop the backups: a stranded backup is invisible to
+    /// every collector but `language uninstall` (`recover_interrupted_query_install`
+    /// returns early because the live directory is present again), so it would
+    /// linger forever.
+    fn drop(&mut self) {
+        for published in std::mem::take(&mut self.published) {
+            discard_backup(&published);
+        }
+    }
+}
+
+/// [`discard_backup`] under the language's replace lock.
+///
+/// `language uninstall` enumerates and removes owned backups while holding that
+/// lock; deleting one underneath it makes its own removal fail on a directory
+/// that is vanishing as it reads it, and the uninstall reports a failure for
+/// work that did happen.
+///
+/// Never call this while already holding the lock for the same language: the
+/// guard opens its own file descriptor, and `flock` blocks a second one even
+/// within one process.
+fn discard_backup_locked(published: &PublishedQueryDir) {
+    let _replace_lock = published
+        .queries_dir
+        .parent()
+        .map(|parent| QueryReplaceLockGuard::acquire(parent, &published.language));
+    discard_backup(published);
+}
+
+/// Drop a displaced query directory and the sidecar that marks it as ours.
+///
+/// The sidecar is removed even when the directory is already gone: gating it on
+/// a successful removal is how orphaned `.kakehashi-backup` files accumulate
+/// when a concurrent uninstall collects the directory first.
+fn discard_backup(published: &PublishedQueryDir) {
+    let Some(backup) = &published.backup else {
+        return;
+    };
+    let _ = fs::remove_dir_all(backup);
+    let _ = fs::remove_file(backup_ownership_sidecar(backup));
 }
 
 /// What staging found for one language.
@@ -521,6 +636,7 @@ fn stage_queries_recursive(
     let staged_dir = StagedQueryDir {
         language: language.to_string(),
         queries_dir,
+        force,
         tmp: TempQueryDirGuard {
             path: tmp_queries_dir.clone(),
         },
@@ -1181,16 +1297,18 @@ mod staging_tests {
     /// The per-language replace locks are long-lived by design: they serialize
     /// concurrent installers and are reused, so they are not install residue.
     fn residue(queries_parent: &Path) -> Vec<String> {
-        fs::read_dir(queries_parent)
+        let mut names: Vec<String> = fs::read_dir(queries_parent)
             .expect("read queries parent")
             .flatten()
             .map(|entry| entry.file_name().to_string_lossy().into_owned())
             .filter(|name| !name.ends_with(".replace.lock"))
-            .collect()
+            .collect();
+        names.sort();
+        names
     }
 
     /// Stage a query directory by hand, without touching the network.
-    fn stage(queries_parent: &Path, language: &str, contents: &str) -> StagedQueryDir {
+    fn stage(queries_parent: &Path, language: &str, contents: &str, force: bool) -> StagedQueryDir {
         fs::create_dir_all(queries_parent).expect("create queries parent");
         let tmp_dir = create_unique_temp_query_dir(queries_parent, language).expect("stage dir");
         fs::write(tmp_dir.join("highlights.scm"), contents).expect("write staged highlights");
@@ -1198,6 +1316,7 @@ mod staging_tests {
         StagedQueryDir {
             language: language.to_string(),
             queries_dir: queries_parent.join(language),
+            force,
             tmp: TempQueryDirGuard { path: tmp_dir },
         }
     }
@@ -1215,8 +1334,8 @@ mod staging_tests {
             files_downloaded: vec!["highlights.scm".to_string()],
             requested_already_complete: false,
             entries: vec![
-                stage(&queries_parent, "child", "; inherits: parent\n"),
-                stage(&queries_parent, "parent", "(comment) @comment\n"),
+                stage(&queries_parent, "child", "; inherits: parent\n", false),
+                stage(&queries_parent, "parent", "(comment) @comment\n", false),
             ],
         };
 
@@ -1246,10 +1365,10 @@ mod staging_tests {
             install_path: queries_parent.join("child"),
             files_downloaded: vec!["highlights.scm".to_string()],
             requested_already_complete: false,
-            entries: vec![stage(&queries_parent, "child", "replacement")],
+            entries: vec![stage(&queries_parent, "child", "replacement", true)],
         };
 
-        let published = staged.publish(true).expect("publish should succeed");
+        let published = staged.publish().expect("publish should succeed");
         assert_eq!(
             fs::read_to_string(queries_dir.join("highlights.scm")).unwrap(),
             "replacement",
@@ -1273,11 +1392,12 @@ mod staging_tests {
         );
     }
 
-    /// A language that had no queries before must be removed again on rollback:
-    /// leaving it behind is exactly the half-installed state staging exists to
-    /// prevent.
+    /// The requested language had no queries before, so rollback must remove it
+    /// again — leaving it behind is exactly the half-installed state staging
+    /// exists to prevent. Its inherited parent stays: another install may
+    /// already have skipped staging its own copy because ours was there.
     #[test]
-    fn rolling_back_a_first_install_removes_the_published_queries() {
+    fn rolling_back_a_first_install_removes_only_the_requested_queries() {
         let temp = TempDir::new().unwrap();
         let queries_parent = temp.path().join("queries");
         let staged = StagedQueryInstall {
@@ -1286,21 +1406,94 @@ mod staging_tests {
             files_downloaded: vec!["highlights.scm".to_string()],
             requested_already_complete: false,
             entries: vec![
-                stage(&queries_parent, "child", "; inherits: parent\n"),
-                stage(&queries_parent, "parent", "(comment) @comment\n"),
+                stage(&queries_parent, "child", "; inherits: parent\n", false),
+                stage(&queries_parent, "parent", "(comment) @comment\n", false),
             ],
         };
 
-        staged
-            .publish(false)
-            .expect("publish should succeed")
-            .rollback();
+        staged.publish().expect("publish should succeed").rollback();
 
-        let leftovers = residue(&queries_parent);
         assert!(
-            leftovers.is_empty(),
-            "rollback must remove every directory this install published, found {:?}",
-            leftovers
+            !queries_parent.join("child").exists(),
+            "the requested language must not stay published"
+        );
+        assert_eq!(
+            residue(&queries_parent),
+            vec!["parent".to_string()],
+            "an inherited parent must survive, with no backup or sidecar beside it"
+        );
+    }
+
+    /// A published install that is neither committed nor rolled back — only a
+    /// panic gets here — must still drop the directories it displaced, because
+    /// nothing else collects them once the live directory is back in place.
+    #[test]
+    fn dropping_a_published_install_discards_the_backups() {
+        let temp = TempDir::new().unwrap();
+        let queries_parent = temp.path().join("queries");
+        let queries_dir = queries_parent.join("child");
+        fs::create_dir_all(&queries_dir).unwrap();
+        fs::write(queries_dir.join("highlights.scm"), "previous").unwrap();
+        write_install_marker(&queries_dir).unwrap();
+        let staged = StagedQueryInstall {
+            language: "child".to_string(),
+            install_path: queries_dir.clone(),
+            files_downloaded: vec!["highlights.scm".to_string()],
+            requested_already_complete: false,
+            entries: vec![stage(&queries_parent, "child", "replacement", true)],
+        };
+
+        drop(staged.publish().expect("publish should succeed"));
+
+        assert_eq!(
+            fs::read_to_string(queries_dir.join("highlights.scm")).unwrap(),
+            "replacement",
+            "an abandoned publish keeps the queries it made visible"
+        );
+        assert_eq!(
+            residue(&queries_parent),
+            vec!["child".to_string()],
+            "the displaced directory and its sidecar must not be stranded"
+        );
+    }
+
+    /// Publishing stops at the first entry it cannot publish and undoes the
+    /// requested language it had already made visible.
+    #[test]
+    fn publishing_stops_at_an_uninstalled_entry_and_restores_the_earlier_ones() {
+        let temp = TempDir::new().unwrap();
+        let queries_parent = temp.path().join("queries");
+        let queries_dir = queries_parent.join("child");
+        fs::create_dir_all(&queries_dir).unwrap();
+        fs::write(queries_dir.join("highlights.scm"), "previous").unwrap();
+        write_install_marker(&queries_dir).unwrap();
+        let staged = StagedQueryInstall {
+            language: "child".to_string(),
+            install_path: queries_dir.clone(),
+            files_downloaded: vec!["highlights.scm".to_string()],
+            requested_already_complete: false,
+            entries: vec![
+                stage(&queries_parent, "child", "replacement", true),
+                stage(&queries_parent, "parent", "(comment) @comment\n", false),
+            ],
+        };
+        write_uninstall_tombstone(&queries_parent, "parent").unwrap();
+
+        let result = staged.publish();
+
+        assert!(
+            matches!(&result, Err(QueryInstallError::IoError(e)) if e.kind() == std::io::ErrorKind::Interrupted),
+            "a tombstoned entry must abort the publish"
+        );
+        assert_eq!(
+            fs::read_to_string(queries_dir.join("highlights.scm")).unwrap(),
+            "previous",
+            "the already-published requested language must be restored"
+        );
+        assert_eq!(
+            residue(&queries_parent),
+            vec![".parent.uninstalled".to_string(), "child".to_string()],
+            "no backup or sidecar may be stranded"
         );
     }
 }
