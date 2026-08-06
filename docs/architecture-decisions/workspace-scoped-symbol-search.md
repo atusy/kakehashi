@@ -1116,47 +1116,59 @@ searched and found nothing" — and making it while every server was unreachable
 is confidently wrong at exactly the moment the user is least able to tell. A
 client shown "no matches" during an outage concludes the symbol does not exist.
 
-So the outcome is decided on whether any server's answer was **successfully
-processed**, tracked **across every phase**, not just the response phase. A target can be lost after
+So the outcome is decided on whether any server's answer was **informative**,
+tracked **across every phase**, not just the response phase. A target can be lost after
 selection and before dispatch too: its reopen barrier fails, its send cannot
 re-acquire `connections` within budget, or registration, the stale-handle
 re-check, or the enqueue fails. Counting only "dispatched targets that errored"
 would let a query whose every target died pre-dispatch report a confident empty
 answer, since zero dispatches looks the same as zero results.
 
-The unit is a **successfully processed answer**, and the line that defines it is
-between *semantic* rejection and *infrastructure* failure:
+Every entry ends in exactly one of three states, and the outcome is derived from
+those rather than from whole responses:
 
-- **Semantic rejection is successful processing.** An entry dropped because its
-  region died, its language changed, its range escaped the region, its host has
-  no current geometry, or its content identity moved was examined and found not
-  to describe a place in this workspace. The answer was processed; it yielded
-  fewer symbols. These are the silent drops points 5 and 7 already accept, and
-  they do not poison anything.
-- **Infrastructure failure poisons the answer.** The pass-0 host→virtual
-  snapshot, the translation-time identity re-read, or a host's `edit_lock`
-  expiring means the entries were never examined at all. Nothing was learned
-  about them, so they are not evidence of absence.
+- **Translated** — it reached the client.
+- **Semantically rejected** — examined, and found not to describe a place in
+  this workspace: the region is *gone*, its language changed, the indexed URI is
+  retired, the range escaped its region, or the content identity moved. The
+  answer was processed; it yielded fewer symbols. These are the silent drops
+  points 5 and 7 already accept.
+- **Infrastructure-failed** — never examined at all, so nothing was learned. The
+  pass-0 host→virtual snapshot, the translation-time identity re-read, or a
+  host's `edit_lock` expiring; and, importantly, geometry that is *unsettled*
+  rather than gone — a host still parsing, a pass whose 200ms ensure timed out,
+  or a region cache left empty by a population that lost an epoch race and could
+  not commit. "The parse has not caught up" is not "the symbol is not there",
+  even though both surface as no current geometry.
 
-Anything short of one processed answer is "we could not find out", not "there
-is nothing".
+An answer is **informative** when it produced at least one translated entry, or
+when every one of its entries was semantically rejected — including a
+legitimately empty response, which is a server saying it searched and found
+nothing.
+
+Granularity matters here: `edit_lock` expiry is per *host*, while one response
+can carry real-file entries and virtual entries from several hosts. One
+contended host must not turn an answer whose other entries translated fine into
+a request error, so poisoning is decided per entry and rolled up, never per
+response.
 
 - Selection **completed** and found no candidates → `[]`. Nothing failed; there
   was nothing to ask.
-- **At least one** successfully processed answer → its results, or `[]` if they
-  genuinely contained nothing. Partial failure stays soft.
-- Candidates existed and **no answer was successfully processed** — for any
-  reason, at any phase → **request error**.
-- Selection **did not complete** and nothing was processed → **request error**.
+- **At least one informative** answer → its results, or `[]` if they genuinely
+  contained nothing. Partial failure stays soft.
+- Candidates existed and **no answer was informative** — for any reason, at any
+  phase → **request error**.
+- Selection **did not complete** and nothing was informative → **request
+  error**.
 
-The last two cases are why the unit is processing rather than response. Selection
-can expire its tracker or `connections` acquisition, and `_self` discovery is
-incomplete whenever `host_documents` was contended, so "no candidates" and "we
-could not find out" are different states. Just as importantly, a fan-in failure
-counts: if servers returned symbols and every entry was dropped because the
-late host→virtual snapshot or the identity re-read could not be acquired, the
-client would otherwise be told the search found nothing — the same confident
-falsehood as reporting an outage that way, arrived at from the other end.
+The last two cases are why the unit is the entry rather than the response.
+Selection can expire its tracker or `connections` acquisition, and `_self`
+discovery is incomplete whenever `host_documents` was contended, so "no
+candidates" and "we could not find out" are different states. And a fan-in
+failure counts: if servers returned symbols and every entry was lost to a lock
+that could not be acquired or a parse that had not settled, the client would
+otherwise be told the search found nothing — the same confident falsehood as
+reporting an outage that way, arrived at from the other end.
 
 A downstream `null` is an answer, not a failure. The method's result type is
 `Option<WorkspaceSymbolResponse>` precisely because `null` is valid, so it
@@ -1265,13 +1277,13 @@ arriving mid-processing would otherwise wait on unrelated work with no bound.
 - **Fan-in**: the pass-0 host→virtual snapshot, and the translation-time
   identity re-read — three seconds each. These come *after* every downstream
   response, so they are easy to overlook, and unbudgeted they would reintroduce
-  an unbounded wait at the very end of the query. Expiry drops the affected
-  entries **and counts against the outcome rule** (point 5) as infrastructure
-  failure, not semantic rejection: entries never examined are not evidence that
-  the search found nothing.
+  an unbounded wait at the very end of the query. Expiry marks the affected
+  entries **infrastructure-failed** (point 5), not semantically rejected:
+  entries never examined are not evidence that the search found nothing.
 - **Translation's `edit_lock`** per host: three seconds. A host whose lock
-  cannot be taken in time loses that query's entries, exactly like a host whose
-  geometry was stale.
+  cannot be taken in time loses that query's entries — marked
+  infrastructure-failed, like unsettled geometry and unlike a region that is
+  genuinely gone (point 5).
 
 Separate budgets rather than one deadline spanning the whole dispatch, because a
 single outer deadline would silently consume the reopen barrier's two seconds
