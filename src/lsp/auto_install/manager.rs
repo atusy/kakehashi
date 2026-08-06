@@ -653,6 +653,7 @@ mod tests {
             queries_path: None,
             parser_error: Some("compile failed".to_string()),
             queries_error: None,
+            files_downloaded: Vec::new(),
         };
 
         assert_eq!(
@@ -671,6 +672,7 @@ mod tests {
             queries_path: None,
             parser_error: None,
             queries_error: Some("network unreachable".to_string()),
+            files_downloaded: Vec::new(),
         };
 
         assert_eq!(
@@ -753,6 +755,7 @@ mod tests {
                             queries_path: Some(PathBuf::from("/installed/queries")),
                             parser_error: None,
                             queries_error: None,
+                            files_downloaded: Vec::new(),
                         }
                     },
                 )
