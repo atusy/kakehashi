@@ -627,7 +627,20 @@ fn main() {
                 // trigger this — the client has no routed command to fire yet),
                 // so the command the client fires next lands on a RESPAWNED
                 // connection whose document tracker was purged.
-                if mode == "code-action-reopen-order" && surfaced_action && crash_once() {
+                // Never on the SECOND host, whose codeAction exists only to
+                // open that host deterministically *before* the crash: its
+                // response is what proves the didOpen reached this
+                // incarnation, and dying there would destroy the predecessor
+                // state the re-open test then attributes its evidence to.
+                let second_host = message
+                    .pointer("/params/textDocument/uri")
+                    .and_then(Value::as_str)
+                    .is_some_and(|uri| uri.contains("second_host"));
+                if mode == "code-action-reopen-order"
+                    && surfaced_action
+                    && !second_host
+                    && crash_once()
+                {
                     let _ = writer.flush();
                     std::process::exit(0);
                 }

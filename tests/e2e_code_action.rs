@@ -310,33 +310,64 @@ fn dirty_bystanders(client: &mut LspClient, count: usize) {
     }
 }
 
-/// Block until the FIRST incarnation has opened `uri_marker`'s virtual
-/// document — i.e. before any respawn, so a later appearance of that host can
-/// only have come from the re-open sweep.
-fn await_initial_open(log: &std::path::Path, uri_marker: &str) {
+/// Open the second host on the FIRST incarnation and *prove* it, by driving the
+/// open through a request instead of waiting for the eager fan-out to show up
+/// in the wire log.
+///
+/// The request path calls `ensure_document_opened` before it queues the
+/// request, on the same connection FIFO, so a codeAction that comes back with
+/// actions is proof that this incarnation already received the `didOpen` — no
+/// budget racing a background task that a loaded machine can starve past any
+/// deadline. (The previous log poll gave the eager open 15s and still lost
+/// under the full parallel suite.) The retry is the same idiom every other
+/// caller in this file uses for a cold downstream: it advances on responses,
+/// not on the clock.
+///
+/// The mock is gated not to crash on this host, so the predecessor survives to
+/// be the incarnation that opened it — which is what lets the caller attribute
+/// a LATER appearance of this host, in the replacement's segment, to the sweep.
+fn open_second_host_on_the_predecessor(client: &mut LspClient, log: &std::path::Path) {
     for _ in 0..300 {
-        if let Ok(wire) = std::fs::read_to_string(log) {
-            let incarnations = wire
-                .lines()
-                .filter(|l| l.split('\t').next() == Some("initialize"))
-                .count();
-            assert!(
-                incarnations <= 1,
-                "the predecessor died before it opened {uri_marker}; this test \
-                 cannot then attribute a later open to the sweep:\n{wire}"
+        let response = client.send_request(
+            "textDocument/codeAction",
+            json!({
+                "textDocument": { "uri": format!("file:///{SECOND_HOST_DIR}/other.md") },
+                "range": {
+                    "start": { "line": 3, "character": 0 },
+                    "end": { "line": 3, "character": 5 }
+                },
+                "context": { "diagnostics": [] }
+            }),
+        );
+        if response["result"].as_array().is_some_and(|a| !a.is_empty()) {
+            let wire = std::fs::read_to_string(log).unwrap_or_default();
+            assert_eq!(
+                wire.lines()
+                    .filter(|l| l.split('\t').next() == Some("initialize"))
+                    .count(),
+                1,
+                "the predecessor must still be the only incarnation, else a later \
+                 open of this host cannot be attributed to the sweep:\n{wire}"
             );
-            if wire.lines().any(|l| {
-                let mut parts = l.split('\t');
-                parts.next() == Some("textDocument/didOpen")
-                    && parts.next().is_some_and(|uri| uri.contains(uri_marker))
-            }) {
-                return;
-            }
+            assert!(
+                wire.lines().any(|l| {
+                    let mut parts = l.split('\t');
+                    parts.next() == Some("textDocument/didOpen")
+                        && parts
+                            .next()
+                            .is_some_and(|uri| uri.contains(SECOND_HOST_DIR))
+                }),
+                "a codeAction answered for this host without a didOpen preceding it:\n{wire}"
+            );
+            return;
         }
+        // The same 50ms the sibling retry uses. Without it 300 null responses
+        // can complete faster than a cold handshake makes any progress, which
+        // would reintroduce the very race this helper replaced.
         std::thread::sleep(Duration::from_millis(50));
     }
     let wire = std::fs::read_to_string(log).unwrap_or_default();
-    panic!("the first incarnation never opened a {uri_marker} document:\n{wire}");
+    panic!("the predecessor never surfaced an action for {SECOND_HOST_DIR}:\n{wire}");
 }
 
 /// Block until the replacement incarnation has both initialized AND received a
@@ -519,8 +550,9 @@ fn a_completed_reopen_releases_the_command_it_was_holding() {
     // parsing asynchronously and the eager open that follows uses
     // `connection: None`, so a task still in flight when the predecessor dies
     // could open this host on the REPLACEMENT without the sweep — which would
-    // silently make the assertion below non-discriminating again.
-    await_initial_open(&log, SECOND_HOST_DIR);
+    // silently make the assertion below non-discriminating again. Driven by a
+    // request rather than waited for, so the proof is a response.
+    open_second_host_on_the_predecessor(&mut client, &log);
 
     let actions = code_action_with_retry(&mut client);
     let routed = actions

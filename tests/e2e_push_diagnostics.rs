@@ -1439,3 +1439,38 @@ fn e2e_downstream_refresh_gated_off_for_refresh_incapable_client() {
     client.send_request("shutdown", json!(null));
     client.send_notification("exit", json!(null));
 }
+
+#[test]
+fn e2e_workspace_folder_change_refreshes_pull_clients() {
+    // A workspace-folder change moves the project a downstream analyses, so what
+    // it reports about a file can change while the file — and its version — does
+    // not. A pull-mode editor has no event of its own for that, and the bridge
+    // has just dropped the `previousResultId` lineage that let a downstream
+    // answer `unchanged`, so an answer accepted across the change resolves to an
+    // EMPTY layer. Both need the same nudge.
+    //
+    // The `workspace-folders` mock mode publishes no diagnostics and no document
+    // is opened, so no connection is ever spawned: any refresh observed here is
+    // the folder change's own. The harness passes `--config-file`, which is the
+    // path that skips the settings reload — the nudge must not ride on it.
+    let (mut client, _config_dir) =
+        init_client_with_mode_caps("workspace-folders", refresh_capable_caps());
+
+    client.send_notification(
+        "workspace/didChangeWorkspaceFolders",
+        json!({
+            "event": {
+                "added": [{ "uri": "file:///added-workspace", "name": "added" }],
+                "removed": []
+            }
+        }),
+    );
+
+    let (refresh_id, _) = client
+        .wait_for_server_request("workspace/diagnostic/refresh", Duration::from_secs(15))
+        .expect("a workspace-folder change must nudge a pull-mode editor to re-pull");
+    client.send_response(refresh_id, json!(null));
+
+    client.send_request("shutdown", json!(null));
+    client.send_notification("exit", json!(null));
+}

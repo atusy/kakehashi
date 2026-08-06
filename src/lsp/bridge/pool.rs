@@ -380,7 +380,8 @@ pub struct LanguageServerPool {
     /// this advances on close so an old response cannot attach to a reopen of
     /// the same URI on the same process.
     pub(crate) diagnostic_document_generations: DashMap<(ConnectionKey, String), u64>,
-    /// Per-connection settings/respawn fence for in-flight baseline reads.
+    /// Per-connection settings/respawn/workspace-folder fence for in-flight
+    /// baseline reads.
     pub(crate) diagnostic_pull_generations: DashMap<ConnectionKey, u64>,
     /// Serializes baseline snapshots/mutations with every invalidation fence.
     pub(crate) diagnostic_pull_lock: std::sync::Mutex<()>,
@@ -681,20 +682,91 @@ impl LanguageServerPool {
         self.workspace_folders.snapshot()
     }
 
-    /// Update the upstream client workspace snapshot used by future
-    /// client-fallback downstream connections.
+    /// Apply an upstream `workspace/didChangeWorkspaceFolders` to every
+    /// connection that follows the client workspace.
+    ///
+    /// The client snapshot and derived root URI are updated first, for future
+    /// spawns. Three effects then share one `connections` guard: the
+    /// pull-diagnostic lineage of client-fallback connections is fenced, the
+    /// event is forwarded to those that advertise support, and the rest —
+    /// mid-handshake, incapable, or unable to queue — are recycled and armed
+    /// for re-open. Their processes are shut down after the guard is released,
+    /// as `propagate_settings` does. Marker-rooted and shared connections
+    /// derive their folders from marker-root acquisition and are left alone.
+    ///
+    /// Answers whether the event described a change at all, so the caller can
+    /// decide from one definition — this one — whether the work it owns
+    /// (the client re-pull, the project-config reload) is warranted.
     pub(crate) async fn apply_workspace_folder_change(
         &self,
         added: Vec<tower_lsp_server::ls_types::WorkspaceFolder>,
         removed: &[tower_lsp_server::ls_types::WorkspaceFolder],
-    ) {
+    ) -> bool {
+        // An event naming neither an addition nor a removal describes no
+        // change: `WorkspaceFolderSet::apply_change` is a no-op for it, so the
+        // derived root cannot move, the forwarded notification would say
+        // nothing, and no connection's lineage stopped describing its project.
+        //
+        // Returning here rather than guarding only the fence below is
+        // deliberate. The recycle loop is not conditional on the event saying
+        // anything, and the fence is the ONLY thing that drops a connection's
+        // baselines — the respawn path's own invalidation is gated on finding
+        // an existing connection, which this function has already removed. A
+        // guard that skipped the fence alone would therefore hand a dead
+        // process's resultId to its replacement.
+        if added.is_empty() && removed.is_empty() {
+            return false;
+        }
+
+        // The snapshot is mutated UNDER the connections guard, not before it.
+        // `didChangeWorkspaceFolders` has no ingress ordering gate and tower-lsp
+        // polls handlers concurrently, so two events could otherwise apply to
+        // the snapshot in one order and reach the forwarding loop in the other
+        // — leaving the pool's set and a downstream's disagreeing about which
+        // folder is current. Under the guard the snapshot, the derived root,
+        // the fence, and the forwarding are one transaction per event. The
+        // spawn path reads both while holding the same guard, so a connection
+        // cannot be created from a half-applied change either.
+        let mut connections = self.connections.lock().await;
+
         self.workspace_folders.apply_change(added.clone(), removed);
         self.set_root_uri(
             self.workspace_folders()
                 .and_then(|folders| folders.first().map(|folder| folder.uri.to_string())),
         );
+        // Every connection that follows the client workspace has just had the
+        // project its diagnostics describe replaced, so no previousResultId
+        // lineage survives the change — the same reasoning `propagate_settings`
+        // applies to a settings replacement.
+        //
+        // This is the only fence such a connection gets. One that is recycled
+        // below at least moves its connection generation when the purge bumps
+        // it; one that merely takes the notification moves nothing else in
+        // `diagnostic_pull_lineage_is_current`, so without this its answer to a
+        // pull issued against the previous folder set would be accepted as
+        // current and its resultId kept as the next baseline.
+        //
+        // What closes that window is the guard, not the statement order: a pull
+        // enqueues its request while holding `connections` (`execute.rs` for a
+        // virtual region, `host.rs` for a host document — both span the
+        // liveness check, the didOpen/sync, and `send_request`), so none
+        // can be enqueued between this bump and the notification below. A pull
+        // that snapshotted before this guard was taken carries the old
+        // generation and loses; one that snapshots after cannot overtake the
+        // notification on the outbound FIFO. Moving this call after the loop
+        // would be equivalent — it stays here to match `propagate_settings`.
+        // Deliberately not narrowed by a before/after comparison of our own
+        // snapshot: a duplicate add or a removal of a folder we never held
+        // leaves that snapshot untouched, but the notification is forwarded
+        // downstream regardless and its view is not ours to diff. The empty
+        // event — the only one that provably says nothing — returned above.
+        let following_client_workspace: Vec<ConnectionKey> = connections
+            .keys()
+            .filter(|key| key.is_client_fallback())
+            .cloned()
+            .collect();
+        self.invalidate_diagnostic_connections(&following_client_workspace);
 
-        let mut connections = self.connections.lock().await;
         let mut invalidated = Vec::new();
         for (key, handle) in connections.iter() {
             let follows_client_workspace = key.is_client_fallback();
@@ -752,6 +824,7 @@ impl LanguageServerPool {
         for (key, handle) in stale_handles {
             shutdown_invalidated_connection(key, handle);
         }
+        true
     }
 
     /// Set the upstream client capabilities.
@@ -3609,6 +3682,129 @@ mod tests {
 
         assert!(pool.connections.lock().await.contains_key(&key));
         assert_eq!(handle.workspace_folders().snapshot(), Some(vec![marker]));
+    }
+
+    #[tokio::test]
+    async fn workspace_folder_change_drops_pull_diagnostic_lineage_of_client_fallbacks() {
+        // A pull already in flight when the folder set changes was answered
+        // against the previous project, and every generation in the lineage
+        // gate is unchanged for a connection that merely took the
+        // notification — so without a bump here that stale answer is accepted
+        // as current and its resultId seeds the next request. Scoped to the
+        // connections that follow the client workspace: a marker-owned one is
+        // rooted on disk and its lineage stays valid.
+        let fallback_key = ConnectionKey::for_server("fallback");
+        let marker_key = ConnectionKey::new("marker", Some("file:///marker".to_string()));
+        let pool = LanguageServerPool::new();
+        let fallback = create_handle_with_key(ConnectionState::Ready, fallback_key.clone()).await;
+        fallback.set_server_capabilities(capable_workspace_folders_caps());
+        let marker = create_handle_with_key(ConnectionState::Ready, marker_key.clone()).await;
+        marker.set_server_capabilities(capable_workspace_folders_caps());
+        pool.insert_connection(Arc::clone(&fallback)).await;
+        pool.insert_connection(marker).await;
+        for key in [&fallback_key, &marker_key] {
+            pool.diagnostic_pull_baselines.insert(
+                (key.clone(), "file:///v.lua".to_string()),
+                DiagnosticPullBaseline {
+                    result_id: "r1".to_string(),
+                    diagnostics: Arc::new(Vec::new()),
+                    request_sequence: 1,
+                },
+            );
+        }
+
+        pool.apply_workspace_folder_change(
+            vec![tower_lsp_server::ls_types::WorkspaceFolder {
+                uri: "file:///added".parse().unwrap(),
+                name: "added".to_string(),
+            }],
+            &[],
+        )
+        .await;
+
+        // The fence is load-bearing for exactly one shape: a connection that
+        // TOOK the notification and stayed. A recycled one is already fenced by
+        // the connection generation `purge_connection` bumps, so a fixture that
+        // silently drifted into the recycle branch would cover nothing while
+        // staying green.
+        assert!(
+            pool.connections.lock().await.contains_key(&fallback_key),
+            "the fixture must exercise a connection that took the notification"
+        );
+        assert_eq!(
+            fallback.workspace_folders().snapshot(),
+            Some(vec![tower_lsp_server::ls_types::WorkspaceFolder {
+                uri: "file:///added".parse().unwrap(),
+                name: "added".to_string(),
+            }]),
+            "and must have applied it",
+        );
+        assert!(
+            !pool
+                .diagnostic_pull_baselines
+                .contains_key(&(fallback_key.clone(), "file:///v.lua".to_string())),
+            "no previousResultId may cross a change of the project it described"
+        );
+        assert!(
+            pool.diagnostic_pull_generations
+                .get(&fallback_key)
+                .is_some_and(|generation| *generation > 0),
+            "a pull in flight across the change must lose to the generation"
+        );
+        assert!(
+            pool.diagnostic_pull_baselines
+                .contains_key(&(marker_key.clone(), "file:///v.lua".to_string())),
+            "a marker-owned connection's project did not change"
+        );
+        assert!(
+            !pool.diagnostic_pull_generations.contains_key(&marker_key),
+            "so its fence must not move either"
+        );
+    }
+
+    #[tokio::test]
+    async fn empty_workspace_folder_change_preserves_pull_diagnostic_lineage() {
+        // An event carrying neither an addition nor a removal describes no
+        // change of project, so there is nothing for the lineage to have
+        // stopped describing. Dropping the baselines anyway would cost one
+        // full downstream report per open document for nothing — the same
+        // anti-storm property `no_op_settings_reload_preserves_diagnostic_pull_baselines`
+        // pins on the settings path.
+        //
+        // The fixture is deliberately a connection the recycle branch WOULD
+        // claim (Ready, no folder-change capability): skipping only the fence
+        // while still recycling would leave its replacement inheriting this
+        // baseline, since the respawn path's own invalidation is gated on an
+        // existing connection that the recycle already removed.
+        let key = ConnectionKey::for_server("fallback");
+        let pool = LanguageServerPool::new();
+        let handle = create_handle_with_key(ConnectionState::Ready, key.clone()).await;
+        handle.set_server_capabilities(Default::default());
+        pool.insert_connection(handle).await;
+        pool.diagnostic_pull_baselines.insert(
+            (key.clone(), "file:///v.lua".to_string()),
+            DiagnosticPullBaseline {
+                result_id: "r1".to_string(),
+                diagnostics: Arc::new(Vec::new()),
+                request_sequence: 1,
+            },
+        );
+
+        pool.apply_workspace_folder_change(Vec::new(), &[]).await;
+
+        assert!(
+            pool.diagnostic_pull_baselines
+                .contains_key(&(key.clone(), "file:///v.lua".to_string())),
+            "an event that changes no folder must not cost a full re-pull"
+        );
+        assert!(
+            !pool.diagnostic_pull_generations.contains_key(&key),
+            "and must not move the fence either"
+        );
+        assert!(
+            pool.connections.lock().await.contains_key(&key),
+            "nor recycle a process over an event that named no folder"
+        );
     }
 
     fn shared_config() -> crate::config::settings::BridgeServerConfig {
