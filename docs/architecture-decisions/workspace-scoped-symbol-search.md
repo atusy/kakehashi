@@ -907,7 +907,9 @@ hand. "Its own offset" does not mean "its own resolution", though; see pass 3.
              │
              ▼
      ┌───────────────────┐  no
-     │ has a range?      ├─────▶ DROP as a PROTOCOL FAILURE (see below)
+     │ has a WELL-FORMED ├─────▶ DROP as a PROTOCOL FAILURE (see below)
+     │ range? (present,  │
+     │ start ≤ end)      │
      └─────────┬─────────┘
                │ yes
                ▼
@@ -993,8 +995,19 @@ Two things about *when* and *per what* are load-bearing:
   document's own downstream version and fingerprint from `host_documents`, not a
   virtual one.
 
-  Comparing that recorded pair across the request is **not enough on its own**,
-  and for a sharper reason than in the virtual case. Downstream host
+  Version and fingerprint alone cannot tell a **close/reopen** from no change at
+  all. Closing removes the sync state and reopening recreates it at version 1
+  with the same fingerprint when the text is unchanged, so both the recorded
+  comparison and the current-text comparison pass — while on a multilingual
+  server the document may have reopened under a *different language*, and an
+  answer computed for the prior lifetime would be accepted. So the host's
+  **incarnation and language** are captured per URI alongside the `_self`
+  dispatch identity and compared with it. This is the same lifetime check the
+  candidate walk already makes at selection; it has to survive into fan-in,
+  because the reopen can happen after dispatch.
+
+  Comparing the recorded pair across the request is also **not enough on its
+  own**, and for a sharper reason than in the virtual case. Downstream host
   synchronization is deferred to the diagnostic debounce and then launched
   asynchronously, so an edit can update the `DocumentStore` and leave
   `HostDocSyncState` untouched for some time — both readings equal, both stale.
@@ -1051,7 +1064,16 @@ existing strict position machinery rather than a new comparison, and only then
 is the range translated and checked against the host-side region bound. Validating in virtual coordinates before translating is
 what catches the column case; the host bound catches what survives it.
 
-A range-less entry is **not** a semantic rejection, and the distinction matters:
+The first check is **well-formedness, before the virtual/real branch** — the
+range must be present *and* correctly ordered. Bounds validation is necessarily
+per-document and happens later, against the region's own content, but ordering
+is not: a `start > end` range is malformed whatever it describes, and a real-file
+or `_self` entry carrying one would otherwise sail past untouched, since
+non-virtual locations are passed through unvalidated. Checking order once, up
+front, is what makes "an unusable range is a failure" true for every entry
+rather than only for the ones that happen to be translated.
+
+A malformed entry is **not** a semantic rejection, and the distinction matters:
 the server reported a match and kakehashi could not use it. Counting it as
 semantic would let a response consisting entirely of range-less entries come
 back as an informative `[]` — telling the user there are no symbols at the
