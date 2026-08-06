@@ -302,8 +302,14 @@ selected it always merges B, and with `priorities` naming only A there is no B
 to fall back to. So a user gets *either* B's duplicates always, *or* no backup;
 not "A normally, B when A has nothing".
 
+It is also implementable, and the ADR should not pretend otherwise. The
+attribution argument in point 2 is about *symbols* — no entry can be traced to a
+configured pair — but a whole *response* is plainly attributable to the
+connection that produced it, and this design already carries that key through
+fan-in. `preferred` over connections could be built.
+
 The trade is accepted as **uniformity**, not because fallback-on-empty is
-invalid. It would be easy to over-argue this, so: an empty answer from A
+invalid or unbuildable. It would be easy to over-argue this, so: an empty answer from A
 establishes only that A's index has no match, and says nothing about B's — which
 is exactly why `union` returns B's matches when A is empty, and why treating
 empty as a reason to consult B is a defensible policy rather than a semantic
@@ -339,15 +345,20 @@ configuration would contribute **no candidates at all**. Treating `_` instead as
 `bridge.python.enabled = false` or `priorities = []` excluded, and union has no
 way to subtract that contribution.
 
-Both axes therefore come from **what is actually open**, which is also the set
-the live-only rule already commits to:
+Both axes therefore come from **admission records** — the concrete pairs that
+justified opening a document on a connection, retained per connection and
+generation-stamped (point 7). A record is written when a document is opened:
 
-- **Host languages**: the languages of the currently open documents
+- **Host language**: taken from the host document at open time
   (`DocumentStore::open_uris()` + language detection). Concrete by
-  construction — it never comes from a map key.
-- **Injection languages**: the languages of the currently **open virtual
-  documents**, read from `VirtualDocumentUri::language()` on the pool's tracked
-  `OpenedVirtualDoc` entries, plus `_self` for the host tier.
+  construction — never a map key.
+- **Injection language**: `VirtualDocumentUri::language()` for a virtual
+  document, or `_self` for a host-tier open.
+
+Reading admission records rather than live document tracking is what keeps
+`host_documents` and the tracker off the selection path for *discovery*; they
+are still consulted for validation, but a candidate no longer disappears merely
+because its document closed.
 
 Deriving the injection axis from configuration instead — concrete bridge keys
 plus the languages servers declare — looks equivalent and is not. It loses every
@@ -370,8 +381,8 @@ a host-only document can have a perfectly valid `_self` connection that no
 virtual document names. Deriving `_self` targets from virtual documents would
 therefore either omit host bridging entirely or fall back to expanding a server
 name across roots, recreating the leak point 3 exists to prevent. The
-`(host_language, _self, ConnectionKey)` triples come from `host_documents`
-directly.
+`(host_language, _self, ConnectionKey)` admission records are therefore written
+at host-open time from `host_documents`' own key, alongside the virtual ones.
 
 That is a second async map, read **under** `connections` by the batch validator
 below rather than snapshotted separately, so selection's acquisitions are the
@@ -434,15 +445,20 @@ final barrier.** The order is fixed:
    `ConnectionState` also has `Initializing`, `Failed`, `Closing`, `Closed`);
    drops handles lacking `workspace/symbol`; drops handles whose recorded launch
    configuration no longer matches the `BridgeServerConfig` that admitted them;
-   and confirms current membership — the live reverse index for a virtual
-   candidate, `host_documents` for a `_self` one.
+   and confirms the admission record's **generation** still matches the
+   connection's.
 
-   The reverse index is a sharded map and answers synchronously. `host_documents`
-   is a separate Tokio mutex, so it is taken with **`try_lock`**, never awaited:
-   on contention the `_self` candidates are dropped for that query and the
-   virtual ones are unaffected. Awaiting it while holding `connections` would
-   make this path exactly the kind of unbounded holder that forced every budget
-   in point 6, and there is no version of "briefly" that is safe there.
+   The generation comparison is a field read on the handle — synchronous, no
+   second lock — which is why admission records carry it. An earlier draft
+   validated `_self` candidates against `host_documents` instead, taken with
+   `try_lock` under `connections`; that had to be abandoned because the mutex is
+   not brief bookkeeping. Host synchronization holds it across awaited
+   downstream notification sends, so ordinary editing or writer backpressure
+   would contend it, and a `_self` server would vanish from search — or the
+   query would fail outright — for reasons that are pure scheduling. Coverage
+   must not be a function of who happened to hold a lock. Virtual candidates are
+   additionally confirmed against the live reverse index, which is a sharded map
+   and answers synchronously.
 3. Apply the per-pair `priorities` allowlist and `max_fan_out` cap to the
    survivors — pure computation, after the lock is released.
 4. Dedup by **connection key** `(server, root)`.
@@ -453,18 +469,18 @@ The validator is **pool-owned** for two reasons. It is the only way to do all of
 this under one acquisition — `launch_config` and its comparator are private to
 the pool, and the exposed comparison helper takes `connections` itself, so a
 caller in `bridge/workspace/symbol.rs` doing these checks piecemeal would
-re-lock between them and validate against a map that had already moved. And it
-is what lets `host_documents` be consulted **while `connections` is held**
-rather than snapshotted first: a `_self` candidate has no reverse-index check to fall
-back on, `HostDocSyncState` records neither connection generation nor handle
-identity, and a respawn can purge the entry and install a fresh `Ready` handle
-under the same `ConnectionKey` — so a released snapshot would let a connection
-that never opened the host document pass every other check. The language and
-incarnation recheck does not catch that, because the host lifetime never
-changed; only the connection did.
+re-lock between them and validate against a map that had already moved.
 
-The resulting order is `connections` → {tracker, `host_documents`}, which is the
-pool's own nesting and the one the respawn purge takes.
+It is also where the generation comparison happens, and why admission records
+carry one. `HostDocSyncState` records neither connection generation nor handle
+identity, and a respawn can install a fresh `Ready` handle under the same
+`ConnectionKey` — so a `_self` candidate carrying only a key would let a
+connection that never opened the host document pass every other check. The
+language and incarnation recheck does not catch that, because the host lifetime
+never changed; only the connection did. A stamped record does.
+
+The resulting order is `connections` → tracker, which is the pool's own nesting
+and the one the respawn purge takes.
 
 Every filter in step 2 precedes the cap in step 3, and that ordering is
 load-bearing for each of them: with `priorities = [A, B]` and
@@ -623,14 +639,22 @@ neither the query's requests nor its connections. That is a real divergence from
 its documented promise to "cap the number of concurrent server requests", and
 the fix is documentation, not a mechanism: the setting's description must say so
 (point 8). What actually bounds the total is the live-connection set (point 7).
-A workspace-level ceiling belongs in a separate setting with its own name and
-semantics rather than smuggled into this one, and is listed as deferred work in
-point 9 rather than left as a vague possibility — this method is the widest
-fan-out kakehashi has, and it is the one the existing guard does not bound.
+A workspace-level ceiling therefore **ships with the feature**, as its own
+top-level setting rather than smuggled into this one. Leaving it out would mean
+advertising the widest fan-out kakehashi has with its only load control
+documented as applying and not applying — and documentation cannot restore a
+guarantee the code stopped providing.
+
+It is a single value, which is what makes it definable where a derived global
+cap was not: there is no "uncapped pair means infinity" to reconcile and no
+per-pair priority list to merge. It applies **after dedup**, to the connection
+set, and when it truncates it does so in a **stable documented order** —
+`(server name, root)` — rather than by priority, since per-pair priorities
+conflict and walk order varies run to run. Unset means no limit.
 
 ```
-  open host docs × their open virtual docs    ← concrete languages only,
-        │  (never a raw `_` map key)             no arbitration
+  admission records (per connection,          ← concrete languages only,
+        │  generation-stamped, outlive close)    no arbitration
         ▼
   ┌──────────────────────┐   ┌──────────────────────┐
   │ (LANG_1, _self)      │   │ (LANG_2, _self)      │  ... every pair
@@ -645,6 +669,8 @@ fan-out kakehashi has, and it is the one the existing guard does not bound.
         │ stale-config, confirm still open on  │
         │ that exact connection                │
         │ then: allowlist + per-pair maxFanOut │
+        │ then dedup, then the workspace-wide  │
+        │ ceiling (stable server,root order)   │
         │ NEVER spawns a connection            │
         └──────────────────┬───────────────────┘
                            ▼
@@ -1162,8 +1188,7 @@ response.
   error**.
 
 The last two cases are why the unit is the entry rather than the response.
-Selection can expire its tracker or `connections` acquisition, and `_self`
-discovery is incomplete whenever `host_documents` was contended, so "no
+Selection can expire its tracker or `connections` acquisition, so "no
 candidates" and "we could not find out" are different states. And a fan-in
 failure counts: if servers returned symbols and every entry was lost to a lock
 that could not be acquired or a parse that had not settled, the client would
@@ -1256,16 +1281,17 @@ budget, and failing to acquire it drops the affected target or host** rather
 than blocking the query. That is more than the `connections` mutex — selection
 also awaits the tracker snapshot, each send re-acquires `connections` before
 enqueue, and translation takes each host's `edit_lock`. (`host_documents` is not
-in that list: it is `try_lock`ed under `connections` and never awaited, so
-contention drops the `_self` candidates immediately rather than consuming a
-budget.) None of these is safe to assume fast: injection processing holds
+in that list at all: selection no longer consults it, since `_self` candidates
+are validated by generation comparison instead — see point 3 for why
+`try_lock`ing it was abandoned.) None of these is safe to assume fast: injection
+processing holds
 `edit_lock` across downstream close, change, and eager-spawn awaits, so a query
 arriving mid-processing would otherwise wait on unrelated work with no bound.
 
 - **Selection**: the tracker snapshot, then `connections` — three seconds each.
   Nothing else is *awaited*: under `connections` the validator queries the
-  reverse index synchronously and `host_documents` with `try_lock`, so there is
-  no third acquisition to budget and no await while a lock is held. The budget
+  reverse index synchronously and compares generations as field reads, so there
+  is no third acquisition to budget and no await while a lock is held. The budget
   covers *acquiring* each lock, not the filtering between them — that walk is synchronous with no
   await, so a timeout could not preempt it anyway, and bounding what cannot be
   interrupted would promise something the runtime does not deliver.
@@ -1303,23 +1329,32 @@ requests.
 A candidate with no live connection is **skipped**, not spawned. Coverage is
 therefore bounded by what the client has opened, and grows as it opens more.
 
-Stated precisely, it is **the servers currently holding an open document for
-this workspace** — not "every running server". The two differ, and the gap is
-user-visible: `didClose` removes kakehashi's document tracking but deliberately
-leaves the downstream connection running, so closing the last buffer for a
-language drops that server from selection even though it is still `Ready`. What
-that costs depends on the server: whether a downstream retains a usable
-workspace index after `didClose` is server-specific and not something kakehashi
-can know. Where it does, a query that would have been answered comes back
-empty — and if that server was the only one selected, the whole search does,
-with no failure anywhere.
+Stated precisely, it is **every live connection some open document once
+justified** — not "every running server", and not "servers with a document open
+right now". The middle reading is the one that matters: `didClose` removes
+kakehashi's document tracking but deliberately leaves the downstream connection
+running, and whether that server keeps a usable workspace index afterwards is
+server-specific. Selecting on live documents would therefore make closing the
+last buffer for a language silently drop a `Ready`, possibly well-indexed server
+— so selection uses retained admission records instead (point 3).
 
-That follows from deriving the candidate axes from open documents, which is what
-makes them concrete (point 3) — the alternative derivations lose `_` handling or
-`["*"]` servers entirely. Closing it properly means retaining each connection's
-admitting policy independently of document tracking, so a connection can outlive
-the document that justified it. That is a change to what the pool remembers, not
-to this method, and is left as a follow-up rather than smuggled in here.
+This is **not** deferred, because a provider that quietly stops answering when
+you close a buffer is not a workspace search. The pool retains an **admission
+record** per connection — the concrete `(host_language, injection_language_or_
+_self)` pairs that ever justified opening a document on it, stamped with the
+connection's generation — written when the document is opened and *not* removed
+when it closes. Candidates come from those records rather than from live
+document tracking.
+
+The records stay concrete, because each was created from a real open document at
+the time (point 3's requirement), and they survive both closure and the respawn
+purge window, which is the same root cause seen twice. The generation stamp is
+what makes them safe to hold: a record whose generation no longer matches the
+connection's is stale and is discarded rather than trusted, so a replaced
+process cannot inherit its predecessor's admissions.
+
+A record is dropped when its connection is, so this bounds memory by live
+connections, not by session history.
 
 This is not merely a cost trade. Cold-starting cannot deliver the coverage it
 appears to promise:
@@ -1415,12 +1450,6 @@ documenting only two values.
   `workspaceSymbolProvider`. The existing client-progress aggregator is keyed by
   region and has no meaning for a request that has no region. Both tokens are
   optional in LSP 3.18.
-- **A request-wide fan-out ceiling.** `max_fan_out` bounds a pair's name
-  selection, not the query (point 3), so nothing caps how many connections one
-  query touches except how many are live. That is a real gap in a generic load
-  control, and this is the method most able to expose it. The fix is a
-  separately named workspace-level limit — a new user-facing setting, which is
-  why it is deferred rather than decided here.
 - **Request coalescing.** A symbol picker typically fires one request per
   keystroke, and this design has no single-flight, debounce, or supersession —
   each keystroke fans out to every live connection. The repo has prior art for
@@ -1555,15 +1584,14 @@ Including it would defeat dedup on a field carrying no identity.
   in methods that have no use for it.
 - A server still `Initializing` when the query arrives is skipped entirely, so
   a search in the seconds after opening a file can miss it (point 3).
-- `_self` targets are dropped when `host_documents` is contended at validation
-  time, since it is `try_lock`ed rather than awaited (point 3). Host-bridged
-  symbols can therefore be absent from one query for a reason the user cannot
-  see.
+- Admission records add per-connection state the pool must maintain and expire
+  with the connection (point 3) — the cost of not tying coverage to document
+  lifetime.
 - Every lock this path *awaits* — the candidate tracker snapshot, `connections`,
   each send's re-acquisition, the two fan-in tracker reads, each host's
-  `edit_lock` — is bounded only in its **acquisition** (`host_documents` and the
-  per-send identity snapshot are never awaited; they are `try_lock`ed under
-  `connections`, and contention drops the affected candidates), because
+  `edit_lock` — is bounded only in its **acquisition** (the per-send identity
+  snapshot is `try_lock`ed under `connections` rather than awaited, and
+  contention drops that target), because
   other paths hold these across unbounded async work (point 6); the filtering
   between them is synchronous and cannot be preempted, so neither total
   selection time nor cancellation blocking is capped. Expiring any of those
@@ -1577,15 +1605,17 @@ Including it would defeat dedup on a field carrying no identity.
   releases `connections` before bumping its revision and recording its
   fingerprint, so a change landing beside a dispatch can expose a pair no
   snapshot matches, and those symbols are dropped from that query (point 4).
-- `max_fan_out` does not bound this method's total fan-out. It selects names
-  per pair, and a connection one pair excluded re-enters through another pair
-  that legitimately opened it. Its documented promise to cap concurrent server
-  requests does not hold here, which is why the documentation must say so.
+- `max_fan_out` does not bound this method's total fan-out on its own — it
+  selects names per pair, and a connection one pair excluded re-enters through
+  another. A new top-level ceiling restores the guarantee, at the cost of one
+  more user-facing setting to learn (point 3).
 - The `kakehashi-virtual-uri-*` filename space is reserved: a real workspace
   file named into it is invisible to symbol search (point 5).
 - No configuration can express "suppress B's duplicates, but fall back to B when
   A fails" — `union` has no conditional and `priorities` is unconditional, so
-  users pick one or the other (point 2).
+  users pick one or the other. This is a choice, not a limitation: a
+  per-connection `preferred` is implementable, and was declined for uniformity
+  (point 2).
 - `strategy` becomes a knob that this one method ignores. A **method-specific**
   entry warns; a `_` wildcard that happens to reach the method is overridden
   silently, by design (point 2). Users
