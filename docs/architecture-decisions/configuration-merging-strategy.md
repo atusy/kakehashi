@@ -100,6 +100,15 @@ exhaustively, so a new field on either fails to compile until it is classified;
 a new *top-level* path field is not covered, since `searchPaths` reaches the
 walk as a parameter.
 
+Omitted, empty, and non-empty are three distinct statements, uniformly across
+every map and list setting: omitted inherits the layer below, an explicit empty
+container clears it, and a non-empty one merges per key (maps) or replaces
+wholesale (lists). Expressing that requires the field to be `Option`-typed —
+`#[serde(default)]` on a bare `HashMap`/`Vec` cannot tell an omitted key from an
+empty one — so every such field carries `Option` and `skip_serializing_if`, the
+latter so settings written back out do not gain an empty container that reads as
+a clear on the next load.
+
 Bases per layer: a config file uses its own directory (each `--config-file`
 layer its own), `initializationOptions` and `didChangeConfiguration` use the
 workspace root, and the programmed defaults have no base. That root is not
