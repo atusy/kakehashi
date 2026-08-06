@@ -27,7 +27,17 @@ impl Kakehashi {
         // A lazy resolve can arrive after edits changed a formerly contiguous
         // combined document into one with masked host gaps. Fail closed for
         // legacy/stale envelopes before the downstream can add new edits.
+        //
+        // A genuine HOST-layer item (#958) carries no region — it is forwarded
+        // verbatim in host coordinates — so this gate, which resolves the
+        // envelope's `region_id` and would find nothing for the empty host one,
+        // is skipped. `is_host_layer` additionally requires that empty
+        // `region_id`, so a conforming client can't skip the gate merely by
+        // toggling `host_layer` on a virt envelope. It is not a security
+        // boundary (the envelope round-trips through unprotected client `data`)
+        // — it guards against accidental bypass, and the host path fails soft.
         if let Some(envelope) = extract_envelope(&params)
+            && !envelope.is_host_layer()
             && !self.completion_envelope_is_fresh(&envelope)
         {
             return Ok(params);

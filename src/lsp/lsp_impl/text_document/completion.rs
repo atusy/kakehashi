@@ -6,14 +6,22 @@
 //! and the response verbatim. The first layer producing completion items, or an
 //! incomplete `CompletionList` that asks the client to re-query, wins
 //! (`preferred`).
+//!
+//! The host layer cannot use the generic verbatim raw-value walk: its items
+//! need the routing envelope that makes `completionItem/resolve` reach the host
+//! server that produced them (#958), so it dispatches typed per server to keep
+//! the server name and its advertised capabilities.
 
 use tower_lsp_server::jsonrpc::Result;
 use tower_lsp_server::ls_types::{
-    CompletionList, CompletionParams, CompletionResponse, Position, Uri,
+    CompletionList, CompletionParams, CompletionResponse, MessageType, Position, Uri,
 };
 
 use super::super::Kakehashi;
-use crate::lsp::aggregation::server::dispatch_preferred;
+use crate::lsp::aggregation::server::{
+    FanInResult, HostFanOutTask, dispatch_host_preferred, dispatch_preferred,
+};
+use crate::lsp::bridge::{HostDocument, envelope_host_item};
 use crate::lsp::lsp_impl::bridge_context::parse_host_verbatim;
 
 const METHOD: &str = "textDocument/completion";
@@ -28,16 +36,98 @@ impl Kakehashi {
         let position = params.text_document_position.position;
 
         let virt = self.completion_virt_layer(&lsp_uri, position);
-        self.walk_layers(
+        let host = self.completion_host_layer(&lsp_uri, raw_params);
+        self.walk_layer_futures(
             &lsp_uri,
             METHOD,
             METHOD,
-            raw_params,
             virt,
-            parse_host_verbatim::<CompletionResponse>,
+            host,
+            std::future::ready(Ok(None)),
             completion_response_has_result,
         )
         .await
+    }
+
+    /// Host layer: forward the params verbatim to the host language's own
+    /// servers, then envelope each item so a later `completionItem/resolve`
+    /// routes back to the server that produced it (#958). Coordinates stay
+    /// untranslated — they are already real.
+    ///
+    /// The envelope is minted only for a server that advertises
+    /// `completionItem/resolve`: for one that does not, it would be pure wire
+    /// weight on every item of every completion, and the resolve would fail
+    /// soft back to the unresolved item anyway.
+    async fn completion_host_layer(
+        &self,
+        lsp_uri: &Uri,
+        raw_params: serde_json::Value,
+    ) -> Result<Option<CompletionResponse>> {
+        let Some(ctx) = self.resolve_host_bridge_context(lsp_uri, METHOD) else {
+            return Ok(None);
+        };
+        let (cancel_rx, _cancel_guard) = self.subscribe_cancel(ctx.upstream_request_id.as_ref());
+        let pool = self.bridge.pool_arc();
+        let f = move |t: HostFanOutTask| {
+            let params = raw_params.clone();
+            async move {
+                let raw = t
+                    .pool
+                    .send_host_raw_request(
+                        &t.server_name,
+                        &t.server_config,
+                        &HostDocument {
+                            uri: &t.uri,
+                            language_id: &t.language_id,
+                            text: &t.text,
+                        },
+                        METHOD,
+                        params,
+                        t.upstream_id,
+                    )
+                    .await?;
+                let Some(raw) = raw else {
+                    return Ok(None);
+                };
+                let Some(mut response) = parse_host_verbatim::<CompletionResponse>(raw.value)
+                else {
+                    return Ok(None);
+                };
+                if raw.handle.has_capability("completionItem/resolve") {
+                    envelope_host_completion_items(&mut response, &t.server_name, t.uri.as_str());
+                }
+                Ok(Some(response))
+            }
+        };
+        // No layer-level `unregister_all` here: the virt layer runs
+        // concurrently under the SAME upstream id, so wiping the registry on
+        // this layer's completion would drop the sibling's live cancel
+        // registrations. `run_layer_race` sweeps after the whole race.
+        let fan_in = dispatch_host_preferred(
+            &ctx,
+            pool.clone(),
+            f,
+            |opt| matches!(opt, Some(v) if completion_response_has_result(v)),
+            cancel_rx,
+        )
+        .await;
+        // Quieter than `FanInResult::handle`: an all-empty host layer is the
+        // normal outcome whenever virt answers, so only real failures surface.
+        match fan_in {
+            FanInResult::Done(value) => Ok(value),
+            FanInResult::NoResult { errors } => {
+                if errors > 0 {
+                    self.notifier()
+                        .log(
+                            MessageType::WARNING,
+                            format!("No {METHOD} response from any host bridge server"),
+                        )
+                        .await;
+                }
+                Ok(None)
+            }
+            FanInResult::Cancelled => Err(tower_lsp_server::jsonrpc::Error::request_cancelled()),
+        }
     }
 
     /// Virt layer: bridge the injection region under the cursor.
@@ -88,6 +178,24 @@ impl Kakehashi {
                 Ok(v.map(CompletionResponse::List))
             })
             .await
+    }
+}
+
+/// Envelope every item of a host-layer response for `completionItem/resolve`
+/// routing. Both response shapes are enveloped: host servers answer with a bare
+/// array as often as with a `CompletionList`, and a List-only loop would leave
+/// array responses unresolvable — the very bug this fixes.
+fn envelope_host_completion_items(
+    response: &mut CompletionResponse,
+    server_name: &str,
+    host_uri: &str,
+) {
+    let items = match response {
+        CompletionResponse::Array(items) => items,
+        CompletionResponse::List(list) => &mut list.items,
+    };
+    for item in items.iter_mut() {
+        envelope_host_item(item, server_name, host_uri);
     }
 }
 

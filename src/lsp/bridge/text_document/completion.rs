@@ -80,6 +80,7 @@ impl LanguageServerPool {
                         region_id,
                         offset: ctx.offset,
                         region_end: Some(region_end),
+                        host_layer: false,
                     }),
                 )
             },
@@ -408,6 +409,29 @@ pub(crate) struct KakehashiEnvelope {
     /// fully fail-closed guard in prefixed regions.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub region_end: Option<(u32, u32)>,
+    /// Host-layer item (`bridge._self`, #958): it is already in host
+    /// coordinates, so `completionItem/resolve` routes to the host server
+    /// VERBATIM — no virtual URI, region, or offset translation.
+    /// `region_id`/`offset`/`region_end` are unused for these. Defaults to
+    /// `false` (virt layer) so existing enveloped items deserialize unchanged.
+    #[serde(default)]
+    pub host_layer: bool,
+}
+
+impl KakehashiEnvelope {
+    /// Whether this is a genuine HOST-layer envelope: `host_layer` set AND no
+    /// region identity. A host envelope is minted with an empty `region_id`
+    /// ([`envelope_host_item`]), so requiring both here means a CONFORMING
+    /// client that merely flips `host_layer = true` on a VIRT envelope (which
+    /// keeps its `region_id`) still can't route it through the translation-free
+    /// host path and skip the region freshness / coordinate validation. This is
+    /// not a security boundary: the envelope round-trips through client-supplied
+    /// `CompletionItem.data` and is not integrity-protected, so a client could
+    /// clear `region_id` too — the check guards against ACCIDENTAL bypass, not a
+    /// malicious one (which the translation-free host path also fails soft on).
+    pub(crate) fn is_host_layer(&self) -> bool {
+        self.host_layer && self.region_id.is_empty()
+    }
 }
 
 /// Offset snapshot stored in the envelope for coordinate back-translation.
@@ -456,6 +480,10 @@ pub(crate) struct EnvelopeContext<'a> {
     /// Region end (host coords) snapshot for the resolve-path safety guard;
     /// `None` only when re-enveloping a legacy envelope that never carried it.
     pub region_end: Option<Position>,
+    /// Carries the layer through a re-envelope: a host-layer item resolved
+    /// once must still route through the host path on the NEXT resolve.
+    /// Minting sites use `false` (virt) or [`envelope_host_item`].
+    pub host_layer: bool,
 }
 
 /// Wrap `item.data` in a Kakehashi envelope for origin tracking.
@@ -471,6 +499,31 @@ pub(crate) fn envelope_item_data(item: &mut CompletionItem, ctx: &EnvelopeContex
         inner,
         offset: EnvelopeOffset::from(ctx.offset),
         region_end: ctx.region_end.map(|end| (end.line, end.character)),
+        host_layer: ctx.host_layer,
+    };
+    item.data = Some(serde_json::json!({ ENVELOPE_KEY: envelope }));
+}
+
+/// Wrap a HOST-layer item's `data` in a routing envelope so a later
+/// `completionItem/resolve` routes back to the host server (#958). The host
+/// document is forwarded verbatim, so no region/offset is captured
+/// (`host_layer = true` tells the resolve path to skip all coordinate
+/// translation and its region-geometry guards).
+pub(crate) fn envelope_host_item(item: &mut CompletionItem, server_name: &str, host_uri: &str) {
+    let inner = item.data.take();
+    let envelope = KakehashiEnvelope {
+        origin: server_name.to_string(),
+        host_uri: host_uri.to_string(),
+        region_id: String::new(),
+        inner,
+        // Unused on the host path (resolve forwards verbatim); a zero offset.
+        offset: EnvelopeOffset {
+            line: 0,
+            column: 0,
+            line_column_offsets: None,
+        },
+        region_end: None,
+        host_layer: true,
     };
     item.data = Some(serde_json::json!({ ENVELOPE_KEY: envelope }));
 }
@@ -1015,6 +1068,7 @@ mod tests {
             region_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV",
             offset: &offset,
             region_end: Some(TEST_REGION_END),
+            host_layer: false,
         };
         envelope_item_data(&mut item, &ctx);
 
@@ -1060,6 +1114,73 @@ mod tests {
         );
     }
 
+    /// A pre-#958 envelope carries no `host_layer` field; it must deserialize
+    /// as a VIRT envelope, not fail — `serde(default)` backward compatibility.
+    #[test]
+    fn envelope_without_host_layer_field_defaults_to_virt() {
+        let legacy = json!({
+            "origin": "lua-ls",
+            "host_uri": "file:///test/doc.md",
+            "region_id": "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+            "inner": null,
+            "offset": { "line": 1, "column": 0 }
+        });
+        let envelope: KakehashiEnvelope =
+            serde_json::from_value(legacy).expect("legacy envelope must still deserialize");
+        assert!(!envelope.host_layer);
+        assert!(!envelope.is_host_layer());
+    }
+
+    /// A host-layer item is enveloped with the layer marker and NO region
+    /// identity — the resolve path routes it verbatim off those two facts.
+    #[test]
+    fn host_envelope_is_marked_and_carries_no_region() {
+        let mut item = CompletionItem {
+            label: "./test".to_string(),
+            data: Some(json!({"pathCompletion": "/tmp/test"})),
+            ..Default::default()
+        };
+        envelope_host_item(&mut item, "tsudoi-ls", "file:///test/doc.txt");
+
+        let envelope = extract_envelope(&item).expect("should extract envelope");
+        assert!(envelope.is_host_layer());
+        assert_eq!(envelope.origin, "tsudoi-ls");
+        assert_eq!(envelope.host_uri, "file:///test/doc.txt");
+        assert_eq!(envelope.region_id, "");
+        assert_eq!(envelope.region_end, None);
+        assert_eq!(envelope.inner, Some(json!({"pathCompletion": "/tmp/test"})));
+    }
+
+    /// `host_layer` alone does not make an envelope host-layer: a conforming
+    /// client flipping the flag on a VIRT envelope (which keeps its
+    /// `region_id`) must not skip the region freshness / coordinate guards.
+    #[test]
+    fn is_host_layer_requires_an_empty_region_id() {
+        let mut item = CompletionItem {
+            label: "print".to_string(),
+            ..Default::default()
+        };
+        let offset = RegionOffset::new(3, 4);
+        envelope_item_data(
+            &mut item,
+            &EnvelopeContext {
+                server_name: "lua-ls",
+                host_uri: "file:///test/doc.md",
+                region_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+                offset: &offset,
+                region_end: Some(TEST_REGION_END),
+                host_layer: true,
+            },
+        );
+
+        let envelope = extract_envelope(&item).expect("should extract envelope");
+        assert!(envelope.host_layer);
+        assert!(
+            !envelope.is_host_layer(),
+            "a region-carrying envelope stays on the virt resolve path"
+        );
+    }
+
     #[test]
     fn envelope_round_trip_with_none_data() {
         let mut item = CompletionItem {
@@ -1074,6 +1195,7 @@ mod tests {
             region_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV",
             offset: &offset,
             region_end: Some(TEST_REGION_END),
+            host_layer: false,
         };
         envelope_item_data(&mut item, &ctx);
 

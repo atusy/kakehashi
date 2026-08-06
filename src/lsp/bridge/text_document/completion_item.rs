@@ -17,7 +17,7 @@ use log::warn;
 use tower_lsp_server::ls_types::{CompletionItem, Position};
 use url::Url;
 
-use super::super::pool::{LanguageServerPool, UpstreamId};
+use super::super::pool::{ConnectionHandle, LanguageServerPool, UpstreamId};
 use super::super::protocol::{
     JsonRpcRequest, RegionOffset, RequestId, response_has_jsonrpc_error,
     translate_host_range_to_virtual,
@@ -73,8 +73,84 @@ impl LanguageServerPool {
             return item;
         };
 
+        // Host-layer items are already in host coordinates — route their
+        // resolve to the host server VERBATIM (no translation, #958). A genuine
+        // host envelope has no region identity; requiring that blocks a client
+        // flipping `host_layer` on a virt envelope to skip translation.
+        if envelope.is_host_layer() {
+            return self
+                .send_host_completion_resolve(&config, item, envelope, upstream_id)
+                .await;
+        }
+
         self.send_completion_resolve_request(&config, item, envelope, upstream_id)
             .await
+    }
+
+    /// Route a HOST-layer `completionItem/resolve` back to its host server
+    /// VERBATIM: the item is already in host coordinates, so nothing is
+    /// translated and the injection-region edit guard — which has no region to
+    /// judge against here — does not run. Fails soft (returns the item
+    /// unresolved, envelope restored) at every step.
+    async fn send_host_completion_resolve(
+        &self,
+        server_config: &BridgeServerConfig,
+        mut item: CompletionItem,
+        envelope: KakehashiEnvelope,
+        upstream_id: Option<UpstreamId>,
+    ) -> CompletionItem {
+        let server_name = &envelope.origin;
+        // `host_uri` comes from client-supplied `data` (the resolve params echo
+        // the item's envelope), so a malformed value must fail soft, NOT fall
+        // through to `get_or_create_connection(.., None)` — a `None` document
+        // hint routes to a rootless client-fallback / shared key that could run
+        // the resolve against the wrong workspace. The bridge only ever mints a
+        // valid `Url::as_str()` here, so a parse failure means a corrupt or
+        // foreign envelope.
+        let Ok(host_url) = Url::parse(&envelope.host_uri) else {
+            warn!(
+                target: "kakehashi::bridge",
+                "completionItem/resolve (host): envelope host_uri '{}' is not a valid URL; ignoring",
+                envelope.host_uri
+            );
+            re_envelope_item(&mut item, &envelope);
+            return item;
+        };
+        let handle = match self
+            .get_or_create_connection(server_name, server_config, Some(&host_url))
+            .await
+        {
+            Ok(h) => h,
+            Err(e) => {
+                warn!(
+                    target: "kakehashi::bridge",
+                    "completionItem/resolve (host): failed to connect to {server_name}: {e}"
+                );
+                re_envelope_item(&mut item, &envelope);
+                return item;
+            }
+        };
+        if !handle.has_capability("completionItem/resolve") {
+            re_envelope_item(&mut item, &envelope);
+            return item;
+        }
+
+        // Host coordinates throughout: the item goes out as served (minus the
+        // envelope, already stripped) and the resolved reply needs no
+        // translation on the way back.
+        match self
+            .send_completion_resolve_on_handle(&handle, item.clone(), upstream_id)
+            .await
+        {
+            Some(mut resolved) => {
+                re_envelope_item(&mut resolved, &envelope);
+                resolved
+            }
+            None => {
+                re_envelope_item(&mut item, &envelope);
+                item
+            }
+        }
     }
 
     /// Send a `completionItem/resolve` request to the downstream server that
@@ -120,74 +196,14 @@ impl LanguageServerPool {
             return item;
         }
 
-        // Route per-connection cancel state by this handle's pool key (#382) —
-        // the same connection the completion ran on, recovered from the
-        // envelope's host URI above.
-        let connection_key = handle.key();
-
-        // Register in the upstream request registry FIRST for cancel lookup.
-        if let Some(ref id) = upstream_id {
-            self.register_upstream_request(id.clone(), connection_key);
-        }
-
-        let (request_id, response_rx) =
-            match handle.register_request_with_upstream(upstream_id.clone()) {
-                Ok(pair) => pair,
-                Err(e) => {
-                    warn!(
-                        target: "kakehashi::bridge",
-                        "completionItem/resolve: failed to register request for {}: {}",
-                        server_name, e
-                    );
-                    if let Some(ref id) = upstream_id {
-                        self.unregister_upstream_request(id, connection_key);
-                    }
-                    re_envelope_item(&mut item, &envelope);
-                    return item;
-                }
-            };
-
         // The original host-coordinate `item` is kept untouched for the
-        // fail-soft returns below.
-        let request = prepare_completion_resolve_request(&item, &envelope, request_id);
+        // fail-soft returns below; the outgoing clone carries virtual ranges.
+        let outgoing = prepare_completion_resolve_item(&item, &envelope);
 
-        let mut router_guard = RouterCleanupGuard::new(Arc::clone(handle.router()), request_id);
-
-        if let Err(e) = handle.send_request(request, request_id) {
-            warn!(
-                target: "kakehashi::bridge",
-                "completionItem/resolve: failed to send request for {}: {}",
-                server_name, e
-            );
-            if let Some(ref id) = upstream_id {
-                self.unregister_upstream_request(id, connection_key);
-            }
-            re_envelope_item(&mut item, &envelope);
-            return item;
-        }
-
-        let response = handle.wait_for_response(request_id, response_rx).await;
-        router_guard.disarm();
-
-        // Unregister from the upstream request registry regardless of result
-        if let Some(ref id) = upstream_id {
-            self.unregister_upstream_request(id, connection_key);
-        }
-
-        let response = match response {
-            Ok(r) => r,
-            Err(e) => {
-                warn!(
-                    target: "kakehashi::bridge",
-                    "completionItem/resolve failed for server {}: {}",
-                    server_name, e
-                );
-                re_envelope_item(&mut item, &envelope);
-                return item;
-            }
-        };
-
-        match parse_completion_resolve_response(response) {
+        match self
+            .send_completion_resolve_on_handle(&handle, outgoing, upstream_id)
+            .await
+        {
             Some(mut resolved) => {
                 let offset = RegionOffset::from(&envelope.offset);
                 let region_end = resolve_guard_region_end(&envelope, &offset);
@@ -210,6 +226,78 @@ impl LanguageServerPool {
             None => {
                 re_envelope_item(&mut item, &envelope);
                 item
+            }
+        }
+    }
+
+    /// Transport half of `completionItem/resolve`, shared by the virt and host
+    /// paths: register for cancel forwarding, send `outgoing` on `handle`, and
+    /// parse the reply. `None` on every failure (registration, send, transport,
+    /// error/malformed response) — the callers own the fail-soft policy of
+    /// returning the unresolved item with its envelope restored. The upstream
+    /// registry entry is removed on every exit.
+    async fn send_completion_resolve_on_handle(
+        &self,
+        handle: &Arc<ConnectionHandle>,
+        outgoing: CompletionItem,
+        upstream_id: Option<UpstreamId>,
+    ) -> Option<CompletionItem> {
+        // Route per-connection cancel state by this handle's pool key (#382) —
+        // the same connection the completion ran on, recovered from the
+        // envelope's host URI by the caller.
+        let connection_key = handle.key();
+
+        // Register in the upstream request registry FIRST for cancel lookup.
+        if let Some(ref id) = upstream_id {
+            self.register_upstream_request(id.clone(), connection_key);
+        }
+
+        let (request_id, response_rx) = match handle
+            .register_request_with_upstream(upstream_id.clone())
+        {
+            Ok(pair) => pair,
+            Err(e) => {
+                warn!(
+                    target: "kakehashi::bridge",
+                    "completionItem/resolve: failed to register request on {connection_key:?}: {e}"
+                );
+                if let Some(ref id) = upstream_id {
+                    self.unregister_upstream_request(id, connection_key);
+                }
+                return None;
+            }
+        };
+
+        let request = build_completion_resolve_request(outgoing, request_id);
+        let mut router_guard = RouterCleanupGuard::new(Arc::clone(handle.router()), request_id);
+
+        if let Err(e) = handle.send_request(request, request_id) {
+            warn!(
+                target: "kakehashi::bridge",
+                "completionItem/resolve: failed to send request on {connection_key:?}: {e}"
+            );
+            if let Some(ref id) = upstream_id {
+                self.unregister_upstream_request(id, connection_key);
+            }
+            return None;
+        }
+
+        let response = handle.wait_for_response(request_id, response_rx).await;
+        router_guard.disarm();
+
+        // Unregister from the upstream request registry regardless of result
+        if let Some(ref id) = upstream_id {
+            self.unregister_upstream_request(id, connection_key);
+        }
+
+        match response {
+            Ok(response) => parse_completion_resolve_response(response),
+            Err(e) => {
+                warn!(
+                    target: "kakehashi::bridge",
+                    "completionItem/resolve failed on {connection_key:?}: {e}"
+                );
+                None
             }
         }
     }
@@ -240,19 +328,19 @@ fn parse_completion_resolve_response(mut response: serde_json::Value) -> Option<
     serde_json::from_value(result).ok()
 }
 
-/// Build the outgoing `completionItem/resolve` request from a SERVED item:
+/// Build the outgoing `completionItem/resolve` item from a SERVED one:
 /// a clone with its edit ranges restored to VIRTUAL coordinates (the served
 /// item is host-translated; a downstream that echoes the ranges verbatim
 /// would otherwise get them re-translated on the way back — a double shift
 /// the safety guard can't always catch). Mirrors the codeAction resolve path.
-fn prepare_completion_resolve_request(
+/// The HOST path has no such translation to undo and skips this entirely.
+fn prepare_completion_resolve_item(
     item: &CompletionItem,
     envelope: &KakehashiEnvelope,
-    request_id: RequestId,
-) -> JsonRpcRequest<CompletionItem> {
+) -> CompletionItem {
     let mut outgoing = item.clone();
     translate_item_ranges_host_to_virtual(&mut outgoing, &RegionOffset::from(&envelope.offset));
-    build_completion_resolve_request(outgoing, request_id)
+    outgoing
 }
 
 /// Translate a served (host-coordinate) item's edit ranges back to virtual
@@ -290,6 +378,9 @@ fn re_envelope_item(item: &mut CompletionItem, envelope: &KakehashiEnvelope) {
         region_end: envelope
             .region_end
             .map(|(line, character)| Position { line, character }),
+        // Preserve the layer: a host-layer item that has been resolved once
+        // must still take the host path on the client's NEXT resolve of it.
+        host_layer: envelope.host_layer,
     };
     envelope_item_data(item, &ctx);
 }
@@ -342,6 +433,7 @@ mod tests {
                 line_column_offsets: None,
             },
             region_end: Some((9, 0)),
+            host_layer: false,
         }
     }
 
@@ -500,6 +592,33 @@ mod tests {
         );
     }
 
+    /// A host-layer item resolved ONCE must still route through the host path
+    /// on the client's next resolve of it: `re_envelope_item` has to carry the
+    /// layer marker across, or the second resolve silently takes the virt path
+    /// and fails closed on a region that never existed. Two round trips —
+    /// a single one passes even when the marker is dropped.
+    #[test]
+    fn re_envelope_preserves_the_host_layer_marker() {
+        let mut item = CompletionItem {
+            label: "./test".to_string(),
+            ..Default::default()
+        };
+        crate::lsp::bridge::text_document::completion::envelope_host_item(
+            &mut item,
+            "tsudoi-ls",
+            "file:///test/doc.txt",
+        );
+
+        for round in 1..=2 {
+            let envelope = strip_envelope(&mut item).expect("should strip");
+            assert!(
+                envelope.is_host_layer(),
+                "envelope must stay host-layer through resolve round {round}"
+            );
+            re_envelope_item(&mut item, &envelope);
+        }
+    }
+
     #[test]
     fn re_envelope_preserves_none_data() {
         let envelope = test_envelope();
@@ -531,6 +650,7 @@ mod tests {
                 line_column_offsets: None,
             },
             region_end: Some((9, 0)),
+            host_layer: false,
         };
         let mut item = CompletionItem {
             label: "print".to_string(),
@@ -601,6 +721,32 @@ mod tests {
             envelope.origin, "lua-ls",
             "a disabled server's item is returned unresolved, not respawned"
         );
+    }
+
+    /// A HOST-layer item whose origin cannot be reached comes back unresolved
+    /// with the layer marker intact, so the client's next resolve still routes
+    /// through the host path instead of falling into the virt geometry gate.
+    #[tokio::test]
+    async fn dispatch_re_envelopes_host_item_when_server_not_configured() {
+        let pool = std::sync::Arc::new(LanguageServerPool::new());
+        let settings = WorkspaceSettings::default();
+        let mut item = CompletionItem {
+            label: "./test".to_string(),
+            ..Default::default()
+        };
+        crate::lsp::bridge::text_document::completion::envelope_host_item(
+            &mut item,
+            "tsudoi-ls",
+            "file:///test/doc.txt",
+        );
+
+        let result = pool
+            .dispatch_completion_resolve(item, &settings, None)
+            .await;
+
+        let envelope = extract_envelope(&result).expect("should have envelope");
+        assert_eq!(envelope.origin, "tsudoi-ls");
+        assert!(envelope.is_host_layer());
     }
 
     /// The disabled gate must also apply when the server inherits `enabled:
@@ -711,7 +857,10 @@ mod tests {
 
         // Go through the SAME request-preparation helper production uses, and
         // assert on the serialized request.
-        let request = prepare_completion_resolve_request(&item, &envelope, RequestId::new(7));
+        let request = build_completion_resolve_request(
+            prepare_completion_resolve_item(&item, &envelope),
+            RequestId::new(7),
+        );
         let wire = serde_json::to_value(&request).unwrap();
 
         assert_eq!(

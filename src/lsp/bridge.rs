@@ -84,7 +84,7 @@ pub(crate) use text_document::{
     CodeActionEnvelope, CodeLensEnvelope, UpstreamCodeActionCaps, bridge_code_actions,
     extract_code_action_envelope, extract_code_lens_envelope, parse_code_actions_leniently,
 };
-pub(crate) use text_document::{KakehashiEnvelope, extract_envelope};
+pub(crate) use text_document::{KakehashiEnvelope, envelope_host_item, extract_envelope};
 pub(crate) use text_document::{OpenExpectation, OpenOutcome};
 pub(crate) use workspace::WorkspaceFolderSet;
 

@@ -58,6 +58,11 @@ pub(crate) struct HostDocument<'a> {
 pub(crate) struct HostRawResponse {
     pub(crate) value: serde_json::Value,
     pub(crate) connection_key: ConnectionKey,
+    /// The very connection that answered, so a caller can consult its
+    /// advertised capabilities (e.g. `completionItem/resolve` before minting
+    /// resolve envelopes) without a second `get_or_create_connection` — that
+    /// lookup repeats the marker walk this request already paid for.
+    pub(crate) handle: Arc<ConnectionHandle>,
 }
 
 fn fingerprint(text: &str) -> u64 {
@@ -306,6 +311,7 @@ impl LanguageServerPool {
         // re-resolve it — that would repeat the marker filesystem walk on a
         // request-frequency path (execute-command-routing-token).
         let connection_key = handle.key().clone();
+        let capabilities_handle = Arc::clone(&handle);
         let value = self
             .execute_host_request(
                 handle,
@@ -321,6 +327,7 @@ impl LanguageServerPool {
         Ok(value.map(|value| HostRawResponse {
             value,
             connection_key,
+            handle: capabilities_handle,
         }))
     }
 
