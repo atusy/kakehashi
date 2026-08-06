@@ -329,7 +329,7 @@ fn install_language_with_query_stager(
     // compile that would then be thrown away. Following `; inherits:` here is
     // what makes languages like html (which keeps its @comment capture in
     // html_tags) highlight correctly.
-    let staged_queries = match stage_queries(queries_base_url, language, data_dir, force) {
+    let mut staged_queries = match stage_queries(queries_base_url, language, data_dir, force) {
         Ok(staged) => staged,
         Err(e) => {
             result.queries_error = Some(e.to_string());
@@ -393,14 +393,15 @@ fn install_language_with_query_stager(
     // same way, or the two halves can end up published by different installs —
     // one's queries beside the other's grammar. Dropping the staged parser here
     // reclaims the compiled file.
-    let staged_parser = match staged_parser {
-        parser::StagedParserOutcome::Staged(_)
-            if !force && let Some(path) = parser_file_exists(language, data_dir) =>
-        {
-            parser::StagedParserOutcome::AlreadyInstalled(path)
-        }
-        outcome => outcome,
-    };
+    let staged_parser =
+        staged_parser.yield_to_existing(force, parser_file_exists(language, data_dir));
+    if matches!(staged_parser, parser::StagedParserOutcome::Staged(_)) {
+        // This install is the one establishing the pair, so its queries publish
+        // with its parser instead of yielding to a copy that appeared since
+        // staging — an install of a language that *inherits* this one can
+        // publish these queries without holding this language's lock.
+        staged_queries.claim_requested_language();
+    }
 
     let published_queries = match staged_queries.publish() {
         Ok(published) => published,

@@ -749,8 +749,8 @@ fn run_language_uninstall(
         // Hold the language's install lock across both removals, so a
         // concurrent install cannot publish one artifact between them and leave
         // the language half-removed after this command reports success.
-        let _transaction = match queries::lock_language(&data_dir, lang) {
-            Ok(lock) => Some(lock),
+        let transaction = match queries::lock_language(&data_dir, lang) {
+            Ok(lock) => lock,
             Err(e) => {
                 eprintln!("✗ Failed to lock '{}' for uninstall: {}", lang, e);
                 any_failed = true;
@@ -766,7 +766,7 @@ fn run_language_uninstall(
         // an install that is about to publish its parser: that install checks
         // for it under this same lock and gives up instead of leaving a parser
         // behind for a language the user just removed.
-        match queries::remove_query_install_and_backups(&queries_dir, lang) {
+        match queries::remove_query_install_and_backups(&transaction) {
             Ok(removal) => {
                 if removal.removed_queries {
                     eprintln!("✓ Removed queries: {}", queries_dir.join(lang).display());
