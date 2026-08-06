@@ -1067,11 +1067,18 @@ fn run_install(language: &str, force: bool, verbose: bool, no_cache: bool) -> Re
         // which half survived and whether a retry needs --force. Scoped to the
         // requested language: queries for a base language it inherits stay
         // published (they are shared), and bookkeeping is written either way.
-        if result.left_published_queries {
+        if let Some(residue) = result.rollback_residue {
+            let left = match residue {
+                kakehashi::install::RollbackResidue::NewQueriesLive => {
+                    "the queries it had already published could not be withdrawn"
+                }
+                kakehashi::install::RollbackResidue::PreviousQueriesStranded => {
+                    "the queries it replaced could not be put back"
+                }
+            };
             eprintln!(
-                "\nFailed to install '{}' language support, and the queries it had already \
-                 published could not be withdrawn — see the warnings above.",
-                language
+                "\nFailed to install '{}' language support, and {} — see the warnings above.",
+                language, left
             );
         } else {
             eprintln!(

@@ -386,9 +386,14 @@ pub(crate) fn stage_parser(
     let parser_dir = options.data_dir.join("parser");
     let parser_file = parser_dir.join(format!("{}.{}", language, std::env::consts::DLL_EXTENSION));
 
-    // Check if parser already exists
-    if parser_file.exists() && !options.force {
-        return Ok(StagedParserOutcome::AlreadyInstalled(parser_file));
+    // Check if a usable parser is already installed. `is_file` via
+    // `parser_file_exists`, not a bare existence check: a directory carrying a
+    // parser's name is not a parser, and treating it as one made the install
+    // report success over something it never wrote.
+    if !options.force
+        && let Some(installed) = parser_file_exists(language, &options.data_dir)
+    {
+        return Ok(StagedParserOutcome::AlreadyInstalled(installed));
     }
 
     // Fetch metadata (with caching support)
@@ -505,7 +510,12 @@ pub fn recover_interrupted_parser_installs(parser_dir: &Path) -> std::io::Result
         if super::queries::process_is_running(pid) {
             continue;
         }
-        let _ = fs::remove_file(&path);
+        match fs::remove_file(&path) {
+            Ok(()) => {}
+            // Someone else collected it between the scan and the removal.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e),
+        }
     }
     Ok(())
 }

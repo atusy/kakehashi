@@ -201,9 +201,9 @@ pub struct InstallResult {
     pub parser_error: Option<String>,
     /// Error message if queries install failed.
     pub queries_error: Option<String>,
-    /// True when a failed install could not withdraw queries it had already
-    /// published, so the data directory still holds them. The errors say which.
-    pub left_published_queries: bool,
+    /// What a failed install left of the queries it had already published, when
+    /// undoing them did not fully succeed. `None` on every other outcome.
+    pub rollback_residue: Option<RollbackResidue>,
     /// Query files this install downloaded, for the requested language.
     /// Empty when its queries were already present.
     pub files_downloaded: Vec<String>,
@@ -213,6 +213,26 @@ impl InstallResult {
     /// Check if the installation was fully successful.
     pub fn is_success(&self) -> bool {
         self.parser_error.is_none() && self.queries_error.is_none()
+    }
+}
+
+/// What a failed install left behind when it could not fully undo itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RollbackResidue {
+    /// The queries this install published are still live.
+    NewQueriesLive,
+    /// Its queries are gone, and so are the ones they displaced — those are in
+    /// a backup directory named by the warnings on stderr.
+    PreviousQueriesStranded,
+}
+
+fn rollback_residue(outcome: queries::RollbackOutcome) -> Option<RollbackResidue> {
+    match outcome {
+        queries::RollbackOutcome::Undone => None,
+        queries::RollbackOutcome::NewQueriesRemain => Some(RollbackResidue::NewQueriesLive),
+        queries::RollbackOutcome::PreviousQueriesStranded => {
+            Some(RollbackResidue::PreviousQueriesStranded)
+        }
     }
 }
 
@@ -294,7 +314,7 @@ fn install_language_with_query_stager(
         queries_path: None,
         parser_error: None,
         queries_error: None,
-        left_published_queries: false,
+        rollback_residue: None,
         files_downloaded: Vec::new(),
     };
 
@@ -428,26 +448,25 @@ fn install_language_with_query_stager(
         parser::StagedParserOutcome::Staged(staged) => match staged.publish() {
             Ok(parser_result) => result.parser_path = Some(parser_result.install_path),
             Err(e) => {
-                result.left_published_queries =
-                    published_queries.rollback() == queries::RollbackOutcome::LeftPublished;
+                result.rollback_residue = rollback_residue(published_queries.rollback());
                 result.parser_error = Some(e.to_string());
                 return result;
             }
         },
-        parser::StagedParserOutcome::AlreadyInstalled(path) => {
+        parser::StagedParserOutcome::AlreadyInstalled(_) => {
             // Staging saw this parser before the transaction lock was taken, so
-            // re-check it: publishing queries against a parser an uninstall has
-            // since removed is the queries-only state this lock exists to
-            // prevent, and nothing was staged that could replace it.
-            if !path.exists() {
-                result.left_published_queries =
-                    published_queries.rollback() == queries::RollbackOutcome::LeftPublished;
+            // re-check it rather than trusting what it found: publishing queries
+            // against a parser an uninstall has since removed is the
+            // queries-only state this lock exists to prevent, and nothing was
+            // staged that could replace it.
+            let Some(path) = parser_file_exists(language, data_dir) else {
+                result.rollback_residue = rollback_residue(published_queries.rollback());
                 result.parser_error = Some(format!(
                     "the installed parser for '{}' was removed while it was being installed",
                     language
                 ));
                 return result;
-            }
+            };
             result.parser_path = Some(path);
         }
     }
@@ -498,7 +517,7 @@ pub(crate) async fn install_language_async(
         queries_path: None,
         parser_error: Some(format!("Task panicked: {}", e)),
         queries_error: None,
-        left_published_queries: false,
+        rollback_residue: None,
         files_downloaded: Vec::new(),
     })
 }
@@ -817,7 +836,7 @@ mod tests {
             queries_path: Some(PathBuf::from("/tmp/queries")),
             parser_error: None,
             queries_error: None,
-            left_published_queries: false,
+            rollback_residue: None,
             files_downloaded: Vec::new(),
         };
         assert!(success.is_success());
@@ -827,7 +846,7 @@ mod tests {
             queries_path: None,
             parser_error: Some("Parser failed".to_string()),
             queries_error: Some("Queries failed".to_string()),
-            left_published_queries: false,
+            rollback_residue: None,
             files_downloaded: Vec::new(),
         };
         assert!(!failure.is_success());
