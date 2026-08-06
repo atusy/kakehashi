@@ -178,8 +178,13 @@ pub fn query_install_chain_is_complete(queries_parent: &Path, language: &str) ->
 /// would report success and leave the loader looking for a language nothing
 /// fetched.
 fn normalize_inherited_language_name(name: &str) -> String {
-    name.trim_start_matches('(')
-        .trim_end_matches(')')
+    // Character for character what `query_loader` does, including only
+    // stripping a *matched* pair: on `(cpp` the loader looks for a language
+    // literally called `(cpp`, and an installer that helpfully fetched `cpp`
+    // would report success over a language it still cannot load.
+    name.strip_prefix('(')
+        .and_then(|name| name.strip_suffix(')'))
+        .unwrap_or(name)
         .trim()
         .to_string()
 }
@@ -463,7 +468,7 @@ impl StagedQueryInstall {
                 !self
                     .entries
                     .iter()
-                    .any(|entry| &&entry.language == language)
+                    .any(|entry| entry.language == **language)
             })
             .find(|language| {
                 !query_install_is_complete(&self.queries_parent.join(language.as_str()))
@@ -807,9 +812,10 @@ fn stage_queries_with_dependencies(
 
 /// Internal recursive helper for staging queries with dependencies.
 ///
-/// Appends the requested language's staging directory to `entries` before
-/// recursing, so publication order matches the old install order: a language
-/// becomes visible before the parents it inherits from.
+/// Appends a language's staging directory to `entries` *after* recursing into
+/// the languages it inherits, so `entries` comes out in dependency order and
+/// publishing it forward puts every base language in place before the language
+/// that needs it.
 fn stage_queries_recursive(
     base_url: &str,
     language: &str,
@@ -1377,22 +1383,47 @@ pub fn lock_language(data_dir: &Path, language: &str) -> Result<LanguageLock, Qu
     })
 }
 
-/// [`lock_language`] without the wait: `None` when another install holds it.
+/// [`lock_language`] without the wait.
 ///
 /// For callers that must not block — the LSP's async path — and that only need
-/// to know whether the language is settled. A language someone is mid-publish
-/// on can still have those queries rolled back, so "busy" and "could not
-/// probe" both answer no. The guard is returned rather than the answer, because
-/// releasing it before reading the artifacts would put the whole publish back
-/// inside the window.
-pub fn try_lock_language(data_dir: &Path, language: &str) -> Option<LanguageLock> {
-    let (file, queries_parent) = open_language_lock_file(data_dir, language).ok()?;
-    file.try_lock().ok()?;
-    Some(LanguageLock {
-        _file: file,
-        queries_parent,
-        language: language.to_string(),
-    })
+/// to know whether the language is settled. The guard is returned rather than
+/// the answer, because releasing it before reading the artifacts would put the
+/// whole publish back inside the window.
+pub fn try_lock_language(data_dir: &Path, language: &str) -> LanguageLockProbe {
+    let Ok((file, queries_parent)) = open_language_lock_file(data_dir, language) else {
+        // The lock file cannot be created or opened for writing — a read-only
+        // or otherwise unwritable data directory. Nobody can be publishing into
+        // it either, so what is on disk is settled; answering "busy" here would
+        // make a perfectly good preinstalled language unusable.
+        return LanguageLockProbe::Unlockable;
+    };
+    match file.try_lock() {
+        Ok(()) => LanguageLockProbe::Idle(LanguageLock {
+            _file: file,
+            queries_parent,
+            language: language.to_string(),
+        }),
+        Err(_) => LanguageLockProbe::Busy,
+    }
+}
+
+/// What [`try_lock_language`] found.
+pub enum LanguageLockProbe {
+    /// Nobody holds the lock, and nobody can take it while the guard lives.
+    Idle(LanguageLock),
+    /// An install is mid-publish: what is on disk can still be rolled back.
+    Busy,
+    /// The lock cannot be taken at all, so nothing can be publishing either.
+    /// Whatever is on disk is as settled as it will ever be.
+    Unlockable,
+}
+
+impl LanguageLockProbe {
+    /// Whether the artifacts on disk can be trusted to stay put — either
+    /// because this probe holds the lock, or because nobody can publish.
+    pub fn is_settled(&self) -> bool {
+        !matches!(self, Self::Busy)
+    }
 }
 
 /// Open (creating if needed) the file behind a language's lock.
@@ -1920,6 +1951,35 @@ mod staging_tests {
         assert!(query_install_chain_is_complete(&queries_parent, "cyc_a"));
     }
 
+    /// A data directory nothing can write to has nothing in flight either, so
+    /// its languages must still read as settled — answering "busy" there would
+    /// make a read-only installation unusable.
+    #[test]
+    #[cfg(unix)]
+    fn an_unlockable_data_dir_is_settled() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = TempDir::new().unwrap();
+        let queries_parent = temp.path().join("queries");
+        fs::create_dir_all(&queries_parent).unwrap();
+        let mut permissions = fs::metadata(&queries_parent).unwrap().permissions();
+        permissions.set_mode(0o500);
+        fs::set_permissions(&queries_parent, permissions).unwrap();
+
+        let probe = try_lock_language(temp.path(), "lua");
+
+        let settled = probe.is_settled();
+        // Restore before asserting, so a failure does not leave an
+        // undeletable directory behind for the whole test run.
+        let mut permissions = fs::metadata(&queries_parent).unwrap().permissions();
+        permissions.set_mode(0o700);
+        fs::set_permissions(&queries_parent, permissions).unwrap();
+        assert!(
+            settled,
+            "an unwritable data dir cannot have a publish in flight"
+        );
+    }
+
     /// A language nobody is publishing can be claimed without waiting; one an
     /// install holds cannot, because that install can still roll it back.
     #[test]
@@ -1928,17 +1988,20 @@ mod staging_tests {
         let data_dir = temp.path();
 
         let probe = try_lock_language(data_dir, "lua");
-        assert!(probe.is_some(), "a language nobody has touched is settled");
+        assert!(
+            matches!(probe, LanguageLockProbe::Idle(_)),
+            "a language nobody has touched is settled"
+        );
         drop(probe);
 
         let lock = lock_language(data_dir, "lua").unwrap();
         assert!(
-            try_lock_language(data_dir, "lua").is_none(),
+            matches!(try_lock_language(data_dir, "lua"), LanguageLockProbe::Busy),
             "a held lock means an install is between publishing and committing"
         );
         drop(lock);
         assert!(
-            try_lock_language(data_dir, "lua").is_some(),
+            try_lock_language(data_dir, "lua").is_settled(),
             "and it is settled again once that install is done"
         );
     }
@@ -2507,6 +2570,22 @@ mod tests {
         assert_eq!(
             parse_inherits_directive("; inherits: c, (cpp), (cuda)\n"),
             vec!["c".to_string(), "cpp".to_string(), "cuda".to_string()]
+        );
+    }
+
+    /// Only a matched pair is a wrapper. An unmatched one is part of the name
+    /// as far as the loader is concerned, so it must be part of it here too —
+    /// and such a name is then rejected as unsafe rather than turned into a
+    /// different language's.
+    #[test]
+    fn parse_inherits_directive_keeps_unmatched_parentheses() {
+        assert!(
+            parse_inherits_directive("; inherits: (cpp\n").is_empty(),
+            "an unmatched leading parenthesis is part of the name, and unsafe"
+        );
+        assert!(
+            parse_inherits_directive("; inherits: cpp)\n").is_empty(),
+            "and so is an unmatched trailing one"
         );
     }
 
