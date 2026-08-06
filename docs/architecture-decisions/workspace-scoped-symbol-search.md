@@ -394,10 +394,10 @@ load-bearing.
 
 Putting the cap *before* the liveness filter would let dead or absent servers
 consume cap slots and silently exclude a live server ranked below the cutoff,
-contradicting this decision's own coverage contract. Putting it *after* the
-Ready wait would make the cap a global barrier: with `max_fan_out = 1` and
-priorities `[initializing_A, ready_B]`, nothing could dispatch until A's wait
-resolved — up to the full 30 seconds — even though B was ready immediately.
+contradicting this decision's own coverage contract. (In the abandoned waiting
+design this placement had a second failure mode too — the cap became a global
+barrier — but with `Initializing` excluded there is nothing left to wait for,
+so only the coverage argument applies.)
 Deciding membership synchronously and waiting per target removes the
 interaction entirely.
 
@@ -730,9 +730,20 @@ alone. An ordinary edit preserves the incarnation and only bumps the content
 version, and `DocumentSnapshot` does not carry that version — so an
 incarnation-only comparison would miss precisely the race described above.
 The resolution variant therefore retains the snapshot's content/parsed version
-alongside the language and virtual content, compares both fields against a
-single live `SnapshotView`, and holds the document edit lock through validation
-so the comparison cannot itself be raced. This is the discipline the semantic
+alongside the language and virtual content, and compares both fields against a
+single live `SnapshotView`.
+
+The document edit lock must be acquired **before the resolution snapshot is
+taken**, not merely around that comparison, and held through translation. This
+is not just about making the comparison unraceable: `resolve_by_region_id`
+**mutates** the tracker — it goes through the named-layer allocator and then
+`calculate_region_id`, which can mint a ULID. A resolution that reads stale
+coordinates and loses the race to `didChange` would therefore mint a **ghost id
+at coordinates that no longer exist**, and the version check afterwards drops
+the symbol but cannot undo the mutation. Post-checking a side-effecting
+resolution is not enough; the lock has to cover the side effect. (A genuinely
+read-only resolver that reused the requested id and never reached a minting
+helper would be the alternative, and does not exist today.) This is the discipline the semantic
 token path already uses, and only the whole of it works; the incarnation half
 alone would leave "the tree is gone" as the only edit race the design notices.
 
