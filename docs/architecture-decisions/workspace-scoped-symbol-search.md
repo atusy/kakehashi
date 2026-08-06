@@ -347,7 +347,8 @@ way to subtract that contribution.
 
 Both axes therefore come from **admission records** — the concrete pairs that
 justified opening a document on a connection, retained per connection and
-generation-stamped (point 7). A record is written when a document is opened:
+keyed by `ConnectionKey` (point 7). A record is written when a document is
+opened:
 
 - **Host language**: taken from the host document at open time
   (`DocumentStore::open_uris()` + language detection). Concrete by
@@ -436,29 +437,25 @@ existing configuration from becoming a silent no-op here.
 **No candidate is waited for; the only waits are lock acquisitions and the
 final barrier.** The order is fixed:
 
-1. **Snapshot the tracker's host→virtual map** under its own lock and release
-   it. This only *enumerates* candidates; every entry is re-validated in step 2
-   before it can contribute.
+1. **Read the admission records** — `ConnectionKey → the pairs it serves`. This
+   is the *whole* of discovery. Nothing here consults the document tracker,
+   which is the point: `didClose` removes tracking while leaving the connection
+   open, so any discovery that went through the tracker would lose that
+   connection the moment its last document closed, and supplementing the records
+   with a tracker check would reintroduce exactly the defect they exist to fix.
 2. Hand the candidate set to a **pool-owned batch validator**, which takes
    `connections` **once** and, without awaiting inside, per candidate: keeps
    only `Ready` handles (`connections()` returns the raw map, and
    `ConnectionState` also has `Initializing`, `Failed`, `Closing`, `Closed`);
-   drops handles lacking `workspace/symbol`; drops handles whose recorded launch
-   configuration no longer matches the `BridgeServerConfig` that admitted them;
-   and confirms the admission record's **generation** still matches the
-   connection's.
+   drops handles lacking `workspace/symbol`; and drops handles whose recorded
+   launch configuration no longer matches the `BridgeServerConfig` that admitted
+   them.
 
-   The generation comparison is a field read on the handle — synchronous, no
-   second lock — which is why admission records carry it. An earlier draft
-   validated `_self` candidates against `host_documents` instead, taken with
-   `try_lock` under `connections`; that had to be abandoned because the mutex is
-   not brief bookkeeping. Host synchronization holds it across awaited
-   downstream notification sends, so ordinary editing or writer backpressure
-   would contend it, and a `_self` server would vanish from search — or the
-   query would fail outright — for reasons that are pure scheduling. Coverage
-   must not be a function of who happened to hold a lock. Virtual candidates are
-   additionally confirmed against the live reverse index, which is a sharded map
-   and answers synchronously.
+   These are the only checks, and they are all about the **connection**, not
+   about any document. Whether a document is currently open on it is
+   deliberately not asked — that is what step 1 stopped depending on. Whether
+   its documents have been *replayed* after a respawn is asked, but later and
+   differently, by the barrier in step 5.
 3. Apply the per-pair `priorities` allowlist and `max_fan_out` cap to the
    survivors — pure computation, after the lock is released.
 4. Dedup by **connection key** `(server, root)`.
@@ -471,16 +468,12 @@ the pool, and the exposed comparison helper takes `connections` itself, so a
 caller in `bridge/workspace/symbol.rs` doing these checks piecemeal would
 re-lock between them and validate against a map that had already moved.
 
-It is also where the generation comparison happens, and why admission records
-carry one. `HostDocSyncState` records neither connection generation nor handle
-identity, and a respawn can install a fresh `Ready` handle under the same
-`ConnectionKey` — so a `_self` candidate carrying only a key would let a
-connection that never opened the host document pass every other check. The
-language and incarnation recheck does not catch that, because the host lifetime
-never changed; only the connection did. A stamped record does.
-
-The resulting order is `connections` → tracker, which is the pool's own nesting
-and the one the respawn purge takes.
+It also takes only **one** lock. Because discovery reads admission records and
+validation asks only about connections, neither `host_documents` nor the
+tracker is on this path at all — which removes the lock-ordering question that
+earlier drafts kept getting wrong, and with it the `try_lock` policy that made
+`_self` coverage depend on whether host synchronization happened to hold its
+mutex.
 
 Every filter in step 2 precedes the cap in step 3, and that ordering is
 load-bearing for each of them: with `priorities = [A, B]` and
@@ -647,14 +640,29 @@ guarantee the code stopped providing.
 
 It is a single value, which is what makes it definable where a derived global
 cap was not: there is no "uncapped pair means infinity" to reconcile and no
-per-pair priority list to merge. It applies **after dedup**, to the connection
-set, and when it truncates it does so in a **stable documented order** —
-`(server name, root)` — rather than by priority, since per-pair priorities
-conflict and walk order varies run to run. Unset means no limit.
+per-pair priority list to merge.
+
+As a configuration surface it is `workspaceSymbolMaxFanOut`, a top-level
+`Option<i64>` alongside the existing top-level settings, mirroring
+`max_fan_out`'s own conventions so users meet no new ones: absent or `null` =
+no limit, `0` = disable the method entirely, positive = cap, negative = treated
+as no limit. It merges like every other scalar — a later layer's value replaces
+an earlier one — which means it needs the same raw/resolved field pair, the same
+layered-merge entry, the same default, and the same schema and documentation
+coverage as its neighbours. Naming it here without that inventory would leave an
+implementer unable to expose or reload it consistently.
+
+It applies **after dedup**, to the connection set, and truncates in a **stable
+documented order** rather than by priority — per-pair priorities conflict, and
+walk order varies run to run. The order is `(server name, root discriminator,
+root path)`: the discriminator is required because `ClientFallback` and `Shared`
+both report no marker root and can coexist for one server, so comparing only the
+name and the marker path leaves them tied and the tie falls back to hash
+iteration order — the nondeterminism this ordering exists to remove.
 
 ```
-  admission records (per connection,          ← concrete languages only,
-        │  generation-stamped, outlive close)    no arbitration
+  admission records, keyed by ConnectionKey   ← concrete languages only,
+        │  (outlive didClose and respawn)        no arbitration
         ▼
   ┌──────────────────────┐   ┌──────────────────────┐
   │ (LANG_1, _self)      │   │ (LANG_2, _self)      │  ... every pair
@@ -669,8 +677,6 @@ conflict and walk order varies run to run. Unset means no limit.
         │ stale-config, confirm still open on  │
         │ that exact connection                │
         │ then: allowlist + per-pair maxFanOut │
-        │ then dedup, then the workspace-wide  │
-        │ ceiling (stable server,root order)   │
         │ NEVER spawns a connection            │
         └──────────────────┬───────────────────┘
                            ▼
@@ -679,7 +685,8 @@ conflict and walk order varies run to run. Unset means no limit.
         │   each pair admits ONLY the conns it │
         │   actually opened — never a name     │
         │   expanded across roots              │
-        │ (no global cap — see §3)             │
+        │ then workspaceSymbolMaxFanOut, in    │
+        │ (name, root-kind, root) order        │
         └──────────────────┬───────────────────┘
                            ▼
               await the 2s reopen barrier concurrently,
@@ -1278,20 +1285,20 @@ already been spent.
 
 The rule is uniform: **every lock this path *awaits* carries a three-second
 budget, and failing to acquire it drops the affected target or host** rather
-than blocking the query. That is more than the `connections` mutex — selection
-also awaits the tracker snapshot, each send re-acquires `connections` before
-enqueue, and translation takes each host's `edit_lock`. (`host_documents` is not
+than blocking the query. That is more than one acquisition — each send
+re-acquires `connections` before enqueue, fan-in reads the tracker twice, and
+translation takes each host's `edit_lock`. (`host_documents` is not
 in that list at all: selection no longer consults it, since `_self` candidates
-are validated by generation comparison instead — see point 3 for why
-`try_lock`ing it was abandoned.) None of these is safe to assume fast: injection
+come from admission records instead — see point 3 for why `try_lock`ing it was
+abandoned.) None of these is safe to assume fast: injection
 processing holds
 `edit_lock` across downstream close, change, and eager-spawn awaits, so a query
 arriving mid-processing would otherwise wait on unrelated work with no bound.
 
-- **Selection**: the tracker snapshot, then `connections` — three seconds each.
-  Nothing else is *awaited*: under `connections` the validator queries the
-  reverse index synchronously and compares generations as field reads, so there
-  is no third acquisition to budget and no await while a lock is held. The budget
+- **Selection**: `connections` — three seconds. That is the only lock selection
+  takes: discovery reads admission records and validation asks only about
+  connections, so there is no tracker or `host_documents` acquisition to budget
+  and no await while a lock is held. The budget
   covers *acquiring* each lock, not the filtering between them — that walk is synchronous with no
   await, so a timeout could not preempt it anyway, and bounding what cannot be
   interrupted would promise something the runtime does not deliver.
@@ -1340,21 +1347,35 @@ last buffer for a language silently drop a `Ready`, possibly well-indexed server
 
 This is **not** deferred, because a provider that quietly stops answering when
 you close a buffer is not a workspace search. The pool retains an **admission
-record** per connection — the concrete `(host_language, injection_language_or_
-_self)` pairs that ever justified opening a document on it, stamped with the
-connection's generation — written when the document is opened and *not* removed
-when it closes. Candidates come from those records rather than from live
-document tracking.
+record** keyed by **`ConnectionKey`** — the concrete
+`(host_language, injection_language_or__self)` pairs that have justified opening
+a document on that `(server, root)` — written when a document is opened and
+removed only when the key itself goes away. Candidates come from these records
+instead of from live document tracking, and the tracker is consulted only for
+things that genuinely are about documents.
 
-The records stay concrete, because each was created from a real open document at
-the time (point 3's requirement), and they survive both closure and the respawn
-purge window, which is the same root cause seen twice. The generation stamp is
-what makes them safe to hold: a record whose generation no longer matches the
-connection's is stale and is discarded rather than trusted, so a replaced
-process cannot inherit its predecessor's admissions.
+Keying on `ConnectionKey` rather than on a handle is what makes them survive
+both events that motivated this. A `didClose` does not touch them. Neither does
+a respawn: the replacement serves the same `(server, root)` under the same
+configuration, so the pairs that admitted its predecessor admit it too — that
+is not stale inheritance but the correct answer. An earlier draft stamped
+records with the connection generation to prevent exactly that inheritance,
+which was solving a problem that does not exist; the reopen barrier, not a
+generation check, is what handles a replacement whose documents are not yet
+replayed.
 
-A record is dropped when its connection is, so this bounds memory by live
-connections, not by session history.
+The records stay concrete because each was created from a real open document
+(point 3's requirement). They are removed when their `ConnectionKey` is — a
+server dropped from configuration, or a root that no longer resolves — so a
+long-lived session does not accumulate keys for servers it no longer has.
+
+Their size is bounded by **distinct `(host_language, injection_language)` pairs
+per key**, not by session history. That is small for ordinary configurations,
+but it is not closed: a `languages = ["*"]` server admits any injection language
+a document happens to contain, so a long-lived connection in a polyglot
+workspace accumulates one entry per language ever seen on it. Entries are
+`(String, String)`; the growth is real but slow, and capping it would trade a
+bounded leak for silently forgetting a language the user still has open.
 
 This is not merely a cost trade. Cold-starting cannot deliver the coverage it
 appears to promise:
@@ -1561,7 +1582,7 @@ Including it would defeat dedup on a field carrying no identity.
   user expecting an indexed whole-project search will find this surprising.
 - Latency is max-over-live-targets, and every *wait* is bounded: the pool's 30s
   request timeout and liveness timeout, a three-second budget on **every** lock
-  this path awaits (the candidate tracker snapshot, `connections`, each send's
+  this path awaits (selection's `connections`, each send's
   `connections` re-acquisition, the pass-0 host→virtual snapshot, the
   translation-time identity re-read, and each host's `edit_lock`), and the
   reopen barrier's two seconds. Total latency is not bounded, because the synchronous
@@ -1584,12 +1605,13 @@ Including it would defeat dedup on a field carrying no identity.
   in methods that have no use for it.
 - A server still `Initializing` when the query arrives is skipped entirely, so
   a search in the seconds after opening a file can miss it (point 3).
-- Admission records add per-connection state the pool must maintain and expire
-  with the connection (point 3) — the cost of not tying coverage to document
-  lifetime.
-- Every lock this path *awaits* — the candidate tracker snapshot, `connections`,
-  each send's re-acquisition, the two fan-in tracker reads, each host's
-  `edit_lock` — is bounded only in its **acquisition** (the per-send identity
+- Admission records add per-`ConnectionKey` state the pool must maintain. It is
+  bounded by distinct `(host_language, injection_language)` pairs per key rather
+  than by session history, but not closed: a `languages = ["*"]` connection in a
+  polyglot workspace gains an entry per language ever seen on it (point 3).
+- Every lock this path *awaits* — selection's `connections`, each send's
+  re-acquisition, the two fan-in tracker reads, each host's `edit_lock` — is
+  bounded only in its **acquisition** (the per-send identity
   snapshot is `try_lock`ed under `connections` rather than awaited, and
   contention drops that target), because
   other paths hold these across unbounded async work (point 6); the filtering
@@ -1607,8 +1629,8 @@ Including it would defeat dedup on a field carrying no identity.
   snapshot matches, and those symbols are dropped from that query (point 4).
 - `max_fan_out` does not bound this method's total fan-out on its own — it
   selects names per pair, and a connection one pair excluded re-enters through
-  another. A new top-level ceiling restores the guarantee, at the cost of one
-  more user-facing setting to learn (point 3).
+  another. `workspaceSymbolMaxFanOut` restores the guarantee, at the cost of one
+  more user-facing setting to learn, document, merge, and schema (point 3).
 - The `kakehashi-virtual-uri-*` filename space is reserved: a real workspace
   file named into it is invisible to symbol search (point 5).
 - No configuration can express "suppress B's duplicates, but fall back to B when
