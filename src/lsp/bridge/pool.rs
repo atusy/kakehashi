@@ -2723,44 +2723,67 @@ impl LanguageServerPool {
                         &command_registration_key,
                         palette_commands.unwrap_or_default(),
                     );
-                    // Advertise the NEWLY-added names upstream so the editor's
-                    // palette lists them. Fire-and-forget; skipped when the
-                    // client can't accept a dynamic registration — in which case
-                    // the registry is told, so it never believes the editor holds
-                    // something that was never sent.
-                    if !outcome.newly_advertised.is_empty() {
+                    // Advertise the new names upstream so the editor's palette
+                    // lists them — the raw one and this connection's routed one
+                    // in ONE request. Not two: the forwarding loop spawns a task
+                    // per request, so two would race and the editor could see
+                    // them in either order.
+                    //
+                    // Skipped when the client can't accept a dynamic
+                    // registration, in which case the registry is told, so it
+                    // never believes the editor holds something never sent.
+                    // Deduplicated: a downstream advertising both `foo` and the
+                    // literal text of `foo`'s routed name would otherwise put
+                    // two Registrations with the SAME derived id in one request,
+                    // which a client may reject wholesale — taking the unrelated
+                    // names in the batch down with it.
+                    let mut announce: Vec<String> = Vec::new();
+                    for name in outcome
+                        .newly_advertised
+                        .iter()
+                        .cloned()
+                        .chain(outcome.newly_encoded.iter().cloned())
+                    {
+                        if !announce.contains(&name) {
+                            announce.push(name);
+                        }
+                    }
+                    if !announce.is_empty() {
                         if supports_dynamic_command_registration {
-                            if let Err(e) =
-                                upstream_request_tx.send(UpstreamRequest::RegisterCommands {
-                                    commands: outcome.newly_advertised.clone(),
-                                })
+                            if let Err(e) = upstream_request_tx
+                                .send(UpstreamRequest::RegisterCommands { commands: announce })
                             {
                                 log::warn!(
                                     target: "kakehashi::bridge",
                                     "Failed to queue palette-command registration \
                                      (forwarding loop gone): {e}"
                                 );
-                                command_origins.forget_registration(&outcome.newly_advertised);
+                                command_origins.forget_registration(&outcome);
                             }
                         } else {
-                            command_origins.forget_registration(&outcome.newly_advertised);
+                            command_origins.forget_registration(&outcome);
                         }
                     }
                     // A name whose every advertiser has stopped offering it is
                     // dead even though its server is still configured — the
                     // in-place-upgrade shape, which the config-driven sweep
-                    // cannot see.
+                    // cannot see. Encoded entries retire per connection, so one
+                    // server dropping a command takes only its own rows.
+                    //
                     // Gated like every other send on this path. It is currently
                     // redundant — with no capability nothing was announced, so
                     // nothing can be orphaned — but that is an invariant two
                     // steps away, and a retirement that stops asking would name
                     // ids the editor never held.
-                    if !outcome.orphaned.is_empty()
+                    let dead: Vec<String> = outcome
+                        .orphaned
+                        .into_iter()
+                        .chain(outcome.retired_encoded)
+                        .collect();
+                    if !dead.is_empty()
                         && supports_dynamic_command_registration
-                        && let Err(e) =
-                            upstream_request_tx.send(UpstreamRequest::UnregisterCommands {
-                                commands: outcome.orphaned,
-                            })
+                        && let Err(e) = upstream_request_tx
+                            .send(UpstreamRequest::UnregisterCommands { commands: dead })
                     {
                         log::warn!(
                             target: "kakehashi::bridge",
@@ -7649,8 +7672,16 @@ mod tests {
         pool.propagate_settings(|_| None).await;
 
         match rx.try_recv() {
-            Ok(super::UpstreamRequest::UnregisterCommands { commands }) => {
-                assert_eq!(commands, vec!["ruff.fix".to_string()]);
+            Ok(super::UpstreamRequest::UnregisterCommands { mut commands }) => {
+                commands.sort();
+                assert_eq!(
+                    commands,
+                    vec![
+                        "kakehashi|c|ruff||ruff.fix".to_string(),
+                        "ruff.fix".to_string()
+                    ],
+                    "the raw entry AND the routed one that named the gone connection"
+                );
             }
             Ok(_) => panic!("expected an UnregisterCommands request"),
             Err(e) => panic!("expected an UnregisterCommands request, got {e:?}"),
@@ -7700,8 +7731,16 @@ mod tests {
         .await;
 
         match rx.try_recv() {
-            Ok(super::UpstreamRequest::UnregisterCommands { commands }) => {
-                assert_eq!(commands, vec!["ruff.fix".to_string()]);
+            Ok(super::UpstreamRequest::UnregisterCommands { mut commands }) => {
+                commands.sort();
+                assert_eq!(
+                    commands,
+                    vec![
+                        "kakehashi|c|ruff||ruff.fix".to_string(),
+                        "ruff.fix".to_string()
+                    ],
+                    "the raw entry AND the routed one that named the disabled server"
+                );
             }
             Ok(_) => panic!("expected an UnregisterCommands request"),
             Err(e) => panic!("expected an UnregisterCommands request, got {e:?}"),

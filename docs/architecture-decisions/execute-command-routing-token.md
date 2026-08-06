@@ -245,21 +245,39 @@ narrows by configuration first.
 
 ## Decision–Implementation Gap
 
-**Dynamic registration of encoded names is deferred.** Making the name set
-finite is the precondition, not the feature. Two questions must be settled
-empirically before registering them, and neither can be answered from the
-protocol text:
+**Dynamic registration of encoded names is no longer deferred (#823 stack).**
+Making the name set finite was the precondition. Two questions had to be settled
+empirically first, and neither could be answered from the protocol text:
 
 - Roots are discovered lazily as documents open, so the registerable set grows
-  during a session. The existing palette registration mints a fresh
-  registration id per batch and never unregisters; whether real clients
-  tolerate repeated `workspace/executeCommand` registrations with overlapping
-  command lists is untested.
-- Whether a client that filters on registered ids also expects a
-  human-readable command id, given these are machine-generated.
+  during a session. Whether real clients tolerate repeated
+  `workspace/executeCommand` registrations, with the ids and lists that produces,
+  was untested.
+- Whether a client that filters on registered ids also expects a human-readable
+  command id, given these are machine-generated.
 
-Until that is settled, `executeCommandProvider.commands` stays empty and the
-vscode-languageclient limitation stands.
+**Measured in Neovim** (v0.13 nightly, `scripts/probe_palette_registration.lua`,
+one kakehashi spanning two `.git` roots so one downstream server has two
+connections):
+
+- Registrations DO accumulate — one request per root as it is discovered — and
+  Neovim accepts every one without error. The raw name is announced exactly once;
+  each new root adds only its own encoded entry. No duplicate registration ids,
+  which the derived-id scheme (one id per name, `kakehashi/executeCommand/<name>`)
+  is what guarantees.
+- Neovim keys dynamic registrations by CAPABILITY name, so they land in
+  `client.registrations.executeCommandProvider` — enumerable, and the encoded
+  names are usable as-is: firing one runs the command on exactly its connection,
+  while firing the raw name is refused with a `window/logMessage` naming the
+  connections that collided.
+- **Neovim does not advertise `workspace.executeCommand.dynamicRegistration` at
+  all** (checked against `vim.lsp.protocol.make_client_capabilities()`), so none
+  of this happens there unless the user opts in by setting that capability. The
+  palette-registration feature is inert in a default Neovim.
+
+Answered for Neovim only. The vscode-languageclient limitation is unmeasured, so
+`executeCommandProvider.commands` still stays empty in the initialize result —
+this path is dynamic registration only.
 
 **A DEAD shared-instance connection cannot be re-rooted from the token alone.**
 A `preferSharedInstance` connection is keyed without a root, and announcing a
