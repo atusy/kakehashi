@@ -297,6 +297,26 @@ region's real one.
 so the walk can pair each open virtual document with its host document's
 language directly rather than taking a cross product of the two axes.
 
+An entry must be **validated before it contributes**, because the tracker's
+host→virtual map is not an "already open downstream" set: `register_pending_document`
+inserts an entry to own its close-cleanup *before* `didOpen` reaches the writer
+FIFO, and only `mark_open_sent` promotes it into the live reverse index. A
+cloned entry can also outlive a connection purge. Taken at face value, the walk
+would derive a pair from a `didOpen` the downstream has not seen, or from a
+replaced connection whose documents were never replayed.
+
+The save path already establishes the discipline this needs, and the reasoning
+there applies unchanged: snapshot the tracker, then take `connections` **once**
+and hold it across the checks with no `.await` inside, require the handle to be
+the current `Ready` one, and only then consult
+`is_virtual_doc_open_on_connection`. Holding `connections` is what makes it
+sound — a reverse-index check alone would not, since a purge could swap in a
+fresh `Ready` handle that never opened the document. The lock order is
+`connections` → tracker, matching the respawn purge. This composes with the
+stale-handle re-check the send already performs (point 4): the enqueue is
+non-blocking, so both happen under the same lock and only the response is
+awaited outside it.
+
 Candidates for each `(host, injection)` pair then come from the **existing
 routing entry point**, `get_all_configs_for_language`, rather than from a
 hand-rolled lookup. That function already applies the `is_language_bridgeable`
