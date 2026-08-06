@@ -261,11 +261,73 @@ fn compile_parser(grammar_path: &Path, output_path: &Path) -> Result<(), ParserI
     Ok(())
 }
 
-/// Install a Tree-sitter parser for a language.
-pub fn install_parser(
+/// A compiled parser that has not been moved into the data directory yet.
+///
+/// Installing a language means publishing two artifacts (parser and queries),
+/// and either can fail. Staging separates the expensive, failure-prone work
+/// (metadata, source fetch, compile) from the single rename that makes the
+/// parser visible, so a caller can prepare both halves first and publish only
+/// once both are ready. Dropping a staged parser without publishing removes the
+/// compiled artifact, leaving the data directory exactly as it was.
+pub(crate) struct StagedParser {
+    language: String,
+    revision: String,
+    tmp_file: PathBuf,
+    parser_file: PathBuf,
+    /// Whether the drop guard still owns `tmp_file`. Cleared by `publish`,
+    /// which hands the file over to the data directory.
+    armed: bool,
+}
+
+impl StagedParser {
+    /// Move the compiled library into its final location.
+    ///
+    /// On unix `rename` atomically replaces an existing parser. Windows
+    /// `rename` instead fails if the destination exists, which would make a
+    /// `force` reinstall fail after a good compile — remove the old file
+    /// first there (a small non-atomic window, acceptable on the
+    /// non-primary platform).
+    pub(crate) fn publish(mut self) -> Result<ParserInstallResult, ParserInstallError> {
+        #[cfg(windows)]
+        let _ = fs::remove_file(&self.parser_file);
+        if let Err(e) = fs::rename(&self.tmp_file, &self.parser_file) {
+            return Err(ParserInstallError::IoError(e));
+        }
+        // The rename consumed the staging file; anything the drop guard would
+        // remove now belongs to the data dir.
+        self.armed = false;
+        Ok(ParserInstallResult {
+            language: std::mem::take(&mut self.language),
+            install_path: std::mem::take(&mut self.parser_file),
+            revision: std::mem::take(&mut self.revision),
+        })
+    }
+}
+
+impl Drop for StagedParser {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = fs::remove_file(&self.tmp_file);
+        }
+    }
+}
+
+/// What [`stage_parser`] found or produced.
+pub(crate) enum StagedParserOutcome {
+    /// A parser was compiled and is waiting to be published.
+    Staged(StagedParser),
+    /// A usable parser is already installed and `force` was not requested, so
+    /// nothing was compiled.
+    AlreadyInstalled(PathBuf),
+}
+
+/// Compile a Tree-sitter parser into a staging file without publishing it.
+///
+/// See [`StagedParser`] for why publication is deferred.
+pub(crate) fn stage_parser(
     language: &str,
     options: &InstallOptions,
-) -> Result<ParserInstallResult, ParserInstallError> {
+) -> Result<StagedParserOutcome, ParserInstallError> {
     // `language` becomes path segments (`parser/<language>.<ext>` and the temp
     // file) and a URL/metadata key, so reject traversal-capable names before
     // touching the filesystem. Higher-level callers (auto-install) already gate
@@ -283,7 +345,7 @@ pub fn install_parser(
 
     // Check if parser already exists
     if parser_file.exists() && !options.force {
-        return Err(ParserInstallError::AlreadyExists(parser_file));
+        return Ok(StagedParserOutcome::AlreadyInstalled(parser_file));
     }
 
     // Fetch metadata (with caching support)
@@ -319,11 +381,11 @@ pub fn install_parser(
         eprintln!("Building parser in: {}", source_dir.display());
     }
 
-    // Compile to a temp path in the install dir, then atomically rename into place
-    // on success. A failed or deadline-killed compile can leave a partial/corrupt
-    // library behind (`parser_file_exists` only checks existence, so a leftover
-    // would make later runs skip reinstall and load a broken parser); writing to a
-    // temp and renaming only on success means a failure never clobbers a
+    // Compile to a temp path in the install dir; the caller renames it into place
+    // (see `StagedParser::publish`). A failed or deadline-killed compile can leave a
+    // partial/corrupt library behind (`parser_file_exists` only checks existence, so
+    // a leftover would make later runs skip reinstall and load a broken parser);
+    // writing to a temp and renaming only on success means a failure never clobbers a
     // previously-working parser (e.g. a `force` reinstall that fails) and concurrent
     // readers never observe a half-written file.
     //
@@ -341,39 +403,40 @@ pub fn install_parser(
         TMP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
         std::env::consts::DLL_EXTENSION
     ));
-    let compiled = match options.compile {
-        ParserCompile::KillableSubprocess => compile_parser(&source_dir, &tmp_file),
-        ParserCompile::InProcess => compile_parser_inprocess(&source_dir, &tmp_file),
+    let staged = StagedParser {
+        language: language.to_string(),
+        revision: metadata.revision,
+        tmp_file,
+        parser_file,
+        armed: true,
     };
-    match compiled {
-        Ok(()) => {
-            // On unix `rename` atomically replaces an existing parser. Windows
-            // `rename` instead fails if the destination exists, which would make a
-            // `force` reinstall fail after a good compile — remove the old file
-            // first there (a small non-atomic window, acceptable on the
-            // non-primary platform).
-            #[cfg(windows)]
-            let _ = fs::remove_file(&parser_file);
-            if let Err(e) = fs::rename(&tmp_file, &parser_file) {
-                let _ = fs::remove_file(&tmp_file);
-                return Err(ParserInstallError::IoError(e));
-            }
-        }
-        Err(e) => {
-            let _ = fs::remove_file(&tmp_file);
-            return Err(e);
-        }
-    }
+    match options.compile {
+        ParserCompile::KillableSubprocess => compile_parser(&source_dir, &staged.tmp_file),
+        ParserCompile::InProcess => compile_parser_inprocess(&source_dir, &staged.tmp_file),
+    }?;
 
     if options.verbose {
-        eprintln!("Installed to: {}", parser_file.display());
+        eprintln!("Compiled to: {}", staged.tmp_file.display());
     }
 
-    Ok(ParserInstallResult {
-        language: language.to_string(),
-        install_path: parser_file,
-        revision: metadata.revision,
-    })
+    Ok(StagedParserOutcome::Staged(staged))
+}
+
+/// Install a Tree-sitter parser for a language, publishing it immediately.
+pub fn install_parser(
+    language: &str,
+    options: &InstallOptions,
+) -> Result<ParserInstallResult, ParserInstallError> {
+    match stage_parser(language, options)? {
+        StagedParserOutcome::Staged(staged) => {
+            let result = staged.publish()?;
+            if options.verbose {
+                eprintln!("Installed to: {}", result.install_path.display());
+            }
+            Ok(result)
+        }
+        StagedParserOutcome::AlreadyInstalled(path) => Err(ParserInstallError::AlreadyExists(path)),
+    }
 }
 
 /// Construct a GitHub archive download URL from a repository URL and revision.
@@ -1383,6 +1446,102 @@ mod tests {
         let result = parser_file_exists("lua", temp.path());
         assert!(result.is_some());
         assert_eq!(result.unwrap(), parser_file);
+    }
+
+    /// Build a staged parser over a hand-written temp file, so the staging
+    /// contract can be tested without metadata, a clone, or a `cc` run.
+    fn fake_staged_parser(data_dir: &Path, language: &str) -> StagedParser {
+        let parser_dir = data_dir.join("parser");
+        fs::create_dir_all(&parser_dir).expect("create parser dir");
+        let ext = std::env::consts::DLL_EXTENSION;
+        let tmp_file = parser_dir.join(format!(".{}.staged.{}.tmp", language, ext));
+        fs::write(&tmp_file, b"staged parser").expect("write staged parser");
+        StagedParser {
+            language: language.to_string(),
+            revision: "deadbeef".to_string(),
+            tmp_file,
+            parser_file: parser_dir.join(format!("{}.{}", language, ext)),
+            armed: true,
+        }
+    }
+
+    /// The whole point of staging: an install that gives up before publishing
+    /// must leave the parser directory byte-identical, with no stray temp file
+    /// for a later run (or `language status`) to trip over.
+    #[test]
+    fn dropping_a_staged_parser_leaves_the_parser_dir_unchanged() {
+        let temp = tempdir().expect("temp dir");
+        let parser_dir = temp.path().join("parser");
+
+        drop(fake_staged_parser(temp.path(), "lua"));
+
+        let leftovers: Vec<_> = fs::read_dir(&parser_dir)
+            .expect("read parser dir")
+            .flatten()
+            .map(|entry| entry.file_name())
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "an unpublished staged parser must leave nothing behind, found {:?}",
+            leftovers
+        );
+    }
+
+    /// Dropping must not touch a parser that was already installed: the
+    /// abandoned install never owned it.
+    #[test]
+    fn dropping_a_staged_parser_preserves_an_existing_parser() {
+        let temp = tempdir().expect("temp dir");
+        let ext = std::env::consts::DLL_EXTENSION;
+        let parser_file = temp.path().join("parser").join(format!("lua.{}", ext));
+        let staged = fake_staged_parser(temp.path(), "lua");
+        fs::write(&parser_file, b"previously installed").expect("write existing parser");
+
+        drop(staged);
+
+        assert_eq!(
+            fs::read(&parser_file).expect("read existing parser"),
+            b"previously installed",
+            "staging cleanup must not remove an already-installed parser"
+        );
+    }
+
+    #[test]
+    fn publishing_a_staged_parser_moves_it_into_place() {
+        let temp = tempdir().expect("temp dir");
+        let ext = std::env::consts::DLL_EXTENSION;
+        let staged = fake_staged_parser(temp.path(), "lua");
+        let tmp_file = staged.tmp_file.clone();
+
+        let result = staged.publish().expect("publish should succeed");
+
+        assert_eq!(
+            result.install_path,
+            temp.path().join("parser").join(format!("lua.{}", ext))
+        );
+        assert_eq!(
+            fs::read(&result.install_path).expect("read published parser"),
+            b"staged parser"
+        );
+        assert!(
+            !tmp_file.exists(),
+            "publishing must consume the staging file"
+        );
+    }
+
+    /// A published parser is owned by the data dir, not by the (now dropped)
+    /// staging handle — the drop guard must not delete what it just handed over.
+    #[test]
+    fn publishing_disarms_the_staging_cleanup() {
+        let temp = tempdir().expect("temp dir");
+        let staged = fake_staged_parser(temp.path(), "lua");
+
+        let result = staged.publish().expect("publish should succeed");
+
+        assert!(
+            result.install_path.exists(),
+            "the published parser must survive the staging handle's drop"
+        );
     }
 
     #[test]
