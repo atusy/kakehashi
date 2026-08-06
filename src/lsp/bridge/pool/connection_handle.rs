@@ -1953,19 +1953,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn replacement_rejects_a_removed_execute_command_name() {
-        let original = spawn_sink_handle().await;
-        original.set_server_capabilities(ServerCapabilities {
-            execute_command_provider: Some(tower_lsp_server::ls_types::ExecuteCommandOptions {
-                commands: vec!["source.fixAll".to_string()],
-                work_done_progress_options: Default::default(),
-            }),
-            ..Default::default()
-        });
-        assert!(original.advertises_execute_command("source.fixAll"));
-
-        let replacement = spawn_sink_handle().await;
-        replacement.set_server_capabilities(ServerCapabilities {
+    async fn advertises_execute_command_matches_the_exact_name() {
+        let handle = spawn_sink_handle().await;
+        handle.set_server_capabilities(ServerCapabilities {
             execute_command_provider: Some(tower_lsp_server::ls_types::ExecuteCommandOptions {
                 commands: vec!["source.organizeImports".to_string()],
                 work_done_progress_options: Default::default(),
@@ -1973,11 +1963,30 @@ mod tests {
             ..Default::default()
         });
 
-        assert!(replacement.advertises_execute_command("source.organizeImports"));
+        assert!(handle.advertises_execute_command("source.organizeImports"));
         assert!(
-            !replacement.advertises_execute_command("source.fixAll"),
-            "a replacement must not inherit a historical raw command name"
+            !handle.advertises_execute_command("source.fixAll"),
+            "a server that dropped a name across a respawn must not still receive it"
         );
+        assert!(
+            !handle.advertises_execute_command("source.organizeImports.eslint"),
+            "the match is the whole name, not a prefix of one"
+        );
+    }
+
+    #[tokio::test]
+    async fn advertises_execute_command_is_false_without_capabilities() {
+        // The two shapes that are NOT an advertisement, and the reason this is
+        // not `has_capability`: a handle mid-handshake has no capabilities at
+        // all, and a Ready server may have no `executeCommandProvider`. Reading
+        // either as "advertises everything" would make every connection collide
+        // with every command name.
+        let handshaking = spawn_sink_handle().await;
+        assert!(!handshaking.advertises_execute_command("source.fixAll"));
+
+        let no_provider = spawn_sink_handle().await;
+        no_provider.set_server_capabilities(ServerCapabilities::default());
+        assert!(!no_provider.advertises_execute_command("source.fixAll"));
     }
 
     /// Test has_capability returns true with static capability only.
