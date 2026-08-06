@@ -96,7 +96,6 @@ pub mod test_support {
 
     /// Languages whose parsers and queries every kakehashi test relies on.
     ///
-    /// Mirrors the `make deps/tree-sitter/.installed` Makefile target.
     /// Tests that open lua / markdown / rust / yaml documents expect
     /// parsers and highlight queries to already be present; without
     /// them, semantic-tokens and similar end-to-end tests come back
@@ -126,8 +125,9 @@ pub mod test_support {
     /// the `.installed` marker is missing, writing the marker only when
     /// every required install succeeded.
     ///
-    /// Covers the same languages as `make deps/tree-sitter/.installed`.
-    /// The install short-circuits when a language is up-to-date; any
+    /// Serves the same purpose as `make deps/tree-sitter/.installed` for the
+    /// in-process test suite, over an overlapping but not identical language
+    /// set. The install short-circuits when a language is up-to-date; any
     /// genuine failure is logged so tests depending on that language fail
     /// with a clearer error rather than the whole suite panicking in setup.
     ///
@@ -189,8 +189,8 @@ fn resolve_data_dir(env_fn: impl Fn(&str) -> Option<String>) -> Option<PathBuf> 
 ///
 /// A language is installed as a unit: every failure path returns before
 /// publishing either half, or undoes the one it published. A `None` path with
-/// no matching error means that half was never published because the other half
-/// failed.
+/// no matching error means that half was not left published — either it was
+/// never published, or it was undone when the other half failed.
 #[derive(Debug)]
 pub struct InstallResult {
     /// Path where the parser was installed, if successful.
@@ -229,11 +229,14 @@ pub struct LanguageInstallOptions {
 
 /// Install a language's parser and queries as a unit.
 ///
-/// Both halves are prepared before either is published, so a failure publishes
-/// neither, rather than installing one half and reporting the other as an
-/// error. Bookkeeping a failed install may still leave behind: the parser
-/// metadata cache, the `parser/` and `queries/` directories, the per-language
-/// lock files, and the removal of an uninstall tombstone for the language.
+/// Both halves are prepared before either is published, so a failure leaves the
+/// requested language neither half-installed nor reported as half-failed.
+///
+/// Two things a failure can still leave behind: queries for a base language the
+/// install had to fetch, which are shared with every language that inherits them
+/// and inert on their own, and bookkeeping — the parser metadata cache, the
+/// `parser/` and `queries/` directories, the per-language lock files, and the
+/// removal of an uninstall tombstone for the language.
 pub fn install_language(language: &str, options: &LanguageInstallOptions) -> InstallResult {
     install_language_with_query_stager(
         language,
@@ -312,7 +315,7 @@ fn install_language_with_query_stager(
 
     // Stage both halves before publishing either, so a language is never left
     // half-installed: whichever half fails, every staging artifact is dropped
-    // and no parser or query files are published.
+    // and the requested language's parser and queries stay unpublished.
     //
     // Queries first because they are the cheap half — a language whose queries
     // cannot be fetched is rejected in seconds instead of after a parser
@@ -360,7 +363,7 @@ fn install_language_with_query_stager(
     //
     // AlreadyInstalled means the artifact is present and usable — success, not
     // failure; treating it as an error made the auto-install manager degrade a
-    // fully-installed language to "installed but with warnings".
+    // fully-installed language to a warning about its own success.
     match staged_parser {
         parser::StagedParserOutcome::Staged(staged) => match staged.publish() {
             Ok(parser_result) => result.parser_path = Some(parser_result.install_path),
@@ -687,7 +690,7 @@ mod tests {
     /// A language whose parser and queries are already on disk is a
     /// successful install, not a failure: reporting AlreadyExists as an
     /// error made the auto-install manager degrade a fully-usable language
-    /// to "installed but with warnings".
+    /// to a warning about its own success.
     #[test]
     fn install_language_blocking_treats_already_installed_as_success() {
         let temp = tempfile::TempDir::new().unwrap();

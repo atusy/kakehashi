@@ -95,11 +95,12 @@ pub(crate) enum InstallOutcome {
         /// Directory where parser and queries were installed
         data_dir: PathBuf,
     },
-    /// The install failed, but a parser for the language is on disk from an
-    /// earlier or concurrent install, so the language is still loadable — with
-    /// whatever queries that other install left, which may be none.
+    /// The install failed, but a parser for the language was published by
+    /// another install while this one ran, so the language is still loadable —
+    /// with whatever queries that install left, which may be none.
     SuccessWithWarnings {
-        /// Directory where parser and queries were installed
+        /// Directory the language loads from. The parser there is another
+        /// install's, not this one's.
         data_dir: PathBuf,
     },
     /// Parser already exists, just needs reload (no installation performed)
@@ -562,8 +563,8 @@ impl AutoInstallManager {
             });
             InstallResult::with_claim(outcome, events, install_marker)
         } else if matches!(outcome, InstallOutcome::SuccessWithWarnings { .. }) {
-            // The install published nothing, but a parser is on disk from an
-            // earlier or concurrent install, so the language still loads. Only
+            // The install published nothing, but a concurrent install put a
+            // parser on disk, so the language still loads. Only
             // when the parser half itself did not fail: a parser that failed to
             // publish leaves a file whose provenance is somebody else's install,
             // and reporting that as a near-success would hide a real error.
@@ -612,9 +613,10 @@ impl AutoInstallManager {
 /// Decide what an install attempt means for the client.
 ///
 /// `parser_exists` is read from disk rather than from `result`, because a
-/// parser can be present without this install having published it — an earlier
-/// run, or another process installing the same language. That is the only way
-/// a failed install is still worth reloading for.
+/// parser can be present without this install having published it: an install
+/// that already had one short-circuits before reaching here, so what this
+/// catches is another process publishing one while this install ran. That is
+/// the only way a failed install is still worth reloading for.
 ///
 /// It is not enough on its own: an install whose *parser* half failed leaves a
 /// file whose provenance is somebody else's, and reporting that as a

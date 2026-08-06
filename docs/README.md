@@ -878,15 +878,21 @@ Installing a language is all-or-nothing. The parser, the language's query
 files, and every query file it pulls in through `; inherits:` are prepared
 first, and only made visible once all of them are ready. A failed install — no
 network, an unsupported language, a compile error, or a base language that
-cannot be downloaded — publishes neither half, so whatever was installed before
-is still exactly what is installed. (Bookkeeping is not covered by that: the
-parser metadata cache, the `parser/` and `queries/` directories, and the
-per-language lock files may be created or refreshed either way.)
+cannot be downloaded — never leaves the language you asked for half-installed:
+its parser and its queries are published together or not at all.
+
+Two things a failed install can still leave behind. Queries for a *base*
+language it had to fetch stay installed: they are shared with every language
+that inherits them, and a base language nothing uses is inert. And bookkeeping —
+the parser metadata cache, the `parser/` and `queries/` directories, the
+per-language lock files, and the clearing of the language's uninstall
+tombstone — is written either way.
 
 Re-running the command is safe: whatever is already installed is left alone,
 and the missing halves — including the queries of a base language it inherits —
-are fetched without `--force`. Use `--force` to *replace* something already on
-disk, such as a parser that fails to load.
+are fetched without `--force`. Use `--force` to *replace* the requested
+language's parser and queries, such as a parser that fails to load; base
+languages are never replaced, so install one by name to refresh it.
 
 ### Configuration Management
 
