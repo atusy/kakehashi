@@ -375,6 +375,18 @@ fn install_language_with_query_stager(
         }
     };
 
+    // Queries that staging found already complete were never copied, so this is
+    // the only thing that would notice an uninstall removing them since. Checked
+    // under the transaction lock, before anything is published, so there is
+    // nothing to undo.
+    if !staged_queries.requested_queries_still_complete() {
+        result.queries_error = Some(format!(
+            "the installed queries for '{}' were removed while it was being installed",
+            language
+        ));
+        return result;
+    }
+
     let published_queries = match staged_queries.publish() {
         Ok(published) => published,
         Err(e) => {
