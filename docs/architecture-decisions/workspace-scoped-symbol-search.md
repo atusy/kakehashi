@@ -373,12 +373,10 @@ name across roots, recreating the leak point 3 exists to prevent. The
 `(host_language, _self, ConnectionKey)` triples come from `host_documents`
 directly.
 
-That is a second async map, so selection acquires three locks in all — the
-tracker snapshot, `host_documents`, then `connections` — and each falls under
-point 6's budget rather than the "one acquisition then synchronous work" shape
-an earlier draft assumed. The first two are snapshots taken and released before
-`connections` is held, so the only nesting is `connections` → tracker, which is
-the pool's own order.
+That is a second async map, read **under** `connections` by the batch validator
+below rather than snapshotted separately, so selection's acquisitions are the
+tracker snapshot and then `connections`, each falling under point 6's budget —
+not the "one acquisition then synchronous work" shape an earlier draft assumed.
 
 The two snapshots also have to be **joined safely**. Host language comes from
 the document store, while the exact keys come from pool tracking read later, and
@@ -427,33 +425,48 @@ existing configuration from becoming a silent no-op here.
 **No candidate is waited for; the only waits are lock acquisitions and the
 final barrier.** The order is fixed:
 
-1. **Snapshot the tracker's host→virtual map, then `host_documents`**, each
-   under its own lock and each **released before the next**. Nothing is held
-   across them, so no ordering question arises between the two.
-2. **Take `connections` once** and hold it across every per-handle check below,
-   with no `.await` inside. Consulting the tracker's live reverse index while
-   holding it is the pool's own `connections` → tracker order, which the
-   respawn purge also takes.
-3. Under that lock, per candidate: keep only `Ready` handles (`connections()`
-   returns the raw map, and `ConnectionState` also has `Initializing`,
-   `Failed`, `Closing`, `Closed`); drop handles lacking `workspace/symbol`;
-   drop handles whose recorded launch configuration no longer matches the
-   `BridgeServerConfig` that admitted them; and confirm the
-   `(virtual_uri, connection)` pair is still in the live reverse index.
-4. Release the lock, then apply the per-pair `priorities` allowlist and
-   `max_fan_out` cap — pure computation over what survived.
-5. Dedup the survivors by **connection key** `(server, root)`.
-6. Await `wait_for_pending_reopen` for the survivors, **concurrently**, then
+1. **Snapshot the tracker's host→virtual map** under its own lock and release
+   it. This only *enumerates* candidates; every entry is re-validated in step 2
+   before it can contribute.
+2. Hand the candidate set to a **pool-owned batch validator**, which takes
+   `connections` **once** and, without awaiting inside, per candidate: keeps
+   only `Ready` handles (`connections()` returns the raw map, and
+   `ConnectionState` also has `Initializing`, `Failed`, `Closing`, `Closed`);
+   drops handles lacking `workspace/symbol`; drops handles whose recorded launch
+   configuration no longer matches the `BridgeServerConfig` that admitted them;
+   and confirms current membership — the live reverse index for a virtual
+   candidate, `host_documents` for a `_self` one.
+3. Apply the per-pair `priorities` allowlist and `max_fan_out` cap to the
+   survivors — pure computation, after the lock is released.
+4. Dedup by **connection key** `(server, root)`.
+5. Await `wait_for_pending_reopen` for the survivors, **concurrently**, then
    send.
 
-Every filter in step 3 precedes the cap in step 4, and that ordering is
+The validator is **pool-owned** for two reasons. It is the only way to do all of
+this under one acquisition — `launch_config` and its comparator are private to
+the pool, and the exposed comparison helper takes `connections` itself, so a
+caller in `bridge/workspace/symbol.rs` doing these checks piecemeal would
+re-lock between them and validate against a map that had already moved. And it
+is what lets `host_documents` be read **while `connections` is held** rather
+than snapshotted first: a `_self` candidate has no reverse-index check to fall
+back on, `HostDocSyncState` records neither connection generation nor handle
+identity, and a respawn can purge the entry and install a fresh `Ready` handle
+under the same `ConnectionKey` — so a released snapshot would let a connection
+that never opened the host document pass every other check. The language and
+incarnation recheck does not catch that, because the host lifetime never
+changed; only the connection did.
+
+The resulting order is `connections` → {tracker, `host_documents`}, which is the
+pool's own nesting and the one the respawn purge takes.
+
+Every filter in step 2 precedes the cap in step 3, and that ordering is
 load-bearing for each of them: with `priorities = [A, B]` and
 `max_fan_out = 1`, an A that is incapable, stale-configured, or no longer
 holding its documents would otherwise take the only slot and then be dropped,
 leaving the query to consult nobody. Filtering on what is already knowable
 before allocating slots costs nothing and removes all three cases at once.
 
-Step 6 exists because a connection reaches `Ready` *before* its virtual
+Step 5 exists because a connection reaches `Ready` *before* its virtual
 documents are replayed after a respawn, so a query landing in that window would
 under-report that server's embedded symbols indistinguishably from "no matches".
 The barrier is **bounded to two seconds** and enforced with a timeout, and
@@ -600,10 +613,10 @@ with its own name and semantics rather than smuggled into this one.
                           ▼
         ┌──────────────────────────────────────┐
         │ SELECTION (3s per lock ACQUIRE, §6)  │
-        │ under `connections`, all before the  │
-        │ cap: keep Ready only, drop incapable,│
-        │ drop stale-config, confirm still     │
-        │ open on that connection              │
+        │ pool-owned batch validator, one lock:│
+        │ Ready only, drop incapable, drop     │
+        │ stale-config, confirm still open on  │
+        │ that exact connection                │
         │ then: allowlist + per-pair maxFanOut │
         │ NEVER spawns a connection            │
         └──────────────────┬───────────────────┘
@@ -1132,9 +1145,10 @@ send re-acquires `connections` before enqueue, and translation takes each host's
 `edit_lock` across downstream close, change, and eager-spawn awaits, so a query
 arriving mid-processing would otherwise wait on unrelated work with no bound.
 
-- **Selection** (`connections`, then `host_documents`, then the tracker
-  snapshot, in that order): three seconds each. The budget covers *acquiring*
-  each lock, not the filtering between them — that walk is synchronous with no
+- **Selection**: the tracker snapshot, then `connections` (under which the
+  validator also reads `host_documents` and the live reverse index) — three
+  seconds each. The budget covers *acquiring* each lock, not the filtering
+  between them — that walk is synchronous with no
   await, so a timeout could not preempt it anyway, and bounding what cannot be
   interrupted would promise something the runtime does not deliver.
 - **Each send's pre-enqueue re-acquisition** of `connections`: three seconds,
@@ -1365,9 +1379,9 @@ Including it would defeat dedup on a field carrying no identity.
   user expecting an indexed whole-project search will find this surprising.
 - Latency is max-over-live-targets, and every *wait* is bounded: the pool's 30s
   request timeout and liveness timeout, a three-second budget on **every** lock
-  this path acquires (`connections`, `host_documents`, the tracker snapshot,
-  each send's re-acquisition, and each host's `edit_lock`), and the reopen
-  barrier's two seconds. Total latency is not bounded, because the synchronous
+  this path acquires (the tracker snapshot, `connections`, each send's
+  re-acquisition, and each host's `edit_lock`), and the reopen barrier's two
+  seconds. Total latency is not bounded, because the synchronous
   filtering between those waits cannot be preempted. Forwarded cancellation is
   best-effort, since a downstream may ignore it.
 - One request per keystroke, un-coalesced (point 9).
@@ -1387,9 +1401,9 @@ Including it would defeat dedup on a field carrying no identity.
   in methods that have no use for it.
 - A server still `Initializing` when the query arrives is skipped entirely, so
   a search in the seconds after opening a file can miss it (point 3).
-- Every lock this path takes — the tracker snapshot, `host_documents`,
-  `connections`, each send's re-acquisition, each host's `edit_lock` — is
-  bounded only in its **acquisition**, because other paths hold these across
+- Every lock this path takes — the tracker snapshot, `connections` (under which
+  `host_documents` and the reverse index are read), each send's re-acquisition,
+  each host's `edit_lock` — is bounded only in its **acquisition**, because other paths hold these across
   unbounded async work (point 6); the filtering between them is synchronous and
   cannot be preempted, so neither total selection time nor cancellation blocking
   is capped. Expiring either
