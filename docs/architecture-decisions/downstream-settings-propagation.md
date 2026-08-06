@@ -216,14 +216,22 @@ keeps propagation proportional to actual change.
 
 The following are **deferred** and intentionally out of scope:
 
-- **Upstream pull** (kakehashi → editor `workspace/configuration`): needed only
-  to support pull-model editors (e.g. VS Code sends `didChangeConfiguration`
-  with no usable `settings` and expects the server to pull). Editors that push
-  full settings via `initializationOptions` / `didChangeConfiguration` (e.g.
-  Neovim) do not need it. When added, it must be gated on the editor's
-  `capabilities.workspace.configuration`.
-- **`scopeUri` / multi-root resolution**: `ConfigurationItem.scopeUri` is
-  ignored; a single per-server `settings` value answers all scopes.
+- ~~**Upstream pull**~~ (kakehashi → editor `workspace/configuration`):
+  **implemented** (#952 stage 1). Gated on the editor's
+  `capabilities.workspace.configuration`, as this decision required. kakehashi
+  asks once the handshake completes, and again whenever a
+  `didChangeConfiguration` carries no usable payload — which is the shape
+  pull-model editors send. The answer is applied as a configuration layer,
+  identically to a push of the same section (see the accumulate contract in
+  configuration-merging-strategy), so nothing about the merge is special-cased
+  for having been pulled.
+- **`scopeUri` / multi-root resolution**: on the downstream side
+  `ConfigurationItem.scopeUri` is ignored — a single per-server `settings`
+  value answers all scopes. Upstream, kakehashi asks without a scope on
+  purpose: it resolves one effective settings snapshot for the whole process,
+  so naming a scope and applying the answer process-wide would promote one
+  folder's configuration to global. Scoped pull is #952 stage 2 and changes
+  that invariant.
 
 ## Validation
 

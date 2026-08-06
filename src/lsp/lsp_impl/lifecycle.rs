@@ -701,12 +701,6 @@ impl Kakehashi {
     pub(crate) async fn initialized_impl(&self, _: InitializedParams) {
         self.notifier().log_info("server is ready").await;
 
-        // Now that the handshake is complete, ask a pull-capable client for its
-        // configuration. Editors that send `didChangeConfiguration` with no
-        // usable `settings` have no other way to configure kakehashi past
-        // `initializationOptions`.
-        self.pull_client_configuration().await;
-
         // Forward downstream-initiated messages to the upstream editor
         // (workspace/applyEdit is answered locally instead when the editor
         // never declared the capability). The reader tasks feed three
@@ -776,6 +770,17 @@ impl Kakehashi {
                 editor_supports_apply_edit,
             ));
         }
+
+        // Ask a pull-capable client for its configuration now that the
+        // handshake is complete. Editors that send `didChangeConfiguration`
+        // with no usable `settings` have no other way to configure kakehashi
+        // past `initializationOptions`.
+        //
+        // Last, deliberately: this awaits a response from the client, and a
+        // client that is slow to answer — or never does — must not hold up the
+        // forwarding loops above. Nothing follows it, so the only thing such a
+        // client delays is its own configuration.
+        self.pull_client_configuration().await;
     }
 
     /// Arm a Unix-signal watcher that reaps the downstream server pool when
