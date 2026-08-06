@@ -229,28 +229,28 @@ fn install_language_blocking(
     queries_base_url: &str,
     compile: parser::ParserCompile,
 ) -> InstallResult {
-    install_language_blocking_with_query_installer(
+    install_language_blocking_with_query_stager(
         language,
         data_dir,
         force,
         queries_base_url,
         compile,
-        queries::install_queries_with_dependencies_from,
+        queries::stage_queries_with_dependencies_from,
     )
 }
 
-fn install_language_blocking_with_query_installer(
+fn install_language_blocking_with_query_stager(
     language: &str,
     data_dir: &std::path::Path,
     force: bool,
     queries_base_url: &str,
     compile: parser::ParserCompile,
-    install_queries: fn(
+    stage_queries: fn(
         &str,
         &str,
         &std::path::Path,
         bool,
-    ) -> Result<queries::QueryInstallResult, queries::QueryInstallError>,
+    ) -> Result<queries::StagedQueryInstall, queries::QueryInstallError>,
 ) -> InstallResult {
     let mut result = InstallResult {
         parser_path: None,
@@ -270,11 +270,27 @@ fn install_language_blocking_with_query_installer(
     }
 
     if let Err(e) = queries::clear_uninstall_tombstone_for_install(data_dir, language) {
-        let reason = e.to_string();
-        result.queries_error = Some(reason);
+        result.queries_error = Some(e.to_string());
+        return result;
     }
 
-    // Install parser
+    // Stage both halves before publishing either, so a language is never left
+    // half-installed: whichever half fails, every staging artifact is dropped
+    // and the data directory is exactly as it was.
+    //
+    // Queries first because they are the cheap half — a language whose queries
+    // cannot be fetched is rejected in seconds instead of after a parser
+    // compile that would then be thrown away. Following `; inherits:` here is
+    // what makes languages like html (which keeps its @comment capture in
+    // html_tags) highlight correctly.
+    let staged_queries = match stage_queries(queries_base_url, language, data_dir, force) {
+        Ok(staged) => staged,
+        Err(e) => {
+            result.queries_error = Some(e.to_string());
+            return result;
+        }
+    };
+
     // For async/auto-install, always use cache (background operation)
     let parser_options = parser::InstallOptions {
         data_dir: data_dir.to_path_buf(),
@@ -287,25 +303,42 @@ fn install_language_blocking_with_query_installer(
         // for it; test/embedder callers pass InProcess.
         compile,
     };
-
-    // AlreadyExists means the artifact is present and usable — success,
-    // not failure; treating it as an error made the auto-install manager
-    // degrade a fully-installed language to "installed but with warnings".
-    match parser::install_parser(language, &parser_options) {
-        Ok(parser_result) => {
-            result.parser_path = Some(parser_result.install_path);
-        }
-        Err(parser::ParserInstallError::AlreadyExists(path)) => {
-            result.parser_path = Some(path);
-        }
+    let staged_parser = match parser::stage_parser(language, &parser_options) {
+        Ok(staged) => staged,
         Err(e) => {
             result.parser_error = Some(e.to_string());
+            return result;
         }
+    };
+
+    let published_queries = match staged_queries.publish(force) {
+        Ok(published) => published,
+        Err(e) => {
+            result.queries_error = Some(e.to_string());
+            return result;
+        }
+    };
+
+    // The parser is published last: requests are routed to a language only once
+    // its parser is registered, so an install cut short here leaves inert
+    // queries rather than a parser whose queries are missing.
+    //
+    // AlreadyInstalled means the artifact is present and usable — success, not
+    // failure; treating it as an error made the auto-install manager degrade a
+    // fully-installed language to "installed but with warnings".
+    match staged_parser {
+        parser::StagedParserOutcome::Staged(staged) => match staged.publish() {
+            Ok(parser_result) => result.parser_path = Some(parser_result.install_path),
+            Err(e) => {
+                published_queries.rollback();
+                result.parser_error = Some(e.to_string());
+                return result;
+            }
+        },
+        parser::StagedParserOutcome::AlreadyInstalled(path) => result.parser_path = Some(path),
     }
 
-    // Install queries, following `; inherits:` so languages like html
-    // (which keeps its @comment capture in html_tags) highlight correctly.
-    match install_queries(queries_base_url, language, data_dir, force) {
+    match published_queries.commit() {
         Ok(query_result) => {
             result.queries_path = Some(query_result.install_path);
         }
@@ -357,13 +390,13 @@ fn install_language_blocking_allowing_http_queries_for_tests(
     queries_base_url: &str,
     compile: parser::ParserCompile,
 ) -> InstallResult {
-    install_language_blocking_with_query_installer(
+    install_language_blocking_with_query_stager(
         language,
         data_dir,
         force,
         queries_base_url,
         compile,
-        queries::install_queries_with_dependencies_from_allowing_http_for_tests,
+        queries::stage_queries_with_dependencies_from_allowing_http_for_tests,
     )
 }
 
@@ -676,54 +709,105 @@ mod tests {
         let temp = tempfile::TempDir::new().unwrap();
         let data_dir = temp.path();
 
-        // Keep the parser side successful without fetching metadata or source:
-        // this test isolates how a query tombstone failure is classified.
-        let parser_dir = data_dir.join("parser");
-        std::fs::create_dir_all(&parser_dir).unwrap();
-        std::fs::write(
-            parser_dir.join(format!("lua.{}", std::env::consts::DLL_EXTENSION)),
-            "",
-        )
-        .unwrap();
+        // A file where the queries directory belongs makes tombstone cleanup
+        // fail; the base URL points nowhere so a download would fail loudly.
         std::fs::write(data_dir.join("queries"), "not a directory").unwrap();
         let expected_queries_error =
             queries::clear_uninstall_tombstone_for_install(data_dir, "lua")
                 .unwrap_err()
                 .to_string();
 
-        fn successful_query_install(
-            _base_url: &str,
-            language: &str,
-            data_dir: &std::path::Path,
-            _force: bool,
-        ) -> Result<queries::QueryInstallResult, queries::QueryInstallError> {
-            Ok(queries::QueryInstallResult {
-                language: language.to_string(),
-                install_path: data_dir.join("queries").join(language),
-                files_downloaded: Vec::new(),
-            })
-        }
-
-        let result = install_language_blocking_with_query_installer(
+        let result = install_language_blocking(
             "lua",
             data_dir,
             false,
             "https://example.invalid",
             parser::ParserCompile::InProcess,
-            successful_query_install,
         );
 
         assert!(
             result.parser_error.is_none(),
             "tombstone cleanup must not be reported as a parser error"
         );
-        assert!(
-            result.parser_path.is_some(),
-            "query tombstone cleanup failures must preserve the available parser result"
-        );
         assert_eq!(
             result.queries_error.as_deref(),
             Some(expected_queries_error.as_str())
+        );
+        assert!(
+            result.parser_path.is_none(),
+            "a failure before staging must not report a parser as installed"
+        );
+    }
+
+    /// All-or-nothing: a language whose queries cannot be fetched must not
+    /// leave a compiled parser behind. The parser here is pre-installed, so
+    /// the assertion is about what the failed run publishes, not about
+    /// compiling one.
+    #[test]
+    fn failed_queries_publish_no_parser() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let data_dir = temp.path();
+        // No routes: highlights.scm 404s, so the language is unsupported.
+        let base_url = spawn_query_file_server(vec![]);
+
+        let result = install_language_blocking_allowing_http_queries_for_tests(
+            "unsupported_lang",
+            data_dir,
+            false,
+            &base_url,
+            parser::ParserCompile::InProcess,
+        );
+
+        assert!(!result.is_success(), "the install must fail");
+        assert!(
+            result.parser_path.is_none(),
+            "a failed install must not report an installed parser"
+        );
+        assert!(
+            parser_file_exists("unsupported_lang", data_dir).is_none(),
+            "a failed install must not leave a parser on disk"
+        );
+        assert!(
+            !data_dir.join("queries").join("unsupported_lang").exists(),
+            "a failed install must not leave queries on disk"
+        );
+    }
+
+    /// The inherited-parent chain is staged before anything is published, so a
+    /// parent that 404s takes the whole install down with it — including the
+    /// child's queries, which would otherwise be published with a dangling
+    /// `; inherits:`.
+    #[test]
+    fn a_failing_inherited_parent_publishes_neither_half() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let data_dir = temp.path();
+        let parser_dir = data_dir.join("parser");
+        std::fs::create_dir_all(&parser_dir).unwrap();
+        std::fs::write(
+            parser_dir.join(format!("orphan_child.{}", std::env::consts::DLL_EXTENSION)),
+            "",
+        )
+        .unwrap();
+        let base_url = spawn_query_file_server(vec![(
+            "/orphan_child/highlights.scm",
+            "; inherits: missing_parent\n(identifier) @variable\n",
+        )]);
+
+        let result = install_language_blocking_allowing_http_queries_for_tests(
+            "orphan_child",
+            data_dir,
+            false,
+            &base_url,
+            parser::ParserCompile::InProcess,
+        );
+
+        assert!(
+            !result.is_success(),
+            "a missing parent must fail the install"
+        );
+        assert!(
+            !data_dir.join("queries").join("orphan_child").exists(),
+            "the child's queries must not be published without the parent it inherits"
         );
     }
 }
