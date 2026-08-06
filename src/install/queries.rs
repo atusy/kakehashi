@@ -123,6 +123,53 @@ fn validate_safe_language_name(language: &str) -> Result<(), QueryInstallError> 
     }
 }
 
+/// Languages an installed query directory inherits, across every query kind.
+///
+/// Each kind resolves its own `; inherits:` chain when it loads, and a parent it
+/// names but that is not installed makes that load fail outright — so
+/// injections.scm's parents matter exactly as much as highlights.scm's.
+fn inherited_languages_on_disk(queries_dir: &Path) -> Vec<String> {
+    let mut parents: Vec<String> = Vec::new();
+    for query_file in QUERY_FILES {
+        let Ok(content) = fs::read_to_string(queries_dir.join(query_file)) else {
+            continue;
+        };
+        for parent in parse_inherits_directive(&content) {
+            if !parents.contains(&parent) {
+                parents.push(parent);
+            }
+        }
+    }
+    parents
+}
+
+/// Whether a language and everything it inherits are installed and complete.
+///
+/// [`query_install_is_complete`] answers for one directory; a language whose own
+/// queries are complete still fails to load when a language they inherit is
+/// missing, because the loader resolves the chain and gives up on the first gap.
+pub fn query_install_chain_is_complete(queries_parent: &Path, language: &str) -> bool {
+    fn walk(queries_parent: &Path, language: &str, seen: &mut Vec<String>) -> bool {
+        // An inheritance cycle among on-disk files (a self-inherit typo, A↔B)
+        // is the loader's problem to report, not a reason to call the install
+        // incomplete and re-download forever.
+        if seen.iter().any(|visited| visited == language) {
+            return true;
+        }
+        seen.push(language.to_string());
+        let queries_dir = queries_parent.join(language);
+        query_install_is_complete(&queries_dir)
+            && inherited_languages_on_disk(&queries_dir)
+                .into_iter()
+                .all(|parent| walk(queries_parent, &parent, seen))
+    }
+
+    if !is_safe_language_name(language) {
+        return false;
+    }
+    walk(queries_parent, language, &mut Vec::new())
+}
+
 /// Parse the `; inherits: lang1,lang2` directive from query content.
 /// Returns the list of parent languages, dropping unsafe names
 /// (see [`is_safe_language_name`]).
@@ -732,24 +779,18 @@ fn stage_queries_recursive(
         staged.insert(language.to_string());
 
         // Even if skipping, we need to check for inherited dependencies
-        let highlights_path = queries_dir.join("highlights.scm");
-        if highlights_path.exists()
-            && let Ok(content) = std::fs::read_to_string(&highlights_path)
-        {
-            let parents = parse_inherits_directive(&content);
-            for parent in parents {
-                // Stage parent dependencies (don't force, just ensure they exist)
-                clear_uninstall_tombstone(&queries_parent, &parent)?;
-                stage_queries_recursive(
-                    base_url,
-                    &parent,
-                    data_dir,
-                    false,
-                    staged,
-                    entries,
-                    http_policy,
-                )?;
-            }
+        for parent in inherited_languages_on_disk(&queries_dir) {
+            // Stage parent dependencies (don't force, just ensure they exist)
+            clear_uninstall_tombstone(&queries_parent, &parent)?;
+            stage_queries_recursive(
+                base_url,
+                &parent,
+                data_dir,
+                false,
+                staged,
+                entries,
+                http_policy,
+            )?;
         }
         return Ok(StageOutcome::NothingToDo);
     }
@@ -774,9 +815,13 @@ fn stage_queries_recursive(
 
         match download_file(&url, http_policy) {
             Ok(content) => {
-                // Check for inherits directive in highlights.scm
-                if *query_file == "highlights.scm" {
-                    parents_to_install = parse_inherits_directive(&content);
+                // Every query kind resolves its own `; inherits:` chain at load
+                // time, so a parent named by injections.scm is as load-bearing
+                // as one named by highlights.scm.
+                for parent in parse_inherits_directive(&content) {
+                    if !parents_to_install.contains(&parent) {
+                        parents_to_install.push(parent);
+                    }
                 }
 
                 let file_path = tmp_queries_dir.join(query_file);
@@ -1756,6 +1801,55 @@ mod staging_tests {
         );
     }
 
+    /// The chain check is what a caller needs before deciding a language is
+    /// ready: its own queries being complete says nothing about the parents its
+    /// load will go looking for.
+    #[test]
+    fn the_inheritance_chain_decides_completeness() {
+        let temp = TempDir::new().unwrap();
+        let queries_parent = temp.path().join("queries");
+        let child_dir = queries_parent.join("child");
+        fs::create_dir_all(&child_dir).unwrap();
+        fs::write(child_dir.join("highlights.scm"), "; inherits: parent\n").unwrap();
+        write_install_marker(&child_dir).unwrap();
+
+        assert!(
+            query_install_is_complete(&child_dir),
+            "the language's own queries are complete"
+        );
+        assert!(
+            !query_install_chain_is_complete(&queries_parent, "child"),
+            "but the parent it inherits is missing"
+        );
+
+        let parent_dir = queries_parent.join("parent");
+        fs::create_dir_all(&parent_dir).unwrap();
+        fs::write(parent_dir.join("highlights.scm"), "(comment) @comment\n").unwrap();
+        write_install_marker(&parent_dir).unwrap();
+
+        assert!(query_install_chain_is_complete(&queries_parent, "child"));
+    }
+
+    /// A cycle among on-disk files is the loader's problem to report; treating
+    /// it as incomplete would make every caller reinstall forever.
+    #[test]
+    fn an_inheritance_cycle_does_not_read_as_incomplete() {
+        let temp = TempDir::new().unwrap();
+        let queries_parent = temp.path().join("queries");
+        for (language, inherits) in [("cyc_a", "cyc_b"), ("cyc_b", "cyc_a")] {
+            let dir = queries_parent.join(language);
+            fs::create_dir_all(&dir).unwrap();
+            fs::write(
+                dir.join("highlights.scm"),
+                format!("; inherits: {}\n", inherits),
+            )
+            .unwrap();
+            write_install_marker(&dir).unwrap();
+        }
+
+        assert!(query_install_chain_is_complete(&queries_parent, "cyc_a"));
+    }
+
     /// A language nobody is publishing can be claimed without waiting; one an
     /// install holds cannot, because that install can still roll it back.
     #[test]
@@ -2506,6 +2600,39 @@ mod tests {
             leftovers.is_empty(),
             "a failed dependency must leave no queries behind, found {:?}",
             leftovers
+        );
+    }
+
+    /// Every query kind resolves its own inheritance, so a parent named only by
+    /// injections.scm must be staged like one named by highlights.scm.
+    #[test]
+    fn injections_inheritance_is_followed_too() {
+        let temp_dir = TempDir::new().unwrap();
+        let data_dir = temp_dir.path().to_path_buf();
+        let base_url = spawn_query_file_server(vec![
+            ("/inj_child/highlights.scm", "(identifier) @variable\n"),
+            (
+                "/inj_child/injections.scm",
+                "; inherits: inj_parent\n(comment) @injection.content\n",
+            ),
+            ("/inj_parent/highlights.scm", "(comment) @comment\n"),
+        ]);
+
+        install_queries_with_dependencies_from_allowing_http_for_tests(
+            &base_url,
+            "inj_child",
+            &data_dir,
+            false,
+        )
+        .expect("install should succeed");
+
+        assert!(
+            data_dir
+                .join("queries")
+                .join("inj_parent")
+                .join("highlights.scm")
+                .exists(),
+            "a parent named by injections.scm must be installed"
         );
     }
 

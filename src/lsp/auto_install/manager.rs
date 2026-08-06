@@ -628,8 +628,12 @@ fn language_is_complete(language: &str, data_dir: &std::path::Path) -> bool {
         return false;
     };
     crate::install::parser_file_exists(language, data_dir).is_some()
-        && crate::install::queries::query_install_is_complete(
-            &data_dir.join("queries").join(language),
+        // The whole chain, not just this language's own queries: a missing
+        // inherited parent makes the query load fail outright, and skipping the
+        // install over it is what leaves such a language unrepairable.
+        && crate::install::queries::query_install_chain_is_complete(
+            &data_dir.join("queries"),
+            language,
         )
 }
 
