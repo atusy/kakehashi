@@ -347,7 +347,7 @@ fn install_language_with_query_stager(
         }
     };
 
-    let published_queries = match staged_queries.publish(force) {
+    let published_queries = match staged_queries.publish() {
         Ok(published) => published,
         Err(e) => {
             result.queries_error = Some(e.to_string());
