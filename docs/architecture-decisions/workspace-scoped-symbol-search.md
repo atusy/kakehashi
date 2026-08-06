@@ -121,7 +121,7 @@ per-entry global fan-in translator, and a single deduplicating union. Defer
    │             │  1. collect every entry        │
    │             │  2. dedup  (name, kind,        │
    │             │             uri, range)        │
-   │             │  3. sort   (uri, line, char,   │
+   │             │  3. sort   (uri, start, end,   │
    │             │             name, kind)        │
    │             └───────────────┬────────────────┘
    │◀── WorkspaceSymbol[] ───────┘
@@ -146,7 +146,13 @@ pub enum AggregationStrategy {
 
 `Union` = collect from **every** target, then **deduplicate** on
 `(name, kind, uri, range)`, then **sort deterministically** by
-`(uri, start.line, start.character, name, kind)`.
+`(uri, start.line, start.character, end.line, end.character, name, kind)`.
+
+The sort key is deliberately a **superset** of the dedup key. Two entries that
+survive dedup differ in at least one key field, so a superset sort leaves no
+ties and the order cannot fall back to `JoinSet` completion order. Dropping
+`end` from the sort would break exactly the case this decision predicts below —
+two servers agreeing on a symbol's start and disagreeing on its end.
 
 It is a distinct value rather than a reuse of `Concatenated` because
 `Concatenated` deliberately preserves duplicates and source ordering (diagnostics
@@ -472,6 +478,10 @@ not emitted. No client capability governs the choice, so none is consulted.
 
 Every target is awaited, so latency is max-over-targets. The bounds are:
 
+- The Ready wait in point 3 is bounded by `wait_for_ready`'s
+  `INIT_TIMEOUT_SECS`, also **30 seconds**, and it happens *before* the target's
+  request is sent. Each target waits independently: a slow `Initializing`
+  connection must not delay dispatch to connections that are already `Ready`.
 - `wait_for_response` wraps each request in a hardcoded **30-second** timeout and
   removes the router entry when it fires.
 - The reader's **liveness timeout** can independently fail a connection that has
@@ -480,9 +490,11 @@ Every target is awaited, so latency is max-over-targets. The bounds are:
   permits a downstream to ignore `$/` notifications, so it is best-effort and
   cannot be the guarantee.
 
-No *additional* per-request deadline is introduced. Because no target is ever
-cold-started (point 7), the practical worst case is bounded by servers that are
-already running and already answering other requests.
+So a single target's worst case is the two 30-second bounds in series, not one.
+No *additional* deadline is introduced. Because no target is ever cold-started
+(point 7), the practical case is bounded by servers that are already running and
+already answering other requests — a target that is still `Initializing` at
+query time is one the client's own file-open just started.
 
 ### 7. Coverage is what is live, and a query never cold-starts a server
 
