@@ -539,6 +539,36 @@ impl LanguageServerPool {
         &self.command_origins
     }
 
+    /// Tell the USER, not just the log, that a request they invoked could not be
+    /// served — as a `window/logMessage` at WARNING.
+    ///
+    /// `log::warn!` is invisible at the default log level (the binary installs
+    /// `env_logger` with no default directive, so an unset `RUST_LOG` filters at
+    /// ERROR), which makes "fail soft with a warning" indistinguishable from
+    /// "fail silently" for anyone not already debugging. The editor-bound
+    /// `window/logMessage` gate defaults to `Info`, which admits WARNING, so this
+    /// reaches the editor's log with no configuration.
+    ///
+    /// Best-effort like every other user of this channel: a full queue drops the
+    /// message rather than stalling the caller.
+    pub(crate) fn warn_to_editor(&self, message: String) {
+        if self
+            .window_tx
+            .try_send(UpstreamNotification::LogMessage {
+                typ: tower_lsp_server::ls_types::MessageType::WARNING,
+                message: format!("[kakehashi] {message}"),
+            })
+            .is_err()
+        {
+            // The `warn!` at the call site already recorded the condition; this
+            // only means the editor will not hear about it.
+            log::debug!(
+                target: "kakehashi::bridge",
+                "Dropping editor warning (window queue full or forwarding loop gone)"
+            );
+        }
+    }
+
     /// The existing `Ready` connection for `key`, if one is live. Used to route a
     /// palette command back to the exact connection that advertised it (right
     /// workspace root/context) rather than spawning a fresh client-root one.
