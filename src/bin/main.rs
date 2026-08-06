@@ -1044,11 +1044,12 @@ fn run_install(language: &str, force: bool, verbose: bool, no_cache: bool) -> Re
     if !result.is_success() {
         // Both halves are staged before either is published, so a failure
         // published neither — say so, rather than leaving the user to guess
-        // which half survived and whether a retry needs --force. Scoped to what
-        // is published: a failed install can still have written the metadata
-        // cache or created the data directories.
+        // which half survived and whether a retry needs --force. Scoped to the
+        // requested language: queries for a base language it inherits stay
+        // published (they are shared), and bookkeeping is written either way.
         eprintln!(
-            "\nFailed to install '{}' language support. No parser or query files were published.",
+            "\nFailed to install '{}' language support. Neither its parser nor its queries were \
+             published.",
             language
         );
         return Err(ExitCode::FAILURE);

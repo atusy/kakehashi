@@ -296,8 +296,8 @@ struct StagedQueryDir {
 ///
 /// Staging the whole dependency chain before publishing any of it is what makes
 /// an install all-or-nothing — a parent that fails to download aborts the
-/// install with the data directory untouched, instead of leaving a language
-/// whose inherited queries are missing.
+/// install before anything is published, instead of leaving a language whose
+/// inherited queries are missing.
 pub(crate) struct StagedQueryInstall {
     language: String,
     /// Where the requested language's queries live once published.
@@ -438,6 +438,13 @@ impl PublishedQueryInstall {
     /// succeeded, and a failure here is reported rather than retried, because
     /// the alternative — leaving a half-restored directory — is worse than
     /// telling the user what state they are in.
+    ///
+    /// Known gap: the lock keeps this out of another process's critical
+    /// section, but nothing records *whose* publish the live directory is. A
+    /// second process that installed the same language and committed while this
+    /// one was compiling would have its work undone here. Closing that needs
+    /// provenance in the install marker; same-language cross-process installs
+    /// are rare enough that the marker format has not been changed for it.
     pub(crate) fn rollback(mut self) {
         for published in std::mem::take(&mut self.published) {
             if !published.requested {
@@ -501,10 +508,14 @@ impl Drop for PublishedQueryInstall {
     /// Backstop for an install abandoned without committing or rolling back —
     /// today only a panic between the two.
     ///
-    /// Keep the publish and drop the backups: a stranded backup is invisible to
-    /// every collector but `language uninstall` (`recover_interrupted_query_install`
-    /// returns early because the live directory is present again), so it would
-    /// linger forever.
+    /// Keep the publish and drop the backups: a stranded backup is only
+    /// reachable by a later `language status`/`uninstall` sweep, so dropping it
+    /// here is what keeps the common case clean.
+    ///
+    /// Unlocked, unlike `commit`: this can run while unwinding, and blocking a
+    /// panic on another process's `flock` is worse than the race the lock
+    /// avoids (a concurrent uninstall reporting a failure for work that did
+    /// happen).
     fn drop(&mut self) {
         for published in std::mem::take(&mut self.published) {
             discard_backup(&published);
@@ -1343,9 +1354,9 @@ fn publish_query_dir(
 
     // The backup outlives this function: it is dropped by
     // `PublishedQueryInstall::commit` once every language in the install has
-    // been published. Until then `recover_interrupted_query_install` will not
-    // collect it — `queries_dir` exists again, so it returns early — which is
-    // the pre-existing orphan-backup window that `language uninstall` cleans up.
+    // been published. A process killed inside that window strands it —
+    // `recover_interrupted_query_install` will not restore it, `queries_dir`
+    // exists again — which is what `collect_superseded_backups` sweeps up.
     Ok(PublishQueryDirOutcome::Published {
         backup: Some(backup_dir),
     })
