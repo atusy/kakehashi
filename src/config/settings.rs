@@ -582,15 +582,31 @@ pub(crate) fn on_type_formatting_trigger_union(
 }
 
 /// Custom mappings from Tree-sitter capture names to semantic token types, per query kind.
+///
+/// Both fields are optional so that omitting one and writing an empty one say
+/// different things: omit to inherit the layer below, write `{}` to clear it.
+/// A layer that configures only `highlights` must not silently drop the folds
+/// a lower layer supplied, which a non-optional field could not express.
 #[derive(Debug, Clone, Deserialize, Serialize, Default, PartialEq, Eq, JsonSchema)]
 pub struct QueryTypeMappings {
-    /// Capture mappings for highlights queries.
-    #[serde(default)]
-    pub highlights: CaptureMapping,
-    /// Capture mappings for folds queries.
+    /// Capture mappings for highlights queries. Omit to inherit; `{}` clears.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub highlights: Option<CaptureMapping>,
+    /// Capture mappings for folds queries. Omit to inherit; `{}` clears.
     /// Reserved for future folding range support — populated and merged but not yet consumed by analysis.
-    #[serde(default)]
-    pub folds: CaptureMapping,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub folds: Option<CaptureMapping>,
+}
+
+/// The empty map an unset [`QueryTypeMappings`] field reads as.
+static NO_CAPTURE_MAPPING: std::sync::LazyLock<CaptureMapping> =
+    std::sync::LazyLock::new(CaptureMapping::new);
+
+impl QueryTypeMappings {
+    /// The highlights mappings in effect — empty when this entry names none.
+    pub(crate) fn highlights(&self) -> &CaptureMapping {
+        self.highlights.as_ref().unwrap_or(&NO_CAPTURE_MAPPING)
+    }
 }
 
 pub type CaptureMappings = HashMap<String, QueryTypeMappings>;
@@ -692,8 +708,9 @@ pub struct RawWorkspaceSettings {
     #[serde(default)]
     pub languages: HashMap<String, LanguageSettings>,
     /// Custom mappings from Tree-sitter capture names to semantic token types.
-    #[serde(default)]
-    pub capture_mappings: CaptureMappings,
+    /// Omit to inherit the layer below; `{}` clears every language's entry.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capture_mappings: Option<CaptureMappings>,
     /// Deprecated: use `languages._.autoInstall` (and per-language
     /// `languages.<lang>.autoInstall`) instead. Whether to automatically
     /// install missing parsers and queries. Still honored when no per-language
@@ -1324,7 +1341,7 @@ mod tests {
         assert!(settings.languages.is_empty());
         assert!(settings.search_paths.is_none());
         assert!(settings.auto_install.is_none());
-        assert!(settings.capture_mappings.is_empty());
+        assert!(settings.capture_mappings.is_none());
     }
 
     #[test]
@@ -1486,7 +1503,7 @@ mod tests {
         let mut config = RawWorkspaceSettings {
             search_paths: None,
             languages: HashMap::new(),
-            capture_mappings: HashMap::new(),
+            capture_mappings: None,
             auto_install: None,
             diagnostics_debounce_ms: None,
             features: None,

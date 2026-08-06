@@ -18,7 +18,11 @@ pub(crate) use merge::{
     merge_bridge_server_configs, merge_layer_aggregation_configs, merge_workspace_settings,
     resolve_with_wildcard,
 };
-pub(crate) use settings::{CaptureMappings, DEFAULT_DEBOUNCE_MS, QueryTypeMappings};
+pub(crate) use settings::{CaptureMapping, CaptureMappings, DEFAULT_DEBOUNCE_MS};
+// Raw and effective settings share this type, so converting between them no
+// longer names it; only the tests that build fixtures do.
+#[cfg(test)]
+pub(crate) use settings::QueryTypeMappings;
 pub use settings::{LanguageSettings, RawWorkspaceSettings, WorkspaceSettings, json_schema};
 pub(crate) use user::load_user_config;
 
@@ -45,19 +49,9 @@ fn default_search_paths() -> Vec<String> {
 /// internally by `try_from_settings`.
 fn base_convert(settings: &RawWorkspaceSettings) -> WorkspaceSettings {
     let languages = settings.languages.clone();
-    let capture_mappings = settings
-        .capture_mappings
-        .iter()
-        .map(|(lang, mappings)| {
-            (
-                lang.clone(),
-                QueryTypeMappings {
-                    highlights: mappings.highlights.clone(),
-                    folds: mappings.folds.clone(),
-                },
-            )
-        })
-        .collect();
+    // The raw and effective sides share `QueryTypeMappings`, so the layer's map
+    // carries over as-is; a raw layer that named none contributes nothing.
+    let capture_mappings = settings.capture_mappings.clone().unwrap_or_default();
 
     // Use explicit search_paths if provided, otherwise use platform defaults
     let search_paths = settings
@@ -456,19 +450,7 @@ impl WorkspaceSettings {
 impl From<&WorkspaceSettings> for RawWorkspaceSettings {
     fn from(settings: &WorkspaceSettings) -> Self {
         let languages = strip_inherited_languages(&settings.languages);
-        let capture_mappings = settings
-            .capture_mappings
-            .iter()
-            .map(|(lang, mappings)| {
-                (
-                    lang.clone(),
-                    QueryTypeMappings {
-                        highlights: mappings.highlights.clone(),
-                        folds: mappings.folds.clone(),
-                    },
-                )
-            })
-            .collect();
+        let capture_mappings = Some(settings.capture_mappings.clone());
 
         let search_paths = Some(settings.search_paths.clone());
 
@@ -973,8 +955,8 @@ mod tests {
         );
 
         let query_type_mappings = QueryTypeMappings {
-            highlights,
-            folds: HashMap::new(),
+            highlights: Some(highlights),
+            folds: None,
         };
 
         capture_mappings.insert(WILDCARD_KEY.to_string(), query_type_mappings);
@@ -983,11 +965,11 @@ mod tests {
         assert!(capture_mappings.contains_key(WILDCARD_KEY));
         let wildcard_mappings = capture_mappings.get(WILDCARD_KEY).unwrap();
         assert_eq!(
-            wildcard_mappings.highlights.get("@module"),
+            wildcard_mappings.highlights().get("@module"),
             Some(&"@namespace".to_string())
         );
         assert_eq!(
-            wildcard_mappings.highlights.get("@module.builtin"),
+            wildcard_mappings.highlights().get("@module.builtin"),
             Some(&"@namespace.defaultLibrary".to_string())
         );
     }
@@ -999,7 +981,7 @@ mod tests {
         let settings = RawWorkspaceSettings {
             search_paths: None,
             languages: HashMap::new(),
-            capture_mappings: HashMap::new(),
+            capture_mappings: None,
             auto_install: None,
             diagnostics_debounce_ms: None,
             features: None,
@@ -1029,7 +1011,7 @@ mod tests {
         let settings = RawWorkspaceSettings {
             search_paths: Some(vec!["/custom/path".to_string()]),
             languages: HashMap::new(),
-            capture_mappings: HashMap::new(),
+            capture_mappings: None,
             auto_install: None,
             diagnostics_debounce_ms: None,
             features: None,
@@ -1052,7 +1034,7 @@ mod tests {
         let settings = RawWorkspaceSettings {
             search_paths: Some(paths.clone()),
             languages: HashMap::new(),
-            capture_mappings: HashMap::new(),
+            capture_mappings: None,
             auto_install: None,
             diagnostics_debounce_ms: None,
             features: None,
@@ -1079,7 +1061,7 @@ mod tests {
         let settings = RawWorkspaceSettings {
             search_paths: None,
             languages: HashMap::new(),
-            capture_mappings: HashMap::new(),
+            capture_mappings: None,
             auto_install,
             diagnostics_debounce_ms: None,
             features: None,
@@ -1099,7 +1081,7 @@ mod tests {
         let settings = RawWorkspaceSettings {
             search_paths: None,
             languages: HashMap::new(),
-            capture_mappings: HashMap::new(),
+            capture_mappings: None,
             auto_install: None,
             diagnostics_debounce_ms: raw,
             features: None,
@@ -1511,7 +1493,7 @@ mod try_from_settings_tests {
         let settings = RawWorkspaceSettings {
             search_paths: Some(vec!["$TEST_VAR/parsers".to_string()]),
             languages: HashMap::new(),
-            capture_mappings: HashMap::new(),
+            capture_mappings: None,
             auto_install: None,
             diagnostics_debounce_ms: None,
             features: None,
@@ -1535,7 +1517,7 @@ mod try_from_settings_tests {
         let settings = RawWorkspaceSettings {
             search_paths: None,
             languages,
-            capture_mappings: HashMap::new(),
+            capture_mappings: None,
             auto_install: None,
             diagnostics_debounce_ms: None,
             features: None,
@@ -1565,7 +1547,7 @@ mod try_from_settings_tests {
         let settings = RawWorkspaceSettings {
             search_paths: None,
             languages,
-            capture_mappings: HashMap::new(),
+            capture_mappings: None,
             auto_install: None,
             diagnostics_debounce_ms: None,
             features: None,
@@ -1601,7 +1583,7 @@ mod try_from_settings_tests {
         let settings = RawWorkspaceSettings {
             search_paths: None,
             languages,
-            capture_mappings: HashMap::new(),
+            capture_mappings: None,
             auto_install: None,
             diagnostics_debounce_ms: None,
             features: None,
@@ -1623,7 +1605,7 @@ mod try_from_settings_tests {
         let settings = RawWorkspaceSettings {
             search_paths: Some(vec!["$UNDEFINED/path".to_string()]),
             languages: HashMap::new(),
-            capture_mappings: HashMap::new(),
+            capture_mappings: None,
             auto_install: None,
             diagnostics_debounce_ms: None,
             features: None,
@@ -1653,7 +1635,7 @@ mod try_from_settings_tests {
         let settings = RawWorkspaceSettings {
             search_paths: Some(vec!["$MISSING_ONE/parsers".to_string()]),
             languages,
-            capture_mappings: HashMap::new(),
+            capture_mappings: None,
             auto_install: None,
             diagnostics_debounce_ms: None,
             features: None,
@@ -1673,7 +1655,7 @@ mod try_from_settings_tests {
         let settings = RawWorkspaceSettings {
             search_paths: Some(vec!["~/parsers".to_string()]),
             languages: HashMap::new(),
-            capture_mappings: HashMap::new(),
+            capture_mappings: None,
             auto_install: None,
             diagnostics_debounce_ms: None,
             features: None,

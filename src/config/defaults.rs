@@ -21,7 +21,7 @@ pub fn default_settings() -> RawWorkspaceSettings {
     RawWorkspaceSettings {
         search_paths: Some(vec!["${KAKEHASHI_DATA_DIR}".to_string()]),
         languages: default_languages(),
-        capture_mappings: default_capture_mappings(),
+        capture_mappings: Some(default_capture_mappings()),
         // Safe to carry here even though the key is deprecated: this struct is
         // also merge layer 1, and a user's own top-level value overlays THE
         // SAME key, so it wins. `languages._.autoInstall` is the one that must
@@ -228,8 +228,10 @@ pub fn default_capture_mappings() -> CaptureMappings {
 
     let highlights = default_highlight_mappings();
     let wildcard = QueryTypeMappings {
-        highlights,
-        folds: CaptureMapping::new(),
+        highlights: Some(highlights),
+        // Omitted rather than empty: the defaults layer names no folds, and an
+        // empty map would clear whatever a user layer supplies.
+        folds: None,
     };
 
     mappings.insert(WILDCARD_KEY.to_string(), wildcard);
@@ -542,7 +544,7 @@ mod tests {
 
         // "variable" should map to "variable" (identity mapping)
         assert_eq!(
-            wildcard.highlights.get("variable"),
+            wildcard.highlights().get("variable"),
             Some(&"variable".to_string()),
             "should map 'variable' capture to 'variable' token type"
         );
@@ -706,13 +708,20 @@ mod tests {
 
         // Should have capture mappings populated
         assert!(
-            !settings.capture_mappings.is_empty(),
+            settings
+                .capture_mappings
+                .as_ref()
+                .is_some_and(|m| !m.is_empty()),
             "capture_mappings should not be empty"
         );
 
         // Should contain the wildcard "_" key
         assert!(
-            settings.capture_mappings.contains_key(WILDCARD_KEY),
+            settings
+                .capture_mappings
+                .as_ref()
+                .unwrap()
+                .contains_key(WILDCARD_KEY),
             "capture_mappings should contain wildcard '_' key"
         );
     }
@@ -807,7 +816,7 @@ mod tests {
         );
         let wildcard = ws_settings.capture_mappings.get(WILDCARD_KEY).unwrap();
         assert_eq!(
-            wildcard.highlights.get("markup.strong"),
+            wildcard.highlights().get("markup.strong"),
             Some(&String::new()),
             "WorkspaceSettings should map markup.strong to empty string"
         );
@@ -824,7 +833,7 @@ mod tests {
         );
         let coord_wildcard = mappings.get(WILDCARD_KEY).unwrap();
         assert_eq!(
-            coord_wildcard.highlights.get("markup.strong"),
+            coord_wildcard.highlights().get("markup.strong"),
             Some(&String::new()),
             "Coordinator should map markup.strong to empty string after loading settings"
         );

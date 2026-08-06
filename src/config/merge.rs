@@ -1,9 +1,9 @@
 use super::settings::{
     AggregationConfig, BridgeLanguageConfig, BridgeServerConfig, DebounceFeatureSettings,
     FeatureSettings, LanguageSettings, LayerAggregationConfig, LayersConfig,
-    LogMessageFeatureSettings,
+    LogMessageFeatureSettings, QueryTypeMappings,
 };
-use super::{CaptureMappings, RawWorkspaceSettings, WILDCARD_KEY};
+use super::{CaptureMapping, CaptureMappings, RawWorkspaceSettings, WILDCARD_KEY};
 use std::collections::{HashMap, HashSet};
 
 /// Resolve a key from a map with wildcard fallback and merging.
@@ -495,14 +495,62 @@ fn merge_language_servers(
     }
 }
 
-fn merge_capture_mappings(mut base: CaptureMappings, overlay: CaptureMappings) -> CaptureMappings {
-    // Deep merge: overlay values override base values for the same key
-    for (lang, overlay_mappings) in overlay {
-        let base_mappings = base.entry(lang).or_default();
-        base_mappings.highlights.extend(overlay_mappings.highlights);
-        base_mappings.folds.extend(overlay_mappings.folds);
+/// Deep merge two optional capture-mapping maps.
+///
+/// Mirrors [`merge_bridge_maps`]: an empty overlay map (`Some({})`) clears the
+/// base (empty-means-clear); otherwise per-language entries merge field by
+/// field via [`merge_query_type_mappings`].
+fn merge_capture_mappings(
+    base: Option<CaptureMappings>,
+    overlay: Option<CaptureMappings>,
+) -> Option<CaptureMappings> {
+    match (base, overlay) {
+        (None, None) => None,
+        (Some(mappings), None) | (None, Some(mappings)) => Some(mappings),
+        (Some(_), Some(overlay)) if overlay.is_empty() => Some(CaptureMappings::new()),
+        (Some(mut base), Some(overlay)) => {
+            for (lang, overlay_mappings) in overlay {
+                base.entry(lang)
+                    .and_modify(|base_mappings| {
+                        *base_mappings =
+                            merge_query_type_mappings(base_mappings, &overlay_mappings);
+                    })
+                    .or_insert(overlay_mappings);
+            }
+            Some(base)
+        }
     }
-    base
+}
+
+/// Field-level merge of one language's capture mappings. The two query kinds
+/// are independent: writing `highlights` says nothing about `folds`.
+fn merge_query_type_mappings(
+    base: &QueryTypeMappings,
+    overlay: &QueryTypeMappings,
+) -> QueryTypeMappings {
+    QueryTypeMappings {
+        highlights: merge_capture_mapping(base.highlights.as_ref(), overlay.highlights.as_ref()),
+        folds: merge_capture_mapping(base.folds.as_ref(), overlay.folds.as_ref()),
+    }
+}
+
+/// Deep merge one query kind's capture names. Empty-means-clear, then
+/// per-capture override — the value is a plain string, so an entry the overlay
+/// names wins outright.
+fn merge_capture_mapping(
+    base: Option<&CaptureMapping>,
+    overlay: Option<&CaptureMapping>,
+) -> Option<CaptureMapping> {
+    match (base, overlay) {
+        (None, None) => None,
+        (Some(mapping), None) | (None, Some(mapping)) => Some(mapping.clone()),
+        (Some(_), Some(overlay)) if overlay.is_empty() => Some(CaptureMapping::new()),
+        (Some(base), Some(overlay)) => {
+            let mut merged = base.clone();
+            merged.extend(overlay.iter().map(|(k, v)| (k.clone(), v.clone())));
+            Some(merged)
+        }
+    }
 }
 
 #[cfg(test)]
@@ -698,31 +746,31 @@ mod tests {
                     },
                 ),
             ])),
-            capture_mappings: HashMap::from([
+            capture_mappings: Some(HashMap::from([
                 (
                     "_".to_string(),
                     QueryTypeMappings {
-                        highlights: HashMap::from([
+                        highlights: Some(HashMap::from([
                             ("variable.builtin".to_string(), "base.variable".to_string()),
                             ("function.builtin".to_string(), "base.function".to_string()),
-                        ]),
-                        folds: HashMap::from([(
+                        ])),
+                        folds: Some(HashMap::from([(
                             "fold.comment".to_string(),
                             "base.comment".to_string(),
-                        )]),
+                        )])),
                     },
                 ),
                 (
                     "lua".to_string(),
                     QueryTypeMappings {
-                        highlights: HashMap::from([(
+                        highlights: Some(HashMap::from([(
                             "keyword".to_string(),
                             "base.keyword".to_string(),
-                        )]),
+                        )])),
                         ..Default::default()
                     },
                 ),
-            ]),
+            ])),
         };
 
         // ── overlay ───────────────────────────────────────────────────
@@ -782,37 +830,37 @@ mod tests {
                     },
                 ),
             ])),
-            capture_mappings: HashMap::from([
+            capture_mappings: Some(HashMap::from([
                 (
                     // shared key: _ — overlay overrides variable.builtin, adds type.builtin;
                     //   adds folds fold.function
                     "_".to_string(),
                     QueryTypeMappings {
-                        highlights: HashMap::from([
+                        highlights: Some(HashMap::from([
                             (
                                 "variable.builtin".to_string(),
                                 "overlay.variable".to_string(),
                             ),
                             ("type.builtin".to_string(), "overlay.type".to_string()),
-                        ]),
-                        folds: HashMap::from([(
+                        ])),
+                        folds: Some(HashMap::from([(
                             "fold.function".to_string(),
                             "overlay.function".to_string(),
-                        )]),
+                        )])),
                     },
                 ),
                 (
                     // new key: rust — added by overlay
                     "rust".to_string(),
                     QueryTypeMappings {
-                        highlights: HashMap::from([(
+                        highlights: Some(HashMap::from([(
                             "type.builtin".to_string(),
                             "rust.type".to_string(),
-                        )]),
+                        )])),
                         ..Default::default()
                     },
                 ),
-            ]),
+            ])),
         };
 
         // ── merge & snapshot ──────────────────────────────────────────
@@ -1900,7 +1948,8 @@ mod tests {
 
         // Verify defaults have empty string for markup.strong
         assert_eq!(
-            defaults.capture_mappings[WILDCARD_KEY].highlights["markup.strong"], "",
+            defaults.capture_mappings.as_ref().unwrap()[WILDCARD_KEY].highlights()["markup.strong"],
+            "",
             "Defaults should suppress markup.strong with empty string"
         );
 
@@ -1911,19 +1960,21 @@ mod tests {
 
         // After merge, user's "keyword" should override default's ""
         assert_eq!(
-            merged.capture_mappings[WILDCARD_KEY].highlights["markup.strong"], "keyword",
+            merged.capture_mappings.as_ref().unwrap()[WILDCARD_KEY].highlights()["markup.strong"],
+            "keyword",
             "User's markup.strong = 'keyword' should override default's ''"
         );
 
         // Also verify other user mappings are present
         assert_eq!(
-            merged.capture_mappings[WILDCARD_KEY].highlights["markup.heading.1"], "class",
+            merged.capture_mappings.as_ref().unwrap()[WILDCARD_KEY].highlights()["markup.heading.1"],
+            "class",
             "User's markup.heading.1 mapping should be present"
         );
 
         // Verify other defaults are still present
         assert_eq!(
-            merged.capture_mappings[WILDCARD_KEY].highlights["variable.builtin"],
+            merged.capture_mappings.as_ref().unwrap()[WILDCARD_KEY].highlights()["variable.builtin"],
             "variable.defaultLibrary",
             "Default variable.builtin mapping should be inherited"
         );
@@ -1948,7 +1999,9 @@ mod tests {
             .expect("two settings merge");
 
         assert!(
-            merged.capture_mappings[WILDCARD_KEY].highlights.is_empty(),
+            merged.capture_mappings.as_ref().unwrap()[WILDCARD_KEY]
+                .highlights()
+                .is_empty(),
             "an explicit empty highlights map should clear the defaults"
         );
     }
@@ -1975,13 +2028,14 @@ mod tests {
 
         let merged =
             merge_workspace_settings(Some(base), Some(overlay)).expect("two settings merge");
-        let wildcard = &merged.capture_mappings[WILDCARD_KEY];
+        let wildcard = &merged.capture_mappings.as_ref().unwrap()[WILDCARD_KEY];
 
         assert_eq!(
-            wildcard.folds["comment"], "comment",
+            wildcard.folds.as_ref().unwrap()["comment"],
+            "comment",
             "writing highlights must not clear folds"
         );
-        assert_eq!(wildcard.highlights["keyword"], "keyword");
+        assert_eq!(wildcard.highlights()["keyword"], "keyword");
     }
 
     /// The whole map clears too, so a layer can drop every language's mappings.
@@ -1996,7 +2050,7 @@ mod tests {
             .expect("two settings merge");
 
         assert!(
-            merged.capture_mappings.is_empty(),
+            merged.capture_mappings.as_ref().unwrap().is_empty(),
             "an explicit empty captureMappings should clear every language entry"
         );
     }

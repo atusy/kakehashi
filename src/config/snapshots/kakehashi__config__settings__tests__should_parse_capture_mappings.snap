@@ -1,5 +1,6 @@
 ---
 source: src/config/settings.rs
+assertion_line: 1471
 expression: settings.capture_mappings
 ---
 {
@@ -7,13 +8,11 @@ expression: settings.capture_mappings
     "highlights": {
       "function.builtin": "function.defaultLibrary",
       "variable.builtin": "variable.defaultLibrary"
-    },
-    "folds": {}
+    }
   },
   "rust": {
     "highlights": {
       "type.builtin": "type.defaultLibrary"
-    },
-    "folds": {}
+    }
   }
 }
