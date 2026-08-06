@@ -45,9 +45,14 @@ pub(crate) struct SettingsSnapshot {
 pub(crate) struct SettingsManager {
     root_path: ArcSwap<Option<PathBuf>>,
     /// The root to fall back to once the client's workspace-folder list is
-    /// empty: `initialize`'s ladder below `workspaceFolders` (`rootUri`, then
-    /// the deprecated `rootPath`, then the process CWD), resolved during
-    /// `initialize` because the params it reads do not outlive that request.
+    /// empty: the roots `initialize` was given below `workspaceFolders` —
+    /// `rootUri`, then the deprecated `rootPath` — resolved during `initialize`
+    /// because the params it reads do not outlive that request.
+    ///
+    /// Stops there deliberately. `initialize` itself ends at the process
+    /// working directory, but that rung answers for a session opened with no
+    /// workspace at all; a session that had one and lost it gets no project
+    /// layer instead. See `config_root_after_folder_change`.
     ///
     /// A `OnceLock` because no rung below `workspaceFolders` can change after
     /// the handshake — only the folder list does.

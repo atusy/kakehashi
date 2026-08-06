@@ -326,11 +326,11 @@ impl Kakehashi {
         // moved into the pool below and that ends any borrow of `params`.
         let (root_path, source) = config_root_path(client_root(&params));
         // The root a later `didChangeWorkspaceFolders` falls back to once it
-        // empties the folder list: the same ladder minus its top rung, since a
-        // session that loses its last folder ends up where a session that never
-        // had one starts. Resolved here because `params` does not outlive this
-        // request, and without `config_root_path`'s process-CWD rung — see
-        // `config_root_after_folder_change`.
+        // empties the folder list. Resolved here because `params` does not
+        // outlive this request, and deliberately without `config_root_path`'s
+        // process-CWD rung: a session that started folderless may load the
+        // launch directory's config, while one that lost its last folder gets
+        // no project layer — see `config_root_after_folder_change`.
         self.settings_manager.set_folderless_root_path(
             client_root_without_folders(&params).and_then(|root| root.to_file_path()),
         );
