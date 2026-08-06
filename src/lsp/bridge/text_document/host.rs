@@ -50,18 +50,20 @@ pub(crate) struct HostDocument<'a> {
     pub(crate) text: &'a str,
 }
 
-/// A raw host-server response plus the connection it came from.
+/// A raw host-server response plus the very connection that answered it.
 ///
-/// The key rides along because resolving it separately means repeating the
+/// The connection rides along because re-resolving it means repeating the
 /// marker filesystem walk that the request already performed — measurable on
-/// `textDocument/codeAction`, which some editors fire on cursor hold.
+/// `textDocument/codeAction`, which some editors fire on cursor hold, and on
+/// `textDocument/completion`, which fires per keystroke. Callers read the pool
+/// key from it (`workspace/executeCommand` routing tokens) or its advertised
+/// capabilities (`completionItem/resolve`, before minting resolve envelopes).
+///
+/// Asking THIS handle is also more accurate than a fresh lookup: it is the
+/// process that produced the response, where a re-resolve could answer for a
+/// replacement spawned since.
 pub(crate) struct HostRawResponse {
     pub(crate) value: serde_json::Value,
-    pub(crate) connection_key: ConnectionKey,
-    /// The very connection that answered, so a caller can consult its
-    /// advertised capabilities (e.g. `completionItem/resolve` before minting
-    /// resolve envelopes) without a second `get_or_create_connection` — that
-    /// lookup repeats the marker walk this request already paid for.
     pub(crate) handle: Arc<ConnectionHandle>,
 }
 
@@ -307,11 +309,11 @@ impl LanguageServerPool {
             return Ok(None);
         }
         // Carried out with the response so a caller that must name this exact
-        // connection (the `workspace/executeCommand` routing token) does not
-        // re-resolve it — that would repeat the marker filesystem walk on a
-        // request-frequency path (execute-command-routing-token).
-        let connection_key = handle.key().clone();
-        let capabilities_handle = Arc::clone(&handle);
+        // connection (the `workspace/executeCommand` routing token) or ask what
+        // it advertises (`completionItem/resolve`) does not re-resolve it —
+        // that would repeat the marker filesystem walk on a request-frequency
+        // path (execute-command-routing-token).
+        let answering = Arc::clone(&handle);
         let value = self
             .execute_host_request(
                 handle,
@@ -326,30 +328,8 @@ impl LanguageServerPool {
             .await??;
         Ok(value.map(|value| HostRawResponse {
             value,
-            connection_key,
-            handle: capabilities_handle,
+            handle: answering,
         }))
-    }
-
-    /// Whether the host server for `(server_name, uri)` advertises `method`
-    /// (e.g. `codeAction/resolve`). Reuses the existing connection when the
-    /// request that ran just before already opened it, but still goes through
-    /// `get_or_create_connection`, which re-resolves the marker/root and takes
-    /// the pool lock even on a cache hit — cheap, not free, so callers gate the
-    /// call when the answer can't change the outcome. Fail-closed (`false`) when
-    /// the server can't be reached. Used to decide whether a host lazy action can
-    /// be resolve-routed rather than disabled (#627).
-    pub(crate) async fn host_server_advertises(
-        &self,
-        server_name: &str,
-        server_config: &BridgeServerConfig,
-        uri: &url::Url,
-        method: &str,
-    ) -> bool {
-        self.get_or_create_connection(server_name, server_config, Some(uri))
-            .await
-            .map(|handle| handle.has_capability(method))
-            .unwrap_or(false)
     }
 
     /// Send a host formatting request. Unlike [`Self::send_host_raw_request`],

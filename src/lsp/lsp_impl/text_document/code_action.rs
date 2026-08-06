@@ -506,16 +506,22 @@ impl Kakehashi {
                 let Some(raw) = raw else {
                     return Ok(None);
                 };
-                let connection_key = raw.connection_key;
+                let answering = raw.handle;
+                let connection_key = answering.key().clone();
                 let Some(actions) = parse_code_actions_leniently(raw.value) else {
                     return Ok(None);
                 };
                 // Whether this host server advertises `codeAction/resolve`, so a
                 // host lazy action can be enveloped for resolve-routing back to
-                // it (#627) rather than disabled. Queried on the just-opened
-                // connection — but only when the answer can actually change the
-                // outcome, so the probe (and its marker-root resolution + pool
-                // lock) is skippable on this hot `textDocument/codeAction` path:
+                // it (#627) rather than disabled. Read off the connection that
+                // ANSWERED — which is both free (no re-resolution, so no marker
+                // walk or pool lock on this hot `textDocument/codeAction` path,
+                // which some editors fire on cursor hold) and more accurate than
+                // a fresh lookup, since a re-resolve could answer for a
+                // replacement spawned since these actions were produced.
+                //
+                // The two cheap terms still short-circuit ahead of it, because
+                // they also say the answer cannot change the outcome:
                 //
                 // - `server_resolves` is read by `bridge_code_action` ONLY for a
                 //   possibly-lazy action (no edit, no command, and not already
@@ -536,14 +542,7 @@ impl Kakehashi {
                 };
                 let server_resolves = client_can_use_resolve
                     && actions.iter().any(maybe_lazy)
-                    && t.pool
-                        .host_server_advertises(
-                            &t.server_name,
-                            &t.server_config,
-                            &t.uri,
-                            "codeAction/resolve",
-                        )
-                        .await;
+                    && answering.has_capability("codeAction/resolve");
                 Ok(Some(bridge_code_actions(
                     actions,
                     &connection_key,
