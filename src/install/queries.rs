@@ -854,7 +854,7 @@ fn stage_queries_recursive(
         // Even if skipping, we need to check for inherited dependencies
         for parent in inherited_languages_on_disk(&queries_dir) {
             // Stage parent dependencies (don't force, just ensure they exist)
-            clear_uninstall_tombstone(&queries_parent, &parent)?;
+            clear_uninstall_tombstone_for_dependency(data_dir, &parent)?;
             stage_queries_recursive(
                 base_url,
                 &parent,
@@ -940,7 +940,7 @@ fn stage_queries_recursive(
     // inherits.
     for parent in parents_to_install {
         eprintln!("Staging inherited queries: {}", parent);
-        clear_uninstall_tombstone(&queries_parent, &parent)?;
+        clear_uninstall_tombstone_for_dependency(data_dir, &parent)?;
         stage_queries_recursive(
             base_url,
             &parent,
@@ -1516,6 +1516,26 @@ fn clear_uninstall_tombstone(
     }
 }
 
+/// Clear a base language's uninstall tombstone while holding that language's
+/// lock.
+///
+/// Staging clears the tombstone of every base language it is about to fetch, so
+/// the later publish is not refused by a marker left by an old uninstall. Doing
+/// it without the language's own lock let it land *inside* a running
+/// `language uninstall` — between the marker that uninstall writes and the
+/// parser it removes — after which the uninstall reported success while this
+/// install went on to republish what it had just removed. Taking the lock orders
+/// the two: either the uninstall finishes first and this install knowingly
+/// refetches the base language it needs, or it supersedes this install through
+/// the tombstone check the publish makes under the same lock.
+fn clear_uninstall_tombstone_for_dependency(
+    data_dir: &Path,
+    language: &str,
+) -> Result<(), QueryInstallError> {
+    let _transaction = lock_language(data_dir, language)?;
+    clear_uninstall_tombstone(&data_dir.join("queries"), language)
+}
+
 pub fn clear_uninstall_tombstone_for_install(
     data_dir: &Path,
     language: &str,
@@ -1949,6 +1969,32 @@ mod staging_tests {
         }
 
         assert!(query_install_chain_is_complete(&queries_parent, "cyc_a"));
+    }
+
+    /// Clearing a base language's tombstone goes through that language's own
+    /// lock, so it cannot land inside a running uninstall of it. The lock is
+    /// released again, or the staging that follows would block on itself.
+    #[test]
+    fn clearing_a_dependency_tombstone_takes_and_releases_its_lock() {
+        let temp = TempDir::new().unwrap();
+        let data_dir = temp.path();
+        let queries_parent = data_dir.join("queries");
+        fs::create_dir_all(&queries_parent).unwrap();
+        write_uninstall_tombstone(&queries_parent, "parent").unwrap();
+
+        clear_uninstall_tombstone_for_dependency(data_dir, "parent").unwrap();
+
+        assert!(
+            !uninstall_tombstone_path(&queries_parent, "parent").is_file(),
+            "the tombstone must be gone"
+        );
+        assert!(
+            matches!(
+                try_lock_language(data_dir, "parent"),
+                LanguageLockProbe::Idle(_)
+            ),
+            "and the lock it took must be free again"
+        );
     }
 
     /// A data directory nothing can write to has nothing in flight either, so
