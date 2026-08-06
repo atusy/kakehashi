@@ -533,24 +533,50 @@ impl LanguageServerPool {
         }
     }
 
-    /// Registry mapping a downstream server's advertised palette command names to
-    /// the connection that advertised them (#628 palette-fired executeCommand).
+    /// What is known about the raw palette command names downstream servers have
+    /// advertised (#628 palette-fired executeCommand).
+    ///
+    /// Two questions, not one: whether a name is one the editor was told about
+    /// (the decode gate), and which of its origins could be RECONNECTED if none
+    /// is live. It does not say which connection should run a live command —
+    /// that is decided by scanning the connections map, the only view that
+    /// cannot lag a handshake.
     pub(crate) fn command_origins(&self) -> &CommandOriginRegistry {
         &self.command_origins
     }
 
-    /// The existing `Ready` connection for `key`, if one is live. Used to route a
-    /// palette command back to the exact connection that advertised it (right
-    /// workspace root/context) rather than spawning a fresh client-root one.
-    pub(crate) async fn ready_connection_by_key(
-        &self,
-        key: &ConnectionKey,
-    ) -> Option<Arc<ConnectionHandle>> {
-        self.ready_connection_by_key_for_config(key, None).await
+    /// Tell the USER, not just the log, that a request they invoked could not be
+    /// served — as a `window/logMessage` at WARNING.
+    ///
+    /// `log::warn!` is invisible at the default log level (the binary installs
+    /// `env_logger` with no default directive, so an unset `RUST_LOG` filters at
+    /// ERROR), which makes "fail soft with a warning" indistinguishable from
+    /// "fail silently" for anyone not already debugging. The editor-bound
+    /// `window/logMessage` gate defaults to `Info`, which admits WARNING, so this
+    /// reaches the editor's log with no configuration.
+    ///
+    /// Best-effort like every other user of this channel: a full queue drops the
+    /// message rather than stalling the caller.
+    pub(crate) fn warn_to_editor(&self, message: String) {
+        if self
+            .window_tx
+            .try_send(UpstreamNotification::LogMessage {
+                typ: tower_lsp_server::ls_types::MessageType::WARNING,
+                message: format!("[kakehashi] {message}"),
+            })
+            .is_err()
+        {
+            // The `warn!` at the call site already recorded the condition; this
+            // only means the editor will not hear about it.
+            log::debug!(
+                target: "kakehashi::bridge",
+                "Dropping editor warning (window queue full or forwarding loop gone)"
+            );
+        }
     }
 
-    /// As [`ready_connection_by_key`](Self::ready_connection_by_key), but also
-    /// rejects a connection whose SPAWN config no longer matches `config`.
+    /// The existing `Ready` connection for `key`, if one is live — and, when
+    /// `config` is given, only if its SPAWN config still matches.
     ///
     /// Every acquisition through `get_or_create_connection_resolved` compares the
     /// live handle's launch config and treats a mismatch as `Failed` (respawn).
@@ -569,12 +595,7 @@ impl LanguageServerPool {
         connections
             .get(key)
             .filter(|handle| handle.state() == ConnectionState::Ready)
-            .filter(|handle| match config {
-                Some(config) => handle
-                    .launch_config()
-                    .is_none_or(|live| same_launch_config(live, config)),
-                None => true,
-            })
+            .filter(|handle| config.is_none_or(|config| handle.matches_launch_config(config)))
             .map(Arc::clone)
     }
 
@@ -1300,7 +1321,7 @@ impl LanguageServerPool {
     ) -> Option<Arc<ConnectionHandle>> {
         let server = key.server();
         // A connection can exist under this key and simply not be Ready yet —
-        // `ready_connection_by_key` filters on Ready, so a respawn mid-handshake
+        // `ready_connection_by_key_for_config` filters on Ready, so a respawn mid-handshake
         // lands here. Wait it out rather than spawn a second process: this is the
         // wait-through-initialization the previous
         // `get_or_create_connection_wait_ready` call provided, and for a SHARED
@@ -1351,7 +1372,7 @@ impl LanguageServerPool {
         if key.is_shared() {
             // Reviving a DEAD shared instance needs a marker to announce its
             // workspace folders, and only a document can produce one. A live
-            // instance is reachable above and via `ready_connection_by_key`.
+            // instance is reachable above and via `ready_connection_by_key_for_config`.
             log::warn!(
                 target: "kakehashi::bridge",
                 "executeCommand: shared-instance connection for {server:?} is gone and \
@@ -4904,7 +4925,9 @@ mod tests {
         // `None` keeps the plain state-only filter for callers with no config to
         // compare (the palette path).
         assert!(
-            pool.ready_connection_by_key(&key).await.is_some(),
+            pool.ready_connection_by_key_for_config(&key, None)
+                .await
+                .is_some(),
             "the config-less variant still filters on state alone"
         );
     }
@@ -4928,7 +4951,9 @@ mod tests {
         // The Ready-only fast path misses, so a request falls through to the
         // reconnect — which must WAIT rather than take the shared-key bail.
         assert!(
-            pool.ready_connection_by_key(&key).await.is_none(),
+            pool.ready_connection_by_key_for_config(&key, None)
+                .await
+                .is_none(),
             "an Initializing connection is not served by the Ready fast path"
         );
         let waiter = {
