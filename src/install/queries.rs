@@ -604,6 +604,7 @@ impl PublishedQueryInstall {
             // land inside another installer's or the uninstaller's critical
             // section.
             let Some(queries_parent) = published.queries_dir.parent() else {
+                outcome = RollbackOutcome::NewQueriesRemain;
                 continue;
             };
             let _replace_lock =
@@ -614,6 +615,9 @@ impl PublishedQueryInstall {
                             "Warning: could not lock '{}' to undo its query install: {}",
                             published.language, e
                         );
+                        // Not undone: without the lock the queries stay live,
+                        // and the caller must not say nothing was published.
+                        outcome = RollbackOutcome::NewQueriesRemain;
                         continue;
                     }
                 };
