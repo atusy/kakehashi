@@ -310,6 +310,13 @@ pub(crate) struct StagedQueryInstall {
     /// missing parents (if any) were staged.
     requested_already_complete: bool,
     entries: Vec<StagedQueryDir>,
+    /// Every language this install needs on disk — the requested one and its
+    /// whole `; inherits:` chain, whether staged or found already complete.
+    /// Sorted, so locking them in this order cannot deadlock against another
+    /// install locking an overlapping set.
+    dependencies: Vec<String>,
+    /// Where those languages live, for the completeness re-check.
+    queries_parent: PathBuf,
 }
 
 /// A query directory that has been renamed into place, with the directory it
@@ -351,17 +358,34 @@ impl StagedQueryInstall {
         }
     }
 
-    /// Whether the requested language's queries are still where staging left
-    /// them.
+    /// Languages this install needs to lock before publishing: the requested
+    /// one and every language it reaches through `; inherits:`, sorted.
+    pub(crate) fn dependencies(&self) -> &[String] {
+        &self.dependencies
+    }
+
+    /// The first language staging skipped as already complete whose queries are
+    /// no longer there.
     ///
-    /// Staging skips a language whose queries are already complete, so there is
-    /// no staged copy to publish and nothing that would notice them
-    /// disappearing. An uninstall between staging and publication would
-    /// otherwise leave the install publishing a parser and reporting success
-    /// over queries that are gone. Callers check this once they hold the lock
-    /// that keeps the answer true.
-    pub(crate) fn requested_queries_still_complete(&self) -> bool {
-        !self.requested_already_complete || query_install_is_complete(&self.install_path)
+    /// Staging does not copy a language whose queries are already complete, so
+    /// there is no staged copy to publish and nothing in the publish that would
+    /// notice them disappearing. An uninstall between staging and publication
+    /// would otherwise leave this install reporting success over a language
+    /// whose own queries — or a base language it inherits — are gone. Callers
+    /// check this once they hold the locks that keep the answer true.
+    pub(crate) fn missing_skipped_dependency(&self) -> Option<&str> {
+        self.dependencies
+            .iter()
+            .filter(|language| {
+                !self
+                    .entries
+                    .iter()
+                    .any(|entry| &&entry.language == language)
+            })
+            .find(|language| {
+                !query_install_is_complete(&self.queries_parent.join(language.as_str()))
+            })
+            .map(String::as_str)
     }
 
     /// Rename every staged directory into place, keeping the displaced
@@ -373,6 +397,8 @@ impl StagedQueryInstall {
             files_downloaded,
             requested_already_complete,
             entries,
+            dependencies: _,
+            queries_parent: _,
         } = self;
         let mut publish = PublishedQueryInstall {
             install_path,
@@ -634,6 +660,8 @@ fn stage_queries_with_dependencies(
     http_policy: QueryHttpPolicy,
 ) -> Result<StagedQueryInstall, QueryInstallError> {
     let mut entries = Vec::new();
+    // Every language the recursion visits, staged or already complete: the set
+    // this install needs to still be there when it publishes.
     let mut staged = std::collections::HashSet::new();
     // On any error the entries collected so far are dropped here, and with them
     // every staging directory: a failed install publishes nothing.
@@ -650,12 +678,16 @@ fn stage_queries_with_dependencies(
         StageOutcome::Staged { files_downloaded } => (files_downloaded, false),
         StageOutcome::NothingToDo => (Vec::new(), true),
     };
+    let mut dependencies: Vec<String> = staged.into_iter().collect();
+    dependencies.sort();
     Ok(StagedQueryInstall {
         language: language.to_string(),
         install_path: data_dir.join("queries").join(language),
         files_downloaded,
         requested_already_complete,
         entries,
+        dependencies,
+        queries_parent: data_dir.join("queries"),
     })
 }
 
@@ -1241,6 +1273,27 @@ pub fn lock_language(data_dir: &Path, language: &str) -> Result<LanguageLock, Qu
     })
 }
 
+/// Take [`lock_language`] for every language an install depends on.
+///
+/// `languages` must be sorted: two installs whose dependency sets overlap
+/// acquire the shared locks in the same order, so they queue instead of
+/// deadlocking. Holding the parents' locks too is what stops an install of one
+/// language from publishing over — or uninstalling — a base language another
+/// install has already decided to rely on.
+pub(crate) fn lock_languages(
+    data_dir: &Path,
+    languages: &[String],
+) -> Result<Vec<LanguageLock>, QueryInstallError> {
+    debug_assert!(
+        languages.windows(2).all(|pair| pair[0] <= pair[1]),
+        "dependency locks must be acquired in sorted order"
+    );
+    languages
+        .iter()
+        .map(|language| lock_language(data_dir, language))
+        .collect()
+}
+
 /// Exclusive claim on one language's artifacts. See [`lock_language`].
 pub struct LanguageLock {
     _file: fs::File,
@@ -1547,6 +1600,8 @@ mod staging_tests {
                 stage(&queries_parent, "child", "; inherits: parent\n", false),
                 stage(&queries_parent, "parent", "(comment) @comment\n", false),
             ],
+            dependencies: vec!["child".to_string(), "parent".to_string()],
+            queries_parent: queries_parent.clone(),
         };
 
         drop(staged);
@@ -1576,6 +1631,8 @@ mod staging_tests {
             files_downloaded: vec!["highlights.scm".to_string()],
             requested_already_complete: false,
             entries: vec![stage(&queries_parent, "child", "replacement", true)],
+            dependencies: Vec::new(),
+            queries_parent: queries_parent.clone(),
         };
 
         let published = staged.publish().expect("publish should succeed");
@@ -1619,6 +1676,8 @@ mod staging_tests {
                 stage(&queries_parent, "child", "; inherits: parent\n", false),
                 stage(&queries_parent, "parent", "(comment) @comment\n", false),
             ],
+            dependencies: vec!["child".to_string(), "parent".to_string()],
+            queries_parent: queries_parent.clone(),
         };
 
         staged.publish().expect("publish should succeed").rollback();
@@ -1651,6 +1710,8 @@ mod staging_tests {
             files_downloaded: vec!["highlights.scm".to_string()],
             requested_already_complete: false,
             entries: vec![stage(&queries_parent, "child", "replacement", true)],
+            dependencies: Vec::new(),
+            queries_parent: queries_parent.clone(),
         };
 
         drop(staged.publish().expect("publish should succeed"));
@@ -1670,7 +1731,7 @@ mod staging_tests {
     /// Staging does not copy queries it found complete, so nothing else would
     /// notice an uninstall removing them before the publish.
     #[test]
-    fn a_skipped_requested_language_is_rechecked() {
+    fn a_skipped_dependency_is_rechecked() {
         let temp = TempDir::new().unwrap();
         let queries_parent = temp.path().join("queries");
         let queries_dir = queries_parent.join("child");
@@ -1683,13 +1744,45 @@ mod staging_tests {
             files_downloaded: Vec::new(),
             requested_already_complete: true,
             entries: Vec::new(),
+            dependencies: vec!["child".to_string()],
+            queries_parent: queries_parent.clone(),
         };
 
-        assert!(staged.requested_queries_still_complete());
+        assert_eq!(staged.missing_skipped_dependency(), None);
         fs::remove_dir_all(&queries_dir).unwrap();
-        assert!(
-            !staged.requested_queries_still_complete(),
+        assert_eq!(
+            staged.missing_skipped_dependency(),
+            Some("child"),
             "queries removed after staging must not pass as already installed"
+        );
+    }
+
+    /// A base language the requested one inherits counts too: staging skipped
+    /// it because it was complete, and losing it leaves a dangling
+    /// `; inherits:` behind an install that reported success.
+    #[test]
+    fn a_skipped_inherited_parent_is_rechecked() {
+        let temp = TempDir::new().unwrap();
+        let queries_parent = temp.path().join("queries");
+        let staged = StagedQueryInstall {
+            language: "child".to_string(),
+            install_path: queries_parent.join("child"),
+            files_downloaded: vec!["highlights.scm".to_string()],
+            requested_already_complete: false,
+            entries: vec![stage(
+                &queries_parent,
+                "child",
+                "; inherits: parent\n",
+                false,
+            )],
+            dependencies: vec!["child".to_string(), "parent".to_string()],
+            queries_parent: queries_parent.clone(),
+        };
+
+        assert_eq!(
+            staged.missing_skipped_dependency(),
+            Some("parent"),
+            "a base language that is neither staged nor on disk must be caught"
         );
     }
 
@@ -1705,9 +1798,11 @@ mod staging_tests {
             files_downloaded: vec!["highlights.scm".to_string()],
             requested_already_complete: false,
             entries: vec![stage(&queries_parent, "child", "staged", false)],
+            dependencies: vec!["child".to_string()],
+            queries_parent: queries_parent.clone(),
         };
 
-        assert!(staged.requested_queries_still_complete());
+        assert_eq!(staged.missing_skipped_dependency(), None);
     }
 
     /// `--force` replaces the requested language, not the base languages it
@@ -1728,6 +1823,8 @@ mod staging_tests {
                 stage(&queries_parent, "child", "; inherits: parent\n", true),
                 stage(&queries_parent, "parent", "ours", false),
             ],
+            dependencies: vec!["child".to_string(), "parent".to_string()],
+            queries_parent: queries_parent.clone(),
         };
         // The parent appears while this install is busy with the parser.
         fs::create_dir_all(&parent_dir).unwrap();
@@ -1772,6 +1869,8 @@ mod staging_tests {
                 stage(&queries_parent, "child", "replacement", true),
                 stage(&queries_parent, "parent", "(comment) @comment\n", false),
             ],
+            dependencies: Vec::new(),
+            queries_parent: queries_parent.clone(),
         };
         write_uninstall_tombstone(&queries_parent, "parent").unwrap();
 

@@ -356,33 +356,35 @@ fn install_language_with_query_stager(
         }
     };
 
-    // From here on the two artifacts move together, so take the lock that
-    // orders this install against another install or an uninstall of the same
-    // language, and re-check that the language is still wanted. Taken after
-    // staging so a compile never blocks an uninstall.
-    let transaction = match queries::lock_language(data_dir, language) {
-        Ok(lock) if lock.language_was_uninstalled() => {
-            result.queries_error = Some(format!(
-                "'{}' was uninstalled while it was being installed",
-                language
-            ));
-            return result;
-        }
-        Ok(lock) => lock,
+    // From here on every artifact moves together, so take the locks that order
+    // this install against another install or an uninstall — one per language
+    // it depends on, since a base language it inherits is as load-bearing as
+    // its own queries. Taken after staging, so a compile never blocks anyone.
+    let transaction = match queries::lock_languages(data_dir, staged_queries.dependencies()) {
+        Ok(locks) => locks,
         Err(e) => {
             result.queries_error = Some(e.to_string());
             return result;
         }
     };
+    if transaction
+        .iter()
+        .any(queries::LanguageLock::language_was_uninstalled)
+    {
+        result.queries_error = Some(format!(
+            "'{}' or a language it inherits was uninstalled while it was being installed",
+            language
+        ));
+        return result;
+    }
 
     // Queries that staging found already complete were never copied, so this is
-    // the only thing that would notice an uninstall removing them since. Checked
-    // under the transaction lock, before anything is published, so there is
-    // nothing to undo.
-    if !staged_queries.requested_queries_still_complete() {
+    // the only thing that would notice them being removed since. Checked under
+    // the locks, before anything is published, so there is nothing to undo.
+    if let Some(missing) = staged_queries.missing_skipped_dependency() {
         result.queries_error = Some(format!(
-            "the installed queries for '{}' were removed while it was being installed",
-            language
+            "the installed queries for '{}' were removed while '{}' was being installed",
+            missing, language
         ));
         return result;
     }
