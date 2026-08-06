@@ -1980,6 +1980,74 @@ mod tests {
         );
     }
 
+    /// An explicit empty `cmd` says "this server has no command", not "inherit
+    /// the wildcard's". Same for `languages`: a list the layer wrote is the
+    /// list, empty or not. Omitting the key is what inherits.
+    #[test]
+    fn bridge_server_empty_lists_clear_rather_than_inherit() {
+        let base: RawWorkspaceSettings = toml::from_str(
+            r#"
+            [languageServers._]
+            cmd = ["shared-server"]
+            languages = ["*"]
+        "#,
+        )
+        .expect("should parse");
+        let overlay: RawWorkspaceSettings = toml::from_str(
+            r#"
+            [languageServers.quiet]
+            cmd = []
+            languages = []
+        "#,
+        )
+        .expect("should parse");
+
+        let merged =
+            merge_workspace_settings(Some(base), Some(overlay)).expect("two settings merge");
+        let servers = merged.language_servers.expect("servers survive the merge");
+        let wildcard = servers.get(WILDCARD_KEY);
+        let quiet = servers.get("quiet").expect("the overlay's server");
+
+        assert!(
+            !quiet.is_spawnable_with_wildcard(wildcard),
+            "an explicitly empty cmd must not inherit the wildcard's command"
+        );
+        assert!(
+            quiet.effective_languages_with_wildcard(wildcard).is_empty(),
+            "an explicitly empty languages list must not inherit the wildcard's"
+        );
+    }
+
+    /// Omitting the keys still inherits, which is what makes the empty spelling
+    /// mean something.
+    #[test]
+    fn bridge_server_omitted_lists_still_inherit() {
+        let base: RawWorkspaceSettings = toml::from_str(
+            r#"
+            [languageServers._]
+            cmd = ["shared-server"]
+            languages = ["*"]
+        "#,
+        )
+        .expect("should parse");
+        let overlay: RawWorkspaceSettings = toml::from_str(
+            r#"
+            [languageServers.loud]
+            enabled = true
+        "#,
+        )
+        .expect("should parse");
+
+        let merged =
+            merge_workspace_settings(Some(base), Some(overlay)).expect("two settings merge");
+        let servers = merged.language_servers.expect("servers survive the merge");
+        let wildcard = servers.get(WILDCARD_KEY);
+        let loud = servers.get("loud").expect("the overlay's server");
+
+        assert!(loud.is_spawnable_with_wildcard(wildcard));
+        assert_eq!(loud.effective_languages_with_wildcard(wildcard), ["*"]);
+    }
+
     /// An explicit empty map clears the layer below, the same spelling
     /// `languageServers`, `bridge`, and `layers.aggregation` already answer to.
     /// Omitting the key still inherits.
