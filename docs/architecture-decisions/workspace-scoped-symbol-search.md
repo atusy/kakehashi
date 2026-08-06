@@ -398,8 +398,7 @@ contradicting this decision's own coverage contract. (In the abandoned waiting
 design this placement had a second failure mode too — the cap became a global
 barrier — but with `Initializing` excluded there is nothing left to wait for,
 so only the coverage argument applies.)
-Deciding membership synchronously and waiting per target removes the
-interaction entirely.
+Deciding membership synchronously removes the interaction entirely.
 
 Step 2 must precede step 3: capping first would let a **known-incapable**
 server take a slot from a capable one — with `priorities = [A, B]`,
@@ -544,9 +543,10 @@ function once the offset resolver is injected.
 
 ### 5. Fan-in: a global virtual→host translator
 
-Every entry is classified independently. Because each one resolves **its own**
-`(host_url, region_id, offset)`, this path may cross blocks where the goto path
-may not: the goto filter exists because only one region's offset is in hand.
+Every entry is classified independently, and each is translated against **its
+own** region's offset — which is what lets this path cross blocks where the goto
+path may not: the goto filter exists because only one region's offset is in
+hand. "Its own offset" does not mean "its own resolution", though; see pass 3.
 
 ```
   one entry of the downstream's result array
@@ -630,7 +630,8 @@ index** built once up front:
 1. Classify every entry against that index, **grouping entries by host**. No
    parse and no lock is involved, so nothing waits here.
 2. Ensure the distinct hosts that actually appear, **concurrently**.
-3. Resolve each entry's offset and translate, per group.
+3. Resolve each host's regions **once**, then translate its entries against
+   that one resolution.
 
 Pass 0 is built **late, and verified late**, because a single early snapshot
 is wrong in both directions across a collection phase that runs concurrently and
@@ -725,27 +726,52 @@ resolution that reads the tracker just ahead of that update finishes against its
 own stale snapshot and passes both the language and range checks with old
 coordinates.
 
-The check must be on **incarnation *and* content version**, not incarnation
-alone. An ordinary edit preserves the incarnation and only bumps the content
-version, and `DocumentSnapshot` does not carry that version — so an
-incarnation-only comparison would miss precisely the race described above.
-The resolution variant therefore retains the snapshot's content/parsed version
-alongside the language and virtual content, and compares both fields against a
-single live `SnapshotView`.
+**Resolution is per host, not per entry.** `resolve_by_region_id` runs the whole
+injection walk over the host on every call, so resolving each entry
+independently would be `symbols × regions` work — a 2,000-symbol response from a
+100-region host would walk that host 2,000 times — while holding a lock that
+blocks every `didChange` and close for it. Memoizing individual ids does not fix
+this: the first lookup for each distinct region still walks, so the worst case
+stays quadratic.
 
-The document edit lock must be acquired **before the resolution snapshot is
-taken**, not merely around that comparison, and held through translation. This
-is not just about making the comparison unraceable: `resolve_by_region_id`
-**mutates** the tracker — it goes through the named-layer allocator and then
-`calculate_region_id`, which can mint a ULID. A resolution that reads stale
-coordinates and loses the race to `didChange` would therefore mint a **ghost id
-at coordinates that no longer exist**, and the version check afterwards drops
-the symbol but cannot undo the mutation. Post-checking a side-effecting
-resolution is not enough; the lock has to cover the side effect. (A genuinely
-read-only resolver that reused the requested id and never reached a minting
-helper would be the alternative, and does not exist today.) This is the discipline the semantic
-token path already uses, and only the whole of it works; the incarnation half
-alone would leave "the tree is gone" as the only edit race the design notices.
+Each host is therefore resolved **once** into a request-local
+`region_id → (offset, region_end, virtual_content, injection_language)` map, and
+every entry for that host is translated against it. The preferred source is the
+**generation-stamped resolved-region snapshot** the document store already
+keeps; only when that is unavailable does fan-in run one full resolution for the
+host and build the map from it.
+
+Preferring the cached snapshot is not only about cost. `resolve_by_region_id`
+**mutates** the tracker — it reaches the named-layer allocator and then
+`calculate_region_id`, which can mint a ULID — so an inline resolution that
+loses a race mints a **ghost id at coordinates that no longer exist**, and no
+post-check can undo that. Reading an already-resolved snapshot has no such side
+effect.
+
+Two identities must hold, not one:
+
+- **Document freshness.** The retained content/parsed version *and* incarnation
+  are compared against a single live `SnapshotView`. Incarnation alone is
+  insufficient: an ordinary edit preserves it and only bumps the content
+  version, which `DocumentSnapshot` does not carry. This is the discipline the
+  semantic token path already uses, and only the whole of it works — the
+  incarnation half alone would leave "the tree is gone" as the only edit race
+  the design notices.
+- **Query generation.** A settings reload replaces the injection queries and
+  bumps the settings generation *before* invalidating parses, and takes no
+  document edit lock — so a resolution can straddle a reload, use
+  mixed-generation query state, and still pass the document-version check. The
+  generation is captured and re-checked, as the other query-sensitive paths
+  already do. Because an inline resolution mutates the tracker, detecting a
+  mismatch afterwards cannot undo it; this is the second reason the
+  generation-stamped snapshot is the preferred source, and the reason the inline
+  fallback must be serialized against reload.
+
+The inline fallback additionally requires the document edit lock **before its
+resolution snapshot is taken**, not merely around the comparison, and held
+through translation — the lock has to cover the side effect, not merely observe
+it. (A genuinely read-only resolver, reusing the requested id and never reaching
+a minting helper, would remove that requirement; it does not exist today.)
 
 Taking that lock carries an obligation the happy path hides. `edit_lock`
 **creates** an entry unconditionally, so a host that closed between indexing and
