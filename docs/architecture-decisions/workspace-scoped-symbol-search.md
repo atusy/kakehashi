@@ -628,7 +628,7 @@ with its own name and semantics rather than smuggled into this one.
              └────────────┬─────────────┘
                           ▼
         ┌──────────────────────────────────────┐
-        │ SELECTION (3s per lock ACQUIRE, §6)  │
+        │ SELECTION (3s per AWAITED lock, §6)  │
         │ pool-owned batch validator, one lock:│
         │ Ready only, drop incapable, drop     │
         │ stale-config, confirm still open on  │
@@ -1179,9 +1179,9 @@ arriving mid-processing would otherwise wait on unrelated work with no bound.
 
 Separate budgets rather than one deadline spanning the whole dispatch, because a
 single outer deadline would silently consume the reopen barrier's two seconds
-(point 3) and cancel it in a way its own timeout never reports. These are the
-only deadlines the design imposes; every other bound it relies on already
-existed.
+(point 3) and cancel it in a way its own timeout never reports. Together with
+the 200ms bound on each parse ensure (point 5), these are the deadlines the
+design adds; every other bound it relies on already existed.
 
 Beyond those budgets, nothing new is introduced: every target is already
 `Ready` when chosen (point 3), so nothing waits for a handshake before the
@@ -1427,13 +1427,13 @@ Including it would defeat dedup on a field carrying no identity.
 - Every lock this path *awaits* — the tracker snapshot, `connections`, each
   send's re-acquisition, each host's `edit_lock` — is bounded only in its
   **acquisition** (`host_documents` is never awaited; it is `try_lock`ed under
-  `connections`, and contention drops that query's `_self` candidates), because other paths hold these across
-  unbounded async work (point 6); the filtering between them is synchronous and
-  cannot be preempted, so neither total selection time nor cancellation blocking
-  is capped. Expiring either
-  budget answers from a partial target set — and a
-  cancellation queued behind that same mutex may arrive too late to stop it, so
-  a cancelled request can still be answered.
+  `connections`, and contention drops that query's `_self` candidates), because
+  other paths hold these across unbounded async work (point 6); the filtering
+  between them is synchronous and cannot be preempted, so neither total
+  selection time nor cancellation blocking is capped. Expiring any of those
+  budgets answers from a partial target set — and a cancellation queued behind
+  the `connections` mutex may arrive too late to stop it, so a cancelled request
+  can still be answered.
 - The content-identity check proves a `didChange` was *enqueued*, not delivered:
   notifications carry no acknowledgement and a failed write does not fail the
   connection. The stale-result window is narrowed, not closed (point 5).
