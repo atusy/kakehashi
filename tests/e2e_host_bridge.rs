@@ -1547,27 +1547,48 @@ fn e2e_host_bridge_completion_resolve_round_trips_verbatim() {
         item["detail"].is_null(),
         "the item is unresolved (no detail yet), got: {item}"
     );
-    assert!(
-        item["data"].is_object(),
-        "a resolvable host item carries a routing envelope, got: {item}"
+    assert_eq!(
+        item["data"]["kakehashi"]["host_layer"], true,
+        "a resolvable host item carries a HOST-layer routing envelope: {item}"
+    );
+    assert_eq!(
+        item["data"]["kakehashi"]["inner"],
+        json!({ "mockPath": MARKDOWN_URI }),
+        "with the server's own data preserved inside it: {item}"
     );
 
-    let resolved = client.send_request("completionItem/resolve", item);
-    assert!(
-        resolved.get("error").is_none(),
-        "resolve errored: {resolved}"
-    );
-    let result = &resolved["result"];
-    assert_eq!(
-        result["detail"],
-        format!("mock-resolved:{MARKDOWN_URI}"),
-        "the resolve must reach the host server, which fills detail from the \
-         item's own data — proving both the routing and the data round trip: {result}"
-    );
-    assert!(
-        result["data"].is_object(),
-        "the resolved item keeps its envelope so it can be resolved again: {result}"
-    );
+    // Resolve twice: the second round is what proves the envelope survives a
+    // resolve with its layer marker intact. With the marker dropped, round two
+    // takes the virt path, fails the region gate, and comes back unresolved.
+    let mut resolved = client.send_request("completionItem/resolve", item);
+    for round in 1..=2 {
+        assert!(
+            resolved.get("error").is_none(),
+            "resolve round {round} errored: {resolved}"
+        );
+        let result = &resolved["result"];
+        assert_eq!(
+            result["detail"],
+            format!("mock-resolved:{MARKDOWN_URI}"),
+            "round {round}: the resolve must reach the host server, which fills detail from \
+             the item's own data — proving both the routing and the data round trip: {result}"
+        );
+        // The materialized edit sits on host line 2, outside any injection
+        // region. The virt resolve path would reject it as unsafe and serve
+        // the item unresolved, so its arrival — at its original coordinates —
+        // is what proves the VERBATIM host path ran.
+        assert_eq!(
+            result["textEdit"]["range"]["start"]["line"], 2,
+            "round {round}: the host resolve must not translate coordinates: {result}"
+        );
+        assert_eq!(result["textEdit"]["newText"], "resolved-edit");
+        assert_eq!(
+            result["data"]["kakehashi"]["host_layer"], true,
+            "round {round}: the resolved item keeps its host marker so the NEXT \
+             resolve still routes to the host server: {result}"
+        );
+        resolved = client.send_request("completionItem/resolve", result.clone());
+    }
 
     shutdown(&mut client);
 }

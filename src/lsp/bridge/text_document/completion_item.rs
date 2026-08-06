@@ -746,15 +746,30 @@ mod tests {
         );
     }
 
-    /// A HOST-layer item whose origin cannot be reached comes back unresolved
-    /// with the layer marker intact, so the client's next resolve still routes
-    /// through the host path instead of falling into the virt geometry gate.
+    /// A HOST-layer item whose origin cannot be CONNECTED to comes back
+    /// unresolved with the layer marker intact, so the client's next resolve
+    /// still routes through the host path instead of falling into the virt
+    /// geometry gate.
+    ///
+    /// The origin must be spawnable for this to mean anything: with no config
+    /// the dispatch returns at the `is_server_spawnable` gate, several branches
+    /// above the host routing this is meant to exercise.
     #[tokio::test]
-    async fn dispatch_re_envelopes_host_item_when_server_not_configured() {
+    async fn dispatch_re_envelopes_host_item_when_origin_cannot_be_reached() {
         let pool = std::sync::Arc::new(LanguageServerPool::new());
-        let settings = WorkspaceSettings::default();
+        let mut settings = WorkspaceSettings::default();
+        settings.language_servers.insert(
+            "tsudoi-ls".to_string(),
+            BridgeServerConfig {
+                // Spawnable per config, unspawnable in fact — so the dispatch
+                // reaches `send_host_completion_resolve` and fails there.
+                cmd: Some(vec!["kakehashi-no-such-binary-958".to_string()]),
+                ..Default::default()
+            },
+        );
         let mut item = CompletionItem {
             label: "./test".to_string(),
+            data: Some(json!({"pathCompletion": "/tmp/test"})),
             ..Default::default()
         };
         crate::lsp::bridge::text_document::completion::envelope_host_item(
@@ -769,7 +784,15 @@ mod tests {
 
         let envelope = extract_envelope(&result).expect("should have envelope");
         assert_eq!(envelope.origin, "tsudoi-ls");
-        assert!(envelope.is_host_layer());
+        assert!(
+            envelope.is_host_layer(),
+            "the marker must survive so the next resolve still takes the host path"
+        );
+        assert_eq!(
+            envelope.inner,
+            Some(json!({"pathCompletion": "/tmp/test"})),
+            "and the downstream's own data must survive with it"
+        );
     }
 
     /// The disabled gate must also apply when the server inherits `enabled:

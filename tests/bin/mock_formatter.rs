@@ -591,6 +591,14 @@ fn main() {
             // Fill in `detail` from the item's own `data` — absent in the
             // completion response, so a resolved item that carries it proves
             // the resolve actually reached this server.
+            //
+            // The materialized `textEdit` is what makes the e2e discriminate
+            // the HOST routing branch: it sits on host line 2, which the VIRT
+            // resolve path would reject as unsafe for the injection region
+            // (a host envelope carries a zero offset and no region end, so
+            // that path's guard fails closed) and serve the item unresolved.
+            // Reaching the client intact proves the resolve took the verbatim
+            // host path, not merely that some server answered.
             "completionItem/resolve" => {
                 let mut item = message
                     .pointer("/params")
@@ -602,6 +610,13 @@ fn main() {
                     .unwrap_or("?")
                     .to_string();
                 item["detail"] = json!(format!("mock-resolved:{path}"));
+                item["textEdit"] = json!({
+                    "range": {
+                        "start": { "line": 2, "character": 4 },
+                        "end": { "line": 2, "character": 9 }
+                    },
+                    "newText": "resolved-edit"
+                });
                 respond(&mut writer, id, item);
             }
             "textDocument/codeAction" => {
