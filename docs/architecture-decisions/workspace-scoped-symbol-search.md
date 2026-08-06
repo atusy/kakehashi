@@ -486,10 +486,21 @@ final barrier.** The order is fixed:
       The filter is on the **connection's root**, not on result URIs: a server
       legitimately rooted inside the workspace may return symbols from a
       dependency outside it, and that is its own call, not pollution.
+      The boundary is the declared **workspace folders**, or — when the client
+      sent an explicit empty folder list but did keep a `rootUri` — that root.
+      The two are stored separately and an empty list is preserved deliberately,
+      so this case is real and needs saying: without the rule, an implementer
+      could equally drop every marker-rooted target or admit every disjoint
+      project. Filtering is disabled only when **neither** exists, where there
+      is no boundary to enforce and the alternative would be to answer nothing.
+
       `ClientFallback`-rooted connections sit at the client root and always
-      pass. A session that declared **no** root or folders at all has no
-      boundary to enforce, so nothing is filtered — the alternative would be to
-      answer nothing.
+      pass. That is a **third leak**, not a clean case: a stray file with no
+      marker above it — or with markers disabled — also routes to
+      `ClientFallback`, so its document is opened on that process and its
+      symbols can come back. Since result URIs are deliberately unfiltered,
+      nothing here removes them. Dropping the fallback connection instead would
+      discard the client root's own symbols, which is worse.
 
       A `preferSharedInstance` connection needs its own rule, because `Shared`
       exposes **no** marker root: the roots it actually serves live in the
@@ -896,7 +907,7 @@ hand. "Its own offset" does not mean "its own resolution", though; see pass 3.
              │
              ▼
      ┌───────────────────┐  no
-     │ has a range?      ├─────▶ DROP  (uri-only location — see below)
+     │ has a range?      ├─────▶ DROP as a PROTOCOL FAILURE (see below)
      └─────────┬─────────┘
                │ yes
                ▼
@@ -1039,6 +1050,13 @@ real positions in that text and the range must be correctly ordered, using the
 existing strict position machinery rather than a new comparison, and only then
 is the range translated and checked against the host-side region bound. Validating in virtual coordinates before translating is
 what catches the column case; the host bound catches what survives it.
+
+A range-less entry is **not** a semantic rejection, and the distinction matters:
+the server reported a match and kakehashi could not use it. Counting it as
+semantic would let a response consisting entirely of range-less entries come
+back as an informative `[]` — telling the user there are no symbols at the
+moment a server has just said there are. It is an infrastructure failure in the
+accounting of point 5, so such a response errors instead.
 
 The range check comes first because `WorkspaceSymbol.location` is
 `OneOf<Location, WorkspaceLocation>` and the `WorkspaceLocation` form carries a
@@ -1293,7 +1311,9 @@ those rather than from whole responses:
   retired, or the range escaped its region. The answer was processed; it yielded
   fewer symbols. These are the silent drops points 5 and 7 already accept.
 - **Infrastructure-failed** — nothing was learned. This covers entries never
-  examined, and also entries whose **content identity moved**: an edit during
+  examined — including an entry a downstream returned **without a range**, which
+  it reported as a match and kakehashi could not place — and also entries whose
+  **content identity moved**: an edit during
   the request means the downstream answered about text that no longer exists, so
   a symbol it did not mention may simply have shifted. The bridge learned
   neither that the workspace has no match nor where the match now is, which is
@@ -1750,11 +1770,12 @@ Including it would defeat dedup on a field carrying no identity.
 
 - A file opened from outside the client's workspace no longer contributes its
   project's symbols here, though the connection it spawned still serves that
-  file's own bridged requests. Two leaks remain by design (point 3): a
+  file's own bridged requests. Three leaks remain by design (point 3): a
   `preferSharedInstance` server holding both an in-workspace and an external
-  root is indivisible, and a server rooted *above* the workspace — the ordinary
-  case when `.git` sits above the opened folder — indexes its whole tree, so a
-  search returns sibling packages too.
+  root is indivisible; a server rooted *above* the workspace — the ordinary case
+  when `.git` sits above the opened folder — indexes its whole tree, so a search
+  returns sibling packages too; and a stray file with no marker above it lands
+  on the always-admitted `ClientFallback` connection.
 - Results depend on what is open, and coverage can shrink (close, respawn,
   silent connection death). Closing the last buffer for a language removes its
   server from search even though the process is still running and may still be
