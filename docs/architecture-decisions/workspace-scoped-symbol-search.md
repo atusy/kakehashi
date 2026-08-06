@@ -436,6 +436,13 @@ final barrier.** The order is fixed:
    configuration no longer matches the `BridgeServerConfig` that admitted them;
    and confirms current membership — the live reverse index for a virtual
    candidate, `host_documents` for a `_self` one.
+
+   The reverse index is a sharded map and answers synchronously. `host_documents`
+   is a separate Tokio mutex, so it is taken with **`try_lock`**, never awaited:
+   on contention the `_self` candidates are dropped for that query and the
+   virtual ones are unaffected. Awaiting it while holding `connections` would
+   make this path exactly the kind of unbounded holder that forced every budget
+   in point 6, and there is no version of "briefly" that is safe there.
 3. Apply the per-pair `priorities` allowlist and `max_fan_out` cap to the
    survivors — pure computation, after the lock is released.
 4. Dedup by **connection key** `(server, root)`.
@@ -447,8 +454,8 @@ this under one acquisition — `launch_config` and its comparator are private to
 the pool, and the exposed comparison helper takes `connections` itself, so a
 caller in `bridge/workspace/symbol.rs` doing these checks piecemeal would
 re-lock between them and validate against a map that had already moved. And it
-is what lets `host_documents` be read **while `connections` is held** rather
-than snapshotted first: a `_self` candidate has no reverse-index check to fall
+is what lets `host_documents` be consulted **while `connections` is held**
+rather than snapshotted first: a `_self` candidate has no reverse-index check to fall
 back on, `HostDocSyncState` records neither connection generation nor handle
 identity, and a respawn can purge the entry and install a fresh `Ready` handle
 under the same `ConnectionKey` — so a released snapshot would let a connection
@@ -1145,10 +1152,11 @@ send re-acquires `connections` before enqueue, and translation takes each host's
 `edit_lock` across downstream close, change, and eager-spawn awaits, so a query
 arriving mid-processing would otherwise wait on unrelated work with no bound.
 
-- **Selection**: the tracker snapshot, then `connections` (under which the
-  validator also reads `host_documents` and the live reverse index) — three
-  seconds each. The budget covers *acquiring* each lock, not the filtering
-  between them — that walk is synchronous with no
+- **Selection**: the tracker snapshot, then `connections` — three seconds each.
+  Nothing else is *awaited*: under `connections` the validator queries the
+  reverse index synchronously and `host_documents` with `try_lock`, so there is
+  no third acquisition to budget and no await while a lock is held. The budget
+  covers *acquiring* each lock, not the filtering between them — that walk is synchronous with no
   await, so a timeout could not preempt it anyway, and bounding what cannot be
   interrupted would promise something the runtime does not deliver.
 - **Each send's pre-enqueue re-acquisition** of `connections`: three seconds,
@@ -1379,7 +1387,7 @@ Including it would defeat dedup on a field carrying no identity.
   user expecting an indexed whole-project search will find this surprising.
 - Latency is max-over-live-targets, and every *wait* is bounded: the pool's 30s
   request timeout and liveness timeout, a three-second budget on **every** lock
-  this path acquires (the tracker snapshot, `connections`, each send's
+  this path awaits (the tracker snapshot, `connections`, each send's
   re-acquisition, and each host's `edit_lock`), and the reopen barrier's two
   seconds. Total latency is not bounded, because the synchronous
   filtering between those waits cannot be preempted. Forwarded cancellation is
@@ -1401,9 +1409,14 @@ Including it would defeat dedup on a field carrying no identity.
   in methods that have no use for it.
 - A server still `Initializing` when the query arrives is skipped entirely, so
   a search in the seconds after opening a file can miss it (point 3).
-- Every lock this path takes — the tracker snapshot, `connections` (under which
-  `host_documents` and the reverse index are read), each send's re-acquisition,
-  each host's `edit_lock` — is bounded only in its **acquisition**, because other paths hold these across
+- `_self` targets are dropped when `host_documents` is contended at validation
+  time, since it is `try_lock`ed rather than awaited (point 3). Host-bridged
+  symbols can therefore be absent from one query for a reason the user cannot
+  see.
+- Every lock this path *awaits* — the tracker snapshot, `connections`, each
+  send's re-acquisition, each host's `edit_lock` — is bounded only in its
+  **acquisition** (`host_documents` is never awaited; it is `try_lock`ed under
+  `connections`, and contention drops that query's `_self` candidates), because other paths hold these across
   unbounded async work (point 6); the filtering between them is synchronous and
   cannot be preempted, so neither total selection time nor cancellation blocking
   is capped. Expiring either
