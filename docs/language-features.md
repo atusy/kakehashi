@@ -107,8 +107,8 @@ embedded blocks. Works for any grammar, no setup required.
 The features below are served by a language server configured for the
 embedded language — most of them also on the surrounding document itself,
 by a `bridge._self` host server (exceptions: document color stays
-injection-only, and host completion-item and code-lens resolves pass
-through unrouted). Placing the cursor outside an embedded
+injection-only, and host code-lens resolves pass through unrouted).
+Placing the cursor outside an embedded
 code block yields no result from the injection bridges; with `bridge._self`
 configured, the host language's own servers still answer there.
 

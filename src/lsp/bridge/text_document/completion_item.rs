@@ -3,13 +3,19 @@
 //! the original completion fan-out. Uses `send_request()` for FIFO ordering
 //! through the single writer task (ls-bridge-message-ordering).
 //!
-//! No `didOpen` is sent here — the virtual document is already open from the
-//! completion that produced this item. If the downstream server has since
-//! restarted (or the connection was recreated), the resolve fails and we
-//! return the unresolved item with envelope intact: graceful degradation.
-//! The same degradation serves a resolved item whose primary edit is unsafe
-//! for the injection region — escapes it, breaks per-line prefixes, or merges
-//! content into the closing fence (see `resolve_guard_region_end`).
+//! No document sync is sent here — `completionItem/resolve` carries no
+//! `textDocument`, and the completion that produced the item already opened
+//! the virtual document (virt) or synced the host one (host). If the
+//! downstream server has since restarted (or the connection was recreated),
+//! the resolve fails and we return the unresolved item with envelope intact:
+//! graceful degradation.
+//!
+//! Two paths share that degradation. The VIRT path translates coordinates and
+//! additionally serves the unresolved item when the resolved primary edit is
+//! unsafe for the injection region — escapes it, breaks per-line prefixes, or
+//! merges content into the closing fence (see `resolve_guard_region_end`). The
+//! HOST path (#958) forwards verbatim: its item is already in host
+//! coordinates, so neither the translation nor that region guard applies.
 
 use std::sync::Arc;
 
@@ -36,9 +42,11 @@ impl LanguageServerPool {
     /// Route a `completionItem/resolve` request to the origin downstream server.
     ///
     /// Strips the Kakehashi envelope to identify the origin server, looks up
-    /// the server config from `settings`, and delegates to
-    /// `send_completion_resolve_request`. If any routing step fails (no envelope,
-    /// server not configured), the item is returned as-is.
+    /// the server config from `settings`, and delegates to whichever path the
+    /// envelope's layer selects: `send_host_completion_resolve` (verbatim) for
+    /// a host-layer item, `send_completion_resolve_request` (coordinate
+    /// translation + region guard) otherwise. If any routing step fails (no
+    /// envelope, server not configured), the item is returned as-is.
     pub(crate) async fn dispatch_completion_resolve(
         &self,
         mut item: CompletionItem,
@@ -101,12 +109,14 @@ impl LanguageServerPool {
     ) -> CompletionItem {
         let server_name = &envelope.origin;
         // `host_uri` comes from client-supplied `data` (the resolve params echo
-        // the item's envelope), so a malformed value must fail soft, NOT fall
-        // through to `get_or_create_connection(.., None)` — a `None` document
-        // hint routes to a rootless client-fallback / shared key that could run
-        // the resolve against the wrong workspace. The bridge only ever mints a
-        // valid `Url::as_str()` here, so a parse failure means a corrupt or
-        // foreign envelope.
+        // the item's envelope), so an unparseable value fails soft rather than
+        // falling through to `get_or_create_connection(.., None)`, whose `None`
+        // document hint routes to the rootless client-fallback key. The bridge
+        // only ever mints a valid `Url::as_str()` here, so a parse failure means
+        // a corrupt or foreign envelope. This rejects only UNPARSEABLE strings:
+        // a well-formed non-file URL parses, then fails root resolution and
+        // lands on that same fallback key anyway — the host path is fail-soft
+        // throughout, so that costs a wasted round trip, not correctness.
         let Ok(host_url) = Url::parse(&envelope.host_uri) else {
             warn!(
                 target: "kakehashi::bridge",
@@ -131,6 +141,15 @@ impl LanguageServerPool {
             }
         };
         if !handle.has_capability("completionItem/resolve") {
+            // Anomalous, unlike on the virt path (which envelopes
+            // unconditionally): a host envelope is minted ONLY for a server
+            // that advertised resolve, so reaching here means a respawn
+            // changed capabilities (or the handle is still initializing).
+            warn!(
+                target: "kakehashi::bridge",
+                "completionItem/resolve: host server {server_name:?} no longer advertises \
+                 resolveProvider; returning unresolved"
+            );
             re_envelope_item(&mut item, &envelope);
             return item;
         }
@@ -235,7 +254,11 @@ impl LanguageServerPool {
     /// parse the reply. `None` on every failure (registration, send, transport,
     /// error/malformed response) — the callers own the fail-soft policy of
     /// returning the unresolved item with its envelope restored. The upstream
-    /// registry entry is removed on every exit.
+    /// registry entry is removed on every `return`; a future DROPPED at the
+    /// response await leaks it, since (unlike the layer-walk arms) this has no
+    /// `UpstreamRegistrySweepGuard` above it — `completion_resolve_impl` calls
+    /// the dispatch directly rather than through `run_layer_race`. Pre-existing
+    /// and unchanged by the host path; noted so the claim is not read as RAII.
     async fn send_completion_resolve_on_handle(
         &self,
         handle: &Arc<ConnectionHandle>,

@@ -18,8 +18,10 @@ impl Kakehashi {
     /// Handle a `completionItem/resolve` request.
     ///
     /// Delegates to the pool's `dispatch_completion_resolve`, which strips the
-    /// envelope, routes to the origin server, transforms coordinates, and
-    /// re-envelopes the result. Falls back gracefully at every failure point.
+    /// envelope, routes to the origin server, and re-envelopes the result —
+    /// transforming coordinates on the virt path only, since a host-layer item
+    /// is already in host coordinates. Falls back gracefully at every failure
+    /// point.
     pub(crate) async fn completion_resolve_impl(
         &self,
         params: CompletionItem,

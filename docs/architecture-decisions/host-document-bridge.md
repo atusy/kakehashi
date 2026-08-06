@@ -28,7 +28,10 @@ Partially implemented:
   no per-method request builders or response transformers. Handlers run the
   layer walk (`Kakehashi::walk_layers`, cross-layer-aggregation,
   `preferred` semantics): layers are tried lazily in `priorities` — by default
-  virt first, host as fallback. Covered: definition, hover, declaration,
+  virt first, host as fallback. Two methods need per-server identity in the
+  host arm and so build their own (codeAction, for the `"{title} — {server}"`
+  suffix; completion, for the resolve-routing envelope), calling
+  `walk_layer_futures` / `walk_layers_by_strategy` with it. Covered: definition, hover, declaration,
   typeDefinition, implementation, references, completion, signatureHelp,
   documentHighlight, rename, prepareRename, linkedEditingRange, moniker,
   inlayHint, documentSymbol, documentLink, foldingRange, codeLens,
@@ -42,7 +45,8 @@ Partially implemented:
   too (marked `host_layer`, so the resolve forwards VERBATIM — no coordinate
   translation and no injection-region edit guard), but only for a server that
   advertises `completionItem/resolve`. Without that capability the items stay
-  bare and a resolve falls back gracefully (item returned unresolved). Formatting additionally supports the cross-layer
+  bare and a resolve falls back gracefully (item returned unresolved).
+  Formatting additionally supports the cross-layer
   `concatenated` pipeline: virt region edits apply first, the host
   formatter formats the intermediate text, and the chain collapses into one
   whole-document replacement edit. During that pipeline the host server's
