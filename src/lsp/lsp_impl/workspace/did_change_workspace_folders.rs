@@ -39,7 +39,6 @@ impl Kakehashi {
             first_folder.as_ref().map(|folder| &folder.uri),
             self.settings_manager.folderless_root_path(),
         );
-        self.settings_manager.set_root_path(root_path);
 
         // An explicit `--config-file` replaces the whole config-file stack, so
         // the project layer at the workspace root is never consulted and no
@@ -49,10 +48,14 @@ impl Kakehashi {
         // — which still anchors relative paths — and stopping there is the whole
         // of it.
         if crate::config::expand::config_file_override().is_some() {
+            self.settings_manager.set_root_path(root_path);
             return;
         }
 
-        let root_path = self.settings_manager.root_path().as_ref().clone();
+        // The root stays local until the settings derived from it are the ones
+        // in effect. Publishing it earlier would leave a rejected reload with
+        // the new root over the old snapshot, so the next pushed layer would
+        // anchor to a workspace the settings in effect know nothing about.
         let client_override = self.client_settings_override.load_full();
         let outcome = load_settings(
             root_path.as_deref(),
@@ -77,6 +80,7 @@ impl Kakehashi {
         ) {
             Ok(settings) => {
                 let warnings = Self::misconfigured_settings_warnings(&settings);
+                self.settings_manager.set_root_path(root_path);
                 self.apply_raw_settings_locked(&reload, raw, settings).await;
                 drop(reload);
                 self.warn_on_misconfigured_settings(&warnings).await;
