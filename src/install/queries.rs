@@ -162,20 +162,6 @@ pub fn install_queries_with_dependencies(
     )
 }
 
-pub fn install_queries_with_dependencies_after_install_started(
-    language: &str,
-    data_dir: &Path,
-    force: bool,
-) -> Result<QueryInstallResult, QueryInstallError> {
-    install_queries_with_dependencies_from_with_http_policy(
-        NVIM_TREESITTER_QUERIES_URL,
-        language,
-        data_dir,
-        force,
-        QueryHttpPolicy::HttpsOnly,
-    )
-}
-
 /// Stage the queries for `language` and its `; inherits:` chain from
 /// `base_url`, leaving publication to the caller.
 ///

@@ -198,30 +198,63 @@ fn resolve_data_dir(env_fn: impl Fn(&str) -> Option<String>) -> Option<PathBuf> 
 }
 
 /// Result of installing a language (both parser and queries).
+///
+/// A language is installed as a unit, so a result carries either both paths or
+/// neither: a `None` path with no matching error means that half was never
+/// published because the other half failed.
 #[derive(Debug)]
-pub(crate) struct InstallResult {
+pub struct InstallResult {
     /// Path where the parser was installed, if successful.
-    pub(crate) parser_path: Option<PathBuf>,
+    pub parser_path: Option<PathBuf>,
     /// Path where queries were installed, if successful.
-    pub(crate) queries_path: Option<PathBuf>,
+    pub queries_path: Option<PathBuf>,
     /// Error message if parser install failed.
-    pub(crate) parser_error: Option<String>,
+    pub parser_error: Option<String>,
     /// Error message if queries install failed.
-    pub(crate) queries_error: Option<String>,
+    pub queries_error: Option<String>,
 }
 
 impl InstallResult {
     /// Check if the installation was fully successful.
-    pub(crate) fn is_success(&self) -> bool {
+    pub fn is_success(&self) -> bool {
         self.parser_error.is_none() && self.queries_error.is_none()
     }
 }
 
-/// Install a language synchronously (both parser and queries).
+/// Options for installing one language's parser and queries.
+pub struct LanguageInstallOptions {
+    /// Base data directory the parser and queries are installed into.
+    pub data_dir: PathBuf,
+    /// Reinstall artifacts that are already present.
+    pub force: bool,
+    /// Print progress details to stderr.
+    pub verbose: bool,
+    /// Bypass the parser metadata cache.
+    pub no_cache: bool,
+    /// How to compile the parser source (see [`parser::ParserCompile`]).
+    pub compile: parser::ParserCompile,
+}
+
+/// Install a language's parser and queries as a unit.
 ///
-/// Production callers pass [`queries::NVIM_TREESITTER_QUERIES_URL`]. Tests
-/// can inject other HTTPS endpoints; local HTTP fixtures use a test-only
-/// wrapper below so production downloads stay HTTPS-only.
+/// Both halves are prepared before either is published, so a failure leaves the
+/// data directory exactly as it was rather than installing one half and
+/// reporting the other as an error.
+pub fn install_language(language: &str, options: &LanguageInstallOptions) -> InstallResult {
+    install_language_with_query_stager(
+        language,
+        options,
+        queries::NVIM_TREESITTER_QUERIES_URL,
+        queries::stage_queries_with_dependencies_from,
+    )
+}
+
+/// Install a language synchronously, downloading queries from `queries_base_url`.
+///
+/// Production goes through [`install_language`]; tests use this to point at a
+/// fixture server. Local HTTP fixtures need the test-only wrapper below so
+/// production downloads stay HTTPS-only.
+#[cfg(test)]
 fn install_language_blocking(
     language: &str,
     data_dir: &std::path::Path,
@@ -229,22 +262,24 @@ fn install_language_blocking(
     queries_base_url: &str,
     compile: parser::ParserCompile,
 ) -> InstallResult {
-    install_language_blocking_with_query_stager(
+    install_language_with_query_stager(
         language,
-        data_dir,
-        force,
+        &LanguageInstallOptions {
+            data_dir: data_dir.to_path_buf(),
+            force,
+            verbose: false,
+            no_cache: false,
+            compile,
+        },
         queries_base_url,
-        compile,
         queries::stage_queries_with_dependencies_from,
     )
 }
 
-fn install_language_blocking_with_query_stager(
+fn install_language_with_query_stager(
     language: &str,
-    data_dir: &std::path::Path,
-    force: bool,
+    options: &LanguageInstallOptions,
     queries_base_url: &str,
-    compile: parser::ParserCompile,
     stage_queries: fn(
         &str,
         &str,
@@ -252,6 +287,8 @@ fn install_language_blocking_with_query_stager(
         bool,
     ) -> Result<queries::StagedQueryInstall, queries::QueryInstallError>,
 ) -> InstallResult {
+    let data_dir = options.data_dir.as_path();
+    let force = options.force;
     let mut result = InstallResult {
         parser_path: None,
         queries_path: None,
@@ -291,17 +328,16 @@ fn install_language_blocking_with_query_stager(
         }
     };
 
-    // For async/auto-install, always use cache (background operation)
     let parser_options = parser::InstallOptions {
         data_dir: data_dir.to_path_buf(),
         force,
-        verbose: false,
-        no_cache: false,
+        verbose: options.verbose,
+        no_cache: options.no_cache,
         // Caller-chosen: the killable subprocess re-execs this binary's
         // `__compile-parser`, so it is valid only when `current_exe()` is the
         // kakehashi binary. The production caller (LSP auto-install) is, and asks
         // for it; test/embedder callers pass InProcess.
-        compile,
+        compile: options.compile,
     };
     let staged_parser = match parser::stage_parser(language, &parser_options) {
         Ok(staged) => staged,
@@ -365,12 +401,17 @@ pub(crate) async fn install_language_async(
 ) -> InstallResult {
     // Run blocking install operations in a separate thread pool
     tokio::task::spawn_blocking(move || {
-        install_language_blocking(
+        install_language(
             &language,
-            &data_dir,
-            force,
-            queries::NVIM_TREESITTER_QUERIES_URL,
-            compile,
+            &LanguageInstallOptions {
+                data_dir,
+                force,
+                // Auto-install runs in the background: no progress chatter on
+                // the server's stderr, and always use the metadata cache.
+                verbose: false,
+                no_cache: false,
+                compile,
+            },
         )
     })
     .await
@@ -390,12 +431,16 @@ fn install_language_blocking_allowing_http_queries_for_tests(
     queries_base_url: &str,
     compile: parser::ParserCompile,
 ) -> InstallResult {
-    install_language_blocking_with_query_stager(
+    install_language_with_query_stager(
         language,
-        data_dir,
-        force,
+        &LanguageInstallOptions {
+            data_dir: data_dir.to_path_buf(),
+            force,
+            verbose: false,
+            no_cache: false,
+            compile,
+        },
         queries_base_url,
-        compile,
         queries::stage_queries_with_dependencies_from_allowing_http_for_tests,
     )
 }
