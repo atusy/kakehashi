@@ -177,19 +177,24 @@ fn config_root_path(root: Option<ClientRoot<'_>>) -> (Option<std::path::PathBuf>
     }
 }
 
-/// Kakehashi's root for a session whose first workspace folder is now `folder`,
-/// where `folderless` is [`SettingsManager::folderless_root_path`].
+/// Kakehashi's root once the client's folder list has changed: the current first
+/// folder, else `folderless` — the rungs `initialize` resolved below
+/// `workspaceFolders`.
 ///
-/// This is [`config_root_path`] with the top rung supplied by the *current*
-/// folder list rather than the one `initialize` received, so a folder change
-/// resolves the root the same way the handshake did — including the process-CWD
-/// fallback for a folder URI that names no file path.
-pub(super) fn config_root_for_first_folder(
+/// Deliberately **not** [`config_root_path`]: this ladder stops at roots the
+/// client named and never reaches the process CWD. That last rung exists so a
+/// session opened with no workspace at all can still find a configuration; it is
+/// a property of how the server was launched, not of the workspace. Migrating an
+/// established session to the launch directory — where an unrelated
+/// `kakehashi.toml` may name parser libraries to load — is not something closing
+/// a folder should do. A client that named no other root gets no project layer,
+/// which is what it had before it opened the folder.
+pub(super) fn config_root_after_folder_change(
     folder: Option<&Uri>,
     folderless: Option<std::path::PathBuf>,
 ) -> Option<std::path::PathBuf> {
     match folder {
-        Some(uri) => config_root_path(Some(ClientRoot::WorkspaceFolder(uri))).0,
+        Some(uri) => ClientRoot::WorkspaceFolder(uri).to_file_path(),
         None => folderless,
     }
 }
@@ -322,9 +327,12 @@ impl Kakehashi {
         // The root a later `didChangeWorkspaceFolders` falls back to once it
         // empties the folder list: the same ladder minus its top rung, since a
         // session that loses its last folder ends up where a session that never
-        // had one starts.
-        self.settings_manager
-            .set_folderless_root_path(config_root_path(client_root_without_folders(&params)).0);
+        // had one starts. Resolved here because `params` does not outlive this
+        // request, and without `config_root_path`'s process-CWD rung — see
+        // `config_root_after_folder_change`.
+        self.settings_manager.set_folderless_root_path(
+            client_root_without_folders(&params).and_then(|root| root.to_file_path()),
+        );
 
         // Forward root_uri and workspace_folders to bridge pool for downstream server initialization
         let workspace_folders_for_bridge =
@@ -2256,6 +2264,57 @@ mod tests {
             object.insert(key.clone(), field.clone());
         }
         serde_json::from_value(value).expect("valid initialize params")
+    }
+
+    /// The folder-change ladder resolves the current first folder, exactly as
+    /// the handshake resolves `workspaceFolders[0]`.
+    #[test]
+    fn config_root_after_folder_change_uses_the_current_first_folder() {
+        use std::path::PathBuf;
+        use std::str::FromStr as _;
+        let uri = Uri::from_str("file:///current").expect("a file URI");
+
+        assert_eq!(
+            config_root_after_folder_change(Some(&uri), Some(PathBuf::from("/folderless"))),
+            Some(PathBuf::from("/current")),
+            "a folder outranks the folderless fallback",
+        );
+    }
+
+    /// An emptied folder list falls back to the rungs `initialize` resolved
+    /// below `workspaceFolders`, and to nothing when the client named none.
+    #[test]
+    fn config_root_after_folder_change_falls_back_when_no_folder_remains() {
+        use std::path::PathBuf;
+
+        assert_eq!(
+            config_root_after_folder_change(None, Some(PathBuf::from("/folderless"))),
+            Some(PathBuf::from("/folderless")),
+        );
+        assert_eq!(
+            config_root_after_folder_change(None, None),
+            None,
+            "a client that named no other root gets no project layer",
+        );
+    }
+
+    /// The launch directory is a handshake-time last resort, not somewhere a
+    /// folder change may migrate an established session: a folder URI naming no
+    /// file path leaves the session rootless rather than reaching the CWD rung
+    /// that `config_root_path` ends with.
+    #[test]
+    fn config_root_after_folder_change_never_reaches_the_process_cwd() {
+        use std::path::PathBuf;
+        use std::str::FromStr as _;
+        let uri = Uri::from_str("untitled:Untitled-1").expect("a non-file URI");
+
+        assert_eq!(config_root_after_folder_change(Some(&uri), None), None);
+        assert_eq!(
+            config_root_after_folder_change(Some(&uri), Some(PathBuf::from("/folderless"))),
+            None,
+            "an unresolvable folder does not fall through to the folderless rungs \
+             either — the handshake ladder stops at its top rung too",
+        );
     }
 
     #[test]

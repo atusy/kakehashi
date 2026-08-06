@@ -5,7 +5,7 @@ use tower_lsp_server::ls_types::DidChangeWorkspaceFoldersParams;
 use crate::config::WorkspaceSettings;
 use crate::lsp::{SettingsSource, load_settings};
 
-use super::super::{Kakehashi, lock_settings_reload};
+use super::super::{Kakehashi, lifecycle::config_root_after_folder_change, lock_settings_reload};
 
 impl Kakehashi {
     pub(crate) async fn did_change_workspace_folders_impl(
@@ -26,15 +26,16 @@ impl Kakehashi {
         // snapshot the other has already replaced.
         let reload = lock_settings_reload().await;
 
-        // An emptied folder list does not leave the session rootless: it puts it
-        // exactly where a client that never sent a folder starts, so the rungs
-        // below `workspaceFolders` answer, as they did at initialize.
+        // An emptied folder list does not leave the session rootless when the
+        // client named another root: the rungs below `workspaceFolders` answer,
+        // as they did at initialize. A client that named none gets no project
+        // layer rather than the launch directory.
         let first_folder = self
             .bridge
             .pool()
             .workspace_folders()
             .and_then(|folders| folders.first().cloned());
-        let root_path = super::super::lifecycle::config_root_for_first_folder(
+        let root_path = config_root_after_folder_change(
             first_folder.as_ref().map(|folder| &folder.uri),
             self.settings_manager.folderless_root_path(),
         );
