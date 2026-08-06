@@ -701,17 +701,35 @@ mod tests {
             .await
     }
 
-    /// Whether a dispatch actually reached a downstream.
+    /// Assert a dispatch reached a downstream — it parks waiting for a reply the
+    /// sink process never writes, so not settling IS the send.
     ///
-    /// The distinction the refusal tests need, and the one a bare `is_none()`
-    /// cannot make: every branch in this file fails soft to `None`, so "returned
-    /// null" says nothing about whether the command was sent. A forwarded
-    /// command parks waiting for a reply the sink process never writes; a
-    /// refusal returns before that.
-    async fn reached_a_downstream(fut: impl std::future::Future<Output = Option<Value>>) -> bool {
-        tokio::time::timeout(std::time::Duration::from_millis(300), fut)
-            .await
-            .is_err()
+    /// The distinction these tests need, and the one a bare `is_none()` cannot
+    /// make: every branch in this file fails soft to `None`, so "returned null"
+    /// says nothing about whether the command was sent.
+    ///
+    /// The two directions get different budgets on purpose. Proving a send only
+    /// needs long enough for a refusal to have finished (microseconds of map and
+    /// mutex work), so it is short. Proving a REFUSAL waits for the future to
+    /// settle, and a budget that is merely generous would turn a loaded machine
+    /// into a red suite — so that side gets a budget no refusal can plausibly
+    /// exceed while still being far below "parks forever".
+    async fn assert_reached_downstream(fut: impl std::future::Future<Output = Option<Value>>) {
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(250), fut)
+                .await
+                .is_err(),
+            "expected the command to be forwarded, but the dispatch settled — \
+             which only the refusal branches do"
+        );
+    }
+
+    async fn assert_refused(fut: impl std::future::Future<Output = Option<Value>>) {
+        let settled = tokio::time::timeout(std::time::Duration::from_secs(10), fut).await;
+        match settled {
+            Ok(result) => assert!(result.is_none(), "a refusal must answer null"),
+            Err(_) => panic!("expected a refusal, but the dispatch forwarded and parked"),
+        }
     }
 
     #[tokio::test]
@@ -726,10 +744,8 @@ mod tests {
         seed(&pool, &ruff, ConnectionState::Ready, &["source.fixAll"]).await;
         seed(&pool, &eslint, ConnectionState::Ready, &["source.fixAll"]).await;
 
-        assert!(
-            !reached_a_downstream(dispatch(&pool, "source.fixAll")).await,
-            "picking either of two live advertisers is the #823 defect itself"
-        );
+        // Picking either of two live advertisers is the #823 defect itself.
+        assert_refused(dispatch(&pool, "source.fixAll")).await;
     }
 
     #[tokio::test]
@@ -744,10 +760,8 @@ mod tests {
         // Only ruff is live; eslint is a registered-but-dead collision.
         seed(&pool, &ruff, ConnectionState::Ready, &["source.fixAll"]).await;
 
-        assert!(
-            reached_a_downstream(dispatch(&pool, "source.fixAll")).await,
-            "a dead collision must not cost the one advertiser that can serve it"
-        );
+        // A dead collision must not cost the one advertiser that can serve it.
+        assert_reached_downstream(dispatch(&pool, "source.fixAll")).await;
     }
 
     #[tokio::test]
@@ -770,17 +784,15 @@ mod tests {
             .register(&ruff, vec![shaped.to_string()]);
         seed(&pool, &ruff, ConnectionState::Ready, &[shaped]).await;
 
-        assert!(
-            reached_a_downstream(pool.dispatch_execute_command(
-                params(shaped),
-                &WorkspaceSettings::default(),
-                None,
-            ))
-            .await,
-            "the name must be treated as the raw palette command it is; decoding \
-             it first would have stripped it to `reload` and aimed at `srv`, \
-             which nothing here serves"
-        );
+        // Treated as the raw palette command it is. Decoding it first would
+        // have stripped it to `reload` and aimed at `srv`, which nothing serves
+        // — so the dispatch would settle instead of parking.
+        assert_reached_downstream(pool.dispatch_execute_command(
+            params(shaped),
+            &WorkspaceSettings::default(),
+            None,
+        ))
+        .await;
     }
 
     /// Settings in which exactly the named servers can be spawned.
@@ -815,18 +827,17 @@ mod tests {
         );
 
         let settings = settings_with_servers(&["ruff"]);
-        let reached = reached_a_downstream(pool.dispatch_palette_command(
-            params("source.fixAll"),
-            &settings,
-            None,
-        ))
+        // `true` exits immediately, so the revive cannot succeed either way;
+        // what this pins is that the dispatcher got as far as TRYING to revive
+        // `ruff` rather than refusing on a phantom collision. A refusal never
+        // reaches the pool at all.
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_millis(250),
+            pool.dispatch_palette_command(params("source.fixAll"), &settings, None),
+        )
         .await;
-
-        // The spawn of `true` exits immediately, so the command cannot complete
-        // either way; what this pins is that the dispatcher got as far as trying
-        // to revive `ruff` rather than refusing on a phantom collision.
         assert!(
-            reached || !pool.connections().await.is_empty(),
+            !pool.connections().await.is_empty(),
             "a server removed from config must not out-vote the one still configured"
         );
     }
