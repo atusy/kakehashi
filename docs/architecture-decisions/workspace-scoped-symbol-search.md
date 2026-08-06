@@ -73,10 +73,11 @@ WORKSPACE-SCOPED  (workspace/symbol)
 
 Three facts in the existing code make the feature tractable anyway:
 
-- `BridgeCoordinator::resolve_virtual_uri(uri) -> Option<(host_url, region_id)>`
-  is a **global** virtual→host reverse map (it is what `window/showDocument`
-  translation already uses), and `resolve_region_offset` rebuilds the
-  `RegionOffset` from the live parse for any given `host_url` and `region_id`.
+- The pool's tracker holds a **global** virtual→host mapping — it is what
+  `window/showDocument` translation reaches through `resolve_virtual_uri` — and
+  the document store keeps **generation-stamped resolved-region snapshots**,
+  from which a region's offset, end, content, and language can be read without
+  re-resolving anything.
 - `LanguageServerPool::connections()` enumerates the pool's connection map.
 - `send_execute_command_on_handle` (`bridge/workspace/execute_command.rs`) is an
   existing precedent for sending a request on a connection **without** a virtual
@@ -522,12 +523,12 @@ arrives between request acceptance and subscription and delivers it on
 subscribe — but because selecting on it is what makes the handler abandon
 promptly rather than only at its next dispatch boundary.
 
-Fan-in cannot live in the `bridge` module, because `resolve_region_offset` is
-`pub(super)` to `lsp_impl`. So unlike every `transform_*_response_to_host`
-function — which is pure because the caller already resolved *the* offset — this
-translator resolves a different offset per entry and must sit where the
-`DocumentStore` / `LanguageCoordinator` / `BridgeCoordinator` handles are, as
-`ShowDocumentTranslator` does.
+Fan-in cannot live in the `bridge` module: it reads the document store's
+resolved-region snapshots, which `lsp_impl` owns. So unlike every
+`transform_*_response_to_host` function — pure because the caller already handed
+it *the* offset — this translator selects a different region's geometry per
+entry and must sit where the `DocumentStore` / `LanguageCoordinator` /
+`BridgeCoordinator` handles are, as `ShowDocumentTranslator` does.
 
 The value crossing that boundary is **typed, not raw JSON**: the bridge module
 owns deserialization for every other bridged request, and this one keeps that
@@ -593,8 +594,8 @@ Region ids deliberately survive edits, so an in-flight response can carry a
 range measured against an older, larger region while offset resolution against
 the current parse still succeeds — and plain range translation performs no
 boundary check, so the result could point into the closing fence or the host
-text after it. `resolve_region_offset` already returns the region's current
-`region_end` alongside the offset, but that bound alone is not enough: a stale
+text after it. The region map already carries each region's current
+`region_end` alongside its offset, but that bound alone is not enough: a stale
 virtual position like `(0, 1000)` inside a region ending on line 5 compares as
 before the end while carrying a column that never existed, and the workspace-edit
 precedent checks only per-line floors and a global endpoint.
@@ -618,9 +619,10 @@ deliberate: a virtual URI that escapes to the editor names a file that does not
 exist on disk, so the symbol is unopenable. This mirrors `window/showDocument`
 translation, which drops the selection it cannot translate.
 
-**Parse freshness is load-bearing here.** `resolve_region_offset` reads the live
+**Parse freshness is load-bearing here.** The region snapshot tracks the live
 parse, and `didChange` clears the tree and reparses off-ingress, so during the
-reparse window it returns `None` for every region of the edited document — which
+reparse window the edited document has no current geometry for any of its
+regions — which
 this classifier would silently turn into "no embedded symbols". The
 whole-document handlers avoid this by calling `ensure_document_parsed` first;
 this method has no target document to name.
@@ -652,9 +654,9 @@ classification.
 Staleness in the other direction is worse and survives any snapshot time, so it
 is closed by a check rather than by timing. A region keeps its ULID across
 edits, but its **injection language can change** — the close path removes the old
-virtual URI and a new one is opened for the new language. `resolve_region_offset`
-resolves by host and region id alone and discards the language, so a stale entry
-naming the *old* URI would still resolve, and a Python result would be
+virtual URI and a new one is opened for the new language. The geometry is keyed
+by host and region id alone, so a stale entry naming the *old* URI would still
+find a live region, and a Python result would be
 translated into a region that is now Rust. So the index must carry each entry's
 **language**, taken from `OpenedVirtualDoc.virtual_uri.language()`, and that
 language must equal the region's current `injection_language`; a mismatch is a
@@ -708,8 +710,8 @@ Sweeping every open document up front instead — alongside the fan-out — was 
 first shape considered and is worse on both axes. It does work for documents no
 result mentions, and it completes up to 30 seconds before the value is used (a
 target may take the full response timeout), so an edit arriving in between
-re-clears the tree and the sweep guarantees nothing. Ensuring immediately before
-resolution and translation closes that gap to the width of one pass.
+re-clears the tree and the sweep guarantees nothing. Ensuring immediately before the
+snapshot is read closes that gap to the width of one pass.
 
 Only documents that **already have a snapshot** are ensured. `ensure_document_parsed`
 asks for a 200ms wait, but `wait_for_current_snapshot` escalates to the
@@ -724,22 +726,14 @@ check and the ensure moves the URI into a fresh, snapshot-less lifetime and the
 outer 200ms timeout**, so the phase's bound is a property of this call site
 rather than an inference about the callee's internal state.
 
-Resolution also **post-checks the snapshot's freshness**. `resolve_region_offset`
-takes an owned snapshot before it consults the tracker and walks the tree, while
-`didChange` updates tracker positions *before* it clears the visible tree — so a
-resolution that reads the tracker just ahead of that update finishes against its
-own stale snapshot and passes both the language and range checks with old
-coordinates.
+**Geometry is read per host, not resolved per entry.** Calling the resolver per
+entry would run the whole injection walk over the host every time —
+`symbols × regions` work, a 2,000-symbol response walking a 100-region host
+2,000 times — while holding a lock that blocks every `didChange` and close for
+it. Memoizing individual ids does not fix that: the first lookup for each
+distinct region still walks, so the worst case stays quadratic.
 
-**Resolution is per host, not per entry.** `resolve_by_region_id` runs the whole
-injection walk over the host on every call, so resolving each entry
-independently would be `symbols × regions` work — a 2,000-symbol response from a
-100-region host would walk that host 2,000 times — while holding a lock that
-blocks every `didChange` and close for it. Memoizing individual ids does not fix
-this: the first lookup for each distinct region still walks, so the worst case
-stays quadratic.
-
-Each host is therefore resolved **once** into a request-local
+Each host's geometry is therefore read **once** into a request-local
 `region_id → (offset, region_end, virtual_content, injection_language)` map,
 built from the **generation-stamped resolved-region snapshot** the document
 store already keeps. When a host has no current snapshot, its entries are
@@ -764,12 +758,26 @@ Every attempt to make that safe produced a worse problem than it solved:
 - Timing out the awaiter does not rescue it; that is precisely the detached-work
   case above.
 
-Dropping instead costs one query's entries for one host, in a state that is
-transient by construction: the pre-warm in pass 2 exists to make the snapshot
-current, and anything still missing self-corrects on the next query. This is the
-same failure kakehashi already accepts for a region invalidated mid-flight, and
-it keeps the whole fan-in **read-only** — no minting, no detached work, no
-unbounded wait, and no global guard held across one.
+Dropping keeps the whole fan-in **read-only** — no minting, no detached work, no
+unbounded wait, and no global guard held across one — which is what makes every
+other guarantee in this section cheap enough to hold.
+
+Its cost is **not** uniformly transient, and this decision does not claim
+otherwise. Usually it is: the pre-warm in pass 2 exists to make the snapshot
+current, and a host caught mid-reparse is served on the next query. But the
+region cache can also be left **persistently** empty. A populate pass refused
+after an epoch race publishes a current snapshot whose resolved regions are
+`None` and marks parsing finished, while injection processing falls back inline
+and still opens the virtual documents — and `ensure_document_parsed` only checks
+that the snapshot is current, so it will not repopulate that field. A host in
+that state has indexable virtual URIs and no geometry, so symbol search silently
+drops it until an unrelated edit forces a reparse.
+
+That is real coverage loss with no signal, and it is accepted here only because
+the alternative was the resolve-inline path rejected above. The durable fixes
+are outside this decision: populate the region cache whenever virtual documents
+exist for a host, or give the cache a repair path an idle reader may trigger
+safely. Either is a better place to spend the effort than making fan-in mutate.
 
 Two identities must hold, not one:
 
@@ -799,6 +807,14 @@ Because the path is read-only, that lock is held only across a map lookup, a
 version comparison, and arithmetic — no parse, no walk, no await on another
 runtime. That is the whole reason it is safe to hold at all.
 
+Keeping it that short requires care with the range validation above, which is
+where the cost hides. The strict position machinery builds a `PositionMapper`
+whose line index scans the whole text, and the codebase documents that as
+O(document). Rebuilding it per symbol under the lock would be
+`symbols × virtual_content` — the same multiplicative shape this section already
+rejected once. One mapper is built **per referenced region**, before the lock is
+taken; only the freshness comparison and the arithmetic happen inside it.
+
 Taking that lock carries an obligation the happy path hides. `edit_lock`
 **creates** an entry unconditionally, so a host that closed between indexing and
 fan-in yields no live `SnapshotView` — and simply dropping the symbol would
@@ -808,12 +824,11 @@ reaches this case routinely, because the index is built from documents that may
 close while other targets are still answering.
 
 A residual race remains and is **accepted**: a `didChange` landing between the
-ensure and the offset resolution clears the tree again, and that entry is
-dropped like any other unresolvable one. Closing it entirely would mean pinning
-a per-document snapshot generation across the whole fan-in and resolving against
-the pinned tree — which would translate results against text the client has
-already replaced. Dropping is the safer failure, and it self-corrects on the
-next query.
+ensure and the freshness check invalidates the geometry, and those entries are
+dropped like any other unresolvable ones. Closing it entirely would mean pinning
+a per-document snapshot across the whole fan-in and translating against the
+pinned text — which would answer with coordinates into text the client has
+already replaced. Dropping is the safer failure.
 
 The response to the client is always an **array**, never `null`, so "no server
 was running", "everything was dropped", and "every target errored or timed out"
@@ -1082,10 +1097,12 @@ Including it would defeat dedup on a field carrying no identity.
 - Fan-in can wait on a parse: the distinct host documents a result addresses are
   ensured before translation. Because they are ensured concurrently the pass
   costs about one 200ms wait rather than one per document (point 5).
-- An edit landing between that ensure and the freshness check still drops the
-  affected entries, as does a host whose resolved-region snapshot is not current
-  when fan-in reaches it. The window is small but not closed, and the failure is
-  silent — the symbols simply are not there.
+- An edit landing between that ensure and the freshness check drops the affected
+  entries. The window is small but not closed, and the failure is silent.
+- A host whose region cache was left empty by a refused populate pass loses its
+  embedded symbols **until an unrelated edit forces a reparse** — not just for
+  one query (point 5). This is the one accepted failure here that is not
+  self-correcting, and it has no signal to the user.
 - `max_fan_out` no longer bounds a query's total fan-out — only each pair's
   contribution — so the only real bound on how many connections one query
   touches is how many are live.
