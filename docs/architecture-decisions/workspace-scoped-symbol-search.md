@@ -403,13 +403,18 @@ cloned entry can also outlive a connection purge. Taken at face value, the walk
 would derive a pair from a `didOpen` the downstream has not seen, or from a
 replaced connection whose documents were never replayed.
 
-The save path already establishes the discipline this needs, and the ordering
-below follows it: snapshot the tracker, then take `connections` **once** and
-hold it across the checks with no `.await` inside, require the handle to be the
-current `Ready` one, and only then consult `is_virtual_doc_open_on_connection`. Holding `connections` is what makes it
-sound — a reverse-index check alone would not, since a purge could swap in a
-fresh `Ready` handle that never opened the document. The lock order is
-`connections` → tracker, matching the respawn purge. This composes with the
+The save path establishes most of the discipline this needs: snapshot the
+tracker, then take `connections` **once** and hold it across the checks with no
+`.await` inside. Holding `connections` is what makes it sound — a membership
+check alone would not, since a purge could swap in a fresh handle that never
+opened the document. The lock order is `connections` → tracker, matching the
+respawn purge.
+
+This method departs from that precedent in one respect, and step 2 below spells
+it out: **currency is confirmed first**, before state, capability or
+configuration. The save path can check liveness first because it only decides
+whether to send; this one also has to decide what a *missing* target means, and
+a stale entry misclassified as a dead connection would be counted as an outage. This composes with the
 stale-handle re-check the send already performs (point 4): the enqueue is
 non-blocking, so both happen under the same lock and only the response is
 awaited outside it.
@@ -732,9 +737,10 @@ fix. Nothing in this design bounds the query at all, which point 9 names as a
         ┌──────────────────────────────────────┐
         │ SELECTION (3s per AWAITED lock, §6)  │
         │ pool-owned batch validator, one lock:│
-        │ Ready only, drop incapable, drop     │
-        │ stale-config, confirm still open on  │
-        │ that exact connection                │
+        │ (a) confirm still current — else it  │
+        │     is STALE, not failed             │
+        │ (b) Ready only, drop incapable, drop │
+        │     stale-config                     │
         │ then: allowlist + per-pair maxFanOut │
         │ NEVER spawns a connection            │
         └──────────────────┬───────────────────┘
