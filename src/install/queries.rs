@@ -1253,18 +1253,7 @@ fn collect_superseded_backups(
 /// replace lock — the operations it covers take that one underneath, and
 /// `flock` blocks a second descriptor even within one process.
 pub fn lock_language(data_dir: &Path, language: &str) -> Result<LanguageLock, QueryInstallError> {
-    validate_safe_language_name(language)?;
-    // The lock lives beside the query directories, so the directory has to
-    // exist to take it. Staging already created it; this also covers a caller
-    // that skipped straight here.
-    let queries_parent = data_dir.join("queries");
-    fs::create_dir_all(&queries_parent)?;
-    let path = queries_parent.join(format!(".{}{}", language, LANGUAGE_LOCK_SUFFIX));
-    let file = fs::OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(false)
-        .open(path)?;
+    let (file, queries_parent) = open_language_lock_file(data_dir, language)?;
     file.lock()?;
     Ok(LanguageLock {
         _file: file,
@@ -1273,43 +1262,43 @@ pub fn lock_language(data_dir: &Path, language: &str) -> Result<LanguageLock, Qu
     })
 }
 
-/// Whether another install is between publishing this language's queries and
-/// committing them.
+/// [`lock_language`] without the wait: `None` when another install holds it.
 ///
-/// Non-blocking, unlike [`lock_language`]: this answers on the LSP's async path,
-/// where waiting on another process is not acceptable. A language someone is
-/// mid-publish on reads as unsettled — its queries can still be rolled back —
-/// so a caller that would otherwise treat it as installed falls through to a
-/// real install instead, and that install queues on the same lock properly.
+/// For callers that must not block — the LSP's async path — and that only need
+/// to know whether the language is settled. A language someone is mid-publish
+/// on can still have those queries rolled back, so "busy" and "could not
+/// probe" both answer no. The guard is returned rather than the answer, because
+/// releasing it before reading the artifacts would put the whole publish back
+/// inside the window.
+pub fn try_lock_language(data_dir: &Path, language: &str) -> Option<LanguageLock> {
+    let (file, queries_parent) = open_language_lock_file(data_dir, language).ok()?;
+    file.try_lock().ok()?;
+    Some(LanguageLock {
+        _file: file,
+        queries_parent,
+        language: language.to_string(),
+    })
+}
+
+/// Open (creating if needed) the file behind a language's lock.
 ///
-/// A language nobody is publishing, and any error taking the probe, read as
-/// settled: this only withholds a shortcut, and failing to take a lock is not
-/// evidence of an install in flight.
-pub fn language_publish_in_flight(data_dir: &Path, language: &str) -> bool {
-    if !is_safe_language_name(language) {
-        return false;
-    }
-    let path = data_dir
-        .join("queries")
-        .join(format!(".{}{}", language, LANGUAGE_LOCK_SUFFIX));
-    if !path.is_file() {
-        return false;
-    }
-    let Ok(file) = fs::OpenOptions::new()
-        .create(false)
+/// The lock lives beside the query directories, so the directory has to exist
+/// to take it. Staging already created it; this also covers a caller that
+/// skipped straight here.
+fn open_language_lock_file(
+    data_dir: &Path,
+    language: &str,
+) -> Result<(fs::File, PathBuf), QueryInstallError> {
+    validate_safe_language_name(language)?;
+    let queries_parent = data_dir.join("queries");
+    fs::create_dir_all(&queries_parent)?;
+    let path = queries_parent.join(format!(".{}{}", language, LANGUAGE_LOCK_SUFFIX));
+    let file = fs::OpenOptions::new()
+        .create(true)
         .write(true)
         .truncate(false)
-        .open(path)
-    else {
-        return false;
-    };
-    match file.try_lock() {
-        Ok(()) => {
-            let _ = file.unlock();
-            false
-        }
-        Err(_) => true,
-    }
+        .open(path)?;
+    Ok((file, queries_parent))
 }
 
 /// Take [`lock_language`] for every language an install depends on.
@@ -1767,26 +1756,25 @@ mod staging_tests {
         );
     }
 
-    /// A language nobody is publishing is settled; one whose lock is held is
-    /// not, because that install can still roll its queries back.
+    /// A language nobody is publishing can be claimed without waiting; one an
+    /// install holds cannot, because that install can still roll it back.
     #[test]
     fn a_publish_in_flight_is_visible_without_waiting_for_it() {
         let temp = TempDir::new().unwrap();
         let data_dir = temp.path();
 
-        assert!(
-            !language_publish_in_flight(data_dir, "lua"),
-            "a language nobody has touched is settled"
-        );
+        let probe = try_lock_language(data_dir, "lua");
+        assert!(probe.is_some(), "a language nobody has touched is settled");
+        drop(probe);
 
         let lock = lock_language(data_dir, "lua").unwrap();
         assert!(
-            language_publish_in_flight(data_dir, "lua"),
+            try_lock_language(data_dir, "lua").is_none(),
             "a held lock means an install is between publishing and committing"
         );
         drop(lock);
         assert!(
-            !language_publish_in_flight(data_dir, "lua"),
+            try_lock_language(data_dir, "lua").is_some(),
             "and it is settled again once that install is done"
         );
     }
