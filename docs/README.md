@@ -847,11 +847,17 @@ kakehashi language uninstall --all --force
 
 Installing a language is all-or-nothing. The parser, the language's query
 files, and every query file it pulls in through `; inherits:` are prepared
-first, and only made visible once all of them are ready — so a failed install
-(no network, an unsupported language, a compile error) leaves the data
-directory exactly as it was. Re-running the command is always safe and never
-needs `--force`: whatever is already installed is left alone, and only the
-missing pieces are fetched.
+first, and only made visible once all of them are ready. A failed install — no
+network, an unsupported language, a compile error, or a base language that
+cannot be downloaded — publishes neither half, so whatever was installed before
+is still exactly what is installed. (Bookkeeping is not covered by that: the
+parser metadata cache, the `parser/` and `queries/` directories, and the
+per-language lock files may be created or refreshed either way.)
+
+Re-running the command is safe: whatever is already installed is left alone,
+and the missing halves — including the queries of a base language it inherits —
+are fetched without `--force`. Use `--force` to *replace* something already on
+disk, such as a parser that fails to load.
 
 ### Configuration Management
 
@@ -1153,7 +1159,8 @@ RUST_LOG=kakehashi::lock_recovery=warn kakehashi
 ### Queries not working for TypeScript/JavaScript
 
 These languages use query inheritance. Re-run the install to fetch any base
-queries that are missing:
+queries that are missing; if a base language cannot be downloaded the install
+fails rather than leaving a dangling `; inherits:`:
 
 ```bash
 kakehashi language install typescript
