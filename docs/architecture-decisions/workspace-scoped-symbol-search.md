@@ -356,10 +356,10 @@ opened:
 - **Injection language**: `VirtualDocumentUri::language()` for a virtual
   document, or `_self` for a host-tier open.
 
-Reading admission records rather than live document tracking is what keeps
-`host_documents` and the tracker off the selection path for *discovery*; they
-are still consulted for validation, but a candidate no longer disappears merely
-because its document closed.
+Reading admission records keeps both the tracker and `host_documents` off the
+query path **entirely** — validation as much as discovery. Consulting either
+during validation would undo the point, since a candidate would disappear again
+the moment its document closed.
 
 Deriving the injection axis from configuration instead — concrete bridge keys
 plus the languages servers declare — looks equivalent and is not. It loses every
@@ -372,9 +372,10 @@ the region's actual `"python"` and lets `handles_language` recognize `"*"`.
 Starting from open virtual documents restores exactly that: the language is the
 region's real one.
 
-`OpenedVirtualDoc` also carries the `connection_key` the document was opened on,
-so the walk can pair each open virtual document with its host document's
-language directly rather than taking a cross product of the two axes.
+`OpenedVirtualDoc` carries the `connection_key` the document was opened on,
+which is what a record captures at open time — the pair and the exact
+connection, together, from one event, rather than a cross product of two axes
+read at different moments.
 
 `_self` needs its **own** source. Host-bridge opens are not `OpenedVirtualDoc`s
 — they live in the pool's `host_documents`, keyed by `(uri, ConnectionKey)` — so
@@ -417,6 +418,12 @@ existing configuration from becoming a silent no-op here.
 **No candidate is waited for; the only waits are lock acquisitions and the
 final barrier.** The order is fixed:
 
+0. If the method is **disabled** — `workspaceSymbolMaxFanOut = 0` — return `[]`
+   immediately, before any lock is taken. "Disable entirely" has to mean that
+   literally: applying zero at the end would make a disabled method still walk
+   admissions, take `connections`, and wait on barriers, any of which can expire
+   and turn a deliberate disable into a request error.
+
 1. **Read the admission records** — `ConnectionKey → the pairs it serves`. This
    is the *whole* of discovery. Nothing here consults the document tracker,
    which is the point: `didClose` removes tracking while leaving the connection
@@ -447,8 +454,17 @@ The ceiling comes **after** the barrier, not before, because a cap allocated to
 connections that then fail their barrier wastes its slots: with a ceiling of one
 and a first-ordered connection whose repair fails, the healthy connections below
 it would already have been truncated away and the query would error despite
-having had a sendable target. Capping what is actually sendable avoids needing a
-backfill rule at all.
+having had a sendable target.
+
+For the same reason each candidate's handle is **re-checked as its slot is
+assigned**, not only when it was validated. The barrier is keyed by
+`ConnectionKey`, not by handle identity, so a connection can pass its barrier
+and be replaced before the cap runs — consuming a slot and then failing the
+stale-handle check at enqueue, after the healthy connections below it were
+truncated. Re-checking at assignment keeps the cap spent on connections that
+still exist, which is what makes a backfill rule unnecessary rather than merely
+unstated. A candidate that fails it is dropped and the slot goes to the next in
+order.
 
 The validator is **pool-owned** for two reasons. It is the only way to do all of
 this under one acquisition — `launch_config` and its comparator are private to
@@ -474,14 +490,12 @@ Step 5 exists because a connection reaches `Ready` *before* its virtual
 documents are replayed after a respawn, so a query landing in that window would
 under-report that server's embedded symbols indistinguishably from "no matches".
 
-It closes **part** of that window, not all of it. Selection admits a candidate
-only if the tracker still records the document on that connection, and a respawn
-purge removes exactly those records — so a query arriving between the purge and
-the first replayed `didOpen` discovers no candidate at all and never reaches the
-barrier. The barrier helps once a target is discoverable but not yet replayed;
-before that, the connection is invisible to selection. Both halves have the same
-root cause and the same fix — retaining a connection's admitting policy
-independently of document tracking (point 7) — so neither is patched here.
+It closes that window because admission records survive the purge. A selection
+that went through the tracker could not: the purge removes exactly the records
+such a selection depends on, so a query arriving between the purge and the first
+replayed `didOpen` would have found no candidate and never reached the barrier
+at all. Keyed by `ConnectionKey`, the admission stays, the target stays
+discoverable, and the barrier is what decides whether it is ready to answer.
 The barrier is **bounded to two seconds** and enforced with a timeout, and
 awaiting the survivors concurrently costs that bound once for the whole query —
 not once per target.
@@ -585,9 +599,9 @@ Within a pair it works as everywhere else: `truncate_entries` truncates a
 flattened name list in walk order, keeping the highest-priority N names.
 
 A surviving name admits **only the connections that pair actually opened**, not
-every live connection of that server. The tracker records each open virtual
-document's `ConnectionKey` next to its language, so a pair's targets are known
-exactly and never derived by expanding a name across roots. That distinction is
+every live connection of that server. Each admission record pairs a language
+pair with the exact `ConnectionKey` it was opened on, so a pair's targets are
+known and never derived by expanding a name across roots. That distinction is
 load-bearing: expanding would let a Python pair that admits A reach `A/root2`
 even when the pair that actually opened A on root2 excluded it with
 `priorities = []` — turning `priorities` from a policy boundary into a hint, and
@@ -601,30 +615,23 @@ request, contradicting the setting's documented promise to "cap the number of
 concurrent server requests" — a generic load control quietly losing its
 load-controlling property in exactly the method most able to fan out.
 
-A second, global cap after dedup was tried and **rejected**. It cannot be given
-coherent semantics:
-
-- An uncapped pair must mean "no limit" — that is what `None` means everywhere
-  else — so any workspace containing one uncapped pair has no global cap at all.
-  Since uncapped is the default, the cap would be inert in almost every real
-  configuration, and present only where a user capped *something*, throttling
-  languages they never mentioned.
-- It has no principled victim order. `priorities` exists per pair and pairs may
-  rank the same server differently; merging those rankings is exactly what this
-  decision rejects elsewhere as unprincipled. Falling back to walk order is
-  worse than arbitrary — open documents and connections live in hash maps, so
-  which connections survived would vary run to run.
-
 So `max_fan_out` stays a **per-pair name-selection rule** here and bounds
-neither the query's requests nor its connections. That is a real divergence from
-its documented promise to "cap the number of concurrent server requests", and
-the fix is documentation, not a mechanism: the setting's description must say so
-(point 8). What actually bounds the total is the live-connection set (point 7).
-A workspace-level ceiling therefore **ships with the feature**, as its own
-top-level setting rather than smuggled into this one. Leaving it out would mean
-advertising the widest fan-out kakehashi has with its only load control
-documented as applying and not applying — and documentation cannot restore a
-guarantee the code stopped providing.
+neither the query's requests nor its connections — a real divergence from its
+documented promise to "cap the number of concurrent server requests", which the
+setting's description must record (point 8).
+
+Deriving a global cap from the per-pair values was tried and **rejected**: an
+uncapped pair must mean "no limit", so any workspace containing one has no
+global cap at all — and uncapped is the default, making such a cap inert in
+almost every real configuration and active only where a user capped something
+unrelated. It also has no principled victim order, since pairs may rank the same
+server differently and merging those rankings is what this decision rejects
+elsewhere.
+
+What ships instead is a **separate top-level ceiling**, `workspaceSymbolMaxFanOut`.
+Leaving the query unbounded was the alternative, and it is not acceptable for
+the widest fan-out kakehashi has: documentation cannot restore a guarantee the
+code stopped providing.
 
 It is a single value, which is what makes it definable where a derived global
 cap was not: there is no "uncapped pair means infinity" to reconcile and no
@@ -675,8 +682,8 @@ iteration order — the nondeterminism this ordering exists to remove.
         │ SELECTION (3s per AWAITED lock, §6)  │
         │ pool-owned batch validator, one lock:│
         │ Ready only, drop incapable, drop     │
-        │ stale-config, confirm still open on  │
-        │ that exact connection                │
+        │ stale-config. No document check —    │
+        │ that is what admissions replaced.    │
         │ then: allowlist + per-pair maxFanOut │
         │ NEVER spawns a connection            │
         └──────────────────┬───────────────────┘
@@ -1375,13 +1382,39 @@ for three different reasons and only one of them preserves meaning:
 - **Configuration change or removal** — the server's spawn-time config changed,
   or it left the config entirely. Records are **cleared**: the pairs that
   admitted the old executable say nothing about a differently-configured one.
-- **Client workspace invalidation, or a changed client root under
-  `ClientFallback`** — that key is reused across workspaces, so retaining
-  records would transfer one workspace's admissions into another. **Cleared.**
+- **Client workspace invalidation under `ClientFallback`** — that key is reused
+  across workspaces, so retaining records would transfer one workspace's
+  admissions into another. **Cleared** *when the connection is torn down*.
 
 Clearing on every removal would break respawn survival; retaining on every
 removal would leak admissions into a reconfigured server or a different
 workspace. Neither is safe, so the removal reason has to reach the records.
+
+Two edges follow from that, and both cut against a naive "clear on workspace
+change":
+
+- A client root change **keeps** a `Ready` fallback connection that supports
+  workspace-folder changes — it is updated dynamically, not replaced. Clearing
+  its admissions would make its already-open documents undiscoverable with no
+  replay to rebuild them. So a same-handle dynamic update **retains** its
+  records; only a teardown clears.
+- A failure respawn **removes the old connection before it knows whether a
+  replacement will start**, and a spawn can fail. A preserved record can
+  therefore be orphaned — no live connection under its key — and settings
+  propagation discovers changed or removed servers by iterating *live*
+  connections, so an orphan would evade invalidation and later admit a
+  differently-configured process under the reused key. Configuration and
+  workspace invalidation must therefore sweep the **admission registry itself**,
+  not only the connections map.
+
+One case is **accepted rather than solved**: marker-root migration. Routing
+re-walks filesystem markers on every acquisition, so adding or removing a marker
+moves a document to a different `ConnectionKey` while the old connection keeps
+running. Its admission survives its documents and keeps that obsolete root
+queryable, which can return stale or duplicate symbols until the connection
+ends. Evicting on migration would mean detecting it, and routing does not report
+it; the duplicates are visible and the staleness is bounded by the old process's
+own index, so this is recorded rather than mechanised.
 
 The records stay concrete because each was created from a real open document
 (point 3's requirement).
@@ -1590,12 +1623,9 @@ Including it would defeat dedup on a field carrying no identity.
 ### Negative
 
 - Results depend on what is open, and coverage can shrink (close, respawn,
-  silent connection death). Closing the last buffer for a language removes its
-  server from search even though the process is still running and may still be
-  usefully indexed — the sharpest form of this, and a follow-up rather than a
-  fix here (point 7). The respawn window has the same cause: a purged
-  connection is invisible to selection until its documents are replayed. The same query answers differently at different
-  points in a session. LSP permits partial `workspace/symbol` results, but a
+  silent connection death). Closing a buffer no longer removes its server —
+  admission records outlive `didClose` and the respawn purge (point 3) — but the
+  same query still answers differently at different points in a session. LSP permits partial `workspace/symbol` results, but a
   user expecting an indexed whole-project search will find this surprising.
 - Latency is max-over-live-targets, and every *wait* is bounded: the pool's 30s
   request timeout and liveness timeout, a three-second budget on **every** lock
@@ -1622,10 +1652,15 @@ Including it would defeat dedup on a field carrying no identity.
   in methods that have no use for it.
 - A server still `Initializing` when the query arrives is skipped entirely, so
   a search in the seconds after opening a file can miss it (point 3).
-- Admission records add per-`ConnectionKey` state the pool must maintain. It is
-  bounded by distinct `(host_language, injection_language)` pairs per key rather
-  than by session history, but not closed: a `languages = ["*"]` connection in a
-  polyglot workspace gains an entry per language ever seen on it (point 3).
+- Admission records add per-`ConnectionKey` state the pool must maintain, and it
+  must be swept by configuration and workspace invalidation independently of the
+  connections map. It is bounded by distinct `(host_language, injection_language)`
+  pairs per key rather than by session history, but not closed: a
+  `languages = ["*"]` connection in a polyglot workspace gains an entry per
+  language ever seen on it (point 3).
+- After a marker-root migration the old connection stays queryable at its
+  obsolete root until it ends, so a query can see stale or duplicated symbols
+  from a root the document no longer belongs to (point 3).
 - Every lock this path *awaits* — selection's `connections`, each send's
   re-acquisition, the two fan-in tracker reads, each host's `edit_lock` — is
   bounded only in its **acquisition** (the per-send identity
@@ -1646,8 +1681,8 @@ Including it would defeat dedup on a field carrying no identity.
   snapshot matches, and those symbols are dropped from that query (point 4).
 - `max_fan_out` does not bound this method's total fan-out on its own — it
   selects names per pair, and a connection one pair excluded re-enters through
-  another. `workspaceSymbolMaxFanOut` restores the guarantee, at the cost of one
-  more user-facing setting to learn, document, merge, and schema (point 3).
+  another. `workspaceSymbolMaxFanOut` bounds the query instead, at the cost of
+  one more user-facing setting to learn, document, merge, and schema (point 3).
 - The `kakehashi-virtual-uri-*` filename space is reserved: a real workspace
   file named into it is invisible to symbol search (point 5).
 - No configuration can express "suppress B's duplicates, but fall back to B when
