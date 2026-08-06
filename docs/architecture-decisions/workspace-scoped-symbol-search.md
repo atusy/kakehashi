@@ -1005,7 +1005,7 @@ normalization**: set `deprecated = Some(true)` when the normalized tags contain
 it was meant to preserve. It is bounded: the modern type is used everywhere
 else.
 
-### 6. Latency is bounded by the pool's timeouts and our own phase budgets
+### 6. Every wait is bounded; the synchronous work between them is not
 
 Every target is awaited, so latency is max-over-targets. The bounds are:
 
@@ -1105,8 +1105,8 @@ one region's offset is known. Workspace symbol search holds every region's
 geometry for the hosts it touches, so each entry is translated by its own
 region's offset rather than by a single borrowed one.
 
-Shipping this obliges edits in **both** user-facing docs, in three separate
-respects each. They are listed here because more than one review round found the
+Shipping this obliges edits in **both** user-facing docs, in four separate
+respects. They are listed here because more than one review round found the
 inventory incomplete.
 
 *The no-cross-block rule is stated as a blanket claim and must be amended, not
@@ -1264,11 +1264,12 @@ Including it would defeat dedup on a field carrying no identity.
   silent connection death). The same query answers differently at different
   points in a session. LSP permits partial `workspace/symbol` results, but a
   user expecting an indexed whole-project search will find this surprising.
-- Latency is max-over-live-targets, bounded by the pool's existing 30s request
-  timeout and liveness timeout, plus three-second budgets on selection's and
-  each send's `connections` **lock acquisition** — the synchronous filtering
-  that follows is outside them — and the reopen barrier's two seconds; forwarded cancellation is best-effort because a downstream may
-  ignore it.
+- Latency is max-over-live-targets, and every *wait* is bounded: the pool's 30s
+  request timeout and liveness timeout, three-second budgets on selection's and
+  each send's `connections` lock **acquisition**, and the reopen barrier's two
+  seconds. Total latency is not bounded, because the synchronous filtering
+  between those waits cannot be preempted. Forwarded cancellation is
+  best-effort, since a downstream may ignore it.
 - One request per keystroke, un-coalesced (point 9).
 - Fan-in can wait on a parse: the distinct host documents a result addresses are
   ensured before translation. Because they are ensured concurrently the pass
