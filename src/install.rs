@@ -435,17 +435,19 @@ fn install_language_with_query_stager(
 
     let published_queries = match staged_queries.publish() {
         Ok(published) => published,
-        Err(e) => {
-            // Publishing can fail *after* it has moved the live queries aside,
-            // with no way to put them back. That is not a residue-free failure,
-            // and the command must not report it as one.
-            if matches!(
-                e,
-                queries::QueryInstallError::PreviousQueriesStranded { .. }
-            ) {
-                result.rollback_residue = Some(RollbackResidue::PreviousQueriesStranded);
-            }
-            result.queries_error = Some(e.to_string());
+        Err(failure) => {
+            // Publishing can fail *after* it has published something, and its
+            // own rollback can fail in turn. Either way this is not a
+            // residue-free failure: the error says what went wrong, the residue
+            // says what is still on disk because of it.
+            result.rollback_residue = rollback_residue(failure.residue).or_else(|| {
+                matches!(
+                    failure.error,
+                    queries::QueryInstallError::PreviousQueriesStranded { .. }
+                )
+                .then_some(RollbackResidue::PreviousQueriesStranded)
+            });
+            result.queries_error = Some(failure.error.to_string());
             return result;
         }
     };

@@ -394,7 +394,8 @@ fn install_queries_with_dependencies_from_with_http_policy(
     if let Some(missing) = staged.missing_skipped_dependency() {
         return Err(QueryInstallError::DependencyRemoved(missing.to_string()));
     }
-    match staged.publish()?.commit() {
+    let published = staged.publish().map_err(|failure| failure.error)?;
+    match published.commit() {
         CommittedQueryInstall::Installed(result) => Ok(result),
         // The `install_queries_*` entry points predate staging and report an
         // untouched language as `AlreadyExists`; their callers read it as a
@@ -527,7 +528,7 @@ impl StagedQueryInstall {
 
     /// Rename every staged directory into place, keeping the displaced
     /// directories so the whole install can still be undone.
-    pub(crate) fn publish(self) -> Result<PublishedQueryInstall, QueryInstallError> {
+    pub(crate) fn publish(self) -> Result<PublishedQueryInstall, PublishFailure> {
         let Self {
             language: requested_language,
             install_path,
@@ -576,18 +577,21 @@ impl StagedQueryInstall {
                     }
                 }
                 Ok(PublishQueryDirOutcome::Uninstalled) => {
-                    let _ = publish.rollback();
-                    return Err(QueryInstallError::IoError(std::io::Error::new(
-                        std::io::ErrorKind::Interrupted,
-                        format!(
-                            "Query install for {} was superseded by uninstall",
-                            entry.language
-                        ),
-                    )));
+                    let residue = publish.rollback();
+                    return Err(PublishFailure {
+                        error: QueryInstallError::IoError(std::io::Error::new(
+                            std::io::ErrorKind::Interrupted,
+                            format!(
+                                "Query install for {} was superseded by uninstall",
+                                entry.language
+                            ),
+                        )),
+                        residue,
+                    });
                 }
                 Err(e) => {
-                    let _ = publish.rollback();
-                    return Err(e);
+                    let residue = publish.rollback();
+                    return Err(PublishFailure { error: e, residue });
                 }
             }
         }
@@ -714,6 +718,17 @@ impl PublishedQueryInstall {
         }
         outcome
     }
+}
+
+/// A publish that failed, and what its rollback could not put back.
+///
+/// The two travel together because the caller reports them together: an error
+/// on its own would let a command say nothing was published while the queries
+/// this install wrote are still live.
+#[derive(Debug)]
+pub(crate) struct PublishFailure {
+    pub(crate) error: QueryInstallError,
+    pub(crate) residue: RollbackOutcome,
 }
 
 /// What a rollback managed to put back.
@@ -1458,7 +1473,13 @@ pub fn try_lock_language(data_dir: &Path, language: &str) -> LanguageLockProbe {
             queries_parent,
             language: language.to_string(),
         }),
-        Err(_) => LanguageLockProbe::Busy,
+        // Only contention means an install is in flight. A filesystem that
+        // cannot do advisory locks at all — some NFS and FUSE mounts — errors
+        // here too, and calling that busy would make every language on such a
+        // mount read as unusable while the repair it triggers fails for the
+        // same reason. Nobody can lock there, so nobody can publish there.
+        Err(std::fs::TryLockError::WouldBlock) => LanguageLockProbe::Busy,
+        Err(std::fs::TryLockError::Error(_)) => LanguageLockProbe::Unlockable,
     }
 }
 
@@ -2344,7 +2365,7 @@ mod staging_tests {
         let result = staged.publish();
 
         assert!(
-            matches!(&result, Err(QueryInstallError::IoError(e)) if e.kind() == std::io::ErrorKind::Interrupted),
+            matches!(&result, Err(failure) if matches!(&failure.error, QueryInstallError::IoError(e) if e.kind() == std::io::ErrorKind::Interrupted)),
             "a tombstoned entry must abort the publish"
         );
         assert_eq!(
