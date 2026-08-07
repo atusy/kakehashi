@@ -48,6 +48,13 @@ pub enum QueryInstallError {
     IoError(std::io::Error),
     /// Queries already exist and --force not specified.
     AlreadyExists(PathBuf),
+    /// Publishing moved the live queries aside and could not put anything back:
+    /// the language has no queries, and the previous ones are in `backup`.
+    PreviousQueriesStranded {
+        language: String,
+        backup: PathBuf,
+        reason: String,
+    },
 }
 
 impl std::fmt::Display for QueryInstallError {
@@ -76,6 +83,19 @@ impl std::fmt::Display for QueryInstallError {
                     f,
                     "Queries already exist at {}. Use --force to overwrite.",
                     path.display()
+                )
+            }
+            Self::PreviousQueriesStranded {
+                language,
+                backup,
+                reason,
+            } => {
+                write!(
+                    f,
+                    "'{}' now has no queries: {}. The previous ones are kept at {}.",
+                    language,
+                    reason,
+                    backup.display()
                 )
             }
         }
@@ -1682,9 +1702,19 @@ fn publish_query_dir(
                 let _ = fs::remove_file(backup_ownership_sidecar(&backup_dir));
             }
             Err(rollback_error) => {
-                return Err(QueryInstallError::IoError(std::io::Error::other(format!(
-                    "failed to publish staged queries: {e}; failed to restore backup: {rollback_error}"
-                ))));
+                // The live directory was moved aside and neither the staged copy
+                // nor the original could be put in its place. The language has
+                // no queries at all now, and the caller has to say where the
+                // previous ones went — a typed error rather than a message,
+                // because "nothing was published" would be a lie.
+                return Err(QueryInstallError::PreviousQueriesStranded {
+                    language: language.to_string(),
+                    backup: backup_dir,
+                    reason: format!(
+                        "failed to publish staged queries: {e}; failed to restore backup: \
+                         {rollback_error}"
+                    ),
+                });
             }
         }
         return Err(QueryInstallError::IoError(e));
@@ -1969,6 +1999,29 @@ mod staging_tests {
         }
 
         assert!(query_install_chain_is_complete(&queries_parent, "cyc_a"));
+    }
+
+    /// Publishing can fail after it has already moved the live queries aside,
+    /// leaving the language with none. Reaching that needs two renames to fail
+    /// in a row, so what is pinned here is the part that matters to whoever
+    /// hits it: the error says where the previous queries went.
+    #[test]
+    fn the_stranded_queries_error_names_the_backup() {
+        let error = QueryInstallError::PreviousQueriesStranded {
+            language: "lua".to_string(),
+            backup: PathBuf::from("/data/queries/.lua.42.0.backup"),
+            reason: "rename failed".to_string(),
+        };
+
+        let reported = error.to_string();
+        assert!(
+            reported.contains("'lua' now has no queries"),
+            "the message must not read as a routine failure: {reported}"
+        );
+        assert!(
+            reported.contains(".lua.42.0.backup"),
+            "and it must say where to find them: {reported}"
+        );
     }
 
     /// Clearing a base language's tombstone goes through that language's own

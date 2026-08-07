@@ -300,9 +300,14 @@ impl StagedParser {
         // `remove_file` that cannot remove it — the rename below fails instead,
         // which is the error the user needs to see.
         let displaced = if cfg!(windows) && self.parser_file.is_file() {
-            let aside = self
-                .parser_file
-                .with_file_name(format!("{}.displaced", staging_file_name(&self.language)));
+            // An unused name, not merely a generated one: pids are reused, and
+            // the staging sweep does not run off unix, so a `.displaced` file
+            // left by a crashed process that had this pid would otherwise make
+            // every later reinstall fail at this rename.
+            let mut aside = self.displaced_path();
+            while aside.exists() {
+                aside = self.displaced_path();
+            }
             fs::rename(&self.parser_file, &aside)?;
             Some(aside)
         } else {
@@ -341,6 +346,15 @@ impl StagedParser {
             install_path: std::mem::take(&mut self.parser_file),
             revision: std::mem::take(&mut self.revision),
         })
+    }
+}
+
+impl StagedParser {
+    /// A name to move the parser being replaced aside to. Each call returns a
+    /// different one; the caller checks it is actually free.
+    fn displaced_path(&self) -> PathBuf {
+        self.parser_file
+            .with_file_name(format!("{}.displaced", staging_file_name(&self.language)))
     }
 }
 
