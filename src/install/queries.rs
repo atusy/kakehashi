@@ -279,13 +279,8 @@ pub fn install_queries_with_dependencies(
     data_dir: &Path,
     force: bool,
 ) -> Result<QueryInstallResult, QueryInstallError> {
-    // Half of a language on its own, but still inside the transaction protocol.
-    // The clear takes the lock and gives it back before staging, exactly as a
-    // whole-language install does; the publish below takes one per dependency.
-    {
-        let _transaction = lock_language(data_dir, language)?;
-        clear_uninstall_tombstone_for_install(data_dir, language)?;
-    }
+    // No tombstone clear here either: staging does it once per language, under
+    // that language's lock. See `install_language`.
     install_queries_with_dependencies_from_with_http_policy(
         NVIM_TREESITTER_QUERIES_URL,
         language,
