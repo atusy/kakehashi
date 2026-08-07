@@ -120,7 +120,11 @@ pub fn parser_file_exists(language: &str, data_dir: &Path) -> Option<PathBuf> {
         data_dir
             .join("parser")
             .join(format!("{}.{}", language, std::env::consts::DLL_EXTENSION));
-    if parser_file.exists() {
+    // A file, not merely an entry: a directory with a parser's name is not a
+    // parser, and reading it as one made an install report success over
+    // something it never wrote — while `language status`, which does check for
+    // a file, called the same language missing.
+    if parser_file.is_file() {
         Some(parser_file)
     } else {
         None
@@ -261,29 +265,152 @@ fn compile_parser(grammar_path: &Path, output_path: &Path) -> Result<(), ParserI
     Ok(())
 }
 
-/// Install a Tree-sitter parser for a language.
-pub fn install_parser(
+/// A compiled parser that has not been moved into the data directory yet.
+///
+/// Installing a language means publishing two artifacts (parser and queries),
+/// and either can fail. Staging separates the expensive, failure-prone work
+/// (metadata, source fetch, compile) from the single rename that makes the
+/// parser visible, so a caller can prepare both halves first and publish only
+/// once both are ready. Dropping a staged parser without publishing removes the
+/// compiled artifact, leaving the data directory exactly as it was.
+pub(crate) struct StagedParser {
+    language: String,
+    revision: String,
+    tmp_file: PathBuf,
+    parser_file: PathBuf,
+    /// Whether the drop guard still owns `tmp_file`. Cleared by `publish`,
+    /// which hands the file over to the data directory.
+    armed: bool,
+}
+
+impl StagedParser {
+    /// Move the compiled library into its final location.
+    ///
+    /// On unix `rename` atomically replaces an existing parser. Windows
+    /// `rename` instead fails if the destination exists, which would make a
+    /// `force` reinstall fail after a good compile — so there the previous
+    /// parser is moved aside first, and moved back if the rename then fails.
+    /// Deleting it instead would leave a `force` reinstall that failed at the
+    /// rename with no parser at all, while the caller reports that nothing was
+    /// published.
+    pub(crate) fn publish(mut self) -> Result<ParserInstallResult, ParserInstallError> {
+        // `cfg!` rather than `#[cfg]` so this compiles everywhere it is read,
+        // not only where it runs. `is_file`, so a directory sitting where the
+        // parser belongs is not moved aside and then left stranded by a
+        // `remove_file` that cannot remove it — the rename below fails instead,
+        // which is the error the user needs to see.
+        let displaced = if cfg!(windows) && self.parser_file.is_file() {
+            // An unused name, not merely a generated one: pids are reused, and
+            // the staging sweep does not run off unix, so a `.displaced` file
+            // left by a crashed process that had this pid would otherwise make
+            // every later reinstall fail at this rename.
+            let mut aside = self.displaced_path();
+            while aside.exists() {
+                aside = self.displaced_path();
+            }
+            fs::rename(&self.parser_file, &aside)?;
+            Some(aside)
+        } else {
+            None
+        };
+        if let Err(e) = fs::rename(&self.tmp_file, &self.parser_file) {
+            if let Some(aside) = &displaced
+                && let Err(restore) = fs::rename(aside, &self.parser_file)
+            {
+                // Both halves of the swap failed: say where the previous parser
+                // is, because nothing else will move it back.
+                return Err(ParserInstallError::IoError(std::io::Error::other(format!(
+                    "failed to publish the compiled parser: {e}; failed to restore the previous \
+                     one from {}: {restore}",
+                    aside.display()
+                ))));
+            }
+            return Err(ParserInstallError::IoError(e));
+        }
+        if let Some(aside) = &displaced
+            && let Err(e) = fs::remove_file(aside)
+            && e.kind() != std::io::ErrorKind::NotFound
+        {
+            eprintln!(
+                "Warning: the parser replaced for '{}' could not be removed from {}: {}",
+                self.language,
+                aside.display(),
+                e
+            );
+        }
+        // The rename consumed the staging file; anything the drop guard would
+        // remove now belongs to the data dir.
+        self.armed = false;
+        Ok(ParserInstallResult {
+            language: std::mem::take(&mut self.language),
+            install_path: std::mem::take(&mut self.parser_file),
+            revision: std::mem::take(&mut self.revision),
+        })
+    }
+}
+
+impl StagedParser {
+    /// A name to move the parser being replaced aside to. Each call returns a
+    /// different one; the caller checks it is actually free.
+    fn displaced_path(&self) -> PathBuf {
+        self.parser_file
+            .with_file_name(format!("{}.displaced", staging_file_name(&self.language)))
+    }
+}
+
+impl Drop for StagedParser {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = fs::remove_file(&self.tmp_file);
+        }
+    }
+}
+
+/// What [`stage_parser`] found or produced.
+pub(crate) enum StagedParserOutcome {
+    /// A parser was compiled and is waiting to be published.
+    Staged(StagedParser),
+    /// A usable parser is already installed and `force` was not requested, so
+    /// nothing was compiled.
+    AlreadyInstalled(PathBuf),
+}
+
+impl StagedParserOutcome {
+    /// Give way to a parser that appeared while this one was being compiled.
+    ///
+    /// Staging decides whether to compile from the state it sees, but the
+    /// compile takes long enough for a concurrent install of the same language
+    /// to finish. Without `force`, that install's parser is as good as ours and
+    /// is already paired with its queries, so replacing it would split the
+    /// pair. Dropping the staged parser here reclaims the compiled file.
+    pub(crate) fn yield_to_existing(self, force: bool, existing: Option<PathBuf>) -> Self {
+        match (self, existing) {
+            (Self::Staged(_), Some(path)) if !force => Self::AlreadyInstalled(path),
+            (outcome, _) => outcome,
+        }
+    }
+}
+
+/// Compile a Tree-sitter parser into a staging file without publishing it.
+///
+/// See [`StagedParser`] for why publication is deferred.
+pub(crate) fn stage_parser(
     language: &str,
     options: &InstallOptions,
-) -> Result<ParserInstallResult, ParserInstallError> {
-    // `language` becomes path segments (`parser/<language>.<ext>` and the temp
-    // file) and a URL/metadata key, so reject traversal-capable names before
-    // touching the filesystem. Higher-level callers (auto-install) already gate
-    // this, but `install_parser` is a public entry point and must be safe on its
-    // own — a name like `../../evil` would otherwise write outside the data dir.
-    if !super::queries::is_safe_language_name(language) {
-        return Err(ParserInstallError::IoError(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            format!("unsafe language name '{}'", language.escape_default()),
-        )));
-    }
+) -> Result<StagedParserOutcome, ParserInstallError> {
+    reject_unsafe_language_name(language)?;
 
     let parser_dir = options.data_dir.join("parser");
     let parser_file = parser_dir.join(format!("{}.{}", language, std::env::consts::DLL_EXTENSION));
 
-    // Check if parser already exists
-    if parser_file.exists() && !options.force {
-        return Err(ParserInstallError::AlreadyExists(parser_file));
+    // Check if a usable parser is already installed. `is_file` via
+    // `parser_file_exists`, not a bare existence check: a directory carrying a
+    // parser's name is not a parser, and treating it as one made the install
+    // report success over something it never wrote.
+    if !options.force
+        && let Some(installed) = parser_file_exists(language, &options.data_dir)
+    {
+        return Ok(StagedParserOutcome::AlreadyInstalled(installed));
     }
 
     // Fetch metadata (with caching support)
@@ -319,61 +446,204 @@ pub fn install_parser(
         eprintln!("Building parser in: {}", source_dir.display());
     }
 
-    // Compile to a temp path in the install dir, then atomically rename into place
-    // on success. A failed or deadline-killed compile can leave a partial/corrupt
-    // library behind (`parser_file_exists` only checks existence, so a leftover
-    // would make later runs skip reinstall and load a broken parser); writing to a
-    // temp and renaming only on success means a failure never clobbers a
+    // Compile to a temp path in the install dir; the caller renames it into place
+    // (see `StagedParser::publish`). A failed or deadline-killed compile can leave a
+    // partial/corrupt library behind (`parser_file_exists` only checks existence, so
+    // a leftover would make later runs skip reinstall and load a broken parser);
+    // writing to a temp and renaming only on success means a failure never clobbers a
     // previously-working parser (e.g. a `force` reinstall that fails) and concurrent
     // readers never observe a half-written file.
     //
-    // The temp name combines the pid with a process-local counter so two installs
-    // in the same process never collide on it, independent of the per-language
-    // install dedup. (Windows caveat: replacing a parser that is *currently loaded*
-    // by this process still fails at the rename — a loaded DLL can't be removed — a
+    // (Windows caveat: replacing a parser that is *currently loaded* by this
+    // process still fails at the rename — a loaded DLL can't be removed — a
     // pre-existing platform limitation this scheme doesn't change.)
     fs::create_dir_all(&parser_dir)?;
+    let tmp_file = parser_dir.join(staging_file_name(language));
+    let staged = StagedParser {
+        language: language.to_string(),
+        revision: metadata.revision,
+        tmp_file,
+        parser_file,
+        armed: true,
+    };
+    match options.compile {
+        ParserCompile::KillableSubprocess => compile_parser(&source_dir, &staged.tmp_file),
+        ParserCompile::InProcess => compile_parser_inprocess(&source_dir, &staged.tmp_file),
+    }?;
+
+    if options.verbose {
+        eprintln!("Compiled parser for '{}'", language);
+    }
+
+    Ok(StagedParserOutcome::Staged(staged))
+}
+
+/// Reject a language name that cannot be used to build a path.
+///
+/// `language` becomes path segments (`parser/<language>.<ext>` and the temp
+/// file) and a URL/metadata key. Higher-level callers (auto-install) already
+/// gate this, but the entry points below are public and must be safe on their
+/// own — a name like `../../evil` would otherwise write outside the data dir.
+fn reject_unsafe_language_name(language: &str) -> Result<(), ParserInstallError> {
+    if super::queries::is_safe_language_name(language) {
+        Ok(())
+    } else {
+        Err(ParserInstallError::IoError(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("unsafe language name '{}'", language.escape_default()),
+        )))
+    }
+}
+
+/// Collect parser staging files whose owning process is gone.
+///
+/// Publication renames the staging file away, and the drop guard reclaims it on
+/// every error path — but a killed process runs neither, and nothing else knows
+/// the name. The query side has had this since staging directories were
+/// introduced; this is its parser counterpart. Dot-prefixed staging files are
+/// already invisible to parser discovery, so this only reclaims disk.
+///
+/// Names carry the owning pid, and a live owner's file is left alone. Off unix
+/// there is no portable liveness test, so nothing is collected — the same
+/// conservative stance the query sweep takes.
+pub fn recover_interrupted_parser_installs(parser_dir: &Path) -> std::io::Result<()> {
+    let entries = match fs::read_dir(parser_dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e),
+    };
+    for entry in entries {
+        // An entry this pass cannot read is reported, not skipped: a sweep that
+        // returns success while residue remains is how the residue becomes
+        // permanent.
+        let entry = entry?;
+        let path = entry.path();
+        if !entry.file_type()?.is_file() {
+            continue;
+        }
+        let Some(staging) = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .and_then(staging_file_owner)
+        else {
+            continue;
+        };
+        if super::queries::process_is_running(staging.pid) {
+            continue;
+        }
+        // A displaced file is the previous parser, moved aside by a publish that
+        // then could not put it back. If the language has no parser now, it is
+        // the only copy left and the publication error told the user where it
+        // is — put it back instead of collecting it.
+        if staging.displaced {
+            let parser_file = parser_dir.join(format!(
+                "{}.{}",
+                staging.language,
+                std::env::consts::DLL_EXTENSION
+            ));
+            if !parser_file.is_file() {
+                fs::rename(&path, &parser_file)?;
+                continue;
+            }
+        }
+        match fs::remove_file(&path) {
+            Ok(()) => {}
+            // Someone else collected it between the scan and the removal.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
+}
+
+/// A generated staging file: which language and process it belongs to, and
+/// whether it is a compile's output or a parser moved aside by a publish.
+struct StagingFile<'a> {
+    language: &'a str,
+    pid: &'a str,
+    displaced: bool,
+}
+
+/// Read a generated staging file name, if it is one.
+///
+/// Shape: `.{language}.{pid}.{counter}.{ext}.tmp`, plus the `.displaced` copy a
+/// Windows publish moves the previous parser to. A user's own dot-file is left
+/// alone because it will not parse into these parts.
+fn staging_file_owner(name: &str) -> Option<StagingFile<'_>> {
+    let body = name.strip_prefix('.')?;
+    let (body, displaced) = match body.strip_suffix(".displaced") {
+        Some(body) => (body, true),
+        None => (body, false),
+    };
+    let rest = body.strip_suffix(".tmp")?;
+    let mut parts = rest.split('.');
+    let language = parts.next()?;
+    let pid = parts.next()?;
+    let counter = parts.next()?;
+    // The real extension, not any segment: without this a user's own
+    // `.notes.123.0.bak.tmp` under `parser/` parses as one of ours.
+    let extension = parts.next()?;
+    if parts.next().is_none()
+        && extension == std::env::consts::DLL_EXTENSION
+        && super::queries::is_safe_language_name(language)
+        && pid.bytes().all(|b| b.is_ascii_digit())
+        && counter.bytes().all(|b| b.is_ascii_digit())
+    {
+        Some(StagingFile {
+            language,
+            pid,
+            displaced,
+        })
+    } else {
+        None
+    }
+}
+
+/// Name of the staging file a parser compiles into, inside `parser/`.
+///
+/// Dot-prefixed and `.tmp`-suffixed so parser discovery walks past it, and
+/// combining the pid with a process-local counter so two installs in the same
+/// process never collide on it, independent of the per-language install dedup.
+fn staging_file_name(language: &str) -> String {
     static TMP_COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-    let tmp_file = parser_dir.join(format!(
+    format!(
         ".{}.{}.{}.{}.tmp",
         language,
         std::process::id(),
         TMP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
         std::env::consts::DLL_EXTENSION
-    ));
-    let compiled = match options.compile {
-        ParserCompile::KillableSubprocess => compile_parser(&source_dir, &tmp_file),
-        ParserCompile::InProcess => compile_parser_inprocess(&source_dir, &tmp_file),
-    };
-    match compiled {
-        Ok(()) => {
-            // On unix `rename` atomically replaces an existing parser. Windows
-            // `rename` instead fails if the destination exists, which would make a
-            // `force` reinstall fail after a good compile — remove the old file
-            // first there (a small non-atomic window, acceptable on the
-            // non-primary platform).
-            #[cfg(windows)]
-            let _ = fs::remove_file(&parser_file);
-            if let Err(e) = fs::rename(&tmp_file, &parser_file) {
-                let _ = fs::remove_file(&tmp_file);
-                return Err(ParserInstallError::IoError(e));
+    )
+}
+
+/// Install a Tree-sitter parser for a language, publishing it immediately.
+pub fn install_parser(
+    language: &str,
+    options: &InstallOptions,
+) -> Result<ParserInstallResult, ParserInstallError> {
+    // Half of a language on its own, but still inside the transaction protocol:
+    // a parser published without this lock can land after an uninstall removed
+    // the other half, recreating the parser-only state that uninstall reported
+    // as gone. Checked before the lock so an unusable name keeps reporting
+    // itself rather than a lock failure.
+    reject_unsafe_language_name(language)?;
+    let _transaction = super::queries::lock_language(&options.data_dir, language)
+        .map_err(|e| ParserInstallError::IoError(std::io::Error::other(e.to_string())))?;
+    // An explicit install overrides an earlier uninstall, exactly as the
+    // whole-language one does — and clearing the marker under this lock is what
+    // keeps the two consistent. Leaving it would put a fresh parser next to a
+    // tombstone saying the language is gone, which the query side then honours.
+    super::queries::clear_uninstall_tombstone_for_install(&options.data_dir, language)
+        .map_err(|e| ParserInstallError::IoError(std::io::Error::other(e.to_string())))?;
+    match stage_parser(language, options)? {
+        StagedParserOutcome::Staged(staged) => {
+            let result = staged.publish()?;
+            if options.verbose {
+                eprintln!("Installed to: {}", result.install_path.display());
             }
+            Ok(result)
         }
-        Err(e) => {
-            let _ = fs::remove_file(&tmp_file);
-            return Err(e);
-        }
+        StagedParserOutcome::AlreadyInstalled(path) => Err(ParserInstallError::AlreadyExists(path)),
     }
-
-    if options.verbose {
-        eprintln!("Installed to: {}", parser_file.display());
-    }
-
-    Ok(ParserInstallResult {
-        language: language.to_string(),
-        install_path: parser_file,
-        revision: metadata.revision,
-    })
 }
 
 /// Construct a GitHub archive download URL from a repository URL and revision.
@@ -1363,6 +1633,166 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
+    fn interrupted_parser_staging_files_are_collected() {
+        let temp = tempdir().expect("temp dir");
+        let parser_dir = temp.path().join("parser");
+        fs::create_dir_all(&parser_dir).expect("create parser dir");
+        let ext = std::env::consts::DLL_EXTENSION;
+        let dead = parser_dir.join(format!(".lua.{}.0.{}.tmp", dead_pid(), ext));
+        let live = parser_dir.join(format!(".lua.{}.0.{}.tmp", std::process::id(), ext));
+        let installed = parser_dir.join(format!("lua.{}", ext));
+        let unmanaged = parser_dir.join(".notes.txt");
+        for path in [&dead, &live, &installed, &unmanaged] {
+            fs::write(path, b"x").expect("write file");
+        }
+
+        recover_interrupted_parser_installs(&parser_dir).expect("sweep should succeed");
+
+        assert!(!dead.exists(), "a dead owner's staging file is reclaimed");
+        assert!(
+            live.exists(),
+            "a live owner is still compiling into its file"
+        );
+        assert!(installed.exists(), "the installed parser is untouched");
+        assert!(
+            unmanaged.exists(),
+            "files this module did not name are left alone"
+        );
+    }
+
+    /// A pid no live process can have, found the same way the query sweep's
+    /// test finds one.
+    #[cfg(unix)]
+    fn dead_pid() -> u32 {
+        let mut pid = std::process::id().saturating_add(100_000);
+        while super::super::queries::process_is_running(&pid.to_string()) {
+            pid = pid.saturating_add(1);
+        }
+        pid
+    }
+
+    /// A parser published beside a live uninstall tombstone is a language the
+    /// query side still believes is gone. An explicit install overrides the
+    /// uninstall — but it has to say so on disk, not leave the two disagreeing.
+    #[test]
+    fn installing_a_parser_clears_the_uninstall_tombstone() {
+        let temp = tempdir().expect("temp dir");
+        let data_dir = temp.path();
+        let queries_parent = data_dir.join("queries");
+        fs::create_dir_all(&queries_parent).expect("create queries dir");
+        super::super::queries::write_uninstall_tombstone_for_tests(&queries_parent, "lua")
+            .expect("write tombstone");
+        // A parser is already installed, so this returns before any network.
+        let parser_dir = data_dir.join("parser");
+        fs::create_dir_all(&parser_dir).expect("create parser dir");
+        fs::write(
+            parser_dir.join(format!("lua.{}", std::env::consts::DLL_EXTENSION)),
+            b"installed",
+        )
+        .expect("write parser");
+
+        let result = install_parser(
+            "lua",
+            &InstallOptions {
+                data_dir: data_dir.to_path_buf(),
+                force: false,
+                verbose: false,
+                no_cache: false,
+                compile: ParserCompile::InProcess,
+            },
+        );
+
+        assert!(matches!(result, Err(ParserInstallError::AlreadyExists(_))));
+        assert!(
+            !queries_parent.join(".lua.uninstalled").is_file(),
+            "the marker saying the language is gone must not outlive the install"
+        );
+    }
+
+    /// The sweep only owns names it could have written. A user's own dotfile
+    /// that happens to have the same shape is not one, and a rename or a
+    /// removal of it would be this module reaching outside what it manages.
+    #[test]
+    #[cfg(unix)]
+    fn the_parser_sweep_leaves_lookalike_files_alone() {
+        let temp = tempdir().expect("temp dir");
+        let parser_dir = temp.path().join("parser");
+        fs::create_dir_all(&parser_dir).expect("create parser dir");
+        // Same shape, but the extension segment is not the one this platform
+        // compiles parsers to.
+        let lookalike = parser_dir.join(format!(".notes.{}.0.bak.tmp", dead_pid()));
+        fs::write(&lookalike, b"mine").expect("write lookalike");
+
+        recover_interrupted_parser_installs(&parser_dir).expect("sweep should succeed");
+
+        assert!(
+            lookalike.exists(),
+            "a file this module could not have written is not its to collect"
+        );
+    }
+
+    /// A displaced file is the previous parser, moved aside by a publish that
+    /// could not put it back. If the language has no parser now it is the only
+    /// copy left — and the publication error told the user it was there, so a
+    /// sweep must not be what deletes it.
+    #[test]
+    #[cfg(unix)]
+    fn a_displaced_parser_is_restored_when_the_language_has_none() {
+        let temp = tempdir().expect("temp dir");
+        let parser_dir = temp.path().join("parser");
+        fs::create_dir_all(&parser_dir).expect("create parser dir");
+        let ext = std::env::consts::DLL_EXTENSION;
+        let displaced = parser_dir.join(format!(".lua.{}.0.{}.tmp.displaced", dead_pid(), ext));
+        fs::write(&displaced, b"previous parser").expect("write displaced parser");
+
+        recover_interrupted_parser_installs(&parser_dir).expect("sweep should succeed");
+
+        assert_eq!(
+            fs::read(parser_dir.join(format!("lua.{}", ext))).expect("read restored parser"),
+            b"previous parser",
+            "the only copy left must be put back, not collected"
+        );
+    }
+
+    /// Once the language has a parser again, the copy that was displaced is
+    /// superseded and only takes up room.
+    #[test]
+    #[cfg(unix)]
+    fn a_displaced_parser_is_collected_once_superseded() {
+        let temp = tempdir().expect("temp dir");
+        let parser_dir = temp.path().join("parser");
+        fs::create_dir_all(&parser_dir).expect("create parser dir");
+        let ext = std::env::consts::DLL_EXTENSION;
+        let installed = parser_dir.join(format!("lua.{}", ext));
+        fs::write(&installed, b"current parser").expect("write installed parser");
+        let displaced = parser_dir.join(format!(".lua.{}.0.{}.tmp.displaced", dead_pid(), ext));
+        fs::write(&displaced, b"previous parser").expect("write displaced parser");
+
+        recover_interrupted_parser_installs(&parser_dir).expect("sweep should succeed");
+
+        assert!(!displaced.exists(), "a superseded copy is collected");
+        assert_eq!(
+            fs::read(&installed).expect("read installed parser"),
+            b"current parser",
+            "and the installed parser is untouched"
+        );
+    }
+
+    /// A directory that happens to carry a parser's name is not a parser —
+    /// `language status` already says so, and an install that disagreed
+    /// reported success over something it never wrote.
+    #[test]
+    fn a_parser_shaped_directory_is_not_an_installed_parser() {
+        let temp = tempdir().expect("temp dir");
+        let ext = std::env::consts::DLL_EXTENSION;
+        fs::create_dir_all(temp.path().join("parser").join(format!("lua.{}", ext)))
+            .expect("create parser-shaped directory");
+
+        assert!(parser_file_exists("lua", temp.path()).is_none());
+    }
+
+    #[test]
     fn test_parser_file_exists_returns_none_when_missing() {
         let temp = tempdir().expect("Failed to create temp dir");
         let result = parser_file_exists("nonexistent", temp.path());
@@ -1383,6 +1813,188 @@ mod tests {
         let result = parser_file_exists("lua", temp.path());
         assert!(result.is_some());
         assert_eq!(result.unwrap(), parser_file);
+    }
+
+    /// Build a staged parser over a hand-written temp file, so the staging
+    /// contract can be tested without metadata, a clone, or a `cc` run.
+    ///
+    /// The temp path is built the same way `stage_parser` builds it, so a
+    /// change to that shape cannot silently leave these tests pinning a name
+    /// production no longer produces.
+    fn fake_staged_parser(data_dir: &Path, language: &str) -> StagedParser {
+        let parser_dir = data_dir.join("parser");
+        fs::create_dir_all(&parser_dir).expect("create parser dir");
+        let ext = std::env::consts::DLL_EXTENSION;
+        let tmp_file = parser_dir.join(staging_file_name(language));
+        fs::write(&tmp_file, b"staged parser").expect("write staged parser");
+        StagedParser {
+            language: language.to_string(),
+            revision: "deadbeef".to_string(),
+            tmp_file,
+            parser_file: parser_dir.join(format!("{}.{}", language, ext)),
+            armed: true,
+        }
+    }
+
+    /// The whole point of staging: an install that gives up before publishing
+    /// must leave the parser directory byte-identical, with no stray temp file
+    /// for a later run (or `language status`) to trip over.
+    #[test]
+    fn dropping_a_staged_parser_leaves_the_parser_dir_unchanged() {
+        let temp = tempdir().expect("temp dir");
+        let parser_dir = temp.path().join("parser");
+
+        drop(fake_staged_parser(temp.path(), "lua"));
+
+        let leftovers: Vec<_> = fs::read_dir(&parser_dir)
+            .expect("read parser dir")
+            .flatten()
+            .map(|entry| entry.file_name())
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "an unpublished staged parser must leave nothing behind, found {:?}",
+            leftovers
+        );
+    }
+
+    /// Dropping must not touch a parser that was already installed: the
+    /// abandoned install never owned it.
+    #[test]
+    fn dropping_a_staged_parser_preserves_an_existing_parser() {
+        let temp = tempdir().expect("temp dir");
+        let ext = std::env::consts::DLL_EXTENSION;
+        let parser_file = temp.path().join("parser").join(format!("lua.{}", ext));
+        let staged = fake_staged_parser(temp.path(), "lua");
+        fs::write(&parser_file, b"previously installed").expect("write existing parser");
+
+        drop(staged);
+
+        assert_eq!(
+            fs::read(&parser_file).expect("read existing parser"),
+            b"previously installed",
+            "staging cleanup must not remove an already-installed parser"
+        );
+    }
+
+    #[test]
+    fn publishing_a_staged_parser_moves_it_into_place() {
+        let temp = tempdir().expect("temp dir");
+        let ext = std::env::consts::DLL_EXTENSION;
+        let staged = fake_staged_parser(temp.path(), "lua");
+        let tmp_file = staged.tmp_file.clone();
+
+        let result = staged.publish().expect("publish should succeed");
+
+        assert_eq!(
+            result.install_path,
+            temp.path().join("parser").join(format!("lua.{}", ext))
+        );
+        assert_eq!(
+            fs::read(&result.install_path).expect("read published parser"),
+            b"staged parser"
+        );
+        assert!(
+            !tmp_file.exists(),
+            "publishing must consume the staging file"
+        );
+    }
+
+    #[test]
+    fn a_staged_parser_yields_to_one_that_appeared_while_it_compiled() {
+        let temp = tempdir().expect("temp dir");
+        let ext = std::env::consts::DLL_EXTENSION;
+        let staged = fake_staged_parser(temp.path(), "lua");
+        let tmp_file = staged.tmp_file.clone();
+        let winner = temp.path().join("parser").join(format!("lua.{}", ext));
+
+        let outcome =
+            StagedParserOutcome::Staged(staged).yield_to_existing(false, Some(winner.clone()));
+
+        assert!(matches!(outcome, StagedParserOutcome::AlreadyInstalled(path) if path == winner));
+        assert!(
+            !tmp_file.exists(),
+            "yielding must reclaim the parser it compiled"
+        );
+    }
+
+    #[test]
+    fn a_staged_parser_keeps_its_place_when_forced_or_unopposed() {
+        let temp = tempdir().expect("temp dir");
+        let ext = std::env::consts::DLL_EXTENSION;
+        let winner = temp.path().join("parser").join(format!("lua.{}", ext));
+
+        let forced = StagedParserOutcome::Staged(fake_staged_parser(temp.path(), "lua"))
+            .yield_to_existing(true, Some(winner));
+        assert!(
+            matches!(forced, StagedParserOutcome::Staged(_)),
+            "--force replaces whatever is there"
+        );
+
+        let unopposed = StagedParserOutcome::Staged(fake_staged_parser(temp.path(), "lua"))
+            .yield_to_existing(false, None);
+        assert!(
+            matches!(unopposed, StagedParserOutcome::Staged(_)),
+            "with nothing to yield to, the staged parser is published"
+        );
+    }
+
+    /// The previous parser is displaced, not deleted, so a publish that fails
+    /// at the rename leaves the language exactly as it was. (The displacement
+    /// only happens on Windows, where rename cannot replace; elsewhere the
+    /// rename is atomic and there is nothing to displace.)
+    #[test]
+    fn publishing_over_an_existing_parser_replaces_it() {
+        let temp = tempdir().expect("temp dir");
+        let ext = std::env::consts::DLL_EXTENSION;
+        let parser_file = temp.path().join("parser").join(format!("lua.{}", ext));
+        let staged = fake_staged_parser(temp.path(), "lua");
+        fs::write(&parser_file, b"previous parser").expect("write previous parser");
+
+        let result = staged.publish().expect("publish should succeed");
+
+        assert_eq!(
+            fs::read(&result.install_path).expect("read published parser"),
+            b"staged parser"
+        );
+        let leftovers: Vec<_> = fs::read_dir(temp.path().join("parser"))
+            .expect("read parser dir")
+            .flatten()
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name != &format!("lua.{}", ext))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "replacing a parser must not strand the one it displaced, found {:?}",
+            leftovers
+        );
+    }
+
+    /// A publish that cannot complete must still reclaim its staging file:
+    /// the install is over, and a leftover temp file is exactly what the
+    /// staging design exists to avoid.
+    #[test]
+    fn a_failed_publish_removes_the_staging_file() {
+        let temp = tempdir().expect("temp dir");
+        let ext = std::env::consts::DLL_EXTENSION;
+        let staged = fake_staged_parser(temp.path(), "lua");
+        let tmp_file = staged.tmp_file.clone();
+        // A non-empty directory where the parser file belongs: the rename
+        // cannot replace it.
+        let blocker = temp.path().join("parser").join(format!("lua.{}", ext));
+        fs::create_dir_all(blocker.join("occupied")).expect("create blocking dir");
+
+        let error = staged.publish().expect_err("publish must fail");
+
+        assert!(matches!(error, ParserInstallError::IoError(_)));
+        assert!(
+            !tmp_file.exists(),
+            "a failed publish must not leave its staging file behind"
+        );
+        assert!(
+            blocker.join("occupied").exists(),
+            "a failed publish must not disturb what was already there"
+        );
     }
 
     #[test]

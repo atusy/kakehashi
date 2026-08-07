@@ -874,6 +874,63 @@ kakehashi language uninstall lua --force
 kakehashi language uninstall --all --force
 ```
 
+Installing a language is all-or-nothing. The parser, the language's query
+files, and every query file it pulls in through `; inherits:` are prepared
+first, and only made visible once all of them are ready. A failed install — no
+network, an unsupported language, a compile error, or a base language that
+cannot be downloaded — does not leave the language you asked for
+half-installed: its parser and its queries are published together or not at
+all. (If undoing a publish itself fails — a permission error, a file held open
+— the command says so instead, and names what is left where.)
+
+Two things a failed install can still leave behind. Queries for a *base*
+language it had to fetch stay installed: they are shared with every language
+that inherits them, and a base language nothing uses is inert. And bookkeeping —
+the parser metadata cache, the `parser/` and `queries/` directories, the
+per-language lock files, and the clearing of the language's uninstall
+tombstone — is written either way.
+
+Re-running the command is safe: whatever is already installed is left alone,
+and the missing halves — including the queries of a base language it inherits —
+are fetched without `--force`. Use `--force` to *replace* the requested
+language's parser and queries, such as a parser that fails to load; base
+languages are never replaced, so install one by name to refresh it.
+
+One gap `--force` is the only fix for: a `--force` reinstall that is killed
+between publishing the new queries and publishing the new parser leaves new
+queries against the old parser. Both halves look installed, so a plain re-run
+accepts them — reinstall with `--force` to line them up again. A kill that
+leaves the parser itself missing needs no `--force`: a plain re-run sees the
+missing half and fetches it.
+
+Three more limits worth knowing, all of them about a language being *loaded*
+while it is being installed, or about files upstream does not provide:
+
+- Publication is atomic per file, not to readers. A running server that loads a
+  language *while* a `--force` reinstall is publishing can see the new queries
+  against the parser still being replaced, and keep that pairing until it
+  reloads. Worse, a server that loads a language whose base language is being
+  removed at that moment registers it with the query error as a warning and
+  caches that verdict, so later opens do not retry the install. Fixing that
+  takes both steps: install the missing language, then restart or reload the
+  server, since the install repairs the disk and the reload clears the cached
+  verdict. Installing while nothing is using the language avoids the whole
+  situation.
+- Base languages are tracked by name, not by which query kind needed them. A
+  base language is fetched with whatever kinds upstream publishes for it, and
+  the optional kinds are best-effort: if upstream does not ship the base
+  language's `injections.scm`, or that one download fails, a language whose own
+  `injections.scm` inherits it installs successfully and fails to load its
+  injections. A plain re-run skips the base language as complete —
+  `kakehashi language install <base> --force` is what re-fetches it, followed by
+  a server reload if it has already cached the failure.
+- Staging files left behind by a process that was killed are collected by
+  `kakehashi language status` on Linux and macOS. On Windows there is no
+  portable way to tell whether the owning process is still running, so they are
+  left alone. They are inert, and safe to delete by hand once no kakehashi
+  server or install is running — while one is, a staging file may be the one it
+  is compiling into.
+
 ### Configuration Management
 
 ```bash
@@ -1173,9 +1230,11 @@ RUST_LOG=kakehashi::lock_recovery=warn kakehashi
 
 ### Queries not working for TypeScript/JavaScript
 
-These languages use query inheritance. Ensure base queries are installed:
+These languages use query inheritance. Re-run the install to fetch any base
+queries that are missing; if a base language cannot be downloaded the install
+fails rather than leaving a dangling `; inherits:`:
 
 ```bash
-kakehashi language install typescript --force
-# This automatically installs 'ecma' queries
+kakehashi language install typescript
+# This also installs the 'ecma' queries typescript inherits from
 ```
