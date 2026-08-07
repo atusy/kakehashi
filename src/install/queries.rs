@@ -159,11 +159,17 @@ fn validate_safe_language_name(language: &str) -> Result<(), QueryInstallError> 
 /// Each kind resolves its own `; inherits:` chain when it loads, and a parent it
 /// names but that is not installed makes that load fail outright — so
 /// injections.scm's parents matter exactly as much as highlights.scm's.
-fn inherited_languages_on_disk(queries_dir: &Path) -> Vec<String> {
+fn inherited_languages_on_disk(queries_dir: &Path) -> Option<Vec<String>> {
     let mut parents: Vec<String> = Vec::new();
     for query_file in QUERY_FILES {
-        let Ok(content) = fs::read_to_string(queries_dir.join(query_file)) else {
-            continue;
+        let content = match fs::read_to_string(queries_dir.join(query_file)) {
+            Ok(content) => content,
+            // A kind this language does not have.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            // A kind it has but that cannot be read. Answering "no parents"
+            // would let a caller call the chain complete on a file it never
+            // saw, so say the chain cannot be determined instead.
+            Err(_) => return None,
         };
         for parent in parse_inherits_directive(&content) {
             if !parents.contains(&parent) {
@@ -171,7 +177,7 @@ fn inherited_languages_on_disk(queries_dir: &Path) -> Vec<String> {
             }
         }
     }
-    parents
+    Some(parents)
 }
 
 /// Hold every language in an inheritance chain still, and report whether all of
@@ -210,9 +216,11 @@ pub fn lock_complete_chain(data_dir: &Path, language: &str) -> Option<Vec<Langua
         }
         let queries_dir = data_dir.join("queries").join(language);
         query_install_is_complete(&queries_dir)
-            && inherited_languages_on_disk(&queries_dir)
-                .into_iter()
-                .all(|parent| walk(data_dir, &parent, seen, guards))
+            && inherited_languages_on_disk(&queries_dir).is_some_and(|parents| {
+                parents
+                    .into_iter()
+                    .all(|parent| walk(data_dir, &parent, seen, guards))
+            })
     }
 
     let mut guards = Vec::new();
@@ -916,7 +924,12 @@ fn stage_queries_recursive(
         staged.insert(language.to_string());
 
         // Even if skipping, we need to check for inherited dependencies
-        for parent in inherited_languages_on_disk(&queries_dir) {
+        let parents = inherited_languages_on_disk(&queries_dir).ok_or_else(|| {
+            QueryInstallError::IoError(std::io::Error::other(format!(
+                "cannot read the query files installed for '{language}' to find what it inherits"
+            )))
+        })?;
+        for parent in parents {
             // Stage parent dependencies (don't force, just ensure they exist)
             clear_uninstall_tombstone_for_dependency(data_dir, &parent)?;
             stage_queries_recursive(
@@ -1115,6 +1128,11 @@ pub fn recover_interrupted_query_installs(queries_parent: &Path) -> Result<(), Q
 pub struct QueryRemoval {
     pub removed_queries: bool,
     pub removed_backups: bool,
+    /// Whether the language's query directory is gone — removed by this call or
+    /// already absent when it started. Distinct from `removed_queries`, which
+    /// only says whether *this* call did the removing: a caller deciding
+    /// whether it may now remove the parser needs the state, not the action.
+    pub queries_absent: bool,
 }
 
 impl QueryRemoval {
@@ -1135,6 +1153,7 @@ pub fn remove_query_install_and_backups(
     let mut removal = QueryRemoval {
         removed_queries: false,
         removed_backups: false,
+        queries_absent: false,
     };
     match remove_query_install_and_backups_inner(lock, &mut removal) {
         Ok(()) => Ok(removal),
@@ -1175,6 +1194,9 @@ fn remove_query_install_and_backups_inner(
     // installed" over a still-present unreadable dir. The tolerant removal
     // reports whether anything was actually removed.
     removal.removed_queries = remove_dir_all_tolerating_vanished(&queries_dir)?;
+    // Either branch of that call leaves the directory gone; anything else
+    // returned an error above.
+    removal.queries_absent = true;
 
     // Propagate per-entry read_dir errors: uninstall must not report success
     // while backups it could not even enumerate stay behind.
@@ -2143,6 +2165,39 @@ mod staging_tests {
                 LanguageLockProbe::Idle(_)
             ),
             "and the lock it took must be free again"
+        );
+    }
+
+    /// A query file that exists but cannot be read is not the same as a
+    /// language with no parents: answering "no parents" would let a caller call
+    /// the chain complete on a file it never saw.
+    #[test]
+    #[cfg(unix)]
+    fn an_unreadable_query_file_makes_the_chain_undecidable() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = TempDir::new().unwrap();
+        let queries_dir = temp.path().join("queries").join("child");
+        fs::create_dir_all(&queries_dir).unwrap();
+        fs::write(queries_dir.join("highlights.scm"), "(x) @y\n").unwrap();
+        write_install_marker(&queries_dir).unwrap();
+        let injections = queries_dir.join("injections.scm");
+        fs::write(&injections, "; inherits: parent\n").unwrap();
+        let mut permissions = fs::metadata(&injections).unwrap().permissions();
+        permissions.set_mode(0o000);
+        fs::set_permissions(&injections, permissions).unwrap();
+
+        let parents = inherited_languages_on_disk(&queries_dir);
+        let chained = lock_complete_chain(temp.path(), "child").is_some();
+
+        // Restore before asserting so a failure cannot leave the file locked.
+        let mut permissions = fs::metadata(&injections).unwrap().permissions();
+        permissions.set_mode(0o600);
+        fs::set_permissions(&injections, permissions).unwrap();
+        assert!(parents.is_none(), "an unreadable kind hides its parents");
+        assert!(
+            !chained,
+            "so the chain cannot be called complete on the strength of it"
         );
     }
 
