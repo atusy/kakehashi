@@ -213,7 +213,9 @@ pub(crate) fn lock_complete_chain(data_dir: &Path, language: &str) -> Option<Vec
             // Nothing can publish into a data directory nothing can write, so
             // what is there is settled without a guard to prove it.
             LanguageLockProbe::Unlockable => {}
-            LanguageLockProbe::Busy | LanguageLockProbe::UnusableName => return false,
+            LanguageLockProbe::Busy
+            | LanguageLockProbe::UnusableName
+            | LanguageLockProbe::Unavailable => return false,
         }
         let queries_dir = data_dir.join("queries").join(language);
         query_install_is_complete(&queries_dir)
@@ -1541,12 +1543,22 @@ fn try_lock_language(data_dir: &Path, language: &str) -> LanguageLockProbe {
         // would go on to build paths out of it.
         return LanguageLockProbe::UnusableName;
     }
-    let Ok((file, queries_parent)) = open_language_lock_file(data_dir, language) else {
-        // The lock file cannot be created or opened for writing — a read-only
-        // or otherwise unwritable data directory. Nobody can be publishing into
-        // it either, so what is on disk is settled; answering "busy" here would
-        // make a perfectly good preinstalled language unusable.
-        return LanguageLockProbe::Unlockable;
+    let (file, queries_parent) = match open_language_lock_file(data_dir, language) {
+        Ok(opened) => opened,
+        // The data directory cannot be written at all. Nobody can be publishing
+        // into it either, so what is on disk is settled — answering otherwise
+        // would make a perfectly good preinstalled language unusable.
+        Err(QueryInstallError::IoError(e))
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::ReadOnlyFilesystem
+            ) =>
+        {
+            return LanguageLockProbe::Unlockable;
+        }
+        // Anything else — out of descriptors, an I/O error — says nothing about
+        // whether an install is in flight, so do not pretend it does.
+        Err(_) => return LanguageLockProbe::Unavailable,
     };
     match file.try_lock() {
         Ok(()) => LanguageLockProbe::Idle(LanguageLock {
@@ -1575,6 +1587,9 @@ enum LanguageLockProbe {
     Unlockable,
     /// The name is not one this module could have installed under.
     UnusableName,
+    /// The lock could not be probed for a reason that says nothing about
+    /// whether an install is in flight — no descriptors left, an I/O error.
+    Unavailable,
 }
 
 /// Open (creating if needed) the file behind a language's lock.
