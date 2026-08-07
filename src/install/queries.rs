@@ -92,7 +92,8 @@ impl std::fmt::Display for QueryInstallError {
             Self::DependencyRemoved(language) => {
                 write!(
                     f,
-                    "The installed queries for '{}' were removed while it was being installed",
+                    "The queries installed for '{}' were removed or replaced while it was being \
+                     installed",
                     language
                 )
             }
@@ -399,8 +400,8 @@ fn install_queries_with_dependencies_from_with_http_policy(
             format!("Query install for {language} was superseded by uninstall"),
         )));
     }
-    if let Some(missing) = staged.missing_skipped_dependency() {
-        return Err(QueryInstallError::DependencyRemoved(missing.to_string()));
+    if let Some(unstable) = staged.unstable_skipped_dependency() {
+        return Err(QueryInstallError::DependencyRemoved(unstable.to_string()));
     }
     let published = staged.publish().map_err(|failure| failure.error)?;
     match published.commit() {
@@ -510,28 +511,42 @@ impl StagedQueryInstall {
         &self.dependencies
     }
 
-    /// The first language staging skipped as already complete whose queries are
-    /// no longer there.
+    /// The first language staging skipped as already installed whose state has
+    /// moved since — its queries gone, unreadable, or now inheriting something
+    /// this install never discovered.
     ///
     /// Staging does not copy a language whose queries are already complete, so
     /// there is no staged copy to publish and nothing in the publish that would
-    /// notice them disappearing. An uninstall between staging and publication
-    /// would otherwise leave this install reporting success over a language
-    /// whose own queries — or a base language it inherits — are gone. Callers
-    /// check this once they hold the locks that keep the answer true.
-    pub(crate) fn missing_skipped_dependency(&self) -> Option<&str> {
-        self.dependencies
-            .iter()
-            .filter(|language| {
-                !self
-                    .entries
-                    .iter()
-                    .any(|entry| entry.language == **language)
-            })
-            .find(|language| {
-                !query_install_is_complete(&self.queries_parent.join(language.as_str()))
-            })
-            .map(String::as_str)
+    /// notice it changing. Without this, an uninstall or a forced reinstall
+    /// between staging and publication would leave this install reporting
+    /// success over a chain nobody was holding still. Callers check it once
+    /// they hold the locks that keep the answer true.
+    pub(crate) fn unstable_skipped_dependency(&self) -> Option<&str> {
+        for language in &self.dependencies {
+            if self.entries.iter().any(|entry| &entry.language == language) {
+                // Staged by this install: its publish re-checks it under the
+                // lock, and what it publishes is what this install downloaded.
+                continue;
+            }
+            let queries_dir = self.queries_parent.join(language);
+            if !query_install_is_complete(&queries_dir) {
+                return Some(language);
+            }
+            // A forced reinstall of this language by someone else can replace
+            // it with queries that inherit something new — a language this
+            // install never discovered, so never locked and never checked. The
+            // chain it publishes would then be one nobody is holding still.
+            let Some(parents) = inherited_languages_on_disk(&queries_dir) else {
+                return Some(language);
+            };
+            if parents
+                .iter()
+                .any(|parent| !self.dependencies.contains(parent))
+            {
+                return Some(language);
+            }
+        }
+        None
     }
 
     /// Rename every staged directory into place, keeping the displaced
@@ -587,13 +602,7 @@ impl StagedQueryInstall {
                 Ok(PublishQueryDirOutcome::Uninstalled) => {
                     let residue = publish.rollback();
                     return Err(PublishFailure {
-                        error: QueryInstallError::IoError(std::io::Error::new(
-                            std::io::ErrorKind::Interrupted,
-                            format!(
-                                "Query install for {} was superseded by uninstall",
-                                entry.language
-                            ),
-                        )),
+                        error: QueryInstallError::DependencyRemoved(entry.language),
                         residue,
                     });
                 }
@@ -2331,12 +2340,56 @@ mod staging_tests {
             queries_parent: queries_parent.clone(),
         };
 
-        assert_eq!(staged.missing_skipped_dependency(), None);
+        assert_eq!(staged.unstable_skipped_dependency(), None);
         fs::remove_dir_all(&queries_dir).unwrap();
         assert_eq!(
-            staged.missing_skipped_dependency(),
+            staged.unstable_skipped_dependency(),
             Some("child"),
             "queries removed after staging must not pass as already installed"
+        );
+    }
+
+    /// A skipped language that grew a new base language while this install was
+    /// staging is as unstable as one that vanished: the new base was never
+    /// discovered, so it is neither locked nor checked, and publishing over it
+    /// would report success on a chain nobody was holding still.
+    #[test]
+    fn a_skipped_dependency_that_gained_a_parent_is_rechecked() {
+        let temp = TempDir::new().unwrap();
+        let queries_parent = temp.path().join("queries");
+        let parent_dir = queries_parent.join("parent");
+        fs::create_dir_all(&parent_dir).unwrap();
+        fs::write(parent_dir.join("highlights.scm"), "(comment) @comment\n").unwrap();
+        write_install_marker(&parent_dir).unwrap();
+        let staged = StagedQueryInstall {
+            language: "child".to_string(),
+            install_path: queries_parent.join("child"),
+            files_downloaded: vec!["highlights.scm".to_string()],
+            requested_already_complete: false,
+            entries: vec![stage(
+                &queries_parent,
+                "child",
+                "; inherits: parent\n",
+                false,
+            )],
+            dependencies: vec!["child".to_string(), "parent".to_string()],
+            queries_parent: queries_parent.clone(),
+        };
+
+        assert_eq!(staged.unstable_skipped_dependency(), None);
+
+        // Someone force-reinstalls the parent, and its new queries inherit a
+        // language this install never saw.
+        fs::write(
+            parent_dir.join("highlights.scm"),
+            "; inherits: grandparent\n(comment) @comment\n",
+        )
+        .unwrap();
+
+        assert_eq!(
+            staged.unstable_skipped_dependency(),
+            Some("parent"),
+            "a base language that gained a parent must stop the publish"
         );
     }
 
@@ -2363,7 +2416,7 @@ mod staging_tests {
         };
 
         assert_eq!(
-            staged.missing_skipped_dependency(),
+            staged.unstable_skipped_dependency(),
             Some("parent"),
             "a base language that is neither staged nor on disk must be caught"
         );
@@ -2385,7 +2438,7 @@ mod staging_tests {
             queries_parent: queries_parent.clone(),
         };
 
-        assert_eq!(staged.missing_skipped_dependency(), None);
+        assert_eq!(staged.unstable_skipped_dependency(), None);
     }
 
     /// `--force` replaces the requested language, not the base languages it
@@ -2460,7 +2513,7 @@ mod staging_tests {
         let result = staged.publish();
 
         assert!(
-            matches!(&result, Err(failure) if matches!(&failure.error, QueryInstallError::IoError(e) if e.kind() == std::io::ErrorKind::Interrupted)),
+            matches!(&result, Err(failure) if matches!(&failure.error, QueryInstallError::DependencyRemoved(language) if language == "parent")),
             "a tombstoned entry must abort the publish"
         );
         assert_eq!(
