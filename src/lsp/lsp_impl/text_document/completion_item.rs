@@ -21,7 +21,7 @@ impl Kakehashi {
     /// envelope, routes to the origin server, and re-envelopes the result —
     /// transforming coordinates on the virt path only, since a host-layer item
     /// is already in host coordinates. Falls back gracefully at every failure
-    /// point.
+    /// point, except a client cancel, which surfaces as `RequestCancelled`.
     pub(crate) async fn completion_resolve_impl(
         &self,
         params: CompletionItem,
@@ -47,10 +47,31 @@ impl Kakehashi {
         let settings = self.settings_manager.load_settings();
         let pool = self.bridge.pool_arc();
         let upstream_id = current_upstream_id();
-        let item = pool
-            .dispatch_completion_resolve(params, &settings, upstream_id)
-            .await;
-        Ok(item)
+        // Propagate a client `$/cancelRequest` as RequestCancelled instead of
+        // masking it as an unresolved-item success: the cancel IS forwarded
+        // downstream, and the -32800 that comes back is collapsed to "no usable
+        // response" by the fail-soft parsing. Mirrors `code_action_resolve_impl`.
+        let (cancel_rx, _cancel_guard) = self.subscribe_cancel(upstream_id.as_ref());
+        let sweep_id = upstream_id.clone();
+        let dispatch = pool.dispatch_completion_resolve(params, &settings, upstream_id);
+        // The cancel arm DROPS the in-flight dispatch, which then never reaches
+        // its own unregister. An RAII sweep covers that — and, unlike a trailing
+        // statement, also runs when this whole handler future is dropped (client
+        // disconnect / shutdown), which is how the entry leaked before. The
+        // CAPTURED id, not a re-read of the task-local: the sweep must target
+        // exactly the id the dispatch registered under.
+        let _sweep = crate::lsp::lsp_impl::bridge_context::UpstreamRegistrySweepGuard::new(
+            std::sync::Arc::clone(&pool),
+            sweep_id,
+        );
+        match cancel_rx {
+            Some(rx) => tokio::select! {
+                biased;
+                _ = rx => Err(tower_lsp_server::jsonrpc::Error::request_cancelled()),
+                item = dispatch => Ok(item),
+            },
+            None => Ok(dispatch.await),
+        }
     }
 
     fn completion_envelope_is_fresh(&self, envelope: &KakehashiEnvelope) -> bool {
