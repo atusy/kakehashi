@@ -1111,6 +1111,7 @@ pub fn recover_interrupted_query_installs(queries_parent: &Path) -> Result<(), Q
     Ok(())
 }
 
+#[derive(Debug)]
 pub struct QueryRemoval {
     pub removed_queries: bool,
     pub removed_backups: bool,
@@ -1130,7 +1131,37 @@ impl QueryRemoval {
 /// the lock is what an install waits on.
 pub fn remove_query_install_and_backups(
     lock: &LanguageLock,
-) -> Result<QueryRemoval, QueryInstallError> {
+) -> Result<QueryRemoval, QueryRemovalFailure> {
+    let mut removal = QueryRemoval {
+        removed_queries: false,
+        removed_backups: false,
+    };
+    match remove_query_install_and_backups_inner(lock, &mut removal) {
+        Ok(()) => Ok(removal),
+        // The caller decides what to do next from how far this got — leaving a
+        // parser beside queries that *are* gone is the half-removed language
+        // the whole path avoids, so the progress travels with the error.
+        Err(error) => Err(QueryRemovalFailure { error, removal }),
+    }
+}
+
+/// A removal that failed, and how much of it had already happened.
+#[derive(Debug)]
+pub struct QueryRemovalFailure {
+    pub error: QueryInstallError,
+    pub removal: QueryRemoval,
+}
+
+impl std::fmt::Display for QueryRemovalFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.error)
+    }
+}
+
+fn remove_query_install_and_backups_inner(
+    lock: &LanguageLock,
+    removal: &mut QueryRemoval,
+) -> Result<(), QueryInstallError> {
     let queries_parent = lock.queries_parent.as_path();
     let language = lock.language.as_str();
     validate_safe_language_name(language)?;
@@ -1138,10 +1169,6 @@ pub fn remove_query_install_and_backups(
     let _replace_lock = QueryReplaceLockGuard::acquire(queries_parent, language)?;
     write_uninstall_tombstone(queries_parent, language)?;
     let queries_dir = queries_parent.join(language);
-    let mut removal = QueryRemoval {
-        removed_queries: false,
-        removed_backups: false,
-    };
 
     // No exists() pre-check: Path::exists() reads false on metadata errors
     // (e.g. PermissionDenied), which would skip removal and report "not
@@ -1183,7 +1210,7 @@ pub fn remove_query_install_and_backups(
             }
         }
     }
-    Ok(removal)
+    Ok(())
 }
 
 /// `fs::remove_dir_all` that treats a CONFIRMED-vanished directory as the
@@ -1405,9 +1432,17 @@ fn collect_superseded_backups(
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(e) => return Err(QueryInstallError::IoError(e)),
     };
-    for entry in entries.flatten() {
+    for entry in entries {
+        // Propagated, not skipped: a sweep that reports success over entries it
+        // could not even read is how residue it never saw becomes permanent.
+        let entry = entry.map_err(QueryInstallError::IoError)?;
         let path = entry.path();
-        if !path.is_dir() || !backup_is_owned(&path) {
+        if !entry
+            .file_type()
+            .map_err(QueryInstallError::IoError)?
+            .is_dir()
+            || !backup_is_owned(&path)
+        {
             continue;
         }
         let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
@@ -2582,12 +2617,11 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let queries_parent = temp.path().join("queries");
 
-        let result = lock_language(temp.path(), "a/../../victim")
-            .map(|lock| remove_query_install_and_backups(&lock))
-            .and_then(|result| result);
+        // The lock itself refuses the name, so removal is never reached.
+        let locked = lock_language(temp.path(), "a/../../victim");
 
         assert!(
-            matches!(result, Err(QueryInstallError::InvalidLanguageName(_))),
+            matches!(locked, Err(QueryInstallError::InvalidLanguageName(_))),
             "unsafe language must be rejected before cleanup paths are derived"
         );
         assert!(
