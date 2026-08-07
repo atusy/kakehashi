@@ -626,20 +626,19 @@ fn language_is_complete(language: &str, data_dir: &std::path::Path) -> bool {
     // async path, and "busy" is as useful an answer as waiting for one. A data
     // directory that cannot be locked at all — read-only, or predating the lock
     // files — is settled by definition, and must still be readable.
-    let settled = crate::install::queries::try_lock_language(data_dir, language);
-    if !settled.is_settled() {
+    // The whole chain, not just this language's own queries: a missing inherited
+    // parent makes the query load fail outright, and skipping the install over
+    // it is what leaves such a language unrepairable. Every language in the
+    // chain is held still while this decides — an install mid-publish can still
+    // roll its queries back, and a base language can be uninstalled out from
+    // under the walk. Non-blocking, so a busy language answers "not ready"
+    // rather than stalling the async path.
+    let Some(chain) = crate::install::queries::lock_complete_chain(data_dir, language) else {
         return false;
-    }
-    let complete = crate::install::parser_file_exists(language, data_dir).is_some()
-        // The whole chain, not just this language's own queries: a missing
-        // inherited parent makes the query load fail outright, and skipping the
-        // install over it is what leaves such a language unrepairable.
-        && crate::install::queries::query_install_chain_is_complete(
-            &data_dir.join("queries"),
-            language,
-        );
-    // Held until here on purpose: the reads above must not straddle a publish.
-    drop(settled);
+    };
+    let complete = crate::install::parser_file_exists(language, data_dir).is_some();
+    // The guards live until here: the parser read must not straddle a publish.
+    drop(chain);
     complete
 }
 
