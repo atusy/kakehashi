@@ -253,12 +253,13 @@ impl LanguageServerPool {
     /// paths: register for cancel forwarding, send `outgoing` on `handle`, and
     /// parse the reply. `None` on every failure (registration, send, transport,
     /// error/malformed response) — the callers own the fail-soft policy of
-    /// returning the unresolved item with its envelope restored. The upstream
-    /// registry entry is removed on every `return`; a future DROPPED at the
-    /// response await leaks it, since (unlike the layer-walk arms) this has no
-    /// `UpstreamRegistrySweepGuard` above it — `completion_resolve_impl` calls
-    /// the dispatch directly rather than through `run_layer_race`. Pre-existing
-    /// and unchanged by the host path; noted so the claim is not read as RAII.
+    /// returning the unresolved item with its envelope restored.
+    ///
+    /// The upstream registry entry is removed on every `return` here, but that
+    /// is NOT RAII — a future dropped at the response await skips it. The
+    /// `UpstreamRegistrySweepGuard` in `completion_resolve_impl` covers that
+    /// case (this dispatch is called directly, not through `run_layer_race`,
+    /// so it has no walk-level sweep above it).
     async fn send_completion_resolve_on_handle(
         &self,
         handle: &Arc<ConnectionHandle>,
