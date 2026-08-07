@@ -409,10 +409,11 @@ fn install_language_with_query_stager(
     // Queries that staging found already complete were never copied, so this is
     // the only thing that would notice them being removed since. Checked under
     // the locks, before anything is published, so there is nothing to undo.
-    if let Some(missing) = staged_queries.missing_skipped_dependency() {
+    if let Some(unstable) = staged_queries.unstable_skipped_dependency() {
         result.queries_error = Some(format!(
-            "the installed queries for '{}' were removed while '{}' was being installed",
-            missing, language
+            "the queries installed for '{}' were removed or replaced while '{}' was being \
+             installed",
+            unstable, language
         ));
         return result;
     }
