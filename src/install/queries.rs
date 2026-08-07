@@ -48,6 +48,10 @@ pub enum QueryInstallError {
     IoError(std::io::Error),
     /// Queries already exist and --force not specified.
     AlreadyExists(PathBuf),
+    /// A language this install needed was removed after staging found it
+    /// already installed. Not an upstream problem — the remedy is to retry, not
+    /// to look for a language nvim-treesitter does not have.
+    DependencyRemoved(String),
     /// Publishing moved the live queries aside and could not put anything back:
     /// the language has no queries, and the previous ones are in `backup`.
     PreviousQueriesStranded {
@@ -83,6 +87,13 @@ impl std::fmt::Display for QueryInstallError {
                     f,
                     "Queries already exist at {}. Use --force to overwrite.",
                     path.display()
+                )
+            }
+            Self::DependencyRemoved(language) => {
+                write!(
+                    f,
+                    "The installed queries for '{}' were removed while it was being installed",
+                    language
                 )
             }
             Self::PreviousQueriesStranded {
@@ -163,13 +174,26 @@ fn inherited_languages_on_disk(queries_dir: &Path) -> Vec<String> {
     parents
 }
 
-/// Whether a language and everything it inherits are installed and complete.
+/// Hold every language in an inheritance chain still, and report whether all of
+/// them are installed.
 ///
-/// [`query_install_is_complete`] answers for one directory; a language whose own
-/// queries are complete still fails to load when a language they inherit is
-/// missing, because the loader resolves the chain and gives up on the first gap.
-pub fn query_install_chain_is_complete(queries_parent: &Path, language: &str) -> bool {
-    fn walk(queries_parent: &Path, language: &str, seen: &mut Vec<String>) -> bool {
+/// `Some(guards)` means the chain is complete and stays that way while the
+/// guards live — so a caller can read the rest of its state (a parser file, say)
+/// without the answer moving underneath it. `None` means a language in the chain
+/// is missing, or one of them is mid-publish and its queries can still be rolled
+/// back, or the name is not one that could be installed.
+///
+/// Locks are taken with [`try_lock_language`], so this never waits: it runs on
+/// the LSP's async path, and there "someone is publishing, look again later" is
+/// as useful as an answer as blocking for one. Because nothing waits, taking
+/// them in discovery order cannot deadlock.
+pub fn lock_complete_chain(data_dir: &Path, language: &str) -> Option<Vec<LanguageLock>> {
+    fn walk(
+        data_dir: &Path,
+        language: &str,
+        seen: &mut Vec<String>,
+        guards: &mut Vec<LanguageLock>,
+    ) -> bool {
         // An inheritance cycle among on-disk files (a self-inherit typo, A↔B)
         // is the loader's problem to report, not a reason to call the install
         // incomplete and re-download forever.
@@ -177,17 +201,22 @@ pub fn query_install_chain_is_complete(queries_parent: &Path, language: &str) ->
             return true;
         }
         seen.push(language.to_string());
-        let queries_dir = queries_parent.join(language);
+        match try_lock_language(data_dir, language) {
+            LanguageLockProbe::Idle(guard) => guards.push(guard),
+            // Nothing can publish into a data directory nothing can write, so
+            // what is there is settled without a guard to prove it.
+            LanguageLockProbe::Unlockable => {}
+            LanguageLockProbe::Busy | LanguageLockProbe::UnusableName => return false,
+        }
+        let queries_dir = data_dir.join("queries").join(language);
         query_install_is_complete(&queries_dir)
             && inherited_languages_on_disk(&queries_dir)
                 .into_iter()
-                .all(|parent| walk(queries_parent, &parent, seen))
+                .all(|parent| walk(data_dir, &parent, seen, guards))
     }
 
-    if !is_safe_language_name(language) {
-        return false;
-    }
-    walk(queries_parent, language, &mut Vec::new())
+    let mut guards = Vec::new();
+    walk(data_dir, language, &mut Vec::new(), &mut guards).then_some(guards)
 }
 
 /// Strip the parentheses nvim-treesitter puts around some inherited names.
@@ -363,7 +392,7 @@ fn install_queries_with_dependencies_from_with_http_policy(
         )));
     }
     if let Some(missing) = staged.missing_skipped_dependency() {
-        return Err(QueryInstallError::LanguageNotSupported(missing.to_string()));
+        return Err(QueryInstallError::DependencyRemoved(missing.to_string()));
     }
     match staged.publish()?.commit() {
         CommittedQueryInstall::Installed(result) => Ok(result),
@@ -1410,6 +1439,12 @@ pub fn lock_language(data_dir: &Path, language: &str) -> Result<LanguageLock, Qu
 /// the answer, because releasing it before reading the artifacts would put the
 /// whole publish back inside the window.
 pub fn try_lock_language(data_dir: &Path, language: &str) -> LanguageLockProbe {
+    if !is_safe_language_name(language) {
+        // Nothing this module manages can be under such a name, so there is no
+        // on-disk state to call settled — and a caller that believed otherwise
+        // would go on to build paths out of it.
+        return LanguageLockProbe::UnusableName;
+    }
     let Ok((file, queries_parent)) = open_language_lock_file(data_dir, language) else {
         // The lock file cannot be created or opened for writing — a read-only
         // or otherwise unwritable data directory. Nobody can be publishing into
@@ -1436,13 +1471,15 @@ pub enum LanguageLockProbe {
     /// The lock cannot be taken at all, so nothing can be publishing either.
     /// Whatever is on disk is as settled as it will ever be.
     Unlockable,
+    /// The name is not one this module could have installed under.
+    UnusableName,
 }
 
 impl LanguageLockProbe {
     /// Whether the artifacts on disk can be trusted to stay put — either
     /// because this probe holds the lock, or because nobody can publish.
     pub fn is_settled(&self) -> bool {
-        !matches!(self, Self::Busy)
+        matches!(self, Self::Idle(_) | Self::Unlockable)
     }
 }
 
@@ -1969,7 +2006,7 @@ mod staging_tests {
             "the language's own queries are complete"
         );
         assert!(
-            !query_install_chain_is_complete(&queries_parent, "child"),
+            lock_complete_chain(temp.path(), "child").is_none(),
             "but the parent it inherits is missing"
         );
 
@@ -1978,7 +2015,7 @@ mod staging_tests {
         fs::write(parent_dir.join("highlights.scm"), "(comment) @comment\n").unwrap();
         write_install_marker(&parent_dir).unwrap();
 
-        assert!(query_install_chain_is_complete(&queries_parent, "child"));
+        assert!(lock_complete_chain(temp.path(), "child").is_some());
     }
 
     /// A cycle among on-disk files is the loader's problem to report; treating
@@ -1998,7 +2035,10 @@ mod staging_tests {
             write_install_marker(&dir).unwrap();
         }
 
-        assert!(query_install_chain_is_complete(&queries_parent, "cyc_a"));
+        assert!(
+            lock_complete_chain(temp.path(), "cyc_a").is_some(),
+            "a cycle is the loader's problem to report, not a reason to reinstall forever"
+        );
     }
 
     /// Publishing can fail after it has already moved the live queries aside,
@@ -2047,6 +2087,56 @@ mod staging_tests {
                 LanguageLockProbe::Idle(_)
             ),
             "and the lock it took must be free again"
+        );
+    }
+
+    /// A base language that is mid-publish, or missing, makes the whole chain
+    /// unusable — and the guards must be released when the answer is no, or the
+    /// install that follows would block on them.
+    #[test]
+    fn locking_a_chain_reports_and_releases() {
+        let temp = TempDir::new().unwrap();
+        let data_dir = temp.path();
+        let queries_parent = data_dir.join("queries");
+        for (language, content) in [
+            ("child", "; inherits: parent\n"),
+            ("parent", "(comment) @comment\n"),
+        ] {
+            let dir = queries_parent.join(language);
+            fs::create_dir_all(&dir).unwrap();
+            fs::write(dir.join("highlights.scm"), content).unwrap();
+            write_install_marker(&dir).unwrap();
+        }
+
+        let held = lock_complete_chain(data_dir, "child").expect("a complete chain locks");
+        assert_eq!(held.len(), 2, "both languages in the chain are held");
+        assert!(
+            matches!(
+                try_lock_language(data_dir, "parent"),
+                LanguageLockProbe::Busy
+            ),
+            "including the base language, which is the point"
+        );
+        drop(held);
+
+        // A base language mid-publish makes the chain unusable...
+        let publishing_parent = lock_language(data_dir, "parent").unwrap();
+        assert!(lock_complete_chain(data_dir, "child").is_none());
+        drop(publishing_parent);
+        assert!(
+            lock_complete_chain(data_dir, "child").is_some(),
+            "and usable again once it is done"
+        );
+
+        // ...as does one that is simply gone.
+        fs::remove_dir_all(queries_parent.join("parent")).unwrap();
+        assert!(lock_complete_chain(data_dir, "child").is_none());
+        assert!(
+            matches!(
+                try_lock_language(data_dir, "child"),
+                LanguageLockProbe::Idle(_)
+            ),
+            "a chain that answered no must not leave its locks held"
         );
     }
 
