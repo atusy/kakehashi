@@ -625,6 +625,12 @@ pub fn install_parser(
     reject_unsafe_language_name(language)?;
     let _transaction = super::queries::lock_language(&options.data_dir, language)
         .map_err(|e| ParserInstallError::IoError(std::io::Error::other(e.to_string())))?;
+    // An explicit install overrides an earlier uninstall, exactly as the
+    // whole-language one does — and clearing the marker under this lock is what
+    // keeps the two consistent. Leaving it would put a fresh parser next to a
+    // tombstone saying the language is gone, which the query side then honours.
+    super::queries::clear_uninstall_tombstone_for_install(&options.data_dir, language)
+        .map_err(|e| ParserInstallError::IoError(std::io::Error::other(e.to_string())))?;
     match stage_parser(language, options)? {
         StagedParserOutcome::Staged(staged) => {
             let result = staged.publish()?;
@@ -1661,6 +1667,44 @@ mod tests {
             pid = pid.saturating_add(1);
         }
         pid
+    }
+
+    /// A parser published beside a live uninstall tombstone is a language the
+    /// query side still believes is gone. An explicit install overrides the
+    /// uninstall — but it has to say so on disk, not leave the two disagreeing.
+    #[test]
+    fn installing_a_parser_clears_the_uninstall_tombstone() {
+        let temp = tempdir().expect("temp dir");
+        let data_dir = temp.path();
+        let queries_parent = data_dir.join("queries");
+        fs::create_dir_all(&queries_parent).expect("create queries dir");
+        super::super::queries::write_uninstall_tombstone_for_tests(&queries_parent, "lua")
+            .expect("write tombstone");
+        // A parser is already installed, so this returns before any network.
+        let parser_dir = data_dir.join("parser");
+        fs::create_dir_all(&parser_dir).expect("create parser dir");
+        fs::write(
+            parser_dir.join(format!("lua.{}", std::env::consts::DLL_EXTENSION)),
+            b"installed",
+        )
+        .expect("write parser");
+
+        let result = install_parser(
+            "lua",
+            &InstallOptions {
+                data_dir: data_dir.to_path_buf(),
+                force: false,
+                verbose: false,
+                no_cache: false,
+                compile: ParserCompile::InProcess,
+            },
+        );
+
+        assert!(matches!(result, Err(ParserInstallError::AlreadyExists(_))));
+        assert!(
+            !queries_parent.join(".lua.uninstalled").is_file(),
+            "the marker saying the language is gone must not outlive the install"
+        );
     }
 
     /// A displaced file is the previous parser, moved aside by a publish that
