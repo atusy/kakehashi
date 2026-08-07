@@ -908,6 +908,13 @@ fn stage_queries_recursive(
         return Ok(StageOutcome::NothingToDo);
     }
 
+    // Clear any uninstall tombstone here rather than at the call sites, so a
+    // language the graph reaches twice — a cycle, or two languages sharing a
+    // base — is cleared once. A second clear on the revisit would erase a
+    // marker written by an uninstall that completed in between, and the
+    // transaction would then republish what that uninstall had removed.
+    clear_uninstall_tombstone_for_dependency(data_dir, language)?;
+
     let queries_dir = data_dir.join("queries").join(language);
     let queries_parent = data_dir.join("queries");
     fs::create_dir_all(&queries_parent)?;
@@ -931,7 +938,6 @@ fn stage_queries_recursive(
         })?;
         for parent in parents {
             // Stage parent dependencies (don't force, just ensure they exist)
-            clear_uninstall_tombstone_for_dependency(data_dir, &parent)?;
             stage_queries_recursive(
                 base_url,
                 &parent,
@@ -1017,7 +1023,6 @@ fn stage_queries_recursive(
     // inherits.
     for parent in parents_to_install {
         eprintln!("Staging inherited queries: {}", parent);
-        clear_uninstall_tombstone_for_dependency(data_dir, &parent)?;
         stage_queries_recursive(
             base_url,
             &parent,

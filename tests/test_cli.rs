@@ -1497,17 +1497,28 @@ fn test_language_status_preserves_incomplete_query_dir_when_backup_exists() {
 /// language is the state the atomic install/uninstall path exists to avoid, and
 /// leaving both halves keeps the retry a plain retry.
 #[test]
+#[cfg(unix)]
 fn test_language_uninstall_keeps_the_parser_when_queries_cannot_be_removed() {
     use std::fs;
+    use std::os::unix::fs::PermissionsExt;
 
     let test_dir = tempfile::tempdir().expect("Failed to create temp dir");
     fs::create_dir_all(test_dir.path().join("parser")).expect("Failed to create parser dir");
     let ext = std::env::consts::DLL_EXTENSION;
     let parser_file = test_dir.path().join(format!("parser/stuck_lang.{ext}"));
     fs::write(&parser_file, "fake").expect("Failed to write parser");
-    // A file where the queries directory belongs makes the removal fail.
-    fs::write(test_dir.path().join("queries"), "not a directory")
-        .expect("Failed to write blocking file");
+    // `queries/` itself must stay writable — the language lock lives there and
+    // is taken before the removal. Make the language's own directory
+    // undeletable instead, so the run reaches the removal and fails there.
+    let queries_dir = test_dir.path().join("queries/stuck_lang");
+    fs::create_dir_all(&queries_dir).expect("Failed to create queries dir");
+    fs::write(queries_dir.join("highlights.scm"), "(comment) @comment")
+        .expect("Failed to write queries");
+    let mut permissions = fs::metadata(&queries_dir)
+        .expect("Failed to read permissions")
+        .permissions();
+    permissions.set_mode(0o500);
+    fs::set_permissions(&queries_dir, permissions).expect("Failed to seal queries dir");
 
     let output = Command::new(env!("CARGO_BIN_EXE_kakehashi"))
         .args([
@@ -1522,7 +1533,19 @@ fn test_language_uninstall_keeps_the_parser_when_queries_cannot_be_removed() {
         .expect("Failed to execute command");
 
     let stderr = String::from_utf8_lossy(&output.stderr);
+    // Unseal before asserting, so a failure cannot leave an undeletable
+    // directory behind for the temp dir to trip over.
+    let mut permissions = fs::metadata(&queries_dir)
+        .expect("Failed to read permissions")
+        .permissions();
+    permissions.set_mode(0o700);
+    fs::set_permissions(&queries_dir, permissions).expect("Failed to unseal queries dir");
+
     assert!(!output.status.success(), "stderr: {stderr}");
+    assert!(
+        stderr.contains("Failed to remove queries"),
+        "the run must reach the removal and fail there, not earlier: {stderr}"
+    );
     assert!(
         parser_file.exists(),
         "a failed query removal must leave the parser alone: {stderr}"

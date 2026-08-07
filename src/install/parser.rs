@@ -521,15 +521,30 @@ pub fn recover_interrupted_parser_installs(parser_dir: &Path) -> std::io::Result
         if !entry.file_type()?.is_file() {
             continue;
         }
-        let Some(pid) = path
+        let Some(staging) = path
             .file_name()
             .and_then(|name| name.to_str())
             .and_then(staging_file_owner)
         else {
             continue;
         };
-        if super::queries::process_is_running(pid) {
+        if super::queries::process_is_running(staging.pid) {
             continue;
+        }
+        // A displaced file is the previous parser, moved aside by a publish that
+        // then could not put it back. If the language has no parser now, it is
+        // the only copy left and the publication error told the user where it
+        // is — put it back instead of collecting it.
+        if staging.displaced {
+            let parser_file = parser_dir.join(format!(
+                "{}.{}",
+                staging.language,
+                std::env::consts::DLL_EXTENSION
+            ));
+            if !parser_file.is_file() {
+                fs::rename(&path, &parser_file)?;
+                continue;
+            }
         }
         match fs::remove_file(&path) {
             Ok(()) => {}
@@ -541,17 +556,26 @@ pub fn recover_interrupted_parser_installs(parser_dir: &Path) -> std::io::Result
     Ok(())
 }
 
-/// The pid embedded in a generated staging file name, if it is one.
+/// A generated staging file: which language and process it belongs to, and
+/// whether it is a compile's output or a parser moved aside by a publish.
+struct StagingFile<'a> {
+    language: &'a str,
+    pid: &'a str,
+    displaced: bool,
+}
+
+/// Read a generated staging file name, if it is one.
 ///
 /// Shape: `.{language}.{pid}.{counter}.{ext}.tmp`, plus the `.displaced` copy a
 /// Windows publish moves the previous parser to. A user's own dot-file is left
 /// alone because it will not parse into these parts.
-fn staging_file_owner(name: &str) -> Option<&str> {
-    let rest = name
-        .strip_prefix('.')?
-        .strip_suffix(".displaced")
-        .unwrap_or(name.strip_prefix('.')?)
-        .strip_suffix(".tmp")?;
+fn staging_file_owner(name: &str) -> Option<StagingFile<'_>> {
+    let body = name.strip_prefix('.')?;
+    let (body, displaced) = match body.strip_suffix(".displaced") {
+        Some(body) => (body, true),
+        None => (body, false),
+    };
+    let rest = body.strip_suffix(".tmp")?;
     let mut parts = rest.split('.');
     let language = parts.next()?;
     let pid = parts.next()?;
@@ -562,7 +586,11 @@ fn staging_file_owner(name: &str) -> Option<&str> {
         && pid.bytes().all(|b| b.is_ascii_digit())
         && counter.bytes().all(|b| b.is_ascii_digit())
     {
-        Some(pid)
+        Some(StagingFile {
+            language,
+            pid,
+            displaced,
+        })
     } else {
         None
     }
@@ -1633,6 +1661,53 @@ mod tests {
             pid = pid.saturating_add(1);
         }
         pid
+    }
+
+    /// A displaced file is the previous parser, moved aside by a publish that
+    /// could not put it back. If the language has no parser now it is the only
+    /// copy left — and the publication error told the user it was there, so a
+    /// sweep must not be what deletes it.
+    #[test]
+    #[cfg(unix)]
+    fn a_displaced_parser_is_restored_when_the_language_has_none() {
+        let temp = tempdir().expect("temp dir");
+        let parser_dir = temp.path().join("parser");
+        fs::create_dir_all(&parser_dir).expect("create parser dir");
+        let ext = std::env::consts::DLL_EXTENSION;
+        let displaced = parser_dir.join(format!(".lua.{}.0.{}.tmp.displaced", dead_pid(), ext));
+        fs::write(&displaced, b"previous parser").expect("write displaced parser");
+
+        recover_interrupted_parser_installs(&parser_dir).expect("sweep should succeed");
+
+        assert_eq!(
+            fs::read(parser_dir.join(format!("lua.{}", ext))).expect("read restored parser"),
+            b"previous parser",
+            "the only copy left must be put back, not collected"
+        );
+    }
+
+    /// Once the language has a parser again, the copy that was displaced is
+    /// superseded and only takes up room.
+    #[test]
+    #[cfg(unix)]
+    fn a_displaced_parser_is_collected_once_superseded() {
+        let temp = tempdir().expect("temp dir");
+        let parser_dir = temp.path().join("parser");
+        fs::create_dir_all(&parser_dir).expect("create parser dir");
+        let ext = std::env::consts::DLL_EXTENSION;
+        let installed = parser_dir.join(format!("lua.{}", ext));
+        fs::write(&installed, b"current parser").expect("write installed parser");
+        let displaced = parser_dir.join(format!(".lua.{}.0.{}.tmp.displaced", dead_pid(), ext));
+        fs::write(&displaced, b"previous parser").expect("write displaced parser");
+
+        recover_interrupted_parser_installs(&parser_dir).expect("sweep should succeed");
+
+        assert!(!displaced.exists(), "a superseded copy is collected");
+        assert_eq!(
+            fs::read(&installed).expect("read installed parser"),
+            b"current parser",
+            "and the installed parser is untouched"
+        );
     }
 
     /// A directory that happens to carry a parser's name is not a parser —
