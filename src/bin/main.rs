@@ -783,13 +783,15 @@ fn run_language_uninstall(
                 eprintln!("✗ Failed to remove queries for '{}': {}", lang, failure);
                 any_failed = true;
                 removed_something |= failure.removal.removed_anything();
-                // Whether to go on to the parser depends on how far the removal
-                // got. With the queries gone, stopping would leave a
-                // parser-only language — the half-removed state this command
-                // exists to avoid — so finish the job. With them still there,
-                // taking the parser would *create* that state, so leave both
-                // and let the retry be a plain retry.
-                if !failure.removal.removed_queries {
+                // Whether to go on to the parser depends on the state the
+                // removal left, not on whether it did the removing: a language
+                // that was already parser-only still needs its parser taken.
+                // With the queries gone, stopping would leave a parser-only
+                // language — the half-removed state this command exists to
+                // avoid — so finish the job. With them still there, taking the
+                // parser would *create* that state, so leave both and let the
+                // retry be a plain retry.
+                if !failure.removal.queries_absent {
                     eprintln!(
                         "  Leaving the parser for '{}' in place; run the command again.",
                         lang
