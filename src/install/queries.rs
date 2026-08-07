@@ -558,7 +558,7 @@ impl StagedQueryInstall {
             files_downloaded,
             requested_already_complete,
             entries,
-            dependencies: _,
+            dependencies,
             queries_parent: _,
         } = self;
         let mut publish = PublishedQueryInstall {
@@ -593,8 +593,23 @@ impl StagedQueryInstall {
                     });
                 }
                 // A concurrent installer completed this language while we were
-                // downloading. Its files are as good as ours, so keep them.
+                // downloading. Its files are as good as ours, so keep them —
+                // but only if they need the same base languages. A winner that
+                // inherits something this install never discovered leaves that
+                // language unlocked and unchecked, which is the dangling chain
+                // the whole dependency set exists to prevent.
                 Ok(PublishQueryDirOutcome::AlreadyComplete) => {
+                    let chain_matches = inherited_languages_on_disk(&entry.queries_dir)
+                        .is_some_and(|parents| {
+                            parents.iter().all(|parent| dependencies.contains(parent))
+                        });
+                    if !chain_matches {
+                        let residue = publish.rollback();
+                        return Err(PublishFailure {
+                            error: QueryInstallError::DependencyRemoved(entry.language),
+                            residue,
+                        });
+                    }
                     if requested {
                         publish.requested_already_complete = true;
                     }
@@ -2439,6 +2454,49 @@ mod staging_tests {
         };
 
         assert_eq!(staged.unstable_skipped_dependency(), None);
+    }
+
+    /// Yielding to a copy that appeared while this install was busy is right
+    /// only when that copy needs the same base languages. One that inherits
+    /// something this install never discovered leaves that language unlocked
+    /// and unchecked — the dangling chain the dependency set exists to prevent.
+    #[test]
+    fn yielding_to_a_winner_that_changed_the_chain_fails_the_publish() {
+        let temp = TempDir::new().unwrap();
+        let queries_parent = temp.path().join("queries");
+        let staged = StagedQueryInstall {
+            language: "child".to_string(),
+            install_path: queries_parent.join("child"),
+            files_downloaded: vec!["highlights.scm".to_string()],
+            requested_already_complete: false,
+            entries: vec![
+                stage(&queries_parent, "child", "; inherits: parent\n", false),
+                stage(&queries_parent, "parent", "(comment) @comment\n", false),
+            ],
+            dependencies: vec!["child".to_string(), "parent".to_string()],
+            queries_parent: queries_parent.clone(),
+        };
+        // Someone else finishes `parent` first, with queries that inherit a
+        // language this install never staged or locked.
+        let parent_dir = queries_parent.join("parent");
+        fs::create_dir_all(&parent_dir).unwrap();
+        fs::write(
+            parent_dir.join("highlights.scm"),
+            "; inherits: grandparent\n(comment) @comment\n",
+        )
+        .unwrap();
+        write_install_marker(&parent_dir).unwrap();
+
+        let Err(failure) = staged.publish() else {
+            panic!("a winner that changed the chain must fail the publish");
+        };
+        assert!(
+            matches!(&failure.error, QueryInstallError::DependencyRemoved(language) if language == "parent")
+        );
+        assert!(
+            !queries_parent.join("child").exists(),
+            "and the requested language must not be left published"
+        );
     }
 
     /// `--force` replaces the requested language, not the base languages it
