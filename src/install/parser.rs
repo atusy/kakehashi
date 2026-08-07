@@ -580,8 +580,11 @@ fn staging_file_owner(name: &str) -> Option<StagingFile<'_>> {
     let language = parts.next()?;
     let pid = parts.next()?;
     let counter = parts.next()?;
-    let _extension = parts.next()?;
+    // The real extension, not any segment: without this a user's own
+    // `.notes.123.0.bak.tmp` under `parser/` parses as one of ours.
+    let extension = parts.next()?;
     if parts.next().is_none()
+        && extension == std::env::consts::DLL_EXTENSION
         && super::queries::is_safe_language_name(language)
         && pid.bytes().all(|b| b.is_ascii_digit())
         && counter.bytes().all(|b| b.is_ascii_digit())
@@ -1704,6 +1707,28 @@ mod tests {
         assert!(
             !queries_parent.join(".lua.uninstalled").is_file(),
             "the marker saying the language is gone must not outlive the install"
+        );
+    }
+
+    /// The sweep only owns names it could have written. A user's own dotfile
+    /// that happens to have the same shape is not one, and a rename or a
+    /// removal of it would be this module reaching outside what it manages.
+    #[test]
+    #[cfg(unix)]
+    fn the_parser_sweep_leaves_lookalike_files_alone() {
+        let temp = tempdir().expect("temp dir");
+        let parser_dir = temp.path().join("parser");
+        fs::create_dir_all(&parser_dir).expect("create parser dir");
+        // Same shape, but the extension segment is not the one this platform
+        // compiles parsers to.
+        let lookalike = parser_dir.join(format!(".notes.{}.0.bak.tmp", dead_pid()));
+        fs::write(&lookalike, b"mine").expect("write lookalike");
+
+        recover_interrupted_parser_installs(&parser_dir).expect("sweep should succeed");
+
+        assert!(
+            lookalike.exists(),
+            "a file this module could not have written is not its to collect"
         );
     }
 

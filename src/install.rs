@@ -342,17 +342,10 @@ fn install_language_with_query_stager(
         return result;
     }
 
-    // Clearing the tombstone is what makes this install override an earlier
-    // uninstall, so it has to wait for any uninstall in flight: clearing it
-    // between that uninstall's two removals would leave this install staging
-    // against a parser the uninstall was about to delete. The lock is released
-    // again immediately — the expensive staging below must not block anyone.
-    let cleared = queries::lock_language(data_dir, language)
-        .and_then(|_lock| queries::clear_uninstall_tombstone_for_install(data_dir, language));
-    if let Err(e) = cleared {
-        result.queries_error = Some(e.to_string());
-        return result;
-    }
+    // No tombstone clear here. Staging does it, once per language and under
+    // that language's lock — including the requested one, which is a dependency
+    // of itself. A second clear is exactly what erases a tombstone an uninstall
+    // wrote in between, which is the race clearing it once was written to close.
 
     // Stage both halves before publishing either, so a language is never left
     // half-installed: whichever half fails, every staging artifact is dropped
