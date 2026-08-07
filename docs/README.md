@@ -606,8 +606,8 @@ The reserved `_self` key makes the host language its own bridge target: with
 it enabled, requests on the host document are forwarded to servers whose
 `languages` matches the **host** language (including a `"*"` server), with the real URI and no
 coordinate translation. All bridged request methods are wired (exceptions:
-semantic tokens; document color stays injection-only; host completion-item
-and code-lens resolves pass through unrouted); by default the host layer is
+semantic tokens; document color stays injection-only; host code-lens
+resolves pass through unrouted); by default the host layer is
 tried after
 `virt` (see `layers` above), so for `preferred` methods injections keep
 winning inside code fences while the host server answers everywhere else —

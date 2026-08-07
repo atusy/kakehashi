@@ -234,6 +234,21 @@ fn main() {
                         "hoverProvider": mode == "diagnostics-refresh-prefetch-mixed",
                         "textDocumentSync": 1
                     }),
+                    // `completion-resolve`: advertises completion WITH
+                    // resolveProvider and fills `detail` on
+                    // completionItem/resolve — the shape that motivates #958
+                    // (a host-layer item must still be resolvable).
+                    // `completion-no-resolve` answers completion the same way
+                    // but does NOT advertise resolveProvider, so the bridge
+                    // must not weigh its items down with routing envelopes.
+                    "completion-resolve" => json!({
+                        "completionProvider": { "resolveProvider": true },
+                        "textDocumentSync": 1
+                    }),
+                    "completion-no-resolve" => json!({
+                        "completionProvider": {},
+                        "textDocumentSync": 1
+                    }),
                     "on-type" => json!({
                         "documentOnTypeFormattingProvider": {
                             "firstTriggerCharacter": "}",
@@ -549,6 +564,60 @@ fn main() {
                     })
                     .unwrap_or(Value::Null);
                 respond(&mut writer, id, result);
+            }
+            // Answers only for documents this server received via `didOpen`,
+            // so a non-null result proves the host document was synced and the
+            // request carried the real URI. The item's `data` carries that URI
+            // back, so `completionItem/resolve` can prove the downstream's own
+            // data survived the round trip through the routing envelope (#958).
+            "textDocument/completion" => {
+                let result = message
+                    .pointer("/params/textDocument/uri")
+                    .and_then(Value::as_str)
+                    .filter(|uri| documents.contains_key(*uri))
+                    .map(|uri| {
+                        json!({
+                            "isIncomplete": false,
+                            "items": [{
+                                "label": "./test",
+                                "kind": 19,
+                                "data": { "mockPath": uri }
+                            }]
+                        })
+                    })
+                    .unwrap_or(Value::Null);
+                respond(&mut writer, id, result);
+            }
+            // Fill in `detail` from the item's own `data` — absent in the
+            // completion response, so a resolved item that carries it proves
+            // the resolve actually reached this server.
+            //
+            // The materialized `textEdit` is what makes the e2e discriminate
+            // the HOST routing branch: it sits on host line 2, which the VIRT
+            // resolve path would reject as unsafe for the injection region
+            // (a host envelope carries a zero offset and no region end, so
+            // that path's guard fails closed) and serve the item unresolved.
+            // Reaching the client intact proves the resolve took the verbatim
+            // host path, not merely that some server answered.
+            "completionItem/resolve" => {
+                let mut item = message
+                    .pointer("/params")
+                    .cloned()
+                    .unwrap_or_else(|| json!({}));
+                let path = item
+                    .pointer("/data/mockPath")
+                    .and_then(Value::as_str)
+                    .unwrap_or("?")
+                    .to_string();
+                item["detail"] = json!(format!("mock-resolved:{path}"));
+                item["textEdit"] = json!({
+                    "range": {
+                        "start": { "line": 2, "character": 4 },
+                        "end": { "line": 2, "character": 9 }
+                    },
+                    "newText": "resolved-edit"
+                });
+                respond(&mut writer, id, item);
             }
             "textDocument/codeAction" => {
                 let result = message

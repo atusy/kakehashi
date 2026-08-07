@@ -21,7 +21,7 @@
 use tower_lsp_server::jsonrpc::Result;
 use tower_lsp_server::ls_types::{
     CodeAction, CodeActionContext, CodeActionOrCommand, CodeActionParams, CodeActionResponse,
-    MessageType, NumberOrString, Position, Range, Uri,
+    NumberOrString, Position, Range, Uri,
 };
 use ulid::Ulid;
 use url::Url;
@@ -31,7 +31,7 @@ use super::super::{Kakehashi, detect_document_language};
 use crate::config::settings::AggregationStrategy;
 use crate::language::InjectionResolver;
 use crate::lsp::aggregation::server::{
-    FanInResult, FanOutTask, HostFanOutTask, dispatch_concatenated, dispatch_host_concatenated,
+    FanOutTask, HostFanOutTask, dispatch_concatenated, dispatch_host_concatenated,
     dispatch_host_preferred, dispatch_preferred,
 };
 use crate::lsp::bridge::{
@@ -506,16 +506,22 @@ impl Kakehashi {
                 let Some(raw) = raw else {
                     return Ok(None);
                 };
-                let connection_key = raw.connection_key;
+                let answering = raw.handle;
+                let connection_key = answering.key().clone();
                 let Some(actions) = parse_code_actions_leniently(raw.value) else {
                     return Ok(None);
                 };
                 // Whether this host server advertises `codeAction/resolve`, so a
                 // host lazy action can be enveloped for resolve-routing back to
-                // it (#627) rather than disabled. Queried on the just-opened
-                // connection — but only when the answer can actually change the
-                // outcome, so the probe (and its marker-root resolution + pool
-                // lock) is skippable on this hot `textDocument/codeAction` path:
+                // it (#627) rather than disabled. Read off the connection that
+                // ANSWERED — which is both free (no re-resolution, so no marker
+                // walk or pool lock on this hot `textDocument/codeAction` path,
+                // which some editors fire on cursor hold) and more accurate than
+                // a fresh lookup, since a re-resolve could answer for a
+                // replacement spawned since these actions were produced.
+                //
+                // The two cheap terms still short-circuit ahead of it, because
+                // they also say the answer cannot change the outcome:
                 //
                 // - `server_resolves` is read by `bridge_code_action` ONLY for a
                 //   possibly-lazy action (no edit, no command, and not already
@@ -536,14 +542,7 @@ impl Kakehashi {
                 };
                 let server_resolves = client_can_use_resolve
                     && actions.iter().any(maybe_lazy)
-                    && t.pool
-                        .host_server_advertises(
-                            &t.server_name,
-                            &t.server_config,
-                            &t.uri,
-                            "codeAction/resolve",
-                        )
-                        .await;
+                    && answering.has_capability("codeAction/resolve");
                 Ok(Some(bridge_code_actions(
                     actions,
                     &connection_key,
@@ -569,39 +568,13 @@ impl Kakehashi {
                     cancel_rx,
                 )
                 .await;
-                self.host_code_action_result(fan_in, |v| v).await
+                self.host_layer_result(fan_in, METHOD, |v| v).await
             }
             AggregationStrategy::Concatenated => {
                 let fan_in =
                     dispatch_host_concatenated(&ctx, pool.clone(), f, cancel_rx, None, None).await;
-                self.host_code_action_result(fan_in, concat_merge).await
+                self.host_layer_result(fan_in, METHOD, concat_merge).await
             }
-        }
-    }
-
-    /// Fold a host-layer fan-in result into the handler's return, with the
-    /// host-arm quieting: an all-empty host layer is the normal outcome
-    /// whenever virt answers, so it stays SILENT (unlike [`FanInResult::handle`],
-    /// which logs a LOG-level message) and warns only on real failures.
-    async fn host_code_action_result<T>(
-        &self,
-        result: FanInResult<T>,
-        on_done: impl FnOnce(T) -> Option<CodeActionResponse>,
-    ) -> Result<Option<CodeActionResponse>> {
-        match result {
-            FanInResult::Done(value) => Ok(on_done(value)),
-            FanInResult::NoResult { errors } => {
-                if errors > 0 {
-                    self.notifier()
-                        .log(
-                            MessageType::WARNING,
-                            format!("No {METHOD} response from any host bridge server"),
-                        )
-                        .await;
-                }
-                Ok(None)
-            }
-            FanInResult::Cancelled => Err(tower_lsp_server::jsonrpc::Error::request_cancelled()),
         }
     }
 }

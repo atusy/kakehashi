@@ -6,6 +6,12 @@
 //! and the response verbatim. The first layer producing completion items, or an
 //! incomplete `CompletionList` that asks the client to re-query, wins
 //! (`preferred`).
+//!
+//! The host layer cannot use the generic verbatim raw-value walk: its items
+//! need the routing envelope that makes `completionItem/resolve` reach the host
+//! server that produced them (#958), so it dispatches typed per server to keep
+//! the server name and its advertised capabilities, and hands both to the
+//! bridge's `bridge_host_completion_items` policy.
 
 use tower_lsp_server::jsonrpc::Result;
 use tower_lsp_server::ls_types::{
@@ -13,7 +19,10 @@ use tower_lsp_server::ls_types::{
 };
 
 use super::super::Kakehashi;
-use crate::lsp::aggregation::server::dispatch_preferred;
+use crate::lsp::aggregation::server::{
+    HostFanOutTask, dispatch_host_preferred, dispatch_preferred,
+};
+use crate::lsp::bridge::{HostDocument, bridge_host_completion_items};
 use crate::lsp::lsp_impl::bridge_context::parse_host_verbatim;
 
 const METHOD: &str = "textDocument/completion";
@@ -28,15 +37,94 @@ impl Kakehashi {
         let position = params.text_document_position.position;
 
         let virt = self.completion_virt_layer(&lsp_uri, position);
-        self.walk_layers(
+        let host = self.completion_host_layer(&lsp_uri, raw_params);
+        self.walk_layer_futures(
             &lsp_uri,
             METHOD,
             METHOD,
-            raw_params,
             virt,
-            parse_host_verbatim::<CompletionResponse>,
+            host,
+            std::future::ready(Ok(None)),
             completion_response_has_result,
         )
+        .await
+    }
+
+    /// Host layer: forward the params verbatim to the host language's own
+    /// servers, then envelope each item so a later `completionItem/resolve`
+    /// routes back to the server that produced it (#958). Coordinates stay
+    /// untranslated — they are already real.
+    ///
+    /// The envelope is minted only for a server that advertises
+    /// `completionItem/resolve`: for one that does not, it would be pure wire
+    /// weight on every item of every completion, and the resolve would fail
+    /// soft back to the unresolved item anyway.
+    ///
+    /// Minting also happens only for the server that WINS the fan-in. Each
+    /// fanned-out server carries its identity back beside its response
+    /// ([`HostCompletion`]) instead of enveloping in its own task, so a
+    /// multi-server `bridge._self` does not pay a per-item pass in every
+    /// losing task on every keystroke only to discard it.
+    async fn completion_host_layer(
+        &self,
+        lsp_uri: &Uri,
+        raw_params: serde_json::Value,
+    ) -> Result<Option<CompletionResponse>> {
+        let Some(ctx) = self.resolve_host_bridge_context(lsp_uri, METHOD) else {
+            return Ok(None);
+        };
+        let (cancel_rx, _cancel_guard) = self.subscribe_cancel(ctx.upstream_request_id.as_ref());
+        let pool = self.bridge.pool_arc();
+        let f = move |t: HostFanOutTask| {
+            let params = raw_params.clone();
+            async move {
+                let raw = t
+                    .pool
+                    .send_host_raw_request(
+                        &t.server_name,
+                        &t.server_config,
+                        &HostDocument {
+                            uri: &t.uri,
+                            language_id: &t.language_id,
+                            text: &t.text,
+                        },
+                        METHOD,
+                        params,
+                        t.upstream_id,
+                    )
+                    .await?;
+                let Some(raw) = raw else {
+                    return Ok(None);
+                };
+                let Some(response) = parse_host_verbatim::<CompletionResponse>(raw.value) else {
+                    return Ok(None);
+                };
+                Ok(Some(HostCompletion {
+                    response,
+                    // Two allocations per SERVER, versus an envelope per item
+                    // in a task whose result the fan-in may well discard.
+                    server_resolves: raw.handle.has_capability("completionItem/resolve"),
+                    server_name: t.server_name,
+                    host_uri: t.uri.into(),
+                }))
+            }
+        };
+        // No layer-level `unregister_all` here: the virt layer runs
+        // concurrently under the SAME upstream id, so wiping the registry on
+        // this layer's completion would drop the sibling's live cancel
+        // registrations. `run_layer_race` sweeps after the whole race.
+        let fan_in = dispatch_host_preferred(
+            &ctx,
+            pool.clone(),
+            f,
+            |opt| matches!(opt, Some(v) if completion_response_has_result(&v.response)),
+            cancel_rx,
+        )
+        .await;
+        // The envelope pass rides in `on_done`, so only the WINNER pays it.
+        self.host_layer_result(fan_in, METHOD, |won| {
+            won.map(HostCompletion::into_enveloped_response)
+        })
         .await
     }
 
@@ -88,6 +176,30 @@ impl Kakehashi {
                 Ok(v.map(CompletionResponse::List))
             })
             .await
+    }
+}
+
+/// One host server's completion response plus the identity the resolve
+/// envelope needs, carried through the fan-in so only the WINNER is enveloped.
+struct HostCompletion {
+    response: CompletionResponse,
+    /// The server that answered — the `origin` a later resolve routes to.
+    server_name: String,
+    /// The real host document URI the resolve reconnects on.
+    host_uri: String,
+    /// Whether that server advertises `completionItem/resolve`.
+    server_resolves: bool,
+}
+
+impl HostCompletion {
+    fn into_enveloped_response(mut self) -> CompletionResponse {
+        bridge_host_completion_items(
+            &mut self.response,
+            &self.server_name,
+            &self.host_uri,
+            self.server_resolves,
+        );
+        self.response
     }
 }
 

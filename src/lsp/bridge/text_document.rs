@@ -15,7 +15,7 @@ pub(crate) use code_action::{
 };
 pub(crate) use code_lens::{CodeLensEnvelope, extract_code_lens_envelope};
 mod completion;
-pub(crate) use completion::{KakehashiEnvelope, extract_envelope};
+pub(crate) use completion::{KakehashiEnvelope, bridge_host_completion_items, extract_envelope};
 mod completion_item;
 mod declaration;
 mod definition;

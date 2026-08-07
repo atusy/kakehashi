@@ -1460,3 +1460,153 @@ fn e2e_host_bridge_codeaction_resolve_round_trips_verbatim() {
 
     shutdown(&mut client);
 }
+
+/// Bring up a host-bridged markdown client backed by one `mock-host` server
+/// running `mode`, and return it with the first completion response for a
+/// position outside any injection (so only the host layer can answer). Retries
+/// while the host connection warms up.
+fn init_host_completion_client(mode: &str) -> (LspClient, tempfile::TempDir, Value) {
+    let config_dir = tempfile::TempDir::new().expect("temp dir");
+    let config_path = config_dir.path().join("host_completion.toml");
+    std::fs::write(
+        &config_path,
+        "[languages.markdown.bridge._self]\nenabled = true\n",
+    )
+    .expect("write config");
+
+    let mut client = LspClient::builder()
+        .arg("--config-file")
+        .arg(config_path.to_str().expect("utf-8 path"))
+        .build();
+
+    client.send_request(
+        "initialize",
+        json!({
+            "processId": std::process::id(),
+            "rootUri": null,
+            "capabilities": {},
+            "workspaceFolders": null,
+            "initializationOptions": {
+                "languageServers": {
+                    "mock-host": {
+                        "cmd": [mock_bin(), mode],
+                        "languages": ["markdown"]
+                    }
+                }
+            }
+        }),
+    );
+    client.send_notification("initialized", json!({}));
+    client.send_notification(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": MARKDOWN_URI,
+                "languageId": "markdown",
+                "version": 1,
+                "text": MARKDOWN
+            }
+        }),
+    );
+
+    let item = (0..300)
+        .find_map(|_| {
+            let resp = client.send_request(
+                "textDocument/completion",
+                json!({
+                    "textDocument": { "uri": MARKDOWN_URI },
+                    "position": { "line": 2, "character": 6 }
+                }),
+            );
+            let first = resp["result"]["items"]
+                .as_array()
+                .and_then(|items| items.first().cloned());
+            if first.is_none() {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            first
+        })
+        .expect("host completion returns an item");
+
+    (client, config_dir, item)
+}
+
+#[test]
+fn e2e_host_bridge_completion_resolve_round_trips_verbatim() {
+    // #958: a HOST-layer (bridge._self) completion item is enveloped, and its
+    // completionItem/resolve routes back to the host server VERBATIM (no
+    // coordinate translation), so the server can fill in the lazy fields.
+    // Guards against the resolve path being inert — the symptom was a response
+    // byte-for-byte identical to the request, because an un-enveloped item has
+    // no origin to route to and the lsp_impl region-freshness gate would reject
+    // a host envelope, which carries no region.
+    let (mut client, _config_dir, item) = init_host_completion_client("completion-resolve");
+
+    assert_eq!(item["label"], "./test");
+    assert!(
+        item["detail"].is_null(),
+        "the item is unresolved (no detail yet), got: {item}"
+    );
+    assert_eq!(
+        item["data"]["kakehashi"]["host_layer"], true,
+        "a resolvable host item carries a HOST-layer routing envelope: {item}"
+    );
+    assert_eq!(
+        item["data"]["kakehashi"]["inner"],
+        json!({ "mockPath": MARKDOWN_URI }),
+        "with the server's own data preserved inside it: {item}"
+    );
+
+    // Resolve twice: the second round is what proves the envelope survives a
+    // resolve with its layer marker intact. With the marker dropped, round two
+    // takes the virt path, fails the region gate, and comes back unresolved.
+    let mut resolved = client.send_request("completionItem/resolve", item);
+    for round in 1..=2 {
+        assert!(
+            resolved.get("error").is_none(),
+            "resolve round {round} errored: {resolved}"
+        );
+        let result = &resolved["result"];
+        assert_eq!(
+            result["detail"],
+            format!("mock-resolved:{MARKDOWN_URI}"),
+            "round {round}: the resolve must reach the host server, which fills detail from \
+             the item's own data — proving both the routing and the data round trip: {result}"
+        );
+        // The materialized edit sits on host line 2, outside any injection
+        // region. The virt resolve path would reject it as unsafe and serve
+        // the item unresolved, so its arrival — at its original coordinates —
+        // is what proves the VERBATIM host path ran.
+        assert_eq!(
+            result["textEdit"]["range"]["start"]["line"], 2,
+            "round {round}: the host resolve must not translate coordinates: {result}"
+        );
+        assert_eq!(result["textEdit"]["newText"], "resolved-edit");
+        assert_eq!(
+            result["data"]["kakehashi"]["host_layer"], true,
+            "round {round}: the resolved item keeps its host marker so the NEXT \
+             resolve still routes to the host server: {result}"
+        );
+        resolved = client.send_request("completionItem/resolve", result.clone());
+    }
+
+    shutdown(&mut client);
+}
+
+#[test]
+fn e2e_host_bridge_completion_skips_envelope_without_resolve_support() {
+    // The envelope exists only to route completionItem/resolve. A host server
+    // that does not advertise resolveProvider gets none: it would be pure wire
+    // weight on every item of every completion.
+    let (mut client, _config_dir, item) = init_host_completion_client("completion-no-resolve");
+
+    assert_eq!(item["label"], "./test");
+    assert_eq!(
+        item["data"],
+        json!({ "mockPath": MARKDOWN_URI }),
+        "the server's own data must reach the client untouched, with no \
+         routing envelope wrapped around it: {item}"
+    );
+
+    shutdown(&mut client);
+}

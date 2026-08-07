@@ -61,6 +61,30 @@ impl DynamicCapabilityRegistry {
             .any(|r| r.method == method)
     }
 
+    /// Whether any dynamic registration of `method` sets the boolean
+    /// `registerOptions.<flag>`.
+    ///
+    /// Sub-capabilities that live INSIDE another method's options have no
+    /// method of their own to register — `completionItem/resolve` is
+    /// `textDocument/completion`'s `resolveProvider`, not a registrable method
+    /// — so [`Self::has_registration`] can never see them. Without this, a
+    /// server that registers completion dynamically with `resolveProvider:
+    /// true` and advertises nothing statically reads as non-resolving.
+    pub(crate) fn registration_options_flag(&self, method: &str, flag: &str) -> bool {
+        self.registrations
+            .read()
+            .recover_poison("DynamicCapabilityRegistry::registration_options_flag")
+            .values()
+            .filter(|r| r.method == method)
+            .any(|r| {
+                r.register_options
+                    .as_ref()
+                    .and_then(|options| options.get(flag))
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false)
+            })
+    }
+
     pub(crate) fn store_log_message_level(&self, level: crate::config::settings::LogMessageLevel) {
         self.log_message_level
             .store(level.as_u8(), Ordering::Release);
