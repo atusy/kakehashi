@@ -556,6 +556,19 @@ impl ConnectionHandle {
         if self.dynamic_capabilities().has_registration(method) {
             return true;
         }
+        // A sub-capability that lives inside ANOTHER method's options has no
+        // method of its own to register, so the name match above can never see
+        // it: `completionItem/resolve` is `textDocument/completion`'s
+        // `resolveProvider`. Without this, a server that registers completion
+        // dynamically and advertises nothing statically reads as non-resolving,
+        // and its items are served with no way to resolve them.
+        if method == "completionItem/resolve"
+            && self
+                .dynamic_capabilities()
+                .registration_options_flag("textDocument/completion", "resolveProvider")
+        {
+            return true;
+        }
         // Fall back to static capabilities from initialize response
         let Some(caps) = self.server_capabilities() else {
             return false;
@@ -2634,6 +2647,54 @@ mod tests {
         handle.set_server_capabilities(ServerCapabilities::default());
 
         assert!(!handle.has_capability("completionItem/resolve"));
+    }
+
+    /// `completionItem/resolve` is not a registrable method — it is
+    /// `textDocument/completion`'s `resolveProvider` — so a server that
+    /// registers completion DYNAMICALLY carries the flag in that
+    /// registration's options, where a method-name match can never find it.
+    #[tokio::test]
+    async fn completion_resolve_capability_true_from_dynamic_completion_registration() {
+        use tower_lsp_server::ls_types::Registration;
+
+        let handle = spawn_sink_handle().await;
+        // Statically silent, exactly like a server that defers everything to
+        // client/registerCapability.
+        handle.set_server_capabilities(ServerCapabilities::default());
+        assert!(!handle.has_capability("completionItem/resolve"));
+
+        handle.dynamic_capabilities().register(vec![Registration {
+            id: "completion-1".to_string(),
+            method: "textDocument/completion".to_string(),
+            register_options: Some(serde_json::json!({ "resolveProvider": true })),
+        }]);
+
+        assert!(
+            handle.has_capability("completionItem/resolve"),
+            "a dynamic completion registration's resolveProvider must count"
+        );
+    }
+
+    /// The flag must be READ, not merely assumed from the registration's
+    /// presence: a server registering completion without resolve support still
+    /// gets its items served bare.
+    #[tokio::test]
+    async fn completion_resolve_capability_false_when_dynamic_registration_omits_the_flag() {
+        use tower_lsp_server::ls_types::Registration;
+
+        let handle = spawn_sink_handle().await;
+        handle.set_server_capabilities(ServerCapabilities::default());
+        handle.dynamic_capabilities().register(vec![Registration {
+            id: "completion-1".to_string(),
+            method: "textDocument/completion".to_string(),
+            register_options: Some(serde_json::json!({ "triggerCharacters": ["."] })),
+        }]);
+
+        assert!(!handle.has_capability("completionItem/resolve"));
+        assert!(
+            handle.has_capability("textDocument/completion"),
+            "the registration itself still provides completion"
+        );
     }
 
     // ========================================
