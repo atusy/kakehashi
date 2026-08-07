@@ -1777,7 +1777,6 @@ fn write_backup_ownership_marker(backup_dir: &Path) -> Result<(), QueryInstallEr
     Ok(())
 }
 
-#[cfg(test)]
 /// [`write_uninstall_tombstone`] for tests in sibling modules.
 #[cfg(test)]
 pub(crate) fn write_uninstall_tombstone_for_tests(
@@ -1787,6 +1786,7 @@ pub(crate) fn write_uninstall_tombstone_for_tests(
     write_uninstall_tombstone(queries_parent, language)
 }
 
+#[cfg(test)]
 pub(crate) fn write_install_marker_for_tests(queries_dir: &Path) -> Result<(), QueryInstallError> {
     write_install_marker(queries_dir)
 }
