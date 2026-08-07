@@ -194,7 +194,7 @@ fn inherited_languages_on_disk(queries_dir: &Path) -> Option<Vec<String>> {
 /// the LSP's async path, and there "someone is publishing, look again later" is
 /// as useful as an answer as blocking for one. Because nothing waits, taking
 /// them in discovery order cannot deadlock.
-pub fn lock_complete_chain(data_dir: &Path, language: &str) -> Option<Vec<LanguageLock>> {
+pub(crate) fn lock_complete_chain(data_dir: &Path, language: &str) -> Option<Vec<LanguageLock>> {
     fn walk(
         data_dir: &Path,
         language: &str,
@@ -1539,7 +1539,7 @@ pub fn lock_language(data_dir: &Path, language: &str) -> Result<LanguageLock, Qu
 /// to know whether the language is settled. The guard is returned rather than
 /// the answer, because releasing it before reading the artifacts would put the
 /// whole publish back inside the window.
-pub fn try_lock_language(data_dir: &Path, language: &str) -> LanguageLockProbe {
+fn try_lock_language(data_dir: &Path, language: &str) -> LanguageLockProbe {
     if !is_safe_language_name(language) {
         // Nothing this module manages can be under such a name, so there is no
         // on-disk state to call settled — and a caller that believed otherwise
@@ -1570,7 +1570,7 @@ pub fn try_lock_language(data_dir: &Path, language: &str) -> LanguageLockProbe {
 }
 
 /// What [`try_lock_language`] found.
-pub enum LanguageLockProbe {
+enum LanguageLockProbe {
     /// Nobody holds the lock, and nobody can take it while the guard lives.
     Idle(LanguageLock),
     /// An install is mid-publish: what is on disk can still be rolled back.
@@ -1580,14 +1580,6 @@ pub enum LanguageLockProbe {
     Unlockable,
     /// The name is not one this module could have installed under.
     UnusableName,
-}
-
-impl LanguageLockProbe {
-    /// Whether the artifacts on disk can be trusted to stay put — either
-    /// because this probe holds the lock, or because nobody can publish.
-    pub fn is_settled(&self) -> bool {
-        matches!(self, Self::Idle(_) | Self::Unlockable)
-    }
 }
 
 /// Open (creating if needed) the file behind a language's lock.
@@ -2306,7 +2298,7 @@ mod staging_tests {
 
         let probe = try_lock_language(temp.path(), "lua");
 
-        let settled = probe.is_settled();
+        let settled = matches!(probe, LanguageLockProbe::Unlockable);
         // Restore before asserting, so a failure does not leave an
         // undeletable directory behind for the whole test run.
         let mut permissions = fs::metadata(&queries_parent).unwrap().permissions();
@@ -2339,7 +2331,10 @@ mod staging_tests {
         );
         drop(lock);
         assert!(
-            try_lock_language(data_dir, "lua").is_settled(),
+            matches!(
+                try_lock_language(data_dir, "lua"),
+                LanguageLockProbe::Idle(_)
+            ),
             "and it is settled again once that install is done"
         );
     }

@@ -1094,6 +1094,9 @@ fn run_install(language: &str, force: bool, verbose: bool, no_cache: bool) -> Re
                 kakehashi::install::RollbackResidue::PreviousQueriesStranded => {
                     "the queries it replaced could not be put back"
                 }
+                // The library can name a residue this build predates; the
+                // warnings above still say what and where.
+                _ => "it could not undo everything it had already published",
             };
             eprintln!(
                 "\nFailed to install '{}' language support, and {} — see the warnings above.",

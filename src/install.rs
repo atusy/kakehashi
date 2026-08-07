@@ -187,6 +187,10 @@ fn resolve_data_dir(env_fn: impl Fn(&str) -> Option<String>) -> Option<PathBuf> 
 
 /// Result of installing a language (both parser and queries).
 ///
+/// `#[non_exhaustive]`: what an install has to report about itself has grown
+/// twice already in review, and a downstream match or literal should not break
+/// the next time it does.
+///
 /// A language is installed as a unit: every failure path returns before
 /// publishing either half, or undoes the one it published.
 ///
@@ -196,6 +200,7 @@ fn resolve_data_dir(env_fn: impl Fn(&str) -> Option<String>) -> Option<PathBuf> 
 /// neither published that half nor left one it had published, which says
 /// nothing about a copy an earlier install put there. Read the disk for that.
 #[derive(Debug)]
+#[non_exhaustive]
 pub struct InstallResult {
     /// Path where the parser was installed, if successful.
     pub parser_path: Option<PathBuf>,
@@ -222,6 +227,7 @@ impl InstallResult {
 
 /// What a failed install left behind when it could not fully undo itself.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum RollbackResidue {
     /// The queries this install published are still live.
     NewQueriesLive,
