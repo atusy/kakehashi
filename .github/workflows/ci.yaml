@@ -6,6 +6,9 @@ on:
   pull_request:
     branches: [main]
 
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
 
@@ -16,6 +19,8 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - run: cargo check
+      - run: cargo check --bench semantic_tokens --features e2e
+      - run: KAKEHASHI_BENCH_VALIDATE_SCENARIOS=1 cargo test --bench semantic_tokens --features e2e
 
   test:
     name: Test
@@ -25,6 +30,7 @@ jobs:
       - run: rustup component add rust-analyzer
       - run: make deps/tree-sitter
       - run: cargo test
+      - run: python3 -m unittest discover -s benches -p 'test_*.py'
 
   fmt:
     name: Format
@@ -39,6 +45,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - run: cargo clippy -- -D warnings
+      - run: cargo clippy --bench semantic_tokens --features e2e -- -D warnings
 
   audit:
     name: Audit
