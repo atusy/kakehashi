@@ -1,5 +1,7 @@
 pub mod auto_install;
 mod bridge;
+#[cfg(test)]
+pub(crate) use bridge::test_logging;
 mod cache;
 mod client;
 mod debounced_diagnostics;

@@ -18,6 +18,7 @@ static LOGGER: CapturingLogger = CapturingLogger {
 static INIT_LOGGER: Once = Once::new();
 static CAPTURE_LOCK: Mutex<()> = Mutex::new(());
 static CAPTURING: AtomicBool = AtomicBool::new(false);
+static CAPTURE_FILTER: Mutex<Option<(&'static str, Level)>> = Mutex::new(None);
 
 struct CapturingLogger {
     messages: Mutex<Vec<String>>,
@@ -33,9 +34,15 @@ impl Drop for CaptureGuard {
 
 impl Log for CapturingLogger {
     fn enabled(&self, metadata: &Metadata<'_>) -> bool {
-        CAPTURING.load(Ordering::Acquire)
-            && metadata.level() <= Level::Warn
-            && metadata.target() == "kakehashi::bridge"
+        if !CAPTURING.load(Ordering::Acquire) {
+            return false;
+        }
+        CAPTURE_FILTER
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .is_some_and(|(target, max_level)| {
+                metadata.level() <= max_level && metadata.target() == target
+            })
     }
 
     fn log(&self, record: &Record<'_>) {
@@ -56,9 +63,18 @@ impl Log for CapturingLogger {
 /// formatted `LEVEL:target:message`. Serialized across the process: parallel
 /// callers block on an internal lock rather than interleave captures.
 pub(crate) fn captured_warnings_for<F: FnOnce()>(f: F) -> Vec<String> {
+    captured_logs_for("kakehashi::bridge", Level::Warn, f)
+}
+
+/// Run `f` while capturing one exact log target through `max_level`.
+pub(crate) fn captured_logs_for<F: FnOnce()>(
+    target: &'static str,
+    max_level: Level,
+    f: F,
+) -> Vec<String> {
     INIT_LOGGER.call_once(|| {
         log::set_logger(&LOGGER).expect("the shared test logger installs once per process");
-        log::set_max_level(LevelFilter::Warn);
+        log::set_max_level(LevelFilter::Debug);
     });
     let _capture = CAPTURE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     LOGGER
@@ -66,6 +82,7 @@ pub(crate) fn captured_warnings_for<F: FnOnce()>(f: F) -> Vec<String> {
         .lock()
         .unwrap_or_else(|p| p.into_inner())
         .clear();
+    *CAPTURE_FILTER.lock().unwrap_or_else(|p| p.into_inner()) = Some((target, max_level));
     CAPTURING.store(true, Ordering::Release);
     let guard = CaptureGuard;
     f();
@@ -80,5 +97,6 @@ pub(crate) fn captured_warnings_for<F: FnOnce()>(f: F) -> Vec<String> {
         .lock()
         .unwrap_or_else(|p| p.into_inner())
         .clear();
+    *CAPTURE_FILTER.lock().unwrap_or_else(|p| p.into_inner()) = None;
     captured
 }

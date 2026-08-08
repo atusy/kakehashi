@@ -163,6 +163,7 @@ impl ParseCoordinator {
         language_name: &str,
         uri: &Url,
         text_len: usize,
+        attribution: crate::compute_pool::ComputeWork,
         parse_fn: F,
     ) -> Option<T>
     where
@@ -177,7 +178,7 @@ impl ParseCoordinator {
         let language_name_owned = language_name.to_string();
         let result = tokio::time::timeout(
             PARSE_AWAIT_BACKSTOP,
-            self.compute_pool.run(None, move || {
+            self.compute_pool.run(attribution, None, move || {
                 let mut parse_fn = parse_fn;
                 let mut language_name_owned = language_name_owned;
                 for attempt in 0..2 {
@@ -374,8 +375,14 @@ impl ParseCoordinator {
             .settings_manager
             .load_settings()
             .any_bridge_server_runnable();
+        let attribution = crate::compute_pool::ComputeWork::document(
+            "injection_populate",
+            &uri,
+            Some(incarnation),
+            Some(content_version),
+        );
         self.compute_pool
-            .run(None, move || {
+            .run(attribution, None, move || {
                 // A refused pass (`None`) maps to all-`None` region fields —
                 // the snapshot then rides WITHOUT regions and readers fall
                 // back to inline resolution. Mapping it to the ran-and-empty
@@ -509,6 +516,12 @@ impl ParseCoordinator {
                     &language_name,
                     &uri,
                     text.len(),
+                    crate::compute_pool::ComputeWork::document(
+                        "parse_open",
+                        &uri,
+                        Some(incarnation),
+                        Some(content_version),
+                    ),
                     move |mut parser, deadline, _generation_retry| {
                         let parse_result =
                             parse_text_with_deadline(&mut parser, &text_for_parse, None, deadline);
@@ -786,6 +799,12 @@ impl ParseCoordinator {
                     &language_name,
                     &uri,
                     text_len,
+                    crate::compute_pool::ComputeWork::document(
+                        "parse_install_retry",
+                        &uri,
+                        Some(expected_incarnation),
+                        Some(content_version),
+                    ),
                     move |mut parser, deadline, _generation_retry| {
                         let result =
                             parse_text_with_deadline(&mut parser, &text_for_parse, None, deadline);
@@ -980,6 +999,12 @@ impl ParseCoordinator {
                 &language_name,
                 uri,
                 text_len,
+                crate::compute_pool::ComputeWork::document(
+                    "parse_edit",
+                    uri,
+                    Some(incarnation),
+                    Some(content_version),
+                ),
                 move |mut parser, deadline, generation_retry| {
                     let result = parse_text_with_deadline(
                         &mut parser,
