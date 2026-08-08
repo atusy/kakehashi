@@ -22,6 +22,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+      - run: python3 -m unittest benches/profile/test_drive.py -v
       - run: rustup component add rust-analyzer
       - run: make deps/tree-sitter
       - run: cargo test
