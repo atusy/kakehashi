@@ -174,13 +174,20 @@ mod tests {
     /// transaction — `load_settings`, `WorkspaceSettings::try_from_settings`,
     /// `apply_raw_settings_locked` — never ran.
     ///
-    /// No `XDG_CONFIG_HOME` isolation needed here: the early return happens
-    /// before `load_settings` is ever called, so this path never reads real
-    /// environment state regardless of which machine runs it. Bounded anyway
-    /// so a regression fails on the assertion rather than hanging — see the
-    /// sibling test below for what an unskipped reload can actually block on.
+    /// `XDG_CONFIG_HOME` is isolated even though the *current* early return
+    /// never reaches `load_settings`: this test exists to catch a regression
+    /// that removes that early return, and a false pass is exactly what a
+    /// developer machine's real `~/.config/kakehashi/kakehashi.toml` could
+    /// produce in that case — e.g. an invalid real config makes
+    /// `WorkspaceSettings::try_from_settings` fail before publishing a new
+    /// snapshot, leaving `Arc::ptr_eq` true for the wrong reason and hiding
+    /// the very regression this test is meant to catch.
     #[tokio::test]
+    #[serial(xdg_env)]
     async fn an_empty_folder_event_does_not_reload_settings() {
+        let xdg_scratch = tempfile::tempdir().expect("failed to create scratch XDG_CONFIG_HOME");
+        let _xdg_guard = XdgConfigHomeGuard::set(xdg_scratch.path());
+
         let (service, _socket) = LspService::new(Kakehashi::new);
         let server = service.inner();
         let before = server.settings_manager.load_settings_pair();
@@ -220,11 +227,19 @@ mod tests {
     /// configuration can turn this call into actual disk work whose outcome
     /// (and duration, past the 5s bound below) depends on whoever's machine
     /// runs it, rather than on the code under test.
+    ///
+    /// The added folder is a real scratch directory rather than a bare
+    /// `file:///added`, for the same reason: `load_settings` also reads
+    /// `<root>/kakehashi.toml` from the folder it derives as the project
+    /// root, and a literal `/added` risks resolving to a real top-level
+    /// directory (and a real config file inside it) on some host.
     #[tokio::test]
     #[serial(xdg_env)]
     async fn a_non_empty_folder_event_still_reloads_settings() {
         let xdg_scratch = tempfile::tempdir().expect("failed to create scratch XDG_CONFIG_HOME");
         let _xdg_guard = XdgConfigHomeGuard::set(xdg_scratch.path());
+        let workspace_dir = tempfile::tempdir().expect("failed to create scratch workspace dir");
+        let folder_uri = format!("file://{}", workspace_dir.path().display());
 
         let (service, _socket) = LspService::new(Kakehashi::new);
         let server = service.inner();
@@ -235,7 +250,7 @@ mod tests {
             server.did_change_workspace_folders_impl(DidChangeWorkspaceFoldersParams {
                 event: WorkspaceFoldersChangeEvent {
                     added: vec![WorkspaceFolder {
-                        uri: "file:///added".parse().unwrap(),
+                        uri: folder_uri.parse().unwrap(),
                         name: "added".to_string(),
                     }],
                     removed: Vec::new(),
