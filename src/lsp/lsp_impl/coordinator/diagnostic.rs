@@ -201,8 +201,8 @@ impl DiagnosticSnapshotPreparer {
         // Whether `pullFallback = false` dropped a pull-eligible layer below —
         // the editor's own pull does not honor that gate, so a snapshot with
         // this set covers less than the editor's re-pull would (see
-        // `DiagnosticSnapshot::pull_gated`).
-        let mut pull_gated = false;
+        // `DiagnosticSnapshot::narrower_than_editor_pull`).
+        let mut narrower_than_editor_pull = false;
 
         // Virt layer: `None` = the document can never have virt diagnostics
         // (no injection query), distinct from `Some(vec![])` = gated off or
@@ -288,7 +288,7 @@ impl DiagnosticSnapshotPreparer {
                                             // fan-out too) narrows this snapshot below the
                                             // editor's re-pull surface — record it.
                                             if !agg.pull_fallback {
-                                                pull_gated = true;
+                                                narrower_than_editor_pull = true;
                                                 None
                                             } else if !dispatches_to_any_server(
                                                 &agg.priorities,
@@ -361,7 +361,7 @@ impl DiagnosticSnapshotPreparer {
             if !agg.pull_fallback {
                 // Same rule as the virt gate above: only the `pullFallback`
                 // drop narrows below the editor's re-pull surface.
-                pull_gated = true;
+                narrower_than_editor_pull = true;
             }
             Some(HostRequestContext {
                 uri: uri.clone(),
@@ -391,7 +391,7 @@ impl DiagnosticSnapshotPreparer {
             },
             virt_contexts,
             host_pull_enabled,
-            pull_gated,
+            narrower_than_editor_pull,
             host,
             layer_cfg,
         })

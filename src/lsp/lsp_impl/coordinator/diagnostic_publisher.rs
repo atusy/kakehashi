@@ -372,14 +372,14 @@ impl DiagnosticPublisher {
                 continue;
             };
             let lineage = snapshot.lineage;
-            let pull_gated = snapshot.pull_gated;
+            let narrower_than_editor_pull = snapshot.narrower_than_editor_pull;
             let pool = self.bridge.pool_arc();
             let publisher = self.clone();
             tasks.spawn(async move {
                 let mut summary = ForwardedPrefetchSummary {
                     // A pullFallback-gated layer is pulled by the editor but
                     // not by this prefetch — coverage is incomplete either way.
-                    coverage_incomplete: pull_gated,
+                    coverage_incomplete: narrower_than_editor_pull,
                     ..Default::default()
                 };
                 let errors = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -1671,7 +1671,7 @@ mod tests {
         )]));
         server.settings_manager.apply_settings(settings);
 
-        let uri = Url::parse("file:///test/pull_gated_host.rs").unwrap();
+        let uri = Url::parse("file:///test/narrower_than_editor_pull_host.rs").unwrap();
         server.documents.insert(
             uri.clone(),
             "fn main() {}".to_string(),

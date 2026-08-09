@@ -906,7 +906,7 @@ print("hello")
                 },
             virt_contexts: vec![],
             host_pull_enabled: true,
-            pull_gated: false,
+            narrower_than_editor_pull: false,
             host: Some(HostRequestContext {
                 uri: uri.clone(),
                 language_id: "rust".to_string(),
@@ -1021,7 +1021,7 @@ print("hello")
                 },
             virt_contexts: vec![],
             host_pull_enabled: true,
-            pull_gated: false,
+            narrower_than_editor_pull: false,
             host: Some(HostRequestContext {
                 uri: uri.clone(),
                 language_id: "rust".to_string(),
@@ -1498,7 +1498,7 @@ print("hello")
     /// `_self` server. If the gate dropped the context, that server would analyze
     /// stale text (re-opening #380 for the host).
     #[tokio::test]
-    async fn prepare_diagnostic_snapshot_keeps_host_for_resync_when_pull_gated() {
+    async fn prepare_diagnostic_snapshot_keeps_host_for_resync_when_narrower_than_editor_pull() {
         let (service, _socket) = LspService::new(Kakehashi::new);
         let server = service.inner();
         configure_rust_self_host(server);
@@ -1527,7 +1527,7 @@ print("hello")
         }
         server.settings_manager.apply_settings(settings);
 
-        let uri = Url::parse("file:///test/host_pull_gated.rs").unwrap();
+        let uri = Url::parse("file:///test/host_narrower_than_editor_pull.rs").unwrap();
         let text = "fn main() {}".to_string();
         server
             .documents

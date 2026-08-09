@@ -54,7 +54,7 @@ pub(crate) struct DiagnosticSnapshot {
     /// set, a pull built from this snapshot covers LESS than the editor's
     /// re-pull would — the forwarded-refresh prefetch must then keep its
     /// forced editor nudge instead of standing in for it.
-    pub(crate) pull_gated: bool,
+    pub(crate) narrower_than_editor_pull: bool,
     /// Cross-layer combine config for `textDocument/publishDiagnostics`.
     pub(crate) layer_cfg: ResolvedLayerConfig,
 }
@@ -136,7 +136,7 @@ pub(crate) async fn collect_push_diagnostics_with_error_sink(
         mut virt_contexts,
         host,
         host_pull_enabled,
-        pull_gated: _,
+        narrower_than_editor_pull: _,
         layer_cfg,
     } = snapshot;
 
@@ -308,7 +308,7 @@ mod tests {
                 content_version: 0,
             },
             virt_contexts: vec![virt_ctx_for_server("test")],
-            pull_gated: false,
+            narrower_than_editor_pull: false,
             host: None,
             host_pull_enabled: false,
             layer_cfg: ResolvedLayerConfig::with_defaults("textDocument/publishDiagnostics"),
