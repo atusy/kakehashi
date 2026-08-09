@@ -1841,9 +1841,7 @@ mod tests {
         use std::os::unix::ffi::OsStrExt;
 
         let parent = TempDir::new().unwrap();
-        let dir = parent
-            .path()
-            .join(OsStr::from_bytes(b"proj-\xFF").to_os_string());
+        let dir = parent.path().join(OsStr::from_bytes(b"proj-\xFF"));
         if std::fs::create_dir(&dir).is_err() {
             eprintln!(
                 "skipping: this filesystem rejects non-UTF-8 directory names, so the case \
@@ -1854,8 +1852,11 @@ mod tests {
 
         let relative = dir.join("relative.toml");
         std::fs::write(&relative, "searchPaths = ['./runtime']\n").unwrap();
-        let rejected =
-            read_explicit_layers(&[relative.clone()], None, crate::config::make_env(&[]));
+        let rejected = read_explicit_layers(
+            std::slice::from_ref(&relative),
+            None,
+            crate::config::make_env(&[]),
+        );
         assert!(
             rejected
                 .fatal_error

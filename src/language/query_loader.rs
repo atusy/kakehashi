@@ -595,15 +595,18 @@ mod tests {
 
         // `runtime/queries` sits two components below the tempdir root, so the
         // pre-fix join cleaned to exactly the file planted above.
-        let result =
-            QueryLoader::find_query_file(&[runtime.clone()], "../../outside", "highlights.scm");
+        let result = QueryLoader::find_query_file(
+            std::slice::from_ref(&runtime),
+            "../../outside",
+            "highlights.scm",
+        );
 
         assert_eq!(result, None);
 
         // An absolute name is the worse variant: `join` discards the base
         // outright, so no `..` arithmetic is needed to escape.
         let result = QueryLoader::find_query_file(
-            &[runtime.clone()],
+            std::slice::from_ref(&runtime),
             outside.to_str().unwrap(),
             "highlights.scm",
         );
