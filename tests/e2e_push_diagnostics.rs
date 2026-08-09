@@ -968,21 +968,22 @@ fn open_host_with_text(client: &mut LspClient, text: &str) {
 #[test]
 fn e2e_downstream_refresh_with_unchanged_prefetch_is_absorbed() {
     // The refresh↔pull loop breaker: a downstream `workspace/diagnostic/refresh`
-    // whose prefetch commits a pull layer IDENTICAL to the cached one proves the
-    // editor's re-pull would answer `unchanged`, so the bridge absorbs the nudge
-    // instead of forwarding it. Forwarding it unconditionally closed a feedback
-    // loop on quiescent multi-region files: nudge → editor re-pull → downstream
-    // analysis → another downstream refresh → nudge, ~1 Hz forever with zero
-    // edits. (The forward-when-something-changed guarantee (#521) stays pinned
-    // by e2e_downstream_refresh_prefetches_before_forwarding and the ack-order/
+    // whose prefetch commits a pull layer IDENTICAL to the one a covering
+    // editor pull already received is absorbed instead of forwarded (the
+    // editor's re-pull would answer `unchanged`). Forwarding it
+    // unconditionally closed a feedback loop on quiescent multi-region files:
+    // nudge → editor re-pull → downstream analysis → another downstream
+    // refresh → nudge, ~1 Hz forever with zero edits. (The
+    // forward-when-something-changed guarantee (#521) stays pinned by
+    // e2e_downstream_refresh_prefetches_before_forwarding and the ack-order/
     // failure/stale tests, whose prefetches all end in a change or a coverage
-    // gap.)
+    // gap; the never-pulled arm is pinned by
+    // e2e_downstream_refresh_forwarded_when_editor_never_pulled.)
     let (mut client, _config_dir) =
-        init_client_with_mode_caps("diagnostics-refresh-settled", refresh_capable_caps());
+        init_client_with_mode_caps("diagnostics-refresh-settled-pulled", refresh_capable_caps());
     open_host(&mut client);
 
-    // The didOpen host-event pull commits the settled set first — the mock
-    // fires its refresh only 300 ms after answering that pull.
+    // The didOpen host-event pull commits the settled set first.
     client
         .wait_for_notification_where(
             &["textDocument/publishDiagnostics"],
@@ -997,12 +998,29 @@ fn e2e_downstream_refresh_with_unchanged_prefetch_is_absorbed() {
         )
         .expect("precondition: the didOpen pull layer is committed and published");
 
+    // A covering editor pull delivers that set into the pull namespace and
+    // clears the un-nudged commit's pull-view lag — only then is absorption
+    // legitimate. The mock fires its refresh 300 ms after answering THIS
+    // pull, so the lag-clearing order is under the test's control.
+    let pulled = client.send_request(
+        "textDocument/diagnostic",
+        json!({ "textDocument": { "uri": MD_URI } }),
+    );
+    assert!(
+        pulled["result"]["items"]
+            .as_array()
+            .is_some_and(|diagnostics| diagnostics.iter().any(|diagnostic| {
+                diagnostic["message"] == json!("mock-diagnostic-refresh-settled")
+            })),
+        "precondition: the covering pull delivers the settled set: {pulled}"
+    );
+
     assert!(
         client
             .wait_for_server_request("workspace/diagnostic/refresh", Duration::from_millis(1500))
             .is_none(),
-        "a refresh whose covering prefetch changed nothing must be absorbed, \
-         not forwarded (refresh↔pull loop)"
+        "a refresh whose covering prefetch changed nothing (and whose set the \
+         editor already pulled) must be absorbed, not forwarded (refresh↔pull loop)"
     );
 
     client.send_request("shutdown", json!(null));

@@ -75,10 +75,14 @@
 //!   prove that forward is capability-gated (#521).
 //! - `diagnostics-refresh-settled` — advertises pull diagnostics, answers every
 //!   pull with the SAME one-diagnostic set, and sends its refresh 300 ms after
-//!   answering the first pull. The bridge's prefetch then commits an identical
-//!   pull layer, so the editor nudge must be absorbed (the refresh↔pull loop
-//!   breaker); the post-answer delay makes the commit-before-prefetch order
-//!   deterministic.
+//!   answering the FIRST pull (the didOpen host-event pull). The commit was
+//!   never nudged and the editor never pulled, so the pull-view lag must keep
+//!   the forwarded refresh alive.
+//! - `diagnostics-refresh-settled-pulled` — same settled answers, but the
+//!   refresh fires 300 ms after the SECOND pull (the test client's covering
+//!   pull, which clears the lag): the prefetch then commits an identical pull
+//!   layer and the editor nudge must be absorbed (the refresh↔pull loop
+//!   breaker). The post-answer delay is a scheduling margin, not a proof.
 //! - `diagnostics-refresh-burst` — advertises pull diagnostics, sends generation
 //!   1's refresh on `didOpen`, then emits generations 2–10 after the first pull.
 //!   The editor-facing test keeps the leading refresh unacknowledged during that
@@ -232,6 +236,7 @@ fn main() {
                     | "diagnostics-refresh-prefetch-stale"
                     | "diagnostics-refresh-prefetch-unchanged"
                     | "diagnostics-refresh-settled"
+                    | "diagnostics-refresh-settled-pulled"
                     | "diagnostics-refresh-burst"
                     | "diagnostics-push-pullcap" => json!({
                         "diagnosticProvider": {
@@ -1038,15 +1043,23 @@ fn main() {
                     }
                     continue;
                 }
-                if mode == "diagnostics-refresh-settled" {
+                if mode == "diagnostics-refresh-settled"
+                    || mode == "diagnostics-refresh-settled-pulled"
+                {
                     diagnostic_generation += 1;
                     // Every pull answers the SAME settled set, so the
-                    // forwarded-refresh prefetch commits an identical pull layer
-                    // and the bridge absorbs the editor nudge (the refresh↔pull
-                    // loop breaker). The refresh fires only AFTER the first
-                    // pull's answer (plus a settle delay), so the pull layer is
-                    // deterministically committed before the prefetch runs —
-                    // no first-commit race can mark the prefetch as a change.
+                    // forwarded-refresh prefetch commits an identical pull
+                    // layer. In the plain mode the refresh fires after the
+                    // FIRST pull (the didOpen host-event pull) — the editor
+                    // has never pulled, so the un-nudged commit's pull-view
+                    // lag must keep the forward alive. In the `-pulled` mode
+                    // it fires after the SECOND pull (the test client's own
+                    // covering pull, which clears the lag) — the bridge must
+                    // then absorb the nudge (the refresh↔pull loop breaker).
+                    // The post-answer delay gives kakehashi's commit a large
+                    // head start over the refresh's prefetch; it is a margin,
+                    // not a proof — if load ever inverts it, the affected
+                    // test fails red (never a false green).
                     respond(
                         &mut writer,
                         id,
@@ -1062,7 +1075,12 @@ fn main() {
                             }]
                         }),
                     );
-                    if diagnostic_generation == 1 {
+                    let refresh_after = if mode == "diagnostics-refresh-settled" {
+                        1
+                    } else {
+                        2
+                    };
+                    if diagnostic_generation == refresh_after {
                         std::thread::sleep(std::time::Duration::from_millis(300));
                         request(&mut writer, json!(1000), "workspace/diagnostic/refresh");
                     }

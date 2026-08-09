@@ -432,6 +432,10 @@ impl Kakehashi {
         self.diagnostics.mark_served(uri, coverage_stamp);
         self.diagnostics
             .forget_degraded_pull_from(uri, coverage_stamp);
+        // The editor now holds the current merged state, so any un-nudged
+        // pull-layer move is delivered — the forwarded-refresh absorption may
+        // trust the recorded set again (see `pull_view_lag`).
+        self.diagnostics.clear_pull_view_lag(uri);
     }
 
     /// pushFallback fold (Path B, #425): append push-driven servers' cached

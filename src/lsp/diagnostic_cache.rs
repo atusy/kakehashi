@@ -440,6 +440,22 @@ pub(crate) struct DiagnosticAggregator {
     /// backstop would find nothing and the editor would keep a region-less
     /// answer (#745).
     degraded_pulls: Mutex<HashMap<Url, Option<u64>>>,
+    /// Hosts whose recorded merged set moved through an **editor-origin,
+    /// nudge-less** republish (`publish_pull_layer`/`clear_pull_layer`, and
+    /// the refresh prefetch's own commit) since the last **covering** editor
+    /// pull. Those writers never emit `workspace/diagnostic/refresh` (by
+    /// design — they are normally paired with the editor's own event-driven
+    /// pull), but that pairing is a race: the editor's pull can answer with
+    /// the downstream's PRE-analysis state while the slower synthetic pull
+    /// commits the post-analysis set. The forwarded-refresh absorption
+    /// compares against kakehashi's record, so without this debt it would
+    /// read exactly that raced commit as "the editor already has it" and
+    /// starve the one signal that heals the lag. A covering pull clears the
+    /// debt ([`Self::clear_pull_view_lag`] via the pull handler); `didClose`
+    /// forgets it ([`Self::forget_published`]). The debt is deliberately NOT
+    /// cleared when a nudge is sent — only the editor actually re-pulling
+    /// proves the lag closed.
+    pull_view_lag: Mutex<std::collections::HashSet<Url>>,
     /// Per-host coalescing state for the editor-facing `publishDiagnostics`
     /// wire sends (the quiet window): see [`WireGate`] and
     /// [`Self::wire_gate_admit`]. Mutated under the host's republish lock
@@ -1140,6 +1156,40 @@ impl DiagnosticAggregator {
         self.last_wire_published
             .lock()
             .recover_poison("DiagnosticAggregator::last_wire_published")
+            .remove(host);
+        self.pull_view_lag
+            .lock()
+            .recover_poison("DiagnosticAggregator::pull_view_lag")
+            .remove(host);
+    }
+
+    /// Record that `host`'s merged set moved through an editor-origin,
+    /// nudge-less republish (see the [`Self::pull_view_lag`] field doc).
+    pub(crate) fn record_pull_view_lag(&self, host: &Url) {
+        self.pull_view_lag
+            .lock()
+            .recover_poison("DiagnosticAggregator::pull_view_lag")
+            .insert(host.clone());
+    }
+
+    /// Whether `host` carries an outstanding pull-view lag — the recorded set
+    /// moved without a nudge and no covering pull has been answered since.
+    pub(crate) fn has_pull_view_lag(&self, host: &Url) -> bool {
+        self.pull_view_lag
+            .lock()
+            .recover_poison("DiagnosticAggregator::pull_view_lag")
+            .contains(host)
+    }
+
+    /// A covering editor pull was answered for `host`: whatever the recorded
+    /// set is, the editor now holds it — the lag is closed. (A pull that
+    /// answered concurrently with the very commit that recorded the lag can
+    /// clear it while carrying the pre-commit set — a narrow race whose
+    /// consequence is the pre-debt behavior, i.e. one absorbed refresh.)
+    pub(crate) fn clear_pull_view_lag(&self, host: &Url) {
+        self.pull_view_lag
+            .lock()
+            .recover_poison("DiagnosticAggregator::pull_view_lag")
             .remove(host);
     }
 

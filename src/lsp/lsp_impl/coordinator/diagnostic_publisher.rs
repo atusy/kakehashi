@@ -375,12 +375,18 @@ impl DiagnosticPublisher {
             let narrower_than_editor_pull = snapshot.narrower_than_editor_pull;
             let pool = self.bridge.pool_arc();
             let publisher = self.clone();
+            // An outstanding pull-view lag means the recorded set already
+            // moved without a nudge (see `pull_view_lag`): even an unchanged
+            // prefetch compares against data the editor may never have
+            // pulled, so the nudge must survive until a covering pull clears
+            // the lag.
+            let pull_view_lags = self.aggregator.has_pull_view_lag(&uri);
             tasks.spawn(async move {
                 let mut summary = ForwardedPrefetchSummary {
+                    set_changed: pull_view_lags,
                     // A pullFallback-gated layer is pulled by the editor but
                     // not by this prefetch — coverage is incomplete either way.
                     coverage_incomplete: narrower_than_editor_pull,
-                    ..Default::default()
                 };
                 let errors = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
                 let error_sink = Some(std::sync::Arc::clone(&errors));
@@ -478,10 +484,18 @@ impl DiagnosticPublisher {
             }
         }
         drop(edit_guard);
+        // `Deferred` counts as changed: the cache moved, only the geometry
+        // re-anchor is pending — the editor's view is stale either way.
+        let set_changed = self.republish(uri).await.nudges_pull_clients();
+        if set_changed {
+            // The in-cycle nudge below is only a request; record the lag so
+            // that if the editor does not actually re-pull, the NEXT cycle's
+            // unchanged prefetch still forwards instead of absorbing forever
+            // (cleared by the covering pull, like `publish_pull_layer`).
+            self.aggregator.record_pull_view_lag(uri);
+        }
         ForwardedPrefetchSummary {
-            // `Deferred` counts as changed: the cache moved, only the geometry
-            // re-anchor is pending — the editor's view is stale either way.
-            set_changed: self.republish(uri).await.nudges_pull_clients(),
+            set_changed,
             ..Default::default()
         }
     }
@@ -816,7 +830,14 @@ impl DiagnosticPublisher {
     /// self-heals on the next completed pull.
     pub(crate) async fn publish_pull_layer(&self, host: &Url, diagnostics: Vec<Diagnostic>) {
         self.aggregator.set_pull_layer(host, diagnostics);
-        self.republish(host).await;
+        if self.republish(host).await.nudges_pull_clients() {
+            // This commit moved the recorded set without any editor nudge; if
+            // the editor's own event-driven pull raced ahead of it, only a
+            // later covering pull closes the gap — record the lag so the
+            // forwarded-refresh absorption does not mistake kakehashi's own
+            // record for the editor's view (see `pull_view_lag`).
+            self.aggregator.record_pull_view_lag(host);
+        }
     }
 
     /// Evict the host's `PullLayer` blob and republish — the host-event pull had
@@ -839,7 +860,11 @@ impl DiagnosticPublisher {
     pub(crate) async fn clear_pull_layer(&self, host: &Url) {
         self.aggregator
             .evict_source(host, &DiagnosticSource::PullLayer);
-        self.republish(host).await;
+        if self.republish(host).await.nudges_pull_clients() {
+            // Same pull-view lag rule as `publish_pull_layer`: a cleared set
+            // the editor still displays is the worse variant of the lag.
+            self.aggregator.record_pull_view_lag(host);
+        }
     }
 
     /// Evict every diagnostic slot a now-exited downstream connection produced and
