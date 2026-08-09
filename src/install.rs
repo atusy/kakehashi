@@ -91,12 +91,11 @@ pub(crate) fn test_data_dir() -> PathBuf {
 /// in-tree test harness.
 #[cfg(any(test, feature = "e2e"))]
 pub mod test_support {
-    use super::{parser, queries};
+    use super::parser;
     use std::path::{Path, PathBuf};
 
     /// Languages whose parsers and queries every kakehashi test relies on.
     ///
-    /// Mirrors the `make deps/tree-sitter/.installed` Makefile target.
     /// Tests that open lua / markdown / rust / yaml documents expect
     /// parsers and highlight queries to already be present; without
     /// them, semantic-tokens and similar end-to-end tests come back
@@ -126,11 +125,11 @@ pub mod test_support {
     /// the `.installed` marker is missing, writing the marker only when
     /// every required install succeeded.
     ///
-    /// Mirrors the install loop in `make deps/tree-sitter/.installed`.
-    /// Both the parser and queries installs short-circuit when a
-    /// language is up-to-date; any genuine failure is logged so tests
-    /// depending on that language fail with a clearer error rather than
-    /// the whole suite panicking in setup.
+    /// Serves the same purpose as `make deps/tree-sitter/.installed` for the
+    /// in-process test suite, over an overlapping but not identical language
+    /// set. The install short-circuits when a language is up-to-date; any
+    /// genuine failure is logged so tests depending on that language fail
+    /// with a clearer error rather than the whole suite panicking in setup.
     ///
     /// A transient failure (network, file lock, compile error) must not
     /// leave the marker behind: a marker over a half-populated data dir
@@ -142,7 +141,7 @@ pub mod test_support {
         if marker.exists() {
             return Ok(());
         }
-        let parser_options = parser::InstallOptions {
+        let options = super::LanguageInstallOptions {
             data_dir: data_dir.to_path_buf(),
             force: false,
             verbose: false,
@@ -153,28 +152,17 @@ pub mod test_support {
         };
         let mut all_ok = true;
         for lang in TEST_LANGUAGES {
-            // `AlreadyExists` means the artifact is present from an earlier
-            // run — success for setup purposes, not a failure. Treating it as
-            // failure would make a partial prior run unrecoverable: if parsers
-            // installed but a query failed (so the marker was never written),
-            // every later run would see `AlreadyExists` for the parser and
-            // could never write the marker without deleting files by hand.
-            match parser::install_parser(lang, &parser_options) {
-                Ok(_) | Err(parser::ParserInstallError::AlreadyExists(_)) => {}
-                Err(e) => {
-                    eprintln!("[test setup] install_parser({}) failed: {}", lang, e);
-                    all_ok = false;
+            // Artifacts already present from an earlier run are a success for
+            // setup purposes, and `install_language` reports them as such.
+            let result = super::install_language(lang, &options);
+            if !result.is_success() {
+                for error in [result.parser_error, result.queries_error]
+                    .into_iter()
+                    .flatten()
+                {
+                    eprintln!("[test setup] install_language({}) failed: {}", lang, error);
                 }
-            }
-            match queries::install_queries_with_dependencies(lang, data_dir, false) {
-                Ok(_) | Err(queries::QueryInstallError::AlreadyExists(_)) => {}
-                Err(e) => {
-                    eprintln!(
-                        "[test setup] install_queries_with_dependencies({}) failed: {}",
-                        lang, e
-                    );
-                    all_ok = false;
-                }
+                all_ok = false;
             }
         }
         if all_ok {
@@ -198,30 +186,105 @@ fn resolve_data_dir(env_fn: impl Fn(&str) -> Option<String>) -> Option<PathBuf> 
 }
 
 /// Result of installing a language (both parser and queries).
+///
+/// `#[non_exhaustive]`: what an install has to report about itself has grown
+/// twice already in review, and a downstream match or literal should not break
+/// the next time it does.
+///
+/// A language is installed as a unit: every failure path returns before
+/// publishing either half, or undoes the one it published.
+///
+/// The paths describe what this run *settled on*, not what is on disk. They are
+/// populated together on success — including when a half was already installed
+/// and left alone — and a `None` path with no matching error means this run
+/// neither published that half nor left one it had published, which says
+/// nothing about a copy an earlier install put there. Read the disk for that.
 #[derive(Debug)]
-pub(crate) struct InstallResult {
+#[non_exhaustive]
+pub struct InstallResult {
     /// Path where the parser was installed, if successful.
-    pub(crate) parser_path: Option<PathBuf>,
+    pub parser_path: Option<PathBuf>,
     /// Path where queries were installed, if successful.
-    pub(crate) queries_path: Option<PathBuf>,
+    pub queries_path: Option<PathBuf>,
     /// Error message if parser install failed.
-    pub(crate) parser_error: Option<String>,
+    pub parser_error: Option<String>,
     /// Error message if queries install failed.
-    pub(crate) queries_error: Option<String>,
+    pub queries_error: Option<String>,
+    /// What a failed install left of the queries it had already published, when
+    /// undoing them did not fully succeed. `None` on every other outcome.
+    pub rollback_residue: Option<RollbackResidue>,
+    /// Query files this install downloaded, for the requested language.
+    /// Empty when its queries were already present.
+    pub files_downloaded: Vec<String>,
 }
 
 impl InstallResult {
     /// Check if the installation was fully successful.
-    pub(crate) fn is_success(&self) -> bool {
+    pub fn is_success(&self) -> bool {
         self.parser_error.is_none() && self.queries_error.is_none()
     }
 }
 
-/// Install a language synchronously (both parser and queries).
+/// What a failed install left behind when it could not fully undo itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum RollbackResidue {
+    /// The queries this install published are still live.
+    NewQueriesLive,
+    /// Its queries are gone, and so are the ones they displaced — those are in
+    /// a backup directory named by the warnings on stderr.
+    PreviousQueriesStranded,
+}
+
+fn rollback_residue(outcome: queries::RollbackOutcome) -> Option<RollbackResidue> {
+    match outcome {
+        queries::RollbackOutcome::Undone => None,
+        queries::RollbackOutcome::NewQueriesRemain => Some(RollbackResidue::NewQueriesLive),
+        queries::RollbackOutcome::PreviousQueriesStranded => {
+            Some(RollbackResidue::PreviousQueriesStranded)
+        }
+    }
+}
+
+/// Options for installing one language's parser and queries.
+pub struct LanguageInstallOptions {
+    /// Base data directory the parser and queries are installed into.
+    pub data_dir: PathBuf,
+    /// Reinstall artifacts that are already present.
+    pub force: bool,
+    /// Print progress details to stderr.
+    pub verbose: bool,
+    /// Bypass the parser metadata cache.
+    pub no_cache: bool,
+    /// How to compile the parser source (see [`parser::ParserCompile`]).
+    pub compile: parser::ParserCompile,
+}
+
+/// Install a language's parser and queries as a unit.
 ///
-/// Production callers pass [`queries::NVIM_TREESITTER_QUERIES_URL`]. Tests
-/// can inject other HTTPS endpoints; local HTTP fixtures use a test-only
-/// wrapper below so production downloads stay HTTPS-only.
+/// Both halves are prepared before either is published, so a failure leaves the
+/// requested language neither half-installed nor reported as half-failed.
+///
+/// Two things a failure can still leave behind: queries for a base language the
+/// install had to fetch, which are shared with every language that inherits them
+/// and inert on their own, and bookkeeping — the parser metadata cache, the
+/// `parser/` and `queries/` directories, the per-language lock files, and the
+/// removal of an uninstall tombstone for the language.
+pub fn install_language(language: &str, options: &LanguageInstallOptions) -> InstallResult {
+    install_language_with_query_stager(
+        language,
+        options,
+        queries::NVIM_TREESITTER_QUERIES_URL,
+        queries::stage_queries_with_dependencies_from,
+    )
+}
+
+/// Install a language synchronously, downloading queries from `queries_base_url`.
+///
+/// Production goes through [`install_language`]; tests use this to point at a
+/// fixture server. Local HTTP fixtures need the test-only wrapper below so
+/// production downloads stay HTTPS-only.
+#[cfg(test)]
 fn install_language_blocking(
     language: &str,
     data_dir: &std::path::Path,
@@ -229,91 +292,209 @@ fn install_language_blocking(
     queries_base_url: &str,
     compile: parser::ParserCompile,
 ) -> InstallResult {
-    install_language_blocking_with_query_installer(
+    install_language_with_query_stager(
         language,
-        data_dir,
-        force,
+        &LanguageInstallOptions {
+            data_dir: data_dir.to_path_buf(),
+            force,
+            verbose: false,
+            no_cache: false,
+            compile,
+        },
         queries_base_url,
-        compile,
-        queries::install_queries_with_dependencies_from,
+        queries::stage_queries_with_dependencies_from,
     )
 }
 
-fn install_language_blocking_with_query_installer(
+fn install_language_with_query_stager(
     language: &str,
-    data_dir: &std::path::Path,
-    force: bool,
+    options: &LanguageInstallOptions,
     queries_base_url: &str,
-    compile: parser::ParserCompile,
-    install_queries: fn(
+    stage_queries: fn(
         &str,
         &str,
         &std::path::Path,
         bool,
-    ) -> Result<queries::QueryInstallResult, queries::QueryInstallError>,
+    ) -> Result<queries::StagedQueryInstall, queries::QueryInstallError>,
 ) -> InstallResult {
+    let data_dir = options.data_dir.as_path();
+    let force = options.force;
     let mut result = InstallResult {
         parser_path: None,
         queries_path: None,
         parser_error: None,
         queries_error: None,
+        rollback_residue: None,
+        files_downloaded: Vec::new(),
     };
 
     // The queries installer re-checks names itself, but the parser
     // installer also builds paths from the name (`parser/<name>.<ext>`),
-    // so reject traversal-capable names before touching either.
+    // so reject traversal-capable names before touching either. Report the
+    // queries installer's wording, which names the allowed characters — the
+    // user's next move is to correct the name.
     if !queries::is_safe_language_name(language) {
-        let reason = format!("Language name '{}' is unsafe", language.escape_default());
+        let reason =
+            queries::QueryInstallError::InvalidLanguageName(language.escape_default().to_string())
+                .to_string();
         result.parser_error = Some(reason.clone());
         result.queries_error = Some(reason);
         return result;
     }
 
-    if let Err(e) = queries::clear_uninstall_tombstone_for_install(data_dir, language) {
-        let reason = e.to_string();
-        result.queries_error = Some(reason);
-    }
+    // No tombstone clear here. Staging does it, once per language and under
+    // that language's lock — including the requested one, which is a dependency
+    // of itself. A second clear is exactly what erases a tombstone an uninstall
+    // wrote in between, which is the race clearing it once was written to close.
 
-    // Install parser
-    // For async/auto-install, always use cache (background operation)
+    // Stage both halves before publishing either, so a language is never left
+    // half-installed: whichever half fails, every staging artifact is dropped
+    // and the requested language's parser and queries stay unpublished.
+    //
+    // Queries first because they are the cheap half — a language whose queries
+    // cannot be fetched is rejected in seconds instead of after a parser
+    // compile that would then be thrown away. Following `; inherits:` here is
+    // what makes languages like html (which keeps its @comment capture in
+    // html_tags) highlight correctly.
+    let mut staged_queries = match stage_queries(queries_base_url, language, data_dir, force) {
+        Ok(staged) => staged,
+        Err(e) => {
+            result.queries_error = Some(e.to_string());
+            return result;
+        }
+    };
+
     let parser_options = parser::InstallOptions {
         data_dir: data_dir.to_path_buf(),
         force,
-        verbose: false,
-        no_cache: false,
+        verbose: options.verbose,
+        no_cache: options.no_cache,
         // Caller-chosen: the killable subprocess re-execs this binary's
         // `__compile-parser`, so it is valid only when `current_exe()` is the
         // kakehashi binary. The production caller (LSP auto-install) is, and asks
         // for it; test/embedder callers pass InProcess.
-        compile,
+        compile: options.compile,
     };
-
-    // AlreadyExists means the artifact is present and usable — success,
-    // not failure; treating it as an error made the auto-install manager
-    // degrade a fully-installed language to "installed but with warnings".
-    match parser::install_parser(language, &parser_options) {
-        Ok(parser_result) => {
-            result.parser_path = Some(parser_result.install_path);
-        }
-        Err(parser::ParserInstallError::AlreadyExists(path)) => {
-            result.parser_path = Some(path);
-        }
+    let staged_parser = match parser::stage_parser(language, &parser_options) {
+        Ok(staged) => staged,
         Err(e) => {
             result.parser_error = Some(e.to_string());
+            return result;
+        }
+    };
+
+    // From here on every artifact moves together, so take the locks that order
+    // this install against another install or an uninstall — one per language
+    // it depends on, since a base language it inherits is as load-bearing as
+    // its own queries. Taken after staging, so a compile never blocks anyone.
+    let transaction = match queries::lock_languages(data_dir, staged_queries.dependencies()) {
+        Ok(locks) => locks,
+        Err(e) => {
+            result.queries_error = Some(e.to_string());
+            return result;
+        }
+    };
+    if transaction
+        .iter()
+        .any(queries::LanguageLock::language_was_uninstalled)
+    {
+        result.queries_error = Some(format!(
+            "'{}' or a language it inherits was uninstalled while it was being installed",
+            language
+        ));
+        return result;
+    }
+
+    // Queries that staging found already complete were never copied, so this is
+    // the only thing that would notice them being removed since. Checked under
+    // the locks, before anything is published, so there is nothing to undo.
+    if let Some(unstable) = staged_queries.unstable_skipped_dependency() {
+        result.queries_error = Some(format!(
+            "the queries installed for '{}' were removed or replaced while '{}' was being \
+             installed",
+            unstable, language
+        ));
+        return result;
+    }
+
+    // A parser that appeared since staging belongs to a concurrent install of
+    // the same language. Without `force`, the query side already yields to such
+    // a winner (`PublishQueryDirOutcome::AlreadyComplete`); yield the parser the
+    // same way, or the two halves can end up published by different installs —
+    // one's queries beside the other's grammar. Dropping the staged parser here
+    // reclaims the compiled file.
+    let staged_parser =
+        staged_parser.yield_to_existing(force, parser_file_exists(language, data_dir));
+    if matches!(staged_parser, parser::StagedParserOutcome::Staged(_)) {
+        // This install is the one establishing the pair, so its queries publish
+        // with its parser instead of yielding to a copy that appeared since
+        // staging — an install of a language that *inherits* this one can
+        // publish these queries without holding this language's lock.
+        staged_queries.claim_requested_language();
+    }
+
+    let published_queries = match staged_queries.publish() {
+        Ok(published) => published,
+        Err(failure) => {
+            // Publishing can fail *after* it has published something, and its
+            // own rollback can fail in turn. Either way this is not a
+            // residue-free failure: the error says what went wrong, the residue
+            // says what is still on disk because of it.
+            result.rollback_residue = rollback_residue(failure.residue).or_else(|| {
+                matches!(
+                    failure.error,
+                    queries::QueryInstallError::PreviousQueriesStranded { .. }
+                )
+                .then_some(RollbackResidue::PreviousQueriesStranded)
+            });
+            result.queries_error = Some(failure.error.to_string());
+            return result;
+        }
+    };
+
+    // The parser is published last: requests are routed to a language only once
+    // its parser is registered, so an install cut short here leaves inert
+    // queries rather than a parser whose queries are missing.
+    //
+    // AlreadyInstalled means the artifact is present and usable — success, not
+    // failure; treating it as an error made the auto-install manager degrade a
+    // fully-installed language to a warning about its own success.
+    match staged_parser {
+        parser::StagedParserOutcome::Staged(staged) => match staged.publish() {
+            Ok(parser_result) => result.parser_path = Some(parser_result.install_path),
+            Err(e) => {
+                result.rollback_residue = rollback_residue(published_queries.rollback());
+                result.parser_error = Some(e.to_string());
+                return result;
+            }
+        },
+        parser::StagedParserOutcome::AlreadyInstalled(_) => {
+            // Staging saw this parser before the transaction lock was taken, so
+            // re-check it rather than trusting what it found: publishing queries
+            // against a parser an uninstall has since removed is the
+            // queries-only state this lock exists to prevent, and nothing was
+            // staged that could replace it.
+            let Some(path) = parser_file_exists(language, data_dir) else {
+                result.rollback_residue = rollback_residue(published_queries.rollback());
+                result.parser_error = Some(format!(
+                    "the installed parser for '{}' was removed while it was being installed",
+                    language
+                ));
+                return result;
+            };
+            result.parser_path = Some(path);
         }
     }
 
-    // Install queries, following `; inherits:` so languages like html
-    // (which keeps its @comment capture in html_tags) highlight correctly.
-    match install_queries(queries_base_url, language, data_dir, force) {
-        Ok(query_result) => {
+    let committed = published_queries.commit();
+    drop(transaction);
+    match committed {
+        queries::CommittedQueryInstall::Installed(query_result) => {
             result.queries_path = Some(query_result.install_path);
+            result.files_downloaded = query_result.files_downloaded;
         }
-        Err(queries::QueryInstallError::AlreadyExists(path)) => {
+        queries::CommittedQueryInstall::AlreadyInstalled(path) => {
             result.queries_path = Some(path);
-        }
-        Err(e) => {
-            result.queries_error = Some(e.to_string());
         }
     }
 
@@ -332,12 +513,17 @@ pub(crate) async fn install_language_async(
 ) -> InstallResult {
     // Run blocking install operations in a separate thread pool
     tokio::task::spawn_blocking(move || {
-        install_language_blocking(
+        install_language(
             &language,
-            &data_dir,
-            force,
-            queries::NVIM_TREESITTER_QUERIES_URL,
-            compile,
+            &LanguageInstallOptions {
+                data_dir,
+                force,
+                // Auto-install runs in the background: no progress chatter on
+                // the server's stderr, and always use the metadata cache.
+                verbose: false,
+                no_cache: false,
+                compile,
+            },
         )
     })
     .await
@@ -346,6 +532,8 @@ pub(crate) async fn install_language_async(
         queries_path: None,
         parser_error: Some(format!("Task panicked: {}", e)),
         queries_error: None,
+        rollback_residue: None,
+        files_downloaded: Vec::new(),
     })
 }
 
@@ -357,13 +545,17 @@ fn install_language_blocking_allowing_http_queries_for_tests(
     queries_base_url: &str,
     compile: parser::ParserCompile,
 ) -> InstallResult {
-    install_language_blocking_with_query_installer(
+    install_language_with_query_stager(
         language,
-        data_dir,
-        force,
+        &LanguageInstallOptions {
+            data_dir: data_dir.to_path_buf(),
+            force,
+            verbose: false,
+            no_cache: false,
+            compile,
+        },
         queries_base_url,
-        compile,
-        queries::install_queries_with_dependencies_from_allowing_http_for_tests,
+        queries::stage_queries_with_dependencies_from_allowing_http_for_tests,
     )
 }
 
@@ -590,7 +782,7 @@ mod tests {
             result
                 .parser_error
                 .as_deref()
-                .is_some_and(|e| e.contains("unsafe")),
+                .is_some_and(|e| e.contains("Invalid language name")),
             "parser side must be blocked by the name guard, got {:?}",
             result.parser_error
         );
@@ -598,7 +790,7 @@ mod tests {
             result
                 .queries_error
                 .as_deref()
-                .is_some_and(|e| e.contains("unsafe")),
+                .is_some_and(|e| e.contains("Invalid language name")),
             "queries side must be blocked by the name guard, got {:?}",
             result.queries_error
         );
@@ -611,7 +803,7 @@ mod tests {
     /// A language whose parser and queries are already on disk is a
     /// successful install, not a failure: reporting AlreadyExists as an
     /// error made the auto-install manager degrade a fully-usable language
-    /// to "installed but with warnings".
+    /// to a warning about its own success.
     #[test]
     fn install_language_blocking_treats_already_installed_as_success() {
         let temp = tempfile::TempDir::new().unwrap();
@@ -659,6 +851,8 @@ mod tests {
             queries_path: Some(PathBuf::from("/tmp/queries")),
             parser_error: None,
             queries_error: None,
+            rollback_residue: None,
+            files_downloaded: Vec::new(),
         };
         assert!(success.is_success());
 
@@ -667,63 +861,146 @@ mod tests {
             queries_path: None,
             parser_error: Some("Parser failed".to_string()),
             queries_error: Some("Queries failed".to_string()),
+            rollback_residue: None,
+            files_downloaded: Vec::new(),
         };
         assert!(!failure.is_success());
     }
 
+    /// Preparing the query side — taking the language lock and clearing any
+    /// uninstall tombstone — happens before either half is staged, so its
+    /// failure is a query error and nothing else.
     #[test]
     fn install_language_reports_tombstone_cleanup_as_query_error_only() {
         let temp = tempfile::TempDir::new().unwrap();
         let data_dir = temp.path();
 
-        // Keep the parser side successful without fetching metadata or source:
-        // this test isolates how a query tombstone failure is classified.
+        // An already-installed parser, so "no parser was published" is a claim
+        // about this run rather than about an empty data dir.
         let parser_dir = data_dir.join("parser");
         std::fs::create_dir_all(&parser_dir).unwrap();
-        std::fs::write(
-            parser_dir.join(format!("lua.{}", std::env::consts::DLL_EXTENSION)),
-            "",
-        )
-        .unwrap();
+        let parser_file = parser_dir.join(format!("lua.{}", std::env::consts::DLL_EXTENSION));
+        std::fs::write(&parser_file, "").unwrap();
+        // A file where the queries directory belongs makes tombstone cleanup
+        // fail; the base URL points nowhere so a download would fail loudly.
         std::fs::write(data_dir.join("queries"), "not a directory").unwrap();
-        let expected_queries_error =
-            queries::clear_uninstall_tombstone_for_install(data_dir, "lua")
-                .unwrap_err()
-                .to_string();
+        // Derived the same way the installer does, so the assertion follows the
+        // code rather than a copy of its message.
+        let expected_queries_error = queries::lock_language(data_dir, "lua")
+            .and_then(|_lock| queries::clear_uninstall_tombstone_for_install(data_dir, "lua"))
+            .unwrap_err()
+            .to_string();
 
-        fn successful_query_install(
-            _base_url: &str,
-            language: &str,
-            data_dir: &std::path::Path,
-            _force: bool,
-        ) -> Result<queries::QueryInstallResult, queries::QueryInstallError> {
-            Ok(queries::QueryInstallResult {
-                language: language.to_string(),
-                install_path: data_dir.join("queries").join(language),
-                files_downloaded: Vec::new(),
-            })
-        }
-
-        let result = install_language_blocking_with_query_installer(
+        let result = install_language_blocking(
             "lua",
             data_dir,
             false,
             "https://example.invalid",
             parser::ParserCompile::InProcess,
-            successful_query_install,
         );
 
         assert!(
             result.parser_error.is_none(),
             "tombstone cleanup must not be reported as a parser error"
         );
-        assert!(
-            result.parser_path.is_some(),
-            "query tombstone cleanup failures must preserve the available parser result"
-        );
         assert_eq!(
             result.queries_error.as_deref(),
             Some(expected_queries_error.as_str())
+        );
+        assert!(
+            result.parser_path.is_none(),
+            "a failure before staging must not report the already-installed parser as this \
+             run's work"
+        );
+        assert!(
+            parser_file.exists(),
+            "a failed install must not disturb an already-installed parser"
+        );
+    }
+
+    /// All-or-nothing: a language whose queries cannot be fetched must not
+    /// leave a compiled parser behind. The parser here is pre-installed, so
+    /// the assertion is about what the failed run publishes, not about
+    /// compiling one.
+    #[test]
+    fn failed_queries_publish_no_parser() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let data_dir = temp.path();
+        // A parser is already on disk: the old installer reported it as this
+        // run's `parser_path`, which is exactly what must not happen when the
+        // queries half fails.
+        let parser_dir = data_dir.join("parser");
+        std::fs::create_dir_all(&parser_dir).unwrap();
+        let parser_file = parser_dir.join(format!(
+            "unsupported_lang.{}",
+            std::env::consts::DLL_EXTENSION
+        ));
+        std::fs::write(&parser_file, "").unwrap();
+        // No routes: highlights.scm 404s, so the language is unsupported.
+        let base_url = spawn_query_file_server(vec![]);
+
+        let result = install_language_blocking_allowing_http_queries_for_tests(
+            "unsupported_lang",
+            data_dir,
+            false,
+            &base_url,
+            parser::ParserCompile::InProcess,
+        );
+
+        assert!(!result.is_success(), "the install must fail");
+        assert!(
+            result.parser_path.is_none(),
+            "a failed install must not report an installed parser"
+        );
+        assert!(
+            parser_file.exists(),
+            "a failed install must leave the parser that was already there alone"
+        );
+        assert!(
+            !data_dir.join("queries").join("unsupported_lang").exists(),
+            "a failed install must not leave queries on disk"
+        );
+    }
+
+    /// The inherited-parent chain is staged before anything is published, so a
+    /// parent that 404s takes the whole install down with it — including the
+    /// child's queries, which would otherwise be published with a dangling
+    /// `; inherits:`.
+    #[test]
+    fn a_failing_inherited_parent_publishes_neither_half() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let data_dir = temp.path();
+        let parser_dir = data_dir.join("parser");
+        std::fs::create_dir_all(&parser_dir).unwrap();
+        std::fs::write(
+            parser_dir.join(format!("orphan_child.{}", std::env::consts::DLL_EXTENSION)),
+            "",
+        )
+        .unwrap();
+        let base_url = spawn_query_file_server(vec![(
+            "/orphan_child/highlights.scm",
+            "; inherits: missing_parent\n(identifier) @variable\n",
+        )]);
+
+        let result = install_language_blocking_allowing_http_queries_for_tests(
+            "orphan_child",
+            data_dir,
+            false,
+            &base_url,
+            parser::ParserCompile::InProcess,
+        );
+
+        assert!(
+            !result.is_success(),
+            "a missing parent must fail the install"
+        );
+        assert!(
+            result.parser_path.is_none(),
+            "a failed install must not report the pre-existing parser as installed"
+        );
+        assert!(
+            !data_dir.join("queries").join("orphan_child").exists(),
+            "the child's queries must not be published without the parent it inherits"
         );
     }
 }

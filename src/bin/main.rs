@@ -416,6 +416,9 @@ fn run_language_status(verbose: bool) -> Result<(), ExitCode> {
         eprintln!("Error: failed to recover interrupted query installs: {e}");
         ExitCode::FAILURE
     })?;
+    if let Err(e) = parser::recover_interrupted_parser_installs(&parser_dir) {
+        eprintln!("Warning: failed to collect interrupted parser installs: {e}");
+    }
 
     // Collect all installed languages from both parser and queries directories
     let mut languages = BTreeSet::new();
@@ -746,6 +749,61 @@ fn run_language_uninstall(
 
         let mut removed_something = false;
 
+        // Hold the language's install lock across both removals, so a
+        // concurrent install cannot publish one artifact between them and leave
+        // the language half-removed after this command reports success.
+        let transaction = match queries::lock_language(&data_dir, lang) {
+            Ok(lock) => lock,
+            Err(e) => {
+                eprintln!("✗ Failed to lock '{}' for uninstall: {}", lang, e);
+                any_failed = true;
+                continue;
+            }
+        };
+
+        // Remove queries directory and any kakehashi-created backups under the
+        // same lock used by install replacement, so uninstall cannot race a
+        // concurrent install into resurrecting queries after reporting success.
+        //
+        // Before the parser, so the tombstone this writes is already visible to
+        // an install that is about to publish its parser: that install checks
+        // for it under this same lock and gives up instead of leaving a parser
+        // behind for a language the user just removed.
+        match queries::remove_query_install_and_backups(&transaction) {
+            Ok(removal) => {
+                if removal.removed_queries {
+                    eprintln!("✓ Removed queries: {}", queries_dir.join(lang).display());
+                }
+                if removal.removed_backups {
+                    eprintln!("✓ Removed query backups for '{}'", lang);
+                }
+                removed_something |= removal.removed_anything();
+            }
+            Err(failure) => {
+                eprintln!("✗ Failed to remove queries for '{}': {}", lang, failure);
+                any_failed = true;
+                removed_something |= failure.removal.removed_anything();
+                // Whether to go on to the parser depends on the state the
+                // removal left, not on whether it did the removing: a language
+                // that was already parser-only still needs its parser taken.
+                // With the queries gone, stopping would leave a parser-only
+                // language — the half-removed state this command exists to
+                // avoid — so finish the job. With them still there, taking the
+                // parser would *create* that state, so leave both and let the
+                // retry be a plain retry.
+                if !failure.removal.queries_absent {
+                    eprintln!(
+                        "  Leaving the parser for '{}' in place; run the command again.",
+                        lang
+                    );
+                    if removed_something {
+                        any_removed = true;
+                    }
+                    continue;
+                }
+            }
+        }
+
         // Remove parser file
         if let Some(parser_path) = find_parser_file(&parser_dir, lang) {
             match fs::remove_file(&parser_path) {
@@ -757,25 +815,6 @@ fn run_language_uninstall(
                     eprintln!("✗ Failed to remove parser {}: {}", parser_path.display(), e);
                     any_failed = true;
                 }
-            }
-        }
-
-        // Remove queries directory and any kakehashi-created backups under the
-        // same lock used by install replacement, so uninstall cannot race a
-        // concurrent install into resurrecting queries after reporting success.
-        match queries::remove_query_install_and_backups(&queries_dir, lang) {
-            Ok(removal) => {
-                if removal.removed_queries {
-                    eprintln!("✓ Removed queries: {}", queries_dir.join(lang).display());
-                }
-                if removal.removed_backups {
-                    eprintln!("✓ Removed query backups for '{}'", lang);
-                }
-                removed_something |= removal.removed_anything();
-            }
-            Err(e) => {
-                eprintln!("✗ Failed to remove queries for '{}': {}", lang, e);
-                any_failed = true;
             }
         }
 
@@ -1011,70 +1050,81 @@ fn run_install(language: &str, force: bool, verbose: bool, no_cache: bool) -> Re
         ExitCode::FAILURE
     })?;
 
-    // Track success/failure for exit code
-    let mut parser_success = true;
-    let mut queries_success = true;
+    eprintln!("Installing '{}' to {:?}...", language, data_dir);
 
-    if let Err(e) = queries::clear_uninstall_tombstone_for_install(&data_dir, language) {
-        eprintln!("✗ Failed to prepare query installation: {}", e);
-        queries_success = false;
-    }
+    let result = kakehashi::install::install_language(
+        language,
+        &kakehashi::install::LanguageInstallOptions {
+            data_dir,
+            force,
+            verbose,
+            no_cache,
+            // The CLI runs from the kakehashi binary, so the killable subprocess path
+            // is available and a hung cc is deadline-bounded.
+            compile: parser::ParserCompile::KillableSubprocess,
+        },
+    );
 
-    // Install parser
-    eprintln!("Installing parser for '{}' to {:?}...", language, data_dir);
-
-    let options = parser::InstallOptions {
-        data_dir: data_dir.clone(),
-        force,
-        verbose,
-        no_cache,
-        // The CLI runs from the kakehashi binary, so the killable subprocess path
-        // is available and a hung cc is deadline-bounded.
-        compile: parser::ParserCompile::KillableSubprocess,
-    };
-
-    match parser::install_parser(language, &options) {
-        Ok(result) => {
-            eprintln!("✓ Parser installed: {}", result.install_path.display());
-            if verbose {
-                eprintln!("  Revision: {}", result.revision);
-            }
+    // The name guard reports the same reason for both halves; printing it once
+    // is the whole message.
+    if result.parser_error == result.queries_error {
+        if let Some(e) = &result.parser_error {
+            eprintln!("✗ Installation failed: {}", e);
         }
-        Err(e) => {
-            eprintln!("✗ Parser installation failed: {}", e);
-            parser_success = false;
-        }
-    }
-
-    // Install queries (with inherited dependencies)
-    eprintln!("Installing queries for '{}' to {:?}...", language, data_dir);
-
-    match queries::install_queries_with_dependencies_after_install_started(
-        language, &data_dir, force,
-    ) {
-        Ok(result) => {
-            eprintln!("✓ Queries installed: {}", result.install_path.display());
-            if verbose {
-                eprintln!("  Files: {}", result.files_downloaded.join(", "));
-            }
-        }
-        Err(e) => {
-            eprintln!("✗ Query installation failed: {}", e);
-            queries_success = false;
-        }
-    }
-
-    // Summary
-    if parser_success && queries_success {
-        eprintln!("\nSuccessfully installed '{}' language support.", language);
-        Ok(())
-    } else if !parser_success && !queries_success {
-        eprintln!("\nFailed to install '{}' language support.", language);
-        Err(ExitCode::FAILURE)
     } else {
-        eprintln!("\nPartially installed '{}' language support.", language);
-        Err(ExitCode::FAILURE)
+        if let Some(e) = &result.parser_error {
+            eprintln!("✗ Parser installation failed: {}", e);
+        }
+        if let Some(e) = &result.queries_error {
+            eprintln!("✗ Query installation failed: {}", e);
+        }
     }
+
+    if !result.is_success() {
+        // Both halves are staged before either is published, so a failure
+        // published neither — say so, rather than leaving the user to guess
+        // which half survived and whether a retry needs --force. Scoped to the
+        // requested language: queries for a base language it inherits stay
+        // published (they are shared), and bookkeeping is written either way.
+        if let Some(residue) = result.rollback_residue {
+            let left = match residue {
+                kakehashi::install::RollbackResidue::NewQueriesLive => {
+                    "the queries it had already published could not be withdrawn"
+                }
+                kakehashi::install::RollbackResidue::PreviousQueriesStranded => {
+                    "the queries it replaced could not be put back"
+                }
+                // The library can name a residue this build predates; the
+                // warnings above still say what and where.
+                _ => "it could not undo everything it had already published",
+            };
+            eprintln!(
+                "\nFailed to install '{}' language support, and {} — see the warnings above.",
+                language, left
+            );
+        } else {
+            eprintln!(
+                "\nFailed to install '{}' language support. Neither its parser nor its queries \
+                 were published.",
+                language
+            );
+        }
+        return Err(ExitCode::FAILURE);
+    }
+
+    // Paths are reported rather than "installed": either half may have already
+    // been present, in which case this run left it alone.
+    if let Some(path) = &result.parser_path {
+        eprintln!("✓ Parser: {}", path.display());
+    }
+    if let Some(path) = &result.queries_path {
+        eprintln!("✓ Queries: {}", path.display());
+        if verbose && !result.files_downloaded.is_empty() {
+            eprintln!("  Files: {}", result.files_downloaded.join(", "));
+        }
+    }
+    eprintln!("\nSuccessfully installed '{}' language support.", language);
+    Ok(())
 }
 
 /// Run the hidden `__compile-parser` subprocess entry: compile one grammar
