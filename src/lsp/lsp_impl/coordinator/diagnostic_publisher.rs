@@ -1441,8 +1441,15 @@ mod tests {
         }
     }
 
-    #[tokio::test(start_paused = true)]
-    async fn forwarded_refresh_sends_the_leading_edge_immediately() {
+    /// Loop-breaker: a downstream `workspace/diagnostic/refresh` whose prefetch
+    /// covered every open document and changed nothing must NOT nudge the
+    /// editor. The editor's re-pull would answer `unchanged`, and the nudge is
+    /// what closes the refresh↔pull feedback loop: pull → downstream analysis →
+    /// downstream refresh → forced nudge → pull → … at ~1 Hz on a quiescent
+    /// file. With no open documents the prefetch vacuously covers everything,
+    /// so no send may happen.
+    #[tokio::test]
+    async fn forwarded_refresh_with_covering_unchanged_prefetch_sends_nothing() {
         let (service, _socket) = LspService::new(Kakehashi::new);
         let server = service.inner();
         server
@@ -1457,20 +1464,85 @@ mod tests {
                 ..Default::default()
             });
         let publisher = DiagnosticPublisher::new(server);
-        let before = tokio::time::Instant::now();
 
         publisher.request_forwarded_diagnostic_refresh();
-        tokio::time::advance(std::time::Duration::ZERO).await;
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
+        let metrics = server.diagnostics.metrics_snapshot();
+        assert_eq!(metrics.refreshes_requested, 1);
         assert_eq!(
-            tokio::time::Instant::now(),
-            before,
-            "the leading send must happen without advancing to the debounce timer"
+            metrics.refreshes_sent, 0,
+            "an unchanged covering prefetch must not nudge the editor (refresh↔pull loop)"
         );
+    }
+
+    /// Safe direction: when `pullFallback = false` gates a pull-eligible layer
+    /// out of the prefetch, the prefetch canNOT stand in for the editor's
+    /// re-pull (the editor's live fan-out still pulls that layer), so the
+    /// forwarded refresh must keep its forced editor send.
+    #[tokio::test]
+    async fn forwarded_refresh_still_sends_when_pull_fallback_gates_a_layer() {
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+        server
+            .settings_manager
+            .set_capabilities(ClientCapabilities {
+                workspace: Some(WorkspaceClientCapabilities {
+                    diagnostics: Some(DiagnosticWorkspaceClientCapabilities {
+                        refresh_support: Some(true),
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            });
+        register_rust(server);
+        let mut settings = rust_settings(true);
+        let lang = settings
+            .languages
+            .get_mut("rust")
+            .expect("rust_settings defines the rust language");
+        let bridge = lang
+            .bridge
+            .as_mut()
+            .expect("rust_settings configures the _self bridge");
+        bridge
+            .get_mut(HOST_BRIDGE_KEY)
+            .expect("rust_settings configures the _self bridge")
+            .aggregation = Some(HashMap::from([(
+            "textDocument/publishDiagnostics".to_string(),
+            crate::config::settings::AggregationConfig {
+                pull_fallback: Some(false),
+                ..Default::default()
+            },
+        )]));
+        server.settings_manager.apply_settings(settings);
+
+        let uri = Url::parse("file:///test/pull_gated_host.rs").unwrap();
+        server.documents.insert(
+            uri.clone(),
+            "fn main() {}".to_string(),
+            Some("rust".to_string()),
+            None,
+        );
+        server
+            .parse_coordinator()
+            .parse_document(uri.clone(), Some("rust"), None)
+            .await;
+
+        let publisher = DiagnosticPublisher::new(server);
+        publisher.request_forwarded_diagnostic_refresh();
+
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        while server.diagnostics.metrics_snapshot().refreshes_sent == 0
+            && tokio::time::Instant::now() < deadline
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
         assert_eq!(
             server.diagnostics.metrics_snapshot().refreshes_sent,
             1,
-            "the first refresh after idle must not wait for the debounce window"
+            "a pullFallback-gated layer means the prefetch did not cover the editor's \
+             re-pull surface — the forced send must survive"
         );
     }
 
