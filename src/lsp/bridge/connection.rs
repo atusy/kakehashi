@@ -61,11 +61,27 @@ impl BridgeReader {
         use tokio::io::AsyncReadExt;
 
         let mut content_length: Option<usize> = None;
+        let mut saw_header = false;
 
         // Read headers until empty line
         loop {
             let mut line = String::new();
-            self.stdout.read_line(&mut line).await?;
+            let bytes_read = self.stdout.read_line(&mut line).await?;
+
+            // `read_line` returning 0 is EOF, which would otherwise be
+            // indistinguishable from the end-of-headers empty line and
+            // misreport a dead process as "missing Content-Length header" —
+            // sending crash triage down a protocol-desync path.
+            if bytes_read == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    if saw_header {
+                        "downstream closed stdout mid-headers (truncated frame)"
+                    } else {
+                        "downstream closed stdout (EOF)"
+                    },
+                ));
+            }
 
             // Trim CRLF/LF endings
             let trimmed = line.trim_end_matches(['\r', '\n']);
@@ -73,6 +89,7 @@ impl BridgeReader {
             if trimmed.is_empty() {
                 break; // Empty line = end of headers
             }
+            saw_header = true;
 
             if let Some(value) = trimmed.strip_prefix("Content-Length: ") {
                 content_length = Some(value.trim().parse().map_err(|_| {
