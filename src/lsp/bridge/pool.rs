@@ -683,11 +683,28 @@ impl LanguageServerPool {
 
     /// Update the upstream client workspace snapshot used by future
     /// client-fallback downstream connections.
+    ///
+    /// Returns whether the event described a change at all, so the caller
+    /// (`did_change_workspace_folders_impl`) can skip the settings reload it
+    /// owns for an event this function already found to be a no-op, instead
+    /// of duplicating the emptiness check.
     pub(crate) async fn apply_workspace_folder_change(
         &self,
         added: Vec<tower_lsp_server::ls_types::WorkspaceFolder>,
         removed: &[tower_lsp_server::ls_types::WorkspaceFolder],
-    ) {
+    ) -> bool {
+        // An event naming neither an addition nor a removal describes no
+        // change: `WorkspaceFolderSet::apply_change` is a no-op for it, so the
+        // client workspace snapshot cannot move. Returning here rather than
+        // letting the body run unconditionally matters beyond that snapshot,
+        // though — the recycle loop below does not look at the event either,
+        // so without this guard a folder-change-incapable fallback would be
+        // invalidated, recycled, and armed for re-open over a notification
+        // that named nothing.
+        if added.is_empty() && removed.is_empty() {
+            return false;
+        }
+
         self.workspace_folders.apply_change(added.clone(), removed);
         self.set_root_uri(
             self.workspace_folders()
@@ -752,6 +769,7 @@ impl LanguageServerPool {
         for (key, handle) in stale_handles {
             shutdown_invalidated_connection(key, handle);
         }
+        true
     }
 
     /// Set the upstream client capabilities.
