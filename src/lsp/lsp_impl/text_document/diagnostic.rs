@@ -177,6 +177,16 @@ impl Kakehashi {
             None
         };
 
+        // Tee the request-failure count through an internal sink: the caller's
+        // sink (CLI diagnose) receives the total after the fan-out settles,
+        // and this handler additionally learns whether ITS OWN fan-out was
+        // clean — a failed/partial pull hands the editor an incomplete set,
+        // which must not clear the pull-view lag (the absorption would then
+        // trust a view the editor does not actually hold).
+        let external_error_sink = request_error_sink;
+        let internal_errors = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let request_error_sink: RequestErrorSink = Some(std::sync::Arc::clone(&internal_errors));
+
         // Get upstream request ID from task-local storage (set by RequestIdCapture middleware)
         let upstream_request_id = crate::lsp::current_upstream_id();
 
@@ -354,6 +364,16 @@ impl Kakehashi {
         )
         .await;
 
+        // Settle the failure tee: hand the caller's sink (CLI diagnose) the
+        // total, and derive whether this pull's own fan-out was clean.
+        let request_failures = internal_errors.load(std::sync::atomic::Ordering::Relaxed);
+        if request_failures > 0
+            && let Some(external) = &external_error_sink
+        {
+            external.fetch_add(request_failures, std::sync::atomic::Ordering::Relaxed);
+        }
+        let pull_clean = request_failures == 0;
+
         // Degraded-answer guard (the pull-side sibling of `republish`'s
         // geometry-unknown deferral): the bounded parse wait above can lapse
         // under load, leaving `snapshot` `None` for an open document while the
@@ -404,7 +424,21 @@ impl Kakehashi {
                     .request_pull_diagnostic_refresh(true);
             }
         } else {
-            self.mark_pull_covered(&uri, coverage_stamp, pull_view_lag_stamp);
+            // A failed/partial fan-out (`!pull_clean`) still advances the
+            // coverage version (pre-existing #497 semantics: the editor got
+            // AN answer) but must not clear the pull-view lag — the editor's
+            // view may be missing exactly the servers whose lag is recorded,
+            // and clearing would let the next unchanged prefetch absorb the
+            // healing refresh.
+            self.mark_pull_covered(
+                &uri,
+                coverage_stamp,
+                if pull_clean {
+                    pull_view_lag_stamp
+                } else {
+                    None
+                },
+            );
         }
 
         let items = combine_layer_diagnostics(&layer_cfg, virt_items, host_items);

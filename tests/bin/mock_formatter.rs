@@ -1130,6 +1130,24 @@ fn main() {
                             id,
                             json!({ "kind": "unchanged", "resultId": "refresh-prefetch-stable" }),
                         );
+                        // Barrier for the retention e2e: the bridge forwards
+                        // downstream window/logMessage upstream, so the test
+                        // can wait until an UNCHANGED report was actually
+                        // answered (and thus resolved against the baseline)
+                        // before asserting retention — the publish marker
+                        // alone can come from the initial full answer.
+                        // type 2 (Warning): the bridge's workspace log
+                        // threshold drops Info-level downstream logs by
+                        // default, and the forward prefixes the server name —
+                        // the test matches by substring for that reason.
+                        notify(
+                            &mut writer,
+                            "window/logMessage",
+                            json!({
+                                "type": 2,
+                                "message": "mock-unchanged-report-answered"
+                            }),
+                        );
                     } else {
                         respond(
                             &mut writer,

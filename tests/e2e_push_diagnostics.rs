@@ -1296,6 +1296,31 @@ fn e2e_downstream_refresh_preserves_unchanged_prefetch_results() {
         client.send_response(refresh_id, json!(null));
     }
 
+    // First pull: by now the downstream baseline (resultId
+    // "refresh-prefetch-stable") is established by whichever earlier pull's
+    // FULL answer stored it, so this fan-out carries previousResultId and the
+    // mock answers `kind: unchanged`, emitting the marker. (The didOpen pull
+    // and the prefetch can BOTH land without a baseline on a racy arm — full
+    // answers only — which is why the barrier hangs off the client's own pull
+    // rather than the earlier publish.) Async + notification wait because the
+    // synchronous response helper discards notifications that arrive while it
+    // waits; this pull's response is deliberately dropped with them.
+    let _pull_id = client.send_request_async(
+        "textDocument/diagnostic",
+        json!({ "textDocument": { "uri": MD_URI } }),
+    );
+    client
+        .wait_for_notification_where(&["window/logMessage"], Duration::from_secs(5), |params| {
+            // Substring: the bridge prefixes the originating server's name.
+            params["message"]
+                .as_str()
+                .is_some_and(|m| m.contains("mock-unchanged-report-answered"))
+        })
+        .expect("the pull must exercise the unchanged-report baseline reuse");
+
+    // Second pull, synchronous: its downstream fan-out resolves the unchanged
+    // report against the stored baseline again — the retention assert below
+    // therefore checks the baseline-reuse path, not an initial full answer.
     let pulled = client.send_request(
         "textDocument/diagnostic",
         json!({ "textDocument": { "uri": MD_URI } }),

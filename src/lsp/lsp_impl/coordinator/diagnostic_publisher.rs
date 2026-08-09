@@ -340,6 +340,20 @@ impl DiagnosticPublisher {
         if self.shutdown.is_cancelled() {
             return false;
         }
+        let mut summary = summary;
+        // Read the pull-view lag at DECISION time, after the prefetch joined:
+        // a host-event pull committing concurrently with the prefetch records
+        // its lag while the prefetch is in flight, and the prefetch — having
+        // pulled the same post-commit set — reports Unchanged. Sampling only
+        // at prefetch start would absorb this cycle despite the outstanding
+        // lag. (A lag recorded after this read belongs to the next
+        // generation: nothing clears it but a covering pull, so it survives
+        // to be read then.)
+        summary.set_changed |= self
+            .documents
+            .open_uris()
+            .iter()
+            .any(|uri| self.aggregator.has_pull_view_lag(uri));
         self.aggregator
             .mark_forwarded_refresh_prefetched(generation);
 
@@ -389,18 +403,15 @@ impl DiagnosticPublisher {
             let narrower_than_editor_pull = snapshot.narrower_than_editor_pull;
             let pool = self.bridge.pool_arc();
             let publisher = self.clone();
-            // An outstanding pull-view lag means the recorded set already
-            // moved without a nudge (see `pull_view_lag`): even an unchanged
-            // prefetch compares against data the editor may never have
-            // pulled, so the nudge must survive until a covering pull clears
-            // the lag.
-            let pull_view_lags = self.aggregator.has_pull_view_lag(&uri);
+            // The outstanding pull-view lag is deliberately NOT read here:
+            // the caller sweeps it at decision time, after the join, so a
+            // lag recorded while this prefetch is in flight is still seen.
             tasks.spawn(async move {
                 let mut summary = ForwardedPrefetchSummary {
-                    set_changed: pull_view_lags,
                     // A pullFallback-gated layer is pulled by the editor but
                     // not by this prefetch — coverage is incomplete either way.
                     coverage_incomplete: narrower_than_editor_pull,
+                    ..Default::default()
                 };
                 let errors = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
                 let error_sink = Some(std::sync::Arc::clone(&errors));
