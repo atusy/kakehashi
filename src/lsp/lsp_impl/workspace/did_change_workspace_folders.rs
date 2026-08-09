@@ -239,7 +239,12 @@ mod tests {
         let xdg_scratch = tempfile::tempdir().expect("failed to create scratch XDG_CONFIG_HOME");
         let _xdg_guard = XdgConfigHomeGuard::set(xdg_scratch.path());
         let workspace_dir = tempfile::tempdir().expect("failed to create scratch workspace dir");
-        let folder_uri = format!("file://{}", workspace_dir.path().display());
+        // `Url::from_directory_path` percent-encodes reserved characters and
+        // handles platform path quirks (e.g. Windows drive letters) that a
+        // bare `format!("file://{}", ...)` would mangle if the scratch path
+        // ever contained one — `$TMPDIR` is not guaranteed plain-ASCII.
+        let folder_uri = url::Url::from_directory_path(workspace_dir.path())
+            .expect("scratch workspace dir must convert to a file:// URL");
 
         let (service, _socket) = LspService::new(Kakehashi::new);
         let server = service.inner();
@@ -250,7 +255,7 @@ mod tests {
             server.did_change_workspace_folders_impl(DidChangeWorkspaceFoldersParams {
                 event: WorkspaceFoldersChangeEvent {
                     added: vec![WorkspaceFolder {
-                        uri: folder_uri.parse().unwrap(),
+                        uri: folder_uri.as_str().parse().unwrap(),
                         name: "added".to_string(),
                     }],
                     removed: Vec::new(),
