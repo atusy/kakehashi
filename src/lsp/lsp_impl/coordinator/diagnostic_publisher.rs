@@ -351,10 +351,24 @@ impl DiagnosticPublisher {
     /// (see [`ForwardedPrefetchSummary`]).
     async fn prefetch_open_pull_fallback_diagnostics(&self) -> Option<ForwardedPrefetchSummary> {
         let mut tasks = tokio::task::JoinSet::new();
+        let mut summary = ForwardedPrefetchSummary::default();
         for uri in self.documents.open_uris() {
             let Some(snapshot) = self.snapshot_preparer.prepare_diagnostic_snapshot(&uri) else {
-                // Document gone or it can never contribute: the editor's
-                // re-pull would find the same nothing.
+                // No snapshot conflates two very different states. A document
+                // that is gone or has no detectable language is covered: the
+                // editor's re-pull finds the same nothing. But an OPEN
+                // document whose parse snapshot is transiently absent
+                // (didChange cleared the tree, parse pending or given up,
+                // settings-reload invalidate) IS answerable by the editor's
+                // re-pull (bounded tree wait + tree-less host layer), so this
+                // prefetch cannot vouch for it — safe direction: nudge.
+                if self
+                    .documents
+                    .get(&uri)
+                    .is_some_and(|doc| doc.snapshot().is_none())
+                {
+                    summary.coverage_incomplete = true;
+                }
                 continue;
             };
             let lineage = snapshot.lineage;
@@ -393,7 +407,6 @@ impl DiagnosticPublisher {
             });
         }
 
-        let mut summary = ForwardedPrefetchSummary::default();
         while !tasks.is_empty() {
             tokio::select! {
                 biased;
