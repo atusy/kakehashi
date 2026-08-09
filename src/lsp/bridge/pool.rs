@@ -3559,6 +3559,46 @@ mod tests {
         );
     }
 
+    /// An event naming neither an addition nor a removal describes no change:
+    /// nothing about the client's workspace moved. Recycling a
+    /// folder-change-incapable fallback anyway — which the capability check
+    /// below does unconditionally, without looking at the event it is
+    /// reacting to — costs a respawn and a re-open storm for a notification
+    /// that said nothing.
+    #[tokio::test]
+    async fn workspace_folder_change_skips_recycling_for_an_empty_event() {
+        let pool = LanguageServerPool::new();
+        let key = ConnectionKey::for_server("fallback");
+        let handle = create_handle_with_key(ConnectionState::Ready, key.clone()).await;
+        // No capabilities set: an incapable fallback, the shape the recycle
+        // branch claims for a real (non-empty) event.
+        handle.set_server_capabilities(Default::default());
+        pool.insert_connection(Arc::clone(&handle)).await;
+        let original = tower_lsp_server::ls_types::WorkspaceFolder {
+            uri: "file:///original".parse().unwrap(),
+            name: "original".to_string(),
+        };
+        pool.set_root_uri(Some(original.uri.to_string()));
+        pool.set_workspace_folders(Some(vec![original.clone()]));
+
+        pool.apply_workspace_folder_change(Vec::new(), &[]).await;
+
+        assert!(
+            pool.connections.lock().await.contains_key(&key),
+            "an event that names no folder must not recycle an incapable fallback"
+        );
+        assert!(
+            pool.pending_reopen.claim(&key).is_none(),
+            "and must not arm it for a re-open it never earned"
+        );
+        assert_eq!(
+            pool.root_uri(),
+            Some("file:///original".to_string()),
+            "and must not touch the client workspace snapshot"
+        );
+        assert_eq!(pool.workspace_folders(), Some(vec![original]));
+    }
+
     #[tokio::test]
     async fn workspace_folder_change_does_not_touch_marker_owned_connection() {
         let pool = LanguageServerPool::new();
