@@ -474,8 +474,12 @@ pub(crate) struct DiagnosticAggregator {
     /// converts it into the confirmed lag, an Unchanged record drops it (the
     /// mutation demonstrably left the merged set alone). Revision-keying is
     /// what stops an unrelated earlier Changed from consuming a mark whose
-    /// mutation it never saw, and marks are deliberately invisible to pull
-    /// stamps and the decision sweep until confirmed.
+    /// mutation it never saw. Marks are invisible to pull STAMPS until
+    /// confirmed (a pull must never clear an unconfirmed change), but the
+    /// absorption sweep counts them conservatively as lag
+    /// ([`Self::has_pull_view_lag`]): a writer parked between its mutation
+    /// and its republish is a real, unconfirmed change the cycle must not
+    /// absorb past.
     pull_view_lag_pending: Mutex<HashMap<Url, u64>>,
     /// Allocator for [`Self::pull_view_lag`] serials. Process-wide (not
     /// per-host) so a close/reopen can never re-mint an already-captured
@@ -1353,11 +1357,27 @@ impl DiagnosticAggregator {
     }
 
     /// Whether `host` carries an outstanding pull-view lag — the recorded set
-    /// moved without a nudge and no covering pull has been answered since.
+    /// moved without a nudge and no covering pull has been answered since —
+    /// or an UNSETTLED pending mark. The pending half is deliberate
+    /// conservatism for the absorption sweep: a writer that has mutated the
+    /// cache but not yet reached its republish is a real, unconfirmed change
+    /// (the republish that later confirms it emits no nudge of its own), so
+    /// the sweep must not absorb past it. A mark whose republish turns out
+    /// Unchanged costs one spurious nudge — the safe direction. Pull stamps
+    /// stay confirmed-only ([`Self::pull_view_lag_stamp`]): a pull must never
+    /// clear what is not yet confirmed.
     pub(crate) fn has_pull_view_lag(&self, host: &Url) -> bool {
-        self.pull_view_lag
+        if self
+            .pull_view_lag
             .lock()
             .recover_poison("DiagnosticAggregator::pull_view_lag")
+            .contains_key(host)
+        {
+            return true;
+        }
+        self.pull_view_lag_pending
+            .lock()
+            .recover_poison("DiagnosticAggregator::pull_view_lag_pending")
             .contains_key(host)
     }
 
