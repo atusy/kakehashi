@@ -452,11 +452,22 @@ pub(crate) struct DiagnosticAggregator {
     /// compares against kakehashi's record, so without this debt it would
     /// read exactly that raced commit as "the editor already has it" and
     /// starve the one signal that heals the lag. A covering pull clears the
-    /// debt ([`Self::clear_pull_view_lag`] via the pull handler); `didClose`
-    /// forgets it ([`Self::forget_published`]). The debt is deliberately NOT
-    /// cleared when a nudge is sent — only the editor actually re-pulling
-    /// proves the lag closed.
-    pull_view_lag: Mutex<std::collections::HashSet<Url>>,
+    /// debt ([`Self::clear_pull_view_lag_up_to`] via the pull handler);
+    /// `didClose` forgets it ([`Self::forget_published`]). The debt is
+    /// deliberately NOT cleared when a nudge is sent — only the editor
+    /// actually re-pulling proves the lag closed.
+    ///
+    /// The value is a monotonic recording serial (from
+    /// [`Self::next_pull_view_lag_serial`]). A covering pull captures the
+    /// host's serial at ENTRY and clears only up to it: a lag recorded while
+    /// the pull was in flight — including one recorded by a reopened
+    /// lifetime after a close raced the pull (#745's defect class) — carries
+    /// a newer serial and survives the stale clear.
+    pull_view_lag: Mutex<HashMap<Url, u64>>,
+    /// Allocator for [`Self::pull_view_lag`] serials. Process-wide (not
+    /// per-host) so a close/reopen can never re-mint an already-captured
+    /// value.
+    next_pull_view_lag_serial: AtomicU64,
     /// Per-host coalescing state for the editor-facing `publishDiagnostics`
     /// wire sends (the quiet window): see [`WireGate`] and
     /// [`Self::wire_gate_admit`]. Mutated under the host's republish lock
@@ -1171,12 +1182,17 @@ impl DiagnosticAggregator {
     }
 
     /// Record that `host`'s merged set moved through an editor-origin,
-    /// nudge-less republish (see the [`Self::pull_view_lag`] field doc).
+    /// nudge-less republish (see the [`Self::pull_view_lag`] field doc). A
+    /// repeat record re-stamps the entry with a fresh serial, so an in-flight
+    /// pull that started before it cannot clear it.
     pub(crate) fn record_pull_view_lag(&self, host: &Url) {
+        let serial = self
+            .next_pull_view_lag_serial
+            .fetch_add(1, Ordering::Relaxed);
         self.pull_view_lag
             .lock()
             .recover_poison("DiagnosticAggregator::pull_view_lag")
-            .insert(host.clone());
+            .insert(host.clone(), serial);
     }
 
     /// Whether `host` carries an outstanding pull-view lag — the recorded set
@@ -1185,14 +1201,45 @@ impl DiagnosticAggregator {
         self.pull_view_lag
             .lock()
             .recover_poison("DiagnosticAggregator::pull_view_lag")
-            .contains(host)
+            .contains_key(host)
     }
 
-    /// A covering editor pull was answered for `host`: whatever the recorded
-    /// set is, the editor now holds it — the lag is closed. (A pull that
-    /// answered concurrently with the very commit that recorded the lag can
-    /// clear it while carrying the pre-commit set — a narrow race whose
-    /// consequence is the pre-debt behavior, i.e. one absorbed refresh.)
+    /// The serial a covering pull must capture at ENTRY to be allowed to
+    /// clear the lag it observed (`None` = no lag outstanding right now).
+    pub(crate) fn pull_view_lag_stamp(&self, host: &Url) -> Option<u64> {
+        self.pull_view_lag
+            .lock()
+            .recover_poison("DiagnosticAggregator::pull_view_lag")
+            .get(host)
+            .copied()
+    }
+
+    /// A covering editor pull that observed `stamp` at entry was answered for
+    /// `host`: the editor now holds everything recorded up to that point, so
+    /// clear the lag — but only when no NEWER lag was recorded meanwhile (a
+    /// mid-pull commit, or a close/reopen lifetime the stale pull must not
+    /// settle, #745). `stamp == None` means no lag was outstanding at entry,
+    /// so there is nothing this pull can vouch for — never clear. (A pull
+    /// that answered concurrently with the very commit whose serial it
+    /// captured can still clear while carrying the pre-commit set — a narrow
+    /// race whose consequence is the pre-debt behavior, i.e. one absorbed
+    /// refresh.)
+    pub(crate) fn clear_pull_view_lag_up_to(&self, host: &Url, stamp: Option<u64>) {
+        let Some(stamp) = stamp else {
+            return;
+        };
+        let mut lags = self
+            .pull_view_lag
+            .lock()
+            .recover_poison("DiagnosticAggregator::pull_view_lag");
+        if lags.get(host).is_some_and(|&serial| serial <= stamp) {
+            lags.remove(host);
+        }
+    }
+
+    /// Test-only unconditional clear, standing in for a covering pull in unit
+    /// fixtures that seed the cache directly.
+    #[cfg(test)]
     pub(crate) fn clear_pull_view_lag(&self, host: &Url) {
         self.pull_view_lag
             .lock()

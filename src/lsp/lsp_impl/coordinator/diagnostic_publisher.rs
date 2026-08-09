@@ -508,7 +508,10 @@ impl DiagnosticPublisher {
         // `Deferred` counts as changed: the cache moved, only the geometry
         // re-anchor is pending — the editor's view is stale either way.
         let set_changed = self.republish(uri).await.nudges_pull_clients();
-        if set_changed {
+        // Re-check the store: a didClose can slip in after the edit guard
+        // dropped, and its forget must win — recording after it would leak a
+        // closed host's entry until reopen (one spurious nudge there).
+        if set_changed && self.documents.get(uri).is_some() {
             // The in-cycle nudge below is only a request; record the lag so
             // that if the editor does not actually re-pull, the NEXT cycle's
             // unchanged prefetch still forwards instead of absorbing forever
@@ -851,7 +854,9 @@ impl DiagnosticPublisher {
     /// self-heals on the next completed pull.
     pub(crate) async fn publish_pull_layer(&self, host: &Url, diagnostics: Vec<Diagnostic>) {
         self.aggregator.set_pull_layer(host, diagnostics);
-        if self.republish(host).await.nudges_pull_clients() {
+        // The store re-check mirrors `commit_refresh_prefetch`'s: a racing
+        // didClose's forget must win over this record.
+        if self.republish(host).await.nudges_pull_clients() && self.documents.get(host).is_some() {
             // This commit moved the recorded set without any editor nudge; if
             // the editor's own event-driven pull raced ahead of it, only a
             // later covering pull closes the gap — record the lag so the
@@ -881,7 +886,7 @@ impl DiagnosticPublisher {
     pub(crate) async fn clear_pull_layer(&self, host: &Url) {
         self.aggregator
             .evict_source(host, &DiagnosticSource::PullLayer);
-        if self.republish(host).await.nudges_pull_clients() {
+        if self.republish(host).await.nudges_pull_clients() && self.documents.get(host).is_some() {
             // Same pull-view lag rule as `publish_pull_layer`: a cleared set
             // the editor still displays is the worse variant of the lag.
             self.aggregator.record_pull_view_lag(host);

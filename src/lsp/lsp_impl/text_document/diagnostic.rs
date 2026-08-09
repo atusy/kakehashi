@@ -131,11 +131,15 @@ impl Kakehashi {
         // no-op against the new lifetime rather than poisoning it with a stale-high
         // version (#745).
         let coverage_stamp = self.diagnostics.coverage_stamp(&uri);
+        // Captured alongside: the pull-view lag serial this pull may clear.
+        // A lag recorded after this point (mid-pull commit, or a reopened
+        // lifetime after a close raced this pull) must survive our clear.
+        let pull_view_lag_stamp = self.diagnostics.pull_view_lag_stamp(&uri);
 
         // Get the language for this document
         let Some(language_name) = self.document_language(&uri) else {
             log::debug!(target: "kakehashi::diagnostic", "No language detected");
-            self.mark_pull_covered(&uri, coverage_stamp);
+            self.mark_pull_covered(&uri, coverage_stamp, pull_view_lag_stamp);
             return Ok(empty_diagnostic_report());
         };
 
@@ -156,7 +160,7 @@ impl Kakehashi {
                 "no diagnostic layer enabled for {} (layers.aggregation priorities / bridge._self)",
                 language_name
             );
-            self.mark_pull_covered(&uri, coverage_stamp);
+            self.mark_pull_covered(&uri, coverage_stamp, pull_view_lag_stamp);
             return Ok(empty_diagnostic_report());
         }
 
@@ -400,7 +404,7 @@ impl Kakehashi {
                     .request_pull_diagnostic_refresh(true);
             }
         } else {
-            self.mark_pull_covered(&uri, coverage_stamp);
+            self.mark_pull_covered(&uri, coverage_stamp, pull_view_lag_stamp);
         }
 
         let items = combine_layer_diagnostics(&layer_cfg, virt_items, host_items);
@@ -428,14 +432,23 @@ impl Kakehashi {
     /// Both halves are scoped to the coverage lifetime this pull observed. A
     /// pull that started before a close+reopen may neither mark the reopened
     /// lifetime served nor clear a debt recorded within it (#745).
-    fn mark_pull_covered(&self, uri: &Url, coverage_stamp: Option<DiagnosticCoverageStamp>) {
+    fn mark_pull_covered(
+        &self,
+        uri: &Url,
+        coverage_stamp: Option<DiagnosticCoverageStamp>,
+        pull_view_lag_stamp: Option<u64>,
+    ) {
         self.diagnostics.mark_served(uri, coverage_stamp);
         self.diagnostics
             .forget_degraded_pull_from(uri, coverage_stamp);
-        // The editor now holds the current merged state, so any un-nudged
-        // pull-layer move is delivered — the forwarded-refresh absorption may
-        // trust the recorded set again (see `pull_view_lag`).
-        self.diagnostics.clear_pull_view_lag(uri);
+        // The editor now holds the merged state recorded up to this pull's
+        // entry, so the un-nudged pull-layer moves it observed are delivered —
+        // the forwarded-refresh absorption may trust the recorded set again.
+        // Serial-scoped like the two stamped halves above: a lag recorded
+        // after this pull began (including by a reopened lifetime, #745's
+        // defect class) survives (see `pull_view_lag`).
+        self.diagnostics
+            .clear_pull_view_lag_up_to(uri, pull_view_lag_stamp);
     }
 
     /// pushFallback fold (Path B, #425): append push-driven servers' cached

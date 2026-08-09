@@ -424,6 +424,10 @@ impl DiagnosticSnapshotPreparer {
         // layer gate hid the host layer the diagnostic key keeps), so an
         // empty-but-flagged snapshot is returned to carry the flag to the
         // forwarded-refresh prefetch instead of vanishing into the skip.
+        // Accepted cost under a diverging config: every open unbridgeable
+        // document of this language now yields an empty snapshot per host
+        // event / prefetch cycle — a no-op Clear plus an Unchanged republish
+        // after the first, cleaned up on close.
         let virt_contexts = match (virt_contexts, host.is_some()) {
             (None, false) if !narrower_than_editor_pull => return None,
             (virt, _) => virt.unwrap_or_default(),
