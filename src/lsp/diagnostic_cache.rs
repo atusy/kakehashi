@@ -1281,12 +1281,16 @@ impl DiagnosticAggregator {
             );
         if changed {
             revisions.insert(host.clone(), self.allocate_cache_revision());
+            // Stamp only a REAL change (Qodo, PR #972): a no-op mutation owes
+            // the editor nothing, and its stale mark would otherwise be
+            // converted into a spurious lag by whatever unrelated Changed
+            // republish settles next.
+            let revision = revisions.get(host).copied().unwrap_or(0);
+            self.pull_view_lag_pending
+                .lock()
+                .recover_poison("DiagnosticAggregator::pull_view_lag_pending")
+                .insert(host.clone(), revision);
         }
-        let revision = revisions.get(host).copied().unwrap_or(0);
-        self.pull_view_lag_pending
-            .lock()
-            .recover_poison("DiagnosticAggregator::pull_view_lag_pending")
-            .insert(host.clone(), revision);
     }
 
     /// Evict the pull-layer blob AND stamp the pending mark, like
@@ -1309,12 +1313,13 @@ impl DiagnosticAggregator {
         };
         if removed {
             revisions.insert(host.clone(), self.allocate_cache_revision());
+            // Same real-change gate as `set_pull_layer_nudgeless`.
+            let revision = revisions.get(host).copied().unwrap_or(0);
+            self.pull_view_lag_pending
+                .lock()
+                .recover_poison("DiagnosticAggregator::pull_view_lag_pending")
+                .insert(host.clone(), revision);
         }
-        let revision = revisions.get(host).copied().unwrap_or(0);
-        self.pull_view_lag_pending
-            .lock()
-            .recover_poison("DiagnosticAggregator::pull_view_lag_pending")
-            .insert(host.clone(), revision);
     }
 
     /// Settle any pending mark covered by the revision a republish just
