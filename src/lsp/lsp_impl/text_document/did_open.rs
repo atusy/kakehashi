@@ -906,6 +906,7 @@ print("hello")
                 },
             virt_contexts: vec![],
             host_pull_enabled: true,
+            pull_gated: false,
             host: Some(HostRequestContext {
                 uri: uri.clone(),
                 language_id: "rust".to_string(),
@@ -1020,6 +1021,7 @@ print("hello")
                 },
             virt_contexts: vec![],
             host_pull_enabled: true,
+            pull_gated: false,
             host: Some(HostRequestContext {
                 uri: uri.clone(),
                 language_id: "rust".to_string(),

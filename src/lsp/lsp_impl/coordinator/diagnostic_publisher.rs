@@ -76,6 +76,36 @@ impl RepublishOutcome {
     }
 }
 
+/// What a forwarded-refresh prefetch learned, folded across every open
+/// document: whether it moved any host's published set, and whether some
+/// document escaped its coverage — so the editor nudge can be dropped exactly
+/// when the prefetch proves the editor's re-pull would answer `unchanged`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct ForwardedPrefetchSummary {
+    /// Some host's merged set changed (`Changed`/`Deferred` republish): the
+    /// editor's pulled view is stale, nudge it.
+    set_changed: bool,
+    /// Some document's downstream state could not be determined — a
+    /// `pullFallback`-gated layer the editor would still pull, a failed pull
+    /// that kept the previous layer, or a commit discarded by an edit race.
+    /// Ambiguity resolves toward nudging: a spurious refresh costs one
+    /// round-trip, a suppressed one hides diagnostics until the next edit.
+    coverage_incomplete: bool,
+}
+
+impl ForwardedPrefetchSummary {
+    fn absorb(&mut self, other: Self) {
+        self.set_changed |= other.set_changed;
+        self.coverage_incomplete |= other.coverage_incomplete;
+    }
+
+    /// The forwarded refresh still needs its editor send: something changed,
+    /// or this prefetch cannot vouch that nothing did.
+    fn needs_editor_nudge(&self) -> bool {
+        self.set_changed || self.coverage_incomplete
+    }
+}
+
 /// Programmed quiet-window default used by paused-time tests. Runtime scheduling
 /// reads the top-level feature policy on each set-changing admission.
 #[cfg(test)]
@@ -276,9 +306,24 @@ impl DiagnosticPublisher {
     }
 
     /// Complete one scheduled downstream-refresh cycle: refresh every proactive
-    /// pullFallback cache entry first, then (when supported) notify the editor.
+    /// pullFallback cache entry first, then notify the editor — but only when
+    /// the prefetch either changed something or could not stand in for the
+    /// editor's re-pull ([`ForwardedPrefetchSummary::needs_editor_nudge`]).
+    ///
+    /// The unconditional forced send this replaces closed a feedback loop on
+    /// quiescent multi-region documents: the nudged editor re-pull fans out to
+    /// every region, the downstream servers analyze and send their own
+    /// `workspace/diagnostic/refresh`, which arrived here and was forwarded
+    /// forced again — ~1 Hz forever with zero edits. An unchanged covering
+    /// prefetch proves the editor's re-pull would answer `unchanged`, so the
+    /// nudge is dropped and the loop starves. The generation is still marked
+    /// covered: the downstream activity was fully handled (prefetched and
+    /// found current), and any NEW downstream refresh mints a new generation.
     async fn complete_forwarded_refresh_cycle(&self, generation: u64) -> bool {
-        if !self.prefetch_open_pull_fallback_diagnostics().await || self.shutdown.is_cancelled() {
+        let Some(summary) = self.prefetch_open_pull_fallback_diagnostics().await else {
+            return false;
+        };
+        if self.shutdown.is_cancelled() {
             return false;
         }
         self.aggregator
@@ -290,7 +335,9 @@ impl DiagnosticPublisher {
             .aggregator
             .forwarded_refresh_needs_editor_send(generation)
         {
-            if !self.request_pull_diagnostic_refresh_inner(true, false) {
+            if summary.needs_editor_nudge()
+                && !self.request_pull_diagnostic_refresh_inner(true, false)
+            {
                 return false;
             }
             self.aggregator.mark_forwarded_refresh_covered(generation);
@@ -298,16 +345,29 @@ impl DiagnosticPublisher {
         true
     }
 
-    async fn prefetch_open_pull_fallback_diagnostics(&self) -> bool {
+    /// Prefetch every open document's pullFallback cache entry. `None` means
+    /// the shutdown token aborted the prefetch; `Some` carries whether any
+    /// host's published set changed and whether some document escaped coverage
+    /// (see [`ForwardedPrefetchSummary`]).
+    async fn prefetch_open_pull_fallback_diagnostics(&self) -> Option<ForwardedPrefetchSummary> {
         let mut tasks = tokio::task::JoinSet::new();
         for uri in self.documents.open_uris() {
             let Some(snapshot) = self.snapshot_preparer.prepare_diagnostic_snapshot(&uri) else {
+                // Document gone or it can never contribute: the editor's
+                // re-pull would find the same nothing.
                 continue;
             };
             let lineage = snapshot.lineage;
+            let pull_gated = snapshot.pull_gated;
             let pool = self.bridge.pool_arc();
             let publisher = self.clone();
             tasks.spawn(async move {
+                let mut summary = ForwardedPrefetchSummary {
+                    // A pullFallback-gated layer is pulled by the editor but
+                    // not by this prefetch — coverage is incomplete either way.
+                    coverage_incomplete: pull_gated,
+                    ..Default::default()
+                };
                 let errors = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
                 let error_sink = Some(std::sync::Arc::clone(&errors));
                 let outcome = collect_push_diagnostics_with_error_sink(
@@ -320,33 +380,46 @@ impl DiagnosticPublisher {
                 .await;
                 if errors.load(std::sync::atomic::Ordering::Relaxed) != 0 {
                     log::warn!(target: LOG_TARGET, "Keeping the previous pull layer after refresh prefetch failed for {uri}");
-                    return;
+                    // The kept layer may lag the downstream's state.
+                    summary.coverage_incomplete = true;
+                    return summary;
                 }
-                publisher
-                    .commit_refresh_prefetch(&uri, lineage, outcome)
-                    .await;
+                summary.absorb(
+                    publisher
+                        .commit_refresh_prefetch(&uri, lineage, outcome)
+                        .await,
+                );
+                summary
             });
         }
 
+        let mut summary = ForwardedPrefetchSummary::default();
         while !tasks.is_empty() {
             tokio::select! {
                 biased;
                 _ = self.shutdown.cancelled() => {
                     tasks.abort_all();
                     while tasks.join_next().await.is_some() {}
-                    return false;
+                    return None;
                 }
                 result = tasks.join_next() => {
-                    if let Some(Err(error)) = result {
-                        log::warn!(target: LOG_TARGET, "Diagnostic refresh prefetch task failed: {error}");
+                    match result {
+                        Some(Ok(task_summary)) => summary.absorb(task_summary),
+                        Some(Err(error)) => {
+                            log::warn!(target: LOG_TARGET, "Diagnostic refresh prefetch task failed: {error}");
+                            // The doc's coverage state is unknown — safe direction.
+                            summary.coverage_incomplete = true;
+                        }
+                        None => {}
                     }
                 }
             }
         }
-        true
+        Some(summary)
     }
 
-    /// Commit a refresh prefetch only while its document inputs are current.
+    /// Commit a refresh prefetch only while its document inputs are current,
+    /// reporting what the commit means for the forwarded-refresh editor nudge.
     ///
     /// The lineage check and synchronous cache mutation share the document's
     /// edit lock with didChange/didClose/didOpen. This closes the check→commit
@@ -356,14 +429,15 @@ impl DiagnosticPublisher {
         uri: &Url,
         lineage: DiagnosticSnapshotLineage,
         outcome: PullLayerOutcome,
-    ) {
+    ) -> ForwardedPrefetchSummary {
         let edit_lock = self.documents.edit_lock(uri);
         let edit_guard = edit_lock.lock().await;
         let Some(document) = self.documents.get(uri) else {
             drop(edit_guard);
             self.documents.remove_edit_lock_if_unshared(uri, &edit_lock);
             log::debug!(target: LOG_TARGET, "Discarding refresh prefetch for closed {uri}");
-            return;
+            // Closed: nothing for the editor to re-pull.
+            return ForwardedPrefetchSummary::default();
         };
         let current = {
             document.incarnation() == lineage.incarnation
@@ -372,11 +446,16 @@ impl DiagnosticPublisher {
         drop(document);
         if !current {
             log::debug!(target: LOG_TARGET, "Discarding stale refresh prefetch for {uri}");
-            return;
+            // An edit raced the prefetch: this result says nothing about the
+            // downstream's state for the CURRENT content — safe direction.
+            return ForwardedPrefetchSummary {
+                coverage_incomplete: true,
+                ..Default::default()
+            };
         }
 
         match outcome {
-            PullLayerOutcome::Skip => return,
+            PullLayerOutcome::Skip => return ForwardedPrefetchSummary::default(),
             PullLayerOutcome::Clear => {
                 self.aggregator
                     .evict_source(uri, &DiagnosticSource::PullLayer);
@@ -386,7 +465,12 @@ impl DiagnosticPublisher {
             }
         }
         drop(edit_guard);
-        self.republish(uri).await;
+        ForwardedPrefetchSummary {
+            // `Deferred` counts as changed: the cache moved, only the geometry
+            // re-anchor is pending — the editor's view is stale either way.
+            set_changed: self.republish(uri).await.nudges_pull_clients(),
+            ..Default::default()
+        }
     }
 
     fn diagnostic_refresh_supported(&self) -> bool {

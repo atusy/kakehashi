@@ -198,6 +198,12 @@ impl DiagnosticSnapshotPreparer {
             "textDocument/publishDiagnostics",
         );
 
+        // Whether `pullFallback = false` dropped a pull-eligible layer below —
+        // the editor's own pull does not honor that gate, so a snapshot with
+        // this set covers less than the editor's re-pull would (see
+        // `DiagnosticSnapshot::pull_gated`).
+        let mut pull_gated = false;
+
         // Virt layer: `None` = the document can never have virt diagnostics
         // (no injection query), distinct from `Some(vec![])` = gated off or
         // currently no regions (publish-empty-to-clear).
@@ -276,13 +282,19 @@ impl DiagnosticSnapshotPreparer {
                                             // pull layer never falsely suppresses a
                                             // server's spontaneous push. The push path is
                                             // untouched — only kakehashi's pulling stops.
-                                            if !agg.pull_fallback
-                                                || !dispatches_to_any_server(
-                                                    &agg.priorities,
-                                                    &configs,
-                                                    agg.max_fan_out,
-                                                )
-                                            {
+                                            //
+                                            // A `pullFallback` drop (unlike an empty
+                                            // selection, which empties the editor's
+                                            // fan-out too) narrows this snapshot below the
+                                            // editor's re-pull surface — record it.
+                                            if !agg.pull_fallback {
+                                                pull_gated = true;
+                                                None
+                                            } else if !dispatches_to_any_server(
+                                                &agg.priorities,
+                                                &configs,
+                                                agg.max_fan_out,
+                                            ) {
                                                 None
                                             } else {
                                                 Some((configs, agg))
@@ -346,6 +358,11 @@ impl DiagnosticSnapshotPreparer {
             let agg = lang_settings.resolve_host_aggregation("textDocument/publishDiagnostics");
             host_pull_enabled = agg.pull_fallback
                 && dispatches_to_any_server(&agg.priorities, &configs, agg.max_fan_out);
+            if !agg.pull_fallback {
+                // Same rule as the virt gate above: only the `pullFallback`
+                // drop narrows below the editor's re-pull surface.
+                pull_gated = true;
+            }
             Some(HostRequestContext {
                 uri: uri.clone(),
                 language_id: language_name.clone(),
@@ -374,6 +391,7 @@ impl DiagnosticSnapshotPreparer {
             },
             virt_contexts,
             host_pull_enabled,
+            pull_gated,
             host,
             layer_cfg,
         })
