@@ -1687,6 +1687,9 @@ mod tests {
 
         let publisher = DiagnosticPublisher::new(server);
         publisher.publish_pull_layer(&uri, Vec::new()).await;
+        // Clear the seed's own pull-view lag so the timing below measures the
+        // narrower_than_editor_pull send path, like the other divergence pins.
+        server.diagnostics.clear_pull_view_lag(&uri);
         let before = tokio::time::Instant::now();
         publisher.request_forwarded_diagnostic_refresh();
 
@@ -1803,8 +1806,12 @@ mod tests {
         // Seed a recorded (empty) published set first: without it the cycle's
         // very first republish compares against nothing and reports Changed,
         // which would make this test pass without exercising the divergence
-        // flag at all (a first commit always nudges).
+        // flag at all (a first commit always nudges). The seed itself records
+        // a pull-view lag (it IS an un-nudged first commit) — clear it, as a
+        // covering editor pull would, so the send below can only come from
+        // the narrower_than_editor_pull flag.
         publisher.publish_pull_layer(&uri, Vec::new()).await;
+        server.diagnostics.clear_pull_view_lag(&uri);
         publisher.request_forwarded_diagnostic_refresh();
 
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
@@ -1876,8 +1883,10 @@ mod tests {
 
         let publisher = DiagnosticPublisher::new(server);
         // Seed a recorded set so the cycle's republish can genuinely report
-        // Unchanged (see the seal test above for why).
+        // Unchanged, and clear the seed's own pull-view lag (see the seal
+        // test above for why both steps are load-bearing).
         publisher.publish_pull_layer(&uri, Vec::new()).await;
+        server.diagnostics.clear_pull_view_lag(&uri);
         publisher.request_forwarded_diagnostic_refresh();
 
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
@@ -1949,8 +1958,10 @@ mod tests {
 
         let publisher = DiagnosticPublisher::new(server);
         // Seed a recorded set so the send below can only come from the
-        // narrower_than_editor_pull flag, not from a first-commit Changed.
+        // narrower_than_editor_pull flag — not from a first-commit Changed,
+        // and (after clearing the seed's own lag) not from pull-view lag.
         publisher.publish_pull_layer(&uri, Vec::new()).await;
+        server.diagnostics.clear_pull_view_lag(&uri);
         publisher.request_forwarded_diagnostic_refresh();
 
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
