@@ -334,6 +334,13 @@ impl DiagnosticPublisher {
     /// on every downstream refresh. A consecutive-absorbed backoff is
     /// follow-up material.
     async fn complete_forwarded_refresh_cycle(&self, generation: u64) -> bool {
+        // Cycle-level settings fence: the per-commit lineage check can pass
+        // just before a `didChangeConfiguration` stores a wider surface, so
+        // re-check across the WHOLE prefetch — any reload during it means
+        // this cycle cannot vouch for the editor's (new-config) re-pull. A
+        // reload after this fence postdates the refresh being handled; the
+        // config-apply path owns signaling its own changes.
+        let settings_generation = self.settings_manager.settings_generation();
         let Some(summary) = self.prefetch_open_pull_fallback_diagnostics().await else {
             return false;
         };
@@ -341,6 +348,8 @@ impl DiagnosticPublisher {
             return false;
         }
         let mut summary = summary;
+        summary.coverage_incomplete |=
+            self.settings_manager.settings_generation() != settings_generation;
         // Read the pull-view lag at DECISION time, after the prefetch
         // joined. This read is race-free against the nudge-less writers
         // because their marks are revision-stamped with the mutation and
