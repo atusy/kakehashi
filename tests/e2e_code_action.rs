@@ -361,6 +361,7 @@ fn open_second_host_on_the_predecessor(client: &mut LspClient, log: &std::path::
             );
             return;
         }
+        std::thread::sleep(Duration::from_millis(50));
     }
     let wire = std::fs::read_to_string(log).unwrap_or_default();
     panic!("the predecessor never surfaced an action for {SECOND_HOST_DIR}:\n{wire}");
