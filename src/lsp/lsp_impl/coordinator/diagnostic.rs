@@ -191,13 +191,12 @@ impl DiagnosticSnapshotPreparer {
         // aggregation configs below. A layer gated off still yields a
         // snapshot (with that layer absent) so that publishing an empty list
         // clears anything a previously-enabled configuration left behind.
-        // Generation captured BEFORE the load (see
-        // `SettingsManager::settings_generation`): the only racy arm is then
-        // a config store between the two, which flags the snapshot stale even
-        // though the load already saw the new settings — one over-nudge, the
-        // safe direction.
-        let settings_generation = self.settings_manager.settings_generation();
-        let settings = self.settings_manager.load_settings();
+        // One ArcSwap load supplies BOTH the settings and their generation,
+        // so the lineage's generation always names exactly the snapshot this
+        // surface was resolved from (see `SettingsSnapshot::generation`).
+        let settings_pair = self.settings_manager.load_settings_pair();
+        let settings_generation = settings_pair.generation;
+        let settings = std::sync::Arc::clone(&settings_pair.settings);
         let layer_cfg = crate::lsp::lsp_impl::bridge_context::resolve_layer_config_from_settings(
             &settings,
             &language_name,
