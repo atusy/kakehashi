@@ -1135,8 +1135,14 @@ fn e2e_downstream_refresh_skips_pull_fallback_disabled_contexts() {
     );
     open_host(&mut client);
 
+    // Discrimination math for the window: the mock sleeps 1000 ms before
+    // answering any pull, so a wrongly-dispatched pull delays the refresh to
+    // ≥ 1000 ms + mock startup (~350 ms baseline observed); the skip path
+    // delivers at startup cost alone (~340-500 ms, jittering to ~900 ms under
+    // ambient load). 900 ms keeps a clean margin on both sides where the old
+    // 600 ms window flaked against the startup jitter.
     let (refresh_id, _) = client
-        .wait_for_server_request("workspace/diagnostic/refresh", Duration::from_millis(600))
+        .wait_for_server_request("workspace/diagnostic/refresh", Duration::from_millis(900))
         .expect("pullFallback=false must not delay the editor refresh with a downstream pull");
     client.send_response(refresh_id, json!(null));
     assert!(
