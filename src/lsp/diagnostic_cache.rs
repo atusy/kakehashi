@@ -1418,6 +1418,20 @@ impl DiagnosticAggregator {
         }
     }
 
+    /// Test-only: hold the CONFIRMED-lag lock open, so a test can prove
+    /// [`Self::has_pull_view_lag`] answers a pending-only host without ever
+    /// touching it (the pending → confirmed nesting: pending is read first
+    /// and short-circuits). The pre-fix implementation locked confirmed
+    /// FIRST and deadlocks against this guard.
+    #[cfg(test)]
+    pub(crate) fn lock_confirmed_pull_view_lag_for_test(
+        &self,
+    ) -> std::sync::MutexGuard<'_, HashMap<Url, u64>> {
+        self.pull_view_lag
+            .lock()
+            .recover_poison("DiagnosticAggregator::pull_view_lag")
+    }
+
     /// Test-only unconditional clear, standing in for a covering pull in unit
     /// fixtures that seed the cache directly.
     #[cfg(test)]
@@ -2236,6 +2250,38 @@ impl DiagnosticAggregator {
 
 #[cfg(test)]
 mod tests {
+    /// Lock-order pin for `has_pull_view_lag`: a pending-only host must be
+    /// answerable from the pending lock alone (pending → confirmed nesting,
+    /// pending read first with a short-circuit). The pre-fix implementation
+    /// acquired the confirmed lock FIRST, so with that lock held here it
+    /// would block forever — this test turns red (timeout) if the read order
+    /// regresses, which is exactly the order whose two unlocked halves let a
+    /// settle hide mid-transition.
+    #[test]
+    fn pending_only_lag_is_answerable_without_the_confirmed_lock() {
+        use super::*;
+        use std::sync::Arc as StdArc;
+        let agg = StdArc::new(DiagnosticAggregator::new());
+        let host = Url::parse("file:///lag_lock_order.md").unwrap();
+        agg.set_pull_layer_nudgeless(&host, Vec::new());
+
+        let _confirmed_guard = agg.lock_confirmed_pull_view_lag_for_test();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let reader = {
+            let agg = StdArc::clone(&agg);
+            let host = host.clone();
+            std::thread::spawn(move || {
+                let _ = tx.send(agg.has_pull_view_lag(&host));
+            })
+        };
+        let answered = rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("pending-only lag must be answerable while the confirmed lock is held");
+        assert!(answered, "the pending mark must read as lag");
+        drop(_confirmed_guard);
+        reader.join().expect("reader thread");
+    }
+
     #[test]
     fn pull_view_lag_is_visible_across_the_settle_transition_states() {
         use super::*;
