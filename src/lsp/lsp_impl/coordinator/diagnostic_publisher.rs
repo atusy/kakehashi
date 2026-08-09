@@ -1743,6 +1743,65 @@ mod tests {
         );
     }
 
+    /// A tree-less editor pull cannot see the virt layer at all — its answer
+    /// is missing everything a cached non-empty PullLayer holds — so it must
+    /// be treated as DEGRADED (like the cached-Region case) rather than as a
+    /// clean covering pull that clears the pull-view lag. codex fresh-session
+    /// finding: with a pull-only injected server (PullLayer, no Region push
+    /// slots), a pull landing in the parse gap answered empty, read as clean,
+    /// cleared the lag, and the next downstream refresh was absorbed while
+    /// the editor displayed the empty answer.
+    #[tokio::test]
+    async fn tree_less_pull_over_a_nonempty_pull_layer_does_not_clear_the_lag() {
+        use std::str::FromStr;
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+        register_rust(server);
+        // Host bridging OFF: with a `_self` server configured, its failing
+        // fan-out would already count as a request error and keep the lag for
+        // the wrong reason — the hole under test is the VIRT layer being
+        // invisible to a tree-less pull while the cached PullLayer holds it.
+        server.settings_manager.apply_settings(rust_settings(false));
+
+        // Open WITHOUT parsing: the tree stays absent, like the didChange /
+        // invalidate_parse window.
+        let uri = Url::parse("file:///test/treeless_pull_layer.rs").unwrap();
+        server.documents.insert(
+            uri.clone(),
+            "fn main() {}".to_string(),
+            Some("rust".to_string()),
+            None,
+        );
+
+        // A committed non-empty pull layer records the lag (first commit is
+        // Changed; nothing has nudged the editor).
+        let publisher = DiagnosticPublisher::new(server);
+        publisher.publish_pull_layer(&uri, vec![diag("virt")]).await;
+        assert!(
+            server.diagnostics.has_pull_view_lag(&uri),
+            "precondition: the un-nudged commit recorded the lag"
+        );
+
+        // The editor pull answers without the virt layer (no tree): it must
+        // be degraded, not a covering clean pull.
+        let lsp_uri = tower_lsp_server::ls_types::Uri::from_str(uri.as_str()).unwrap();
+        let _ = server
+            .diagnostic_impl(tower_lsp_server::ls_types::DocumentDiagnosticParams {
+                text_document: tower_lsp_server::ls_types::TextDocumentIdentifier { uri: lsp_uri },
+                identifier: None,
+                previous_result_id: None,
+                work_done_progress_params: Default::default(),
+                partial_result_params: Default::default(),
+            })
+            .await;
+
+        assert!(
+            server.diagnostics.has_pull_view_lag(&uri),
+            "a tree-less answer misses the cached PullLayer content — it must \
+             not clear the pull-view lag"
+        );
+    }
+
     /// The epoch-cover compensation: an intervening refresh (sent after this
     /// cycle's activity, epoch bumped) suppresses the normal send path, but
     /// its induced re-pull can have answered before this cycle's prefetch
