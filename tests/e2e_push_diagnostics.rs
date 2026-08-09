@@ -1514,9 +1514,12 @@ fn e2e_downstream_refresh_gated_off_for_refresh_incapable_client() {
     // #521: the same downstream refresh must NOT be forwarded when the client did
     // not advertise `workspace.diagnostics.refreshSupport` — forwarding it would
     // leak a tower-lsp pending-request entry on a client that silently ignores it.
-    // Empty capabilities (`init_client_with_mode`) → refresh unsupported. Paired
-    // with the positive test above (same mock mode), so a "no refresh" result here
-    // is the gate working, not the mock failing to emit.
+    // Empty capabilities (`init_client_with_mode`) → refresh unsupported. Positive
+    // evidence that a refresh-capable, never-pulling client WOULD receive the
+    // forward (so "no refresh" here is the gate working, not the mock failing to
+    // emit or the absorption firing) is pinned by
+    // e2e_downstream_refresh_forwarded_when_editor_never_pulled and
+    // e2e_downstream_refresh_prefetches_before_forwarding.
     let (mut client, _config_dir) = init_client_with_mode("diagnostics-refresh");
     open_host(&mut client);
 

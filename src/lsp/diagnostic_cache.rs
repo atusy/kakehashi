@@ -387,8 +387,9 @@ pub(crate) struct DiagnosticAggregator {
     /// refreshes (#789). Unlike [`Self::refresh_flight`], which only coalesces
     /// while the editor's acknowledgement is outstanding, this also collapses
     /// bursts when the editor answers each request immediately. The first
-    /// activity after idle sends without waiting; later activity produces a
-    /// trailing send only when no refresh from any origin has covered it.
+    /// activity after idle starts its cycle without waiting (the cycle's
+    /// prefetch may then absorb the send); later activity produces a
+    /// trailing cycle only when no refresh from any origin has covered it.
     forwarded_refresh_debounce: Mutex<ForwardedRefreshDebounce>,
     /// Per-host coverage versions for the refresh **coverage gate** (#497, commit 2).
     /// `current` bumps on every set-changing republish (the editor's pulled view is
@@ -771,9 +772,9 @@ impl DiagnosticAggregator {
 
     /// Check whether activity occurred during the debounce wait. A newer
     /// generation restarts the settle window. Once the wait settles, request a
-    /// trailing refresh only when no refresh send has covered the latest
-    /// downstream activity; the leading send or another refresh origin may
-    /// already have done so.
+    /// trailing cycle only when no cycle has covered the latest downstream
+    /// activity; the leading cycle (whose nudge may have been absorbed) or
+    /// another refresh origin may already have done so.
     pub(crate) fn finish_forwarded_refresh_wait(
         &self,
         observed: u64,
@@ -846,9 +847,14 @@ impl DiagnosticAggregator {
             .task_scheduled = false;
     }
 
-    /// Record that a forced refresh has been admitted for the latest downstream
-    /// activity. Admission is enough: the refresh single-flight guarantees that
-    /// an in-flight request will eventually emit its forced pending successor.
+    /// Record that the latest downstream activity is fully handled: a forced
+    /// refresh was admitted, the client lacks refresh support, or the cycle's
+    /// covering-unchanged prefetch absorbed the nudge. For the admitted case,
+    /// admission is enough: the refresh single-flight guarantees that an
+    /// in-flight request will eventually emit its forced pending successor.
+    /// For the absorbed case the prefetch itself is the handling — any NEW
+    /// downstream activity mints a new generation, which this mark (being
+    /// generation-guarded) can never cover.
     pub(crate) fn mark_forwarded_refresh_covered(&self, generation: u64) {
         let mut debounce = self
             .forwarded_refresh_debounce
@@ -872,9 +878,10 @@ impl DiagnosticAggregator {
         }
     }
 
-    /// Whether a completed prefetch for `generation` should still nudge the
-    /// editor. Newer activity must first receive its own prefetch, while another
-    /// refresh sent after this activity already supplies the nudge.
+    /// Whether a completed prefetch for `generation` still owes the editor
+    /// handling (the actual nudge is additionally gated by the prefetch
+    /// summary). Newer activity must first receive its own prefetch, while
+    /// another refresh sent after this activity already supplies the nudge.
     pub(crate) fn forwarded_refresh_needs_editor_send(&self, generation: u64) -> bool {
         let debounce = self
             .forwarded_refresh_debounce

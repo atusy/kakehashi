@@ -79,7 +79,9 @@ impl RepublishOutcome {
 /// What a forwarded-refresh prefetch learned, folded across every open
 /// document: whether it moved any host's published set, and whether some
 /// document escaped its coverage — so the editor nudge can be dropped exactly
-/// when the prefetch proves the editor's re-pull would answer `unchanged`.
+/// when the prefetch indicates the editor's re-pull would answer `unchanged`
+/// (for a downstream that signals changes via refresh: a state move after the
+/// prefetch re-arrives as a new refresh generation and re-runs the cycle).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct ForwardedPrefetchSummary {
     /// Some host's merged set changed (`Changed`/`Deferred` republish): the
@@ -206,9 +208,11 @@ impl DiagnosticPublisher {
         (snapshot, settle_window, max_wait)
     }
 
-    /// Forward the first downstream `workspace/diagnostic/refresh` immediately,
-    /// then coalesce later burst activity into at most one trailing refresh
-    /// after quiet or the max-wait deadline (#789).
+    /// Run the first downstream `workspace/diagnostic/refresh`'s cycle
+    /// immediately (prefetch, then a conditional editor forward — see
+    /// [`Self::complete_forwarded_refresh_cycle`]), then coalesce later burst
+    /// activity into at most one trailing cycle after quiet or the max-wait
+    /// deadline (#789).
     pub(crate) fn request_forwarded_diagnostic_refresh(&self) {
         if self.shutdown.is_cancelled() {
             return;
@@ -315,10 +319,20 @@ impl DiagnosticPublisher {
     /// every region, the downstream servers analyze and send their own
     /// `workspace/diagnostic/refresh`, which arrived here and was forwarded
     /// forced again — ~1 Hz forever with zero edits. An unchanged covering
-    /// prefetch proves the editor's re-pull would answer `unchanged`, so the
-    /// nudge is dropped and the loop starves. The generation is still marked
-    /// covered: the downstream activity was fully handled (prefetched and
-    /// found current), and any NEW downstream refresh mints a new generation.
+    /// prefetch indicates the editor's re-pull would answer `unchanged` (any
+    /// later downstream state move re-arrives as a new refresh generation), so
+    /// the nudge is dropped and the EDITOR leg of the loop starves. The
+    /// generation is still marked covered: the downstream activity was fully
+    /// handled (prefetched and found current), and any NEW downstream refresh
+    /// mints a new generation.
+    ///
+    /// Scope of the starvation: the prefetch leg persists — every generation
+    /// still runs the full fan-out — and a configuration whose prefetch can
+    /// never vouch (`coverage_incomplete` every cycle: a pullFallback-gated or
+    /// per-method-diverging layer, a persistently failing downstream pull, a
+    /// tree-less document that never parses) keeps the pre-absorption forward
+    /// on every downstream refresh. A consecutive-absorbed backoff is
+    /// follow-up material.
     async fn complete_forwarded_refresh_cycle(&self, generation: u64) -> bool {
         let Some(summary) = self.prefetch_open_pull_fallback_diagnostics().await else {
             return false;
@@ -1356,8 +1370,11 @@ impl DiagnosticPublisher {
     /// `published_set_changed`, converging once the re-pushed set stabilizes;
     /// and the forwarded-refresh path — where the induced re-pull's downstream
     /// fan-out makes servers like tsgo emit ANOTHER refresh, un-bounded by any
-    /// set comparison — is starved by `complete_forwarded_refresh_cycle`
-    /// dropping the nudge when its covering prefetch changed nothing.)
+    /// set comparison — has its editor leg starved by
+    /// `complete_forwarded_refresh_cycle` dropping the nudge when its covering
+    /// prefetch changed nothing after a covering editor pull; the prefetch leg
+    /// persists at debounce cadence, and a config whose prefetch can never
+    /// vouch keeps the forward — see that method's scope note.)
     ///
     /// **Spawned, not awaited:** `workspace/diagnostic/refresh` is a request whose
     /// future resolves only when the editor answers, so awaiting it inline would
