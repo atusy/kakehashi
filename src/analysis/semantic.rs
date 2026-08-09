@@ -307,18 +307,19 @@ mod tests {
     #[test]
     fn sequential_injection_does_not_start_after_host_cancel() {
         let starts = std::cell::Cell::new(0);
-        let mut work = || {
+        // Captures `&starts` (a `Copy` reference), so the closure itself is
+        // `Copy` — calling it three times below by value into an `impl
+        // FnOnce() -> T` parameter copies the closure rather than moving it,
+        // and every copy still shares the one underlying `Cell`.
+        let work = || {
             starts.set(starts.get() + 1);
             "ran"
         };
 
-        assert_eq!(run_sequential_injection(false, false, &mut work), None);
-        assert_eq!(run_sequential_injection(true, true, &mut work), None);
+        assert_eq!(run_sequential_injection(false, false, work), None);
+        assert_eq!(run_sequential_injection(true, true, work), None);
         assert_eq!(starts.get(), 0);
-        assert_eq!(
-            run_sequential_injection(true, false, &mut work),
-            Some("ran")
-        );
+        assert_eq!(run_sequential_injection(true, false, work), Some("ran"));
         assert_eq!(starts.get(), 1);
     }
     use tower_lsp_server::ls_types::{Range, SemanticToken};

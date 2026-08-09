@@ -449,68 +449,6 @@ impl Kakehashi {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use tower_lsp_server::LspService;
-
-    #[tokio::test]
-    async fn injection_node_rejects_close_reopen_during_language_load() {
-        let (service, _socket) = LspService::new(Kakehashi::new);
-        let server = service.inner();
-        server
-            .language
-            .language_registry_for_parallel()
-            .register("rust".to_string(), tree_sitter_rust::LANGUAGE.into());
-        server
-            .language
-            .language_registry_for_parallel()
-            .register("go".to_string(), tree_sitter_go::LANGUAGE.into());
-        let uri = Url::parse("file:///workspace/reopened.rs").unwrap();
-        let old_incarnation = server.documents.insert(
-            uri.clone(),
-            "fn old() {}".to_string(),
-            Some("rust".to_string()),
-            None,
-        );
-        assert!(
-            server
-                .parse_coordinator()
-                .parse_document(uri.clone(), Some("rust"), None)
-                .await
-        );
-        let params = NodeParams {
-            text_document: TextDocumentIdentifier {
-                uri: uri.as_str().parse().unwrap(),
-            },
-            position: Position::new(0, 0),
-            injection: Some(Value::Bool(true)),
-        };
-
-        let result = server
-            .kakehashi_node_after_injection_load(params, async {
-                server.documents.remove(&uri);
-                let new_incarnation = server.documents.insert(
-                    uri.clone(),
-                    "package main".to_string(),
-                    Some("go".to_string()),
-                    None,
-                );
-                assert_ne!(new_incarnation, old_incarnation);
-                assert!(
-                    server
-                        .parse_coordinator()
-                        .parse_document(uri.clone(), Some("go"), None)
-                        .await
-                );
-            })
-            .await
-            .unwrap();
-
-        assert_eq!(result, Value::Null);
-    }
-}
-
 /// Find the smallest node containing `byte` under the half-open `[start, end)` rule,
 /// with the node-reference-protocol end-of-document exception.
 ///
@@ -582,4 +520,66 @@ fn deepest_node_ending_at(node: tree_sitter::Node<'_>, target_end: usize) -> tre
         }
     }
     current
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tower_lsp_server::LspService;
+
+    #[tokio::test]
+    async fn injection_node_rejects_close_reopen_during_language_load() {
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+        server
+            .language
+            .language_registry_for_parallel()
+            .register("rust".to_string(), tree_sitter_rust::LANGUAGE.into());
+        server
+            .language
+            .language_registry_for_parallel()
+            .register("go".to_string(), tree_sitter_go::LANGUAGE.into());
+        let uri = Url::parse("file:///workspace/reopened.rs").unwrap();
+        let old_incarnation = server.documents.insert(
+            uri.clone(),
+            "fn old() {}".to_string(),
+            Some("rust".to_string()),
+            None,
+        );
+        assert!(
+            server
+                .parse_coordinator()
+                .parse_document(uri.clone(), Some("rust"), None)
+                .await
+        );
+        let params = NodeParams {
+            text_document: TextDocumentIdentifier {
+                uri: uri.as_str().parse().unwrap(),
+            },
+            position: Position::new(0, 0),
+            injection: Some(Value::Bool(true)),
+        };
+
+        let result = server
+            .kakehashi_node_after_injection_load(params, async {
+                server.documents.remove(&uri);
+                let new_incarnation = server.documents.insert(
+                    uri.clone(),
+                    "package main".to_string(),
+                    Some("go".to_string()),
+                    None,
+                );
+                assert_ne!(new_incarnation, old_incarnation);
+                assert!(
+                    server
+                        .parse_coordinator()
+                        .parse_document(uri.clone(), Some("go"), None)
+                        .await
+                );
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(result, Value::Null);
+    }
 }

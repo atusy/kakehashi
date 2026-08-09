@@ -276,7 +276,7 @@ mod tests {
         let diagnostics = collect_joined_region_diagnostics(join_set, &sink, "test").await;
 
         assert!(diagnostics.is_empty());
-        assert_eq!(sink.unwrap().load(Ordering::Relaxed), 1);
+        assert_eq!(sink.as_ref().unwrap().load(Ordering::Relaxed), 1);
     }
 
     /// An all-incapable virt snapshot must still publish an (empty) pull layer,
