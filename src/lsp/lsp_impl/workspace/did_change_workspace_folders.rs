@@ -276,20 +276,27 @@ mod tests {
         // the early-return path instead. Polling for the one effect this test
         // cares about still drives `handler` forward without needing the rest
         // of it to resolve.
+        // `bool` distinguishes "the folder set moved" from "the handler
+        // completed" — codex review finding: an earlier version of this loop
+        // returned on either event alike, so a regression that let the
+        // handler finish WITHOUT ever mutating the pool (e.g. a `return`
+        // introduced ahead of the pool call) would still resolve the timeout
+        // as `Ok`, passing an assertion that only checked `is_ok()`.
         let moved = tokio::time::timeout(std::time::Duration::from_secs(2), async {
             loop {
                 if server.bridge.pool().workspace_folders().is_some() {
-                    return;
+                    return true;
                 }
                 tokio::select! {
-                    () = &mut handler => return,
+                    () = &mut handler => return false,
                     () = tokio::time::sleep(std::time::Duration::from_millis(5)) => {}
                 }
             }
         })
         .await;
-        assert!(
-            moved.is_ok(),
+        assert_eq!(
+            moved,
+            Ok(true),
             "the pool's folder set must move once the handler could acquire the reload lock"
         );
     }
