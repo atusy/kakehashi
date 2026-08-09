@@ -123,10 +123,40 @@ impl Kakehashi {
 mod tests {
     use super::*;
 
+    use serial_test::serial;
     use std::sync::Arc;
     use std::time::Duration;
     use tower_lsp_server::LspService;
     use tower_lsp_server::ls_types::{WorkspaceFolder, WorkspaceFoldersChangeEvent};
+
+    /// Restores `XDG_CONFIG_HOME` when dropped, even if the test body panics —
+    /// matching the convention in `src/config/user.rs` / `src/lsp/settings.rs`.
+    /// Callers must carry `#[serial(xdg_env)]`, since the variable is
+    /// process-wide.
+    struct XdgConfigHomeGuard(Option<std::ffi::OsString>);
+
+    impl XdgConfigHomeGuard {
+        fn set(path: &std::path::Path) -> Self {
+            let original = std::env::var_os("XDG_CONFIG_HOME");
+            // SAFETY: #[serial(xdg_env)] prevents concurrent modification of
+            // XDG_CONFIG_HOME.
+            unsafe { std::env::set_var("XDG_CONFIG_HOME", path) };
+            Self(original)
+        }
+    }
+
+    impl Drop for XdgConfigHomeGuard {
+        fn drop(&mut self) {
+            // SAFETY: #[serial(xdg_env)] prevents concurrent modification of
+            // XDG_CONFIG_HOME.
+            unsafe {
+                match self.0.take() {
+                    Some(value) => std::env::set_var("XDG_CONFIG_HOME", value),
+                    None => std::env::remove_var("XDG_CONFIG_HOME"),
+                }
+            }
+        }
+    }
 
     /// An event naming neither an addition nor a removal describes no change
     /// of project: `apply_workspace_folder_change` already reports as much
@@ -144,9 +174,11 @@ mod tests {
     /// transaction — `load_settings`, `WorkspaceSettings::try_from_settings`,
     /// `apply_raw_settings_locked` — never ran.
     ///
-    /// Bounded so a regression fails on the assertion rather than hanging: an
-    /// unskipped reload reaches client notifications this harness's unused
-    /// `_socket` never drains.
+    /// No `XDG_CONFIG_HOME` isolation needed here: the early return happens
+    /// before `load_settings` is ever called, so this path never reads real
+    /// environment state regardless of which machine runs it. Bounded anyway
+    /// so a regression fails on the assertion rather than hanging — see the
+    /// sibling test below for what an unskipped reload can actually block on.
     #[tokio::test]
     async fn an_empty_folder_event_does_not_reload_settings() {
         let (service, _socket) = LspService::new(Kakehashi::new);
@@ -178,8 +210,22 @@ mod tests {
     /// the default settings this session starts with, so the `Ok` arm runs
     /// `apply_raw_settings_locked`, which republishes a fresh snapshot even
     /// though its *content* is unchanged from the default.
+    ///
+    /// `XDG_CONFIG_HOME` is pointed at an empty scratch directory for the
+    /// duration of the call. Unlike the sibling test above, this path DOES
+    /// reach `load_settings`, which reads `$XDG_CONFIG_HOME` (falling back to
+    /// `~/.config`) for a real user config file — left unisolated, a
+    /// developer machine's own `~/.config/kakehashi/kakehashi.toml` loads
+    /// instead of empty defaults, and its real search paths / language
+    /// configuration can turn this call into actual disk work whose outcome
+    /// (and duration, past the 5s bound below) depends on whoever's machine
+    /// runs it, rather than on the code under test.
     #[tokio::test]
+    #[serial(xdg_env)]
     async fn a_non_empty_folder_event_still_reloads_settings() {
+        let xdg_scratch = tempfile::tempdir().expect("failed to create scratch XDG_CONFIG_HOME");
+        let _xdg_guard = XdgConfigHomeGuard::set(xdg_scratch.path());
+
         let (service, _socket) = LspService::new(Kakehashi::new);
         let server = service.inner();
         let before = server.settings_manager.load_settings_pair();
