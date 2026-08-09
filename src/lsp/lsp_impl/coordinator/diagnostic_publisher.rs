@@ -346,14 +346,15 @@ impl DiagnosticPublisher {
         // its lag while the prefetch is in flight, and the prefetch — having
         // pulled the same post-commit set — reports Unchanged. Sampling only
         // at prefetch start would absorb this cycle despite the outstanding
-        // lag. (A lag recorded after this read belongs to the next
-        // generation: nothing clears it but a covering pull, so it survives
-        // to be read then.)
-        summary.set_changed |= self
-            .documents
-            .open_uris()
-            .iter()
-            .any(|uri| self.aggregator.has_pull_view_lag(uri));
+        // lag.
+        let any_pull_view_lag = |publisher: &Self| {
+            publisher
+                .documents
+                .open_uris()
+                .iter()
+                .any(|uri| publisher.aggregator.has_pull_view_lag(uri))
+        };
+        summary.set_changed |= any_pull_view_lag(self);
         self.aggregator
             .mark_forwarded_refresh_prefetched(generation);
 
@@ -363,12 +364,21 @@ impl DiagnosticPublisher {
             .aggregator
             .forwarded_refresh_needs_editor_send(generation)
         {
-            if summary.needs_editor_nudge()
-                && !self.request_pull_diagnostic_refresh_inner(true, false)
-            {
+            let nudged = summary.needs_editor_nudge();
+            if nudged && !self.request_pull_diagnostic_refresh_inner(true, false) {
                 return false;
             }
             self.aggregator.mark_forwarded_refresh_covered(generation);
+            // The sweep→covered window: a lag recorded in between was seen by
+            // neither the sweep above nor any future cycle this (now covered)
+            // generation would trigger — and a lag-recording commit mints no
+            // refresh generation of its own. Re-check after covering and fire
+            // the nudge directly; a spurious double-nudge (the recorder's set
+            // change racing an already-sent nudge) is coalesced by the
+            // refresh single-flight.
+            if !nudged && any_pull_view_lag(self) {
+                let _ = self.request_pull_diagnostic_refresh_inner(true, false);
+            }
         }
         true
     }

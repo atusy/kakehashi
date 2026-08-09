@@ -1149,6 +1149,19 @@ fn main() {
                             }),
                         );
                     } else {
+                        // Up to TWO baseline-less fulls are legitimate (the
+                        // didOpen pull and the refresh prefetch can race
+                        // before either stores the baseline). A third one
+                        // means a later pull LOST the baseline and is
+                        // re-fetching — answer with a distinguishable message
+                        // so the retention assert cannot pass off a repairing
+                        // full instead of genuine baseline reuse.
+                        diagnostic_generation += 1;
+                        let full_message = if diagnostic_generation <= 2 {
+                            "mock-diagnostic-refresh-unchanged"
+                        } else {
+                            "mock-diagnostic-unexpected-refetch"
+                        };
                         respond(
                             &mut writer,
                             id,
@@ -1161,7 +1174,7 @@ fn main() {
                                         "end": { "line": 0, "character": 1 }
                                     },
                                     "severity": 2,
-                                    "message": "mock-diagnostic-refresh-unchanged"
+                                    "message": full_message
                                 }]
                             }),
                         );

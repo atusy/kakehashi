@@ -304,13 +304,23 @@ impl Kakehashi {
 
             // Cancellation is handled by the outer select dropping this
             // future (which drops the JoinSet, aborting region tasks).
-            crate::lsp::aggregation::region::collect_region_results_with_cancel(
-                outer_join_set,
-                None,
-                |acc, items: Vec<Diagnostic>| acc.extend(items),
-            )
-            .await
-            .unwrap_or_default()
+            // Drained inline (rather than via collect_region_results_with_cancel)
+            // so a PANICKED region task counts as a request failure: it dropped
+            // its whole region from the answer, and a partial answer must not
+            // read as clean to the pull-view lag check below.
+            let mut collected: Vec<Diagnostic> = Vec::new();
+            let mut panicked_regions = 0usize;
+            while let Some(result) = outer_join_set.join_next().await {
+                match result {
+                    Ok(items) => collected.extend(items),
+                    Err(join_err) => {
+                        log::warn!("region task panicked: {join_err}");
+                        panicked_regions += 1;
+                    }
+                }
+            }
+            count_request_errors(&request_error_sink, panicked_regions);
+            collected
         };
 
         // Host layer (host-document-bridge): the host language's own servers
