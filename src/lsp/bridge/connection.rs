@@ -87,7 +87,18 @@ impl BridgeReader {
             let trimmed = line.trim_end_matches(['\r', '\n']);
 
             if trimmed.is_empty() {
-                break; // Empty line = end of headers
+                // Only a newline-TERMINATED empty line ends the headers. A
+                // lone '\r' (or bare partial) without its '\n' can only mean
+                // the stream ended mid-separator — `read_line` returns a
+                // newline-less line exclusively at EOF — so fall through to
+                // the next read, which reports the EOF instead of letting a
+                // dying gasp masquerade as a complete (and then
+                // Content-Length-less) header block.
+                if line.ends_with('\n') {
+                    break; // Empty line = end of headers
+                }
+                saw_header = true;
+                continue;
             }
             saw_header = true;
 
@@ -103,9 +114,20 @@ impl BridgeReader {
             io::Error::new(io::ErrorKind::InvalidData, "missing Content-Length header")
         })?;
 
-        // Read exact body bytes
+        // Read exact body bytes. Name a mid-body EOF like the header-side
+        // classifications (tokio's generic "early eof" otherwise breaks the
+        // uniform crash-triage reading this reader's errors now have).
         let mut body = vec![0u8; content_length];
-        self.stdout.read_exact(&mut body).await?;
+        self.stdout.read_exact(&mut body).await.map_err(|e| {
+            if e.kind() == io::ErrorKind::UnexpectedEof {
+                io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "downstream closed stdout mid-body (truncated frame)",
+                )
+            } else {
+                e
+            }
+        })?;
 
         Ok(body)
     }
