@@ -1564,6 +1564,59 @@ mod tests {
         );
     }
 
+    /// An OPEN document whose parse snapshot is transiently absent (didChange
+    /// cleared the tree; parse pending or given up) must count as a coverage
+    /// gap: the editor's re-pull answers it (bounded tree wait + tree-less
+    /// host layer), so the prefetch cannot vouch for it. Review finding
+    /// (contract regression, HIGH): the skip previously counted such a
+    /// document as vacuously covered, absorbing the refresh — with
+    /// `pullFallback = false` or a settings-reload `invalidate_parse` window
+    /// there is no later signal, and the editor rots until the next edit.
+    #[tokio::test]
+    async fn forwarded_refresh_still_sends_when_an_open_document_has_no_snapshot() {
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+        server
+            .settings_manager
+            .set_capabilities(ClientCapabilities {
+                workspace: Some(WorkspaceClientCapabilities {
+                    diagnostics: Some(DiagnosticWorkspaceClientCapabilities {
+                        refresh_support: Some(true),
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            });
+        register_rust(server);
+        server.settings_manager.apply_settings(rust_settings(true));
+
+        // Insert WITHOUT parsing: the document is open but has no tree, so
+        // `prepare_diagnostic_snapshot` returns `None` transiently.
+        let uri = Url::parse("file:///test/tree_pending_host.rs").unwrap();
+        server.documents.insert(
+            uri.clone(),
+            "fn main() {}".to_string(),
+            Some("rust".to_string()),
+            None,
+        );
+
+        let publisher = DiagnosticPublisher::new(server);
+        publisher.request_forwarded_diagnostic_refresh();
+
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        while server.diagnostics.metrics_snapshot().refreshes_sent == 0
+            && tokio::time::Instant::now() < deadline
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            server.diagnostics.metrics_snapshot().refreshes_sent,
+            1,
+            "an open document without a parse snapshot is NOT covered by the \
+             prefetch — the forced send must survive"
+        );
+    }
+
     /// Safe direction: when `pullFallback = false` gates a pull-eligible layer
     /// out of the prefetch, the prefetch canNOT stand in for the editor's
     /// re-pull (the editor's live fan-out still pulls that layer), so the
