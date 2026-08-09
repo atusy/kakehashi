@@ -341,20 +341,20 @@ impl DiagnosticPublisher {
             return false;
         }
         let mut summary = summary;
-        // Read the pull-view lag at DECISION time, after the prefetch joined:
-        // a host-event pull committing concurrently with the prefetch records
-        // its lag while the prefetch is in flight, and the prefetch — having
-        // pulled the same post-commit set — reports Unchanged. Sampling only
-        // at prefetch start would absorb this cycle despite the outstanding
-        // lag.
-        let any_pull_view_lag = |publisher: &Self| {
-            publisher
-                .documents
-                .open_uris()
-                .iter()
-                .any(|uri| publisher.aggregator.has_pull_view_lag(uri))
-        };
-        summary.set_changed |= any_pull_view_lag(self);
+        // Read the pull-view lag at DECISION time, after the prefetch
+        // joined. This read is race-free against the nudge-less recorders
+        // because they record BEFORE their republish (see
+        // `record_pull_view_lag`): the per-host republish lock serializes a
+        // recorder's republish against this cycle's own prefetch commit, so
+        // any change the prefetch's Unchanged-compare could have observed had
+        // its lag visible here first; a recorder whose lag lands after this
+        // read also republishes after it — its change postdates the cycle and
+        // its (uncleared) lag is this same sweep's input next generation.
+        summary.set_changed |= self
+            .documents
+            .open_uris()
+            .iter()
+            .any(|uri| self.aggregator.has_pull_view_lag(uri));
         self.aggregator
             .mark_forwarded_refresh_prefetched(generation);
 
@@ -364,21 +364,12 @@ impl DiagnosticPublisher {
             .aggregator
             .forwarded_refresh_needs_editor_send(generation)
         {
-            let nudged = summary.needs_editor_nudge();
-            if nudged && !self.request_pull_diagnostic_refresh_inner(true, false) {
+            if summary.needs_editor_nudge()
+                && !self.request_pull_diagnostic_refresh_inner(true, false)
+            {
                 return false;
             }
             self.aggregator.mark_forwarded_refresh_covered(generation);
-            // The sweep→covered window: a lag recorded in between was seen by
-            // neither the sweep above nor any future cycle this (now covered)
-            // generation would trigger — and a lag-recording commit mints no
-            // refresh generation of its own. Re-check after covering and fire
-            // the nudge directly; a spurious double-nudge (the recorder's set
-            // change racing an already-sent nudge) is coalesced by the
-            // refresh single-flight.
-            if !nudged && any_pull_view_lag(self) {
-                let _ = self.request_pull_diagnostic_refresh_inner(true, false);
-            }
         }
         true
     }
@@ -525,19 +516,19 @@ impl DiagnosticPublisher {
                 self.aggregator.set_pull_layer(uri, diagnostics);
             }
         }
+        // Provisional record-before-republish, like `publish_pull_layer`:
+        // the in-cycle nudge this commit may trigger is only a request — if
+        // the editor does not actually re-pull, the NEXT cycle's unchanged
+        // prefetch must still forward instead of absorbing forever (the lag
+        // is cleared by the covering pull). A racing didClose's forget wins
+        // regardless of which side of the republish it lands on.
+        let provisional = self.aggregator.record_pull_view_lag(uri);
         drop(edit_guard);
         // `Deferred` counts as changed: the cache moved, only the geometry
         // re-anchor is pending — the editor's view is stale either way.
         let set_changed = self.republish(uri).await.nudges_pull_clients();
-        // Re-check the store: a didClose can slip in after the edit guard
-        // dropped, and its forget must win — recording after it would leak a
-        // closed host's entry until reopen (one spurious nudge there).
-        if set_changed && self.documents.get(uri).is_some() {
-            // The in-cycle nudge below is only a request; record the lag so
-            // that if the editor does not actually re-pull, the NEXT cycle's
-            // unchanged prefetch still forwards instead of absorbing forever
-            // (cleared by the covering pull, like `publish_pull_layer`).
-            self.aggregator.record_pull_view_lag(uri);
+        if !set_changed {
+            self.aggregator.retract_pull_view_lag(uri, provisional);
         }
         ForwardedPrefetchSummary {
             set_changed,
@@ -874,16 +865,15 @@ impl DiagnosticPublisher {
     /// (push-propagation-diagnostic-forwarding) handles generally; until then it
     /// self-heals on the next completed pull.
     pub(crate) async fn publish_pull_layer(&self, host: &Url, diagnostics: Vec<Diagnostic>) {
+        // Record the lag BEFORE the republish (see `record_pull_view_lag` —
+        // this ordering is what linearizes the forwarded-refresh absorption
+        // against this nudge-less commit), retracting if nothing changed. A
+        // racing didClose's forget wins either way: it removes the record
+        // whether it lands before or after the republish.
+        let provisional = self.aggregator.record_pull_view_lag(host);
         self.aggregator.set_pull_layer(host, diagnostics);
-        // The store re-check mirrors `commit_refresh_prefetch`'s: a racing
-        // didClose's forget must win over this record.
-        if self.republish(host).await.nudges_pull_clients() && self.documents.get(host).is_some() {
-            // This commit moved the recorded set without any editor nudge; if
-            // the editor's own event-driven pull raced ahead of it, only a
-            // later covering pull closes the gap — record the lag so the
-            // forwarded-refresh absorption does not mistake kakehashi's own
-            // record for the editor's view (see `pull_view_lag`).
-            self.aggregator.record_pull_view_lag(host);
+        if !self.republish(host).await.nudges_pull_clients() {
+            self.aggregator.retract_pull_view_lag(host, provisional);
         }
     }
 
@@ -905,12 +895,14 @@ impl DiagnosticPublisher {
     /// here would therefore duplicate that cycle's nudge; an incapable editor still
     /// receives the clearing `publishDiagnostics` notification from `republish`.
     pub(crate) async fn clear_pull_layer(&self, host: &Url) {
+        // Same provisional record-before-republish as `publish_pull_layer`:
+        // a cleared set the editor still displays is the worse variant of
+        // the lag.
+        let provisional = self.aggregator.record_pull_view_lag(host);
         self.aggregator
             .evict_source(host, &DiagnosticSource::PullLayer);
-        if self.republish(host).await.nudges_pull_clients() && self.documents.get(host).is_some() {
-            // Same pull-view lag rule as `publish_pull_layer`: a cleared set
-            // the editor still displays is the worse variant of the lag.
-            self.aggregator.record_pull_view_lag(host);
+        if !self.republish(host).await.nudges_pull_clients() {
+            self.aggregator.retract_pull_view_lag(host, provisional);
         }
     }
 

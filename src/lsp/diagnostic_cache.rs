@@ -649,6 +649,15 @@ struct HostCoverage {
     served: u64,
 }
 
+/// A provisional pull-view lag record (see
+/// [`DiagnosticAggregator::record_pull_view_lag`]): the minted serial plus
+/// the previous serial it displaced, which a retraction must restore.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ProvisionalPullViewLag {
+    serial: u64,
+    previous: Option<u64>,
+}
+
 /// The diagnostic coverage observed when a pull begins.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct DiagnosticCoverageStamp {
@@ -1181,18 +1190,56 @@ impl DiagnosticAggregator {
             .remove(host);
     }
 
-    /// Record that `host`'s merged set moved through an editor-origin,
-    /// nudge-less republish (see the [`Self::pull_view_lag`] field doc). A
-    /// repeat record re-stamps the entry with a fresh serial, so an in-flight
-    /// pull that started before it cannot clear it.
-    pub(crate) fn record_pull_view_lag(&self, host: &Url) {
+    /// Record that `host`'s merged set is ABOUT to move through an
+    /// editor-origin, nudge-less republish (see the [`Self::pull_view_lag`]
+    /// field doc). Recorded BEFORE the republish, deliberately: the per-host
+    /// republish lock serializes the recorder's republish against the
+    /// forwarded-refresh prefetch's own commit, so record-before-republish
+    /// guarantees any change visible to the prefetch's compare had its lag
+    /// visible to the cycle's decision sweep first — the linearization that
+    /// makes the absorption race-free. A republish that turns out Unchanged
+    /// retracts its provisional record via
+    /// [`Self::retract_pull_view_lag`]. A repeat record re-stamps the entry
+    /// with a fresh serial, so an in-flight pull that started before it
+    /// cannot clear it. Returns the provisional record — serial plus the
+    /// PREVIOUS serial it displaced — for the retraction: a retraction must
+    /// restore that predecessor, never bare-remove, or a provisional
+    /// re-stamp followed by an Unchanged republish would erase an older,
+    /// still-owed lag.
+    pub(crate) fn record_pull_view_lag(&self, host: &Url) -> ProvisionalPullViewLag {
         let serial = self
             .next_pull_view_lag_serial
             .fetch_add(1, Ordering::Relaxed);
-        self.pull_view_lag
+        let previous = self
+            .pull_view_lag
             .lock()
             .recover_poison("DiagnosticAggregator::pull_view_lag")
             .insert(host.clone(), serial);
+        ProvisionalPullViewLag { serial, previous }
+    }
+
+    /// Retract a provisional lag record whose republish reported Unchanged:
+    /// restore the serial it displaced (an older lag is still owed a nudge)
+    /// or remove the entry when there was none — but only when no NEWER
+    /// record re-stamped the entry meanwhile (that newer recorder's own
+    /// retraction/confirmation owns it now). Restoring the OLDER serial keeps
+    /// pull stamps sound: a covering pull that captured the provisional
+    /// serial at entry may clear the restored (older) one.
+    pub(crate) fn retract_pull_view_lag(&self, host: &Url, provisional: ProvisionalPullViewLag) {
+        let mut lags = self
+            .pull_view_lag
+            .lock()
+            .recover_poison("DiagnosticAggregator::pull_view_lag");
+        if lags.get(host) == Some(&provisional.serial) {
+            match provisional.previous {
+                Some(previous) => {
+                    lags.insert(host.clone(), previous);
+                }
+                None => {
+                    lags.remove(host);
+                }
+            }
+        }
     }
 
     /// Whether `host` carries an outstanding pull-view lag — the recorded set

@@ -155,6 +155,10 @@ fn main() {
     let mut did_save_count: usize = 0;
     let mut last_did_save_uri: Option<String> = None;
     let mut diagnostic_generation: u64 = 0;
+    // `diagnostics-refresh-prefetch-unchanged`: once ANY unchanged report was
+    // answered, the baseline demonstrably exists — a later baseline-less full
+    // request means a pull LOST it and is re-fetching.
+    let mut unchanged_answered = false;
 
     while let Some(message) = read_message(&mut reader) {
         let method = message
@@ -1136,6 +1140,7 @@ fn main() {
                         // answered (and thus resolved against the baseline)
                         // before asserting retention — the publish marker
                         // alone can come from the initial full answer.
+                        unchanged_answered = true;
                         // type 2 (Warning): the bridge's workspace log
                         // threshold drops Info-level downstream logs by
                         // default, and the forward prefixes the server name —
@@ -1149,18 +1154,18 @@ fn main() {
                             }),
                         );
                     } else {
-                        // Up to TWO baseline-less fulls are legitimate (the
-                        // didOpen pull and the refresh prefetch can race
-                        // before either stores the baseline). A third one
-                        // means a later pull LOST the baseline and is
-                        // re-fetching — answer with a distinguishable message
-                        // so the retention assert cannot pass off a repairing
-                        // full instead of genuine baseline reuse.
-                        diagnostic_generation += 1;
-                        let full_message = if diagnostic_generation <= 2 {
-                            "mock-diagnostic-refresh-unchanged"
-                        } else {
+                        // Baseline-less fulls are legitimate only BEFORE any
+                        // unchanged report was answered (the didOpen pull and
+                        // the prefetch may race before either stores the
+                        // baseline). After one, the baseline demonstrably
+                        // existed — a baseline-less request means a pull LOST
+                        // it and is re-fetching, so answer with a
+                        // distinguishable message: the retention assert must
+                        // not pass off a repairing full as baseline reuse.
+                        let full_message = if unchanged_answered {
                             "mock-diagnostic-unexpected-refetch"
+                        } else {
+                            "mock-diagnostic-refresh-unchanged"
                         };
                         respond(
                             &mut writer,
