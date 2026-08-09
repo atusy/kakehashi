@@ -1769,6 +1769,67 @@ mod tests {
         );
     }
 
+    /// A nudge-less writer that has mutated the cache (pending mark stamped)
+    /// but not yet reached its republish is a real, unconfirmed change the
+    /// sweep must treat conservatively as lag: absorbing past it and letting
+    /// the later republish confirm the lag nudge-lessly leaves a pull-first
+    /// editor stale until another refresh. codex fresh-session #4 finding —
+    /// the parked writer is simulated by mutating WITHOUT republishing.
+    #[tokio::test]
+    async fn pending_lag_mark_blocks_absorption_at_the_sweep() {
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+        server
+            .settings_manager
+            .set_capabilities(ClientCapabilities {
+                workspace: Some(WorkspaceClientCapabilities {
+                    diagnostics: Some(DiagnosticWorkspaceClientCapabilities {
+                        refresh_support: Some(true),
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            });
+        register_rust(server);
+        server.settings_manager.apply_settings(rust_settings(false));
+
+        // An open doc keeps the sweep's URI set non-empty; with host bridging
+        // off and no injection query the prefetch skips it without flags.
+        let uri = Url::parse("file:///test/pending_mark_sweep.rs").unwrap();
+        server.documents.insert(
+            uri.clone(),
+            "fn main() {}".to_string(),
+            Some("rust".to_string()),
+            None,
+        );
+        server
+            .parse_coordinator()
+            .parse_document(uri.clone(), Some("rust"), None)
+            .await;
+
+        // The parked writer: mutation + pending mark stamped, republish not
+        // yet run (no settle, no confirmed lag).
+        server
+            .diagnostics
+            .set_pull_layer_nudgeless(&uri, vec![diag("in-flight")]);
+
+        let publisher = DiagnosticPublisher::new(server);
+        publisher.request_forwarded_diagnostic_refresh();
+
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        while server.diagnostics.metrics_snapshot().refreshes_sent == 0
+            && tokio::time::Instant::now() < deadline
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            server.diagnostics.metrics_snapshot().refreshes_sent,
+            1,
+            "an unsettled pending mark is an unconfirmed change the sweep must \
+             not absorb past"
+        );
+    }
+
     /// Behavior-level pin for the mid-flight reload guards (the per-commit
     /// lineage check and the cycle-level fence): a settings reload landing
     /// while the prefetch is in flight must force the send, whichever guard
