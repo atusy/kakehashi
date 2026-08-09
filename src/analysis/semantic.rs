@@ -307,6 +307,10 @@ mod tests {
     #[test]
     fn sequential_injection_does_not_start_after_host_cancel() {
         let starts = std::cell::Cell::new(0);
+        // Captures `&starts` (a `Copy` reference), so the closure itself is
+        // `Copy` — calling it three times below by value into an `impl
+        // FnOnce() -> T` parameter copies the closure rather than moving it,
+        // and every copy still shares the one underlying `Cell`.
         let work = || {
             starts.set(starts.get() + 1);
             "ran"
