@@ -58,6 +58,14 @@ pub(crate) struct SettingsManager {
     /// the handshake — only the folder list does.
     folderless_root_path: OnceLock<Option<PathBuf>>,
     settings_snapshot: ArcSwap<SettingsSnapshot>,
+    /// Monotonic count of settings applications. Captured by long-running
+    /// consumers (the diagnostic refresh prefetch) BEFORE loading the
+    /// settings they resolve against, and re-checked at commit: a mismatch
+    /// means a `didChangeConfiguration` landed mid-flight and the resolved
+    /// surface may be stale. Capture-before-load makes the only racy arm the
+    /// safe one (a store between capture and load flags a mismatch even
+    /// though the load already saw the new settings — one over-nudge).
+    settings_generation: std::sync::atomic::AtomicU64,
     /// Client capabilities from initialize() - immutable after initialization.
     /// Uses OnceLock to enforce "set once, read many" semantics per LSP protocol.
     client_capabilities: OnceLock<ClientCapabilities>,
@@ -118,6 +126,7 @@ impl SettingsManager {
                 raw_settings: Arc::new(raw_settings),
                 settings: Arc::new(settings),
             })),
+            settings_generation: std::sync::atomic::AtomicU64::new(0),
             client_capabilities: OnceLock::new(),
             root_markers_deprecation_warned: AtomicBool::new(false),
             auto_install_deprecation_warned: AtomicBool::new(false),
@@ -253,6 +262,17 @@ impl SettingsManager {
             raw_settings: Arc::new(raw_settings),
             settings: Arc::new(settings),
         }));
+        // After the store: a generation observed as unchanged across a
+        // capture→load→commit span then guarantees the loaded settings were
+        // at least as new as the capture (see the field doc).
+        self.settings_generation
+            .fetch_add(1, std::sync::atomic::Ordering::Release);
+    }
+
+    /// The current settings generation (see the field doc).
+    pub(crate) fn settings_generation(&self) -> u64 {
+        self.settings_generation
+            .load(std::sync::atomic::Ordering::Acquire)
     }
 
     /// Returns true only if client declared workspace.semanticTokens.refreshSupport.

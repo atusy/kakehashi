@@ -23,6 +23,15 @@ use super::{RequestErrorSink, count_request_errors};
 pub(crate) struct DiagnosticSnapshotLineage {
     pub(crate) incarnation: u64,
     pub(crate) content_version: u64,
+    /// The settings generation the pull surface was resolved under (captured
+    /// BEFORE loading the settings — see
+    /// `SettingsManager::settings_generation`). The refresh prefetch
+    /// re-checks it at commit: a `workspace/didChangeConfiguration` landing
+    /// mid-prefetch can widen the editor's pull surface (new
+    /// server/layer/priorities) without touching the document fields, and an
+    /// old-surface prefetch must then count as incomplete coverage rather
+    /// than vouch for the editor's re-pull.
+    pub(crate) settings_generation: u64,
 }
 
 /// Everything a push-diagnostics task needs, captured at schedule time
@@ -306,6 +315,7 @@ mod tests {
             lineage: DiagnosticSnapshotLineage {
                 incarnation: 0,
                 content_version: 0,
+                settings_generation: 0,
             },
             virt_contexts: vec![virt_ctx_for_server("test")],
             narrower_than_editor_pull: false,

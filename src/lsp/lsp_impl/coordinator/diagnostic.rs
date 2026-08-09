@@ -191,6 +191,12 @@ impl DiagnosticSnapshotPreparer {
         // aggregation configs below. A layer gated off still yields a
         // snapshot (with that layer absent) so that publishing an empty list
         // clears anything a previously-enabled configuration left behind.
+        // Generation captured BEFORE the load (see
+        // `SettingsManager::settings_generation`): the only racy arm is then
+        // a config store between the two, which flags the snapshot stale even
+        // though the load already saw the new settings — one over-nudge, the
+        // safe direction.
+        let settings_generation = self.settings_manager.settings_generation();
         let settings = self.settings_manager.load_settings();
         let layer_cfg = crate::lsp::lsp_impl::bridge_context::resolve_layer_config_from_settings(
             &settings,
@@ -437,6 +443,7 @@ impl DiagnosticSnapshotPreparer {
             lineage: DiagnosticSnapshotLineage {
                 incarnation: snapshot.incarnation(),
                 content_version,
+                settings_generation,
             },
             virt_contexts,
             host_pull_enabled,

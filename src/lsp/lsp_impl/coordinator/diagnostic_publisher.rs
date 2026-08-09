@@ -504,6 +504,23 @@ impl DiagnosticPublisher {
                 && document.content_version() == lineage.content_version
         };
         drop(document);
+        // A `didChangeConfiguration` landing mid-prefetch can widen the
+        // editor's pull surface (new server/layer/priorities) without
+        // touching the document fields — an old-surface result must not
+        // vouch for the editor's re-pull, and (unlike the lineage discard
+        // below) nothing else is guaranteed to re-pull after a pure config
+        // change, so committing the possibly-narrower result is skipped too.
+        if lineage.settings_generation != self.settings_manager.settings_generation() {
+            log::debug!(
+                target: LOG_TARGET,
+                "Discarding refresh prefetch resolved under stale settings for {uri}"
+            );
+            drop(edit_guard);
+            return ForwardedPrefetchSummary {
+                coverage_incomplete: true,
+                ..Default::default()
+            };
+        }
         if !current {
             log::debug!(target: LOG_TARGET, "Discarding stale refresh prefetch for {uri}");
             // An edit raced the prefetch: this result says nothing about the
@@ -1740,6 +1757,61 @@ mod tests {
             tokio::time::Instant::now(),
             before,
             "the leading forced send must not wait for the settle window"
+        );
+    }
+
+    /// A prefetch whose surface was resolved under settings that changed
+    /// mid-flight cannot vouch for the editor's re-pull (the new config can
+    /// have widened the surface), and nothing re-pulls after a pure config
+    /// change — the commit must be discarded as incomplete coverage. codex
+    /// fresh-session finding.
+    #[tokio::test]
+    async fn stale_settings_prefetch_counts_as_incomplete_coverage() {
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+        register_rust(server);
+        server.settings_manager.apply_settings(rust_settings(true));
+
+        let uri = Url::parse("file:///test/stale_settings_prefetch.rs").unwrap();
+        server.documents.insert(
+            uri.clone(),
+            "fn main() {}".to_string(),
+            Some("rust".to_string()),
+            None,
+        );
+        let (incarnation, content_version) = {
+            let doc = server.documents.get(&uri).expect("doc just inserted");
+            (doc.incarnation(), doc.content_version())
+        };
+        let lineage =
+            crate::lsp::lsp_impl::text_document::publish_diagnostic::DiagnosticSnapshotLineage {
+                incarnation,
+                content_version,
+                settings_generation: server.settings_manager.settings_generation(),
+            };
+        // The mid-flight config change: any apply bumps the generation.
+        server.settings_manager.apply_settings(rust_settings(true));
+
+        let publisher = DiagnosticPublisher::new(server);
+        let summary = publisher
+            .commit_refresh_prefetch(
+                &uri,
+                lineage,
+                PullLayerOutcome::Publish(vec![diag("old-surface")]),
+            )
+            .await;
+
+        assert!(
+            summary.coverage_incomplete,
+            "a prefetch resolved under stale settings cannot vouch for the editor's re-pull"
+        );
+        assert!(
+            !summary.set_changed,
+            "the old-surface result must not be committed as a change"
+        );
+        assert!(
+            server.diagnostics.snapshot(&uri).is_empty(),
+            "the old-surface result must not reach the cache"
         );
     }
 

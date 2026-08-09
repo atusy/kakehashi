@@ -903,6 +903,7 @@ print("hello")
                 crate::lsp::lsp_impl::text_document::publish_diagnostic::DiagnosticSnapshotLineage {
                     incarnation: 0,
                     content_version: 0,
+                    settings_generation: 0,
                 },
             virt_contexts: vec![],
             host_pull_enabled: true,
@@ -1018,6 +1019,7 @@ print("hello")
                 crate::lsp::lsp_impl::text_document::publish_diagnostic::DiagnosticSnapshotLineage {
                     incarnation: 0,
                     content_version: 0,
+                    settings_generation: 0,
                 },
             virt_contexts: vec![],
             host_pull_enabled: true,
