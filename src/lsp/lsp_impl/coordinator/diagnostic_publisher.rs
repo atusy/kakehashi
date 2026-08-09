@@ -1743,6 +1743,136 @@ mod tests {
         );
     }
 
+    /// The epoch-cover compensation: an intervening refresh (sent after this
+    /// cycle's activity, epoch bumped) suppresses the normal send path, but
+    /// its induced re-pull can have answered before this cycle's prefetch
+    /// committed — a changed/lagged summary must coalesce a compensating
+    /// forced nudge instead of trusting the cover. Removing the compensation
+    /// branch turns the send below into silence (this test's RED).
+    #[tokio::test]
+    async fn forwarded_refresh_epoch_cover_is_compensated_when_the_prefetch_cannot_vouch() {
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+        server
+            .settings_manager
+            .set_capabilities(ClientCapabilities {
+                workspace: Some(WorkspaceClientCapabilities {
+                    diagnostics: Some(DiagnosticWorkspaceClientCapabilities {
+                        refresh_support: Some(true),
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            });
+        register_rust(server);
+        let mut settings = rust_settings(true);
+        let lang = settings
+            .languages
+            .get_mut("rust")
+            .expect("rust_settings defines the rust language");
+        let bridge = lang
+            .bridge
+            .as_mut()
+            .expect("rust_settings configures the _self bridge");
+        bridge
+            .get_mut(HOST_BRIDGE_KEY)
+            .expect("rust_settings configures the _self bridge")
+            .aggregation = Some(HashMap::from([(
+            "textDocument/publishDiagnostics".to_string(),
+            crate::config::settings::AggregationConfig {
+                pull_fallback: Some(false),
+                ..Default::default()
+            },
+        )]));
+        server.settings_manager.apply_settings(settings);
+
+        let uri = Url::parse("file:///test/epoch_covered_host.rs").unwrap();
+        server.documents.insert(
+            uri.clone(),
+            "fn main() {}".to_string(),
+            Some("rust".to_string()),
+            None,
+        );
+        server
+            .parse_coordinator()
+            .parse_document(uri.clone(), Some("rust"), None)
+            .await;
+        let publisher = DiagnosticPublisher::new(server);
+        publisher.publish_pull_layer(&uri, Vec::new()).await;
+        server.diagnostics.clear_pull_view_lag(&uri);
+
+        // Register the downstream activity, then simulate the intervening
+        // refresh: a wire send AFTER the activity bumps the epoch, which is
+        // exactly the state the epoch cover suppresses.
+        let snapshot = server
+            .diagnostics
+            .begin_forwarded_refresh_debounce()
+            .expect("idle scheduler admits the cycle");
+        server.diagnostics.record_refresh_sent();
+        assert_eq!(server.diagnostics.metrics_snapshot().refreshes_sent, 1);
+
+        assert!(
+            publisher
+                .complete_forwarded_refresh_cycle(snapshot.generation)
+                .await,
+            "the cycle itself must complete"
+        );
+
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        while server.diagnostics.metrics_snapshot().refreshes_sent < 2
+            && tokio::time::Instant::now() < deadline
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            server.diagnostics.metrics_snapshot().refreshes_sent,
+            2,
+            "a changed/lagged summary under the epoch cover must coalesce the \
+             compensating forced nudge"
+        );
+        server.diagnostics.cancel_forwarded_refresh_debounce();
+    }
+
+    /// The absorption arm of the epoch cover: an unchanged covering prefetch
+    /// keeps trusting the intervening refresh — no compensating send.
+    #[tokio::test]
+    async fn forwarded_refresh_epoch_cover_is_trusted_when_the_prefetch_vouches() {
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+        server
+            .settings_manager
+            .set_capabilities(ClientCapabilities {
+                workspace: Some(WorkspaceClientCapabilities {
+                    diagnostics: Some(DiagnosticWorkspaceClientCapabilities {
+                        refresh_support: Some(true),
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            });
+        let publisher = DiagnosticPublisher::new(server);
+
+        // No open documents: the prefetch vacuously covers and changes nothing.
+        let snapshot = server
+            .diagnostics
+            .begin_forwarded_refresh_debounce()
+            .expect("idle scheduler admits the cycle");
+        server.diagnostics.record_refresh_sent();
+
+        assert!(
+            publisher
+                .complete_forwarded_refresh_cycle(snapshot.generation)
+                .await
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert_eq!(
+            server.diagnostics.metrics_snapshot().refreshes_sent,
+            1,
+            "an absorbed summary must keep trusting the epoch cover"
+        );
+        server.diagnostics.cancel_forwarded_refresh_debounce();
+    }
+
     /// An OPEN document whose parse snapshot is transiently absent (didChange
     /// cleared the tree; parse pending or given up) must count as a coverage
     /// gap: the editor's re-pull answers it (bounded tree wait + tree-less
