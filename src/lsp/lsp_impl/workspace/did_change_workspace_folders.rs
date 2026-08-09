@@ -155,7 +155,7 @@ mod tests {
     use tower_lsp_server::LspService;
     use tower_lsp_server::ls_types::{
         ClientCapabilities, DiagnosticWorkspaceClientCapabilities, WorkspaceClientCapabilities,
-        WorkspaceFoldersChangeEvent,
+        WorkspaceFolder, WorkspaceFoldersChangeEvent,
     };
 
     /// A client that advertises `workspace.diagnostics.refreshSupport`, which is
@@ -219,6 +219,78 @@ mod tests {
             server.diagnostics.metrics_snapshot().refreshes_requested,
             1,
             "the capability gate must be open for the assertion above to mean anything"
+        );
+    }
+
+    /// A non-empty event must not touch the pool before it can acquire the
+    /// settings-reload lock — reload-then-connections is the order every path
+    /// that takes both locks must follow (see the doc comment on
+    /// `apply_workspace_folder_change` in `pool.rs`). Racing the handler
+    /// against an externally-held `reload` guard is the only way to observe
+    /// that ordering rather than just the refresh count: a regression that
+    /// moved the lock acquisition to *after* the pool call would leave this
+    /// test's earlier assertions unchanged (the pool call and the refresh
+    /// still happen eventually) but would let the folder set move while an
+    /// unrelated reload is still in flight.
+    #[tokio::test]
+    async fn a_non_empty_folder_event_waits_for_the_reload_lock_before_touching_the_pool() {
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+
+        let folder = WorkspaceFolder {
+            uri: "file:///wf-lock-order".parse().unwrap(),
+            name: "wf-lock-order".to_string(),
+        };
+
+        // Held by this task, not the handler's — a tokio::sync::Mutex blocks a
+        // second await regardless of which logical task requests it.
+        let outer_reload = lock_settings_reload().await;
+
+        let handler = server.did_change_workspace_folders_impl(DidChangeWorkspaceFoldersParams {
+            event: WorkspaceFoldersChangeEvent {
+                added: vec![folder],
+                removed: Vec::new(),
+            },
+        });
+        tokio::pin!(handler);
+
+        let raced_to_completion = tokio::select! {
+            () = &mut handler => true,
+            () = tokio::time::sleep(std::time::Duration::from_millis(50)) => false,
+        };
+        assert!(
+            !raced_to_completion,
+            "the handler must block on the reload lock rather than run to completion while it is held elsewhere"
+        );
+        assert!(
+            server.bridge.pool().workspace_folders().is_none(),
+            "the pool's folder set must not move before the handler can acquire the reload lock"
+        );
+
+        drop(outer_reload);
+
+        // Not awaited to completion: past the pool mutation this asserts on,
+        // the general reload path writes settings-change notifications to the
+        // LSP client socket, which this fixture never drains — the same hang
+        // `an_empty_folder_event_requests_no_pull_refresh` avoids by taking
+        // the early-return path instead. Polling for the one effect this test
+        // cares about still drives `handler` forward without needing the rest
+        // of it to resolve.
+        let moved = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if server.bridge.pool().workspace_folders().is_some() {
+                    return;
+                }
+                tokio::select! {
+                    () = &mut handler => return,
+                    () = tokio::time::sleep(std::time::Duration::from_millis(5)) => {}
+                }
+            }
+        })
+        .await;
+        assert!(
+            moved.is_ok(),
+            "the pool's folder set must move once the handler could acquire the reload lock"
         );
     }
 }
