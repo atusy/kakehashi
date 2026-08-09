@@ -1315,7 +1315,11 @@ impl DiagnosticPublisher {
     /// guard — consumes its debt on firing and the induced re-pull sees ready
     /// geometry and answers covering, so it begets at most one round; the indirect
     /// push→refresh→re-pull→downstream-re-push→here path is bounded by
-    /// `published_set_changed`, converging once the re-pushed set stabilizes.)
+    /// `published_set_changed`, converging once the re-pushed set stabilizes;
+    /// and the forwarded-refresh path — where the induced re-pull's downstream
+    /// fan-out makes servers like tsgo emit ANOTHER refresh, un-bounded by any
+    /// set comparison — is starved by `complete_forwarded_refresh_cycle`
+    /// dropping the nudge when its covering prefetch changed nothing.)
     ///
     /// **Spawned, not awaited:** `workspace/diagnostic/refresh` is a request whose
     /// future resolves only when the editor answers, so awaiting it inline would
