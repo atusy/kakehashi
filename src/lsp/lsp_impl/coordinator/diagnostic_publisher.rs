@@ -509,27 +509,25 @@ impl DiagnosticPublisher {
             // meaning, NOT a shortcut for "don't bother nudging".
             PullLayerOutcome::Skip => return ForwardedPrefetchSummary::default(),
             PullLayerOutcome::Clear => {
+                self.aggregator.mark_pull_view_lag_pending(uri);
                 self.aggregator
                     .evict_source(uri, &DiagnosticSource::PullLayer);
             }
             PullLayerOutcome::Publish(diagnostics) => {
+                self.aggregator.mark_pull_view_lag_pending(uri);
                 self.aggregator.set_pull_layer(uri, diagnostics);
             }
         }
-        // Provisional record-before-republish, like `publish_pull_layer`:
-        // the in-cycle nudge this commit may trigger is only a request — if
-        // the editor does not actually re-pull, the NEXT cycle's unchanged
-        // prefetch must still forward instead of absorbing forever (the lag
-        // is cleared by the covering pull). A racing didClose's forget wins
-        // regardless of which side of the republish it lands on.
-        let provisional = self.aggregator.record_pull_view_lag(uri);
+        // The pending marks above (announce-before-mutation, like
+        // `publish_pull_layer`) make this commit's change convert into a lag
+        // at whichever republish records it: the in-cycle nudge below is only
+        // a request — if the editor does not actually re-pull, the NEXT
+        // cycle's unchanged prefetch must still forward instead of absorbing
+        // forever (the lag is cleared by the covering pull).
         drop(edit_guard);
         // `Deferred` counts as changed: the cache moved, only the geometry
         // re-anchor is pending — the editor's view is stale either way.
         let set_changed = self.republish(uri).await.nudges_pull_clients();
-        if !set_changed {
-            self.aggregator.retract_pull_view_lag(uri, provisional);
-        }
         ForwardedPrefetchSummary {
             set_changed,
             ..Default::default()
@@ -865,16 +863,13 @@ impl DiagnosticPublisher {
     /// (push-propagation-diagnostic-forwarding) handles generally; until then it
     /// self-heals on the next completed pull.
     pub(crate) async fn publish_pull_layer(&self, host: &Url, diagnostics: Vec<Diagnostic>) {
-        // Record the lag BEFORE the republish (see `record_pull_view_lag` —
-        // this ordering is what linearizes the forwarded-refresh absorption
-        // against this nudge-less commit), retracting if nothing changed. A
-        // racing didClose's forget wins either way: it removes the record
-        // whether it lands before or after the republish.
-        let provisional = self.aggregator.record_pull_view_lag(host);
+        // Announce the nudge-less mutation BEFORE performing it; whichever
+        // republish records the resulting Changed set converts the mark into
+        // the pull-view lag (see `mark_pull_view_lag_pending`). A racing
+        // didClose's forget removes the mark on either side.
+        self.aggregator.mark_pull_view_lag_pending(host);
         self.aggregator.set_pull_layer(host, diagnostics);
-        if !self.republish(host).await.nudges_pull_clients() {
-            self.aggregator.retract_pull_view_lag(host, provisional);
-        }
+        self.republish(host).await;
     }
 
     /// Evict the host's `PullLayer` blob and republish — the host-event pull had
@@ -895,15 +890,12 @@ impl DiagnosticPublisher {
     /// here would therefore duplicate that cycle's nudge; an incapable editor still
     /// receives the clearing `publishDiagnostics` notification from `republish`.
     pub(crate) async fn clear_pull_layer(&self, host: &Url) {
-        // Same provisional record-before-republish as `publish_pull_layer`:
-        // a cleared set the editor still displays is the worse variant of
-        // the lag.
-        let provisional = self.aggregator.record_pull_view_lag(host);
+        // Same announce-before-mutation as `publish_pull_layer`: a cleared
+        // set the editor still displays is the worse variant of the lag.
+        self.aggregator.mark_pull_view_lag_pending(host);
         self.aggregator
             .evict_source(host, &DiagnosticSource::PullLayer);
-        if !self.republish(host).await.nudges_pull_clients() {
-            self.aggregator.retract_pull_view_lag(host, provisional);
-        }
+        self.republish(host).await;
     }
 
     /// Evict every diagnostic slot a now-exited downstream connection produced and
@@ -1108,7 +1100,17 @@ impl DiagnosticPublisher {
                 self.schedule_stale_wire_retry(host);
                 return RepublishOutcome::Deferred;
             }
-            Some(true) => RepublishOutcome::Changed,
+            Some(true) => {
+                // A recorded Changed set consumes any announced nudge-less
+                // mutation: convert it into the confirmed pull-view lag HERE,
+                // under the per-host republish lock and atomically with the
+                // record — whichever republish consumes the revision (the
+                // writer's own, the stale-wire retry, a concurrent push
+                // republish) performs the conversion, so no writer preemption
+                // window can lose it.
+                self.aggregator.convert_pending_pull_view_lag(host);
+                RepublishOutcome::Changed
+            }
             Some(false) => RepublishOutcome::Unchanged,
         };
         if changed == RepublishOutcome::Unchanged && !self.aggregator.wire_gate_is_dirty(host) {

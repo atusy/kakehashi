@@ -442,9 +442,11 @@ pub(crate) struct DiagnosticAggregator {
     /// answer (#745).
     degraded_pulls: Mutex<HashMap<Url, Option<u64>>>,
     /// Hosts whose recorded merged set moved through an **editor-origin,
-    /// nudge-less** republish (`publish_pull_layer`/`clear_pull_layer`, and
+    /// nudge-less** mutation (`publish_pull_layer`/`clear_pull_layer`, and
     /// the refresh prefetch's own commit) since the last **covering** editor
-    /// pull. Those writers never emit `workspace/diagnostic/refresh` (by
+    /// pull — confirmed at the Changed republish that recorded the move (see
+    /// [`Self::mark_pull_view_lag_pending`] /
+    /// [`Self::convert_pending_pull_view_lag`]). Those writers never emit `workspace/diagnostic/refresh` (by
     /// design — they are normally paired with the editor's own event-driven
     /// pull), but that pairing is a race: the editor's pull can answer with
     /// the downstream's PRE-analysis state while the slower synthetic pull
@@ -464,6 +466,13 @@ pub(crate) struct DiagnosticAggregator {
     /// lifetime after a close raced the pull (#745's defect class) — carries
     /// a newer serial and survives the stale clear.
     pull_view_lag: Mutex<HashMap<Url, u64>>,
+    /// Nudge-less mutations announced but not yet confirmed by a Changed
+    /// republish (see [`Self::mark_pull_view_lag_pending`]). Deliberately
+    /// invisible to pull stamps and the decision sweep: only a mutation that
+    /// actually changed the recorded set owes the editor anything, and the
+    /// republish that records that change performs the conversion atomically
+    /// with it.
+    pull_view_lag_pending: Mutex<std::collections::HashSet<Url>>,
     /// Allocator for [`Self::pull_view_lag`] serials. Process-wide (not
     /// per-host) so a close/reopen can never re-mint an already-captured
     /// value.
@@ -647,15 +656,6 @@ struct HostCoverage {
     /// The `current` value a pull was last answered against (a lower bound — read
     /// before the pull's fold, so never ahead of what the editor actually received).
     served: u64,
-}
-
-/// A provisional pull-view lag record (see
-/// [`DiagnosticAggregator::record_pull_view_lag`]): the minted serial plus
-/// the previous serial it displaced, which a retraction must restore.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct ProvisionalPullViewLag {
-    serial: u64,
-    previous: Option<u64>,
 }
 
 /// The diagnostic coverage observed when a pull begins.
@@ -1188,58 +1188,56 @@ impl DiagnosticAggregator {
             .lock()
             .recover_poison("DiagnosticAggregator::pull_view_lag")
             .remove(host);
+        self.pull_view_lag_pending
+            .lock()
+            .recover_poison("DiagnosticAggregator::pull_view_lag_pending")
+            .remove(host);
     }
 
-    /// Record that `host`'s merged set is ABOUT to move through an
-    /// editor-origin, nudge-less republish (see the [`Self::pull_view_lag`]
-    /// field doc). Recorded BEFORE the republish, deliberately: the per-host
-    /// republish lock serializes the recorder's republish against the
-    /// forwarded-refresh prefetch's own commit, so record-before-republish
-    /// guarantees any change visible to the prefetch's compare had its lag
-    /// visible to the cycle's decision sweep first — the linearization that
-    /// makes the absorption race-free. A republish that turns out Unchanged
-    /// retracts its provisional record via
-    /// [`Self::retract_pull_view_lag`]. A repeat record re-stamps the entry
-    /// with a fresh serial, so an in-flight pull that started before it
-    /// cannot clear it. Returns the provisional record — serial plus the
-    /// PREVIOUS serial it displaced — for the retraction: a retraction must
-    /// restore that predecessor, never bare-remove, or a provisional
-    /// re-stamp followed by an Unchanged republish would erase an older,
-    /// still-owed lag.
-    pub(crate) fn record_pull_view_lag(&self, host: &Url) -> ProvisionalPullViewLag {
+    /// Mark that a nudge-less writer is ABOUT to mutate `host`'s slots (see
+    /// the [`Self::pull_view_lag`] field doc). The mark is set BEFORE the
+    /// mutation and converted into a confirmed lag by **whichever republish
+    /// records the resulting Changed set**
+    /// ([`Self::convert_pending_pull_view_lag`], called under the per-host
+    /// republish lock at the compare-and-record point) — not by the writer
+    /// itself. That closes both halves of the confirmation race: a stale-wire
+    /// retry (or any concurrent republish) that consumes the changed revision
+    /// converts the mark, and a writer preempted anywhere between its
+    /// mutation and its own republish has already made the mark visible. A
+    /// mutation that never changes the merged set leaves a sticky mark; a
+    /// LATER Changed republish then converts it into one spurious nudge —
+    /// the safe direction, cleared by the covering pull.
+    pub(crate) fn mark_pull_view_lag_pending(&self, host: &Url) {
+        self.pull_view_lag_pending
+            .lock()
+            .recover_poison("DiagnosticAggregator::pull_view_lag_pending")
+            .insert(host.clone());
+    }
+
+    /// Convert an outstanding pending mark into a confirmed lag. Called by
+    /// `republish` immediately after `published_set_changed_current_revision`
+    /// returns `Some(true)`, while the per-host republish lock is held — the
+    /// same serialization that orders every same-host republish, which is
+    /// what makes the forwarded-refresh decision sweep a linearization point:
+    /// any change the prefetch's Unchanged-compare could have observed was
+    /// recorded by an earlier (lock-ordered) Changed republish, whose
+    /// conversion made the lag visible before the sweep.
+    pub(crate) fn convert_pending_pull_view_lag(&self, host: &Url) {
+        let removed = self
+            .pull_view_lag_pending
+            .lock()
+            .recover_poison("DiagnosticAggregator::pull_view_lag_pending")
+            .remove(host);
+        if !removed {
+            return;
+        }
         let serial = self
             .next_pull_view_lag_serial
             .fetch_add(1, Ordering::Relaxed);
-        let previous = self
-            .pull_view_lag
+        self.pull_view_lag
             .lock()
             .recover_poison("DiagnosticAggregator::pull_view_lag")
             .insert(host.clone(), serial);
-        ProvisionalPullViewLag { serial, previous }
-    }
-
-    /// Retract a provisional lag record whose republish reported Unchanged:
-    /// restore the serial it displaced (an older lag is still owed a nudge)
-    /// or remove the entry when there was none — but only when no NEWER
-    /// record re-stamped the entry meanwhile (that newer recorder's own
-    /// retraction/confirmation owns it now). Restoring the OLDER serial keeps
-    /// pull stamps sound: a covering pull that captured the provisional
-    /// serial at entry may clear the restored (older) one.
-    pub(crate) fn retract_pull_view_lag(&self, host: &Url, provisional: ProvisionalPullViewLag) {
-        let mut lags = self
-            .pull_view_lag
-            .lock()
-            .recover_poison("DiagnosticAggregator::pull_view_lag");
-        if lags.get(host) == Some(&provisional.serial) {
-            match provisional.previous {
-                Some(previous) => {
-                    lags.insert(host.clone(), previous);
-                }
-                None => {
-                    lags.remove(host);
-                }
-            }
-        }
     }
 
     /// Whether `host` carries an outstanding pull-view lag — the recorded set
