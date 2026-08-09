@@ -2255,13 +2255,6 @@ impl DiagnosticAggregator {
 
 #[cfg(test)]
 mod tests {
-    /// Lock-order pin for `has_pull_view_lag`: a pending-only host must be
-    /// answerable from the pending lock alone (pending → confirmed nesting,
-    /// pending read first with a short-circuit). The pre-fix implementation
-    /// acquired the confirmed lock FIRST, so with that lock held here it
-    /// would block forever — this test turns red (timeout) if the read order
-    /// regresses, which is exactly the order whose two unlocked halves let a
-    /// settle hide mid-transition.
     /// Qodo review finding (PR #972): a NO-OP nudgeless mutation (identical
     /// blob, or evicting an absent layer — no revision bump) must not stamp a
     /// pending mark, or an unrelated later Changed republish converts it into
@@ -2298,6 +2291,13 @@ mod tests {
         );
     }
 
+    /// Lock-order pin for `has_pull_view_lag`: a pending-only host must be
+    /// answerable from the pending lock alone (pending → confirmed nesting,
+    /// pending read first with a short-circuit). The pre-fix implementation
+    /// acquired the confirmed lock FIRST, so with that lock held here it
+    /// would block forever — this test turns red (timeout) if the read order
+    /// regresses, which is exactly the order whose two unlocked halves let a
+    /// settle hide mid-transition.
     #[test]
     fn pending_only_lag_is_answerable_without_the_confirmed_lock() {
         use super::*;
