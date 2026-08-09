@@ -493,6 +493,79 @@ mod tests {
         assert!(parsed["result"].is_object());
     }
 
+    /// A downstream that exits cleanly closes stdout; the reader must report
+    /// that as EOF, not as a framing error. The old message ("missing
+    /// Content-Length header") sent crash triage down the wrong path: it read
+    /// as protocol desync when the process had simply died (observed with a
+    /// basedpyright crash under load — and every clean shutdown logged the
+    /// same misleading warning).
+    #[tokio::test]
+    async fn read_message_reports_eof_when_downstream_closes_stdout() {
+        // `true` writes nothing and exits: a clean close before any message.
+        let cmd = vec!["true".to_string()];
+        let mut conn = AsyncBridgeConnection::spawn(cmd)
+            .await
+            .expect("spawn should succeed");
+
+        let err = conn
+            .read_message()
+            .await
+            .expect_err("EOF must surface as an error");
+        assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
+        assert!(
+            err.to_string().contains("closed stdout"),
+            "EOF must not masquerade as a framing error: {err}"
+        );
+    }
+
+    /// EOF in the middle of a header block is a truncated frame (the process
+    /// died mid-write) — still EOF, but named as truncation.
+    #[tokio::test]
+    async fn read_message_reports_truncated_frame_on_eof_mid_headers() {
+        let cmd = vec![
+            "sh".to_string(),
+            "-c".to_string(),
+            "printf 'Content-Length: 10\\r\\n'".to_string(),
+        ];
+        let mut conn = AsyncBridgeConnection::spawn(cmd)
+            .await
+            .expect("spawn should succeed");
+
+        let err = conn
+            .read_message()
+            .await
+            .expect_err("a truncated header block must surface as an error");
+        assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
+        assert!(
+            err.to_string().contains("mid-headers"),
+            "mid-frame EOF should be named as truncation: {err}"
+        );
+    }
+
+    /// A COMPLETE header block (terminated by its empty line) that lacks
+    /// Content-Length is the one genuine framing error — the message is kept
+    /// for exactly this case.
+    #[tokio::test]
+    async fn read_message_keeps_framing_error_for_headers_without_content_length() {
+        let cmd = vec![
+            "sh".to_string(),
+            "-c".to_string(),
+            "printf 'X-Whatever: 1\\r\\n\\r\\n'".to_string(),
+        ];
+        let mut conn = AsyncBridgeConnection::spawn(cmd)
+            .await
+            .expect("spawn should succeed");
+
+        let err = conn
+            .read_message()
+            .await
+            .expect_err("a header block without Content-Length must fail");
+        assert!(
+            err.to_string().contains("missing Content-Length header"),
+            "genuine framing errors keep the framing message: {err}"
+        );
+    }
+
     /// Integration test: Initialize lua-language-server and verify response
     #[tokio::test]
     async fn initialize_lua_language_server() {
