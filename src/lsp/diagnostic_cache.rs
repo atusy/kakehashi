@@ -2257,6 +2257,42 @@ mod tests {
     /// would block forever — this test turns red (timeout) if the read order
     /// regresses, which is exactly the order whose two unlocked halves let a
     /// settle hide mid-transition.
+    /// Qodo review finding (PR #972): a NO-OP nudgeless mutation (identical
+    /// blob, or evicting an absent layer — no revision bump) must not stamp a
+    /// pending mark, or an unrelated later Changed republish converts it into
+    /// a spurious confirmed lag that keeps forcing nudges until a covering
+    /// pull.
+    #[test]
+    fn a_no_op_nudgeless_mutation_mints_no_lag_from_an_unrelated_change() {
+        use super::*;
+        let agg = DiagnosticAggregator::new();
+        let host = Url::parse("file:///no_op_nudgeless.md").unwrap();
+
+        // No-op evict: no PullLayer exists.
+        agg.evict_pull_layer_nudgeless(&host);
+        let (_, revision) = agg.snapshot_with_revision(&host);
+        // An unrelated Changed republish settling at the current revision…
+        agg.settle_pending_pull_view_lag(&host, revision, true);
+        assert!(
+            !agg.has_pull_view_lag(&host),
+            "an absent-layer evict changed nothing — no lag may be minted"
+        );
+
+        // No-op set: identical blob twice. Settle the REAL first change away
+        // (as its own republish would), then repeat it verbatim.
+        agg.set_pull_layer_nudgeless(&host, Vec::new());
+        let (_, revision) = agg.snapshot_with_revision(&host);
+        agg.settle_pending_pull_view_lag(&host, revision, true);
+        agg.clear_pull_view_lag(&host);
+        agg.set_pull_layer_nudgeless(&host, Vec::new());
+        let (_, revision) = agg.snapshot_with_revision(&host);
+        agg.settle_pending_pull_view_lag(&host, revision, true);
+        assert!(
+            !agg.has_pull_view_lag(&host),
+            "an identical re-commit changed nothing — no lag may be minted"
+        );
+    }
+
     #[test]
     fn pending_only_lag_is_answerable_without_the_confirmed_lock() {
         use super::*;
