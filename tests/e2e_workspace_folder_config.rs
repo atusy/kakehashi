@@ -17,6 +17,7 @@ mod helpers;
 use helpers::lsp_client::LspClient;
 use helpers::lsp_polling::poll_until;
 use serde_json::json;
+use std::time::Duration;
 use tempfile::TempDir;
 
 /// A directory holding a project config whose `searchPaths` names it.
@@ -389,4 +390,78 @@ fn test_folder_change_preserves_client_layers() {
         json!(222),
         "the client layers must survive a project-layer reload: {settings}"
     );
+}
+
+/// `--config-file` skips the whole reload transaction, but a folder change
+/// must still publish the new root: it is what anchors a later relative-path
+/// push. This branch has no settings-level effect of its own to poll for —
+/// unlike the general path, it never reloads — so it can't be proven via
+/// `poll_search_paths` the way the tests above are. The barrier here is the
+/// forced `workspace/diagnostic/refresh` request instead: it is sent only
+/// after `set_root_path`, in the same synchronous function body, so seeing it
+/// arrive is proof the root already moved before the push below reads it.
+#[test]
+fn test_config_file_folder_change_anchors_a_later_push_to_the_new_root() {
+    let config_dir = TempDir::new().unwrap();
+    let config_path = config_dir.path().join("override.toml");
+    std::fs::write(&config_path, "autoInstall = false\n").unwrap();
+
+    let folder_a = TempDir::new().unwrap();
+    let folder_b = TempDir::new().unwrap();
+
+    let mut client = LspClient::builder()
+        .arg("--config-file")
+        .arg(config_path.to_str().unwrap())
+        .env_remove("KAKEHASHI_DATA_DIR")
+        .build();
+    client.send_request(
+        "initialize",
+        json!({
+            "processId": std::process::id(),
+            "rootUri": null,
+            "workspaceFolders": [folder(&folder_a, "a")],
+            "capabilities": {
+                "workspace": { "diagnostics": { "refreshSupport": true } }
+            }
+        }),
+    );
+    client.send_notification("initialized", json!({}));
+
+    client.send_notification(
+        "workspace/didChangeWorkspaceFolders",
+        json!({
+            "event": {
+                "added": [folder(&folder_b, "b")],
+                "removed": [folder(&folder_a, "a")],
+            }
+        }),
+    );
+
+    // Proves `set_root_path(folder_b)` already ran: the config-file branch
+    // sends this request only after that call, in the same function body.
+    let (refresh_id, _) = client
+        .wait_for_server_request("workspace/diagnostic/refresh", Duration::from_secs(15))
+        .expect("a folder change under --config-file must still nudge a pull-mode editor");
+    client.send_response(refresh_id, json!(null));
+
+    client.send_notification(
+        "workspace/didChangeConfiguration",
+        json!({ "settings": { "kakehashi": { "searchPaths": ["./libs"] } } }),
+    );
+
+    let expected = folder_b.path().join("libs");
+    let settled = poll_until(20, 100, || {
+        let settings = query_effective_settings(&mut client);
+        (settings["searchPaths"] == json!([expected.to_str().unwrap()])).then_some(settings)
+    });
+    assert!(
+        settled.is_some(),
+        "a relative path pushed after the folder change must anchor to the new root \
+         (folder_b), not the session's original root (folder_a) or the launch \
+         directory; last seen: {}",
+        query_effective_settings(&mut client)["searchPaths"]
+    );
+
+    client.send_request("shutdown", json!(null));
+    client.send_notification("exit", json!(null));
 }
