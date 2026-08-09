@@ -1630,6 +1630,141 @@ mod tests {
         );
     }
 
+    /// The publish wire SEAL (`layers.aggregation."textDocument/publishDiagnostics"
+    /// .priorities = []`, #685) is a documented pull-first setup whose delivery
+    /// signal IS the forwarded refresh. The seal narrows only the
+    /// publishDiagnostics-keyed prefetch surface — the editor's re-pull
+    /// resolves under `textDocument/diagnostic` and is unsealed — so the
+    /// prefetch cannot vouch and the forced send must survive. Review finding
+    /// (adversarial sweep, HIGH): absorbing here made the sealed config
+    /// permanently stale.
+    #[tokio::test]
+    async fn forwarded_refresh_still_sends_under_the_publish_seal() {
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+        server
+            .settings_manager
+            .set_capabilities(ClientCapabilities {
+                workspace: Some(WorkspaceClientCapabilities {
+                    diagnostics: Some(DiagnosticWorkspaceClientCapabilities {
+                        refresh_support: Some(true),
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            });
+        register_rust(server);
+        server
+            .settings_manager
+            .apply_settings(rust_settings_with_publish_seal());
+
+        let uri = Url::parse("file:///test/sealed_host.rs").unwrap();
+        server.documents.insert(
+            uri.clone(),
+            "fn main() {}".to_string(),
+            Some("rust".to_string()),
+            None,
+        );
+        server
+            .parse_coordinator()
+            .parse_document(uri.clone(), Some("rust"), None)
+            .await;
+
+        let publisher = DiagnosticPublisher::new(server);
+        // Seed a recorded (empty) published set first: without it the cycle's
+        // very first republish compares against nothing and reports Changed,
+        // which would make this test pass without exercising the divergence
+        // flag at all (a first commit always nudges).
+        publisher.publish_pull_layer(&uri, Vec::new()).await;
+        publisher.request_forwarded_diagnostic_refresh();
+
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        while server.diagnostics.metrics_snapshot().refreshes_sent == 0
+            && tokio::time::Instant::now() < deadline
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            server.diagnostics.metrics_snapshot().refreshes_sent,
+            1,
+            "the seal narrows only the prefetch surface, not the editor's re-pull — \
+             the forwarded refresh is the sealed setup's delivery signal and must survive"
+        );
+    }
+
+    /// Per-method aggregation divergence: an empty server selection keyed ONLY
+    /// under `textDocument/publishDiagnostics` empties the prefetch's fan-out
+    /// while the editor's `textDocument/diagnostic` fan-out keeps its default —
+    /// the prefetch surface is narrower, so the forced send must survive.
+    #[tokio::test]
+    async fn forwarded_refresh_still_sends_when_publish_selection_diverges() {
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+        server
+            .settings_manager
+            .set_capabilities(ClientCapabilities {
+                workspace: Some(WorkspaceClientCapabilities {
+                    diagnostics: Some(DiagnosticWorkspaceClientCapabilities {
+                        refresh_support: Some(true),
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            });
+        register_rust(server);
+        let mut settings = rust_settings(true);
+        let lang = settings
+            .languages
+            .get_mut("rust")
+            .expect("rust_settings defines the rust language");
+        let bridge = lang
+            .bridge
+            .as_mut()
+            .expect("rust_settings configures the _self bridge");
+        bridge
+            .get_mut(HOST_BRIDGE_KEY)
+            .expect("rust_settings configures the _self bridge")
+            .aggregation = Some(HashMap::from([(
+            "textDocument/publishDiagnostics".to_string(),
+            crate::config::settings::AggregationConfig {
+                priorities: Some(Vec::new()),
+                ..Default::default()
+            },
+        )]));
+        server.settings_manager.apply_settings(settings);
+
+        let uri = Url::parse("file:///test/diverged_host.rs").unwrap();
+        server.documents.insert(
+            uri.clone(),
+            "fn main() {}".to_string(),
+            Some("rust".to_string()),
+            None,
+        );
+        server
+            .parse_coordinator()
+            .parse_document(uri.clone(), Some("rust"), None)
+            .await;
+
+        let publisher = DiagnosticPublisher::new(server);
+        // Seed a recorded set so the cycle's republish can genuinely report
+        // Unchanged (see the seal test above for why).
+        publisher.publish_pull_layer(&uri, Vec::new()).await;
+        publisher.request_forwarded_diagnostic_refresh();
+
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        while server.diagnostics.metrics_snapshot().refreshes_sent == 0
+            && tokio::time::Instant::now() < deadline
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            server.diagnostics.metrics_snapshot().refreshes_sent,
+            1,
+            "a publishDiagnostics-only empty selection narrows the prefetch below \
+             the editor's diagnostic-keyed fan-out — the forced send must survive"
+        );
+    }
+
     /// Safe direction: when `pullFallback = false` gates a pull-eligible layer
     /// out of the prefetch, the prefetch canNOT stand in for the editor's
     /// re-pull (the editor's live fan-out still pulls that layer), so the
@@ -1684,6 +1819,9 @@ mod tests {
             .await;
 
         let publisher = DiagnosticPublisher::new(server);
+        // Seed a recorded set so the send below can only come from the
+        // narrower_than_editor_pull flag, not from a first-commit Changed.
+        publisher.publish_pull_layer(&uri, Vec::new()).await;
         publisher.request_forwarded_diagnostic_refresh();
 
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
