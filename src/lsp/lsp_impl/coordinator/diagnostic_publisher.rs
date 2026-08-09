@@ -371,6 +371,18 @@ impl DiagnosticPublisher {
                 return false;
             }
             self.aggregator.mark_forwarded_refresh_covered(generation);
+        } else if summary.needs_editor_nudge()
+            && self.aggregator.forwarded_refresh_epoch_covered(generation)
+        {
+            // The epoch cover only proves ANOTHER refresh was sent after this
+            // activity — its induced re-pull can have answered before this
+            // cycle's prefetch committed, leaving the editor on the
+            // pre-commit set with no later signal owed. With a changed or
+            // lagged summary, coalesce a compensating forced nudge into the
+            // refresh single-flight (at worst one redundant re-pull answered
+            // `unchanged`); an absorbed summary keeps trusting the cover.
+            let _ = self.request_pull_diagnostic_refresh_inner(true, false);
+            self.aggregator.mark_forwarded_refresh_covered(generation);
         }
         true
     }

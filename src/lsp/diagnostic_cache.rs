@@ -916,6 +916,27 @@ impl DiagnosticAggregator {
             && debounce.refresh_epoch == debounce.refresh_epoch_at_last_activity
     }
 
+    /// Whether `generation` was suppressed ONLY by the epoch cover — an
+    /// intervening refresh from another origin was sent after this activity,
+    /// so [`Self::forwarded_refresh_needs_editor_send`] treats the cycle as
+    /// already nudged. That cover is a heuristic about ORDER: the intervening
+    /// refresh's induced re-pull can have answered BEFORE this cycle's
+    /// prefetch committed, in which case the editor holds the pre-commit set
+    /// and no later signal is guaranteed. A cycle whose prefetch produced a
+    /// changed/lagged summary uses this to coalesce a compensating forced
+    /// nudge into the refresh single-flight instead of trusting the cover.
+    /// Distinct from a GENERATION mismatch, where newer downstream activity
+    /// owns a fresh cycle (and prefetch) of its own — no compensation there.
+    pub(crate) fn forwarded_refresh_epoch_covered(&self, generation: u64) -> bool {
+        let debounce = self
+            .forwarded_refresh_debounce
+            .lock()
+            .recover_poison("DiagnosticAggregator::forwarded_refresh_debounce");
+        debounce.generation == generation
+            && debounce.covered_generation != Some(generation)
+            && debounce.refresh_epoch != debounce.refresh_epoch_at_last_activity
+    }
+
     pub(crate) fn new() -> Self {
         Self::default()
     }
