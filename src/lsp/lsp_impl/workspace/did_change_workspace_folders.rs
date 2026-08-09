@@ -104,3 +104,91 @@ impl Kakehashi {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tower_lsp_server::LspService;
+    use tower_lsp_server::ls_types::{WorkspaceFolder, WorkspaceFoldersChangeEvent};
+
+    /// An event naming neither an addition nor a removal describes no change
+    /// of project: `apply_workspace_folder_change` already reports as much
+    /// (see `pool.rs`), and this handler owns the expensive half of reacting
+    /// to a folder change — the settings reload, which invalidates every open
+    /// document's parse tree and pushes a workspace-wide
+    /// `semanticTokens/refresh`. Paying that cost for a notification that
+    /// changed nothing is wasteful.
+    ///
+    /// Asserted via the settings snapshot's own identity rather than a new
+    /// counter: `apply_raw_settings_locked` always publishes a fresh `Arc`
+    /// through `SettingsManager::apply_settings_with_raw`, regardless of
+    /// whether the content actually differs (see `apply_shared_settings_locked`
+    /// in `lsp_impl.rs`), so an unmoved pointer is proof the whole reload
+    /// transaction — `load_settings`, `WorkspaceSettings::try_from_settings`,
+    /// `apply_raw_settings_locked` — never ran.
+    ///
+    /// Bounded so a regression fails on the assertion rather than hanging: an
+    /// unskipped reload reaches client notifications this harness's unused
+    /// `_socket` never drains.
+    #[tokio::test]
+    async fn an_empty_folder_event_does_not_reload_settings() {
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+        let before = server.settings_manager.load_settings_pair();
+
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            server.did_change_workspace_folders_impl(DidChangeWorkspaceFoldersParams {
+                event: WorkspaceFoldersChangeEvent {
+                    added: Vec::new(),
+                    removed: Vec::new(),
+                },
+            }),
+        )
+        .await
+        .expect("an event that names no folder must return without a reload");
+
+        let after = server.settings_manager.load_settings_pair();
+        assert!(
+            Arc::ptr_eq(&before, &after),
+            "an event that names no folder must not run the settings-reload \
+             transaction at all"
+        );
+    }
+
+    /// Regression guard for the branch above: a real folder change must still
+    /// reach the reload. `WorkspaceSettings::try_from_settings` succeeds for
+    /// the default settings this session starts with, so the `Ok` arm runs
+    /// `apply_raw_settings_locked`, which republishes a fresh snapshot even
+    /// though its *content* is unchanged from the default.
+    #[tokio::test]
+    async fn a_non_empty_folder_event_still_reloads_settings() {
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+        let before = server.settings_manager.load_settings_pair();
+
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            server.did_change_workspace_folders_impl(DidChangeWorkspaceFoldersParams {
+                event: WorkspaceFoldersChangeEvent {
+                    added: vec![WorkspaceFolder {
+                        uri: "file:///added".parse().unwrap(),
+                        name: "added".to_string(),
+                    }],
+                    removed: Vec::new(),
+                },
+            }),
+        )
+        .await
+        .expect("a real folder change must not hang the reload");
+
+        let after = server.settings_manager.load_settings_pair();
+        assert!(
+            !Arc::ptr_eq(&before, &after),
+            "a real folder change must still run the settings-reload transaction"
+        );
+    }
+}
