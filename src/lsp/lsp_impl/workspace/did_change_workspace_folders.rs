@@ -282,13 +282,20 @@ mod tests {
         // handler finish WITHOUT ever mutating the pool (e.g. a `return`
         // introduced ahead of the pool call) would still resolve the timeout
         // as `Ok`, passing an assertion that only checked `is_ok()`.
+        //
+        // Re-checked on completion rather than returning `false` outright: a
+        // single poll of `&mut handler` can run the mutation AND reach
+        // completion together when nothing in between actually blocks (CI
+        // caught this — the pool mutation and the return happened in the
+        // same poll often enough there to make the pre-completion check at
+        // the top of the loop lose the race every time).
         let moved = tokio::time::timeout(std::time::Duration::from_secs(2), async {
             loop {
                 if server.bridge.pool().workspace_folders().is_some() {
                     return true;
                 }
                 tokio::select! {
-                    () = &mut handler => return false,
+                    () = &mut handler => return server.bridge.pool().workspace_folders().is_some(),
                     () = tokio::time::sleep(std::time::Duration::from_millis(5)) => {}
                 }
             }
