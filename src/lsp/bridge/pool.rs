@@ -683,11 +683,28 @@ impl LanguageServerPool {
 
     /// Update the upstream client workspace snapshot used by future
     /// client-fallback downstream connections.
+    ///
+    /// Returns whether the event described a change at all, so the caller
+    /// (`did_change_workspace_folders_impl`) can skip the settings reload it
+    /// owns for an event this function already found to be a no-op, instead
+    /// of duplicating the emptiness check.
     pub(crate) async fn apply_workspace_folder_change(
         &self,
         added: Vec<tower_lsp_server::ls_types::WorkspaceFolder>,
         removed: &[tower_lsp_server::ls_types::WorkspaceFolder],
-    ) {
+    ) -> bool {
+        // An event naming neither an addition nor a removal describes no
+        // change: `WorkspaceFolderSet::apply_change` is a no-op for it, so the
+        // client workspace snapshot cannot move. Returning here rather than
+        // letting the body run unconditionally matters beyond that snapshot,
+        // though — the recycle loop below does not look at the event either,
+        // so without this guard a folder-change-incapable fallback would be
+        // invalidated, recycled, and armed for re-open over a notification
+        // that named nothing.
+        if added.is_empty() && removed.is_empty() {
+            return false;
+        }
+
         self.workspace_folders.apply_change(added.clone(), removed);
         self.set_root_uri(
             self.workspace_folders()
@@ -752,6 +769,7 @@ impl LanguageServerPool {
         for (key, handle) in stale_handles {
             shutdown_invalidated_connection(key, handle);
         }
+        true
     }
 
     /// Set the upstream client capabilities.
@@ -3557,6 +3575,46 @@ mod tests {
             pool.pending_reopen.claim(&capable_key).is_none(),
             "a connection that took the notification keeps its documents open"
         );
+    }
+
+    /// An event naming neither an addition nor a removal describes no change:
+    /// nothing about the client's workspace moved. Recycling a
+    /// folder-change-incapable fallback anyway — which the capability check
+    /// below does unconditionally, without looking at the event it is
+    /// reacting to — costs a respawn and a re-open storm for a notification
+    /// that said nothing.
+    #[tokio::test]
+    async fn workspace_folder_change_skips_recycling_for_an_empty_event() {
+        let pool = LanguageServerPool::new();
+        let key = ConnectionKey::for_server("fallback");
+        let handle = create_handle_with_key(ConnectionState::Ready, key.clone()).await;
+        // No capabilities set: an incapable fallback, the shape the recycle
+        // branch claims for a real (non-empty) event.
+        handle.set_server_capabilities(Default::default());
+        pool.insert_connection(Arc::clone(&handle)).await;
+        let original = tower_lsp_server::ls_types::WorkspaceFolder {
+            uri: "file:///original".parse().unwrap(),
+            name: "original".to_string(),
+        };
+        pool.set_root_uri(Some(original.uri.to_string()));
+        pool.set_workspace_folders(Some(vec![original.clone()]));
+
+        pool.apply_workspace_folder_change(Vec::new(), &[]).await;
+
+        assert!(
+            pool.connections.lock().await.contains_key(&key),
+            "an event that names no folder must not recycle an incapable fallback"
+        );
+        assert!(
+            pool.pending_reopen.claim(&key).is_none(),
+            "and must not arm it for a re-open it never earned"
+        );
+        assert_eq!(
+            pool.root_uri(),
+            Some("file:///original".to_string()),
+            "and must not touch the client workspace snapshot"
+        );
+        assert_eq!(pool.workspace_folders(), Some(vec![original]));
     }
 
     #[tokio::test]
