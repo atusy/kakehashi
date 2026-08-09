@@ -559,6 +559,58 @@ mod tests {
         );
     }
 
+    /// A dying gasp of a lone `\r` (a separator cut before its `\n`) must not
+    /// read as a complete empty line: that resurrects the phantom
+    /// "missing Content-Length header" on a 1-byte window of a crashing
+    /// process. Only a newline-terminated empty line ends the header block.
+    #[tokio::test]
+    async fn read_message_reports_eof_on_a_truncated_separator() {
+        let cmd = vec![
+            "sh".to_string(),
+            "-c".to_string(),
+            "printf 'Content-Length: 10\\r\\n\\r'".to_string(),
+        ];
+        let mut conn = AsyncBridgeConnection::spawn(cmd)
+            .await
+            .expect("spawn should succeed");
+
+        let err = conn
+            .read_message()
+            .await
+            .expect_err("a truncated separator must surface as an error");
+        assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
+        assert!(
+            err.to_string().contains("mid-headers"),
+            "a separator cut before its newline is a truncated frame, \
+             not a framing error: {err}"
+        );
+    }
+
+    /// A process dying mid-body keeps the UnexpectedEof kind but previously
+    /// surfaced tokio's generic "early eof" — name it like the header-side
+    /// classifications so crash triage reads uniformly.
+    #[tokio::test]
+    async fn read_message_names_the_closed_stdout_on_a_truncated_body() {
+        let cmd = vec![
+            "sh".to_string(),
+            "-c".to_string(),
+            "printf 'Content-Length: 100\\r\\n\\r\\nshort'".to_string(),
+        ];
+        let mut conn = AsyncBridgeConnection::spawn(cmd)
+            .await
+            .expect("spawn should succeed");
+
+        let err = conn
+            .read_message()
+            .await
+            .expect_err("a truncated body must surface as an error");
+        assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
+        assert!(
+            err.to_string().contains("mid-body"),
+            "mid-body EOF should carry the classification naming: {err}"
+        );
+    }
+
     /// A COMPLETE header block (terminated by its empty line) that lacks
     /// Content-Length is the one genuine framing error — the message is kept
     /// for exactly this case.
