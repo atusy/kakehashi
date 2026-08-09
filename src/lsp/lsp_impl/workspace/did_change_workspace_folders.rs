@@ -26,13 +26,27 @@ impl Kakehashi {
         // let a push anchor against the old root after the workspace has
         // already moved. The lock order is reload-then-connections on every
         // path that takes both, since the settings reload also reaches the
-        // bridge.
+        // bridge. Taken even for an event that may turn out to name no
+        // folder: the pool's own emptiness check below returns before it
+        // ever reaches `connections`, so nothing is held across that check.
         let reload = lock_settings_reload().await;
 
-        self.bridge
+        // The pool owns the definition of "this event changed something" and
+        // reports it, so this reload cannot drift from that definition by
+        // duplicating its own emptiness check. An event that named no folder
+        // moved no project: re-deriving the settings root from it would drop
+        // the project config layer for a session whose folder list is empty,
+        // and reparsing every open document plus a semantic-tokens refresh is
+        // a high price for a notification that said nothing.
+        if !self
+            .bridge
             .pool()
             .apply_workspace_folder_change(added, &removed)
-            .await;
+            .await
+        {
+            drop(reload);
+            return;
+        }
 
         // An emptied folder list does not leave the session rootless when the
         // client named another root: the rungs below `workspaceFolders` answer,
