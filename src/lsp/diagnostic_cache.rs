@@ -1367,17 +1367,21 @@ impl DiagnosticAggregator {
     /// stay confirmed-only ([`Self::pull_view_lag_stamp`]): a pull must never
     /// clear what is not yet confirmed.
     pub(crate) fn has_pull_view_lag(&self, host: &Url) -> bool {
-        if self
-            .pull_view_lag
+        // Both maps are read under BOTH locks in the fixed pending → confirmed
+        // order shared with `settle_pending_pull_view_lag` and
+        // `forget_published`: two sequential single-lock reads could straddle
+        // a settle (pending removed, confirmed inserted) and see NEITHER —
+        // absorbing past a real lag mid-transition.
+        let pending = self
+            .pull_view_lag_pending
             .lock()
-            .recover_poison("DiagnosticAggregator::pull_view_lag")
-            .contains_key(host)
-        {
+            .recover_poison("DiagnosticAggregator::pull_view_lag_pending");
+        if pending.contains_key(host) {
             return true;
         }
-        self.pull_view_lag_pending
+        self.pull_view_lag
             .lock()
-            .recover_poison("DiagnosticAggregator::pull_view_lag_pending")
+            .recover_poison("DiagnosticAggregator::pull_view_lag")
             .contains_key(host)
     }
 
@@ -2232,6 +2236,47 @@ impl DiagnosticAggregator {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn pull_view_lag_is_visible_across_the_settle_transition_states() {
+        use super::*;
+        let agg = DiagnosticAggregator::new();
+        let host = Url::parse("file:///lag_states.md").unwrap();
+
+        // Pending-only (writer parked before its republish).
+        agg.set_pull_layer_nudgeless(&host, Vec::new());
+        assert!(
+            agg.has_pull_view_lag(&host),
+            "pending mark must read as lag"
+        );
+        assert!(
+            agg.pull_view_lag_stamp(&host).is_none(),
+            "a pull must not be able to clear an unconfirmed mark"
+        );
+
+        // Confirmed (a Changed republish settled it).
+        let (_, revision) = agg.snapshot_with_revision(&host);
+        agg.settle_pending_pull_view_lag(&host, revision, true);
+        assert!(
+            agg.has_pull_view_lag(&host),
+            "confirmed lag must read as lag"
+        );
+        let stamp = agg.pull_view_lag_stamp(&host);
+        assert!(
+            stamp.is_some(),
+            "a confirmed lag is clearable by a covering pull"
+        );
+
+        // Cleared by the covering pull.
+        agg.clear_pull_view_lag_up_to(&host, stamp);
+        assert!(!agg.has_pull_view_lag(&host));
+
+        // Unchanged settles drop the mark without minting a lag.
+        agg.set_pull_layer_nudgeless(&host, Vec::new());
+        let (_, revision) = agg.snapshot_with_revision(&host);
+        agg.settle_pending_pull_view_lag(&host, revision, false);
+        assert!(!agg.has_pull_view_lag(&host));
+    }
+
     use super::*;
     use tower_lsp_server::ls_types::{Position, Range};
 
