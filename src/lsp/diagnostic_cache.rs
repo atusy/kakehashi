@@ -1110,6 +1110,21 @@ impl DiagnosticAggregator {
         cache.get(host).is_some_and(has_live_region_slots)
     }
 
+    /// Whether `host`'s cached `PullLayer` blob holds any diagnostics. The
+    /// degraded-pull guard consults this alongside [`Self::has_region_slots`]:
+    /// a tree-less pull answers without the virt layer entirely, so cached
+    /// pull-layer content (a pull-only server's home — it never has push
+    /// slots) is exactly what such an answer is missing. An empty blob has
+    /// nothing to miss.
+    pub(crate) fn has_nonempty_pull_layer(&self, host: &Url) -> bool {
+        let cache = self.lock();
+        cache.get(host).is_some_and(|slots| {
+            slots
+                .get(&DiagnosticSource::PullLayer)
+                .is_some_and(|servers| servers.values().any(|slot| !slot.diagnostics.is_empty()))
+        })
+    }
+
     /// Drop everything for a host (host `didClose`). Returns whether it existed.
     pub(crate) fn evict_host(&self, host: &Url) -> bool {
         let mut revisions = self

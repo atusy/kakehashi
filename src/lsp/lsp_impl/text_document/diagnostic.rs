@@ -397,8 +397,15 @@ impl Kakehashi {
         // client back to a full view, instead of the gap being masked until
         // the next edit. The predicate mirrors `republish`'s `needs_geometry`
         // (non-empty region slots only).
-        let degraded_virt =
-            virt_enabled && snapshot.is_none() && self.diagnostics.has_region_slots(&uri);
+        // Missing-virt evidence for a tree-less answer: cached Region push
+        // slots (mirrors `republish`'s `needs_geometry`) OR a non-empty
+        // cached PullLayer — a pull-only injected server's diagnostics live
+        // only there, and this answer's virt layer silently skipped them
+        // just the same.
+        let degraded_virt = virt_enabled
+            && snapshot.is_none()
+            && (self.diagnostics.has_region_slots(&uri)
+                || self.diagnostics.has_nonempty_pull_layer(&uri));
 
         // The editor is about to receive the current merged set: advance `served` to
         // the version captured at entry, so the refresh gate stops treating those
