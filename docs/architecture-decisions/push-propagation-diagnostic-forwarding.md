@@ -235,6 +235,14 @@ from that:
   pre-change set, and an answer crossing the fence resolves to an empty layer
   with nothing scheduled to repopulate it.
 
+Known gap (#965): these four rules fence the *pull*-diagnostic lineage only.
+A still-alive client-fallback connection's cached *push* diagnostics — folded
+into a pull response by `fold_push_fallback_diagnostics` (pushFallback, #425)
+— are not evicted by a folder change, so a push-only downstream's stale
+diagnostics can survive it until that server next pushes on its own
+initiative. Left open because the fix needs the same kind of keying/
+lock-ordering decision #932 does, not because the gap is disputed.
+
 ### Per-server source and fallback
 
 Each downstream server has exactly one *native* diagnostic source, decided by
