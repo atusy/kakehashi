@@ -5,7 +5,7 @@ use crate::config::unknown_keys::{
     unknown_workspace_setting_keys,
 };
 use serde_json::Value;
-use tower_lsp_server::ls_types::DidChangeConfigurationParams;
+use tower_lsp_server::ls_types::{ConfigurationItem, DidChangeConfigurationParams};
 
 use crate::config::{RawWorkspaceSettings, WorkspaceSettings, merge_workspace_settings};
 
@@ -71,6 +71,18 @@ fn kakehashi_targeted_payload(object: serde_json::Map<String, Value>) -> serde_j
     Value::Object(object)
 }
 
+/// Whether a pushed `settings` says nothing at all — `null`, or an object with
+/// no keys. Distinct from a payload that mentions only settings kakehashi does
+/// not own, which is a statement about other servers and still says nothing
+/// about this one, but which the unknown-key path reports on.
+fn carries_no_payload(settings: &Value) -> bool {
+    match settings {
+        Value::Null => true,
+        Value::Object(object) => object.is_empty(),
+        _ => false,
+    }
+}
+
 fn format_rejected_keys(keys: &[String]) -> String {
     keys.iter()
         .map(|key| format!("`{key}`"))
@@ -89,9 +101,214 @@ fn is_kakehashi_workspace_entry(key: &str, value: &Value) -> bool {
     is_workspace_setting_key_or_typo(key)
 }
 
+/// Holds the single-flight claim for the duration of one pull, releasing it on
+/// every exit path including the timeout and shutdown arms.
+struct SingleFlightPull<'a>(&'a std::sync::atomic::AtomicBool);
+
+impl<'a> SingleFlightPull<'a> {
+    fn claim(flag: &'a std::sync::atomic::AtomicBool) -> Option<Self> {
+        // `then`, not `then_some`: the latter builds its argument eagerly, so a
+        // failed claim would construct a guard, drop it, and release the flag
+        // it never held — leaving no single-flight at all.
+        (!flag.swap(true, std::sync::atomic::Ordering::AcqRel)).then(|| Self(flag))
+    }
+}
+
+impl Drop for SingleFlightPull<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, std::sync::atomic::Ordering::Release);
+    }
+}
+
+/// How long to wait for the client to answer `workspace/configuration`.
+///
+/// The await lives in a service future the server joins on, so an answer that
+/// never comes must not be waited for indefinitely. Generous, because the cost
+/// of giving up early is a session running on file settings alone.
+const CONFIGURATION_PULL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// How a client-supplied configuration reached kakehashi.
+///
+/// Only used to describe it back to the user: the two arrive by different
+/// routes, and a message naming the wrong one sends people looking for a
+/// notification they never sent.
+#[derive(Clone, Copy)]
+pub(crate) enum ConfigurationIngress {
+    /// The client pushed `workspace/didChangeConfiguration`.
+    Push,
+    /// kakehashi asked, via `workspace/configuration`.
+    Pull,
+}
+
+impl ConfigurationIngress {
+    fn describe(self) -> &'static str {
+        match self {
+            Self::Push => "workspace/didChangeConfiguration",
+            Self::Pull => "the configuration read from the client",
+        }
+    }
+
+    /// What to say once the layer is in effect. A pull runs at startup for
+    /// every capable client, where "Configuration updated!" would describe an
+    /// event the user did not cause.
+    fn applied_message(self) -> &'static str {
+        match self {
+            Self::Push => "Configuration updated!",
+            Self::Pull => "Applied the configuration read from the client",
+        }
+    }
+}
+
 impl Kakehashi {
+    /// Ask the client for its `kakehashi` section and apply what comes back.
+    ///
+    /// Editors that send `didChangeConfiguration` with no usable `settings`
+    /// (VS Code most prominently) expect the server to pull instead. The
+    /// answer is not a delta and not a snapshot of kakehashi's own state — it
+    /// is the client's configuration, which is one layer among the rest, so it
+    /// is applied exactly as a push of the same section would be. Nothing
+    /// supersedes anything: the layer is appended in arrival order like any
+    /// other (#734).
+    ///
+    /// The item carries no `scopeUri`, which asks for the client's global
+    /// settings. kakehashi resolves one effective settings snapshot for the
+    /// whole process, so naming a scope and then applying the answer
+    /// process-wide would silently promote one folder's configuration to
+    /// global. Asking unscoped asks for exactly what the single layer means;
+    /// scoped pull is the separate half of #952.
+    ///
+    /// The answer is trusted as authored: a field written as an empty container
+    /// clears the layer below, exactly as the same spelling would in a config
+    /// file. An editor that materializes `{}` as the default for a setting it
+    /// registers would therefore clear it for a user who configured nothing —
+    /// worth knowing before registering such a default, and the reason a pull
+    /// answer is not merged more leniently than a push.
+    ///
+    /// Those global settings are still anchored against the workspace root, as
+    /// a push is. Relative paths in a client's global configuration therefore
+    /// resolve against whichever workspace is open — accepted, because the
+    /// alternative leaves them resolving against the launch directory.
+    pub(crate) async fn pull_client_configuration(&self) {
+        if !self.settings_manager.supports_configuration_pull() {
+            return;
+        }
+
+        // One pull at a time, with a burst collapsed into at most one trailing
+        // pull. Startup pulls, and so does every no-payload notification, so
+        // two can be in flight at once — and since the reload lock is only
+        // taken once an answer arrives, the older answer could apply last and
+        // merge its snapshot over the newer one.
+        //
+        // Standing down is not enough on its own: the running pull may already
+        // have its answer when the user changes something, and dropping that
+        // trigger would lose the change until the next one. A rejected trigger
+        // is recorded instead, and whoever holds the claim runs one more pull
+        // before letting go.
+        loop {
+            {
+                let Some(_in_flight) = SingleFlightPull::claim(&self.configuration_pull_in_flight)
+                else {
+                    self.configuration_pull_pending
+                        .store(true, std::sync::atomic::Ordering::Release);
+                    return;
+                };
+                // Cleared inside the claim, so a trigger arriving during the
+                // request below is still seen by the trailing check.
+                self.configuration_pull_pending
+                    .store(false, std::sync::atomic::Ordering::Release);
+                self.pull_client_configuration_once().await;
+            }
+            if !self
+                .configuration_pull_pending
+                .swap(false, std::sync::atomic::Ordering::AcqRel)
+            {
+                return;
+            }
+        }
+    }
+
+    /// One round trip: ask, and apply whatever comes back.
+    async fn pull_client_configuration_once(&self) {
+        let items = vec![ConfigurationItem {
+            scope_uri: None,
+            section: Some("kakehashi".to_string()),
+        }];
+        // Bounded by shutdown: this await lives in the `initialized` service
+        // future, which the server joins on, so a client that never answers
+        // would keep `serve` from returning after `exit`. The SIGTERM handler
+        // rescues that on Unix and nothing does on Windows.
+        let answered = match tokio::select! {
+            // Biased, response first: `select!` is unbiased by default, so an
+            // answer that arrives in the same poll as the deadline could be
+            // thrown away. An answer that came is an answer.
+            biased;
+            result = self.client.configuration(items) => result,
+            () = self.shutdown_token.cancelled() => return,
+            () = tokio::time::sleep(CONFIGURATION_PULL_TIMEOUT) => {
+                self.notifier()
+                    .log_warning(
+                        "The client did not answer workspace/configuration in time; \
+                         keeping the settings already in effect"
+                            .to_string(),
+                    )
+                    .await;
+                return;
+            }
+        } {
+            Ok(values) => values,
+            Err(error) => {
+                // Leave the settings in effect alone: a failed pull is no
+                // answer, not an empty one.
+                self.notifier()
+                    .log_warning(format!(
+                        "Could not read configuration from the client: {error}"
+                    ))
+                    .await;
+                return;
+            }
+        };
+
+        // A missing element or `null` is the client saying it cannot provide a
+        // value for this item — no answer, so nothing changes. Anything else is
+        // an answer, including a malformed one: routing it through says so,
+        // where swallowing it would leave the user with a client that is
+        // answering wrongly and a server that looks like it never asked.
+        let section = match answered.into_iter().next() {
+            None | Some(Value::Null) => return,
+            Some(section) => section,
+        };
+
+        self.apply_client_configuration(
+            serde_json::json!({ "kakehashi": section }),
+            ConfigurationIngress::Pull,
+        )
+        .await;
+    }
+
     /// Handle workspace/didChangeConfiguration notification.
+    ///
+    /// A client that carries no usable payload is telling kakehashi that
+    /// something changed, not what — vscode-languageclient's canonical push is
+    /// `{"settings": null}`. When it can answer a pull, the notification is a
+    /// trigger and the answer is the content; when it cannot, there is nothing
+    /// to apply and nothing worth warning about.
+    ///
+    /// The trigger lives here rather than in `apply_client_configuration`, so
+    /// that applying a pulled answer cannot pull again.
     pub(crate) async fn did_change_configuration_impl(&self, params: DidChangeConfigurationParams) {
+        if carries_no_payload(&params.settings) {
+            if self.settings_manager.supports_configuration_pull() {
+                self.pull_client_configuration().await;
+            }
+            return;
+        }
+        self.apply_client_configuration(params.settings, ConfigurationIngress::Push)
+            .await;
+    }
+
+    /// Apply a client-supplied configuration layer, however it arrived.
+    async fn apply_client_configuration(&self, settings: Value, ingress: ConfigurationIngress) {
+        let params = DidChangeConfigurationParams { settings };
         let uses_deprecated_unwrapped_shape =
             uses_deprecated_unwrapped_didchange_shape(&params.settings);
         let (settings_value, unknown_keys) = settings_payload(params.settings);
@@ -132,13 +349,33 @@ impl Kakehashi {
         }
 
         if !unknown_keys.is_empty() {
-            self.notifier()
-                .log_warning(format!(
-                    "workspace/didChangeConfiguration rejected configuration update containing unknown or mixed-format key(s): {}",
-                    format_rejected_keys(&unknown_keys)
-                ))
-                .await;
-            return;
+            match ingress {
+                ConfigurationIngress::Push => {
+                    self.notifier()
+                        .log_warning(format!(
+                            "{} rejected configuration update containing unknown or mixed-format \
+                             key(s): {}",
+                            ingress.describe(),
+                            format_rejected_keys(&unknown_keys)
+                        ))
+                        .await;
+                    return;
+                }
+                // kakehashi asked for the whole section, so it also gets the
+                // keys the editor keeps there — `trace.server` is
+                // vscode-languageclient's near-universal convention, inside
+                // the very section being pulled. Rejecting the layer over one
+                // of those would make the pull useless for the editors it
+                // exists for; the keys are dropped by parsing instead.
+                ConfigurationIngress::Pull => {
+                    self.notifier()
+                        .log_info(format!(
+                            "Ignoring {} in the configuration read from the client",
+                            format_rejected_keys(&unknown_keys)
+                        ))
+                        .await;
+                }
+            }
         }
 
         if settings_value
@@ -228,7 +465,7 @@ impl Kakehashi {
                     .await;
                 drop(reload);
                 self.warn_on_misconfigured_settings(&warnings).await;
-                self.notifier().log_info("Configuration updated!").await;
+                self.notifier().log_info(ingress.applied_message()).await;
             }
             Err(errs) => {
                 drop(reload);
@@ -245,6 +482,58 @@ impl Kakehashi {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn single_flight_pull_admits_one_claim_at_a_time() {
+        use std::sync::atomic::AtomicBool;
+
+        let in_flight = AtomicBool::new(false);
+        let first = SingleFlightPull::claim(&in_flight).expect("the first pull runs");
+        assert!(
+            SingleFlightPull::claim(&in_flight).is_none(),
+            "a second pull must stand down: the one already running reads the \
+             same client state it would have asked for"
+        );
+
+        drop(first);
+        assert!(
+            SingleFlightPull::claim(&in_flight).is_some(),
+            "the claim is released on every exit path, including the timeout \
+             and shutdown arms"
+        );
+    }
+
+    /// The trailing-pull handshake: a trigger rejected while a pull is running
+    /// is recorded, and the running pull sees it after releasing — so a burst
+    /// collapses into one follow-up rather than being dropped.
+    #[test]
+    fn a_rejected_trigger_survives_as_one_trailing_pull() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let in_flight = AtomicBool::new(false);
+        let pending = AtomicBool::new(false);
+
+        let claim = SingleFlightPull::claim(&in_flight).expect("the first pull runs");
+        pending.store(false, Ordering::Release);
+
+        // Two triggers arrive while it is running; both stand down, both leave
+        // the same mark.
+        for _ in 0..2 {
+            assert!(SingleFlightPull::claim(&in_flight).is_none());
+            pending.store(true, Ordering::Release);
+        }
+
+        drop(claim);
+        assert!(
+            pending.swap(false, Ordering::AcqRel),
+            "the burst must leave exactly one follow-up behind"
+        );
+        assert!(
+            !pending.swap(false, Ordering::AcqRel),
+            "and only one — the trailing pull is not run per trigger"
+        );
+        assert!(SingleFlightPull::claim(&in_flight).is_some());
+    }
+
     use super::*;
 
     use std::future::Future;

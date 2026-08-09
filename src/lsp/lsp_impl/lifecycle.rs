@@ -770,6 +770,17 @@ impl Kakehashi {
                 editor_supports_apply_edit,
             ));
         }
+
+        // Ask a pull-capable client for its configuration now that the
+        // handshake is complete. Editors that send `didChangeConfiguration`
+        // with no usable `settings` have no other way to configure kakehashi
+        // past `initializationOptions`.
+        //
+        // Last, deliberately: this awaits a response from the client, and a
+        // client that is slow to answer — or never does — must not hold up the
+        // forwarding loops above. Nothing follows it, so the only thing such a
+        // client delays is its own configuration.
+        self.pull_client_configuration().await;
     }
 
     /// Arm a Unix-signal watcher that reaps the downstream server pool when

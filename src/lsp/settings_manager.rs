@@ -265,6 +265,19 @@ impl SettingsManager {
             .unwrap_or(false)
     }
 
+    /// Whether the client can answer a `workspace/configuration` request.
+    ///
+    /// Editors that send `didChangeConfiguration` with no usable `settings`
+    /// expect the server to pull instead; without the capability there is
+    /// nothing to pull from and the push is all there is.
+    pub(crate) fn supports_configuration_pull(&self) -> bool {
+        self.client_capabilities
+            .get()
+            .and_then(|caps| caps.workspace.as_ref())
+            .and_then(|workspace| workspace.configuration)
+            .unwrap_or(false)
+    }
+
     /// Returns true if client declared textDocument.semanticTokens.multilineTokenSupport.
     /// Returns false if initialize() hasn't been called yet (OnceLock is empty).
     ///
@@ -395,6 +408,35 @@ mod tests {
         assert!(manager.root_path().is_none());
         assert!(manager.client_capabilities().is_none());
         assert!(!manager.supports_semantic_tokens_refresh());
+    }
+
+    #[test]
+    fn configuration_pull_requires_the_client_capability() {
+        let manager = SettingsManager::new();
+        assert!(
+            !manager.supports_configuration_pull(),
+            "no capabilities yet means nothing to pull from"
+        );
+
+        let manager = SettingsManager::new();
+        manager.set_capabilities(ClientCapabilities {
+            workspace: Some(WorkspaceClientCapabilities {
+                configuration: Some(false),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        assert!(!manager.supports_configuration_pull());
+
+        let manager = SettingsManager::new();
+        manager.set_capabilities(ClientCapabilities {
+            workspace: Some(WorkspaceClientCapabilities {
+                configuration: Some(true),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        assert!(manager.supports_configuration_pull());
     }
 
     #[test]
