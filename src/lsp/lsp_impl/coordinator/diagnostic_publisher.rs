@@ -1213,13 +1213,17 @@ impl DiagnosticPublisher {
     /// ([`Self::publish_host_push`], [`Self::publish_region_push`]), the
     /// crash-driven eviction ([`Self::evict_connection_diagnostics`]), the
     /// upstream forwarding loop relaying a downstream server's own
-    /// `workspace/diagnostic/refresh` (`deliver_upstream_notification`), and the
+    /// `workspace/diagnostic/refresh` (`deliver_upstream_notification`), the
     /// reparse loop's post-parse backstop (and the pull-side TOCTOU guard) as
     /// **degraded-pull recovery** — a pull that raced the parse was answered
     /// without the region fold; the per-host debt keys the call, and it is
     /// FORCED past the coverage gate because the debt proves the client holds
     /// a non-covering answer the version-based gate cannot see (an edit-race
-    /// degradation leaves `served == current`) — never from the pull-origin republish
+    /// degradation leaves `served == current`) — and `workspace/didChangeWorkspaceFolders`
+    /// (`did_change_workspace_folders_impl`), FORCED for the same reason: a folder
+    /// change moves the project a downstream analyses without moving any document
+    /// version, so the coverage gate would otherwise suppress the very refresh that
+    /// change needs — never from the pull-origin republish
     /// ([`Self::publish_pull_layer`]) nor the editor-originated eviction paths
     /// ([`Self::clear_pull_layer`], [`Self::clear_host`]): those carry no *new*
     /// result the editor is unaware of — a pull-origin set is already the
