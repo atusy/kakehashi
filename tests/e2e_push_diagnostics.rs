@@ -1010,6 +1010,34 @@ fn e2e_downstream_refresh_with_unchanged_prefetch_is_absorbed() {
 }
 
 #[test]
+fn e2e_downstream_refresh_forwarded_when_editor_never_pulled() {
+    // Pull-view lag debt: the didOpen host-event pull commits the settled set
+    // into the cache WITHOUT any editor nudge (pull-origin commits never
+    // refresh, by design), and this editor has never pulled — so its pull
+    // namespace cannot hold that set. The refresh's prefetch then compares
+    // equal against kakehashi's OWN record, but that record is exactly the
+    // data the editor is missing: absorbing here would let the editor rot
+    // until the next edit. The debt recorded by the un-nudged commit must
+    // keep the forward alive; it is cleared only by a covering editor pull
+    // (see e2e_downstream_refresh_with_unchanged_prefetch_is_absorbed for
+    // the post-pull absorption arm).
+    let (mut client, _config_dir) =
+        init_client_with_mode_caps("diagnostics-refresh-settled", refresh_capable_caps());
+    open_host(&mut client);
+
+    let (refresh_id, _) = client
+        .wait_for_server_request("workspace/diagnostic/refresh", Duration::from_secs(15))
+        .expect(
+            "an un-nudged pull-layer commit the editor never pulled must keep \
+             the forwarded refresh alive (pull-view lag debt)",
+        );
+    client.send_response(refresh_id, json!(null));
+
+    client.send_request("shutdown", json!(null));
+    client.send_notification("exit", json!(null));
+}
+
+#[test]
 fn e2e_downstream_refresh_prefetches_before_forwarding() {
     let (mut client, _config_dir) =
         init_client_with_mode_caps("diagnostics-refresh-prefetch", refresh_capable_caps());
