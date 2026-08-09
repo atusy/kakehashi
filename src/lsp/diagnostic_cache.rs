@@ -466,13 +466,17 @@ pub(crate) struct DiagnosticAggregator {
     /// lifetime after a close raced the pull (#745's defect class) — carries
     /// a newer serial and survives the stale clear.
     pull_view_lag: Mutex<HashMap<Url, u64>>,
-    /// Nudge-less mutations announced but not yet confirmed by a Changed
-    /// republish (see [`Self::mark_pull_view_lag_pending`]). Deliberately
-    /// invisible to pull stamps and the decision sweep: only a mutation that
-    /// actually changed the recorded set owes the editor anything, and the
-    /// republish that records that change performs the conversion atomically
-    /// with it.
-    pull_view_lag_pending: Mutex<std::collections::HashSet<Url>>,
+    /// Nudge-less mutations performed but not yet settled by a recorded
+    /// republish, keyed to the CACHE REVISION current when the mutation
+    /// landed (stamped inside the same `cache_revisions` critical section —
+    /// see [`Self::set_pull_layer_nudgeless`]). The republish that validates
+    /// a revision `r` settles every mark with revision ≤ r: a Changed record
+    /// converts it into the confirmed lag, an Unchanged record drops it (the
+    /// mutation demonstrably left the merged set alone). Revision-keying is
+    /// what stops an unrelated earlier Changed from consuming a mark whose
+    /// mutation it never saw, and marks are deliberately invisible to pull
+    /// stamps and the decision sweep until confirmed.
+    pull_view_lag_pending: Mutex<HashMap<Url, u64>>,
     /// Allocator for [`Self::pull_view_lag`] serials. Process-wide (not
     /// per-host) so a close/reopen can never re-mint an already-captured
     /// value.
@@ -1039,6 +1043,10 @@ impl DiagnosticAggregator {
     ///
     /// The pull-layer is a cross-connection aggregate, not a single connection's
     /// push, so its slot is tagged `None` and is never touched by crash eviction.
+    /// Test-only since the production writers moved to
+    /// [`Self::set_pull_layer_nudgeless`] (which additionally stamps the
+    /// pending pull-view-lag mark in the same critical section).
+    #[cfg(test)]
     pub(crate) fn set_pull_layer(&self, host: &Url, diagnostics: Vec<Diagnostic>) {
         self.record(
             host,
@@ -1184,60 +1192,128 @@ impl DiagnosticAggregator {
             .lock()
             .recover_poison("DiagnosticAggregator::last_wire_published")
             .remove(host);
-        self.pull_view_lag
-            .lock()
-            .recover_poison("DiagnosticAggregator::pull_view_lag")
-            .remove(host);
-        self.pull_view_lag_pending
-            .lock()
-            .recover_poison("DiagnosticAggregator::pull_view_lag_pending")
-            .remove(host);
-    }
-
-    /// Mark that a nudge-less writer is ABOUT to mutate `host`'s slots (see
-    /// the [`Self::pull_view_lag`] field doc). The mark is set BEFORE the
-    /// mutation and converted into a confirmed lag by **whichever republish
-    /// records the resulting Changed set**
-    /// ([`Self::convert_pending_pull_view_lag`], called under the per-host
-    /// republish lock at the compare-and-record point) — not by the writer
-    /// itself. That closes both halves of the confirmation race: a stale-wire
-    /// retry (or any concurrent republish) that consumes the changed revision
-    /// converts the mark, and a writer preempted anywhere between its
-    /// mutation and its own republish has already made the mark visible. A
-    /// mutation that never changes the merged set leaves a sticky mark; a
-    /// LATER Changed republish then converts it into one spurious nudge —
-    /// the safe direction, cleared by the covering pull.
-    pub(crate) fn mark_pull_view_lag_pending(&self, host: &Url) {
-        self.pull_view_lag_pending
-            .lock()
-            .recover_poison("DiagnosticAggregator::pull_view_lag_pending")
-            .insert(host.clone());
-    }
-
-    /// Convert an outstanding pending mark into a confirmed lag. Called by
-    /// `republish` immediately after `published_set_changed_current_revision`
-    /// returns `Some(true)`, while the per-host republish lock is held — the
-    /// same serialization that orders every same-host republish, which is
-    /// what makes the forwarded-refresh decision sweep a linearization point:
-    /// any change the prefetch's Unchanged-compare could have observed was
-    /// recorded by an earlier (lock-ordered) Changed republish, whose
-    /// conversion made the lag visible before the sweep.
-    pub(crate) fn convert_pending_pull_view_lag(&self, host: &Url) {
-        let removed = self
+        // Pending and confirmed lag are cleared under BOTH locks, in the
+        // fixed pending → confirmed order shared with
+        // `settle_pending_pull_view_lag`, so a settle cannot interleave
+        // between the two removals and resurrect a closed host's lag.
+        let mut pending = self
             .pull_view_lag_pending
             .lock()
-            .recover_poison("DiagnosticAggregator::pull_view_lag_pending")
-            .remove(host);
-        if !removed {
-            return;
-        }
-        let serial = self
-            .next_pull_view_lag_serial
-            .fetch_add(1, Ordering::Relaxed);
+            .recover_poison("DiagnosticAggregator::pull_view_lag_pending");
+        pending.remove(host);
         self.pull_view_lag
             .lock()
             .recover_poison("DiagnosticAggregator::pull_view_lag")
-            .insert(host.clone(), serial);
+            .remove(host);
+        drop(pending);
+    }
+
+    /// Replace the pull-layer blob AND stamp the pending pull-view-lag mark
+    /// in one `cache_revisions` critical section — the nudge-less variant of
+    /// [`Self::set_pull_layer`] (see the [`Self::pull_view_lag_pending`]
+    /// field doc). Stamping atomically with the mutation ties the mark to
+    /// the exact revision carrying this data, so a republish can only settle
+    /// it once its validated snapshot INCLUDES the mutation.
+    pub(crate) fn set_pull_layer_nudgeless(&self, host: &Url, diagnostics: Vec<Diagnostic>) {
+        let mut revisions = self
+            .cache_revisions
+            .lock()
+            .recover_poison("DiagnosticAggregator::cache_revisions");
+        let mut cache = self.lock();
+        let source_slots = if let Some(source_slots) = cache.get_mut(host) {
+            source_slots
+        } else {
+            cache.entry(host.clone()).or_default()
+        };
+        let changed = source_slots
+            .get(&DiagnosticSource::PullLayer)
+            .and_then(|servers| servers.get(PULL_LAYER_SERVER))
+            .is_none_or(|slot| slot.diagnostics != diagnostics);
+        source_slots
+            .entry(DiagnosticSource::PullLayer)
+            .or_default()
+            .insert(
+                PULL_LAYER_SERVER.to_string(),
+                SlotEntry {
+                    diagnostics,
+                    connection_id: None,
+                },
+            );
+        if changed {
+            revisions.insert(host.clone(), self.allocate_cache_revision());
+        }
+        let revision = revisions.get(host).copied().unwrap_or(0);
+        self.pull_view_lag_pending
+            .lock()
+            .recover_poison("DiagnosticAggregator::pull_view_lag_pending")
+            .insert(host.clone(), revision);
+    }
+
+    /// Evict the pull-layer blob AND stamp the pending mark, like
+    /// [`Self::set_pull_layer_nudgeless`] — the nudge-less variant of
+    /// `evict_source(host, PullLayer)`.
+    pub(crate) fn evict_pull_layer_nudgeless(&self, host: &Url) {
+        let mut revisions = self
+            .cache_revisions
+            .lock()
+            .recover_poison("DiagnosticAggregator::cache_revisions");
+        let mut cache = self.lock();
+        let removed = if let Some(slots) = cache.get_mut(host) {
+            let removed = slots.remove(&DiagnosticSource::PullLayer).is_some();
+            if slots.is_empty() {
+                cache.remove(host);
+            }
+            removed
+        } else {
+            false
+        };
+        if removed {
+            revisions.insert(host.clone(), self.allocate_cache_revision());
+        }
+        let revision = revisions.get(host).copied().unwrap_or(0);
+        self.pull_view_lag_pending
+            .lock()
+            .recover_poison("DiagnosticAggregator::pull_view_lag_pending")
+            .insert(host.clone(), revision);
+    }
+
+    /// Settle any pending mark covered by the revision a republish just
+    /// validated (see the [`Self::pull_view_lag_pending`] field doc): a
+    /// Changed record converts it into the confirmed lag, an Unchanged
+    /// record drops it. Called by `republish` right after
+    /// `published_set_changed_current_revision` returns `Some(_)`, under the
+    /// per-host republish lock — that lock orders every same-host republish,
+    /// which is what makes the forwarded-refresh decision sweep a
+    /// linearization point. Both maps are locked in the fixed
+    /// pending → confirmed order (shared with [`Self::forget_published`]) so
+    /// a didClose cleanup can never interleave between the settle's two
+    /// halves and resurrect a closed host's lag.
+    pub(crate) fn settle_pending_pull_view_lag(
+        &self,
+        host: &Url,
+        cache_revision: u64,
+        changed: bool,
+    ) {
+        let mut pending = self
+            .pull_view_lag_pending
+            .lock()
+            .recover_poison("DiagnosticAggregator::pull_view_lag_pending");
+        let covered = pending
+            .get(host)
+            .is_some_and(|&revision| revision <= cache_revision);
+        if !covered {
+            return;
+        }
+        pending.remove(host);
+        if changed {
+            let serial = self
+                .next_pull_view_lag_serial
+                .fetch_add(1, Ordering::Relaxed);
+            self.pull_view_lag
+                .lock()
+                .recover_poison("DiagnosticAggregator::pull_view_lag")
+                .insert(host.clone(), serial);
+        }
     }
 
     /// Whether `host` carries an outstanding pull-view lag — the recorded set
