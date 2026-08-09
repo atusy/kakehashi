@@ -342,14 +342,15 @@ impl DiagnosticPublisher {
         }
         let mut summary = summary;
         // Read the pull-view lag at DECISION time, after the prefetch
-        // joined. This read is race-free against the nudge-less recorders
-        // because they record BEFORE their republish (see
-        // `record_pull_view_lag`): the per-host republish lock serializes a
-        // recorder's republish against this cycle's own prefetch commit, so
+        // joined. This read is race-free against the nudge-less writers
+        // because their marks are revision-stamped with the mutation and
+        // settled by whichever republish validates a covering revision (see
+        // `settle_pending_pull_view_lag`): the per-host republish lock
+        // serializes that settle against this cycle's own prefetch commit, so
         // any change the prefetch's Unchanged-compare could have observed had
-        // its lag visible here first; a recorder whose lag lands after this
-        // read also republishes after it — its change postdates the cycle and
-        // its (uncleared) lag is this same sweep's input next generation.
+        // its lag confirmed here first; a mutation landing after that compare
+        // is settled by a later republish — its change postdates the cycle
+        // and its lag is this same sweep's input next generation.
         summary.set_changed |= self
             .documents
             .open_uris()

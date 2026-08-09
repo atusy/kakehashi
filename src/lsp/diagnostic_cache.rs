@@ -445,8 +445,8 @@ pub(crate) struct DiagnosticAggregator {
     /// nudge-less** mutation (`publish_pull_layer`/`clear_pull_layer`, and
     /// the refresh prefetch's own commit) since the last **covering** editor
     /// pull — confirmed at the Changed republish that recorded the move (see
-    /// [`Self::mark_pull_view_lag_pending`] /
-    /// [`Self::convert_pending_pull_view_lag`]). Those writers never emit `workspace/diagnostic/refresh` (by
+    /// [`Self::set_pull_layer_nudgeless`] /
+    /// [`Self::settle_pending_pull_view_lag`]). Those writers never emit `workspace/diagnostic/refresh` (by
     /// design — they are normally paired with the editor's own event-driven
     /// pull), but that pairing is a race: the editor's pull can answer with
     /// the downstream's PRE-analysis state while the slower synthetic pull
