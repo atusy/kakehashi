@@ -966,19 +966,43 @@ fn open_host_with_text(client: &mut LspClient, text: &str) {
 }
 
 #[test]
-fn e2e_downstream_refresh_forwarded_to_refresh_capable_client() {
-    // #521: a downstream server's own `workspace/diagnostic/refresh` request is
-    // forwarded upstream to the editor. With a refresh-capable client the bridge
-    // relays it (the `diagnostics-refresh` mock fires one on didOpen).
+fn e2e_downstream_refresh_with_unchanged_prefetch_is_absorbed() {
+    // The refresh↔pull loop breaker: a downstream `workspace/diagnostic/refresh`
+    // whose prefetch commits a pull layer IDENTICAL to the cached one proves the
+    // editor's re-pull would answer `unchanged`, so the bridge absorbs the nudge
+    // instead of forwarding it. Forwarding it unconditionally closed a feedback
+    // loop on quiescent multi-region files: nudge → editor re-pull → downstream
+    // analysis → another downstream refresh → nudge, ~1 Hz forever with zero
+    // edits. (The forward-when-something-changed guarantee (#521) stays pinned
+    // by e2e_downstream_refresh_prefetches_before_forwarding and the ack-order/
+    // failure/stale tests, whose prefetches all end in a change or a coverage
+    // gap.)
     let (mut client, _config_dir) =
-        init_client_with_mode_caps("diagnostics-refresh", refresh_capable_caps());
+        init_client_with_mode_caps("diagnostics-refresh-settled", refresh_capable_caps());
     open_host(&mut client);
+
+    // The didOpen host-event pull commits the settled set first — the mock
+    // fires its refresh only 300 ms after answering that pull.
+    client
+        .wait_for_notification_where(
+            &["textDocument/publishDiagnostics"],
+            Duration::from_secs(15),
+            |params| {
+                params["diagnostics"].as_array().is_some_and(|diagnostics| {
+                    diagnostics.iter().any(|diagnostic| {
+                        diagnostic["message"] == json!("mock-diagnostic-refresh-settled")
+                    })
+                })
+            },
+        )
+        .expect("precondition: the didOpen pull layer is committed and published");
 
     assert!(
         client
-            .wait_for_server_request("workspace/diagnostic/refresh", Duration::from_secs(15))
-            .is_some(),
-        "a downstream's workspace/diagnostic/refresh must reach a refresh-capable editor (#521)"
+            .wait_for_server_request("workspace/diagnostic/refresh", Duration::from_millis(1500))
+            .is_none(),
+        "a refresh whose covering prefetch changed nothing must be absorbed, \
+         not forwarded (refresh↔pull loop)"
     );
 
     client.send_request("shutdown", json!(null));
@@ -1197,10 +1221,31 @@ fn e2e_downstream_refresh_preserves_unchanged_prefetch_results() {
     );
     open_host(&mut client);
 
-    let (refresh_id, _) = client
-        .wait_for_server_request("workspace/diagnostic/refresh", Duration::from_secs(5))
-        .expect("the unchanged prefetch must complete before forwarding");
-    client.send_response(refresh_id, json!(null));
+    // The completion signal is the committed pull layer's publish, NOT an
+    // editor refresh: the didOpen pull and the refresh prefetch race for the
+    // first commit, and on the arm where the didOpen pull wins the prefetch's
+    // `unchanged` report is absorbed without a forward (the loop breaker) —
+    // waiting on the refresh here would flake on exactly that arm.
+    client
+        .wait_for_notification_where(
+            &["textDocument/publishDiagnostics"],
+            Duration::from_secs(5),
+            |params| {
+                params["diagnostics"].as_array().is_some_and(|diagnostics| {
+                    diagnostics.iter().any(|diagnostic| {
+                        diagnostic["message"] == json!("mock-diagnostic-refresh-unchanged")
+                    })
+                })
+            },
+        )
+        .expect("the unchanged prefetch must preserve and publish the prior diagnostics");
+    // On the arm where the prefetch committed first, its change DID forward a
+    // refresh — answer it if present so shutdown is clean on both arms.
+    if let Some((refresh_id, _)) =
+        client.wait_for_server_request("workspace/diagnostic/refresh", Duration::from_millis(100))
+    {
+        client.send_response(refresh_id, json!(null));
+    }
 
     let pulled = client.send_request(
         "textDocument/diagnostic",

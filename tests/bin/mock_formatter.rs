@@ -73,6 +73,12 @@
 //! - `diagnostics-refresh` — sends a `workspace/diagnostic/refresh` server→client
 //!   request on `didOpen`. The bridge forwards it upstream to the editor; used to
 //!   prove that forward is capability-gated (#521).
+//! - `diagnostics-refresh-settled` — advertises pull diagnostics, answers every
+//!   pull with the SAME one-diagnostic set, and sends its refresh 300 ms after
+//!   answering the first pull. The bridge's prefetch then commits an identical
+//!   pull layer, so the editor nudge must be absorbed (the refresh↔pull loop
+//!   breaker); the post-answer delay makes the commit-before-prefetch order
+//!   deterministic.
 //! - `diagnostics-refresh-burst` — advertises pull diagnostics, sends generation
 //!   1's refresh on `didOpen`, then emits generations 2–10 after the first pull.
 //!   The editor-facing test keeps the leading refresh unacknowledged during that
@@ -225,6 +231,7 @@ fn main() {
                     | "diagnostics-refresh-prefetch-fail"
                     | "diagnostics-refresh-prefetch-stale"
                     | "diagnostics-refresh-prefetch-unchanged"
+                    | "diagnostics-refresh-settled"
                     | "diagnostics-refresh-burst"
                     | "diagnostics-push-pullcap" => json!({
                         "diagnosticProvider": {
@@ -999,8 +1006,8 @@ fn main() {
                 }
                 if mode == "diagnostics-refresh-prefetch-ack-order" {
                     diagnostic_generation += 1;
-                    respond(&mut writer, id, json!({ "kind": "full", "items": [] }));
                     if diagnostic_generation == 1 {
+                        respond(&mut writer, id, json!({ "kind": "full", "items": [] }));
                         request(&mut writer, json!(1000), "workspace/diagnostic/refresh");
                         match read_message(&mut reader) {
                             Some(reply) if reply.get("id") == Some(&json!(1000)) => {}
@@ -1008,6 +1015,56 @@ fn main() {
                                 "refresh prefetch started before its downstream ACK: {other:?}"
                             ),
                         }
+                    } else {
+                        // The prefetch pull (generation 2) answers with a CHANGED
+                        // set so the cycle keeps its editor-facing refresh — an
+                        // unchanged covering prefetch is absorbed by the bridge,
+                        // which would leave this test's completion signal unsent.
+                        respond(
+                            &mut writer,
+                            id,
+                            json!({
+                                "kind": "full",
+                                "items": [{
+                                    "range": {
+                                        "start": { "line": 0, "character": 0 },
+                                        "end": { "line": 0, "character": 1 }
+                                    },
+                                    "severity": 2,
+                                    "message": "mock-diagnostic-ack-order-changed"
+                                }]
+                            }),
+                        );
+                    }
+                    continue;
+                }
+                if mode == "diagnostics-refresh-settled" {
+                    diagnostic_generation += 1;
+                    // Every pull answers the SAME settled set, so the
+                    // forwarded-refresh prefetch commits an identical pull layer
+                    // and the bridge absorbs the editor nudge (the refresh↔pull
+                    // loop breaker). The refresh fires only AFTER the first
+                    // pull's answer (plus a settle delay), so the pull layer is
+                    // deterministically committed before the prefetch runs —
+                    // no first-commit race can mark the prefetch as a change.
+                    respond(
+                        &mut writer,
+                        id,
+                        json!({
+                            "kind": "full",
+                            "items": [{
+                                "range": {
+                                    "start": { "line": 0, "character": 0 },
+                                    "end": { "line": 0, "character": 1 }
+                                },
+                                "severity": 2,
+                                "message": "mock-diagnostic-refresh-settled"
+                            }]
+                        }),
+                    );
+                    if diagnostic_generation == 1 {
+                        std::thread::sleep(std::time::Duration::from_millis(300));
+                        request(&mut writer, json!(1000), "workspace/diagnostic/refresh");
                     }
                     continue;
                 }
