@@ -443,6 +443,8 @@ impl DiagnosticPublisher {
                             // The doc's coverage state is unknown — safe direction.
                             summary.coverage_incomplete = true;
                         }
+                        // Unreachable: `join_next` returns `None` only on an
+                        // empty set, and the loop guard checks `!is_empty()`.
                         None => {}
                     }
                 }
@@ -488,6 +490,11 @@ impl DiagnosticPublisher {
         }
 
         match outcome {
+            // Unreachable from the only caller (the prefetch always passes a
+            // `Some` snapshot, and `Skip` means "no snapshot"). Kept exhaustive
+            // deliberately: Skip ⇔ nothing to pull ⇔ the editor sees the same
+            // nothing — if a future caller reaches it, "covered" is its
+            // meaning, NOT a shortcut for "don't bother nudging".
             PullLayerOutcome::Skip => return ForwardedPrefetchSummary::default(),
             PullLayerOutcome::Clear => {
                 self.aggregator
@@ -1591,7 +1598,11 @@ mod tests {
     /// downstream refresh → forced nudge → pull → … at ~1 Hz on a quiescent
     /// file. With no open documents the prefetch vacuously covers everything,
     /// so no send may happen.
-    #[tokio::test]
+    // Paused time: with zero open documents the whole cycle is timer-free
+    // local work, so auto-advance fires only once every task (including the
+    // absorbed cycle) has run to completion — the `== 0` assert below is
+    // therefore ordering-deterministic, not a wall-clock race.
+    #[tokio::test(start_paused = true)]
     async fn forwarded_refresh_with_covering_unchanged_prefetch_sends_nothing() {
         let (service, _socket) = LspService::new(Kakehashi::new);
         let server = service.inner();
@@ -1616,6 +1627,82 @@ mod tests {
         assert_eq!(
             metrics.refreshes_sent, 0,
             "an unchanged covering prefetch must not nudge the editor (refresh↔pull loop)"
+        );
+    }
+
+    /// The #789 leading-edge timing pin, relocated from the deleted
+    /// unconditional-send test: when the leading cycle DOES send (here via the
+    /// pullFallback coverage gap), it must fire without waiting for the
+    /// debounce/settle timer. The whole chain (prefetch with a gated host →
+    /// Clear → republish → forced send) is timer-free local work, so under
+    /// paused time it completes within bounded yields at an unmoved clock.
+    #[tokio::test(start_paused = true)]
+    async fn forwarded_refresh_leading_cycle_sends_before_the_settle_window() {
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+        server
+            .settings_manager
+            .set_capabilities(ClientCapabilities {
+                workspace: Some(WorkspaceClientCapabilities {
+                    diagnostics: Some(DiagnosticWorkspaceClientCapabilities {
+                        refresh_support: Some(true),
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            });
+        register_rust(server);
+        let mut settings = rust_settings(true);
+        let lang = settings
+            .languages
+            .get_mut("rust")
+            .expect("rust_settings defines the rust language");
+        let bridge = lang
+            .bridge
+            .as_mut()
+            .expect("rust_settings configures the _self bridge");
+        bridge
+            .get_mut(HOST_BRIDGE_KEY)
+            .expect("rust_settings configures the _self bridge")
+            .aggregation = Some(HashMap::from([(
+            "textDocument/publishDiagnostics".to_string(),
+            crate::config::settings::AggregationConfig {
+                pull_fallback: Some(false),
+                ..Default::default()
+            },
+        )]));
+        server.settings_manager.apply_settings(settings);
+
+        let uri = Url::parse("file:///test/leading_edge_host.rs").unwrap();
+        server.documents.insert(
+            uri.clone(),
+            "fn main() {}".to_string(),
+            Some("rust".to_string()),
+            None,
+        );
+        server
+            .parse_coordinator()
+            .parse_document(uri.clone(), Some("rust"), None)
+            .await;
+
+        let publisher = DiagnosticPublisher::new(server);
+        publisher.publish_pull_layer(&uri, Vec::new()).await;
+        let before = tokio::time::Instant::now();
+        publisher.request_forwarded_diagnostic_refresh();
+
+        let mut yields = 0;
+        while server.diagnostics.metrics_snapshot().refreshes_sent == 0 {
+            yields += 1;
+            assert!(
+                yields < 10_000,
+                "the leading send must complete without any timer advance"
+            );
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            tokio::time::Instant::now(),
+            before,
+            "the leading forced send must not wait for the settle window"
         );
     }
 

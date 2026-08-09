@@ -1549,6 +1549,44 @@ print("hello")
             !snapshot.host_pull_enabled,
             "pullFallback = false disables the host pull (host_pull_enabled = false)"
         );
+        assert!(
+            snapshot.narrower_than_editor_pull,
+            "a pullFallback drop must mark the snapshot narrower than the editor's re-pull"
+        );
+    }
+
+    /// The absorption's load-bearing negative: a DEFAULT configuration (no
+    /// per-method overrides) resolves identically under
+    /// `textDocument/publishDiagnostics` and `textDocument/diagnostic`, so the
+    /// snapshot must NOT be flagged narrower — otherwise every default setup
+    /// would force the forwarded-refresh nudge and the refresh↔pull loop the
+    /// flag exists to break would be back for everyone.
+    #[tokio::test]
+    async fn prepare_diagnostic_snapshot_is_not_narrower_under_default_config() {
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+        configure_rust_self_host(server);
+
+        let uri = Url::parse("file:///test/host_default_not_narrower.rs").unwrap();
+        server.documents.insert(
+            uri.clone(),
+            "fn main() {}".to_string(),
+            Some("rust".to_string()),
+            None,
+        );
+        server
+            .parse_coordinator()
+            .parse_document(uri.clone(), Some("rust"), None)
+            .await;
+
+        let snapshot = server
+            .diagnostic_scheduler()
+            .prepare_diagnostic_snapshot(&uri)
+            .expect("a parsed _self-bridged doc yields a snapshot");
+        assert!(
+            !snapshot.narrower_than_editor_pull,
+            "identical per-method resolutions must not flag the snapshot narrower"
+        );
     }
 
     /// #489: in one-shot CLI mode no editor consumes a proactive

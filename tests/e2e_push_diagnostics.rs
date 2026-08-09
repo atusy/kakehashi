@@ -1015,6 +1015,9 @@ fn e2e_downstream_refresh_with_unchanged_prefetch_is_absorbed() {
         "precondition: the covering pull delivers the settled set: {pulled}"
     );
 
+    // The negative window must exceed the forwarded-refresh max-wait (1 s
+    // default: features.workspace_diagnostic_refresh.max_wait_ms) plus margin,
+    // so a wrongly-sent trailing refresh would still land inside it.
     assert!(
         client
             .wait_for_server_request("workspace/diagnostic/refresh", Duration::from_millis(1500))
