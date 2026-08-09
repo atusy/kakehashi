@@ -1769,6 +1769,82 @@ mod tests {
         );
     }
 
+    /// Behavior-level pin for the mid-flight reload guards (the per-commit
+    /// lineage check and the cycle-level fence): a settings reload landing
+    /// while the prefetch is in flight must force the send, whichever guard
+    /// catches it — deleting BOTH turns this red. The doc's edit lock is the
+    /// deterministic seam: the commit blocks on it, the reload lands, then
+    /// the commit resumes and must classify itself stale.
+    #[tokio::test]
+    async fn settings_reload_during_the_prefetch_forces_the_send() {
+        let (service, _socket) = LspService::new(Kakehashi::new);
+        let server = service.inner();
+        server
+            .settings_manager
+            .set_capabilities(ClientCapabilities {
+                workspace: Some(WorkspaceClientCapabilities {
+                    diagnostics: Some(DiagnosticWorkspaceClientCapabilities {
+                        refresh_support: Some(true),
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            });
+        register_rust(server);
+        server.settings_manager.apply_settings(rust_settings(true));
+
+        let uri = Url::parse("file:///test/reload_mid_prefetch.rs").unwrap();
+        server.documents.insert(
+            uri.clone(),
+            "fn main() {}".to_string(),
+            Some("rust".to_string()),
+            None,
+        );
+        server
+            .parse_coordinator()
+            .parse_document(uri.clone(), Some("rust"), None)
+            .await;
+        let publisher = DiagnosticPublisher::new(server);
+        // Establish a recorded set and clear the seed's lag so nothing but
+        // the reload guards can force the send below.
+        publisher.publish_pull_layer(&uri, Vec::new()).await;
+        server.diagnostics.clear_pull_view_lag(&uri);
+
+        // Park the commit on the edit lock, land the reload, release.
+        let edit_lock = server.documents.edit_lock(&uri);
+        let guard = edit_lock.lock().await;
+        let snapshot = server
+            .diagnostics
+            .begin_forwarded_refresh_debounce()
+            .expect("idle scheduler admits the cycle");
+        let cycle = {
+            let publisher = publisher.clone();
+            let generation = snapshot.generation;
+            tokio::spawn(
+                async move { publisher.complete_forwarded_refresh_cycle(generation).await },
+            )
+        };
+        // Let the cycle run up to the parked commit, then reload.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        server.settings_manager.apply_settings(rust_settings(true));
+        drop(guard);
+
+        assert!(cycle.await.expect("cycle task"), "the cycle must complete");
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        while server.diagnostics.metrics_snapshot().refreshes_sent == 0
+            && tokio::time::Instant::now() < deadline
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            server.diagnostics.metrics_snapshot().refreshes_sent,
+            1,
+            "a reload landing mid-prefetch means the cycle cannot vouch for the \
+             editor's (new-config) re-pull — the send must survive"
+        );
+        server.diagnostics.cancel_forwarded_refresh_debounce();
+    }
+
     /// A prefetch whose surface was resolved under settings that changed
     /// mid-flight cannot vouch for the editor's re-pull (the new config can
     /// have widened the surface), and nothing re-pulls after a pure config
