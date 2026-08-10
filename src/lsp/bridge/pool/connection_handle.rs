@@ -151,13 +151,40 @@ impl Drop for CancelOnDropGuard {
                     id: NumberOrString::Number(self.request_id.as_i64() as i32),
                 },
             );
-            let _ = handle.send_notification(notification);
-            log::debug!(
-                target: "kakehashi::bridge::cancel",
-                "[{}] cancelled abandoned downstream request {} on drop",
-                handle.key(),
-                self.request_id.as_i64()
-            );
+            match handle.send_notification(notification) {
+                NotificationSendResult::Queued => {
+                    log::debug!(
+                        target: "kakehashi::bridge::cancel",
+                        "[{}] cancelled abandoned downstream request {} on drop",
+                        handle.key(),
+                        self.request_id.as_i64()
+                    );
+                }
+                NotificationSendResult::QueueFull => {
+                    // No reserved control lane, deliberately: a full 4096-deep
+                    // queue means the writer is stalled far beyond anything
+                    // the request cap models — the connection is degenerate
+                    // and liveness/teardown will fail it. Say so honestly
+                    // instead of claiming the cancel went out.
+                    log::warn!(
+                        target: "kakehashi::bridge::cancel",
+                        "[{}] outbound queue full; cancel for abandoned request {} dropped",
+                        handle.key(),
+                        self.request_id.as_i64()
+                    );
+                }
+                NotificationSendResult::ChannelClosed
+                | NotificationSendResult::SerializationFailed => {
+                    // Writer gone (teardown) or unserializable (impossible for
+                    // CancelParams): nothing left to tell.
+                    log::debug!(
+                        target: "kakehashi::bridge::cancel",
+                        "[{}] cancel for abandoned request {} not sent (writer closed)",
+                        handle.key(),
+                        self.request_id.as_i64()
+                    );
+                }
+            }
         }
     }
 }
