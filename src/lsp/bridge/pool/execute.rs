@@ -714,6 +714,101 @@ mod tests {
         );
     }
 
+    /// A request abandoned by its answer deadline must tell the downstream to
+    /// stop (`$/cancelRequest`): the permit is released at expiry, so without
+    /// the cancel each expiry admits a NEW request while the downstream still
+    /// computes the abandoned one — the cap would bound kakehashi's waiters,
+    /// not the server's actual in-flight work (#974).
+    #[tokio::test]
+    async fn deadline_expiry_cancels_the_downstream_request() {
+        use crate::lsp::bridge::actor::{ResponseRouter, spawn_reader_task};
+        use crate::lsp::bridge::connection::AsyncBridgeConnection;
+        use crate::lsp::bridge::pool::DynamicCapabilityRegistry;
+        use tokio::sync::mpsc;
+
+        // Sink that records everything kakehashi writes, so the wire is
+        // observable after the fact.
+        let wire_capture = std::env::temp_dir().join(format!(
+            "kakehashi-cancel-on-deadline-{}.jsonl",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&wire_capture);
+        let mut conn = AsyncBridgeConnection::spawn(vec![
+            "sh".to_string(),
+            "-c".to_string(),
+            // No `exec`: sh must stay alive holding its own stdout pipe,
+            // otherwise the redirect drops the pipe's write end and the
+            // reader sees EOF (fail_all) instead of a silent downstream.
+            format!("cat > {}", wire_capture.display()),
+        ])
+        .await
+        .expect("spawn capture sink");
+        let (writer, reader) = conn.split();
+        let router = Arc::new(ResponseRouter::new());
+        let reader_handle = spawn_reader_task(reader, Arc::clone(&router));
+        let (tx, rx) = mpsc::channel(crate::lsp::bridge::actor::OUTBOUND_QUEUE_CAPACITY);
+        let handle = Arc::new(ConnectionHandle::with_state(
+            writer,
+            router,
+            reader_handle,
+            ConnectionState::Ready,
+            tx,
+            rx,
+            Arc::new(DynamicCapabilityRegistry::new()),
+            ConnectionKey::for_server("test-server"),
+            crate::lsp::bridge::WorkspaceFolderSet::new(None),
+            Arc::new(arc_swap::ArcSwapOption::empty()),
+            4,
+        ));
+        let pool = Arc::new(LanguageServerPool::new());
+        let host_uri = test_host_uri("cancel-on-deadline");
+        pool.open_host_incarnation(&host_uri, 1).await;
+        pool.insert_connection(Arc::clone(&handle)).await;
+
+        let probe = std::sync::OnceLock::new();
+        let error = pool
+            .execute_bridge_request_observed(
+                Arc::clone(&handle),
+                &host_uri,
+                "lua",
+                TEST_ULID_LUA_0,
+                &RegionOffset::new(0, 0),
+                "print('hello')",
+                None,
+                |_, request_id| {
+                    JsonRpcRequest::new(
+                        request_id.as_i64(),
+                        "test/request",
+                        serde_json::Value::Null,
+                    )
+                },
+                |_, _| (),
+                Some(&probe),
+                Some(std::time::Duration::from_millis(100)),
+            )
+            .await
+            .expect_err("the sink never answers, so the deadline must fire");
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut, "error: {error}");
+        let request_id = probe.get().expect("the request was sent").as_i64();
+
+        // The abandoned request's cancel must reach the wire.
+        let expected = format!("\"method\":\"$/cancelRequest\"");
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if let Ok(wire) = std::fs::read_to_string(&wire_capture)
+                    && wire.contains(&expected)
+                    && wire.contains(&format!("\"id\":{request_id}"))
+                {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("a deadline expiry must forward $/cancelRequest downstream");
+        let _ = std::fs::remove_file(&wire_capture);
+    }
+
     /// The #974 user requirement, pinned directly: a connection saturated to
     /// its in-flight cap must not delay requests to a DIFFERENT connection.
     /// Permits are per-connection and a parked task holds no shared lock, so
