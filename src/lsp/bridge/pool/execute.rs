@@ -268,6 +268,15 @@ impl LanguageServerPool {
                 {
                     Ok(response) => response,
                     Err(_) => {
+                        // The downstream is still computing the abandoned
+                        // request, and this return releases the permit — tell
+                        // it to stop, or each expiry would admit a NEW request
+                        // on top of the still-running one and the cap would
+                        // bound our waiters, not the server's in-flight work.
+                        // Sent BEFORE the unregister so the cancel mappings
+                        // are still consistent at send time; best-effort, like
+                        // every $/cancelRequest.
+                        let _ = self.send_cancel_notification(&handle, connection_key, request_id);
                         // wait_for_response's own cleanup branch never ran, so
                         // the router entry is still pending; router_guard stays
                         // ARMED and removes it on this early return.
@@ -792,11 +801,11 @@ mod tests {
         let request_id = probe.get().expect("the request was sent").as_i64();
 
         // The abandoned request's cancel must reach the wire.
-        let expected = format!("\"method\":\"$/cancelRequest\"");
+        let expected = "\"method\":\"$/cancelRequest\"";
         tokio::time::timeout(std::time::Duration::from_secs(2), async {
             loop {
                 if let Ok(wire) = std::fs::read_to_string(&wire_capture)
-                    && wire.contains(&expected)
+                    && wire.contains(expected)
                     && wire.contains(&format!("\"id\":{request_id}"))
                 {
                     break;

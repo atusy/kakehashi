@@ -579,6 +579,10 @@ impl LanguageServerPool {
                 {
                     Ok(response) => response,
                     Err(_) => {
+                        // Tell the downstream to stop computing the abandoned
+                        // request before this return releases the permit —
+                        // mirrors `execute_bridge_request_observed` (#974).
+                        let _ = self.send_cancel_notification(&handle, connection_key, request_id);
                         // Router entry still pending; router_guard stays ARMED
                         // and removes it on this early return.
                         if let Some(ref id) = upstream_request_id {

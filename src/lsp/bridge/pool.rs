@@ -3044,7 +3044,7 @@ impl LanguageServerPool {
     /// via the single-writer loop (ls-bridge-message-ordering). The pending
     /// entry stays in place: the server may still respond with a result or
     /// `REQUEST_CANCELLED` (-32800).
-    fn send_cancel_notification(
+    pub(in crate::lsp::bridge) fn send_cancel_notification(
         &self,
         handle: &ConnectionHandle,
         connection_key: &ConnectionKey,
