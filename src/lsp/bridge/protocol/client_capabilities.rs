@@ -402,11 +402,14 @@ fn merge_upstream_capabilities(
 /// Merge semantics are [`crate::config::merge::deep_merge_json`] — the same
 /// deep merge that combines the override across config layers.
 ///
-/// `general.positionEncodings` is stripped from the override with a warning:
-/// kakehashi's coordinate translation requires UTF-16, and an override there
-/// would silently corrupt every position in every bridged response. A
-/// non-object override is ignored with a warning — deep-merging it would
-/// replace the whole capabilities object.
+/// `general.positionEncodings` is protected: kakehashi's coordinate
+/// translation requires UTF-16, and an override there would silently corrupt
+/// every position in every bridged response. Enforced as a post-merge
+/// invariant — the baseline value is restored (with a warning) whatever shape
+/// the override took, so a non-object `general` replacing the subtree cannot
+/// bypass it the way an input filter could. A non-object override at the root
+/// is ignored with a warning — deep-merging it would replace the whole
+/// capabilities object.
 pub(super) fn apply_capability_override(
     capabilities: &mut serde_json::Value,
     override_json: &serde_json::Value,
@@ -418,19 +421,40 @@ pub(super) fn apply_capability_override(
         );
         return;
     }
-    let mut override_json = override_json.clone();
-    if let Some(general) = override_json
-        .get_mut("general")
-        .and_then(|general| general.as_object_mut())
-        && general.remove("positionEncodings").is_some()
-    {
-        log::warn!(
-            target: "kakehashi::bridge",
-            "clientCapabilities override of general.positionEncodings is ignored: \
-             kakehashi's coordinate translation requires UTF-16"
-        );
+    let baseline_encodings = capabilities.pointer("/general/positionEncodings").cloned();
+    let merged = crate::config::merge::deep_merge_json(capabilities, override_json);
+    *capabilities = merged;
+
+    let Some(baseline) = baseline_encodings else {
+        return;
+    };
+    if capabilities.pointer("/general/positionEncodings") == Some(&baseline) {
+        return;
     }
-    *capabilities = crate::config::merge::deep_merge_json(capabilities, &override_json);
+    log::warn!(
+        target: "kakehashi::bridge",
+        "clientCapabilities override cannot change general.positionEncodings: \
+         kakehashi's coordinate translation requires UTF-16; keeping {baseline}"
+    );
+    match capabilities.get_mut("general") {
+        Some(serde_json::Value::Object(general)) => {
+            general.insert("positionEncodings".to_string(), baseline);
+        }
+        // A non-object `general` from the override replaced the subtree; a
+        // scalar there is spec-invalid anyway, so rebuild the object around
+        // the load-bearing field.
+        Some(other) => {
+            *other = serde_json::json!({ "positionEncodings": baseline });
+        }
+        None => {
+            if let Some(capabilities) = capabilities.as_object_mut() {
+                capabilities.insert(
+                    "general".to_string(),
+                    serde_json::json!({ "positionEncodings": baseline }),
+                );
+            }
+        }
+    }
 }
 
 /// Build the client capabilities the bridge declares to downstream servers.
@@ -1137,6 +1161,54 @@ mod tests {
             capabilities.pointer("/window/workDoneProgress"),
             Some(&json!(false)),
             "the rest of the override must still apply"
+        );
+    }
+
+    /// The positionEncodings invariant must hold for every override shape,
+    /// not just an object-shaped `general`: a non-object `general` (or a JSON
+    /// null arriving via didChangeConfiguration) replaces the whole subtree in
+    /// a deep merge, which used to bypass an input-filter-style guard.
+    #[test]
+    fn position_encodings_survive_non_object_general_overrides() {
+        use serde_json::json;
+
+        for hostile_general in [json!("utf-8"), json!(null), json!(["utf-8"]), json!(5)] {
+            let merged = build_bridge_client_capabilities(None, true, false);
+            let mut capabilities = serde_json::to_value(&merged).unwrap();
+
+            apply_capability_override(
+                &mut capabilities,
+                &json!({"general": hostile_general, "window": {"workDoneProgress": false}}),
+            );
+
+            assert_eq!(
+                capabilities.pointer("/general/positionEncodings"),
+                Some(&json!(["utf-16"])),
+                "a non-object general ({hostile_general}) must not delete positionEncodings"
+            );
+            assert_eq!(
+                capabilities.pointer("/window/workDoneProgress"),
+                Some(&json!(false)),
+                "the rest of the override must still apply"
+            );
+        }
+    }
+
+    /// A non-object override at the root would replace the entire capabilities
+    /// object in a deep merge; it must be ignored wholesale.
+    #[test]
+    fn non_object_override_is_ignored() {
+        use serde_json::json;
+
+        let merged = build_bridge_client_capabilities(None, true, false);
+        let mut capabilities = serde_json::to_value(&merged).unwrap();
+        let untouched = capabilities.clone();
+
+        apply_capability_override(&mut capabilities, &json!("nope"));
+
+        assert_eq!(
+            capabilities, untouched,
+            "a scalar override must leave the advertised capabilities unchanged"
         );
     }
 
