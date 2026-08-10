@@ -1,6 +1,9 @@
 /target
 /deps
 __pycache__/
+# Raw per-pair sample dumps from benches/collect_semantic_pairs.py. The
+# committed evidence keeps summary.json, the manifests, and pair-*.txt.
+benches/results/*/pair-*.json
 
 # Nix
 /result
