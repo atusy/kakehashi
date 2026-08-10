@@ -1280,6 +1280,64 @@ mod tests {
         .expect("slot frees once the permit drops");
     }
 
+    /// A reader-death terminal state is DERIVED, not set: `state()` reports
+    /// `Failed` from `!router.is_accepting()` without any `set_state` call,
+    /// so the semaphore never gets its close. A permit granted on such a
+    /// connection must still come out as an error — in production the freed
+    /// permits of failed in-flight requests would otherwise hand parked
+    /// waiters a permit to a corpse, which they'd only discover at register.
+    #[tokio::test]
+    async fn acquire_after_router_terminal_errors_even_without_set_state() {
+        let mut conn = AsyncBridgeConnection::spawn(vec![
+            "sh".to_string(),
+            "-c".to_string(),
+            "cat > /dev/null".to_string(),
+        ])
+        .await
+        .expect("spawn sink");
+        let (writer, reader) = conn.split();
+        let router = Arc::new(ResponseRouter::new());
+        let reader_handle = spawn_reader_task(reader, Arc::clone(&router));
+        let (tx, rx) = mpsc::channel(OUTBOUND_QUEUE_CAPACITY);
+        let handle = Arc::new(ConnectionHandle::with_state(
+            writer,
+            Arc::clone(&router),
+            reader_handle,
+            ConnectionState::Ready,
+            tx,
+            rx,
+            default_dynamic_caps(),
+            ConnectionKey::for_server("reader-died"),
+            crate::lsp::bridge::WorkspaceFolderSet::new(None),
+            Arc::new(arc_swap::ArcSwapOption::empty()),
+            1,
+        ));
+
+        let held = handle
+            .acquire_request_slot()
+            .await
+            .expect("the only slot acquires while healthy");
+        let parked = {
+            let handle = Arc::clone(&handle);
+            tokio::spawn(async move { handle.acquire_request_slot().await })
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+
+        // Reader death: fail_all flips is_accepting without any set_state.
+        router.fail_all("test: reader died");
+        assert_eq!(handle.state(), ConnectionState::Failed, "derived terminal");
+
+        // The in-flight holder finishes (its oneshot failed) and frees the
+        // permit — the parked waiter must NOT be handed a permit to a corpse.
+        drop(held);
+        let result = tokio::time::timeout(std::time::Duration::from_secs(2), parked)
+            .await
+            .expect("waiter resolves promptly")
+            .expect("waiter task must not panic");
+        let error = result.expect_err("a derived-terminal connection must error, not acquire");
+        assert_eq!(error.kind(), std::io::ErrorKind::NotConnected);
+    }
+
     /// A connection leaving service (crash → `Failed`, teardown → `Closing`)
     /// must WAKE tasks parked on its request slots with an error (#974): the
     /// permits of a dead connection never free, so without this a parked
