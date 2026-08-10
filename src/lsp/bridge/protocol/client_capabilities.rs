@@ -554,11 +554,19 @@ pub(crate) fn capability_override_user_warnings(
             "clientCapabilities.general must be a table; general.positionEncodings stays utf-16"
                 .to_string(),
         ),
-        Some(general) if general.get("positionEncodings").is_some() => warnings.push(
-            "clientCapabilities cannot change general.positionEncodings \
-             (kakehashi's coordinate translation requires utf-16); keeping utf-16"
-                .to_string(),
-        ),
+        // An override restating the enforced utf-16 baseline is a no-op, not
+        // a conflict — warn only when the value would actually change.
+        Some(general)
+            if general
+                .get("positionEncodings")
+                .is_some_and(|encodings| encodings != &serde_json::json!(["utf-16"])) =>
+        {
+            warnings.push(
+                "clientCapabilities cannot change general.positionEncodings \
+                 (kakehashi's coordinate translation requires utf-16); keeping utf-16"
+                    .to_string(),
+            )
+        }
         _ => {}
     }
     if override_json
@@ -571,20 +579,35 @@ pub(crate) fn capability_override_user_warnings(
                 .to_string(),
         );
     }
-    if let Some(forced) = override_json
-        .pointer("/workspace/configuration")
-        .and_then(serde_json::Value::as_bool)
-        && forced != advertise_configuration
-    {
-        warnings.push(if forced {
-            "clientCapabilities forces workspace.configuration=true but this server has no \
-             settings to serve: every configuration pull will be answered null"
-                .to_string()
-        } else {
-            "clientCapabilities forces workspace.configuration=false while this server has \
-             settings: a pull-model server may never read them"
-                .to_string()
-        });
+    // The conflict check reasons about the EFFECTIVE post-merge value, not
+    // just a boolean leaf: a non-object `workspace` replaces the whole
+    // subtree, and `configuration: null`/scalar displaces the advertised
+    // `true` — both turn the capability off as surely as `false` does.
+    match override_json.get("workspace") {
+        Some(workspace) if !workspace.is_object() => warnings.push(
+            "clientCapabilities.workspace must be a table; replacing it wholesale drops every \
+             workspace capability kakehashi advertised"
+                .to_string(),
+        ),
+        Some(workspace) => {
+            let effective_on = workspace
+                .get("configuration")
+                .map(|value| value.as_bool() == Some(true));
+            if let Some(effective_on) = effective_on
+                && effective_on != advertise_configuration
+            {
+                warnings.push(if effective_on {
+                    "clientCapabilities forces workspace.configuration=true but this server has \
+                     no settings to serve: every configuration pull will be answered null"
+                        .to_string()
+                } else {
+                    "clientCapabilities overrides workspace.configuration away from true while \
+                     this server has settings: a pull-model server may never read them"
+                        .to_string()
+                });
+            }
+        }
+        None => {}
     }
     warnings
 }
@@ -1500,6 +1523,36 @@ mod tests {
             capability_override_user_warnings(&json!({"workspace": {"configuration": true}}), true)
                 .is_empty(),
             "configuration matching the gate is not a conflict"
+        );
+        assert!(
+            capability_override_user_warnings(
+                &json!({"general": {"positionEncodings": ["utf-16"]}}),
+                false
+            )
+            .is_empty(),
+            "restating the enforced utf-16 baseline is a no-op, not a conflict"
+        );
+
+        // The conflict check must see through non-boolean displacement, not
+        // just boolean leaves: null/scalar shapes turn the capability off too.
+        assert_eq!(
+            capability_override_user_warnings(&json!({"workspace": null}), true).len(),
+            1,
+            "a non-object workspace wholesale-drops advertised capabilities"
+        );
+        assert_eq!(
+            capability_override_user_warnings(&json!({"workspace": {"configuration": null}}), true)
+                .len(),
+            1,
+            "configuration:null displaces the advertised true as surely as false"
+        );
+        assert!(
+            capability_override_user_warnings(
+                &json!({"workspace": {"configuration": null}}),
+                false
+            )
+            .is_empty(),
+            "configuration:null where nothing was advertised changes nothing"
         );
     }
 
