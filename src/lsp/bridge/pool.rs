@@ -71,6 +71,7 @@ fn same_launch_config(
         languages: old_languages,
         initialization_options: old_initialization_options,
         settings: _,
+        client_capabilities: old_client_capabilities,
         workspace_markers: old_workspace_markers,
         on_type_formatting_triggers: old_on_type_formatting_triggers,
         prefer_shared_instance: _,
@@ -87,6 +88,7 @@ fn same_launch_config(
         languages: new_languages,
         initialization_options: new_initialization_options,
         settings: _,
+        client_capabilities: new_client_capabilities,
         workspace_markers: new_workspace_markers,
         on_type_formatting_triggers: new_on_type_formatting_triggers,
         prefer_shared_instance: _,
@@ -96,6 +98,7 @@ fn same_launch_config(
     old_cmd == new_cmd
         && old_languages == new_languages
         && old_initialization_options == new_initialization_options
+        && old_client_capabilities == new_client_capabilities
         && old_workspace_markers == new_workspace_markers
         && old_on_type_formatting_triggers == new_on_type_formatting_triggers
         && old.prefers_shared_instance() == new.prefers_shared_instance()
@@ -4427,6 +4430,7 @@ mod tests {
         crate::config::settings::BridgeServerConfig {
             prefer_shared_instance: Some(true),
             force_start: None,
+            client_capabilities: None,
             settings: None,
             ..devnull_config()
         }
@@ -5572,6 +5576,7 @@ mod tests {
             prefer_shared_instance: None,
             force_start: None,
             enabled: None,
+            client_capabilities: None,
             settings: None,
         };
 
@@ -9050,6 +9055,7 @@ mod tests {
         let lua =
             create_handle_with_key(ConnectionState::Ready, ConnectionKey::for_server("lua")).await;
         ra.record_launch_config(&crate::config::settings::BridgeServerConfig {
+            client_capabilities: None,
             settings: Some(json!({ "not-retained": true })),
             ..Default::default()
         });
@@ -9068,10 +9074,12 @@ mod tests {
         let pushed = pool
             .propagate_settings(move |name| match name {
                 "rust-analyzer" => Some(crate::config::settings::BridgeServerConfig {
+                    client_capabilities: None,
                     settings: Some(ra_value_for_resolve.clone()),
                     ..Default::default()
                 }),
                 "lua" => Some(crate::config::settings::BridgeServerConfig {
+                    client_capabilities: None,
                     settings: Some(lua_value_for_resolve.clone()),
                     ..Default::default()
                 }),
@@ -9100,10 +9108,12 @@ mod tests {
         let pushed_again = pool
             .propagate_settings(move |name| match name {
                 "rust-analyzer" => Some(crate::config::settings::BridgeServerConfig {
+                    client_capabilities: None,
                     settings: Some(ra_again.clone()),
                     ..Default::default()
                 }),
                 "lua" => Some(crate::config::settings::BridgeServerConfig {
+                    client_capabilities: None,
                     settings: Some(lua_again.clone()),
                     ..Default::default()
                 }),
@@ -9136,6 +9146,7 @@ mod tests {
         let pushed = pool
             .propagate_settings(move |_| {
                 Some(crate::config::settings::BridgeServerConfig {
+                    client_capabilities: None,
                     settings: Some(value_for_resolve.clone()),
                     ..Default::default()
                 })
@@ -9158,6 +9169,7 @@ mod tests {
         let pushed = pool
             .propagate_settings(|_| {
                 Some(crate::config::settings::BridgeServerConfig {
+                    client_capabilities: None,
                     settings: Some(serde_json::json!({ "x": 1 })),
                     ..Default::default()
                 })

@@ -2453,6 +2453,7 @@ mod tests {
                 prefer_shared_instance: None,
                 force_start: None,
                 enabled: None,
+                client_capabilities: None,
                 settings: None,
             },
         );
@@ -2486,6 +2487,7 @@ mod tests {
             prefer_shared_instance: None,
             force_start: None,
             enabled: None,
+            client_capabilities: None,
             settings: None,
         };
         let mut servers = HashMap::new();
@@ -2538,6 +2540,7 @@ mod tests {
                 prefer_shared_instance: None,
                 force_start: None,
                 enabled: None,
+                client_capabilities: None,
                 settings: None,
             },
         );
@@ -2553,6 +2556,7 @@ mod tests {
                 prefer_shared_instance: None,
                 force_start: None,
                 enabled: None,
+                client_capabilities: None,
                 settings: None,
             },
         );
@@ -2612,6 +2616,7 @@ mod tests {
                 prefer_shared_instance: None,
                 force_start: None,
                 enabled: None,
+                client_capabilities: None,
                 settings: None,
             },
         );
@@ -2661,6 +2666,7 @@ mod tests {
             prefer_shared_instance: None,
             force_start: None,
             enabled: None,
+            client_capabilities: None,
             settings: None,
         };
         let mut servers = HashMap::new();
@@ -2828,6 +2834,7 @@ mod tests {
                 prefer_shared_instance: None,
                 force_start: None,
                 enabled: None,
+                client_capabilities: None,
                 settings: None,
             },
         );
@@ -2871,6 +2878,7 @@ mod tests {
                 prefer_shared_instance: None,
                 force_start: None,
                 enabled: None,
+                client_capabilities: None,
                 settings: None,
             },
         );
@@ -2885,6 +2893,7 @@ mod tests {
                 prefer_shared_instance: None,
                 force_start: None,
                 enabled: None,
+                client_capabilities: None,
                 settings: None,
             },
         );
@@ -2946,6 +2955,7 @@ mod tests {
                 prefer_shared_instance: None,
                 force_start: None,
                 enabled: Some(false),
+                client_capabilities: None,
                 settings: None,
             },
         );
@@ -2960,6 +2970,7 @@ mod tests {
                 prefer_shared_instance: None,
                 force_start: None,
                 enabled: None,
+                client_capabilities: None,
                 settings: None,
             },
         );
@@ -3018,6 +3029,7 @@ mod tests {
                 prefer_shared_instance: None,
                 force_start: None,
                 enabled: Some(false),
+                client_capabilities: None,
                 settings: None,
             },
         );
@@ -3032,6 +3044,7 @@ mod tests {
                 prefer_shared_instance: None,
                 force_start: None,
                 enabled: Some(true),
+                client_capabilities: None,
                 settings: None,
             },
         );
@@ -3070,6 +3083,7 @@ mod tests {
                 prefer_shared_instance: None,
                 force_start: None,
                 enabled: None,
+                client_capabilities: None,
                 settings: None,
             },
         );
@@ -3084,6 +3098,7 @@ mod tests {
                 prefer_shared_instance: None,
                 force_start: None,
                 enabled: None,
+                client_capabilities: None,
                 settings: None,
             },
         );
@@ -3463,6 +3478,7 @@ mod tests {
                 prefer_shared_instance: None,
                 force_start: None,
                 enabled: None,
+                client_capabilities: None,
                 settings: None,
             },
         );
@@ -3502,6 +3518,7 @@ mod tests {
                 prefer_shared_instance: None,
                 force_start: None,
                 enabled: None,
+                client_capabilities: None,
                 settings: None,
             },
         );
@@ -3622,6 +3639,7 @@ mod tests {
                 prefer_shared_instance: None,
                 force_start: None,
                 enabled: None,
+                client_capabilities: None,
                 settings: None,
             },
         );
@@ -3849,6 +3867,7 @@ mod tests {
                 prefer_shared_instance: None,
                 force_start: None,
                 enabled: None,
+                client_capabilities: None,
                 settings: None,
             },
         );
