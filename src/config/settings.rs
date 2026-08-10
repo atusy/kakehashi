@@ -413,17 +413,24 @@ pub struct BridgeServerConfig {
     ///
     /// Deep-merged over the capabilities kakehashi would otherwise send in
     /// `initialize` (after the editor's own capabilities are folded in), so
-    /// values written here always win. Keys cannot be removed — TOML has no
-    /// null — so disable a capability with an explicit `false`, e.g.
-    /// `clientCapabilities = { window = { workDoneProgress = false } }` to
-    /// stop a progress-chatty server from streaming `$/progress`.
+    /// values written here always win. The merge only sets keys, never
+    /// removes them: disable a boolean capability with an explicit `false`,
+    /// e.g. `clientCapabilities = { window = { workDoneProgress = false } }`
+    /// to stop a progress-chatty server from streaming `$/progress`. Disable
+    /// an object-typed capability via its inner boolean (e.g.
+    /// `window = { showDocument = { support = false } }`) — `false` in place
+    /// of an object is an invalid shape a strict server may reject.
     ///
     /// `general.positionEncodings` is protected: kakehashi's coordinate
-    /// translation depends on it, so an override there is ignored with a
-    /// warning. Adding capabilities the editor or kakehashi cannot actually
-    /// handle may invite downstream requests that fail; reducing capabilities
-    /// is always safe. Consumed only at `initialize` time — a change needs a
-    /// server restart.
+    /// translation depends on it, so an override there is reverted with a
+    /// warning. Forcing `workspace.configuration` on or off is honored but
+    /// warned when it contradicts kakehashi's own gate: enabled without
+    /// `settings`, every configuration pull is answered null; disabled with
+    /// `settings`, the server may never read them. Adding capabilities the
+    /// editor or kakehashi cannot actually handle may invite downstream
+    /// requests that fail; reducing capabilities is safe apart from the
+    /// protected field. Consumed only at `initialize` time — a change
+    /// relaunches this server's connections on the next config reload.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub client_capabilities: Option<Value>,
     /// Marker files/directories that locate the workspace root for this
