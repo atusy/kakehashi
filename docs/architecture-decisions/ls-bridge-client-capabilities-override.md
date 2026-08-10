@@ -31,15 +31,22 @@ workDoneProgress = false
 - **User wins, applied last.** Merge order is baseline → upstream-editor merge
   → user override, so an upstream-propagated `true` is reliably masked by a
   user's `false`.
-- **JSON-layer merge, deferred to serialization.** The override folds into the
-  serialized `initialize` params, not the typed `ClientCapabilities` — a typed
-  round-trip would silently drop fields the types don't model (the same trap
-  documented for `workspaceEdit` metadata). The no-override path does not
-  round-trip through `serde_json::Value` at all, keeping its serialization
-  byte-identical. The merge itself reuses config's `deep_merge_json`, so
+- **JSON-layer merge.** The override folds into the serialized `initialize`
+  params, not the typed `ClientCapabilities` — a typed round-trip would
+  silently drop capability fields the types don't model (the same trap the
+  `workspaceEdit` mirror comments in
+  `src/lsp/bridge/protocol/client_capabilities.rs` document). Key order is a
+  non-issue: serde_json's `preserve_order` is active build-wide, and the
+  writer serializes every outbound request from a `serde_json::Value`
+  regardless. The merge itself reuses config's `deep_merge_json`, so
   advertise-time and config-layer merge semantics cannot drift apart.
-- **Explicit `false` is the only negation.** TOML has no `null`, so keys
-  cannot be removed, only set; an explicit `false` is a spec-honest denial.
+- **Explicit `false` is the only negation.** The deep merge only sets keys:
+  TOML cannot write `null`, and a JSON-carried `null` (editor-pushed config)
+  is written through as `null` rather than removing the key. Deny a
+  boolean-typed capability with `false`; deny an object-typed one via its
+  inner boolean (`window.showDocument.support = false`) — `false` in place
+  of an object is an invalid shape a strictly-typed server may reject at
+  `initialize`.
 - **`general.positionEncodings` is protected.** Enforced as a post-merge
   invariant: whatever shape the override takes (an object override, a
   non-object `general` replacing the subtree, a JSON `null`), the baseline
@@ -68,3 +75,14 @@ server's value) — see configuration-merging-strategy.
   requests as it always has for unsupported traffic. This is accepted — the
   guard list is limited to fields whose corruption would be silent
   (`positionEncodings`).
+- One enabling lie is warned rather than failed: forcing
+  `workspace.configuration` against the settings-presence gate
+  (downstream-settings-propagation). Enabled without `settings`, the server
+  flips to pull and every section is answered `null`; disabled with
+  `settings`, the server may never read them. The override wins — it is
+  user-explicit — but the spawn site names the conflict per server.
+- `workDoneProgress = false` stops *server-initiated* progress at the source
+  (`window/workDoneProgress/create` is capability-gated). Progress a server
+  reports against a client-supplied `workDoneToken` forwarded with a request
+  is a separate channel and is unaffected; the motivating basedpyright flood
+  is the former.
