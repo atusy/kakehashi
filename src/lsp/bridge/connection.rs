@@ -6,7 +6,7 @@
 use std::io;
 use std::process::Stdio;
 
-use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command};
 
 /// Writer handle for sending LSP messages to downstream language server.
@@ -37,6 +37,17 @@ impl BridgeWriter {
 
 /// Longest stray line quoted back in a framing error.
 const STRAY_LINE_MAX_QUOTE_BYTES: usize = 300;
+
+/// tokio's `BufReader` default capacity, and so the point above which reading a
+/// body remainder directly beats staging it through that buffer.
+const BUF_READER_CAPACITY: usize = 8 * 1024;
+
+/// A body remainder large enough to read straight from the source.
+struct LargeBodyRead<'a> {
+    /// Bytes this frame still owes — the cap that keeps the read inside it.
+    remaining: u64,
+    buf: &'a mut Vec<u8>,
+}
 
 /// How far into the current frame the parser has got.
 ///
@@ -170,6 +181,27 @@ impl FrameParseState {
         }
     }
 
+    /// The body buffer and how much it still owes, when the remainder is big
+    /// enough to be worth reading straight from the source instead of staging
+    /// through the `BufReader`.
+    ///
+    /// `buffer_drained` must be the caller's `BufReader` state: bypassing it
+    /// while it still holds bytes would read past them and reorder the stream.
+    fn large_body_remainder(&mut self, buffer_drained: bool) -> Option<LargeBodyRead<'_>> {
+        if !buffer_drained {
+            return None;
+        }
+        let length = self.content_length?;
+        let body = self.body.as_mut()?;
+        let remaining = length - body.len();
+        // Below one BufReader-full, staging is the cheaper path: it batches the
+        // syscall with whatever else is in flight instead of issuing its own.
+        (remaining >= BUF_READER_CAPACITY).then_some(LargeBodyRead {
+            remaining: remaining as u64,
+            buf: body,
+        })
+    }
+
     /// The finished body, if the frame is complete. Resets for the next frame.
     fn take_completed_frame(&mut self) -> Option<Vec<u8>> {
         let length = self.content_length?;
@@ -221,6 +253,34 @@ impl<R: AsyncRead + Unpin> BridgeReader<R> {
         // Split the borrow so the buffer and the parse state can be held at once.
         let Self { stdout, frame } = self;
         loop {
+            if let Some(body) = frame.large_body_remainder(stdout.buffer().is_empty()) {
+                // Staging a multi-megabyte body through the 8 KiB BufReader costs
+                // an extra copy of every byte and ~8x the read() syscalls, because
+                // poll_fill_buf (unlike poll_read) has no large-read bypass. Read
+                // straight into the frame buffer instead.
+                //
+                // Still cancel-safe: read_buf is a single poll_read that appends
+                // nothing when it returns Pending, and body.len() remains the
+                // resume marker.
+                //
+                // `take` bounds the read to this frame. It is deliberately
+                // forward-looking: today `Vec::with_capacity` returns an exact
+                // fit, so read_buf could not overshoot anyway (removing the cap
+                // keeps every test green). But the contract only promises *at
+                // least* the requested capacity, so a pooled or rounded-up buffer
+                // would silently read the next frame's header into this body —
+                // the exact desync this module exists to prevent. The cap makes
+                // that impossible by construction rather than by luck.
+                let read = (&mut *stdout.get_mut()).take(body.remaining).read_buf(body.buf).await?;
+                if read == 0 {
+                    return Err(frame.eof_error());
+                }
+                if let Some(done) = frame.take_completed_frame() {
+                    return Ok(done);
+                }
+                continue;
+            }
+
             let (consumed, outcome) = {
                 let available = stdout.fill_buf().await?;
                 if available.is_empty() {
@@ -1221,6 +1281,49 @@ mod tests {
         tx.write_all(b"Content-Length: 0\r\n\r\n").await.unwrap();
         // Deliberately no further writes and no EOF.
         assert_eq!(reader.read_message_bytes().await.unwrap(), b"");
+    }
+
+    /// A body past the BufReader capacity is read straight from the source,
+    /// bypassing that buffer. The bypass must stop exactly at the frame's last
+    /// byte: `Vec::with_capacity` only promises *at least* the requested
+    /// capacity, so an unbounded read into the spare capacity would swallow the
+    /// next frame's header and desync the stream.
+    #[tokio::test]
+    async fn a_large_body_does_not_swallow_the_next_frame() {
+        let big = vec![b'x'; 100 * 1024];
+        let small = br#"{"id":2}"#;
+
+        let (mut tx, mut reader) = duplex_reader();
+        let mut stream = header_for(&big);
+        stream.extend_from_slice(&big);
+        stream.extend_from_slice(&header_for(small));
+        stream.extend_from_slice(small);
+        // The duplex buffer is smaller than this stream, so the writer has to
+        // stay live and be drained by the reads below.
+        tokio::spawn(async move {
+            tx.write_all(&stream).await.unwrap();
+        });
+
+        assert_eq!(reader.read_message_bytes().await.unwrap(), big);
+        assert_eq!(reader.read_message_bytes().await.unwrap(), small);
+    }
+
+    /// The large-body bypass is a second await point, so it needs the same
+    /// cancel-safety as the staged path: bytes already read stay in the frame
+    /// and the read resumes at the right offset.
+    #[tokio::test]
+    async fn read_resumes_after_cancellation_inside_a_large_body() {
+        let big = vec![b'y'; 100 * 1024];
+        let (mut tx, mut reader) = duplex_reader();
+
+        tx.write_all(&header_for(&big)).await.unwrap();
+        tx.write_all(&big[..32 * 1024]).await.unwrap();
+        cancel_a_read(&mut reader).await;
+
+        tokio::spawn(async move {
+            tx.write_all(&big[32 * 1024..]).await.unwrap();
+        });
+        assert_eq!(reader.read_message_bytes().await.unwrap(), vec![b'y'; 100 * 1024]);
     }
 
     /// A framing error must leave the reader able to move on: the bytes that
